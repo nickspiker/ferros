@@ -59,3 +59,10 @@ pub fn ira_key(slot: u64, domain: &str) -> Option<[u8; 32]> {
     let r = svc(IRA, cap(slot), off(domain.as_ptr()), domain.len() as u64, off(out.as_mut_ptr()), 0);
     (r == 32).then_some(out)
 }
+
+const DMA: u64 = 7;
+
+/// The base of a region this process holds a token for, the token in the process's own memory (the camera's view: docs/CAMERA.md "The view"); ERR once it is taken back.
+pub fn dma(token: &[u8; 32]) -> u64 {
+    svc(DMA, off(token.as_ptr()), 0, 0, 0, 0)
+}

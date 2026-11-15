@@ -101,10 +101,12 @@ The list is a VSF document (the house format for anything structured); a frame i
 | op | request | reply |
 |---|---|---|
 | 0 LIST | `[0]` | a VSF document, a section `camera` per camera the driver can stream (none: an empty document) |
-| 1 OPEN | `[1][id]` | `[0]` open, `[1]` no such camera, `[2]` another holds it |
+| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view | `[0]` open, `[1]` no such camera, `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view") |
 | 2 FRAME | `[2][bin]` | waits for the next frame: a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample, row by row |
 | 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus (the actuator's position) |
-| 4 CLOSE | `[4]` | the camera stops; it also stops when its holder ends |
+| 4 CLOSE | `[4]` | the view taken back, the camera stops; it also stops when its holder ends |
+| 5 MAP | `[5][buffer to give back, G#FF none]` | with the view: waits for a frame newer than the last mapped and holds its buffer; its 64-byte header (bin 1; the buffer at +40, the format at +41, a line's bytes at +44, the buffer's place in the view at +48), the samples read in place |
+| 6 RELEASE | `[6][buffer]` | the held buffer given back: `[0]`, `[1]` when it was not held |
 
 A `camera` section's fields: `id` (u), `name` (a: main, ultrawide, front), `facing` (u: 0 away from the person, 1 toward), `width` and `height` (u: the readout), `cfa` (u: the 2 x 2 cell's channels, 2 bits each, top left first, 0 R 1 G 2 B: husky's main G B / R G is G#49), `black` and `white` (u), `rotation` (u: quarter turns clockwise to stand it upright; husky's main 1), `idt` (nine f5: the Absolute IDT's matrix, row-major, camera to VSF RGB), `sensitivity` (three f5), `exposure_min`, `exposure_max` (u, ns), `gain_min`, `gain_max` (u, 1024 unity), `focus_min`, `focus_max` (u).
 The IDT is the device's calibration (husky's main: `pixel 8 pro calibration data/derived/cam2-main.idt.vsf`), kept in the vault beside the sensor's init, never in a kist.
@@ -113,8 +115,31 @@ The frame header: count (u32, +0), width and height after binning (u16, +4, +6),
 The client's reader and the header's writer are side by side in rust/lumis-ferros/src/camera.rs, tested together.
 
 A frame by copy is for the preview: husky's main at bin 2 is 2040 x 1536 samples, 6 MiB a frame, 90 MB/s at 14.5 frames a second.
-A full raw frame for a capture (25 MB at 16 bits) wants a mapping instead, a ring of frame buffers the kist reads in place (KISTS.md "Lumis"); that is an object the kernel does not have yet.
+A full raw frame for a capture (25 MB at 16 bits) wants a mapping instead, a ring of frame buffers the kist reads in place (KISTS.md "Lumis"): the view, since 2026-11-15 ("The view" below).
 How large a reply the kernel copies between two processes in one call (read from the code, 2026-11-14): a plain reply was capped at a store transfer, 256 KiB, so the preview frame could not cross; since 2026-11-14 up to 8 MiB (`REPLY_MAX`), copied server to caller under the kernel lock (about a millisecond for 6 MiB, unmeasured).
+
+## The view (2026-11-15): whole frames to the kist, read in place
+
+The owner, 2026-11-15, seeing Lumis's saves: "why the ridiculously low camera resolution?"
+A frame by copy is capped at a reply (8 MiB, `REPLY_MAX`), so Lumis only ever had bin 2: 2040 x 1536, a quarter of the sensor, and its saves were 3 MP of a 12 MP sensor.
+The view gives the kist that holds the camera the driver's frames themselves, read-only, in place.
+
+**The ring** (payloads/camera, ferros_cam job `main_ring`): the image body's slot of the job's region becomes a ring of buffers of 16 MiB (eight frames of the pool each; a 4080 x 3072 RAW10 frame at G#1400 a line is 15 MiB), four of them (128 MiB with the rest of the region and the long ring's frame: the camera's window whole), else three, two, or one (the region before the view, 40 frames), under 4 GiB first as before; one buffer gives no view (frames by copy only), so a pool with little room (a jumped session's) opens the camera with no more memory than before (the driver's arc is unchanged too, four frames).
+The job's program writes the image body's address once (`image_words`: words 30 and 32 of the main camera's 6620-byte program), so the driver puts a copy of the program per buffer in the long ring's frame, each naming its own buffer, and at every DMA_DONE writes the descriptor it is about to release to name a buffer that is neither held (by the kist, or by the binning of a FRAME by copy), nor still with the engine, nor the newest written one (`ring_turn`).
+Which buffer a frame lands in is measured, not assumed: each buffer's probe (the first 64 bytes of its last line, written last of the frame) is patterned as the buffer is given to the engine, and the frame's DMA_DONE finds the buffer whose probe moved; the console says, every 64 MAPs, how many releases back each frame's buffer was given (0: the descriptor released at the frame before), frames whose buffer was not found, and turns that found no free buffer.
+A held buffer's probe is kept when it is handed out and compared when it is given back: any write while held is counted and said (the ring's promise is none).
+FRAME by copy stays for anything that wants it, binned from the newest buffer, held while it bins.
+
+**The kernel's view** (process.rs `cam_view_give`, `cam_view_drop`; cachemap `CAM_VIEW_VA`): at an OPEN that asks for it, the driver calls SYS_DMA x1 = 4 on its region with the OPEN's reply token, and the kernel maps the ring's frames of the driver's run, read-only for EL0 (and for EL2: AP[2] binds both in the VHE regime) and non-cacheable (the front end does not snoop), at G#50_3800_0000, past the driver's own window; it gives the process waiting on that reply token a capability for the `camera-view` region and writes its token into the driver's arc for the OPEN's reply to carry.
+The kist presents the token to SYS_DMA for the view's base (x1 = 1 its size), as any region.
+Isolation, as the system has it for surfaces and GPU blocks: only the holder has the token; the view is never a syscall buffer (`dma_span` leaves it out, so the kernel never writes thru it), never granted by name, never passed on in a spawn; the GPU never sees it (its S2MPU admits surfaces and blocks only), and the front end's S2MPUs admit the driver's run and nothing else, as before.
+Native processes share one translation table (KERNEL.md, execution model), so a native process that guessed the address could read the view while it is mapped, as it could a surface; a masked one cannot.
+Taken back (every block mapped to the blank frame, every TLB told, the holder's capability gone so its token answers ERR): at the driver's close (SYS_DMA x1 = 5, the first thing `close` does), when either the holder or the driver ends (`cam_free`), or when a new view is given.
+The frames go back to the pool wiped when the driver ends, as before.
+
+**Lumis** (std/lumis): opens with the view, and per frame MAPs (giving back the buffer it held), copies each line out of the view in 64-byte loads, unpacks RAW10 to 16 bits across the cores, and integrates the whole 4080 x 3072 frame; its saves are the sensor's whole frame (VSF RAW, and VSF 8B through vsf's AV1 on Lumis's `vsf8b-av1`). An open answered without the view (a driver or kernel from before) falls back to frames by copy at bin 2. Its heap's ceiling is 2 GiB (the integrator's memory at full size is about 350 MB, a save's on top).
+
+**payloads/camtest** drives it headless: bin 1 (`4001`: 64 frames) opens with the view, MAPs, reads each frame in place (a whole frame's copy timed), closes and tries the token again (it must be refused); `40010002` also stores into the view at the end, which must end camtest on the fault.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 

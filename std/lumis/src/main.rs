@@ -21,7 +21,6 @@ use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DISPLAY: u64 = 1;
@@ -30,8 +29,83 @@ const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const CAMERA: u64 = 7;
 
-/// The binning Lumis asks the driver for: the largest frame a call can carry is 8 MiB (process.rs `REPLY_MAX`), so the main camera's whole readout (4080 x 3072 samples, 24 MiB) cannot cross and bin 2 (2040 x 1536, 6 MiB) is the finest Lumis integrates.
+/// The binning Lumis asks the driver for when the open gave no view (a driver or kernel from before it): the largest frame a call can carry is 8 MiB (process.rs `REPLY_MAX`), so the main camera's whole readout (4080 x 3072 samples, 24 MiB) cannot cross and bin 2 (2040 x 1536, 6 MiB) is the finest a copy carries.
+/// With the view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?") Lumis integrates and saves whole sensor frames, read in place.
 const BIN: u32 = 2;
+
+/// Rows unpacked per task when a frame is taken out of the view.
+const ROWS_PER_TASK: usize = 1 << 4;
+
+/// Where the camera service's frames come from.
+enum Source {
+    /// The view: whole frames read in place (`base` where this process reads it), the buffer held, the frame unpacked to 16 bits.
+    View { base: usize, view: camera::View, held: u8, frame: Vec<u16> },
+    /// Frames by copy at `BIN`, header and samples.
+    Copy { buf: Vec<u8> },
+}
+
+/// A frame's time in the camera service, for the console every 64: waiting on the driver, unpacking out of the view, the integrator, the whole turn (each summed, microseconds).
+#[derive(Default)]
+struct Turns {
+    wait: u64,
+    unpack: u64,
+    integrate: u64,
+    since: Option<std::time::Instant>,
+    n: u64,
+}
+
+/// `len` bytes from the non-cacheable view at `src` into `dst`, 64 bytes a load (four NEON registers): each load of non-cacheable memory is its own bus transaction, and the camera driver measured 8-byte loads at 121 ms a frame against 14.4 ms (docs/CAMERA.md).
+fn copy_from_view(src: usize, dst: &mut [u8]) {
+    #[cfg(target_arch = "aarch64")]
+    for i in 0..dst.len() / 64 {
+        unsafe {
+            let v = core::arch::aarch64::vld1q_u8_x4((src + i * 64) as *const u8);
+            core::arch::aarch64::vst1q_u8_x4(dst.as_mut_ptr().add(i * 64), v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len())
+    };
+}
+
+impl Source {
+    /// The next frame, its header and its samples (16 bits, little-endian, row by row), with the wait and the unpacking counted.
+    fn next(&mut self, t: &mut Turns) -> Option<(camera::FrameHeader, &[u8])> {
+        let t0 = std::time::Instant::now();
+        match self {
+            Source::View { base, view, held, frame } => {
+                let mut r = [0u8; camera::FRAME_HEADER];
+                let n = sys::call_live(CAMERA, &[camera::OP_MAP, *held], &mut r);
+                let m = (n != sys::ERR).then(|| camera::parse_map(&r[..n as usize])).flatten()?;
+                *held = m.buffer;
+                let t1 = std::time::Instant::now();
+                t.wait += (t1 - t0).as_micros() as u64;
+                let (w, line) = (view.width, view.line);
+                let src = *base + m.offset;
+                frame.par_chunks_mut(w * ROWS_PER_TASK).enumerate().for_each_init(
+                    || vec![0u8; line],
+                    |tmp, (k, rows)| {
+                        for (j, row) in rows.chunks_exact_mut(w).enumerate() {
+                            copy_from_view(src + (k * ROWS_PER_TASK + j) * line, tmp);
+                            camera::unpack_raw10(tmp, row);
+                        }
+                    },
+                );
+                t.unpack += t1.elapsed().as_micros() as u64;
+                // SAFETY: the u16 samples' own bytes, little-endian on this target as the integrator reads them.
+                let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 2) };
+                Some((m.frame, bytes))
+            }
+            Source::Copy { buf } => {
+                let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
+                t.wait += t0.elapsed().as_micros() as u64;
+                let h = (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()?;
+                Some((h, &buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()]))
+            }
+        }
+    }
+}
 
 /// Lumis's focus control is in diopters (Camera2's LENS_FOCUS_DISTANCE: 0 at infinity, the nearest focus at LENS_INFO_MINIMUM_FOCUS_DISTANCE); the driver's is the actuator's position (`focus_min`..`focus_max`).
 /// Unmeasured on the Pro: Lumis's range is taken as 0 to 2^3 diopters (12.5 cm), mapped straight onto the actuator's range, infinity at `focus_min`.
@@ -111,8 +185,8 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 id: c.name.clone(),
                 index,
                 facing: if c.facing == 1 { 0 } else { 1 },
-                width: c.width / BIN,
-                height: c.height / BIN,
+                width: c.width,
+                height: c.height,
                 white_level: c.white as i32,
                 black_level: c.black as i32,
                 bayer_pattern: bayer as i32,
@@ -171,21 +245,36 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         println!("lumis: camera {}: {why}", cam.name);
         *opened.lock().unwrap() = Some(Opened::Failed(why));
     };
-    let mut r = [0u8; 4];
-    match (sys::call_live(CAMERA, &[camera::OP_OPEN, cam.id], &mut r), r[0]) {
+    // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
+    let mut r = [0u8; camera::VIEW_REPLY];
+    let n = sys::call_live(CAMERA, &[camera::OP_OPEN, cam.id, camera::OPEN_VIEW], &mut r);
+    match (n, r[0]) {
         (sys::ERR, _) => return fail("the camera driver did not answer the open".into()),
         (_, 0) => {}
         (_, 1) => return fail("the driver has no such camera".into()),
         (_, 2) => return fail("another kist has this camera open".into()),
         (_, k) => return fail(format!("the driver refused the open ({k})")),
     }
-    // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
-    let mut buf = vec![0u8; camera::FRAME_HEADER + (1 << 23)];
-    let frame = |buf: &mut [u8]| -> Option<camera::FrameHeader> {
-        let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
-        (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()
+    // The view's token is kept in this process's memory for the life of the camera: the kernel answers its base from it.
+    let mut src = match camera::parse_view(&r[..n as usize]) {
+        Some(v) if v.format == camera::FORMAT_RAW10 => {
+            let token = Box::leak(Box::new(v.token));
+            let base = sys::dma(token);
+            if base == sys::ERR {
+                return fail("the view's token was refused".into());
+            }
+            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at {base:#x}", cam.name, v.buffers, v.width, v.height);
+            Source::View { base: base as usize, view: v, held: camera::NONE, frame: vec![0u16; v.width * v.height] }
+        }
+        Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),
+        None => {
+            println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
+            // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
+            Source::Copy { buf: vec![0u8; camera::FRAME_HEADER + (1 << 23)] }
+        }
     };
-    let Some(first) = frame(&mut buf) else {
+    let mut turns = Turns::default();
+    let Some((first, _)) = src.next(&mut turns) else {
         return fail("no first frame".into());
     };
     println!("lumis: camera {}: first frame, {} x {} samples (bin {}), exposure {} us, gain {}/1024", cam.name, first.width, first.height, first.bin, first.exposure_ns / 1000, first.gain);
@@ -227,11 +316,20 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let focus_of = |diopters: f32| cam.focus_min as u64 + ((diopters as f64 / NEAREST_DIOPTERS) * (cam.focus_max - cam.focus_min) as f64) as u64;
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
-    let mut head = first;
     let mut frames = 0u64;
+    // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
-        let samples = &buf[camera::FRAME_HEADER..camera::FRAME_HEADER + head.samples_bytes()];
+        let Some((head, samples)) = src.next(&mut turns) else {
+            println!("lumis: camera {}: no frame (the driver refused or ended); Lumis ends, as Android's camera process does on a camera error", cam.name);
+            lumis_core::platform::exit();
+        };
+        if head.width != first.width || head.height != first.height {
+            println!("lumis: camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first; Lumis ends", cam.name, head.width, head.height, first.width, first.height);
+            lumis_core::platform::exit();
+        }
+        let t_integrate = std::time::Instant::now();
         let (iso, shutter_ns, focus) = integrator.process_frame(samples, (iso(head.gain)) as i32, head.exposure_ns as i64, 0., false, head.width * 2);
+        turns.integrate += t_integrate.elapsed().as_micros() as u64;
         if iso != sent.0 && !set(camera::SET_GAIN, gain_of(iso)) {
             println!("lumis: the camera did not take gain {} (ISO {iso})", gain_of(iso));
         }
@@ -248,26 +346,21 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         integrator.try_save();
         keep_saves(vault.as_deref(), &mut *integrator.header);
         frames += 1;
-        if frames & ((1 << 8) - 1) == 0 {
-            println!("lumis: {frames} frames integrated");
+        turns.n += 1;
+        if turns.n == 1 << 6 {
+            let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
+            println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, unpacking {} us, the integrator {} us", first.width, first.height, whole / 64, turns.wait / 64, turns.unpack / 64, turns.integrate / 64);
+            turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
+        } else if turns.since.is_none() {
+            turns.since = Some(std::time::Instant::now());
         }
-        head = match frame(&mut buf) {
-            Some(h) if h.width == first.width && h.height == first.height => h,
-            Some(h) => {
-                println!("lumis: camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first; Lumis ends", cam.name, h.width, h.height, first.width, first.height);
-                lumis_core::platform::exit();
-            }
-            None => {
-                println!("lumis: camera {}: no frame (the driver refused or ended); Lumis ends, as Android's camera process does on a camera error", cam.name);
-                lumis_core::platform::exit();
-            }
-        };
     }
 }
 
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
     while let Some((bytes, name)) = lumis_core::get_pending_save_data() {
+        let t = std::time::Instant::now();
         let kept = match vault {
             Some(v) => match v.write_device(&format!("save/{name}"), &bytes) {
                 Ok(()) => true,
@@ -282,7 +375,7 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
             }
         };
         if kept {
-            println!("lumis: kept {name}, {} bytes", bytes.len());
+            println!("lumis: kept {name}, {} bytes, into the vault in {} ms", bytes.len(), t.elapsed().as_millis());
         }
         // A calibration map is not a photo: it never counts (as on Android).
         app::save_done(header, kept && !name.starts_with("cal_"));
@@ -311,10 +404,8 @@ struct Lumis {
     finger: Option<(f32, f32)>,
     down_sampled: bool,
     pending_up: bool,
-    /// Lumis's frame as last shown, three bytes a pixel, and as fluor's pixels; the rows that differ since the last show.
-    shown: Vec<u8>,
-    pixels: Vec<G2t16>,
-    changed: Option<(usize, usize)>,
+    /// Lumis posted a frame since the last show: the next draw converts it whole from Lumis's own buffer straight into fluor's scratch (no copy of the frame here: neither its bytes nor its pixels, 44 MB on the Pro).
+    changed: bool,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
     lut: [u32; 256],
 }
@@ -326,7 +417,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, shown: Vec::new(), pixels: Vec::new(), changed: None, lut }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, lut }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -346,38 +437,6 @@ impl Lumis {
         }
     }
 
-    /// The rows of Lumis's frame that changed since the last show, into fluor's pixels (each row compared, then converted only if it differs).
-    fn take_frame(&mut self) -> bool {
-        let Some(surface) = &self.surface else { return false };
-        let w = self.width;
-        let (lo, hi) = (AtomicUsize::new(usize::MAX), AtomicUsize::new(0));
-        let lut = &self.lut;
-        self.shown
-            .par_chunks_mut(w * 3)
-            .zip(self.pixels.par_chunks_mut(w))
-            .zip(surface.pixels().par_chunks(w * 3))
-            .enumerate()
-            .for_each(|(y, ((shown, px), src))| {
-                if shown == src {
-                    return;
-                }
-                shown.copy_from_slice(src);
-                for (p, rgb) in px.iter_mut().zip(src.chunks_exact(3)) {
-                    *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
-                }
-                lo.fetch_min(y, Ordering::Relaxed);
-                hi.fetch_max(y + 1, Ordering::Relaxed);
-            });
-        let (lo, hi) = (lo.into_inner(), hi.into_inner());
-        if lo >= hi {
-            return false;
-        }
-        self.changed = Some(match self.changed {
-            Some((a, b)) => (a.min(lo), b.max(hi)),
-            None => (lo, hi),
-        });
-        true
-    }
 }
 
 impl FluorApp<G2t16> for Lumis {
@@ -393,11 +452,7 @@ impl FluorApp<G2t16> for Lumis {
         // The frame is the panel, set once at start (ferros windows are the whole screen); Lumis is built for that size, as Android builds its menu and UI for the surface's.
         (self.width, self.height) = (w, h);
         self.surface = Some(PixelSurface::new(w, h));
-        self.shown = vec![0u8; w * h * 3];
-        // Black, as Lumis's zeroed frame is: a row Lumis never draws then reads the same in both.
-        let black = G2t16::from_channels(G2t16::ONE, [self.lut[0]; 3]);
-        self.pixels = vec![black; w * h];
-        self.changed = Some((0, h));
+        self.changed = true;
         self.menu = Some(app::menu_new(width, height, DENSITY_DPI, camera_infos(&self.cameras)));
         self.menu_dirty = true;
         ctx.window.request_redraw();
@@ -478,20 +533,28 @@ impl FluorApp<G2t16> for Lumis {
                 }
             }
         }
-        let posted = surface.take_posted();
-        posted && self.take_frame()
+        self.changed |= surface.take_posted();
+        self.changed
     }
 
+    /// The whole frame when Lumis posted one, nothing otherwise (a touch that drew nothing shows nothing new; fluor's default, the whole viewport, would clear the scratch for a frame never converted).
     fn damage_rect(&mut self, viewport: fluor::geom::Viewport) -> Option<fluor::canvas::PixelRect> {
-        let (y0, y1) = self.changed?;
-        Some(fluor::canvas::PixelRect::new(0, y0, viewport.width_px as usize, y1))
+        let h = if self.changed { viewport.height_px as usize } else { 0 };
+        Some(fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, h))
     }
 
-    fn render(&mut self, target: &mut [G2t16], _ctx: &mut Context) {
-        // Lumis's frame is opaque everywhere, so the rows that changed are copied whole, nothing under them.
-        let Some((y0, y1)) = self.changed.take() else { return };
-        let w = self.width;
-        target[y0 * w..y1 * w].copy_from_slice(&self.pixels[y0 * w..y1 * w]);
+    /// Lumis's frame (gamma-2 bytes) into fluor's pixels, the rows of the damage clip, straight from Lumis's buffer, a row per task on the worker cores. The frame is opaque everywhere, so every pixel is written and nothing lies under it.
+    /// Lumis's buffer starts zeroed, black, so the host's first frame (always the whole viewport) shows black wherever Lumis has not drawn yet.
+    fn render(&mut self, target: &mut [G2t16], ctx: &mut Context) {
+        let Some(surface) = self.surface.as_ref() else { return };
+        self.changed = false;
+        let (w, lut) = (self.width, &self.lut);
+        let (y0, y1) = (ctx.damage_clip.y0, ctx.damage_clip.y1);
+        target[y0 * w..y1 * w].par_chunks_mut(w).zip(surface.pixels()[y0 * w * 3..y1 * w * 3].par_chunks(w * 3)).for_each(|(px, src)| {
+            for (p, rgb) in px.iter_mut().zip(src.chunks_exact(3)) {
+                *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
+            }
+        });
     }
 
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {

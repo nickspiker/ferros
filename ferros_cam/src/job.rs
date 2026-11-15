@@ -74,6 +74,49 @@ pub const fn layout(sizes: &[u64; SLOTS]) -> Layout {
 /// The main camera's region.
 pub const MAIN: Layout = layout(&MAIN_SLOT_BYTES);
 
+/// One frame of the image ring (docs/CAMERA.md "The view"): the image body, 4080 x 3072 RAW10 at G#1400 a line (15 MiB), in 16 MiB, eight frames of the pool, so the view maps whole frames of image and nothing else.
+pub const IMAGE_BYTES: u64 = 16 * MIB;
+/// The most image buffers a ring holds: the view's window (kernel cachemap `CAM_VIEW_VA`, 128 MiB).
+pub const RING_MOST: usize = 1 << 3;
+
+/// The main camera's region with an image ring of `n` buffers (1 to `RING_MOST`): slot 2, the image body, made `n` buffers of `IMAGE_BYTES` side by side, the job's own address in the first; every other slot as `MAIN` has it. The ring's buffer k is at `slots[OLD_SLOT_IMAGE].0 + k * IMAGE_BYTES`.
+pub const fn main_ring(n: usize) -> Layout {
+    let mut sizes = MAIN_SLOT_BYTES;
+    sizes[OLD_SLOT_IMAGE] = n as u64 * IMAGE_BYTES;
+    layout(&sizes)
+}
+
+/// The job's register program, the piece at `OLD_JOB + LIST_OFFSET`: where its bytes start in the image and their length.
+pub fn list_piece(job: &[u8]) -> Result<(usize, usize), Error> {
+    let p = pieces(job)?;
+    p.iter().find(|x| x.0 == OLD_JOB + LIST_OFFSET).map(|x| (x.1, x.2)).ok_or(Error::NoList)
+}
+
+/// The words of the program (a `list_piece`'s bytes) that write the image body's address register and its high half (`IMAGE_REG`, `IMAGE_REG` + 4), as word indices into it: each copy of the program the ring gets names its own buffer there (docs/CAMERA.md "The view"). An error when the program writes either not exactly once.
+pub fn image_words(list: &[u8]) -> Result<(usize, usize), Error> {
+    let words = list.len() / 4;
+    let (mut lo, mut hi) = ([0usize; 2], [0usize; 2]);
+    let (mut nl, mut nh) = (0, 0);
+    each_write(words, &|i| w32(list, i * 4), &mut |i, reg| {
+        // WHY the bounds: a second write of either is counted but not kept; the count refuses it below.
+        if reg == IMAGE_REG {
+            if nl < 2 {
+                lo[nl] = i;
+            }
+            nl += 1;
+        } else if reg == IMAGE_REG + 4 {
+            if nh < 2 {
+                hi[nh] = i;
+            }
+            nh += 1;
+        }
+    })?;
+    if nl != 1 || nh != 1 {
+        return Err(Error::ImageWrites(nl as u32, nh as u32));
+    }
+    Ok((lo[0], hi[0]))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Error {
     /// Not a 'CPR3'.
@@ -93,6 +136,8 @@ pub enum Error {
     LoadHigh(u32),
     /// More address-register writes than the 25 registers once each, with room to spare: not the job this was built for.
     TooManyAddresses,
+    /// The program writes the image body's address register, or its high half, other than once each (how many times each): the ring could not name its buffers in it.
+    ImageWrites(u32, u32),
 }
 
 /// The most pieces a job holds: the ring, the program and its block-load sources (the main camera's has 14).
@@ -393,6 +438,42 @@ mod tests {
         assert_eq!(relocate(&mut job, 0xA000_0000, &layout(&sizes)), Err(Error::Unplaced(0xAF00_0000)));
     }
 
+    #[test]
+    fn a_ring_layout() {
+        assert_eq!(main_ring(1).slots, MAIN.slots);
+        assert_eq!(main_ring(1).bytes, MAIN.bytes);
+        for n in 1..=RING_MOST {
+            let l = main_ring(n);
+            let (img, size) = l.slots[OLD_SLOT_IMAGE];
+            assert_eq!(size, n as u64 * IMAGE_BYTES);
+            assert_eq!(img % FRAME, 0, "the ring starts on a frame, so the view maps whole frames");
+            // Every other slot keeps its size, apart from the ring and each other.
+            for k in 0..SLOTS {
+                let (o, s) = l.slots[k];
+                if k != OLD_SLOT_IMAGE {
+                    assert_eq!(s, MAIN_SLOT_BYTES[k]);
+                }
+                if s != 0 && k != OLD_SLOT_IMAGE {
+                    assert!(o + s <= img || img + size <= o, "slot {k} and the ring of {n}");
+                }
+            }
+            println!("ring of {n}: {} MiB, {} frames, the ring at {} MiB", l.bytes >> 20, l.bytes / FRAME, img >> 20);
+        }
+        // A 4080 x 3072 RAW10 frame at G#1400 a line fits a buffer.
+        assert!(3072 * 0x1400 <= IMAGE_BYTES);
+    }
+
+    #[test]
+    fn the_image_words() {
+        let mut job = synthetic();
+        relocate(&mut job, 0x9_2000_0000, &main_ring(4)).unwrap();
+        let (at, len) = list_piece(&job).unwrap();
+        let (lo, hi) = image_words(&job[at..at + len]).unwrap();
+        assert_eq!((lo, hi), (2, 5));
+        let img = 0x9_2000_0000 + main_ring(4).slots[OLD_SLOT_IMAGE].0;
+        assert_eq!((w32(&job, at + lo * 4), w32(&job, at + hi * 4)), (img as u32, (img >> 32) as u32));
+    }
+
     /// The local job, when it is on this machine (target/cam/cam.pdma, the main camera's, list 2): every address it names lands in the region, in the slots the layout measured.
     #[test]
     fn the_local_job() {
@@ -409,5 +490,18 @@ mod tests {
             assert_eq!(m.highs, 24);
             assert_eq!(m.highs_left, if base >> 32 != 0 { 1 } else { 0 });
         }
+        // The ring: the program names the image body once, and each of its copies can name its own buffer (docs/CAMERA.md "The view").
+        let mut job = orig.clone();
+        let l = main_ring(4);
+        relocate(&mut job, 0xA000_0000, &l).expect("the main job moves into a ring's region");
+        let (at, len) = list_piece(&job).unwrap();
+        let (lo, hi) = image_words(&job[at..at + len]).expect("the image body is written once");
+        assert_eq!(w32(&job, at + lo * 4) as u64, 0xA000_0000 + l.slots[OLD_SLOT_IMAGE].0);
+        assert_eq!(w32(&job, at + hi * 4), 0);
+        let p = pieces(&job).unwrap();
+        for &(pa, _, n) in p.iter() {
+            println!("piece G#{pa:X}: {n} bytes");
+        }
+        println!("the program: {len} bytes, the image's words {lo} and {hi}; a ring of 4: {} MiB", l.bytes >> 20);
     }
 }

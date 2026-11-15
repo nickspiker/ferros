@@ -1105,6 +1105,8 @@ impl Process {
         // The address and length are the process's: an end that wraps would pass the comparison below.
         let end = a.checked_add(len)?;
         self.cspace.iter().find_map(|c| match c.object {
+            // Never the camera's view: read-only at EL2 too (cachemap `cam_view_map`), so a kernel write into a buffer there would fault under the lock.
+            Object::Dma(i) if DMA[i].name == "camera-view" => None,
             Object::Dma(i) if region(i).1 > 0 && a >= region(i).0 && end <= region(i).0 + region(i).1 => Some(a),
             _ => None,
         })
@@ -1855,6 +1857,8 @@ pub static DMA: &[Dma] = &[
     surface_slot(8), surface_slot(9), surface_slot(10), surface_slot(11), surface_slot(12), surface_slot(13), surface_slot(14), surface_slot(15),
     // The camera driver's region (cachemap CAM_VA, docs/CAMERA.md "The driver"): one run of frames side by side, taken from the pool when the driver asks (SYS_DMA x1 = 3, `cam_ask`), non-cacheable, the front end's S2MPUs fenced to exactly them (s2mpu.rs `fence_cam`), wiped back into the pool when the driver ends (`cam_free`); its size the frames it holds (`region`).
     Dma { name: "camera", base: crate::cachemap::CAM_VA.0, size: crate::cachemap::CAM_VA.1 - crate::cachemap::CAM_VA.0 },
+    // The camera's view (cachemap CAM_VIEW_VA, docs/CAMERA.md "The view"): the frames of the driver's image ring, read-only, given by the driver to the kist that opened the camera (SYS_DMA x1 = 4, `cam_view_give`) and taken back at its close or when either ends (`cam_view_drop`); its size the frames it shows (`region`). Never granted by name nor passed on, only given; never a syscall buffer (`dma_span`).
+    Dma { name: "camera-view", base: crate::cachemap::CAM_VIEW_VA.0, size: crate::cachemap::CAM_VIEW_VA.1 - crate::cachemap::CAM_VIEW_VA.0 },
     // The display's sprite cache (cachemap DISPLAY_SPRITES): cacheable, the display server's alone.
     Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
     // The display's 16-bit canvas (cachemap DISPLAY_CANVAS): its back buffer.
@@ -2090,6 +2094,10 @@ fn region(i: usize) -> (usize, usize) {
         let c = unsafe { &*(&raw const CAM) };
         return (DMA[i].base, c.n * crate::frames::FRAME);
     }
+    if DMA[i].name == "camera-view" {
+        let v = unsafe { &*(&raw const CAM_VIEW) };
+        return (DMA[i].base, if v.holder != 0 { v.n * crate::frames::FRAME } else { 0 });
+    }
     (DMA[i].base, DMA[i].size)
 }
 
@@ -2156,8 +2164,97 @@ fn cam_ask(p: &Process, n: u64, low: bool) -> u64 {
     pa as u64
 }
 
+/// The camera's view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?"): which kist holds it (a process epoch, 0 none), the driver that gave it (its epoch), and the frames of the driver's run it shows, from `first`, `n` of them, read-only at cachemap `CAM_VIEW_VA`.
+struct CamView {
+    holder: u64,
+    driver: u64,
+    first: usize,
+    n: usize,
+}
+/// Under the kernel lock.
+static mut CAM_VIEW: CamView = CamView { holder: 0, driver: 0, first: 0, n: 0 };
+/// The most frames the view may show: its window.
+const CAM_VIEW_FRAMES: usize = (crate::cachemap::CAM_VIEW_VA.1 - crate::cachemap::CAM_VIEW_VA.0) / crate::frames::FRAME;
+fn cam_view_index() -> usize {
+    DMA.iter().position(|r| r.name == "camera-view").unwrap()
+}
+
+/// SYS_DMA x1 = 4 on the `camera` region, the driver's alone: the process waiting on the reply token at arc offset `reply_off` (the caller of the OPEN being answered) is given a read-only view of frames `first` to `first + n` of the driver's run (the image ring), a capability of its own for the `camera-view` region, whose token is written at `out_off` in the driver's arc for its reply to carry; a view held already, by anyone, is taken back first (`cam_view_drop`). The view's base, which the holder also gets from SYS_DMA on its token. ERR, said on the console: the caller holds no run, the frames are past it or past the view's window, the token answers no process. Under the lock.
+fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64) -> u64 {
+    let c = unsafe { &*(&raw const CAM) };
+    let say = |what: &str| {
+        let line = alloc::format!("camera view: {}: {what}\n", core::str::from_utf8(&p.name).unwrap_or("?"));
+        k().console.extend_from_slice(line.as_bytes());
+    };
+    if c.owner != p.epoch || c.n == 0 {
+        say("not the holder of the camera's region");
+        return ERR;
+    }
+    // WHY: `first` and `n` are the driver's words; a view past its run would map frames it does not hold, and one past the window could not be mapped.
+    if n == 0 || n as usize > CAM_VIEW_FRAMES || first >= c.n as u64 || n > c.n as u64 - first {
+        say("frames outside its run or past the view's window");
+        return ERR;
+    }
+    let token = p.read(reply_off, 32);
+    let holder = match p.lookup(&token).map(|i| p.cspace[i].object) {
+        Some(Object::Reply(t)) if t != KERNEL_CALLER => proc_of(t).filter(|q| q.epoch != p.epoch && !q.dying),
+        _ => None,
+    };
+    let Some(q) = holder else {
+        say("the reply token answers no other process");
+        return ERR;
+    };
+    // The blank frame the view leaves behind when it is taken back, taken now so the taking back cannot fail.
+    if blank_frame().is_none() {
+        say("the frame pool has no frame for the blank the view leaves");
+        return ERR;
+    }
+    cam_view_drop("given anew");
+    let (first, n) = (first as usize, n as usize);
+    for j in 0..n {
+        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(c.first + first + j));
+    }
+    crate::cachemap::surface_unmapped(crate::cachemap::CAM_VIEW_VA.0, n * crate::frames::FRAME);
+    let vi = cam_view_index();
+    let t = mint(Object::Dma(vi), RIGHT_SEND, q.epoch);
+    q.cspace.push(CapEntry { token: t, object: Object::Dma(vi), rights: RIGHT_SEND });
+    unsafe { *(&raw mut CAM_VIEW) = CamView { holder: q.epoch, driver: p.epoch, first, n } };
+    p.write(out_off, &t);
+    say(&alloc::format!("A#{n} frames of its run from A#{first} shown read-only to {} at G#{:X}", core::str::from_utf8(&q.name).unwrap_or("?"), crate::cachemap::CAM_VIEW_VA.0));
+    crate::cachemap::CAM_VIEW_VA.0 as u64
+}
+
+/// The view taken back (the driver's close, SYS_DMA x1 = 5; either end of it ending, `cam_free`; a new view given): every block of it the blank frame (still read-only, so a reader in a frame as it goes reads zeros of nobody's, process.rs `blank_frame`), every TLB told, then the holder's capability gone, so SYS_DMA on its token answers ERR. Under the lock.
+fn cam_view_drop(why: &str) {
+    let v = unsafe { &mut *(&raw mut CAM_VIEW) };
+    if v.holder == 0 {
+        return;
+    }
+    // The blank frame was taken when the view was given (`cam_view_give`), so it is there.
+    let blank = unsafe { SURFACE_BLANK }.expect("camera view: the blank frame its give took");
+    for j in 0..v.n {
+        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(blank));
+    }
+    crate::cachemap::surface_unmapped(crate::cachemap::CAM_VIEW_VA.0, v.n * crate::frames::FRAME);
+    let vi = cam_view_index();
+    let kk = k();
+    if let Some(q) = kk.procs.iter_mut().flatten().find(|q| q.epoch == v.holder) {
+        q.cspace.retain(|c| !matches!(c.object, Object::Dma(i) if i == vi));
+    }
+    let line = alloc::format!("camera view: taken back ({why}), A#{} frames\n", v.n);
+    kk.console.extend_from_slice(line.as_bytes());
+    *v = CamView { holder: 0, driver: 0, first: 0, n: 0 };
+}
+
 /// The camera's run back to the pool when its holder ends (`end_process`, `kill_locked`): the front end's S2MPUs shut first while its domain is on (the engine may still be writing: a holder that ended mid-stream leaves the switch on until the service loop's next pass), the window unmapped and every TLB told, then each frame wiped as it goes back (frames.rs `give`). Under the lock.
+/// The view goes first when either its holder or the driver that gave it ends (`cam_view_drop`).
 fn cam_free(epoch: u64) {
+    {
+        let v = unsafe { &*(&raw const CAM_VIEW) };
+        if v.holder != 0 && (v.holder == epoch || v.driver == epoch) {
+            cam_view_drop(if v.holder == epoch { "its holder ended" } else { "the driver ended" });
+        }
+    }
     let c = unsafe { &mut *(&raw mut CAM) };
     if c.owner != epoch || c.n == 0 {
         return;
@@ -4750,8 +4847,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     // The whole blocks' window passes as a 32 MiB block of it, the child's own (GPU-KISTS.md plan step 1, 2026-11-12): init hands the attest screen its region this way.
                     Some((Object::Dma(i), r)) if DMA[i].name == "arena" => objects.push((Object::NewRegion(BLOCK_LEAST_LOG), r)),
-                    // A GPU block is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's.
-                    Some((Object::Dma(i), _)) if DMA[i].name == "gpu-block" => {
+                    // A GPU block is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's. The camera's view likewise: its holder's, taken back at the camera's close.
+                    Some((Object::Dma(i), _)) if DMA[i].name == "gpu-block" || DMA[i].name == "camera-view" => {
                         bad = true;
                         bad_at = bad_at.min(j);
                     }
@@ -4982,6 +5079,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
                 // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, f.x[2], f.x[3] & 1 == 1),
+                // x1 = 4 (2026-11-15, docs/CAMERA.md "The view"): the driver gives the caller of the OPEN it is answering (its reply token at arc offset x2) a read-only view of x3's frames of its run (low half the first, high half how many), the holder's token written at arc offset x4; answered the view's base (`cam_view_give`). x1 = 5: the view taken back, at the driver's close (`cam_view_drop`) → 0.
+                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 4 => cam_view_give(p, f.x[2], f.x[3] & 0xFFFF_FFFF, f.x[3] >> 32, f.x[4]),
+                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 5 && unsafe { (*(&raw const CAM_VIEW)).driver } == p.epoch => {
+                    cam_view_drop("the driver closed");
+                    0
+                }
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
                 Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
@@ -6838,6 +6941,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Dma(b"layers") => (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV),
             Grant::Dma(b"layers-32") => (Object::NewRegion(BLOCK_LEAST_LOG), RIGHT_SEND | RIGHT_RECV),
             Grant::Dma(b"gpu-block") => return Err("a GPU block is given (`layers`, `layers-32`), never named"),
+            Grant::Dma(b"camera-view") => return Err("the camera's view is given by the camera driver at an open, never named"),
             Grant::Dma(n) => match DMA.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
