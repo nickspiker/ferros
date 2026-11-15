@@ -1212,11 +1212,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
     restart_with(store, names, b"", rep)
 }
 
-/// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. Not after a jump from Android: the radios are still Android's there, and the WiFi driver's first register write once hung the bus (init leaves both drivers out then too).
+/// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. After a jump from Android too (2026-11-15): neither power-down touches the controller's ELBI or DBI, which stalled the bus when Android left its link suspended (the PHY powered down, its isolation released); both crowbar Android's chip into the cold state (the Pro, b878: WiFi's `off`, then the WiFi driver joined and leased; the modem's `off` took Android's live CP down).
 fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
-    if platform::jumped() {
-        return false;
-    }
     let (name, input): (&[u8], &[u8]) = if i == 0 { (b"modem", b"off") } else { (b"pcie1", &[0xF0]) };
     let mut rep = alloc::vec::Vec::new();
     restart_with(store, name, input, &mut rep);
@@ -2210,8 +2207,8 @@ pub fn run(mut b: Boot) -> ! {
     }
     platform::mark(0x35);
 
-    // The USB DMA master on physical addresses (the HSI0 S2MPU bypassed, every USB SYSMMU context off), reported by DIAG. USB itself is the USB process's (payloads/usb, USB.md): the kernel brings up no controller of its own and readies the link only when the process asks (`power usb on`, ptlink.rs).
-    let dma = open_usb_dma_path();
+    // The USB DMA master on physical addresses (the HSI0 S2MPU bypassed, every USB SYSMMU context off), reported by DIAG; after a jump the path is denied instead until the `usb` switch has reset the controller (platform::close_usb_dma_path). USB itself is the USB process's (payloads/usb, USB.md): the kernel brings up no controller of its own and readies the link only when the process asks (`power usb on`, ptlink.rs).
+    let dma = if platform::jumped() { platform::close_usb_dma_path() } else { open_usb_dma_path() };
     platform::mark(0x36);
 
     // The worker cores (smp.rs): up once the kernel is settled on its own core, before the first slice is handed out.
@@ -2273,6 +2270,11 @@ pub fn run(mut b: Boot) -> ! {
     let mut spawn_stage: Option<(crate::process::Arc, usize, usize, usize, usize)> = None;
     // `diag frames test`'s run so far: the next frame, frames tested, words wrong, frames with one wrong, the first wrong word's address.
     let mut frames_test = (0usize, 0usize, 0usize, 0usize, 0usize);
+    // `diag frames trip`'s pass so far: which (0 arm, 1 check, 2 off), the next frame, frames acted on, words changed; the runs a check found and the changed lines past the most it keeps; when the last arm was done.
+    let mut trip = (0u8, 0usize, 0usize, 0usize);
+    let mut trip_runs: alloc::vec::Vec<crate::frames::TripRun> = alloc::vec::Vec::new();
+    let mut trip_more = 0usize;
+    let mut trip_armed_at = 0u64;
 
     unsafe extern "C" {
         static __stack_top: u8;
@@ -2319,6 +2321,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut kists_started = false;
     // ARC_FREES when the stower's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no stower for the rest of the boot): tried again once an arc has come back since.
     let mut kists_refused_at: Option<u64> = None;
+    // Whether the flash log has had the background wipe's line (frames.rs `wipe_report`).
+    let mut wipe_logged = false;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
     // The display engine fenced to its own regions when the DPU is up already (ABL's splash, or a jump from a lit Android); a DPU that is down is fenced by the `dpu` switch as it powers it (s2mpu::fence_dpu). Before init starts the display server, so it never runs unfenced.
@@ -2327,18 +2331,35 @@ pub fn run(mut b: Boot) -> ! {
         crate::flashlog::line(&alloc::format!("dpu: S2MPUs fenced at boot: G#{r:X} (1 = fenced)"));
     }
     // The CoreSight system's bus master (the debug port's memory access, STM, the trace sinks) cut off from all memory on a cold boot: ferros uses none of it, and ABL leaves its S2MPU open. Not the cores' path: deny-all on it with ferros running left every core, the display and USB running (2026-11-04). Not after a jump: closed there, the jumped ferros froze right after its vault opened (most likely Android's trace still running on the cores, its sink cut off, backing up into them); that waits for tracing switched off on every core first.
+    // The modem's link fenced to its shared memory before init starts its driver (s2mpu::fence_modem), after a jump too: the hv's deny-all would refuse the CP the boot image, and the driver takes Android's CP down before it brings one up (payloads/modem `off`).
+    // Between this and that crowbar a CP Android left linked could write only into the carve-outs, which hold nothing of ferros's until the driver loads its image after the CP is down; the jump of 2026-11-15 found the link suspended (the ch0 PHY powered down), so no DMA at all.
+    let r = crate::s2mpu::fence_modem();
+    crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
     if !platform::jumped() {
         let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
         crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
-        // The modem's link fenced to its shared memory before init starts its driver (s2mpu::fence_modem). After a jump the hv has denied it all, and the modem is not started.
-        let r = crate::s2mpu::fence_modem();
-        crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
         // BLK_MISC's bus masters (PDMA1, SPDMA1, DIT), none of them ferros's: denied all, as the hv denies them at the jump.
         let r = crate::s2mpu::deny_all(crate::s2mpu::MISC_S2MPU);
         crate::flashlog::line(&alloc::format!("misc: BLK_MISC's S2MPU denied all: G#{r:X} (1 = done)"));
         // The GPU held to its own memory (gpu-mem) before any process can program it: its page tables are a process's.
         let r = crate::s2mpu::fence_gpu();
         crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU fenced to gpu-mem: G#{r:X} (1 = fenced)"));
+    } else {
+        // After a jump (HV.md "The high bank after a jump", 2026-11-15): every bus master Android left that the hv's deny-alls and the domains cut leave able to write, stopped before init starts anything.
+        // Trace's sinks first (coresight.rs: the ETR would write a buffer Linux allocated, now ferros's memory), the TMCs only. Measured on the jumped Pro (b879, 2026-11-15): every TMC off and the ETR never given a buffer. The kernel of b880 also read every core's trace unit here and stalled the bus (APC watchdog), so those are left alone.
+        // CPUCL0's S2MPU stays open after a jump for now: its deny froze the jump of 2026-11-04, and with trace proven off that freeze is unexplained; it is tried alone, by hand (`diag s2mpu deny cpucl0`), before it joins these.
+        let mut s = alloc::string::String::new();
+        crate::coresight::report(&mut s);
+        crate::coresight::stop(&mut s);
+        for l in s.lines() {
+            crate::flashlog::line(&alloc::format!("trace after the jump: {l}"));
+        }
+        // Android's GPU, left powered with Android's page tables: cut off from memory (ferros runs no GPU service after a jump).
+        let r = crate::s2mpu::deny_gpu();
+        crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU denied all after the jump: G#{r:X} (1 = done, E4 = pd_g3d off)"));
+        // The AoC, still in Android's session: held to its own carve-out.
+        let r = crate::s2mpu::fence_aoc();
+        crate::flashlog::line(&alloc::format!("aoc: its S2MPU fenced to its carve-out after the jump: G#{r:X} (1 = fenced)"));
     }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
@@ -2396,6 +2417,14 @@ pub fn run(mut b: Boot) -> ! {
             }
         }
         let person = store.as_ref().is_some_and(|s| s.unlocked());
+        // The deck is up: idle workers may now zero the frames Android left (frames.rs, after a jump only), and the flash log says once when they are done.
+        if person {
+            crate::frames::wipe_allow();
+        }
+        if !wipe_logged && crate::frames::wipe_done() {
+            wipe_logged = true;
+            crate::flashlog::line(crate::frames::wipe_report().trim_end());
+        }
         // The stower (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
         let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);
         if !person {
@@ -3794,6 +3823,25 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"frames" {
                     resp.extend_from_slice(crate::frames::map_report().as_bytes());
                     resp.extend_from_slice(crate::process::with_lock(crate::frames::pool_report).as_bytes());
+                    resp.extend_from_slice(crate::frames::wipe_report().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag frames release`: the frames a `FERROS_FRAMES_JUMP_HOLD=1` build held after a jump given to the pool (frames.rs `release_held`), once the tripwire and the fences say Android left nothing writing there.
+                if cmd.params == b"frames release" {
+                    let n = crate::process::with_lock(crate::frames::release_held);
+                    resp.extend_from_slice(alloc::format!("frames release: A#{n} held frames (A#{} MiB) given to the pool\n", n * 2).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag trace`: zuma's CoreSight trace sinks as they stand (coresight.rs: the TMCs and the ETR's buffer; not the per-core trace units, whose read stalled a jumped kernel), read only; `diag trace stop` stops a sink that captures.
+                if cmd.params == b"trace" || cmd.params == b"trace stop" {
+                    let mut s = alloc::string::String::new();
+                    if cmd.params == b"trace stop" {
+                        crate::coresight::stop(&mut s);
+                    }
+                    crate::coresight::report(&mut s);
+                    resp.extend_from_slice(s.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3820,6 +3868,73 @@ pub fn run(mut b: Boot) -> ! {
                     } else {
                         resp.extend_from_slice(alloc::format!("frames test done: A#{n} free frames written and read back, A#{bad} words wrong in A#{bad_frames} frames{tail}\n").as_bytes());
                         frames_test = (0, 0, 0, 0, 0);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag frames trip arm|check|off`: the tripwire (frames.rs `trip_arm`): every free or held frame written with a pattern naming each word's own address, read back on command for writes no CPU made, then wiped. A bus master Android left running after a jump (or any device writing where it should not) shows as changed runs with their address, extent and words. 256 frames (512 MiB) a call and a hold of the kernel lock a frame, as `frames test`; call again until it says done. A check re-arms what it found changed, so each reports the writes since the one before.
+                if let Some(op) = cmd.params.strip_prefix(b"frames trip ") {
+                    let kind = match op {
+                        b"arm" => 0u8,
+                        b"check" => 1,
+                        b"off" => 2,
+                        _ => 3,
+                    };
+                    if kind == 3 {
+                        resp.extend_from_slice(b"frames trip: arm, check or off\n");
+                        queue_pt_response(&mut pt_out_data, &resp);
+                        continue;
+                    }
+                    if trip.0 != kind {
+                        trip = (kind, 0, 0, 0);
+                        trip_runs.clear();
+                        trip_more = 0;
+                    }
+                    let total = crate::process::with_lock(crate::frames::total);
+                    let t0 = cntpct();
+                    let mut acted = 0;
+                    while trip.1 < total && acted < 1 << 8 {
+                        let f = trip.1;
+                        let did = crate::process::with_lock(|| match kind {
+                            0 => crate::frames::trip_arm(f).then_some(0),
+                            1 => crate::frames::trip_check(f, &mut trip_runs, 1 << 6, &mut trip_more),
+                            _ => crate::frames::trip_off(f).then_some(0),
+                        });
+                        if let Some(words) = did {
+                            acted += 1;
+                            trip.2 += 1;
+                            trip.3 += words;
+                        }
+                        trip.1 += 1;
+                    }
+                    let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
+                    let (at, n, words) = (trip.1, trip.2, trip.3);
+                    if at < total {
+                        resp.extend_from_slice(alloc::format!("frames trip {}: A#{at} of A#{total} frames so far, A#{n} acted on (this call A#{us} us); again for the next\n", core::str::from_utf8(op).unwrap_or("")).as_bytes());
+                    } else {
+                        match kind {
+                            0 => {
+                                trip_armed_at = cntpct();
+                                resp.extend_from_slice(alloc::format!("frames trip armed: A#{n} frames (A#{} MiB), every free and held frame\n", n * 2).as_bytes());
+                            }
+                            1 => {
+                                let s = cntpct().wrapping_sub(trip_armed_at) / cntfrq();
+                                resp.extend_from_slice(alloc::format!("frames trip check: A#{n} armed frames read back, A#{s} s after the arm, A#{words} words changed in A#{} runs{}\n", trip_runs.len(), if trip_more == 0 { alloc::string::String::new() } else { alloc::format!(" (and A#{trip_more} changed lines past those)") }).as_bytes());
+                                // Each word as read, and where it is a pattern word from elsewhere, the address it names (`p:`).
+                                let word = |w: u64| {
+                                    let x = w ^ crate::frames::TRIP_SALT;
+                                    if x >> 36 == 0 && x & 7 == 0 { alloc::format!("p:G#{x:X}") } else { alloc::format!("G#{w:X}") }
+                                };
+                                for r in &trip_runs {
+                                    let sample: alloc::vec::Vec<alloc::string::String> = r.sample.iter().map(|&w| word(w)).collect();
+                                    resp.extend_from_slice(alloc::format!("G#{:X}-G#{:X}: A#{} bytes, A#{} words changed; G#{:X}: {}\n", r.start, r.end, r.end - r.start, r.words, r.line, sample.join(" ")).as_bytes());
+                                }
+                            }
+                            _ => resp.extend_from_slice(alloc::format!("frames trip off: A#{n} frames wiped\n").as_bytes()),
+                        }
+                        trip = (kind, 0, 0, 0);
+                        trip_runs.clear();
+                        trip_more = 0;
                     }
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

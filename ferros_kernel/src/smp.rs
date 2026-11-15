@@ -276,6 +276,12 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         } {
             continue;
         }
+        // Nothing to run: a frame of the background wipe (frames.rs, after a jump once a person is in) in place of the sleep, IRQs open meanwhile; the loop then looks for work again before the next frame.
+        unsafe { core::arch::asm!("msr daifclr, #2") };
+        if crate::frames::wipe_step() {
+            continue;
+        }
+        unsafe { core::arch::asm!("msr daifset, #2") };
         if option_env!("FERROS_IDLE_WFI").is_some() {
             // Under test (FERROS_IDLE_WFI=1 builds). IRQs are masked from the look above to the `wfi`: a kick (SGI 1) that lands in between stays pending and ends the `wfi` at once instead of being taken and forgotten — a touch call once waited the whole 7.8 ms tick that way (2026-10-23). `wfi` wakes on a pending interrupt whatever the mask; it is taken when the mask lifts after.
             let f = crate::platform::cntfrq();

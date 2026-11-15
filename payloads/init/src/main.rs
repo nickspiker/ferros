@@ -76,11 +76,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut failed = 0u64;
     // The keepers' stacks: in this frame, which never returns.
     let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
-    // After the jump from a running Android (fact 31 = 6) the radios and the AoC are still in Android's state, and their drivers know only the bootloader's: the WiFi driver's first register write hung the bus (the fifth jump, 2026-11-01), as the modem's read and the AoC start had. They wait for drivers that bring their block up from any state; the shell, the screen and USB start as always.
-    // Fact 31 = 7, ferros's own restart (power + volume up, the kernel's restart.rs), meets the state the last session left the same way: these stand down until each has a bring-up from any state.
+    // After the jump from a running Android (fact 31 = 6) the AoC is still in Android's state, and its start knows only the bootloader's (the AoC start stalled the service loop, 2026-11-01): sensors waits for a start from any state; the shell, the screen and USB start as always.
+    // Fact 31 = 7, ferros's own restart (power + volume up, the kernel's restart.rs), meets the state the last session left the same way.
+    // The radios start since 2026-11-15: WiFi and the modem take Android's chip and link down first (each driver's `off` at the head of its bring-up, never the controller's ELBI or DBI before), Bluetooth and NFC power-cycle their chips at every start (the kernel's `bt` and `nfc` switches; the NFC bus is brought up fresh after a jump). Measured on the Pro's jump b878: WiFi joined and leased, Bluetooth and NFC up, Android's live CP taken down.
     let jumped = matches!(ferros_sys::facts().0[31], 6 | 7);
     // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
-    let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
+    let after_jump = |n: &[u8]| jumped && matches!(n, b"sensors" | b"gpu");
     // Whether the map was started ahead of fgtw (the device bound already at the attest).
     let mut map_first = false;
     for (name, key, slots) in SHELL.iter() {

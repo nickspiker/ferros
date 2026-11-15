@@ -148,6 +148,11 @@ pub fn power(on: bool) -> bool {
         crate::pixel8_eusb_phy_init();
         crate::checklist::dot(4);
         crate::board::probe(84);
+        // The controller reset before the path opens (2026-11-15): after a jump Android's DWC3 may still hold a transfer list, and the path's S2MPU stayed denied until now (platform::close_usb_dma_path).
+        let reset_ok = crate::platform::usb_controller_reset();
+        if crate::platform::jumped() {
+            crate::flashlog::line(&alloc::format!("usb: the controller reset before the DMA path opened: {}", if reset_ok { "done" } else { "CSFTRST never cleared" }));
+        }
         let _ = crate::platform::open_usb_dma_path();
         crate::checklist::dot(5);
         crate::board::probe(85);

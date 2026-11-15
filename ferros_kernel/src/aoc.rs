@@ -400,6 +400,10 @@ static mut AOC_L1: L1 = L1([0; 4096]);
 fn mmu_table() -> usize {
     (&raw const AOC_L1) as usize
 }
+/// The table's bytes, [start, end): what the AoC's S2MPU fence after a jump admits besides the carve-out (s2mpu::fence_aoc).
+pub fn mmu_table_range() -> (usize, usize) {
+    (mmu_table(), mmu_table() + core::mem::size_of::<L1>())
+}
 
 /// The firmware's own IOMMU table, from its signed header (aoc_firmware.c `_aoc_fw_iommu_entry`): image_config at header offset G#C0+, the table at image_config + iommu_offset; each 64-bit entry is iova[19:0]<<12, pa[43:20]<<12, size[63:44]<<12. For husky's aoc.bin: the DRAM window G#9800_0000 (48 MiB) onto the carve-out, then the mailboxes, GPIO, ACPM and alive/CMU windows the firmware reaches.
 fn fw_iommu_entries() -> alloc::vec::Vec<(usize, usize, usize)> {

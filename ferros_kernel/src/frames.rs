@@ -44,7 +44,7 @@ const AKITA: [(usize, usize); 6] = [
     // Past the hv's 64 MiB, up to Linux's own allocations and the camera and video pools (G#9_BC04_0000).
     (0x9_0400_0000, 0x9_BC00_0000),
 ];
-/// Either board kept to the two old pools and the old carve-outs of the layer arena and the surfaces (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build): what ferros ran from after jumps before ARCS, the GPU's memory and surfaces included.
+/// Either board kept to the two old pools and the old carve-outs of the layer arena and the surfaces (`map` in a `FERROS_FRAMES_HIGH=0` build; after a jump the frames outside them are held, `held_after_jump`): what ferros ran from after jumps before ARCS, the GPU's memory and surfaces included.
 #[cfg(not(shim_handoff))]
 const LOW: [(usize, usize); 4] = [crate::cachemap::POOL, crate::cachemap::POOL_LAYERS, crate::cachemap::POOL_BIG, crate::cachemap::POOL_SURF];
 
@@ -57,15 +57,21 @@ const AKITA: [(usize, usize); 1] = [crate::cachemap::POOL];
 const LOW: [(usize, usize); 1] = [crate::cachemap::POOL];
 
 /// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps either board to the two old pools and the surfaces' old carve-out: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
-/// After a jump from Android (or a ferros restart, jump style) the high bank stays out of the pool too (2026-11-11, the Pro: a boot that came from a jump ran about a minute after attest and reset with no panic recorded): Android can leave a DMA master running, and a device still writing into high-bank frames would land in a process's memory. The two old pools are what ferros ran from after jumps before ARCS. The high bank comes back after jumps once every master Android left running is fenced or reset (the jump is a killswitch: memory feedback_jump_is_killswitch).
+/// The map is the same after a jump (the kernel maps every frame of it by its own address, so the tripwire reaches the high bank); what a jump changes is which frames are held (`held_after_jump`).
 pub fn map() -> &'static [(usize, usize)] {
-    if option_env!("FERROS_FRAMES_HIGH") == Some("0") || crate::platform::jumped() {
+    if option_env!("FERROS_FRAMES_HIGH") == Some("0") {
         &LOW
     } else if crate::board::akita() {
         &AKITA
     } else {
         &HUSKY
     }
+}
+
+/// A `FERROS_FRAMES_JUMP_HOLD=1` build holds the frames outside the old pools (`LOW`) after a jump from Android (or a ferros restart, jump style): in the map and mapped, never given to an arc until `diag frames release`, so the tripwire (`trip_arm`, `trip_check`) can watch Android's memory for writes before any process lives there.
+/// Every build did so from 2026-11-11 (the Pro: a boot that came from a jump ran about a minute after attest and reset with no panic recorded, read as a DMA master Android left running) until 2026-11-15, when the tripwire on the jumped Pro and every bus master accounted for (HV.md "The high bank after a jump") gave the high bank back to jumped sessions.
+fn held_after_jump(a: usize) -> bool {
+    option_env!("FERROS_FRAMES_JUMP_HOLD") == Some("1") && crate::platform::jumped() && !LOW.iter().any(|&(lo, hi)| a >= lo && a < hi)
 }
 
 /// The ranges as `diag frames` reads them: start, end, and size in MiB.
@@ -96,17 +102,22 @@ struct Small([[u64; 512]; SMALL_TABLES]);
 static mut SMALL: Small = Small([[0; 512]; SMALL_TABLES]);
 
 /// The frames, by index across the map's ranges in order: which are taken, which are known to hold zeros (every frame given back is wiped; a frame not yet taken this boot holds whatever DRAM held), and how many of the first frames hold the level-3 tables (frame k's is table k % 512 of frame k / 512; never handed out, and not one run: husky's ten spill from the page pool's range into the big pool's).
+/// `held`: frames in the map no arc may take (`held_after_jump`), counted in `used` too so no take finds them, and never scrubbed (they hold no process's bytes).
+/// `armed`: frames the tripwire wrote its pattern into (`trip_arm`), free or held; a take clears the bit (the frame is zeroed then, since arming clears `clean`).
 struct Pool {
     used: [u64; WORDS],
     clean: [u64; WORDS],
+    held: [u64; WORDS],
+    armed: [u64; WORDS],
     total: usize,
     free: usize,
+    held_n: usize,
     table_frames: usize,
     init: bool,
 }
 
 /// Every access is under the kernel lock (process.rs `lock`), as the arcs that hold these frames are; the scrub before a reset reads it with every other core stopped.
-static mut POOL: Pool = Pool { used: [0; WORDS], clean: [0; WORDS], total: 0, free: 0, table_frames: 0, init: false };
+static mut POOL: Pool = Pool { used: [0; WORDS], clean: [0; WORDS], held: [0; WORDS], armed: [0; WORDS], total: 0, free: 0, held_n: 0, table_frames: 0, init: false };
 
 fn pool() -> &'static mut Pool {
     let p = unsafe { &mut *(&raw mut POOL) };
@@ -121,9 +132,28 @@ fn pool() -> &'static mut Pool {
             p.used[f / 64] |= 1 << (f % 64);
             zero(pa(f));
         }
-        p.free = p.total - p.table_frames;
+        for f in p.table_frames..p.total {
+            if held_after_jump(pa(f)) {
+                p.used[f / 64] |= 1 << (f % 64);
+                p.held[f / 64] |= 1 << (f % 64);
+                p.held_n += 1;
+            }
+        }
+        p.free = p.total - p.table_frames - p.held_n;
     }
     p
+}
+
+/// Frame `f` taken (under the kernel lock): marked used, out of the tripwire, zeroed unless known clean.
+fn took(p: &mut Pool, f: usize, zeroed: bool) {
+    let (w, b) = (f / 64, 1u64 << (f % 64));
+    p.used[w] |= b;
+    p.armed[w] &= !b;
+    p.free -= 1;
+    if zeroed && p.clean[w] & b == 0 {
+        zero(pa(f));
+    }
+    p.clean[w] &= !b;
 }
 
 /// Frame `f`'s address: its range's start plus its place in it.
@@ -165,7 +195,7 @@ pub fn free() -> usize {
 /// The bytes arcs hold now (the scrub's count before a reset).
 pub fn taken_bytes() -> usize {
     let p = pool();
-    (p.total - p.table_frames - p.free) * FRAME
+    (p.total - p.table_frames - p.held_n - p.free) * FRAME
 }
 
 /// A free frame, zeroed, now taken; None when every frame is taken. The first free in the map's order, so the ranges ferros has used longest fill first.
@@ -176,12 +206,7 @@ pub fn take() -> Option<usize> {
     if f >= p.total {
         return None;
     }
-    p.used[w] |= 1 << (f % 64);
-    p.free -= 1;
-    if p.clean[w] & 1 << (f % 64) == 0 {
-        zero(pa(f));
-    }
-    p.clean[w] &= !(1 << (f % 64));
+    took(p, f, true);
     Some(f)
 }
 
@@ -194,12 +219,7 @@ pub fn take_top() -> Option<usize> {
     let w = (0..=last).rev().find(|&w| (p.used[w] | if w == last { past } else { 0 }) != u64::MAX)?;
     let free = !(p.used[w] | if w == last { past } else { 0 });
     let f = w * 64 + 63 - free.leading_zeros() as usize;
-    p.used[w] |= 1 << (f % 64);
-    p.free -= 1;
-    if p.clean[w] & 1 << (f % 64) == 0 {
-        zero(pa(f));
-    }
-    p.clean[w] &= !(1 << (f % 64));
+    took(p, f, true);
     Some(f)
 }
 
@@ -227,13 +247,8 @@ pub fn take_run(n: usize, below: usize) -> Option<usize> {
             run += 1;
             if run == n {
                 for g in f..f + n {
-                    p.used[g / 64] |= 1 << (g % 64);
-                    if p.clean[g / 64] & 1 << (g % 64) == 0 {
-                        zero(pa(g));
-                    }
-                    p.clean[g / 64] &= !(1 << (g % 64));
+                    took(p, g, true);
                 }
-                p.free -= n;
                 return Some(f);
             }
         }
@@ -261,9 +276,7 @@ pub fn take_for_copy() -> Option<usize> {
     if f >= p.total {
         return None;
     }
-    p.used[w] |= 1 << (f % 64);
-    p.clean[w] &= !(1 << (f % 64));
-    p.free -= 1;
+    took(p, f, false);
     Some(f)
 }
 
@@ -286,12 +299,12 @@ fn zero(a: usize) {
     }
 }
 
-/// Every frame a process holds, zeroed and cleaned to DRAM before a reset (platform::scrub_memory, every other core stopped): free frames are wiped already, and the tables hold no process's bytes. Returns the bytes zeroed.
+/// Every frame a process holds, zeroed and cleaned to DRAM before a reset (platform::scrub_memory, every other core stopped): the tables hold no process's bytes, and neither does a free frame: one given back was wiped (`give`), one never taken this boot holds what DRAM held before it (after a jump, Android's, until the background wipe passes it; held and armed frames likewise), never a ferros process's, since every take zeroes first. A reset before the wipe is done so leaves only Android's leftovers in the never-taken frames, which the power cycle that ends a jumped session decays (HV.md). Returns the bytes zeroed.
 pub fn scrub() -> usize {
     let p = pool();
     let mut n = 0;
     for f in p.table_frames..p.total {
-        if p.used[f / 64] & 1 << (f % 64) != 0 {
+        if (p.used[f / 64] & !p.held[f / 64]) & 1 << (f % 64) != 0 {
             let a = pa(f);
             let mut x = a;
             while x < a + FRAME {
@@ -339,5 +352,219 @@ pub fn total() -> usize {
 /// `diag frames`'s second half: how the pool stands.
 pub fn pool_report() -> alloc::string::String {
     let p = pool();
-    alloc::format!("pool: A#{} frames, A#{} free, A#{} taken by arcs, A#{} holding the tables\n", p.total - p.table_frames, p.free, p.total - p.table_frames - p.free, p.table_frames)
+    let armed: u32 = p.armed.iter().map(|w| w.count_ones()).sum();
+    alloc::format!(
+        "pool: A#{} frames, A#{} free, A#{} taken by arcs, A#{} holding the tables, A#{} held (after a jump), A#{armed} armed by the tripwire\n",
+        p.total - p.table_frames,
+        p.free,
+        p.total - p.table_frames - p.held_n - p.free,
+        p.table_frames,
+        p.held_n
+    )
+}
+
+/// `diag frames release`: every held frame given to the pool (free, not clean: a take zeroes it, the background wipe zeroes it first). Under the kernel lock. Returns how many.
+pub fn release_held() -> usize {
+    let p = pool();
+    let n = p.held_n;
+    for w in 0..WORDS {
+        p.used[w] &= !p.held[w];
+        p.held[w] = 0;
+    }
+    p.free += n;
+    p.held_n = 0;
+    n
+}
+
+// ---------------------------------------------------------------- the background wipe
+
+/// The background wipe (owner, 2026-11-15: "zero the RAM"): after a jump from Android, every frame no arc has taken still holds what Android left in DRAM.
+/// Once a person has attested (the deck is up: service.rs), idle workers zero those frames one at a time (`wipe_step`, in place of their sleep: no timer, no core woken for it), so Android's data does not sit in DRAM for the session.
+/// It skips held and armed frames, and never runs on a cold boot (its never-taken frames hold no session's data: a warm reset's scrub zeroed what arcs held).
+static WIPE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static WIPE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The next frame the wipe looks at, frames wiped, the counter at the first and at the last, under the kernel lock.
+static mut WIPE: (usize, usize, u64, u64) = (0, 0, 0, 0);
+
+/// The wipe allowed from now (the service loop, once a person is in, after a jump only).
+pub fn wipe_allow() {
+    if crate::platform::jumped() {
+        WIPE_GO.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// One frame of the wipe, on an idle worker: the next free frame that is not clean taken out of the pool under the lock, zeroed and cleaned to DRAM outside it (2 MiB, about a tenth of a millisecond, so work queued meanwhile waits at most that), then given back clean. False when there is nothing to do (not allowed yet, or done).
+pub fn wipe_step() -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    if !WIPE_GO.load(Acquire) || WIPE_DONE.load(Acquire) {
+        return false;
+    }
+    let f = crate::process::with_lock(|| {
+        let p = pool();
+        let w = unsafe { &mut *(&raw mut WIPE) };
+        if w.0 < p.table_frames {
+            w.0 = p.table_frames;
+            w.2 = crate::platform::cntpct();
+        }
+        while w.0 < p.total {
+            let f = w.0;
+            w.0 += 1;
+            let (i, b) = (f / 64, 1u64 << (f % 64));
+            if (p.used[i] | p.clean[i] | p.armed[i]) & b == 0 {
+                p.used[i] |= b;
+                p.free -= 1;
+                return Some(f);
+            }
+        }
+        w.3 = crate::platform::cntpct();
+        WIPE_DONE.store(true, core::sync::atomic::Ordering::Release);
+        None
+    });
+    let Some(f) = f else {
+        return false;
+    };
+    let a = pa(f);
+    let mut x = a;
+    while x < a + FRAME {
+        unsafe { core::arch::asm!("dc zva, {x}", "dc cvac, {x}", x = in(reg) x) };
+        x += 64;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    crate::process::with_lock(|| {
+        let p = pool();
+        let (i, b) = (f / 64, 1u64 << (f % 64));
+        p.used[i] &= !b;
+        p.clean[i] |= b;
+        p.free += 1;
+        unsafe { (*(&raw mut WIPE)).1 += 1 };
+    });
+    true
+}
+
+/// The wipe's line for `diag frames` and the flash log: not started, under way, or done with its frames and time.
+pub fn wipe_report() -> alloc::string::String {
+    let (next, n, t0, t1) = unsafe { *(&raw const WIPE) };
+    let f = crate::platform::cntfrq();
+    if !WIPE_GO.load(core::sync::atomic::Ordering::Acquire) {
+        alloc::string::String::from("wipe: not started (after a jump, once a person is in)\n")
+    } else if WIPE_DONE.load(core::sync::atomic::Ordering::Acquire) {
+        alloc::format!("wipe: done, A#{n} frames (A#{} MiB) zeroed in A#{} ms on idle workers\n", n * 2, t1.wrapping_sub(t0) * 1000 / f)
+    } else {
+        alloc::format!("wipe: under way, A#{n} frames zeroed, at frame A#{next}\n")
+    }
+}
+
+/// Whether the wipe has finished (the service loop logs it once).
+pub fn wipe_done() -> bool {
+    WIPE_DONE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// ---------------------------------------------------------------- the tripwire
+
+/// The tripwire (`diag frames trip`, 2026-11-15): every free or held frame written with a pattern, then read back on command, so a bus master writing anywhere in them is caught with its address, its extent and what it wrote.
+/// The pattern: each 8-byte word holds its own address XOR this salt, so a changed word names itself, and a word copied from elsewhere in the pattern still names where it came from (the word XOR the salt).
+/// The salt's top bits are no physical address (the SoC decodes 36 bits), so neither zeros nor a pointer a device writes can pass for the pattern.
+pub const TRIP_SALT: u64 = 0x7472_6970_0000_0000;
+
+/// Lines in a frame.
+const LINES: usize = FRAME / 64;
+
+/// One run of changed lines a check found: `[start, end)`, the words changed in it, and the first changed line's address and its eight words as read.
+pub struct TripRun {
+    pub start: usize,
+    pub end: usize,
+    pub words: usize,
+    pub line: usize,
+    pub sample: [u64; 8],
+}
+
+/// Frame `f`'s lines written with the pattern and cleaned to DRAM (the frame is the kernel's by its own address: cachemap `frame_block`, Normal write-back), then armed and marked not clean (a take zeroes it). Only a frame no arc holds (free or held); false for any other.
+/// Under the kernel lock, a frame a hold (service.rs `diag frames trip arm` takes 256 a call).
+pub fn trip_arm(f: usize) -> bool {
+    let p = pool();
+    let (w, b) = (f / 64, 1u64 << (f % 64));
+    if f < p.table_frames || f >= p.total || p.used[w] & !p.held[w] & b != 0 {
+        return false;
+    }
+    let a = pa(f);
+    let words = unsafe { core::slice::from_raw_parts_mut(a as *mut u64, FRAME / 8) };
+    for (k, x) in words.iter_mut().enumerate() {
+        *x = (a + k * 8) as u64 ^ TRIP_SALT;
+    }
+    clean_lines(a, LINES);
+    p.armed[w] |= b;
+    p.clean[w] &= !b;
+    true
+}
+
+/// Frame `f` read back from DRAM against the pattern if it is armed: every changed line added to `runs` (merged with the run before when it continues it; past `most` runs only counted in `more`) and armed again, so the next check reports only what was written since this one. None when the frame is not armed; else the words changed.
+/// Each line is invalidated first (`dc civac`: armed lines are clean, so nothing is written back), so the reads see DRAM and not a line the cache kept from the arm or fetched since.
+/// Under the kernel lock, a frame a hold.
+pub fn trip_check(f: usize, runs: &mut alloc::vec::Vec<TripRun>, most: usize, more: &mut usize) -> Option<usize> {
+    let p = pool();
+    if f >= p.total || p.armed[f / 64] & 1 << (f % 64) == 0 {
+        return None;
+    }
+    let a = pa(f);
+    unsafe { core::arch::asm!("dsb sy") };
+    for l in 0..LINES {
+        unsafe { core::arch::asm!("dc civac, {x}", x = in(reg) a + l * 64) };
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    let mut changed = 0;
+    for l in 0..LINES {
+        let line = a + l * 64;
+        let mut got = [0u64; 8];
+        let mut n = 0;
+        for (k, g) in got.iter_mut().enumerate() {
+            *g = unsafe { core::ptr::read_volatile((line + k * 8) as *const u64) };
+            n += (*g != (line + k * 8) as u64 ^ TRIP_SALT) as usize;
+        }
+        if n == 0 {
+            continue;
+        }
+        changed += n;
+        let joins = runs.last().is_some_and(|r| r.end == line);
+        if joins {
+            let r = runs.last_mut().unwrap();
+            r.end += 64;
+            r.words += n;
+        } else if runs.len() < most {
+            runs.push(TripRun { start: line, end: line + 64, words: n, line, sample: got });
+        } else {
+            *more += 1;
+        }
+        for k in 0..8 {
+            unsafe { core::ptr::write_volatile((line + k * 8) as *mut u64, (line + k * 8) as u64 ^ TRIP_SALT) };
+        }
+        clean_lines(line, 1);
+    }
+    Some(changed)
+}
+
+/// Frame `f` out of the tripwire: zeroed, cleaned to DRAM and marked clean, if it is armed. Under the kernel lock, a frame a hold.
+pub fn trip_off(f: usize) -> bool {
+    let p = pool();
+    let (w, b) = (f / 64, 1u64 << (f % 64));
+    if f >= p.total || p.armed[w] & b == 0 {
+        return false;
+    }
+    let a = pa(f);
+    let mut x = a;
+    while x < a + FRAME {
+        unsafe { core::arch::asm!("dc zva, {x}", "dc cvac, {x}", x = in(reg) x) };
+        x += 64;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    p.armed[w] &= !b;
+    p.clean[w] |= b;
+    true
+}
+
+/// `n` lines from `a` cleaned to the point of coherency (`dc cvac`), then a barrier: what the CPU wrote is in DRAM, where a device's write would land.
+fn clean_lines(a: usize, n: usize) {
+    for l in 0..n {
+        unsafe { core::arch::asm!("dc cvac, {x}", x = in(reg) a + l * 64) };
+    }
+    unsafe { core::arch::asm!("dsb sy") };
 }

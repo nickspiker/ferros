@@ -115,6 +115,9 @@ mod slot;
 // Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into). Compiled into the handoff build too: the service and the drivers it shares with the cold boot call it (2026-11-06: the shim build had stopped compiling).
 #[cfg(feature = "pixel8")]
 mod s2mpu;
+// zuma's CoreSight trace, stopped after a jump before CPUCL0's S2MPU closes (coresight.rs).
+#[cfg(feature = "pixel8")]
+mod coresight;
 // Power + volume up inside ferros: kill everything and start again from the image the hv kept, no bootloader (restart.rs).
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod restart;
@@ -2066,8 +2069,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     board::probe(1);
     platform::pstore_prev_handoff();
     platform::mark_trail(0);
-    platform::detect_jump();
-    platform::pstore(if platform::jumped() { b"ferros: started by the jump from Android\n" as &[u8] } else { b"ferros: not a jump\n" });
+    platform::detect_jump(dtb_addr);
+    platform::pstore(if platform::from_android() {
+        b"ferros: started by the jump from Android\n" as &[u8]
+    } else if platform::jumped() && dtb_addr & 1 == 1 {
+        b"ferros: a reload in a session the jump from Android began\n"
+    } else if platform::jumped() {
+        b"ferros: started by ferros's own restart\n"
+    } else {
+        b"ferros: not a jump\n"
+    });
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
     platform::pstore(b"ferros: killswitch armed\n");

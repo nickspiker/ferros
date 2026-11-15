@@ -69,12 +69,7 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     hw::init(grants);
-    // After the jump from a running Android (fact 31 = 6) the CP is still in Android's session, and this driver has no way yet to reset it: the first jump that let it run hung the bus on one of its register reads (core 7 in SYS_MMIO_READ for this thread, the APM watchdog reset the device, 2026-11-01). Stand down until the CP reset exists.
-    // Fact 31 = 7, ferros's own restart, leaves the CP in the last session's state: the same.
-    if matches!(ferros_sys::facts().0[31], 6 | 7) {
-        hw::say(b"modem: started by the jump from Android; the CP is Android's, left alone (no CP reset yet)\n");
-        ferros_sys::exit(0)
-    }
+    // After the jump from a running Android (fact 31 = 6) or ferros's own restart (7) the CP is still in the last session's: every path below takes it and the link down first (modem.rs `off`, at the head of each bring-up), never reading the controller before (the first jump that let this driver run hung the bus on the survey's ELBI read, 2026-11-01).
     let base = ferros_sys::arc_base();
     let arg: alloc::vec::Vec<u8> = (0..input_len as usize).map(|k| unsafe { core::ptr::read_volatile((base + input + k as u64) as *const u8) }).collect();
     let mut rep = alloc::vec::Vec::new();

@@ -186,6 +186,33 @@ pub fn fence_gpu() -> u32 {
     r
 }
 
+/// After a jump from Android: the GPU cut off from all memory while pd_g3d is on (G#E4 when it is off: left alone, and nothing of Android's runs in a domain that is down). ferros starts no GPU service after a jump (service.rs), and `pd::gate_at_boot` leaves g3d powered (it has no way back on), so Android's Mali stays up with Android's page tables and the S2MPU as ABL left it, open: whatever job it held could still write.
+pub fn deny_gpu() -> u32 {
+    if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
+        return 0xE4;
+    }
+    let r = deny_all(GPU_S2MPU);
+    GPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// The AoC's S2MPU (zuma-s2mpu.dtsi s2mpu_s0_aoc, in the AoC block, always on): in front of the AoC's way out to DRAM, behind its SysMMU (G#1909_0000). ABL and Android (pKVM off) leave it open.
+pub const AOC_S2MPU: usize = 0x190C_0000;
+/// The AoC's carve-out (zuma-rmem.dtsi aoc_reserve): 48 MiB at G#9400_0000.
+const AOC_CARVEOUT: (usize, usize) = (0x9400_0000, 0x9700_0000);
+static mut AOC_TABLE: Smpt = Smpt([0; 32768]);
+
+/// After a jump from Android: the AoC, still running Android's firmware (ferros leaves its session alone: no restart path), held to its own carve-out for every VID, nothing else. Its other DRAM buffers were Linux's, and its SysMMU's tables lie in Linux memory ferros has since written over (measured on the jumped Pro, b879: VM0 enabled, its table base G#8FBC_0000, inside the display's phases; the S2MPU open, protection 0), so with the S2MPU open a walk of those tables could send its writes anywhere.
+/// ferros's own first-level table for the AoC (aoc.rs `AOC_L1`, in the DMA memory) is admitted too, so a ferros AoC start after a jump, when one exists, finds the table it installs readable. Both lie in GiB 2.
+pub fn fence_aoc() -> u32 {
+    let (a, b) = AOC_CARVEOUT;
+    let (t0, t1) = crate::aoc::mmu_table_range();
+    if t0 >> 30 != a >> 30 || (t1 - 1) >> 30 != a >> 30 {
+        return 0xE3;
+    }
+    fence_at(AOC_S2MPU, &raw mut AOC_TABLE, a >> 30, 0xC, 0xFF, &|pa| (pa >= a && pa < b) || (pa >= t0 && pa < t1))
+}
+
 /// The ISP front end's three S2MPUs (zuma-s2mpu.dtsi s2mpu_s0/s1/s2_ispfe, inside pd_ispfe), in front of its SYSMMUs and so of every write the camera's front end makes: the image, its phase-detect rows and its statistics, and the PDMA engine's reads of its job. ABL leaves them as the domain's reset does; the kernel's camera tools turned their protection off for every VID (camera.rs `ispfe_dma_open`), which let the front end write anywhere at an address a program named.
 pub const ISPFE_S2MPUS: [usize; 3] = [0x1C14_0000, 0x1C18_0000, 0x1C1C_0000];
 static CAM_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -305,7 +332,7 @@ fn clean(a: usize, len: usize) {
 
 /// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
 pub fn is_fence(base: usize) -> bool {
-    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == GPU_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base) || ISPFE_S2MPUS.contains(&base)
+    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == GPU_S2MPU || base == CPUCL0_S2MPU || base == AOC_S2MPU || DPU_S2MPUS.contains(&base) || ISPFE_S2MPUS.contains(&base)
 }
 
 /// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
