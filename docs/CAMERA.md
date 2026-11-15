@@ -41,7 +41,10 @@ $B diag console; $B diag                                # the driver's lines; S2
 **On the 8a, 2026-11-14, against std/camreplay** (this branch's kernel RAM-reloaded, nothing stored): with no server and no capsule, a call on `camera` started the on-demand path, which found no capsule and answered the waiting call ERR in 1 ms (no hang). With camreplay serving, camtest took 32 frames of 6266944 bytes at bin 2, 68.0 ms apart (camreplay's own 67.8 ms), mean sample 70: the 8 MiB reply crosses whole. Lumis, launched by hand with a kist's slots, listed the camera, opened it at bin 2 and showed the recorded frame developed through the main camera's Absolute IDT, upright, its controls under it (shutter 1/15 s, gain 1.00x, focus G#3800, display -4 stops); camreplay served 110 frames per 8 s (13.75 a second) and the display showed Lumis's window about 9 times a second. Not measured: the kernel lock's hold for a 6 MiB reply. The waiting half of the first-call change (a live call held until a capsule's server starts) needs a stored capsule and was not run.
 The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what October's runs proved; `cam.region` = `high` asks higher first). The Pixel source does not settle the high halves: Linux's ISP DMA always goes thru the SYSMMU, whose window samsung-iommu-v9.c clamps to 32 bits, so the halves are always zero under Linux. On a running Pro the low ranges are likely full of arcs (the 8a's were), and the driver then takes a run higher and says so.
 
-Left: Lumis on the Pro (its preview at bin 2), the controls (exposure and focus mid-stream), and the harness out (KERNEL-OUT.md decision 3).
+**A kist, end to end** (the Pro, the same day): the stand-in Lumis front, stowed by the owner thru `ferros send` and granted the camera, listed the camera, and a tap on "main (back)" brought its first frame (2040 x 1536 at bin 2) 2276 ms after the driver's open, 15 ms after the front end's. The front then ended on its own memory (its arc refused growth past its ceiling, "memory allocation of 6266880 bytes failed": Lumis's, not the driver's; the real Lumis is being ported onto fluor instead). The driver saw 64 frames go unasked, closed, and gave its frames back, the S2MPUs still at 0 faults.
+**The controls, mid-stream** (payloads/camtest `60080001`, bin 8): exposure to a quarter (17.2 ms) took the mean sample from 134 to 81 on the very next frame (70 to 17 above black: 0.24 for 0.25) and back to 133 the frame after the restore; gain 2048 answered 1 (outside the captured code), 1024 answered 0; focus G#2000 taken; 96 frames 68.1 ms apart, the stream never stalled. Not measured: the lens's movement (sharpness, or the actuator's position at 84).
+**The binning on four threads** (one for each A715): 17 to 19 ms a frame; the clock governor at rest for 7.3 of 10 s streaming (was none), the A715s at a mean 639 MHz (was 1062).
+**The harness went** the same day (KERNEL-OUT.md decision 3): every `diag cam` tool, the probes, the PDMA runs and the viewfinder, camera_events.rs, camera_snap.rs, the ultrawide's and front camera's receiver tables and the FERROS_CAM_* blobs. camera.rs keeps what the switch runs; the record of how it was found is docs/oracle/CAMERA.md, the code forge's history before that commit.
 
 ## Where it stands (2026-11-12, measured)
 
@@ -64,7 +67,7 @@ Left: Lumis on the Pro (its preview at bin 2), the controls (exposure and focus 
   That is the frame pool's second range (`POOL_BIG`, G#A000_0000-G#B400_0000: the processes' own memory since 2026-11-11), the GPU's memory (G#B400_0000-G#B600_0000) and the secure carveout from G#B600_0000 (the slices there "read as zeros", CAMERA.md 2026-10-21).
   The run patterns every slice before it starts, and the focus sweep copies to G#9800_0000, the layer arena.
   So `diag cam pdma` on a kernel whose shell is running would write over live processes, the GPU's rings and the arena.
-  **Do not run `diag cam pdma` on a running shell.** It is safe only on a boot where nothing has started (as all of October's runs were).
+  It was never run on a running shell, and since 2026-11-14 it is gone with the harness.
 - It runs inside the kernel's service loop and spins there for the whole run, answering the front end every 15 to 50 ms: nothing else in the system is served meanwhile.
 - It adopts the panel itself (`display::adopt`), which the display server owns now.
 - Whether the Pro's running kernel even carries the PDMA job is unchecked tonight (a build without FERROS_CAM_PDMA refuses with "no PDMA job built in"): no camera command was run on the Pro.
@@ -84,7 +87,7 @@ Left: Lumis on the Pro (its preview at bin 2), the controls (exposure and focus 
 | the camera right | built (code 9) | a kernel, stower and map with it on each device |
 | the endpoint | served by payloads/camera (built 2026-11-14) | a run on the Pro |
 | frame memory | a run of 39 frames from the pool, fenced (built 2026-11-14) | a run on the Pro |
-| the driver | payloads/camera behind the `camera` switch (built 2026-11-14) | a run on the Pro, then the harness out |
+| the driver | payloads/camera behind the `camera` switch (built 2026-11-14) | streams on the Pro (2026-11-14); the harness out the same day |
 | the front end's answer | its interrupt, SPI 479, in the driver's frame thread (built 2026-11-14) | whether the line fires (else the thread's own tick, said on the console) |
 | the PDMA job | from the vault (`cam.boitata.pdma`), moved into the region in Rust (ferros_cam job, built 2026-11-14) | the vault entry on the Pro |
 | akita's cameras | nothing | power, ID, init at 26 MHz, the receiver and front end from a capture |

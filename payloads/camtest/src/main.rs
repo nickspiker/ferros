@@ -1,7 +1,7 @@
 //! camtest: the camera driver's endpoint driven headless, for the measures docs/CAMERA.md asks of a run (development): LIST, OPEN, frames at one bin, CLOSE, with the time to the first frame, the frames' spacing, a frame's mean sample and its header on the console. No screen, no touch: nothing the person sees moves.
 //!
 //! ferros-bridge spawn camtest.bin <hex input> --name camtest --use camera   (e.g. `4008`: 64 frames at bin 8)
-//! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), and optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024).
+//! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 #![no_std]
 #![no_main]
 
@@ -62,8 +62,21 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
     }
+    // With a fourth input byte of 1, the controls mid-stream (SET, docs/CAMERA.md "The endpoint"), each at its frame, the frames around each change said with their means: the exposure to a quarter of its longest at frame 16, the gain to twice unity at 32 (outside the captured code's range: refused) and back to unity, the focus to G#2000 at 48, the exposure back to its longest at 64.
+    let controls = arg(3) == 1;
+    let set = |what: u8, value: u64| -> u8 {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut r = [0xEEu8; 1];
+        if call(ep, &m, &mut r) == ERR { 0xEE } else { r[0] }
+    };
+    let changes: [(u32, u8, u64); 5] = [(16, 0, 17_200_000), (32, 1, 2048), (32, 1, 1024), (48, 2, 0x2000), (64, 0, 68_800_000)];
+    let near = |k: u32| controls && changes.iter().any(|c| k + 1 >= c.0 && k <= c.0 + 4);
     let (mut first_us, mut last, mut gaps, mut got) = (0u64, ferros_sys::now(), 0u64, 0u32);
     for k in 0..frames {
+        for &(_, what, value) in changes.iter().filter(|c| controls && c.0 == k) {
+            say!(g, "camtest: before frame A#{k}: SET A#{what} to A#{value}: answered A#{}\n", set(what, value));
+        }
         let n = call(ep, &[2, bin], buf);
         let now = ferros_sys::now();
         if n == ERR || n < 64 {
@@ -79,7 +92,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         last = now;
         let h = &buf[..64];
         let (w, hh) = (u16::from_le_bytes([h[4], h[5]]) as u64, u16::from_le_bytes([h[6], h[7]]) as u64);
-        if k == 0 || k + 1 == frames {
+        if k == 0 || k + 1 == frames || near(k) {
             let samples = &buf[64..n as usize];
             let mut sum = 0u64;
             for s in samples.chunks_exact(2).step_by(1 << 4) {

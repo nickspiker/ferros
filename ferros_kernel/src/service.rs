@@ -3031,25 +3031,6 @@ pub fn run(mut b: Boot) -> ! {
                 // Development tools: not in a production build at all (FERROS_PRODUCTION=1, build.rs), which answers only the plain DIAG below and a reboot.
                 #[cfg(not(ferros_production))]
                 {
-                // hsi2c_14 has one owner (torch.rs): while the `torch` switch is on it is the torch process's, so the camera tools, whose PMIC is on it, refuse. Every `cam` tool, not only the ones that touch that bus: one rule a person can hold in their head.
-                if cmd.params.starts_with(b"cam") && crate::torch::held() {
-                    resp.extend_from_slice(b"refused: the torch holds hsi2c_14, the camera PMIC's bus (torch.rs); turn the torch off (`[0, 0]` to `torch`) or `diag \"kill torch\"` first\n");
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                // The camera driver holds the camera (camera_power.rs): its buses, its module and the front end are its own while its switch is on, and the kernel's tools would drive them under it.
-                if cmd.params.starts_with(b"cam") && crate::camera_power::held() {
-                    resp.extend_from_slice(b"refused: the camera driver holds the camera (its `camera` switch is on, camera_power.rs); close it, or `diag \"kill camera\"` first\n");
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }                // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
-                if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else { None } {
-                    if !crate::pd::is_on(name) {
-                        resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());
-                        queue_pt_response(&mut pt_out_data, &resp);
-                        continue;
-                    }
-                }
                 if cmd.params.starts_with(b"lun ") {
                     // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
                     let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
@@ -3409,23 +3390,6 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"boot" {
                     // `diag boot`: reset-to-entry, then each boot step's time since ferros was entered (checklist.rs).
                     resp.extend_from_slice(crate::checklist::boot_times().as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam uw scan" || cmd.params == b"cam uw scan init" {
-                    crate::camera::uw_scan(&mut resp, cmd.params == b"cam uw scan init");
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam front up" {
-                    // `diag cam front up`: power the front camera in its own sequence and read its identifier (camera.rs).
-                    crate::camera::front_up(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam uw up" {
-                    // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
-                    crate::camera::uw_up(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3859,191 +3823,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"cam bus" {
-                    // `diag cam bus`: mux and bring up both camera HS-I2C controllers (no device addressed).
-                    crate::camera::buses_up(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params.starts_with(b"cam pdma") {
-                    // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
-                    let mut b2 = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
-                    if b2.is_none() && cfg!(cam_frame_blob) {
-                        b2 = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                    }
-                    let init = match b2.as_deref() {
-                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                            if 8 + n <= b.len() { Some(b[8..8 + n].to_vec()) } else { None }
-                        }
-                        _ => crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten())),
-                    };
-                    let prog = match b2.as_deref() {
-                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                            if 8 + n <= b.len() { Some(b[8 + n..].to_vec()) } else { None }
-                        }
-                        _ => crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
-                    };
-                    let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
-                    // `cam pdma uw ...`: the ultrawide's own init and CPU setup (FERROS_CAM_UW), `cam pdma front ...` the front camera's (FERROS_CAM_FRONT), instead of the main camera's bundle.
-                    let (init, prog) = if words.contains(&&b"uw"[..]) { crate::camera::Cam::uw_bundle() } else if words.contains(&&b"front"[..]) { crate::camera::Cam::front_bundle() } else { (init, prog) };
-                    crate::camera::pdma_probe(&mut resp, init, prog, if words.contains(&&b"slit"[..]) { 64 } else { 0 }, words.contains(&&b"fast"[..]), crate::camera::Shot::parse(&cmd.params));
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam frame" {
-                    // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
-                    // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).
-                    let mut bundle = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
-                    if bundle.is_none() && cfg!(cam_frame_blob) {
-                        bundle = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                    }
-                    let (init, prog) = match bundle.as_deref() {
-                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                            if 8 + n <= b.len() { (Some(b[8..8 + n].to_vec()), Some(b[8 + n..].to_vec())) } else { (None, None) }
-                        }
-                        _ => (crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten())), crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()))),
-                    };
-                    crate::camera::frame_probe(&mut resp, init, prog);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam stream" || cmd.params == b"cam raw" || cmd.params == b"cam lochs" {
-                    // `diag cam stream`: replay the sensor init, configure CSI link 1, stream 300 ms, report what the link saw and dump its words.
-                    // The init comes from the same places `cam frame` takes it from: the vault's own key, the bundled `cam.frame` value, or the image's built-in bundle. The vault lost these keys in the move to manifestus, and the dump is the whole point of the command, so it should not depend on which of the three is present.
-                    let mut init = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()));
-                    if init.is_none() {
-                        let mut b = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
-                        if b.is_none() && cfg!(cam_frame_blob) {
-                            b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                        }
-                        if let Some(b) = b.as_deref() {
-                            if b.len() > 8 && &b[..4] == b"CFRM" {
-                                let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                if 8 + n <= b.len() {
-                                    init = Some(b[8..8 + n].to_vec());
-                                }
-                            }
-                        }
-                    }
-                    if cmd.params == b"cam raw" { crate::camera::raw_probe(&mut resp, init) } else if cmd.params == b"cam lochs" { crate::camera::lochs_probe(&mut resp, init) } else { crate::camera::stream_probe(&mut resp, init) }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam slit" || cmd.params == b"cam slitsweep" {
-                    // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
-                    let mut t = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()));
-                    if t.is_none() {
-                        let mut b = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
-                        if b.is_none() && cfg!(cam_frame_blob) {
-                            b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                        }
-                        if let Some(b) = b.as_deref() {
-                            if b.len() > 8 && &b[..4] == b"CFRM" {
-                                let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                if 8 + n <= b.len() {
-                                    t = Some(b[8..8 + n].to_vec());
-                                }
-                            }
-                        }
-                    }
-                    if cmd.params == b"cam slitsweep" { crate::camera::slit_sweep(&mut resp, t) } else { crate::camera::slit(&mut resp, t, 64) }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam preexist" {
-                    // `diag cam preexist`: front-end state Linux had before the capture window, which nothing in the replay sets up (camera.rs).
-                    crate::camera::preexisting(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam probe" {
-                    // `diag cam probe`: whether an impossible capability read is the sensor's answer or this driver's (camera.rs).
-                    crate::camera::read_probe(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam preview" {
-                    // `diag cam preview`: the camera app's 1344 x 1008 NV12 preview, its luma painted 1:1 (camera.rs).
-                    crate::camera::preview(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam iova" {
-                    // `diag cam iova`: every buffer the camera IOMMU maps, by walking its page table in DRAM (camera.rs).
-                    crate::camera::iova_scan(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam inherit" {
-                    // `diag cam inherit`: after a live handoff with the camera running, read the frame Linux's pipeline wrote and paint it (camera.rs).
-                    crate::camera::inherit_probe(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam scan all" {
-                    // `diag cam scan all`: power each camera module in turn and read its model ID (camera.rs).
-                    crate::camera::scan_all(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam buses" {
-                    // `diag cam buses`: all four camera I2C controllers up, nothing powered and no device addressed (camera.rs).
-                    crate::camera::buses_all(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam clamp" {
-                    // `diag cam clamp`: prove the camera-PMIC overvoltage guard refuses what it must, with no I2C at all (camera.rs).
-                    crate::camera::clamp_test(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam caps" {
-                    // `diag cam caps`: the sensor's MIPI CCS capability block — what rates, windows and modes the silicon says it allows (camera.rs).
-                    crate::camera::caps_dump(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam events" {
-                    // `diag cam events`: every ISP interrupt source that is reporting, with its bits named (camera.rs, camera_events.rs).
-                    crate::camera::events_dump(&mut resp, false);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam link" {
-                    // `diag cam link`: every CSI link 1 word the camera stack touches, for diffing a cold ferros against a streaming Android through the handoff (camera.rs).
-                    crate::camera::link_dump(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam fe" {
-                    // `diag cam fe`: power the ISP front end, restore its clocks, read CSI link 1's version.
-                    crate::camera::fe_up(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam up" {
-                    // `diag cam up`: power the main camera module (rails programmed and verified first), then read the sensor's model ID.
-                    crate::camera::power_up(&mut resp);
-                    crate::camera::sensor_id(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam off" {
-                    // `diag cam off`: power the main camera module down.
-                    crate::camera::power_down(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam scan" {
-                    // `diag cam scan`: which addresses acknowledge on the camera-PMIC bus.
-                    crate::camera::scan(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params.starts_with(b"acpm ") {
                     // `diag acpm r <speedy> <type> <reg>` / `diag acpm u <speedy> <type> <reg> <val> <mask>` (hex): one PMIC transaction over the ACPM channel, for experiments without a rebuild.
                     let words: alloc::vec::Vec<&[u8]> = cmd.params[5..].split(|&c| c == b' ').filter(|w| !w.is_empty()).collect();
@@ -4058,18 +3837,6 @@ pub fn run(mut b: Boot) -> ! {
                         _ => alloc::string::String::from("usage: acpm r <speedy> <type> <reg> | acpm u <speedy> <type> <reg> <val> <mask> (hex)\n"),
                     };
                     resp.extend_from_slice(out.as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam pmicon" {
-                    // `diag cam pmicon`: raise the camera PMIC's supply enables (sub-PMIC GPIO1, GPIO3) and read its ID.
-                    crate::camera::pmic_power_on(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam pmic" {
-                    // `diag cam pmic`: the camera PMIC's ID and the main camera's regulators, read only.
-                    crate::camera::pmic_dump(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -4330,12 +4097,6 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"modem hwcfg" {
                     // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
                     crate::modem::hwcfg(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"cam state" {
-                    // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
-                    crate::camera::state(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

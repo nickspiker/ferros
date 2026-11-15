@@ -17,21 +17,6 @@ fn main() {
         println!("cargo:rustc-cfg=shim_handoff");
     }
     println!("cargo:rustc-check-cfg=cfg(shim_handoff)");
-    // FERROS_CAM_FRAME=<file>: embed a `cam.frame` bundle ('CFRM' + init length + sensor init + front-end program) so `diag cam frame` works without the vault. Dev only: the bundle carries the sensor vendor's settings, so it comes from a local file (never the repo) and only into a locally built image.
-    println!("cargo:rustc-check-cfg=cfg(cam_frame_blob)");
-    println!("cargo:rerun-if-env-changed=FERROS_CAM_FRAME");
-    // FERROS_CAM_PDMA=<file>: embed a `cam.pdma` job (tools/camera-pdma-image.py) so `diag cam pdma` can hand the front end's register program to the PDMA engine. Dev only, and from a local file like the frame bundle.
-    println!("cargo:rustc-check-cfg=cfg(cam_pdma_blob)");
-    println!("cargo:rerun-if-env-changed=FERROS_CAM_PDMA");
-    let pout = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_pdma.bin");
-    match std::env::var("FERROS_CAM_PDMA") {
-        Ok(path) => {
-            println!("cargo:rerun-if-changed={path}");
-            std::fs::copy(&path, &pout).unwrap_or_else(|e| panic!("FERROS_CAM_PDMA {path}: {e}"));
-            println!("cargo:rustc-cfg=cam_pdma_blob");
-        }
-        Err(_) => std::fs::write(&pout, b"").unwrap(),
-    }
     // FERROS_VAULT_CAPSULE=<file>: the vault process's signed capsule rides in the kernel image (VAULT-OUT.md decision 0: whatever verifies the kernel verifies it, and kernel and vault ship and roll back together). The kernel starts the vault from it at home, before init, and from the `vault` entry of its own vault only when this is absent or refused. Unset: as before, from that entry alone.
     println!("cargo:rustc-check-cfg=cfg(ferros_vault_capsule)");
     println!("cargo:rerun-if-env-changed=FERROS_VAULT_CAPSULE");
@@ -43,36 +28,6 @@ fn main() {
             println!("cargo:rustc-cfg=ferros_vault_capsule");
         }
         Err(_) => std::fs::write(&vout, b"").unwrap(),
-    }
-    // FERROS_CAM_UW=<prefix> (the ultrawide, `diag cam pdma uw`) and FERROS_CAM_FRONT=<prefix> (the front camera, `diag cam pdma front`): each camera's <prefix>.init (tools/camera-init.py), <prefix>.cpr2 (tools/camera-cpu.py) and <prefix>.pdma (tools/camera-pdma-image.py). Dev only and local, like the main camera's: the init carries the sensor vendor's settings.
-    let od = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    for (env, tag) in [("FERROS_CAM_UW", "uw"), ("FERROS_CAM_FRONT", "front")] {
-        println!("cargo:rustc-check-cfg=cfg(cam_{tag}_blob)");
-        println!("cargo:rerun-if-env-changed={env}");
-        match std::env::var(env) {
-            Ok(prefix) => {
-                for ext in ["init", "cpr2", "pdma"] {
-                    let src = format!("{prefix}.{ext}");
-                    println!("cargo:rerun-if-changed={src}");
-                    std::fs::copy(&src, od.join(format!("{tag}_{ext}.bin"))).unwrap_or_else(|e| panic!("{env} {src}: {e}"));
-                }
-                println!("cargo:rustc-cfg=cam_{tag}_blob");
-            }
-            Err(_) => {
-                for ext in ["init", "cpr2", "pdma"] {
-                    std::fs::write(od.join(format!("{tag}_{ext}.bin")), b"").unwrap();
-                }
-            }
-        }
-    }
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_frame.bin");
-    match std::env::var("FERROS_CAM_FRAME") {
-        Ok(path) => {
-            println!("cargo:rerun-if-changed={path}");
-            std::fs::copy(&path, &out).unwrap_or_else(|e| panic!("FERROS_CAM_FRAME {path}: {e}"));
-            println!("cargo:rustc-cfg=cam_frame_blob");
-        }
-        Err(_) => std::fs::write(&out, b"").unwrap(),
     }
     // FERROS_RESCUE: the vault's usb, pcie1 and bt capsules mended with the native builds the kernel carries when a masked one got stored (service.rs `start_home`).
     println!("cargo:rustc-check-cfg=cfg(ferros_rescue)");

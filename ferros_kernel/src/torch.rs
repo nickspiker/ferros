@@ -1,6 +1,6 @@
 //! The torch's power (docs/TORCH.md): a TI LM3644 flash LED driver at G#63 on hsi2c_14 (PERIC0 USI14, G#1098_0000), its hardware enable (HWEN) on gpp8-2, on husky and akita alike (zuma-husky-camera.dtsi, zuma-akita-camera.dtsi: `flash-lm3644`, LWIS, so Linux only passes the HAL's register writes thru). Its registers are the `torch` process's (payloads/torch, thru its `hsi2c14` grant); this is what it may not do: the bus's pins, clock source and controller, and HWEN.
 //!
-//! hsi2c_14 is also the camera PMIC's bus (SLG51002 at G#75, camera.rs `PMIC_BUS`). One owner at a time: while this switch is on the bus is the torch process's and every `diag cam …` is refused (service.rs); while a camera tool runs the switch cannot come on, because both run on the kernel's core and the service loop runs no process slice (so no SYS_POWER) while it runs a diag. The torch process touches the bus only between its switch's on and off.
+//! hsi2c_14 is also the camera PMIC's bus (SLG51002 at G#75, camera.rs `PMIC_BUS`). One owner at a time: while this switch is on the bus is the torch process's and the `camera` switch refuses; while that one is on, this one refuses (camera_power.rs). The torch process touches the bus only between its switch's on and off.
 //!
 //! Off is HWEN driven low: the chip goes to shutdown and its registers to their defaults (standby, flash and torch off, the STROBE and TORCH pins ignored), whatever its I2C state and whatever the process left in it. That is the whole off path: one GPIO write, no bus, no PMIC, nothing that can fail. A process that ends with the switch on (one shot dead) has it turned off by the service loop's next pass (process.rs `power_offs_apply`). Out of any reset the pin is an input and the chip's own HWEN pulldown keeps it in shutdown (the DT's idle state for gpp8-2: input, no pull).
 
@@ -44,7 +44,7 @@ fn hwen(high: bool) {
     pin_field(GPP8, HWEN, 1);
 }
 
-/// Whether the bus is the torch process's now (the camera tools refuse while it is).
+/// Whether the bus is the torch process's now (the `camera` switch refuses while it is).
 pub fn held() -> bool {
     HELD.load(Ordering::Acquire)
 }
@@ -62,7 +62,7 @@ pub fn power(on: bool) -> bool {
         return false;
     }
     for g in PMIC_BUS.gates {
-        // WHY: a read into a block whose clock gate is closed can hang the core (camera.rs `state`); the camera tools have always found these open cold, so this only opens one something else closed.
+        // WHY: a read into a block whose clock gate is closed can hang the core (the camera harness's state reads, 2026-10-19); they have always been found open cold, so this only opens one something else closed.
         if !crate::camera::gate_open(rd(g)) {
             wr(g, rd(g) | 1 << 20 | 1 << 21);
         }

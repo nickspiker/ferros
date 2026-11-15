@@ -4,7 +4,7 @@
 //!
 //! Measured with the screen off (odpm and the gauge, 2026-10-25): the rails' outputs 1558 → 1185 mW (the PLL rail 127 → 25, INT 85 → 23, the GPU's 66 → 15, the camera's 35 → 14), the battery 0.98 → 0.64 W; with the screen on 1.58 → 1.38 W.
 //!
-//! On by default: the service loop gates every domain here once, 16 s in (`gate_at_boot`). `on` brings a simple domain back — CONFIGURATION bit 0 through EL3, a millisecond, the secure world's restore — without Linux's saved CMU registers, so the block starts from its reset defaults, not from ABL's setup — and it is not yet trusted: a TPU on and off by hand preceded a reset during the next power window (the boot's last crumb G#B4, 2026-10-25), while the same windows on a boot gated once at start ran clean three times. So the camera and TPU diags refuse while their domains are gated, and `diag pd on` is by hand only. The GPU's embedded part needs a PLL and atomic-alias sequence not written yet: once gated, the GPU stays off until that is.
+//! On by default: the service loop gates every domain here once, 16 s in (`gate_at_boot`). `on` brings a simple domain back — CONFIGURATION bit 0 through EL3, a millisecond, the secure world's restore — without Linux's saved CMU registers, so the block starts from its reset defaults, not from ABL's setup — and it is not yet trusted: a TPU on and off by hand preceded a reset during the next power window (the boot's last crumb G#B4, 2026-10-25), while the same windows on a boot gated once at start ran clean three times. So `diag pd on` is by hand only; the one domain brought back in use is the camera's front end, by the `camera` switch (camera_power.rs), once a boot, its restore the pair of the gating's save. The GPU's embedded part needs a PLL and atomic-alias sequence not written yet: once gated, the GPU stays off until that is.
 
 use crate::platform::priv_reg;
 
@@ -116,7 +116,7 @@ pub fn on(name: &str, out: &mut alloc::vec::Vec<u8>) {
     let w = priv_reg(PMU + pmu_off, true, before | 1);
     ms(1);
     let r = tz_restore(cmu + 0x1_0204);
-    // The front end's restore is the camera's prepare call (the same SMC): made a second time it never returns (2026-10-21), so `fe_up` must know it was made.
+    // The front end's restore is the camera's prepare call (the same SMC): made a second time it never returns (2026-10-21), so the camera's `PREPARED` must know it was made (camera.rs `prepare_once`).
     if name == "ispfe" {
         crate::camera::mark_prepared();
     }
@@ -126,13 +126,6 @@ pub fn on(name: &str, out: &mut alloc::vec::Vec<u8>) {
 /// Whether a domain's CONFIGURATION reads on (through EL3).
 pub fn is_on(name: &str) -> bool {
     DOMAINS.iter().find(|d| d.0 == name).map(|&(_, _, off)| conf(off) & 1 == 1).unwrap_or(true)
-}
-
-/// The camera's blocks back on (by hand, `diag pd on`, not automatic: see the module doc).
-pub fn camera_on(out: &mut alloc::vec::Vec<u8>) {
-    for n in ["ispfe", "rgbp", "yuvp", "gdc", "gse", "mcsc", "tnr"] {
-        on(n, out);
-    }
 }
 
 static mut GATED: bool = false;

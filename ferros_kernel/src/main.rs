@@ -58,10 +58,6 @@ mod odpm;
 mod pd;
 #[cfg(feature = "pixel8")]
 mod camera;
-#[cfg(feature = "pixel8")]
-mod camera_events;
-#[cfg(feature = "pixel8")]
-mod camera_snap;
 mod x3;
 mod smp;
 // The kernel core's idle: tickless while dark, and powered down (PSCI c2) when nothing is due (POWER.md "Deep idle").
@@ -81,9 +77,6 @@ mod camera_close;
 #[cfg(feature = "pixel8")]
 mod camera_power;
 mod camera_rx;
-#[cfg(feature = "pixel8")]
-mod camera_rx_uw;
-mod camera_rx_front;
 #[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]

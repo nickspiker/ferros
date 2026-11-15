@@ -3233,7 +3233,7 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
     // Bluetooth (docs/BT.md): the APM's USI1 UART (serial_18). The USI mode word and the chip's power lines are the kernel's (`POWERS`).
     Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
-    // The torch (docs/TORCH.md, payloads/torch): hsi2c_14, the LM3644 flash driver's bus, which it shares with the camera PMIC (the kernel's camera tools refuse while the `torch` switch holds it). Pins, clock source, the controller's bring-up and the chip's enable are the kernel's (`POWERS`).
+    // The torch (docs/TORCH.md, payloads/torch): hsi2c_14, the LM3644 flash driver's bus, which it shares with the camera PMIC (the `torch` and `camera` switches hold it one at a time). Pins, clock source, the controller's bring-up and the chip's enable are the kernel's (`POWERS`).
     Hw { name: "hsi2c14", base: 0x1098_0000, size: 0x1000, via_el3: false },
     // The camera driver (docs/CAMERA.md "The driver", payloads/camera): the main sensor's bus (hsi2c_1, its lens actuator on it too), the ISP front end whole (its core, statistics blocks and the PDMA engine, 1 MiB: zuma-isp.dtsi `lwis_isp_fe`), the CSI links and the combo D-PHY (`csis-link-phy`, up to the front end's first SYSMMU), and SYSREG_ISPFE's first page (the receiver's input select). The buses' pins and clocks, the module's rails, the front end's domain and clocks, the SYSMMUs and the S2MPUs are the kernel's (the `camera` switch, camera_power.rs).
     Hw { name: "hsi2c1", base: 0x1088_0000, size: 0x1000, via_el3: false },
