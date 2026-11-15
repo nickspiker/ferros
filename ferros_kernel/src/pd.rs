@@ -2,7 +2,7 @@
 //!
 //! The off sequence is Linux's (cal-if/zuma/flexpmu_cal_local_zuma.h `<pd>_off`, cal-if/pmucal_local.c `pmucal_local_disable`): the secure world's save (exynos-pd_el3.c `exynos_pd_tz_save`: SMC G#8200_0410, 0 = going down, the domain's `need_smc` address from zuma-pm-domains.dtsi, group 2), the domain's CMU controller option bit 24 cleared (its own clock controller, reachable while the domain is still on), then PMU CONFIGURATION bit 0 cleared. CONFIGURATION is written and read through EL3 (`priv_reg`; word 0 of each domain block is the one EL3 will read), STATUS (+4) read plainly, as display.rs reads the DPU's; the sequence waits a fixed millisecond rather than polling STATUS. The EL3 poison rule (a firmware call that never returns after an access to a block that is down or secure) is an SError left waiting on the core, which EL3 bounces back until it panics (platform.rs `take_serror`): before each firmware call here one waiting is taken at EL2 and named.
 //!
-//! After a jump the domains Android left on are cut thru the PMU alone (`cut`): CONFIGURATION off through EL3, nothing of the block touched, since Linux's sequence ran into a frozen g2d twice (2026-11-10 and 2026-11-15 b883, the kernel's last line "pd: gating g2d after the jump") and the jump trusts nothing Android left. Each step says itself in the flash log after a jump. `diag pd cut <name>|all` runs the cut on a cold boot; `diag pd poison <name>` makes the EL3 poison on purpose (a read of a down domain's CMU) and cures it.
+//! After a jump Linux's sequence ran into a frozen g2d twice (2026-11-10 and 2026-11-15 b883, the kernel's last line "pd: gating g2d after the jump"). Now each step says itself in the flash log after a jump, each CMU access is checked for an error answer, and a domain whose CMU answered with one is left on with its S2MPUs denied all (`left_on`) instead of hanging the next firmware call. A cut thru the PMU alone is no way out: it never completes and wedges the APM (`off`, measured on b885). `diag pd poison <name>` makes the EL3 poison on purpose (a read of a down domain's CMU) and cures it.
 //!
 //! Measured with the screen off (odpm and the gauge, 2026-10-25): the rails' outputs 1558 → 1185 mW (the PLL rail 127 → 25, INT 85 → 23, the GPU's 66 → 15, the camera's 35 → 14), the battery 0.98 → 0.64 W; with the screen on 1.58 → 1.38 W.
 //!
@@ -100,7 +100,44 @@ fn status(pmu_off: u64) -> u32 {
     rd((PMU + pmu_off) as usize + 4)
 }
 
-/// Linux's off sequence, for a domain in the state ferros knows (a cold boot's, ABL's): the secure save, the CMU's controller option, CONFIGURATION through EL3.
+/// Each domain's S2MPUs (zuma-s2mpu.dtsi, each inside its domain), in front of every DMA its block makes. The GPU's is s2mpu.rs's own (`deny_gpu`).
+fn s2mpus(name: &str) -> &'static [usize] {
+    match name {
+        "g2d" => &[0x1A8A_0000],
+        "gdc" => &[0x1D4F_0000],
+        "gse" => &[0x1D8A_0000],
+        "mcsc" => &[0x1D0D_0000],
+        "mfc" => &[0x1A4A_0000],
+        "rgbp" => &[0x1C4D_0000, 0x1C51_0000],
+        "tnr" => &[0x1CCB_0000, 0x1CCF_0000, 0x1CD3_0000],
+        "yuvp" => &[0x1C8A_0000],
+        "aur" => &[0x20A8_0000],
+        "bw" => &[0x1A67_0000],
+        "eh" => &[0x16C7_0000],
+        "ispfe" => &[0x1C14_0000, 0x1C18_0000, 0x1C1C_0000],
+        "tpu" => &[0x1A37_0000],
+        _ => &[],
+    }
+}
+
+/// A domain whose CMU answered an access with an error, left on: its power-down cannot be asked for (`off`), so its block's DMA is stopped at its S2MPUs instead, each denied all (s2mpu.rs `deny_all`, the hv's steps at the jump), each said with whether its own accesses were answered with an error too.
+fn left_on(name: &str, what: &str, out: &mut alloc::vec::Vec<u8>) {
+    let mut t = alloc::format!("{name}: the CMU's controller option {what} was answered with an error (an SError, taken at EL2): left on, no secure save, no configuration write (a power-down the CMU does not answer wedged the APM until its watchdog reset the Pro, 2026-11-15 b885); its S2MPUs denied all:");
+    for &b in s2mpus(name) {
+        step(name, &alloc::format!("denying its S2MPU G#{b:X}"));
+        let r = crate::s2mpu::deny_all(b);
+        t.push_str(&alloc::format!(" G#{b:X} G#{r:X}{}", if crate::platform::take_serror() { " (an error answered)" } else { "" }));
+    }
+    if crate::platform::jumped() {
+        crate::flashlog::line(&alloc::format!("pd: {t}"));
+    }
+    out.extend_from_slice(alloc::format!("{t}\n").as_bytes());
+}
+
+/// Linux's off sequence (flexpmu_cal_local_zuma.h `<pd>_save` then `<pd>_off`): the CMU's controller option read (the save reads it first), the secure save, bit 24 of the controller option cleared, CONFIGURATION off through EL3.
+/// The CMU's part is not optional: a domain cut thru the PMU alone (CONFIGURATION off with bit 24 still set) never reached STATUS off, and the APM wedged until its watchdog reset the device (`diag pd cut`, 2026-11-15 b885, removed).
+/// Each CMU access is checked for an error answer (an SError, taken at EL2): after a jump the block is as Android left it, and the chord freezes Android in the middle of a domain's job (G2D's driver holds its clock and EL3's protection for each job and gives both back only in its completion), a state Linux's own off never meets. A CMU that answered with an error leaves the domain on, fenced at its S2MPUs (`left_on`).
+/// After a jump every step says itself in the flash log first, so a step that hangs is the last one named (b883 froze after "pd: gating g2d after the jump", five steps inside that line).
 fn off(name: &str, cmu: usize, pmu_off: u64, out: &mut alloc::vec::Vec<u8>) {
     if name == "g3d" {
         embedded_g3d_off(out);
@@ -111,40 +148,34 @@ fn off(name: &str, cmu: usize, pmu_off: u64, out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(alloc::format!("{name}: already off\n").as_bytes());
         return;
     }
-    // STATUS as well, as the hv's jump checks the display's domains: CONFIGURATION is only the request, and reads on while a domain is still coming up or going down. A CMU access in a domain that is down is answered with an error, which waits as an SError and poisons the next firmware call (platform.rs `take_serror`).
+    // STATUS as well, as the hv's jump checks the display's domains: CONFIGURATION is only the request, and reads on while a domain is still coming up or going down. A CMU access in a domain that is down is answered with an error (measured, `diag pd poison`).
     step(name, "reading its status");
     let st = status(pmu_off);
     if st & 1 == 0 {
         out.extend_from_slice(alloc::format!("{name}: requested on (G#{before:X}) but its status reads off (G#{st:X}): left alone, no CMU access\n").as_bytes());
         return;
     }
-    step(name, "the secure save");
-    serror_before(name, "the secure save", out);
-    let s = tz_save(cmu + 0x1_0204);
     step(name, "reading the CMU's controller option");
     let opt = rd(cmu + 0x800);
-    serror_before(name, "the CMU write (after its read)", out);
+    if crate::platform::take_serror() {
+        left_on(name, "read", out);
+        return;
+    }
+    step(name, &alloc::format!("controller option G#{opt:X}; the secure save"));
+    serror_before(name, "the secure save", out);
+    let s = tz_save(cmu + 0x1_0204);
     step(name, "writing the CMU's controller option");
     wr(cmu + 0x800, opt & !(1 << 24));
-    serror_before(name, "the configuration write (after the CMU write)", out);
+    if crate::platform::take_serror() {
+        left_on(name, "write", out);
+        return;
+    }
     step(name, "configuration off thru EL3");
     let w = priv_reg(PMU + pmu_off, true, before & !1);
     ms(1);
-    out.extend_from_slice(alloc::format!("{name}: secure save {s}, configuration G#{before:X} -> write {w:X} -> G#{:X}\n", conf(pmu_off)).as_bytes());
+    out.extend_from_slice(alloc::format!("{name}: controller option G#{opt:X}, secure save {s}, configuration G#{before:X} -> write {w:X} -> G#{:X} status G#{:X}\n", conf(pmu_off), status(pmu_off)).as_bytes());
 }
 
-/// After a jump: a domain Android left on (or half on) cut thru the PMU alone, CONFIGURATION off through EL3, with no access to the block itself: neither the CMU's controller option nor EL3's secure save (which reads the domain's D_TZPC).
-/// Android runs most of these blocks under runtime power management, so one found on was in the middle of a job when the chord froze Android: G2D's driver, for one, holds its clock and asks EL3 for its protection (SMC_PROTECTION_SET, G2D_ALWAYS_S) for each job and undoes both only in the job's completion, which never runs; Linux's own off sequence never meets that state.
-/// The jump is a killswitch (feedback_jump_is_killswitch): the domain's power is cut without trusting its clocks, its Q-channels or what Android set in it, which stops any master in it dead, and the only things touched are the PMU and EL3, both answering in this same pass.
-/// Left out on purpose: EL3's copy of the domain's secure settings is then Android's last save, which a later `on` restores (only the camera's front end is ever brought back).
-fn cut(name: &str, pmu_off: u64, before: u32, out: &mut alloc::vec::Vec<u8>) {
-    let st = status(pmu_off);
-    step(name, &alloc::format!("configuration G#{before:X} status G#{st:X}: cut thru the PMU alone"));
-    serror_before(name, "the cut", out);
-    let w = priv_reg(PMU + pmu_off, true, before & !1);
-    ms(1);
-    out.extend_from_slice(alloc::format!("{name}: cut thru the PMU alone (no CMU, no secure save): configuration G#{before:X} status G#{st:X} -> write {w:X} -> G#{:X} status G#{:X}\n", conf(pmu_off), status(pmu_off)).as_bytes());
-}
 
 fn tz_restore(addr: usize) -> i64 {
     let r: i64;
@@ -185,7 +216,6 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
     }
     unsafe { GATED = true };
     let mut out = alloc::vec::Vec::new();
-    let jumped = crate::platform::jumped();
     // An SError waiting from anything before this pass would hang its first firmware call (the configuration read below): taken first, and named.
     serror_before("pass", "the first domain", &mut out);
     // The GPU stays as ABL leaves it, powered and clocked, since ferros drives it (GPU.md, 2026-11-04): this file has its off sequence but no on, which needs its PLLs back through ACPM's DVFS. Gating it saved about 50 mW (its rail 66 to 15 mW, 2026-10-25); the GPU driver will gate it itself once it has a power switch with both directions.
@@ -193,18 +223,10 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
     for (i, &(name, cmu, pmu_off)) in DOMAINS.iter().enumerate().filter(|(_, d)| d.0 != "g3d" && !(d.0 == "ispfe" && crate::camera_power::fe_on())) {
         // Said before each domain is gated, crumb and line both (the crumb G#E0 + its index, the core's note), so a hang inside one names it: twice a jump froze the kernel's core in this pass with nothing logged after the display's fence (2026-11-09).
         crate::platform::crumb(0xE0 + i as u64);
-        if !jumped {
-            off(name, cmu, pmu_off, &mut out);
-            continue;
+        if crate::platform::jumped() {
+            crate::flashlog::line(&alloc::format!("pd: gating {name} after the jump"));
         }
-        crate::flashlog::line(&alloc::format!("pd: gating {name} after the jump"));
-        // After a jump a domain is either off (Android's runtime power management let it go) or cut: Linux's sequence ran into a frozen g2d twice (2026-11-10, 2026-11-15 b883) where it had worked on every cold boot and on every jump's EH (`cut`).
-        let before = conf(pmu_off);
-        if before & 1 == 0 && status(pmu_off) & 1 == 0 {
-            out.extend_from_slice(alloc::format!("{name}: already off\n").as_bytes());
-        } else {
-            cut(name, pmu_off, before, &mut out);
-        }
+        off(name, cmu, pmu_off, &mut out);
     }
     for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
         if let Ok(t) = core::str::from_utf8(l) {
@@ -213,7 +235,7 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
     }
 }
 
-/// `diag pd`: every domain's CONFIGURATION through EL3. `diag pd off|on <name>|all`: the off sequence, or a simple domain back on. `diag pd cut <name>|all`: the cut a jump uses. `diag pd poison <name>`: the EL3 poison made and cured, on a domain that is down.
+/// `diag pd`: every domain's CONFIGURATION through EL3. `diag pd off|on <name>|all`: the off sequence, or a simple domain back on. `diag pd poison <name>`: the EL3 poison made and cured, on a domain that is down.
 pub fn diag(args: &str, out: &mut alloc::vec::Vec<u8>) {
     let mut w = args.split_whitespace();
     match (w.next(), w.next()) {
@@ -225,17 +247,6 @@ pub fn diag(args: &str, out: &mut alloc::vec::Vec<u8>) {
         (Some("off"), Some(which)) => {
             for &(name, cmu, pmu_off) in DOMAINS.iter().filter(|d| which == "all" || d.0 == which) {
                 off(name, cmu, pmu_off, out);
-            }
-        }
-        (Some("cut"), Some(which)) => {
-            for &(name, _, pmu_off) in DOMAINS.iter().filter(|d| d.0 != "g3d" && (which == "all" || d.0 == which)) {
-                serror_before(name, "its configuration read", out);
-                let before = conf(pmu_off);
-                if before & 1 == 0 && status(pmu_off) & 1 == 0 {
-                    out.extend_from_slice(alloc::format!("{name}: already off\n").as_bytes());
-                } else {
-                    cut(name, pmu_off, before, out);
-                }
             }
         }
         (Some("poison"), Some(which)) => {
