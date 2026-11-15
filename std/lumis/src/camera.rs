@@ -11,6 +11,18 @@ pub const OP_FRAME: u8 = 2;
 pub const OP_SET: u8 = 3;
 /// [OP_CLOSE]: stop streaming. The driver also closes when the holder ends, so Lumis never needs to say it on the way out.
 pub const OP_CLOSE: u8 = 4;
+/// [OP_MAP][release]: with the view (an [OP_OPEN][id][`OPEN_VIEW`] answered with [`VIEW_REPLY`] bytes), give back the buffer `release` names (`NONE` for none), wait for a frame newer than the last mapped and hold its buffer: the reply a [`FRAME_HEADER`] whose samples are read in place thru the view ([`MapHeader`]; docs/CAMERA.md "The view").
+pub const OP_MAP: u8 = 5;
+/// [OP_RELEASE][buffer]: the held buffer given back. Reply [0], [1] when it was not held.
+pub const OP_RELEASE: u8 = 6;
+/// The third byte of an open that asks for the view.
+pub const OPEN_VIEW: u8 = 1;
+/// No buffer, in [`OP_MAP`]'s release byte.
+pub const NONE: u8 = 0xFF;
+/// An open's reply with the view: [0], the view's token (32 bytes at 1), the ring's buffers (33), the format (34), width and height (u16 at 36, 38), a line's bytes (u32 at 40), a buffer's bytes in the view (u32 at 44).
+pub const VIEW_REPLY: usize = 48;
+/// The view's samples as MIPI RAW10: four samples in five bytes, the high eight bits of each, then their low two bits.
+pub const FORMAT_RAW10: u8 = 1;
 
 /// Exposure per frame, in nanoseconds.
 pub const SET_EXPOSURE: u8 = 0;
@@ -148,6 +160,77 @@ pub fn parse_frame(r: &[u8]) -> Option<FrameHeader> {
     (r.len() >= FRAME_HEADER + h.samples_bytes()).then_some(h)
 }
 
+/// The view an open gave: the kernel's token for it and the ring's shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    pub token: [u8; 32],
+    pub buffers: u8,
+    pub format: u8,
+    pub width: usize,
+    pub height: usize,
+    /// A line's bytes, and a buffer's place from the next one's in the view.
+    pub line: usize,
+    pub buffer: usize,
+}
+
+/// The view from an open's reply; None for a plain open (`[0]` alone: the kernel or the driver gave none, and frames come by copy).
+pub fn parse_view(r: &[u8]) -> Option<View> {
+    if r.len() < VIEW_REPLY || r[0] != 0 {
+        return None;
+    }
+    let u16_at = |k: usize| u16::from_le_bytes([r[k], r[k + 1]]) as usize;
+    let u32_at = |k: usize| u32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]) as usize;
+    Some(View { token: r[1..33].try_into().unwrap(), buffers: r[33], format: r[34], width: u16_at(36), height: u16_at(38), line: u32_at(40), buffer: u32_at(44) })
+}
+
+/// A MAP's answer: the frame's header, the buffer that holds it (what the next MAP or a RELEASE gives back), and where its samples start in the view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapHeader {
+    pub frame: FrameHeader,
+    pub buffer: u8,
+    pub offset: usize,
+}
+
+/// A MAP's header; None when it is not one (no frame: the driver closed).
+pub fn parse_map(r: &[u8]) -> Option<MapHeader> {
+    if r.len() < FRAME_HEADER {
+        return None;
+    }
+    let mut h = [0u8; FRAME_HEADER];
+    h.copy_from_slice(&r[..FRAME_HEADER]);
+    // The header's samples are not in the reply: parsed as a frame of none.
+    let frame = parse_frame_header(&h);
+    Some(MapHeader { frame, buffer: r[40], offset: u64::from_le_bytes(r[48..56].try_into().unwrap()) as usize })
+}
+
+/// One MIPI RAW10 line into 16-bit samples: each five bytes four samples, `(high << 2) | low bits`.
+pub fn unpack_raw10(line: &[u8], out: &mut [u16]) {
+    for (px, b) in out.chunks_exact_mut(4).zip(line.chunks_exact(5)) {
+        let lo = b[4];
+        for i in 0..4 {
+            px[i] = (b[i] as u16) << 2 | ((lo >> (2 * i)) & 3) as u16;
+        }
+    }
+}
+
+fn parse_frame_header(r: &[u8; FRAME_HEADER]) -> FrameHeader {
+    let u16_at = |k: usize| u16::from_le_bytes([r[k], r[k + 1]]);
+    let u32_at = |k: usize| u32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]);
+    FrameHeader {
+        count: u32_at(0),
+        width: u16_at(4) as usize,
+        height: u16_at(6) as usize,
+        bin: r[8],
+        cfa: r[9],
+        black: u16_at(10),
+        white: u16_at(12),
+        exposure_ns: u64::from_le_bytes(r[16..24].try_into().unwrap()),
+        gain: u32_at(24),
+        focus: u32_at(28),
+        time: u64::from_le_bytes(r[32..40].try_into().unwrap()) as i64,
+    }
+}
+
 /// The header's bytes for a frame (the driver's side of [`parse_frame`], kept beside it so the two cannot drift; the tests use it).
 pub fn frame_header(f: &FrameHeader) -> [u8; FRAME_HEADER] {
     let mut h = [0u8; FRAME_HEADER];
@@ -221,6 +304,38 @@ mod tests {
         assert_eq!((c.id, c.name.as_str(), c.width, c.height, c.black, c.white, c.rotation), (0, "main", 4080, 3072, 64, 1023, 1));
         assert_eq!(c.cfa & 3, 1);
         assert_eq!(c.idt[4], 1.);
+    }
+
+    #[test]
+    fn a_view_and_a_map_read_back() {
+        // The driver's OPEN reply with the view (payloads/camera `VIEW_REPLY`).
+        let mut r = [0u8; VIEW_REPLY];
+        r[1..33].copy_from_slice(&[7u8; 32]);
+        r[33] = 4;
+        r[34] = FORMAT_RAW10;
+        r[36..38].copy_from_slice(&4080u16.to_le_bytes());
+        r[38..40].copy_from_slice(&3072u16.to_le_bytes());
+        r[40..44].copy_from_slice(&0x1400u32.to_le_bytes());
+        r[44..48].copy_from_slice(&(1u32 << 24).to_le_bytes());
+        let v = parse_view(&r).unwrap();
+        assert_eq!((v.token, v.buffers, v.format, v.width, v.height, v.line, v.buffer), ([7; 32], 4, FORMAT_RAW10, 4080, 3072, 0x1400, 1 << 24));
+        assert!(parse_view(&r[..1]).is_none());
+        // A MAP's header (payloads/camera `header` at bin 1).
+        let f = FrameHeader { count: 9, width: 4080, height: 3072, bin: 1, cfa: 0x49, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: 5 };
+        let mut h = frame_header(&f);
+        h[40] = 2;
+        h[48..56].copy_from_slice(&(2u64 << 24).to_le_bytes());
+        let m = parse_map(&h).unwrap();
+        assert_eq!((m.frame, m.buffer, m.offset), (f, 2, 2 << 24));
+    }
+
+    #[test]
+    fn raw10_unpacks() {
+        // Samples 0, 1023, 512, 3: high bytes 0, 255, 128, 0; low bits 0, 3, 0, 3 (low byte 0b11_00_11_00).
+        let line = [0u8, 255, 128, 0, 0b1100_1100];
+        let mut px = [0u16; 4];
+        unpack_raw10(&line, &mut px);
+        assert_eq!(px, [0, 1023, 512, 3]);
     }
 
     #[test]

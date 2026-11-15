@@ -30,8 +30,83 @@ const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const CAMERA: u64 = 7;
 
-/// The binning Lumis asks the driver for: the largest frame a call can carry is 8 MiB (process.rs `REPLY_MAX`), so the main camera's whole readout (4080 x 3072 samples, 24 MiB) cannot cross and bin 2 (2040 x 1536, 6 MiB) is the finest Lumis integrates.
+/// The binning Lumis asks the driver for when the open gave no view (a driver or kernel from before it): the largest frame a call can carry is 8 MiB (process.rs `REPLY_MAX`), so the main camera's whole readout (4080 x 3072 samples, 24 MiB) cannot cross and bin 2 (2040 x 1536, 6 MiB) is the finest a copy carries.
+/// With the view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?") Lumis integrates and saves whole sensor frames, read in place.
 const BIN: u32 = 2;
+
+/// Rows unpacked per task when a frame is taken out of the view.
+const ROWS_PER_TASK: usize = 1 << 4;
+
+/// Where the camera service's frames come from.
+enum Source {
+    /// The view: whole frames read in place (`base` where this process reads it), the buffer held, the frame unpacked to 16 bits.
+    View { base: usize, view: camera::View, held: u8, frame: Vec<u16> },
+    /// Frames by copy at `BIN`, header and samples.
+    Copy { buf: Vec<u8> },
+}
+
+/// A frame's time in the camera service, for the console every 64: waiting on the driver, unpacking out of the view, the integrator, the whole turn (each summed, microseconds).
+#[derive(Default)]
+struct Turns {
+    wait: u64,
+    unpack: u64,
+    integrate: u64,
+    since: Option<std::time::Instant>,
+    n: u64,
+}
+
+/// `len` bytes from the non-cacheable view at `src` into `dst`, 64 bytes a load (four NEON registers): each load of non-cacheable memory is its own bus transaction, and the camera driver measured 8-byte loads at 121 ms a frame against 14.4 ms (docs/CAMERA.md).
+fn copy_from_view(src: usize, dst: &mut [u8]) {
+    #[cfg(target_arch = "aarch64")]
+    for i in 0..dst.len() / 64 {
+        unsafe {
+            let v = core::arch::aarch64::vld1q_u8_x4((src + i * 64) as *const u8);
+            core::arch::aarch64::vst1q_u8_x4(dst.as_mut_ptr().add(i * 64), v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len())
+    };
+}
+
+impl Source {
+    /// The next frame, its header and its samples (16 bits, little-endian, row by row), with the wait and the unpacking counted.
+    fn next(&mut self, t: &mut Turns) -> Option<(camera::FrameHeader, &[u8])> {
+        let t0 = std::time::Instant::now();
+        match self {
+            Source::View { base, view, held, frame } => {
+                let mut r = [0u8; camera::FRAME_HEADER];
+                let n = sys::call_live(CAMERA, &[camera::OP_MAP, *held], &mut r);
+                let m = (n != sys::ERR).then(|| camera::parse_map(&r[..n as usize])).flatten()?;
+                *held = m.buffer;
+                let t1 = std::time::Instant::now();
+                t.wait += (t1 - t0).as_micros() as u64;
+                let (w, line) = (view.width, view.line);
+                let src = *base + m.offset;
+                frame.par_chunks_mut(w * ROWS_PER_TASK).enumerate().for_each_init(
+                    || vec![0u8; line],
+                    |tmp, (k, rows)| {
+                        for (j, row) in rows.chunks_exact_mut(w).enumerate() {
+                            copy_from_view(src + (k * ROWS_PER_TASK + j) * line, tmp);
+                            camera::unpack_raw10(tmp, row);
+                        }
+                    },
+                );
+                t.unpack += t1.elapsed().as_micros() as u64;
+                // SAFETY: the u16 samples' own bytes, little-endian on this target as the integrator reads them.
+                let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 2) };
+                Some((m.frame, bytes))
+            }
+            Source::Copy { buf } => {
+                let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
+                t.wait += t0.elapsed().as_micros() as u64;
+                let h = (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()?;
+                Some((h, &buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()]))
+            }
+        }
+    }
+}
 
 /// Lumis's focus control is in diopters (Camera2's LENS_FOCUS_DISTANCE: 0 at infinity, the nearest focus at LENS_INFO_MINIMUM_FOCUS_DISTANCE); the driver's is the actuator's position (`focus_min`..`focus_max`).
 /// Unmeasured on the Pro: Lumis's range is taken as 0 to 2^3 diopters (12.5 cm), mapped straight onto the actuator's range, infinity at `focus_min`.
@@ -111,8 +186,8 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 id: c.name.clone(),
                 index,
                 facing: if c.facing == 1 { 0 } else { 1 },
-                width: c.width / BIN,
-                height: c.height / BIN,
+                width: c.width,
+                height: c.height,
                 white_level: c.white as i32,
                 black_level: c.black as i32,
                 bayer_pattern: bayer as i32,
@@ -171,21 +246,36 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         println!("lumis: camera {}: {why}", cam.name);
         *opened.lock().unwrap() = Some(Opened::Failed(why));
     };
-    let mut r = [0u8; 4];
-    match (sys::call_live(CAMERA, &[camera::OP_OPEN, cam.id], &mut r), r[0]) {
+    // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
+    let mut r = [0u8; camera::VIEW_REPLY];
+    let n = sys::call_live(CAMERA, &[camera::OP_OPEN, cam.id, camera::OPEN_VIEW], &mut r);
+    match (n, r[0]) {
         (sys::ERR, _) => return fail("the camera driver did not answer the open".into()),
         (_, 0) => {}
         (_, 1) => return fail("the driver has no such camera".into()),
         (_, 2) => return fail("another kist has this camera open".into()),
         (_, k) => return fail(format!("the driver refused the open ({k})")),
     }
-    // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
-    let mut buf = vec![0u8; camera::FRAME_HEADER + (1 << 23)];
-    let frame = |buf: &mut [u8]| -> Option<camera::FrameHeader> {
-        let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
-        (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()
+    // The view's token is kept in this process's memory for the life of the camera: the kernel answers its base from it.
+    let mut src = match camera::parse_view(&r[..n as usize]) {
+        Some(v) if v.format == camera::FORMAT_RAW10 => {
+            let token = Box::leak(Box::new(v.token));
+            let base = sys::dma(token);
+            if base == sys::ERR {
+                return fail("the view's token was refused".into());
+            }
+            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at {base:#x}", cam.name, v.buffers, v.width, v.height);
+            Source::View { base: base as usize, view: v, held: camera::NONE, frame: vec![0u16; v.width * v.height] }
+        }
+        Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),
+        None => {
+            println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
+            // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
+            Source::Copy { buf: vec![0u8; camera::FRAME_HEADER + (1 << 23)] }
+        }
     };
-    let Some(first) = frame(&mut buf) else {
+    let mut turns = Turns::default();
+    let Some((first, _)) = src.next(&mut turns) else {
         return fail("no first frame".into());
     };
     println!("lumis: camera {}: first frame, {} x {} samples (bin {}), exposure {} us, gain {}/1024", cam.name, first.width, first.height, first.bin, first.exposure_ns / 1000, first.gain);
@@ -227,11 +317,20 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let focus_of = |diopters: f32| cam.focus_min as u64 + ((diopters as f64 / NEAREST_DIOPTERS) * (cam.focus_max - cam.focus_min) as f64) as u64;
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
-    let mut head = first;
     let mut frames = 0u64;
+    // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
-        let samples = &buf[camera::FRAME_HEADER..camera::FRAME_HEADER + head.samples_bytes()];
+        let Some((head, samples)) = src.next(&mut turns) else {
+            println!("lumis: camera {}: no frame (the driver refused or ended); Lumis ends, as Android's camera process does on a camera error", cam.name);
+            lumis_core::platform::exit();
+        };
+        if head.width != first.width || head.height != first.height {
+            println!("lumis: camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first; Lumis ends", cam.name, head.width, head.height, first.width, first.height);
+            lumis_core::platform::exit();
+        }
+        let t_integrate = std::time::Instant::now();
         let (iso, shutter_ns, focus) = integrator.process_frame(samples, (iso(head.gain)) as i32, head.exposure_ns as i64, 0., false, head.width * 2);
+        turns.integrate += t_integrate.elapsed().as_micros() as u64;
         if iso != sent.0 && !set(camera::SET_GAIN, gain_of(iso)) {
             println!("lumis: the camera did not take gain {} (ISO {iso})", gain_of(iso));
         }
@@ -248,26 +347,21 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         integrator.try_save();
         keep_saves(vault.as_deref(), &mut *integrator.header);
         frames += 1;
-        if frames & ((1 << 8) - 1) == 0 {
-            println!("lumis: {frames} frames integrated");
+        turns.n += 1;
+        if turns.n == 1 << 6 {
+            let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
+            println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, unpacking {} us, the integrator {} us", first.width, first.height, whole / 64, turns.wait / 64, turns.unpack / 64, turns.integrate / 64);
+            turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
+        } else if turns.since.is_none() {
+            turns.since = Some(std::time::Instant::now());
         }
-        head = match frame(&mut buf) {
-            Some(h) if h.width == first.width && h.height == first.height => h,
-            Some(h) => {
-                println!("lumis: camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first; Lumis ends", cam.name, h.width, h.height, first.width, first.height);
-                lumis_core::platform::exit();
-            }
-            None => {
-                println!("lumis: camera {}: no frame (the driver refused or ended); Lumis ends, as Android's camera process does on a camera error", cam.name);
-                lumis_core::platform::exit();
-            }
-        };
     }
 }
 
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
     while let Some((bytes, name)) = lumis_core::get_pending_save_data() {
+        let t = std::time::Instant::now();
         let kept = match vault {
             Some(v) => match v.write_device(&format!("save/{name}"), &bytes) {
                 Ok(()) => true,
@@ -282,7 +376,7 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
             }
         };
         if kept {
-            println!("lumis: kept {name}, {} bytes", bytes.len());
+            println!("lumis: kept {name}, {} bytes, into the vault in {} ms", bytes.len(), t.elapsed().as_millis());
         }
         // A calibration map is not a photo: it never counts (as on Android).
         app::save_done(header, kept && !name.starts_with("cal_"));

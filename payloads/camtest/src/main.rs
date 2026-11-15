@@ -2,6 +2,7 @@
 //!
 //! ferros-bridge spawn camtest.bin <hex input> --name camtest --use camera   (e.g. `4008`: 64 frames at bin 8)
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
+//! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 #![no_std]
 #![no_main]
 
@@ -41,7 +42,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         n => n as u32 * if arg(2) == 0 { 1 } else { arg(2) as u32 },
     };
     let bin = match arg(1) {
-        2 => 2u8,
+        1 => 1u8,
+        2 => 2,
         4 => 4,
         _ => 8,
     };
@@ -56,6 +58,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     let t1 = ferros_sys::now();
+    if bin == 1 {
+        view(g, ep, frames, arg(3) == 2, t1);
+    }
     let mut r = [0u8; 4];
     let n = call(ep, &[1, 0], &mut r);
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
@@ -105,6 +110,84 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// The view's token, where the kernel looks for it (an arc offset).
+static mut VIEW_TOKEN: [u8; 32] = [0; 32];
+
+/// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.
+fn view(g: u64, ep: u64, frames: u32, write: bool, t1: u64) -> ! {
+    let mut r = [0u8; 64];
+    let n = call(ep, &[1, 0, 1], &mut r);
+    say!(g, "camtest: OPEN with the view answered G#{:X}, A#{} bytes, in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, if n == ERR { 0 } else { n }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 || n < 48 {
+        ferros_sys::exit(1);
+    }
+    let tok = unsafe { &mut *(&raw mut VIEW_TOKEN) };
+    tok.copy_from_slice(&r[1..33]);
+    let toff = ferros_sys::off(tok.as_ptr());
+    let base = ferros_sys::dma(toff);
+    let size = ferros_sys::svc(ferros_sys::nr::DMA, toff, 1, 0, 0, 0);
+    let (ring, w, h) = (r[33], u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    say!(g, "camtest: the view at G#{base:X}, A#{} MiB; a ring of A#{ring}, A#{w} x A#{h}, A#{stride} bytes a line, format A#{}\n", if size == ERR { 0 } else { size >> 20 }, r[34]);
+    if base == ERR {
+        ferros_sys::exit(1);
+    }
+    let (mut held, mut waits, mut most, mut got, mut last_count) = (0xFFu8, 0u64, 0u64, 0u32, 0u32);
+    let mut h64 = [0u8; 64];
+    for k in 0..frames {
+        let t = ferros_sys::now();
+        let n = call(ep, &[5, held], &mut h64);
+        let us = ferros_sys::us_since(t);
+        if n == ERR || n < 64 {
+            say!(g, "camtest: MAP A#{k}: no frame (G#{:X})\n", n);
+            break;
+        }
+        got += 1;
+        if k != 0 {
+            waits += us;
+            most = most.max(us);
+        }
+        held = h64[40];
+        let count = u32::from_le_bytes([h64[0], h64[1], h64[2], h64[3]]);
+        let skipped = count.wrapping_sub(last_count).wrapping_sub(1);
+        last_count = count;
+        if k == 0 || k + 1 == frames {
+            let at = base as usize + u64::from_le_bytes(h64[48..56].try_into().unwrap()) as usize;
+            let (mut sum, mut cnt) = (0u64, 0u64);
+            for y in (0..h).step_by(1 << 4) {
+                // Every 65th byte of the line's samples: a multiple of five, so always a sample's high eight bits (MIPI RAW10: four of those, then their low bits).
+                for x in (0..w * 5 / 4).step_by(65) {
+                    sum += unsafe { core::ptr::read_volatile((at + y * stride + x) as *const u8) } as u64;
+                    cnt += 1;
+                }
+            }
+            // A whole frame out of the view, 64 bytes a load, as a kist takes one (into a scratch line, so nothing but the reads is timed).
+            let t = ferros_sys::now();
+            let mut acc = 0u64;
+            for y in 0..h {
+                let line = (at + y * stride) as *const u8;
+                for i in 0..stride / 64 {
+                    let v = unsafe { core::arch::aarch64::vld1q_u8_x4(line.add(i * 64)) };
+                    acc ^= unsafe { core::arch::aarch64::vgetq_lane_u64::<0>(core::arch::aarch64::vreinterpretq_u64_u8(v.0)) };
+                }
+            }
+            let copy_us = ferros_sys::us_since(t);
+            say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, 4 * sum / cnt.max(1), acc & 0xFF);
+        }
+    }
+    say!(g, "camtest: A#{got} frames mapped, A#{} us apart on average, A#{most} us the longest\n", if got > 1 { waits / (got - 1) as u64 } else { 0 });
+    if write {
+        say!(g, "camtest: a store into the view (read-only: this process should end on the fault)\n");
+        unsafe { core::ptr::write_volatile(base as *mut u64, 0) };
+        say!(g, "camtest: the store into the view went thru: the view is NOT read-only\n");
+    }
+    let mut c = [0u8; 4];
+    let n = call(ep, &[4], &mut c);
+    let after = ferros_sys::dma(toff);
+    say!(g, "camtest: CLOSE G#{:X}; the view's token after it: {}\n", if n == ERR { 0xEEE } else { c[0] as u64 }, if after == ERR { "refused (taken back)" } else { "STILL ANSWERS" });
     ferros_sys::exit(0)
 }
 

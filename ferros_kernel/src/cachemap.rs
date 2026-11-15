@@ -169,6 +169,16 @@ pub fn cam_map(va: usize, pa: Option<usize>) {
     };
 }
 
+/// The camera's view (2026-11-15, the owner: "why the ridiculously low camera resolution?"; docs/CAMERA.md "The view"): the frames of the driver's image ring, read-only, for the kist that holds the camera, so it reads whole sensor frames in place where a reply carries at most 8 MiB (process.rs `REPLY_MAX`). The rest of the surfaces' GiB past the camera's window: 128 MiB of addresses, eight frames of 16 MiB. Each 2 MiB block one frame of the driver's run (process.rs `cam_view_give`), Normal non-cacheable as the driver's own window is (the front end writes them by DMA and does not snoop), EL0 read-only, never executable; the blank frame in every block once the view is taken back, so a reader still in a frame as it goes reads nothing anyone owns rather than faulting; unmapped before the first view.
+pub const CAM_VIEW_VA: (usize, usize) = (0x50_3800_0000, 0x50_4000_0000);
+const _: () = assert!(CAM_VIEW_VA.0 == CAM_VA.1 && (CAM_VIEW_VA.1 - 1) / GIB == SURF_VA.0 / GIB && CAM_VIEW_VA.0 % MIB2 == 0, "the camera's view: in the surfaces' GiB, past the camera's window");
+
+/// The camera's view: the block at `va` maps frame `pa`, Normal non-cacheable, EL0 read-only (AP[2], which binds EL2 too in the VHE regime, so the kernel never writes thru it either: process.rs `dma_span` leaves the view out), never executable. Then `surface_unmapped` over what changed.
+pub fn cam_view_map(va: usize, pa: usize) {
+    let e = unsafe { &mut (*(&raw mut L2_SURF)).0[(va / MIB2) % 512] };
+    *e = dma_pool(vhe(), pa, BLOCK) | AP_RO;
+}
+
 /// The most GPU memory one client may hold (2026-11-13, the coordinator's call, the owner may resize it: a power of two of at least a frame): its block, frames of the pool on demand (process.rs `block_grow`). Mahere at the 8a's 1080 x 2400 names up to 376 cells of a MiB at full detail, which 384 MiB would not quite hold beside its frame regions; 512 MiB does.
 pub const GPU_BLOCK_MOST: usize = 512 << 20;
 /// How many GPU blocks may be held at once: slots of the blocks' window, each `GPU_BLOCK_MOST` of addresses and as many frames as its holder asked for, so the limit costs addresses, not memory.
