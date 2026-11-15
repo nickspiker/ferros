@@ -6,6 +6,8 @@
 pub mod cams;
 pub mod inputs;
 pub mod job;
+#[cfg(any(feature = "list", test))]
+pub mod list;
 pub mod raw;
 pub mod rx;
 

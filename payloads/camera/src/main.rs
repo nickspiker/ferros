@@ -3,7 +3,7 @@
 //!
 //! The kernel keeps what a process may not do behind the `camera` power switch (kernel camera_power.rs): the camera buses' pins and clocks, the module's rails behind the overvoltage guard (which module: the switch's argument, ferros_sys `power_arg`), the front end's power domain and clocks, the D-PHY's isolation, the SYSMMUs in bypass and the S2MPUs fenced to this driver's frames. Here, thru its grants: the open camera's sensor and lens actuator on its bus, the front end and its PDMA engine, the CSI links and PHY, and the front end's line 0.
 //!
-//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on for that camera's module, the sensor's identity read, its init replayed from the vault (`cam.<key>.init`; the main's also `cam.frame`), the PDMA job from the vault (`cam.<key>.pdma`) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.<key>.prog`; the main's `cam.ispfe.prog`), the engine started, the camera's receiver last, the CPU's writes after it, the lens set, the stream on. The keys: boitata (main), oksoko (ultrawide), dokkaebi (front), kraken (tele).
+//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on for that camera's module, the sensor's identity read, its init replayed from the vault (`cam.<key>.init`; the main's also `cam.frame`), the PDMA job from the vault (`cam.<key>.pdma`; its IDT `cam.<key>.idt` beside them, for the list) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.<key>.prog`; the main's `cam.ispfe.prog`), the engine started, the camera's receiver last, the CPU's writes after it, the lens set, the stream on. The keys: boitata (main), oksoko (ultrawide), dokkaebi (front), kraken (tele).
 //! Then the front end is answered on its interrupt: every acknowledgement in the order Linux makes them (the camera's, ferros_cam cams `ack`), loch0's paths enabled after the first SHADOW_UPDATE (G#81 to G#1C32_00A0), the engine's descriptor index advanced once a frame. Left unanswered past about a frame period the front end stops for good (docs/oracle/CAMERA.md "Focus, exposure"), which is why this is its own thread on an interrupt and not the kernel's spin.
 //!
 //! Spawn by hand (the kernel also starts it itself on a call to `camera`):
@@ -11,7 +11,7 @@
 //! Grant slots, in that order: 0 console, 1 serve camera, 2 hsi2c_1, 3 the front end, 4 the CSI links and PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.`, 7 the switch, 8 the region, 9 the line, 10 hsi2c_3 (the ultrawide), 11 hsi2c_2 (the front), 12 hsi2c_4 (the tele).
 //!
 //! The `camera` endpoint (docs/CAMERA.md "The endpoint"), first byte the op:
-//! - `0` LIST: the list, a VSF document made at build time (build.rs): a section per camera that can stream whose inputs are in the vault.
+//! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`.
 //! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
 //! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus. `[0]` taken, `[1]` outside the range.
@@ -22,6 +22,8 @@
 //! A holder that ends without closing: its waiting FRAME's reply fails, or 64 frames pass with nobody asking; either closes. The kernel takes the view back when either ends.
 #![no_std]
 #![no_main]
+
+extern crate alloc;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -47,17 +49,20 @@ fn cam() -> &'static Cam {
     cams::CAMS[CAM.load(Ordering::Relaxed) as usize]
 }
 
-/// The lists (build.rs): 'LST8', eight lengths (u32), then eight VSF documents, document k holding the sections of the cameras whose bit is set in k (bit 0 the main, 1 the ultrawide, 2 the front).
-static LISTS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lists.bin"));
-/// The cameras the lists can name, by bit.
-const LISTED: [u8; 3] = [0, 1, 2];
+/// The heap the list is built in (ferros_cam list: an IDT's document parsed, the list's sections and document made), at LIST only. A list of three cameras is about 1.3 KB and an IDT 7.7 KB; 2^20 bytes leaves room for vsf's working copies many times over.
+const HEAP_BYTES: usize = 1 << 20;
+#[repr(C, align(16))]
+struct Region<const N: usize>(core::cell::UnsafeCell<[u8; N]>);
+unsafe impl<const N: usize> Sync for Region<N> {}
+static HEAP: Region<HEAP_BYTES> = Region(core::cell::UnsafeCell::new([0; HEAP_BYTES]));
+#[global_allocator]
+static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
-/// List `mask`'s document.
-fn list(mask: usize) -> &'static [u8] {
-    let len = |k: usize| u32::from_le_bytes(LISTS[4 + 4 * k..8 + 4 * k].try_into().unwrap()) as usize;
-    let at = 4 + 4 * (1 << LISTED.len()) + (0..mask).map(len).sum::<usize>();
-    &LISTS[at..at + len(mask)]
-}
+/// The cameras the list can name: those that stream.
+const LISTED: [u8; 3] = [0, 1, 2];
+/// The largest IDT the driver reads (each `.idt.vsf` is 7764 bytes).
+const IDT_MOST: usize = 1 << 14;
+static mut IDT: [u8; IDT_MOST] = [0; IDT_MOST];
 
 struct Line {
     b: [u8; 256],
@@ -78,6 +83,24 @@ macro_rules! say {
         let _ = write!(l, $($t)*);
         console($g, &l.b[..l.n]);
     }};
+}
+
+/// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
+fn list(g: u64) -> alloc::vec::Vec<u8> {
+    let mut secs = alloc::vec::Vec::new();
+    for &id in LISTED.iter() {
+        let c = cams::CAMS[id as usize];
+        if !inputs_held(g, c) {
+            continue;
+        }
+        let mut kb = [0u8; 32];
+        let Some(idt) = get(g, input_key(&mut kb, c, b"idt"), unsafe { &mut *(&raw mut IDT) }) else { continue };
+        match ferros_cam::list::section(c, idt) {
+            Ok(s) => secs.push(s),
+            Err(e) => say!(g, "camera: cam.{}.idt does not read ({e:?}); {} left out of the list\n", c.key, c.name),
+        }
+    }
+    ferros_cam::list::document(secs).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- registers
@@ -621,12 +644,12 @@ fn has(g: u64, key: &[u8]) -> bool {
     ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
 }
 
-/// Whether camera `c`'s inputs are in the vault: its job, and its init and CPU program (the main's also as the bundle `cam.frame`, or by their older names).
+/// Whether camera `c`'s inputs are in the vault: its IDT and its job, and its init and CPU program (the main's also as the bundle `cam.frame`, or by their older names).
 fn inputs_held(g: u64, c: &Cam) -> bool {
     let mut b = [0u8; 32];
     let both = has(g, input_key(&mut b, c, b"init")) && has(g, input_key(&mut [0u8; 32], c, b"prog"));
     let main = c.id == 0 && (has(g, b"frame") || has(g, b"ispfe.prog") && has(g, b"boitata.init"));
-    has(g, input_key(&mut [0u8; 32], c, b"pdma")) && (both || main)
+    has(g, input_key(&mut [0u8; 32], c, b"idt")) && has(g, input_key(&mut [0u8; 32], c, b"pdma")) && (both || main)
 }
 
 /// PROBE (op 7, no camera open): camera `c`'s module powered thru the switch, its sensor's identity read, every 7-bit address on its bus asked for one byte (its register 0) to see which acknowledge, the module powered down.
@@ -1145,6 +1168,7 @@ const FRAME_LATE_US: u64 = 1 << 21;
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
+    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
         ferros_sys::thread_spawn(binner, unsafe { &mut (*(&raw mut BIN_STACKS))[k - 1] }, k as u64);
@@ -1180,10 +1204,9 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
             continue;
         }
         match msg[0] {
-            // LIST: the cameras that can stream whose inputs are in the vault (`inputs_held`), so a camera shows once its init, program and job are stored on this device.
+            // LIST: the cameras that can stream whose inputs and IDT are in the vault (`list`), so a camera shows once its init, program, job and calibration are stored on this device.
             0 => {
-                let mask = LISTED.iter().enumerate().filter(|&(_, &id)| inputs_held(g, cams::CAMS[id as usize])).fold(0, |m, (k, _)| m | 1 << k);
-                reply(&token, list(mask));
+                reply(&token, &list(g));
             }
             1 => {
                 let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams) } else { None };

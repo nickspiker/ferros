@@ -7,3 +7,13 @@ description = "The camera front end's tables and its PDMA job's move into a regi
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# The `camera` endpoint's list, built by the driver from each camera's IDT in the vault (`list`): vsf and a heap, which the kernel's copy of this crate has no use for.
+list = ["dep:vsf"]
+
+[dependencies]
+vsf = { path = "../../vsf", default-features = false, optional = true }
+
+[dev-dependencies]
+vsf = { path = "../../vsf" }

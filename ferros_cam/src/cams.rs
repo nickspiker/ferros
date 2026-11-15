@@ -70,7 +70,14 @@ pub const FRAME_ACK_UW: [usize; 29] = [
     0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
 ];
 
+// The mosaic, levels and orientation of every camera, from the Android captures the IDTs were solved from (2026-10-21, `pixel 8 pro calibration data/*average.vsf`, local only: a per-unit fingerprint; only these numbers come from them).
+// Each capture's plane: `cfa` a 2 x 2 tensor over R G B (0 R, 1 G, 2 B), black 64 and white 1023 on all three (10 bits), `orientation` EXIF's (6 a quarter turn clockwise to stand upright, 8 three quarters), its readout size.
+// Whether ferros reads out the same way: each capture's size is exactly what the init ferros replays sets (CCS x_output_size and y_output_size), the init being Android's own, captured from the same HAL opening the same camera; so the mode, its crop start and its flip are Android's.
+// Every crop start in the four inits is even (x_addr_start, y_addr_start: the main 16, 16; the ultrawide 0, 464; the front 136, 0; the tele 8, 0), so no start moves the 2 x 2 phase; the flip (CCS image_orientation G#0101) ferros writes is the HAL's own write (the main's 3 in its stream-on, the ultrawide's 3 in its init; the front's 0 in its stream-on; the tele's in no captured write).
+// The camera's register state while Android took each capture was not itself captured: that the HAL ran the same mode for its RAW stream as for the session the init came from rests on the matching size alone (docs/CAMERA.md "The other cameras").
+
 /// The main camera (boitata), as the driver has streamed it since 2026-11-14: every field measured (docs/oracle/CAMERA.md).
+/// Its capture (cam 2, 4080 x 3072): cfa G B / R G, black 64, white 1023, orientation 6; ferros's frames developed with it in true colour (2026-10-21, "First colour") and stand upright in Lumis at a quarter turn (2026-11-14).
 pub const MAIN: Cam = Cam {
     id: 0,
     name: "main",
@@ -110,8 +117,7 @@ pub const MAIN: Cam = Cam {
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
 /// Measured: the bus, address and identity (G#0787 at the CCS sensor register G#0016), the stream writes (G#0100 alone, 8-bit), the receiver (link 2), the acknowledgement, the tick, the geometry (stride G#13C0, its front-end program's), the outputs (`job::UW_SLOT_BYTES`).
 /// From the init, not measured: the line time, 9568 pixel clocks (`line_length_pck`) at the PLL's 1458.2 MHz (24.576 MHz / 3 x 178), 6.5616 µs, which makes its 5081-line frame 33.3 ms, the 30 a second seen; the integration, 4124 lines; the longest offered, the frame less 2^6 lines (Sony's margin is not read).
-/// From the Lumis captures of this module (cam 3, 8000 x 6000 quad Bayer, black 64 x 43 frames): the mosaic B G / G R once binned, black 64, white 1023; its colour order is not yet confirmed on a known scene (docs/oracle/CAMERA.md "Continuous frames and colour").
-/// A guess: the rotation, the main's (both rear modules; Lumis's captures of it on 2026-10-18 say a half turn, on a rig whose orientation is not recorded).
+/// From its capture (cam 3, 4000 x 3000, the binned mode ferros's init sets): cfa B G / G R, black 64, white 1023, orientation 6, so a quarter turn as the main; derived, its init's crop start even and its flip (G#0101 = 3) the HAL's. Not yet seen on a ferros frame. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
 /// Its lens actuator (G#0F) never acknowledged ferros (docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"), so focus is not offered and the lens stays at rest.
 pub const ULTRAWIDE: Cam = Cam {
     id: 1,
@@ -150,7 +156,8 @@ pub const ULTRAWIDE: Cam = Cam {
 /// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06, but its sensor has never answered ferros (docs/CAMERA.md "The other cameras"), so nothing here has run.
 /// From the init: 3840 x 2736 RAW10 (stride G#12C0 in its front-end program), the integration 1712 lines in a 4001-line frame.
 /// Its line time is a guess: the PLL's 2023 MHz over 8448 pixel clocks is 4.18 µs at one pixel a clock (60 frames a second) or 8.35 µs at a half (30, taken here); so the exposure is offered only up to the init's own until a run measures the frame rate.
-/// Guesses: the mosaic (the main's, unmeasured), the rotation (three quarter turns, Android's usual for a front module), black 64 and white 1023 (RAW10 as the others); its acknowledgement and tick the ultrawide's, as the harness had them.
+/// From its two captures (cam 7, 3840 x 2736, the size its init sets): cfa G R / B G, black 64, white 1023; orientation 8 (three quarter turns) in the second, none recorded in the first; derived, its init's crop start even and its stream-on's flip 0 the HAL's write.
+/// Guesses: its acknowledgement and tick, the ultrawide's, as the harness had them.
 /// Its lens actuator (G#0C) is driven as the main's; focus is not offered until its range is measured.
 pub const FRONT: Cam = Cam {
     id: 2,
@@ -180,7 +187,7 @@ pub const FRONT: Cam = Cam {
     line_ps: 8_350_202,
     exposure_lines: 1712,
     exposure_max_lines: 1712,
-    cfa: cfa(1, 2, 0, 1),
+    cfa: cfa(1, 0, 2, 1),
     black: 64,
     white: 1023,
     rotation: 3,
@@ -188,6 +195,7 @@ pub const FRONT: Cam = Cam {
 
 /// The folded tele (kraken, Samsung, G#08D5 at G#0000 under Linux's boot probe): only its init is captured (target/cam/tele.init, 4032 x 3024 RAW10 from its CCS writes); its receiver and job need a capture of Android streaming it, which needs a bright scene (docs/oracle/CAMERA.md: in dim light the app's 5x is a crop of the main).
 /// So it does not stream; the endpoint's PROBE powers it and reads its identity (docs/CAMERA.md "The other cameras").
+/// From its capture (cam 4, 4032 x 3024, the size its init sets): cfa B G / G R, black 64, white 1023, orientation 6 (a quarter turn); derived, its init's crop start even, its flip in no captured write (its stream-on was never captured).
 pub const TELE: Cam = Cam {
     id: 3,
     name: "tele",
@@ -216,7 +224,7 @@ pub const TELE: Cam = Cam {
     line_ps: 0,
     exposure_lines: 2232,
     exposure_max_lines: 2232,
-    cfa: cfa(1, 2, 0, 1),
+    cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,
     rotation: 1,
@@ -270,6 +278,11 @@ mod tests {
                 }
             }
             assert!(c.exposure_lines <= c.exposure_max_lines);
+        }
+        // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout.
+        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [2, 1, 1, 0], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [2, 1, 1, 0], 1, (4032, 3024))] {
+            assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
+            assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }
         assert_eq!(MAIN.binned(2), (2040, 1536));
         assert_eq!(ULTRAWIDE.binned(8), (500, 374));
