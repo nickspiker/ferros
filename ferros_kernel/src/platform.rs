@@ -428,13 +428,27 @@ pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
 /// This core's power-mode hint (PMU CPU_INFORM, G#1546_0860 + 4 per core: 0 none, 1 C2, 2 cluster power-down) cleared, as Linux's online does (pmucal_cpu_enable) on each core it starts. A no-op after the bootloader, whose hints read 0; after the jump from Android the hv leaves 1 on each core it parked, and a core started with its hint still set could be powered down by the PMU whenever it idles.
 static JUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Whether this boot is the jump from a running Android: the hv's gate mark with answer 6, read before `ready::answered_by_hv` takes it (the X3's launch comes first). Called once at entry; `jumped` reads the result.
-pub fn detect_jump() {
+/// Whether this boot is the jump from a running Android: the hv's gate mark with answer 6, read before `ready::answered_by_hv` takes it (the X3's launch comes first). Called once at entry with ABL's x0 (or a RELOAD's tag); `jumped` reads the result.
+/// A RELOAD (an odd x0) finds no gate mark, since the first kernel of the session took it: it is in a jumped session when the hv's counters say this power-on's Android was jumped from (`reload_in_jumped_session`), and then it runs as after a jump (Android's hardware was met this session, so the high bank stays held and sensors stay out) and answers fact 31 = 6 as the first kernel did. Until 2026-11-15 a reloaded kernel took such a session for a cold one and started sensors over Android's AoC.
+pub fn detect_jump(x0: u64) {
     let g = crate::board::hv_gate_mark();
     let (mark, tel) = unsafe { (read_volatile(g as *const u64), read_volatile((g + 8) as *const u64)) };
     let hv = mark == 0x4741_5445_464F_5252;
-    JUMPED.store(hv && matches!(tel & 0xFF, 6 | 7), core::sync::atomic::Ordering::Relaxed);
+    let reload_jumped = !hv && x0 & 1 == 1 && reload_in_jumped_session();
+    JUMPED.store((hv && matches!(tel & 0xFF, 6 | 7)) || reload_jumped, core::sync::atomic::Ordering::Relaxed);
     FROM_ANDROID.store(hv && tel & 0xFF == 6, core::sync::atomic::Ordering::Relaxed);
+    if reload_jumped {
+        crate::ready::GATE_TELEMETRY.store(6, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The hv core's counters in the report page (ferros_hv hvcore STATS, G#FD60_0D00): word 0 its magic "HVCORE01", written with every counter cleared as the hv starts Android (`save_for_jump`, the Android path only), word 16 the jumps begun, word 19 the jump's last stage (6: ferros started).
+/// A RELOAD keeps DRAM, so these are this power-on's: the magic, a jump begun and its last stage reached say this session began with the jump from Android.
+/// A session that began on the gate's ferros path leaves the counters as the previous power-on did, and the reset that ends a jumped session is a power cycle that decays them (HV.md, 2026-11-13), so a cold session does not read as jumped.
+fn reload_in_jumped_session() -> bool {
+    const STATS: usize = 0xFD60_0D00;
+    let w = |k: usize| unsafe { read_volatile((STATS + k * 8) as *const u64) };
+    w(0) == 0x4856_434F_5245_3031 && w(16) != 0 && w(19) == 6
 }
 /// This boot met hardware a running system left (the jump from Android, answer 6, or ferros's own restart, answer 7, restart.rs): every driver that cannot yet bring its block up from any state stands down, and the display runs its whole modeset.
 pub fn jumped() -> bool {
@@ -845,6 +859,34 @@ pub struct DmaPath {
     pub num_vm: usize,
     pub vm_ctrl_before: [u32; 8],
     pub vm_ctrl_after: [u32; 8],
+}
+
+/// After a jump from Android, at the service's start: the HSI0 S2MPU denied all instead of opened (2026-11-15). Android's DWC3 may still hold a running transfer list at IOVAs its SysMMU translated, and opening the path before anything reset the controller would let it write those addresses as physical ones; the `usb` switch opens the path only after it has reset the controller (`usb_controller_reset`, ptlink.rs). What Android left is still reported (the S2MPU's control word, each VM context's).
+pub fn close_usb_dma_path() -> DmaPath {
+    let rd = |a: usize| unsafe { read_volatile(a as *const u32) };
+    let s2mpu_ctrl = rd(S2MPU_HSI0);
+    let num_vm = ((rd(USB_SYSMMU + SYSMMU_NUM_CONTEXT) & 0x1F) as usize).clamp(1, 8);
+    let mut d = DmaPath { s2mpu_ctrl, num_vm, vm_ctrl_before: [0; 8], vm_ctrl_after: [0; 8] };
+    for vm in 0..num_vm {
+        d.vm_ctrl_before[vm] = rd(USB_SYSMMU + SYSMMU_CTRL_VM + vm * SYSMMU_VM_STRIDE);
+        d.vm_ctrl_after[vm] = d.vm_ctrl_before[vm];
+    }
+    let r = crate::s2mpu::deny_all(S2MPU_HSI0);
+    crate::flashlog::line(&alloc::format!("usb: HSI0's S2MPU denied all after the jump until the controller is reset: G#{r:X} (1 = done; it read G#{s2mpu_ctrl:X})"));
+    d
+}
+
+/// The DWC3's device controller reset (DCTL: Run/Stop off, CSFTRST, then CSFTRST self-clearing, a hardware handshake of at most 2^16 reads), as the USB process's own init does: whatever transfer list a previous owner left stops before the DMA path opens. Only once the `usb` switch has put the path's clocks and isolation back (`pixel8_usb_path_restore`): a register access to a gated controller would hang the bus. True when CSFTRST cleared.
+pub fn usb_controller_reset() -> bool {
+    const DCTL: usize = 0x1121_C704;
+    let dctl = unsafe { read_volatile(DCTL as *const u32) };
+    unsafe { write_volatile(DCTL as *mut u32, (dctl & !(1 << 31)) | (1 << 30)) };
+    for _ in 0..1 << 16 {
+        if unsafe { read_volatile(DCTL as *const u32) } & (1 << 30) == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Put the DWC3 DMA master on physical addresses: bypass the HSI0 S2MPU, disable translation in every SYSMMU VM context.
