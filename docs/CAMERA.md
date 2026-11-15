@@ -127,6 +127,16 @@ The pipeline is understood now for the main camera and the ultrawide, so this is
   How many of the 22 outputs the main camera's job really writes is measured by a run's own per-slice report ("buffer A#k at ...: A#n probe points written"); October's runs were read for the image body only.
 - **Then the harness goes**, its diagnostics with it (decision 4's bucket for `cam`).
 
+## Lumis itself (2026-11-14)
+
+The front above is retired (owner, 2026-11-14: "Lumis, that is a camera app for Android, most is in Rust so it should be a minimal transplant").
+Lumis runs on ferros as itself: `std/lumis` builds Lumis's own core (lumis_core, Lumis branch `ferros-port`) under fluor's ferros host, and only the platform layer is new (lumis_core `app` and `platform`).
+- **The seam**: every JNI entry point is a thin wrapper over `lumis_core::app` (menu, camera setup, UI frame, calibration, save done); the window is a `platform::Surface` (Android's ANativeWindow, or an RGB888 `PixelSurface` elsewhere); exit, descriptors and the config store are `platform` too. Android's build is the same code thru JNI.
+- **The ferros arm** (std/lumis): the menu from the camera list (each camera at bin 2, the finest a call carries), the camera service as a thread (open, the first frame seeds the integrator, then a frame a call into `process_frame`, the settings it answers sent with SET), the UI as a second thread over the integrator's memory, Lumis's frame shown as fluor's 16-bit g2t pixels (the rows that changed), its settings and saves in the kist's vault (kete, device scope).
+- **Colour**: the display matrix is the list's Absolute IDT with its sensitivity, white at green 1, ending in VSF RGB (`platform::DISPLAY_VSF_RGB`); Android's ends in Rec.2020 as before.
+- **Saves**: VSF RAW and VSF 8B only (the house formats); the JPEG, JPEG XL, TIFF and DNG writers are not in the ferros build.
+- **Run on the Pro** (hand-spawned with a kist's slots, the camera kernel b874): the menu, the lens's modes, the live preview at about 9.6 frames a second (Lumis's draw 90 ms a frame on the CPU), the camera served 115 ms apart, the shutter slider taken by the driver, a VSF RAW save kept (3918758 bytes).
+
 ## For the morning
 
 On akita (nothing to decide, nothing at risk): Lumis's front, spawned by hand with the slots a kist gets, shows its "no camera driver" page.
