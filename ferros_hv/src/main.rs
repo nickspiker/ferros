@@ -432,6 +432,36 @@ unsafe fn stage2_remap(ipa: u64) {
     asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
 }
 
+/// FERROS_HV_ORACLE_LATE (2026-11-15): the oracle's pages trapped only from `ORACLE_ARM_AFTER_MS` on, not from the hv's start.
+/// akita's Android hard-locked a core 24 s into a boot with the ISP front end's 42 pages trapped from the start (its camera stack's boot probe, trapped access by access), and a capture wants only the camera open that comes a minute later.
+/// The pages' tables are split at boot, before stage 2 is live (`stage2_base`), and left mapped; here each page's valid descriptor is made invalid on the live table and every TLB told, a change that needs no break-before-make.
+/// Once, from the first trapped SMC past the time, on whichever core it is (the swap keeps a second core out); never on a boot the one-shot marker made skip the oracle.
+static mut ORACLE_LATE_ON: bool = false;
+static ORACLE_LATE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+unsafe fn oracle_late_arm(now: u64, freq: u64) {
+    if !read_volatile(&raw const ORACLE_LATE_ON) || now / (freq / 1000) < ORACLE_ARM_AFTER_MS || ORACLE_LATE_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    let mut i = 0;
+    while i < ORACLE_TARGETS.len() {
+        let ipa = ORACLE_TARGETS[i];
+        // WHY the table checks: `stage2_unmap` leaves a block whole when the table pools run out (take_l2, take_l3), and a block's address field read as a table would point the write into memory that is no table.
+        let e1 = read_volatile(s2.add((ipa >> 30) as usize));
+        if e1 & 0b11 == 0b11 {
+            let e2 = read_volatile(((e1 & S2_ADDR) as *mut u64).add(((ipa >> 21) & 0x1FF) as usize));
+            if e2 & 0b11 == 0b11 {
+                write_volatile(((e2 & S2_ADDR) as *mut u64).add(((ipa >> 12) & 0x1FF) as usize), 0);
+            }
+        }
+        i += 1;
+    }
+    asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
+    let mut ht = [0u8; 16];
+    pstore::log(&[b"\nferros hv: oracle pages trapped from t=", pstore::hex(now / (freq / 1000), &mut ht), b" ms (late)\n"]);
+}
+
 include!(concat!(env!("OUT_DIR"), "/snap_list.rs"));
 include!(concat!(env!("OUT_DIR"), "/xplant_list.rs"));
 static mut XP_LINES: u32 = 0;
@@ -713,7 +743,14 @@ unsafe fn stage2_base() -> u64 {
             let mut i = 0;
             while i < ORACLE_TARGETS.len() {
                 stage2_unmap(ORACLE_TARGETS[i]);
+                // A late oracle (FERROS_HV_ORACLE_LATE) splits the page's tables now, while stage 2 is not yet live, and leaves the page mapped until `oracle_late_arm`.
+                if cfg!(hv_oracle_late) {
+                    stage2_remap(ORACLE_TARGETS[i]);
+                }
                 i += 1;
+            }
+            if cfg!(hv_oracle_late) {
+                write_volatile(&raw mut ORACLE_LATE_ON, true);
             }
         }
         if cfg!(hv_ufs) {
@@ -1253,6 +1290,9 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 write_volatile(&raw mut LAST_ARGS[core], [frame[1], frame[2]]);
                 write_volatile(&raw mut LAST_T[core], now);
                 stats_tick(now, freq);
+                if cfg!(hv_oracle_late) {
+                    oracle_late_arm(now, freq);
+                }
             }
             // The hv's own core is not Linux's to start: refused (PSCI DENIED, Linux logs the CPU as failed to boot and carries on with eight). Any other CPU_ON is the moment Linux's distributor is set up (boot, and every resume from system suspend), so the hv core is started there if it is not running.
             if cfg!(hv_core) && (fid == PSCI_CPU_ON || fid == PSCI_CPU_ON_32) && hvcore::enabled() {
