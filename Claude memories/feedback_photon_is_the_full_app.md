@@ -22,3 +22,5 @@ The owner, 2026-11-05: "there is no Photon core, there is FGTW that handles the 
 - Read "photon_core" in old docs as superseded. Retiring it (payloads/fgtw, beamtest and tools/photon-interop depend on it) is the owner's call.
 
 Related: [[std-target-status]], [[photon-on-ferros-no-bootstrap]], [[ferros_vocabulary]].
+
+**The same for Lumis and every owner app (2026-11-14):** a session built `rust/lumis-ferros`, a separate minimal camera front, instead of running Lumis; the owner, seeing its camera list on the Pro: "Lumis, that is a camera app for Android, most is in Rust so it should be a minimal transplant." Port an app by replacing only its platform layer (JNI/Kotlin → fluor's ferros host + ferros endpoints), never by writing a lookalike front.
