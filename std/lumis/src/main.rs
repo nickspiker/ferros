@@ -21,7 +21,6 @@ use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DISPLAY: u64 = 1;
@@ -405,10 +404,8 @@ struct Lumis {
     finger: Option<(f32, f32)>,
     down_sampled: bool,
     pending_up: bool,
-    /// Lumis's frame as last shown, three bytes a pixel, and as fluor's pixels; the rows that differ since the last show.
-    shown: Vec<u8>,
-    pixels: Vec<G2t16>,
-    changed: Option<(usize, usize)>,
+    /// Lumis posted a frame since the last show: the next draw converts it whole from Lumis's own buffer straight into fluor's scratch (no copy of the frame here: neither its bytes nor its pixels, 44 MB on the Pro).
+    changed: bool,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
     lut: [u32; 256],
 }
@@ -420,7 +417,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, shown: Vec::new(), pixels: Vec::new(), changed: None, lut }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, lut }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -440,38 +437,6 @@ impl Lumis {
         }
     }
 
-    /// The rows of Lumis's frame that changed since the last show, into fluor's pixels (each row compared, then converted only if it differs).
-    fn take_frame(&mut self) -> bool {
-        let Some(surface) = &self.surface else { return false };
-        let w = self.width;
-        let (lo, hi) = (AtomicUsize::new(usize::MAX), AtomicUsize::new(0));
-        let lut = &self.lut;
-        self.shown
-            .par_chunks_mut(w * 3)
-            .zip(self.pixels.par_chunks_mut(w))
-            .zip(surface.pixels().par_chunks(w * 3))
-            .enumerate()
-            .for_each(|(y, ((shown, px), src))| {
-                if shown == src {
-                    return;
-                }
-                shown.copy_from_slice(src);
-                for (p, rgb) in px.iter_mut().zip(src.chunks_exact(3)) {
-                    *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
-                }
-                lo.fetch_min(y, Ordering::Relaxed);
-                hi.fetch_max(y + 1, Ordering::Relaxed);
-            });
-        let (lo, hi) = (lo.into_inner(), hi.into_inner());
-        if lo >= hi {
-            return false;
-        }
-        self.changed = Some(match self.changed {
-            Some((a, b)) => (a.min(lo), b.max(hi)),
-            None => (lo, hi),
-        });
-        true
-    }
 }
 
 impl FluorApp<G2t16> for Lumis {
@@ -487,11 +452,7 @@ impl FluorApp<G2t16> for Lumis {
         // The frame is the panel, set once at start (ferros windows are the whole screen); Lumis is built for that size, as Android builds its menu and UI for the surface's.
         (self.width, self.height) = (w, h);
         self.surface = Some(PixelSurface::new(w, h));
-        self.shown = vec![0u8; w * h * 3];
-        // Black, as Lumis's zeroed frame is: a row Lumis never draws then reads the same in both.
-        let black = G2t16::from_channels(G2t16::ONE, [self.lut[0]; 3]);
-        self.pixels = vec![black; w * h];
-        self.changed = Some((0, h));
+        self.changed = true;
         self.menu = Some(app::menu_new(width, height, DENSITY_DPI, camera_infos(&self.cameras)));
         self.menu_dirty = true;
         ctx.window.request_redraw();
@@ -572,20 +533,28 @@ impl FluorApp<G2t16> for Lumis {
                 }
             }
         }
-        let posted = surface.take_posted();
-        posted && self.take_frame()
+        self.changed |= surface.take_posted();
+        self.changed
     }
 
+    /// The whole frame when Lumis posted one, nothing otherwise (a touch that drew nothing shows nothing new; fluor's default, the whole viewport, would clear the scratch for a frame never converted).
     fn damage_rect(&mut self, viewport: fluor::geom::Viewport) -> Option<fluor::canvas::PixelRect> {
-        let (y0, y1) = self.changed?;
-        Some(fluor::canvas::PixelRect::new(0, y0, viewport.width_px as usize, y1))
+        let h = if self.changed { viewport.height_px as usize } else { 0 };
+        Some(fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, h))
     }
 
-    fn render(&mut self, target: &mut [G2t16], _ctx: &mut Context) {
-        // Lumis's frame is opaque everywhere, so the rows that changed are copied whole, nothing under them.
-        let Some((y0, y1)) = self.changed.take() else { return };
-        let w = self.width;
-        target[y0 * w..y1 * w].copy_from_slice(&self.pixels[y0 * w..y1 * w]);
+    /// Lumis's frame (gamma-2 bytes) into fluor's pixels, the rows of the damage clip, straight from Lumis's buffer, a row per task on the worker cores. The frame is opaque everywhere, so every pixel is written and nothing lies under it.
+    /// Lumis's buffer starts zeroed, black, so the host's first frame (always the whole viewport) shows black wherever Lumis has not drawn yet.
+    fn render(&mut self, target: &mut [G2t16], ctx: &mut Context) {
+        let Some(surface) = self.surface.as_ref() else { return };
+        self.changed = false;
+        let (w, lut) = (self.width, &self.lut);
+        let (y0, y1) = (ctx.damage_clip.y0, ctx.damage_clip.y1);
+        target[y0 * w..y1 * w].par_chunks_mut(w).zip(surface.pixels()[y0 * w * 3..y1 * w * 3].par_chunks(w * 3)).for_each(|(px, src)| {
+            for (p, rgb) in px.iter_mut().zip(src.chunks_exact(3)) {
+                *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
+            }
+        });
     }
 
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
