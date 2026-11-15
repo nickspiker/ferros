@@ -410,7 +410,9 @@ fn ring_turn(n: u64, desc: Option<u64>) {
                 None
             };
         }
-        let q2 = q | r.map_or(0, |r| 1 << r);
+        // The buffer the descriptor will name: the one chosen, else the last one named (below); either is with the engine from now on, so its frame is found at the next DMA_DONE (the last one named unpatterned, so found at once: a ring of one, held while it is binned, is the driver before the view).
+        let named = r.or_else(|| desc.map(|_| LAST_R.load(Ordering::Relaxed) as usize));
+        let q2 = q | named.map_or(0, |r| 1 << r);
         let ns = held | q2 << QUEUED | newest.map_or(0, |b| (b as u64) << NEWEST | HAS_NEWEST);
         if STATE.compare_exchange(s, ns, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             if desc.is_some() && r.is_some_and(|r| newest_bit >> r & 1 == 1) {
@@ -847,8 +849,10 @@ const STRIDE: usize = 0x1400;
 /// A ring buffer's probe: its last line's first 64 bytes, written last of the frame (October's extent: the image body to +G#EFFF00).
 const PROBE_AT: usize = (H - 1) * STRIDE;
 const HEADER: usize = 1 << 6;
-/// The image rings the open asks for, the most first, under 4 GiB first (`open`): four buffers leave one free for the engine with one held by the kist, one by the binning or the newest, and one with the engine; three still never write a held one, but may write over the newest.
-const RINGS: [usize; 2] = [4, 3];
+/// The image rings the open asks for, the most first, under 4 GiB first (`open`): four buffers leave one free for the engine with one held by the kist, one by the binning or the newest, and one with the engine; three and two still never write a held one, but may write over the newest; one is the region before the view (40 frames with the long ring's), so a pool with room for no more (a jumped session's, about 150 MiB free on 2026-11-15) still opens the camera as before, with frames by copy only and no view (`VIEW_LEAST`).
+const RINGS: [usize; 4] = [4, 3, 2, 1];
+/// The fewest buffers a view is given with: with one, the engine's next frame could only go where the kist holds.
+const VIEW_LEAST: usize = 2;
 /// The largest reply: bin 2, 2040 x 1536 samples of 16 bits, and the header.
 static mut OUT: [u8; HEADER + (W / 2) * (H / 2) * 2] = [0; HEADER + (W / 2) * (H / 2) * 2];
 const BIN_MOST: usize = 1 << 3;
@@ -1107,7 +1111,9 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                 out[0] = r;
                 let mut len = 1;
                 if let (0, Some(o)) = (r, open_cam.as_mut()) {
-                    if got >= 3 && msg[2] == 1 {
+                    if got >= 3 && msg[2] == 1 && o.ring < VIEW_LEAST {
+                        say!(g, "camera: no view: the pool gave a ring of one buffer; frames by copy only\n");
+                    } else if got >= 3 && msg[2] == 1 {
                         let first = o.l.slots[job::OLD_SLOT_IMAGE].0 / job::FRAME;
                         let n = o.ring as u64 * job::IMAGE_BYTES / job::FRAME;
                         let mut t = [0u8; 32];
