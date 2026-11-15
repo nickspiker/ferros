@@ -4,6 +4,8 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod cams;
+pub mod ccs;
+pub mod geom;
 pub mod inputs;
 pub mod job;
 #[cfg(any(feature = "list", test))]

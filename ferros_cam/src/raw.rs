@@ -38,9 +38,199 @@ pub fn bin_row(pix: &[u16], w: usize, bin: usize, phase: usize, acc: &mut [u16],
     }
 }
 
+// ---------------------------------------------------------------- the accumulate (owner, 2026-11-15: "straight add/accumulate and see what numbers we can hit")
+
+/// Samples a block: eight RAW10 groups, 40 bytes, unpacked and added 32 at a time.
+pub const BLOCK_SAMPLES: usize = 32;
+pub const BLOCK_BYTES: usize = 40;
+/// Bytes a line must hold past its last block: each block is read as three 16-byte loads (48 bytes) and uses the first 40.
+pub const SLACK: usize = 8;
+
+/// The blocks a line of `w` samples takes (the accumulator's row pitch is `blocks * 32` samples: the main's 4080 make 128 blocks, 4096 samples, the last 16 its stride's padding).
+pub const fn blocks(w: usize) -> usize {
+    (w + BLOCK_SAMPLES - 1) / BLOCK_SAMPLES
+}
+
+/// The table lookups that turn a block's 40 bytes into its 32 samples: for output sample i, its high byte at 5 (i / 4) + i % 4 and its low-bits byte at 5 (i / 4) + 4; the low bits then shifted right by 2 (i % 4) and masked (`LOW_SHIFT`), the high byte shifted left by 2, or-ed.
+const HIGH_IDX: [[u8; 16]; 2] = {
+    let mut t = [[0u8; 16]; 2];
+    let mut i = 0;
+    while i < 32 {
+        t[i / 16][i % 16] = (5 * (i / 4) + i % 4) as u8;
+        i += 1;
+    }
+    t
+};
+const LOW_IDX: [[u8; 16]; 2] = {
+    let mut t = [[0u8; 16]; 2];
+    let mut i = 0;
+    while i < 32 {
+        t[i / 16][i % 16] = (5 * (i / 4) + 4) as u8;
+        i += 1;
+    }
+    t
+};
+/// Per 16-bit lane, the right shift (as NEON's left shift by a negative count) that brings sample i % 4's two low bits down.
+const LOW_SHIFT: [i16; 8] = [0, -2, -4, -6, 0, -2, -4, -6];
+
+/// One block's 32 samples, in four lanes of eight: the same table lookups and shifts the NEON path makes, lane by lane, for the host's tests (and any build that is not aarch64).
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn block_model(b: &[u8]) -> [[u16; 8]; 4] {
+    let mut out = [[0u16; 8]; 4];
+    for q in 0..4 {
+        for l in 0..8 {
+            let i = q * 8 + l;
+            let hi = b[HIGH_IDX[i / 16][i % 16] as usize] as u16;
+            let lo = b[LOW_IDX[i / 16][i % 16] as usize] as u16;
+            out[q][l] = hi << 2 | (lo >> -LOW_SHIFT[l]) & 3;
+        }
+    }
+    out
+}
+
+/// One RAW10 line's first `blocks` blocks added into a row of 16-bit sums (`acc`, `blocks * 32` samples): 64 frames of 1023 fit 16 bits (65472), so a u16 row takes up to 2^6 frames before it is folded into a wider total (`fold`). `line` holds `blocks * 40 + SLACK` bytes. One path, no branch per sample.
+pub fn add10_u16(line: &[u8], acc: &mut [u16], blocks: usize) {
+    assert!(line.len() >= blocks * BLOCK_BYTES + SLACK && acc.len() >= blocks * BLOCK_SAMPLES);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let hi0 = vld1q_u8(HIGH_IDX[0].as_ptr());
+        let hi1 = vld1q_u8(HIGH_IDX[1].as_ptr());
+        let lo0 = vld1q_u8(LOW_IDX[0].as_ptr());
+        let lo1 = vld1q_u8(LOW_IDX[1].as_ptr());
+        let sh = vld1q_s16(LOW_SHIFT.as_ptr());
+        let three = vdupq_n_u16(3);
+        for k in 0..blocks {
+            // SAFETY: block k's 48 bytes lie inside `line` (40 k + 48 <= blocks 40 + SLACK) and its 32 sums inside `acc`, by the assert above.
+            let t = vld1q_u8_x3(line.as_ptr().add(k * BLOCK_BYTES));
+            let (h0, h1) = (vqtbl3q_u8(t, hi0), vqtbl3q_u8(t, hi1));
+            let (l0, l1) = (vqtbl3q_u8(t, lo0), vqtbl3q_u8(t, lo1));
+            let s = |h: uint8x8_t, l: uint8x8_t| vorrq_u16(vshll_n_u8::<2>(h), vandq_u16(vshlq_u16(vmovl_u8(l), sh), three));
+            let a = acc.as_mut_ptr().add(k * BLOCK_SAMPLES);
+            vst1q_u16(a, vaddq_u16(vld1q_u16(a), s(vget_low_u8(h0), vget_low_u8(l0))));
+            vst1q_u16(a.add(8), vaddq_u16(vld1q_u16(a.add(8)), s(vget_high_u8(h0), vget_high_u8(l0))));
+            vst1q_u16(a.add(16), vaddq_u16(vld1q_u16(a.add(16)), s(vget_low_u8(h1), vget_low_u8(l1))));
+            vst1q_u16(a.add(24), vaddq_u16(vld1q_u16(a.add(24)), s(vget_high_u8(h1), vget_high_u8(l1))));
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for k in 0..blocks {
+        let q = block_model(&line[k * BLOCK_BYTES..k * BLOCK_BYTES + 48]);
+        for (j, lane) in q.iter().enumerate() {
+            for (l, &v) in lane.iter().enumerate() {
+                let a = &mut acc[k * BLOCK_SAMPLES + j * 8 + l];
+                *a = a.wrapping_add(v);
+            }
+        }
+    }
+}
+
+/// `add10_u16` into 32-bit sums: no fold, twice the bytes the add reads and writes.
+pub fn add10_u32(line: &[u8], acc: &mut [u32], blocks: usize) {
+    assert!(line.len() >= blocks * BLOCK_BYTES + SLACK && acc.len() >= blocks * BLOCK_SAMPLES);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let hi0 = vld1q_u8(HIGH_IDX[0].as_ptr());
+        let hi1 = vld1q_u8(HIGH_IDX[1].as_ptr());
+        let lo0 = vld1q_u8(LOW_IDX[0].as_ptr());
+        let lo1 = vld1q_u8(LOW_IDX[1].as_ptr());
+        let sh = vld1q_s16(LOW_SHIFT.as_ptr());
+        let three = vdupq_n_u16(3);
+        for k in 0..blocks {
+            // SAFETY: as `add10_u16`'s.
+            let t = vld1q_u8_x3(line.as_ptr().add(k * BLOCK_BYTES));
+            let (h0, h1) = (vqtbl3q_u8(t, hi0), vqtbl3q_u8(t, hi1));
+            let (l0, l1) = (vqtbl3q_u8(t, lo0), vqtbl3q_u8(t, lo1));
+            let s = |h: uint8x8_t, l: uint8x8_t| vorrq_u16(vshll_n_u8::<2>(h), vandq_u16(vshlq_u16(vmovl_u8(l), sh), three));
+            let a = acc.as_mut_ptr().add(k * BLOCK_SAMPLES);
+            let add = |a: *mut u32, s: uint16x8_t| {
+                vst1q_u32(a, vaddw_u16(vld1q_u32(a), vget_low_u16(s)));
+                vst1q_u32(a.add(4), vaddw_high_u16(vld1q_u32(a.add(4)), s));
+            };
+            add(a, s(vget_low_u8(h0), vget_low_u8(l0)));
+            add(a.add(8), s(vget_high_u8(h0), vget_high_u8(l0)));
+            add(a.add(16), s(vget_low_u8(h1), vget_low_u8(l1)));
+            add(a.add(24), s(vget_high_u8(h1), vget_high_u8(l1)));
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for k in 0..blocks {
+        let q = block_model(&line[k * BLOCK_BYTES..k * BLOCK_BYTES + 48]);
+        for (j, lane) in q.iter().enumerate() {
+            for (l, &v) in lane.iter().enumerate() {
+                let a = &mut acc[k * BLOCK_SAMPLES + j * 8 + l];
+                *a = a.wrapping_add(v as u32);
+            }
+        }
+    }
+}
+
+/// One RAW10 line's blocks unpacked (no add): the slit's ring takes its samples this way.
+pub fn unpack10(line: &[u8], out: &mut [u16], blocks: usize) {
+    out[..blocks * BLOCK_SAMPLES].fill(0);
+    add10_u16(line, out, blocks);
+}
+
+/// A row of 16-bit sums folded into the 32-bit total and cleared: every 2^6 frames of `add10_u16`.
+pub fn fold(acc: &mut [u16], total: &mut [u32]) {
+    for (t, a) in total.iter_mut().zip(acc.iter_mut()) {
+        *t += *a as u32;
+        *a = 0;
+    }
+}
+
+/// One RAW12 line (two samples in three bytes: the two high bytes, then the low nibbles, the first sample's in bits 3 to 0) added into 32-bit sums, `w` samples (even). For the RAW12 attempt only: plain loops the compiler vectorises as it can.
+pub fn add12_u32(line: &[u8], acc: &mut [u32], w: usize) {
+    for (p, b) in acc[..w].chunks_exact_mut(2).zip(line.chunks_exact(3)) {
+        p[0] += (b[0] as u32) << 4 | (b[2] & 0xF) as u32;
+        p[1] += (b[1] as u32) << 4 | (b[2] >> 4) as u32;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block path (its lookups and shifts, as the NEON path makes them) against the plain unpack, over every low-bits pattern and a sweep of high bytes; and the u16 and u32 adds agree.
+    #[test]
+    fn blocks_unpack_as_the_plain_path() {
+        let w = 4080;
+        let n = blocks(w);
+        let stride = 0x1400;
+        let mut line = vec![0u8; stride + SLACK];
+        for (i, b) in line.iter_mut().enumerate() {
+            *b = (i * 131 + (i >> 3) * 7) as u8;
+        }
+        let mut plain = vec![0u16; n * BLOCK_SAMPLES];
+        unpack(&line[..n * BLOCK_BYTES], &mut plain);
+        let mut a16 = vec![0u16; n * BLOCK_SAMPLES];
+        let mut a32 = vec![0u32; n * BLOCK_SAMPLES];
+        for _ in 0..3 {
+            add10_u16(&line, &mut a16, n);
+            add10_u32(&line, &mut a32, n);
+        }
+        for i in 0..w {
+            assert_eq!(a16[i], 3 * plain[i], "sample {i}");
+            assert_eq!(a32[i], 3 * plain[i] as u32);
+        }
+        let mut total = vec![0u32; n * BLOCK_SAMPLES];
+        fold(&mut a16, &mut total);
+        assert_eq!(&total[..w], &a32[..w]);
+        assert!(a16.iter().all(|&a| a == 0));
+        assert_eq!(n, 128);
+        assert_eq!(blocks(4000) * BLOCK_BYTES + SLACK, 5008);
+        assert!(blocks(4000) * BLOCK_BYTES + SLACK <= 0x13C0 + 64);
+        // 64 frames of the brightest sample fit 16 bits.
+        assert!(64 * 1023 <= u16::MAX as u32);
+    }
+
+    #[test]
+    fn raw12_adds() {
+        let mut acc = [0u32; 2];
+        add12_u32(&[0xAB, 0xCD, 0x21], &mut acc, 2);
+        assert_eq!(acc, [0xAB1, 0xCD2]);
+    }
 
     #[test]
     fn a_quad_unpacks() {

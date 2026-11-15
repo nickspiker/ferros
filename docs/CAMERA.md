@@ -101,13 +101,17 @@ The list is a VSF document (the house format for anything structured); a frame i
 | op | request | reply |
 |---|---|---|
 | 0 LIST | `[0]` | a VSF document, a section `camera` per camera the driver can stream whose inputs are in the vault (none: an empty document; "The other cameras") |
-| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view") |
+| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]` ("Modes, the bench and the slit") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, a slit's record offset at 56) |
 | 2 FRAME | `[2][bin]` | waits for the next frame: a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample, row by row |
 | 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus (the actuator's position) |
 | 4 CLOSE | `[4]` | the view taken back, the camera stops; it also stops when its holder ends |
 | 5 MAP | `[5][buffer to give back, G#FF none]` | with the view: waits for a frame newer than the last mapped and holds its buffer; its 64-byte header (bin 1; the buffer at +40, the format at +41, a line's bytes at +44, the buffer's place in the view at +48), the samples read in place |
 | 6 RELEASE | `[6][buffer]` | the held buffer given back: `[0]`, `[1]` when it was not held |
 | 7 PROBE | `[7][id]`, development, no camera open | that camera's module powered, its identity read, the addresses that answer on its bus mapped, the module down: `[code][id: 2][error]` and a 16-byte map (bit a of byte a / 8); code 0 it answered as itself, 1 another identity, 2 no answer (the bus's error), 3 the switch refused, 4 no such camera, 5 a camera is open |
+| 8 STATS | `[8]` | 26 u64s: frames written, answers, on the line, the frame thread's ticks and most, slit frames late, ring frames unseen, the long ring's count and end, the counter and its frequency, refused, status bits, rows, width, line, buffer, slit ring, fll, line length, integration, bits, slim, PD, ticking, open time |
+| 9 SLITS | `[9][after: u32]`, a slit ring open | waits for a frame past `after`: 8 u64s, the newest count, the ring's count, a buffer's bytes, rows, line, width, late, ring ended; frame n is in buffer (n - 1) mod the ring, its record (count, counter, Eagle ns, probe moved) after its rows |
+| 10 RATE | `[10][windows]` | the sensor's frame counter (CCS G#0005) read every 2^16 us for `windows` (16) windows beside the front end's count: 5 u64s, sensor frames, front-end frames, ticks, frequency, failed reads |
+| 11 CAPS | `[11]`, a camera open | 73 bytes: the sensor's data formats (G#00C0 and 16 descriptors), integration least and margin (G#1004), the mode registers read back, a bit per failed read |
 
 The ids: 0 the main (boitata), 1 the ultrawide (oksoko), 2 the front (dokkaebi), 3 the tele (kraken); each is also the `camera` switch's module (ferros_cam cams).
 
@@ -135,7 +139,7 @@ Which buffer a frame lands in is measured, not assumed: each buffer's probe (the
 A held buffer's probe is kept when it is handed out and compared when it is given back: any write while held is counted and said (the ring's promise is none).
 FRAME by copy stays for anything that wants it, binned from the newest buffer, held while it bins.
 
-**The kernel's view** (process.rs `cam_view_give`, `cam_view_drop`; cachemap `CAM_VIEW_VA`): at an OPEN that asks for it, the driver calls SYS_DMA x1 = 4 on its region with the OPEN's reply token, and the kernel maps the ring's frames of the driver's run, read-only for EL0 (and for EL2: AP[2] binds both in the VHE regime) and non-cacheable (the front end does not snoop), at G#50_3800_0000, past the driver's own window; it gives the process waiting on that reply token a capability for the `camera-view` region and writes its token into the driver's arc for the OPEN's reply to carry.
+**The kernel's view** (process.rs `cam_view_give`, `cam_view_drop`; cachemap `CAM_VIEW_VA`): at an OPEN that asks for it, the driver calls SYS_DMA x1 = 4 on its region with the OPEN's reply token, and the kernel maps the ring's frames of the driver's run, read-only for EL0 (and for EL2: AP[2] binds both in the VHE regime) and non-cacheable (the front end does not snoop), at G#50_3800_0000, past the driver's own window (since the bench, G#51_2000_0000 in the camera's own GiB: "Modes, the bench and the slit"); it gives the process waiting on that reply token a capability for the `camera-view` region and writes its token into the driver's arc for the OPEN's reply to carry.
 The kist presents the token to SYS_DMA for the view's base (x1 = 1 its size), as any region.
 Isolation, as the system has it for surfaces and GPU blocks: only the holder has the token; the view is never a syscall buffer (`dma_span` leaves it out, so the kernel never writes thru it), never granted by name, never passed on in a spawn; the GPU never sees it (its S2MPU admits surfaces and blocks only), and the front end's S2MPUs admit the driver's run and nothing else, as before.
 Native processes share one translation table (KERNEL.md, execution model), so a native process that guessed the address could read the view while it is mapped, as it could a surface; a masked one cannot.
@@ -143,6 +147,21 @@ Taken back (every block mapped to the blank frame, every TLB told, the holder's 
 The frames go back to the pool wiped when the driver ends, as before.
 
 **Lumis** (std/lumis): opens with the view, and per frame MAPs (giving back the buffer it held), copies each line out of the view in 64-byte loads, unpacks RAW10 to 16 bits across the cores, and integrates the whole 4080 x 3072 frame; its saves are the sensor's whole frame (VSF RAW, and VSF 8B through vsf's AV1 on Lumis's `vsf8b-av1`). An open answered without the view (a driver or kernel from before) falls back to frames by copy at bin 2. Its heap's ceiling is 2 GiB (the integrator's memory at full size is about 350 MB, a save's on top).
+
+**On the Pro, 2026-11-15** (cold boot b881, this kernel RAM-reloaded as b882; the driver and camtest stored and read back exact):
+- camtest `4001`: a ring of four in 64 frames under 4 GiB (G#CA00_0000); 64 whole 4080 x 3072 frames thru the view 66.3 ms apart (the full 15 a second), none skipped; DMA_DONE to the MAP's answer 20 us on average, 52 us at most; every frame in the buffer released at the frame before (64 of 64), none unseen, none crowded, held buffers written over 0; the token refused after the close. A whole frame read out of the view on one thread: 60 to 66 ms.
+- camtest `08010002`: the store into the view ended camtest on a permission fault (ESR G#9200004E, a write, level 2; FAR G#50_3800_0000), and the kernel took the view back as its holder ended.
+- **Above 4 GiB, measured**: with Lumis running no run was free under 4 GiB, and the driver took 64 frames at G#A_E5E0_0000; frames landed there with S2MPU faults 0 on all three, so the front end drives the high address halves with its SYSMMUs in bypass.
+- Lumis 0.2.10 (stowed): frames of 4080 x 3072; the display showed its window 144 times in 10 s (14.4 a second; about 9.6 at bin 2). A turn of the camera thread 68.7 ms over 64 frames: 15.4 waiting for the driver, 25.8 unpacking out of the view across the cores, 29.6 in the integrator (the next 64: 78 ms; 110 ms with a save running). 192 MAPs, every frame in the buffer released at the frame before, held buffers written over 0.
+- A VSF RAW save: 15669179 bytes, four times the bin-2 save's 3918758 (the whole sensor), 3.09 s from the request to kept, 2641 ms of it the write into the vault (not read back: it is in the kist's own domain).
+- A VSF 8B save (AV1): Lumis ended 2.4 s after the request (exit 0: lumis_core `platform::exit`, whose callers are the camera thread's UI-heartbeat timeout of 1.6 s, the Exit button and the calibration's exits), with no save kept. Which one is not yet measured.
+- S2MPU faults 0 in every run, the camera's fence 1.
+
+**Lumis 0.2.11, built the same day, not yet run** (std/lumis; Lumis branch `ferros-fullres`, kete branch `ferros-write-pieces`):
+- The lost save, read from the code (not measured): lumis_core's exits are the camera thread's UI-heartbeat timeout (1.6 s), the Exit buttons and the calibration's; the heartbeat's line was printed only in Lumis's debug build. On ferros the UI and the camera service are threads of one process sharing rayon's pool, and a VSF 8B save's demosaic and AV1 tiles (rav1e on rayon) fill it: the UI's draw asks the pool for work from outside it and waits behind the whole encode, past 1.6 s. On Android they are two processes, two pools. Now a save encodes in a pool of its own (half the cores), every exit says why on the console and names a save it loses, and the camera thread keeps what is encoded before it ends.
+- Each save is written as a bulk value (out of kete's read cache), read back from the vault and compared (blake3), one line: size, encode ms, write ms, read ms, match.
+- The 2.6 s write, read from the code: kete wrote every value in 4 KiB pieces, a 15.7 MB still in 3826 store calls (0.69 ms each), where the kernel takes a set of 256 KiB (STORE_MAX) and the vault process streams pieces of any size. kete's branch writes 256 KiB pieces (60 calls), stepping down on a refusal.
+- The first run should show: a VSF 8B save's line with its encode time, Lumis still running after it, and the write time of both saves.
 
 **payloads/camtest** drives it headless: bin 1 (`4001`: 64 frames) opens with the view, MAPs, reads each frame in place (a whole frame's copy timed), closes and tries the token again (it must be refused); `40010002` also stores into the view at the end, which must end camtest on the fault.
 
@@ -261,6 +280,111 @@ The steps (FERROS_PORT the Pro's port, 1-2.2 on 2026-11-14; each step after the 
 7. **The front camera's probe**: camtest `0000000702`, then the console and `$B diag log | grep "camera:"`. The flash log shows each step of its sequence, `sub GPIO2 high: G#40 -> G#60` among them. Answered G#30A1: the LV buck was it; store the front's inputs (`cam.dokkaebi.init` from `$C/front.init`, `.prog` from `$C/front.cpr2`, `.pdma` from `$C/front.pdma`, `.idt` from `"$P/cam7-front.idt.vsf"`, cmp each) and try its frames, camtest `4008000002` (everything about its stream is first-time: a stall needs a cold boot). Still NACK: the address map says what lives on its bus (G#51 its EEPROM, G#0C its actuator), and the next measure is Android's debugfs line for GPIO2 with the front open, then a capture (above).
 8. **The tele's probe**: camtest `0000000703`: answered G#08D5 means its power is right and only its capture is missing.
 9. **Restore** if anything misbehaves: put back what step 0 saved (`store rm` the keys that were absent), and reboot to the flashed kernel.
+
+## Modes, the bench and the slit (2026-11-15): built, not run
+
+The owner, 2026-11-15: "I want straight as fast as possible full frame 1:1 and 2x binned for all back cams integrating into the buffer. straight add/accumulate and see what numbers we can hit. Then I want the slitscan wired up, same idea, we'll only use the center four pixels (two binned) so as narrow as we want to run that, same idea, binned and 1:1, how fast can we capture? Get it ready so when the pro is available we can run it."
+Built on branch `camtrials` (from worktree-agent-a072c735fcd747099 and forge) while the Pro was away: nothing here has run. Capsules and the kernel: /mnt/Harbor/tmp/camtrials/out (camera, camtest, cambench native; ferros_kernel.elf).
+
+**What changed, one place each:**
+- **ferros_cam ccs**: each init's mode read back out of it (direct writes on the CCS page, or thru Samsung's indirect window G#6028/G#602A/G#6F12), and the modes built from it: the binned mode with its frame and integration cut (`timed`), a 1:1 readout (`unbinned`, a guess), slits (`slit`), RAW12 (`raw12`); `writes` gives the I2C writes inside the camera's own hold (`Cam::hold`), refusing an integration that does not fit the frame with a 2^5-line margin.
+- **ferros_cam geom**: the front end's geometry rewritten from the captured frame to the mode's (`value`, `rewrite`): the image and PD paths' strides and sizes, the CSI link's channel sizes and data types; `Scope::Core` (the frame's way into memory) or `Scope::All` (every register, the October tool's reach); and the slim per-frame program (`slim`).
+- **ferros_cam raw**: the NEON unpack-and-add (`add10_u16`, `add10_u32`, `unpack10`, `fold`, `add12_u32`): 40 bytes to 32 samples with three table lookups and a lane-wise shift, no branch per sample; host-tested lane by lane against the plain unpack (the build has no aarch64 emulator: cambench checks the NEON path against the plain one on the device, on the first frame's middle line).
+- **ferros_cam job, cams**: a buffer's bytes per camera and mode (`buffer_bytes`, `slit_bytes`, `with_image`, `Cam::buffer_bytes`), no longer one 16 MiB constant (the 8a's 4624 x 3472 main needs 22 MiB).
+- **The kernel**: the camera's window and view in a GiB of their own (cachemap `CAM_GIB` G#51_0000_0000, 512 MiB each), so four 60 MiB 1:1 frames and their region fit (the main's: 302 MiB).
+- **payloads/camera**: OPEN's mode block (below); the mode written after the init and before stream on; buffers sized to the mode; a slit ring; STATS, SLITS, RATE and CAPS (the endpoint table); the holder taken for gone after 2^22 us of silence instead of 64 frames.
+- **payloads/cambench**: the bench (below).
+
+### The modes, per camera: known and not
+
+From each init (target/cam, the decode in ferros_cam ccs's tests):
+
+| camera | Android's binned mode (the init) | addresses | 1:1 (Android's maximum resolution) | what the 1:1 needs |
+|---|---|---|---|---|
+| main (Samsung G#08EF) | 4080 x 3072, x G#10 to G#3FCF, y G#10 to G#300F, increments 4, binning G#0900 = G#32, G#0901 = G#44, frame 21362 lines (10584 in its first block) of 6320 clocks, integration 21342, RAW10, 4 lanes | 2 a pixel: 16320 x 12288 for 8160 x 6144 | 8160 x 6144 RAW10 | a capture: Samsung's G#0900 is not CCS's (G#32 G#44 here, G#22 G#22 on the tele), and its setfile writes on pages G#2000 to G#2021 may carry mode timing |
+| ultrawide (Sony IMX787) | 4000 x 3000 from a 9248 x 6016 window binned (G#0900 = 1, G#0901 = G#22, G#0902 = 8), digital crop 312, 4, frame 5081 lines of 9568 clocks, integration 4124 | 1 a pixel | 8000 x 6000 RAW10 (Lumis took these on 2026-10-18) | a capture: Sony's quad Bayer full readout normally also sets its remosaic registers, which no CCS register names |
+| tele (Samsung G#08D5) | 4032 x 3024, x 8 to G#1F87, y 0 to G#17BF, increments 2, binning G#22 G#22, frame 5457 lines of 5568 clocks, integration 2232, 2 lanes | 1 a pixel: 8064 x 6080 | 8064 x 6048 (Lumis's bug report: the HAL's log says "sensor output size: 8064 x 6048") | it has never streamed on ferros (no receiver, CPU setup or job captured: "The tele's capture"), and then the 1:1 capture |
+
+- **2x binned** is known for the main and the ultrawide (it is what they stream); what is new is cutting the frame (`fll`) and the integration, both inside the hold, timing only, nothing in the front end changes.
+- **1:1** is built as a guess from the CCS registers alone (binning G#00 G#11, the increments one pixel, the output Android's maximum, the line length doubled since a 1:1 line carries twice the pixels at the same link rate, the frame 256 lines past the rows), with the front end's geometry rewritten (strides G#2800, sizes 8160 x 6144 or 8000 x 6000) and the PD path off. It may not stream, or stream garbage; the capture below gives the real one.
+- **RAW12**: whether the sensor offers it is CAPS's first line (the CCS data format descriptors, G#0C0C). The attempt writes G#0112 = G#0C0C, the link's data type G#2C and stride G#1800; the front end's own format word is not known (G#1C32_0478 = G#014C1E38 and G#1C32_048C = G#01000200 are the candidates in the CPU's writes), and Android's maximum-resolution RAW is RAW10 only, so no capture can show it: an experiment, nothing more.
+- **How the slit is centred**: the captured window's middle (the optical axis as Android crops it: main y G#1810, ultrawide y 3472), the slit's start rounded to the nearest colour filter period from the window's top (8 addresses on the main, 4 on the ultrawide and tele: a 2 x 2 Bayer cell binned, a 4 x 4 quad cell 1:1), so the mosaic keeps the captured phase; a slit of an odd number of periods sits half a period off the true middle (the binned 2-row slit of the main: y G#1810 to G#1817 against the middle G#1810).
+
+### The October slit, read again
+
+`diag cam slitsweep` (2026-10-21, git 7cae2561) measured 4 rows as the floor and 1212 frames a second as the ceiling (825 us, however few rows), 2 and 1 rows refused, a frame of 68 lines stopping the stream and 96 running, and "exactly one geometry change per stream session".
+Its writes went without the hold: `w16(G#0104, 1)` writes G#0104 = 0 and G#0105 = 1, which is the release (G#0104 is one byte, found the same night); and with the init's integration of 21342 lines left in frames of 68 to 576 lines.
+So each change landed register by register (y_end before y_output_size, a frame shorter than its integration), which is the likeliest cause of the stuck sensor and of the "never starts before stream on".
+The driver now writes every mode inside the real hold with an integration inside the frame; whether the 825 us floor and the 4-row floor stand is the first thing the bench measures.
+
+### The bench (payloads/cambench)
+
+`ferros-bridge spawn cambench.bin <16 hex bytes> --name cambench --use camera`, the bytes: +0 camera, +1 kind (0 the init's, 1 binned cut, 2 1:1, 3 binned slit, 4 1:1 slit), +2 rows (u16 LE), +4 fll (u16 LE; 0 the default, FFFF the mode's own), +6 integration lines (u16 LE; 0 the driver's 16), +8 flags (1 RAW12, 2 mid-stream, 4 PD on, 8 geometry everywhere, G#10 slim program, G#20 slim level 2, G#40 front end left as captured), +9 slit ring log2 (0: 2^8), +10 line length (u16 LE), +12 work (0 map only, 1 read only, 2 read + u16 add folded into u32 every 64 frames, 3 read + u32 add), +13 frames in 16s (0: 64), +14 sweep (1 slit rows 64 down, 2 frame length from the mode's own down), +15 threads (0: four).
+
+Per open it says: the OPEN and the view's shape; CAPS (the data formats, with "RAW12 G#0C0C offered" or not; the mode registers as the sensor holds them, so a mode that did not land shows); RATE (the sensor's own counter against the front end's DMA_DONEs over a second); per frame the read and add time per thread, frames skipped, cores used and left; the link's and the bus's MB a second; the sums' mean a frame (the adds landed); for slits, slits a second, lost to the ring, read over, the cost a slit; STATS (answers, the frame thread's time an answer and its most, late slit frames, the long ring).
+
+**Why u16 sums by default:** 64 frames of 1023 fit 16 bits (65472), so the add reads and writes half the bytes of u32 sums and NEON adds eight lanes, not four; every 64th frame each row folds into the u32 total (once a row per 64 frames, not a branch per sample). Work 3 measures plain u32 for comparison.
+
+**Why reading is separate (work 1) and map only (work 0):** the view is non-cacheable (the front end does not snoop), and reading it is the measured cost: a whole binned frame took 60 to 66 ms on one thread in camtest, 14.4 ms in the driver's binning copy, 25.8 ms in Lumis across the cores (2026-11-14/15). Work 0 shows what the front end delivers with no CPU on the frames; work 1 the read's ceiling; 2 and 3 the add on top.
+
+### Expected numbers (arithmetic, before any run)
+
+- **Main, binned, cut**: the line is 3.2237 us (measured: 21362 lines a 68.9 ms frame). The default cut, 3072 + 256 = 3328 lines, is 10.7 ms, **93 frames a second** if the sensor takes it (the sweep finds its least). The link carries 4080 RAW10 samples a line either way (about 12.7 Gbit/s while lines run; the cut shortens only the blanking): 1.46 GB/s of image averaged at 93 a second, and the front end writes the same. The read out of the view decides the bench: 15.7 MB a frame at 0.25 to 1.1 GB/s a thread is 3.6 to 16 ms on four threads, so between about 60 and 270 frames a second of reading; the add is about 1.5 ms of a thread a frame (12.5 M samples, 32 a block). Expect the read, not the sensor or the add, to be the ceiling at work 1 to 3.
+- **Main, 1:1 (if the guess streams)**: lines of 12640 clocks, 6.45 us; 6400 lines, 41 ms, **24 a second**; 63 MB a frame (60 MiB buffers), 1.5 GB/s; reading 4 times a binned frame, so 15 to 60 frames a second of reading on four cores, near the sensor's.
+- **Ultrawide, binned, cut**: lines 6.5616 us (from its init: 9568 clocks at 1458.2 MHz); 3256 lines, 21.4 ms, **47 a second** (30 now); 15.2 MB a frame.
+- **Ultrawide, 1:1 (guess)**: 13.1 us lines, 6256 lines, 82 ms, about 12 a second.
+- **Main, binned slit**: October's floor 825 us, **1212 slits a second** at 4 rows (24.8 MB a second, 20 KiB a slit), 954 a second at 64 rows on its model (about 443 us past 3.15 us a frame line). If the floor was the missing hold's, the default 4-row frame (132 lines) is 425 us of lines, up to about 2350 a second.
+- **Per slit, the front end**: the frame thread's answer is about 57 register accesses (each a syscall: the driver's DMA_DONE to MAP measured 20 us on average), so about 4 to 7 percent of a core at 1212 a second. The engine runs the whole job's program every frame: 1447 writes and 3048 loaded words for the main; at 100 to 200 ns a write that is 150 to 300 us of an 825 us slit, the likeliest front-end ceiling; the slim program (flag G#10) re-arms only loch0's paths, 21 writes (176 bytes; G#20 adds the processing blocks' request words, 680 bytes).
+- **The slit ring**: descriptors written once at the open (descriptor e names buffer e mod the ring), so a frame costs the CPU the answer and one index write; 2^8 buffers of 24 KiB cover 211 ms at 1212 a second, and the bench's SLITS calls need to come at least that often; a long ring of 2^16 descriptors (if the count register holds it; else 2^14) is 54 s at 1212 a second, after which the stream ends.
+- **What only the device can tell**: whether a mode written before stream on starts at all (October's never did, without the hold); the sensor's least frame and blanking; whether the front end takes a 4-row frame (with the frame's sizes rewritten; October's matched slit predates the G#81 enable, so it never had a chance); how long the PDMA program takes; the view's read rate on four cores at once; RAW12 support; anything 1:1.
+
+**Where the ceiling is, read off a run:** RATE's sensor rate under the asked frame means the sensor (its floor); the front end's rate under the sensor's means the front end (late descriptors: STATS late, SLITS lost; or the engine's program: compare slim); MAP's taken rate under the front end's with cores used near four means the CPU (work 1 against 0 separates the read from the add); the link is never near its rate at these sizes except 1:1.
+
+### The 1:1 captures (need the owner; not run)
+
+What the 1:1 guess lacks is Android's own maximum-resolution mode: the sensor's writes when Lumis opens a camera in SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION (Lumis's second entry per camera, "50 MP" on the main), and the front end's program for that frame.
+One camera, one bus a capture (feedback_oracle_capture_integrity), as the tele's recipe above: the Pro on USB, Android under the hv (the gate's volume down), adb with root, Lumis installed on Android, the phone still on a stand.
+Save what slot a runs first and flash it back after (the tele's recipe says how).
+The sensor's bus, the essential one (the main's hsi2c_1 below; the ultrawide's G#108A_0000, the tele's G#108B_0000 with their own quiet lists, the same nine offsets):
+```
+FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 FERROS_HV_ORACLE_PAGES="G#1088_0000" FERROS_HV_ORACLE_CAP=32768 \
+FERROS_HV_ORACLE_QUIET="G#1088_0000,G#1088_0004,G#1088_0008,G#1088_0020,G#1088_0024,G#1088_0030,G#1088_0040,G#1088_0048,G#1088_0050" \
+FERROS_HV_ORACLE_ARM_AFTER_MS=60000 tools/husky-hv.sh --no-ferros --flash
+# past 62 s of uptime: quiet the console and mark
+adb shell 'su -c "echo 4 > /proc/sys/kernel/printk; echo \"<3>ferros-mark: lumis maxres open\" > /dev/kmsg"'
+# by hand: open Lumis, pick the main camera's maximum-resolution entry, let it run 10 s, then
+adb shell 'su -c "echo \"<3>ferros-mark: closed\" > /dev/kmsg; echo c > /proc/sysrq-trigger"'
+# after the reboot
+adb shell 'su -c "grep -aE \"ferros hv|ferros-mark\" /sys/fs/pstore/console-ramoops-0"' > target/hv/main-maxres-i2c.log
+```
+Then the PDMA dump of the same session (`FERROS_HV_PDMA_DUMP=1`, pages G#1C39_0000, cap 4096, as the tele's step 1) for the front end's program at 8160 x 6144, and optionally the 42 front-end pages (the tele's step 0) for the link's channel words.
+Check: the I2C log decodes with no LENGTH MISMATCH (`tools/oracle-decode-hsi2c.py`), holds a G#0100 stream on, and its G#034C/G#034E read 8160 x 6144 (G#1FE0, G#1800) in the decode.
+From it: `tools/camera-init.py` gives a 1:1 init (target/cam/main-full.init, local, the vendor's settings), whose mode `ccs::Mode::captured` reads; the driver then wants that init as a second input per camera (`cam.<key>.init.full`, not built yet: one key and a kind that replays it instead of writing the guess).
+The tele's 1:1 waits on its first capture (it has never streamed); its Lumis entry is the tele-virtual camera (physical id 6) and, per the bug report, the HAL may serve it from another sensor: check the I2C log is the tele's bus.
+
+### Run plan (for the owner's return)
+
+Risks first:
+- **Nothing electrical is new**: the modes are sensor registers inside its hold and front-end registers the driver already writes; no rail, voltage or PMU access changed; the overvoltage guard is untouched.
+- **A stuck sensor**: every mode is written before stream on (the default), and each open powers the module up from off (the switch's off at every close powers it down), which October's stuck runs never had between tries. If an open's RATE shows 0 sensor frames, the next open is a cold module; if that also shows 0, a cold boot of the Pro (the owner) clears it. The sweeps stop at the first open that does not stream.
+- **A frame too short stops the stream** (October: 68 lines at 4 rows): the frame sweep goes from long to short and stops there.
+- **Mid-stream (flag 2)** is October's order and October's trap: last, and only if before-stream-on never starts.
+- **1:1 and RAW12 are guesses**: last; a 1:1 attempt that hangs the front end needs a cold boot.
+- **Memory**: a 1:1 ring of four is 302 MiB in one run; the driver tries rings of 4, 3, 2, 1 and goes above 4 GiB (measured to work), and says when the pool has no run.
+
+The steps (FERROS_PORT the Pro's; `B=/mnt/Harbor/Code/ferros/target/debug/ferros-bridge`, `O=/mnt/Harbor/tmp/camtrials/out`; every cambench line the same but its 16 bytes, `$B spawn $O/cambench.bin <bytes> --name cambench --use camera`, then `$B diag "console kept 64"`):
+0. **Back up** `camera` and `camtest` (`$B store get <k> /mnt/Harbor/tmp/camtrials/back/<k>`).
+1. **The kernel**, a minute after a boot: `$B reload $O/ferros_kernel.elf` (RAM only), then attest. An old driver works on it unchanged; this driver on an old kernel cannot take a 1:1 region (its window is 224 MiB) but streams the binned modes.
+2. **Store** `$B store put camera @$O/camera.capsule.vsf`, `$B store put camtest @$O/camtest.capsule.vsf`, `store get` each and `cmp` (native: no seal). cambench is spawned from the host, not stored.
+3. **Regression**: camtest `4001` and `4008` as on 2026-11-15 (the view at 15 a second, every frame where the ring put it; Lumis the same). The view's base now reads G#51_2000_0000 or past.
+4. **The capture's ceiling at the init's mode**: `00000000000000000000000000040000` (map only), `...0104...` (read), `...0204...` (u16 add), `...0304...` (u32 add), i.e. `00000000000000000000000001040000`, `00000000000000000000000002040000`, `00000000000000000000000003040000`. Expect RATE about 14.7 and 14.7, no skips, CAPS showing frame 21362 and the formats, the NEON check "matches", per-frame read and add times and cores used: these are the cost a frame at any rate.
+5. **Binned, the frame cut**: first the mode's own frame thru the new path, `00010000FFFF00000000000002040000` (integration 16 lines, so a dark frame: the sums' mean near 64); then the frame sweep `00010000000000000000000002040200`. Expect the rate to rise as the frame falls until the sensor's floor (stops) or the read's ceiling (skips).
+6. **The binned slit**: one 64-row slit `00034000000000000000000002080000`, then the rows sweep `00030000000000000000000002080100` (64 down to 2), then the frame sweep at the narrowest that streamed, e.g. 4 rows `00030400000000000000000002080200`; then the slim program at the best: `00030400000000001000000002080000` and level 2 `00030400000000003000000002080000`. Expect October's 1212 a second at 4 rows or more; compare STATS late and SLITS lost with and without slim.
+7. **The ultrawide**: the same with +0 = 01 (`01000000000000000000000002040000`, `01010000FFFF00000000000002040000`, `01010000000000000000000002040200`, `01034000000000000000000002080000`, `01030000000000000000000002080100`).
+8. **RAW12**, only where CAPS said G#0C0C: `00010000FFFF00000100000003040000`; the console's CAPS line shows G#0112 as written; frames that land read as RAW12 (the sums' mean about 4 times RAW10's), or the front end writes nothing (no frames: then its format word is the missing piece).
+9. **1:1 (guess)**: `00020000000000000000000002040000` and the 1:1 slit `00040400000000000000000002080000`. Expect either frames (8160 x 6144, the sums' mean sensible) or no frames and a cold boot; either way, then the captures above.
+10. **Mid-stream**, only if step 5 or 6 never started before stream on: `00034000000000000200000002080000`, then a cold boot.
+11. **Restore** if anything misbehaves: put back what step 0 saved and reboot to the flashed kernel.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 

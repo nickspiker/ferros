@@ -320,12 +320,13 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
         let Some((head, samples)) = src.next(&mut turns) else {
-            println!("lumis: camera {}: no frame (the driver refused or ended); Lumis ends, as Android's camera process does on a camera error", cam.name);
-            lumis_core::platform::exit();
+            // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
+            keep_saves(vault.as_deref(), &mut *integrator.header);
+            lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
         };
         if head.width != first.width || head.height != first.height {
-            println!("lumis: camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first; Lumis ends", cam.name, head.width, head.height, first.width, first.height);
-            lumis_core::platform::exit();
+            keep_saves(vault.as_deref(), &mut *integrator.header);
+            lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
         }
         let t_integrate = std::time::Instant::now();
         let (iso, shutter_ns, focus) = integrator.process_frame(samples, (iso(head.gain)) as i32, head.exposure_ns as i64, 0., false, head.width * 2);
@@ -358,14 +359,40 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
 }
 
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
+/// Each save goes into the vault as a bulk value (kete `write_device_bulk`: kept out of the read cache, which would otherwise hold a second copy of every still), is read back from the vault itself (`read_device_bulk`, never the cache) and compared with what was written (blake3 of both), so "kept" means the vault gives the file back whole: one console line with its size, its encode's time, the write's, the read's, and the match.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
-    while let Some((bytes, name)) = lumis_core::get_pending_save_data() {
+    while let Some(lumis_core::PendingSave { bytes, name, encode_ms }) = lumis_core::get_pending_save() {
+        let key = format!("save/{name}");
         let t = std::time::Instant::now();
         let kept = match vault {
-            Some(v) => match v.write_device(&format!("save/{name}"), &bytes) {
-                Ok(()) => true,
+            Some(v) => match v.write_device_bulk(&[(key.clone(), bytes.clone())]) {
+                Ok(()) => {
+                    let write_ms = t.elapsed().as_millis();
+                    let t = std::time::Instant::now();
+                    let back = v.read_device_bulk(&key);
+                    let read_ms = t.elapsed().as_millis();
+                    let want = blake3::hash(&bytes);
+                    match back {
+                        Ok(Some(b)) if blake3::hash(&b) == want => {
+                            println!("lumis: kept {name}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", bytes.len(), &want.to_hex()[..16]);
+                            true
+                        }
+                        Ok(Some(b)) => {
+                            println!("lumis: {name} NOT kept whole: wrote {} bytes (blake3 {}), read back {} bytes (blake3 {}); encoded in {encode_ms} ms, written in {write_ms} ms, read in {read_ms} ms", bytes.len(), &want.to_hex()[..16], b.len(), &blake3::hash(&b).to_hex()[..16]);
+                            false
+                        }
+                        Ok(None) => {
+                            println!("lumis: {name} NOT kept: written ({} bytes in {write_ms} ms), then absent on reading it back", bytes.len());
+                            false
+                        }
+                        Err(e) => {
+                            println!("lumis: {name} NOT kept: written ({} bytes in {write_ms} ms), then the read back failed: {e:?}", bytes.len());
+                            false
+                        }
+                    }
+                }
                 Err(e) => {
-                    println!("lumis: {name} ({} bytes) not kept: {e:?}", bytes.len());
+                    println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) not kept: {e:?}", bytes.len());
                     false
                 }
             },
@@ -374,9 +401,6 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
                 false
             }
         };
-        if kept {
-            println!("lumis: kept {name}, {} bytes, into the vault in {} ms", bytes.len(), t.elapsed().as_millis());
-        }
         // A calibration map is not a photo: it never counts (as on Android).
         app::save_done(header, kept && !name.starts_with("cal_"));
     }
