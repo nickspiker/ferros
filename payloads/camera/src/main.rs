@@ -46,7 +46,7 @@ const S_BUS: [u64; 4] = [2, 10, 11, 12];
 /// The open camera's id (ferros_cam cams), set by the open before anything reads it.
 static CAM: AtomicU64 = AtomicU64::new(0);
 fn cam() -> &'static Cam {
-    cams::CAMS[CAM.load(Ordering::Relaxed) as usize]
+    cams::all()[CAM.load(Ordering::Relaxed) as usize]
 }
 
 /// The heap the list is built in (ferros_cam list: an IDT's document parsed, the list's sections and document made), at LIST only. A list of three cameras is about 1.3 KB and an IDT 7.7 KB; 2^20 bytes leaves room for vsf's working copies many times over.
@@ -89,8 +89,9 @@ macro_rules! say {
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
     for &id in LISTED.iter() {
-        let c = cams::CAMS[id as usize];
-        if !inputs_held(g, c) {
+        let c = cams::all()[id as usize];
+        // akita's cameras do not stream yet (no receiver or job captured), whatever its vault holds.
+        if !c.streams || !inputs_held(g, c) {
             continue;
         }
         let mut kb = [0u8; 32];
@@ -1169,6 +1170,8 @@ const FRAME_LATE_US: u64 = 1 << 21;
 pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    // The board's cameras (fact 84: 1 husky, 2 akita), once, before anything reads the table; a kernel that does not say is husky's.
+    cams::set_board(ferros_sys::facts().board().unwrap_or(cams::BOARD_HUSKY as u64) as u8);
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
         ferros_sys::thread_spawn(binner, unsafe { &mut (*(&raw mut BIN_STACKS))[k - 1] }, k as u64);

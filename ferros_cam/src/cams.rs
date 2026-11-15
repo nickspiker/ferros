@@ -230,13 +230,145 @@ pub const TELE: Cam = Cam {
     rotation: 1,
 };
 
-/// Every camera, by id.
+/// Every camera of the Pro (husky), by id.
 pub const CAMS: [&Cam; 4] = [&MAIN, &ULTRAWIDE, &FRONT, &TELE];
 
-/// The camera with this id.
+// ---------------------------------------------------------------- akita (Pixel 8a)
+
+// akita's three cameras (docs/CAMERA.md "akita's cameras"), from its device tree (the factory image's MP overlay, dtbo 18, "ZUMA AKITA MP", the same as zuma-akita-camera.dtsi): every one on its own bus at G#1A, 16-bit register addresses, 8-bit values.
+// The buses are husky's (hsi2c_1, hsi2c_3, hsi2c_2), so the driver's grant slots by id hold on both boards.
+// Not yet known, until an hv capture of Android opening each: the receiver (CSI link and lanes), the front end's program and job, the readout mode; so none streams and none is listed, and PROBE is what runs.
+// The geometry below is a placeholder (husky's IMX787 mode, 4000 x 3000 at G#13C0), never used while `streams` is false.
+
+/// akita's main camera (oksoko): a Sony IMX787 (the same part as husky's ultrawide, G#0787 at the CCS sensor register G#0016), on hsi2c_1 at G#1A, its master clock CIS_CLK3 asked at 26 MHz by the device tree (cold it runs from the 24.576 MHz oscillator, CMU_TOP G#2604_101C = 0, read 2026-11-15).
+/// Its lens is driven by "nessie" at G#24 (the actuator, the OIS and the EEPROM share that address, 32-bit values): not the main's protocol, so no focus here.
+pub const AKITA_MAIN: Cam = Cam {
+    id: 0,
+    name: "main",
+    key: "oksoko",
+    facing: 0,
+    bus: 0x1088_0000,
+    addr: 0x1A,
+    id_reg: [0x00, 0x16],
+    id_val: [0x07, 0x87],
+    stream_on: &[0x01, 0x00, 0x01],
+    stream_off: &[0x01, 0x00, 0x00],
+    hold: &[0x01, 0x04, 0x01],
+    release: &[0x01, 0x04, 0x00],
+    actuator: 0,
+    focus: (0, 0),
+    streams: false,
+    rx_start: &[],
+    rx_stop: &[],
+    ack: &crate::FRAME_ACK,
+    tick_us: 1 << 13,
+    width: 4000,
+    height: 3000,
+    stride: 0x13C0,
+    sizes: [0; SLOTS],
+    skip: job::NO_SKIP,
+    line_ps: 0,
+    exposure_lines: 0,
+    exposure_max_lines: 0,
+    cfa: cfa(2, 1, 1, 0),
+    black: 64,
+    white: 1023,
+    rotation: 1,
+};
+
+/// akita's ultrawide (leshen-uw): a part the device tree does not name, on hsi2c_3 at G#1A, CIS_CLK0 at 24 MHz; read at the CCS sensor register G#0016 as the Sony parts are.
+/// The identity wanted is a guess (G#0712, Sony IMX712, the part the leshen modules are reported to carry); PROBE says what answers.
+pub const AKITA_ULTRAWIDE: Cam = Cam {
+    id: 1,
+    name: "ultrawide",
+    key: "leshen-uw",
+    facing: 0,
+    bus: 0x108A_0000,
+    addr: 0x1A,
+    id_reg: [0x00, 0x16],
+    id_val: [0x07, 0x12],
+    stream_on: &[0x01, 0x00, 0x01],
+    stream_off: &[0x01, 0x00, 0x00],
+    hold: &[0x01, 0x04, 0x01],
+    release: &[0x01, 0x04, 0x00],
+    actuator: 0,
+    focus: (0, 0),
+    streams: false,
+    rx_start: &[],
+    rx_stop: &[],
+    ack: &crate::FRAME_ACK,
+    tick_us: 1 << 13,
+    width: 4000,
+    height: 3000,
+    stride: 0x13C0,
+    sizes: [0; SLOTS],
+    skip: job::NO_SKIP,
+    line_ps: 0,
+    exposure_lines: 0,
+    exposure_max_lines: 0,
+    cfa: cfa(2, 1, 1, 0),
+    black: 64,
+    white: 1023,
+    rotation: 1,
+};
+
+/// akita's front camera (leshen): the ultrawide's module family (the same name), on hsi2c_2 at G#1A, CIS_CLK1 at 24 MHz; the identity wanted the same guess as the ultrawide's.
+pub const AKITA_FRONT: Cam = Cam {
+    id: 2,
+    name: "front",
+    key: "leshen",
+    facing: 1,
+    bus: 0x1089_0000,
+    addr: 0x1A,
+    id_reg: [0x00, 0x16],
+    id_val: [0x07, 0x12],
+    stream_on: &[0x01, 0x00, 0x01],
+    stream_off: &[0x01, 0x00, 0x00],
+    hold: &[0x01, 0x04, 0x01],
+    release: &[0x01, 0x04, 0x00],
+    actuator: 0,
+    focus: (0, 0),
+    streams: false,
+    rx_start: &[],
+    rx_stop: &[],
+    ack: &crate::FRAME_ACK,
+    tick_us: 1 << 13,
+    width: 4000,
+    height: 3000,
+    stride: 0x13C0,
+    sizes: [0; SLOTS],
+    skip: job::NO_SKIP,
+    line_ps: 0,
+    exposure_lines: 0,
+    exposure_max_lines: 0,
+    cfa: cfa(2, 1, 1, 0),
+    black: 64,
+    white: 1023,
+    rotation: 3,
+};
+
+/// Every camera of the 8a (akita), by id: there is no tele.
+pub const AKITA: [&Cam; 3] = [&AKITA_MAIN, &AKITA_ULTRAWIDE, &AKITA_FRONT];
+
+/// The board the table is for: ferros_sys's fact 84 numbers (1 husky, 2 akita), set once by whoever reads the table (the kernel from its board, the driver from its facts) before any read; 0 or 1 is husky's.
+static BOARD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+pub const BOARD_HUSKY: u8 = 1;
+pub const BOARD_AKITA: u8 = 2;
+
+/// Which board's cameras the table names from now on.
+pub fn set_board(board: u8) {
+    BOARD.store(board, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The board's cameras, by id.
+pub fn all() -> &'static [&'static Cam] {
+    if BOARD.load(core::sync::atomic::Ordering::Relaxed) == BOARD_AKITA { &AKITA } else { &CAMS }
+}
+
+/// The camera with this id on this board.
 /// WHY `get`: the id is the caller's byte (an OPEN or PROBE on the endpoint), so one past the table is answered "no such camera", not indexed.
 pub fn by_id(id: u8) -> Option<&'static Cam> {
-    CAMS.get(id as usize).copied()
+    all().get(id as usize).copied()
 }
 
 /// The widest readout, the most rows and the longest line of any camera that streams: the driver's buffers are sized for them.
@@ -284,6 +416,17 @@ mod tests {
             assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
             assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }
+        // akita's: ids in order, none streaming yet, and each id's bus husky's for the same id (the driver's grant slots are by id).
+        for (k, c) in AKITA.iter().enumerate() {
+            assert_eq!(c.id as usize, k);
+            assert!(!c.streams);
+            assert_eq!(c.bus, CAMS[k].bus, "{}", c.name);
+        }
+        set_board(BOARD_AKITA);
+        assert_eq!(by_id(0).unwrap().key, "oksoko");
+        assert!(by_id(3).is_none());
+        set_board(BOARD_HUSKY);
+        assert_eq!(by_id(0).unwrap().key, "boitata");
         assert_eq!(MAIN.binned(2), (2040, 1536));
         assert_eq!(ULTRAWIDE.binned(8), (500, 374));
         // The ultrawide's line: 9568 clocks at 24.576 MHz / 3 x 178.
