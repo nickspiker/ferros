@@ -164,3 +164,44 @@ pub fn report_vault(p: &VaultProbe, exit: u8) {
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
 }
+
+/// A reset into a bootloader mode asked for in a session the bootloader cannot hand it to (the jump from Android), carried across that reset in the vault for the cold boot after it (2026-11-15, the Pro: `bridge reboot fastboot` from the jump b875 showed the ROM's USB recovery and came back into ferros as b876).
+/// Why the vault: every reset ferros has ordered from a jumped session ended in a power cycle (b863 to b864, b871 to b872, b875 to b876: DRAM decayed each time), the PMU word the mode is stamped in does not survive that, and ABL restores it after a power-on reset only from RSBM, the copy Linux keeps in the fuel gauge's storage (ABL's mode getter at G#C48C of ripcurrent-16.4-14540574), which ferros never writes.
+/// A kernel-only name: no process lists or reaches it.
+const NEXT_BOOT_KEY: &str = "\0boot.next";
+fn next_boot_schema() -> vsf::schema::SectionSchema {
+    vsf::schema::SectionSchema::new("next_boot").field("mode", vsf::schema::TypeConstraint::AnyUnsigned).field("from_boot", vsf::schema::TypeConstraint::AnyUnsigned)
+}
+
+/// Keep the wish: the reboot mode (platform REBOOT_MODE_*) and the flash log's number for this boot, so only the very next ferros boot takes it. True when the vault holds it, read back.
+pub fn next_boot_keep(store: &mut ShimStore, mode: u32) -> bool {
+    let boot = crate::flashlog::boot();
+    // No flash log, no boot number: the next boot could not tell this wish from a stale one.
+    if boot == 0 {
+        return false;
+    }
+    let Some(section) = next_boot_schema().build().set("mode", vsf::VsfType::u(mode as usize, false)).ok().and_then(|b| b.set("from_boot", vsf::VsfType::u(boot as usize, false)).ok()).and_then(|b| b.encode().ok()) else { return false };
+    let Some(doc) = vsf::VsfBuilder::new().creation_time_oscillations(crate::settings::eagle_now()).provenance_only().add_unboxed("next_boot", section).build().ok() else { return false };
+    store.set(NEXT_BOOT_KEY, &doc).is_ok() && store.get_by_key(NEXT_BOOT_KEY).ok().flatten().as_deref() == Some(&doc[..])
+}
+
+/// At a cold boot, before anything else runs: the wish the previous boot kept, removed from the vault first (and its removal read back) so that a failure on the way can never repeat it. Some(mode) only when it came from the boot just before this one; a stale one is dropped and logged.
+pub fn next_boot_take(store: &mut ShimStore) -> Option<u32> {
+    let doc = store.get_by_key(NEXT_BOOT_KEY).ok().flatten()?;
+    let gone = store.remove_key(NEXT_BOOT_KEY).is_ok() && store.get_by_key(NEXT_BOOT_KEY).ok().flatten().is_none();
+    if !gone {
+        crate::flashlog::line("next boot: a kept wish could not be removed, so it is not acted on");
+        return None;
+    }
+    let section = vsf::schema::SectionBuilder::parse_document(next_boot_schema(), &doc, None).ok()?;
+    let read = |name: &str| section.get_fields(name).first().and_then(|f| f.values.first()).and_then(|v| v.as_u64());
+    let (mode, from) = (read("mode")?, read("from_boot")?);
+    let boot = crate::flashlog::boot() as u64;
+    // WHY the boot == 0 test: 0 means no flash log this boot, where `boot - 1` would wrap.
+    // PROOF: flashlog::boot is 0 before init or without a log, otherwise at least 1; `from` is the disk's and is only compared, never added to.
+    if boot == 0 || from != boot - 1 {
+        crate::flashlog::line(&alloc::format!("next boot: a wish for mode G#{mode:X} from b{from} dropped (this is b{boot})"));
+        return None;
+    }
+    Some(mode as u32)
+}

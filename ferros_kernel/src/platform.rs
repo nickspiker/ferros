@@ -564,8 +564,68 @@ pub fn dss_mark_clean_reboot() {
 /// Reset straight into the bootloader (fastboot): mark the reset clean in the DSS header, stamp the reboot mode through the EL3 monitor, then fire the cluster watchdog with a count of 1.
 /// Why the watchdog and not PSCI: measured on husky, a PSCI SYSTEM_RESET issued by ferros comes back as RST_STAT PIN_RESET (reason G#CECA) and the bootloader reads "Reboot mode: 0x0" even though the EL3 readback showed G#FC just before; an APC watchdog reset (RST_STAT CLUSTER0_NONCPU_WDTRESET) with the same mode stamped boots into fastboot ("Reboot mode: 0xfc - Bootloader"). Linux's own PSCI reset comes back as PIN_RESET|PO_RESET with the mode intact, so EL3 treats the two differently; the watchdog sidesteps whatever that is.
 /// Returns only if the monitor refused the write (nonzero) or the watchdog never fired, so the caller can report it.
+/// Only from a cold session (ABL booted this ferros): there the watchdog's reset is warm, the PMU word survives it, and ABL keeps it for a watchdog reset (RST_STAT bit 0).
+/// From a jumped session it does not reach the bootloader (2026-11-15, the Pro, b875: the ROM's USB recovery for two seconds, then back into ferros as b876): every reset ordered there has ended in a power cycle, which clears the PMU word, and after a power-on reset ABL takes the mode only from RSBM, the copy in the fuel gauge's storage that Linux writes with every reboot command (pixel-zuma-reboot.c `pixel_reboot_mode_set`) and ferros does not (ABL ripcurrent-16.4-14540574, its mode getter at G#C48C: RSBM valid and RST_STAT without bits 0 and 7, then PMU word := RSBM).
+/// The service takes a jumped session's request across the reset in the vault instead (vault_boot `next_boot_keep`), and the cold boot after it comes here.
 /// `reboot_to_bootloader` result when the watchdog never reset the SoC. Distinct from every EL3 return: the monitor reports errors as negative values (e.g. -1 = G#FFFF_FFFF_FFFF_FFFF), which an earlier u64::MAX sentinel could not be told apart from.
 pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
+
+/// ABL's log of this boot (BOOT.md: `bl_log` at G#FD80_0000, 512 KiB, text up to its first NUL; the boot before's at G#FD88_0000), overwritten by the next bootloader run.
+const ABL_LOG: usize = 0xFD80_0000;
+const ABL_LOG_LEN: usize = 512 << 10;
+/// What ABL's log of this boot says about the reset that started it, for the flash log, where it outlives the next bootloader run (2026-11-15: the reset behind the Pro's ROM recovery was unreadable an hour later, two bootloader runs on).
+/// Its lines naming the reset (RST_STAT, the reason, the mode, a `[PRE]` record of a crash it handled, its dump stage's start) and the PMIC's power-on and power-off sources, quoted in ABL's words with its 0x numbers written G#; a line is kept only for a person to read, never parsed.
+/// Read only from DRAM ABL wrote; never the PMU (the EL3 poison rule).
+pub fn abl_reset_lines() -> alloc::string::String {
+    const KEYS: [&[u8]; 7] = [b"RST_STAT", b"Reboot reason", b"Reboot mode", b"reset message", b"DSS LOGS START", b"PWRONSRC", b"OFFSRC1"];
+    // WHY the two caps: the text is ABL's, its length unknown to ferros; a line is copied into the heap and every kept line into one flash-log line.
+    // PROOF: without them a log with no newline would grow one buffer to 512 KiB; the boot logs read so far run about 20 KiB with lines under 120 bytes, the reset's lines number under 16.
+    const LINE_MAX: usize = 1 << 8;
+    const OUT_MAX: usize = 1 << 11;
+    let mut out = alloc::string::String::new();
+    let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(LINE_MAX);
+    let take = |line: &[u8], out: &mut alloc::string::String| {
+        if out.len() >= OUT_MAX || !KEYS.iter().any(|k| line.windows(k.len()).any(|w| w == *k)) {
+            return;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        let t = line.trim_ascii();
+        let mut i = 0;
+        while i < t.len() {
+            if t[i..].starts_with(b"0x") {
+                out.push_str("G#");
+                i += 2;
+                while i < t.len() && t[i].is_ascii_hexdigit() {
+                    out.push(t[i].to_ascii_uppercase() as char);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(if (0x20..0x7F).contains(&t[i]) { t[i] as char } else { '.' });
+            i += 1;
+        }
+    };
+    let mut a = ABL_LOG;
+    'scan: while a < ABL_LOG + ABL_LOG_LEN {
+        let w = unsafe { read_volatile(a as *const u64) };
+        for b in w.to_le_bytes() {
+            if b == 0 {
+                break 'scan;
+            }
+            if b == b'\n' {
+                take(&line, &mut out);
+                line.clear();
+            } else if line.len() < LINE_MAX {
+                line.push(b);
+            }
+        }
+        a += 8;
+    }
+    take(&line, &mut out);
+    out
+}
 
 /// A plain reset through EL3 (PSCI SYSTEM_RESET). Measured on husky: the bootloader reads it as "Reboot mode: 0x0", a normal boot of the active slot — which is what the gate's Android choice wants after `slot::set_active(0)`.
 /// Run before every reset this kernel orders (AUTH.md): the vault drops the unlocked identity's key, its bytes overwritten, so a warm reset hands nothing to whatever boots next — Android at the gate's other answer, or a crash's next boot. Registered by the service once the vault is open.
@@ -687,6 +747,19 @@ pub fn reboot_to_mode(mode: u32) -> u64 {
     RESET_ORDERED.store(false, core::sync::atomic::Ordering::Relaxed);
     crumb(0xB7);
     WATCHDOG_DID_NOT_FIRE
+}
+
+/// PSCI SYSTEM_RESET with nothing before it: for a path that has already been through `before_reset` (its scrub zeroed the heap, so nothing may allocate or log after it).
+pub fn reset_now() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
 }
 
 /// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.
