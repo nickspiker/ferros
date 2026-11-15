@@ -2346,7 +2346,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU fenced to gpu-mem: G#{r:X} (1 = fenced)"));
     } else {
         // After a jump (HV.md "The high bank after a jump", 2026-11-15): every bus master Android left that the hv's deny-alls and the domains cut leave able to write, stopped before init starts anything.
-        // Trace first, sources then sinks (coresight.rs: the ETR would write a buffer Linux allocated, now ferros's memory). Measured on the jumped Pro (b879, 2026-11-15): nothing was tracing, every TMC off and the ETR never given a buffer.
+        // Trace's sinks first (coresight.rs: the ETR would write a buffer Linux allocated, now ferros's memory), the TMCs only. Measured on the jumped Pro (b879, 2026-11-15): every TMC off and the ETR never given a buffer. The kernel of b880 also read every core's trace unit here and stalled the bus (APC watchdog), so those are left alone.
         // CPUCL0's S2MPU stays open after a jump for now: its deny froze the jump of 2026-11-04, and with trace proven off that freeze is unexplained; it is tried alone, by hand (`diag s2mpu deny cpucl0`), before it joins these.
         let mut s = alloc::string::String::new();
         crate::coresight::report(&mut s);
@@ -3834,7 +3834,7 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                // `diag trace`: zuma's CoreSight trace as it stands (coresight.rs: each core's trace unit, the TMCs, the ETR's buffer and the bridge to USB), read only; `diag trace stop` stops what runs, sources first.
+                // `diag trace`: zuma's CoreSight trace sinks as they stand (coresight.rs: the TMCs and the ETR's buffer; not the per-core trace units, whose read stalled a jumped kernel), read only; `diag trace stop` stops a sink that captures.
                 if cmd.params == b"trace" || cmd.params == b"trace stop" {
                     let mut s = alloc::string::String::new();
                     if cmd.params == b"trace stop" {
