@@ -2,24 +2,27 @@
 //!
 //! On:
 //! - both camera buses' pins, clock sources and controllers (hsi2c_14, the camera PMIC's, which the torch shares; hsi2c_1, the main sensor's, whose transfers are then the process's thru its `hsi2c1` grant);
-//! - the main camera module's power, as the harness's `diag cam up` ran it: the camera PMIC's supplies over ACPM channel 2, every rail's voltage programmed and read back behind the overvoltage guard while all are off, then the device tree's sequence and the sensor's reset released;
+//! - one camera module's power, the one SYS_POWER's argument names (`select`; 0 the main, 1 the ultrawide, 2 the front, 3 the tele, ferros_cam cams): the camera PMIC's supplies over ACPM channel 2, every rail's voltage programmed and read back behind the overvoltage guard while all are off, then the module's device-tree sequence and its sensor's reset released (the main's as the harness's `diag cam up` ran it, camera.rs `power_up`; the others' camera.rs `power_module`), then its sensor's bus (the ultrawide's hsi2c_3, the front's hsi2c_2, the tele's hsi2c_4, each the process's thru its grant);
 //! - the ISP front end's power domain thru EL3 (the boot gated it, pd.rs; pd.rs `on` writes its configuration and makes the secure world's restore, the prepare call, the pair of the boot's save), never a PMU read from here;
 //! - the front end's clocks (camera.rs `fe_clocks`: VDD_CAM, the ISPFE_NOC clock, CMU_ISPFE, SYSREG_ISPFE);
 //! - the combo D-PHY's isolation bypass (PMU G#3EBC bit 0), once per boot;
 //! - the front end's SYSMMUs in bypass and its core clock on;
 //! - its three S2MPUs fenced to the frames the driver holds (s2mpu.rs `fence_cam`), nothing at all while it holds none.
 //!
-//! Off: the sensor's stream stopped if it still runs (a holder that ended without closing), the PDMA engine stopped and Linux's close replayed (camera_close.rs) when a job was given, the S2MPUs shut to everything, then the module powered down. The front end's domain stays on: switching it off and on again is not yet trusted (pd.rs), so a boot makes its pair of calls once.
+//! Off: the held camera's sensor stream stopped if it still runs (a holder that ended without closing), the PDMA engine stopped, that camera's receiver stopped and Linux's close replayed (camera_close.rs) when a job was given, the S2MPUs shut to everything, then the module powered down in its own order. The front end's domain stays on: switching it off and on again is not yet trusted (pd.rs), so a boot makes its pair of calls once.
 //! A process that ends with the switch on has it turned off by the service loop's next pass (process.rs `power_offs_apply`); its frames went back to the pool already, behind a shut fence (process.rs `cam_free`).
 //!
 //! hsi2c_14 has one owner at a time: the torch switch refuses while this one is on, and this one while the torch's is (torch.rs).
 
 use crate::camera::{PMIC_BUS, SENSOR_ADDR, SENSOR_BUS};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 /// The switch is on: the buses, the module and the front end are the camera driver's.
 static HELD: AtomicBool = AtomicBool::new(false);
+/// The module the next switch on powers (`select`, from SYS_POWER's argument), and the one the switch holds while on: the camera's id (ferros_cam cams: 0 the main, 1 the ultrawide, 2 the front, 3 the tele).
+static NEXT: AtomicU8 = AtomicU8::new(0);
+static MODULE: AtomicU8 = AtomicU8::new(0);
 /// The front end's domain was brought on by this switch this boot (and is never gated again: the boot's gating skips it, pd.rs `gate_at_boot`).
 static FE_ON: AtomicBool = AtomicBool::new(false);
 /// The frames the camera driver holds: one run, its physical start and length in bytes (0 while none), set by process.rs `cam_ask` and `cam_free` under the kernel lock.
@@ -62,6 +65,16 @@ pub fn power(on: bool) -> bool {
     if on { up() } else { down() }
 }
 
+/// Which module the next switch on powers: SYS_POWER's argument bits 8-15 for this switch (ferros_sys `power_arg`; 0, the main, for a plain `power`), set just before `power` under the kernel lock.
+pub fn select(module: u8) {
+    NEXT.store(module, Ordering::Release);
+}
+
+/// The module the switch holds (meaningful while `held`).
+pub fn module() -> u8 {
+    MODULE.load(Ordering::Acquire)
+}
+
 /// The last lines of a report into the flash log, so a refusal says why.
 fn log_tail(what: &str, rep: &[u8]) {
     let text = core::str::from_utf8(rep).unwrap_or("");
@@ -73,9 +86,26 @@ fn log_tail(what: &str, rep: &[u8]) {
 }
 
 fn up() -> bool {
+    let want = NEXT.load(Ordering::Acquire);
     if held() {
+        // One module at a time: they share the camera PMIC's rails and the front end.
+        if want != module() {
+            crate::flashlog::line(&alloc::format!("camera: refused module A#{want}, the switch holds A#{}", module()));
+            return false;
+        }
         return true;
     }
+    // WHY the check: the module is the caller's byte (SYS_POWER's argument); one with no sequence is refused before anything is powered.
+    let other = match want {
+        0 => None,
+        k => match crate::camera::module(k) {
+            Some(m) => Some(m),
+            None => {
+                crate::flashlog::line(&alloc::format!("camera: refused, no module A#{want}"));
+                return false;
+            }
+        },
+    };
     if crate::torch::held() {
         crate::flashlog::line("camera: refused, the torch holds hsi2c_14 (the camera PMIC's bus)");
         return false;
@@ -89,27 +119,54 @@ fn up() -> bool {
         log_tail("buses", &rep);
         return false;
     }
-    crate::flashlog::line("camera: on, the module");
-    if !crate::camera::power_up(&mut rep) {
-        log_tail("module", &rep);
-        crate::camera::power_down(&mut rep);
-        return false;
-    }
-    // The sensor's bus again now its pads are powered (as the harness found it, 2026-10-19), and only then asked whether it is ready.
-    crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, crate::camera::FS_DIV, 0x2_0000);
-    if !crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode) {
-        let b = SENSOR_BUS.base;
-        crate::flashlog::line(&alloc::format!("camera: the sensor's bus not ready with the module powered (TRANS_STATUS G#{:X}, gpp2 DAT G#{:X})", rd(b + 0x50), rd(0x1084_0044)));
-        crate::camera::power_down(&mut rep);
-        return false;
+    match other {
+        None => {
+            crate::flashlog::line("camera: on, the main module");
+            if !crate::camera::power_up(&mut rep) {
+                log_tail("module", &rep);
+                crate::camera::power_down(&mut rep);
+                return false;
+            }
+            // The sensor's bus again now its pads are powered (as the harness found it, 2026-10-19), and only then asked whether it is ready.
+            crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, crate::camera::FS_DIV, 0x2_0000);
+            if !crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode) {
+                let b = SENSOR_BUS.base;
+                crate::flashlog::line(&alloc::format!("camera: the sensor's bus not ready with the module powered (TRANS_STATUS G#{:X}, gpp2 DAT G#{:X})", rd(b + 0x50), rd(0x1084_0044)));
+                crate::camera::power_down(&mut rep);
+                return false;
+            }
+        }
+        Some(m) => {
+            crate::flashlog::line(&alloc::format!("camera: on, the {} module", m.name));
+            crate::camera::module_bus_up(m);
+            let ok = crate::camera::power_module(m, &mut rep);
+            // Every step of the sequence into the flash log, the sub-PMIC GPIO readings among them: the front camera's and the tele's power-up is a first try (docs/CAMERA.md "The other cameras").
+            for l in core::str::from_utf8(&rep).unwrap_or("").lines().filter(|l| l.contains(m.name) || l.contains("FAILED") || l.contains("refusing")) {
+                crate::flashlog::line(&alloc::format!("camera: {l}"));
+            }
+            if !ok {
+                return false;
+            }
+            crate::camera::module_bus_up(m);
+            if !crate::hsi2c::ready(m.bus, m.usi_mode) {
+                crate::flashlog::line(&alloc::format!("camera: the {} sensor's bus not ready with the module powered (TRANS_STATUS G#{:X}, pins DAT G#{:X})", m.name, rd(m.bus + 0x50), rd(0x1084_0004 + m.bus_bank)));
+                crate::camera::power_down_module(m, &mut rep);
+                return false;
+            }
+        }
     }
     // The front end's domain thru EL3 only: CONFIGURATION, then the secure world's restore (pd.rs `on`), the pair of the save the boot's gating made. Never gated (a switch on before the gating at 16 s), the prepare call alone, once a boot, as the harness's `fe_up` made it on October's cold boots.
+    // The module that was powered, down again (a refusal past this point).
+    let module_down = |rep: &mut alloc::vec::Vec<u8>| match other {
+        None => crate::camera::power_down(rep),
+        Some(m) => crate::camera::power_down_module(m, rep),
+    };
     crate::flashlog::line("camera: on, the front end's domain");
     if !crate::pd::is_on("ispfe") {
         crate::pd::on("ispfe", &mut rep);
         if !crate::pd::is_on("ispfe") {
             log_tail("domain", &rep);
-            crate::camera::power_down(&mut rep);
+            module_down(&mut rep);
             return false;
         }
     } else if let Some(r) = crate::camera::prepare_once() {
@@ -120,7 +177,7 @@ fn up() -> bool {
     while !crate::camera::fe_powered() && crate::platform::cntpct() < until {}
     if !crate::camera::fe_powered() {
         crate::flashlog::line("camera: the front end's domain was asked on and its status never said so; nothing of it touched");
-        crate::camera::power_down(&mut rep);
+        module_down(&mut rep);
         return false;
     }
     FE_ON.store(true, Ordering::Release);
@@ -131,8 +188,9 @@ fn up() -> bool {
     // The engine's ring base cleared while it is idle: `down` reads it to know whether a job was ever given.
     wr(PDMA + ferros_cam::PDMA_BASE_LO, 0);
     let fenced = fence_now();
+    MODULE.store(want, Ordering::Release);
     HELD.store(true, Ordering::Release);
-    crate::flashlog::line(&alloc::format!("camera: on in A#{} ms, S2MPUs G#{fenced:X} (1 fenced)", ms_since(t0)));
+    crate::flashlog::line(&alloc::format!("camera: on in A#{} ms, module A#{want}, S2MPUs G#{fenced:X} (1 fenced)", ms_since(t0)));
     true
 }
 
@@ -163,22 +221,26 @@ pub fn region_changed() -> u32 {
 fn down() -> bool {
     let t0 = crate::platform::cntpct();
     let was = HELD.swap(false, Ordering::AcqRel);
+    let m = module();
+    // The held camera's sensor and receiver (ferros_cam cams): `MODULE` is only ever a module `up` accepted (0 to 3), or the main's 0 before any.
+    let cam = ferros_cam::cams::CAMS[m as usize];
+    let (bus, addr) = if m == 0 { (SENSOR_BUS.base, SENSOR_ADDR) } else { (cam.bus, cam.addr) };
     let mut rep = alloc::vec::Vec::new();
     let mut steps = alloc::string::String::new();
     if fe_on() {
-        // A holder that ended without closing leaves the sensor streaming: mode_select (G#0100) bit 0. Stopped, then a frame's time (67.8 ms measured; 2^16 µs) before the engine, as `cam pdma` waited 50 ms.
-        let mut m = [0u8; 1];
-        if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00], &mut m).is_ok() && m[0] & 1 == 1 {
-            let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+        // A holder that ended without closing leaves the sensor streaming: mode_select (G#0100) bit 0. Stopped with its own write (16-bit values on the Samsung parts, 8-bit on the ultrawide's Sony), then a frame's time (67.8 ms measured on the main; 2^16 µs) before the engine, as `cam pdma` waited 50 ms.
+        let mut s = [0u8; 1];
+        if crate::hsi2c::write_read(bus, addr, &[0x01, 0x00], &mut s).is_ok() && s[0] & 1 == 1 {
+            let _ = crate::hsi2c::write_bytes(bus, addr, cam.stream_off);
             spin_us(1 << 16);
             steps.push_str(" stream stopped;");
         }
         if rd(PDMA + ferros_cam::PDMA_BASE_LO) != 0 {
-            // The engine stopped as `cam pdma` stops it after a run, the receiver's stop, then Linux's close (camera_close.rs, 223 writes): without it the next open's front end takes no frames (2026-10-21).
+            // The engine stopped as `cam pdma` stops it after a run, the held camera's receiver stopped, then Linux's close (camera_close.rs, 223 writes, captured after the main camera; the harness replayed it after its ultrawide runs too): without it the next open's front end takes no frames (2026-10-21).
             wr(PDMA + ferros_cam::PDMA_CTRL, 0);
             wr(PDMA + 0x2C, 0);
             wr(PDMA + 0x40, 0);
-            for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+            for &(a, v) in cam.rx_stop.iter() {
                 wr(a, v);
             }
             for &(a, v) in crate::camera_close::CLOSE.iter() {
@@ -190,7 +252,10 @@ fn down() -> bool {
         let f = crate::s2mpu::fence_cam(0, 0);
         steps.push_str(&alloc::format!(" S2MPUs shut G#{f:X};"));
     }
-    crate::camera::power_down(&mut rep);
-    crate::flashlog::line(&alloc::format!("camera: off{} module down in A#{} ms{}", steps, ms_since(t0), if was { "" } else { " (it was not on)" }));
+    match crate::camera::module(m) {
+        Some(md) if was => crate::camera::power_down_module(md, &mut rep),
+        _ => crate::camera::power_down(&mut rep),
+    }
+    crate::flashlog::line(&alloc::format!("camera: off{} module A#{m} down in A#{} ms{}", steps, ms_since(t0), if was { "" } else { " (it was not on)" }));
     true
 }

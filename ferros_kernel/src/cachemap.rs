@@ -156,8 +156,9 @@ pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SL
 /// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out. Its entries past the surfaces' slots are the camera's window (`CAM_VA`).
 static mut L2_SURF: Table = Table([0; 512]);
 
-/// The camera driver's region (2026-11-14, docs/CAMERA.md "The driver"): addresses in the surfaces' GiB above their slots, each 2 MiB block one frame of the run of frames the driver holds (process.rs `cam_ask`), Normal non-cacheable, EL0 read/write, never executable, as the DMA regions are: the front end writes the frames by DMA and does not snoop the CPU's caches. 128 MiB of addresses, more than the main camera's 78 MiB (ferros_cam job `MAIN`); unmapped while nobody holds it.
-pub const CAM_VA: (usize, usize) = (0x50_3000_0000, 0x50_3800_0000);
+/// The camera driver's region (2026-11-14, docs/CAMERA.md "The driver"): addresses in the surfaces' GiB above their slots, each 2 MiB block one frame of the run of frames the driver holds (process.rs `cam_ask`), Normal non-cacheable, EL0 read/write, never executable, as the DMA regions are: the front end writes the frames by DMA and does not snoop the CPU's caches. Unmapped while nobody holds it.
+/// 224 MiB of addresses since 2026-11-15, from the surfaces' last slot's end (it was 128 MiB from G#50_3000_0000, which held the main camera's region with a ring of four, 126 MiB and the long ring's frame, exactly): the front camera's region keeps every output's whole 16 MiB granule until its outputs are measured, 178 MiB with a ring of four (ferros_cam job `FRONT_SLOT_BYTES`). Addresses only; the frames are taken as the driver asks.
+pub const CAM_VA: (usize, usize) = (SURF_VA.1, 0x50_3800_0000);
 const _: () = assert!(CAM_VA.0 >= SURF_VA.1 && CAM_VA.0 / GIB == SURF_VA.0 / GIB && (CAM_VA.1 - 1) / GIB == SURF_VA.0 / GIB && CAM_VA.0 % MIB2 == 0, "the camera's window: in the surfaces' GiB, past their slots");
 
 /// The camera's window: the block at `va` maps frame `pa` (Normal non-cacheable, EL0 read/write, never executable), or nothing (`pa` None). Then `surface_unmapped` over what changed.

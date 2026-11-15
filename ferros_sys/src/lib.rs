@@ -1547,9 +1547,14 @@ pub fn sensors_board(cap: u64) -> (u32, u32) {
 
 /// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.
 pub fn power(cap: u64, on: bool) -> bool {
+    power_arg(cap, on, 0)
+}
+
+/// `power` with a byte for the switch in bits 8-15 of its word: the `camera` switch's module (0 the main, 1 the ultrawide, 2 the front, 3 the tele; kernel camera_power.rs `select`). Every other switch takes 0.
+pub fn power_arg(cap: u64, on: bool, arg: u8) -> bool {
     pin(CORES_BIG);
     sleep_until(now() + freq() / 1000);
-    let r = svc(nr::POWER, cap, on as u64, 0, 0, 0);
+    let r = svc(nr::POWER, cap, on as u64 | (arg as u64) << 8, 0, 0, 0);
     pin(0);
     r == 0
 }

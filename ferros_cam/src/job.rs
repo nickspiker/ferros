@@ -46,15 +46,43 @@ pub const MAIN_SLOT_BYTES: [u64; SLOTS] = [
     16 * MIB, MIB, 4 * MIB, 2 * MIB, 4 * KIB, MIB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// Where each October slot lands in the region: (offset, bytes), (0, 0) for none; and the region's whole size, in frames.
+/// The ultrawide's outputs (docs/CAMERA.md "The other cameras"), measured on the Pro (target/cam/run-uw1..4.txt, 2026-10-22: every October slice patterned, sampled every 256 bytes after a ten-frame run, the same extents in all four runs).
+/// Its job was built by the later image builder, which kept each output's offset in its 16 MiB IOVA granule, so an output lies at its captured offset inside its slot rather than at the slot's start (`UW_SLOT_SKIP`, the lowest offset any address register names there; nothing was written below it, except in slot 9, which slot 8 runs on into).
+/// Seen written, from the skip: 0 two 16-byte headers to +G#2100; 1 the PD path (4000 x 750 at G#13A0 a line, G#398000 bytes); 2 the image body (4000 x 3000 RAW10 at G#13C0 a line, G#E77100); 3 to +G#D0100; 4 to +G#6100; 5 to +G#9EF000; 6 to +G#6C300; 7 to +G#5D4000; 8 to its end (+G#FFFE00, running on into 9); 9 to +G#9F0800.
+/// The four runs wrote every output to the same byte, so each size is what was written rounded up, not twice it as `MAIN_SLOT_BYTES` has: to a power of two under a frame, to whole frames past one (59 KiB of room at the least, slot 9), the image exactly its buffer, slot 8 exactly its granule so 9 follows it as it did in October.
+/// Twice would make the region 174 MiB with a ring of four; this is 120 MiB, so a ring of one (72 MiB) still opens on a pool with little free (a jumped session's).
+/// The driver patterns every output at each open and says after the eighth frame how far each was written, so a run re-measures this.
+pub const UW_SLOT_BYTES: [u64; SLOTS] = [
+    16 * KIB, 4 * MIB, 16 * MIB, MIB, 32 * KIB, 10 * MIB, 512 * KIB, 6 * MIB, 16 * MIB, 10 * MIB, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+pub const UW_SLOT_SKIP: [u64; SLOTS] = [
+    0x48_7000, 0xC0_0000, 0, 0xE7_8000, 0xFE_0000, 0x4F_2000, 0xAF_4000, 0x9F_4000, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+/// The front camera's outputs: never measured (the sensor has not answered ferros), so each slot its job names (0 to 7, read from target/cam/front.pdma) keeps its whole 16 MiB granule, every captured offset as it is, as October's layout had them.
+pub const FRONT_SLOT_BYTES: [u64; SLOTS] = [
+    16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+/// No skips: every output at its slot's start (the main camera's job), or its slot's whole granule (the front camera's).
+pub const NO_SKIP: [u64; SLOTS] = [0; SLOTS];
+
+/// Where each October slot lands in the region: (offset, bytes), (0, 0) for none; the offset in its 16 MiB granule each slot's first byte stands for (`skip`, 0 for the main camera's); and the region's whole size, in frames.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub slots: [(u64, u64); SLOTS],
+    pub skip: [u64; SLOTS],
     pub bytes: u64,
 }
 
-/// The job's frame first, then each slot in order, each aligned to its own size up to a frame (sizes are powers of two), the whole rounded up to frames.
+/// The job's frame first, then each slot in order, each aligned to its own size up to a frame (sizes under a frame are powers of two, the rest whole frames), the whole rounded up to frames.
 pub const fn layout(sizes: &[u64; SLOTS]) -> Layout {
+    layout_at(sizes, &NO_SKIP)
+}
+
+/// `layout` with each slot standing for its granule from `skip[k]` on.
+pub const fn layout_at(sizes: &[u64; SLOTS], skip: &[u64; SLOTS]) -> Layout {
     let mut slots = [(0u64, 0u64); SLOTS];
     let mut off = FRAME;
     let mut k = 0;
@@ -68,7 +96,7 @@ pub const fn layout(sizes: &[u64; SLOTS]) -> Layout {
         }
         k += 1;
     }
-    Layout { slots, bytes: (off + FRAME - 1) & !(FRAME - 1) }
+    Layout { slots, skip: *skip, bytes: (off + FRAME - 1) & !(FRAME - 1) }
 }
 
 /// The main camera's region.
@@ -81,9 +109,14 @@ pub const RING_MOST: usize = 1 << 3;
 
 /// The main camera's region with an image ring of `n` buffers (1 to `RING_MOST`): slot 2, the image body, made `n` buffers of `IMAGE_BYTES` side by side, the job's own address in the first; every other slot as `MAIN` has it. The ring's buffer k is at `slots[OLD_SLOT_IMAGE].0 + k * IMAGE_BYTES`.
 pub const fn main_ring(n: usize) -> Layout {
-    let mut sizes = MAIN_SLOT_BYTES;
-    sizes[OLD_SLOT_IMAGE] = n as u64 * IMAGE_BYTES;
-    layout(&sizes)
+    ring(&MAIN_SLOT_BYTES, &NO_SKIP, n)
+}
+
+/// Any camera's region with an image ring of `n` buffers: its slot sizes and skips (`MAIN_SLOT_BYTES`, `UW_SLOT_BYTES` with `UW_SLOT_SKIP`, ..), slot 2 made `n` buffers of `IMAGE_BYTES` side by side. Every camera's image body is slot 2, at its granule's start (tools/camera-pdma-image.py pinned it there for every camera).
+pub const fn ring(sizes: &[u64; SLOTS], skip: &[u64; SLOTS], n: usize) -> Layout {
+    let mut s = *sizes;
+    s[OLD_SLOT_IMAGE] = n as u64 * IMAGE_BYTES;
+    layout_at(&s, skip)
 }
 
 /// The job's register program, the piece at `OLD_JOB + LIST_OFFSET`: where its bytes start in the image and their length.
@@ -210,10 +243,11 @@ pub fn moved(old: u64, base: u64, l: &Layout) -> Result<u64, Error> {
         let k = ((old - OLD_SLICES) / OLD_SLICE) as usize;
         let off = old % OLD_SLICE;
         let (at, size) = l.slots[k];
-        if size == 0 || off >= size {
+        // WHY the check: an address below the slot's skip, or past its room, is one this layout was not measured on; moved anyway it would land in another slot or past the region (where the fence faults it), so the job is refused instead.
+        if size == 0 || off < l.skip[k] || off - l.skip[k] >= size {
             return Err(Error::Unplaced(old));
         }
-        return Ok(base + at + off);
+        return Ok(base + at + off - l.skip[k]);
     }
     Err(Error::Unplaced(old))
 }
@@ -503,5 +537,75 @@ mod tests {
             println!("piece G#{pa:X}: {n} bytes");
         }
         println!("the program: {len} bytes, the image's words {lo} and {hi}; a ring of 4: {} MiB", l.bytes >> 20);
+    }
+
+    /// A skip moves an output to its slot's start less the skip, and refuses one below it.
+    #[test]
+    fn a_skip_moves_and_refuses() {
+        let l = ring(&UW_SLOT_BYTES, &UW_SLOT_SKIP, 1);
+        let s0 = l.slots[0].0;
+        assert_eq!(moved(0xA048_7000, 0xA000_0000, &l), Ok(0xA000_0000 + s0));
+        assert_eq!(moved(0xA048_9000, 0xA000_0000, &l), Ok(0xA000_0000 + s0 + 0x2000));
+        assert_eq!(moved(0xA048_6000, 0xA000_0000, &l), Err(Error::Unplaced(0xA048_6000)));
+        // Slot 9 follows slot 8 whole, as in October, so 8's run on into 9 lands where it did.
+        assert_eq!(l.slots[9].0, l.slots[8].0 + 16 * MIB);
+        assert_eq!(moved(0xA900_0000, 0, &l), Ok(moved(0xA800_0000, 0, &l).unwrap() + 16 * MIB));
+    }
+
+    /// The kernel's window for the camera's region (kernel cachemap `CAM_VA`, 224 MiB since 2026-11-15) holds every camera's region with a ring of four and the long ring's frame; no two slots overlap and each is aligned to its size up to a frame.
+    #[test]
+    fn every_ring_fits_the_window() {
+        const WINDOW: u64 = 224 * MIB;
+        for (name, sizes, skip) in [("main", MAIN_SLOT_BYTES, NO_SKIP), ("ultrawide", UW_SLOT_BYTES, UW_SLOT_SKIP), ("front", FRONT_SLOT_BYTES, NO_SKIP)] {
+            for n in 1..=RING_MOST >> 1 {
+                let l = ring(&sizes, &skip, n);
+                assert!(l.bytes + FRAME <= WINDOW, "{name}, a ring of {n}: {} MiB", l.bytes >> 20);
+                for a in 0..SLOTS {
+                    let (o, s) = l.slots[a];
+                    if s == 0 {
+                        continue;
+                    }
+                    assert_eq!(o % s.min(FRAME), 0, "{name} slot {a}");
+                    for b in a + 1..SLOTS {
+                        let (p, t) = l.slots[b];
+                        assert!(t == 0 || o + s <= p || p + t <= o, "{name} slots {a} and {b}");
+                    }
+                }
+            }
+            println!("{name}: a ring of 1 {} MiB, of 4 {} MiB", ring(&sizes, &skip, 1).bytes >> 20, ring(&sizes, &skip, 4).bytes >> 20);
+        }
+    }
+
+    /// The ultrawide's local job (target/cam/uw.pdma, local), when it is on this machine: every address it names lands in its region, in slots 0 to 9, and each copy of its program can name its own ring buffer.
+    #[test]
+    fn the_local_uw_job() {
+        let Ok(orig) = std::fs::read("/mnt/Harbor/Code/ferros/target/cam/uw.pdma") else { return };
+        for n in [1, RING_MOST >> 1] {
+            let l = ring(&UW_SLOT_BYTES, &UW_SLOT_SKIP, n);
+            for base in [0xA000_0000u64, 0x9_2000_0000] {
+                let mut job = orig.clone();
+                let m = relocate(&mut job, base, &l).expect("the ultrawide's job moves");
+                assert_eq!((m.addr_regs, m.loads, m.slots), (25, 12, (1 << 10) - 1));
+                let (at, len) = list_piece(&job).unwrap();
+                let (lo, hi) = image_words(&job[at..at + len]).expect("the image body is written once");
+                assert_eq!(w32(&job, at + lo * 4) as u64 | (w32(&job, at + hi * 4) as u64) << 32, base + l.slots[OLD_SLOT_IMAGE].0);
+            }
+            println!("the ultrawide, a ring of {n}: {} MiB", l.bytes >> 20);
+        }
+        // A 4000 x 3000 RAW10 frame at G#13C0 a line fits a buffer.
+        assert!(3000 * 0x13C0 <= IMAGE_BYTES);
+    }
+
+    /// The front camera's local job (target/cam/front.pdma), when it is on this machine: it moves into its region of whole granules.
+    #[test]
+    fn the_local_front_job() {
+        let Ok(orig) = std::fs::read("/mnt/Harbor/Code/ferros/target/cam/front.pdma") else { return };
+        let l = ring(&FRONT_SLOT_BYTES, &NO_SKIP, RING_MOST >> 1);
+        let mut job = orig.clone();
+        let m = relocate(&mut job, 0xA000_0000, &l).expect("the front camera's job moves");
+        assert_eq!((m.addr_regs, m.loads, m.slots), (25, 12, (1 << 8) - 1));
+        let (at, len) = list_piece(&job).unwrap();
+        assert!(image_words(&job[at..at + len]).is_ok());
+        println!("the front camera, a ring of 4: {} MiB", l.bytes >> 20);
     }
 }

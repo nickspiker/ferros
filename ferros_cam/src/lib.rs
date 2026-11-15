@@ -3,6 +3,7 @@
 //! Host-tested (`cargo test -p ferros_cam`), with the local job and bundle (target/cam, the vendor's settings, never in the repository) when they are on this machine.
 #![cfg_attr(not(test), no_std)]
 
+pub mod cams;
 pub mod inputs;
 pub mod job;
 pub mod raw;

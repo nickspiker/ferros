@@ -76,7 +76,6 @@ mod trusty;
 mod camera_close;
 #[cfg(feature = "pixel8")]
 mod camera_power;
-mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]

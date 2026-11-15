@@ -1,4 +1,5 @@
-//! The main rear camera (boitata, sensor@0) on husky: the steps of its power-up the `camera` switch runs (camera_power.rs), from the device tree and the hv register oracle (docs/oracle/CAMERA.md).
+//! The Pro's camera modules (husky): the steps of their power-up the `camera` switch runs (camera_power.rs), from the device tree and the hv register oracle (docs/oracle/CAMERA.md).
+//! The main rear camera (boitata, sensor@0) below as measured since 2026-10-19 (`power_up`); the ultrawide, the front camera and the tele from their device-tree sequences (`Module`, `power_module`, 2026-11-15; docs/CAMERA.md "The other cameras").
 //!
 //! Power order (`module_power_seq@0`): camera-PMIC LDO1, sub-PMIC GPIO2 (sensor enable), LDO8, sub-PMIC LDO26 and LDO12, LDO4, master-clock pin on, ToF reset, LDO5, the GPIO4 switch; then the sensor reset released and 9 ms before the first I2C.
 //! The camera PMIC (SLG51002 at G#75) sits on HS-I2C USI14 (G#1098_0000); the sensor (G#3D) on HS-I2C USI1 (G#1088_0000). The sub-PMIC is reached through ACPM (acpm.rs).
@@ -200,21 +201,9 @@ fn pin_out(bank: usize, pin: u32, high: bool) {
     pin_field(a, pin, 1);
 }
 
-/// Power the main camera module in `module_power_seq@0` order with its delays, after programming and verifying the rail voltages. Refuses if any camera-PMIC rail is already on. On any failure it powers back down.
-pub fn power_up(rep: &mut Vec<u8>) -> bool {
-    pmic_power_on(rep);
-    let step = |rep: &mut Vec<u8>, label: &str, r: Result<alloc::string::String, alloc::string::String>| -> bool {
-        match r {
-            Ok(s) => {
-                line(rep, alloc::format!("  {label}: {s}\n"));
-                true
-            }
-            Err(s) => {
-                line(rep, alloc::format!("  {label}: FAILED {s}\n"));
-                false
-            }
-        }
-    };
+/// Every camera-PMIC rail's voltage programmed and read back while every rail is off, each code thru the overvoltage guard and inside the chip's own range before it reaches the chip; refused (false) when any rail is already on or the chip does not answer.
+/// The step every module's power-up begins with (the main's `power_up`, the others' `power_module`): no enable bit is set before this has passed.
+fn program_rails(rep: &mut Vec<u8>) -> bool {
     let hex = |e: u32| alloc::format!("G#{e:X}");
     match pmic_read(MATRIX_A) {
         Ok(0) => {}
@@ -227,7 +216,6 @@ pub fn power_up(rep: &mut Vec<u8>) -> bool {
             return false;
         }
     }
-    // Voltages first, verified, while every rail is off.
     for rail in RAILS.iter() {
         let (name, vsel, code, range) = (rail.name, rail.vsel, rail.code, rail.range);
         let r = (|| -> Result<alloc::string::String, alloc::string::String> {
@@ -246,10 +234,36 @@ pub fn power_up(rep: &mut Vec<u8>) -> bool {
             }
             Ok(alloc::format!("G#{before:02X} -> G#{after:02X}, A#{mv} mV"))
         })();
-        if !step(rep, name, r) {
-            power_down(rep);
-            return false;
+        match r {
+            Ok(s) => line(rep, alloc::format!("  {name}: {s}\n")),
+            Err(s) => {
+                line(rep, alloc::format!("  {name}: FAILED {s}\n"));
+                return false;
+            }
         }
+    }
+    true
+}
+
+/// Power the main camera module in `module_power_seq@0` order with its delays, after programming and verifying the rail voltages. Refuses if any camera-PMIC rail is already on. On any failure it powers back down.
+pub fn power_up(rep: &mut Vec<u8>) -> bool {
+    pmic_power_on(rep);
+    let step = |rep: &mut Vec<u8>, label: &str, r: Result<alloc::string::String, alloc::string::String>| -> bool {
+        match r {
+            Ok(s) => {
+                line(rep, alloc::format!("  {label}: {s}\n"));
+                true
+            }
+            Err(s) => {
+                line(rep, alloc::format!("  {label}: FAILED {s}\n"));
+                false
+            }
+        }
+    };
+    let hex = |e: u32| alloc::format!("G#{e:X}");
+    if !program_rails(rep) {
+        power_down(rep);
+        return false;
     }
     let ldo = |bit: u32| ldo_on(bit).map(|m| alloc::format!("matrix G#{m:02X}")).map_err(hex);
     let sub = |n: u32| sub_gpio_high(n).map(|_| alloc::string::String::from("high")).map_err(hex);
@@ -335,6 +349,204 @@ pub fn power_down(rep: &mut Vec<u8>) {
         acpm::read(acpm::SUB, acpm::T_GPIO, 0x09).map(|v| alloc::format!("G#{v:02X}")).ok(),
         acpm::read(acpm::SUB, acpm::T_GPIO, 0x0A).map(|v| alloc::format!("G#{v:02X}")).ok(),
         acpm::read(acpm::SUB, acpm::T_GPIO, 0x0B).map(|v| alloc::format!("G#{v:02X}")).ok()));
+}
+
+// ---------------------------------------------------------------- the other three modules
+
+/// One step of a module's power sequence (zuma-husky-camera.dtsi `power-up-seqs`), and its delay after, in µs.
+#[derive(Clone, Copy)]
+pub enum Step {
+    /// A camera-PMIC LDO, by its enable bit in MATRIX_CONF_A (LDO1 bit 0 .. LDO8 bit 7).
+    Ldo(u32),
+    /// A sub-PMIC LDO, by its control register (enable bit 7; its voltage is the boot's): LDO12 G#3A (1.85 V), LDO26 G#48 (3.3 V).
+    SubLdo(u32),
+    /// A sub-PMIC GPIO driven high (over ACPM).
+    SubGpio(u32),
+    /// A camera-PMIC load switch (`slg51002_gpioN`), by its control register: gpio1 G#1710 .. gpio4 G#1713, bit 0.
+    Switch(u16),
+    /// The module's master clock out on its pin (`mclk_on`: function 2, no pull, the drive the board's device tree gives it).
+    Mclk,
+    /// The sensor's reset released.
+    Reset,
+}
+
+/// A camera module other than the main (whose sequence is `power_up`, measured since 2026-10-19 and left as it runs), from the device tree: its sensor's bus, its pins and its power sequences.
+/// The three share the camera PMIC's rails with the main, so one module is powered at a time (the `camera` switch holds one).
+pub struct Module {
+    pub name: &'static str,
+    /// Its sensor's HS-I2C controller, the GPIO bank of its bus's pins (0 and 1, `hsi2cN_bus`: function 3, pull-up), its USI mode word (SYSREG_PERIC0 + `samsung,usi-offset`) and its USI's clock-source mux (cmucal-sfr.c PLL_CON0_MUX_CLKCMU_PERIC0_USIn_USI_USER).
+    pub bus: usize,
+    pub bus_bank: usize,
+    pub usi_mode: usize,
+    pub usi_mux: usize,
+    /// Its reset pin (bank, pin), and its master clock's pin 0 as (bank, drive), the drive the husky device tree gives it (`sensor_mclkN_fn`: ZUMA_PIN_DRV_X3 is 2, X4 is 3).
+    pub reset: (usize, u32),
+    pub mclk: (usize, u32),
+    /// The power-up sequence and the power-down sequence, each step with its delay after.
+    pub up: &'static [(Step, u64)],
+    pub down: &'static [(Step, u64)],
+}
+
+/// GPP bank offsets inside GPIO_PERIC0 (zuma-pinctrl.dtsi order: G#20 a bank).
+const GPP3: usize = 0x60;
+const GPP4: usize = 0x80;
+const GPP5: usize = 0xA0;
+const GPP6: usize = 0xC0;
+const GPP7: usize = 0xE0;
+const GPP8: usize = 0x100;
+
+/// The sub-PMIC's GPIO2: the main's `enable-gpios`, CAMS_LVBUCK_EN ("for ldo8", the device tree's own comment: the low-voltage buck that feeds the camera PMIC's LDO8).
+/// The front camera and the tele list LDO8 as a supply and no enable of their own; under Android the main is powered at boot (`lwis,power-up-to-suspend`) and this line stays high, so it is high whenever they run there.
+/// Every ferros reading of it from a cold boot was G#40 (output, low), and nothing in the front camera's or the tele's power-up ever raised it: the one supply of theirs no register comparison could have covered, since their power-up never touches it (docs/CAMERA.md "The other cameras").
+/// So their sequences raise it where the main's does (after LDO1, 10 µs before LDO8): a guess from the device tree, to be measured.
+/// The ultrawide's does not: it answered and streamed from a cold boot with the line low (2026-10-22), and its LDO8 is not its sensor's core (its 1.1 V core is LDO6).
+pub const LV_BUCK_EN: u32 = 2;
+
+/// The ultrawide (oksoko, Sony IMX787): hsi2c_3 (G#108A_0000, gpp6-0/1, USI offset 8), reset gpp6-3, master clock gpp3-0 (CIS_CLK0, `sensor_mclk1`, drive X4).
+/// The sequence is the device tree's (`sensor@2` power-up-seqs and delays); the harness's own order (October, the same rails and switch, LDO2/4/6 in table order, the switch before the clock, 9 ms after the reset) also answered and streamed.
+pub const ULTRAWIDE: Module = Module {
+    name: "ultrawide",
+    bus: 0x108A_0000,
+    bus_bank: GPP6,
+    usi_mode: SYSREG_PERIC0 + 0x8,
+    usi_mux: CMU_PERIC0 + 0x670,
+    reset: (GPP6, 3),
+    mclk: (GPP3, 3),
+    up: &[(Step::Ldo(0), 500), (Step::Ldo(7), 750), (Step::SubLdo(0x3A), 0), (Step::Ldo(5), 0), (Step::Ldo(1), 0), (Step::Ldo(3), 1000), (Step::Switch(0x1711), 1000), (Step::Mclk, 1000), (Step::Reset, 10_000)],
+    down: &[(Step::Reset, 1000), (Step::Mclk, 1000), (Step::Switch(0x1711), 0), (Step::Ldo(3), 0), (Step::Ldo(1), 0), (Step::Ldo(5), 0), (Step::SubLdo(0x3A), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0)],
+};
+
+/// The front camera (dokkaebi): hsi2c_2 (G#1089_0000, gpp4-0/1, USI offset 4), reset gpp4-2, master clock gpp5-0 (CIS_CLK1, `sensor_mclk2`, drive X3), its lens actuator powered by the shared enable (sub GPIO4).
+/// The device tree's sequence (`sensor@1`), with the low-voltage buck's enable (`LV_BUCK_EN`) added where the main raises it.
+pub const FRONT: Module = Module {
+    name: "front",
+    bus: 0x1089_0000,
+    bus_bank: GPP4,
+    usi_mode: SYSREG_PERIC0 + 0x4,
+    usi_mux: CMU_PERIC0 + 0x660,
+    reset: (GPP4, 2),
+    mclk: (GPP5, 2),
+    up: &[(Step::Ldo(0), 500), (Step::SubGpio(LV_BUCK_EN), 10), (Step::Ldo(7), 750), (Step::SubLdo(0x48), 0), (Step::SubLdo(0x3A), 0), (Step::Switch(0x1712), 500), (Step::SubGpio(4), 500), (Step::Mclk, 1000), (Step::Reset, 8000)],
+    down: &[(Step::Reset, 0), (Step::SubGpio(4), 0), (Step::Mclk, 1000), (Step::Switch(0x1712), 0), (Step::SubLdo(0x3A), 0), (Step::SubLdo(0x48), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0), (Step::SubGpio(LV_BUCK_EN), 0)],
+};
+
+/// The folded tele (kraken): hsi2c_4 (G#108B_0000, gpp8-0/1, USI offset G#C), reset gpp6-2 (RTCAM_RST_L), master clock gpp7-0 (CIS_CLK2, `sensor_mclk3`, drive X3).
+/// The device tree's sequence (`sensor@3`), with the low-voltage buck's enable added as the front's.
+/// Its bus's pin bank gpp8 also carries the torch's enable (gpp8-2, torch.rs), which this never touches: the pins are set one field at a time.
+pub const TELE: Module = Module {
+    name: "tele",
+    bus: 0x108B_0000,
+    bus_bank: GPP8,
+    usi_mode: SYSREG_PERIC0 + 0xC,
+    usi_mux: CMU_PERIC0 + 0x680,
+    reset: (GPP6, 2),
+    mclk: (GPP7, 2),
+    up: &[(Step::Ldo(0), 500), (Step::SubGpio(LV_BUCK_EN), 10), (Step::Ldo(7), 750), (Step::SubLdo(0x3A), 300), (Step::Ldo(6), 0), (Step::Ldo(2), 0), (Step::Ldo(4), 500), (Step::Switch(0x1710), 500), (Step::Mclk, 1000), (Step::Reset, 10_000)],
+    down: &[(Step::Reset, 0), (Step::Mclk, 0), (Step::Switch(0x1710), 1000), (Step::Ldo(4), 0), (Step::Ldo(6), 0), (Step::SubLdo(0x3A), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0), (Step::Ldo(2), 0), (Step::SubGpio(LV_BUCK_EN), 0)],
+};
+
+/// The module the `camera` switch powers for camera `id` (ferros_cam cams: 0 the main, whose own `power_up` runs; 1 the ultrawide, 2 the front, 3 the tele).
+pub fn module(id: u8) -> Option<&'static Module> {
+    match id {
+        1 => Some(&ULTRAWIDE),
+        2 => Some(&FRONT),
+        3 => Some(&TELE),
+        _ => None,
+    }
+}
+
+/// A module's sensor bus: its pins muxed (function 3, pull-up), its USI's clock taken from the oscillator (as the main's: the I2C timing `FS_DIV` is counted on it), the controller brought up. Before the module's power its lines read held low (the main's did, 2026-11-14), so the switch brings it up again after.
+pub fn module_bus_up(m: &Module) {
+    let bank = GPIO_PERIC0 + m.bus_bank;
+    for pin in 0..2 {
+        pin_field(bank, pin, 3);
+        pin_field(bank + 8, pin, 3);
+    }
+    wr(m.usi_mux, rd(m.usi_mux) & !(1 << 4));
+    crate::hsi2c::bring_up(m.bus, m.usi_mode, FS_DIV, 0x2_0000);
+}
+
+/// One step on (`on`) or off, its outcome for the report.
+fn module_step(m: &Module, s: Step, on: bool) -> Result<alloc::string::String, alloc::string::String> {
+    let hex = |e: u32| alloc::format!("G#{e:X}");
+    match s {
+        Step::Ldo(bit) => {
+            let v = pmic_read(MATRIX_A).map_err(hex)?;
+            let n = if on { v | (1 << bit) as u8 } else { v & !((1 << bit) as u8) };
+            pmic_write(MATRIX_A, n).map_err(hex)?;
+            Ok(alloc::format!("LDO{} {}: matrix G#{:02X}", bit + 1, if on { "on" } else { "off" }, pmic_read(MATRIX_A).map_err(hex)?))
+        }
+        Step::SubLdo(reg) => {
+            acpm::update(acpm::SUB, acpm::T_PMIC, reg, if on { 0x80 } else { 0 }, 0x80).map_err(hex)?;
+            Ok(alloc::format!("sub LDO G#{reg:X} {}: ctrl G#{:02X}", if on { "on" } else { "off" }, acpm::read(acpm::SUB, acpm::T_PMIC, reg).map_err(hex)?))
+        }
+        Step::SubGpio(n) => {
+            let before = acpm::read(acpm::SUB, acpm::T_GPIO, 0x08 + n).map_err(hex)?;
+            if on {
+                sub_gpio_high(n).map_err(hex)?;
+            } else {
+                acpm::update(acpm::SUB, acpm::T_GPIO, 0x08 + n, 0x40, 0x60).map_err(hex)?;
+            }
+            Ok(alloc::format!("sub GPIO{n} {}: G#{before:02X} -> G#{:02X}", if on { "high" } else { "low" }, acpm::read(acpm::SUB, acpm::T_GPIO, 0x08 + n).map_err(hex)?))
+        }
+        Step::Switch(reg) => {
+            let v = pmic_read(reg).map_err(hex)?;
+            pmic_write(reg, if on { v | 1 } else { v & !1 }).map_err(hex)?;
+            Ok(alloc::format!("switch G#{reg:X} {}: G#{:02X}", if on { "on" } else { "off" }, pmic_read(reg).map_err(hex)?))
+        }
+        Step::Mclk => {
+            let (bank, drv) = m.mclk;
+            let a = GPIO_PERIC0 + bank;
+            if on {
+                pin_field(a + 0xC, 0, drv);
+                pin_field(a + 0x8, 0, 0);
+                pin_field(a, 0, 2);
+            } else {
+                pin_out(bank, 0, false);
+            }
+            Ok(alloc::format!("master clock pin {}: CON G#{:X} DRV G#{:X}", if on { "on" } else { "off" }, rd(a), rd(a + 0xC)))
+        }
+        Step::Reset => {
+            let (bank, pin) = m.reset;
+            pin_out(bank, pin, on);
+            Ok(alloc::format!("reset {}: DAT G#{:X}", if on { "released" } else { "held" }, rd(GPIO_PERIC0 + bank + 4)))
+        }
+    }
+}
+
+/// Power a module other than the main: the camera PMIC's supplies (`pmic_power_on`), every rail's voltage programmed and verified while all are off (`program_rails`: refused if any rail is on), then its device-tree sequence with its delays. On any failure it powers back down.
+pub fn power_module(m: &Module, rep: &mut Vec<u8>) -> bool {
+    pmic_power_on(rep);
+    if !program_rails(rep) {
+        power_down_module(m, rep);
+        return false;
+    }
+    for &(s, us) in m.up {
+        match module_step(m, s, true) {
+            Ok(t) => line(rep, alloc::format!("  {}: {t}\n", m.name)),
+            Err(t) => {
+                line(rep, alloc::format!("  {}: FAILED {t}\n", m.name));
+                power_down_module(m, rep);
+                return false;
+            }
+        }
+        spin_us(us);
+    }
+    true
+}
+
+/// A module down in its device-tree power-down order with its delays, then the camera PMIC's supplies as the main's `power_down` drops them (chip select stays high, as Android leaves it). Best effort: every step runs even if one fails.
+pub fn power_down_module(m: &Module, rep: &mut Vec<u8>) {
+    for &(s, us) in m.down {
+        if let Err(t) = module_step(m, s, false) {
+            line(rep, alloc::format!("  {}: off FAILED {t}\n", m.name));
+        }
+        spin_us(us);
+    }
+    let left = pmic_read(MATRIX_A);
+    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x0B, 0x40, 0x60);
+    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x09, 0x40, 0x60);
+    line(rep, alloc::format!("{} powered down: MATRIX_CONF_A before supplies off {:?}\n", m.name, left.map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))));
 }
 
 /// The ISP front end's power domain (zuma-pm-domains.dtsi pd_ispfe; flexpmu_cal_local_zuma.h ispfe_on): CONFIGURATION bit 0 on, wait for STATUS bit 0. As in Linux's CAL engine (pmucal_rae.c `pmucal_write_reg`), PMU writes go through EL3 (SMC G#82000504, option 1) and PMU reads are plain reads; EL3 refuses a read request for these registers (returned -22, measured 2026-10-19). Then the domain's prepare call exactly as Linux's exynos-pd makes it (exynos-pd_el3.c `exynos_pd_tz_restore`: SMC G#82000410, wake-up = 1, the domain's `need_smc` address, group 2).

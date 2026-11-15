@@ -3,6 +3,7 @@
 //! ferros-bridge spawn camtest.bin <hex input> --name camtest --use camera   (e.g. `4008`: 64 frames at bin 8)
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
+//! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
 #![no_std]
 #![no_main]
 
@@ -58,11 +59,25 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     let t1 = ferros_sys::now();
+    // The fifth input byte: which camera (0 the main, 1 the ultrawide, 2 the front, 3 the tele; ferros_cam cams).
+    let id = arg(4);
+    // A fourth byte of 7: PROBE that camera instead (power it, read its identity, map which addresses answer on its bus, power it down), and end.
+    if arg(3) == 7 {
+        let mut p = [0u8; 20];
+        let n = call(ep, &[7, id], &mut p);
+        say!(g, "camtest: PROBE of camera A#{id} answered A#{} in A#{} ms: identity G#{:02X}{:02X}, error G#{:X}\n", if n == ERR { 0xEEE } else { p[0] as u64 }, ferros_sys::us_since(t1) / 1000, p[1], p[2], p[3]);
+        for a in 0x08u8..0x78 {
+            if p[4 + (a >> 3) as usize] >> (a & 7) & 1 == 1 {
+                say!(g, "camtest: G#{a:02X} acknowledged on its bus\n");
+            }
+        }
+        ferros_sys::exit(if n == ERR || p[0] != 0 { 1 } else { 0 });
+    }
     if bin == 1 {
-        view(g, ep, frames, arg(3) == 2, t1);
+        view(g, ep, id, frames, arg(3) == 2, t1);
     }
     let mut r = [0u8; 4];
-    let n = call(ep, &[1, 0], &mut r);
+    let n = call(ep, &[1, id], &mut r);
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
@@ -117,9 +132,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
 static mut VIEW_TOKEN: [u8; 32] = [0; 32];
 
 /// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.
-fn view(g: u64, ep: u64, frames: u32, write: bool, t1: u64) -> ! {
+fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
     let mut r = [0u8; 64];
-    let n = call(ep, &[1, 0, 1], &mut r);
+    let n = call(ep, &[1, id, 1], &mut r);
     say!(g, "camtest: OPEN with the view answered G#{:X}, A#{} bytes, in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, if n == ERR { 0 } else { n }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 || n < 48 {
         ferros_sys::exit(1);

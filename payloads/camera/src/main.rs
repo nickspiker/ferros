@@ -1,33 +1,35 @@
-//! The camera driver (docs/CAMERA.md "The driver"; owner, 2026-11-14: "Can we get Lumis wired up?"): the Pro's main camera served on the `camera` endpoint, started by the kernel when a call on it finds no server (process.rs `ON_DEMAND`), ended by itself once its holder closes.
+//! The camera driver (docs/CAMERA.md "The driver"; owner, 2026-11-14: "Can we get Lumis wired up?"): the Pro's cameras served on the `camera` endpoint, started by the kernel when a call on it finds no server (process.rs `ON_DEMAND`), ended by itself once its holder closes.
+//! The main camera since 2026-11-14; the ultrawide, and the front camera as far as it answers, since 2026-11-15 (owner: "would be nice to get the other cams online"; docs/CAMERA.md "The other cameras"). Each camera's facts are ferros_cam cams, one camera open at a time.
 //!
-//! The kernel keeps what a process may not do behind the `camera` power switch (kernel camera_power.rs): both camera buses' pins and clocks, the module's rails behind the overvoltage guard, the front end's power domain and clocks, the D-PHY's isolation, the SYSMMUs in bypass and the S2MPUs fenced to this driver's frames. Here, thru its grants: the sensor and its lens actuator on hsi2c_1, the front end and its PDMA engine, the CSI links and PHY, and the front end's line 0.
+//! The kernel keeps what a process may not do behind the `camera` power switch (kernel camera_power.rs): the camera buses' pins and clocks, the module's rails behind the overvoltage guard (which module: the switch's argument, ferros_sys `power_arg`), the front end's power domain and clocks, the D-PHY's isolation, the SYSMMUs in bypass and the S2MPUs fenced to this driver's frames. Here, thru its grants: the open camera's sensor and lens actuator on its bus, the front end and its PDMA engine, the CSI links and PHY, and the front end's line 0.
 //!
-//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on, the sensor's identity read, its init replayed from the vault (`cam.boitata.init`, or the bundle `cam.frame`), the PDMA job from the vault (`cam.boitata.pdma`) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.ispfe.prog`), the engine started, the receiver last, the CPU's writes after it, the lens set, the stream on.
-//! Then the front end is answered on its interrupt: every acknowledgement in the order Linux makes them (ferros_cam `FRAME_ACK`), loch0's paths enabled after the first SHADOW_UPDATE (G#81 to G#1C32_00A0), the engine's descriptor index advanced once a frame. Left unanswered for about 50 ms the front end stops for good (docs/oracle/CAMERA.md "Focus, exposure"), which is why this is its own thread on an interrupt and not the kernel's spin.
+//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on for that camera's module, the sensor's identity read, its init replayed from the vault (`cam.<key>.init`; the main's also `cam.frame`), the PDMA job from the vault (`cam.<key>.pdma`) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.<key>.prog`; the main's `cam.ispfe.prog`), the engine started, the camera's receiver last, the CPU's writes after it, the lens set, the stream on. The keys: boitata (main), oksoko (ultrawide), dokkaebi (front), kraken (tele).
+//! Then the front end is answered on its interrupt: every acknowledgement in the order Linux makes them (the camera's, ferros_cam cams `ack`), loch0's paths enabled after the first SHADOW_UPDATE (G#81 to G#1C32_00A0), the engine's descriptor index advanced once a frame. Left unanswered past about a frame period the front end stops for good (docs/oracle/CAMERA.md "Focus, exposure"), which is why this is its own thread on an interrupt and not the kernel's spin.
 //!
 //! Spawn by hand (the kernel also starts it itself on a call to `camera`):
-//! ferros-bridge spawn camera.bin --name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0
-//! Grant slots, in that order: 0 console, 1 serve camera, 2 hsi2c_1, 3 the front end, 4 the CSI links and PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.`, 7 the switch, 8 the region, 9 the line.
+//! ferros-bridge spawn camera.bin --name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0 --hw hsi2c3 --hw hsi2c2 --hw hsi2c4
+//! Grant slots, in that order: 0 console, 1 serve camera, 2 hsi2c_1, 3 the front end, 4 the CSI links and PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.`, 7 the switch, 8 the region, 9 the line, 10 hsi2c_3 (the ultrawide), 11 hsi2c_2 (the front), 12 hsi2c_4 (the tele).
 //!
 //! The `camera` endpoint (docs/CAMERA.md "The endpoint"), first byte the op:
-//! - `0` LIST: the list, a VSF document made at build time (build.rs).
-//! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera, `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
+//! - `0` LIST: the list, a VSF document made at build time (build.rs): a section per camera that can stream whose inputs are in the vault.
+//! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
 //! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus. `[0]` taken, `[1]` outside the range.
 //! - `4` CLOSE: the view taken back, the stream stopped, the switch off, `[0]`, and the driver ends; its frames go back to the pool wiped.
 //! - `5` MAP + the buffer to give back (G#FF none), with the view: waits for a frame newer than the last mapped and holds its buffer; the frame's 64-byte header (bin 1, the buffer at +40), the samples read in place thru the view (docs/CAMERA.md "The view").
 //! - `6` RELEASE + buffer: the held buffer given back; `[0]`, `[1]` when it was not held.
+//! - `7` PROBE + id (development, with no camera open): that camera's module powered, its sensor's identity read, the module powered down; `[0]` and the two bytes read when it answered as itself, `[1]` and them when another identity answered, `[2]` and the bus's error when it did not answer, `[3]` when the switch refused (the flash log says why), `[4]` no such camera. The tele's whole bring-up so far, and the front camera's first measure (docs/CAMERA.md "Device test plan").
 //! A holder that ends without closing: its waiting FRAME's reply fails, or 64 frames pass with nobody asking; either closes. The kernel takes the view back when either ends.
 #![no_std]
 #![no_main]
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use ferros_cam::cams::{self, Cam};
 use ferros_cam::{inputs, job};
 use ferros_sys::{cap, console, mmio_read, mmio_write, recv, reply, ERR, NOTHING};
 
 const S_SERVE: u64 = 1;
-const S_BUS: u64 = 2;
 const S_FE: u64 = 3;
 const S_CSIS: u64 = 4;
 const S_SYSREG: u64 = 5;
@@ -36,8 +38,26 @@ const S_POWER: u64 = 7;
 const S_REGION: u64 = 8;
 const S_IRQ: u64 = 9;
 
-/// The list (build.rs).
-static LIST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/list.vsf"));
+/// Each camera's sensor bus's grant slot, by id: hsi2c_1 (the main) at 2 as before, the other three after the line (the kernel's `camera_grants`).
+const S_BUS: [u64; 4] = [2, 10, 11, 12];
+
+/// The open camera's id (ferros_cam cams), set by the open before anything reads it.
+static CAM: AtomicU64 = AtomicU64::new(0);
+fn cam() -> &'static Cam {
+    cams::CAMS[CAM.load(Ordering::Relaxed) as usize]
+}
+
+/// The lists (build.rs): 'LST8', eight lengths (u32), then eight VSF documents, document k holding the sections of the cameras whose bit is set in k (bit 0 the main, 1 the ultrawide, 2 the front).
+static LISTS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lists.bin"));
+/// The cameras the lists can name, by bit.
+const LISTED: [u8; 3] = [0, 1, 2];
+
+/// List `mask`'s document.
+fn list(mask: usize) -> &'static [u8] {
+    let len = |k: usize| u32::from_le_bytes(LISTS[4 + 4 * k..8 + 4 * k].try_into().unwrap()) as usize;
+    let at = 4 + 4 * (1 << LISTED.len()) + (0..mask).map(len).sum::<usize>();
+    &LISTS[at..at + len(mask)]
+}
 
 struct Line {
     b: [u8; 256],
@@ -98,9 +118,9 @@ fn rd(g: u64, a: usize) -> u32 {
     }
 }
 
-// ---------------------------------------------------------------- hsi2c_1
+// ---------------------------------------------------------------- the sensor's bus
 
-// The HS-I2C controller (kernel hsi2c.rs, i2c-exynos5.c auto mode), as payloads/torch drives hsi2c_14.
+// The HS-I2C controller (kernel hsi2c.rs, i2c-exynos5.c auto mode), as payloads/torch drives hsi2c_14: the open camera's (hsi2c_1, 3, 2 or 4, the same block each).
 const CTL: u64 = 0x00;
 const FIFO_CTL: u64 = 0x04;
 const INT_ENABLE: u64 = 0x20;
@@ -135,20 +155,22 @@ const E_NODEV: u32 = 4;
 const E_BUS: u32 = 8;
 const E_TIMEOUT: u32 = 0x10;
 
-/// The main sensor (boitata, Samsung, G#3D) and its lens actuator (cornerfolk, G#0C), both on hsi2c_1 (docs/oracle/CAMERA.md).
-const SENSOR: u8 = 0x3D;
-const ACTUATOR: u8 = 0x0C;
-
+/// A camera's sensor bus, thru its grant (`S_BUS`).
 struct Bus {
     g: u64,
+    s: u64,
 }
 
 impl Bus {
+    /// The bus of camera `c`.
+    fn of(g: u64, c: &Cam) -> Bus {
+        Bus { g, s: S_BUS[c.id as usize] }
+    }
     fn rd(&self, off: u64) -> u32 {
-        mmio_read(cap(self.g, S_BUS), off) as u32
+        mmio_read(cap(self.g, self.s), off) as u32
     }
     fn wr(&self, off: u64, v: u32) {
-        mmio_write(cap(self.g, S_BUS), off, v);
+        mmio_write(cap(self.g, self.s), off, v);
     }
     fn fail(&self, st: u32) -> Option<u32> {
         if st & INT_NODEV != 0 {
@@ -266,11 +288,11 @@ static OPEN_AT: AtomicU64 = AtomicU64::new(0);
 /// Set by the frame thread when no interrupt came on the line within `FIRST_LINE_US` of the stream starting: it answers on its own tick from then on.
 static TICKING: AtomicU64 = AtomicU64::new(0);
 
-/// How long the frame thread waits for the line's first interrupt once the stream is on before it answers on a tick instead: the front end stops for good unanswered past about 50 ms (2026-10-21), so this is that deadline and no longer.
-const FIRST_LINE_US: u64 = 1 << 15;
-/// The tick, if the line never comes: well under the 50 ms the front end waits (the kernel's harness answered every 50 ms at the main camera's 14.5 frames a second and that held).
-const TICK_US: u64 = 1 << 15;
-/// With the line working, the longest the frame thread waits on it before it looks whether it was asked to stop: two frame periods (67.8 ms each), so it wakes on its own only once the stream has stopped, and a close never waits on a line that will not fire again.
+/// How long the frame thread waits for the line's first interrupt once the stream is on before it answers on a tick instead, and that tick: the camera's `tick_us` (ferros_cam cams), under the time the front end waits unanswered before it stops for good (the main's 2^15 µs, under the 50 ms its stream held at; the ultrawide's 2^13, under the 15 ms its stream held at, 2026-10-22).
+fn tick_us() -> u64 {
+    cam().tick_us
+}
+/// With the line working, the longest the frame thread waits on it before it looks whether it was asked to stop: two of the main camera's frame periods (67.8 ms each), four of the ultrawide's, so it wakes on its own only once the stream has stopped, and a close never waits on a line that will not fire again.
 const QUIET_US: u64 = 1 << 17;
 /// The ring's descriptors and the index's step. The job's own ring has 1024, and an index written back to 0 after its last stops the front end for good (the Pro, 2026-11-14: no frame after the 1025th), so the engine gets a ring of its own, every descriptor the job's first, in a frame past the job's region: 2^14 of them, about 18 minutes at 14.7 frames a second, if the count register holds it (`RING_JOB` otherwise).
 const RING: u64 = 1 << 14;
@@ -342,7 +364,7 @@ static LAST_R: AtomicU64 = AtomicU64::new(0);
 
 /// Buffer `b`'s probe: the first 64 bytes of its last line, as one load would read them.
 fn probe_at(b: usize) -> *mut u64 {
-    (RING_VA.load(Ordering::Relaxed) as usize + b * job::IMAGE_BYTES as usize + PROBE_AT) as *mut u64
+    (RING_VA.load(Ordering::Relaxed) as usize + b * job::IMAGE_BYTES as usize + probe_off()) as *mut u64
 }
 fn probe_read(b: usize) -> [u64; 8] {
     let p = probe_at(b);
@@ -450,7 +472,7 @@ fn desc_write(e: u64, r: usize) {
 /// The front end answered once: its aggregate and loch0's image status read, every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and on a frame's DMA_DONE the ring's turn (`ring_turn`), the engine's index advanced and the frame counted.
 fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let img = rd(g, ferros_cam::IMG_STATUS);
-    for &a in ferros_cam::FRAME_ACK.iter() {
+    for &a in cam().ack.iter() {
         let v = rd(g, a);
         wr(g, a, v);
     }
@@ -493,7 +515,7 @@ extern "C" fn frame_thread(g: u64) -> ! {
     let started = ferros_sys::now();
     let ticks = |us: u64| ferros_sys::now() + ferros_sys::freq() * us / 1_000_000;
     loop {
-        let wait = if ticking { TICK_US } else if ON_LINE.load(Ordering::Relaxed) == 0 { FIRST_LINE_US } else { QUIET_US };
+        let wait = if ticking || ON_LINE.load(Ordering::Relaxed) == 0 { tick_us() } else { QUIET_US };
         let r = ferros_sys::irq_wait(line, ticks(wait));
         if RUN.load(Ordering::Acquire) != 1 {
             RUN.store(3, Ordering::Release);
@@ -510,7 +532,7 @@ extern "C" fn frame_thread(g: u64) -> ! {
             // No interrupt on the line in the front end's own deadline: answered on the tick from now on, and the console says so with the words that would say why.
             ticking = true;
             TICKING.store(1, Ordering::Relaxed);
-            say!(g, "camera: no interrupt on SPI 479 in A#{} us of the stream; answering on a A#{} us tick (front end aggregate G#{:X}, image G#{:X}, engine G#{:X} index G#{:X})\n", ferros_sys::us_since(started), TICK_US, rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+            say!(g, "camera: no interrupt on SPI 479 in A#{} us of the stream; answering on a A#{} us tick (front end aggregate G#{:X}, image G#{:X}, engine G#{:X} index G#{:X})\n", ferros_sys::us_since(started), tick_us(), rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
             answer(g, &mut idx, &mut enabled);
         }
         // Else the line works and was quiet for two frame periods: nothing is pending, and the stream has likely stopped.
@@ -565,24 +587,90 @@ fn get<'a>(g: u64, key: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// The lens actuator to `pos`: reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 once, then the target into 00/01 (docs/oracle/CAMERA.md "Focus").
-fn focus_init(bus: &Bus) -> Result<(), u32> {
-    bus.write(ACTUATOR, &[0x02, 0x40])?;
+/// The lens actuator (the camera's `actuator`) to `pos`: reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 once, then the target into 00/01 (docs/oracle/CAMERA.md "Focus"). The main's protocol; the front camera's actuator takes it untried.
+fn focus_init(bus: &Bus, c: &Cam) -> Result<(), u32> {
+    bus.write(c.actuator, &[0x02, 0x40])?;
     ferros_sys::delay_us(1 << 13);
-    bus.write(ACTUATOR, &[0x02, 0x00])?;
-    bus.write(ACTUATOR, &[0xF1, 0x00])
+    bus.write(c.actuator, &[0x02, 0x00])?;
+    bus.write(c.actuator, &[0xF1, 0x00])
 }
-fn focus_set(bus: &Bus, pos: u64) -> Result<(), u32> {
-    bus.write(ACTUATOR, &[0x00, (pos >> 8) as u8])?;
-    bus.write(ACTUATOR, &[0x01, pos as u8])
+fn focus_set(bus: &Bus, c: &Cam, pos: u64) -> Result<(), u32> {
+    bus.write(c.actuator, &[0x00, (pos >> 8) as u8])?;
+    bus.write(c.actuator, &[0x01, pos as u8])
 }
 
-/// The sensor's exposure in lines, inside the grouped-parameter hold (G#0104 is one byte: the hold is 01 04 01 01, its release 01 04 00 01; Linux's per-frame block, camera-main-open-transfers.txt 771-778).
-fn exposure_set(bus: &Bus, lines: u64) -> Result<(), u32> {
-    bus.write(SENSOR, &[0x01, 0x04, 0x01, 0x01])?;
-    let r = bus.write(SENSOR, &[0x02, 0x02, (lines >> 8) as u8, lines as u8]);
-    bus.write(SENSOR, &[0x01, 0x04, 0x00, 0x01])?;
+/// The sensor's exposure in lines (CCS coarse_integration_time, G#0202 and G#0203, the same on every camera), inside its grouped-parameter hold (the main's G#0104 is one byte: the hold is 01 04 01 01, its release 01 04 00 01, Linux's per-frame block, camera-main-open-transfers.txt 771-778; the ultrawide's 8-bit registers take 01 04 01 and 01 04 00, the end of its captured init).
+fn exposure_set(bus: &Bus, c: &Cam, lines: u64) -> Result<(), u32> {
+    bus.write(c.addr, c.hold)?;
+    let r = bus.write(c.addr, &[0x02, 0x02, (lines >> 8) as u8, lines as u8]);
+    bus.write(c.addr, c.release)?;
     r
+}
+
+/// A vault key for camera `c`'s input: `<key>.<what>` in the scope `cam.` (the grant's), into `buf`.
+fn input_key<'a>(buf: &'a mut [u8; 32], c: &Cam, what: &[u8]) -> &'a [u8] {
+    let (k, n) = (c.key.as_bytes(), c.key.len());
+    buf[..n].copy_from_slice(k);
+    buf[n] = b'.';
+    buf[n + 1..n + 1 + what.len()].copy_from_slice(what);
+    &buf[..n + 1 + what.len()]
+}
+
+/// Whether the vault holds `key` (its length asked with a buffer of none: the kernel answers a value's whole length).
+fn has(g: u64, key: &[u8]) -> bool {
+    ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
+}
+
+/// Whether camera `c`'s inputs are in the vault: its job, and its init and CPU program (the main's also as the bundle `cam.frame`, or by their older names).
+fn inputs_held(g: u64, c: &Cam) -> bool {
+    let mut b = [0u8; 32];
+    let both = has(g, input_key(&mut b, c, b"init")) && has(g, input_key(&mut [0u8; 32], c, b"prog"));
+    let main = c.id == 0 && (has(g, b"frame") || has(g, b"ispfe.prog") && has(g, b"boitata.init"));
+    has(g, input_key(&mut [0u8; 32], c, b"pdma")) && (both || main)
+}
+
+/// PROBE (op 7, no camera open): camera `c`'s module powered thru the switch, its sensor's identity read, every 7-bit address on its bus asked for one byte (its register 0) to see which acknowledge, the module powered down.
+/// The reply: `[code][id: 2][the error]` and the 16-byte map of the addresses that acknowledged (bit a of byte a / 8): code 0 it answered as itself, 1 another identity answered, 2 it did not answer (the bus's error after the identity), 3 the switch refused (the flash log says why).
+/// The map says whether the bus and the module's 1.8 V side live when the sensor does not: the front camera's EEPROM (G#51) and lens actuator (G#0C) sit on its bus, the ultrawide's EEPROM (G#50) and actuator (G#0F) on its (docs/oracle/CAMERA.md "The buses").
+fn probe_id(g: u64, c: &'static Cam) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    CAM.store(c.id as u64, Ordering::Relaxed);
+    if !ferros_sys::power_arg(cap(g, S_POWER), true, c.id) {
+        out[0] = 3;
+        say!(g, "camera: probe {}: the switch refused on (the flash log says why)\n", c.name);
+        return out;
+    }
+    let bus = Bus::of(g, c);
+    let mut id = [0u8; 2];
+    let r = bus.write_read(c.addr, &c.id_reg, &mut id);
+    out[1..3].copy_from_slice(&id);
+    out[0] = match r {
+        Ok(()) if id == c.id_val => 0,
+        Ok(()) => 1,
+        Err(e) => {
+            out[3] = e as u8;
+            2
+        }
+    };
+    let mut acks = 0u32;
+    for a in 0x08u8..0x78 {
+        let mut b = [0u8; 1];
+        if bus.write_read(a, &[0x00], &mut b).is_ok() {
+            out[4 + (a >> 3) as usize] |= 1 << (a & 7);
+            acks += 1;
+        }
+    }
+    let off = ferros_sys::power(cap(g, S_POWER), false);
+    say!(g, "camera: probe {}: identity at G#{:02X}{:02X} {} G#{:02X}{:02X} (wanted G#{:02X}{:02X}), A#{acks} addresses acknowledged on its bus; switch off {}\n", c.name, c.id_reg[0], c.id_reg[1], match out[0] { 0 => "answered", 1 => "answered another,", _ => "did not answer, error" }, id[0], id[1], c.id_val[0], c.id_val[1], if off { "done" } else { "refused" });
+    if out[0] == 2 {
+        say!(g, "camera: probe {}: the bus's error G#{:X}\n", c.name, out[3]);
+    }
+    for a in 0x08u8..0x78 {
+        if out[4 + (a >> 3) as usize] >> (a & 7) & 1 == 1 {
+            say!(g, "camera: probe {}: G#{a:02X} acknowledged\n", c.name);
+        }
+    }
+    out
 }
 
 /// Why an open did not happen.
@@ -595,10 +683,11 @@ enum Fail {
     Job(job::Error),
 }
 
-fn open(g: u64) -> Result<Open, Fail> {
+fn open(g: u64, c: &'static Cam) -> Result<Open, Fail> {
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
     let t0 = ferros_sys::now();
-    let bus = Bus { g };
+    CAM.store(c.id as u64, Ordering::Relaxed);
+    let bus = Bus::of(g, c);
     // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14). Linux never shows whether the front end drives the high address halves: its ISP DMA always goes thru the SYSMMU, whose window the driver clamps to 32 bits (samsung-iommu-v9.c `dma-window`), so the halves are always zero there. Only when no run is free under 4 GiB is one taken higher (the job carries the high halves, ferros_cam job; a write that loses them faults at the fence, `diag`). A vault entry `cam.region` reading `high` asks higher first, to measure that.
     // The job's region with an image ring (`RINGS`, the most that fits first) and one frame more, for the engine's long ring (`RING`) and the program's copies (`PROG_AT`).
     let mut hint = [0u8; 8];
@@ -607,7 +696,7 @@ fn open(g: u64) -> Result<Open, Fail> {
     let mut got = None;
     'ask: for low in [low_first, !low_first] {
         for &n in RINGS.iter() {
-            let frames = job::main_ring(n).bytes / job::FRAME + 1;
+            let frames = c.layout(n).bytes / job::FRAME + 1;
             let pa = ask(frames, low);
             if pa != ERR {
                 got = Some((pa, n, frames));
@@ -618,35 +707,41 @@ fn open(g: u64) -> Result<Open, Fail> {
     let Some((pa, ring, frames)) = got else {
         return Err(Fail::Region);
     };
-    let l = job::main_ring(ring);
+    let l = c.layout(ring);
     let va = ferros_sys::dma(cap(g, S_REGION));
     if va == ERR {
         return Err(Fail::Region);
     }
     let va = va as usize;
-    say!(g, "camera: A#{frames} frames at G#{pa:X}, read at G#{va:X}, an image ring of A#{ring}\n");
-    if !ferros_sys::power(cap(g, S_POWER), true) {
+    say!(g, "camera: {}: A#{frames} frames at G#{pa:X}, read at G#{va:X}, an image ring of A#{ring}\n", c.name);
+    if !ferros_sys::power_arg(cap(g, S_POWER), true, c.id) {
         return Err(Fail::Switch);
     }
     let powered = ferros_sys::us_since(t0);
     let mut id = [0u8; 2];
-    bus.write_read(SENSOR, &[0x00, 0x00], &mut id).map_err(Fail::Sensor)?;
-    if id != [0x08, 0xEF] {
+    bus.write_read(c.addr, &c.id_reg, &mut id).map_err(Fail::Sensor)?;
+    if id != c.id_val {
         return Err(Fail::Sensor(u16::from_be_bytes(id) as u32 | 1 << 16));
     }
-    // The inputs: the bundle if the vault holds one, else the init and the program apart; the job.
+    // The inputs: the camera's own (`cam.<key>.init`, `.prog`, `.pdma`); the main's also as the bundle `cam.frame` or by their older names, as before.
+    let mut kb = [0u8; 32];
     let (init, prog) = unsafe {
-        match get(g, b"frame", &mut *(&raw mut BUNDLE)).and_then(inputs::split_bundle) {
-            Some(both) => both,
-            None => (
-                get(g, b"boitata.init", &mut *(&raw mut INIT)).ok_or(Fail::Inputs("no cam.boitata.init (nor cam.frame) in the vault"))?,
-                get(g, b"ispfe.prog", &mut *(&raw mut PROG)).ok_or(Fail::Inputs("no cam.ispfe.prog (nor cam.frame) in the vault"))?,
-            ),
+        let own = (get(g, input_key(&mut kb, c, b"init"), &mut *(&raw mut INIT)), get(g, input_key(&mut [0u8; 32], c, b"prog"), &mut *(&raw mut PROG)));
+        match own {
+            (Some(i), Some(p)) => (i, p),
+            _ if c.id != 0 => return Err(Fail::Inputs("no cam.<key>.init or cam.<key>.prog for this camera in the vault")),
+            _ => match get(g, b"frame", &mut *(&raw mut BUNDLE)).and_then(inputs::split_bundle) {
+                Some(both) => both,
+                None => (
+                    get(g, b"boitata.init", &mut *(&raw mut INIT)).ok_or(Fail::Inputs("no cam.boitata.init (nor cam.frame) in the vault"))?,
+                    get(g, b"ispfe.prog", &mut *(&raw mut PROG)).ok_or(Fail::Inputs("no cam.ispfe.prog (nor cam.frame) in the vault"))?,
+                ),
+            },
         }
     };
     let prog = inputs::prog(prog).ok_or(Fail::Inputs("the CPU program is not a CPR2"))?;
     let jb = unsafe { &mut *(&raw mut JOB) };
-    let jn = get(g, b"boitata.pdma", jb).ok_or(Fail::Inputs("no cam.boitata.pdma in the vault"))?.len();
+    let jn = get(g, input_key(&mut kb, c, b"pdma"), jb).ok_or(Fail::Inputs("no cam.<key>.pdma for this camera in the vault"))?.len();
     // The sensor's init, record by record.
     let t_init = ferros_sys::now();
     let (mut w, mut r) = (0u32, 0u32);
@@ -654,13 +749,13 @@ fn open(g: u64) -> Result<Open, Fail> {
         let res = match rec {
             Ok(inputs::Rec::Write(b)) => {
                 w += 1;
-                bus.write(SENSOR, b)
+                bus.write(c.addr, b)
             }
             Ok(inputs::Rec::Read { count, reg }) => {
                 r += 1;
                 let mut v = [0u8; 8];
                 // WHY the min: the record's count is the table's, and a read past this buffer would index out of it; the value is dropped anyway.
-                bus.write_read(SENSOR, &reg, &mut v[..(count as usize).min(8)])
+                bus.write_read(c.addr, &reg, &mut v[..(count as usize).min(8)])
             }
             Ok(inputs::Rec::Delay(us)) => {
                 ferros_sys::delay_us(us as u64);
@@ -672,7 +767,7 @@ fn open(g: u64) -> Result<Open, Fail> {
             return Err(Fail::Init(k as u32, e));
         }
     }
-    say!(g, "camera: switch on in A#{} ms; sensor G#08EF; init A#{w} writes, A#{r} reads in A#{} ms\n", powered / 1000, ferros_sys::us_since(t_init) / 1000);
+    say!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
     // The job moved into the region, then placed there: the ring and the program in the region's first frame, the outputs patterned.
     let m = job::relocate(&mut jb[..jn], pa, &l).map_err(Fail::Job)?;
     let pieces = job::pieces(&jb[..jn]).map_err(Fail::Job)?;
@@ -745,8 +840,8 @@ fn open(g: u64) -> Result<Open, Fail> {
     for a in AGE.iter() {
         a.store(0, Ordering::Relaxed);
     }
-    for c in [&UNSEEN, &CROWDED, &NONE_FREE] {
-        c.store(0, Ordering::Relaxed);
+    for x in [&UNSEEN, &CROWDED, &NONE_FREE] {
+        x.store(0, Ordering::Relaxed);
     }
     SEQ.store(1, Ordering::Relaxed);
     B_SEQ[0].store(0, Ordering::Relaxed);
@@ -765,8 +860,8 @@ fn open(g: u64) -> Result<Open, Fail> {
     wr(g, pd + ferros_cam::PDMA_CTRL, 1);
     wr(g, pd + 0x34, 0);
     wr(g, pd + 0x28, 1);
-    // The receiver last, as a camera open does it: enabling the link first left the front end latching its configuration and never seeing a frame start (2026-10-20).
-    for &(a, v) in ferros_cam::rx::RX_START.iter() {
+    // The camera's receiver last, as a camera open does it: enabling the link first left the front end latching its configuration and never seeing a frame start (2026-10-20).
+    for &(a, v) in c.rx_start.iter() {
         wr(g, a, v);
     }
     for (a, v) in prog.after.iter() {
@@ -777,16 +872,19 @@ fn open(g: u64) -> Result<Open, Fail> {
     }
     let refused = REFUSED.load(Ordering::Relaxed);
     say!(g, "camera: engine started (ring G#{ring_pa:X}, A#{ring_n} descriptors{}), receiver on, A#{n} CPU writes, A#{refused} refused\n", if held { "" } else { ": the count did not hold the long ring" });
-    let o = Open { va, l, ring, exposure_lines: ferros_cam::MAIN_EXPOSURE_MAX_LINES, gain: 1 << 10, focus: 0x3800, asked_at: 0, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered; elsewhere it stays where it rests (the ultrawide's actuator never answered ferros, the front's range is not measured).
+    let focus = if c.focus.1 != 0 { 0x3800 } else { 0 };
+    let o = Open { va, l, ring, exposure_lines: c.exposure_lines, gain: 1 << 10, focus, asked_at: 0, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(o.exposure_lines, Ordering::Relaxed);
     NOW_GAIN.store(o.gain, Ordering::Relaxed);
     NOW_FOCUS.store(o.focus, Ordering::Relaxed);
-    // The lens to about a metre (its measured sharpest over a floor), then the stream.
-    if let Err(e) = focus_init(&bus).and_then(|_| focus_set(&bus, o.focus)) {
-        say!(g, "camera: the lens actuator did not answer (G#{e:X}); it stays where it rests\n");
+    if c.focus.1 != 0 {
+        if let Err(e) = focus_init(&bus, c).and_then(|_| focus_set(&bus, c, o.focus)) {
+            say!(g, "camera: the lens actuator did not answer (G#{e:X}); it stays where it rests\n");
+        }
     }
     FRAMES.store(0, Ordering::Release);
-    bus.write(SENSOR, &[0x01, 0x00, 0x01, 0x03]).map_err(Fail::Sensor)?;
+    bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP);
     RUN.store(1, Ordering::Release);
@@ -799,8 +897,8 @@ fn open(g: u64) -> Result<Open, Fail> {
 fn close(g: u64) {
     // The view taken back first (SYS_DMA x1 = 5): its blocks the blank frame, the holder's token dead, before the stream stops. Nothing when none was given.
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 5, 0, 0, 0);
-    let bus = Bus { g };
-    let _ = bus.write(SENSOR, &[0x01, 0x00, 0x00, 0x00]);
+    let c = cam();
+    let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
     // The frame thread stopped before the switch stops the engine: it is in a wait of at most `QUIET_US` (or the tick), and answers no more once it sees this. Bounded at twice that, so a thread that never answers cannot keep the switch on.
     if RUN.swap(2, Ordering::AcqRel) == 1 {
@@ -837,17 +935,20 @@ fn probe(g: u64, o: &Open) {
             say!(g, "camera: output A#{k} (A#{} KiB at +G#{off:X}): A#{moved} of A#{} points written, the last at +G#{last:X}\n", size >> 10, size / 256);
         }
     }
-    say!(g, "camera: A#{} of the A#22 outputs written (bits G#{written:X})\n", written.count_ones());
+    say!(g, "camera: {}: A#{} of its A#{} outputs written (bits G#{written:X})\n", cam().name, written.count_ones(), o.l.slots.iter().filter(|s| s.1 != 0).count());
 }
 
 // ---------------------------------------------------------------- frames
 
-const W: usize = 4080;
-const H: usize = 3072;
-/// One RAW10 line: four pixels in five bytes, 4080 pixels on a 256-byte boundary (G#1400).
-const STRIDE: usize = 0x1400;
-/// A ring buffer's probe: its last line's first 64 bytes, written last of the frame (October's extent: the image body to +G#EFFF00).
-const PROBE_AT: usize = (H - 1) * STRIDE;
+/// The largest readout the buffers below are sized for (the main camera's 4080 x 3072, G#1400 a line; ferros_cam cams `W_MOST`), and the open camera's own: a RAW10 line is four pixels in five bytes, on the front end's stride (the main's 4080 on a 256-byte boundary, the ultrawide's 4000 on 64, the front's 3840 exactly).
+const W: usize = cams::W_MOST;
+const H: usize = cams::H_MOST;
+const STRIDE: usize = cams::STRIDE_MOST;
+/// A ring buffer's probe: its last line's first 64 bytes, written last of the frame (October's extent: the main's image body to +G#EFFF00, the ultrawide's to +G#E77100).
+fn probe_off() -> usize {
+    let c = cam();
+    (c.height - 1) * c.stride
+}
 const HEADER: usize = 1 << 6;
 /// The image rings the open asks for, the most first, under 4 GiB first (`open`): four buffers leave one free for the engine with one held by the kist, one by the binning or the newest, and one with the engine; three and two still never write a held one, but may write over the newest; one is the region before the view (40 frames with the long ring's), so a pool with room for no more (a jumped session's, about 150 MiB free on 2026-11-15) still opens the camera as before, with frames by copy only and no view (`VIEW_LEAST`).
 const RINGS: [usize; 4] = [4, 3, 2, 1];
@@ -877,7 +978,9 @@ static COPY_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Binner `k`'s share of a frame: every `BINNERS`th row pair from its own, into `OUT`. Row pairs are disjoint between binners, so no two write the same bytes of `OUT`.
 fn bin_part(k: usize, src: usize, bin: usize) {
-    let (bw, bh) = (W / bin, H / bin);
+    let c = cam();
+    let (w, stride) = (c.width, c.stride);
+    let (bw, bh) = c.binned(bin);
     let s = unsafe { &mut (*(&raw mut SCRATCH))[k] };
     let out = (&raw mut OUT) as *mut u8;
     let rows = 2 * bin;
@@ -885,25 +988,25 @@ fn bin_part(k: usize, src: usize, bin: usize) {
     for pair in (k..bh / 2).step_by(BINNERS) {
         // The 2 x bin lines this row pair reads, copied out of the region whole, then unpacked (ferros_cam raw, host-tested against std/camreplay's binning of a recorded frame).
         for r in 0..rows {
-            // 64 bytes a load (four NEON registers), not 8: each load of non-cacheable memory is its own transaction, and 8-byte ones took 121 ms a frame (the Pro, 2026-11-14).
+            // 64 bytes a load (four NEON registers), not 8: each load of non-cacheable memory is its own transaction, and 8-byte ones took 121 ms a frame (the Pro, 2026-11-14). Every camera's stride is a multiple of 64 (ferros_cam cams' test).
             let t = ferros_sys::now();
-            let line = (src + (pair * rows + r) * STRIDE) as *const u8;
+            let line = (src + (pair * rows + r) * stride) as *const u8;
             let dst = unsafe { s.raw.as_mut_ptr().add(r * words) } as *mut u8;
-            for i in 0..STRIDE / 64 {
+            for i in 0..stride / 64 {
                 unsafe {
                     let v = core::arch::aarch64::vld1q_u8_x4(line.add(i * 64));
                     core::arch::aarch64::vst1q_u8_x4(dst.add(i * 64), v);
                 }
             }
             COPY_TICKS.fetch_add(ferros_sys::now() - t, Ordering::Relaxed);
-            let bytes = unsafe { core::slice::from_raw_parts(s.raw.as_ptr().add(r * words) as *const u8, STRIDE) };
-            ferros_cam::raw::unpack(bytes, &mut s.pix[r * W..(r + 1) * W]);
+            let bytes = unsafe { core::slice::from_raw_parts(s.raw.as_ptr().add(r * words) as *const u8, stride) };
+            ferros_cam::raw::unpack(bytes, &mut s.pix[r * w..(r + 1) * w]);
         }
         for phase in 0..2 {
             let oy = pair * 2 + phase;
-            // SAFETY: row oy of the output is this binner's alone (its row pair), inside `OUT` (bw x bh samples of 2 bytes after the header, bh at most H / 2).
+            // SAFETY: row oy of the output is this binner's alone (its row pair), inside `OUT` (bw x bh samples of 2 bytes after the header, bw at most W / 2 and bh at most H / 2: cams `binned`, at bin 2 or more).
             let row = unsafe { core::slice::from_raw_parts_mut(out.add(HEADER + oy * bw * 2), bw * 2) };
-            ferros_cam::raw::bin_row(&s.pix[..rows * W], W, bin, phase, &mut s.acc, row);
+            ferros_cam::raw::bin_row(&s.pix[..rows * w], w, bin, phase, &mut s.acc, row);
         }
     }
 }
@@ -931,23 +1034,24 @@ fn image(o: &Open, b: usize) -> usize {
 
 /// A frame's header (docs/CAMERA.md "The endpoint"), for buffer `b`'s frame at `bin`: count, width and height after binning, bin, cfa, black and white, exposure (ns), gain, focus, when it ended (Eagle ns); for the view (bin 1) also the buffer at +40, the format at +41 (1: MIPI RAW10, four samples in five bytes), the line's bytes at +44 and the buffer's place in the view at +48.
 fn header(h: &mut [u8], b: usize, bin: usize) {
-    let (bw, bh) = (W / bin, H / bin);
+    let c = cam();
+    let (bw, bh) = c.binned(bin);
     h.fill(0);
     h[0..4].copy_from_slice(&(B_COUNT[b].load(Ordering::Relaxed) as u32).to_le_bytes());
     h[4..6].copy_from_slice(&(bw as u16).to_le_bytes());
     h[6..8].copy_from_slice(&(bh as u16).to_le_bytes());
     h[8] = bin as u8;
-    h[9] = 1 | 2 << 2 | 0 << 4 | 1 << 6;
-    h[10..12].copy_from_slice(&64u16.to_le_bytes());
-    h[12..14].copy_from_slice(&1023u16.to_le_bytes());
-    h[16..24].copy_from_slice(&(B_LINES[b].load(Ordering::Relaxed) * ferros_cam::MAIN_LINE_PS / 1000).to_le_bytes());
+    h[9] = c.cfa;
+    h[10..12].copy_from_slice(&c.black.to_le_bytes());
+    h[12..14].copy_from_slice(&c.white.to_le_bytes());
+    h[16..24].copy_from_slice(&(B_LINES[b].load(Ordering::Relaxed) * c.line_ps / 1000).to_le_bytes());
     h[24..28].copy_from_slice(&(B_GAIN[b].load(Ordering::Relaxed) as u32).to_le_bytes());
     h[28..32].copy_from_slice(&(B_FOCUS[b].load(Ordering::Relaxed) as u32).to_le_bytes());
     h[32..40].copy_from_slice(&B_AT[b].load(Ordering::Relaxed).to_le_bytes());
     if bin == 1 {
         h[40] = b as u8;
         h[41] = 1;
-        h[44..48].copy_from_slice(&(STRIDE as u32).to_le_bytes());
+        h[44..48].copy_from_slice(&(c.stride as u32).to_le_bytes());
         h[48..56].copy_from_slice(&(b as u64 * job::IMAGE_BYTES).to_le_bytes());
     }
 }
@@ -984,9 +1088,9 @@ fn wait_hold(bit: u32, after: u64) -> Option<usize> {
     }
 }
 
-/// Buffer `b`'s frame into `OUT`, binned `bin` x `bin` per colour: output sample (ox, oy) is the mean of the bin x bin same-colour samples of its 2 bin x 2 bin block, so the mosaic keeps its phase (G B / R G), after its header (`header`). Its length.
+/// Buffer `b`'s frame into `OUT`, binned `bin` x `bin` per colour: output sample (ox, oy) is the mean of the bin x bin same-colour samples of its 2 bin x 2 bin block, so the mosaic keeps its phase (the camera's cfa), after its header (`header`). Its length.
 fn bin_frame(o: &Open, bin: usize, b: usize) -> usize {
-    let (bw, bh) = (W / bin, H / bin);
+    let (bw, bh) = cam().binned(bin);
     let src = image(o, b);
     // The binners rung with this frame, this thread doing its own share, then waiting for theirs.
     BIN_SRC.store(src as u64, Ordering::Release);
@@ -1076,16 +1180,20 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
             continue;
         }
         match msg[0] {
+            // LIST: the cameras that can stream whose inputs are in the vault (`inputs_held`), so a camera shows once its init, program and job are stored on this device.
             0 => {
-                reply(&token, LIST);
+                let mask = LISTED.iter().enumerate().filter(|&(_, &id)| inputs_held(g, cams::CAMS[id as usize])).fold(0, |m, (k, _)| m | 1 << k);
+                reply(&token, list(mask));
             }
             1 => {
-                let r = if got < 2 || msg[1] != 0 {
+                let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams) } else { None };
+                let r = if c.is_none() {
                     1
                 } else if open_cam.is_some() {
                     2
                 } else {
-                    match open(g) {
+                    let c = c.unwrap();
+                    match open(g, c) {
                         Ok(o) => {
                             open_cam = Some(o);
                             0
@@ -1094,7 +1202,7 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                             match f {
                                 Fail::Region => say!(g, "camera: no region (the console's `camera region` line says why)\n"),
                                 Fail::Switch => say!(g, "camera: the switch refused on (the flash log says why)\n"),
-                                Fail::Sensor(e) => say!(g, "camera: the sensor did not answer as boitata (G#{e:X})\n"),
+                                Fail::Sensor(e) => say!(g, "camera: the sensor did not answer as {} (G#{e:X})\n", c.key),
                                 Fail::Inputs(why) => say!(g, "camera: {why}\n"),
                                 Fail::Init(k, e) => say!(g, "camera: the init failed at record A#{k} (G#{e:X})\n"),
                                 Fail::Job(e) => say!(g, "camera: the job would not move into the region ({e:?})\n"),
@@ -1123,9 +1231,10 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                             out[1..33].copy_from_slice(&t);
                             out[33] = o.ring as u8;
                             out[34] = 1;
-                            out[36..38].copy_from_slice(&(W as u16).to_le_bytes());
-                            out[38..40].copy_from_slice(&(H as u16).to_le_bytes());
-                            out[40..44].copy_from_slice(&(STRIDE as u32).to_le_bytes());
+                            let c = cam();
+                            out[36..38].copy_from_slice(&(c.width as u16).to_le_bytes());
+                            out[38..40].copy_from_slice(&(c.height as u16).to_le_bytes());
+                            out[40..44].copy_from_slice(&(c.stride as u32).to_le_bytes());
                             out[44..48].copy_from_slice(&(job::IMAGE_BYTES as u32).to_le_bytes());
                             len = VIEW_REPLY;
                             t.fill(0);
@@ -1187,11 +1296,13 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                 };
                 let what = if got >= 2 { msg[1] } else { 0xFF };
                 let value = if got >= 10 { u64::from_le_bytes(msg[2..10].try_into().unwrap()) } else { u64::MAX };
-                let bus = Bus { g };
+                let c = cam();
+                let bus = Bus::of(g, c);
                 let r = match what {
                     0 => {
-                        let lines = value * 1000 / ferros_cam::MAIN_LINE_PS;
-                        if (1..=ferros_cam::MAIN_EXPOSURE_MAX_LINES).contains(&lines) && exposure_set(&bus, lines).is_ok() {
+                        // Every camera that streams has its line time (ferros_cam cams' test), the front's a guess.
+                        let lines = value * 1000 / c.line_ps;
+                        if (1..=c.exposure_max_lines).contains(&lines) && exposure_set(&bus, c, lines).is_ok() {
                             o.exposure_lines = lines;
                             NOW_LINES.store(lines, Ordering::Relaxed);
                             0
@@ -1200,7 +1311,7 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                         }
                     }
                     1 if value == 1 << 10 => 0,
-                    2 if (0x0800..=0x7800).contains(&value) && focus_set(&bus, value).is_ok() => {
+                    2 if c.focus.1 != 0 && (c.focus.0..=c.focus.1).contains(&value) && focus_set(&bus, c, value).is_ok() => {
                         o.focus = value;
                         NOW_FOCUS.store(value, Ordering::Relaxed);
                         0
@@ -1274,6 +1385,17 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                     _ => 1,
                 };
                 reply(&token, &[r]);
+            }
+            // PROBE `[7][id]` (development): `probe_id`'s reply; `[4]` no such camera, `[5]` a camera is open (its module holds the rails).
+            7 => {
+                let c = if got >= 2 { cams::by_id(msg[1]) } else { None };
+                let mut out = [0u8; 20];
+                match (open_cam.is_some(), c) {
+                    (true, _) => out[0] = 5,
+                    (false, None) => out[0] = 4,
+                    (false, Some(c)) => out = probe_id(g, c),
+                }
+                reply(&token, &out);
             }
             _ => {
                 reply(&token, &[]);

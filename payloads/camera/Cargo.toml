@@ -14,3 +14,4 @@ ferros_cam = { path = "../../ferros_cam" }
 
 [build-dependencies]
 vsf = { path = "../../../vsf" }
+ferros_cam = { path = "../../ferros_cam" }

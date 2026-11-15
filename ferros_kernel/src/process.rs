@@ -3352,6 +3352,10 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "hsi2c14", base: 0x1098_0000, size: 0x1000, via_el3: false },
     // The camera driver (docs/CAMERA.md "The driver", payloads/camera): the main sensor's bus (hsi2c_1, its lens actuator on it too), the ISP front end whole (its core, statistics blocks and the PDMA engine, 1 MiB: zuma-isp.dtsi `lwis_isp_fe`), the CSI links and the combo D-PHY (`csis-link-phy`, up to the front end's first SYSMMU), and SYSREG_ISPFE's first page (the receiver's input select). The buses' pins and clocks, the module's rails, the front end's domain and clocks, the SYSMMUs and the S2MPUs are the kernel's (the `camera` switch, camera_power.rs).
     Hw { name: "hsi2c1", base: 0x1088_0000, size: 0x1000, via_el3: false },
+    // The other cameras' sensor buses (docs/CAMERA.md "The other cameras"): hsi2c_3 the ultrawide's (its lens actuator on it too), hsi2c_2 the front camera's, hsi2c_4 the tele's. Their pins, clock sources and modules' power are the `camera` switch's, as hsi2c_1's are.
+    Hw { name: "hsi2c3", base: 0x108A_0000, size: 0x1000, via_el3: false },
+    Hw { name: "hsi2c2", base: 0x1089_0000, size: 0x1000, via_el3: false },
+    Hw { name: "hsi2c4", base: 0x108B_0000, size: 0x1000, via_el3: false },
     Hw { name: "ispfe", base: 0x1C30_0000, size: 0x10_0000, via_el3: false },
     Hw { name: "csis", base: 0x1C04_0000, size: 0xD_0000, via_el3: false },
     Hw { name: "ispfe-sysreg", base: 0x1C02_0000, size: 0x1000, via_el3: false },
@@ -4109,7 +4113,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let found = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights));
             f.x[0] = match found {
                 Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == kernel_mask() => {
-                    let on = f.x[1] == 1;
+                    // The `camera` switch takes which module in bits 8-15 (camera_power.rs `select`, ferros_sys `power_arg`): bit 0 alone is on or off for it, as x1 == 1 is for every other switch.
+                    let on = if POWERS[i].name == "camera" {
+                        crate::camera_power::select((f.x[1] >> 8) as u8);
+                        f.x[1] & 1 == 1
+                    } else {
+                        f.x[1] == 1
+                    };
                     if (POWERS[i].set)(on) {
                         power_owned(i, if on { p.epoch } else { 0 });
                         0

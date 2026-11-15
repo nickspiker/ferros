@@ -1103,10 +1103,10 @@ fn audio_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"audio"), Dma(b"aoc-ipc"), Hardware(b"aoc-mbox"), Irq(b"aoc-mbox-f1"), Hardware(b"usi1-spi"), Hardware(b"gpio-gpn0"), Power(b"amp"), Entropy]
 }
 
-/// The camera driver's grants in its slot order (payloads/camera, docs/CAMERA.md "The driver"): 1 serve camera, 2 hsi2c_1 (the main sensor's bus and its lens actuator), 3 the ISP front end (its core, statistics blocks and PDMA engine), 4 the CSI links and the combo D-PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.` (the sensor's init, the CPU's setup writes, the PDMA job), 7 the `camera` switch, 8 the camera's region (frames on demand, SYS_DMA x1 = 3), 9 the front end's line 0 (its frame clock). Its own list, as the torch's: init's page is full, and the kernel starts it when a call on `camera` finds no server (process.rs `ON_DEMAND`); it ends itself once its holder closes.
+/// The camera driver's grants in its slot order (payloads/camera, docs/CAMERA.md "The driver"): 1 serve camera, 2 hsi2c_1 (the main sensor's bus and its lens actuator), 3 the ISP front end (its core, statistics blocks and PDMA engine), 4 the CSI links and the combo D-PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.` (the sensors' inits, the CPU's setup writes, the PDMA jobs), 7 the `camera` switch, 8 the camera's region (frames on demand, SYS_DMA x1 = 3), 9 the front end's line 0 (its frame clock), and since 2026-11-15 the other cameras' sensor buses after them, so the first nine keep their places: 10 hsi2c_3 (the ultrawide's), 11 hsi2c_2 (the front's), 12 hsi2c_4 (the tele's). Its own list, as the torch's: init's page is full, and the kernel starts it when a call on `camera` finds no server (process.rs `ON_DEMAND`); it ends itself once its holder closes.
 fn camera_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Serve(b"camera"), Hardware(b"hsi2c1"), Hardware(b"ispfe"), Hardware(b"csis"), Hardware(b"ispfe-sysreg"), Store(b"cam"), Power(b"camera"), Dma(b"camera"), Irq(b"ispfe0")]
+    alloc::vec![Serve(b"camera"), Hardware(b"hsi2c1"), Hardware(b"ispfe"), Hardware(b"csis"), Hardware(b"ispfe-sysreg"), Store(b"cam"), Power(b"camera"), Dma(b"camera"), Irq(b"ispfe0"), Hardware(b"hsi2c3"), Hardware(b"hsi2c2"), Hardware(b"hsi2c4")]
 }
 
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
