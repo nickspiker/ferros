@@ -204,8 +204,8 @@ FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 FERROS_HV_ORACLE_P
 FERROS_HV_ORACLE_QUIET="G#108B_0000,G#108B_0004,G#108B_0008,G#108B_0020,G#108B_0024,G#108B_0030,G#108B_0040,G#108B_0048,G#108B_0050" \
 FERROS_HV_ORACLE_ARM_AFTER_MS=60000 tools/husky-hv.sh --no-ferros --flash
 tools/husky-hv-camall.sh target/hv/tele-i2c.log 8 tele:615:1437
-# then slot a back to the gate: tools/husky-hv.sh --flash
 ```
+Before the first flash, save what slot a runs now (its boot image, or the build and FERROS_HV_* flags it came from), and flash that back after the third capture: `husky-hv.sh` without the oracle flags is not the same build (on 2026-11-06 a saved image was flashed back, /mnt/Harbor/tmp/husky-cam-2026-11-06/boot_a_restore_normal.img).
 Check before using any of it: the tele really streamed in each (the I2C capture holds a G#0100 stream-on to G#2D; the front-end capture holds link writes past the main's; a screenshot of the app showing 5x on the tele, not "crop"), and `tools/oracle-decode-hsi2c.py` reports no LENGTH MISMATCH inside the init.
 From them, as for the front on 2026-11-06: `tools/camera-cpu.py` (the CPU setup, a 'CPR2', and the receiver table), `tools/oracle-decode-pdma.py` then `tools/camera-pdma-image.py --list 2` (the job, a 'CPR3'), `tools/camera-init.py` (the init), all local files (target/cam/tele.*, the vendor's settings).
 Then in code: its receiver table into ferros_cam rx, its outputs' slots into a `TELE_SLOT_BYTES`, `streams: true` and its geometry in cams, a list bit; the first run measures the outputs as the ultrawide's did.
