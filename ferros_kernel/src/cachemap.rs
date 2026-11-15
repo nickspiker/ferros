@@ -153,30 +153,35 @@ pub const SURFACE_SLOTS: usize = 16;
 /// Every surface lies back to back in one window of addresses as the four lay in DRAM until then, so every client keeps naming its surface by its address (`dma` past the porch) and the display finds surface k as before; only the frames behind the addresses moved, as an arc's do (ARCS.md).
 /// G#A00_0000 into the GiB above the arcs' windows: each slot aligned to its 32 MiB (a handle's base must be), and the GPU's view of the surfaces (payloads/gpu: G#C000_0000 plus a surface's distance from G#CA00_0000, the old carve-out's base, which Mahere's build reckons from) starting on a GiB, G#50_0000_0000.
 pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SLOTS * SURFACE_SIZE);
-/// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out. Its entries past the surfaces' slots are the camera's window (`CAM_VA`).
+/// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out.
 static mut L2_SURF: Table = Table([0; 512]);
 
-/// The camera driver's region (2026-11-14, docs/CAMERA.md "The driver"): addresses in the surfaces' GiB above their slots, each 2 MiB block one frame of the run of frames the driver holds (process.rs `cam_ask`), Normal non-cacheable, EL0 read/write, never executable, as the DMA regions are: the front end writes the frames by DMA and does not snoop the CPU's caches. Unmapped while nobody holds it.
-/// 224 MiB of addresses since 2026-11-15, from the surfaces' last slot's end (it was 128 MiB from G#50_3000_0000, which held the main camera's region with a ring of four, 126 MiB and the long ring's frame, exactly): the front camera's region keeps every output's whole 16 MiB granule until its outputs are measured, 178 MiB with a ring of four (ferros_cam job `FRONT_SLOT_BYTES`). Addresses only; the frames are taken as the driver asks.
-pub const CAM_VA: (usize, usize) = (SURF_VA.1, 0x50_3800_0000);
-const _: () = assert!(CAM_VA.0 >= SURF_VA.1 && CAM_VA.0 / GIB == SURF_VA.0 / GIB && (CAM_VA.1 - 1) / GIB == SURF_VA.0 / GIB && CAM_VA.0 % MIB2 == 0, "the camera's window: in the surfaces' GiB, past their slots");
+/// The camera's GiB (2026-11-15, owner: "full frame 1:1 ... integrating into the buffer"; docs/CAMERA.md "Modes, the bench and the slit"): the driver's window in its first half, the view in its second, one level-2 table of 2 MiB blocks, every one invalid until the driver asks.
+/// Until then both lived in the surfaces' GiB past their slots (224 and 128 MiB), which a ring of 1:1 frames does not fit: the main's 8160 x 6144 RAW10 frame is 60 MiB (G#2800 a line), so its region with a ring of four is about 320 MiB, and the view of that ring 240 MiB.
+const CAM_GIB: usize = 0x51_0000_0000;
+static mut L2_CAM: Table = Table([0; 512]);
+
+/// The camera driver's region (2026-11-14, docs/CAMERA.md "The driver"): each 2 MiB block one frame of the run of frames the driver holds (process.rs `cam_ask`), Normal non-cacheable, EL0 read/write, never executable, as the DMA regions are: the front end writes the frames by DMA and does not snoop the CPU's caches. Unmapped while nobody holds it.
+/// 512 MiB of addresses since 2026-11-15 (the camera's GiB's first half; it was 128 MiB, then 224, in the surfaces' GiB). Addresses only; the frames are taken as the driver asks.
+pub const CAM_VA: (usize, usize) = (CAM_GIB, CAM_GIB + (512 << 20));
+const _: () = assert!(CAM_VA.0 % GIB == 0 && (CAM_VA.1 - 1) / GIB == CAM_VA.0 / GIB && CAM_VA.0 >= SURF_VA.0 + GIB && CAM_VA.1 <= GPUB_VA.0, "the camera's window: in a GiB of its own, between the surfaces' and the GPU blocks'");
 
 /// The camera's window: the block at `va` maps frame `pa` (Normal non-cacheable, EL0 read/write, never executable), or nothing (`pa` None). Then `surface_unmapped` over what changed.
 pub fn cam_map(va: usize, pa: Option<usize>) {
-    let e = unsafe { &mut (*(&raw mut L2_SURF)).0[(va / MIB2) % 512] };
+    let e = unsafe { &mut (*(&raw mut L2_CAM)).0[(va / MIB2) % 512] };
     *e = match pa {
         Some(pa) => dma_pool(vhe(), pa, BLOCK),
         None => 0,
     };
 }
 
-/// The camera's view (2026-11-15, the owner: "why the ridiculously low camera resolution?"; docs/CAMERA.md "The view"): the frames of the driver's image ring, read-only, for the kist that holds the camera, so it reads whole sensor frames in place where a reply carries at most 8 MiB (process.rs `REPLY_MAX`). The rest of the surfaces' GiB past the camera's window: 128 MiB of addresses, eight frames of 16 MiB. Each 2 MiB block one frame of the driver's run (process.rs `cam_view_give`), Normal non-cacheable as the driver's own window is (the front end writes them by DMA and does not snoop), EL0 read-only, never executable; the blank frame in every block once the view is taken back, so a reader still in a frame as it goes reads nothing anyone owns rather than faulting; unmapped before the first view.
-pub const CAM_VIEW_VA: (usize, usize) = (0x50_3800_0000, 0x50_4000_0000);
-const _: () = assert!(CAM_VIEW_VA.0 == CAM_VA.1 && (CAM_VIEW_VA.1 - 1) / GIB == SURF_VA.0 / GIB && CAM_VIEW_VA.0 % MIB2 == 0, "the camera's view: in the surfaces' GiB, past the camera's window");
+/// The camera's view (2026-11-15, the owner: "why the ridiculously low camera resolution?"; docs/CAMERA.md "The view"): the frames of the driver's image ring, read-only, for the kist that holds the camera, so it reads whole sensor frames in place where a reply carries at most 8 MiB (process.rs `REPLY_MAX`). The camera's GiB's second half: 512 MiB of addresses, a ring of eight 60 MiB 1:1 frames or of 256 frames of the pool. Each 2 MiB block one frame of the driver's run (process.rs `cam_view_give`), Normal non-cacheable as the driver's own window is (the front end writes them by DMA and does not snoop), EL0 read-only, never executable; the blank frame in every block once the view is taken back, so a reader still in a frame as it goes reads nothing anyone owns rather than faulting; unmapped before the first view.
+pub const CAM_VIEW_VA: (usize, usize) = (CAM_VA.1, CAM_GIB + GIB);
+const _: () = assert!(CAM_VIEW_VA.0 == CAM_VA.1 && (CAM_VIEW_VA.1 - 1) / GIB == CAM_VA.0 / GIB && CAM_VIEW_VA.0 % MIB2 == 0, "the camera's view: in the camera's GiB, past the driver's window");
 
 /// The camera's view: the block at `va` maps frame `pa`, Normal non-cacheable, EL0 read-only (AP[2], which binds EL2 too in the VHE regime, so the kernel never writes thru it either: process.rs `dma_span` leaves the view out), never executable. Then `surface_unmapped` over what changed.
 pub fn cam_view_map(va: usize, pa: usize) {
-    let e = unsafe { &mut (*(&raw mut L2_SURF)).0[(va / MIB2) % 512] };
+    let e = unsafe { &mut (*(&raw mut L2_CAM)).0[(va / MIB2) % 512] };
     *e = dma_pool(vhe(), pa, BLOCK) | AP_RO;
 }
 
@@ -411,6 +416,8 @@ pub fn enable() -> bool {
         }
         // The surfaces' window: its level-2 table in place, every block invalid until the first surface is given out (`surface_map`).
         l1.0[SURF_VA.0 / GIB] = &raw const L2_SURF as u64 | TABLE_OR_PAGE;
+        // The camera's GiB: its level-2 table in place, every block invalid until the driver asks for its region (`cam_map`).
+        l1.0[CAM_GIB / GIB] = &raw const L2_CAM as u64 | TABLE_OR_PAGE;
         // The GPU blocks' window: its GiBs' level-2 tables in place, every block invalid until a block is given out there (`gpub_map`).
         for (g, t) in (*(&raw const L2_GPUB)).iter().enumerate() {
             l1.0[GPUB_VA.0 / GIB + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;

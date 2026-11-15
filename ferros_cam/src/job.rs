@@ -114,9 +114,24 @@ pub const fn main_ring(n: usize) -> Layout {
 
 /// Any camera's region with an image ring of `n` buffers: its slot sizes and skips (`MAIN_SLOT_BYTES`, `UW_SLOT_BYTES` with `UW_SLOT_SKIP`, ..), slot 2 made `n` buffers of `IMAGE_BYTES` side by side. Every camera's image body is slot 2, at its granule's start (tools/camera-pdma-image.py pinned it there for every camera).
 pub const fn ring(sizes: &[u64; SLOTS], skip: &[u64; SLOTS], n: usize) -> Layout {
+    with_image(sizes, skip, n as u64 * IMAGE_BYTES)
+}
+
+/// Any camera's region with `image` bytes in slot 2, the image body's (a whole number of frames of the pool, so the view maps image and nothing else): a ring of buffers sized to a mode's frame (docs/CAMERA.md "Modes, the bench and the slit": the main's 1:1 RAW10 frame is 60 MiB, a slit's ring hundreds of small buffers), every other slot as `sizes` has it.
+pub const fn with_image(sizes: &[u64; SLOTS], skip: &[u64; SLOTS], image: u64) -> Layout {
     let mut s = *sizes;
-    s[OLD_SLOT_IMAGE] = n as u64 * IMAGE_BYTES;
+    s[OLD_SLOT_IMAGE] = (image + FRAME - 1) & !(FRAME - 1);
     layout_at(&s, skip)
+}
+
+/// A mode's image buffer: its rows of `stride` bytes rounded up to whole frames of the pool (the binned main's 3072 lines of G#1400 are 15 MiB, so 16 MiB as `IMAGE_BYTES`; its 1:1 6144 lines of G#2800 exactly 60 MiB).
+pub const fn buffer_bytes(rows: u64, stride: u64) -> u64 {
+    (rows * stride + FRAME - 1) & !(FRAME - 1)
+}
+
+/// A slit ring's buffer: its rows and a 64-byte record the driver writes after them at the frame's DMA_DONE (the frame's count and time: the consumer's check that the buffer holds the frame it expects), rounded up to a 4 KiB page (a 4-row binned slit of the main, 20 KiB of lines, takes 24 KiB; a ring's buffers lie side by side, the ring in whole frames of the pool, `with_image`).
+pub const fn slit_bytes(rows: u64, stride: u64) -> u64 {
+    (rows * stride + 64 + 4095) & !4095
 }
 
 /// The job's register program, the piece at `OLD_JOB + LIST_OFFSET`: where its bytes start in the image and their length.
@@ -552,7 +567,29 @@ mod tests {
         assert_eq!(moved(0xA900_0000, 0, &l), Ok(moved(0xA800_0000, 0, &l).unwrap() + 16 * MIB));
     }
 
-    /// The kernel's window for the camera's region (kernel cachemap `CAM_VA`, 224 MiB since 2026-11-15) holds every camera's region with a ring of four and the long ring's frame; no two slots overlap and each is aligned to its size up to a frame.
+    /// The 1:1 rings (docs/CAMERA.md "Modes, the bench and the slit"): the main's and the ultrawide's region with four 1:1 RAW10 buffers, the long ring's frames and the program copies' (two more), inside the camera's window (kernel cachemap `CAM_VA`, 512 MiB since the bench), and the view of the four inside the view's (512 MiB); a slit ring of 2^10 buffers of a 64-row 1:1 slit too.
+    #[test]
+    fn the_full_rings_fit_the_window() {
+        const WINDOW: u64 = 512 * MIB;
+        for (name, sizes, skip, (w, h)) in [("main", MAIN_SLOT_BYTES, NO_SKIP, (8160u64, 6144u64)), ("ultrawide", UW_SLOT_BYTES, UW_SLOT_SKIP, (8000, 6000))] {
+            let stride = (w * 10 / 8 + 255) & !255;
+            let buf = buffer_bytes(h, stride);
+            let l = with_image(&sizes, &skip, 4 * buf);
+            println!("{name} 1:1: G#{stride:X} a line, a buffer {} MiB, the region with four {} MiB", buf >> 20, l.bytes >> 20);
+            assert!(l.bytes + 3 * FRAME <= WINDOW && 4 * buf <= WINDOW);
+            assert_eq!(l.slots[OLD_SLOT_IMAGE].0 % FRAME, 0);
+        }
+        assert_eq!(buffer_bytes(6144, 0x2800), 60 * MIB);
+        assert_eq!(buffer_bytes(3072, 0x1400), IMAGE_BYTES);
+        assert_eq!(slit_bytes(4, 0x1400), 24 * KIB);
+        // A slit ring of 2^8 of the tallest slit the bench sweeps (64 rows 1:1, 644 KiB each), and 2^12 of the smallest (4 rows binned).
+        for (n, rows, stride) in [(1u64 << 8, 64, 0x2800), (1 << 12, 4, 0x1400)] {
+            let l = with_image(&MAIN_SLOT_BYTES, &NO_SKIP, n * slit_bytes(rows, stride));
+            assert!(l.bytes + 3 * FRAME <= WINDOW, "{} MiB", l.bytes >> 20);
+        }
+    }
+
+    /// The kernel's window for the camera's region (kernel cachemap `CAM_VA`, 224 MiB on 2026-11-15, 512 MiB since the bench) holds every camera's region with a ring of four and the long ring's frame; no two slots overlap and each is aligned to its size up to a frame.
     #[test]
     fn every_ring_fits_the_window() {
         const WINDOW: u64 = 224 * MIB;

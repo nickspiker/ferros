@@ -245,9 +245,13 @@ pub const H_MOST: usize = 3072;
 pub const STRIDE_MOST: usize = 0x1400;
 
 impl Cam {
-    /// Its region with an image ring of `n` buffers.
+    /// An image buffer for its captured readout: its rows of `stride` bytes in whole frames of the pool (the Pro's main 16 MiB; a 1:1 mode or a slit sizes its own from the mode, ferros_cam job `buffer_bytes`, `slit_bytes`; the 8a's main, 4624 x 3472 at G#1700, 22 MiB). One constant (`job::IMAGE_BYTES`) held every camera until 2026-11-15.
+    pub const fn buffer_bytes(&self) -> u64 {
+        job::buffer_bytes(self.height as u64, self.stride as u64)
+    }
+    /// Its region with an image ring of `n` buffers of its captured readout.
     pub const fn layout(&self, n: usize) -> job::Layout {
-        job::ring(&self.sizes, &self.skip, n)
+        job::with_image(&self.sizes, &self.skip, n as u64 * self.buffer_bytes())
     }
     /// The binned readout at `bin`: whole 2 x 2 cells of `bin` x `bin` blocks, so the mosaic keeps its phase (the ultrawide's 3000 rows at bin 8 are 374, not 375).
     pub const fn binned(&self, bin: usize) -> (usize, usize) {
@@ -265,7 +269,9 @@ mod tests {
             assert_eq!(c.id as usize, k);
             assert_eq!(by_id(c.id).unwrap().name, c.name);
             // A line holds its RAW10 samples, and a frame fits an image buffer.
-            assert!(c.width * 5 / 4 <= c.stride && c.height * c.stride <= job::IMAGE_BYTES as usize, "{}", c.name);
+            assert!(c.width * 5 / 4 <= c.stride && (c.height * c.stride) as u64 <= c.buffer_bytes(), "{}", c.name);
+            // A ring of four of its buffers and its region fit the kernel's camera window (cachemap `CAM_VA`, 512 MiB) with the engine's area.
+            assert!(c.layout(4).bytes + 3 * job::FRAME <= 512 << 20, "{}", c.name);
             if c.streams {
                 assert!(c.width <= W_MOST && c.height <= H_MOST && c.stride <= STRIDE_MOST, "{}", c.name);
                 assert!(!c.rx_start.is_empty() && !c.rx_stop.is_empty());
