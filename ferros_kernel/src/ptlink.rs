@@ -132,7 +132,7 @@ pub fn busy() -> bool {
     link().busy
 }
 
-/// The `usb` power switch (process.rs POWERS). On, as a USB process starts: the link readied — the Type-C port's USB switch closed, the eUSB2 PHY brought up again (the host sees a fresh attach), the DMA path to physical addresses open — and a command an earlier process left half-done dropped (`reset`), so this one starts clean. The process then resets and runs the controller itself. Off: nothing to give back; the process is going.
+/// The `usb` power switch (process.rs POWERS). On, as a USB process starts: the link readied: the Type-C port's USB switch closed; the USB path put back in the state a cold boot leaves (`pixel8_usb_path_restore`: the rails, the repeater, the PMU isolation, the clocks, remote wake and the PHY suspend, which Android takes down when its USB goes idle and a jump finds so); the eUSB2 PHY brought up again (the host sees a fresh attach); the DMA path to physical addresses open. A command an earlier process left half-done is dropped (`reset`), so this one starts clean. The process then resets and runs the controller itself. Off: nothing to give back; the process is going.
 pub fn power(on: bool) -> bool {
     if on {
         // akita bring-up: a square on the glass after each step (checklist::dot), the last one lit is where it stopped.
@@ -144,6 +144,7 @@ pub fn power(on: bool) -> bool {
         crate::service::tcpc_usb_switch(true);
         crate::checklist::dot(3);
         crate::board::probe(83);
+        crate::pixel8_usb_path_restore();
         crate::pixel8_eusb_phy_init();
         crate::checklist::dot(4);
         crate::board::probe(84);

@@ -1882,6 +1882,153 @@ pub(crate) fn pixel8_eusb_phy_init() {
     }
 }
 
+/// Whether this boot's first `usb` power-on has logged what it found (`pixel8_usb_path_restore`).
+#[cfg(feature = "pixel8")]
+static USB_PATH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The USB path back to the state ABL leaves on a cold boot, before the eUSB2 PHY init (`pixel8_eusb_phy_init`), on every `usb` power-on (ptlink.rs).
+/// What it undoes is what Android's USB driver takes down when its USB goes idle and the jump finds as Android left it: `exynos_usbdrd_utmi_exit` puts the repeater in its disabled mode, isolates the PHY in the PMU and drops its clocks; the HSI0 domain's off takes the PHY's rails (exynos-pd.c); a bus suspend hands the PHY to the remote-wake block (HS ReWA); the DWC3 core runs with PHY suspend on.
+/// The jump of 2026-11-13 (b871) found the USB path so: the USB process never configured in 45 minutes, the host never saw a connect (resets 0, connects 0), the link in suspend (DSTS G#8E0009), with the TCPC attached and its switch closed; the boot path skips the repeater after a jump (2026-11-07), so nothing took it out of its disabled mode.
+/// The order is Android's own bring-up (`exynos_usbdrd_utmi_init`): the rails, the repeater out of its disabled mode and tuned, the PMU isolation off, the clocks requested; then the remote-wake blocks off and the DWC3's PHY suspend off; the link and the PHY follow (`pixel8_eusb_phy_init`).
+/// Each step reads first and writes only what differs from a cold boot, as measured on the Pro (2026-11-14, cold, enumerated): LDO_CTRL1 G#4F, L9M_CTRL G#E6, L19M_CTRL G#FC; repeater I2C_GLOBAL_CONFIG G#0 and the tune; PMU USB2 PHY control G#3; the USB Q-channels G#2; REWA_CTL G#0, U3REWA_CTRL G#0; GUSB2PHYCFG G#102400, GUSB3PIPECTL G#1001002.
+/// A cold boot only reads.
+/// What it found goes into the flash log on the boot's first power-on, and on any power-on that changed something, so the next jump that fails says which part was still Android's.
+#[cfg(feature = "pixel8")]
+pub(crate) fn pixel8_usb_path_restore() {
+    use crate::acpm::{MAIN, T_PMIC};
+    use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
+    use core::fmt::Write;
+    const USBCON: usize = 0x1110_0000;
+    const EUSB_PHY: usize = 0x1111_0000;
+    const CMU_HSI0: usize = 0x1100_0000;
+    const DWC3: usize = 0x1121_0000;
+    // The PHY's isolation word in the PMU (zuma-usb.dtsi usbdrd_phy0: pmu_offset G#3EB0, pmu_mask bit 0; 1 = not isolated), reached only through EL3 (the EL3 poison rule).
+    const PMU_USB2_PHY: u64 = 0x1546_3EB0;
+    let rep_addr = ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR;
+    let rd = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let wr = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+    let udelay = |us: u64| {
+        let t0 = platform::cntpct();
+        let ticks = us * platform::cntfrq() / 1_000_000 + 1;
+        while platform::cntpct().wrapping_sub(t0) < ticks {
+            core::hint::spin_loop();
+        }
+    };
+    let hx = |r: Result<u8, u32>| match r {
+        Ok(v) => alloc::format!("G#{v:X}"),
+        Err(e) => alloc::format!("error G#{e:X}"),
+    };
+    let mut seen = alloc::string::String::new();
+    let mut changed = alloc::string::String::new();
+
+    // The rails (zuma-common.dtsi usbdrd_phy0: vdd075 LDO8M, vdd12 LDO9M, vdd33 LDO19M, which is the repeater's vdd33 too), on the S2MPG14 over ACPM.
+    // Each enable field at 3, on in normal mode (`s2mpg14_of_map_mode`): LDO8M's in LDO_CTRL1 (G#44) bits 1-0, LDO9M's and LDO19M's in their control registers (G#33, G#3D) bits 7-6. Only the enable field is written: the voltage stays as set.
+    let mut rails_up = false;
+    for (name, reg, field) in [("L8M", 0x44u32, 0x03u8), ("L9M", 0x33, 0xC0), ("L19M", 0x3D, 0xC0)] {
+        let v = crate::acpm::read(MAIN, T_PMIC, reg);
+        let _ = write!(seen, " {name} {}", hx(v));
+        if v.is_ok_and(|v| v & field != field) {
+            let w = crate::acpm::update(MAIN, T_PMIC, reg, field, field);
+            let _ = write!(changed, " {name} on ({}, now {})", if w.is_ok() { "written" } else { "write refused" }, hx(crate::acpm::read(MAIN, T_PMIC, reg)));
+            rails_up = true;
+        }
+    }
+    // An LDO's enable time is 128 us (S2MPG14_ENABLE_TIME_LDO); the repeater then needs its own start before it answers.
+    if rails_up {
+        udelay(1 << 10);
+    }
+
+    // The repeater (eusb_repeater.c `eusb_repeater_power_on`): out of its disabled mode (I2C_GLOBAL_CONFIG G#B2, REG_DISABLE_P1 bit 6, which `eusb_repeater_power_off` sets when Android's USB goes idle), 3 ms, then the tune table.
+    // Through the kernel's HS-I2C master, which refuses a bus not left running (`hsi2c::up`) and bounds every wait: the TCPC on the same bus answers it after a jump (b871), where the boot's own repeater snapshot hung on 2026-11-07.
+    let rep = |reg: u8| read_byte(HSI2C_11, rep_addr, reg);
+    match rep(0xB0) {
+        Ok(3) => {
+            let cfg = rep(0xB2);
+            let _ = write!(seen, "; repeater cfg {}", hx(cfg));
+            if let Ok(c) = cfg {
+                if c & 0x40 != 0 {
+                    let w = write_byte(HSI2C_11, rep_addr, 0xB2, c & !0x40);
+                    udelay(1 << 12);
+                    let _ = write!(changed, " repeater out of its disabled mode ({}, now {})", if w.is_ok() { "written" } else { "write refused" }, hx(rep(0xB2)));
+                }
+            }
+            let tune: &[(u8, u8)] = if crate::board::akita() { &ferros_hal::hsi2c::AKITA_REPEATER_TUNE } else { &ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE };
+            let (mut off, mut fixed) = (0u32, 0u32);
+            for &(reg, val) in tune {
+                if rep(reg) != Ok(val) {
+                    off += 1;
+                    if write_byte(HSI2C_11, rep_addr, reg, val).is_ok() && rep(reg) == Ok(val) {
+                        fixed += 1;
+                    }
+                }
+            }
+            let _ = write!(seen, " tune off A#{off}");
+            if off != 0 {
+                let _ = write!(changed, " repeater tune A#{fixed} of A#{off}");
+            }
+        }
+        // Not identified (a dead bus, a NACK): nothing written on a bus the PMIC chain shares.
+        other => {
+            let _ = write!(seen, "; repeater REV_ID {}: left alone", hx(other));
+        }
+    }
+
+    // The PHY's PMU isolation off (`exynos_usbdrd_utmi_phy_isol`, on = 0: the mask bit set).
+    let pmu = platform::priv_reg(PMU_USB2_PHY, false, 0) as u32;
+    let _ = write!(seen, "; pmu G#{pmu:X}");
+    if pmu & 1 == 0 {
+        let w = platform::priv_reg(PMU_USB2_PHY, true, pmu | 1);
+        let _ = write!(changed, " pmu isolation off (smc G#{w:X}, now G#{:X})", platform::priv_reg(PMU_USB2_PHY, false, 0) as u32);
+    }
+
+    // The clocks: the USB2 Q-channels in CMU_HSI0 (cmucal-sfr.c: EUSBPHY G#30A8, EUSBCTL G#30B8, SUBCTL G#30BC, LINK G#30C0) as ABL leaves them, ENABLE (bit 0) off and CLOCK_REQ (bit 1) on, the clock held; Android's clock disable gives them to the hardware's gating.
+    // The reference clock's mux (G#1004) and the PHY's gates (G#20D8 APB, G#20DC the 26 MHz reference, G#20A4 the link's bus clock) are read for the log only.
+    let _ = write!(seen, "; qch");
+    for q in [0x30A8usize, 0x30B8, 0x30BC, 0x30C0] {
+        let v = rd(CMU_HSI0 + q);
+        let _ = write!(seen, " G#{v:X}");
+        if v & 3 != 2 {
+            wr(CMU_HSI0 + q, (v & !3) | 2);
+            let _ = write!(changed, " qch G#{q:X} G#{v:X} -> G#{:X}", rd(CMU_HSI0 + q));
+        }
+    }
+    let _ = write!(seen, ", ref mux G#{:X} gates G#{:X} G#{:X} G#{:X}", rd(CMU_HSI0 + 0x1004), rd(CMU_HSI0 + 0x20D8), rd(CMU_HSI0 + 0x20DC), rd(CMU_HSI0 + 0x20A4));
+
+    // The remote-wake blocks off (exynos-usb-blkcon.c `exynos_usbcon_rewa_cancel`, `ready_rewa`, `exynos_usbcon_u3_rewa_disable`): with HS ReWA on (REWA_CTL G#50 bit 0) the PHY is held in retention for a bus suspend, Android's when its host suspended it, and the link never sees the line.
+    let (rewa, hsrewa, u3rewa) = (rd(USBCON + 0x50), rd(USBCON + 0x58), rd(USBCON + 0x70));
+    let _ = write!(seen, "; rewa G#{rewa:X} hsrewa G#{hsrewa:X} u3rewa G#{u3rewa:X}");
+    if rewa & 1 != 0 {
+        wr(USBCON + 0x50, rewa & !1);
+        // Its interrupts masked (HSREWA_INTR G#54: wakeup, event, timeout, wakeup request), as `ready_rewa` leaves them.
+        wr(USBCON + 0x54, rd(USBCON + 0x54) | 0x1111);
+        let _ = write!(changed, " rewa off (now G#{:X})", rd(USBCON + 0x50));
+    }
+    if u3rewa & 1 != 0 {
+        wr(USBCON + 0x70, u3rewa & !1);
+        let _ = write!(changed, " u3rewa off (now G#{:X})", rd(USBCON + 0x70));
+    }
+
+    // The DWC3's PHY suspend off (GUSB2PHYCFG G#C200 bit 6, GUSB3PIPECTL G#C2C0 bit 17), as ABL leaves it and as `dwc3_core_susphy_set(0)` does: Android's core runs with it on (no dis_u2_susphy_quirk in zuma-usb.dtsi), and the USB process's controller init keeps the global registers it finds.
+    let (gctl, u2, u3) = (rd(DWC3 + 0xC110), rd(DWC3 + 0xC200), rd(DWC3 + 0xC2C0));
+    let _ = write!(seen, "; dwc3 gctl G#{gctl:X} u2phy G#{u2:X} u3pipe G#{u3:X}");
+    if u2 & (1 << 6) != 0 {
+        wr(DWC3 + 0xC200, u2 & !(1 << 6));
+        let _ = write!(changed, " u2phy suspend off (now G#{:X})", rd(DWC3 + 0xC200));
+    }
+    if u3 & (1 << 17) != 0 {
+        wr(DWC3 + 0xC2C0, u3 & !(1 << 17));
+        let _ = write!(changed, " u3pipe suspend off (now G#{:X})", rd(DWC3 + 0xC2C0));
+    }
+
+    // The PHY as found, for the log (RST_CTRL, CMN_CTRL, TESTSE: Android's `phy_exynos_eusb_terminate` leaves phy_enable 0, phy_reset 1, test_iddq 1); the init after this one takes it from any of those.
+    let _ = write!(seen, "; phy G#{:X} G#{:X} G#{:X}", rd(EUSB_PHY), rd(EUSB_PHY + 4), rd(EUSB_PHY + 0x20));
+
+    let first = !USB_PATH_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed);
+    if first || !changed.is_empty() {
+        crate::flashlog::line(&alloc::format!("usb path{}: rails{seen}; changed:{}", if platform::jumped() { " after the jump" } else { "" }, if changed.is_empty() { " nothing" } else { &changed }));
+    }
+}
+
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
