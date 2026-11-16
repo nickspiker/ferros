@@ -386,6 +386,33 @@ The steps (FERROS_PORT the Pro's; `B=/mnt/Harbor/Code/ferros/target/debug/ferros
 10. **Mid-stream**, only if step 5 or 6 never started before stream on: `00034000000000000200000002080000`, then a cold boot.
 11. **Restore** if anything misbehaves: put back what step 0 saved and reboot to the flashed kernel.
 
+### On the Pro, 2026-11-16 (b897 the flashed forge kernel, b898 this branch's kernel RAM-reloaded)
+
+The owner's go; the run plan above in order, the bench on three A715 threads unless said. Logs: /mnt/Harbor/tmp/camtrials/runs.
+
+**Before the reload: the jump counters.** b895 was a cold boot right after a jump that reset (b894), and the hv's counters at G#FD60_0D00 still read the magic "HVCORE01", jumps begun 1, last stage 6: what `reload_in_jumped_session` takes for a jumped session, so a reload would have stood the drivers down. Word 0 was cleared with two pokes and read back 0 (the coordinator's call); the reload then read GATE_ANSWER 0, cold. The real fix (a cold boot marking the counters stale, or the check tying them to this boot) is for the next jump work.
+**The first reload died** (b896): about 16 s after it, as its pd gating pass logged every domain "already off", camtest's open came in and the Pro reset with nothing more in the flash log (no "camera: on" line). The second reload (b898), left idle 79 s past its pass, ran the camera for an hour. Not reproduced: likely a camera open meeting the reload's gating pass; noted for whoever owns pd.rs.
+
+**The main, binned, the init's own mode (15 a second), 64 frames, four threads** (b897): map only 0 us a frame; read only (64-byte loads out of the view) 5.2 ms of wall work, 18.2 ms of thread time (0.86 GB/s a thread, about 3 GB/s on four); read and u16 add 10.4 ms (19.3 reading, 19.5 adding); read and u32 add 11.7 ms (21.9, 21.2). The NEON unpack matches the plain one on the device. The frame thread's answer: 189 us on average, 295 us at most.
+**CAPS**: the main offers G#0A0A, G#0A08, G#0808 (RAW10, 10 to 8 compressed, RAW8); the ultrawide G#0808, G#0A0A, G#0E0E (RAW8, RAW10, RAW14). Neither offers RAW12, so the RAW12 step was not run. Integration least and margin: main 2 and 2, ultrawide 1 and 64.
+**The mode before stream on, inside the real hold, works**: the main's integration of 16 lines landed (the frames' mean 64, black) and every open after streamed. October's "never starts before stream on" was the missing hold.
+
+**The main, binned, the frame cut** (the sweep, b897; the sensor's own counter): 21362 lines 15 a second, 7168 44, 4096 77, 3328 95, 3200 and anything shorter **96**: a floor of about 10.4 ms (about 3230 lines of 3.17 us) the sensor keeps itself; it never stopped, down to the rows and one. The front end delivers 94 to 97.
+**Integrating at 96 a second** (256 frames, three threads; b897 and b898 alike): u16 97 a second, 0 skipped, 7.1 to 7.3 ms of wall work a frame, 2.0 of the 3 cores; u32 96, 1 skipped, 8.8 ms, 2.5 cores; read only 6.0 ms, 1.65 cores.
+**Four threads at 96 a second lose the stream** (five of eleven sweep steps, b897): the bench took 3.5 to 3.8 cores and the driver's frame thread, on the same A715s, missed the front end's deadline; it stopped for good after about a second. **Pinning the frame thread made it worse** (b898): on the X3 (the owner's call) the main stopped after 10 frames at 96 a second, the ultrawide above about 38; on one A715 of its own (core 7) the main stopped too. Unpinned, with the consumer leaving one A715 free, every run was clean. The driver stays unpinned; a consumer at these rates leaves one A715 free.
+
+**The ultrawide** (b898; its first frames thru the driver, the open 571 ms, the first frame 612 ms after it): its own mode 30 a second, read and u16 add 12 ms of wall work a frame, 1.04 of 3 cores. The frame cut: sensor 7096 lines 20, 4024 37, 3256 46, about 50 at its floor (3004 lines); the front end **48 a second at 3128 lines** (128 blank, 256 frames, 0 skipped, 1.5 cores integrating), nothing at 3032 (32 lines, 210 us of blanking). The slim program kills it (one frame).
+
+**Slits: the sensor runs them, the front end takes one frame.**
+- The main's binned slit written before stream on: **1169 a second** on its own counter at 64 rows (October's 1184), 1126 written mid-stream. One frame lands per open, then none: the same at 64 and 1024 rows, at 1170 and 16 a second (the frame left long), with the geometry rewritten (Core, All), the slim program, or the front end left at the captured geometry. The link says why: +G#14 = G#20, ERR_CRC_PH (packet header CRC, isp_fe.h), frame starts on all three channels and no frame end. A y window changed thru CCS alone corrupts this Samsung sensor's packets; its frame length alone does not.
+- The ultrawide's binned slit (Sony): its link is clean (frame starts and ends on both channels, no error), and the front end takes two frames and stops (100 answers, no DMA_DONE), with the geometry rewritten Core or All.
+- No sensor stuck: every next open streamed (the switch powers the module down at each close), mid-stream included. October's "stuck until a cold boot" was a sensor never power-cycled between tries.
+
+**1:1 (the guesses)**: the main takes the registers (CAPS reads 8160 x 6144, increments 2, binning G#00 G#11) and runs about 2 frames a second on its counter, its link with ERR_CRC_PH, no frame. The ultrawide streams 11 a second (its predicted 82 ms frame) but sends lines of its binned width: the link reports both resolution mismatches (+G#1C = G#60). Neither is a mode the sensor runs whole from CCS alone; both need the captures ("The 1:1 captures").
+
+**The coordinator's ideas for the main's slit, not yet tried**: the window with the PD channel and embedded data off (Samsung's PD enable, CCS embedded-data control) and the link set for channel 0 alone, since a window that does not match the sensor's PD layout may be what corrupts the headers; and a capture of Android's 2x on the main, an in-sensor crop of the full readout, which would show Samsung's own windowed writes (the recipe above, with the camera app at 2x instead of Lumis at its maximum resolution).
+
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.

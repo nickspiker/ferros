@@ -593,6 +593,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
 }
 
 extern "C" fn frame_thread(g: u64) -> ! {
+    // Not pinned (measured on the Pro, b898, 2026-11-16): pinned to the X3 the main's stream at 96 a second stopped after 10 frames and the ultrawide's above about 38, pinned to one A715 (core 7) the main's stopped too; unpinned, with a consumer leaving one A715 free, 256 frames at 97 (main) and 48 (ultrawide) a second ran clean. A consumer on all four A715s at those rates starves it (cambench, b897): leave one free.
     let line = cap(g, S_IRQ);
     // Idle until the stream starts: the server rings RUN.
     while RUN.load(Ordering::Acquire) == 0 {
@@ -933,8 +934,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     };
     let mut got = None;
-    'ask: for low in [low_first, !low_first] {
-        for &n in rings.iter() {
+    // The biggest ring first, under 4 GiB and then above it for each count: a ring of one gives no view, so a smaller ring under 4 GiB is not worth more than a bigger one above it (the Pro, b898: the low ranges held a ring of one, and the bench's open came back without a view).
+    'ask: for &n in rings.iter() {
+        for low in [low_first, !low_first] {
             let l = job::with_image(&c.sizes, &c.skip, n as u64 * buf);
             let (f, sl) = copies(n);
             let frames = l.bytes / job::FRAME + engine_bytes(f, sl).div_ceil(job::FRAME);
@@ -1423,6 +1425,17 @@ fn release(g: u64, o: &mut Open, b: usize) {
 /// No frame came in `FRAME_LATE_US`: said with the words that tell why.
 fn late(g: u64) {
     say!(g, "camera: no frame in A#{} ms (A#{} so far; A#{} answers, A#{} on the line; image status bits seen G#{:X}; ring frames unseen A#{}); closing\n", FRAME_LATE_US / 1000, FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), IMG_SEEN.load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed));
+    // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
+    let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
+    let link = a & !0xFFFF;
+    say!(g, "camera: link G#{link:X}: +14 G#{:X} +1C G#{:X} +24 G#{:X} +2C G#{:X}; image path G#{:X}, aggregate G#{:X}\n", rd(g, link + 0x14), rd(g, link + 0x1C), rd(g, link + 0x24), rd(g, link + 0x2C), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::CMN_STATUS));
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: link counters from +634:");
+    for k in 0..(0x6C8 - 0x634) / 4 {
+        let _ = write!(l, " {:X}", rd(g, link + 0x634 + 4 * k));
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
 }
 
 /// How long the stream may run with nobody asking before the holder is taken for gone: 2^22 us (it was 64 frames, 4.4 s at 14.5 a second; a slit runs 64 frames in 53 ms).
