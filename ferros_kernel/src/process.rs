@@ -3520,6 +3520,8 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
+/// The switches SYS_POWER and `power_offs_apply` run with the kernel lock let go (2026-11-16, kernlock): each a kernel-side sequence for a device whose driver reaches it only thru lock-free register syscalls, and whose hardware no path under the lock touches from another core. Bluetooth's is pcie1's too (off before WL_REG_ON is cycled): it held the lock 19.5 ms twice in a camera stream. Not the camera's (its region's S2MPU fence), the USB link's, the sensors', the display's, the panel's nor android's: unaudited, they keep the lock.
+const SWITCH_UNLOCKED: [&str; 6] = ["gps", "nfc", "bt", "touch", "amp", "torch"];
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
@@ -3645,13 +3647,15 @@ pub fn power_offs_apply() {
         return;
     }
     for i in 0..POWERS.len() {
-        // Taken under the lock, switched with it let go (as SYS_POWER switches, 2026-11-16: the camera's off held it with every wait of its close). A process switching it on again can only do so on this core, so not before this returns: then it owns it and it stays on.
-        let pending = with_lock(|| unsafe {
+        // Taken under the lock; a switch in `SWITCH_UNLOCKED` switched with it let go (as SYS_POWER switches it, 2026-11-16). A process switching it on again can only do so on this core, so not before this returns: then it owns it and it stays on.
+        let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
+        // Whether it was pending, and a switch not in `SWITCH_UNLOCKED` switched under this same hold, as before.
+        let (pending, under) = with_lock(|| unsafe {
             let p = POWER_OFF_PENDING >> i & 1 != 0;
             POWER_OFF_PENDING &= !(1 << i);
-            p
+            (p, (p && !free).then(|| (POWERS[i].set)(false)))
         });
-        let done = pending.then(|| (POWERS[i].set)(false));
+        let done = if pending && free { Some((POWERS[i].set)(false)) } else { under };
         if let Some(ok) = done {
             crate::flashlog::line(&alloc::format!("power {}: off, its process ended ({})", POWERS[i].name, if ok { "done" } else { "the switch refused" }));
         }
@@ -4287,15 +4291,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else {
                         f.x[1] == 1
                     };
-                    // The switch runs with the kernel lock let go (2026-11-16, `diag lock`: the camera's on held it 42 to 66 ms, pcie1's 19.5 ms twice, and a camera stream 400 us from its deadline died behind them): a switch is hardware sequences with their waits, and nothing here needs the lock's state meanwhile.
-                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (camera_power, ptlink, torch, touch, amp, bt, gps, nfc, panel_power, dpu_power, sensorlink: no `process` state, the flash log taking the lock itself); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
+                    // An audited switch runs with the kernel lock let go (2026-11-16, `diag lock`: the camera's on held it 42 to 66 ms, Bluetooth's for pcie1 19.5 ms twice, and a camera stream 400 us from its deadline died behind them): a switch is hardware sequences with their waits.
+                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (no `process` state; the flash log takes the lock itself); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
+                    // Only the switches in `SWITCH_UNLOCKED` (whose hardware nothing under the lock touches from another core); the rest keep the lock, as the camera's must while its region's fence (`cam_ask`, `cam_free`, under the lock on any core) writes the front end's S2MPUs its switch powers.
+                    let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
                     let epoch = p.epoch;
-                    unlock();
-                    // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
-                    unsafe { core::arch::asm!("msr daifclr, #2") };
+                    if free {
+                        unlock();
+                        // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
+                        unsafe { core::arch::asm!("msr daifclr, #2") };
+                    }
                     let ok = (POWERS[i].set)(on);
-                    unsafe { core::arch::asm!("msr daifset, #2") };
-                    lock();
+                    if free {
+                        unsafe { core::arch::asm!("msr daifset, #2") };
+                        lock();
+                    }
                     if ok {
                         power_owned(i, if on { epoch } else { 0 });
                         // Its process ended on another core meanwhile (`kill_locked` found its thread here and left it `dying`): what it switched on is turned off as for any other ending.
