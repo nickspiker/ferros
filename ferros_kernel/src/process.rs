@@ -3645,14 +3645,13 @@ pub fn power_offs_apply() {
         return;
     }
     for i in 0..POWERS.len() {
-        // Taken and switched under one hold of the lock: a process switching it on again meanwhile owns it, and it stays on.
-        let done = with_lock(|| unsafe {
-            if POWER_OFF_PENDING >> i & 1 == 0 {
-                return None;
-            }
+        // Taken under the lock, switched with it let go (as SYS_POWER switches, 2026-11-16: the camera's off held it with every wait of its close). A process switching it on again can only do so on this core, so not before this returns: then it owns it and it stays on.
+        let pending = with_lock(|| unsafe {
+            let p = POWER_OFF_PENDING >> i & 1 != 0;
             POWER_OFF_PENDING &= !(1 << i);
-            Some((POWERS[i].set)(false))
+            p
         });
+        let done = pending.then(|| (POWERS[i].set)(false));
         if let Some(ok) = done {
             crate::flashlog::line(&alloc::format!("power {}: off, its process ended ({})", POWERS[i].name, if ok { "done" } else { "the switch refused" }));
         }
@@ -4288,8 +4287,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else {
                         f.x[1] == 1
                     };
-                    if (POWERS[i].set)(on) {
-                        power_owned(i, if on { p.epoch } else { 0 });
+                    // The switch runs with the kernel lock let go (2026-11-16, `diag lock`: the camera's on held it 42 to 66 ms, pcie1's 19.5 ms twice, and a camera stream 400 us from its deadline died behind them): a switch is hardware sequences with their waits, and nothing here needs the lock's state meanwhile.
+                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (camera_power, ptlink, torch, touch, amp, bt, gps, nfc, panel_power, dpu_power, sensorlink: no `process` state, the flash log taking the lock itself); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
+                    let epoch = p.epoch;
+                    unlock();
+                    // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
+                    unsafe { core::arch::asm!("msr daifclr, #2") };
+                    let ok = (POWERS[i].set)(on);
+                    unsafe { core::arch::asm!("msr daifset, #2") };
+                    lock();
+                    if ok {
+                        power_owned(i, if on { epoch } else { 0 });
+                        // Its process ended on another core meanwhile (`kill_locked` found its thread here and left it `dying`): what it switched on is turned off as for any other ending.
+                        if k().procs.iter().flatten().any(|q| q.epoch == epoch && q.dying) {
+                            power_orphaned(epoch);
+                        }
                         0
                     } else {
                         ERR

@@ -25,6 +25,8 @@ fn mirrors() -> Result<(u64, u64), KvError> {
     }
 }
 const RING_LOG2: u8 = manifestus::HOST_RING_LOG2;
+/// The most bytes of capsules `KVault::capsules` keeps (2^22: the camera, pcie1, fgtw and the map together; the kernel heap is 22 MiB).
+const CAPSULES_KEPT: usize = 1 << 22;
 const ADDR_CONTEXT: &str = "ferros.kernel.store.addr.v0";
 const PAYLOAD_CONTEXT: &str = "ferros.kernel.store.payload.v0";
 /// The kernel's list of names ('\n'-separated), itself stored under this name. Every name starting with NUL is the kernel's own (the list, the selftest's scratch): never listed, never indexed, so `store ls` shows only what a caller stored.
@@ -258,6 +260,8 @@ pub struct KVault {
     id: Option<IdKeys>,
     /// Whether an identity's fleet has bound this device, once read (`bound`), kept in step by `bind` and `release`, the only writers of the mark: init asks 64 times a second while it waits for a person, and each read of the mark from the flash held the kernel lock about 300 us (2026-11-16, `diag lock`).
     bound: Option<bool>,
+    /// Capsules as last read for a spawn (`get_capsule`), oldest first, `CAPSULES_KEPT` bytes at most: a keeper's restart and an on-demand server's start (the camera at every open) read the same capsule again, 24 to 60 ms from the flash with the kernel lock held (2026-11-16, `diag lock`: a keeper's spawn of pcie1 held it 30.8 ms and the camera's stream, 400 us from its deadline, died). Device-class names only; `set` and `remove_key` drop a name's copy before they change it.
+    capsules: Vec<(String, Vec<u8>)>,
     /// Mirror A's first LBA, as `open` found it (`mirrors`).
     mirror_a: u64,
 }
@@ -271,7 +275,7 @@ impl KVault {
         let (a, b) = mirrors()?;
         let mirror = Mirror::new(Region { base: a, blocks: REGION_BLOCKS }, Region { base: b, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
         let vault = Vault::open(mirror, RING_LOG2, now(), DeletePolicy::UnlinkOnly)?;
-        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, bound: None, mirror_a: a })
+        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, bound: None, capsules: Vec::new(), mirror_a: a })
     }
 
     /// The address key for `class`: the device's always, the identity's only while one is unlocked.
@@ -375,6 +379,25 @@ impl KVault {
         ferros_pieces::read_whole(&mut Pieces { kv: self, class }, &place).map_err(KvError::from)
     }
 
+    /// A capsule (or any device-class value) for a spawn: the copy kept from its last read when there is one (`capsules`), else read and kept, the oldest kept dropped past `CAPSULES_KEPT` bytes. An identity-class name is read and never kept.
+    pub fn get_capsule(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
+        if class_of(name) == Class::Identity {
+            return self.get_by_key(name);
+        }
+        if let Some((_, v)) = self.capsules.iter().find(|(n, _)| n == name) {
+            return Ok(Some(v.clone()));
+        }
+        let Some(v) = self.get_by_key(name)? else { return Ok(None) };
+        if v.len() <= CAPSULES_KEPT {
+            let mut kept: usize = self.capsules.iter().map(|(_, c)| c.len()).sum();
+            while kept + v.len() > CAPSULES_KEPT {
+                kept -= self.capsules.remove(0).1.len();
+            }
+            self.capsules.push((String::from(name), v.clone()));
+        }
+        Ok(Some(v))
+    }
+
     /// The value under `name` appended to `out` (a reply being built, its status byte already in it): a value in pieces goes in a piece at a time, `out` grown once to take it, so it is never in the heap twice. Whether there was one.
     pub fn get_into(&mut self, name: &str, out: &mut Vec<u8>) -> Result<bool, KvError> {
         let class = class_of(name);
@@ -417,6 +440,8 @@ impl KVault {
     /// A slice, not an owned buffer: the store command's put used to copy the whole payload into a Vec just to hand it here, a third copy of a 2.7 MB capsule in the kernel heap (2026-10-23: it ran the heap out).
     /// A value over `ferros_pieces::PIECE` is kept in sealed pieces under a manifest (2026-11-12): sealed whole, a 2.8 MB capsule held the sealed copy and manifestus's staging of it (each a 3 MB block) in the kernel heap at once, and with Mahere running the 22 MiB heap had the bytes but no such hole and the kernel panicked. A value of either kind replaces the other: the whole entry or the pieces left from before go.
     pub fn set(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
+        // A kept copy goes before the value changes: a put that fails part way leaves it read again.
+        self.capsules.retain(|(n, _)| n != name);
         let class = class_of(name);
         let key = *self.addr_key_of(class)?;
         let place = ferros_pieces::Place::new(&key, name.as_bytes());
@@ -446,6 +471,7 @@ impl KVault {
 
     /// Remove `name`, kept whole or in pieces; true if it existed.
     pub fn remove_key(&mut self, name: &str) -> Result<bool, KvError> {
+        self.capsules.retain(|(n, _)| n != name);
         let class = class_of(name);
         let a = self.addr(class, name)?;
         let mut existed = self.vault.delete(&a, now())?;

@@ -608,6 +608,11 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
 extern "C" fn frame_thread(g: u64) -> ! {
     // Not pinned (measured on the Pro, b898, 2026-11-16): pinned to the X3 the main's stream at 96 a second stopped after 10 frames and the ultrawide's above about 38, pinned to one A715 (core 7) the main's stopped too; unpinned, with a consumer leaving one A715 free, 256 frames at 97 (main) and 48 (ultrawide) a second ran clean. A consumer on all four A715s at those rates starves it (cambench, b897): leave one free.
     let line = cap(g, S_IRQ);
+    // A measuring build pins it (FERROS_CAM_PIN, a core mask in hex: G#100 the X3, G#80 core 7), then sleeps a millisecond so the pin takes at the next reschedule (kernlock, 2026-11-16: the wake's latency pinned and not).
+    if let Some(m) = option_env!("FERROS_CAM_PIN").and_then(|s| u64::from_str_radix(s, 16).ok()) {
+        ferros_sys::pin(m);
+        ferros_sys::sleep_until(ferros_sys::now() + (ferros_sys::freq() >> 10));
+    }
     // Idle until the stream starts: the server rings RUN.
     while RUN.load(Ordering::Acquire) == 0 {
         ferros_sys::wait(&RUN, 0, 0);

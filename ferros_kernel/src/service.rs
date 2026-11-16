@@ -900,7 +900,7 @@ fn store_addr(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) -> Resu
 
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
-    match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k) } {
+    match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_capsule(k) } {
         Ok(v) => v,
         // A read that failed is not an absent key: say which (2026-10-24, touch "not in the vault" at boot, found by a restart minutes later).
         Err(e) => {
@@ -1276,7 +1276,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
             continue;
         }
         // The vault restarts from the stored capsule (the development loop pushes one), else from the one the kernel image carries.
-        let stored = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
+        let stored = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_capsule(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
         let Some(capsule) = stored.or_else(|| (name == b"vault" && !VAULT_CARRIED.is_empty()).then(|| VAULT_CARRIED.to_vec())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
