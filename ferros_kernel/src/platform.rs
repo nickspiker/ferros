@@ -422,6 +422,20 @@ pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
     ret
 }
 
+/// Whether this core had an SError waiting, taken here at EL2 if it had (ISR_EL1.A, bit 8: a physical SError pending at EL2).
+/// This is the EL3 poison rule's mechanism, read from the Pro's BL31 (bl31.factory, its vector entries at G#14C00-G#14F00 and G#3048): on every entry from below, EL3 checks ISR_EL1.A, and with one pending it rewinds ELR_EL3 to the SMC and returns, so the caller takes the SError first; after A#100 returns to the same SMC it panics, and never returns.
+/// The kernel runs with SErrors masked (DAIF G#340), so it never takes one: an error answer to an earlier access (a block that is down, unclocked or secure, which reads 0 non-secure and errs) waits until the next firmware call, which then bounces and hangs.
+/// Taken here instead, with SErrors unmasked for one instruction: the SError vector counts it and returns (main.rs `.Lexc_serror`, as aoc.rs `probe32` does), and the call that follows reaches EL3 clean.
+pub fn take_serror() -> bool {
+    let isr: u64;
+    unsafe { core::arch::asm!("dsb sy", "isb", "mrs {i}, isr_el1", i = out(reg) isr) };
+    if isr & (1 << 8) == 0 {
+        return false;
+    }
+    unsafe { core::arch::asm!("mrs {d}, daif", "msr daifclr, #4", "isb", "msr daif, {d}", d = out(reg) _) };
+    true
+}
+
 /// PMU SYSIP_DAT0 (pmu_alive G#1546_0000 + reboot-cmd-offset G#810): the reboot mode the bootloader reads after a reset. Values from pixel-zuma-reboot.c: G#FC bootloader, G#FA fastbootd, G#FF recovery, 0 normal.
 pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
 
