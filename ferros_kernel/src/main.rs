@@ -144,6 +144,9 @@ mod oracle;
 // Processes: EL0 in an arc, capabilities, the syscall boundary.
 #[cfg(feature = "pixel8")]
 mod process;
+// Device threads and the kernel lock: the measures and the switches (KERNEL.md "Device threads").
+#[cfg(feature = "pixel8")]
+mod devsched;
 // The frame pool: the DRAM every arc is made of, in 2 MiB frames (frames.rs, ARCS.md).
 #[cfg(feature = "pixel8")]
 mod frames;
@@ -648,6 +651,15 @@ _m1_entry:
     ubfx    x2, x2, #8, #4
     mov     x3, #4
     str     x3, [x1, x2, lsl #3]
+    // When it came and on which core (process.rs __irq_at, __irq_core: what devsched measures the waiter's run from), stored before the pending byte and ordered ahead of it.
+    adrp    x1, __irq_at
+    add     x1, x1, :lo12:__irq_at
+    mrs     x3, cntpct_el0
+    str     x3, [x1, x0, lsl #3]
+    adrp    x1, __irq_core
+    add     x1, x1, :lo12:__irq_core
+    strb    w2, [x1, x0]
+    dmb     ish
     // The line is pending for whoever holds its grant (process.rs IRQS); from EL0 the running thread is parked so the scheduler can run the waiter now, from EL2 the service loop's next slice does.
     adrp    x1, __irq_pending
     add     x1, x1, :lo12:__irq_pending

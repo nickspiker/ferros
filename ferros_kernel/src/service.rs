@@ -2810,6 +2810,8 @@ pub fn run(mut b: Boot) -> ! {
             }
         }
 
+        // The kernel lock's alarm (a hold of 2^-7 s or more since the last pass) into the flash log: the line that survives a reset (devsched.rs).
+        crate::devsched::alarm_lines();
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
             t_heartbeat = now;
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
@@ -3685,6 +3687,53 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"pets" {
                     // `diag pets`: the process watchdog's measurements (process.rs pets_report): each process's longest stretch between pets.
                     crate::process::pets_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"lock" || cmd.params.starts_with(b"lock ") {
+                    // `diag lock`: every hold of the kernel lock by length, by syscall and by site, the long holds with what held them (devsched.rs). `diag "lock reset"` zeroes the counts first; `diag "lock long <us>"` sets the long mark.
+                    let arg = cmd.params.strip_prefix(b"lock").unwrap_or(b"").trim_ascii();
+                    if arg == b"reset" {
+                        crate::devsched::lock_reset();
+                    }
+                    if let Some(us) = arg.strip_prefix(b"long ").and_then(|d| core::str::from_utf8(d).ok()).and_then(|d| d.trim().parse::<u64>().ok()) {
+                        // WHY the max: 0 is the unset mark (devsched `hold` puts its default there), so 0 us asks for every hold.
+                        crate::devsched::LONG_TICKS.store((us * cntfrq() / 1_000_000).max(1), core::sync::atomic::Ordering::Relaxed);
+                    }
+                    crate::devsched::lock_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"dev" || cmd.params.starts_with(b"dev ") {
+                    // `diag dev`: device threads (devsched.rs): the switches and each granted line's interrupt to its waiter's run. `diag "dev reset"`, `diag "dev first on|off"`, `diag "dev follow on|off"`, `diag "dev core <k>|off"`, `diag "dev freeze <intid> <us>"` (the scheduler trace stops at the first run of that line's waiter later than that).
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let arg = cmd.params.strip_prefix(b"dev").unwrap_or(b"").trim_ascii();
+                    let num = |s: &[u8]| core::str::from_utf8(s).ok().and_then(|d| d.trim().parse::<u64>().ok());
+                    match arg {
+                        b"reset" => crate::devsched::lat_reset(),
+                        b"first on" => crate::devsched::FIRST.store(true, Relaxed),
+                        b"first off" => crate::devsched::FIRST.store(false, Relaxed),
+                        b"follow on" => crate::devsched::FOLLOW.store(true, Relaxed),
+                        b"follow off" => crate::devsched::FOLLOW.store(false, Relaxed),
+                        b"core off" => crate::devsched::CORE.store(0, Relaxed),
+                        _ => {
+                            if let Some(k) = arg.strip_prefix(b"core ").and_then(num) {
+                                // WHY: a core index the mask's sixteen bits cannot name is refused, not shifted out.
+                                if k < 16 {
+                                    crate::devsched::CORE.store(1 << k, Relaxed);
+                                }
+                            } else if let Some(rest) = arg.strip_prefix(b"freeze ") {
+                                let mut it = rest.split(|&c| c == b' ').filter(|s| !s.is_empty());
+                                if let (Some(i), Some(us)) = (it.next().and_then(num), it.next().and_then(num)) {
+                                    crate::devsched::FREEZE_TICKS.store(us * cntfrq() / 1_000_000, Relaxed);
+                                    crate::devsched::FREEZE_INTID.store(i as usize, Relaxed);
+                                    crate::devsched::FROZEN.store(false, Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    let names: alloc::vec::Vec<(&str, u32)> = crate::process::IRQS.iter().map(|l| (l.name, l.intid)).collect();
+                    crate::devsched::lat_report(&mut resp, &names);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

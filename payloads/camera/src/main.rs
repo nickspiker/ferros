@@ -378,6 +378,8 @@ static NOW_FORMAT: AtomicU64 = AtomicU64::new(10);
 /// The frame thread's time answering the front end (counter ticks, summed and the most in one answer) and frames whose buffer was not the one the ring named (a slit ring's: the frame's probe did not move, so it landed elsewhere, its descriptor released after the frame began).
 static BUSY: AtomicU64 = AtomicU64::new(0);
 static BUSY_MOST: AtomicU64 = AtomicU64::new(0);
+/// From an answer's start to its index write (counter ticks: answers that wrote it, summed, the most): the part of the answer the frame's blanking must hold (2026-11-16, kernlock).
+static IDX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static LATE: AtomicU64 = AtomicU64::new(0);
 /// Set when the long ring's last descriptor was given: the stream ends there (`RING`).
 static RING_END: AtomicU64 = AtomicU64::new(0);
@@ -544,10 +546,35 @@ fn slit_turn(n: u64) {
     ferros_sys::dma_barrier();
 }
 
-/// The front end answered once: its aggregate and loch0's image status read, every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and on a frame's DMA_DONE the ring's turn (`ring_turn`), the engine's index advanced and the frame counted.
+/// The front end answered once: loch0's image status read; on a frame's DMA_DONE the ring's turn (`ring_turn`) and the engine's index advanced at once; then every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and the frame counted.
+/// The index first (2026-11-16, kernlock): the next descriptor must be released before the next frame begins, so the frame's blanking (128 lines, about 400 us, at the main's 96 a second) has to hold the interrupt's wake and everything the answer does before the index write; with the 56 acknowledgements ahead of it (about 170 us of register syscalls) the stream lost every other frame and stopped.
+/// The acknowledgements clear the front end's status words (loch0's image status among them, read again there); the descriptor engine has its own index, so the order between the two is not the front end's.
 fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let t0 = ferros_sys::now();
     let img = rd(g, ferros_cam::IMG_STATUS);
+    if img & ferros_cam::IMG_DMA_DONE != 0 {
+        // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
+        let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
+        let n = FRAMES.load(Ordering::Relaxed) + 1;
+        if SLITS.load(Ordering::Relaxed) != 0 {
+            slit_turn(n);
+        } else {
+            ring_turn(n, more.then_some((*idx / STEP) as u64));
+        }
+        // The next descriptor. Never round the ring: back to 0 the front end stops for good (`RING`). At the ring's end the index is left where it is, the console says so, and the stream ends with its last descriptor (the FRAME that finds no frame closes).
+        if more {
+            *idx += STEP;
+            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
+            let t = ferros_sys::now() - t0;
+            IDX[0].fetch_add(1, Ordering::Relaxed);
+            IDX[1].fetch_add(t, Ordering::Relaxed);
+            IDX[2].fetch_max(t, Ordering::Relaxed);
+            if *idx == RING_N.load(Ordering::Relaxed) as u32 * STEP {
+                RING_END.store(1, Ordering::Relaxed);
+                say!(g, "camera: the ring's last descriptor given after A#{} frames\n", FRAMES.load(Ordering::Relaxed) + 1);
+            }
+        }
+    }
     for &a in cam().ack.iter() {
         let v = rd(g, a);
         wr(g, a, v);
@@ -562,23 +589,6 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}\n", if pd { " with its PD path" } else { ", its PD path left off" });
     }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
-        // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
-        let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
-        let n = FRAMES.load(Ordering::Relaxed) + 1;
-        if SLITS.load(Ordering::Relaxed) != 0 {
-            slit_turn(n);
-        } else {
-            ring_turn(n, more.then_some((*idx / STEP) as u64));
-        }
-        // The next descriptor. Never round the ring: back to 0 the front end stops for good (`RING`). At the ring's end the index is left where it is, the console says so, and the stream ends with its last descriptor (the FRAME that finds no frame closes).
-        if more {
-            *idx += STEP;
-            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
-            if *idx == RING_N.load(Ordering::Relaxed) as u32 * STEP {
-                RING_END.store(1, Ordering::Relaxed);
-                say!(g, "camera: the ring's last descriptor given after A#{} frames\n", FRAMES.load(Ordering::Relaxed) + 1);
-            }
-        }
         FRAME_AT.store(eagle_ns(), Ordering::Release);
         let n = FRAMES.fetch_add(1, Ordering::AcqRel) + 1;
         if n == 1 {
@@ -1204,6 +1214,11 @@ fn close(g: u64) {
         }
     }
     say!(g, "camera: closed after A#{} frames (A#{} answers, A#{} on the line{}); image status bits seen G#{:X}; switch off {}\n", FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), if TICKING.load(Ordering::Relaxed) == 1 { ", the rest on the tick" } else { "" }, IMG_SEEN.load(Ordering::Relaxed), if ok { "done" } else { "refused" });
+    // The answer's cost: in all, and to its index write (the part the blanking must hold).
+    // WHY the max: an open that never streamed has no answers, and its mean is read as 0 rather than divided by zero.
+    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+    let (n, a) = (IDX[0].load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed));
+    say!(g, "camera: answers A#{a}, A#{} us each on average, A#{} us the most; index writes A#{n}, A#{} us into the answer on average, A#{} us the most\n", us(BUSY.load(Ordering::Relaxed)) / a.max(1), us(BUSY_MOST.load(Ordering::Relaxed)), us(IDX[1].load(Ordering::Relaxed)) / n.max(1), us(IDX[2].load(Ordering::Relaxed)));
 }
 
 /// After the eighth frame, once an open: every output's extent, sampled every 256 bytes against the pattern (docs/CAMERA.md: "measure which of the 22 the main camera's job really writes"): its slot, how many points moved, the last.

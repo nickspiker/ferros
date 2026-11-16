@@ -308,6 +308,8 @@ pub fn stop_all() {
         return;
     }
     crate::platform::crumb(0xC9);
+    // Lines routed to a worker (devsched `follow` and `core`) back to the kernel's core first: one routed to a core that is off is never delivered.
+    crate::process::irq_routes_home();
     STOP.store(1, Ordering::Release);
     // Woken by SGI as well as `sev`: a worker asleep in `wfi` hears only the interrupt (two of four never turned off before a reload and came back ALREADY_ON, 2026-10-23).
     unsafe {
@@ -331,6 +333,8 @@ pub fn stop_all() {
         }
     }
     let _ = OFF.load(Ordering::Acquire);
+    // Again with the workers off: a wait made on a worker while it was leaving may have routed its line there.
+    crate::process::irq_routes_home();
     crate::platform::crumb(0xCA);
 }
 
