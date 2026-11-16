@@ -380,6 +380,9 @@ static BUSY: AtomicU64 = AtomicU64::new(0);
 static BUSY_MOST: AtomicU64 = AtomicU64::new(0);
 /// From an answer's start to its index write (counter ticks: answers that wrote it, summed, the most): the part of the answer the frame's blanking must hold (2026-11-16, kernlock).
 static IDX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Quiet spells on a working line: with the front end's status holding bits (an answer its interrupt never brought), and with it clear.
+static QUIET_FOUND: AtomicU64 = AtomicU64::new(0);
+static QUIET_SEEN: AtomicU64 = AtomicU64::new(0);
 static LATE: AtomicU64 = AtomicU64::new(0);
 /// Set when the long ring's last descriptor was given: the stream ends there (`RING`).
 static RING_END: AtomicU64 = AtomicU64::new(0);
@@ -632,8 +635,18 @@ extern "C" fn frame_thread(g: u64) -> ! {
             TICKING.store(1, Ordering::Relaxed);
             say!(g, "camera: no interrupt on SPI 479 in A#{} us of the stream; answering on a A#{} us tick (front end aggregate G#{:X}, image G#{:X}, engine G#{:X} index G#{:X})\n", ferros_sys::us_since(started), tick_us(), rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
             answer(g, &mut idx, &mut enabled);
+        } else {
+            // The line works and was quiet for `QUIET_US`: either the stream stopped, or the front end waits on an answer whose interrupt never came (2026-11-16, kernlock: streams at 96 a second stopped with every answer prompt). Its status words say which; one that holds bits is answered, counted, and said once.
+            let (cmn, img) = (rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS));
+            if cmn | img != 0 {
+                if QUIET_FOUND.fetch_add(1, Ordering::Relaxed) == 0 {
+                    say!(g, "camera: the line quiet A#{} us with the front end waiting (aggregate G#{cmn:X}, image G#{img:X}, engine G#{:X} index G#{:X}, our index G#{idx:X}); answered\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+                }
+                answer(g, &mut idx, &mut enabled);
+            } else if QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
+                say!(g, "camera: the line quiet A#{} us, the front end's status clear (engine G#{:X} index G#{:X}, our index G#{idx:X}): the stream stopped by itself\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+            }
         }
-        // Else the line works and was quiet for two frame periods: nothing is pending, and the stream has likely stopped.
     }
 }
 
