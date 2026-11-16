@@ -454,11 +454,28 @@ pub fn detect_jump(x0: u64) {
     if reload_jumped {
         crate::ready::GATE_TELEMETRY.store(6, core::sync::atomic::Ordering::Relaxed);
     }
+    // The first kernel of a session that is not a jump marks the hv's counters as an earlier session's: their last stage keeps its value with bit 63 set, so a later RELOAD in this session does not read them as its own (`reload_in_jumped_session`).
+    // The power cycle that ends a jumped session does not decay them (b895, the cold boot after jump b894, still read its stage 6), so before this a reload into the cold session after a jump ran as jumped (b885).
+    if x0 & 1 == 0 && !jumped() {
+        hv_counters_stale();
+    }
+}
+
+/// The hv core's counters' last stage (word 19) marked an earlier session's (bit 63), when the magic says they are there at all.
+fn hv_counters_stale() {
+    const STATS: usize = 0xFD60_0D00;
+    unsafe {
+        if read_volatile(STATS as *const u64) == 0x4856_434F_5245_3031 {
+            let a = STATS + 19 * 8;
+            write_volatile(a as *mut u64, read_volatile(a as *const u64) | 1 << 63);
+            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) a as u64);
+        }
+    }
 }
 
 /// The hv core's counters in the report page (ferros_hv hvcore STATS, G#FD60_0D00): word 0 its magic "HVCORE01", written with every counter cleared as the hv starts Android (`save_for_jump`, the Android path only), word 16 the jumps begun, word 19 the jump's last stage (6: ferros started).
 /// A RELOAD keeps DRAM, so these are this power-on's: the magic, a jump begun and its last stage reached say this session began with the jump from Android.
-/// A session that began on the gate's ferros path leaves the counters as the previous power-on did, and the reset that ends a jumped session is a power cycle that decays them (HV.md, 2026-11-13), so a cold session does not read as jumped.
+/// A session that began on the gate's ferros path leaves the counters as the previous power-on did, and the power cycle that ends a jumped session does not decay them (b895 read b894's), so the first kernel of every session that is not a jump marks them an earlier session's (`detect_jump`, bit 63 of the last stage), and a cold session does not read as jumped.
 fn reload_in_jumped_session() -> bool {
     const STATS: usize = 0xFD60_0D00;
     let w = |k: usize| unsafe { read_volatile((STATS + k * 8) as *const u64) };
