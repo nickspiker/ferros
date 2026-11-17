@@ -145,6 +145,49 @@ struct Log {
     buf: Vec<u8>,
 }
 
+/// One pass of the loop timed step by step (2026-11-17, the Pro: a kist's first wait for be you, facets op 2, was answered 5 to 6 s after it came, held behind the pass's other work): the counter at each named step's end, said on the console when the whole pass took longer than an eighth of a second, so the step that holds it is named.
+struct Lap {
+    t0: u64,
+    marks: [(&'static [u8], u64); 1 << 5],
+    n: usize,
+}
+
+impl Lap {
+    fn new() -> Self {
+        Self { t0: now(), marks: [(b"", 0); 1 << 5], n: 0 }
+    }
+
+    /// The step `name` ended now.
+    fn mark(&mut self, name: &'static [u8]) {
+        self.marks[self.n] = (name, now());
+        self.n += 1;
+    }
+
+    /// The pass's steps in ms, each with its time, when the pass took longer than 2^-3 s.
+    fn said(&self, log: &mut Log) {
+        let f = ferros_sys::freq();
+        let end = now();
+        if end - self.t0 <= f >> 3 {
+            return;
+        }
+        log.put(b"fgtw: a long pass, A#");
+        log.dec((end - self.t0) * 1000 / f);
+        log.put(b" ms:");
+        let mut prev = self.t0;
+        for &(name, t) in &self.marks[..self.n] {
+            // Only the steps that took a millisecond or more: the rest are noise in the line.
+            if (t - prev) * 1000 / f >= 1 {
+                log.put(b" ");
+                log.put(name);
+                log.put(b" A#");
+                log.dec((t - prev) * 1000 / f);
+            }
+            prev = t;
+        }
+        log.line();
+    }
+}
+
 impl Log {
     fn put(&mut self, s: &[u8]) {
         self.buf.extend_from_slice(s);
@@ -1543,6 +1586,7 @@ impl Client {
         ferros_sys::thread_spawn(net_watch, unsafe { &mut *WATCH_STACK.0.get() }, self.log.grants);
         loop {
             let t = now_us();
+            let mut lap = Lap::new();
             let mut busy = false;
             // The bell's count before this pass looks: a ring while it runs ends the idle wait at once.
             let bell_seen = NET_BELL.load(Ordering::Acquire);
@@ -1579,6 +1623,9 @@ impl Client {
             }
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
+            lap.mark(b"the network");
+            // The facets first (a kist's wait for be you, its be you, its people): answered before anything slow in this pass, and again between the slow steps below (`facets_now`), never held behind them.
+            busy |= self.facets_now(&mut lap);
             // The attest screen: the state, or its roots (op 4, 65 bytes).
             // On the stack: a syscall's buffers must be in the arc. 512 bytes hold the longest words entry (23 voca words, at most 18 letters each, with spaces).
             let mut req = [0u8; 512];
@@ -1787,23 +1834,32 @@ impl Client {
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
             }
+            lap.mark(b"the attest screen");
             // Joining: the seed's copy of the chain every 16 s, for the sponsor's Add. A sponsor hands the chain and the fan-out to a newcomer at the address its request came from on the LAN; one it knows only from the registry or the tap has no address, and the newcomer has to look (2026-11-04: Brittany's phone bound this device by the tap and the words stayed up). The clock only moves forward, so `t` is never behind the last check.
             if !self.bound && !self.depart_asking() && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
                 self.join_checked_us = t;
                 self.join_check();
             }
+            lap.mark(b"join_check");
             // Leaving: the seed's copy of the chain every 16 s, its fold to the departure machine (depart.rs).
             self.depart_seed_check(t);
+            lap.mark(b"depart_seed_check");
+            busy |= self.facets_now(&mut lap);
             // The departure machine's slow work: signing a request or a deny, an approval's publish, a chain read (depart.rs), here in the loop and never inside a call another process waits on.
             self.depart_work();
+            lap.mark(b"depart_work");
+            busy |= self.facets_now(&mut lap);
             // Sponsoring (add.rs): the radios listening for newcomers and for a departure's tap, the add machine's deadline, and its slow work (signing, the registry's read, the bind, the grow), here in the loop and never inside a call another process waits on.
             self.sponsor_step();
+            lap.mark(b"sponsor_step");
+            busy |= self.facets_now(&mut lap);
             // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
             self.space_step(t);
+            lap.mark(b"space_step");
             // The facets (facets.rs): calls on `facets` taken in, one held binding signed, an add's chain looked up.
-            busy |= self.facets_recv();
-            self.facets_work();
+            busy |= self.facets_now(&mut lap);
             self.person_step();
+            lap.mark(b"person_step");
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             // Either family will do (INFO bit 0 an IPv4 route, bit 1 an IPv6 one): fgtw.org answers on both, and the resolver picks the family the route will use. Until 2026-11-13 only IPv4 counted, and the 8a with no DHCPv4 lease but a working IPv6 stayed grey.
@@ -1842,10 +1898,13 @@ impl Client {
                     }
                 }
             }
+            lap.mark(b"lookup");
+            busy |= self.facets_now(&mut lap);
             // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
             if !self.bound && !self.depart_asking() && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
                 self.mint_request();
             }
+            lap.mark(b"mint_request");
             // Bound: nothing left to prove proximity for.
             if self.bound && self.radios_on {
                 self.radios(None);
@@ -1856,14 +1915,17 @@ impl Client {
                     self.radios(Some((&s, &id)));
                 }
             }
+            lap.mark(b"radios");
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();
             }
+            lap.mark(b"beacon");
             if self.bound && t.saturating_sub(self.last_ping_us) >= 10_000_000 {
                 self.last_ping_us = t;
                 self.pings();
             }
+            lap.mark(b"pings");
             if !self.bound && self.hp.is_some() {
                 if t.saturating_sub(self.last_words_us) >= 60_000_000 {
                     self.last_words_us = t;
@@ -1883,6 +1945,8 @@ impl Client {
             }
             // And the kists waiting for be you (facets op 2), of a change in its readiness made by this pass.
             self.facets_ring();
+            lap.mark(b"words and rings");
+            lap.said(&mut self.log);
             // Work in hand, or PT moving a frame (its acks and resends are paced by its own clock): the next pass a millisecond on, as before.
             // The person at the Fleet page (the add machine open, the radios listening for a tap or a beacon, a departure under way): every 20 ms as before, since the radios are asked for what they heard (sponsor_hear) and the machines' deadlines are theirs.
             // Otherwise nothing is asked on a clock: the wait ends when the network watch rings (`NET_BELL`), when a call comes on an endpoint this thread polls (`fgtw`, `facets`), or at the loop's next deadline (`idle_until`). Without a watch (an ip from before op 11), every 20 ms as before.
