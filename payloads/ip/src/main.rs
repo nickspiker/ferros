@@ -2054,6 +2054,14 @@ impl Ip {
     }
 
     fn udp_send(&mut self, fam: u8, addr: [u8; 16], dport: u16, sport: u16, payload: &[u8]) -> u8 {
+        // An IPv4-mapped IPv6 destination (::ffff:a.b.c.d) is the IPv4 address a.b.c.d, as a dual-stack socket means it (RFC 4291 2.5.5.2): Photon maps every IPv4 destination so before it sends (photon udp.rs `map_v4_for_dualstack`). Until 2026-11-17 such a datagram left as IPv6 to an address no host holds, and every ping, pong and transfer Photon sent on ferros to an IPv4 peer was lost (the Pro: the desktop heard nothing from Photon's device while its beacons, sent unmapped, arrived).
+        let (fam, addr) = if fam == 6 && addr[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF] {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&addr[12..16]);
+            (4, a)
+        } else {
+            (fam, addr)
+        };
         let mut u = [0u8; 1480];
         let n = 8 + payload.len();
         if n > 1460 {
