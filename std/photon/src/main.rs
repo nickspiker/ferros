@@ -12,7 +12,6 @@ use fluor::host::{WakeError, WakeSender};
 use fluor::text::TextRenderer;
 use photon_messenger::crypto::photon_keys::PhotonKeys;
 use photon_messenger::network::fgtw::derive_device_keypair;
-use photon_messenger::network::fgtw::fleet::SigningBundle;
 use photon_messenger::ui::photon_app::PhotonApp;
 use photon_messenger::ui::{PhotonEvent, Px};
 
@@ -366,7 +365,7 @@ fn main() {
     let mut app = PhotonApp::new();
     let made = std::time::Instant::now();
     app.set_device_keypair(derive_device_keypair(&root));
-    app.set_signing_bundle(SigningBundle::derive(&root));
+    // No post-quantum device bundle (a Falcon and a SPHINCS+ keygen, about 370 ms before the first frame on the Pro): Photon on ferros acts as its alias alone and never signs a fleet write with the device key, so init installs the Ed25519 device signer (photon-9c, 2026-11-17).
     println!(
         "photon: {} ms from main to the host: the app made in {} ms, the device's keys from the ira in {} ms",
         started.elapsed().as_millis(),
