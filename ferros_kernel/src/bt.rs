@@ -37,7 +37,7 @@ fn dbo_pulse() {
     dat(GPP24, DBO_PIN, false);
 }
 
-/// On: the UART's USI in UART mode, the lines' modes (DBO first driven high, as nitrous's first rfkill call does), then REG_ON low with a DBO pulse, 30 ms, REG_ON high with a DBO pulse, DEV_WAKE high (the chip awake: ferros does not run its low-power protocol yet), and 20 ms for the chip's ROM. Off: DEV_WAKE low, REG_ON low with a DBO pulse, 20 ms. Powered whatever WiFi's REG_ON is: the measured rule (2026-10-31) is only that WL_REG_ON is never cycled under a powered Bluetooth core, which pcie1 keeps by turning Bluetooth off around its cycle; refusing Bluetooth while WiFi was off was Android's power-up order made a rule, never measured, and it took Bluetooth down silently with a switched-off WiFi (owner, 2026-11-09: "why is bluetooth not to be on whilst wifi is off?"). Tested on the Pro with WL_REG_ON low.
+/// On: the UART's USI in UART mode, the lines' modes (DBO first driven high, as nitrous's first rfkill call does), then REG_ON low with a DBO pulse, 30 ms, REG_ON high with a DBO pulse, DEV_WAKE high (the chip awake: ferros does not run its low-power protocol yet), and 20 ms for the chip's ROM. Off: DEV_WAKE and REG_ON driven low as outputs, then a DBO pulse, 20 ms. Powered whatever WiFi's REG_ON is: the measured rule (2026-10-31) is only that WL_REG_ON is never cycled under a powered Bluetooth core, which pcie1 keeps by turning Bluetooth off around its cycle; refusing Bluetooth while WiFi was off was Android's power-up order made a rule, never measured, and it took Bluetooth down silently with a switched-off WiFi (owner, 2026-11-09: "why is bluetooth not to be on whilst wifi is off?"). Tested on the Pro with WL_REG_ON low.
 pub fn power(on: bool) -> bool {
     let ms = |n: u64| us(n * 1000);
     if on {
@@ -54,8 +54,15 @@ pub fn power(on: bool) -> bool {
         dbo_pulse();
         dat(GPN9, 0, true);
     } else {
+        // Off drives its pins too: the data bits low first, then the pins' modes as outputs (DBO's as well), then the pulse that latches REG_ON low.
+        // Until 2026-11-16 off wrote only the data bits, which drive nothing on a pin still an input (its reset mode, kept while Bluetooth is switched off and never on this boot), and BT_REG_ON read high there (the Pro, b908: gpn8 con 0, dat 1 with its pull-down on).
+        // pcie1's power cycle then ran with Bluetooth's core on (the REG_ON rule above): after a RAM reload with Bluetooth switched off the WiFi chip came back wedged, a BAR read of it never completed, and two keeper restarts read its vendor id as 0; with gpn8 driven low and latched, the next restart brought it up (WIFI.md "A BAR access that never completes").
         dat(GPN9, 0, false);
         dat(GPN8, 0, false);
+        dat(GPP24, DBO_PIN, false);
+        pin_field(GPN9, 0, 1);
+        pin_field(GPN8, 0, 1);
+        pin_field(GPP24, DBO_PIN, 1);
         dbo_pulse();
     }
     ms(20);

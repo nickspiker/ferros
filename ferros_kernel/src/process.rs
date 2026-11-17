@@ -3621,6 +3621,8 @@ fn mmio_fast(f: &Frame) -> Option<u64> {
     let nr = f.x[8];
     crate::platform::crumb(0x90 + nr);
     crate::platform::note_mmio((hw.base + off) as u64 | (write as u64) << 63);
+    // An access to a PCIe link's window noted with its start, so one the endpoint never answers is ended by the service loop (pcie_guard.rs).
+    let link = crate::pcie_guard::begin(c, hw.base + off);
     let v = if write {
         unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
         note_write(hw.base + off);
@@ -3628,6 +3630,9 @@ fn mmio_fast(f: &Frame) -> Option<u64> {
     } else {
         unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
     };
+    if link {
+        crate::pcie_guard::end(c);
+    }
     busy.store(0, Release);
     crate::platform::crumb(0x70 + nr);
     MMIO_PATHS[0].fetch_add(1, Relaxed);
@@ -5057,12 +5062,22 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         ERR
                     } else if f.x[8] == SYS_MMIO_READ {
                         // A read goes straight to the register even in a block only EL3 may write (the PMU): EL2 reads it, as the kernel's own drivers do, and the EL3 path refuses reads of what it does not list (G#FFFF_FFEA, -22: the modem driver's HSI1 power-domain status, 2026-10-29).
-                        unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
+                        // A PCIe link's window noted as on the fast path (pcie_guard.rs): here the lock is held too, so an access never answered would hold it until the service loop ends it.
+                        let link = crate::pcie_guard::begin(core(), hw.base + off);
+                        let v = unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 };
+                        if link {
+                            crate::pcie_guard::end(core());
+                        }
+                        v
                     } else {
                         if hw.via_el3 {
                             crate::platform::priv_reg((hw.base + off) as u64, true, f.x[2] as u32);
                         } else {
+                            let link = crate::pcie_guard::begin(core(), hw.base + off);
                             unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
+                            if link {
+                                crate::pcie_guard::end(core());
+                            }
                         }
                         note_write(hw.base + off);
                         0
