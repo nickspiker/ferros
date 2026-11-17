@@ -30,6 +30,8 @@ const TAG: usize = 16;
 const BATCH: usize = 1 << 4;
 /// The most furrow blocks a read gathers before it reads them (512 KiB, about seven pieces): large enough that a value laid in one stretch is read in commands of that size, small enough that the opener's helpers start on the first pieces while the rest are read.
 const RUN_BLOCKS: usize = 1 << 7;
+/// The widest gap between two wanted furrows that one read still covers (2026-11-17, the Pro, b923: Photon's 47 MB capsule read in 2509 commands of about 23 KB, each piece's 17 furrows one run and its leaf the gap before the next piece's).
+const GAP_BLOCKS: u64 = 1 << 2;
 
 /// Furrows gathered for one read (`Store::read_gathered`): their tract positions in the order the pieces want them, and each piece's slot and how many of them are its.
 struct Gathered {
@@ -352,8 +354,22 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let mut buf: Vec<manifestus::Block> = alloc::vec![manifestus::ZERO_BLOCK; n];
         let mut start = 0;
         for i in 1..=n {
-            if fetched.is_ok() && (i == n || gathered.pos[i] != gathered.pos[i - 1] + 1) {
-                if let Err(e) = self.vault.read_tract_run(gathered.pos[start], &mut buf[start..i]) {
+            // A run goes on over a forward gap of up to GAP_BLOCKS: the blocks between (a piece's leaf, mostly) are read with it and dropped, one command where there were two.
+            let next_in_run = i < n && gathered.pos[i] > gathered.pos[i - 1] && gathered.pos[i] - gathered.pos[i - 1] <= GAP_BLOCKS + 1;
+            if fetched.is_ok() && !next_in_run {
+                let first = gathered.pos[start];
+                let span = (gathered.pos[i - 1] - first + 1) as usize;
+                let r = if span == i - start {
+                    self.vault.read_tract_run(first, &mut buf[start..i])
+                } else {
+                    let mut all: Vec<manifestus::Block> = alloc::vec![manifestus::ZERO_BLOCK; span];
+                    let r = self.vault.read_tract_run(first, &mut all);
+                    for j in start..i {
+                        buf[j] = all[(gathered.pos[j] - first) as usize];
+                    }
+                    r
+                };
+                if let Err(e) = r {
                     *fetched = Err(e.into());
                 }
                 start = i;
@@ -757,12 +773,25 @@ mod tests {
     use manifestus::{Block, DeletePolicy, Mirror};
 
     struct Mem(Vec<Block>);
+    /// Runs of more than one block read, for `gathered_reads_are_few_and_large` (each test thread its own count).
+    std::thread_local! {
+        static RUNS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    }
     impl BlockDev for Mem {
         fn block_count(&self) -> u64 {
             self.0.len() as u64
         }
         fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
             *buf = self.0[lba as usize];
+            Ok(())
+        }
+        fn read_run(&mut self, lba: u64, out: &mut [Block]) -> manifestus::Result<()> {
+            if out.len() > 1 {
+                RUNS.with(|r| r.set(r.get() + 1));
+            }
+            for (k, b) in out.iter_mut().enumerate() {
+                *b = self.0[lba as usize + k];
+            }
             Ok(())
         }
         fn write(&mut self, lba: u64, buf: &Block) -> manifestus::Result<()> {
@@ -772,6 +801,25 @@ mod tests {
         fn flush(&mut self) -> manifestus::Result<()> {
             Ok(())
         }
+    }
+
+    /// A value written in one stretch reads back right in runs of about RUN_BLOCKS, the leaves between pieces read over (2026-11-17: one run a piece before the gaps were bridged).
+    #[test]
+    fn gathered_reads_are_few_and_large() {
+        let mut s = store(1 << 14);
+        let d = domain(4);
+        let v = bytes(48 * PIECE + 123, 9);
+        s.put(&d, b"big", &v).unwrap();
+        s.forget();
+        let before = RUNS.with(|r| r.get());
+        let mut out = std::vec![0u8; v.len()];
+        for (k, chunk) in out.chunks_mut(1 << 20).enumerate() {
+            s.read(&d, b"big", (k << 20) as u64, chunk).unwrap();
+        }
+        let runs = RUNS.with(|r| r.get()) - before;
+        assert!(out == v, "the value reads back whole");
+        // 49 pieces of 17 furrows: at most one run per RUN_BLOCKS wanted blocks, plus one where each 1 MiB get begins.
+        assert!(runs <= ((49 * 17) / RUN_BLOCKS + 1 + 4) as u64, "{runs} runs");
     }
 
     struct Counter(u64);
