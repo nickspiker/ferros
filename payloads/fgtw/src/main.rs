@@ -29,7 +29,8 @@ mod route;
 mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
-const HEAP_BYTES: usize = 2 << 20;
+/// 8 MiB since 2026-11-17: at 2 MiB the Pro's service ended on "memory allocation of 67075 bytes failed" (b916) as the desktop's Photon, reloaded, began its sibling ceremony with this device's member key (baf3dec7 is a fleet member, so every Photon of the fleet takes it for a sibling until the alias cutover, PHOTON.md M4): its 573806-byte ClutchOffer arrives as a transfer this service takes in whole (photon_core pt, MAX_TRANSFER 4 MiB), beside the held chain (about 207 KB) and the bindings. A transfer as large as MAX_TRANSFER now fits beside the rest.
+const HEAP_BYTES: usize = 8 << 20;
 /// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
 const STACK_BYTES: usize = 1 << 20;
 /// What an untouched stack byte holds.
