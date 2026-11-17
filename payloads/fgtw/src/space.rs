@@ -69,11 +69,19 @@ pub struct SpaceSync {
     person_told: Option<[u8; 32]>,
     /// What was last said of the person key (`P_*`), so each state is said once.
     person_said: u8,
+    /// What was last said of the pull's three conditions (`space_ready`: the handle proof, bound, the fleet key), one bit each; 8 before the first line. Said on a change only (2026-11-17: a launch waited on readiness and nothing said why).
+    said_ready: u8,
+    /// Tries of the first pull at fgtw.org so far, said with each.
+    pull_tries: u32,
+    /// The first pull's wait for the network said.
+    said_no_net: bool,
+    /// The key fingerprint of a copy (fgtw.org's or a sibling's) that did not open here: while Some, nothing of ours is pushed to fgtw.org (G2, docs/IDENTITY-SPACE.md).
+    held: Option<[u8; 32]>,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None }
     }
 }
 
@@ -233,20 +241,61 @@ impl Client {
     pub(crate) fn space_seed(&mut self, put: bool) {
         let Some((hp, _)) = self.space_ready() else { return };
         if !self.net_up {
+            if !self.space.settled && !self.space.said_no_net {
+                self.space.said_no_net = true;
+                self.log.put(b"fgtw: space: the first pull waits for the network");
+                self.log.line();
+            }
             return;
+        }
+        // Each try of the first pull said, with its time and how it ended (the lines below, or this one's answer time): from 2026-11-17, when a launch waited on readiness and nothing said whether fgtw.org was asked.
+        let first = !self.space.settled;
+        let asked = now_us();
+        if first {
+            self.space.pull_tries += 1;
+            self.log.put(b"fgtw: space: the first pull, try A#");
+            self.log.dec(self.space.pull_tries as u64);
+            self.log.put(b": asking fgtw.org");
+            self.log.line();
         }
         fgtw::set_clock(eagle());
         let (pulled, ip) = {
             let s = self.seed();
-            let r = fgtw::client::pull_space(&s, &hp);
+            let r = fgtw::client::pull_space_seen(&s, &hp);
             (r, s.ip.get())
         };
         self.seed_ip = ip;
+        // The stored document as served, named by the push below (`prev`): fgtw.org takes ours only over that one.
+        let seen = match &pulled {
+            Ok(Some((_, seen))) => Some(*seen),
+            _ => None,
+        };
+        let pulled = pulled.map(|p| p.map(|(s, _)| s));
+        if first {
+            self.log.put(b"fgtw: space: the first pull, try A#");
+            self.log.dec(self.space.pull_tries as u64);
+            self.log.put(b": fgtw.org ");
+            self.log.put(match &pulled {
+                Ok(Some(_)) => b"sent a copy".as_slice(),
+                Ok(None) => b"keeps none",
+                Err(_) => b"failed (the reason below)",
+            });
+            self.log.put(b" in A#");
+            self.log.dec((now_us() - asked) / 1000);
+            self.log.put(b" ms");
+            self.log.line();
+        }
         match pulled {
             Ok(Some(sealed)) => {
                 self.seed_heard_us = now_us();
                 // What the seed holds, as it came: what ours is compared with before a put.
-                self.space.seed_digest = self.space_take(&sealed, b"fgtw.org").unwrap_or([0; 32]);
+                // A copy that does not open (sealed under a key this device does not hold, or unreadable) neither settles the first pull nor is pushed over: this device's pushes wait until it holds that key or a copy that opens comes (docs/IDENTITY-SPACE.md, G2; 2026-11-17, b925: the Pro pushed its copy over fgtw.org's, sealed under the key before a rotation).
+                let Some(digest) = self.space_take(&sealed, b"fgtw.org") else {
+                    self.space_hold(&sealed.kfp, b"fgtw.org");
+                    return;
+                };
+                self.space_release(b"a copy from fgtw.org opens");
+                self.space.seed_digest = digest;
                 if !self.space.settled {
                     self.space.settled = true;
                     self.log.put(b"fgtw: space: fgtw.org's copy in hand; joining this device's copy to it");
@@ -279,14 +328,14 @@ impl Client {
                 return;
             }
         }
-        if put && self.space.seed_digest != self.space.space.digest() {
+        if put && self.space.held.is_none() && self.space.seed_digest != self.space.space.digest() {
             let Some(sealed) = self.space_sealed() else { return };
             // Signed with everything this device holds (Falcon and SLH-DSA beside Ed25519), as every other write to fgtw.org is: a fleet whose members declared them refuses a bare Ed25519 egg (`below_floor`), and until 2026-11-10 every push from here was refused so, the departure request with it. On the X3, as the binding request signs: SLH-DSA-128s takes seconds on a worker.
             ferros_sys::pin(ferros_sys::CORES_BIG);
             ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
             let r = {
                 let s = self.seed();
-                fgtw::client::push_space(&s, &hp, &self.keys, &sealed)
+                fgtw::client::push_space_prev(&s, &hp, &self.keys, &sealed, seen.as_ref())
             };
             ferros_sys::pin(0);
             match r {
@@ -303,6 +352,28 @@ impl Client {
                     self.log.line();
                 }
             }
+        }
+    }
+
+    /// A copy from `from` that does not open here, sealed under the key `kfp` names: this device's pushes to fgtw.org held (`held`) until it holds that key or a copy that opens comes. Said when the held key changes.
+    fn space_hold(&mut self, kfp: &[u8; 32], from: &[u8]) {
+        if self.space.held != Some(*kfp) {
+            self.log.put(b"fgtw: space: a copy from ");
+            self.log.put(from);
+            self.log.put(b" is sealed under a key this device does not hold (fingerprint ");
+            self.log.fp(kfp);
+            self.log.put(b"): pushes held until this device holds it or a copy that opens comes; the first pull not settled by it");
+            self.log.line();
+        }
+        self.space.held = Some(*kfp);
+    }
+
+    /// The hold lifted (`why`), when there was one. Said once.
+    fn space_release(&mut self, why: &[u8]) {
+        if self.space.held.take().is_some() {
+            self.log.put(b"fgtw: space: pushes go on again: ");
+            self.log.put(why);
+            self.log.line();
         }
     }
 
@@ -323,6 +394,12 @@ impl Client {
     fn space_ask_fleet(&mut self) {
         let Some((hp, _)) = self.space_ready() else { return };
         let Ok(frame) = fgtw::protocol::space_want(&hp, &self.space.space.digest(), self.keys.keypair(), eagle()) else { return };
+        if !self.space.settled {
+            self.log.put(b"fgtw: space: the first pull: the fleet asked for its copy (A#");
+            self.log.dec(self.members.len() as u64);
+            self.log.put(b" members in the chain)");
+            self.log.line();
+        }
         self.push_to_fleet(frame, None);
     }
 
@@ -330,6 +407,10 @@ impl Client {
     pub fn on_space_push(&mut self, from: Addr, bytes: &[u8]) {
         let Ok((hp, sealed, sender)) = fgtw::protocol::parse_space_push(bytes) else { return };
         if Some(hp) != self.hp || !self.members.contains(&sender) || self.space_ready().is_none() {
+            if !self.space.settled {
+                self.log.put(b"fgtw: space: a fleet device's copy came before the first pull settled and was not taken (another identity's, not a member's, or the pull not ready)");
+                self.log.line();
+            }
             return;
         }
         self.space_load();
@@ -339,7 +420,12 @@ impl Client {
             name[2 * k] = h[(c >> 4) as usize];
             name[2 * k + 1] = h[(c & 15) as usize];
         }
-        let Some(theirs) = self.space_take(&sealed, &name) else { return };
+        let Some(theirs) = self.space_take(&sealed, &name) else {
+            // A sibling's copy this device cannot open holds its pushes too (G2): that sibling holds a key this one does not.
+            self.space_hold(&sealed.kfp, &name);
+            return;
+        };
+        self.space_release(b"a fleet device's copy opens");
         if !self.space.settled {
             self.space.settled = true;
             self.log.put(b"fgtw: space: a fleet device's copy in hand; joining this device's copy to it");
@@ -511,11 +597,30 @@ impl Client {
 
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
     pub fn space_step(&mut self, t: u64) {
-        if self.space_ready().is_none() {
+        // The pull's three conditions, said when they change.
+        let ready = self.hp.is_some() as u8 | (self.bound as u8) << 1 | (self.fleet_key.is_some() as u8) << 2;
+        if ready != self.space.said_ready {
+            self.space.said_ready = ready;
+            let yn = |b: u8| if ready & b != 0 { b"yes".as_slice() } else { b"no" };
+            self.log.put(b"fgtw: space: the pull's conditions: the handle proof ");
+            self.log.put(yn(1));
+            self.log.put(b", bound ");
+            self.log.put(yn(2));
+            self.log.put(b", the fleet key ");
+            self.log.put(yn(4));
+            self.log.line();
+        }
+        let Some((_, fk)) = self.space_ready() else {
             return;
+        };
+        // The key a held copy is sealed under now held here (a newer fan-out, or this device's own rotation): its copy opens at the next pull, and the hold goes.
+        if self.space.held == Some(fgtw::fanout::fleet_key_fingerprint(&fk)) {
+            self.space_release(b"this device holds the key the held copy is sealed under");
         }
         if !self.space.loaded {
             self.space_load();
+            // The person key at once from this device's own copy of the space, before the first pull (owner, 2026-11-17: "all my person keys should be immediate as well"): opened only, never minted (a mint before the pull could go over the fleet's key); the pull's settle follows as before and hands another key only if the fleet's space says another won.
+            self.space_person_local();
             self.space_ask_fleet();
             self.space_seed(false);
             self.space.last_seed_us = t;
@@ -544,6 +649,29 @@ impl Client {
 
     /// The person key (docs/FACETS.md D0, D1), at each join once the first pull is done: opened from the space with the fleet key; sealed again under the current fleet key when this device holds it and the space has it under an earlier one (a shrink re-seals, never rotates); minted here when the identity has none yet (its first device to run this) and written into the space, so the person's other devices open the same one. Then handed to the kernel, which derives every kist's alias from it; this service derives no alias and holds none.
     /// The decision is fgtw's (`fgtw::person::settle`, the one Photon makes on the other platforms); this keeps what it settles on, says it once, and hands the space on when it changed.
+    /// The person key opened from this device's kept copy of the space under the current fleet key and handed to the kernel, when it is there; nothing minted, nothing written. Said with the time since the bind's step began.
+    fn space_person_local(&mut self) {
+        let Some((hp, fk)) = self.space_ready() else { return };
+        match fgtw::person::find(&self.space.space, &hp, &fk) {
+            fgtw::person::Found::Key { mut key, id, minted } => {
+                self.log.put(b"fgtw: person key opened from this device's kept copy of the space (id ");
+                self.log.fp(&id);
+                self.log.put(b"), before the first pull");
+                self.log.line();
+                self.person_hold(key, minted);
+                // This frame's copy overwritten: the one kept is `space.person`'s.
+                key.fill(0);
+                core::hint::black_box(&key);
+                self.space.person_said = P_HELD;
+                self.person_to_kernel();
+            }
+            _ => {
+                self.log.put(b"fgtw: no person key in this device's kept copy of the space under the current fleet key: waiting for the first pull");
+                self.log.line();
+            }
+        }
+    }
+
     fn space_person(&mut self) {
         let Some((hp, fk)) = self.space_ready() else { return };
         let (me, grants) = (self.me, self.log.grants);
