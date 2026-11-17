@@ -4,6 +4,7 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
+//! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 64x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 #![no_std]
 #![no_main]
 
@@ -76,6 +77,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if bin == 1 {
         view(g, ep, id, frames, arg(3) == 2, t1);
     }
+    // A fourth byte of 3: the gain's curve (owner, 2026-11-17: "the ISO doesn't do anything in lumis").
+    if arg(3) == 3 {
+        gain_curve(g, ep, id, bin, arg(0), arg(5), t1);
+    }
     let mut r = [0u8; 4];
     let n = call(ep, &[1, id], &mut r);
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
@@ -125,6 +130,71 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// The gain's curve: OPEN, the exposure set to 2^`exp_log2` us (none when 0: the init's), then each gain step in turn (1024 one: 1x to 64x in halves of a stop), the frames' mean sample over `per` frames (16 when 0) after two to let the change land, said with the gain each frame's header carries; a step the driver refuses is said and passed. The mean above black against the gain says whether it is linear and where the analogue gain ends (the driver's console line names the sensor's model and its analogue most).
+fn gain_curve(g: u64, ep: u64, id: u8, bin: u8, per: u8, exp_log2: u8, t1: u64) -> ! {
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    let mut r = [0u8; 4];
+    let n = call(ep, &[1, id], &mut r);
+    say!(g, "camtest: gain curve: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 {
+        ferros_sys::exit(1);
+    }
+    let set = |what: u8, value: u64| -> u8 {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut r = [0xEEu8; 1];
+        if call(ep, &m, &mut r) == ERR { 0xEE } else { r[0] }
+    };
+    if exp_log2 != 0 {
+        say!(g, "camtest: exposure A#{} us: answered A#{}\n", 1u64 << exp_log2, set(0, (1u64 << exp_log2) * 1000));
+    }
+    let per = if per == 0 { 16 } else { per as u32 };
+    // A frame's mean sample (every 16th of its binned samples) and the gain its header carries; None when no frame came.
+    let mut frame = || -> Option<(u64, u32)> {
+        let n = call(ep, &[2, bin], buf);
+        if n == ERR || n < 64 {
+            return None;
+        }
+        let samples = &buf[64..n as usize];
+        let mut sum = 0u64;
+        let mut cnt = 0u64;
+        for s in samples.chunks_exact(2).step_by(1 << 4) {
+            sum += u16::from_le_bytes([s[0], s[1]]) as u64;
+            cnt += 1;
+        }
+        Some((sum * 16 / cnt, u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]])))
+    };
+    // 1x to 64x, a half stop apart (the halves rounded to 1024ths).
+    let steps: [u64; 13] = [1024, 1448, 2048, 2896, 4096, 5793, 8192, 11585, 16384, 23170, 32768, 46341, 65536];
+    for &want in steps.iter() {
+        let a = set(1, want);
+        if a != 0 {
+            say!(g, "camtest: gain A#{want}: refused (A#{a})\n");
+            continue;
+        }
+        for _ in 0..2 {
+            if frame().is_none() {
+                say!(g, "camtest: no frame\n");
+                ferros_sys::exit(1);
+            }
+        }
+        let (mut sum, mut got_gain) = (0u64, 0u32);
+        for _ in 0..per {
+            let Some((m, gn)) = frame() else {
+                say!(g, "camtest: no frame\n");
+                ferros_sys::exit(1);
+            };
+            sum += m;
+            got_gain = gn;
+        }
+        // The mean in 16ths of a code, so the curve near black keeps its fractions.
+        say!(g, "camtest: gain A#{want} asked, A#{got_gain} in the header: mean sample A#{} sixteenths over A#{per} frames\n", sum / per as u64);
+    }
+    let n = call(ep, &[4], &mut r);
+    say!(g, "camtest: gain curve done; CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { r[0] as u64 });
     ferros_sys::exit(0)
 }
 

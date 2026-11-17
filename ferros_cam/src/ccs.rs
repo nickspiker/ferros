@@ -62,14 +62,16 @@ pub struct Array {
     pub weighting: bool,
     /// The binning bytes (G#0900, G#0901) a 1:1 mode writes: a guess on every sensor until a capture of Android's maximum-resolution stream (docs/CAMERA.md "The 1:1 capture").
     pub unbinned: [u8; 2],
+    /// The gain the list offers (1024 one): the sensor's own range (`Gain::range`, read at each open and said on the console), written here once measured on the device so the list, built with no camera powered, can carry it; 1024 and 1024 (the captured code alone) until then.
+    pub gain: (u64, u64),
 }
 
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11] },
-    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11] },
-    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11] },
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11] },
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
+    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
+    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
 ];
 
 /// A readout mode: every CCS register a mode change writes, as the sensor holds it.
@@ -96,13 +98,13 @@ pub struct Mode {
 }
 
 /// The registers `Mode::captured` reads back out of an init, and their widths.
-const READ: [(u16, u8); 25] = [
+const READ: [(u16, u8); 27] = [
     (X_ADDR_START, 2), (Y_ADDR_START, 2), (X_ADDR_END, 2), (Y_ADDR_END, 2), (X_OUTPUT_SIZE, 2), (Y_OUTPUT_SIZE, 2),
     (X_EVEN_INC, 2), (X_ODD_INC, 2), (Y_EVEN_INC, 2), (Y_ODD_INC, 2),
     (BINNING_MODE, 1), (BINNING_MODE + 1, 1), (BINNING_MODE + 2, 1),
     (DIGITAL_CROP_X, 2), (DIGITAL_CROP_Y, 2), (DIGITAL_CROP_W, 2), (DIGITAL_CROP_H, 2),
     (FRAME_LENGTH_LINES, 2), (LINE_LENGTH_PCK, 2), (COARSE_INTEGRATION, 2), (CSI_DATA_FORMAT, 2),
-    (0x0306, 2), (0x0304, 2), (0x0300, 2), (0x0136, 2),
+    (0x0306, 2), (0x0304, 2), (0x0300, 2), (0x0136, 2), (ANALOGUE_GAIN, 2), (DIGITAL_GAIN, 2),
 ];
 
 /// An init table's final values on the CCS page, for the registers in `READ` (the PLL's last four too, for the console): bytes written directly while the page select reads G#4000 (or on a part with no page select), or thru the indirect window into page G#4000; each byte the last one written. None for a register the init never wrote whole.
@@ -371,6 +373,119 @@ impl Writes {
     }
 }
 
+// ---------------------------------------------------------------- gain (owner, 2026-11-17: "the ISO doesn't do anything in lumis")
+
+/// The analogue gain's capability block (CCS: G#0080 analogue_gain_capability, 0 global; G#0084 code min, G#0086 code max, G#0088 code step, G#008A type, G#008C m0, G#008E c0, G#0090 m1, G#0092 c1, the last four signed), read as one 20-byte run from G#0080.
+pub const GAIN_CAPS: u16 = 0x0080;
+pub const GAIN_CAPS_LEN: usize = 20;
+/// The digital gain's limits (CCS: G#1084 digital_gain_min, G#1086 max, G#1088 step), one 6-byte run; its value is 8.8 fixed point (G#0100 one), as both inits write G#020E.
+pub const DGAIN_CAPS: u16 = 0x1084;
+pub const DGAIN_CAPS_LEN: usize = 6;
+pub const ANALOGUE_GAIN: u16 = 0x0204;
+pub const DIGITAL_GAIN: u16 = 0x020E;
+/// The endpoint's gain unit: 1024 one (the list's gain_min and gain_max, SET's value, a frame's gain).
+pub const UNITY: u64 = 1 << 10;
+
+/// A sensor's gain as its CCS capability words state it: analogue gain = (m0 code + c0) / (m1 code + c1) over codes min to max in steps (CCS's model; Sony's 1024 / (1024 - code) is m0 0, c0 1024, m1 -1, c1 1024), then digital gain in 8.8 from d_min to d_max.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gain {
+    pub code_min: u16,
+    pub code_max: u16,
+    pub step: u16,
+    pub m0: i16,
+    pub c0: i16,
+    pub m1: i16,
+    pub c1: i16,
+    pub d_min: u16,
+    pub d_max: u16,
+    pub d_step: u16,
+}
+
+/// A gain split for the sensor: the analogue code, the digital gain (8.8) and the gain they make (1024 one).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GainSet {
+    pub code: u16,
+    pub digital: u16,
+    pub gain: u64,
+}
+
+impl Gain {
+    /// The model from the sensor's own words (`GAIN_CAPS` and `DGAIN_CAPS` read big-endian), or None when they do not describe one: not the global model, no step, codes out of order, a denominator that reaches zero or goes negative over the codes, an analogue gain falling with the code, or digital limits out of order (a sensor whose capability block aliases, as the main's limit block at G#1100 does, says so here instead of driving the gain off a wrong model).
+    pub fn of(a: &[u8; GAIN_CAPS_LEN], d: &[u8; DGAIN_CAPS_LEN]) -> Option<Gain> {
+        let be = |b: &[u8], k: usize| u16::from_be_bytes([b[k], b[k + 1]]);
+        let mut g = Gain {
+            code_min: be(a, 4),
+            code_max: be(a, 6),
+            step: be(a, 8),
+            m0: be(a, 12) as i16,
+            c0: be(a, 14) as i16,
+            m1: be(a, 16) as i16,
+            c1: be(a, 18) as i16,
+            d_min: be(d, 0),
+            d_max: be(d, 2),
+            d_step: be(d, 4),
+        };
+        // No digital step stated: digital gain not offered, left at one.
+        if g.d_step == 0 {
+            (g.d_min, g.d_max, g.d_step) = (0x100, 0x100, 1);
+        }
+        let den =|c: u16| g.m1 as i64 * c as i64 + g.c1 as i64;
+        let ok = be(a, 0) == 0
+            && g.step != 0
+            && g.code_min <= g.code_max
+            && den(g.code_min) > 0
+            && den(g.code_max) > 0
+            && g.analogue(g.code_min) >= 1
+            && g.analogue(g.code_max) >= g.analogue(g.code_min)
+            && g.d_min != 0
+            && g.d_min <= g.d_max;
+        ok.then_some(g)
+    }
+
+    /// The analogue gain a code gives (1024 one).
+    pub fn analogue(&self, code: u16) -> u64 {
+        let num = self.m0 as i64 * code as i64 + self.c0 as i64;
+        let den = self.m1 as i64 * code as i64 + self.c1 as i64;
+        (num * UNITY as i64 / den) as u64
+    }
+
+    /// The least and the most gain offered (1024 one): the least code at the least digital gain, the most code at the most.
+    pub fn range(&self) -> (u64, u64) {
+        (self.analogue(self.code_min) * self.d_min as u64 >> 8, self.analogue(self.code_max) * self.d_max as u64 >> 8)
+    }
+
+    /// The code whose gain is the most not past `want` (1024 one), on the code's step from the least: the model solved for the code, then walked down a step while it overshoots (integer division can land one step high).
+    fn code_under(&self, want: u64) -> u16 {
+        // want = 1024 (m0 c + c0) / (m1 c + c1), so c = (want c1 - 1024 c0) / (1024 m0 - want m1).
+        let (w, u) = (want as i64, UNITY as i64);
+        let den = u * self.m0 as i64 - w * self.m1 as i64;
+        let c = (w * self.c1 as i64 - u * self.c0 as i64) / den;
+        let lo = self.code_min as i64;
+        let k = (c - lo) / self.step as i64;
+        let mut code = (lo + k * self.step as i64) as u16;
+        while code > self.code_min && self.analogue(code) > want {
+            code -= self.step;
+        }
+        code
+    }
+
+    /// `want` (1024 one) for the sensor: analogue alone up to its most, the rest digital (8.8, on its step) up to its most; None outside `range` (SET answers it outside the range: refused, not bounded).
+    pub fn split(&self, want: u64) -> Option<GainSet> {
+        let (lo, hi) = self.range();
+        if want < lo || want > hi {
+            return None;
+        }
+        let a_max = self.analogue(self.code_max);
+        if want <= a_max {
+            let code = self.code_under(want);
+            return Some(GainSet { code, digital: 0x100, gain: self.analogue(code) });
+        }
+        let d = (want << 8) / a_max;
+        let d = d - d % self.d_step as u64;
+        Some(GainSet { code: self.code_max, digital: d as u16, gain: a_max * d >> 8 })
+    }
+}
+
 /// A mode's frame period in picoseconds, from the captured mode's measured line time `line_ps` at its own line length: the line time scales with `llp` (the pixel clock is the PLL's and does not move).
 pub fn frame_ps(m: &Mode, captured_llp: u16, line_ps: u64) -> u64 {
     m.fll as u64 * line_ps * m.llp as u64 / captured_llp as u64
@@ -481,6 +596,42 @@ mod tests {
     }
 
     /// The main's line time scales the frame: the captured mode's 21362 lines at 3.2237 us are its measured 68.9 ms; a 132-line slit is about 426 us of lines (the sensor kept a floor of about 825 us on 2026-10-21).
+    #[test]
+    fn gain_models() {
+        let caps = |min: u16, max: u16, step: u16, m: [i16; 4]| {
+            let mut a = [0u8; GAIN_CAPS_LEN];
+            for (k, v) in [0u16, 0, min, max, step, 0, m[0] as u16, m[1] as u16, m[2] as u16, m[3] as u16].iter().enumerate() {
+                a[2 * k..2 * k + 2].copy_from_slice(&v.to_be_bytes());
+            }
+            a
+        };
+        let d = |min: u16, max: u16, step: u16| {
+            let mut b = [0u8; DGAIN_CAPS_LEN];
+            b[0..2].copy_from_slice(&min.to_be_bytes());
+            b[2..4].copy_from_slice(&max.to_be_bytes());
+            b[4..6].copy_from_slice(&step.to_be_bytes());
+            b
+        };
+        // Sony's convention: gain = 1024 / (1024 - code), codes 0 to 960 (16x); digital 1x to 16x in 1/256.
+        let sony = Gain::of(&caps(0, 960, 1, [0, 1024, -1, 1024]), &d(0x100, 0x1000, 1)).unwrap();
+        assert_eq!(sony.range(), (1024, 16384 * 16));
+        assert_eq!(sony.split(2048), Some(GainSet { code: 512, digital: 0x100, gain: 2048 }));
+        assert_eq!(sony.split(16384), Some(GainSet { code: 960, digital: 0x100, gain: 16384 }));
+        assert_eq!(sony.split(32768), Some(GainSet { code: 960, digital: 0x200, gain: 32768 }));
+        // A gain between codes takes the one under it.
+        let s = sony.split(3000).unwrap();
+        assert!(s.gain <= 3000 && sony.analogue(s.code + 1) > 3000, "{s:?}");
+        assert_eq!(sony.split(1000), None);
+        // A linear model (gain = code / 32), codes 32 to 512; no digital step stated: no digital gain.
+        let lin = Gain::of(&caps(32, 512, 1, [1, 0, 0, 32]), &d(0x100, 0x100, 0)).unwrap();
+        assert_eq!(lin.range(), (1024, 16384));
+        assert_eq!(lin.split(1024).unwrap().code, 32);
+        assert_eq!(lin.split(5000).unwrap(), GainSet { code: 156, digital: 0x100, gain: 4992 });
+        assert_eq!(lin.split(16385), None);
+        // Words that describe no model: the aliasing the main's limit block shows (every word G#4140).
+        assert_eq!(Gain::of(&[0x41, 0x40].repeat(10).try_into().unwrap(), &d(0x100, 0x100, 1)), None);
+    }
+
     #[test]
     fn frame_times() {
         let Some(init) = local("cam.frame") else { return };

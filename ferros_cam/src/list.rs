@@ -45,9 +45,10 @@ pub fn section(c: &Cam, idt: &[u8]) -> Result<vsf::file_format::VsfSection, IdtE
     // Exposure: one line to the longest offered (ferros_cam cams).
     put("exposure_min", u(c.line_ps / 1000));
     put("exposure_max", u(c.exposure_max_lines * c.line_ps / 1000));
-    // Gain: the captured code alone (1024, unity in the endpoint's units) until how each sensor's code maps to gain is measured; any other is answered outside the range.
-    put("gain_min", u(1 << 10));
-    put("gain_max", u(1 << 10));
+    // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
+    let (gmin, gmax) = crate::ccs::ARRAYS[c.id as usize].gain;
+    put("gain_min", u(gmin));
+    put("gain_max", u(gmax));
     // Focus: the lens actuator's targets over the span measured (the main's G#0800 to G#7800); 0 and 0 where focus is not offered.
     put("focus_min", u(c.focus.0));
     put("focus_max", u(c.focus.1));
