@@ -1,0 +1,17 @@
+[package]
+# Stands in for crates.io's sha2-asm under the workspace's [patch.crates-io] (2026-11-17): pure Rust, no C, no assembly file, no build script.
+# Why: sha2 0.10 takes its aarch64 hardware backend (its own Rust intrinsics) only with its `asm` feature, and that feature pulls sha2-asm, which assembles a .S thru cc; a payload may link no C.
+# With this crate in its place a payload turns `asm` on and gets the CPU's SHA-256 (fips205's SPHINCS+: keygen 208 ms to 36 on the Pro's X3, a signature 1841 to 313) while nothing but Rust is built.
+# It exports what sha2 0.10 calls from sha2-asm: `compress256`, and `compress512` off aarch64 (sha2 calls them on x86 only; on aarch64 sha2 uses its own intrinsics), each checked against sha2's software compression and FIPS 180-4's vectors.
+name = "sha2-asm"
+version = "0.6.4"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sha2_asm"
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The reference: sha2's own software compression (`compress` exposes it; without `asm` sha2 never reaches this crate).
+sha2 = { version = "0.10", default-features = false, features = ["compress", "force-soft"] }

@@ -458,6 +458,10 @@ struct KistJob {
     read: bool,
     /// A stow refused and already told why.
     told: bool,
+    /// A launch's two hashes taken as the bytes land in the arc (`kist_hash`): None until the arc is there, or for a capsule whose first bytes name no signature slot (hashed whole at the check, as before).
+    twin: Option<ferros_kist::twin::Twin>,
+    /// The counter ticks spent hashing as the bytes came.
+    hash_ticks: u64,
 }
 
 enum KistWhy {
@@ -479,7 +483,8 @@ use ferros_kist::launch::why;
 fn kist_call(job: &KistJob) -> bool {
     let mut rest = [0u8; 12];
     rest[..8].copy_from_slice(&(job.got as u64).to_le_bytes());
-    rest[8..].copy_from_slice(&(crate::process::STORE_MAX as u32).to_le_bytes());
+    // A megabyte a call where the vault process answers that much (`kernel_get_max`), else a STORE_MAX transfer.
+    rest[8..].copy_from_slice(&(crate::process::kernel_get_max() as u32).to_le_bytes());
     match crate::process::vault_stamp_addr(crate::process::VOP_GET, "capsules", &job.capsule, &rest) {
         Some(msg) => crate::process::vault_call(msg),
         None => false,
@@ -510,12 +515,44 @@ fn kist_tell(job: &KistJob, stage: u64, value: u64) {
     }
 }
 
+/// A launch's bytes in its arc hashed up to what has come (`ferros_kist::twin`: the address and the signature's hash in one pass), the hasher made at the first bytes the arc holds from the slot its header names. The read's own pass is the only one over the bytes; `spawn_kist` checks the two hashes without hashing again.
+fn kist_hash(job: &mut KistJob) {
+    let (KistWhy::Launch(_), Some(arc)) = (&job.why, job.arc) else { return };
+    let t = cntpct();
+    if job.twin.is_none() {
+        // Only from a capsule's first byte: the first call finds nothing hashed, and a job whose header names no slot hashes at the check instead.
+        let first = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE) as *const u8, job.got.min(ferros_kist::fetch::HEAD)) };
+        match ferros_kist::fetch::head(first) {
+            Ok(h) => job.twin = Some(ferros_kist::twin::Twin::new(h.slot)),
+            Err(_) => return,
+        }
+    }
+    let Some(tw) = job.twin.as_mut() else { return };
+    let from = tw.len();
+    let came = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE + from) as *const u8, job.got - from) };
+    tw.update(came);
+    job.hash_ticks += cntpct() - t;
+}
+
 /// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; a stow told it is read and its checker due on the next pass; else the next read.
 fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     if job.got >= job.total {
+        // The last bytes hashed while the job still holds the arc.
+        kist_hash(job);
         let Some(arc) = job.arc.take() else { return Some(Err((why::READ, "the capsule ended before its code"))) };
         return match &job.why {
-            KistWhy::Launch(l) => Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed).map(|()| KistDone::Launched)),
+            KistWhy::Launch(l) => {
+                // The hashes whole only when every byte went thru the hasher; else `spawn_kist` hashes the arc itself.
+                let t = cntpct();
+                let pre = job.twin.take().filter(|tw| tw.len() == job.total).and_then(|tw| {
+                    let first = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE) as *const u8, job.total.min(ferros_kist::fetch::HEAD)) };
+                    let slot = ferros_kist::fetch::head(first).ok()?.slot;
+                    let (address, file) = tw.finish();
+                    Some(crate::process::KistHashes { address, file, slot })
+                });
+                job.hash_ticks += cntpct() - t;
+                Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed, pre.as_ref()).map(|()| KistDone::Launched))
+            }
             KistWhy::Stow(_) => {
                 job.arc = Some(arc);
                 job.read = true;
@@ -526,7 +563,10 @@ fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             }
         };
     }
-    if !kist_call(job) {
+    // The next read asked first, so the vault process works on it while this core hashes what came.
+    let asked = kist_call(job);
+    kist_hash(job);
+    if !asked {
         return Some(Err((why::READ, "the kernel's channel to the vault process would not take the next read")));
     }
     None
@@ -545,7 +585,7 @@ fn stow_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             }
             Err(c) => c,
         },
-        Some((g, m, co, cl)) => match crate::process::stow_seal(&arc, &g, &m, co, cl) {
+        Some((g, m, _, _)) => match crate::process::stow_seal(&g, &m, &job.capsule) {
             Ok(seal) => {
                 job.arc = None;
                 crate::process::with_lock(|| crate::process::arc_free(arc));
@@ -1174,6 +1214,27 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
 
 /// A capsule the vault keeps in pieces (kvault.rs `set`, over `ferros_pieces::PIECE`), spawned without its bytes ever whole in the kernel heap: under the kernel lock, its length read, a staging arc taken from the frame pool and the pieces read straight into it one at a time (the heap holds one piece), then the gate where it lies and the process built from its code (`spawn_capsule_in_place`), and the staging arc given back. None when the capsule is not kept in pieces (stored before 2026-11-12, or under `PIECE`): the caller reads it whole as before.
 /// Why (2026-11-12, twice on the Pro, PREV_EXIT G#EE91): read whole, the display's 2.8 MB capsule was one 3 MB block of the heap and the gate's parse and clone two more, while a store put of it had needed the sealed copy and its staging, two more; with Mahere running, the 22 MiB heap had the bytes and no such holes.
+/// The seals found only in their image form at a launch (process.rs `seal_ok`), moved to the address form (SANDBOX.md "Seal"; owner, 2026-11-17): the new seal written beside the old one, the list read back, and only from a list read back holding the new seal is the old one dropped. A crash between the writes leaves the old seal listed until the new one is, so the image runs either way; a move whose old seal is gone (a release, a move before it) writes nothing.
+fn move_seals(store: &mut Option<ShimStore>) {
+    for (old, new) in crate::process::seal_moves() {
+        // Some(true) moved, Some(false) nothing left to move, None a write or its read back failed.
+        let moved = crate::process::with_lock(|| {
+            let s = store.as_mut()?;
+            let list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
+            let Some(both) = ferros_kist::seal::with_new(&list, &old, &new) else { return Some(false) };
+            s.set("sealed", &both).ok()?;
+            let back = s.get_by_key("sealed").ok().flatten()?;
+            let after = ferros_kist::seal::without_old(&back, &old, &new)?;
+            s.set("sealed", &after).ok().map(|_| true)
+        });
+        match moved {
+            Some(true) => crate::process::push_console(b"seal: an image's seal moved to the address form\n"),
+            Some(false) => {}
+            None => crate::process::push_console(b"seal: an image's seal not moved (its old seal kept; its next launch tries again)\n"),
+        }
+    }
+}
+
 fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
     let key = core::str::from_utf8(name).ok()?;
     // One hold of the lock from the length to the last piece, so the value read is the one the arc was sized for.
@@ -1794,11 +1855,23 @@ static mut GOV_SHOWN_SEEN: u64 = 0;
 static mut GOV_SHOWN_AVG: u64 = 0;
 static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(96);
 
-/// Whether the shared domains should be at the active tier for what the governor asks of the clusters, the GPU's work, or the frames shown.
-fn tier_active(govs: &[Gov; 2]) -> bool {
+/// What asks the shared domains for the active tier now, one bit each (`TIER_CAUSES`): the governor asking the X3 over `X3_REST_KHZ` (bit 0) or the A715s over `A715_REST_KHZ` (bit 1), the GPU's sustained work (bit 2), the frames shown (bit 3). `clock_policy` adds input with the governor off (bit 4) and a PT transfer's hold (bit 5). None: rest, once the dwell has passed (`TIER_DWELL`).
+fn tier_active(govs: &[Gov; 2]) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
-    govs[0].opps[govs[0].at] > X3_REST_KHZ || govs[1].opps[govs[1].at] > A715_REST_KHZ || unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed) || unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)
+    (govs[0].opps[govs[0].at] > X3_REST_KHZ) as u8 | ((govs[1].opps[govs[1].at] > A715_REST_KHZ) as u8) << 1 | ((unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed)) as u8) << 2 | ((unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)) as u8) << 3
 }
+pub const TIER_CAUSES: usize = 6;
+const TIER_CAUSE_NAMES: [&str; TIER_CAUSES] = ["X3", "A715", "GPU", "frames", "input", "transfer"];
+/// The rest tier is taken only once nothing has asked for the active one for 2^-`TIER_DWELL` s (`diag clock dwell <n>`, 2: a quarter second; 0 no dwell, the tier follows its causes window by window as before 2026-11-17).
+/// A real deadline, checked on the service loop's passes: a switch is seven ACPM requests, each waited for by a rate read (`clock_profile`), and on b922 (2026-11-17) the tier switched 2973 times in 16 minutes, about three a second, its causes crossing their thresholds from one 2^-6 s window to the next.
+static TIER_DWELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// When something last asked for the active tier.
+static mut TIER_BUSY_AT: u64 = 0;
+/// The measure of the tiers' switching (`diag clock`): each switch to active by the causes that asked (a switch counts once under each cause it had), each tier's runs by length (bucket b: under 2^b ms, the last everything longer), and the ticks spent switching.
+static mut TIER_WHY: [u64; TIER_CAUSES] = [0; TIER_CAUSES];
+static mut TIER_RUNS: [[u64; 12]; 4] = [[0; 12]; 4];
+static mut TIER_SINCE: u64 = 0;
+static mut TIER_SWITCH_TICKS: u64 = 0;
 static mut GOV_WINDOWS: u64 = 0;
 static mut TIER_RES: [u64; 4] = [0; 4];
 /// Counter ticks the kernel's core has spent asleep in the service loop's `wfe`, added as each sleep ends.
@@ -1838,7 +1911,7 @@ fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
 }
 
 /// The governor's window: each cluster's share measured and its rate moved (`Gov`). `boost` puts both at their top. Returns whether the shared tier should be active for what the clusters ask or the GPU does.
-fn governor(now: u64, f: u64, boost: bool) -> bool {
+fn governor(now: u64, f: u64, boost: bool) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
     let el = now.wrapping_sub(unsafe { GOV_AT });
     let govs = unsafe { &mut *(&raw mut GOV) };
@@ -1852,7 +1925,7 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         for g in govs.iter_mut() {
             let _ = gov_share(g, 1);
         }
-        return false;
+        return 0;
     }
     // The owner's lift (THERMAL.md decision 3): while someone interacts, the A715s' whole table; otherwise their calm ceiling, and a lift that ends brings them under it at once, inside a window too.
     let lifted = interactive(now, f);
@@ -1999,8 +2072,29 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     let gov = GOV_ON.load(core::sync::atomic::Ordering::Relaxed);
     // The governor runs in every tier once the policy has applied one; in the dark the workers are down and only the X3 moves.
     // Governor off (or before the first switch): the tiers alone, active for a second after a touch as before 2026-11-13.
-    let busy = if gov && was != 0 { governor(now, f, (touched && !dark) || pt_busy) } else { input != 0 && now.wrapping_sub(input) < f };
-    let want = if dark { 3 } else if busy || pt_hold { 2 } else { 1 };
+    let causes = if gov && was != 0 { governor(now, f, (touched && !dark) || pt_busy) } else { ((input != 0 && now.wrapping_sub(input) < f) as u8) << 4 } | (pt_hold as u8) << 5;
+    if causes != 0 {
+        unsafe { TIER_BUSY_AT = now };
+    }
+    // Rest only once nothing has asked for active for the dwell (`TIER_DWELL`); up to active at once.
+    let dwell = TIER_DWELL.load(core::sync::atomic::Ordering::Relaxed);
+    let held = was == 2 && dwell != 0 && now.wrapping_sub(unsafe { TIER_BUSY_AT }) < f >> dwell;
+    let want = if dark { 3 } else if causes != 0 || held { 2 } else { 1 };
+    if want != was && was != 0 {
+        unsafe {
+            if want == 2 {
+                for (k, w) in (*(&raw mut TIER_WHY)).iter_mut().enumerate() {
+                    *w += (causes >> k & 1) as u64;
+                }
+            }
+            // The run that ends, by its length: bucket b holds runs under 2^b ms; the last, 2^11 ms and longer.
+            // WHY the min: a run has no upper end (a night at rest), and there are twelve buckets.
+            let ms = now.wrapping_sub(TIER_SINCE) * 1000 / f;
+            let b = (64 - ms.leading_zeros() as usize).min(11);
+            TIER_RUNS[was as usize][b] += 1;
+            TIER_SINCE = now;
+        }
+    }
     if was != 0 && unsafe { TIER_AT } != 0 {
         unsafe { TIER_RES[was as usize] += now.wrapping_sub(TIER_AT) };
     }
@@ -2015,7 +2109,9 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
                 core::hint::spin_loop();
             }
         }
+        let t_switch = cntpct();
         clock_profile(want);
+        unsafe { TIER_SWITCH_TICKS += cntpct().wrapping_sub(t_switch) };
         if want == 3 && workers_dark {
             crate::smp::stop_all();
         }
@@ -2108,7 +2204,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none).
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2124,6 +2220,9 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
             unsafe { TIER_RES = [0; 4] };
             unsafe { GOV_LIFTED = [0; 2] };
             unsafe { SHARED_LIFTS = 0 };
+            unsafe { TIER_WHY = [0; TIER_CAUSES] };
+            unsafe { TIER_RUNS = [[0; 12]; 4] };
+            unsafe { TIER_SWITCH_TICKS = 0 };
             for b in &crate::process::INPUT_TO_FRAME {
                 b.store(0, Relaxed);
             }
@@ -2148,6 +2247,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
         (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
+        (Some(b"dwell"), Some(n)) => TIER_DWELL.store(n, Relaxed),
         _ => {}
     }
     let lifted = interactive(cntpct(), f);
@@ -2156,6 +2256,22 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };
     out.extend_from_slice(alloc::format!("tiers, ms: rest A#{}, active A#{}, dark A#{}\n", ms(tr[1]), ms(tr[2]), ms(tr[3])).as_bytes());
+    let why = unsafe { TIER_WHY };
+    out.extend_from_slice(alloc::format!("tier dwell f>>A#{} (0 none); switches to active by cause:", TIER_DWELL.load(Relaxed)).as_bytes());
+    for (k, n) in why.iter().enumerate() {
+        out.extend_from_slice(alloc::format!(" {} A#{}", TIER_CAUSE_NAMES[k], n).as_bytes());
+    }
+    out.extend_from_slice(alloc::format!("; switching took A#{} us in all\n", unsafe { TIER_SWITCH_TICKS } * 1_000_000 / f).as_bytes());
+    let runs = unsafe { TIER_RUNS };
+    for (t, name) in [(1usize, "rest"), (2, "active")] {
+        out.extend_from_slice(alloc::format!("  {name} runs by ms:").as_bytes());
+        for (b, n) in runs[t].iter().enumerate() {
+            if *n != 0 {
+                out.extend_from_slice(alloc::format!(" <A#{}:A#{}", 1u64 << b, n).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
     for g in govs.iter() {
         let total: u64 = g.res.iter().sum::<u64>().max(1);
         let mean = g.res.iter().zip(g.opps).map(|(&t, &o)| t * (o / 1000) as u64).sum::<u64>() / total;
@@ -2751,7 +2867,7 @@ pub fn run(mut b: Boot) -> ! {
                 };
                 // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
                 let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
-                let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false };
+                let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false, twin: None, hash_ticks: 0 };
                 if kist_call(&job) {
                     kist_tell(&job, crate::process::STOW_READING, 0);
                     kist_job = Some(job);
@@ -2770,11 +2886,27 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        move_seals(&mut store);
         if let Some(job) = kist_job.as_mut() {
             if let Some(r) = kist_step(job) {
                 let ms = (cntpct() - job.t0) * 1000 / cntfrq();
                 let line = match (&job.why, r) {
-                    (KistWhy::Launch(l), Ok(_)) => alloc::format!("kist {}: started from the vault ({} bytes read in {ms} ms)\n", core::str::from_utf8(&l.name).unwrap_or("?"), job.total),
+                    // Where the launch's time went (2026-11-17): the hashing as the bytes came (one pass, both hashes), then each check after the read, the build last.
+                    (KistWhy::Launch(l), Ok(_)) => {
+                        let us = |t: u64| t * 1_000_000 / cntfrq();
+                        let k = |i: usize| us(crate::process::KIST_TICKS[i].load(core::sync::atomic::Ordering::Relaxed));
+                        alloc::format!(
+                            "kist {}: started from the vault ({} bytes read in {ms} ms, {} B a call): hashed as it came {} us; after the read the address {} us, the gate {} us, the seal {} us, the build {} us\n",
+                            core::str::from_utf8(&l.name).unwrap_or("?"),
+                            job.total,
+                            crate::process::kernel_get_max(),
+                            us(job.hash_ticks),
+                            k(crate::process::KT_ADDRESS),
+                            k(crate::process::KT_GATE),
+                            k(crate::process::KT_SEAL),
+                            k(crate::process::KT_BUILD)
+                        )
+                    }
                     // Kept with its reason for the map, which init told "started" (`kist_not_started`): its circle says why. One that started under the same name meanwhile runs, and nothing is kept.
                     (KistWhy::Launch(l), Err((code, e))) => {
                         if code != crate::process::KIST_ALREADY {

@@ -286,6 +286,19 @@ Still open: the roster reaches a sibling as fleet state sealed under the fleet k
 Scrolling on the empty Ready screen measured about 18 fps (fluor's draw 39 ms and present 16 ms a frame) with the A715s three quarters idle; a list to scroll comes with the roster.
 Pinch works thru fluor's ferros host (fluor ferros-pinch); typing into Photon's fields works.
 
+### Where the open's time goes (2026-11-17, owner: "it takes TWO SECONDS to open Photon")
+
+Measured on the Pro (b916/b917 consoles, `diag bench`, payloads/vaultbench and payloads/pqprobe):
+- **The capsule read, 1.48 s**: the vault process 1.19 s (351 gets of 256 KiB; 197 MB of blocks read for 92 MB thru the read-ahead's windows; the index walk 447 ms for about 1400 pieces; opening left after each fetch 501 ms) and the kernel about 290 ms after it, three full BLAKE3 passes over the 92 MB (address, gate, seal) at 652 MB/s.
+- **The crypto per core**: XChaCha20 196 MB/s on an A715 and 630 on the X3, Poly1305 394 and 1227, BLAKE3 over 4 KiB blocks 246 and 731 (the A715s at 1065 MHz, THERMAL.md decision 3).
+- **SPHINCS+ in software**: fips205 hashes with sha2 0.10, whose aarch64 backend needs its `asm` feature, so `+sha2` changes nothing and every SHA-256 is the portable one. pqprobe on the X3, the same keys and signatures to the byte: keygen 208 ms in software, 36 with the CPU's SHA-256; a signature 1841 and 313. The 0.38 s of Photon's device keys and the 0.39 s of its alias keys are each about 98 % SPHINCS+ keygen; the 6.3 s binding is SPHINCS+ signing on a worker.
+- **The capsule's size**: 44.5 MB of the 92 MB is five extra copies of vsf's 8.9 MB `huffman_codes.bin` (a `const` include, copied into each sort the decoder's table build monomorphizes); 10.8 MB is the emoji font; no debug info ships.
+
+Built: the kist job reads a megabyte a call and hashes the capsule once as it lands (`ferros_kist::twin`: its address and its signature's hash from one BLAKE3 pass), the vault process reads a get's furrows as exact runs of up to 512 KiB, and the identity service signs the binding on the X3 and keeps it in the person's class across boots (`fgtw.be_you`, no handle proof; reused once it verifies against the chain as it stands).
+A kept binding never expires (owner, 2026-11-17: "never expire"; FACETS.md D10): it ends only when its signer leaves the fleet or the chain asks more eggs of it.
+The CPU's SHA-256 under fips205: std/photon turns on sha2 0.10's `asm` feature (std processes may link its assembly, which is never called), and payloads take the same feature over `sha2_asm`, a pure-Rust stand-in for sha2-asm under the workspace's patch, so the identity service builds no C.
+Waiting: the device's numbers for all of it; a seal over the capsule's address (the last pass over the bytes, the owner's call); the vsf `static` and the emoji font (the Photon session and vsf's owner).
+
 ## Findings
 
 - **Multicast needs a join.** The device heard another LAN device's beacons but never the dev box's; broadcast arrived, IPv4 multicast did not. The WiFi firmware passes all multicast; the access point's IGMP snooping was the filter. `ip` op 8 JOIN sends an IGMPv2 membership report (IPv4) or an MLDv1 listener report with the Router Alert option (IPv6) now and every 60 s; the client joins both beacon groups at start.

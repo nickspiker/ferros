@@ -41,6 +41,8 @@ pub struct Facets {
     held: Vec<([u8; 32], Vec<u8>, u64)>,
     /// Bindings made this run, by (developer, option, the alias bundle's commitment), each its whole answer.
     made: Vec<([u8; 32], [u8; 32], [u8; 32], Vec<u8>)>,
+    /// The bindings kept in the vault (`KEPT_KEY`), read once a run at the first be you that is not in `made`: None until then.
+    kept: Option<Vec<fgtw::binding::Binding>>,
     /// The add under way, and how the last one ended.
     adding: Option<Adding>,
     pub state: u8,
@@ -53,7 +55,7 @@ pub struct Facets {
 
 impl Facets {
     pub fn new() -> Facets {
-        Facets { held: Vec::new(), made: Vec::new(), adding: None, state: add::NONE, waiting: Vec::new(), ready_gen: 0, ready_seen: false }
+        Facets { held: Vec::new(), made: Vec::new(), kept: None, adding: None, state: add::NONE, waiting: Vec::new(), ready_gen: 0, ready_seen: false }
     }
 }
 
@@ -186,6 +188,7 @@ impl Client {
             self.reply_to(&tok, &[fx::NOT_PRESENT]);
         }
         self.facets.made.clear();
+        self.facets.kept = None;
         self.facets.adding = None;
         self.facets.state = add::NONE;
     }
@@ -217,7 +220,10 @@ impl Client {
         let start = now_us();
         let r = match self.binding_check(&st, body) {
             Ok(Some(r)) => r,
-            Ok(None) => self.binding_make(&st, body),
+            Ok(None) => match self.binding_kept(&st, body) {
+                Some(r) => r,
+                None => self.binding_make(&st, body),
+            },
             Err(code) => alloc::vec![code],
         };
         self.facets_said(&st, "be you", r[0]);
@@ -232,21 +238,70 @@ impl Client {
         self.reply_to(&tok, &r);
     }
 
-    /// The binding signed with this device's member key, and the answer kept for the run.
+    /// The binding signed with this device's member key, the answer kept for the run and the binding kept in the vault (`binding_keep`).
+    /// Signed on the X3 (2026-11-17: 6.3 s on a worker the first launch after a boot, nearly all of it SPHINCS+), as the add and the departure sign there.
     fn binding_make(&mut self, st: &fx::Stamp, body: &[u8]) -> Vec<u8> {
         let (Some((hp, chain)), Some((bundle, _))) = (self.member_chain(), parse_be_you(body)) else { return alloc::vec![fx::NOT_PRESENT] };
-        let Some(identity) = chain.genesis_identity_pubkey() else { return alloc::vec![fx::NOT_PRESENT] };
-        let commit = bundle.commit();
         let mask = chain.declared_mask(&self.me);
+        ferros_sys::pin(ferros_sys::CORES_BIG);
         let b = fgtw::binding::Binding::sign(&self.keys, mask, &hp, &st.developer, &st.option, bundle, eagle());
+        ferros_sys::pin(0);
+        let r = self.binding_answer(st, &chain, &hp, &b);
+        if r[0] == fx::OK {
+            self.binding_keep(b);
+        }
+        r
+    }
+
+    /// A binding's answer, [OK][handle proof][the pinned identity key][the binding], kept for the run.
+    fn binding_answer(&mut self, st: &fx::Stamp, chain: &fgtw::fleet::MembershipBlob, hp: &[u8; 32], b: &fgtw::binding::Binding) -> Vec<u8> {
+        let Some(identity) = chain.genesis_identity_pubkey() else { return alloc::vec![fx::NOT_PRESENT] };
         let Ok(doc) = b.to_vsf_bytes() else { return alloc::vec![fx::NOT_PRESENT] };
         let mut r = Vec::with_capacity(65 + doc.len());
         r.push(fx::OK);
-        r.extend_from_slice(&hp);
+        r.extend_from_slice(hp);
         r.extend_from_slice(&identity);
         r.extend_from_slice(&doc);
-        self.facets.made.push((st.developer, st.option, commit, r.clone()));
+        self.facets.made.push((st.developer, st.option, b.alias.commit(), r.clone()));
         r
+    }
+
+    /// A binding this device made on an earlier run, if one names this kist and this alias and still verifies against the chain as it stands now (its signer, this device, a current member holding the schemes it signed with): the binding has no expiry (fgtw `Binding::verify` reads no time), so it holds until this device leaves the fleet or the chain asks more eggs of it, and the SPHINCS+ signature is made once per kist, not once per boot.
+    fn binding_kept(&mut self, st: &fx::Stamp, body: &[u8]) -> Option<Vec<u8>> {
+        let (hp, chain) = self.member_chain()?;
+        let (bundle, _) = parse_be_you(body)?;
+        if self.facets.kept.is_none() {
+            let list = self.store_get_whole(KEPT_KEY).map(|d| kept_read(&d, &hp)).unwrap_or_default();
+            self.facets.kept = Some(list);
+        }
+        let commit = bundle.commit();
+        let me = self.me;
+        let b = self.facets.kept.as_ref()?.iter().find(|b| b.developer == st.developer && b.option == st.option && b.alias.commit() == commit && b.device == me)?.clone();
+        if b.verify(&chain).is_err() {
+            self.log.put(b"fgtw: facets: a kept binding no longer verifies against the chain; signing a new one");
+            self.log.line();
+            return None;
+        }
+        Some(self.binding_answer(st, &chain, &hp, &b))
+    }
+
+    /// A new binding into the kept list (one per kist and alias: an older one for the same is replaced), written whole to the vault in the person's class (`fgtw.` is the identity class, AUTH.md), without the handle proof, which is a root: it is put back from the roots in hand when the list is read (`kept_read`), and the signature covers it, so a kept binding read under another identity fails to verify.
+    fn binding_keep(&mut self, b: fgtw::binding::Binding) {
+        let mut list = match self.facets.kept.take() {
+            Some(l) => l,
+            None => self.hp.and_then(|hp| self.store_get_whole(KEPT_KEY).map(|d| kept_read(&d, &hp))).unwrap_or_default(),
+        };
+        let commit = b.alias.commit();
+        list.retain(|k| !(k.developer == b.developer && k.option == b.option && k.alias.commit() == commit));
+        list.push(b);
+        match kept_doc(&list) {
+            Some(doc) if self.store_set_whole(KEPT_KEY, &doc) => {}
+            _ => {
+                self.log.put(b"fgtw: facets: the binding was not kept in the vault; the next boot signs it again");
+                self.log.line();
+            }
+        }
+        self.facets.kept = Some(list);
     }
 
     /// Op 1: the people this kist may know, as a document.
@@ -441,6 +496,55 @@ impl Client {
         }
         0
     }
+}
+
+/// The bindings this device made, kept in the person's class (2026-11-17): one VSF document, a section `be_you` for each, its fields by their honest types and no handle proof.
+const KEPT_KEY: &[u8] = b"be_you";
+const KEPT_SECTION: &str = "be_you";
+
+/// The kept list as a document; None when it does not build.
+fn kept_doc(list: &[fgtw::binding::Binding]) -> Option<Vec<u8>> {
+    use vsf::types::EtType;
+    use vsf::VsfType;
+    let mut doc = vsf::VsfBuilder::new().creation_time_oscillations(eagle());
+    for b in list {
+        let mut sec = vsf::VsfSection::new(KEPT_SECTION);
+        sec.add_field("developer", VsfType::ke(b.developer.to_vec()));
+        sec.add_field("option", VsfType::hp(b.option.to_vec()));
+        sec.add_field("alias", VsfType::ge(b.alias.to_bytes()));
+        sec.add_field("when", VsfType::e(EtType::e6(b.when)));
+        sec.add_field("device", VsfType::ke(b.device.to_vec()));
+        sec.add_field("eggs", VsfType::gm(b.sig.clone()));
+        doc = doc.add_section_direct(sec);
+    }
+    doc.build().ok()
+}
+
+/// The kept list read back, each binding given the handle proof in hand (`hp`); a document that does not verify, or a section that does not read, gives nothing of it (the binding is signed again).
+fn kept_read(doc: &[u8], hp: &[u8; 32]) -> Vec<fgtw::binding::Binding> {
+    use vsf::VsfType;
+    let Ok((header, end)) = vsf::verification::read_verified(doc, None) else { return Vec::new() };
+    let Ok(sections) = header.sections(doc, end) else { return Vec::new() };
+    sections
+        .iter()
+        .filter(|s| s.name == KEPT_SECTION)
+        .filter_map(|s| {
+            let first = |name: &str| s.get_field(name).and_then(|f| f.values.first());
+            let key = |name: &str| match first(name) {
+                Some(VsfType::ke(b) | VsfType::hp(b)) => <[u8; 32]>::try_from(b.as_slice()).ok(),
+                _ => None,
+            };
+            let alias = match first("alias") {
+                Some(VsfType::ge(b)) => fgtw::pq::KeyBundle::from_bytes(b).ok()?,
+                _ => return None,
+            };
+            let sig = match first("eggs") {
+                Some(VsfType::gm(b)) => b.clone(),
+                _ => return None,
+            };
+            Some(fgtw::binding::Binding { handle_proof: *hp, developer: key("developer")?, option: key("option")?, alias, when: s.eagle("when")?, device: key("device")?, sig })
+        })
+        .collect()
 }
 
 /// Op 0's body read: [0][the bundle's length u16 LE][the bundle][the eggs]. None when it is short or the bundle does not parse.

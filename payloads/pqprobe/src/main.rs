@@ -186,6 +186,20 @@ extern "C" fn work(_: u64) -> ! {
     l.put(b" ms, sphincs sign ");
     l.dec(t_sphincs_sign / 1000);
     l.put(b" ms\n");
+    // The SHA-256 compression this build runs (sha2_asm's, the CPU's instructions), held to FIPS 180-4's examples and to the chain of every length 0 to 1024 and 256 longer inputs as sha2's software gives it (sha2_asm::CHAIN), and sha2's own digest (the path fips205 takes) to the "abc" example.
+    let t = ferros_sys::now();
+    let own = sha2_asm::self_check(sha2_asm::compress256);
+    let t_check = ferros_sys::us_since(t);
+    let via = {
+        use sha2::Digest;
+        sha2::Sha256::digest(b"abc")[..] == sha2_asm::sha256_with(b"abc", sha2_asm::compress256)[..]
+    };
+    l.put(b"pqprobe: sha-256 compression ");
+    l.put(if own { b"matches FIPS 180-4 and the software chain".as_slice() } else { b"DOES NOT MATCH" });
+    l.put(b" (");
+    l.dec(t_check);
+    l.put(b" us), sha2's digest ");
+    l.put(if via { b"agrees\n".as_slice() } else { b"DISAGREES\n" });
     l.flush();
     ferros_sys::exit(0)
 }

@@ -19,6 +19,8 @@ pqcrypto-hqc = "0.2.2"
 pqcrypto-traits = "0.3.5"
 # getrandom 0.2 takes its custom backend by feature (ferros_rt defines it).
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+# The CPU's SHA-256 for fgtw's SPHINCS+ (fips205's sha2 0.10), as std/photon takes it: its aarch64 backend needs `asm` (std/photon/Cargo.toml says why).
+sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 
 [profile.release]
 opt-level = 2

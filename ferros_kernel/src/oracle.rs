@@ -48,6 +48,11 @@ pub struct Located {
 
 /// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). The signature covers every byte, so a wrong location runs the developer's own bytes, nothing else. A masked kist (stowed or launched from the vault) is gated here too, its modes read in place (`masked_modes`) and its checker run over the code where it lies (`process::stow_check`).
 pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> Result<Located, &'static str> {
+    gate_located_with(capsule, code_offset, code_len, None)
+}
+
+/// `gate_located`, with the hash its signature covers already taken as the capsule came in (`pre`: that hash and the slot it read as zeros, `ferros_kist::twin` in the kist job), so its 92 MB are not hashed again (2026-11-17, Photon's launch). The slot must be the one this gate finds for itself, else the capsule is hashed here as before.
+pub fn gate_located_with(capsule: &mut [u8], code_offset: usize, code_len: usize, pre: Option<(&[u8; 32], (usize, usize))>) -> Result<Located, &'static str> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use vsf::file_format::VsfHeader;
     use vsf::types::VsfType;
@@ -79,9 +84,15 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
         return Err("gate: the signature is not in the header");
     }
     let at = (0..=hdr_len - n).find(|&i| capsule[i..i + n] == slot[..]).ok_or("gate: the signature is not in the header")?;
-    capsule[at..at + n].fill(0);
-    let hash = blake3::hash(capsule);
-    capsule[at..at + n].copy_from_slice(&slot);
+    let hash = match pre {
+        Some((h, s)) if s == (at, n) => blake3::Hash::from_bytes(*h),
+        _ => {
+            capsule[at..at + n].fill(0);
+            let h = blake3::hash(capsule);
+            capsule[at..at + n].copy_from_slice(&slot);
+            h
+        }
+    };
     let key = VerifyingKey::from_bytes(&pubkey).map_err(|_| "gate: bad developer key")?;
     if key.verify_strict(hash.as_bytes(), &Signature::from_bytes(&sig)).is_err() {
         // The flash log gets what was hashed: the bridge prints the same for the file it sent, so a mismatch names the piece of memory, not the code.
@@ -203,40 +214,18 @@ pub fn seal_key() -> Option<[u8; 32]> {
     Some(blake3::derive_key("ferros.seal.v1", &secret))
 }
 
-/// The seal of a gated capsule: keyed BLAKE3 over who signed it, its provenance, whether it is masked, its instruction span and the exact image.
-pub fn seal(g: &Gated) -> Option<[u8; 32]> {
-    seal_parts(&g.developer_pubkey, &g.hp, g.masked, &Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti, exact: g.exact }, &g.code)
+/// A gated capsule's modes, for its seal.
+pub fn modes_of(g: &Gated) -> Modes {
+    Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti, exact: g.exact }
 }
 
-/// The seal over its parts, for a capsule gated where it lies (a kist stowed from the vault, `process::stow_check`, and checked at its launch): the same bytes hashed in the same order as `seal`, so a seal is the same whichever way the capsule was gated.
-pub fn seal_parts(developer: &[u8; 32], hp: &[u8; 32], masked: bool, m: &Modes, code: &[u8]) -> Option<[u8; 32]> {
-    let mut h = blake3::Hasher::new_keyed(&seal_key()?);
-    h.update(developer);
-    h.update(hp);
-    h.update(&[masked as u8]);
-    // Fixed mode's size is part of what was checked, so it is part of the seal (absent for ring, so ring seals are unchanged).
-    if m.fixed != 0 {
-        h.update(b"fixed");
-        h.update(&[m.fixed as u8]);
-    }
-    if m.bti {
-        h.update(b"bti");
-    }
-    if m.exact {
-        h.update(b"exact");
-    }
-    h.update(&(m.text_len as u64).to_le_bytes());
-    h.update(code);
-    Some(*h.finalize().as_bytes())
+/// The address form of a seal (owner, 2026-11-17; ferros_kist::seal `by_address`): the same fields over the capsule's address, its BLAKE3, which the caller computed from the bytes it is about to run on this same launch. What every install writes from now on: the stower's seal, `bridge seal`.
+pub fn seal_address(developer: &[u8; 32], hp: &[u8; 32], masked: bool, m: &Modes, address: &[u8; 32]) -> Option<[u8; 32]> {
+    Some(ferros_kist::seal::by_address(&seal_key()?, developer, hp, masked, m, address))
 }
 
 /// A masked image's span and modes, as its `masked` section gives them (`gate` reads the same fields from a copy).
-pub struct Modes {
-    pub text_len: usize,
-    pub fixed: u32,
-    pub bti: bool,
-    pub exact: bool,
-}
+pub use ferros_kist::seal::Modes;
 
 /// The `masked` section's other fields read where the capsule lies, its code (`code_offset`, `code_len`, found by `process::locate_code`) never copied: a kist's image is tens of megabytes and the kernel heap holds 22 MiB. The code is the section's first field (its byte vector sits in the section's first bytes, where `locate_code` finds it), so the rest follow its closing bracket: `text` (the instruction span), `fixed`, `bti` and `exact`, refused as `gate` refuses them.
 pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Result<Modes, &'static str> {
