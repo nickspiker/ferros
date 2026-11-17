@@ -249,6 +249,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         crate::platform::worker_step(10);
         // The kernel's core (or the lock's holder) silent past half the watchdog's window: where it is, kept for the post-mortem (platform::stall_check). An idle worker wakes for its own deadlines and kicks at least, so a stall that keeps every worker idle is still seen.
         crate::platform::stall_check();
+        // A core stuck in an access to a PCIe link's window ended by that link going down (pcie_guard.rs): from here too, as the stuck core may be the kernel's own.
+        crate::pcie_guard::release_stuck();
         if STOP.load(Ordering::Acquire) != 0 {
             // The keys cleared and this core marked as holding none before it goes off: power-off loses them anyway, and a worker that came back still marked as holding failed its first check every time (four check failures at each dark-to-lit switch, 2026-11-13 on the 8a). The kernel's core holds them meanwhile.
             crate::keys::wipe_for_restart();

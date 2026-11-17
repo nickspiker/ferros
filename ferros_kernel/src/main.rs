@@ -93,6 +93,9 @@ mod flashlog;
 mod kvault;
 #[cfg(feature = "pixel8")]
 mod modem;
+// The PCIe links' guard: an access that never comes back ended by its link going down, and the links crowbarred at a reload or a jump (pcie_guard.rs, WIFI.md).
+#[cfg(feature = "pixel8")]
+mod pcie_guard;
 // The bootloader's lock state from ABL's bootconfig: fact 87, the settings line and a console line (bootlock.rs).
 #[cfg(feature = "pixel8")]
 mod bootlock;

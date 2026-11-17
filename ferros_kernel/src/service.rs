@@ -2335,6 +2335,11 @@ pub fn run(mut b: Boot) -> ! {
     // Between this and that crowbar a CP Android left linked could write only into the carve-outs, which hold nothing of ferros's until the driver loads its image after the CP is down; the jump of 2026-11-15 found the link suspended (the ch0 PHY powered down), so no DMA at all.
     let r = crate::s2mpu::fence_modem();
     crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
+    // A reload is a jump from ferros's own last session: the WiFi chip and the CP may be running, their links up or suspended, their DMA going, Bluetooth's core on. Both links' endpoints are held in reset and Bluetooth switched off with its pins driven before init starts any driver, after a jump too (pcie_guard.rs `crowbar`); each driver's own `off` then takes its chip down.
+    // The reload of 2026-11-16 (b908) wedged the WiFi chip: its driver's power cycle ran under a Bluetooth core whose off had never driven its pin, and the chip's next BAR read never completed (bt.rs `power`).
+    if b.x0 & 1 == 1 || platform::jumped() {
+        crate::pcie_guard::crowbar(if b.x0 & 1 == 1 { "a reload" } else { "a jump" });
+    }
     if !platform::jumped() {
         let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
         crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
@@ -2371,6 +2376,8 @@ pub fn run(mut b: Boot) -> ! {
         platform::pet_watchdogs();
         // The service loop's pass crumbs (2026-11-08: the reset left G#B4, woken from the idle `wfe`, as the X3's last word, and nothing after it said where the pass went): G#D3 the pass's top, G#D4 a command taken from the USB process, G#D5 with its capability and op (bits 8-39 and 40-47), G#D6 the polls, G#D7 the clock policy, G#D8 past the UFS hibernate and the thermal poll; then G#D1 a slice, G#D2 back, G#B3 into the idle `wfe`, G#B4 out of it.
         platform::crumb(0xD3);
+        // A core stuck in an access to a PCIe link's window ended by that link going down (pcie_guard.rs), first in the pass: what follows may take the kernel lock, which a stuck access on the locked path holds.
+        crate::pcie_guard::release_stuck();
         // The power switches a process left on when it ended (one shot dead, no cleanup of its own): turned off here, on the kernel's core.
         crate::process::power_offs_apply();
         // A person unlocked: wallgen, once (`spawn_wallgen`).

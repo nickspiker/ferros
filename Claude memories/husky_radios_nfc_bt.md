@@ -32,3 +32,5 @@ Other traps:
 - `bridge spawn epcall --use X` while X is busy holds the kernel's USB service, and the watchdog can fire.
 
 Related: [[radio-addresses-belong-to-identity]], [[photon-on-ferros-no-bootstrap]].
+
+**2026-11-16: the REG_ON rule was broken by an undriven pin.** With Bluetooth switched off (or never on this boot) BT_REG_ON gpn8-0 stays an input and reads high (con 0, dat 1, pull-down on); the old `bt::power(false)` wrote only data bits, so pcie1's "Bluetooth off" did nothing. A WiFi cycle of a running chip then wedged it: after a RAM reload pcie1's stage 6 BAR read (G#6000_0040) never completed, the modem's access on the other link waited behind it, and keeper restarts read vendor id 0. PERST low on WiFi's link ends a stuck access (measured by hand). Fixed: off drives the pins; a reload or jump crowbars the radios (pcie_guard.rs); the kernel takes a link down under any access 2^-3 s unanswered. WIFI.md "A BAR access that never completes".

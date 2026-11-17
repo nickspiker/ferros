@@ -103,6 +103,8 @@ struct Drv {
     failed: bool,
     /// The backplane window BAR1 shows now (cfg G#84), so a run of accesses in one window costs one config write.
     win: u32,
+    /// The link found down after a read of the chip's BAR or config space came back all ones (`link_up`): no BAR or config access is made after it, and the driver ends (WIFI.md "A BAR access that never completes").
+    dead: bool,
 }
 
 impl Drv {
@@ -110,6 +112,10 @@ impl Drv {
         self.grants + 0x204 + 32 * slot
     }
     fn rd(&mut self, g: u64, off: u64) -> u32 {
+        let chip = g == MEM || g == CFG;
+        if chip && self.dead {
+            return u32::MAX;
+        }
         let v = svc(4, self.cap(g), off, 0, 0, 0);
         if v == ERR {
             self.failed = true;
@@ -119,9 +125,32 @@ impl Drv {
             self.hex(off as u32);
             self.put(b"\n");
         }
+        // All ones from the chip is what a read the link could not carry returns (the completion timeout, or the kernel's pcie guard taking the link down under a read nothing answered): the link looked at, and if it is down nothing more goes to the chip.
+        // A word of all ones the chip really holds (the ROM dumps' gaps, an unset register) finds the link up and changes nothing.
+        if chip && v as u32 == u32::MAX && !self.link_up() {
+            self.dead = true;
+            self.failed = true;
+            self.put(b"link down after a read of ");
+            self.hex(g as u32);
+            self.put(b"+");
+            self.hex(off as u32);
+            self.put(b": nothing more goes to the chip\n");
+        }
         v as u32
     }
+    /// The link as Linux judges it before it touches the chip (pcie-exynos-rc.c `exynos_pcie_rc_link_up`): the LTSSM (ELBI G#2C8 bits 5:0) from Recovery.Lock (G#D) to L1.Idle (G#14).
+    /// ELBI only while the PHY is powered (UDBG G#C700 bit 0, the external PLL's enable, set by stage 1's D2): with the PHY powered down and its isolation released ELBI stalls the core (WIFI.md section 13 item 16).
+    fn link_up(&mut self) -> bool {
+        if self.rd(UDBG, 0xC700) & 1 == 0 {
+            return false;
+        }
+        let s = self.rd(ELBI, 0x2C8) & 0x3F;
+        (0xD..=0x14).contains(&s)
+    }
     fn wr(&mut self, g: u64, off: u64, v: u32) {
+        if self.dead && (g == MEM || g == CFG) {
+            return;
+        }
         if svc(5, self.cap(g), off, v as u64, 0, 0) == ERR {
             self.failed = true;
             self.put(b"!wr ");
@@ -340,7 +369,7 @@ extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The grant count at 0x200 of the grants page (the handle table fills the first 512 bytes since 2026-11-03; read at 0 it was 0, and the driver thought it had no vault scope).
     let has_store = unsafe { core::ptr::read_volatile((base + grants + 0x200) as *const u32) } as u64 > STORE;
     let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else if has_store { 14 } else { 0 };
-    let mut d = Drv { grants, base, freq, log: [0; 3000], reply: [0; 16], n: 0, failed: false, win: u32::MAX };
+    let mut d = Drv { grants, base, freq, log: [0; 3000], reply: [0; 16], n: 0, failed: false, win: u32::MAX, dead: false };
     let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
     run(&mut d, stage, rest);
     d.flush();
@@ -348,8 +377,13 @@ extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
 }
 
 /// The WiFi switch turned off (stage G#F0, kernel service.rs `radio_down`, 2026-11-13): the chip powered down, as Linux's exynos_pcie_rc_poweroff and dhd's wifi_platform_set_power off leave it, where a killed driver left it powered and its link up with no host (the 8a dark with the radios switched off drew 968 mW, more than with them on). Bluetooth's core off first (the REG_ON rule: never move WL_REG_ON under a powered Bluetooth core; its driver brings it back by itself, Bluetooth running with WL_REG_ON low), PERST low, the PHY's power-down (stage 1's A3-A8), the PMU's PHY isolation, WL_REG_ON low. Never the controller's ELBI or DBI: a fresh process does not know the link's state, and a PHY already isolated (a cold boot, an `off` before this one) is left as it is. A chip at rest with no link loses nothing by the order: no PME_Turn_Off, as the chip's power goes with WL_REG_ON.
-fn off(d: &mut Drv) {
-    ferros_sys::power(d.cap(BT_POWER), false);
+fn off(d: &mut Drv) -> bool {
+    // The REG_ON rule: Bluetooth's core off before WL_REG_ON moves. A switch that refuses leaves its state unknown, so WL_REG_ON is not moved at all and the bring-up stops: a cycle under a powered Bluetooth core wedges the chip, and a read of the wedged chip never completes (2026-11-16).
+    if !ferros_sys::power(d.cap(BT_POWER), false) {
+        d.failed = true;
+        d.put(b"off: Bluetooth's switch refused off: WL_REG_ON left as it is (the REG_ON rule)\n");
+        return false;
+    }
     d.clr(GPIO, 0x4, 1 << 0);
     let iso = d.rd(PMU, 0x3EC8);
     if iso & 1 == 1 {
@@ -374,17 +408,20 @@ fn off(d: &mut Drv) {
     d.clr(GPIO, 0x4, 1 << 4);
     let g = d.rd(GPIO, 0x4);
     d.kv(b"off: WL_REG_ON low, gph3.dat", g);
+    true
 }
 
 fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     if stage == 0xF0 {
-        return off(d);
+        off(d);
+        return;
     }
     // Every bring-up starts from the chip taken down (`off`), whatever ran it before: a cold boot, this driver's own last run (the keeper's restart), or Android before a jump (the killswitch: nothing Android set up is adopted).
     // The jump of 2026-11-15 (the Pro, b878) found what Android leaves: PERST low, WL_REG_ON high, the PHY in its power-down (stage 1's A3-A8 values, the external PLL unlocked) with the PMU's isolation released (G#4C1, a cold boot's G#C0), the CMU gates as a cold boot's.
     // That is the state the controller's ELBI and DBI stall the bus in (the first jumps' hangs); `off` leaves the PHY isolated, the cold boot's state, where they answer (the 8a's switch off then on, 2026-11-13).
-    if stage >= 1 {
-        off(d);
+    if stage >= 1 && !off(d) {
+        d.flush();
+        return;
     }
     // ---- stage 0: survey (WIFI.md §2, §3, §9 status registers) ----
     d.put(b"pcie1 stage ");
@@ -452,7 +489,13 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     con = (con & !(0xF << 4)) | (0x2 << 4);
     con = (con & !(0xF << 16)) | (0x1 << 16);
     con &= !(0xF << 20);
-    ferros_sys::power(d.cap(BT_POWER), false);
+    // The REG_ON rule, as in `off`: a refused switch stops the bring-up before WL_REG_ON moves.
+    if !ferros_sys::power(d.cap(BT_POWER), false) {
+        d.failed = true;
+        d.put(b"stage 1: Bluetooth's switch refused off: WL_REG_ON not cycled (the REG_ON rule)\n");
+        d.flush();
+        return;
+    }
     d.clr(GPIO, 0x4, (1 << 0) | (1 << 4)); // B1: both low before switching to outputs
     d.wr(GPIO, 0x0, con);
     let pud = d.rd(GPIO, 0x8);
@@ -784,7 +827,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.wr(CFG, 0x80, 0x1800_0000);
     }
     d.flush();
-    if stage < 6 {
+    if stage < 6 || d.dead {
         return;
     }
 
@@ -851,7 +894,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.kv(b"ram[top] zeroed", v);
     d.show(b"cfg.bar1win", CFG, 0x84);
     d.flush();
-    if stage < 7 {
+    if stage < 7 || d.dead {
         return;
     }
 
@@ -1056,7 +1099,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
     d.put(b"\n");
     d.flush();
-    if stage < 8 {
+    if stage < 8 || d.dead {
         return;
     }
 
@@ -1123,7 +1166,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let wrapped = d.tcm_rd(buf + (idx & !3) + 4) != 0 && idx + 8 < size;
     let (start, len) = if wrapped { (idx, size) } else { (0, idx) };
     console_dump(d, buf, size, start, len);
-    if stage < 9 {
+    if stage < 9 || d.dead {
         return;
     }
 
@@ -2560,6 +2603,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             path = Path::default();
         }
         path.passes += 1;
+        // The PCIe link found down under a read (`Drv::rd`): nothing more can reach the chip, so the driver ends and init's keeper starts it again, the chip taken down first.
+        if d.dead {
+            d.put(b"the PCIe link went down under a read while serving: ending; init's keeper starts this driver again\n");
+            d.flush();
+            m.serving = false;
+            d.failed = true;
+            return;
+        }
         let t_rings = d.now();
         let _ = m.pump(d);
         // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.

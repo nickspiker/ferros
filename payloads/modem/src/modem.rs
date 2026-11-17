@@ -612,7 +612,7 @@ fn rom_boot(rep: &mut Vec<u8>) {
     wr(MSI_PAGE + 0x1C, n as u32);
     wr(BOOT_STAGE, 0);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), 0x1_0000);
+    ring_doorbell(0x1_0000);
     let t0 = now();
     let mut last = 0xFFFF_FFFFu32;
     let mut trace = alloc::string::String::from("boot_stage:");
@@ -809,7 +809,7 @@ fn link_cycle(rep: &mut Vec<u8>) -> bool {
             return false;
         }
     }
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+    ring_doorbell(DB_LINK_ACK);
     line(rep, alloc::format!("link ack rung (G#{DB_LINK_ACK:X})\n"));
     true
 }
@@ -1346,7 +1346,7 @@ const PIF_INIT_DONE: u16 = cmd2int(0x0D);
 fn ap2cp_cmd(cmd: u16) {
     wr(AP2CP_MSG, cmd as u32);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    ring_doorbell(DB_MSG);
     unsafe { core::arch::asm!("dsb sy") };
 }
 
@@ -1573,7 +1573,7 @@ fn pktproc_ul_send(ch: u8, pkt: &[u8]) -> Result<(), alloc::string::String> {
     unsafe { core::arch::asm!("dsb sy") };
     wr(AP2CP_MSG, INT_SEND_DATA);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    ring_doorbell(DB_MSG);
     Ok(())
 }
 
@@ -1894,10 +1894,25 @@ fn resume() -> Result<(), alloc::string::String> {
         crate::hw::say(&rep);
         return Err(alloc::format!("the link did not come back"));
     }
-    unsafe { core::arch::asm!("dsb sy") };
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+    // The link is back before its acknowledgement is rung: `ring_doorbell` rings nothing while the link is marked down.
     LINK_DOWN.store(false, core::sync::atomic::Ordering::Relaxed);
+    unsafe { core::arch::asm!("dsb sy") };
+    ring_doorbell(DB_LINK_ACK);
     Ok(())
+}
+
+/// Doorbells not rung because the link could not carry them (`ring_doorbell`), for the service's state line.
+pub static DOORBELLS_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The CP's doorbell (its BAR0, `DOORBELL`) rung with `v`, only on a link that carries it, as Linux's s51xx_pcie_send_doorbell_int asks exynos_pcie_rc_chk_link_status before every doorbell: not while the service has the link suspended (`LINK_DOWN`: its PHY powered down with the isolation released, where even the controller's ELBI stalls the core), and only with the LTSSM (ELBI G#2C8 bits 5:0) from Recovery.Lock (G#D) to L1.Idle (G#14).
+/// A write the link cannot carry would wait in the controller with the core in it (WIFI.md "A BAR access that never completes": the kernel's pcie guard ends such a wait by taking the link down). Returns whether it rang; a refusal is counted, and the service sees the CP go quiet and restarts it as for any silence.
+fn ring_doorbell(v: u32) -> bool {
+    if LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) || !(0xD..=0x14).contains(&(rd(ELBI + 0x2C8) & 0x3F)) {
+        DOORBELLS_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), v);
+    true
 }
 
 /// Before the AP sends: with the link down, AP2CP_WAKEUP high, the CP's CP2AP_WAKEUP awaited (up to a second: s5100_try_gpio_cp_wakeup and the CP's answer), and the link resumed. Then the send may ring the doorbell.
@@ -1948,7 +1963,7 @@ fn ring_frame(link: &mut SitLink, raw: bool, ch: u8, cfg: u16, payload: &[u8]) -
     unsafe { core::arch::asm!("dsb sy") };
     wr(AP2CP_MSG, int);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    ring_doorbell(DB_MSG);
     Ok(())
 }
 
@@ -3054,7 +3069,7 @@ impl Online {
             // The CP raised its line with the link already up: the acknowledgement it waits for.
             AP2CP_WAKEUP.out(true);
             unsafe { core::arch::asm!("dsb sy") };
-            wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+            ring_doorbell(DB_LINK_ACK);
             self.link_acks += 1;
         }
         // The CP idle (its line low) for 30 ms with nothing waiting to go up in any ring: the link down, as Android's driver does (cp2ap_suspend_work -> s5100_poweroff_pcie, its 30 ms wait and its pending-transmit check). Kept up, the CP sat half-suspended and did not ask for the link when downlink came: a TCP reply waited 32 s (2026-10-31). The service only: the diag stages keep the link as they find it.
@@ -3438,7 +3453,7 @@ impl Online {
             unsafe { core::arch::asm!("dsb sy") };
             wr(AP2CP_MSG, INT_SEND_DATA);
             unsafe { core::arch::asm!("dsb sy") };
-            wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+            ring_doorbell(DB_MSG);
         }
         // The controller's MSI status, cleared while the link is up (its PHY is powered down with the link).
         let msi = if LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) { 0 } else { rd(DBI + 0x830) };
@@ -3661,7 +3676,7 @@ pub fn state(rep: &mut Vec<u8>) {
             Some(o) => {
                 let reg = |k: usize| o.reg_last[k].map(|s| hexs(&|i| s[i as usize], 4)).unwrap_or_else(|| alloc::string::String::from("unknown"));
                 line(rep, alloc::format!("up A#{} s; PS registration ch A#245 {}, ch A#246 {}\n", since_us(o.t0) / 1_000_000, reg(0), reg(1)));
-                line(rep, alloc::format!("lines: AP2CP_WAKEUP {} CP2AP_WAKEUP {} AP_ACTIVE {} PHONE_ACTIVE {}; link acknowledgements sent A#{}, link suspends A#{}, link down now {}\n", AP2CP_WAKEUP.get() as u8, CP2AP_WAKEUP.get() as u8, AP_ACTIVE.get() as u8, PHONE_ACTIVE.get() as u8, o.link_acks, o.suspends, LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) as u8));
+                line(rep, alloc::format!("lines: AP2CP_WAKEUP {} CP2AP_WAKEUP {} AP_ACTIVE {} PHONE_ACTIVE {}; link acknowledgements sent A#{}, link suspends A#{}, link down now {}, doorbells refused (the link not carrying them) A#{}\n", AP2CP_WAKEUP.get() as u8, CP2AP_WAKEUP.get() as u8, AP_ACTIVE.get() as u8, PHONE_ACTIVE.get() as u8, o.link_acks, o.suspends, LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) as u8, DOORBELLS_REFUSED.load(core::sync::atomic::Ordering::Relaxed)));
                 if !LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) {
                     line(rep, alloc::format!("link: ltssm G#{:X}, RC link control/status G#{:X}, msi status G#{:X}\n", rd(ELBI + 0x2C8), rd(DBI + 0x80), rd(DBI + 0x830)));
                 }
