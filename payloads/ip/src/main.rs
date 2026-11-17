@@ -229,6 +229,9 @@ struct Path {
     /// Echo requests answered, IPv4 (WiFi and the cellular call) and IPv6: counted here, said once a window, where each was a console line of its own until 2026-11-14 (`PING_LINES`).
     echoes4: u32,
     echoes6: u32,
+    /// IPv4 fragments dropped (no reassembly here), and the largest datagram one claimed to belong to, from a first fragment's UDP length.
+    frags4: u32,
+    frag_most: u16,
 }
 
 impl Path {
@@ -293,6 +296,13 @@ impl Path {
             ip.put(b" IPv4, A#");
             ip.dec(self.echoes6 as u64);
             ip.put(b" IPv6");
+        }
+        if self.frags4 != 0 {
+            ip.put(b"; IPv4 fragments dropped A#");
+            ip.dec(self.frags4 as u64);
+            ip.put(b" (the largest datagram a first fragment named A#");
+            ip.dec(self.frag_most as u64);
+            ip.put(b" bytes)");
         }
         for &(port, who, n, t, most) in self.took.iter().filter(|e| e.2 > 0) {
             ip.put(b"; port A#");
@@ -1288,6 +1298,15 @@ impl Ip {
         let total = (u16::from_be_bytes([p[2], p[3]]) as usize).min(p.len());
         // WHY: the header length is the sender's; under 20 the body would start inside the header, past the total it would be no packet.
         if ihl < 20 || total < ihl {
+            return;
+        }
+        // A fragment (more fragments to come, or an offset): dropped and counted, never taken for the whole datagram. Until 2026-11-17 a first fragment went up as the datagram cut at 1472 bytes and a later one as a datagram with ports read from its middle (the Pro: "unparsed datagram ... from 192.168.1.213:4383 ... Not enough data (1472B)", from the desktop's Photon); there is no reassembly, and the queue holds 1472 bytes a datagram.
+        if u16::from_be_bytes([p[6], p[7]]) & 0x3FFF != 0 {
+            // WHY: the packet is the network's; a first fragment shorter than its header and the UDP length field would index past `total`.
+            if u16::from_be_bytes([p[6], p[7]]) & 0x1FFF == 0 && p[9] == 17 && total >= ihl + 6 {
+                self.path.frag_most = self.path.frag_most.max(u16::from_be_bytes([p[ihl + 4], p[ihl + 5]]));
+            }
+            self.path.frags4 += 1;
             return;
         }
         let src: [u8; 4] = p[12..16].try_into().unwrap();
