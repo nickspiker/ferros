@@ -52,6 +52,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [No baked apps](no_baked_apps.md) - one built-in circle (settings); no identity = no way past attest
 - [ferros attest is OS-level](ferros_attest_os_level.md) - payloads/ahau at boot; ira unlocks drivers, identity the rest
 - [Identity not on disk by default](identity_not_on_disk_default.md) - handle typed each boot, roots in RAM; opt-in unlock at boot
+- [Person keys at attest](person_keys_at_attest.md) - every person key to the kernel at the bind; never wait for the space pull
 - [Auth flow decisions](auth_flow_decisions.md) - device vs identity vault classes; pairings follow the identity
 - [Identity restores the device](identity_restores_the_device.md) - attest syncs roster, answers, layout; capsules refetched
 - [Settings flow identity to device only](settings_identity_to_device_only.md) - never device to identity; settings are spec VSF
