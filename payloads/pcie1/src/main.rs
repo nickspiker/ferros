@@ -1708,8 +1708,9 @@ impl Msgbuf {
         self.tx_w += 1;
         true
     }
-    /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length), its buffer re-posted.
-    fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32)> {
+    /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length, transaction id), its buffer re-posted.
+    /// ioctl_comp_resp_msg_t (bcmmsgbuf.h): the response buffer's request id at +4, status at +8, resp_len at +12, trans_id at +14, cmd at +16.
+    fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32, u32)> {
         loop {
             let a = self.dma + 0x5000 + 24 * self.rd;
             let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
@@ -1735,7 +1736,7 @@ impl Msgbuf {
                         self.post(d, 0x0B, 1 + b, [8192, 0, self.dma + 0x2_0000 + 0x2000 * b, 0, 0, 0, 0, 0]);
                         self.ring(d);
                     }
-                    return Some((words[2] & 0xFFFF, b, words[3] & 0xFFFF));
+                    return Some((words[2] & 0xFFFF, b, words[3] & 0xFFFF, words[3] >> 16));
                 }
                 // MSG_TYPE_FLOW_RING_CREATE_CMPLT: status +8, flow ring id +10.
                 0x04 => self.flow_status = Some(words[2] & 0xFFFF),
@@ -1954,16 +1955,34 @@ impl Msgbuf {
         }
     }
     /// One ioctl: `in_len` bytes at the request buffer go to the firmware, up to `out_len` come back in a posted response buffer. Waits for the completion (3 s), handling events meanwhile.
+    /// The answer is the completion carrying this ioctl's transaction id, as dhd takes it (dhd_prot_ioctcmplt_process: a trans_id mismatch is not the answer).
+    /// A completion for an earlier ioctl that timed out (a late answer) is dropped, its buffer re-posted by `pump`.
+    /// Until 2026-11-17 the first ioctl completion in the ring was taken as the answer, whichever ioctl it was for: with the chip's interrupt silent (the Pro, 2026-11-17: `irq A#0 wakes`, SPI 439's count still for minutes) every wait ran its 3 s, the completion that came meanwhile was read by the next ioctl, and every later ioctl took an earlier one's answer, so the corners' WiFi circle showed a packet count as dB and a rate of terabits a second.
     fn ioctl(&mut self, d: &mut Drv, cmd: u32, req_buf: u32, in_len: u32, out_len: u32) -> Option<(u32, u32, u32)> {
-        self.trans += 1;
-        self.post(d, 0x09, 0xFFFE, [cmd, self.trans | in_len << 16, out_len, 0, req_buf, 0, 0, 0]);
+        // The id is 16 bits on the wire (ioctl_req_msg_t trans_id), with input_buf_len in the 16 above it: wrapped here, never carried into the length (before 2026-11-17 the 65,536th ioctl ORed its bit 16 into in_len).
+        self.trans = (self.trans + 1) & 0xFFFF;
+        let id = self.trans;
+        self.post(d, 0x09, 0xFFFE, [cmd, id | in_len << 16, out_len, 0, req_buf, 0, 0, 0]);
         self.ring(d);
         let ts = d.now();
-        while d.now().wrapping_sub(ts) < 3 * d.freq {
+        let mut late = 0u32;
+        loop {
             let seen = IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire);
-            if let Some(r) = self.pump(d) {
-                self.silent = 0;
-                return Some(r);
+            // Every completion waiting is read, and the ring once more after the deadline: a completion that came while the wait ran out (no interrupt rang) is this ioctl's answer, not the next one's.
+            while let Some((status, b, len, t)) = self.pump(d) {
+                if t == id {
+                    if late > 0 {
+                        d.put(b"ioctl: late answers to earlier ioctls dropped: ");
+                        d.dec(late);
+                        d.put(b"\n");
+                    }
+                    self.silent = 0;
+                    return Some((status, b, len));
+                }
+                late += 1;
+            }
+            if d.now().wrapping_sub(ts) >= 3 * d.freq {
+                break;
             }
             if IRQ_ON.load(core::sync::atomic::Ordering::Relaxed) {
                 // With the interrupt (serving): the completion's MSI ends the wait, the ioctl's 3 s the deadline (the firmware's own answer time, dhd's IOCTL_RESP_TIMEOUT order). The line re-armed first if it is not, and the ring read again before any wait.
@@ -1976,7 +1995,13 @@ impl Msgbuf {
                 d.us(1000);
             }
         }
-        d.put(b"no ioctl completion\n");
+        d.put(b"no ioctl completion for ");
+        d.dec(cmd);
+        if late > 0 {
+            d.put(b", late answers to earlier ioctls dropped: ");
+            d.dec(late);
+        }
+        d.put(b"\n");
         self.silent += 1;
         None
     }
@@ -2366,7 +2391,7 @@ impl Path {
     /// One line: `rx path, last 32 s: A#<n> passes (A#<n> slept), rings read in A#<us> us a pass; A#<n> exchanges, A#<n> single frames; to ip A#<n> frames (most A#<n> an exchange, copied in A#<ns> ns each, waited A#<us> us on average, A#<us> us most, A#<n> most queued); from ip A#<n> frames, A#<n> refused`. Said only when frames moved, so after a request, so after a pass: `passes` is not zero.
     fn say(&self, d: &mut Drv, ms: u64) {
         let f = d.freq;
-        d.put(b"rx path, last A#");
+        d.put(b"rx path, last ");
         d.dec(ms as u32);
         d.put(b" ms: ");
         d.dec(self.passes);
@@ -2568,7 +2593,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             // The span since the last line: 32 s or more, as no timer brings a pass.
             let ms = d.now().wrapping_sub(lstates_at) * 1000 / d.freq;
             lstates_at = d.now();
-            d.put(b"link states, passes in the last A#");
+            d.put(b"link states, passes in the last ");
             d.dec(ms as u32);
             d.put(b" ms (PCS G#188 2:0 = 0 L0, 2 L1, 5 L1.1, 6 L1.2):");
             for (k, n) in lstates.iter().enumerate() {
@@ -2583,6 +2608,22 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             if path.to_ip + path.from_ip > 0 || irq {
                 path.say(d, ms);
                 m.say_tx(d);
+            }
+            // A window with the line armed and no interrupt (the Pro, 2026-11-17: silent for hours after A#271060 interrupts): the latches as they stand, read only, to find which one holds the line quiet before the clear is changed.
+            // ELBI G#8 bit 17 the MSI's edge, DBI G#830 the MSI controller's status, the chip's mailbox status (G#2C30) and mask (G#2C34): a mailbox status left set with the mask on means the chip raises no new MSI.
+            if irq && path.irq_wakes == 0 {
+                let (e, s, mb, mm) = (d.rd(ELBI, 0x8), d.rd(DBI, 0x830), d.rd(MEM, 0x2C30), d.rd(MEM, 0x2C34));
+                d.put(b"irq silent: armed ");
+                d.dec(IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) as u32);
+                d.put(b", elbi irq2 ");
+                d.hex(e);
+                d.put(b", msi status ");
+                d.hex(s);
+                d.put(b", chip mailbox ");
+                d.hex(mb);
+                d.put(b" mask ");
+                d.hex(mm);
+                d.put(b"\n");
             }
             let i = d.tcm_rd(cons + 16);
             if i != cidx {
