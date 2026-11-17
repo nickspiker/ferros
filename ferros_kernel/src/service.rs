@@ -2024,6 +2024,32 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
             gpu_rate(want != 3);
         }
     }
+    // The memory side of the lift (THERMAL.md decision 3): while someone interacts with the screen lit, MIF and the DSU at the tops of their tables, else the tier's own; not while ferros's thermal policy holds any domain down.
+    let lift = want != 3 && GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ && interactive(now, f) && !crate::thermal::throttled();
+    if lift != unsafe { SHARED_LIFTED } {
+        shared_lift(lift);
+    }
+}
+
+/// MIF and the DSU at the lift's rates while someone interacts (`clock_policy`), or back at the tier's.
+/// Measured 2026-11-17 on the Pro (membench, 2^24-byte buffers): with the A715s at 2367 MHz, four threads' copy 35.9 GB/s at the active tier's MIF 2028 and DSU 1197 MHz, 41.3 at MIF 3744 and DSU 1800; one thread's read 20.8 against 24.4; with the A715s at 1065, four threads' copy 32.5 against 39.5 at MIF 3744 alone. Both are their tables' tops (zuma.dtsi devfreq_mif and devfreq_dsu `freq_info`), which Android's memory-latency and DSU-latency governors reach under load.
+const SHARED_LIFT: [(u32, u32); 2] = [(0, 3_744_000), (5, 1_800_000)];
+static mut SHARED_LIFTED: bool = false;
+/// Times the memory side was lifted (`diag clock`).
+static mut SHARED_LIFTS: u64 = 0;
+fn shared_lift(on: bool) {
+    // Going up MIF first, coming down the DSU first, as the tiers order them; each request waited for by a rate read (`clock_profile`, why).
+    let order: [usize; 2] = if on { [0, 1] } else { [1, 0] };
+    for i in order {
+        let (d, lifted) = SHARED_LIFT[i];
+        let Some(khz) = (if on { Some(lifted) } else { profile_khz(d) }) else { continue };
+        let _ = crate::acpm::dvfs_set(d, khz);
+        let _ = crate::acpm::dvfs_get(d);
+    }
+    unsafe {
+        SHARED_LIFTED = on;
+        SHARED_LIFTS += on as u64;
+    }
 }
 static mut TIER_AT: u64 = 0;
 /// The GPU's clock at its top (G3D 890, G3DL2 900 MHz) or its floor (150 / 160 MHz), the L2 first going up and last going down (GPU.md "The GPU's clock"). At the top while a `gpu` process lives and the screen is lit; at the floor otherwise, the dark profile included (2026-11-10: the GPU's rails held ~40 mW with the screen off at its top, idle).
@@ -2066,6 +2092,8 @@ fn clock_profile(want: u8) {
     }
     let v: u64;
     unsafe {
+        // The tier's table set MIF and the DSU: the memory side's lift, if it was on, is to be asked again (`clock_policy`).
+        SHARED_LIFTED = false;
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
         CLOCK_STATE = want;
         CLOCK_SWITCHES += 1;
@@ -2117,7 +2145,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         _ => {}
     }
     let lifted = interactive(cntpct(), f);
-    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input and while frames come within f>>A#{} of each other; {} now; A#{} windows lifted, A#{} lifts begun\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), if lifted { "lifted" } else { "calm" }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[1] }).as_bytes());
+    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input and while frames come within f>>A#{} of each other; {} now; A#{} windows lifted, A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), if lifted { "lifted" } else { "calm" }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };
