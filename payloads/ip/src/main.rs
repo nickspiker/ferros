@@ -93,7 +93,7 @@ const NO_BIG: u8 = 0xFF;
 /// IPv4 reassembly (2026-11-17, the Pro: a Photon pong to a sibling carries a sealed tail past 1472 bytes, so it came as fragments and only the first went up, cut, failing its check without a word): UDP datagrams up to `REASM_MAX` bytes, `RN` at once.
 /// A datagram unfinished `2^REASM_LOG2` s after its first fragment is dropped at the next fragment's arrival (no timer: nothing waits on a clock, owner 2026-11-10); a new one with every slot busy takes the oldest's.
 const RN: usize = 4;
-const REASM_MAX: usize = 1 << 14;
+const REASM_MAX: usize = 1 << 16;
 const REASM_LOG2: u32 = 4;
 /// Big slots for the queue: datagrams longer than a `Datagram`'s 1472 bytes, as many as can be made whole at once.
 const BIGN: usize = RN;
@@ -3530,7 +3530,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, at: 0, readers: 0, data: [1; 1472], big: NO_BIG };
     #[unsafe(link_section = ".data.queue")]
     static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
-    // IPv4 reassembly and the queue's big slots: zeroed statics, as the connections' below (128 KiB, past the image).
+    // IPv4 reassembly and the queue's big slots: zeroed statics, as the connections' below (512 KiB, past the image; 64 KiB a datagram: Photon receives up to 64 KiB, and its status pongs are uncapped, growing with their sync records).
     static mut REASM: [Reasm; RN] = [REASM_FREE; RN];
     static mut BIG: [[u8; REASM_MAX]; BIGN] = [[0; REASM_MAX]; BIGN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
