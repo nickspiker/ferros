@@ -225,6 +225,13 @@ impl FluorApp<Px> for Ferros {
     fn damage_rect(&mut self, viewport: Viewport) -> Option<fluor::canvas::PixelRect> {
         self.app.damage_rect(viewport)
     }
+    // The damage as Photon's rects and its word that the scratch outside them is never read (fluor 6fc6ea5, photon f209cf09): without these two the host took the defaults, one bounding box and a moved scratch (2026-11-17, the Pro: 5 ms of each scroll frame).
+    fn damage_rects(&mut self, viewport: Viewport, out: &mut [fluor::canvas::PixelRect; fluor::canvas::DAMAGE_RECTS]) -> usize {
+        self.app.damage_rects(viewport, out)
+    }
+    fn scratch_unread_outside_damage(&self) -> bool {
+        self.app.scratch_unread_outside_damage()
+    }
     fn scroll_hint(&mut self, viewport: Viewport) -> Option<(fluor::canvas::PixelRect, i32)> {
         self.app.scroll_hint(viewport)
     }
