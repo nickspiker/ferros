@@ -79,6 +79,15 @@ impl Client {
         chain.is_member(&self.me).then_some((hp, chain))
     }
 
+    /// The facets served now, at the top of the loop's pass and between its slow steps (2026-11-17, the Pro: a kist's first wait for be you was answered 5 to 6 s after it came, behind the pass's other work): calls taken in, every held wait rung if the readiness changed since (`facets_ring`), and a held be you checked and signed. A call is so answered within one slow step of its coming, never a whole pass; nothing here waits or runs on a clock. True when a call came.
+    pub fn facets_now(&mut self, lap: &mut Lap) -> bool {
+        let busy = self.facets_recv();
+        self.facets_ring();
+        self.facets_work();
+        lap.mark(b"facets");
+        busy
+    }
+
     /// Calls on `facets` taken in (one pass of the loop): the people answered at once, a binding held for `facets_work`. A slot with no grant behind it (a kernel from before) answers ERR, and nothing is served.
     pub fn facets_recv(&mut self) -> bool {
         let mut busy = false;
