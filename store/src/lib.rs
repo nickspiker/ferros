@@ -28,6 +28,15 @@ const NONCE: usize = 24;
 const TAG: usize = 16;
 /// Pieces handed to the engine in one commit while a large value is written.
 const BATCH: usize = 1 << 4;
+/// The most furrow blocks a read gathers before it reads them (512 KiB, about seven pieces): large enough that a value laid in one stretch is read in commands of that size, small enough that the opener's helpers start on the first pieces while the rest are read.
+const RUN_BLOCKS: usize = 1 << 7;
+
+/// Furrows gathered for one read (`Store::read_gathered`): their tract positions in the order the pieces want them, and each piece's slot and how many of them are its.
+struct Gathered {
+    pos: Vec<u64>,
+    pieces: Vec<(usize, usize)>,
+}
+
 /// Pieces removed in one engine commit (`drop_pieces`).
 const DROP_BATCH: usize = 1 << 6;
 
@@ -325,26 +334,42 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(Some((at, h)))
     }
 
-    /// A piece fetched for opening: the engine's index walk to it (`locate`, every node and the leaf checked), then its furrows read as they lie, unchecked, each run of consecutive positions one read; their checks are `open_piece`'s, on whichever thread opens it. A lone piece (one that fit its leaf) comes whole. Absent: the value is not whole (`Format`).
-    fn fetch_piece(&mut self, addr: &[u8; 32]) -> Result<Sealed> {
+    /// A piece located for opening: the engine's index walk to it (`locate`, every node and the leaf checked), and the tract positions of its furrows, read later as they lie, unchecked (`read_gathered`); their checks are `open_piece`'s, on whichever thread opens it. A lone piece (one that fit its leaf) comes whole, with no furrows. Absent: the value is not whole (`Format`).
+    fn locate_piece(&mut self, addr: &[u8; 32]) -> Result<(Sealed, Vec<u64>)> {
         let t = self.tick();
         let at = self.vault.locate(addr);
         self.ticks.walk += self.tick() - t;
         match at? {
             manifestus::Located::Absent => Err(Error::Format),
-            manifestus::Located::Lone(bytes) => Ok(Sealed { addr: *addr, bytes, ..Sealed::empty() }),
-            manifestus::Located::Furrows { size, furrows } => {
-                let mut raw: Vec<manifestus::Block> = alloc::vec![manifestus::ZERO_BLOCK; furrows.len()];
-                let mut start = 0;
-                for i in 1..=furrows.len() {
-                    if i == furrows.len() || furrows[i] != furrows[i - 1] + 1 {
-                        self.vault.read_tract_run(furrows[start], &mut raw[start..i])?;
-                        start = i;
-                    }
+            manifestus::Located::Lone(bytes) => Ok((Sealed { addr: *addr, bytes, ..Sealed::empty() }, Vec::new())),
+            manifestus::Located::Furrows { size, furrows } => Ok((Sealed { addr: *addr, size, ..Sealed::empty() }, furrows)),
+        }
+    }
+
+    /// The gathered furrows read, each run of consecutive positions one read (across pieces), each piece given its blocks and handed to the opener in order; `gathered` left empty. A failed read leaves the pieces it should have filled empty (they fail to open) and is kept in `fetched`; they are handed over all the same, as `read_with` hands over every slot.
+    fn read_gathered(&mut self, gathered: &mut Gathered, base: *mut Sealed, opener: &mut dyn Opener, fetched: &mut Result<()>) {
+        let n = gathered.pos.len();
+        let mut buf: Vec<manifestus::Block> = alloc::vec![manifestus::ZERO_BLOCK; n];
+        let mut start = 0;
+        for i in 1..=n {
+            if fetched.is_ok() && (i == n || gathered.pos[i] != gathered.pos[i - 1] + 1) {
+                if let Err(e) = self.vault.read_tract_run(gathered.pos[start], &mut buf[start..i]) {
+                    *fetched = Err(e.into());
                 }
-                Ok(Sealed { addr: *addr, raw, size, ..Sealed::empty() })
+                start = i;
             }
         }
+        let mut at = 0;
+        for &(slot, k) in &gathered.pieces {
+            if k > 0 && fetched.is_ok() {
+                // SAFETY: slot `slot` is this batch's and not yet handed over (`read_with` hands each over here, once, in order).
+                unsafe { (*base.add(slot)).raw = buf[at..at + k].to_vec() };
+            }
+            at += k;
+            opener.ready(slot);
+        }
+        gathered.pos.clear();
+        gathered.pieces.clear();
     }
 
     /// What the cache knows a sealing key by.
@@ -397,16 +422,31 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         if n > 0 {
             // SAFETY: `sealed` is neither moved nor resized, and `d` outlives the batch, until `finish` returns below; each slot is written thru `base` before its `ready` and not touched from it until then.
             unsafe { opener.start(&d.seal, base, n) };
+            // Each piece located in turn (the index walk), its furrows gathered, and read in runs of up to RUN_BLOCKS once that many wait (`read_gathered`): consecutive positions across pieces are one read, so a value laid in one stretch is read in large commands and nothing it does not hold is read (2026-11-17: Photon's 92 MB capsule read 197 MB of blocks in 2248 commands through the read-ahead's windows). Pieces are handed to the opener in order as their furrows come, so the helpers open the first while the later ones are read.
+            let mut gathered = Gathered { pos: Vec::new(), pieces: Vec::new() };
             for (i, addr) in want.iter().enumerate() {
                 // After a failed fetch the rest stay empty (they fail to open, at once) and are handed over all the same, so `finish` still waits for whatever was already being opened.
-                if fetched.is_ok() {
-                    match self.fetch_piece(addr) {
-                        Ok(p) => unsafe { *base.add(i) = p },
-                        Err(e) => fetched = Err(e),
+                let furrows = if fetched.is_ok() {
+                    match self.locate_piece(addr) {
+                        Ok((p, furrows)) => {
+                            unsafe { *base.add(i) = p };
+                            furrows
+                        }
+                        Err(e) => {
+                            fetched = Err(e);
+                            Vec::new()
+                        }
                     }
+                } else {
+                    Vec::new()
+                };
+                if !gathered.pos.is_empty() && gathered.pos.len() + furrows.len() > RUN_BLOCKS {
+                    self.read_gathered(&mut gathered, base, opener, &mut fetched);
                 }
-                opener.ready(i);
+                gathered.pieces.push((i, furrows.len()));
+                gathered.pos.extend_from_slice(&furrows);
             }
+            self.read_gathered(&mut gathered, base, opener, &mut fetched);
         }
         self.ticks.fetch += self.tick() - t;
         if n > 0 {
@@ -764,8 +804,15 @@ mod tests {
         s.put(&d, b"v", &v).unwrap();
         let (_, h) = s.head(&d, b"v").unwrap().unwrap();
         let addr = Store::<Mem, Mem, Counter>::piece_addr(&d, &h.id, 1);
-        let mut p = s.fetch_piece(&addr).unwrap();
-        assert!(!p.raw.is_empty());
+        let (mut p, furrows) = s.locate_piece(&addr).unwrap();
+        struct Hold;
+        impl Opener for Hold {
+            fn open_all(&mut self, _: &[u8; 32], _: &mut [Sealed]) {}
+        }
+        let mut g = Gathered { pieces: alloc::vec![(0, furrows.len())], pos: furrows };
+        let mut fetched = Ok(());
+        s.read_gathered(&mut g, &mut p as *mut Sealed, &mut Hold, &mut fetched);
+        assert!(fetched.is_ok() && !p.raw.is_empty());
         let mut q = Sealed { addr, raw: p.raw.clone(), size: p.size, ..Sealed::empty() };
         assert!(open_piece(&d.seal, &mut p));
         assert_eq!(&p.bytes[NONCE..p.bytes.len() - TAG], &v[PIECE..2 * PIECE]);

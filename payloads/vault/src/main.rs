@@ -325,6 +325,9 @@ fn blocks_write(at: u64, buf: &[u8]) -> bool {
 /// Each fill posts the window after it to the reader thread (`ahead_reader`), which reads it into the second buffer while this thread hashes and decodes the blocks of the first; a run in the second makes it the window (the buffers swap) and posts the one after. Anything else (a run neither holds: another value, a piece out of order) fills afresh from the run.
 /// Nothing checks less: every block still meets its BLAKE3 guard in manifestus and every piece its seal. The windows hold only what the disk holds: the serving thread alone writes blocks, and every write first waits out a read beside it and drops both (`ahead_drop`); manifestus reads blocks it has staged and not yet written from its own staging, never from this device.
 const AHEAD: usize = RUN_MAX;
+/// Off since 2026-11-17: ferros_store gathers a get's furrows and reads exactly their runs, consecutive positions across pieces in one command of up to 512 KiB, where the windows read 197 MB of blocks for Photon's 92 MB capsule (half of what they read was used, the rest read again run by run).
+/// Kept, switched off, for one measurement of both on the device; it goes once that is made.
+const READ_AHEAD: bool = false;
 /// The window: its first block (of the vault's window, both mirrors' numbering), how many it holds; the bytes. The serving thread's alone.
 static mut AHEAD_AT: (u64, usize) = (0, 0);
 static mut AHEAD_BUF: Vec<u8> = Vec::new();
@@ -1049,7 +1052,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 if offset == 0 {
                     unsafe { (AHEAD_READ, AHEAD_GOT, AHEAD_POOR) = (0, 0, false) };
                 }
-                unsafe { AHEAD_ON = bulk };
+                unsafe { AHEAD_ON = bulk && READ_AHEAD };
                 let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers::default());
                 unsafe { AHEAD_ON = false };
                 let big = unsafe { ON_BIG };
