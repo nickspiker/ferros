@@ -2609,6 +2609,22 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 path.say(d, ms);
                 m.say_tx(d);
             }
+            // A window with the line armed and no interrupt (the Pro, 2026-11-17: silent for hours after A#271060 interrupts): the latches as they stand, read only, to find which one holds the line quiet before the clear is changed.
+            // ELBI G#8 bit 17 the MSI's edge, DBI G#830 the MSI controller's status, the chip's mailbox status (G#2C30) and mask (G#2C34): a mailbox status left set with the mask on means the chip raises no new MSI.
+            if irq && path.irq_wakes == 0 {
+                let (e, s, mb, mm) = (d.rd(ELBI, 0x8), d.rd(DBI, 0x830), d.rd(MEM, 0x2C30), d.rd(MEM, 0x2C34));
+                d.put(b"irq silent: armed ");
+                d.dec(IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) as u32);
+                d.put(b", elbi irq2 ");
+                d.hex(e);
+                d.put(b", msi status ");
+                d.hex(s);
+                d.put(b", chip mailbox ");
+                d.hex(mb);
+                d.put(b" mask ");
+                d.hex(mm);
+                d.put(b"\n");
+            }
             let i = d.tcm_rd(cons + 16);
             if i != cidx {
                 console_dump(d, cbuf, csize, cidx, (i + csize - cidx) % csize);
