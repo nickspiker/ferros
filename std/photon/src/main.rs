@@ -4,6 +4,9 @@
 
 use std::sync::Arc;
 
+/// When main began: the waiter says how long after it it came up (2026-11-17, the Pro: be you was asked 5.1 s after the first frame).
+static MAIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 use fluor::coord::Coord;
 use fluor::event::{CursorIcon, Event, ModifiersState};
 use fluor::geom::Viewport;
@@ -322,12 +325,25 @@ impl FluorApp<Px> for Ferros {
     }
 }
 
-/// Wait for the person (facets op 2, ferros_sys::facets::WAIT), then hand them into the running app: the identity service holds the call until be you's readiness changes (attest, the fleet joined, the person key handed to the kernel, or a lock), never asked on a clock (owner, 2026-11-10: "No polling!"). Ready, be you is asked; refused all the same (a lock between the two, a binding not for this alias), the next wait holds until the next change.
+/// Be you asked at once (ready, it answers in one pass of the identity service), else wait for the person (facets op 2, ferros_sys::facets::WAIT), then hand them into the running app: the identity service holds the call until be you's readiness changes (attest, the fleet joined, the person key handed to the kernel, or a lock), never asked on a clock (owner, 2026-11-10: "No polling!"). Ready, be you is asked; refused all the same (a lock between the two, a binding not for this alias), the next wait holds until the next change.
 /// Ends on a refusal of the wait itself: be you not granted (the grant is the launch's, so it never comes while this process runs), or an identity service from before op 2. Photon then stays on its waiting line.
 fn wait_for_person(wake: Arc<dyn WakeSender<Ev>>) {
+    let since = |t: std::time::Instant| t.elapsed().as_millis();
+    let started = std::time::Instant::now();
+    println!("photon: the waiter is up {} ms after main", MAIN.get().map_or(0, |&t| since(t)));
+    // Be you asked first, straight away: when the identity is ready (a relaunch, or any launch after attest) it answers in one pass of the identity service, where the wait below (op 2) took a pass to say "ready" and only then was be you asked (2026-11-17, the Pro: the first frame 5.1 s before be you's call). Refused (the person not in yet), the wait below holds until the identity service's readiness changes.
+    if let Some(keys) = photon_keys() {
+        println!("photon: be you answered at the first ask, {} ms after the waiter started", since(started));
+        let people = people();
+        if wake.send(Ev::Person(keys, people)).is_err() {
+            println!("photon: the app's loop is gone; your identity not handed in");
+        }
+        return;
+    }
     // A count the service never answered (it starts at 0 and moves by one), so the first wait is answered at once with the state now.
     let mut seen = u32::MAX;
     loop {
+        let asked = std::time::Instant::now();
         let mut req = [2u8, 0, 0, 0, 0];
         req[1..5].copy_from_slice(&seen.to_le_bytes());
         let mut r = [0u8; 8];
@@ -340,6 +356,7 @@ fn wait_for_person(wake: Arc<dyn WakeSender<Ev>>) {
             return;
         }
         seen = u32::from_le_bytes([r[1], r[2], r[3], r[4]]);
+        println!("photon: the identity service answered the wait for be you in {} ms ({}, its count {seen})", since(asked), if r[5] == 1 { "ready" } else { "not ready" });
         if r[5] != 1 {
             println!("photon: waiting for your identity (the identity service's count {seen})");
             continue;
@@ -364,6 +381,7 @@ fn main() {
     // The device key from this kist's ira (docs/PHOTON.md, "Photon's device key on ferros", 2026-11-12). Photon's own fallback reads the machine fingerprint, which on ferros (no files) was tohu's last resort, the bytes "unknown": every ferros device's Photon had one device key, derivable by anyone.
     // No ira, no Photon (the ira is handed to every kist since 2026-11-12, KISTS.md "The implicit set", so this is a kernel from before, where a person could say no to it, or no ira this boot): without it Photon has no key of its own to be a device with, and the shared one is the bug above. It ends at once, as it did before with every want off (KISTS.md, "Measured on the Pro").
     let started = std::time::Instant::now();
+    let _ = MAIN.set(started);
     let Some(root) = sys::ira_key(IRA, "photon device") else {
         println!("photon: no ira key at slot {IRA} (the ira right was not granted); Photon has no device key of its own and does not start");
         return;
