@@ -258,7 +258,14 @@ fn mask_of(t: usize) -> u16 {
 /// The cores thread `x` may run on now, among those up: its mask (a pin to the X3 meaning the kernel's core), narrowed by the dedicated core (devsched `core`: a device thread whose mask holds it runs there alone, every other thread anywhere else it may), and every core up when none of its own is.
 fn may_run(x: &Thread) -> u16 {
     let up = cores_up();
-    let mask = if x.mask & MASK_BIG != 0 { (x.mask & !MASK_BIG) | kernel_mask() } else { x.mask };
+    let mask = if x.mask & MASK_BIG != 0 {
+        (x.mask & !MASK_BIG) | kernel_mask()
+    } else if x.mask == MASK_WORKERS && !x.device && X3_SHARE.load(core::sync::atomic::Ordering::Relaxed) {
+        // `sched x3 on`: an unpinned thread may run on the kernel's core too while it is free.
+        x.mask | kernel_mask()
+    } else {
+        x.mask
+    };
     let dc = crate::devsched::CORE.load(core::sync::atomic::Ordering::Relaxed) & up;
     let m = if dc == 0 {
         mask
@@ -399,6 +406,16 @@ fn make_room(t: usize, line: usize, landed: usize) {
 
 /// `diag "sched old on|off"`: the scheduler as before 2026-11-17 (KERNEL.md Order item 8), for measuring the two in adjacent runs on one boot: the lock's spin a bare test-and-set, every yield under the lock and kicking every core, futex and deadline wakes to the back, no `make_way`, deadlines noticed only between slices and idle workers on their event stream, a thread asked to yield kept at the very front and only under devsched `first`. Off by default.
 pub static OLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `diag "sched x3 on|off"`: a thread on the workers' default mask (not pinned, not a device thread) may run on the kernel's core too, when it is free; a thread pinned there (the render thread) woken while one runs there has it yield (`make_way`), as an interrupt's waiter has under devsched `first` (`make_room`). Off by default: measured 2026-11-17, the X3 sat ~60 % idle thru a Photon pinch while the four A715s were saturated.
+pub static X3_SHARE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `diag "sched slice <n>"`: the slice timer at 2^-n s (`slice_ticks`); 0, the default, is `SLICE_MS`. Only the timer: the front credit stays a `SLICE_MS` (`enqueue_woken`), so the fairness bound above reads as before. Measured 2026-11-17: with eight compute threads (rayon's four and the display's four publish workers) on four cores, a parallel section's last worker waited out a whole 10 ms slice of another's.
+pub static SLICE_LOG2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn slice_ticks() -> u64 {
+    match SLICE_LOG2.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => crate::platform::cntfrq() / 1000 * SLICE_MS,
+        n => crate::platform::cntfrq() >> n,
+    }
+}
 /// A woken thread's least claim on a core already running another (`make_way`): that thread has run at least 2^-11 s (about half a millisecond) of its turn and longer than the woken one's front credit.
 const WAY_RUN_LOG2: u32 = 11;
 /// Per core asked: how many times `make_way` asked it to yield, for `diag sched`.
@@ -425,11 +442,20 @@ fn make_way(t: usize) {
     let mut longest = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
     for c in 0..16 {
         // Not this core: its thread is the waker, in the kernel now, and if it blocks next this core takes the woken thread itself; an SGI to itself would land on whatever it switched to.
-        if (m & MASK_WORKERS) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
+        if (m & (MASK_WORKERS | kernel_mask())) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
             continue;
         }
         let Some(r) = cur[c] else { continue };
         let Some(y) = th(r) else { continue };
+        // The kernel's core: only a visitor there (`sched x3 on`, a thread not pinned to it) is asked, and for a thread pinned there (the render thread) whatever its process and however briefly the visitor has run: the core is the pinned threads' first.
+        let x3 = 1u16 << c == kernel_mask();
+        if x3 && y.mask & MASK_BIG != 0 {
+            continue;
+        }
+        if x3 && x.mask & MASK_BIG != 0 {
+            best = Some(c);
+            break;
+        }
         if y.proc == x.proc || (y.on_irq && !over_budget(r, y)) {
             continue;
         }
@@ -6325,7 +6351,7 @@ fn arm_slice() {
         crate::killswitch::enable_ppi(26);
         crate::killswitch::enable_sgi(3);
     }
-    let ticks = crate::platform::cntfrq() / 1000 * SLICE_MS;
+    let ticks = slice_ticks();
     unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
 }
 
