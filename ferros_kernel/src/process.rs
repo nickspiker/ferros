@@ -1883,7 +1883,7 @@ const SYS_LIGHT: u64 = 21;
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
-/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR), 5 the person's export, 6-9 attest with a tag (`tag_syscall`: unlock by a tag, keep, forget, list). AUTH.md.
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op: 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one, bit 2 the person key held), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR), 5 the person's export, 6-9 attest with a tag (`tag_syscall`: unlock by a tag, keep, forget, list), 10 the person key, 11 the identity's doorbell (x2 a word: the state and a change count, rung at every change, `identity_ring`). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
 /// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 2 says a transfer is moving (the clock policy counts it as activity) → 0. Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
@@ -6291,6 +6291,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
+                    // Op 11: the identity's doorbell, x2 a word in the caller's arc (8-aligned, as SYS_WAIT takes one).
+                    // The state as op 0 answers it, with a change count above bit 8 (`ID_WORD`), is written there now and at every change, waking whatever of the process waits on it (`identity_ring`, one of the bells).
+                    // The state is read live first, so an unlock at boot (before any bell existed) is in the first word.
+                    // One word a process; a second registration moves it. → 0, ERR with no vault.
+                    11 => match unlock(0, None) {
+                        Ok(s) => {
+                            identity_ring(s);
+                            bell_register(p, pi, BELL_ID_STATE, f.x[2], ID_WORD.load(core::sync::atomic::Ordering::Acquire))
+                        }
+                        Err(()) => ERR,
+                    },
                     // Op 10: the person key from the identity service (FACETS.md D1), 32 bytes at x2, held beside the identity's keys until lock; ERR while nobody is present. This copy wiped at once.
                     10 => {
                         let mut key = [0u8; 32];
@@ -7576,9 +7587,28 @@ pub const BELL_IDENTITY: usize = 13;
 const BELL_PUCKS: usize = 14;
 /// The camera on the GPU (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"), for the GPU service (the holder of `arena`): counted each time a camera view its holder's GPU calls carried is taken back, so the service unmaps it from that client's address space and says so (`gpu_cam_settled`).
 const BELL_GPU_CAMERA: usize = 15;
-const BELLS: usize = 16;
+/// The identity's state (SYS_UNLOCK op 11, for an Unlock holder; 2026-11-16, owner: "Yuppers" to the identity doorbell): its word is `ID_WORD`, the state with its own change count. Beside `BELL_IDENTITY` (the lock epoch, anyone's by SYS_BELL), which came to forge first with number 13 (merged 2026-11-20).
+const BELL_ID_STATE: usize = 16;
+const BELLS: usize = 17;
 /// The lock epoch last rung into the identity's bell (`identity_bell`).
 static IDENTITY_RUNG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The identity's bell word as last rung (`identity_ring`): bits 0 to 7 SYS_UNLOCK op 0's answer (bit 0 an identity unlocked, bit 1 the device bound, bit 2 the person key held), the change count above bit 8.
+static ID_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `ID_WORD`'s state bits.
+const ID_STATE: u64 = (1 << 8) - 1;
+
+/// The identity's state is `state` (SYS_UNLOCK op 0's answer) after an unlock, a lock, a bind, a release or the person key handed in (service.rs `store_unlock`, `store_tag`), or as a waiter registers (op 11).
+/// When it differs from the state last rung, the count moves on by one and every identity bell rings (`bell_ring`): a process asleep on the word (init's `wait_person`) wakes and reads it, never asking on a timer.
+/// Under the kernel lock.
+pub fn identity_ring(state: u64) {
+    let was = ID_WORD.load(core::sync::atomic::Ordering::Acquire);
+    if was & ID_STATE == state & ID_STATE {
+        return;
+    }
+    let v = ((was >> 8) + 1) << 8 | state & ID_STATE;
+    ID_WORD.store(v, core::sync::atomic::Ordering::Release);
+    bell_ring(BELL_ID_STATE, v);
+}
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.

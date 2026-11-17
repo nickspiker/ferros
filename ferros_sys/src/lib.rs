@@ -2912,6 +2912,16 @@ pub mod window {
         (call(display, &m, &mut r) >= 6 && r[0] == 0).then(|| (u32::from_le_bytes([r[1], r[2], r[3], r[4]]), r[5] == 1))
     }
 
+    /// Whether an app window is in front (display op 5's byte 12) as a doorbell (display op 75, anyone's): held by the display until that changed from what `seen` counted.
+    /// (the count now, in front), None from a display without the op. Call it with a `seen` no answer gave (u32::MAX) for the state at once; with the count it answered, it waits.
+    pub fn front_watch(display: u64, seen: u32) -> Option<(u32, bool)> {
+        let mut m = [0u8; 5];
+        m[0] = 75;
+        m[1..5].copy_from_slice(&seen.to_le_bytes());
+        let mut r = [0u8; 8];
+        (call(display, &m, &mut r) >= 6 && r[0] == 0).then(|| (u32::from_le_bytes([r[1], r[2], r[3], r[4]]), r[5] == 1))
+    }
+
     /// Text typed into the window that wants the keyboard while it is the app in front (display op 70, the system's alone; `EV_TEXT`): at most `PIECE` bytes (more is the caller's bug, and panics). True when it went.
     pub fn type_text(display: u64, text: &[u8]) -> bool {
         let mut m = [0u8; 2 + PIECE];
@@ -3001,6 +3011,20 @@ pub fn identity_unlocked(cap: u64) -> Option<bool> {
 pub fn identity_bound(cap: u64) -> Option<bool> {
     let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
     (r != ERR).then_some(r & 2 == 2)
+}
+
+/// The identity doorbell's word (`identity_doorbell`): an identity is unlocked.
+pub const ID_UNLOCKED: u64 = 1;
+/// The identity doorbell's word: an identity's fleet has bound this device.
+pub const ID_BOUND: u64 = 2;
+/// The identity doorbell's word: the kernel holds the person key (FACETS.md D1).
+pub const ID_PERSON: u64 = 4;
+
+/// The identity's doorbell (SYS_UNLOCK op 11, kernel from 2026-11-16), given the Unlock right: the kernel writes the state into `word` now and at every change (`ID_UNLOCKED`, `ID_BOUND`, `ID_PERSON`; a change count above bit 8), waking whatever waits on it (`wait_world`).
+/// The word must live as long as the process (a static): the kernel keeps writing it.
+/// False without the capability, or from a kernel before.
+pub fn identity_doorbell(cap: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+    svc(nr::UNLOCK, cap, 11, off(word as *const _ as *const u8), 0, 0) == 0
 }
 
 /// What an unlock did.

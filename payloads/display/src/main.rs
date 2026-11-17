@@ -11,6 +11,7 @@
 //! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
 //! - 4 `present`: the frame goes to the panel (what nothing painted shows black). Reply byte 1 = whether DECON advanced.
 //! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32][app in front u8][escapes unused u8][features u8]` (`FEATURES`).
+//! - 75 `front watch [seen u32]` → `[0][count u32][front u8]`: op 5's byte 12 (an app window in front) as a doorbell, held until it changed past `seen` (front.rs).
 //! - 6 `brightness [dbv u16]`: the panel's DBV (196 = 2 nits … 3307 = 1000 nits; DISPLAY-HK3.md §4), through DSIM from this process.
 //! - 7 `refresh [hz u8]`: 60 or 120, the panel's own command set plus DSIM's command-TE timers.
 //! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
@@ -48,6 +49,7 @@ extern crate alloc;
 mod bake;
 mod draw;
 mod events;
+mod front;
 mod glyphs;
 mod hit;
 mod keyboard;
@@ -3427,6 +3429,8 @@ fn wins_mirror() {
         }
     }
     WIN_GENS.store(v, Ordering::Release);
+    // Op 75's doorbell: whether an app is in front may have changed with the table (front.rs).
+    front::changed();
 }
 
 /// Op 5's byte 12, an app in front: a window up whose owner lives. From `WIN_GENS` and the live generations, not `APP`, so the map hears the moment a front app's process ends (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, op 5 kept saying an app was in front, and the map ignored every gesture but the corners until the display was restarted), whatever the render thread is doing; its next pass drops the window and gives the map the glass (`reaper`).
@@ -3446,6 +3450,8 @@ extern "C" fn reaper(_: u64) -> ! {
         let v = SURF_LIVE.load(Ordering::Acquire);
         if v != seen {
             seen = v;
+            // Op 5's byte 12 reads the owners at once (`app_live`), so op 75's doorbell rings now too, before the render thread drops the window (front.rs).
+            front::changed();
             ring_bell();
         }
     }
@@ -7854,6 +7860,12 @@ extern "C" fn receive(grants: u64) -> ! {
             } else {
                 ferros_sys::reply(&tok, &[NOT_YOURS]);
             }
+            continue;
+        }
+        // 75 `front watch [seen u32]`: op 5's byte 12 as a doorbell (front.rs), held until whether an app window is in front changed past `seen` → [0][count u32][front u8].
+        // Anyone's, as op 5 is: init waits on it for the attest screen's window.
+        if op == 75 && n >= 5 {
+            front::watch(u32::from_le_bytes(msg[1..5].try_into().unwrap()), &tok);
             continue;
         }
         // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs; development builds only, status 1 on a release build). Answered here, at once.

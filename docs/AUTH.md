@@ -77,8 +77,11 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 - **The boot order** (init):
   1. Display, touch, the attest screen.
   2. WiFi (the chip comes up; it joins once `wifi.cred` can be read, or the device's `wifi.net` from boot, or a network the page hands in), IP, NFC, Bluetooth, the modem.
-  3. A wait for a person (op 0, unlocked), then fgtw, the identity service: part of attest, it looks the identity up and joins its fleet.
-  4. A wait for the device to be bound to that identity (op 0, bound), then the map. Both read the identity class.
+  3. A wait for a person (the identity's doorbell, op 11: unlocked), then fgtw, the identity service: part of attest, it looks the identity up and joins its fleet.
+  4. A wait for the device to be bound to that identity (the doorbell again: bound), then the map. Both read the identity class.
+
+  Between 1 and 2 init waits for the attest screen's window (the display's op 75, at most 4 s; WINDOWS.md), except when the identity was unlocked and bound at boot: there is no attest screen then.
+- **The identity's doorbell** (2026-11-16, owner: "Yuppers"). Until then init asked op 0 64 times a second while the attest screen was up, up to 16 ms behind a tap and each ask a read of the bound mark from the flash under the kernel lock. Now a process with the Unlock right hands the kernel a word (op 11), and the kernel writes the state into it at once and again at every change it makes itself: an unlock (by the handle or a tag), a lock, a bind, a release, the person key handed in (service.rs `store_unlock`, `store_tag`; process.rs `identity_ring`, one of the bells of SYS_BELL). A waiter sleeps on its word (`ferros_sys::wait_world`) and reads the state from the word itself. A change the state does not show (the same person key twice, a tag kept) rings nothing.
 - **Unlock at boot** (`device.unlock_at_boot`, opt-in, warned): while it is on, the kernel keeps the seed in the device class and unlocks at boot, before init starts. Off, the kept seed is deleted at boot. It and the kept tags are independent: with it on a tag is never needed (the device is unlocked before the attest screen would show), switching it off leaves the tags kept, and a release deletes both.
   - **Two keeps** (2026-11-18): the kernel keeps the seed (`\0id.unlock`, device class) at an unlock with the setting on (op 1 or op 6); the identity service (fgtw) keeps its roots, the fleet key and the chain (`fgtw.identity_seed`, `fgtw.handle_proof`, `fgtw.fleet_key`, `fgtw.chain`, identity class, each its document) whenever the setting is on and it holds them.
     It follows the setting at every pass of its loop (`follow_persist`): turned on mid-session it keeps what it holds at once, turned off it deletes them at once.
@@ -107,6 +110,7 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 | 8 | forget a tag (the start of its id), or every tag | how many |
 | 9 | list the kept tags | how many; each the start of its id and when it was kept |
 | 10 | the person key from the identity service (Unlock right only; FACETS.md D1): 32 bytes, held beside the identity key and wiped with it at lock; the kernel derives each kist's alias from it | 0, or ERR while nobody is present |
+| 11 | the identity's doorbell: x2 a word in the caller's arc, 8-aligned; the state written there now (read live, so an unlock at boot is in it) and at every change, bits 0-2 as op 0 with a change count above bit 8, waking whatever of the process waits on it. One word a process (a second moves it); any number of processes | 0, or ERR with no vault |
 
 ## Attest with a tag (owner, 2026-11-05 and 2026-11-11)
 

@@ -912,8 +912,9 @@ fn lock_before_reset() {
     }
 }
 
-/// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound), 1 unlocks from a seed (the number of entries the identity has on this device, or NOTHING: the device is bound to another identity), 2 locks, 3 binds the device to the unlocked identity, 4 releases it (every identity entry deleted).
-/// Op 0 (init asks 64 times a second while it waits for a person) reads the identity's state in memory under the kernel lock alone (`SPAWN_STORE`), the vault read only for the bound mark's first read; every other op holds the vault's lock too, as it writes the vault or that state.
+/// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound, bit 2 the person key held), 1 unlocks from a seed (the number of entries the identity has on this device, or NOTHING: the device is bound to another identity), 2 locks, 3 binds the device to the unlocked identity, 4 releases it (every identity entry deleted).
+/// Op 0 reads the identity's state in memory under the kernel lock alone (`SPAWN_STORE`), the vault read only for the bound mark's first read; every other op holds the vault's lock too.
+/// Every op but the question rings the identity's state bell after it (process.rs `identity_ring`, SYS_UNLOCK op 11), done or failed part way (an unlock refused has locked); the bell rings only when the state differs from the one it rang last.
 fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     if op == 0 {
         let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
@@ -923,8 +924,19 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
         };
         return Ok(st.unlocked() as u64 | (bound as u64) << 1 | (st.person_held() as u64) << 2);
     }
-    vault(|| store_unlock_held(op, seed))
+    let r = vault(|| store_unlock_held(op, seed));
+    identity_ring();
+    r
 }
+
+/// The identity's state as op 0 answers it, into the identity's state bell (process.rs `identity_ring`).
+/// Under the kernel lock, as every caller of `store_unlock` and `store_tag` holds it (a syscall, or `with_lock` from a diag).
+fn identity_ring() {
+    if let Ok(s) = store_unlock(0, None) {
+        crate::process::identity_ring(s);
+    }
+}
+
 fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match (op, seed) {
@@ -990,8 +1002,14 @@ pub(crate) fn alias(developer: &[u8; 32], option: &[u8; 32]) -> Option<[u8; 32]>
 }
 
 /// Attest with a tag (AUTH.md; SYS_UNLOCK ops 6-9, process.rs `tag_syscall`). The flash log names a tag only by the start of its id (a keyed hash of its UID, kvault `TAG_ID_CONTEXT`), never by its UID.
+/// An unlock by a tag rings the identity's bell after it, as `store_unlock` does (keeping, forgetting and listing tags change no state it carries).
 fn store_tag(op: crate::process::TagOp) -> Result<u64, ()> {
-    vault(|| store_tag_held(op))
+    let unlock = matches!(op, crate::process::TagOp::Unlock(..));
+    let r = vault(|| store_tag_held(op));
+    if unlock {
+        identity_ring();
+    }
+    r
 }
 fn store_tag_held(op: crate::process::TagOp) -> Result<u64, ()> {
     use crate::process::TagOp;

@@ -1,6 +1,6 @@
 //! init: the first process of a cold boot, started by the kernel once the boot ring completes (the USB link up, or 1 s after the press without a cable). It holds exactly the capabilities the shell needs and starts every process of the home from vault capsules, each with its share (SYS_SPAWN: copies of init's own capabilities, never more), then ends. Policy lives here, in a signed and replaceable capsule; the kernel only starts init (owner, 2026-10-22).
 //!
-//! The shell (SHELL.md): `display` owns the panel and keeps the map's scene, `touch` serves contacts, `ahau` is the attest screen, `map` places the circles and turns touch into the camera. Started in that order; a spawn only queues, so init waits for the attest screen's window before it starts the map (`wait_front`).
+//! The shell (SHELL.md): `display` owns the panel and keeps the map's scene, `touch` serves contacts, `ahau` is the attest screen, `map` places the circles and turns touch into the camera. Started in that order; a spawn only queues, so init waits for the attest screen's window before the drivers (`wait_front`, a doorbell from the display), and for a person before the identity service and the map (`wait_person`, the kernel's identity doorbell).
 //!
 //! Then the network (WIFI.md), after the shell so the screen never waits for it: `pcie1`, the WiFi driver, brings up PCIe channel 1, loads the chip's firmware from the vault and joins the network it holds the credential for, then serves Ethernet frames on `wlan`; `ip` (ARP, IPv4 + DHCP, IPv6, UDP) serves `udp` over it. Both are processes with only their own grants; the kernel only hands them out.
 //!
@@ -18,7 +18,8 @@
 
 extern crate alloc;
 
-use ferros_sys::{call_live, cap, console, freq, now, sleep_until, spawn, ERR};
+use core::sync::atomic::{AtomicU64, Ordering};
+use ferros_sys::{cap, console, freq, now, sleep_until, spawn, ERR};
 
 /// Grant slot 104: the Kists right (KISTS.md); 105: serve launch; 107: the vault scope `kists.`.
 const S_KISTS: u64 = 104;
@@ -85,6 +86,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let after_jump = |n: &[u8]| jumped && matches!(n, b"sensors" | b"gpu");
     // Whether the map was started ahead of fgtw (the device bound already at the attest).
     let mut map_first = false;
+    // The identity's doorbell (SYS_UNLOCK op 11): the kernel writes the identity's state into `IDENTITY` now and at every change, and `wait_person` sleeps on it.
+    // Without it (no Unlock right, or a kernel from before 2026-11-16) the word stays 0 and nothing of the person's starts: fail closed, as `wait_person` always has.
+    if !ferros_sys::identity_doorbell(cap(grants, S_UNLOCK), &IDENTITY) {
+        console(grants, b"init: the kernel gave no identity doorbell; nothing of the person's will start\n");
+    }
     for (name, key, slots) in SHELL.iter() {
         if switched_off(name) {
             console(grants, b"init: ");
@@ -108,7 +114,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             wait_person(grants, false);
             // A device already bound to the person who just attested (every attest but its first): the deck first, then the identity service. Each spawn holds the kernel lock while it reads its capsule (fgtw 47 ms, the map 70 ms on the 8a, 2026-11-12), and the map waited behind fgtw's; nothing of the map's start needs fgtw, which answers its Fleet page once it serves.
-            if ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
+            if IDENTITY.load(Ordering::Acquire) & ferros_sys::ID_BOUND != 0 {
                 if let Some((n, k, s)) = SHELL.iter().find(|s| s.0 == b"map") {
                     map_first = spawn(grants, n, k, s) == 0;
                 }
@@ -141,7 +147,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             console(grants, b"\n");
             failed += 1;
         } else if *name == b"ahau" {
-            wait_front(grants);
+            // Unlocked and bound at boot (`device.unlock_at_boot`, AUTH.md): ahau shows no attest screen, only stays as the keyboard, so there is no window to wait for (until 2026-11-16 init waited out the 4 s for it, the drivers after it held off that long).
+            // The one exception is not waited for either: the identity service holding no roots, which ahau learns from fgtw once init has started it, and its attest screen then comes up over whatever has started (AUTH.md "Never stuck").
+            let v = IDENTITY.load(Ordering::Acquire);
+            if v & ferros_sys::ID_UNLOCKED == 0 || v & ferros_sys::ID_BOUND == 0 {
+                wait_front(grants);
+            }
         }
     }
     if failed == 0 {
@@ -149,12 +160,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     // Kists launch from here on (the map's kist circles): the person is present and the device bound by now (`wait_person` before the map).
     ferros_sys::thread_spawn(launcher, unsafe { &mut (*(&raw mut LSTACK)).0 }, grants);
-    // init stays: its keepers and its launcher run in this process. The main thread only waits.
+    // init stays: its keepers and its launcher run in this process. The main thread only waits, on a word nothing rings (until 2026-11-16 a sleep woke it every 1024 s for nothing).
     let _ = failed;
     loop {
-        sleep_until(now() + freq() * 1024);
+        ferros_sys::wait_world(&PARKED, 0, 0);
     }
 }
+
+/// The main thread's word once the shell is started: never rung, so its wait has no end.
+static PARKED: AtomicU64 = AtomicU64::new(0);
 
 /// The `launch` endpoint (KISTS.md, owner 2026-11-08): the map asks for a kist by its capsule's address and init launches it with exactly the rights the person granted, read from the person's own list, never the map's word; the map holds none of a kist's rights. A want never answered launches nothing: the map asks first (init never asks, and no kist can). One process per kist: a second tap finds it running.
 extern "C" fn launcher(grants: u64) -> ! {
@@ -274,14 +288,22 @@ fn switched_off(name: &[u8]) -> bool {
     RADIOS.iter().position(|r| *r == name).is_some_and(|i| ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> i & 1 == 1)
 }
 
-/// The person's space opens only with them (AUTH.md). fgtw, the identity service, starts once an identity is unlocked (`bound` false): it is the attest's own, looking the identity up and joining its fleet. The map starts only once the device is also bound to that identity (`bound` true): a device not attached to an identity is not usable, nothing to save settings into and no point to it (owner, 2026-11-04). At once with unlock at boot (the kernel unlocked a bound device before init started), else when someone attests and, for the map, the fleet binds the device or a mint makes it the identity's first. No timeout: without a person there is nothing of theirs to show. Fails closed: an answer the kernel cannot give (no Unlock right) waits forever, where it once started everything.
+/// The identity's doorbell word (SYS_UNLOCK op 11, `ferros_sys::identity_doorbell`): bit 0 an identity unlocked, bit 1 the device bound, bit 2 the person key held, a change count above bit 8.
+/// The kernel writes it at registration and at every change of the identity's state, and wakes whatever waits here; a static, since it writes it for as long as init lives.
+static IDENTITY: AtomicU64 = AtomicU64::new(0);
+
+/// The person's space opens only with them (AUTH.md).
+/// fgtw, the identity service, starts once an identity is unlocked (`bound` false): it is the attest's own, looking the identity up and joining its fleet.
+/// The map starts only once the device is also bound to that identity (`bound` true): a device not attached to an identity is not usable, nothing to save settings into and no point to it (owner, 2026-11-04).
+/// At once with unlock at boot (the kernel unlocked a bound device before init started), else when someone attests and, for the map, the fleet binds the device or a mint makes it the identity's first.
+/// A doorbell, not a poll (2026-11-16; until then op 0 was asked 64 times a second, up to 16 ms behind the tap): asleep on `IDENTITY` until the kernel rings it, then the state read from the word itself.
+/// No timeout: without a person there is nothing of theirs to show.
+/// Fails closed: with no doorbell (no Unlock right) the word stays 0 and this waits forever, where it once started everything.
 fn wait_person(grants: u64, bound: bool) {
     let mut said = false;
     loop {
-        let ready = match bound {
-            false => ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true),
-            true => ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true),
-        };
+        let v = IDENTITY.load(Ordering::Acquire);
+        let ready = v & ferros_sys::ID_UNLOCKED != 0 && (!bound || v & ferros_sys::ID_BOUND != 0);
         if ready {
             return;
         }
@@ -289,28 +311,52 @@ fn wait_person(grants: u64, bound: bool) {
             console(grants, if bound { b"init: waiting for this device to be bound to the identity before the map\n" } else { b"init: waiting for a person (the attest screen) before the identity service\n" });
             said = true;
         }
-        sleep_until(now() + freq() / 64);
+        ferros_sys::wait_world(&IDENTITY, v, 0);
     }
 }
 
+/// `wait_front`'s word: 1 once its thread heard an app window is in front.
+static FRONT: AtomicU64 = AtomicU64::new(0);
+/// `front_thread`'s stack: one call's few bytes.
+const FRONT_STACK: usize = 1 << 13;
+#[repr(C, align(16))]
+struct FrontStack([u8; FRONT_STACK]);
+static mut FSTACK: FrontStack = FrontStack([0; FRONT_STACK]);
 
-/// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.
+/// The attest screen before the drivers: a spawn only queues the process, and ahau's window should be on the glass before the drivers' starts (each holding the kernel lock while it reads its capsule) come between it and its first frame.
+/// Until 2026-11-04 it also kept the map off the glass before Attest (2026-10-31: the map's circles showed first); `wait_person` does that now.
+/// Waits until an app window is in front (the display's op 75, the doorbell of op 5's byte 12, held by `front_thread`), asleep on `FRONT` meanwhile.
+/// The 4 s bound is a real deadline, not a pace: the USB driver (the bridge's only way in), WiFi and the radios start after this, so an attest screen that fails before its window must not keep them off.
 fn wait_front(grants: u64) {
-    // Unlocked and bound already (unlock at boot, or ahau started again after attest): ahau shows no attest screen (ahau main.rs `at_boot`, the same test), so there is no window to wait for (2026-11-18, the 8a: every unlock-at-boot boot waited the whole 4 s before the map).
-    // The one exception is not waited for either: the identity service holding no roots, which ahau learns from fgtw once init has started it, and its attest screen then comes up over whatever has started (AUTH.md "Never stuck").
-    if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
-        return;
-    }
+    ferros_sys::thread_spawn(front_thread, unsafe { &mut (*(&raw mut FSTACK)).0 }, grants);
     let end = now() + freq() * 4;
-    while now() < end {
-        let mut r = [0u8; 16];
-        let n = call_live(cap(grants, S_USE_DISPLAY), &[5], &mut r);
-        if n != ERR && n >= 13 && r[12] == 1 {
+    while FRONT.load(Ordering::Acquire) == 0 {
+        if ferros_sys::wait_world(&FRONT, 0, end) == 2 {
+            console(grants, b"init: the attest screen's window was not up after 4 s; starting the rest\n");
             return;
         }
-        sleep_until(now() + freq() / 64);
     }
-    console(grants, b"init: the attest screen's window was not up after 4 s; starting the rest\n");
+}
+
+/// Holds the display's op 75 until an app window is in front, then rings `FRONT` and ends.
+/// The display takes the call when it first receives, so one not serving yet needs no asking again.
+/// A display without the op, or one that ended, answers None: the thread ends unrung and `wait_front` keeps its deadline.
+extern "C" fn front_thread(grants: u64) -> ! {
+    let display = cap(grants, S_USE_DISPLAY);
+    // No answer gave this count yet (the display counts from 0), so the first call is answered at once with the state now.
+    let mut seen = u32::MAX;
+    loop {
+        match ferros_sys::window::front_watch(display, seen) {
+            Some((_, true)) => {
+                FRONT.store(1, Ordering::Release);
+                ferros_sys::wake(&FRONT, 1);
+                break;
+            }
+            Some((n, false)) => seen = n,
+            None => break,
+        }
+    }
+    ferros_sys::thread_exit(0)
 }
 
 #[panic_handler]
