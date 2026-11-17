@@ -51,11 +51,13 @@ pub struct Facets {
     /// Op 2's count, moved on each time be you's readiness changes, and the readiness it was last counted at.
     ready_gen: u32,
     ready_seen: bool,
+    /// Be you's two readiness terms as last said (bit 0 the member chain, bit 1 the person key in the kernel); 4 before the first line. Said on a change only.
+    said_terms: u8,
 }
 
 impl Facets {
     pub fn new() -> Facets {
-        Facets { held: Vec::new(), made: Vec::new(), kept: None, adding: None, state: add::NONE, waiting: Vec::new(), ready_gen: 0, ready_seen: false }
+        Facets { held: Vec::new(), made: Vec::new(), kept: None, adding: None, state: add::NONE, waiting: Vec::new(), ready_gen: 0, ready_seen: false, said_terms: 4 }
     }
 }
 
@@ -154,14 +156,21 @@ impl Client {
         self.log.line();
     }
 
-    /// Be you would be answered now: a fleet this service is a member of, and the person key in the kernel, so a kist's alias exists. The kernel's present word follows the roots, which the member chain needs.
-    fn be_you_ready(&self) -> bool {
-        self.member_chain().is_some() && self.person_in_kernel()
-    }
 
     /// Op 2's count moved on when be you's readiness differs from when it was last counted.
+    /// Be you would be answered now when both terms hold: a fleet this service is a member of, and the person key in the kernel, so a kist's alias exists. The kernel's present word follows the roots, which the member chain needs.
     fn ready_count(&mut self) {
-        let ready = self.be_you_ready();
+        // Each term said when it changes (2026-11-17: a launch waited on readiness and nothing said which half was missing).
+        let terms = self.member_chain().is_some() as u8 | (self.person_in_kernel() as u8) << 1;
+        if terms != self.facets.said_terms {
+            self.facets.said_terms = terms;
+            self.log.put(b"fgtw: facets: be you's readiness: the member chain ");
+            self.log.put(if terms & 1 != 0 { b"yes".as_slice() } else { b"no" });
+            self.log.put(b", the person key in the kernel ");
+            self.log.put(if terms & 2 != 0 { b"yes".as_slice() } else { b"no" });
+            self.log.line();
+        }
+        let ready = terms == 3;
         if ready != self.facets.ready_seen {
             self.facets.ready_seen = ready;
             self.facets.ready_gen = self.facets.ready_gen.wrapping_add(1);

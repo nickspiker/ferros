@@ -69,11 +69,17 @@ pub struct SpaceSync {
     person_told: Option<[u8; 32]>,
     /// What was last said of the person key (`P_*`), so each state is said once.
     person_said: u8,
+    /// What was last said of the pull's three conditions (`space_ready`: the handle proof, bound, the fleet key), one bit each; 8 before the first line. Said on a change only (2026-11-17: a launch waited on readiness and nothing said why).
+    said_ready: u8,
+    /// Tries of the first pull at fgtw.org so far, said with each.
+    pull_tries: u32,
+    /// The first pull's wait for the network said.
+    said_no_net: bool,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false }
     }
 }
 
@@ -233,7 +239,22 @@ impl Client {
     pub(crate) fn space_seed(&mut self, put: bool) {
         let Some((hp, _)) = self.space_ready() else { return };
         if !self.net_up {
+            if !self.space.settled && !self.space.said_no_net {
+                self.space.said_no_net = true;
+                self.log.put(b"fgtw: space: the first pull waits for the network");
+                self.log.line();
+            }
             return;
+        }
+        // Each try of the first pull said, with its time and how it ended (the lines below, or this one's answer time): from 2026-11-17, when a launch waited on readiness and nothing said whether fgtw.org was asked.
+        let first = !self.space.settled;
+        let asked = now_us();
+        if first {
+            self.space.pull_tries += 1;
+            self.log.put(b"fgtw: space: the first pull, try A#");
+            self.log.dec(self.space.pull_tries as u64);
+            self.log.put(b": asking fgtw.org");
+            self.log.line();
         }
         fgtw::set_clock(eagle());
         let (pulled, ip) = {
@@ -242,6 +263,20 @@ impl Client {
             (r, s.ip.get())
         };
         self.seed_ip = ip;
+        if first {
+            self.log.put(b"fgtw: space: the first pull, try A#");
+            self.log.dec(self.space.pull_tries as u64);
+            self.log.put(b": fgtw.org ");
+            self.log.put(match &pulled {
+                Ok(Some(_)) => b"sent a copy".as_slice(),
+                Ok(None) => b"keeps none",
+                Err(_) => b"failed (the reason below)",
+            });
+            self.log.put(b" in A#");
+            self.log.dec((now_us() - asked) / 1000);
+            self.log.put(b" ms");
+            self.log.line();
+        }
         match pulled {
             Ok(Some(sealed)) => {
                 self.seed_heard_us = now_us();
@@ -323,6 +358,12 @@ impl Client {
     fn space_ask_fleet(&mut self) {
         let Some((hp, _)) = self.space_ready() else { return };
         let Ok(frame) = fgtw::protocol::space_want(&hp, &self.space.space.digest(), self.keys.keypair(), eagle()) else { return };
+        if !self.space.settled {
+            self.log.put(b"fgtw: space: the first pull: the fleet asked for its copy (A#");
+            self.log.dec(self.members.len() as u64);
+            self.log.put(b" members in the chain)");
+            self.log.line();
+        }
         self.push_to_fleet(frame, None);
     }
 
@@ -330,6 +371,10 @@ impl Client {
     pub fn on_space_push(&mut self, from: Addr, bytes: &[u8]) {
         let Ok((hp, sealed, sender)) = fgtw::protocol::parse_space_push(bytes) else { return };
         if Some(hp) != self.hp || !self.members.contains(&sender) || self.space_ready().is_none() {
+            if !self.space.settled {
+                self.log.put(b"fgtw: space: a fleet device's copy came before the first pull settled and was not taken (another identity's, not a member's, or the pull not ready)");
+                self.log.line();
+            }
             return;
         }
         self.space_load();
@@ -511,6 +556,19 @@ impl Client {
 
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
     pub fn space_step(&mut self, t: u64) {
+        // The pull's three conditions, said when they change.
+        let ready = self.hp.is_some() as u8 | (self.bound as u8) << 1 | (self.fleet_key.is_some() as u8) << 2;
+        if ready != self.space.said_ready {
+            self.space.said_ready = ready;
+            let yn = |b: u8| if ready & b != 0 { b"yes".as_slice() } else { b"no" };
+            self.log.put(b"fgtw: space: the pull's conditions: the handle proof ");
+            self.log.put(yn(1));
+            self.log.put(b", bound ");
+            self.log.put(yn(2));
+            self.log.put(b", the fleet key ");
+            self.log.put(yn(4));
+            self.log.line();
+        }
         if self.space_ready().is_none() {
             return;
         }
