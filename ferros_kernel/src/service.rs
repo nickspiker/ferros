@@ -3744,6 +3744,14 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"sched old on" || cmd.params == b"sched old off" {
+                    // `diag "sched old on|off"`: the scheduler's behaviour before 2026-11-17 back, or not (process.rs `OLD`, KERNEL.md Order item 8), to measure both on one boot.
+                    let on = cmd.params == b"sched old on";
+                    crate::process::OLD.store(on, core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(if on { b"sched: as before 2026-11-17\n" } else { b"sched: as built 2026-11-17\n" });
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"sched" || cmd.params == b"sched reset" || cmd.params == b"sched all" {
                     // `diag sched`: the scheduler's counts (wake to run per kind, the lock's wait per core, register syscalls by path, yields, cores asked to make way) and its trace (process.rs): who called whom, who waited, for how long. `diag "sched reset"` zeroes the counts first; `diag "sched all"` lists the whole ring, not its last 512 events.
                     if cmd.params == b"sched reset" {

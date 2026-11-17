@@ -87,7 +87,7 @@ fn lock() {
         // The holder this wait was behind, as last seen (devsched `irq_lock_wait`).
         let mut by = (0u64, 0u64);
         // Test, then test-and-set: the waiters spin on a plain load of their shared copy of the line and try the exclusive store only once it reads free. Every core hammering the store (2026-11-17, a Photon scroll: four A715s and the X3 waiting on it at once) kept taking the line from the holder, which then waited for it again to let go.
-        while LOCK.load(Ordering::Relaxed) || LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while (LOCK.load(Ordering::Relaxed) && !OLD.load(Ordering::Relaxed)) || LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             by = (LOCK_SITE.load(Ordering::Relaxed), crate::devsched::WHAT.load(Ordering::Relaxed));
             core::hint::spin_loop();
             // Every 4096th turn: is the holder stalled past half the watchdog's window? (platform::stall_check: one SGI to it, its place kept for the post-mortem.) WHY wrapping: a spin past 2^32 turns (minutes, a hang the watchdog ended long before) only feeds this every-4096th test, where a wrap changes nothing.
@@ -397,6 +397,8 @@ fn make_room(t: usize, line: usize, landed: usize) {
     }
 }
 
+/// `diag "sched old on|off"`: the scheduler as before 2026-11-17 (KERNEL.md Order item 8), for measuring the two in adjacent runs on one boot: the lock's spin a bare test-and-set, every yield under the lock and kicking every core, futex and deadline wakes to the back, no `make_way`, deadlines noticed only between slices and idle workers on their event stream, a thread asked to yield kept at the very front and only under devsched `first`. Off by default.
+pub static OLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A woken thread's least claim on a core already running another (`make_way`): that thread has run at least 2^-11 s (about half a millisecond) of its turn and longer than the woken one's front credit.
 const WAY_RUN_LOG2: u32 = 11;
 /// Per core asked: how many times `make_way` asked it to yield, for `diag sched`.
@@ -407,6 +409,9 @@ pub static WAY_LOOKS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::
 /// Never asked: the X3 (the render thread's core and the kernel's), the waker's own core, a thread of the woken one's own process (a parallel section's threads share the work, and the woken one taking its sibling's core gains nothing), a device thread inside its interrupt's run, a core already asked, a thread that has run less than `WAY_RUN_LOG2` or less than the woken thread's spent credit (so two light threads never take turns preempting each other). The thread asked keeps its place just behind the head of the queue (`ferros_el0_preempt`). Under the kernel lock.
 fn make_way(t: usize) {
     use core::sync::atomic::Ordering::Relaxed;
+    if OLD.load(Relaxed) {
+        return;
+    }
     let Some(x) = th(t) else { return };
     let m = may_run(x);
     let cur = unsafe { &*(&raw const CURRENT) };
@@ -3929,7 +3934,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         }
     }
     // A yield (`sleep(0)`, std's `yield_now`) with nothing queued, no interrupt waiting to be noticed and no deadline passed: back to the same thread without the lock, as the locked path would answer (its endpoint test is for a sleep with a deadline, `sleep_until_or_call`). rayon's idle workers yield 32 times before they sleep, and with every yield taking the lock four cores of them kept the X3's render thread waiting on it (2026-11-17). What it reads: three atomics a core may read at any time; a thread queued just after the look is the next yield's, or the slice's end's, and a tick or a hold's SGI that comes meanwhile stays pending (IRQs are masked from the trap to the eret) and parks the thread as the eret lands, as for `mmio_fast`.
-    if f.esr >> 26 == 0x15 && f.x[8] == SYS_SLEEP && f.x[0] == 0 {
+    if f.esr >> 26 == 0x15 && f.x[8] == SYS_SLEEP && f.x[0] == 0 && !OLD.load(core::sync::atomic::Ordering::Relaxed) {
         use core::sync::atomic::Ordering::{Acquire, Relaxed};
         let idle = RUNNABLE_N.load(Acquire) == 0 && unsafe { core::ptr::read_volatile(&raw const __irq_any) } == 0 && NEXT_WAKE.load(Acquire) > crate::platform::cntpct();
         if idle {
@@ -3941,7 +3946,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     }
     lock();
     // A deadline passed while every core that could notice it ran a thread (`wake_sleepers` runs only between slices): noticed by any trap now, so a sleeper's lateness is bounded by the next syscall anywhere, not by the next slice's end (2026-11-17, Photon's scroll: map, touch and display.1 waited 2.4 to 4.5 ms past their deadlines behind four rayon workers' slices).
-    if NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire) <= crate::platform::cntpct() {
+    if NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire) <= crate::platform::cntpct() && !OLD.load(core::sync::atomic::Ordering::Relaxed) {
         wake_sleepers();
     }
     // What this hold is (devsched `WHAT`, `diag lock`): the syscall, its x1's low byte, the thread.
@@ -4181,7 +4186,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 if let Some(x) = th(i).filter(|x| x.proc == pi && matches!(x.state, State::Waiting(a, _) if Some(a) == addr)) {
                     x.state = State::Runnable;
                     // As any other wake: to the front while its front credit holds, a busy worker asked to make way when none is idle (2026-11-17: at the back always, a futex wake that found the A715s busy waited behind the whole queue, up to a slice).
-                    enqueue_woken(i, WAKE_WORD);
+                    if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+                        woken(i, WAKE_WORD);
+                        enqueue_back(i);
+                    } else {
+                        enqueue_woken(i, WAKE_WORD);
+                    }
                     tr(TR_WAKE, i, 0xFFFF);
                     n += 1;
                 }
@@ -5221,13 +5231,19 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // A deadline already passed is a yield: anyone runnable goes first, this process comes back round. A server whose wake time had fallen into the past spun its whole slice on sleep/recv and held every client until the slice timer (the display, 2026-10-23); now it gives the core up on each pass instead.
                 // Nothing queued that this core may run (a thread pinned to the X3 does not count): back at once, as with an empty queue, rather than queueing itself only to be picked again.
                 f.x[0] = 0;
-                if !kk.runnable.iter().any(|&r| may_pick(r)) {
+                let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
+                let nothing = if old { kk.runnable.is_empty() } else { !kk.runnable.iter().any(|&r| may_pick(r)) };
+                if nothing {
                     YIELDS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     0
                 } else {
                     t.state = State::Runnable;
                     t.frame = *f;
-                    queue_back(cur);
+                    if old {
+                        enqueue_back(cur);
+                    } else {
+                        queue_back(cur);
+                    }
                     tr(TR_YIELD, cur, 0);
                     let r = if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
                     YIELDS[2 + (cur_get() == Some(cur)) as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -6267,14 +6283,17 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
     let asked = YIELD[core()].swap(0, core::sync::atomic::Ordering::Relaxed) != 0;
     // Asked by `make_room` (devsched `first` on) or by `make_way` (a light thread woken with every worker busy, 2026-11-17).
-    let keep = asked && ctl & 1 != 0;
+    let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
+    let keep = asked && ctl & 1 != 0 && (!old || crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed));
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
                 p.frame = *f;
                 p.state = State::Runnable;
                 held = Some(p.proc);
-                if keep {
+                if keep && old {
+                    enqueue_front(cur);
+                } else if keep {
                     enqueue_second(cur);
                 } else {
                     enqueue_back(cur);
@@ -6317,7 +6336,12 @@ fn disarm_slice() {
 /// Give the next runnable process one time slice (called from the service loop). Returns false if nothing was runnable. Its console output collects until `take_console`.
 /// A sleeper or a timed waiter at its deadline `d`: queued as any other wake (`enqueue_woken`: to the front while its front credit holds, a busy worker asked to make way when none is idle; at the back always until 2026-11-17, when the map's frame and the display's receive thread waited out rayon's slices), its wait measured from the deadline, so the time to notice it counts.
 fn timer_woken(t: usize, d: u64) {
-    enqueue_woken(t, WAKE_TIMER);
+    if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+        woken(t, WAKE_TIMER);
+        enqueue_back(t);
+    } else {
+        enqueue_woken(t, WAKE_TIMER);
+    }
     if let Some(x) = th(t) {
         x.woke = d;
     }

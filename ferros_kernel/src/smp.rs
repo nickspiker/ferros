@@ -297,7 +297,11 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
             // The EL2 timer armed at the next thread deadline, as the kernel's core arms its own `wfe` (service.rs): an idle worker otherwise noticed a sleeper's deadline only at its event stream's next tick (2.7 ms) or a kick, and with the X3 rendering nothing else did (2026-11-17, deadline wakes 590 us late on average during a Photon scroll). Taken at EL2 the tick only stops the timer (.Lirq_tick). WHY the min: no deadline reads u64::MAX, and TVAL is a signed 32-bit count, so a wait past 2^31 ticks would read as one already passed and spin; a second is the most it waits, a kick or an interrupt ends it sooner. WHY saturating: the deadline may have passed since the look above (run_slice found nothing runnable after waking it): the timer then fires at once and the loop looks again.
             let wait = next.saturating_sub(crate::platform::cntpct()).min(crate::platform::cntfrq());
             unsafe { core::arch::asm!("msr daifclr, #2") };
-            unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) wait, c = out(reg) _) };
+            if crate::process::OLD.load(Ordering::Relaxed) {
+                unsafe { core::arch::asm!("wfe") };
+            } else {
+                unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) wait, c = out(reg) _) };
+            }
             IDLE_WAKES[k].fetch_add(1, Ordering::Relaxed);
             IDLE_TICKS[k].fetch_add(crate::platform::cntpct().wrapping_sub(now), Ordering::Relaxed);
         }
