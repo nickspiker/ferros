@@ -10,6 +10,7 @@ Two of the costs left are the display's side of the frame:
 - **the surface move**, about 2.5 to 2.7 ms: fluor's ferros host moves Photon's surface (30 MB at 16 bits) by the scroll's rows every scroll frame, so only the damage is converted (the scratch's move is already skipped for Photon, `scratch_unread_outside_damage`).
 
 Section 0 is how the path works today, sections 1 to 3 the options, section 4 the combinations, the recommendation and the knobs.
+Section 5 is B+, the owner's direction after reading B: the window as layers (chrome, content, background), each a ring, merged in one pass, with the content in a strip rendered ahead.
 
 ## 0. The publish path today, for an app's surface
 
@@ -245,6 +246,7 @@ A trimmed publish is neither A nor B, but the measured parts show it is where mo
 
 With B, the frame loses its 2.5 to 2.7 ms move; a trimmed publish then gives back most of the publish's A715 time.
 What remains is Photon's own render and the band's convert (9.4 and 2.4 ms in the run above, before the four damage rects), which the display side cannot reach: 8.3 ms needs Photon's side too.
+Section 5 (B+, the owner's layers and strip, added the same day) is the design that takes that render off the scroll frame; its recommendation is there.
 
 ### Knobs (the owner chooses)
 
@@ -257,3 +259,149 @@ What remains is Photon's own render and the band's convert (9.4 and 2.4 ms in th
 6. **The phases' memory** (Option A only): non-cacheable as now, or write-back with a clean before arming (SCTLR_EL2.UCI = 1 for EL0, or a kernel call that cleans a granted range).
 7. **The DPU's windows** (Option C): two windows for the ring's wrap (no memory) or one window over a doubled ring (the phases' region moved past the carveout).
 8. **G2D as a blitter**: not proposed; noted only as the hardware way to move pixels, with its hang after jumps unexplained.
+9. **B+ (section 5)**: the window as layers (chrome, content, background), each a ring, merged in one pass; with or without the content strip.
+10. **The strip's height** H_s: the pane plus how many rows rendered ahead each way (memory against how far a fling runs before a band is rendered on the frame).
+11. **Surfaces for an app**: B+ wants four or five slots of the sixteen for Photon (noise, chrome, the strip's two); how an app asks for more than its spawn's one.
+12. **Which layers**: the three the owner named; whether Photon's fixed overlays drawn into the target (the wave, the chord hint, the toast) move into the chrome layer later.
+13. **Text over the noise composed after the roll-off** (B+ composes baked layers): accept, as on the deck, or keep the noise flattened under the content in fluor (which gives back the strip's cleanness).
+
+## 5. B+: the window as layers, each a ring, merged in one pass
+
+The owner, 2026-11-17, on B: "render a big strip and just chunk our piece we want out", and "I'd assume we layer it so we can wrap the background and keep the content separate so it's one merge pass?"
+
+### The idea
+
+The app hands the display its window as a few layers instead of one finished surface, each with its own source and its own ring origin:
+- **the chrome** (fixed): fluor's chrome layer (`DefaultChrome`'s orb, title strip and buttons), never moved;
+- **the content** (the scrolled pane): the list, drawn with no background under it, in a **strip** taller than the pane, a ring whose origin is the scroll;
+- **the background**: Photon's noise wallpaper (fluor's `NoiseField`), generated once for the frame's size, baked once, and only rolled vertically with the scroll, never scaled.
+
+The display composes them for each output row, front to back, straight into the phase with the dither, in one pass: the glass, bars and hole first (the system's, as today), then the chrome, then the content, then the background; black behind is never reached, since the noise is opaque.
+Each layer is read at its own source row: one row index per layer per output row, nothing per pixel.
+
+"Render a big strip and chunk our piece out" is the strip: the app renders the content's rows ahead of the viewport, and a scroll that stays inside what is rendered is a new origin and nothing else.
+That is where B+ goes past B.
+B removes the moves; B+ with a strip removes the **render** from a scroll frame (Photon's 9.4 ms and the 2.4 ms convert in the run of section 0), which is what stands between Photon and 8.3 ms.
+
+### The rings
+
+- A layer is a source (a surface, or adjacent slots for a tall strip), its format (`BAKED`), the screen rect it covers, the source's height in rows and the origin.
+- Screen row y of the rect reads source row `(y − y0 + origin) mod H`: one compare and one subtraction a row, as in B.
+- The noise is two layers side by side, one for each half of its mirror (`NoiseField`'s right and left strips, split at its axis), each half with its own origin.
+  Settings' split (the rail and the content, each half of the noise with its own pane) is then two rings and no special case.
+  Its height is the frame's: `NoiseField` already wraps at h rows, so its ring is exactly the field.
+- The content strip is H_s rows: at least the pane's height plus the rows rendered ahead in each direction.
+  A second pane scrolling on its own (Settings' rail) is a second content layer.
+- The chrome has no ring.
+- Each layer carries its coverage as COMPOSITOR.md rule 2 already decides for layers: 64 × 64 tiles in its own coordinates, empty, opaque or partial.
+  The display maps a tile thru the ring like a row, skips the layer in an empty tile and ends the walk at an opaque one.
+  The early-outs are per tile and per span, never per pixel (rule 8).
+
+### Front to back and darkness space (AGENT.md "Compositing")
+
+- The walk is `under` only, frontmost first into an empty accumulator, as `fold` and `under_pm` do today: the chrome, then the content under it, then the noise under that.
+- No Porter-Duff over, no `1 − α` between layers.
+- Each layer is premultiplied (fluor's α + darkness, baked to panel codes with its transparency in bits 49-62, as a `BAKED` surface is), so the content's see-through pixels let the noise thru by their α and nothing else.
+- The noise is opaque: where it is reached, the walk ends.
+- One consequence: fluor today composes the content over the noise in its g2t codes and the result is baked; in B+ each layer is baked first and composed in panel codes, after the roll-off, as the deck already is (COMPOSITOR.md "Baked", the owner's "meh, doubt anyone will notice"). The antialiased edges of text over the noise move by a code or so.
+- The dither stays screen-anchored and exact: every scroll frame composes the whole pane into the phase, as today.
+
+### What it removes, per scroll frame
+
+For a pane of about 3.5 Mpx, the passes over pane-sized data in one scroll frame and their memory traffic per pane pixel:
+
+| | today (fluor 6fc6ea5, Photon f209cf09) | B | B+ without a strip | B+ with a strip |
+|---|---|---|---|---|
+| Photon: its hit map moved (`scroll_hit_map`, u16) | 4 B | 4 B | 0 (a ring too, below) | 0 |
+| Photon: the band's content drawn, the noise laid under it | the band | the band | the band, no noise | nothing on the frame (rows rendered ahead) |
+| fluor: the surface moved | 16 B | 0 | 0 | 0 |
+| fluor: the band converted (baked) | the band | the band | the band | nothing on the frame |
+| the display: read, compose, present into the phase | 8 B read, 4 B written | 8 + 4 | content 8 (not in empty tiles), noise 8 (not under opaque tiles), chrome in its tiles only, 4 written | the same |
+| pane-sized passes | 3 | 2 | 1 | 1 |
+| traffic a pane pixel | about 32 B | about 16 B | about 20 B, less where the content's tiles are empty | about 20 B |
+| at 30 to 40 GB/s, four threads | 2.8 to 3.7 ms | 1.4 to 1.9 ms | 1.75 to 2.3 ms | 1.75 to 2.3 ms |
+
+What this says:
+- B+ reads the noise every frame wherever the content is not opaque, which is most of Photon's list (rows of text on the noise), so its one pass carries more bytes than B's: the layer split **alone** does not pay for a pure scroll.
+- What it removes is the noise's flatten under the band (small), the orb's smeared copy in the damage (the chrome is no longer in the pane's pixels), the hit map's move, and, with the strip, the app's whole render and convert on a scroll frame.
+- The compose has arithmetic today's select does not: `under` of up to three layers with partial α, in NEON on the baked codes. An estimate to bench on the display's start-up bench: 2 to 3 cycles a pixel, 7 to 10 M cycles a frame, under a millisecond spread over the X3 and the three workers, overlapping the memory traffic.
+- So a pure scroll frame inside the strip costs the display about 2 to 2.5 ms of its four threads and Photon no render: inside 8.3 ms with room, where today's frame is about 17.
+- A whole frame (a pinch, a screen change) renders as today, but the noise is not in it, so it converts the content only. The noise is baked once per brightness (32 MB at 10.6 cycles a pixel, about 15 ms over four cores, once per `EV_BAKE`).
+
+### The window protocol
+
+A new op (its number taken when built) beside op 22, which stays as it is for every app that hands one surface.
+Its message: `[x u16][y u16][w u16][h u16]` the window's rect, `[level u8]`, `[mode u8]`, `[frame us u32]`, `[n u8]`, then n layer records, frontmost first:
+- `[source u64]`: the surface (or the first of adjacent slots) the layer's pixels are in; the display's "Whose surface" check applies to each;
+- `[format u8]`: 2, `BAKED`, for every layer fluor hands;
+- `[flags u8]`: bit 0 opaque (the walk ends here: the noise), bit 1 fixed (no ring: the chrome);
+- `[x u16][y u16][w u16][h u16]`: the screen rect the layer covers;
+- `[src y u16][src h u16][origin u16]`: the ring's first row and height in the source, and its origin;
+- `[tiles u64]`: where the layer's coverage map is (a byte a 64 × 64 tile, in the source's coordinates), 0 for none (every tile partial).
+
+Then `[n u8]` and up to four changed rects in screen coordinates, as fluor names its damage: what changed in any layer apart from an origin.
+An origin's change is a change of that layer's whole rect, which the display knows from the records.
+A few hundred bytes, well inside a message slot (4096).
+Every show states every layer, so the display holds no layer state the app did not just state; it keeps the last show's records only to see what moved.
+
+The display's side:
+- the window table holds the layer records instead of one surface;
+- `layout_build` is unchanged (the window's rect, level and mode);
+- `publish_app_rows` walks a window's layers inside its span: per row each layer's source row from its ring, per tile its coverage, then the `under` walk and the present;
+- the display's hit map is unchanged: it is by window, and the window owns its rect as it does today (the noise is opaque, so no pixel of a B+ window shows a window behind it);
+- the race of section 2 closes: with a strip the app writes only rows outside the viewport of every show still being published (it keeps the last shows' origins as its guard), so the display never reads a row being written.
+
+### fluor's side
+
+fluor already holds the three apart until the end of a frame:
+- `DefaultChrome::group` (its bg, chrome and hover layers), flattened into the scratch by the app (`flatten_chrome_into`, `flatten_bg_into`);
+- `NoiseField`, laid under the scratch by the app at the end of its render (`under_into`), generated once per size and base and kept at 16 bits;
+- the scratch, which the app draws its content into.
+
+The change is where they meet:
+- **The host takes the layers.** `Context` calls (say `ctx.lay_noise(&mut field, origin, left_scroll, right_scroll)` and `ctx.lay_chrome(&chrome)`) that a host either does as today (Android and the desktop: `under_into` and `flatten_chrome_into` into the frame, the same pixels) or takes as layers (ferros: the noise baked once into a surface of its own, the chrome baked into another when it changes, nothing flattened into the scratch).
+- **The content strip.** The scratch becomes the strip for the pane: H_s rows rendered by rows in strip coordinates; the host bakes the rows it renders into the content surface's ring rows (the convert, off the frame when the rows are rendered ahead).
+- **The hit map as a ring.** The chrome's hit map stays fixed; the content's hit ids live in a u16 strip with the content's origin, and a hit test reads the chrome's first, then the content's thru the ring: front to back, like the pixels. `scroll_hit_map` goes.
+- **The scroll contract.** `scroll_hint` keeps its meaning (the pane's rect and `dy`) and becomes the content layer's origin change; a host that cannot ring moves as today.
+
+### Photon's side
+
+Not none, but small, in two steps:
+- **The layers**: two calls changed, the noise's `under_into` and the chrome's flatten, to the `Context` ones.
+  fluor's host cannot take them over as written: Photon builds its own `Canvas` over the target for `under_into`, so the host never sees the call.
+  The wave, the chord hint, the toast and the other fixed overlays Photon draws into the target stay in the content layer under today's rule (repainted where they sit and where their moved copy lands); they can become chrome later.
+- **The strip**: Photon's pane renderer draws a range of the list's rows in strip coordinates instead of the viewport's, and renders the rows ahead of the scroll (in the fling's direction) on idle frames.
+  Ready already builds only the rows near its damage (Photon 64422e80), which is most of the way.
+  A scroll past the rendered rows renders its band on the frame, as today.
+
+### Android and the desktop
+
+Unchanged at first: their hosts do the `Context` calls as today's flatten and `under_into`, and keep the memmove.
+They can gain the strip later: a host that composes the three layers itself into its window's buffer does one `under` pass a frame (as many as its memmove today) and no render on a scroll.
+
+### Memory on the Pro
+
+| Layer | Size |
+|---|---|
+| the noise, baked, the frame's size | one surface slot (32 MiB), beside fluor's 16-bit strips (30.7 MiB, kept today already) |
+| the chrome, baked | one slot (mostly empty; its tiles say so) |
+| the content strip, baked | ceil(H_s × 1344 × 8 B / 32 MiB) adjacent slots: 2 for two pane heights |
+| the content strip in fluor's α + darkness (the scratch) | the same size again, in the app's heap |
+
+Four or five of the sixteen slots for Photon, against one today; the kernel gives one surface at spawn, so an app needs a way to ask for more (knob 11).
+
+### Cost estimate per scroll frame (the Pro, a pane of about 3.5 Mpx, inside the strip)
+
+- Photon: input and layout, no render.
+- fluor's host: the new origins in the show; no move, no convert.
+- The display: one pass, about 2 to 2.5 ms of its four threads.
+- Rendering ahead: the rows the scroll will need, in idle time on the A715s: the rows the band costs today, off the frame and without the noise under them.
+
+### Recommendation for B+
+
+0. **Build B first** (section 2): small, exact, removes the move now, and its ring and row reader are B+'s.
+1. **Then B+ with the strip, not the layer split alone.**
+   - The split by itself trades the move for a read of the noise every frame, about even.
+   - It pays once the strip takes the render off the scroll frame, the only path here to 120 a second in Photon's scroll.
+   - The split is what makes the strip clean: the noise is never rendered into the strip, it rolls under the fixed rows too, and Settings' two panes are two rings.
+2. **Bench before building**: the `under` walk of two and three layers in NEON on the start-up bench (cycles a pixel), and Photon's pane coverage (how much of the list is empty, opaque or partial in 64 × 64 tiles), which sets the real bytes a pixel.
