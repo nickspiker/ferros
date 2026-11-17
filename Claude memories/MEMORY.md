@@ -22,6 +22,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) - no sRGB/OKLab/709; photopic match via VSF's LMS function
 - [Feedback: no web encodings](feedback_no_web_encodings.md) - no base64/JSON ferros-side; sole exception the eSIM SGP.22 client
+- [Feedback: VSF not for framing](feedback_vsf_not_for_framing.md) - encrypted transport frames lean; VSF for control + the assembled payload
 - [Feedback: no em dashes](feedback_no_em_dashes.md) - owner hates them; never in wire text or VSF `a` fields
 - [Feedback: short spellings](feedback_short_spellings.md) - thru, altho, thruout; never the long forms
 - [Feedback: no manual line wraps](feedback_no_line_wraps.md) - one sentence per line in comments; comment-gate enforces
