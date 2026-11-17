@@ -37,8 +37,8 @@ pub struct Adding {
 
 /// The facets' state on the service.
 pub struct Facets {
-    /// Op 0 calls held for the loop to sign: the reply token and the caller's request (the stamp first).
-    held: Vec<([u8; 32], Vec<u8>)>,
+    /// Op 0 calls held for the loop to sign: the reply token, the caller's request (the stamp first) and when it came in (now_us), so the line that answers it says how long it waited and how long the signing took.
+    held: Vec<([u8; 32], Vec<u8>, u64)>,
     /// Bindings made this run, by (developer, option, the alias bundle's commitment), each its whole answer.
     made: Vec<([u8; 32], [u8; 32], [u8; 32], Vec<u8>)>,
     /// The add under way, and how the last one ended.
@@ -97,7 +97,7 @@ impl Client {
             match body.first().copied() {
                 Some(fx::BE_YOU) => match self.binding_check(&st, body) {
                     Ok(Some(r)) => self.reply_to(&tok, &r),
-                    Ok(None) => self.facets.held.push((tok, msg)),
+                    Ok(None) => self.facets.held.push((tok, msg, now_us())),
                     Err(code) => {
                         self.facets_said(&st, "be you", code);
                         self.reply_to(&tok, &[code]);
@@ -182,7 +182,7 @@ impl Client {
 
     /// The identity forgotten (a lock): the bindings and the add go with it; a be you still held is refused (nobody present now), so its kist is not left waiting on a call nobody answers; the op 2 waits and their count stay, and the next pass rings them with the readiness gone.
     pub fn facets_forget(&mut self) {
-        for (tok, _) in core::mem::take(&mut self.facets.held) {
+        for (tok, _, _) in core::mem::take(&mut self.facets.held) {
             self.reply_to(&tok, &[fx::NOT_PRESENT]);
         }
         self.facets.made.clear();
@@ -212,14 +212,23 @@ impl Client {
         if self.facets.held.is_empty() {
             return;
         }
-        let (tok, msg) = self.facets.held.remove(0);
+        let (tok, msg, came) = self.facets.held.remove(0);
         let Some((st, body)) = fx::Stamp::read(&msg) else { return };
+        let start = now_us();
         let r = match self.binding_check(&st, body) {
             Ok(Some(r)) => r,
             Ok(None) => self.binding_make(&st, body),
             Err(code) => alloc::vec![code],
         };
         self.facets_said(&st, "be you", r[0]);
+        // Where a launch's wait for be you goes (the owner, 2026-11-16: Photon's window took 5 to 10 s on the Pro): held behind the loop's other work, then the check and the signing with every egg.
+        let end = now_us();
+        self.log.put(b"fgtw: facets: be you held ");
+        self.log.dec((start - came) / 1000);
+        self.log.put(b" ms in the loop, checked and signed in ");
+        self.log.dec((end - start) / 1000);
+        self.log.put(b" ms");
+        self.log.line();
         self.reply_to(&tok, &r);
     }
 
