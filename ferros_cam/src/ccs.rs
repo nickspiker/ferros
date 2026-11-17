@@ -68,8 +68,8 @@ pub struct Array {
 
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
-    // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, so 1024 to 20971520; measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03) and thru digital 2x and 4x (1.99, 2.02).
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY * 128) },
+    // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03). Offered: the analogue range alone, 1024 to 163840 (owner, 2026-11-17: digital gain is after the ADC, so analogue only).
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY) },
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
     Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
     Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
@@ -451,9 +451,9 @@ impl Gain {
         (num * UNITY as i64 / den) as u64
     }
 
-    /// The least and the most gain offered (1024 one): the least code at the least digital gain, the most code at the most.
+    /// The least and the most gain offered (1024 one): the analogue range alone, the least code to the most (owner, 2026-11-17: digital gain is after the ADC, so analogue only; the digital limits are read and said, never used).
     pub fn range(&self) -> (u64, u64) {
-        (self.analogue(self.code_min) * self.d_min as u64 >> 8, self.analogue(self.code_max) * self.d_max as u64 >> 8)
+        (self.analogue(self.code_min), self.analogue(self.code_max))
     }
 
     /// The code whose gain is the most not past `want` (1024 one), on the code's step from the least: the model solved for the code, then walked down a step while it overshoots (integer division can land one step high).
@@ -471,20 +471,14 @@ impl Gain {
         code
     }
 
-    /// `want` (1024 one) for the sensor: analogue alone up to its most, the rest digital (8.8, on its step) up to its most; None outside `range` (SET answers it outside the range: refused, not bounded).
+    /// `want` (1024 one) for the sensor: the analogue code whose gain is the most not past it, digital gain left at one (G#0100, written so a digital gain anything else left is undone); None outside `range`, which SET answers as outside the range: refused, never capped (as an exposure past the frame is).
     pub fn split(&self, want: u64) -> Option<GainSet> {
         let (lo, hi) = self.range();
         if want < lo || want > hi {
             return None;
         }
-        let a_max = self.analogue(self.code_max);
-        if want <= a_max {
-            let code = self.code_under(want);
-            return Some(GainSet { code, digital: 0x100, gain: self.analogue(code) });
-        }
-        let d = (want << 8) / a_max;
-        let d = d - d % self.d_step as u64;
-        Some(GainSet { code: self.code_max, digital: d as u16, gain: a_max * d >> 8 })
+        let code = self.code_under(want);
+        Some(GainSet { code, digital: 0x100, gain: self.analogue(code) })
     }
 }
 
@@ -616,10 +610,11 @@ mod tests {
         };
         // Sony's convention: gain = 1024 / (1024 - code), codes 0 to 960 (16x); digital 1x to 16x in 1/256.
         let sony = Gain::of(&caps(0, 960, 1, [0, 1024, -1, 1024]), &d(0x100, 0x1000, 1)).unwrap();
-        assert_eq!(sony.range(), (1024, 16384 * 16));
+        assert_eq!(sony.range(), (1024, 16384));
         assert_eq!(sony.split(2048), Some(GainSet { code: 512, digital: 0x100, gain: 2048 }));
         assert_eq!(sony.split(16384), Some(GainSet { code: 960, digital: 0x100, gain: 16384 }));
-        assert_eq!(sony.split(32768), Some(GainSet { code: 960, digital: 0x200, gain: 32768 }));
+        // Past the analogue most: refused, never digital (owner, 2026-11-17).
+        assert_eq!(sony.split(16385), None);
         // A gain between codes takes the one under it.
         let s = sony.split(3000).unwrap();
         assert!(s.gain <= 3000 && sony.analogue(s.code + 1) > 3000, "{s:?}");
@@ -635,7 +630,9 @@ mod tests {
         let main = Gain::of(&main_a, &d(0x100, 0x8000, 0x100)).unwrap();
         assert_eq!((main.analogue(0x20), main.analogue(0x400), main.analogue(0x1400)), (1024, 32768, 163840));
         assert_eq!(main.split(2048).unwrap().code, 64);
-        assert_eq!(main.range(), (1024, 163840 * 128));
+        assert_eq!(main.range(), (1024, 163840));
+        assert_eq!(main.split(163841), None);
+        assert!(main.split(163840).is_some_and(|s| s.digital == 0x100));
         // Words that describe no model: the aliasing the main's limit block shows (every word G#4140).
         assert_eq!(Gain::of(&[0x41, 0x40].repeat(10).try_into().unwrap(), &d(0x100, 0x100, 1)), None);
     }

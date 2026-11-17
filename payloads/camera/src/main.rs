@@ -922,11 +922,11 @@ fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64) 
     let dig = p.get(ccs::DIGITAL_GAIN).unwrap_or(0x100) as u64;
     let now = m.analogue(code) * dig >> 8;
     let (lo, hi) = m.range();
-    say!(g, "camera: {}: gain = (A#{} code + A#{}) / (A#{} code + A#{}), codes A#{} to A#{} step A#{} (analogue A#{} to A#{}), digital G#{:X} to G#{:X} step G#{:X}: A#{lo} to A#{hi} (1024 one); the init left code G#{code:X}, A#{now}\n", c.name, m.m0, m.c0, m.m1, m.c1, m.code_min, m.code_max, m.step, m.analogue(m.code_min), m.analogue(m.code_max), m.d_min, m.d_max, m.d_step);
+    say!(g, "camera: {}: gain = (A#{} code + A#{}) / (A#{} code + A#{}), codes A#{} to A#{} step A#{} (analogue A#{} to A#{}), digital G#{:X} to G#{:X} step G#{:X} (never used: analogue only): A#{lo} to A#{hi} offered (1024 one); the init left code G#{code:X}, A#{now}\n", c.name, m.m0, m.c0, m.m1, m.c1, m.code_min, m.code_max, m.step, m.analogue(m.code_min), m.analogue(m.code_max), m.d_min, m.d_max, m.d_step);
     (Some(m), now)
 }
 
-/// The gain set inside the sensor's hold (as exposure is: the hold makes the change land whole at a frame's start), analogue code then digital gain.
+/// The gain set inside the sensor's hold (as exposure is: the hold makes the change land whole at a frame's start): the analogue code, then digital gain as `s` has it (always one: analogue only).
 fn gain_set(bus: &Bus, c: &Cam, s: &ccs::GainSet) -> Result<(), u32> {
     bus.write(c.addr, c.hold)?;
     let a = ccs::ANALOGUE_GAIN.to_be_bytes();
@@ -1713,7 +1713,7 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                             1
                         }
                     }
-                    // Gain (1024 one): split by the sensor's own model into its analogue code and, past the analogue's most, digital gain; the frame's header then carries the gain the codes make. With no model, the captured gain alone (1024).
+                    // Gain (1024 one): the analogue code the sensor's own model gives, digital gain written as one (owner, 2026-11-17: digital gain is after the ADC, so analogue only); past the analogue's most refused, never capped; the frame's header then carries the gain the code makes. With no model, the captured gain alone (1024).
                     1 => match o.gain_model.and_then(|m| m.split(value)) {
                         Some(s) if gain_set(&bus, c, &s).is_ok() => {
                             o.gain = s.gain;

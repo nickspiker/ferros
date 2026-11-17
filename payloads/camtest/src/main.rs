@@ -4,6 +4,7 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
+//! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 #![no_std]
 #![no_main]
@@ -74,6 +75,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         }
         ferros_sys::exit(if n == ERR || p[0] != 0 { 1 } else { 0 });
     }
+    // A fourth byte of 4: where the analogue gain really ends (owner, 2026-11-17: "Was that a typo?" of 160x), from raw samples thru the view.
+    if arg(3) == 4 {
+        gain_noise(g, ep, id, arg(0), arg(5), t1);
+    }
     if bin == 1 {
         view(g, ep, id, frames, arg(3) == 2, t1);
     }
@@ -130,6 +135,149 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// Rows of the frame's middle the noise test reads (one green-red row pair at a time is not split: an even count), and the most samples a row holds.
+const NOISE_ROWS: usize = 1 << 6;
+const ROW_MOST: usize = 1 << 13;
+static mut NOISE_A: [u16; NOISE_ROWS * ROW_MOST] = [0; NOISE_ROWS * ROW_MOST];
+static mut NOISE_B: [u16; NOISE_ROWS * ROW_MOST] = [0; NOISE_ROWS * ROW_MOST];
+static mut HIST: [u32; 1 << 10] = [0; 1 << 10];
+static mut NOISE_LINE: [u8; (1 << 14) + 64] = [0; (1 << 14) + 64];
+
+/// `NOISE_ROWS` rows from the frame's middle out of the view (64-byte loads, then the plain RAW10 unpack) into `dst`, `w` samples a row.
+fn noise_rows(at: usize, h: usize, w: usize, stride: usize, dst: &mut [u16]) {
+    let line = unsafe { &mut *(&raw mut NOISE_LINE) };
+    for r in 0..NOISE_ROWS {
+        let src = at + (h / 2 - NOISE_ROWS / 2 + r) * stride;
+        for i in 0..stride / 64 {
+            unsafe {
+                let v = core::arch::aarch64::vld1q_u8_x4((src + i * 64) as *const u8);
+                core::arch::aarch64::vst1q_u8_x4(line.as_mut_ptr().add(i * 64), v);
+            }
+        }
+        for q in 0..w / 4 {
+            let b = &line[q * 5..q * 5 + 5];
+            for j in 0..4 {
+                dst[r * w + q * 4 + j] = (b[j] as u16) << 2 | (b[4] as u16 >> (2 * j)) & 3;
+            }
+        }
+    }
+}
+
+/// The integer square root (Newton's, from above).
+fn isqrt(v: u64) -> u64 {
+    if v < 2 {
+        return v;
+    }
+    let mut x = v;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
+}
+
+/// Where the analogue gain really ends: OPEN with the view, the exposure set to 2^`exp_log2` us (the init's when 0; a short one gives dark frames), then each gain step 1x to 160x a half stop apart, `pairs` pairs of consecutive frames (4 when 0) of the frame's middle `NOISE_ROWS` rows, raw:
+/// - the temporal noise, from each pair's difference (its variance halved), in 16ths of a code, and the same referred to the input (times 1024 over the gain): falling while the gain is analogue (the read noise after the gain shrinks against it), flat once the gain is applied after the ADC;
+/// - the codes' histogram near the mean (within 4 sigma): how many of those codes hold samples, and the samples' residues mod 2 and mod 4 (in 256ths): a gain after the ADC leaves only every 2nd or 4th code filled.
+fn gain_noise(g: u64, ep: u64, id: u8, pairs: u8, exp_log2: u8, t1: u64) -> ! {
+    let mut r = [0u8; 64];
+    let n = call(ep, &[1, id, 1], &mut r);
+    say!(g, "camtest: gain noise: OPEN with the view answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 || n < 48 {
+        ferros_sys::exit(1);
+    }
+    let tok = unsafe { &mut *(&raw mut VIEW_TOKEN) };
+    tok.copy_from_slice(&r[1..33]);
+    let base = ferros_sys::dma(ferros_sys::off(tok.as_ptr()));
+    if base == ERR {
+        ferros_sys::exit(1);
+    }
+    let (w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    let set = |what: u8, value: u64| -> u8 {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut r = [0xEEu8; 1];
+        if call(ep, &m, &mut r) == ERR { 0xEE } else { r[0] }
+    };
+    if exp_log2 != 0 {
+        say!(g, "camtest: exposure A#{} us: answered A#{}\n", 1u64 << exp_log2, set(0, (1u64 << exp_log2) * 1000));
+    }
+    let pairs = if pairs == 0 { 4 } else { pairs as u32 };
+    let mut held = 0xFFu8;
+    let mut h64 = [0u8; 64];
+    // The next frame thru the view: its samples' place and the gain its header carries.
+    let mut map = |held: &mut u8| -> Option<(usize, u32)> {
+        let n = call(ep, &[5, *held], &mut h64);
+        if n == ERR || n < 64 {
+            return None;
+        }
+        *held = h64[40];
+        Some((base as usize + u64::from_le_bytes(h64[48..56].try_into().unwrap()) as usize, u32::from_le_bytes([h64[24], h64[25], h64[26], h64[27]])))
+    };
+    let steps: [u64; 16] = [1024, 1448, 2048, 2896, 4096, 5793, 8192, 11585, 16384, 23170, 32768, 46341, 65536, 92682, 131072, 163840];
+    let (a, b, hist) = unsafe { (&mut *(&raw mut NOISE_A), &mut *(&raw mut NOISE_B), &mut *(&raw mut HIST)) };
+    let len = NOISE_ROWS * w;
+    for &want in steps.iter() {
+        let ans = set(1, want);
+        if ans != 0 {
+            say!(g, "camtest: gain A#{want}: refused (A#{ans})\n");
+            continue;
+        }
+        // Two frames for the change to land.
+        for _ in 0..2 {
+            if map(&mut held).is_none() {
+                say!(g, "camtest: no frame\n");
+                ferros_sys::exit(1);
+            }
+        }
+        hist.fill(0);
+        let (mut sum, mut dsum, mut dsq, mut cnt, mut gain) = (0u64, 0i64, 0u64, 0u64, 0u32);
+        for _ in 0..pairs {
+            let (Some((pa, ga)), _) = (map(&mut held), ()) else {
+                ferros_sys::exit(1);
+            };
+            noise_rows(pa, h, w, stride, &mut a[..len]);
+            let Some((pb, _)) = map(&mut held) else {
+                ferros_sys::exit(1);
+            };
+            noise_rows(pb, h, w, stride, &mut b[..len]);
+            gain = ga;
+            for (&x, &y) in a[..len].iter().zip(b[..len].iter()) {
+                sum += x as u64;
+                let d = x as i64 - y as i64;
+                dsum += d;
+                dsq += (d * d) as u64;
+                hist[x as usize] += 1;
+                cnt += 1;
+            }
+        }
+        // The pair difference's variance is twice a frame's: the noise in 16ths of a code is sqrt(var / 2) x 16.
+        let var256 = (dsq * 256 - (dsum * dsum) as u64 * 256 / cnt) / cnt;
+        let sigma16 = isqrt(var256 / 2);
+        let mean16 = sum * 16 / cnt;
+        // The codes within 4 sigma of the mean: how many hold samples, and the residues mod 2 and 4 of the samples there.
+        // WHY the saturating subtraction and the min: at high gain 4 sigma passes the black level's 64 codes below the mean or the white's above, and the window would index the 1024-entry histogram outside itself; it stops at the codes there are.
+        let (lo, hi) = ((mean16 / 16).saturating_sub(sigma16 * 4 / 16 + 2), ((mean16 / 16) + sigma16 * 4 / 16 + 2).min(1023));
+        let (mut used, mut inside) = (0u64, 0u64);
+        let mut res = [0u64; 4];
+        for c in lo..=hi {
+            let k = hist[c as usize] as u64;
+            used += (k != 0) as u64;
+            inside += k;
+            res[(c & 3) as usize] += k;
+        }
+        // WHY the maxes: a window with no samples (a frame of one code everywhere) and a header without a gain (a driver with no model) would divide by zero and end the measure without its line.
+        let r256 = |k: u64| k * 256 / inside.max(1);
+        say!(g, "camtest: gain A#{want} (header A#{gain}): mean A#{mean16}/16, noise A#{sigma16}/16 of a code, input-referred A#{}/16; codes A#{lo} to A#{hi}: A#{used} of A#{} hold samples; residues mod 4 A#{} A#{} A#{} A#{} of 256\n", sigma16 * 1024 / gain.max(1) as u64, hi - lo + 1, r256(res[0]), r256(res[1]), r256(res[2]), r256(res[3]));
+    }
+    let mut c = [0u8; 4];
+    let n = call(ep, &[4], &mut c);
+    say!(g, "camtest: gain noise done; CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { c[0] as u64 });
     ferros_sys::exit(0)
 }
 
