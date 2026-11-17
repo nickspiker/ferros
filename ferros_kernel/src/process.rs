@@ -1842,6 +1842,10 @@ pub static INPUT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static INPUT_WAIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Frames the display has armed: writes to DECON0's shadow update request (G#1947_0050, the display's `present` and `arm`), one per new picture. Unlike the frame-start interrupt (`FRAME_STARTS`), a panel that DECON re-sends on every TE (the 8a's AK3B, payloads/display `PANEL_HOLDS` 0: 120 a second at rest) does not count here.
 pub static PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// When the last frame was armed (`note_write`), and when the last frame came within 2^-`ANIM_GAP_LOG2` s of the one before it: an animation running (`diag clock gap <n>`, 4: 62.5 ms, so 16 frames a second or more; the rest state's 10 Hz redraws are 100 ms apart).
+pub static PRESENT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ANIM_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ANIM_GAP_LOG2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(4);
 /// Touch to frame: from the first input after the last frame (`INPUT_WAIT`) to the next frame armed, counted in eight buckets by the power of two of its milliseconds (under 1, 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64 and over), with the sum and the longest in counter ticks (`diag clock`).
 /// A finger held still makes no frame, so the next frame that comes for another reason closes its wait: the long buckets hold those, the short ones a moving finger's.
 pub static INPUT_TO_FRAME: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
@@ -1867,6 +1871,12 @@ fn note_write(addr: usize) {
         return;
     }
     PRESENTS.fetch_add(1, Relaxed);
+    // Frames coming close together are an animation (the clock policy's lift, service.rs `interactive`): this frame within `ANIM_GAP_LOG2` of the last. The rest state's redraws (the clock's 10 Hz flip, 100 ms apart) never are.
+    let now = crate::platform::cntpct();
+    let last = PRESENT_AT.swap(now, Relaxed);
+    if now.wrapping_sub(last) < crate::platform::cntfrq() >> ANIM_GAP_LOG2.load(Relaxed) {
+        ANIM_AT.store(now, Relaxed);
+    }
     let t = INPUT_WAIT.swap(0, Relaxed);
     if t != 0 {
         let d = crate::platform::cntpct().wrapping_sub(t);
