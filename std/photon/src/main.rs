@@ -73,11 +73,136 @@ mod sys {
         (r == 32).then_some(out)
     }
 
+    const STORE: u64 = 13;
+    /// The kernel's "absent" (ferros_sys::NOTHING).
+    const NOTHING: u64 = u64::MAX - 1;
+
+    /// `key` read from the vault scope the Store grant in `slot` names (ferros_sys `store_get`): the value's whole length, of which at most `buf.len()` bytes were copied; None when absent or refused.
+    pub fn store_get(slot: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
+        let r = svc(STORE, cap(slot), (buf.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
+        (r != ERR && r != NOTHING).then_some(r as usize)
+    }
+
+    /// `value` written under `key` in that scope (ferros_sys `store_set`, one transfer: at most 256 KiB); true when the vault took it.
+    pub fn store_set(slot: u64, key: &[u8], value: &[u8]) -> bool {
+        svc(STORE, cap(slot), 1 | (value.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(value.as_ptr())) == 0
+    }
+
+    /// `key` deleted from that scope (ferros_sys `store_delete`).
+    pub fn store_delete(slot: u64, key: &[u8]) {
+        svc(STORE, cap(slot), 8, off(key.as_ptr()), key.len() as u64, 0);
+    }
+
     /// A call on the endpoint in `slot`, its answer in `reply`: the answer's length, or None when the kernel refused (an empty slot: the person said no).
     pub fn call(slot: u64, msg: &[u8], reply: &mut [u8]) -> Option<usize> {
         let r = svc(CALL, cap(slot), off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64);
         (r != ERR).then(|| (r as usize).min(reply.len()))
     }
+}
+
+/// Photon's own vault domain's grant slot (the capsule's fifth want, one of the implicit set): its storage on this device, under the person's key and its own (KISTS.md, VAULT-OUT.md).
+const DOMAIN: u64 = 5;
+
+/// The alias's signing bundle kept between launches (2026-11-17, the Pro: deriving it, a Falcon and a SPHINCS+ keygen, was 121 to 394 ms of every launch's be you): its secret keys (fgtw `SigningBundle::to_sealable_bytes`) sealed with XChaCha20-Poly1305 under a key from this kist's ira (bound to this device and to Photon alone), in Photon's own domain, as one VSF document with the bundle's public commitment beside the seal. Opened only when the opened bundle's commitment is the one sealed beside it and its Ed25519 key is the alias's own (`fgtw::alias::ed25519_public`, no keygen); be you then holds it to the binding the identity service returns. The secret bytes go into the seal and nowhere else: never logged, never stored outside it, wiped after use.
+mod alias_cache {
+    use super::{sys, DOMAIN, IRA};
+    use fgtw::pq::SigningBundle;
+    use vsf::VsfType;
+
+    const NAME: &[u8] = b"photon.alias.bundle";
+    const SECTION: &str = "alias_bundle";
+
+    /// The seal's key: the ira's, for this purpose, this device and this kist.
+    fn key() -> Option<[u8; 32]> {
+        sys::ira_key(IRA, "photon alias bundle seal")
+    }
+
+    /// The bytes the seal authenticates beside its own: the alias's Ed25519 key and the bundle's commitment, so a seal is opened only for this alias and this bundle.
+    fn aad(alias: &[u8; 32], commit: &[u8; 32]) -> [u8; 64] {
+        let mut a = [0u8; 64];
+        a[..32].copy_from_slice(&fgtw::alias::ed25519_public(alias));
+        a[32..].copy_from_slice(commit);
+        a
+    }
+
+    fn wipe(b: &mut [u8]) {
+        b.fill(0);
+        core::hint::black_box(b);
+    }
+
+    /// The bundle kept for `alias`, when there is one that opens and is this alias's; None otherwise (none kept, another alias's, a seal that does not open).
+    pub fn open(alias: &[u8; 32]) -> Option<SigningBundle> {
+        use chacha20poly1305::{aead::{Aead, Payload}, KeyInit, XChaCha20Poly1305, XNonce};
+        let mut buf = vec![0u8; 1 << 14];
+        let n = sys::store_get(DOMAIN, NAME, &mut buf)?;
+        // WHY: the vault's word for the value's length; one longer than the buffer was cut, and is not a document to read.
+        if n > buf.len() {
+            return None;
+        }
+        let doc = &buf[..n];
+        let (header, end) = vsf::verification::read_verified(doc, None).ok()?;
+        let sections = header.sections(doc, end).ok()?;
+        let s = sections.iter().find(|s| s.name == SECTION)?;
+        let first = |name: &str| s.get_fields(name).first().and_then(|f| f.values.first()).cloned();
+        let commit: [u8; 32] = match first("commit")? {
+            VsfType::hb(b) => b.try_into().ok()?,
+            _ => return None,
+        };
+        let sealed = match first("sealed")? {
+            VsfType::v(b'e', b) if b.len() > 24 => b,
+            _ => return None,
+        };
+        let mut k = key()?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&k).ok()?;
+        wipe(&mut k);
+        let nonce = XNonce::try_from(&sealed[..24]).ok()?;
+        let mut plain = cipher.decrypt(&nonce, Payload { msg: &sealed[24..], aad: &aad(alias, &commit) }).ok()?;
+        let bundle = SigningBundle::from_sealable_bytes(&plain);
+        wipe(&mut plain);
+        let bundle = bundle.ok()?;
+        let public = bundle.public();
+        (public.commit() == commit && public.ed25519() == fgtw::alias::ed25519_public(alias)).then_some(bundle)
+    }
+
+    /// `bundle`, the alias's, sealed and kept in Photon's domain in place of any kept before. False when it could not be (no seal key, no randomness, the vault refused): the next launch derives it again.
+    pub fn seal(alias: &[u8; 32], bundle: &SigningBundle) -> bool {
+        use chacha20poly1305::{aead::{Aead, Payload}, KeyInit, XChaCha20Poly1305};
+        let commit = bundle.public().commit();
+        let mut nonce = [0u8; 24];
+        let (Some(mut k), Ok(())) = (key(), getrandom02::getrandom(&mut nonce)) else { return false };
+        let Ok(cipher) = XChaCha20Poly1305::new_from_slice(&k) else { return false };
+        wipe(&mut k);
+        let mut plain = bundle.to_sealable_bytes();
+        let sealed = cipher.encrypt(&nonce.into(), Payload { msg: &plain, aad: &aad(alias, &commit) });
+        wipe(&mut plain);
+        let Ok(ct) = sealed else { return false };
+        let mut v = Vec::with_capacity(24 + ct.len());
+        v.extend_from_slice(&nonce);
+        v.extend_from_slice(&ct);
+        let doc = vsf::VsfBuilder::new()
+            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .provenance_only()
+            .add_section(SECTION, vec![("commit".to_string(), VsfType::hb(commit.to_vec())), ("sealed".to_string(), VsfType::v(b'e', v))])
+            .build();
+        doc.is_ok_and(|d| sys::store_set(DOMAIN, NAME, &d))
+    }
+
+    /// The kept bundle dropped (it did not match the binding the identity service returned).
+    pub fn drop_kept() {
+        sys::store_delete(DOMAIN, NAME);
+    }
+}
+
+/// The alias's signing bundle: the one kept sealed when it opens and is this alias's (no keygen), else derived and sealed for the next launch. With whether it was the kept one.
+fn alias_signer(alias: &[u8; 32]) -> (fgtw::pq::SigningBundle, bool) {
+    if let Some(b) = alias_cache::open(alias) {
+        return (b, true);
+    }
+    let b = fgtw::alias::bundle(alias);
+    if !alias_cache::seal(alias, &b) {
+        println!("photon: the alias's bundle could not be kept sealed; the next launch derives it again");
+    }
+    (b, false)
 }
 
 /// The person as Photon's messenger knows them on ferros (docs/PHOTON.md "Photon's own key: the migration"): its alias from the kernel, and from the identity service the handle proof, the pinned identity key and the binding of the alias to the person (be you, op 0 on `facets`). None without the alias or without be you: Photon then waits for them (`wait_for_person`), on its "waiting for your identity" line, never a handle screen. Never the identity seed: ferros hands no kist a root, so `legacy_seed` is None.
@@ -86,51 +211,61 @@ fn photon_keys() -> Option<PhotonKeys> {
         println!("photon: no alias from the kernel (before attest, or the person key not handed in yet)");
         return None;
     };
-    // Each step timed (the owner, 2026-11-16: the launch's wait): the alias's bundle (its keys made from the seed), the possession eggs, and the call (the identity service's loop and its signing, which it says itself).
-    let t0 = std::time::Instant::now();
-    let signer = fgtw::alias::bundle(&alias);
-    let public = signer.public();
-    let bundle = public.to_bytes();
-    let t1 = std::time::Instant::now();
-    let eggs = fgtw::binding::possession(&signer, &public);
-    let t2 = std::time::Instant::now();
-    let mut req = Vec::with_capacity(3 + bundle.len() + eggs.len());
-    req.push(0);
-    req.extend_from_slice(&(bundle.len() as u16).to_le_bytes());
-    req.extend_from_slice(&bundle);
-    req.extend_from_slice(&eggs);
-    let mut reply = vec![0u8; 1 << 16];
-    let answered = sys::call(BE_YOU, &req, &mut reply);
-    println!(
-        "photon: be you took {} ms: the alias's bundle {} ms, its possession {} ms, the identity service's answer {} ms",
-        t0.elapsed().as_millis(),
-        (t1 - t0).as_millis(),
-        (t2 - t1).as_millis(),
-        t2.elapsed().as_millis()
-    );
-    let Some(n) = answered else {
-        println!("photon: be you not granted (or no identity service behind the slot): Photon waits for your identity");
-        return None;
-    };
-    if n < 65 || reply[0] != 0 {
-        println!("photon: the identity service refused be you ({})", reply.first().copied().unwrap_or(0xFF));
-        return None;
-    }
-    let mut hp = [0u8; 32];
-    let mut identity = [0u8; 32];
-    hp.copy_from_slice(&reply[1..33]);
-    identity.copy_from_slice(&reply[33..65]);
-    let binding = reply[65..n].to_vec();
-    // The binding names this alias and this handle proof, or it is not taken: a check of the service's answer against what this process holds, never the chain's (that is a contact's, against the chain it fetches).
-    match fgtw::binding::Binding::from_vsf_bytes(&binding) {
-        Ok(b) if b.alias_key() == public.ed25519() && b.handle_proof == hp => {}
-        _ => {
-            println!("photon: the identity service's binding does not name this alias");
+    // Each step timed (the owner, 2026-11-16: the launch's wait): the alias's bundle (kept sealed from a launch before, or its keys made from the seed), the possession eggs, and the call (the identity service's loop and its signing, which it says itself).
+    // A kept bundle whose binding comes back for another bundle is dropped and the bundle made again, once.
+    for again in [false, true] {
+        let t0 = std::time::Instant::now();
+        let (signer, kept) = if again { (fgtw::alias::bundle(&alias), false) } else { alias_signer(&alias) };
+        let public = signer.public();
+        let bundle = public.to_bytes();
+        let t1 = std::time::Instant::now();
+        let eggs = fgtw::binding::possession(&signer, &public);
+        let t2 = std::time::Instant::now();
+        let mut req = Vec::with_capacity(3 + bundle.len() + eggs.len());
+        req.push(0);
+        req.extend_from_slice(&(bundle.len() as u16).to_le_bytes());
+        req.extend_from_slice(&bundle);
+        req.extend_from_slice(&eggs);
+        let mut reply = vec![0u8; 1 << 16];
+        let answered = sys::call(BE_YOU, &req, &mut reply);
+        println!(
+            "photon: be you took {} ms: the alias's bundle {} ms ({}), its possession {} ms, the identity service's answer {} ms",
+            t0.elapsed().as_millis(),
+            (t1 - t0).as_millis(),
+            if kept { "kept sealed, opened" } else { "made" },
+            (t2 - t1).as_millis(),
+            t2.elapsed().as_millis()
+        );
+        let Some(n) = answered else {
+            println!("photon: be you not granted (or no identity service behind the slot): Photon waits for your identity");
+            return None;
+        };
+        if n < 65 || reply[0] != 0 {
+            println!("photon: the identity service refused be you ({})", reply.first().copied().unwrap_or(0xFF));
             return None;
         }
+        let mut hp = [0u8; 32];
+        let mut identity = [0u8; 32];
+        hp.copy_from_slice(&reply[1..33]);
+        identity.copy_from_slice(&reply[33..65]);
+        let binding = reply[65..n].to_vec();
+        // The binding names this alias, this handle proof and this bundle, or it is not taken: a check of the service's answer against what this process holds, never the chain's (that is a contact's, against the chain it fetches).
+        match fgtw::binding::Binding::from_vsf_bytes(&binding) {
+            Ok(b) if b.alias_key() == public.ed25519() && b.handle_proof == hp && b.alias.commit() == public.commit() => {
+                println!("photon: be you: the alias and its binding in hand ({} bytes)", binding.len());
+                return Some(PhotonKeys::new(alias, hp, identity, binding, None));
+            }
+            Ok(b) if kept && b.alias_key() == public.ed25519() && b.handle_proof == hp => {
+                println!("photon: the binding is for another bundle of this alias than the one kept: the kept one dropped, the bundle made again");
+                alias_cache::drop_kept();
+            }
+            _ => {
+                println!("photon: the identity service's binding does not name this alias");
+                return None;
+            }
+        }
     }
-    println!("photon: be you: the alias and its binding in hand ({} bytes)", binding.len());
-    Some(PhotonKeys::new(alias, hp, identity, binding, None))
+    None
 }
 
 /// The person's people Photon may know (people, op 1 on `facets`): all of them or the ones the person chose, without their fleets. Empty without the grant: no lying, nobody is nobody.
