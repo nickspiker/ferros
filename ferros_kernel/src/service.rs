@@ -1850,10 +1850,10 @@ static mut GOV_AT: u64 = 0;
 static mut GOV_INPUT: u64 = 0;
 static mut GOV_GPU_SEEN: u64 = 0;
 static mut GOV_GPU_AVG: u64 = 0;
-/// Frames shown: the display's new pictures (process.rs `PRESENTS`, never DECON's frame-start interrupt, which the 8a's panel takes on every TE), averaged a window as the GPU's calls are, in 256ths; at `GOV_SHOWN` (96: 24 frames a second, the old policy's "animating") the shared tier goes active, for a focused widget or an app drawing with little CPU work (2026-10-25: the focused scope ran 61 frames a second at the rest clocks, 93 at the active ones).
+/// Frames shown: the display's new pictures (process.rs `PRESENTS`, never DECON's frame-start interrupt, which the 8a's panel takes on every TE), averaged a window as the GPU's calls are, in 256ths; at `GOV_SHOWN` (96: 24 frames a second, the old policy's "animating") the shared tier goes active, for a focused widget or an app drawing with little CPU work (2026-10-25: the focused scope ran 61 frames a second at the rest clocks, 93 at the active ones). Since 2026-11-17 the threshold is 192: the average takes a quarter of each 2^-6 s window, so at 96 a single window with two frames in it (128) crossed it, and on b923 at rest that alone made half the tier's switches (64 of 128 in 64 s); at 192 none of 32 were the frames'.
 static mut GOV_SHOWN_SEEN: u64 = 0;
 static mut GOV_SHOWN_AVG: u64 = 0;
-static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(96);
+static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(192);
 
 /// What asks the shared domains for the active tier now, one bit each (`TIER_CAUSES`): the governor asking the X3 over `X3_REST_KHZ` (bit 0) or the A715s over `A715_REST_KHZ` (bit 1), the GPU's sustained work (bit 2), the frames shown (bit 3). `clock_policy` adds input with the governor off (bit 4) and a PT transfer's hold (bit 5). None: rest, once the dwell has passed (`TIER_DWELL`).
 fn tier_active(govs: &[Gov; 2]) -> u8 {
@@ -1862,9 +1862,9 @@ fn tier_active(govs: &[Gov; 2]) -> u8 {
 }
 pub const TIER_CAUSES: usize = 6;
 const TIER_CAUSE_NAMES: [&str; TIER_CAUSES] = ["X3", "A715", "GPU", "frames", "input", "transfer"];
-/// The rest tier is taken only once nothing has asked for the active one for 2^-`TIER_DWELL` s (`diag clock dwell <n>`, 2: a quarter second; 0 no dwell, the tier follows its causes window by window as before 2026-11-17).
-/// A real deadline, checked on the service loop's passes: a switch is seven ACPM requests, each waited for by a rate read (`clock_profile`), and on b922 (2026-11-17) the tier switched 2973 times in 16 minutes, about three a second, its causes crossing their thresholds from one 2^-6 s window to the next.
-static TIER_DWELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// The rest tier is taken only once nothing has asked for the active one for 2^-`TIER_DWELL` s (`diag clock dwell <n>`; 0, the default, no dwell: the tier follows its causes window by window).
+/// A real deadline, checked on the service loop's passes: a switch is seven ACPM requests, each waited for by a rate read (`clock_profile`), and on b922 (2026-11-17) the tier switched 2973 times in 16 minutes, about three a second, its causes crossing their thresholds from one 2^-6 s window to the next. Measured on b923 at rest (Photon in front, 64 s each, the frames threshold at 96): no dwell 128 switches with the active tier 14 % of the time, 2^-2 s 66 switches at 51 %, 2^-1 s 45 at 71 %: the causes come in bursts about a second apart, so a dwell halves the switches only by holding MIF and the DSU up most of the time (about 0.36 W). Kept as a knob.
+static TIER_DWELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// When something last asked for the active tier.
 static mut TIER_BUSY_AT: u64 = 0;
 /// The measure of the tiers' switching (`diag clock`): each switch to active by the causes that asked (a switch counts once under each cause it had), each tier's runs by length (bucket b: under 2^b ms, the last everything longer), and the ticks spent switching.
@@ -1872,6 +1872,11 @@ static mut TIER_WHY: [u64; TIER_CAUSES] = [0; TIER_CAUSES];
 static mut TIER_RUNS: [[u64; 12]; 4] = [[0; 12]; 4];
 static mut TIER_SINCE: u64 = 0;
 static mut TIER_SWITCH_TICKS: u64 = 0;
+/// A tier switch's requests sent one after another with one rate read after the last (`clock_profile`; `diag clock pipeline 0|1`, on by default since 2026-11-17), or each waited for before the next as before. On b923 a switch took about 4.5 ms of the service loop, its five to seven requests each waited for in turn.
+static TIER_PIPELINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// A tier's requests sent, and those skipped for a domain already at the rate (`acpm::ASKED`).
+static mut TIER_ASKS: u64 = 0;
+static mut TIER_SKIPPED: u64 = 0;
 static mut GOV_WINDOWS: u64 = 0;
 static mut TIER_RES: [u64; 4] = [0; 4];
 /// Counter ticks the kernel's core has spent asleep in the service loop's `wfe`, added as each sleep ends.
@@ -2175,6 +2180,10 @@ fn clock_profile(want: u8) {
     // Each rate under the thermal policy's cap for its domain (thermal.rs `capped`), so a switch never undoes a cap.
     // The memory side lifted (`shared_lift`) and the screen staying lit: MIF and the DSU are left where the lift put them, so a tier switch while someone interacts asks nothing of them (2026-11-17, b922: the tier switched 2973 times in 16 minutes and each switch set them to the tier's and the next pass back up, 3660 lifts in all, two ACPM requests each). Going dark the table applies and the lift ends.
     let keep_shared = unsafe { SHARED_LIFTED } && want != 3;
+    // A domain already at the rate asked is not asked again (DISP at 400 MHz in both rest and active; `acpm::ASKED` records every request); and with `TIER_PIPELINE` the requests go out one after another with one rate read after the last, which the firmware answers only once every request before it is done (it answers in order, as above), instead of a read after each. The firmware's queue takes two requests ahead of its answers (acpm.rs `call` waits for room).
+    let pipeline = TIER_PIPELINE.load(core::sync::atomic::Ordering::Relaxed);
+    let mut last = None;
+    let t0 = cntpct();
     for &(d, khz) in table {
         if d == 4 || d == 3 {
             if own {
@@ -2185,8 +2194,23 @@ fn clock_profile(want: u8) {
         if keep_shared && SHARED_LIFT.iter().any(|&(sd, _)| sd == d) {
             continue;
         }
-        let t0 = cntpct();
-        let _ = crate::acpm::dvfs_set(d, crate::thermal::capped(d, khz));
+        let rate = crate::thermal::capped(d, khz);
+        if crate::acpm::ASKED[d as usize].load(core::sync::atomic::Ordering::Relaxed) == rate {
+            unsafe { TIER_SKIPPED += 1 };
+            continue;
+        }
+        let t1 = cntpct();
+        let _ = crate::acpm::dvfs_set(d, rate);
+        unsafe { TIER_ASKS += 1 };
+        if pipeline {
+            last = Some(d);
+        } else {
+            let _ = crate::acpm::dvfs_get(d);
+            let us = cntpct().wrapping_sub(t1) * 1_000_000 / cntfrq();
+            unsafe { CLOCK_WAIT_MAX_US = CLOCK_WAIT_MAX_US.max(us) };
+        }
+    }
+    if let Some(d) = last {
         let _ = crate::acpm::dvfs_get(d);
         let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
         unsafe { CLOCK_WAIT_MAX_US = CLOCK_WAIT_MAX_US.max(us) };
@@ -2204,7 +2228,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none), `diag clock pipeline 0|1` its requests pipelined or each waited for.
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2223,6 +2247,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
             unsafe { TIER_WHY = [0; TIER_CAUSES] };
             unsafe { TIER_RUNS = [[0; 12]; 4] };
             unsafe { TIER_SWITCH_TICKS = 0 };
+            unsafe { (TIER_ASKS, TIER_SKIPPED) = (0, 0) };
             for b in &crate::process::INPUT_TO_FRAME {
                 b.store(0, Relaxed);
             }
@@ -2248,6 +2273,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
         (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
         (Some(b"dwell"), Some(n)) => TIER_DWELL.store(n, Relaxed),
+        (Some(b"pipeline"), Some(n)) => TIER_PIPELINE.store(n != 0, Relaxed),
         _ => {}
     }
     let lifted = interactive(cntpct(), f);
@@ -2261,7 +2287,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     for (k, n) in why.iter().enumerate() {
         out.extend_from_slice(alloc::format!(" {} A#{}", TIER_CAUSE_NAMES[k], n).as_bytes());
     }
-    out.extend_from_slice(alloc::format!("; switching took A#{} us in all\n", unsafe { TIER_SWITCH_TICKS } * 1_000_000 / f).as_bytes());
+    out.extend_from_slice(alloc::format!("; switching took A#{} us in all; A#{} requests sent, A#{} skipped (already at the rate), {}\n", unsafe { TIER_SWITCH_TICKS } * 1_000_000 / f, unsafe { TIER_ASKS }, unsafe { TIER_SKIPPED }, if TIER_PIPELINE.load(Relaxed) { "pipelined" } else { "each waited for" }).as_bytes());
     let runs = unsafe { TIER_RUNS };
     for (t, name) in [(1usize, "rest"), (2, "active")] {
         out.extend_from_slice(alloc::format!("  {name} runs by ms:").as_bytes());
