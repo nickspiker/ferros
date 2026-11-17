@@ -45,6 +45,20 @@ Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carrie
 - **fgtw.org keeps one copy**, the backup a total loss recovers from: a new fleet-sealed slot `space_put` / `space_get` beside `fstate` (fgtw-bootstrap: the two slots are one implementation; member-gated write, monotonic stamp, 1 MiB, public read of ciphertext). Chosen over riding inside `fstate`: that slot is Photon's roster and settings, written whole by every Photon client, and an older client would drop a section it does not know, and the fstate codec needs std (`x` text) that the device's no_std identity service lacks. A put is always pull, merge, put, so a sibling's copy there is never written over. Until the worker is deployed the seed answers `unknown_op`, which the device says once and treats as "no copy there": the space then lives on the device and its fleet.
 - **Rotation**: a copy sealed under a fleet key since rotated does not open; each device re-seals its own copy under the new key on its next push.
 
+## A rotation that left the person key behind (2026-11-17)
+
+Measured on the Pro (boot b925, console in /mnt/Harbor/tmp/scroll-R/runs/b925-attest.log) and on the desktop's Photon log.
+- 21:44:04 UTC the desktop Photon opened the person key (id 22415a56) with the fleet key it started with.
+- 21:44:28 its shrink heal (Photon devices.rs, the fan-out held more wraps than members after the Pro's removal and re-add on 2026-11-10) minted a new fleet key, re-sealed its own `fstate` from the old key to the new, and overwrote the old key. The person fact in the identity space was never re-sealed.
+- The Pro attested later, recovered the new key from the fan-out, and could not open the person fact: fgtw's settle waits (`WaitingElsewhere`) and never mints over it, so no person key reached the kernel and Photon sat on "Waiting for your identity".
+- fgtw.org's space copy, sealed under the old key, did not open on the Pro; the Pro then pushed its own copy over it (48 facts, sealed under the new key). The person fact rode in it untouched, still sealed under the old key, so fgtw.org holds it; the previous document as a whole is gone.
+- The old key survives only on a device that has not synced the fan-out since 21:44:28 (the MacBook or the Android, if Photon has not run there), or in dead blocks of the desktop's vault (reflink copies taken 14:34 PST).
+
+Three gaps, none fixed yet:
+- G0. **Every key change must carry the person fact across** (Photon, the shrink heal and every mint; and any device replacing its key with a newer one from the fan-out while it still holds the old one): open the person fact with the old key, seal it under the new, push the space. The heal for today is the same code run on a device that still holds the old key.
+- G1. **fgtw.org takes a space sealed under any key** (fgtw-bootstrap `handle_slot_put`): it checks the signature, membership, scheme floor, an optional `prev` and a rising stamp, but never the space's `kfp` (in the clear) against the current fan-out's. It should refuse a space sealed under anything but the current key.
+- G2. **A device pushes over a copy it cannot open** (payloads/fgtw space.rs `space_seed`): a copy that does not open still settles the first pull, and the push sends no `prev`. A copy that does not open should hold the push until the device holds the key it was sealed under, or a newer copy arrives.
+
 ## At attest
 
 1. The identity service (payloads/fgtw) has the chain and the fleet key.
