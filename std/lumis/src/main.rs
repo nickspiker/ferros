@@ -171,7 +171,7 @@ enum Opened {
 }
 
 /// The camera list as Lumis's menu takes it: each camera at the binning Lumis integrates it at, Camera2's conventions where Lumis's code reads them.
-/// The optical facts (sensor size, focal length, aperture) are not in the driver's list, so the menu draws no sensor or field of view for them.
+/// The optical facts (sensor size, focal length, aperture) come from the driver's list since 2026-11-17 (owner: "Missing lens stats on the Lumis page"), so the menu draws each sensor and its field of view.
 fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
     cameras
         .iter()
@@ -195,10 +195,11 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 max_iso: (c.gain_max as f64 * ISO_AT_UNITY / camera::GAIN_UNITY as f64) as i32,
                 min_exposure: c.exposure_min as i64,
                 max_exposure: c.exposure_max as i64,
-                sensor_width: 0.,
-                sensor_height: 0.,
-                focal_lengths: Vec::new(),
-                apertures: Vec::new(),
+                // The optics from the driver's list (Android's Camera2 values; 0 and none from a driver before 2026-11-17, which the page shows as unknown).
+                sensor_width: c.sensor_mm.0,
+                sensor_height: c.sensor_mm.1,
+                focal_lengths: if c.focal_mm > 0. { vec![c.focal_mm] } else { Vec::new() },
+                apertures: if c.f_number > 0. { vec![c.f_number] } else { Vec::new() },
                 min_focus_distance: if c.focus_max > c.focus_min { NEAREST_DIOPTERS as f32 } else { 0. },
                 has_ois: false,
                 // Shown as "RAW": full manual control of a raw stream.

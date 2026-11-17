@@ -52,6 +52,12 @@ pub fn section(c: &Cam, idt: &[u8]) -> Result<vsf::file_format::VsfSection, IdtE
     // Focus: the lens actuator's targets over the span measured (the main's G#0800 to G#7800); 0 and 0 where focus is not offered.
     put("focus_min", u(c.focus.0));
     put("focus_max", u(c.focus.1));
+    // The optics (ferros_cam optics: Android's Camera2 values Lumis recorded on the Pro): the sensor's size in mm, the focal length in mm, the f-number.
+    let o = crate::optics::OPTICS[c.id as usize];
+    put("sensor_width_mm", alloc::vec![VsfType::f5(o.sensor_mm.0)]);
+    put("sensor_height_mm", alloc::vec![VsfType::f5(o.sensor_mm.1)]);
+    put("focal_mm", alloc::vec![VsfType::f5(o.focal_mm)]);
+    put("f_number", alloc::vec![VsfType::f5(o.f_number)]);
     Ok(s)
 }
 
@@ -92,6 +98,8 @@ mod tests {
             for f in ["facing", "width", "height", "cfa", "black", "white", "rotation", "exposure_min", "exposure_max", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
+            let o = crate::optics::OPTICS[k];
+            assert_eq!((floats("sensor_width_mm"), floats("sensor_height_mm"), floats("focal_mm"), floats("f_number")), (vec![o.sensor_mm.0], vec![o.sensor_mm.1], vec![o.focal_mm], vec![o.f_number]), "{}", c.name);
             let (m, sens) = (floats("idt"), floats("sensitivity"));
             assert_eq!((m.len(), sens.len()), (9, 3));
             assert!(!seen.contains(&m), "{} has another camera's matrix", c.name);
