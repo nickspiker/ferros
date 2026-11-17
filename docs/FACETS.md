@@ -221,6 +221,7 @@ A person who wants a kist not to know two devices are theirs stows it on one of 
 - **The people and the places themselves**: facts in the space (`PERSON`, `SPOT`), so a new device of the fleet has them at its first pull.
 - **Aliases**: not stored anywhere, not synced; derived the same on every device from the root and the kist's identity. A device that has the root has every alias.
 - **Bindings** (be you): made on whichever device the kist first needs one; the record names no device beyond its signer, and any device's identity service can make another, so nothing needs syncing.
+  Each device keeps the bindings it made in the person's class (`fgtw.be_you`, without the handle proof, which is put back from the roots in hand) and reuses one at a later boot once it verifies against the chain as it stands, so SPHINCS+ signs a kist's binding once, not once a boot (built 2026-11-17, PHOTON.md "Where the open's time goes").
 - **Picks**: not kept by the system; the kist keeps what it was given. STORE.md's item picks are the exception it proposes (its open question 3).
 - **Last used** (KISTS.md "Last used on the card"): per device, as it happened there; whether the cards show the latest across all the person's devices is KISTS.md's decision P4.
 
@@ -288,6 +289,7 @@ Owner, 2026-11-14, of Photon's handle screen on ferros: "why is that in the ferr
 - **D7. Accepted**: no public binding slot; bindings travel with what a kist sends.
 - **D8. Leave the chain's public read as it is.** Seeing how many devices a person has harms no one; gating it is work for no gain under this threat model.
 - **D9. Accepted**: "facet", "alias", "be you", "the person key", `PERSON`, `SPOT`.
+- **D10. A binding never expires** (owner, 2026-11-17: "never expire"). Its `when` is a record of when it was made, signed with the rest, and nothing reads it as an age: a binding holds while its signer is a current member of the person's fleet and holds the schemes the chain says it holds (fgtw `Binding::verify`), so a departure, a lockout or a chain that asks more eggs of that device ends it, and a kept binding is checked against the chain as it stands before every reuse.
 
 **The split, in one line**: on ferros no kist ever holds the person's roots (the handle, the identity seed, the person key, the identity key, the fleet key, the ira); a kist holds its alias (derived by the kernel, its own), its ira key (per device, its own) and the facets the person handed it. Until Photon's migration lands (PHOTON.md), Photon on ferros keeps its own handle screen (option C there), so the roots it holds are only those the person typed into it, as on every other platform.
 
