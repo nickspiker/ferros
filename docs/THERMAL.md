@@ -169,6 +169,18 @@ The panel stage on the GPU (GPU-KISTS.md's first choice) moves 4.6 G CPU cycles 
    The memory side lifts with it (service.rs `shared_lift`): while lifted and the screen lit, MIF at 3744 MHz and the DSU at 1800 MHz (their tables' tops, zuma.dtsi devfreq_mif and devfreq_dsu, which Android's memory-latency governors reach under load), else the tier's (active: MIF 2028, DSU 1197); not while ferros's thermal policy holds any domain down.
    Measured on the Pro by hand first (std/membench, two 2^24-byte buffers, A#GB/s read plus written): four threads' copy 32.5 at the active tier with the A715s at 1065 MHz, 37.5 to 39.5 with MIF at 3744, 41.3 with the DSU at 1800 and the A715s at 2367 too, against 35.9 with the A715s at 2367 alone; one thread's copy by q-register pairs 18.9, 23.1 (MIF), 32.3 (all three); std's memcpy (compiler-builtins' word loop) 13.1 to 23.4 on one thread, so a single copy is bound by the core's clock and its own loop before the memory. Stepped up by hand (1572, 1945, 2367 MHz), the A715s ran at 2367 MHz with MIF and the DSU at their tops and no divider event (`diag thermal`: slow seconds 0).
    Knobs: `diag clock lift <kHz>` (the ceiling while interacting; 0 or anything under 1065 MHz: no lift), `diag clock hold <n>` and `diag clock gap <n>` (the two holds as shifts); `diag clock` shows the lift's state and how many windows ran lifted.
+   **Measured** (b922, Photon build D on Ready, adjacent runs on one boot, fluor's own averages a frame over its 10 s console lines):
+   | | draw | present | show | a frame | Photon's render |
+   |---|---|---|---|---|---|
+   | scroll, lift off | 34.5 ms | 11.0 ms | 1.3 ms | about 47 ms (21 a second) | 39-40 ms |
+   | scroll, lift on | 19.6 ms | 6.1 ms | 1.9 ms | about 28 ms (36 a second) | 19-20 ms |
+   | scroll, lift + `sched x3 on` + `sched slice 9` | 16.5 ms | 7.7 ms | 2.7 ms | about 27 ms | 17-18 ms |
+   | pinch, lift off | 19.9-105.7 ms | 6.2-13.8 ms | 1.6-2.9 ms | 28 to 120 ms, longest 743 ms | 23-136 ms |
+   | pinch, lift on | 20.2-21.7 ms | 6.9-7.5 ms | 0.5-2.5 ms | about 30 ms | 17-27 ms |
+   | pinch, lift + x3 + slice 9 | 16.8-24.2 ms | 7.5-10.3 ms | 3.4-3.6 ms | 28-38 ms | 17-39 ms |
+
+   With the lift the A715s spent 6.6 s of the scroll at 2367 MHz and no divider tripped in any run (`diag thermal`: slow seconds 0, every divider's status unchanged). Sharing the X3 and 2 ms slices bought about 1 ms on the scroll and nothing clear on the pinch; both stay off.
+   The first build re-asked MIF and the DSU after every switch of the shared tier (2973 switches in 16 minutes on b922, 3660 lifts): a tier switch while lifted now leaves them where the lift put them.
 4. **The X3's top:** 2914 MHz (3.7 W busy), 2556 (1.9 W) or 2049 (1 W) in the active profile; the top step buys 14 % more speed for twice the power.
 5. **The GPU's clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and the MIF Android pairs with it.
 6. **Sustained or burst:** 120 for as long as the heat allows, then sliding (smooth), or clocks chosen so a lower rate holds forever.
