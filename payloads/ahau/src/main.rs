@@ -375,6 +375,26 @@ extern "C" fn tag_thread(grants: u64) -> ! {
     }
 }
 
+/// Touches that landed on the attest screen while its entry was empty, counted: each a doorbell for the NFC driver to make sure its chip still reads tags (op 11, `probe_thread`). A person who held a tag and saw nothing touches the screen, and the next hold reads; nothing is asked on a timer (2026-11-17: after hours at the attest screen a tag read nothing, the driver believing discovery ran).
+static TAG_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut PROBE_STACK: [u8; 1 << 14] = [0; 1 << 14];
+
+/// Rings the NFC driver's PROBE (op 11) once for every move of TAG_PROBE, however many touches it counted meanwhile, so the screen's loop only counts and never waits on a call.
+extern "C" fn probe_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let nfc = cap(grants, S_NFC);
+    let mut rung = 0u64;
+    loop {
+        let c = TAG_PROBE.load(Ordering::Acquire);
+        if c == rung {
+            ferros_sys::wait_world(&TAG_PROBE, c, 0);
+            continue;
+        }
+        rung = c;
+        ferros_sys::nfc::probe(nfc);
+    }
+}
+
 /// The UID `tag_thread` last published and its sequence count; None when it has not moved from `seen`.
 fn tag_take(seen: u32) -> Option<(u32, ([u8; 10], usize))> {
     use core::sync::atomic::Ordering;
@@ -3288,6 +3308,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ferros_sys::thread_spawn(wlan_thread, unsafe { &mut *(&raw mut WLAN_STACK) }, grants);
     // Attest with a tag (`tag_thread`): the NFC driver's TAG held while this screen is up.
     ferros_sys::thread_spawn(tag_thread, unsafe { &mut *(&raw mut TAG_STACK) }, grants);
+    // Its doorbell (`probe_thread`): a touch on the empty entry asks the NFC driver to make sure its chip reads.
+    ferros_sys::thread_spawn(probe_thread, unsafe { &mut *(&raw mut PROBE_STACK) }, grants);
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
@@ -3382,6 +3404,11 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (x, y) = (held[0].1, held[0].2);
                 if !press_asked {
                     press_asked = true;
+                    // A landing on the screen with nothing typed yet: the NFC driver's doorbell (`TAG_PROBE`), so a tag held next reads even if its chip had stopped.
+                    if a.mode == Mode::Fresh && a.len == 0 {
+                        TAG_PROBE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                        ferros_sys::wake(&TAG_PROBE, 1);
+                    }
                     // Any press after a denial: the screen's own words again, before the press does anything else.
                     if a.denied.take() {
                         a.status(a.prompt().as_str());

@@ -2608,6 +2608,12 @@ pub mod nfc {
         let mut r = [0u8; 1];
         super::call_live(nfc, &[10], &mut r) == 1
     }
+
+    /// The driver makes sure its chip still reads tags (op 11): discovery found stopped is started again, a chip that does not answer is brought up again from a reset pulse. A doorbell, rung at a person's touch, never on a timer. Answered before the check, so it costs the caller a call; true when the driver answered (a driver from before 2026-11-17 answers nothing).
+    pub fn probe(nfc: u64) -> bool {
+        let mut r = [0u8; 1];
+        super::call_live(nfc, &[11], &mut r) == 1
+    }
 }
 
 /// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table at the arc's start (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #16·SLOT]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.

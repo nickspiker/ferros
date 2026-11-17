@@ -19,6 +19,9 @@
 //! - `8` BUZZ + n (one byte, at most G#26): the motor plays ROM waveform n. → [0], or [1] refused (n too large) or a write failed.
 //! - `9` TAG: held until discovery reads an unlock tag (NFC-A, Type 2, a 7- or 10-byte UID), then → its UID; → nothing when let go (op 10, or a fifth caller held). Attest with a tag (AUTH.md): the attest screen holds it while it shows, the settings page while it adds a tag. The screen off stops discovery, so nothing is read in the dark.
 //! - `10` TAG STOP: every held TAG answered with nothing. → [0].
+//! - `11` PROBE: answered [0] at once, then the chip made sure of: running discovery is asked to start again (G#A0, already started, is the chip alive and discovering; a start means it had stopped without a word, and is said), stopped discovery is retried at once, and a chip that does not answer has its reset pulsed and is brought up again. The attest screen rings it at a touch on its empty entry (a doorbell, never a timer: 2026-11-17, a tag that read nothing at the attest screen after hours, `Nfc::probe`).
+//!
+//! A chip that stops answering is brought up again from a reset pulse (`Nfc::restart`), not with NCI commands alone: a command left unanswered, a bring-up that failed, and a reset the chip did by itself (a CORE_RESET notification outside the bring-up) all lead there, at the next retry, which a screen coming on, a TAG held or a PROBE makes at once (2026-11-17: after a RAM reload the Pro's chip never came up, its CORE_RESET answered after A#590 ms, past the old wait, and every retry was CORE_RESET again; on 2026-11-14 it answered nothing at a screen on after A#42 minutes dark, and discovery was retried for good without a pulse).
 //!
 //! The vibration motor (a CS40L26 at G#43) shares this bus, so its driver is here, the bus's one owner (KERNEL-OUT.md decision 8, the kernel's haptics.rs until 2026-11-10): the `nfc` switch pulses its reset with the NFC chip's, and ops 7 and 8 run between NCI exchanges, never during one.
 #![no_std]
@@ -123,6 +126,9 @@ fn sleep_ms(n: u64) {
     sleep_until(now() + freq() / 1000 * n);
 }
 
+/// How long a command waits for its response: two seconds, the NCI stack's own command-complete timeout (libnfc-nci NFC_CMD_CMPL_TIMEOUT), which the chip is held to rather than to a shorter wait of ours. Until 2026-11-17 it was 512 ms, and after a RAM reload the Pro's chip answered CORE_RESET (with its notification, reason 2) A#590 ms after the command, so every bring-up failed.
+const CMD_WAIT_MS: u64 = 1 << 11;
+
 /// The chip's interrupt line (kernel `nfc-irq`, SPI 42, added after the last grant for a holder of hsi2c0: process.rs `LINES_WITH`, 2026-11-13).
 const S_IRQ: u64 = 5;
 /// gpa7's words in gpio-alive: its pin functions, and its external-interrupt type, mask and pending words (pinctrl-gs.c zuma_pin_alive: gpa7's EINT offset G#18 in the wakeup block's ECON G#700, EMASK G#900, EPEND G#A00).
@@ -194,6 +200,22 @@ struct Nfc {
     quiet: bool,
     /// A CORE_RESET_NTF seen since this was cleared (`init`).
     reset_seen: bool,
+    /// Inside `init`, where a reset notification is the bring-up's own; outside it one is the chip resetting by itself, and it is brought up again (`needs_init`).
+    in_init: bool,
+    /// The chip is to be pulsed out of reset and brought up again at the next retry (`restart`): a bring-up that failed, a command it left unanswered, a reset it did by itself.
+    needs_init: bool,
+    /// A command `cmd` sent went unanswered (or could not be written) since this was cleared.
+    unanswered: bool,
+    /// Bring-ups from a reset pulse after the first (`restart`); probes (op 11), and those that found discovery stopped without a word.
+    pulses: u32,
+    probes: u32,
+    found_stopped: u32,
+    /// ST's own notifications (G#6F): counted, the last one's first bytes kept for STATE, and each said while `st_said` is under `ST_SAY` in a 64 s report's window (they were dropped unseen until 2026-11-17; one may be the only word of a chip that stopped).
+    st_notes: u32,
+    st_last: [u8; 8],
+    st_said: u32,
+    /// When the chip last sent anything (the counter), for STATE.
+    heard_at: u64,
     /// Op 9's held calls (attest with a tag, AUTH.md): each a reply token, answered with the UID of the next unlock tag discovery reads (`tag_read`), or with nothing by op 10. At most `HELD`, the oldest giving way.
     held: [[u8; 32]; HELD],
     nheld: usize,
@@ -201,6 +223,12 @@ struct Nfc {
 
 /// How many op 9 calls are held at once: the attest screen's and the settings page's, with room.
 const HELD: usize = 1 << 2;
+/// ST notifications said per 64 s report window: past it they are only counted, so a chatty firmware cannot fill the console ring.
+const ST_SAY: u32 = 1 << 4;
+/// Discovery: listening as a card on NFC-A and NFC-B, and between listens polling for tags on NFC-A, NFC-B and NFC-V (each entry a technology and mode, then 1: every discovery period), as Android interleaves them.
+const DISCOVER: [u8; 14] = [0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01];
+/// RF_DISCOVER's status when discovery runs already (NCI 2.0 DISCOVERY_ALREADY_STARTED).
+const ALREADY_STARTED: u8 = 0xA0;
 
 impl Nfc {
     fn rd(&self, off: u64) -> u32 {
@@ -385,7 +413,10 @@ impl Nfc {
         loop {
             if self.irq() {
                 match self.read(p) {
-                    Ok(Some(n)) => return Some(n),
+                    Ok(Some(n)) => {
+                        self.heard_at = now();
+                        return Some(n);
+                    }
                     Ok(None) => {}
                     // Fresh out of reset the chip raises its line before it answers its address: tried again next millisecond.
                     Err(E_NODEV) => {}
@@ -402,20 +433,22 @@ impl Nfc {
         }
     }
 
-    /// A command and its response (MT 2, the same GID and OID); notifications that come first are handled on the way. None on no response in 512 ms.
+    /// A command and its response (MT 2, the same GID and OID); notifications that come first are handled on the way. None, and `unanswered` set, on a write that failed or no response in `CMD_WAIT_MS`.
     fn cmd(&mut self, c: &[u8], p: &mut Packet) -> Option<usize> {
         if let Err(e) = self.send(c) {
             say!(self.grants, "nfc: write {} failed G#{e:X}\n", Hex(c));
+            self.unanswered = true;
             return None;
         }
-        let end = now() + freq() / 2;
+        let end = now() + freq() / 1000 * CMD_WAIT_MS;
         while now() < end {
-            let Some(n) = self.next(p, 512) else { break };
+            let Some(n) = self.next(p, CMD_WAIT_MS) else { break };
             if p[0] >> 5 == 2 && p[0] & 0xF == c[0] & 0xF && p[1] & 0x3F == c[1] & 0x3F {
                 return Some(n);
             }
             self.packet(p, n);
         }
+        self.unanswered = true;
         if !self.quiet {
             say!(self.grants, "nfc: no response to {}\n", Hex(c));
         }
@@ -464,6 +497,12 @@ impl Nfc {
                 if pl.len() >= 31 {
                     self.version.copy_from_slice(&pl[7..11]);
                     self.config.copy_from_slice(&pl[28..30]);
+                }
+                // Outside the bring-up nobody asked for it: the chip lost its configuration and its discovery with the reset, so it is brought up again (it was left thinking it discovered, and read nothing after, until 2026-11-17).
+                if !self.in_init {
+                    say!(self.grants, "nfc: the chip reset by itself: brought up again\n");
+                    self.needs_init = true;
+                    self.discovering = false;
                 }
             }
             // CORE_CONN_CREDITS_NTF: entries of (conn id, credits).
@@ -529,8 +568,18 @@ impl Nfc {
             }
             // The RF_DEACTIVATE a tag's release sent: its answer.
             (2, 1, 6) => {}
-            // ST's proprietary notifications (G#6F): logging the chip keeps; not ours.
-            (3, 0xF, _) => {}
+            // ST's proprietary notifications (G#6F): not ours to act on, but counted and said (`st_notes`), since a chip that stops reading may say so only here.
+            (3, 0xF, _) => {
+                self.st_notes += 1;
+                // WHY the min: a notification may be shorter than the 8 bytes kept (a 3-byte header and nothing), and copying 8 from it would panic; a longer one keeps its start. The 16 said below is the console line's length, not a bound (n is at most the packet's 258).
+                let k = n.min(self.st_last.len());
+                self.st_last = [0; 8];
+                self.st_last[..k].copy_from_slice(&p[..k]);
+                if self.st_said < ST_SAY {
+                    self.st_said += 1;
+                    say!(self.grants, "nfc: ST notification {}\n", Hex(&p[..n.min(16)]));
+                }
+            }
             _ => say!(self.grants, "nfc: {}\n", Hex(&p[..n])),
         }
     }
@@ -573,13 +622,12 @@ impl Nfc {
         say!(self.grants, "nfc: APDU {} → {}\n", Hex(&a[..a.len().min(16)]), if n == 34 { "S" } else { "status" });
     }
 
-    /// Listening as a card on NFC-A and NFC-B, and between listens polling for tags on NFC-A, NFC-B and NFC-V (each entry a technology and mode, then 1: every discovery period), as Android interleaves them.
+    /// Discovery started (`DISCOVER`).
     fn discover(&mut self, p: &mut Packet) -> bool {
-        let both: &[u8] = &[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01];
         self.quiet = self.discover_failures > 0;
         // G#A0, discovery already started, is discovering too.
-        self.discovering = match self.cmd(both, p) {
-            Some(n) if n >= 4 && (p[3] == 0 || p[3] == 0xA0) => true,
+        self.discovering = match self.cmd(&DISCOVER, p) {
+            Some(n) if n >= 4 && (p[3] == 0 || p[3] == ALREADY_STARTED) => true,
             Some(n) => {
                 if !self.quiet {
                     say!(self.grants, "nfc: discover refused: {}\n", Hex(&p[..n]));
@@ -603,8 +651,31 @@ impl Nfc {
         self.discovering
     }
 
-    /// From reset to listening (the module comment's sequence).
+    /// From reset to listening (the module comment's sequence), its reset notifications its own (`in_init`).
     fn init(&mut self, p: &mut Packet) -> bool {
+        self.in_init = true;
+        let up = self.init_steps(p);
+        self.in_init = false;
+        self.needs_init = !up;
+        up
+    }
+
+    /// The chip's reset pulsed again (the `nfc` power switch on: the kernel's pulse, as at the start) and the chip brought up from it: what a chip that stopped answering needs, since NCI commands are what it stopped answering.
+    fn restart(&mut self, p: &mut Packet) -> bool {
+        self.pulses += 1;
+        self.discovering = false;
+        self.credits = 0;
+        self.apdu_len = 0;
+        self.rstage = 0;
+        if !ferros_sys::power(cap(self.grants, S_POWER), true) {
+            say!(self.grants, "nfc: the reset pulse was refused (HSI1 off?)\n");
+            self.needs_init = true;
+            return false;
+        }
+        self.init(p)
+    }
+
+    fn init_steps(&mut self, p: &mut Packet) -> bool {
         // The reset notification the pulse left.
         if let Some(n) = self.next(p, 64) {
             self.packet(p, n);
@@ -738,7 +809,6 @@ impl Nfc {
         true
     }
 
-    /// How long to wait before starting discovery again after `discover_failures` failures in a row: a second, doubling to at most 64. WHY the cap: a controller that recovers is found again within a minute, and the doubling has nothing left to save past that.
     /// The screen off: discovery stopped (RF_DEACTIVATE to idle) and the controller told (CORE_SET_POWER_SUB_STATE 1, screen off), so neither the field nor the listen runs in the dark; a tap is consent only on a device whose screen is on (AUTH.md), so nothing is lost. On: sub-state 0 (on, unlocked, as the bring-up sets it), and the loop starts discovery again at once. 2026-11-10: NFC drew ~20 mW with the screen off and woke its driver ~115 times a second.
     fn screen(&mut self, dark: bool, p: &mut Packet) {
         if dark {
@@ -752,12 +822,36 @@ impl Nfc {
         }
     }
 
+    /// How long to wait before starting discovery again after `discover_failures` failures in a row: a second, doubling to at most 64. WHY the cap: a controller that recovers is found again within a minute, and the doubling has nothing left to save past that. A screen coming on, a TAG held and a PROBE each retry at once, so a person waiting on a tag never waits on this.
     fn retry_wait(&self) -> u64 {
         freq() << self.discover_failures.min(6)
     }
 
+    /// Op 11 (a doorbell, `PROBE` in the module comment): running discovery asked to start again, G#A0 (already started) the chip alive and discovering. A start means discovery had stopped with no word from the chip, which is said and counted (`found_stopped`): what to look for when a tag reads nothing. No answer: the chip is brought up again from a reset pulse at the next retry. Any other status (an activation in progress refuses it) leaves things as they are. Discovery stopped (the dark, a retry pending): nothing here, the caller retries at once.
+    fn probe(&mut self, p: &mut Packet) {
+        self.probes += 1;
+        if !self.discovering {
+            return;
+        }
+        self.unanswered = false;
+        match self.cmd(&DISCOVER, p) {
+            Some(n) if n >= 4 && p[3] == ALREADY_STARTED => {}
+            Some(n) if n >= 4 && p[3] == 0 => {
+                self.found_stopped += 1;
+                say!(self.grants, "nfc: a probe found discovery stopped without a word from the chip (last heard A#{} ms ago): started again\n", (now() - self.heard_at) * 1000 / freq());
+            }
+            Some(n) => say!(self.grants, "nfc: a probe was answered {}: left as it is\n", Hex(&p[..n.min(8)])),
+            None => {}
+        }
+        if self.unanswered {
+            say!(self.grants, "nfc: a probe found the chip silent: its reset pulsed and brought up again\n");
+            self.needs_init = true;
+            self.discovering = false;
+        }
+    }
+
     fn state(&self, out: &mut Line) {
-        let _ = write!(out, "firmware {}, RF config {}; {}; S {}; activations {}, S served {}, fields {}, tags {}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags);
+        let _ = write!(out, "firmware {}, RF config {}; {}{}; S {}; activations {}, S served {}, fields {}, tags {}; TAG held A#{}; discovery failures A#{}, reset pulses A#{}, probes A#{} (A#{} found discovery stopped); ST notifications A#{} (last {}); chip last heard A#{} ms ago", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.needs_init { ", to be brought up again" } else { "" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags, self.nheld, self.discover_failures, self.pulses, self.probes, self.found_stopped, self.st_notes, Hex(&self.st_last), (now() - self.heard_at) * 1000 / freq());
     }
 
     /// One of the motor's registers: its address written without STOP, then the value read.
@@ -834,15 +928,14 @@ impl Nfc {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, held: [[0; 32]; HELD], nheld: 0 };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, in_init: false, needs_init: false, unanswered: false, pulses: 0, probes: 0, found_stopped: 0, st_notes: 0, st_last: [0; 8], st_said: 0, heard_at: now(), held: [[0; 32]; HELD], nheld: 0 };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
         ferros_sys::exit(1);
     }
+    // A bring-up that failed is tried again whole, from a reset pulse (`restart`), where discovery would be: a controller that never finished its initialisation refuses discovery (status G#06) forever, and one that stopped answering answers no CORE_RESET either.
     let up = nfc.init(&mut p);
-    // A bring-up that failed is tried again whole (from CORE_RESET) where discovery would be: a controller that never finished its initialisation refuses discovery (status G#06) forever.
-    let mut needs_init = !up;
     let mut l = Line { b: [0; 512], n: 0 };
     nfc.state(&mut l);
     say!(grants, "nfc: {}: {}\n", if up { "up" } else { "bring-up failed" }, core::str::from_utf8(&l.b[..l.n]).unwrap_or(""));
@@ -864,16 +957,25 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let seen = RUNG.load(core::sync::atomic::Ordering::Acquire);
         passes += 1;
         if now().wrapping_sub(said_at) >= freq() << 6 {
-            say!(grants, "nfc: A#{passes} passes, A#{waits} waits in the last A#{} ms\n", (now() - said_at) * 1000 / freq());
+            say!(grants, "nfc: A#{passes} passes, A#{waits} waits in the last A#{} ms; ST notifications A#{} so far\n", (now() - said_at) * 1000 / freq(), nfc.st_notes);
             (passes, waits, said_at) = (0, 0, now());
+            nfc.st_said = 0;
         }
         {
             let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
-            if off != dark && !needs_init {
+            if off != dark {
                 dark = off;
-                nfc.screen(dark, &mut p);
                 retry_at = 0;
-                say!(grants, "nfc: screen {}: {}\n", if dark { "off" } else { "on" }, if dark { "discovery stopped" } else { "discovery again" });
+                // A chip to be brought up again is told the screen's state by nothing but its bring-up, which waits for the screen on (below).
+                if !nfc.needs_init {
+                    nfc.unanswered = false;
+                    nfc.screen(dark, &mut p);
+                    if nfc.unanswered {
+                        nfc.needs_init = true;
+                        nfc.discovering = false;
+                    }
+                }
+                say!(grants, "nfc: screen {}: {}\n", if dark { "off" } else { "on" }, if dark { "discovery stopped" } else if nfc.needs_init { "the chip is brought up again from a reset pulse" } else { "discovery again" });
             }
         }
         if shown != Some((nfc.discovering, nfc.field)) {
@@ -884,26 +986,34 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if nfc.irq() {
             match nfc.read(&mut p) {
-                Ok(Some(n)) => nfc.packet(&p, n),
+                Ok(Some(n)) => {
+                    nfc.heard_at = now();
+                    nfc.packet(&p, n);
+                }
                 Ok(None) => {}
                 Err(e) => say!(grants, "nfc: read failed G#{e:X}\n"),
             }
             continue;
         }
-        // Discovery stopped (a deactivation to idle, or a bring-up that failed at the end): started again, a second later, then twice as long after each failure (`retry_wait`).
+        // Discovery stopped (a deactivation to idle, a bring-up that failed, a chip that stopped answering or reset by itself): started again, a second later, then twice as long after each failure (`retry_wait`), at once on a doorbell (the screen on, a TAG held, a PROBE). A chip to be brought up again gets its reset pulsed first (`restart`); one that leaves discovery's start unanswered is brought up so next.
         if !nfc.discovering && !dark && now() > retry_at {
-            if needs_init {
-                nfc.quiet = nfc.discover_failures > 0;
-                needs_init = !nfc.init(&mut p);
+            if nfc.needs_init {
+                let tries = nfc.discover_failures;
+                nfc.quiet = tries > 0;
+                let up = nfc.restart(&mut p);
                 nfc.quiet = false;
-                if needs_init {
-                    nfc.discover_failures += 1;
-                } else {
-                    say!(grants, "nfc: up after {} tries\n", nfc.discover_failures + 1);
+                if up {
+                    say!(grants, "nfc: up again from a reset pulse after A#{} failed tries (pulses A#{})\n", tries, nfc.pulses);
                     nfc.discover_failures = 0;
+                } else {
+                    nfc.discover_failures = tries + 1;
                 }
             } else {
+                nfc.unanswered = false;
                 nfc.discover(&mut p);
+                if nfc.unanswered {
+                    nfc.needs_init = true;
+                }
             }
             retry_at = now() + nfc.retry_wait();
         }
@@ -974,12 +1084,24 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     reply(&token, &[1]);
                 }
                 // Attest with a tag (AUTH.md): the next unlock tag's UID, held until discovery reads one (no polling by the caller), or let go by op 10. Not gated on a person present: this is the owner's exception to "no NFC action while locked" (2026-11-11), and while locked only the attest screen holds this endpoint (fgtw, its other holder, starts once a person is present), which hands the UID to the kernel and nowhere else.
+                // A caller that starts waiting for a tag is a doorbell too: discovery stopped (a failure waiting out `retry_wait`) is tried again at once.
                 9 => {
                     nfc.tag_hold(token);
+                    if !nfc.discovering {
+                        retry_at = 0;
+                    }
                 }
                 10 => {
                     nfc.tag_let_go();
                     reply(&token, &[0]);
+                }
+                // The attest screen's doorbell at a touch (`Nfc::probe`): answered first, so the caller never waits on the chip.
+                11 => {
+                    reply(&token, &[0]);
+                    nfc.probe(&mut p);
+                    if !nfc.discovering {
+                        retry_at = 0;
+                    }
                 }
                 _ => {
                     reply(&token, &[]);
