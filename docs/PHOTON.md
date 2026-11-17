@@ -269,6 +269,23 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **M6. Logs**: keyed from the handle as today (a maintainer handed a handle finds that person's logs), or from the alias (nobody finds them unless the person hands over the tag).
 - **M7. The old way's reader**: kept behind the cutover (photon's precedent), or removed after a census.
 
+## Photon on the Pro: slow to open, no friends (2026-11-16 and 17)
+
+The owner: "why Photon takes forever to load and never loads my friends", then "takes about fifteen seconds to open and then I see an attest screen".
+Each cause, as measured on the Pro (b905 to b917), with what changed:
+- **The window waited for be you.** std/photon's main asked be you before the first frame, and the identity service signs the binding with every egg once a boot (6.3 s; Photon's own alias bundle 0.4 s). Now the window comes first (tap to first frame about 1.9 s: the capsule read 1.5 s, main to the host 0.38 s) and the person is handed in thru the wake path; a relaunch in the same boot gets be you in about 0.5 s.
+- **The attest screen was Photon's own handle screen**, shown by a Photon from before photon f6d954bf when no PhotonKeys came. They came not because the identity service, its lookup gone grey at attest (fgtw.org slow, the MacBook not yet beaconing), turned "joining" when a fleet device beaconed and never asked again, so the person key was never opened. The identity service now asks each fleet device it newly hears for the chain; Photon on ferros (photon 83d7c663) shows one waiting line and nothing else.
+- **The identity service ran out of heap** (2 MiB) when a desktop Photon sent its 573 KB sibling offer to the service's member key; 8 MiB now, and Photon no longer offers ceremonies to a fleet member that is not in the alias's device list (photon a25011af).
+- **Photon's sends to IPv4 peers never left.** Photon maps every IPv4 destination to ::ffff:a.b.c.d (dual-stack), and ip sent those as IPv6 to nobody; only its multicast beacons, sent unmapped, got out. ip now sends a v4-mapped destination as IPv4 (and Photon's ferros_net unmaps too).
+- **Pongs past 1472 bytes came as IPv4 fragments**, and ip handed the first fragment up as the datagram. ip reassembles UDP now: four at once, up to 64 KiB each, an unfinished one dropped 16 s after its first fragment at the next arrival.
+- **Every CLUTCH encapsulation trapped** ("TRAP syscall 6 ... G#54E8 bytes before its arc"). The C crates (PQClean thru cc) were compiled without the target's reserved registers, so gcc used x27 and x28; a C KEM calling back into Rust for random bytes made ferros_rt read a C value as the arc base. Every std build script now compiles C with -ffixed-x24 to -ffixed-x28.
+- **Photon's beacon went once a session**, so two devices met only if they started in the right order (photon a25011af and ddfd1c38 answer a sibling's multicast beacon while it has no proven path).
+
+After these, on 2026-11-17 at 17:22 UTC the Pro's Photon and the desktop's completed their sibling ceremony over the LAN, direct both ways, the chain woven end to end.
+Still open: the roster reaches a sibling as fleet state sealed under the fleet key, which Photon on ferros does not hold (the Photon session's next piece: the roster over the sibling channel); the desktop's avatar does not open on the Pro; the MacBook's Photon (v152) never sends its offer to the Pro.
+Scrolling on the empty Ready screen measured about 18 fps (fluor's draw 39 ms and present 16 ms a frame) with the A715s three quarters idle; a list to scroll comes with the roster.
+Pinch works thru fluor's ferros host (fluor ferros-pinch); typing into Photon's fields works.
+
 ## Findings
 
 - **Multicast needs a join.** The device heard another LAN device's beacons but never the dev box's; broadcast arrived, IPv4 multicast did not. The WiFi firmware passes all multicast; the access point's IGMP snooping was the filter. `ip` op 8 JOIN sends an IGMPv2 membership report (IPv4) or an MLDv1 listener report with the Router Alert option (IPv6) now and every 60 s; the client joins both beacon groups at start.
