@@ -256,6 +256,8 @@ pub struct KVault {
     nonce: crate::wairua::TrngNonce,
     /// The unlocked identity, while one is: dropped when power goes or the device switches to another OS (`lock`).
     id: Option<IdKeys>,
+    /// Whether an identity's fleet has bound this device, once read (`bound`), kept in step by `bind` and `release`, the only writers of the mark: init asks 64 times a second while it waits for a person, and each read of the mark from the flash held the kernel lock about 300 us (2026-11-16, `diag lock`).
+    bound: Option<bool>,
     /// Mirror A's first LBA, as `open` found it (`mirrors`).
     mirror_a: u64,
 }
@@ -269,7 +271,7 @@ impl KVault {
         let (a, b) = mirrors()?;
         let mirror = Mirror::new(Region { base: a, blocks: REGION_BLOCKS }, Region { base: b, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
         let vault = Vault::open(mirror, RING_LOG2, now(), DeletePolicy::UnlinkOnly)?;
-        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, mirror_a: a })
+        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, bound: None, mirror_a: a })
     }
 
     /// The address key for `class`: the device's always, the identity's only while one is unlocked.
@@ -624,7 +626,12 @@ impl KVault {
 
     /// Whether an identity's fleet has bound this device.
     pub fn bound(&mut self) -> Result<bool, KvError> {
-        Ok(self.raw_get(ID_BOUND)?.is_some())
+        if let Some(b) = self.bound {
+            return Ok(b);
+        }
+        let b = self.raw_get(ID_BOUND)?.is_some();
+        self.bound = Some(b);
+        Ok(b)
     }
 
     /// The unlocked identity's fleet has bound this device: from now on only it unlocks here, until release.
@@ -637,12 +644,15 @@ impl KVault {
             self.put_names(Class::Identity, &[])?;
         }
         self.raw_put(ID_BOUND, &[1])?;
+        self.bound = Some(true);
         Ok(())
     }
 
     /// Release the device (a completed departure, or the developer's `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the device-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
     pub fn release(&mut self) -> Result<usize, KvError> {
         let n = self.wipe_identity()?;
+        // The cached mark forgotten first: a delete that fails part way leaves it read again from the flash.
+        self.bound = None;
         for name in [ID_BOUND, ID_UNLOCK, ID_SECRET] {
             let a = self.addr(Class::Device, name)?;
             self.vault.delete(&a, now())?;

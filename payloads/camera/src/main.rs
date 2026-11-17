@@ -92,6 +92,15 @@ macro_rules! say {
     }};
 }
 
+/// An open's step, said on the console and kept in the flash log before it is taken (ferros_sys `console_flash`): an open that hangs the SoC then names its last step after the reset, when the RAM is gone (2026-11-16: the Pro reset in an open after its switch on, nothing of the later steps kept).
+macro_rules! step {
+    ($g:expr, $($t:tt)*) => {{
+        let mut l = Line { b: [0; 256], n: 0 };
+        let _ = write!(l, $($t)*);
+        ferros_sys::console_flash($g, &l.b[..l.n]);
+    }};
+}
+
 /// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
@@ -378,6 +387,11 @@ static NOW_FORMAT: AtomicU64 = AtomicU64::new(10);
 /// The frame thread's time answering the front end (counter ticks, summed and the most in one answer) and frames whose buffer was not the one the ring named (a slit ring's: the frame's probe did not move, so it landed elsewhere, its descriptor released after the frame began).
 static BUSY: AtomicU64 = AtomicU64::new(0);
 static BUSY_MOST: AtomicU64 = AtomicU64::new(0);
+/// From an answer's start to its index write (counter ticks: answers that wrote it, summed, the most): the part of the answer the frame's blanking must hold (2026-11-16, kernlock).
+static IDX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Quiet spells on a working line: with the front end's status holding bits (an answer its interrupt never brought), and with it clear.
+static QUIET_FOUND: AtomicU64 = AtomicU64::new(0);
+static QUIET_SEEN: AtomicU64 = AtomicU64::new(0);
 static LATE: AtomicU64 = AtomicU64::new(0);
 /// Set when the long ring's last descriptor was given: the stream ends there (`RING`).
 static RING_END: AtomicU64 = AtomicU64::new(0);
@@ -544,10 +558,35 @@ fn slit_turn(n: u64) {
     ferros_sys::dma_barrier();
 }
 
-/// The front end answered once: its aggregate and loch0's image status read, every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and on a frame's DMA_DONE the ring's turn (`ring_turn`), the engine's index advanced and the frame counted.
+/// The front end answered once: loch0's image status read; on a frame's DMA_DONE the ring's turn (`ring_turn`) and the engine's index advanced at once; then every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and the frame counted.
+/// The index first (2026-11-16, kernlock): the next descriptor must be released before the next frame begins, so the frame's blanking (128 lines, about 400 us, at the main's 96 a second) has to hold the interrupt's wake and everything the answer does before the index write; with the 56 acknowledgements ahead of it (about 170 us of register syscalls) the stream lost every other frame and stopped.
+/// The acknowledgements clear the front end's status words (loch0's image status among them, read again there); the descriptor engine has its own index, so the order between the two is not the front end's.
 fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let t0 = ferros_sys::now();
     let img = rd(g, ferros_cam::IMG_STATUS);
+    if img & ferros_cam::IMG_DMA_DONE != 0 {
+        // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
+        let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
+        let n = FRAMES.load(Ordering::Relaxed) + 1;
+        if SLITS.load(Ordering::Relaxed) != 0 {
+            slit_turn(n);
+        } else {
+            ring_turn(n, more.then_some((*idx / STEP) as u64));
+        }
+        // The next descriptor. Never round the ring: back to 0 the front end stops for good (`RING`). At the ring's end the index is left where it is, the console says so, and the stream ends with its last descriptor (the FRAME that finds no frame closes).
+        if more {
+            *idx += STEP;
+            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
+            let t = ferros_sys::now() - t0;
+            IDX[0].fetch_add(1, Ordering::Relaxed);
+            IDX[1].fetch_add(t, Ordering::Relaxed);
+            IDX[2].fetch_max(t, Ordering::Relaxed);
+            if *idx == RING_N.load(Ordering::Relaxed) as u32 * STEP {
+                RING_END.store(1, Ordering::Relaxed);
+                say!(g, "camera: the ring's last descriptor given after A#{} frames\n", FRAMES.load(Ordering::Relaxed) + 1);
+            }
+        }
+    }
     for &a in cam().ack.iter() {
         let v = rd(g, a);
         wr(g, a, v);
@@ -562,28 +601,11 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}\n", if pd { " with its PD path" } else { ", its PD path left off" });
     }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
-        // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
-        let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
-        let n = FRAMES.load(Ordering::Relaxed) + 1;
-        if SLITS.load(Ordering::Relaxed) != 0 {
-            slit_turn(n);
-        } else {
-            ring_turn(n, more.then_some((*idx / STEP) as u64));
-        }
-        // The next descriptor. Never round the ring: back to 0 the front end stops for good (`RING`). At the ring's end the index is left where it is, the console says so, and the stream ends with its last descriptor (the FRAME that finds no frame closes).
-        if more {
-            *idx += STEP;
-            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
-            if *idx == RING_N.load(Ordering::Relaxed) as u32 * STEP {
-                RING_END.store(1, Ordering::Relaxed);
-                say!(g, "camera: the ring's last descriptor given after A#{} frames\n", FRAMES.load(Ordering::Relaxed) + 1);
-            }
-        }
         FRAME_AT.store(eagle_ns(), Ordering::Release);
         let n = FRAMES.fetch_add(1, Ordering::AcqRel) + 1;
         if n == 1 {
             let us = ferros_sys::us_since(OPEN_AT.load(Ordering::Relaxed));
-            say!(g, "camera: first frame A#{} ms after the open\n", us / 1000);
+            step!(g, "camera: first frame A#{} ms after the open (open step: first frame)\n", us / 1000);
         }
         ferros_sys::wake(&FRAMES, 4);
     }
@@ -593,8 +615,13 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
 }
 
 extern "C" fn frame_thread(g: u64) -> ! {
-    // Not pinned (measured on the Pro, b898, 2026-11-16): pinned to the X3 the main's stream at 96 a second stopped after 10 frames and the ultrawide's above about 38, pinned to one A715 (core 7) the main's stopped too; unpinned, with a consumer leaving one A715 free, 256 frames at 97 (main) and 48 (ultrawide) a second ran clean. A consumer on all four A715s at those rates starves it (cambench, b897): leave one free.
+    // Not pinned (measured on the Pro, b898 and kernlock, 2026-11-16): pinned to the X3 the main's stream at 96 a second stopped within 19 frames (the X3 runs the service loop, the render thread and ahau), pinned to core 7 within 5 (a consumer thread there is never preempted for it); unpinned with the kernel's `dev first` (or `dev core 7` with it) 2048 frames ran clean with consumers on all four A715s (docs/CAMERA.md "The kernel lock and the frame thread").
     let line = cap(g, S_IRQ);
+    // A measuring build pins it (FERROS_CAM_PIN, a core mask in hex: G#100 the X3, G#80 core 7), then sleeps a millisecond so the pin takes at the next reschedule (kernlock, 2026-11-16: the wake's latency pinned and not).
+    if let Some(m) = option_env!("FERROS_CAM_PIN").and_then(|s| u64::from_str_radix(s, 16).ok()) {
+        ferros_sys::pin(m);
+        ferros_sys::sleep_until(ferros_sys::now() + (ferros_sys::freq() >> 10));
+    }
     // Idle until the stream starts: the server rings RUN.
     while RUN.load(Ordering::Acquire) == 0 {
         ferros_sys::wait(&RUN, 0, 0);
@@ -622,8 +649,18 @@ extern "C" fn frame_thread(g: u64) -> ! {
             TICKING.store(1, Ordering::Relaxed);
             say!(g, "camera: no interrupt on SPI 479 in A#{} us of the stream; answering on a A#{} us tick (front end aggregate G#{:X}, image G#{:X}, engine G#{:X} index G#{:X})\n", ferros_sys::us_since(started), tick_us(), rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
             answer(g, &mut idx, &mut enabled);
+        } else {
+            // The line works and was quiet for `QUIET_US`: either the stream stopped, or the front end waits on an answer whose interrupt never came (2026-11-16, kernlock: streams at 96 a second stopped with every answer prompt). Its status words say which; one that holds bits is answered, counted, and said once.
+            let (cmn, img) = (rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS));
+            if cmn | img != 0 {
+                if QUIET_FOUND.fetch_add(1, Ordering::Relaxed) == 0 {
+                    say!(g, "camera: the line quiet A#{} us with the front end waiting (aggregate G#{cmn:X}, image G#{img:X}, engine G#{:X} index G#{:X}, our index G#{idx:X}); answered\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+                }
+                answer(g, &mut idx, &mut enabled);
+            } else if QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
+                say!(g, "camera: the line quiet A#{} us, the front end's status clear (engine G#{:X} index G#{:X}, our index G#{idx:X}): the stream stopped by itself\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+            }
         }
-        // Else the line works and was quiet for two frame periods: nothing is pending, and the stream has likely stopped.
     }
 }
 
@@ -998,6 +1035,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         return Err(Fail::Switch);
     }
     let powered = ferros_sys::us_since(t0);
+    step!(g, "camera: open step: switch on; the sensor's identity and init next\n");
     let mut id = [0u8; 2];
     bus.write_read(c.addr, &c.id_reg, &mut id).map_err(Fail::Sensor)?;
     if id != c.id_val {
@@ -1028,7 +1066,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             return Err(Fail::Init(k as u32, e));
         }
     }
-    say!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
+    step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
     // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     let arr = &ccs::ARRAYS[c.id as usize];
     if let Some(m) = mode {
@@ -1091,6 +1129,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     ferros_sys::dma_barrier();
+    step!(g, "camera: open step: job placed; the CPU's writes and the engine next\n");
     say!(g, "camera: job placed: A#{} address registers, A#{} high halves (A#{} left as captured), A#{} loads, A#{} descriptors; A#{n_full} full copies of A#{list_len} bytes (the image's words A#{w_lo} and A#{w_hi}), A#{n_slim} slim of A#{slim_len}; A#{regeom} program words of geometry rewritten ({:?}) for A#{} x A#{} at G#{:X} a line\n", m_.addr_regs, m_.highs, m_.highs_left, m_.loads, m_.ring, scope, fe.w, fe.h, fe.stride);
     // The CPU's setup writes before the engine starts, in the capture's order, their geometry the front end's; without them the engine applies the program and the frame writer stays idle (2026-10-20).
     let (mut n, mut cpu_geom) = (0, 0);
@@ -1161,6 +1200,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     STATE.store(1 << QUEUED, Ordering::Release);
     RING_BUFS.store(if slit { 0 } else { ring as u64 }, Ordering::Release);
     ferros_sys::dma_barrier();
+    step!(g, "camera: open step: the engine starting\n");
     wr(g, pd + 0x2C, 1);
     wr(g, pd + 0x40, 0x1F);
     wr(g, pd + 0x20, 0);
@@ -1172,6 +1212,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     wr(g, pd + 0x34, 0);
     wr(g, pd + 0x28, 1);
     // The camera's receiver last, as a camera open does it, its channels' sizes and types the front end's: enabling the link first left the front end latching its configuration and never seeing a frame start (2026-10-20).
+    step!(g, "camera: open step: engine started; the receiver next\n");
     let mut rx_geom = 0;
     for &(a, v) in c.rx_start.iter() {
         let nv = geom::value(a as u32, v, &from, &fe, scope);
@@ -1201,12 +1242,13 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     FRAMES.store(0, Ordering::Release);
+    step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP);
     RUN.store(1, Ordering::Release);
     ferros_sys::wake(&RUN, 1);
-    say!(g, "camera: streaming A#{} ms after the open\n", ferros_sys::us_since(t0) / 1000);
+    step!(g, "camera: streaming A#{} ms after the open (open step: stream on)\n", ferros_sys::us_since(t0) / 1000);
     // Mid-stream, when asked: the mode written once the first frame has landed (October's order; the sensor took one change a session and then needed a cold boot).
     if let (Some(m), true) = (mode, s.flags & F_MID != 0) {
         let until = ferros_sys::now() + ferros_sys::freq() * FRAME_LATE_US / 1_000_000;
@@ -1244,6 +1286,11 @@ fn close(g: u64) {
         }
     }
     say!(g, "camera: closed after A#{} frames (A#{} answers, A#{} on the line{}); image status bits seen G#{:X}; switch off {}\n", FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), if TICKING.load(Ordering::Relaxed) == 1 { ", the rest on the tick" } else { "" }, IMG_SEEN.load(Ordering::Relaxed), if ok { "done" } else { "refused" });
+    // The answer's cost: in all, and to its index write (the part the blanking must hold).
+    // WHY the max: an open that never streamed has no answers, and its mean is read as 0 rather than divided by zero.
+    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+    let (n, a) = (IDX[0].load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed));
+    say!(g, "camera: answers A#{a}, A#{} us each on average, A#{} us the most; index writes A#{n}, A#{} us into the answer on average, A#{} us the most\n", us(BUSY.load(Ordering::Relaxed)) / a.max(1), us(BUSY_MOST.load(Ordering::Relaxed)), us(IDX[1].load(Ordering::Relaxed)) / n.max(1), us(IDX[2].load(Ordering::Relaxed)));
 }
 
 /// After the eighth frame, once an open: every output's extent, sampled every 256 bytes against the pattern (docs/CAMERA.md: "measure which of the 22 the main camera's job really writes"): its slot, how many points moved, the last.

@@ -84,7 +84,10 @@ fn lock() {
         // The wait is timed only when there is one: the uncontended take reads no counter.
         let t0 = crate::platform::cntpct();
         let mut spins = 0u32;
+        // The holder this wait was behind, as last seen (devsched `irq_lock_wait`).
+        let mut by = (0u64, 0u64);
         while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            by = (LOCK_SITE.load(Ordering::Relaxed), crate::devsched::WHAT.load(Ordering::Relaxed));
             core::hint::spin_loop();
             // Every 4096th turn: is the holder stalled past half the watchdog's window? (platform::stall_check: one SGI to it, its place kept for the post-mortem.) WHY wrapping: a spin past 2^32 turns (minutes, a hang the watchdog ended long before) only feeds this every-4096th test, where a wrap changes nothing.
             spins = spins.wrapping_add(1);
@@ -93,12 +96,19 @@ fn lock() {
             }
         }
         let w = &LOCK_WAIT[core()];
+        let waited = crate::platform::cntpct() - t0;
         w[0].fetch_add(1, Ordering::Relaxed);
-        w[1].fetch_add(crate::platform::cntpct() - t0, Ordering::Relaxed);
+        w[1].fetch_add(waited, Ordering::Relaxed);
+        // A thread running for its device's interrupt waited: the part of a device's deadline the lock took, and behind whom.
+        if ON_IRQ[core()].load(Ordering::Relaxed) {
+            crate::devsched::irq_lock_wait(waited, by.0, by.1);
+        }
     }
     let site = site_word(core::panic::Location::caller());
     HOLDER.store(core() + 1, Ordering::Relaxed);
     LOCK_SITE.store(site, Ordering::Relaxed);
+    // Not a syscall's hold until the syscall path says it is (`ferros_el0_trap`).
+    crate::devsched::WHAT.store(0, Ordering::Relaxed);
     LOCK_AT.store(crate::platform::cntpct(), Ordering::Relaxed);
     // Who holds it and from where, for the post-mortem (a hang with the lock held names its core and its call site).
     crate::platform::note(0, core() as u64 + 1 | site << 8);
@@ -117,6 +127,12 @@ fn unlock() {
         LONG_HOLD[i][1].store(held, Relaxed);
         LONG_HOLD[i][2].store(LOCK_SITE.load(Relaxed), Relaxed);
     }
+    // Every hold by length, by syscall or site, the long ones kept and traced (devsched.rs, `diag lock`); still holding, so the trace's ring is ours.
+    if crate::devsched::hold(LOCK_AT.load(Relaxed), held, LOCK_SITE.load(Relaxed)) {
+        let what = crate::devsched::WHAT.load(Relaxed);
+        // WHY the min: the trace's detail is 16 bits of microseconds; a hold of 65 ms or more reads as 65535 rather than wrapping to a short one.
+        tr(TR_LOCK, if what >> 63 != 0 { (what >> 16 & 0xFF) as usize } else { 0xFF }, (held * 1_000_000 / crate::platform::cntfrq()).min(0xFFFF));
+    }
     HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
@@ -132,6 +148,10 @@ static mut CURRENT: [Option<usize>; 16] = [None; 16];
 fn cur_get() -> Option<usize> {
     unsafe { (*(&raw const CURRENT))[core()] }
 }
+/// Per core: a yield asked of it for a device thread (devsched `first`, `make_room`), so it is asked once; cleared when the core next switches.
+static YIELD: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+/// Per core: the thread it runs began its run for its device's interrupt (`Thread::on_irq`), readable without the lock by `lock` on the same core.
+static ON_IRQ: [core::sync::atomic::AtomicBool; 16] = [const { core::sync::atomic::AtomicBool::new(false) }; 16];
 /// When each core's current thread began running there (counter ticks): what `cur_set` charges to the thread it takes off (`Thread::ran`).
 static mut RUN_AT: [u64; 16] = [0; 16];
 /// The register grants of the process each core runs (`Grants`, null for none): what its MMIO syscall reads without the kernel lock (`mmio_fast`). Written only by `cur_set` on its own core, under the lock, together with `CURRENT`; read only by that same core.
@@ -151,12 +171,29 @@ fn cur_set(t: Option<usize>) {
     }
     // A thread made runnable by a call, a reply or its device now runs: how long that took (`WAKE_LAT`).
     if let Some(x) = t.and_then(th) {
+        let woke_at = x.woke;
         if x.woke != 0 {
             // WHY saturating: the stamp may come from another core, and a counter read is not ordered by the lock (an `mrs`, not a memory access), so it can read a tick past this one; a wrap would put 2^64 ticks in the longest wait.
             wake_count(x.wkind as usize, now.saturating_sub(x.woke));
             x.woke = 0;
         }
+        x.last_core = c as u8;
+        x.on_irq = x.urgent;
+        x.irq_run_at = now;
+        x.urgent = false;
+        // A device line's waiter runs: from its interrupt to here, per line (devsched.rs, `diag dev`); the trace's event first, as this run may freeze it.
+        if x.irq_line != 0 {
+            let i = x.irq_line as usize - 1;
+            let (at, landed, noticed) = (x.irq_at, x.irq_core as usize, x.irq_noticed as usize);
+            x.irq_line = 0;
+            // WHY saturating: `at` is another core's counter read (see `ran`).
+            tr(TR_IRQ_RUN, t.unwrap(), (now.saturating_sub(at) * 1_000_000 / crate::platform::cntfrq()).min(0xFFFF));
+            crate::devsched::ran(i, IRQS[i].intid as usize, at, woke_at, now, landed, noticed, c);
+        }
     }
+    // A yield asked of this core is answered by whatever it runs now (devsched `first`, `ferros_el0_preempt`).
+    YIELD[c].store(0, core::sync::atomic::Ordering::Relaxed);
+    ON_IRQ[c].store(t.and_then(th).is_some_and(|x| x.on_irq), core::sync::atomic::Ordering::Relaxed);
     prof_note(c, t);
 }
 /// The profiler's view of what this core runs (prof.rs): the thread, its process's epoch, its image base and its arc, which the tick reads without the lock; and, while a run is on, the thread's names, kept once for the host.
@@ -215,7 +252,27 @@ pub fn kick(mask: u16) {
     }
 }
 fn mask_of(t: usize) -> u16 {
-    k().threads.get(t).and_then(|x| x.as_ref()).map(|x| x.mask).unwrap_or(0xFFFF)
+    k().threads.get(t).and_then(|x| x.as_ref()).map(may_run).unwrap_or(0xFFFF)
+}
+/// The cores thread `x` may run on now, among those up: its mask (a pin to the X3 meaning the kernel's core), narrowed by the dedicated core (devsched `core`: a device thread whose mask holds it runs there alone, every other thread anywhere else it may), and every core up when none of its own is.
+fn may_run(x: &Thread) -> u16 {
+    let up = cores_up();
+    let mask = if x.mask & MASK_BIG != 0 { (x.mask & !MASK_BIG) | kernel_mask() } else { x.mask };
+    let dc = crate::devsched::CORE.load(core::sync::atomic::Ordering::Relaxed) & up;
+    let m = if dc == 0 {
+        mask
+    } else if x.device && mask & dc != 0 {
+        dc
+    } else if mask & !dc & up != 0 {
+        mask & !dc
+    } else {
+        mask
+    };
+    if m & up == 0 { up } else { m & up }
+}
+/// Whether thread `x` may run on this core.
+fn runs_here(x: &Thread) -> bool {
+    may_run(x) >> core() & 1 != 0
 }
 /// A thread that pets, made runnable again: its pause (a wait on the world, or a call) ends here.
 fn unpause(t: usize) {
@@ -269,7 +326,7 @@ fn handoff(t: usize, kind: usize) {
 /// Thread `t` to the front with no kick, when this core will take it at its next pick (allowed here, its process not held); false, nothing done, otherwise.
 fn place_here(t: usize) -> bool {
     let kk = k();
-    let here = th(t).is_some_and(|x| allowed_here(x.mask) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
+    let here = th(t).is_some_and(|x| runs_here(x) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
     if here {
         unpause(t);
         kk.runnable.push_front(t);
@@ -277,8 +334,8 @@ fn place_here(t: usize) -> bool {
     }
     here
 }
-/// A woken thread to the front while it has front credit left (`ran` under a slice), else to the back (see above).
-fn enqueue_woken(t: usize, kind: usize) {
+/// A woken thread to the front while it has front credit left (`ran` under a slice), else to the back (see above). True when it went to the front.
+fn enqueue_woken(t: usize, kind: usize) -> bool {
     woken(t, kind);
     let slice = crate::platform::cntfrq() / 1000 * SLICE_MS;
     // A thread still current here (a server queued after its reply) has its run so far counted too: `cur_set` charges it only as it leaves.
@@ -286,10 +343,90 @@ fn enqueue_woken(t: usize, kind: usize) {
     let now_run = if cur_get() == Some(t) { now - unsafe { (*(&raw const RUN_AT))[c] } } else { 0 };
     if th(t).is_some_and(|x| credit(x, now) + now_run < slice) {
         enqueue_front(t);
+        true
     } else {
         SPENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         enqueue_back(t);
+        false
     }
+}
+
+/// A device thread `t` woken by its line `line` (IRQS index) with front credit left, under devsched `first`: if no core it may run on is idle and the interrupt did not land on one of them (an interrupt taken at EL0 preempts what runs there already), the first such core running a compute thread, from the core `t` last ran on, is asked to yield (SGI 3, `ferros_el0_preempt`: its thread keeps its place at the front, behind `t`, which `pick_runnable` takes first). A core running a device thread is never asked. Under the kernel lock.
+fn make_room(t: usize, line: usize, landed: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(x) = th(t) else { return };
+    let m = may_run(x);
+    let cur = unsafe { &*(&raw const CURRENT) };
+    // The landing core is not taken as free: an interrupt it took in the kernel (its idle look, a syscall) preempted nothing, and it may go on to run a compute thread (2026-11-16, the dedicated core: 25 runs over 5 ms behind the camera's own server thread). One that preempted its thread shows that core idle here, or asks it again at no more cost than a second trip thru the scheduler.
+    let _ = landed;
+    if (0..16).any(|c| m >> c & 1 != 0 && cur[c].is_none()) {
+        return;
+    }
+    let start = x.last_core as usize;
+    for j in 0..16 {
+        // The cores from the last one it ran on, round the sixteen a mask names.
+        let c = (start + j) & 15;
+        let Some(r) = cur[c] else { continue };
+        if m >> c & 1 == 0 || th(r).is_none_or(|y| y.on_irq && !over_budget(r, y)) || YIELD[c].load(Relaxed) != 0 {
+            continue;
+        }
+        YIELD[c].store(1, Relaxed);
+        crate::devsched::LAT[line][9].fetch_add(1, Relaxed);
+        tr(TR_YIELD_ASK, t, c as u64);
+        // SGI 3 to core c, as `hold` sends it.
+        unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
+        return;
+    }
+}
+
+/// The core a line its thread `x` now waits on is routed to (SYS_IRQ_WAIT, the thread on this core): the kernel's core, as since 2026-11-13, unless devsched `follow` or `core` is on; then the one core `x` may run on when it has one (its pin, or the dedicated core), else this core when `x` may run here (where it waits from, so it likely runs here next), else the kernel's.
+/// A worker switched off (the dark profile, a reload) takes its lines home first (`irq_routes_home`), so no line is left routed to a core that is off.
+fn irq_route(x: &Thread) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let home = kernel_mask().trailing_zeros() as usize;
+    if !crate::devsched::FOLLOW.load(Relaxed) && crate::devsched::CORE.load(Relaxed) == 0 {
+        return home;
+    }
+    let m = may_run(x);
+    if m.count_ones() == 1 {
+        m.trailing_zeros() as usize
+    } else if crate::devsched::FOLLOW.load(Relaxed) && m >> core() & 1 != 0 {
+        core()
+    } else {
+        home
+    }
+}
+
+/// Every granted line routed back to the kernel's core: before workers go off (smp `stop_all`), since a line routed to a core that is off is never delivered (killswitch.rs `enable_spi`). Only the routing register is written; whether a line is enabled is left as it is.
+pub fn irq_routes_home() {
+    let home = kernel_mask().trailing_zeros() as usize;
+    for l in IRQS {
+        crate::killswitch::route_spi(l.intid, home);
+    }
+}
+
+/// A run for a device's interrupt is protected from yields (`make_room`) for 2^10 us (devsched `FIRST_BUDGET_US`; the camera's answer measured 100 to 340 us): past it the thread runs on but loses the priority of that wake, and the flash log says so once a boot.
+fn over_budget(t: usize, y: &Thread) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let budget = crate::platform::cntfrq() * crate::devsched::FIRST_BUDGET_US / 1_000_000;
+    // WHY saturating: the stamp is another core's counter read (`cur_set` on that core), which this read is not ordered against.
+    let over = crate::platform::cntpct().saturating_sub(y.irq_run_at) > budget;
+    if over && !crate::devsched::BUDGET_SAID.swap(true, Relaxed) {
+        crate::flashlog::line(&alloc::format!("dev first: {} ran past its 2^10 us on its device's interrupt; it runs on without the priority (said once a boot)", alloc::string::String::from_utf8_lossy(&thread_name(t))));
+    }
+    over
+}
+
+/// A device line's interrupt taken for its waiter `x` (`wake_sleepers`): when it came and on which core (`.Lirq`'s stamps), which line, and the core noticing it now, for the measure of its run (`cur_set`). The stamps were written before the pending byte this caller just took; the fence orders the reads after that take.
+fn irq_stamp(x: &mut Thread, intid: usize) {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    let line = IRQS.iter().position(|l| l.intid as usize == intid);
+    x.irq_line = line.map_or(0, |i| i as u8 + 1);
+    unsafe {
+        x.irq_at = core::ptr::read_volatile(&raw const __irq_at[intid]);
+        x.irq_core = core::ptr::read_volatile(&raw const __irq_core[intid]);
+    }
+    x.irq_noticed = core() as u8;
 }
 /// The leak of the front credit: an eighth of the time passing (2^3). A thread that runs less than an eighth of a core over time never spends its credit, so a driver woken by its device (touch, a few % of a core) or a server woken by its callers is never sent behind the queue for its work; one that runs more spends it a slice later.
 const CREDIT_LEAK_LOG2: u32 = 3;
@@ -694,6 +831,21 @@ struct Thread {
     /// When a wake that `WAKE_LAT` measures made it runnable (0: none pending), and which kind (`WAKE_*`).
     woke: u64,
     wkind: u8,
+    /// The interrupt that woke it, for its run's measure (devsched `ran`): when it came (`__irq_at`), the line (`IRQS` index plus one, 0 none), the core it landed on and the core that noticed it.
+    irq_at: u64,
+    irq_line: u8,
+    irq_core: u8,
+    irq_noticed: u8,
+    /// A device thread: it has waited on an interrupt (SYS_IRQ_WAIT). Never asked to yield for another (devsched `first`), and the dedicated core's (devsched `core`).
+    device: bool,
+    /// Woken by its own device's interrupt with front credit left and not yet run: picked ahead of every other thread while devsched `first` is on.
+    urgent: bool,
+    /// Its run now began as an urgent one (its device's interrupt): never asked to yield for another device thread meanwhile; any other run may be (devsched `first`, `make_room`).
+    on_irq: bool,
+    /// When its current run began (`cur_set`): an `on_irq` run's budget counts from here (`over_budget`).
+    irq_run_at: u64,
+    /// The core it last ran on: where a yield is asked first.
+    last_core: u8,
     /// Its word wait (`State::Waiting` on an arc word) ends for a call to an endpoint it polls (SYS_WAIT x3 bit 1, `wake_server`).
     wait_call: bool,
     /// The name it gave itself (SYS_THREAD_NAME: std's thread name), its first 16 bytes, zero past the end; all zero for none. A fault names the thread by it (`fault_report`).
@@ -729,12 +881,6 @@ pub fn kernel_mask() -> u16 {
 /// The cores that are up: the kernel's, and the workers smp.rs reports.
 fn cores_up() -> u16 {
     kernel_mask() | ((crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16) << 4)
-}
-/// Whether thread `t` may run on this core. A pin to the X3 means the kernel's core, wherever that is.
-fn allowed_here(mask: u16) -> bool {
-    let mask = if mask & MASK_BIG != 0 { (mask & !MASK_BIG) | kernel_mask() } else { mask };
-    let here = 1u16 << core();
-    mask & here != 0 || mask & cores_up() == 0
 }
 
 /// The most of a process's last console line kept for its end's flash log line (`Process::words`).
@@ -850,10 +996,21 @@ const TR_PARK: u8 = 10;
 const TR_POLL_MISS: u8 = 11;
 const TR_RECV_BLOCK: u8 = 12;
 const TR_YIELD: u8 = 13;
-const TR_NAMES: [&str; 14] = ["-", "call", "deliver", "wake-poll", "reply", "sleep", "wake", "switch", "run", "preempt", "park", "poll-miss", "recv-block", "yield"];
+/// A hold of the kernel lock past devsched's long mark: the thread whose syscall held it (255 the kernel's own), microseconds.
+const TR_LOCK: u8 = 14;
+/// A device line's waiter ran: the thread, microseconds from the interrupt.
+const TR_IRQ_RUN: u8 = 15;
+/// A core asked to yield for a device thread (devsched `first`): the thread asked for, the core.
+const TR_YIELD_ASK: u8 = 16;
+/// A device line's interrupt noticed (`wake_sleepers`): the waiter, the core it landed on in bits 8-15 and the INTID's low byte below.
+const TR_IRQ: u8 = 17;
+const TR_NAMES: [&str; 18] = ["-", "call", "deliver", "wake-poll", "reply", "sleep", "wake", "switch", "run", "preempt", "park", "poll-miss", "recv-block", "yield", "lock-held", "irq-run", "yield-ask", "irq"];
 
-/// One scheduling event into the ring.
+/// One scheduling event into the ring, unless the ring is frozen (devsched `FREEZE_*`: a late device thread stops it so what led there stays).
 fn tr(ev: u8, who: usize, detail: u64) {
+    if crate::devsched::FROZEN.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let kk = k();
     let now: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
@@ -930,6 +1087,9 @@ fn sched_counters(out: &mut Vec<u8>) {
 pub fn sched_reset() {
     use core::sync::atomic::Ordering::Relaxed;
     WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
+    // The lock's holds and the device lines' runs with them (devsched.rs), and the trace thawed.
+    crate::devsched::lock_reset();
+    crate::devsched::lat_reset();
 }
 fn sched_report_locked(out: &mut Vec<u8>) {
     let kk = k();
@@ -1019,6 +1179,10 @@ fn proc_of(t: usize) -> Option<&'static mut Process> {
     k().procs.get_mut(pi).and_then(|x| x.as_mut())
 }
 /// A thread's name for the console and the trace: its process's name, with `.N` for every thread but the process's first.
+/// A thread's name for a report outside the lock (devsched.rs), the lock taken unless this core holds it.
+pub fn thread_name_of(t: usize) -> Vec<u8> {
+    with_lock_held_or(|| thread_name(t))
+}
 fn thread_name(t: usize) -> Vec<u8> {
     let kk = k();
     let Some(Some(x)) = kk.threads.get(t) else { return alloc::format!("t{t}").into_bytes() };
@@ -1471,6 +1635,11 @@ fn deadlines_sync() {
 /// One byte per INTID, set by `.Lirq` when a granted line fires (the line is masked at the same time), cleared by `irq_wait` when a thread takes it.
 #[unsafe(no_mangle)]
 pub static mut __irq_pending: [u8; 1024] = [0; 1024];
+/// Per INTID, written by `.Lirq` before the pending byte: the counter when a granted line's interrupt was taken, and the core that took it (MPIDR Aff1). What devsched measures a device thread's wake from.
+#[unsafe(no_mangle)]
+pub static mut __irq_at: [u64; 1024] = [0; 1024];
+#[unsafe(no_mangle)]
+pub static mut __irq_core: [u8; 1024] = [0; 1024];
 /// Threads block on an interrupt as `Waiting(intid, deadline)`: an INTID is far below any arc address, so the two never meet.
 fn irq_pending_take(intid: u32) -> bool {
     unsafe {
@@ -3366,6 +3535,8 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
+/// The switches SYS_POWER and `power_offs_apply` run with the kernel lock let go (2026-11-16, kernlock): each a kernel-side sequence for a device whose driver reaches it only thru lock-free register syscalls, and whose hardware no path under the lock touches from another core. Bluetooth's is pcie1's too (off before WL_REG_ON is cycled): it held the lock 19.5 ms twice in a camera stream. Not the camera's (its region's S2MPU fence), the USB link's, the sensors', the display's, the panel's nor android's: unaudited, they keep the lock.
+const SWITCH_UNLOCKED: [&str; 6] = ["gps", "nfc", "bt", "touch", "amp", "torch"];
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
@@ -3491,14 +3662,15 @@ pub fn power_offs_apply() {
         return;
     }
     for i in 0..POWERS.len() {
-        // Taken and switched under one hold of the lock: a process switching it on again meanwhile owns it, and it stays on.
-        let done = with_lock(|| unsafe {
-            if POWER_OFF_PENDING >> i & 1 == 0 {
-                return None;
-            }
+        // Taken under the lock; a switch in `SWITCH_UNLOCKED` switched with it let go (as SYS_POWER switches it, 2026-11-16). A process switching it on again can only do so on this core, so not before this returns: then it owns it and it stays on.
+        let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
+        // Whether it was pending, and a switch not in `SWITCH_UNLOCKED` switched under this same hold, as before.
+        let (pending, under) = with_lock(|| unsafe {
+            let p = POWER_OFF_PENDING >> i & 1 != 0;
             POWER_OFF_PENDING &= !(1 << i);
-            Some((POWERS[i].set)(false))
+            (p, (p && !free).then(|| (POWERS[i].set)(false)))
         });
+        let done = if pending && free { Some((POWERS[i].set)(false)) } else { under };
         if let Some(ok) = done {
             crate::flashlog::line(&alloc::format!("power {}: off, its process ended ({})", POWERS[i].name, if ok { "done" } else { "the switch refused" }));
         }
@@ -3571,7 +3743,11 @@ fn switch_to_next(f: &mut Frame) -> bool {
 fn pick_runnable() -> Option<usize> {
     let kk = k();
     // A thread of a held process waits in the queue until the hold ends (`hold_try`): its arc is moving or changing its mask.
-    let i = kk.runnable.iter().position(|&t| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| allowed_here(x.mask) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some())))?;
+    let ok = |t: usize| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| runs_here(x) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
+    // devsched `first`: a thread its device's interrupt woke (with front credit left) goes ahead of every other, wherever the queue holds it.
+    let urgent = |t: usize| kk.threads.get(t).and_then(|x| x.as_ref()).is_some_and(|x| x.urgent);
+    let first = crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
+    let i = first.then(|| kk.runnable.iter().position(|&t| urgent(t) && ok(t))).flatten().or_else(|| kk.runnable.iter().position(|&t| ok(t)))?;
     let t = kk.runnable.remove(i);
     runnable_sync();
     t
@@ -3667,6 +3843,8 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         }
     }
     lock();
+    // What this hold is (devsched `WHAT`, `diag lock`): the syscall, its x1's low byte, the thread.
+    crate::devsched::WHAT.store(1 << 63 | (f.x[8] & 0xFF) | (f.x[1] & 0xFF) << 8 | (cur_get().unwrap_or(0xFFFF) as u64 & 0xFFFF) << 16, core::sync::atomic::Ordering::Relaxed);
     let r = el0_trap(f);
     unlock();
     crate::prof::leave();
@@ -3750,7 +3928,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false, label: [0; 16] });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -3795,6 +3973,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
             match p.lookup(&token).map(|i| p.cspace[i].object) {
                 Some(Object::Irq(i)) => {
                     let intid = IRQS[i].intid;
+                    // A thread that waits on a line is a device thread from now on (devsched: never asked to yield for another, and the dedicated core's).
+                    if nr == SYS_IRQ_WAIT {
+                        t.device = true;
+                    }
                     if nr == SYS_IRQ_ACK {
                         f.x[0] = irq_ack_guarded(i, intid, &p.name);
                         0
@@ -3803,6 +3985,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         f.x[0] = ERR;
                         0
                     } else if irq_pending_take(intid) {
+                        // Back at once: the interrupt came while the thread was not waiting (devsched: a late wait, and how long the interrupt sat).
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                        // WHY saturating: the stamp is another core's counter read (devsched `ran`).
+                        crate::devsched::late(i, crate::platform::cntpct().saturating_sub(unsafe { core::ptr::read_volatile(&raw const __irq_at[intid as usize]) }));
                         f.x[0] = 0;
                         0
                     } else if kk.endpoints.iter().any(|e| e.poller == Some(cur) && !e.queue.is_empty()) {
@@ -3814,7 +4000,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         f.x[0] = ERR;
                         0
                     } else {
-                        crate::killswitch::enable_spi(intid);
+                        crate::killswitch::enable_spi_to(intid, irq_route(t));
                         let deadline = f.x[1];
                         let t_now: u64;
                         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
@@ -4125,8 +4311,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else {
                         f.x[1] == 1
                     };
-                    if (POWERS[i].set)(on) {
-                        power_owned(i, if on { p.epoch } else { 0 });
+                    // An audited switch runs with the kernel lock let go (2026-11-16, `diag lock`: the camera's on held it 42 to 66 ms, Bluetooth's for pcie1 19.5 ms twice, and a camera stream 400 us from its deadline died behind them): a switch is hardware sequences with their waits.
+                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (no `process` state; the flash log takes the lock itself); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
+                    // Only the switches in `SWITCH_UNLOCKED` (whose hardware nothing under the lock touches from another core); the rest keep the lock, as the camera's must while its region's fence (`cam_ask`, `cam_free`, under the lock on any core) writes the front end's S2MPUs its switch powers.
+                    let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
+                    let epoch = p.epoch;
+                    if free {
+                        unlock();
+                        // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
+                        unsafe { core::arch::asm!("msr daifclr, #2") };
+                    }
+                    let ok = (POWERS[i].set)(on);
+                    if free {
+                        unsafe { core::arch::asm!("msr daifset, #2") };
+                        lock();
+                    }
+                    if ok {
+                        power_owned(i, if on { epoch } else { 0 });
+                        // Its process ended on another core meanwhile (`kill_locked` found its thread here and left it `dying`): what it switched on is turned off as for any other ending.
+                        if k().procs.iter().flatten().any(|q| q.epoch == epoch && q.dying) {
+                            power_orphaned(epoch);
+                        }
                         0
                     } else {
                         ERR
@@ -4977,7 +5182,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         p.line_start = line[line.len() - 1] == b'\n';
                     }
                     pstore_since(at);
-                    let n = 2usize.min(f.x[4] as usize);
+                    // CONSOLE_FLASH in the reply length: the text goes to the flash log too, the line that survives a reset and a decayed DRAM (2026-11-16: a camera open died after its switch with nothing of its later steps kept). For a driver's few lines a session; each costs a flash-log write under this lock (up to 0.66 ms, `diag lock`).
+                    if f.x[4] & CONSOLE_FLASH != 0 {
+                        let text = alloc::format!("{}: {}", alloc::string::String::from_utf8_lossy(&p.name), alloc::string::String::from_utf8_lossy(msg));
+                        crate::flashlog::line(text.trim_end());
+                    }
+                    let n = 2usize.min((f.x[4] & !(CONSOLE_FLASH | CALL_LIVE)) as usize);
                     p.write(f.x[3], &b"ok"[..n]);
                     f.x[0] = n as u64;
                     0
@@ -5287,6 +5497,8 @@ fn fail_callers(cspace: &[CapEntry]) {
 
 /// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no server is receiving on the endpoint (the process that last received on it has ended, or none has received yet), at the call or later when its server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
 pub const CALL_LIVE: u64 = 1 << 63;
+/// Bit 62 of a console write's reply length: the line goes to the flash log as well (ferros_sys `console_flash`).
+pub const CONSOLE_FLASH: u64 = 1 << 62;
 
 /// Whether the process that last received on endpoint `ep` is alive (not ending).
 fn has_receiver(ep: usize) -> bool {
@@ -5947,13 +6159,22 @@ fn fault_report(f: &Frame, base: u64) {
 pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     lock();
     let mut held = None;
+    // A yield asked of this core for a device thread (devsched `first`, `make_room`), not the slice's end (the tick handler stops the slice timer): the thread keeps its place at the front, behind the urgent thread `pick_runnable` takes first, rather than waiting a queue's turn for a device's microseconds. Any other preemption (the slice's end, an interrupt taken at EL0, a hold) goes to the back as before: a thread put at the front for every interrupt would take a fresh slice ahead of the queue each time.
+    let ctl: u64;
+    unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
+    let asked = YIELD[core()].swap(0, core::sync::atomic::Ordering::Relaxed) != 0;
+    let keep = asked && ctl & 1 != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
                 p.frame = *f;
                 p.state = State::Runnable;
                 held = Some(p.proc);
-                enqueue_back(cur);
+                if keep {
+                    enqueue_front(cur);
+                } else {
+                    enqueue_back(cur);
+                }
             }
             tr(TR_PREEMPT, cur, 0);
         }
@@ -6010,8 +6231,20 @@ fn wake_sleepers() {
                 if a < 1024 && irq_pending_take(a as u32) {
                     p.state = State::Runnable;
                     p.frame.x[0] = 0;
-                    enqueue_woken(i, WAKE_IRQ);
+                    irq_stamp(p, a);
+                    let (line, landed) = (p.irq_line as usize, p.irq_core as usize);
+                    tr(TR_IRQ, i, (landed as u64) << 8 | (a as u64 & 0xFF));
+                    let front = enqueue_woken(i, WAKE_IRQ);
                     tr(TR_WAKE, i, a as u64);
+                    // With front credit left it is urgent (devsched `first`): picked first, and a core made free for it when none is.
+                    if front && line != 0 {
+                        if let Some(x) = th(i) {
+                            x.urgent = true;
+                        }
+                        if crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed) {
+                            make_room(i, line - 1, landed);
+                        }
+                    }
                     continue;
                 }
                 // A timed wait whose deadline passed: back with 2.
@@ -7060,12 +7293,15 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     if fixed != 0 && need > 1 << fixed {
         return Err("spawn: the image does not fit its fixed arc");
     }
+    spawn_step(7);
     let mut arc = if fixed != 0 { arc_alloc(1 << fixed, masked) } else { arc_alloc_room(need, ceiling, masked) }.ok_or("arc pool exhausted")?;
+    spawn_step(8);
     // Exact mode: the limit is what the image needs, rounded to the 16 bytes the stack pointer must keep; the arc around it is the power of two the pool hands out, its rest the room the limit can grow into.
     if exact {
         arc.limit = (need + 15) & !15;
     }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
+    spawn_step(9);
     build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len, bti)
 }
 
@@ -7226,7 +7462,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false, label: [0; 16] });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
     Ok((me, arc, in_off))
 }
 
@@ -7234,10 +7470,14 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
 fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     let read = unsafe { CAPSULES }.ok_or("spawn: no vault to read capsules from")?;
     let t0 = crate::platform::cntpct();
+    spawn_step(1);
     let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
+    spawn_step(2);
     let sealed = read(b"sealed").unwrap_or_default();
     let t_read = crate::platform::cntpct();
+    spawn_step(3);
     let g = crate::oracle::gate(&capsule)?;
+    spawn_step(4);
     // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck: every spawn holds the kernel lock while it reads and checks its capsule).
     let r = spawn_checked(name, &g, &sealed, objects);
     let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
@@ -7266,6 +7506,16 @@ fn push_dec(out: &mut ferros_console::ConRing, v: u64) {
     out.dec(ferros_console::KERNEL, v);
 }
 
+/// A spawn's step into this core's crumb (platform `crumb`, kept in the report page across a warm reset): SYS_SPAWN's entering crumb G#9A with the step in bits 24-31 (1 the capsule's read, 2 read, 3 the seal list read, 4 gated, 5 sealed, 6 ihi, 7 the arc asked, 8 the arc given, 9 the code copied, 10 built, 11 queued), so a spawn that hangs names its step at the next boot as PREV_EXIT and the core's PREV_NOTE (2026-11-16: kernel #3 hung inside a spawn with the lock held, right after the person attested).
+/// And while the kernel heap's largest free block is under 2^22 bytes, each step goes to the flash log too, with that block: a spawn short of heap names itself whatever kind of hang follows.
+fn spawn_step(step: u64) {
+    crate::platform::crumb(0x90 + SYS_SPAWN | step << 24);
+    let largest = crate::heap_largest_free();
+    if largest < 1 << 22 {
+        crate::flashlog::line(&alloc::format!("spawn step A#{step}: the kernel heap's largest free block A#{largest} bytes"));
+    }
+}
+
 /// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
 fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     if g.masked {
@@ -7276,9 +7526,13 @@ fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: 
     } else if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }
+    spawn_step(5);
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+    spawn_step(6);
     let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)?;
+    spawn_step(10);
     enqueue_back(me);
+    spawn_step(11);
     Ok(me)
 }
 
