@@ -59,7 +59,8 @@ The `bt` endpoint:
 
 The rule, following Android's coordinator: Bluetooth is off before WL_REG_ON is cycled. Cycling it under a powered Bluetooth core wedged the chip and, through WiFi's PCIe, the device. On 2026-10-31 there were two watchdog resets, each within a minute of the WiFi keeper restarting pcie1.
 
-- **WiFi driver:** pcie1 holds the `bt` power switch (its grant slot 18) and turns Bluetooth off just before its REG_ON cycle.
+- **WiFi driver:** pcie1 holds the `bt` power switch (its grant slot 18) and turns Bluetooth off just before its REG_ON cycle. A refused switch stops its bring-up with WL_REG_ON untouched (2026-11-16).
+- **The switch's off drives its pins (2026-11-16).** Until then off wrote only the data bits of DEV_WAKE and REG_ON, which drive nothing on a pin still in its reset mode (an input): with Bluetooth switched off, or never on since boot, BT_REG_ON read high (gpn8 con 0, dat 1, pull-down on), so pcie1's "Bluetooth off" did nothing and its cycle of a running WiFi chip wedged it (a RAM reload on the Pro, b908: the chip's next BAR read never completed; WIFI.md "A BAR access that never completes"). Off now sets the data bits low, makes the pins outputs, then pulses DBO.
 - **Bluetooth driver:**
   - At boot it gives WiFi 16 s first.
   - Every 8 s it asks Read_Local_Version. Silence means the core was reset; it then waits 16 s and comes back up (patch, 4 Mbaud) with the beacon it had, from a fresh address. Repeated failures back off from 4 s to 1024 s.
