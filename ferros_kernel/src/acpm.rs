@@ -187,8 +187,15 @@ pub fn dvfs_get(domain: u32) -> Result<u32, u32> {
 pub fn dvfs_set(domain: u32, khz: u32) -> Result<u32, u32> {
     let quiet = domain <= 4;
     let r = call(DVFS_CHANNEL, [domain, khz, FREQ_REQ, 0], !quiet)?;
+    // WHY the bound: the domain is the caller's number; one past the table is not recorded.
+    if let Some(a) = ASKED.get(domain as usize) {
+        a.store(khz, core::sync::atomic::Ordering::Relaxed);
+    }
     Ok(r[3])
 }
+
+/// The rate last asked of each DVFS domain thru `dvfs_set` (every request ferros makes goes thru it), kHz; 0 for none since boot. The clock policy asks a tier's domain only when this differs (service.rs `clock_profile`).
+pub static ASKED: [core::sync::atomic::AtomicU32; DVFS_DOMAINS.len()] = [const { core::sync::atomic::AtomicU32::new(0) }; DVFS_DOMAINS.len()];
 
 /// Read one PMIC register.
 pub fn read(speedy: u32, typ: u32, reg: u32) -> Result<u8, u32> {
