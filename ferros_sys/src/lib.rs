@@ -2041,6 +2041,15 @@ pub fn console(grants: u64, text: &[u8]) {
     call(cap(grants, 0), text, &mut r);
 }
 
+/// Bit 62 of a console write's reply length: the kernel writes the line to the flash log as well (process.rs CONSOLE_FLASH).
+pub const CONSOLE_FLASH: u64 = 1 << 62;
+
+/// `console`, and the same line into the flash log, which survives a reset that loses the RAM (a driver's steps toward a device that may hang the SoC). A few lines a session: each is a flash write under the kernel lock.
+pub fn console_flash(grants: u64, text: &[u8]) {
+    let mut r = [0u8; 16];
+    svc(nr::CALL, cap(grants, 0), off(text.as_ptr()), text.len() as u64, off(r.as_mut_ptr()), r.len() as u64 | CONSOLE_FLASH);
+}
+
 /// What a payload's panic handler calls: exit with G#DEAD (the kernel prints `name: exit G#…DEAD`).
 pub fn panic_exit() -> ! {
     exit(0xDEAD)

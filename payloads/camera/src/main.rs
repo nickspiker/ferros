@@ -92,6 +92,15 @@ macro_rules! say {
     }};
 }
 
+/// An open's step, said on the console and kept in the flash log before it is taken (ferros_sys `console_flash`): an open that hangs the SoC then names its last step after the reset, when the RAM is gone (2026-11-16: the Pro reset in an open after its switch on, nothing of the later steps kept).
+macro_rules! step {
+    ($g:expr, $($t:tt)*) => {{
+        let mut l = Line { b: [0; 256], n: 0 };
+        let _ = write!(l, $($t)*);
+        ferros_sys::console_flash($g, &l.b[..l.n]);
+    }};
+}
+
 /// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
@@ -596,7 +605,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         let n = FRAMES.fetch_add(1, Ordering::AcqRel) + 1;
         if n == 1 {
             let us = ferros_sys::us_since(OPEN_AT.load(Ordering::Relaxed));
-            say!(g, "camera: first frame A#{} ms after the open\n", us / 1000);
+            step!(g, "camera: first frame A#{} ms after the open (open step: first frame)\n", us / 1000);
         }
         ferros_sys::wake(&FRAMES, 4);
     }
@@ -988,6 +997,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         return Err(Fail::Switch);
     }
     let powered = ferros_sys::us_since(t0);
+    step!(g, "camera: open step: switch on; the sensor's identity and init next\n");
     let mut id = [0u8; 2];
     bus.write_read(c.addr, &c.id_reg, &mut id).map_err(Fail::Sensor)?;
     if id != c.id_val {
@@ -1018,7 +1028,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             return Err(Fail::Init(k as u32, e));
         }
     }
-    say!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
+    step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
     // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     let arr = &ccs::ARRAYS[c.id as usize];
     if let Some(m) = mode {
@@ -1081,6 +1091,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     ferros_sys::dma_barrier();
+    step!(g, "camera: open step: job placed; the CPU's writes and the engine next\n");
     say!(g, "camera: job placed: A#{} address registers, A#{} high halves (A#{} left as captured), A#{} loads, A#{} descriptors; A#{n_full} full copies of A#{list_len} bytes (the image's words A#{w_lo} and A#{w_hi}), A#{n_slim} slim of A#{slim_len}; A#{regeom} program words of geometry rewritten ({:?}) for A#{} x A#{} at G#{:X} a line\n", m_.addr_regs, m_.highs, m_.highs_left, m_.loads, m_.ring, scope, fe.w, fe.h, fe.stride);
     // The CPU's setup writes before the engine starts, in the capture's order, their geometry the front end's; without them the engine applies the program and the frame writer stays idle (2026-10-20).
     let (mut n, mut cpu_geom) = (0, 0);
@@ -1151,6 +1162,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     STATE.store(1 << QUEUED, Ordering::Release);
     RING_BUFS.store(if slit { 0 } else { ring as u64 }, Ordering::Release);
     ferros_sys::dma_barrier();
+    step!(g, "camera: open step: the engine starting\n");
     wr(g, pd + 0x2C, 1);
     wr(g, pd + 0x40, 0x1F);
     wr(g, pd + 0x20, 0);
@@ -1162,6 +1174,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     wr(g, pd + 0x34, 0);
     wr(g, pd + 0x28, 1);
     // The camera's receiver last, as a camera open does it, its channels' sizes and types the front end's: enabling the link first left the front end latching its configuration and never seeing a frame start (2026-10-20).
+    step!(g, "camera: open step: engine started; the receiver next\n");
     let mut rx_geom = 0;
     for &(a, v) in c.rx_start.iter() {
         let nv = geom::value(a as u32, v, &from, &fe, scope);
@@ -1189,12 +1202,13 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     FRAMES.store(0, Ordering::Release);
+    step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP);
     RUN.store(1, Ordering::Release);
     ferros_sys::wake(&RUN, 1);
-    say!(g, "camera: streaming A#{} ms after the open\n", ferros_sys::us_since(t0) / 1000);
+    step!(g, "camera: streaming A#{} ms after the open (open step: stream on)\n", ferros_sys::us_since(t0) / 1000);
     // Mid-stream, when asked: the mode written once the first frame has landed (October's order; the sensor took one change a session and then needed a cold boot).
     if let (Some(m), true) = (mode, s.flags & F_MID != 0) {
         let until = ferros_sys::now() + ferros_sys::freq() * FRAME_LATE_US / 1_000_000;

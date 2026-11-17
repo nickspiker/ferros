@@ -11,8 +11,13 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-/// `diag "dev first on|off"`.
-pub static FIRST: AtomicBool = AtomicBool::new(false);
+/// `diag "dev first on|off"`: on by default (the owner, 2026-11-16, after 10 of 10 camera streams at 96 a second died without it and every one with it ran).
+/// Only a thread the kernel woke for its own device's interrupt, with front credit left, is made urgent; its run is protected from yields for `FIRST_BUDGET_US`, then runs on without that priority.
+pub static FIRST: AtomicBool = AtomicBool::new(true);
+/// The urgent run's budget (2^10 us): the camera's answer measured 100 to 340 us, touch and the display's vsync tens.
+pub const FIRST_BUDGET_US: u64 = 1 << 10;
+/// The flash log has said once this boot that a run went past its budget.
+pub static BUDGET_SAID: AtomicBool = AtomicBool::new(false);
 /// `diag "dev follow on|off"`.
 pub static FOLLOW: AtomicBool = AtomicBool::new(false);
 /// `diag "dev core <k>|off"`: the dedicated core as a mask (0: none).

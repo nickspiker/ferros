@@ -179,6 +179,7 @@ fn cur_set(t: Option<usize>) {
         }
         x.last_core = c as u8;
         x.on_irq = x.urgent;
+        x.irq_run_at = now;
         x.urgent = false;
         // A device line's waiter runs: from its interrupt to here, per line (devsched.rs, `diag dev`); the trace's event first, as this run may freeze it.
         if x.irq_line != 0 {
@@ -366,7 +367,7 @@ fn make_room(t: usize, line: usize, landed: usize) {
         // The cores from the last one it ran on, round the sixteen a mask names.
         let c = (start + j) & 15;
         let Some(r) = cur[c] else { continue };
-        if m >> c & 1 == 0 || th(r).is_none_or(|y| y.on_irq) || YIELD[c].load(Relaxed) != 0 {
+        if m >> c & 1 == 0 || th(r).is_none_or(|y| y.on_irq && !over_budget(r, y)) || YIELD[c].load(Relaxed) != 0 {
             continue;
         }
         YIELD[c].store(1, Relaxed);
@@ -402,6 +403,18 @@ pub fn irq_routes_home() {
     for l in IRQS {
         crate::killswitch::route_spi(l.intid, home);
     }
+}
+
+/// A run for a device's interrupt is protected from yields (`make_room`) for 2^10 us (devsched `FIRST_BUDGET_US`; the camera's answer measured 100 to 340 us): past it the thread runs on but loses the priority of that wake, and the flash log says so once a boot.
+fn over_budget(t: usize, y: &Thread) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let budget = crate::platform::cntfrq() * crate::devsched::FIRST_BUDGET_US / 1_000_000;
+    // WHY saturating: the stamp is another core's counter read (`cur_set` on that core), which this read is not ordered against.
+    let over = crate::platform::cntpct().saturating_sub(y.irq_run_at) > budget;
+    if over && !crate::devsched::BUDGET_SAID.swap(true, Relaxed) {
+        crate::flashlog::line(&alloc::format!("dev first: {} ran past its 2^10 us on its device's interrupt; it runs on without the priority (said once a boot)", alloc::string::String::from_utf8_lossy(&thread_name(t))));
+    }
+    over
 }
 
 /// A device line's interrupt taken for its waiter `x` (`wake_sleepers`): when it came and on which core (`.Lirq`'s stamps), which line, and the core noticing it now, for the measure of its run (`cur_set`). The stamps were written before the pending byte this caller just took; the fence orders the reads after that take.
@@ -829,6 +842,8 @@ struct Thread {
     urgent: bool,
     /// Its run now began as an urgent one (its device's interrupt): never asked to yield for another device thread meanwhile; any other run may be (devsched `first`, `make_room`).
     on_irq: bool,
+    /// When its current run began (`cur_set`): an `on_irq` run's budget counts from here (`over_budget`).
+    irq_run_at: u64,
     /// The core it last ran on: where a yield is asked first.
     last_core: u8,
     /// Its word wait (`State::Waiting` on an arc word) ends for a call to an endpoint it polls (SYS_WAIT x3 bit 1, `wake_server`).
@@ -3908,7 +3923,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, last_core: 0, wait_call: false, label: [0; 16] });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -5162,7 +5177,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         p.line_start = line[line.len() - 1] == b'\n';
                     }
                     pstore_since(at);
-                    let n = 2usize.min(f.x[4] as usize);
+                    // CONSOLE_FLASH in the reply length: the text goes to the flash log too, the line that survives a reset and a decayed DRAM (2026-11-16: a camera open died after its switch with nothing of its later steps kept). For a driver's few lines a session; each costs a flash-log write under this lock (up to 0.66 ms, `diag lock`).
+                    if f.x[4] & CONSOLE_FLASH != 0 {
+                        let text = alloc::format!("{}: {}", alloc::string::String::from_utf8_lossy(&p.name), alloc::string::String::from_utf8_lossy(msg));
+                        crate::flashlog::line(text.trim_end());
+                    }
+                    let n = 2usize.min((f.x[4] & !(CONSOLE_FLASH | CALL_LIVE)) as usize);
                     p.write(f.x[3], &b"ok"[..n]);
                     f.x[0] = n as u64;
                     0
@@ -5462,6 +5482,8 @@ fn fail_callers(cspace: &[CapEntry]) {
 
 /// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no server is receiving on the endpoint (the process that last received on it has ended, or none has received yet), at the call or later when its server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
 pub const CALL_LIVE: u64 = 1 << 63;
+/// Bit 62 of a console write's reply length: the line goes to the flash log as well (ferros_sys `console_flash`).
+pub const CONSOLE_FLASH: u64 = 1 << 62;
 
 /// Whether the process that last received on endpoint `ep` is alive (not ending).
 fn has_receiver(ep: usize) -> bool {
@@ -6122,11 +6144,11 @@ fn fault_report(f: &Frame, base: u64) {
 pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     lock();
     let mut held = None;
-    // Not the slice's end (the tick handler stops the slice timer; a device's interrupt or a yield's SGI 3 leaves it armed): under devsched `first` the thread keeps its place at the front, behind the urgent thread `pick_runnable` takes first, rather than waiting a queue's turn for a device's microseconds.
+    // A yield asked of this core for a device thread (devsched `first`, `make_room`), not the slice's end (the tick handler stops the slice timer): the thread keeps its place at the front, behind the urgent thread `pick_runnable` takes first, rather than waiting a queue's turn for a device's microseconds. Any other preemption (the slice's end, an interrupt taken at EL0, a hold) goes to the back as before: a thread put at the front for every interrupt would take a fresh slice ahead of the queue each time.
     let ctl: u64;
     unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
-    let keep = ctl & 1 != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
-    YIELD[core()].store(0, core::sync::atomic::Ordering::Relaxed);
+    let asked = YIELD[core()].swap(0, core::sync::atomic::Ordering::Relaxed) != 0;
+    let keep = asked && ctl & 1 != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
@@ -7422,7 +7444,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, last_core: 0, wait_call: false, label: [0; 16] });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
     Ok((me, arc, in_off))
 }
 
