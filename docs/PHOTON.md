@@ -296,7 +296,8 @@ Measured on the Pro (b916/b917 consoles, `diag bench`, payloads/vaultbench and p
 
 Built: the kist job reads a megabyte a call and hashes the capsule once as it lands (`ferros_kist::twin`: its address and its signature's hash from one BLAKE3 pass), the vault process reads a get's furrows as exact runs of up to 512 KiB, and the identity service signs the binding on the X3 and keeps it in the person's class across boots (`fgtw.be_you`, no handle proof; reused once it verifies against the chain as it stands).
 A kept binding never expires (owner, 2026-11-17: "never expire"; FACETS.md D10): it ends only when its signer leaves the fleet or the chain asks more eggs of it.
-Waiting: hardware SHA-256 for fips205 (how to carry the sha2 change), a seal over the capsule's address (the last pass over the bytes), the vsf `static` and the emoji font (the Photon session and vsf's owner).
+The CPU's SHA-256 under fips205: std/photon turns on sha2 0.10's `asm` feature (std processes may link its assembly, which is never called), and payloads take the same feature over `sha2_asm`, a pure-Rust stand-in for sha2-asm under the workspace's patch, so the identity service builds no C.
+Waiting: the device's numbers for all of it; a seal over the capsule's address (the last pass over the bytes, the owner's call); the vsf `static` and the emoji font (the Photon session and vsf's owner).
 
 ## Findings
 
