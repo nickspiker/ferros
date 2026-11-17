@@ -574,6 +574,8 @@ impl Client {
         }
         if !self.space.loaded {
             self.space_load();
+            // The person key at once from this device's own copy of the space, before the first pull (owner, 2026-11-17: "all my person keys should be immediate as well"): opened only, never minted (a mint before the pull could go over the fleet's key); the pull's settle follows as before and hands another key only if the fleet's space says another won.
+            self.space_person_local();
             self.space_ask_fleet();
             self.space_seed(false);
             self.space.last_seed_us = t;
@@ -602,6 +604,29 @@ impl Client {
 
     /// The person key (docs/FACETS.md D0, D1), at each join once the first pull is done: opened from the space with the fleet key; sealed again under the current fleet key when this device holds it and the space has it under an earlier one (a shrink re-seals, never rotates); minted here when the identity has none yet (its first device to run this) and written into the space, so the person's other devices open the same one. Then handed to the kernel, which derives every kist's alias from it; this service derives no alias and holds none.
     /// The decision is fgtw's (`fgtw::person::settle`, the one Photon makes on the other platforms); this keeps what it settles on, says it once, and hands the space on when it changed.
+    /// The person key opened from this device's kept copy of the space under the current fleet key and handed to the kernel, when it is there; nothing minted, nothing written. Said with the time since the bind's step began.
+    fn space_person_local(&mut self) {
+        let Some((hp, fk)) = self.space_ready() else { return };
+        match fgtw::person::find(&self.space.space, &hp, &fk) {
+            fgtw::person::Found::Key { mut key, id, minted } => {
+                self.log.put(b"fgtw: person key opened from this device's kept copy of the space (id ");
+                self.log.fp(&id);
+                self.log.put(b"), before the first pull");
+                self.log.line();
+                self.person_hold(key, minted);
+                // This frame's copy overwritten: the one kept is `space.person`'s.
+                key.fill(0);
+                core::hint::black_box(&key);
+                self.space.person_said = P_HELD;
+                self.person_to_kernel();
+            }
+            _ => {
+                self.log.put(b"fgtw: no person key in this device's kept copy of the space under the current fleet key: waiting for the first pull");
+                self.log.line();
+            }
+        }
+    }
+
     fn space_person(&mut self) {
         let Some((hp, fk)) = self.space_ready() else { return };
         let (me, grants) = (self.me, self.log.grants);

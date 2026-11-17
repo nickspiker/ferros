@@ -199,6 +199,16 @@ extern "C" fn roots_thread(grants: u64) -> ! {
             continue;
         }
         absent = freq() >> 6;
+        // Taken: the roots overwritten here, the message's copy and the screen's (owner, 2026-11-17: the keys held by the kernel alone; ahau kept them for the whole run). Not when newer roots came meanwhile: those are the next to hand.
+        for b in m.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        if ROOTS_GEN.load(Ordering::Acquire) == g {
+            for b in unsafe { (*(&raw mut ROOTS)).iter_mut() } {
+                unsafe { core::ptr::write_volatile(b, 0) };
+            }
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
         ROOTS_TAKEN.store(g, Ordering::Release);
         ferros_sys::wake(&ROOTS_TAKEN, 1);
     }
