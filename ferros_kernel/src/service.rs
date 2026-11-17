@@ -3744,12 +3744,40 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"sched" || cmd.params == b"sched reset" {
-                    // `diag sched`: the scheduler's counts (wake to run per kind, the lock's wait per core, register syscalls by path) and its trace (process.rs): who called whom, who waited, for how long. `diag "sched reset"` zeroes the counts first.
+                if cmd.params == b"sched old on" || cmd.params == b"sched old off" {
+                    // `diag "sched old on|off"`: the scheduler's behaviour before 2026-11-17 back, or not (process.rs `OLD`, KERNEL.md Order item 8), to measure both on one boot.
+                    let on = cmd.params == b"sched old on";
+                    crate::process::OLD.store(on, core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(if on { b"sched: as before 2026-11-17\n" } else { b"sched: as built 2026-11-17\n" });
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"sched x3 on" || cmd.params == b"sched x3 off" {
+                    // `diag "sched x3 on|off"`: unpinned threads may also run on the kernel's core while it is free (process.rs `X3_SHARE`).
+                    let on = cmd.params == b"sched x3 on";
+                    crate::process::X3_SHARE.store(on, core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(if on { b"sched: unpinned threads may run on the kernel's core\n" } else { b"sched: unpinned threads on the workers only\n" });
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(n) = cmd.params.strip_prefix(b"sched slice ") {
+                    // `diag "sched slice <n>"`: the slice timer at 2^-n s, 0 for the default 10 ms (process.rs `SLICE_LOG2`). WHY the range: the number is the bridge's; a slice longer than 2^-6 s (15.6 ms, past the default) or shorter than 2^-12 s (244 us, a few switches' worth) is refused, not clamped.
+                    match core::str::from_utf8(n).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+                        Some(n) if n == 0 || (6..=12).contains(&n) => {
+                            crate::process::SLICE_LOG2.store(n, core::sync::atomic::Ordering::Relaxed);
+                            resp.extend_from_slice(alloc::format!("sched: slice {}\n", if n == 0 { alloc::string::String::from("10 ms (the default)") } else { alloc::format!("2^-{n} s") }).as_bytes());
+                        }
+                        _ => resp.extend_from_slice(b"sched slice <n>: 0 (10 ms) or 6 to 12 (2^-n s)\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"sched" || cmd.params == b"sched reset" || cmd.params == b"sched all" {
+                    // `diag sched`: the scheduler's counts (wake to run per kind, the lock's wait per core, register syscalls by path, yields, cores asked to make way) and its trace (process.rs): who called whom, who waited, for how long. `diag "sched reset"` zeroes the counts first; `diag "sched all"` lists the whole ring, not its last 512 events.
                     if cmd.params == b"sched reset" {
                         crate::process::sched_reset();
                     }
-                    crate::process::sched_report(&mut resp);
+                    crate::process::sched_report(&mut resp, cmd.params == b"sched all");
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

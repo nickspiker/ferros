@@ -86,7 +86,8 @@ fn lock() {
         let mut spins = 0u32;
         // The holder this wait was behind, as last seen (devsched `irq_lock_wait`).
         let mut by = (0u64, 0u64);
-        while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        // Test, then test-and-set: the waiters spin on a plain load of their shared copy of the line and try the exclusive store only once it reads free. Every core hammering the store (2026-11-17, a Photon scroll: four A715s and the X3 waiting on it at once) kept taking the line from the holder, which then waited for it again to let go.
+        while (LOCK.load(Ordering::Relaxed) && !OLD.load(Ordering::Relaxed)) || LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             by = (LOCK_SITE.load(Ordering::Relaxed), crate::devsched::WHAT.load(Ordering::Relaxed));
             core::hint::spin_loop();
             // Every 4096th turn: is the holder stalled past half the watchdog's window? (platform::stall_check: one SGI to it, its place kept for the post-mortem.) WHY wrapping: a spin past 2^32 turns (minutes, a hang the watchdog ended long before) only feeds this every-4096th test, where a wrap changes nothing.
@@ -257,7 +258,14 @@ fn mask_of(t: usize) -> u16 {
 /// The cores thread `x` may run on now, among those up: its mask (a pin to the X3 meaning the kernel's core), narrowed by the dedicated core (devsched `core`: a device thread whose mask holds it runs there alone, every other thread anywhere else it may), and every core up when none of its own is.
 fn may_run(x: &Thread) -> u16 {
     let up = cores_up();
-    let mask = if x.mask & MASK_BIG != 0 { (x.mask & !MASK_BIG) | kernel_mask() } else { x.mask };
+    let mask = if x.mask & MASK_BIG != 0 {
+        (x.mask & !MASK_BIG) | kernel_mask()
+    } else if x.mask == MASK_WORKERS && !x.device && X3_SHARE.load(core::sync::atomic::Ordering::Relaxed) {
+        // `sched x3 on`: an unpinned thread may run on the kernel's core too while it is free.
+        x.mask | kernel_mask()
+    } else {
+        x.mask
+    };
     let dc = crate::devsched::CORE.load(core::sync::atomic::Ordering::Relaxed) & up;
     let m = if dc == 0 {
         mask
@@ -285,6 +293,11 @@ fn unpause(t: usize) {
 }
 /// A thread onto the back of the run queue, and the idle cores that may run it told. Behind everyone, its front credit is whole again (`ran` = 0, see `enqueue_woken`).
 fn enqueue_back(t: usize) {
+    queue_back(t);
+    kick(mask_of(t));
+}
+/// `enqueue_back` with no core told: for a yield, whose own core picks from the queue at once (`SYS_SLEEP`). A kick for every yield woke every idle core into the lock to find the yielder already taken (2026-11-17, rayon's idle workers yielding every few microseconds: the lock's waits on the X3 and the A715s were 6 to 9 % of their time).
+fn queue_back(t: usize) {
     unpause(t);
     if let Some(x) = th(t) {
         x.ran = 0;
@@ -296,11 +309,19 @@ fn enqueue_back(t: usize) {
     }
     k().runnable.push_back(t);
     runnable_sync();
-    kick(mask_of(t));
 }
 fn enqueue_front(t: usize) {
     unpause(t);
     k().runnable.push_front(t);
+    runnable_sync();
+    kick(mask_of(t));
+}
+/// A thread that yielded its core for the thread at the head of the queue (`ferros_el0_preempt`, asked by `make_room` or `make_way`): just behind that head, so it runs again next after it, and the woken thread its core was asked for is still the one its core picks (at the very front it was picked again itself whenever devsched `first`'s urgency did not apply).
+fn enqueue_second(t: usize) {
+    unpause(t);
+    let q = &mut k().runnable;
+    // WHY the min: the head may be gone already (another core took the woken thread), and an insert past the end panics; with the queue empty it goes to the front.
+    q.insert(q.len().min(1), t);
     runnable_sync();
     kick(mask_of(t));
 }
@@ -343,6 +364,10 @@ fn enqueue_woken(t: usize, kind: usize) -> bool {
     let now_run = if cur_get() == Some(t) { now - unsafe { (*(&raw const RUN_AT))[c] } } else { 0 };
     if th(t).is_some_and(|x| credit(x, now) + now_run < slice) {
         enqueue_front(t);
+        // A light thread a call, a word or its deadline woke takes a busy worker's core if none is idle (`make_way`); an interrupt's waiter has devsched's `make_room`, and a server going on after its reply or a caller after it are mid-exchange on a core already.
+        if kind == WAKE_CALL || kind == WAKE_WORD || kind == WAKE_TIMER {
+            make_way(t);
+        }
         true
     } else {
         SPENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -377,6 +402,79 @@ fn make_room(t: usize, line: usize, landed: usize) {
         unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
         return;
     }
+}
+
+/// `diag "sched old on|off"`: the scheduler as before 2026-11-17 (KERNEL.md Order item 8), for measuring the two in adjacent runs on one boot: the lock's spin a bare test-and-set, every yield under the lock and kicking every core, futex and deadline wakes to the back, no `make_way`, deadlines noticed only between slices and idle workers on their event stream, a thread asked to yield kept at the very front and only under devsched `first`. Off by default.
+pub static OLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `diag "sched x3 on|off"`: a thread on the workers' default mask (not pinned, not a device thread) may run on the kernel's core too, when it is free; a thread pinned there (the render thread) woken while one runs there has it yield (`make_way`), as an interrupt's waiter has under devsched `first` (`make_room`). Off by default: measured 2026-11-17, the X3 sat ~60 % idle thru a Photon pinch while the four A715s were saturated.
+pub static X3_SHARE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `diag "sched slice <n>"`: the slice timer at 2^-n s (`slice_ticks`); 0, the default, is `SLICE_MS`. Only the timer: the front credit stays a `SLICE_MS` (`enqueue_woken`), so the fairness bound above reads as before. Measured 2026-11-17: with eight compute threads (rayon's four and the display's four publish workers) on four cores, a parallel section's last worker waited out a whole 10 ms slice of another's.
+pub static SLICE_LOG2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn slice_ticks() -> u64 {
+    match SLICE_LOG2.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => crate::platform::cntfrq() / 1000 * SLICE_MS,
+        n => crate::platform::cntfrq() >> n,
+    }
+}
+/// A woken thread's least claim on a core already running another (`make_way`): that thread has run at least 2^-11 s (about half a millisecond) of its turn and longer than the woken one's front credit.
+const WAY_RUN_LOG2: u32 = 11;
+/// Per core asked: how many times `make_way` asked it to yield, for `diag sched`.
+pub static WAY_ASKS: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+/// `make_way`'s looks: [0] light threads woken by a call, a word or a deadline, [1] of those that found no worker idle, [2] of those with no thread long enough in its turn to ask.
+pub static WAY_LOOKS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+/// Thread `t`, woken to the front by a word, a deadline or a call (`enqueue_woken`, its front credit unspent): when no worker it may run on is idle, the worker whose thread has run longest in its turn is asked to yield for it (SGI 3, as `make_room` asks for a device's thread), so a light thread never waits out a busy thread's slice (2026-11-17, Photon's scroll: with rayon's four workers computing a whole 10 ms slice on the four A715s, the display's receive thread, the touch server and the map waited 2.4 to 4.5 ms, and every futex wake that found the workers busy waited up to a slice).
+/// Never asked: the X3 (the render thread's core and the kernel's), the waker's own core, a thread of the woken one's own process (a parallel section's threads share the work, and the woken one taking its sibling's core gains nothing), a device thread inside its interrupt's run, a core already asked, a thread that has run less than `WAY_RUN_LOG2` or less than the woken thread's spent credit (so two light threads never take turns preempting each other). The thread asked keeps its place just behind the head of the queue (`ferros_el0_preempt`). Under the kernel lock.
+fn make_way(t: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if OLD.load(Relaxed) {
+        return;
+    }
+    let Some(x) = th(t) else { return };
+    let m = may_run(x);
+    let cur = unsafe { &*(&raw const CURRENT) };
+    WAY_LOOKS[0].fetch_add(1, Relaxed);
+    if (0..16).any(|c| m >> c & 1 != 0 && cur[c].is_none()) {
+        return;
+    }
+    WAY_LOOKS[1].fetch_add(1, Relaxed);
+    let now = crate::platform::cntpct();
+    let mut best = None;
+    let mut longest = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
+    for c in 0..16 {
+        // Not this core: its thread is the waker, in the kernel now, and if it blocks next this core takes the woken thread itself; an SGI to itself would land on whatever it switched to.
+        if (m & (MASK_WORKERS | kernel_mask())) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
+            continue;
+        }
+        let Some(r) = cur[c] else { continue };
+        let Some(y) = th(r) else { continue };
+        // The kernel's core: only a visitor there (`sched x3 on`, a thread not pinned to it) is asked, and for a thread pinned there (the render thread) whatever its process and however briefly the visitor has run: the core is the pinned threads' first.
+        let x3 = 1u16 << c == kernel_mask();
+        if x3 && y.mask & MASK_BIG != 0 {
+            continue;
+        }
+        if x3 && x.mask & MASK_BIG != 0 {
+            best = Some(c);
+            break;
+        }
+        if y.proc == x.proc || (y.on_irq && !over_budget(r, y)) {
+            continue;
+        }
+        // WHY saturating: `RUN_AT[c]` is core c's counter read, which this core's read is not ordered against (see `cur_set`).
+        let run = now.saturating_sub(unsafe { (*(&raw const RUN_AT))[c] });
+        if run >= longest {
+            longest = run;
+            best = Some(c);
+        }
+    }
+    let Some(c) = best else {
+        WAY_LOOKS[2].fetch_add(1, Relaxed);
+        return;
+    };
+    YIELD[c].store(1, Relaxed);
+    WAY_ASKS[c].fetch_add(1, Relaxed);
+    tr(TR_YIELD_ASK, t, c as u64);
+    // SGI 3 to core c, as `make_room` and `hold` send it.
+    unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
 }
 
 /// The core a line its thread `x` now waits on is routed to (SYS_IRQ_WAIT, the thread on this core): the kernel's core, as since 2026-11-13, unless devsched `follow` or `core` is on; then the one core `x` may run on when it has one (its pin, or the dedicated core), else this core when `x` may run here (where it waits from, so it likely runs here next), else the kernel's.
@@ -458,6 +556,8 @@ pub static WAKE_LAT: [[core::sync::atomic::AtomicU64; 3]; WAKE_KINDS] = [const {
 pub static WAKE_HIST: [[core::sync::atomic::AtomicU64; 64]; WAKE_KINDS] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 64] }; WAKE_KINDS];
 /// Hand-offs (a woken thread run next on the waker's core), and woken threads sent to the back for a spent credit (`enqueue_woken`).
 pub static HANDOFFS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Yields (`sleep(0)` and past deadlines, SYS_SLEEP): [0] answered without the lock (nothing queued, `ferros_el0_trap`), [1] under it with nothing queued this core may run, [2] that gave the core to another thread, [3] that queued and took the core back.
+pub static YIELDS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 pub static SPENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 fn wake_count(kind: usize, ticks: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -1044,10 +1144,11 @@ pub fn threads_report(out: &mut Vec<u8>) {
 }
 
 /// The trace, oldest first, as text: time since the first entry in microseconds, the event, the process name and the detail. Then per call: the wait before the server took it, the server's time to the reply, and the caller's wait after the reply before it ran again — the three parts of a round trip.
-pub fn sched_report(out: &mut Vec<u8>) {
+/// `all`: every event the ring holds rather than the last 512 (`diag "sched all"`: rayon's yields after a parallel section fill 512 in a few milliseconds).
+pub fn sched_report(out: &mut Vec<u8>, all: bool) {
     sched_counters(out);
     lock();
-    sched_report_locked(out);
+    sched_report_locked(out, all);
     unlock();
 }
 
@@ -1073,6 +1174,18 @@ fn sched_counters(out: &mut Vec<u8>) {
         out.push(b'\n');
     }
     out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed)).as_bytes());
+    let y: [u64; 4] = core::array::from_fn(|i| YIELDS[i].load(Relaxed));
+    out.extend_from_slice(alloc::format!("yields: A#{} without the lock, A#{} with nothing queued here, A#{} to another thread, A#{} back to itself\n", y[0], y[1], y[2], y[3]).as_bytes());
+    let w: [u64; 3] = core::array::from_fn(|i| WAY_LOOKS[i].load(Relaxed));
+    out.extend_from_slice(alloc::format!("light wakes (call, word, deadline): A#{}, A#{} with no worker idle, A#{} of them with none to ask; ", w[0], w[1], w[2]).as_bytes());
+    out.extend_from_slice(b"cores asked to make way for one:");
+    for (c, a) in WAY_ASKS.iter().enumerate() {
+        let n = a.load(Relaxed);
+        if n != 0 {
+            out.extend_from_slice(alloc::format!(" c{c} A#{n}").as_bytes());
+        }
+    }
+    out.push(b'\n');
     out.extend_from_slice(b"lock waits per core (contended takes, us waited):");
     for (c, w) in LOCK_WAIT.iter().enumerate() {
         let n = w[0].load(Relaxed);
@@ -1086,12 +1199,12 @@ fn sched_counters(out: &mut Vec<u8>) {
 /// `diag "sched reset"`: the counters `sched_counters` shows, zeroed.
 pub fn sched_reset() {
     use core::sync::atomic::Ordering::Relaxed;
-    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
+    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain(YIELDS.iter()).chain(WAY_ASKS.iter()).chain(WAY_LOOKS.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
     // The lock's holds and the device lines' runs with them (devsched.rs), and the trace thawed.
     crate::devsched::lock_reset();
     crate::devsched::lat_reset();
 }
-fn sched_report_locked(out: &mut Vec<u8>) {
+fn sched_report_locked(out: &mut Vec<u8>, all: bool) {
     let kk = k();
     let f = crate::platform::cntfrq();
     let ring = unsafe { &*TRACE_RING.0.get() };
@@ -1148,7 +1261,7 @@ fn sched_report_locked(out: &mut Vec<u8>) {
         out.extend_from_slice(alloc::format!("  {} -> {}: A#{} trips, mean wait A#{} us, server A#{} us, after A#{} us\n", name(c), name(sv), k, w * 1_000_000 / f / k as u64, h * 1_000_000 / f / k as u64, b * 1_000_000 / f / k as u64).as_bytes());
     }
     // The last 512 events, so a stall just now is in view.
-    let start = entries.len().saturating_sub(512);
+    let start = if all { 0 } else { entries.len().saturating_sub(512) };
     for e in &entries[start..] {
         out.extend_from_slice(alloc::format!("{:>9} c{} {:<10} {:<8} {}\n", us(e.0), e.4, TR_NAMES[e.1 as usize], name(e.2), e.3).as_bytes());
     }
@@ -3740,10 +3853,14 @@ fn switch_to_next(f: &mut Frame) -> bool {
 }
 
 /// The first queued thread this core may run, taken off the queue (a dead entry is dropped and the next tried).
+/// Whether this core may take queued thread `t` now: allowed here, and its process not held (a thread of a held process waits in the queue until the hold ends, `hold_try`: its arc is moving or changing its mask). A dead entry counts, so `pick_runnable` drops it.
+fn may_pick(t: usize) -> bool {
+    let kk = k();
+    kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| runs_here(x) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()))
+}
 fn pick_runnable() -> Option<usize> {
     let kk = k();
-    // A thread of a held process waits in the queue until the hold ends (`hold_try`): its arc is moving or changing its mask.
-    let ok = |t: usize| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| runs_here(x) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
+    let ok = may_pick;
     // devsched `first`: a thread its device's interrupt woke (with front credit left) goes ahead of every other, wherever the queue holds it.
     let urgent = |t: usize| kk.threads.get(t).and_then(|x| x.as_ref()).is_some_and(|x| x.urgent);
     let first = crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
@@ -3842,7 +3959,22 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             return 0;
         }
     }
+    // A yield (`sleep(0)`, std's `yield_now`) with nothing queued, no interrupt waiting to be noticed and no deadline passed: back to the same thread without the lock, as the locked path would answer (its endpoint test is for a sleep with a deadline, `sleep_until_or_call`). rayon's idle workers yield 32 times before they sleep, and with every yield taking the lock four cores of them kept the X3's render thread waiting on it (2026-11-17). What it reads: three atomics a core may read at any time; a thread queued just after the look is the next yield's, or the slice's end's, and a tick or a hold's SGI that comes meanwhile stays pending (IRQs are masked from the trap to the eret) and parks the thread as the eret lands, as for `mmio_fast`.
+    if f.esr >> 26 == 0x15 && f.x[8] == SYS_SLEEP && f.x[0] == 0 && !OLD.load(core::sync::atomic::Ordering::Relaxed) {
+        use core::sync::atomic::Ordering::{Acquire, Relaxed};
+        let idle = RUNNABLE_N.load(Acquire) == 0 && unsafe { core::ptr::read_volatile(&raw const __irq_any) } == 0 && NEXT_WAKE.load(Acquire) > crate::platform::cntpct();
+        if idle {
+            YIELDS[0].fetch_add(1, Relaxed);
+            crate::prof::leave();
+            frame_check(f);
+            return 0;
+        }
+    }
     lock();
+    // A deadline passed while every core that could notice it ran a thread (`wake_sleepers` runs only between slices): noticed by any trap now, so a sleeper's lateness is bounded by the next syscall anywhere, not by the next slice's end (2026-11-17, Photon's scroll: map, touch and display.1 waited 2.4 to 4.5 ms past their deadlines behind four rayon workers' slices).
+    if NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire) <= crate::platform::cntpct() && !OLD.load(core::sync::atomic::Ordering::Relaxed) {
+        wake_sleepers();
+    }
     // What this hold is (devsched `WHAT`, `diag lock`): the syscall, its x1's low byte, the thread.
     crate::devsched::WHAT.store(1 << 63 | (f.x[8] & 0xFF) | (f.x[1] & 0xFF) << 8 | (cur_get().unwrap_or(0xFFFF) as u64 & 0xFFFF) << 16, core::sync::atomic::Ordering::Relaxed);
     let r = el0_trap(f);
@@ -4073,18 +4205,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
             // A word outside the arc has no waiter (a wait there is refused): none woken.
             let addr = p.word(f.x[0]);
             let mut n = 0u64;
-            for (i, x) in kk.threads.iter_mut().enumerate() {
+            for i in 0..kk.threads.len() {
                 if n >= f.x[1] {
                     break;
                 }
-                if let Some(x) = x {
-                    if x.proc == pi && matches!(x.state, State::Waiting(a, _) if Some(a) == addr) {
-                        x.state = State::Runnable;
-                        (x.woke, x.wkind) = (crate::platform::cntpct(), WAKE_WORD as u8);
+                if let Some(x) = th(i).filter(|x| x.proc == pi && matches!(x.state, State::Waiting(a, _) if Some(a) == addr)) {
+                    x.state = State::Runnable;
+                    // As any other wake: to the front while its front credit holds, a busy worker asked to make way when none is idle (2026-11-17: at the back always, a futex wake that found the A715s busy waited behind the whole queue, up to a slice).
+                    if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+                        woken(i, WAKE_WORD);
                         enqueue_back(i);
-                        tr(TR_WAKE, i, 0xFFFF);
-                        n += 1;
+                    } else {
+                        enqueue_woken(i, WAKE_WORD);
                     }
+                    tr(TR_WAKE, i, 0xFFFF);
+                    n += 1;
                 }
             }
             f.x[0] = n;
@@ -5120,15 +5255,25 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 0
             } else if f.x[0] <= now {
                 // A deadline already passed is a yield: anyone runnable goes first, this process comes back round. A server whose wake time had fallen into the past spun its whole slice on sleep/recv and held every client until the slice timer (the display, 2026-10-23); now it gives the core up on each pass instead.
+                // Nothing queued that this core may run (a thread pinned to the X3 does not count): back at once, as with an empty queue, rather than queueing itself only to be picked again.
                 f.x[0] = 0;
-                if kk.runnable.is_empty() {
+                let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
+                let nothing = if old { kk.runnable.is_empty() } else { !kk.runnable.iter().any(|&r| may_pick(r)) };
+                if nothing {
+                    YIELDS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     0
                 } else {
                     t.state = State::Runnable;
                     t.frame = *f;
-                    enqueue_back(cur);
+                    if old {
+                        enqueue_back(cur);
+                    } else {
+                        queue_back(cur);
+                    }
                     tr(TR_YIELD, cur, 0);
-                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                    let r = if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
+                    YIELDS[2 + (cur_get() == Some(cur)) as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    r
                 }
             } else {
                 t.state = State::Sleeping(f.x[0]);
@@ -6163,15 +6308,19 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     let ctl: u64;
     unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
     let asked = YIELD[core()].swap(0, core::sync::atomic::Ordering::Relaxed) != 0;
-    let keep = asked && ctl & 1 != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
+    // Asked by `make_room` (devsched `first` on) or by `make_way` (a light thread woken with every worker busy, 2026-11-17).
+    let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
+    let keep = asked && ctl & 1 != 0 && (!old || crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed));
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
                 p.frame = *f;
                 p.state = State::Runnable;
                 held = Some(p.proc);
-                if keep {
+                if keep && old {
                     enqueue_front(cur);
+                } else if keep {
+                    enqueue_second(cur);
                 } else {
                     enqueue_back(cur);
                 }
@@ -6202,7 +6351,7 @@ fn arm_slice() {
         crate::killswitch::enable_ppi(26);
         crate::killswitch::enable_sgi(3);
     }
-    let ticks = crate::platform::cntfrq() / 1000 * SLICE_MS;
+    let ticks = slice_ticks();
     unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
 }
 
@@ -6211,7 +6360,20 @@ fn disarm_slice() {
 }
 
 /// Give the next runnable process one time slice (called from the service loop). Returns false if nothing was runnable. Its console output collects until `take_console`.
-/// Sleepers whose deadline has passed become runnable (called before every slice).
+/// A sleeper or a timed waiter at its deadline `d`: queued as any other wake (`enqueue_woken`: to the front while its front credit holds, a busy worker asked to make way when none is idle; at the back always until 2026-11-17, when the map's frame and the display's receive thread waited out rayon's slices), its wait measured from the deadline, so the time to notice it counts.
+fn timer_woken(t: usize, d: u64) {
+    if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+        woken(t, WAKE_TIMER);
+        enqueue_back(t);
+    } else {
+        enqueue_woken(t, WAKE_TIMER);
+    }
+    if let Some(x) = th(t) {
+        x.woke = d;
+    }
+}
+
+/// Sleepers whose deadline has passed become runnable (called before every slice, and by any trap once the earliest deadline has passed).
 fn wake_sleepers() {
     let kk = k();
     unsafe { core::ptr::write_volatile(&raw mut __irq_any, 0) };
@@ -6222,8 +6384,7 @@ fn wake_sleepers() {
             if let State::Sleeping(d) = p.state {
                 if d <= now {
                     p.state = State::Runnable;
-                    (p.woke, p.wkind) = (d, WAKE_TIMER as u8);
-                    enqueue_back(i);
+                    timer_woken(i, d);
                     tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
                 }
             } else if let State::Waiting(a, d) = p.state {
@@ -6251,8 +6412,7 @@ fn wake_sleepers() {
                 if d != 0 && d <= now {
                     p.state = State::Runnable;
                     p.frame.x[0] = 2;
-                    (p.woke, p.wkind) = (d, WAKE_TIMER as u8);
-                    enqueue_back(i);
+                    timer_woken(i, d);
                     tr(TR_WAKE, i, 0xFFFE);
                 }
             }
