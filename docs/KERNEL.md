@@ -428,6 +428,20 @@ husky has 1× Cortex-X3, 4× A715, 4× A510 (ASID.md). The kernel today is one c
    - Any trap that finds the earliest deadline passed wakes the sleepers (`wake_sleepers`), so a deadline is noticed at the next syscall anywhere, not at the next slice's end; and an idle worker arms the EL2 timer at the next deadline before its `wfe`, as the kernel's core does (it waited for its event stream, 2.7 ms).
    - The lock spins test-then-test-and-set: a waiter reads its shared copy of the word and tries the exclusive store only once it reads free.
    - `diag sched` counts the yields by path and the light wakes that found no worker idle and the cores asked to make way; `diag "sched all"` lists the whole ring (512 events are a few milliseconds of rayon's yields).
+   - `diag "sched old on|off"` puts the behaviour before all this back at run time (bare test-and-set, locked kicking yields, word and deadline wakes to the back, no `make_way`, deadlines noticed between slices only, idle workers on their event stream), so the two are measured in adjacent runs on one boot.
+   **Measured after** (b919, one boot, adjacent runs, Photon on the Pro, `sched old` against the new, tools in /mnt/Harbor/tmp/schedwake):
+   | | scroll, old | scroll, new | pinch, old | pinch, new |
+   |---|---|---|---|---|
+   | futex (word) wake to run, mean | 247 us | 120 us | 982 us | 540 us |
+   | word wakes waiting 1.3 ms or more | 848 | 325 | 911 | 401 |
+   | deadline wake to run, mean | 1000 us | 266 us | 613 us | 157 us |
+   | deadline wakes waiting 1.3 ms or more | 1363 | 206 | 984 | 129 |
+   | lock waits, each A715 / the X3 | 710-737 / 1049 ms | 340-690 / 522 ms | 350-376 / 387 ms | 321-462 / 307 ms |
+   | a thread woken with every worker busy, in the ring | 1.52-1.56 ms | 0.08-0.23 ms | | |
+   | Photon's render (full) / fluor draw + present | 49 ms | 49 ms | 9.6 + 18.8 ms | 11.0 + 18.5 ms |
+
+   The waits shrank three to six times; the frames did not move. The A715s are saturated: in 67 ms of a scroll Photon.1 ran 51 ms (a thread of Photon's taking whole slices), Photon's UI thread 34, rayon's four ~80 (with ~1,700 yields between them), the display's publish workers ~40, the modem ~8 to 12, the cores idle ~15 % in all; in 337 ms of a pinch rayon's four took 700 ms of core time and the display's ~440 ms, the A715s ~20 % idle, while the X3 was ~60 % idle (only pinned threads may use it). What is left of the stalls is oversubscription, eight compute threads on four cores: a section's last worker waits a slice (rayon's at every section start waited 8.5 ms behind the display's publish workers; the display's publish is taken by stripes, so a late worker of its own costs nothing). Two run-time knobs, off by default, to measure next: `diag "sched slice <n>"` (the slice timer at 2^-n s, 6 to 12, 0 the 10 ms default; the front credit stays 10 ms) and `diag "sched x3 on|off"` (an unpinned non-device thread may run on the kernel's core while it is free; a thread pinned there that wakes while one runs has `make_way` ask it to yield).
+   For 120 frames a second the kernel's side is the smaller part: Photon's ~46 ms of CPU a frame on cores at A#1065 MHz (the clock policy's ceiling for the A715s, THERMAL.md decision 3, the owner's) cannot fit 8.3 ms however it is scheduled, and the modem driver spins on its PCIe registers (`poll`, `us(10)`) for 5 to 7 ms each time `ap_wake` brings its link back.
 
 What the GPU and TPU are not for: the compositor at 1344×2992 fits on NEON across the A715s, and effects (glow, shadow, shine) are separable integer blurs on sprite-cached pixels. The Mali needs its closed CSF firmware and a shader compiler we do not have; it belongs after toka, when an app needs it. The TPU is closed end to end and is not on the path.
 
