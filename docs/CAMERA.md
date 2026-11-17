@@ -446,7 +446,25 @@ Lumis sends ISO as gain in 1024ths of one (ISO 100 = 1024) and holds it inside t
 - Linear: twice the signal per doubling from 8x up, within the noise of a dim scene; below 8x the signal is under a code above black, so the ratios there say little.
 - The analogue ends at 160x as the words say: asking 181x or 256x gives 160x (digital steps are whole, so the next is 320x); 160x over 128x gave 1.14 for 1.25, the one step that falls short (unexplained: clipping at black, or the top of the analogue range).
 - Digital doubles cleanly: 1.99 and 2.02.
-- Not measured: the ultrawide. The flashed kernel (b913) has no camera-module switch, so only the main opens; its model is read at its first open on a kernel with the other-cameras switch, and its range goes into `ARRAYS` then (until then the list offers it 1024 alone).
+- The ultrawide, measured later the same day (b915, forge with this branch: the module switch): its words read capability 0, codes 0 to G#3F0 step 1, m0 0, c0 G#400, m1 -1, c1 G#400: Sony's gain = 1024 / (1024 - code), **1x to 64x analogue**; digital G#100 to G#FFFF step 1 (never used).
+
+**Where the analogue really ends** (the owner: "Was that a typo?" of 160x; camtest `0400000400` lit and `040000040007` dark on the main, `0400000401` and `040000040107` on the ultrawide (the fourth byte 4): four frame pairs a step, the middle 64 rows raw thru the view, the temporal noise from each pair's difference, the codes near the mean; the Pro on a tripod, steady light, b915):
+
+| main, dark (128 us) | 1x | 2x | 4x | 8x | 16x | 32x | 64x | 128x | 160x |
+|---|---|---|---|---|---|---|---|---|---|
+| noise, 16ths of a code | 13 | 13 | 19 | 22 | 20 | 22 | 30 | 50 | 55 |
+| input-referred (noise / gain), codes | 0.81 | 0.41 | 0.30 | 0.17 | 0.078 | 0.043 | 0.029 | 0.024 | 0.021 |
+| codes near the mean holding samples | 8 of 11 | 7 of 11 | 9 of 13 | 12 of 15 | 12 of 15 | 15 of 15 | 19 of 19 | 29 of 29 | 31 of 31 |
+
+| main, lit (68.8 ms) | 1x | 4x | 16x | 64x | 128x | 160x |
+|---|---|---|---|---|---|---|
+| noise, 16ths | 13 | 21 | 44 | 155 | 286 | 315 |
+| codes near the mean holding samples | 10 of 11 | 15 of 15 | 27 of 27 | 81 of 81 | 147 of 147 | 161 of 161 |
+
+- **No empty codes at any step**, dark or lit, and the residues mod 4 even (63 to 66 of 256 each) wherever the noise spans more than a few codes: a gain after a 10-bit ADC would leave every 2nd code empty at 2x past it. (The dark low steps' uneven residues are a distribution narrower than a code around black 64, not gaps.)
+- **The input-referred noise keeps falling thru 160x**: a gain after the ADC multiplies everything already quantised, so its noise grows exactly with it (x2 a doubling, x1.25 from 128x to 160x); measured x1.67 from 64x to 128x and x1.10 from 128x to 160x. So the gain is still applied before the noise floor there: analogue to the stated 160x, and **the main's ceiling stays 1024 to 163840** (ISO 100 to 16000).
+- The caveat the test cannot close: a sensor whose ADC has more bits than its RAW10 output, with digital gain applied before the cut to 10 bits, shows no empty codes until that gain passes the extra bits; the noise growth above still argues against it up to 160x.
+- **The ultrawide** (dark, 128 us): noise 7, 8, 11, 16 sixteenths at 1x, 2x, 4x, 8x and 77 at 64x (x4.8 from 8x to 64x, against x8 for a gain after the ADC); every code near the mean holding samples at 64x (43 of 43); lit (its init's exposure) the same, no empty codes to 64x. **Its ceiling: 1024 to 65536** (ISO 100 to 6400), now in `ARRAYS`, so Lumis's ISO works on it too. (The console ring dropped the 11x to 45x lines of its dark run; the runs are in /mnt/Harbor/tmp/camtrials/runs.)
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
