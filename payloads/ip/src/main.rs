@@ -84,7 +84,35 @@ struct Datagram {
     /// The readers (`pins`, a bit each) yet to take it; 0: the first RECV of its port takes it, as before readers.
     readers: u16,
     data: [u8; 1472],
+    /// A datagram longer than `data` (one made whole from IPv4 fragments) is kept in big slot `big` instead; `NO_BIG` for none.
+    big: u8,
 }
+
+const NO_BIG: u8 = 0xFF;
+
+/// IPv4 reassembly (2026-11-17, the Pro: a Photon pong to a sibling carries a sealed tail past 1472 bytes, so it came as fragments and only the first went up, cut, failing its check without a word): UDP datagrams up to `REASM_MAX` bytes, `RN` at once.
+/// A datagram unfinished `2^REASM_LOG2` s after its first fragment is dropped at the next fragment's arrival (no timer: nothing waits on a clock, owner 2026-11-10); a new one with every slot busy takes the oldest's.
+const RN: usize = 4;
+const REASM_MAX: usize = 1 << 14;
+const REASM_LOG2: u32 = 4;
+/// Big slots for the queue: datagrams longer than a `Datagram`'s 1472 bytes, as many as can be made whole at once.
+const BIGN: usize = RN;
+
+struct Reasm {
+    used: bool,
+    src: [u8; 4],
+    dst: [u8; 4],
+    id: u16,
+    /// When its first fragment came (the counter).
+    at: u64,
+    /// The datagram's length once its last fragment came (0 until then), and the 8-byte units filled (`got`, a bit each), so a fragment sent twice counts once.
+    total: usize,
+    units: usize,
+    got: [u64; REASM_MAX / 8 / 64],
+    buf: [u8; REASM_MAX],
+}
+
+const REASM_FREE: Reasm = Reasm { used: false, src: [0; 4], dst: [0; 4], id: 0, at: 0, total: 0, units: 0, got: [0; REASM_MAX / 8 / 64], buf: [0; REASM_MAX] };
 
 struct Ip {
     grants: u64,
@@ -116,6 +144,10 @@ struct Ip {
     nd: [([u8; 16], [u8; 6]); 8],
     nd_n: usize,
     q: &'static mut [Datagram; QN],
+    /// The datagrams being made whole from IPv4 fragments; taken out while a whole one is handed on (`ipv4_in`), so its bytes are read beside `self`.
+    reasm: Option<&'static mut [Reasm; RN]>,
+    /// The queue's big slots (`Datagram::big`).
+    big: &'static mut [[u8; REASM_MAX]; BIGN],
     frames: u32,
     /// WiFi's DNS servers: IPv4 from DHCP (option 6), IPv6 from the router's advertisement (RDNSS, RFC 8106). Zero for none; both forgotten with the network (`wifi_down`).
     dns: [u8; 4],
@@ -229,9 +261,11 @@ struct Path {
     /// Echo requests answered, IPv4 (WiFi and the cellular call) and IPv6: counted here, said once a window, where each was a console line of its own until 2026-11-14 (`PING_LINES`).
     echoes4: u32,
     echoes6: u32,
-    /// IPv4 fragments dropped (no reassembly here), and the largest datagram one claimed to belong to, from a first fragment's UDP length.
+    /// IPv4 fragments in, the UDP datagrams made whole from them and the largest, and the fragments dropped (`Reasm`).
     frags4: u32,
-    frag_most: u16,
+    whole4: u32,
+    whole_most: usize,
+    frag_dropped: u32,
 }
 
 impl Path {
@@ -298,11 +332,19 @@ impl Path {
             ip.put(b" IPv6");
         }
         if self.frags4 != 0 {
-            ip.put(b"; IPv4 fragments dropped A#");
+            ip.put(b"; IPv4 fragments in A#");
             ip.dec(self.frags4 as u64);
-            ip.put(b" (the largest datagram a first fragment named A#");
-            ip.dec(self.frag_most as u64);
-            ip.put(b" bytes)");
+            ip.put(b", datagrams made whole A#");
+            ip.dec(self.whole4 as u64);
+            ip.put(b" (the largest A#");
+            ip.dec(self.whole_most as u64);
+            ip.put(b" bytes), dropped A#");
+            ip.dec(self.frag_dropped as u64);
+            ip.put(b" (not UDP, past A#");
+            ip.dec(REASM_MAX as u64);
+            ip.put(b" bytes, unfinished after A#");
+            ip.dec(1 << REASM_LOG2);
+            ip.put(b" s, or given way)");
         }
         for &(port, who, n, t, most) in self.took.iter().filter(|e| e.2 > 0) {
             ip.put(b"; port A#");
@@ -1300,23 +1342,92 @@ impl Ip {
         if ihl < 20 || total < ihl {
             return;
         }
-        // A fragment (more fragments to come, or an offset): dropped and counted, never taken for the whole datagram. Until 2026-11-17 a first fragment went up as the datagram cut at 1472 bytes and a later one as a datagram with ports read from its middle (the Pro: "unparsed datagram ... from 192.168.1.213:4383 ... Not enough data (1472B)", from the desktop's Photon); there is no reassembly, and the queue holds 1472 bytes a datagram.
-        if u16::from_be_bytes([p[6], p[7]]) & 0x3FFF != 0 {
-            // WHY: the packet is the network's; a first fragment shorter than its header and the UDP length field would index past `total`.
-            if u16::from_be_bytes([p[6], p[7]]) & 0x1FFF == 0 && p[9] == 17 && total >= ihl + 6 {
-                self.path.frag_most = self.path.frag_most.max(u16::from_be_bytes([p[ihl + 4], p[ihl + 5]]));
-            }
-            self.path.frags4 += 1;
-            return;
-        }
         let src: [u8; 4] = p[12..16].try_into().unwrap();
         let dst: [u8; 4] = p[16..20].try_into().unwrap();
+        // A fragment (more fragments to come, or an offset): a UDP one is kept until its datagram is whole (`reasm_in`), then the datagram goes on as if it came in one packet; any other is dropped. Until 2026-11-17 a first fragment went up as the datagram cut at 1472 bytes and a later one as a datagram with ports read from its middle (the Pro: "unparsed datagram ... from 192.168.1.213:4383 ... Not enough data (1472B)", the desktop Photon's pong).
+        if u16::from_be_bytes([p[6], p[7]]) & 0x3FFF != 0 {
+            self.path.frags4 += 1;
+            if p[9] != 17 {
+                self.path.frag_dropped += 1;
+                return;
+            }
+            let Some(i) = self.reasm_in(src, dst, p, ihl, total) else { return };
+            let Some(pool) = self.reasm.take() else { return };
+            let n = pool[i].total;
+            self.path.whole4 += 1;
+            self.path.whole_most = self.path.whole_most.max(n);
+            self.ipv4_body(cell, src_mac, src, dst, 17, &pool[i].buf[..n]);
+            pool[i].used = false;
+            self.reasm = Some(pool);
+            return;
+        }
+        self.ipv4_body(cell, src_mac, src, dst, p[9], &p[ihl..total]);
+    }
+
+    /// A fragment of a UDP datagram taken in: its bytes at its offset, a bit for each 8-byte unit it fills. The slot's index once the datagram is whole (its length in `total`, its bytes from `buf[0]`, the UDP header first), else None.
+    fn reasm_in(&mut self, src: [u8; 4], dst: [u8; 4], p: &[u8], ihl: usize, total: usize) -> Option<usize> {
+        let t = now();
+        let late = self.freq << REASM_LOG2;
+        let flags = u16::from_be_bytes([p[6], p[7]]);
+        let off = (flags & 0x1FFF) as usize * 8;
+        let more = flags & 0x2000 != 0;
+        let id = u16::from_be_bytes([p[4], p[5]]);
+        let data = &p[ihl..total];
+        let Some(pool) = self.reasm.as_mut() else { return None };
+        // Those started too long ago, given up here, at an arrival, as RFC 791's timer would have (no timer runs: owner, 2026-11-10).
+        for r in pool.iter_mut().filter(|r| r.used && t.wrapping_sub(r.at) >= late) {
+            r.used = false;
+            self.path.frag_dropped += 1;
+        }
+        // WHY: the offset and length are the sender's; a datagram past REASM_MAX would write past the slot's buffer. Such datagrams are dropped (counted), and a fragment that is not the last must fill whole 8-byte units (RFC 791), or the units would not add up.
+        if off + data.len() > REASM_MAX || (more && data.len() % 8 != 0) {
+            self.path.frag_dropped += 1;
+            return None;
+        }
+        let i = match pool.iter().position(|r| r.used && r.src == src && r.dst == dst && r.id == id) {
+            Some(i) => i,
+            None => {
+                let i = match pool.iter().position(|r| !r.used) {
+                    Some(i) => i,
+                    None => {
+                        self.path.frag_dropped += 1;
+                        (0..RN).min_by_key(|&k| pool[k].at).unwrap_or(0)
+                    }
+                };
+                let r = &mut pool[i];
+                r.used = true;
+                r.src = src;
+                r.dst = dst;
+                r.id = id;
+                r.at = t;
+                r.total = 0;
+                r.units = 0;
+                r.got = [0; REASM_MAX / 8 / 64];
+                i
+            }
+        };
+        let r = &mut pool[i];
+        r.buf[off..off + data.len()].copy_from_slice(data);
+        for u in off / 8..(off + data.len()).div_ceil(8) {
+            let (w, b) = (u >> 6, 1u64 << (u & 63));
+            if r.got[w] & b == 0 {
+                r.got[w] |= b;
+                r.units += 1;
+            }
+        }
+        if !more {
+            r.total = off + data.len();
+        }
+        (r.total != 0 && r.units == r.total.div_ceil(8)).then_some(i)
+    }
+
+    /// An IPv4 packet's body, whole (in one packet, or made whole from its fragments): protocol `proto` from `src` to `dst`.
+    fn ipv4_body(&mut self, cell: bool, src_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, body: &[u8]) {
         // Unicast to us: WiFi's bound address, or the call's on the cellular link.
         let mine = if cell { self.cell.flags & 3 == 3 && dst == self.cell.v4 } else { self.bound && dst == self.v4 };
         // Ours: our address, or on WiFi broadcast (limited or the subnet's) or IPv4 multicast (224/4: Photon's LAN beacon group 239.104.199.144; the firmware passes all multicast, and only opened ports keep a datagram).
         let ours = mine || (!cell && (dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k])) || dst[0] & 0xF0 == 0xE0));
-        let body = &p[ihl..total];
-        match p[9] {
+        match proto {
             // ICMP echo request → reply up the call, or to the sender's MAC on WiFi (no resolution needed).
             1 if mine && body.len() >= 8 && body[0] == 8 && cell => {
                 let mut r = [0u8; 1480];
@@ -1843,14 +1954,35 @@ impl Ip {
         d.seq = seq;
         d.at = now();
         d.readers = readers;
-        let n = data.len().min(d.data.len());
         d.used = true;
         d.fam = fam;
         d.addr = addr;
         d.sport = sport;
         d.dport = dport;
-        d.len = n;
-        d.data[..n].copy_from_slice(&data[..n]);
+        d.big = NO_BIG;
+        if data.len() <= d.data.len() {
+            d.len = data.len();
+            d.data[..data.len()].copy_from_slice(data);
+            return;
+        }
+        // Longer than a slot (made whole from fragments): a big slot no other queued datagram holds; with none free it is cut to the slot, as before reassembly (`REASM_MAX` bounds what `reasm_in` makes, the big slot's size).
+        let q = &*self.q;
+        match (0..BIGN).find(|&k| !q.iter().enumerate().any(|(j, e)| j != slot && e.used && e.big == k as u8)) {
+            Some(k) => {
+                // WHY the min: a datagram over REASM_MAX does not reach here from `reasm_in`, but a single packet's UDP body is bounded by its own length only, not by this slot.
+                let n = data.len().min(REASM_MAX);
+                self.big[k][..n].copy_from_slice(&data[..n]);
+                let d = &mut self.q[slot];
+                d.big = k as u8;
+                d.len = n;
+            }
+            None => {
+                let d = &mut self.q[slot];
+                let n = d.data.len();
+                d.len = n;
+                d.data.copy_from_slice(&data[..n]);
+            }
+        }
     }
 
     /// Whether reader `k` (`pins`) reads its port now: a held watch of its id names the port, or one did in the last 64 s.
@@ -2959,7 +3091,8 @@ impl Ip {
         out[17..19].copy_from_slice(&d.sport.to_be_bytes());
         out[19..21].copy_from_slice(&d.dport.to_be_bytes());
         let n = d.len.min(out.len() - 21);
-        out[21..21 + n].copy_from_slice(&d.data[..n]);
+        let src = if d.big == NO_BIG { &d.data[..n] } else { &self.big[d.big as usize][..n] };
+        out[21..21 + n].copy_from_slice(src);
         21 + n
     }
 
@@ -3394,9 +3527,12 @@ fn csum(data: &[u8], init: u32) -> u16 {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     // The queue lives in `.data` (a non-zero initializer keeps it out of `.bss`, which the flat image does not carry), not on the 64 KiB stack.
-    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, at: 0, readers: 0, data: [1; 1472] };
+    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, at: 0, readers: 0, data: [1; 1472], big: NO_BIG };
     #[unsafe(link_section = ".data.queue")]
     static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
+    // IPv4 reassembly and the queue's big slots: zeroed statics, as the connections' below (128 KiB, past the image).
+    static mut REASM: [Reasm; RN] = [REASM_FREE; RN];
+    static mut BIG: [[u8; REASM_MAX]; BIGN] = [[0; REASM_MAX]; BIGN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
     static mut TCBS: [Tcb; TCPN] = [TCB_FREE; TCPN];
     static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
@@ -3446,6 +3582,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         nd: [([0; 16], [0; 6]); 8],
         nd_n: 0,
         q: unsafe { &mut *(&raw mut QUEUE) },
+        reasm: Some(unsafe { &mut *(&raw mut REASM) }),
+        big: unsafe { &mut *(&raw mut BIG) },
         frames: 0,
         dns: [0; 4],
         dns6: [0; 16],
