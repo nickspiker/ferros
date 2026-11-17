@@ -17,6 +17,8 @@ pub mod fetch;
 pub mod note;
 /// A signing key kept as VSF: its one reader and writer (the host tools).
 pub mod secret;
+/// A capsule's address and the hash its signature covers, both in one pass over its bytes (the kernel's kist launch).
+pub mod twin;
 
 use alloc::string::String;
 use alloc::vec::Vec;

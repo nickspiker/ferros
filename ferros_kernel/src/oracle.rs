@@ -48,6 +48,11 @@ pub struct Located {
 
 /// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). The signature covers every byte, so a wrong location runs the developer's own bytes, nothing else. A masked kist (stowed or launched from the vault) is gated here too, its modes read in place (`masked_modes`) and its checker run over the code where it lies (`process::stow_check`).
 pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> Result<Located, &'static str> {
+    gate_located_with(capsule, code_offset, code_len, None)
+}
+
+/// `gate_located`, with the hash its signature covers already taken as the capsule came in (`pre`: that hash and the slot it read as zeros, `ferros_kist::twin` in the kist job), so its 92 MB are not hashed again (2026-11-17, Photon's launch). The slot must be the one this gate finds for itself, else the capsule is hashed here as before.
+pub fn gate_located_with(capsule: &mut [u8], code_offset: usize, code_len: usize, pre: Option<(&[u8; 32], (usize, usize))>) -> Result<Located, &'static str> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use vsf::file_format::VsfHeader;
     use vsf::types::VsfType;
@@ -79,9 +84,15 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
         return Err("gate: the signature is not in the header");
     }
     let at = (0..=hdr_len - n).find(|&i| capsule[i..i + n] == slot[..]).ok_or("gate: the signature is not in the header")?;
-    capsule[at..at + n].fill(0);
-    let hash = blake3::hash(capsule);
-    capsule[at..at + n].copy_from_slice(&slot);
+    let hash = match pre {
+        Some((h, s)) if s == (at, n) => blake3::Hash::from_bytes(*h),
+        _ => {
+            capsule[at..at + n].fill(0);
+            let h = blake3::hash(capsule);
+            capsule[at..at + n].copy_from_slice(&slot);
+            h
+        }
+    };
     let key = VerifyingKey::from_bytes(&pubkey).map_err(|_| "gate: bad developer key")?;
     if key.verify_strict(hash.as_bytes(), &Signature::from_bytes(&sig)).is_err() {
         // The flash log gets what was hashed: the bridge prints the same for the file it sent, so a mismatch names the piece of memory, not the code.

@@ -3021,6 +3021,11 @@ fn vault_ep() -> Option<usize> {
 /// The largest get the vault process serving now has said it answers (`SYS_VAULT` op 3: its epoch, the length), else STORE_MAX: a vault process from before 2026-11-11 has a reply buffer of one STORE_MAX transfer, and a larger get would index past it. Under the kernel lock.
 static mut VAULT_GET: (u64, usize) = (u64::MAX, STORE_MAX);
 
+/// The get bound for the kernel's own call (`vault_call`), as for a process's forwarded get: a kist's capsule is read a megabyte a call where the vault process answers that much (2026-11-17: Photon's 92 MB went in 351 calls of 256 KiB, each batch of four pieces waiting on its slowest helper). Takes the kernel lock.
+pub fn kernel_get_max() -> usize {
+    with_lock(|| vault_ep().map(vault_get_max).unwrap_or(STORE_MAX))
+}
+
 /// The get bound for the vault process serving `ep` (`VAULT_GET` when that process said it, STORE_MAX otherwise).
 fn vault_get_max(ep: usize) -> usize {
     let kk = k();
@@ -5501,8 +5506,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     let len = (f.x[2] as usize).min(STORE_MAX + 8);
                     let mut handed = false;
                     if caller == KERNEL_CALLER {
-                        // The kernel's own call (`vault_call`): kept for the service loop; the server runs on.
-                        kernel_answered(Ok(p.read(f.x[1], len)));
+                        // The kernel's own call (`vault_call`): kept for the service loop; the server runs on. A get's reply up to STORE_GET_MAX (a kist's capsule, `kernel_get_max`); every other call of the kernel's asks no more than STORE_MAX. WHY the min: the length is the server's own.
+                        kernel_answered(Ok(p.read(f.x[1], (f.x[2] as usize).min(STORE_GET_MAX + 8))));
                     } else if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
                         if let State::Calling(roff, rcap) = ct.state {
                             if rcap & STORE_REPLY != 0 {
@@ -6973,11 +6978,15 @@ pub fn kist_masked(head: &[u8], total: usize) -> bool {
 }
 
 /// A masked kist's code where it lies in its staged capsule, gated, its modes read and its seal found in `sealed` (32-byte entries): SANDBOX.md's "spawn runs only sealed images", one BLAKE3 over the image and no checker. Returns the developer's key and identity for the ihi, and the modes.
-fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8]) -> Result<(crate::oracle::Located, crate::oracle::Modes), KistFault> {
+fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8], pre: Option<&KistHashes>) -> Result<(crate::oracle::Located, crate::oracle::Modes), KistFault> {
     use ferros_kist::launch::why;
-    let g = crate::oracle::gate_located(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
+    let t = crate::platform::cntpct();
+    let g = crate::oracle::gate_located_with(capsule, co, cl, pre.map(|p| (&p.file, p.slot))).map_err(|e| (why::CHECKS, e))?;
+    kist_time(KT_GATE, t);
+    let t = crate::platform::cntpct();
     let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
     let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or((why::OTHER, "no system secret: cannot check a seal"))?;
+    kist_time(KT_SEAL, t);
     if !sealed.chunks_exact(32).any(|e| e == s) {
         return Err((why::NOT_HERE, "gate: masked kist not stowed on this device (no seal)"));
     }
@@ -6989,16 +6998,46 @@ pub type KistFault = (u8, &'static str);
 /// Not a fault: a process of the kist's name started while its capsule was read, so it runs and nothing is kept for the map.
 pub const KIST_ALREADY: u8 = u8::MAX;
 
+/// A capsule's two hashes, taken in one pass as it was read into its arc (`ferros_kist::twin`, service.rs `KistJob`): its address, the hash its signature covers, and where its header puts the signature's slot. The arc is the kernel's alone from the read to the build (no process maps it), so what was hashed is what is checked and run.
+pub struct KistHashes {
+    pub address: [u8; 32],
+    pub file: [u8; 32],
+    pub slot: (usize, usize),
+}
+
+/// The last kist launch's checks, each in counter ticks, for the service loop's "started from the vault" line (2026-11-17, owner: "it takes TWO SECONDS to open Photon"): the address, the gate, the seal, the build.
+pub const KT_ADDRESS: usize = 0;
+pub const KT_GATE: usize = 1;
+pub const KT_SEAL: usize = 2;
+pub const KT_BUILD: usize = 3;
+pub static KIST_TICKS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The ticks since `t` kept as check `k` of the last launch.
+fn kist_time(k: usize, t: u64) {
+    KIST_TICKS[k].store(crate::platform::cntpct() - t, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every asked right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be asked for), the implicit set handed to it without a question in the slots `ferros_kist::slots` gives them. Masked code runs only with its seal in `sealed` (the stower's, `stow_kist`), the checker never run again; native code only in a development build (the bridge's `kist stow`). Then the code moves down, the rest is zeroed, and the process is built with exactly the layout's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
-pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), KistFault> {
+/// `pre`: the address and the signature's hash as the read took them (`KistHashes`), checked here in place of hashing the capsule again; None hashes it here.
+pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Option<&KistHashes>) -> Result<(), KistFault> {
     use ferros_kist::launch::why;
+    for t in &KIST_TICKS {
+        t.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
     let mut arc = arc;
     let r = (|| {
         if CODE + total + STACK > arc.size {
             return Err((why::OTHER, "kist: the capsule does not fit its arc"));
         }
         let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, total) };
-        if blake3::hash(capsule).as_bytes() != &l.capsule {
+        // The address taken as the bytes came in, where the job could (a capsule with a signature slot in its first bytes); else hashed here.
+        let t = crate::platform::cntpct();
+        let address = match pre {
+            Some(p) => p.address,
+            None => *blake3::hash(capsule).as_bytes(),
+        };
+        kist_time(KT_ADDRESS, t);
+        if address != l.capsule {
             return Err((why::READ, "kist: the vault's capsule is not the one named (its blake3)"));
         }
         let wants = ferros_kist::want_codes(capsule).map_err(|e| (why::READ, e))?;
@@ -7007,14 +7046,18 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
         }
         let (co, cl, masked) = locate_code(capsule, total).map_err(|e| (why::READ, e))?;
         let (g, modes) = if masked {
-            let (g, m) = kist_sealed(capsule, co, cl, sealed)?;
+            let (g, m) = kist_sealed(capsule, co, cl, sealed, pre)?;
             (g, Some(m))
         } else {
             if cfg!(ferros_production) {
                 return Err((why::CHECKS, "gate: production refuses unmasked native code"));
             }
-            (crate::oracle::gate_located(capsule, co, cl).map_err(|e| (why::CHECKS, e))?, None)
+            let t = crate::platform::cntpct();
+            let g = crate::oracle::gate_located_with(capsule, co, cl, pre.map(|p| (&p.file, p.slot))).map_err(|e| (why::CHECKS, e))?;
+            kist_time(KT_GATE, t);
+            (g, None)
         };
+        let t_build = crate::platform::cntpct();
         // A masked arc is the one its code was checked for: fixed mode's exactly 2^K, which a staged capsule's arc is not (it holds the whole capsule first).
         if modes.as_ref().is_some_and(|m| m.fixed != 0 && arc.size != 1 << m.fixed) {
             return Err((why::OTHER, "kist: a fixed-mode kist is not launched from the vault yet (its arc must be exactly the sealed size)"));
@@ -7027,9 +7070,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
         }
-        Ok((ihi, cl, modes, wants, (g.developer_pubkey, g.hp)))
+        Ok((ihi, cl, modes, wants, (g.developer_pubkey, g.hp), t_build))
     })();
-    let (ihi, cl, modes, wants, gate) = match r {
+    let (ihi, cl, modes, wants, gate, t_build) = match r {
         Ok(x) => x,
         Err(e) => {
             with_lock(|| arc_free(arc));
@@ -7073,6 +7116,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
                 }
                 enqueue_back(me);
                 kist_started(&l.capsule);
+                kist_time(KT_BUILD, t_build);
                 Ok(())
             }
             Err(e) => {

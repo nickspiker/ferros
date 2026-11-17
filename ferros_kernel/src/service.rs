@@ -458,6 +458,10 @@ struct KistJob {
     read: bool,
     /// A stow refused and already told why.
     told: bool,
+    /// A launch's two hashes taken as the bytes land in the arc (`kist_hash`): None until the arc is there, or for a capsule whose first bytes name no signature slot (hashed whole at the check, as before).
+    twin: Option<ferros_kist::twin::Twin>,
+    /// The counter ticks spent hashing as the bytes came.
+    hash_ticks: u64,
 }
 
 enum KistWhy {
@@ -479,7 +483,8 @@ use ferros_kist::launch::why;
 fn kist_call(job: &KistJob) -> bool {
     let mut rest = [0u8; 12];
     rest[..8].copy_from_slice(&(job.got as u64).to_le_bytes());
-    rest[8..].copy_from_slice(&(crate::process::STORE_MAX as u32).to_le_bytes());
+    // A megabyte a call where the vault process answers that much (`kernel_get_max`), else a STORE_MAX transfer.
+    rest[8..].copy_from_slice(&(crate::process::kernel_get_max() as u32).to_le_bytes());
     match crate::process::vault_stamp_addr(crate::process::VOP_GET, "capsules", &job.capsule, &rest) {
         Some(msg) => crate::process::vault_call(msg),
         None => false,
@@ -510,12 +515,44 @@ fn kist_tell(job: &KistJob, stage: u64, value: u64) {
     }
 }
 
+/// A launch's bytes in its arc hashed up to what has come (`ferros_kist::twin`: the address and the signature's hash in one pass), the hasher made at the first bytes the arc holds from the slot its header names. The read's own pass is the only one over the bytes; `spawn_kist` checks the two hashes without hashing again.
+fn kist_hash(job: &mut KistJob) {
+    let (KistWhy::Launch(_), Some(arc)) = (&job.why, job.arc) else { return };
+    let t = cntpct();
+    if job.twin.is_none() {
+        // Only from a capsule's first byte: the first call finds nothing hashed, and a job whose header names no slot hashes at the check instead.
+        let first = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE) as *const u8, job.got.min(ferros_kist::fetch::HEAD)) };
+        match ferros_kist::fetch::head(first) {
+            Ok(h) => job.twin = Some(ferros_kist::twin::Twin::new(h.slot)),
+            Err(_) => return,
+        }
+    }
+    let Some(tw) = job.twin.as_mut() else { return };
+    let from = tw.len();
+    let came = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE + from) as *const u8, job.got - from) };
+    tw.update(came);
+    job.hash_ticks += cntpct() - t;
+}
+
 /// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; a stow told it is read and its checker due on the next pass; else the next read.
 fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     if job.got >= job.total {
+        // The last bytes hashed while the job still holds the arc.
+        kist_hash(job);
         let Some(arc) = job.arc.take() else { return Some(Err((why::READ, "the capsule ended before its code"))) };
         return match &job.why {
-            KistWhy::Launch(l) => Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed).map(|()| KistDone::Launched)),
+            KistWhy::Launch(l) => {
+                // The hashes whole only when every byte went thru the hasher; else `spawn_kist` hashes the arc itself.
+                let t = cntpct();
+                let pre = job.twin.take().filter(|tw| tw.len() == job.total).and_then(|tw| {
+                    let first = unsafe { core::slice::from_raw_parts((arc.base + crate::process::CODE) as *const u8, job.total.min(ferros_kist::fetch::HEAD)) };
+                    let slot = ferros_kist::fetch::head(first).ok()?.slot;
+                    let (address, file) = tw.finish();
+                    Some(crate::process::KistHashes { address, file, slot })
+                });
+                job.hash_ticks += cntpct() - t;
+                Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed, pre.as_ref()).map(|()| KistDone::Launched))
+            }
             KistWhy::Stow(_) => {
                 job.arc = Some(arc);
                 job.read = true;
@@ -526,7 +563,10 @@ fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             }
         };
     }
-    if !kist_call(job) {
+    // The next read asked first, so the vault process works on it while this core hashes what came.
+    let asked = kist_call(job);
+    kist_hash(job);
+    if !asked {
         return Some(Err((why::READ, "the kernel's channel to the vault process would not take the next read")));
     }
     None
@@ -2660,7 +2700,7 @@ pub fn run(mut b: Boot) -> ! {
                 };
                 // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
                 let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
-                let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false };
+                let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false, twin: None, hash_ticks: 0 };
                 if kist_call(&job) {
                     kist_tell(&job, crate::process::STOW_READING, 0);
                     kist_job = Some(job);
@@ -2683,7 +2723,22 @@ pub fn run(mut b: Boot) -> ! {
             if let Some(r) = kist_step(job) {
                 let ms = (cntpct() - job.t0) * 1000 / cntfrq();
                 let line = match (&job.why, r) {
-                    (KistWhy::Launch(l), Ok(_)) => alloc::format!("kist {}: started from the vault ({} bytes read in {ms} ms)\n", core::str::from_utf8(&l.name).unwrap_or("?"), job.total),
+                    // Where the launch's time went (2026-11-17): the hashing as the bytes came (one pass, both hashes), then each check after the read, the build last.
+                    (KistWhy::Launch(l), Ok(_)) => {
+                        let us = |t: u64| t * 1_000_000 / cntfrq();
+                        let k = |i: usize| us(crate::process::KIST_TICKS[i].load(core::sync::atomic::Ordering::Relaxed));
+                        alloc::format!(
+                            "kist {}: started from the vault ({} bytes read in {ms} ms, {} B a call): hashed as it came {} us; after the read the address {} us, the gate {} us, the seal {} us, the build {} us\n",
+                            core::str::from_utf8(&l.name).unwrap_or("?"),
+                            job.total,
+                            crate::process::kernel_get_max(),
+                            us(job.hash_ticks),
+                            k(crate::process::KT_ADDRESS),
+                            k(crate::process::KT_GATE),
+                            k(crate::process::KT_SEAL),
+                            k(crate::process::KT_BUILD)
+                        )
+                    }
                     // Kept with its reason for the map, which init told "started" (`kist_not_started`): its circle says why. One that started under the same name meanwhile runs, and nothing is kept.
                     (KistWhy::Launch(l), Err((code, e))) => {
                         if code != crate::process::KIST_ALREADY {
