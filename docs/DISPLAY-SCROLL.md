@@ -41,6 +41,21 @@ The DPU never reads a surface: the display composes every window on the CPU into
 Under a finger the phases flip with every show, so each scroll frame writes a different phase, and the phase it writes owes the pane of the last four shows (all of it, since each show changed the whole pane).
 The other three are brought up only an eighth of a second after the last op 22 (the idle pass, one phase a pass): after a scroll stops, three more publishes of the pane.
 
+### One phase a frame while moving, the rest only at rest
+
+The owner (2026-11-17): "we only need to render one phase as we go since it's likely that whilst scrolling we'll have a different next phase."
+This holds for every option in this document:
+- **While the content moves**, each frame composes only the phase it shows next. The other three are never caught up meanwhile: each would be stale by the time it came round, since the next frame moves the content again, and its own turn composes it fresh.
+- **At rest** the three that are behind are filled, one an idle pass, and only then do the 10 Hz flips resume (the flip already waits for the next phase to be current, `flip_due` reads its owed rect).
+- **Every cost estimate here is one phase a frame**: no catch-up pass is counted during motion, and the three catch-ups at rest are counted apart (three pane publishes once, after the last frame).
+
+**What "at rest" means.** Today it is a timer: no op 22 for an eighth of a second (`last_interaction`, the idle pass).
+Proposed instead, counted, not timed: rest begins once the panel has started N frames (TE, the frame starts the display already counts, `FRAME_STARTS`) with no new show from the window in front.
+- N = 2^1 is the proven floor: a show that comes one frame late (the app missed a refresh) must not start a catch-up that the next show throws away, and a 120 Hz app that missed one refresh is still moving.
+- Each catch-up is due before its phase is next on the glass, which is the real deadline: the flips do not resume until the next phase is current, so a slow catch-up delays the first 10 Hz flip and never shows a stale phase.
+- A show arriving during the catch-up wins: the catch-up of a phase it owes again is simply dropped (that phase's owed rect grows by the show's change, as now), so nothing at rest ever delays a moving frame by more than the one phase pass in progress.
+- N is a knob (knob 14); the count is in the panel's own frames, so it means the same at 120 Hz, at 60 and at the idle floors.
+
 ### The dither
 
 - A 16 × 16 blue-noise field (`neon::BLUE`, every rank 0 to 255 once), its two low bits XOR `TURN[k]` = [0, 2, 3, 1] in phase k (COMPOSITOR.md "The dither").
@@ -195,7 +210,7 @@ The `changed` rect stays what the present wrote: the damage, and on a ring frame
 ### Cost
 
 - fluor: the surface move goes, about 2.5 to 2.7 ms of the four A715s a scroll frame; a rare rotation when a pane changes under a live ring.
-- The display: a row's index computed per row; the publish of the pane itself is unchanged (still one phase a show).
+- The display: a row's index computed per row; the publish of the pane itself is unchanged: one phase a show while the content moves, the other three filled only at rest (section 0, "One phase a frame while moving"), each read thru the ring's origin as it then stands.
 - Memory: none (the ring lives in the surface's own rows).
 - Exactness: total, since the display reads the same pixels the memmove would have put there, and the dither stays screen-anchored as now.
 
@@ -264,6 +279,7 @@ Section 5 (B+, the owner's layers and strip, added the same day) is the design t
 11. **Surfaces for an app**: B+ wants four or five slots of the sixteen for Photon (noise, chrome, the strip's two); how an app asks for more than its spawn's one.
 12. **Which layers**: the three the owner named; whether Photon's fixed overlays drawn into the target (the wave, the chord hint, the toast) move into the chrome layer later.
 13. **Text over the noise composed after the roll-off** (B+ composes baked layers): accept, as on the deck, or keep the noise flattened under the content in fluor (which gives back the strip's cleanness).
+14. **At rest**: N panel frame starts with no new show before the three stale phases are filled (proposed N = 2, counted in the panel's frames), in place of today's eighth of a second.
 
 ## 5. B+: the window as layers, each a ring, merged in one pass
 
@@ -305,6 +321,7 @@ B removes the moves; B+ with a strip removes the **render** from a scroll frame 
 - The noise is opaque: where it is reached, the walk ends.
 - One consequence: fluor today composes the content over the noise in its g2t codes and the result is baked; in B+ each layer is baked first and composed in panel codes, after the roll-off, as the deck already is (COMPOSITOR.md "Baked", the owner's "meh, doubt anyone will notice"). The antialiased edges of text over the noise move by a code or so.
 - The dither stays screen-anchored and exact: every scroll frame composes the whole pane into the phase, as today.
+- One phase a frame (section 0, "One phase a frame while moving"): while the content moves, each frame's one pass composes only the phase shown next; the other three are filled only at rest, from the layers as they then stand (three more passes, once). The costs below are that one pass.
 
 ### What it removes, per scroll frame
 
