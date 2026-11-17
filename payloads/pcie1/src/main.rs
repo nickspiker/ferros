@@ -2449,11 +2449,18 @@ impl Path {
 }
 
 /// The interrupt's latches cleared, before the rings are read (`WIFI_IRQ`): the root complex's ELBI PCIE_IRQ2 (write back what it holds, as the Exynos RC driver's handler does), its MSI status (DBI G#830, write-1-to-clear, as the modem driver does on channel 0), then the chip's mailbox interrupt (BRCMF_PCIE_64_PCIE2REG_MAILBOXINT G#C30, write back, as brcmfmac's handler does). In that order, and the rings read after: a completion before the chip's latch is cleared is in the rings this pass reads, and one after it raises a new MSI into latches already clear, so the line rises again and the next wait ends at once.
+/// The MSI status is cleared until it reads 0: ELBI latches only its rising edge, so a status left at 1 after the edge was cleared means no MSI raises the line again.
+/// Measured on the Pro (2026-11-17, b917, the `irq silent:` line): ELBI G#32180C00 (bit 17 clear), MSI status G#1, the chip's mailbox 0 with its mask G#FFFF, the line armed and quiet for whole 42 s windows; with the screen off and ip waiting on the doorbell nothing made a pass, and the driver sat until the access point dropped the link.
+/// The status read 0 after the edge was cleared, any later MSI is a new edge the latch keeps; one set while the loop runs is cleared by it, its completion read with the rings after `irq_arm`.
 fn irq_clear(d: &mut Drv) {
     let s = d.rd(ELBI, 0x8);
     d.wr(ELBI, 0x8, s);
-    let m = d.rd(DBI, 0x830);
-    if m != 0 {
+    // WHY the all-ones test: `rd` gives all ones when the read itself failed (ERR), never a status, and the loop must not spin on it.
+    loop {
+        let m = d.rd(DBI, 0x830);
+        if m == 0 || m == u32::MAX {
+            break;
+        }
         d.wr(DBI, 0x830, m);
     }
     let c = d.rd(MEM, 0x2C30);
