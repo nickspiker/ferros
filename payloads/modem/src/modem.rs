@@ -140,10 +140,14 @@ fn us(n: u64) {
 fn ms(n: u64) {
     ferros_sys::sleep_until(now() + crate::hw::freq() / 1000 * n);
 }
+/// The step of every wait on the link that lasts longer than a few microseconds, 2^-13 s (122 us), the core given away meanwhile: the link's resume takes 77 us to L0, 100 us to the PLL's lock and 6.75 ms to the PHY's offset calibration (measured on the Pro, 2026-10 and 11), and every one of those waits spun the core in `us(10)` until 2026-11-17, 5 to 7 ms of an A715 at each resume while a Photon scroll needed every A715 it had. Linux waits the same lines by polling too (no interrupt says the PHY locked or the link trained), from a kworker the scheduler may preempt.
+fn nap() {
+    ferros_sys::sleep_until(now() + (crate::hw::freq() >> 13));
+}
 fn since_us(t0: u64) -> u64 {
     (now() - t0) * 1_000_000 / crate::hw::freq()
 }
-/// Poll `(rd(a) & mask) == want` every 10 µs for at most `max_us`; the microseconds it took.
+/// Poll `(rd(a) & mask) == want` every `nap` for at most `max_us`; the microseconds it took.
 fn poll(a: usize, mask: u32, want: u32, max_us: u64) -> Option<u64> {
     let t0 = now();
     loop {
@@ -153,7 +157,7 @@ fn poll(a: usize, mask: u32, want: u32, max_us: u64) -> Option<u64> {
         if since_us(t0) > max_us {
             return None;
         }
-        us(10);
+        nap();
     }
 }
 fn kv(rep: &mut Vec<u8>, k: &str, v: u32) {
@@ -488,7 +492,7 @@ fn link_at(rep: &mut Vec<u8>, speed: u32, lanes: u32) -> bool {
             l0 = true;
             break;
         }
-        us(10);
+        nap();
     }
     trace.push('\n');
     line(rep, trace);
@@ -1867,7 +1871,7 @@ fn ring_send(link: &mut SitLink, raw: bool, ch: u8, payload: &[u8]) -> Result<()
         let t1 = now();
         let mut r = ring_frame(link, raw, ch, cfg, part);
         while r.is_err() && k > 0 && since_us(t1) < 200_000 {
-            us(100);
+            nap();
             r = ring_frame(link, raw, ch, cfg, part);
         }
         r?;
@@ -1926,7 +1930,7 @@ fn ap_wake() -> Result<(), alloc::string::String> {
         if since_us(t0) > 1_000_000 {
             return Err(alloc::format!("the CP did not raise CP2AP_WAKEUP"));
         }
-        us(100);
+        nap();
     }
     resume()
 }
@@ -3222,7 +3226,7 @@ impl Online {
                         let t1 = now();
                         let mut r = fmt_send(&mut self.link, CH_MODEM_SVC, &reply);
                         while r.is_err() && since_us(t1) < 200_000 {
-                            us(100);
+                            nap();
                             r = fmt_send(&mut self.link, CH_MODEM_SVC, &reply);
                         }
                         if let Err(e) = r {
