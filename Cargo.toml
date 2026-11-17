@@ -13,6 +13,7 @@ members = [
     "ferros_hal_m1",
     "vault",
     "store",
+    "sha2_asm",
     "ferros_ledger",
     "ferros_pt",
     "ferros_heap",
@@ -168,3 +169,7 @@ opt-level = 3
 
 [profile.dev.package.ferros_pt]
 opt-level = 3
+
+[patch.crates-io]
+# sha2-asm in pure Rust (sha2_asm/Cargo.toml says why): a payload that turns sha2 0.10's `asm` feature on gets the CPU's SHA-256 and builds no C.
+sha2-asm = { path = "sha2_asm" }

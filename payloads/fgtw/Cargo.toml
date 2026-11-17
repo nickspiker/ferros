@@ -16,6 +16,8 @@ fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout",
 # Photon Transport names a frame by its BLAKE3 when it answers a send (depart.rs, route.rs): the same pure build photon_core takes.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }
+# The CPU's SHA-256 under fgtw's SPHINCS+ (fips205's sha2 0.10, whose aarch64 backend needs `asm`): the workspace patches sha2-asm with sha2_asm, pure Rust, so nothing but Rust is built (sha2_asm/Cargo.toml). Every binding's signature, the device keys at start.
+sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 # x-full: the `x` text codec without std for every Unicode scalar value (fgtw's Cargo.toml: a no_std build that wants every character enables vsf/x-full; the owner's call for ferros, so every language's text encodes, as ferros_idea does).
 # Without a codec a kept departure or add holding a device's name (`x`) did not read ("VsfType::x is Huffman-coded and requires the 'text' feature"), so fgtw started fresh at every start, and a name it wrote flattened empty.
 vsf = { path = "../../../vsf", default-features = false, features = ["x-full"] }

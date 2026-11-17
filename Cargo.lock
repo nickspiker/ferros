@@ -889,6 +889,7 @@ dependencies = [
  "ferros_sys",
  "fgtw",
  "photon_core",
+ "sha2",
  "vsf 0.11.0",
 ]
 
@@ -1058,6 +1059,8 @@ dependencies = [
  "fn-dsa",
  "rand_chacha",
  "rand_core",
+ "sha2",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -2896,6 +2899,14 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]
