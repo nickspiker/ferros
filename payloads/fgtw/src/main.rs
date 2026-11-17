@@ -794,6 +794,19 @@ impl Client {
                 self.log.addr(&addr);
                 self.log.line();
                 self.sponsors.push(Sponsor { key, addr, asked_t: 0, heard_us: t, online: false });
+                // Not bound: that device is asked for the chain at once, unicast (a member is answered with it, `on_fleet_req` on its side), so a member of the fleet binds from its own devices.
+                // The Pro, b913 (2026-11-17): the lookup's broadcast went before the MacBook beaconed and fgtw.org did not answer, so the verdict went GREY; the MacBook's beacon 57 s later made it "joining", the lookup is not run again while joining, and a member of the fleet sat minting a binding request with no person key, so Photon got no alias.
+                if !self.bound {
+                    if let Some(hp) = self.hp {
+                        if let Ok(frame) = fgtw::protocol::fleet_req(&hp, self.keys.keypair(), eagle()) {
+                            self.udp.send(&Addr { port: join::BEACON_PORT, ..from }, join::BEACON_PORT, &frame);
+                            self.log.put(b"fgtw: lookup: asking ");
+                            self.log.fp(&key);
+                            self.log.put(b" for our fleet's chain");
+                            self.log.line();
+                        }
+                    }
+                }
                 // A device beaconing under our handle: the identity has a fleet, whatever the seed said.
                 if matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
                     self.verdict = V_JOIN;
