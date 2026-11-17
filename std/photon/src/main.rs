@@ -205,6 +205,9 @@ impl FluorApp<Px> for Ferros {
     fn on_zoom(&mut self, factor: f32, anchor_x: Coord, anchor_y: Coord, ctx: &mut Context) {
         self.app.on_zoom(factor, anchor_x, anchor_y, ctx)
     }
+    fn on_zoom_end(&mut self, ctx: &mut Context) {
+        self.app.on_zoom_end(ctx)
+    }
     fn owns_zoom_gesture(&self) -> bool {
         self.app.owns_zoom_gesture()
     }
