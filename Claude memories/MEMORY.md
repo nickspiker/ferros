@@ -6,6 +6,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: AVB key freedom](feedback_avb_key_freedom.md) - use keys/avb.vsf freely while it stays VSF in Code/keys
 - [Feedback: no attribution](feedback_no_attribution.md) - "Built with Claude", never Co-Authored-By or authorship claims
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) - commit + push each verified step; own hunks only
+- [Feedback: reload the Pro freely](feedback_pro_reload_freely.md) - reloads/restarts/stores need no ask; unplugged = hands off
 - [Feedback: deploy sites freely](feedback_deploy_sites_ok.md) - fgtw.org, passless.org, ferros.org deploys need no go; keys/handles rules hold
 - [Feedback: don't SSH](feedback_no_ssh.md) - never SSH into another machine unless told to
 - [Feedback: no Google connectors](feedback_no_google_connectors.md) - owner doesn't use Google; ignore those auth notices
