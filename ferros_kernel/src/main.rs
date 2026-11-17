@@ -242,6 +242,11 @@ pub fn heap_report() -> Option<ferros_heap::kernel::Report> {
     KERNEL_HEAP.report()
 }
 
+/// The kernel heap's largest free block in bytes; `usize::MAX` when the heap is busy on another core (the caller's test then passes, as it would have a moment later).
+pub fn heap_largest_free() -> usize {
+    KERNEL_HEAP.report().map_or(usize::MAX, |r| r.largest)
+}
+
 /// `diag heap`: the kernel heap as text, its free space by size included (a walk of every free block, under the heap's lock).
 pub fn heap_text() -> alloc::string::String {
     let Some(r) = KERNEL_HEAP.report() else {

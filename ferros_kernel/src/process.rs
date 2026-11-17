@@ -7278,12 +7278,15 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     if fixed != 0 && need > 1 << fixed {
         return Err("spawn: the image does not fit its fixed arc");
     }
+    spawn_step(7);
     let mut arc = if fixed != 0 { arc_alloc(1 << fixed, masked) } else { arc_alloc_room(need, ceiling, masked) }.ok_or("arc pool exhausted")?;
+    spawn_step(8);
     // Exact mode: the limit is what the image needs, rounded to the 16 bytes the stack pointer must keep; the arc around it is the power of two the pool hands out, its rest the room the limit can grow into.
     if exact {
         arc.limit = (need + 15) & !15;
     }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
+    spawn_step(9);
     build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len, bti)
 }
 
@@ -7452,10 +7455,14 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
 fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     let read = unsafe { CAPSULES }.ok_or("spawn: no vault to read capsules from")?;
     let t0 = crate::platform::cntpct();
+    spawn_step(1);
     let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
+    spawn_step(2);
     let sealed = read(b"sealed").unwrap_or_default();
     let t_read = crate::platform::cntpct();
+    spawn_step(3);
     let g = crate::oracle::gate(&capsule)?;
+    spawn_step(4);
     // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck: every spawn holds the kernel lock while it reads and checks its capsule).
     let r = spawn_checked(name, &g, &sealed, objects);
     let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
@@ -7484,6 +7491,16 @@ fn push_dec(out: &mut ferros_console::ConRing, v: u64) {
     out.dec(ferros_console::KERNEL, v);
 }
 
+/// A spawn's step into this core's crumb (platform `crumb`, kept in the report page across a warm reset): SYS_SPAWN's entering crumb G#9A with the step in bits 24-31 (1 the capsule's read, 2 read, 3 the seal list read, 4 gated, 5 sealed, 6 ihi, 7 the arc asked, 8 the arc given, 9 the code copied, 10 built, 11 queued), so a spawn that hangs names its step at the next boot as PREV_EXIT and the core's PREV_NOTE (2026-11-16: kernel #3 hung inside a spawn with the lock held, right after the person attested).
+/// And while the kernel heap's largest free block is under 2^22 bytes, each step goes to the flash log too, with that block: a spawn short of heap names itself whatever kind of hang follows.
+fn spawn_step(step: u64) {
+    crate::platform::crumb(0x90 + SYS_SPAWN | step << 24);
+    let largest = crate::heap_largest_free();
+    if largest < 1 << 22 {
+        crate::flashlog::line(&alloc::format!("spawn step A#{step}: the kernel heap's largest free block A#{largest} bytes"));
+    }
+}
+
 /// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
 fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     if g.masked {
@@ -7494,9 +7511,13 @@ fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: 
     } else if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }
+    spawn_step(5);
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+    spawn_step(6);
     let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)?;
+    spawn_step(10);
     enqueue_back(me);
+    spawn_step(11);
     Ok(me)
 }
 
