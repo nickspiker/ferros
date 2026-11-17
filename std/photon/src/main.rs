@@ -1,5 +1,6 @@
 //! Photon on ferros: the app Photon's library builds, run through fluor's ferros host over the display server's app surface and the touch server. Launched as a kist (tools/photon-capsule.sh) with, in slot order, the display and touch endpoints, the app surface, the udp endpoint, its own vault domain, the ira and entropy (placements of the implicit set, KISTS.md), then be you and the person's people (asked, docs/FACETS.md); the GPU's three and sound out after them. The desktop main (photon's src/main.rs) does the winit things; this one does the ferros things.
-//! Photon has no handle screen on ferros (owner, 2026-11-14: "why is that in the ferros build at all?"; photon f6d954bf): the person comes from the identity service as PhotonKeys, at start when be you answers then, else later into the running app (`Ferros`, `wait_for_person`), and until then Photon shows "waiting for your identity".
+//! Photon has no handle screen on ferros (owner, 2026-11-14: "why is that in the ferros build at all?"; photon f6d954bf): the person comes from the identity service as PhotonKeys, always into the running app (`Ferros`, `wait_for_person`), and until then Photon shows "waiting for your identity".
+//! The window comes first (owner, 2026-11-16: from the tap to Photon's window took 5 to 10 s on the Pro): on b905 the first frame came 6.7 s after main began, all of it be you (the alias's bundle and possession here, the binding signed with every egg in the identity service), asked before the first frame. Now be you is asked on the waiter's thread from the start and the person handed in thru the wake path, which the late launch used already.
 
 use std::sync::Arc;
 
@@ -83,17 +84,29 @@ fn photon_keys() -> Option<PhotonKeys> {
         println!("photon: no alias from the kernel (before attest, or the person key not handed in yet)");
         return None;
     };
+    // Each step timed (the owner, 2026-11-16: the launch's wait): the alias's bundle (its keys made from the seed), the possession eggs, and the call (the identity service's loop and its signing, which it says itself).
+    let t0 = std::time::Instant::now();
     let signer = fgtw::alias::bundle(&alias);
     let public = signer.public();
     let bundle = public.to_bytes();
+    let t1 = std::time::Instant::now();
     let eggs = fgtw::binding::possession(&signer, &public);
+    let t2 = std::time::Instant::now();
     let mut req = Vec::with_capacity(3 + bundle.len() + eggs.len());
     req.push(0);
     req.extend_from_slice(&(bundle.len() as u16).to_le_bytes());
     req.extend_from_slice(&bundle);
     req.extend_from_slice(&eggs);
     let mut reply = vec![0u8; 1 << 16];
-    let Some(n) = sys::call(BE_YOU, &req, &mut reply) else {
+    let answered = sys::call(BE_YOU, &req, &mut reply);
+    println!(
+        "photon: be you took {} ms: the alias's bundle {} ms, its possession {} ms, the identity service's answer {} ms",
+        t0.elapsed().as_millis(),
+        (t1 - t0).as_millis(),
+        (t2 - t1).as_millis(),
+        t2.elapsed().as_millis()
+    );
+    let Some(n) = answered else {
         println!("photon: be you not granted (or no identity service behind the slot): Photon waits for your identity");
         return None;
     };
@@ -151,7 +164,7 @@ impl WakeSender<PhotonEvent> for Lift {
 /// Every method of fluor's FluorApp is passed on here, defaults included, so PhotonApp answers each as it does under any host; the GPU ones (`cfg(fluor_gpu)`) are not compiled for ferros. A method fluor adds later takes its default here until it is passed on too.
 struct Ferros {
     app: PhotonApp,
-    /// No PhotonKeys at start: the waiter is started once the host hands over the wake sender.
+    /// The waiter is started once the host hands over the wake sender: every launch since 2026-11-16, as the person is never asked before the first frame.
     waiting: bool,
 }
 
@@ -341,23 +354,23 @@ fn main() {
     }));
     // The device key from this kist's ira (docs/PHOTON.md, "Photon's device key on ferros", 2026-11-12). Photon's own fallback reads the machine fingerprint, which on ferros (no files) was tohu's last resort, the bytes "unknown": every ferros device's Photon had one device key, derivable by anyone.
     // No ira, no Photon (the ira is handed to every kist since 2026-11-12, KISTS.md "The implicit set", so this is a kernel from before, where a person could say no to it, or no ira this boot): without it Photon has no key of its own to be a device with, and the shared one is the bug above. It ends at once, as it did before with every want off (KISTS.md, "Measured on the Pro").
+    let started = std::time::Instant::now();
     let Some(root) = sys::ira_key(IRA, "photon device") else {
         println!("photon: no ira key at slot {IRA} (the ira right was not granted); Photon has no device key of its own and does not start");
         return;
     };
-    // The person, as facets (docs/FACETS.md; PHOTON.md "ferros's part"): Photon's alias and its binding, and the person's people, asked at start, before the first frame. Without be you now (launched before the identity service holds the fleet and the person key, or be you not granted), Photon starts on "waiting for your identity" (photon f6d954bf) and `wait_for_person` hands the person in later.
-    let keys = photon_keys();
-    let people = people();
-    println!("photon: {} of the person's people handed in", people.len());
+    // The person, as facets (docs/FACETS.md; PHOTON.md "ferros's part"): Photon's alias and its binding, and the person's people, are asked on the waiter's thread once the host hands over the wake sender (`set_event_proxy`), never before the first frame. Photon starts on "waiting for your identity" (photon f6d954bf) and `wait_for_person` hands the person in: at once when the identity service is ready (op 2 answers a first wait straight away), else when it becomes so.
     let mut app = PhotonApp::new();
+    let made = std::time::Instant::now();
     app.set_device_keypair(derive_device_keypair(&root));
     app.set_signing_bundle(SigningBundle::derive(&root));
-    // The person, handed in before Photon starts (photon 47f8b360): with PhotonKeys Photon opens its vault under the alias and lands on its contacts; it refuses a binding that does not name this alias and this handle proof (it says "PHOTON KEYS: refused") and waits for its identity. The people merge into its contacts once its vault is open.
-    let waiting = keys.is_none();
-    if let Some(keys) = keys {
-        app.set_photon_keys(keys);
-    }
-    app.set_people(people);
+    println!(
+        "photon: {} ms from main to the host: the app made in {} ms, the device's keys from the ira in {} ms",
+        started.elapsed().as_millis(),
+        (made - started).as_millis(),
+        made.elapsed().as_millis()
+    );
+    let waiting = true;
     // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
     fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };

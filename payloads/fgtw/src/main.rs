@@ -29,7 +29,8 @@ mod route;
 mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
-const HEAP_BYTES: usize = 2 << 20;
+/// 8 MiB since 2026-11-17: at 2 MiB the Pro's service ended on "memory allocation of 67075 bytes failed" (b916) as the desktop's Photon, reloaded, began its sibling ceremony with this device's member key (baf3dec7 is a fleet member, so every Photon of the fleet takes it for a sibling until the alias cutover, PHOTON.md M4): its 573806-byte ClutchOffer arrives as a transfer this service takes in whole (photon_core pt, MAX_TRANSFER 4 MiB), beside the held chain (about 207 KB) and the bindings. A transfer as large as MAX_TRANSFER now fits beside the rest.
+const HEAP_BYTES: usize = 8 << 20;
 /// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
 const STACK_BYTES: usize = 1 << 20;
 /// What an untouched stack byte holds.
@@ -794,6 +795,19 @@ impl Client {
                 self.log.addr(&addr);
                 self.log.line();
                 self.sponsors.push(Sponsor { key, addr, asked_t: 0, heard_us: t, online: false });
+                // Not bound: that device is asked for the chain at once, unicast (a member is answered with it, `on_fleet_req` on its side), so a member of the fleet binds from its own devices.
+                // The Pro, b913 (2026-11-17): the lookup's broadcast went before the MacBook beaconed and fgtw.org did not answer, so the verdict went GREY; the MacBook's beacon 57 s later made it "joining", the lookup is not run again while joining, and a member of the fleet sat minting a binding request with no person key, so Photon got no alias.
+                if !self.bound {
+                    if let Some(hp) = self.hp {
+                        if let Ok(frame) = fgtw::protocol::fleet_req(&hp, self.keys.keypair(), eagle()) {
+                            self.udp.send(&Addr { port: join::BEACON_PORT, ..from }, join::BEACON_PORT, &frame);
+                            self.log.put(b"fgtw: lookup: asking ");
+                            self.log.fp(&key);
+                            self.log.put(b" for our fleet's chain");
+                            self.log.line();
+                        }
+                    }
+                }
                 // A device beaconing under our handle: the identity has a fleet, whatever the seed said.
                 if matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
                     self.verdict = V_JOIN;
