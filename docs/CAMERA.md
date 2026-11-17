@@ -103,7 +103,7 @@ The list is a VSF document (the house format for anything structured); a frame i
 | 0 LIST | `[0]` | a VSF document, a section `camera` per camera the driver can stream whose inputs are in the vault (none: an empty document; "The other cameras") |
 | 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]` ("Modes, the bench and the slit") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, a slit's record offset at 56) |
 | 2 FRAME | `[2][bin]` | waits for the next frame: a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample, row by row |
-| 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus (the actuator's position) |
+| 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 gain (1024 unity: the sensor's analogue gain up to its most, digital gain past it, by its own CCS model read at the open, "Gain"), 2 focus (the actuator's position) |
 | 4 CLOSE | `[4]` | the view taken back, the camera stops; it also stops when its holder ends |
 | 5 MAP | `[5][buffer to give back, G#FF none]` | with the view: waits for a frame newer than the last mapped and holds its buffer; its 64-byte header (bin 1; the buffer at +40, the format at +41, a line's bytes at +44, the buffer's place in the view at +48), the samples read in place |
 | 6 RELEASE | `[6][buffer]` | the held buffer given back: `[0]`, `[1]` when it was not held |
@@ -426,6 +426,27 @@ The owner: "Measure the kernel lock, see if we can dedicate it something, would 
 - **Kernel #3 and #4 (dev first on by default) hung twice right after the person attested**: not the camera. Two cores sat wedged in PCIe BAR accesses left by the RAM reload (WIFI.md, last section); the first spawn of fgtw or the map then hung with the lock held. With WiFi and cellular off by the radios preference the attested reload ran.
 - **In that attested session (kernel #4, the person's processes running) the 96 fps stream still died**: 2048-frame runs with 4 threads, off 0 of 3 (100 frames), `first` 0 of 3 (361 to 793 frames), `core 7` + `first` 0 of 3 (100 to 1155 frames), `first` with 3 threads 0 of 1 (606). The answers were in time (interrupt to run 23 to 41 us on average, the index written 11 us into the answer, 59 us at most), and the death has the same signature (image status G#1, the engine's index ours). So with the shell and the person's processes up, something other than the frame thread holds the front end past the blanking: unmeasured (the engine's program fetch and its writes against the DRAM traffic of four reading threads and the person's display is the first candidate; the PDMA's own status words during a death are the next thing to read). The un-attested session (kernel #2) ran 6 of 6 clean with the same switches. The torch held the camera PMIC's bus once (the switch refused, as designed).
 - **Not yet run**: the ultrawide's line-length sweep (its line 9568 clocks, its front end needing 128 blank lines), and the kernel fast path (a checked list of register writes run in the interrupt handler) that would take the frame thread off the deadline entirely.
+
+## Gain (2026-11-17): the sensor's own model, measured on the main
+
+The owner, using Lumis on the Pro: "the ISO doesn't do anything in lumis, everything else looks to be wired."
+Lumis sends ISO as gain in 1024ths of one (ISO 100 = 1024) and holds it inside the list's `gain_min` and `gain_max`, which were 1024 and 1024; the driver took 1024 alone ("the captured gain only"). So ISO was pinned at 100.
+
+**Built** (camtrials): the driver reads each sensor's gain model from its own CCS words at the open (G#0080 to G#0093: the capability, codes least and most and step, gain = (m0 code + c0) / (m1 code + c1); G#1084 to G#1089: the digital gain's least, most and step, 8.8 fixed point) and says the words on its console (ferros_cam ccs `Gain`). SET gain is split into the analogue code up to the analogue's most and digital gain past it, both written inside the hold as exposure is; a frame's header carries the gain the codes make, and the init's own gain is reported as it is (the main's init leaves code G#400: 32x, not one). A sensor whose words describe no model keeps the captured gain alone. The list's range comes from ferros_cam ccs `ARRAYS` (filled from a measurement: the list is built with no sensor powered). camtest's fourth byte 3 measures the curve (1x to 640x in half stops at a fixed exposure).
+
+**The main's words** (the Pro, b913, the flashed kernel, 2026-11-17): G#0080 = 2 (CCS's "alternate" capability; its init drives G#0204 regardless), codes G#20 to G#1400 step 1, m0 1, c0 0, m1 0, c1 G#20: gain = code / 32, **1x to 160x analogue**; digital G#100 to G#8000 step G#100: 1x to 128x in whole steps. The list now offers 1024 to 20971520 (ISO 100 to 2048000: the whole of what the sensor states; trim it in `ARRAYS` if Lumis's slider wants less).
+
+**The curve** (camtest `1008000300`: bin 8, 16 frames a step, the init's 68.8 ms exposure, a dim room; the mean sample in 16ths, black 1022):
+
+| gain | 1x | 2x | 4x | 8x | 16x | 32x | 64x | 128x | 160x (analogue most) | 320x (digital 2x) | 640x (digital 4x) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| mean above black (16ths) | 0 | 2 | 7 | 20 | 47 | 99 | 206 | 419 | 476 | 949 | 1917 |
+| per doubling | | | | 2.9 | 2.35 | 2.1 | 2.08 | 2.03 | (x1.25: 1.14) | 1.99 | 2.02 |
+
+- Linear: twice the signal per doubling from 8x up, within the noise of a dim scene; below 8x the signal is under a code above black, so the ratios there say little.
+- The analogue ends at 160x as the words say: asking 181x or 256x gives 160x (digital steps are whole, so the next is 320x); 160x over 128x gave 1.14 for 1.25, the one step that falls short (unexplained: clipping at black, or the top of the analogue range).
+- Digital doubles cleanly: 1.99 and 2.02.
+- Not measured: the ultrawide. The flashed kernel (b913) has no camera-module switch, so only the main opens; its model is read at its first open on a kernel with the other-cameras switch, and its range goes into `ARRAYS` then (until then the list offers it 1024 alone).
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 

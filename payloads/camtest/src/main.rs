@@ -4,7 +4,7 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
-//! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 64x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
+//! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 #![no_std]
 #![no_main]
 
@@ -167,8 +167,8 @@ fn gain_curve(g: u64, ep: u64, id: u8, bin: u8, per: u8, exp_log2: u8, t1: u64) 
         }
         Some((sum * 16 / cnt, u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]])))
     };
-    // 1x to 64x, a half stop apart (the halves rounded to 1024ths).
-    let steps: [u64; 13] = [1024, 1448, 2048, 2896, 4096, 5793, 8192, 11585, 16384, 23170, 32768, 46341, 65536];
+    // 1x to 256x, a half stop apart (the halves rounded to 1024ths): past the main's analogue most (160x) into its digital gain, whose steps are whole (320x, 640x: the main's digital step is G#100, one).
+    let steps: [u64; 19] = [1024, 1448, 2048, 2896, 4096, 5793, 8192, 11585, 16384, 23170, 32768, 46341, 65536, 92682, 131072, 185364, 262144, 327680, 655360];
     for &want in steps.iter() {
         let a = set(1, want);
         if a != 0 {

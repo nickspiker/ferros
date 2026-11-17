@@ -68,7 +68,8 @@ pub struct Array {
 
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
+    // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, so 1024 to 20971520; measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03) and thru digital 2x and 4x (1.99, 2.02).
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY * 128) },
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
     Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
     Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
@@ -410,7 +411,7 @@ pub struct GainSet {
 }
 
 impl Gain {
-    /// The model from the sensor's own words (`GAIN_CAPS` and `DGAIN_CAPS` read big-endian), or None when they do not describe one: not the global model, no step, codes out of order, a denominator that reaches zero or goes negative over the codes, an analogue gain falling with the code, or digital limits out of order (a sensor whose capability block aliases, as the main's limit block at G#1100 does, says so here instead of driving the gain off a wrong model).
+    /// The model from the sensor's own words (`GAIN_CAPS` and `DGAIN_CAPS` read big-endian), or None when they do not describe one: a capability other than 0 or 2, no step, codes out of order, a denominator that reaches zero or goes negative over the codes, an analogue gain falling with the code, or digital limits out of order (a sensor whose capability block aliases, as the main's limit block at G#1100 does, says so here instead of driving the gain off a wrong model).
     pub fn of(a: &[u8; GAIN_CAPS_LEN], d: &[u8; DGAIN_CAPS_LEN]) -> Option<Gain> {
         let be = |b: &[u8], k: usize| u16::from_be_bytes([b[k], b[k + 1]]);
         let mut g = Gain {
@@ -429,8 +430,9 @@ impl Gain {
         if g.d_step == 0 {
             (g.d_min, g.d_max, g.d_step) = (0x100, 0x100, 1);
         }
-        let den =|c: u16| g.m1 as i64 * c as i64 + g.c1 as i64;
-        let ok = be(a, 0) == 0
+        let den = |c: u16| g.m1 as i64 * c as i64 + g.c1 as i64;
+        // The capability 0 (global) or 2: the main answers 2 (the Pro, 2026-11-17: words 2 0 20 1400 1 0 1 0 0 20, codes 32 to 5120 at code / 32, its init at G#400) and its init drives G#0204 all the same, so the code model stands; the curve measured on the device says whether it holds.
+        let ok = matches!(be(a, 0), 0 | 2)
             && g.step != 0
             && g.code_min <= g.code_max
             && den(g.code_min) > 0
@@ -628,6 +630,12 @@ mod tests {
         assert_eq!(lin.split(1024).unwrap().code, 32);
         assert_eq!(lin.split(5000).unwrap(), GainSet { code: 156, digital: 0x100, gain: 4992 });
         assert_eq!(lin.split(16385), None);
+        // The main's own words (the Pro, 2026-11-17): capability 2, codes G#20 to G#1400 step 1, gain = code / 32; digital 1x to 128x in whole steps. Its init's G#400 is 32x.
+        let main_a: [u8; GAIN_CAPS_LEN] = [0, 2, 0, 0, 0, 0x20, 0x14, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0x20];
+        let main = Gain::of(&main_a, &d(0x100, 0x8000, 0x100)).unwrap();
+        assert_eq!((main.analogue(0x20), main.analogue(0x400), main.analogue(0x1400)), (1024, 32768, 163840));
+        assert_eq!(main.split(2048).unwrap().code, 64);
+        assert_eq!(main.range(), (1024, 163840 * 128));
         // Words that describe no model: the aliasing the main's limit block shows (every word G#4140).
         assert_eq!(Gain::of(&[0x41, 0x40].repeat(10).try_into().unwrap(), &d(0x100, 0x100, 1)), None);
     }
