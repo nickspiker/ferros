@@ -107,7 +107,7 @@ Repeat with `diag dvfs set 3 2367000` to reproduce the instant drop.
 The thermal policy acts only thru caps: the clock policy asks each domain's rate thru `thermal::capped`, which returns the lower of what it wants and the domain's cap, so the two never fight.
 `bridge diag "thermal policy step|smooth|off"`; every boot starts at `step`.
 
-- **step** (the default, as since 2026-10-23, now kept across profile switches): the hottest CPU zone at 95 °C caps the X3 at 1.4 GHz; below 85 the cap goes.
+- **step** (the default, as since 2026-10-23, now kept across profile switches): the hottest CPU zone at 95 °C caps the X3 at 1.4 GHz, and since 2026-11-17 (decision 3) the A715s at 1065 MHz; below 85 the caps go.
 - **smooth** (built, off by default, never run on the device): one controller per domain, Android's zones and trips:
 
 | domain | zone | trip | floor (zuma-cpu.dtsi, zuma-gpu.dtsi) |
@@ -160,6 +160,15 @@ The panel stage on the GPU (GPU-KISTS.md's first choice) moves 4.6 G CPU cycles 
 1. **Which zones count:** the step policy looks at the CPU zones only; add the GPU's (the likely hottest under Mahere)?
 2. **The trips:** Android's (90, 90, 95, 90 °C) or ferros's own; and whether ferros's policy may lower the GPU, which a 120 frame budget feels first.
 3. **The A715s' active clock:** 1065 MHz (0.8 W for four busy), 1328-1572 (1.3-1.8 W), 2367 (6 W, which also trips the divider at once).
+   **Decided 2026-11-17** (the owner: "lift the core cap, yes", for 120 frames a second in Photon's scroll and pinch, measured CPU-bound on the A715s at 1065 MHz, KERNEL.md Order item 8): while someone interacts the A715s may use their whole table, up to 2367 MHz; otherwise their ceiling stays 1065 MHz.
+   Built (service.rs `interactive`, `gov_top`): interacting means input (a touch interrupt or an injected batch) within the last 2^-1 s, or frames armed within 2^-4 s of each other (an animation at 16 frames a second or more; the rest state's 10 Hz redraws are 100 ms apart and never count), the frame's own hold its gap.
+   The hold after input is a real deadline: a finger lifted ends the input, not the fling or settle it set going, and Photon's frames during a drag at the calm clock came 50 to 70 ms apart, slower than the animation's gap.
+   Input still jumps the A715s only to 1065 MHz; above it they climb with the load (a saturated window moves a quarter past the rate: 1065 to 2367 MHz in three windows, under 2^-4 s), never in one step, since one jump from 1065 to 2367 tripped the divider (section 3).
+   When the lift ends they go back under 1065 MHz at the service loop's next pass, and decay from there.
+   The thermal policy stays in charge: every rate goes thru `capped`, and the step policy now caps the A715s at 1065 MHz with the X3 at its trip; the firmware's trips and the divider remain.
+   The memory side lifts with it (service.rs `shared_lift`): while lifted and the screen lit, MIF at 3744 MHz and the DSU at 1800 MHz (their tables' tops, zuma.dtsi devfreq_mif and devfreq_dsu, which Android's memory-latency governors reach under load), else the tier's (active: MIF 2028, DSU 1197); not while ferros's thermal policy holds any domain down.
+   Measured on the Pro by hand first (std/membench, two 2^24-byte buffers, A#GB/s read plus written): four threads' copy 32.5 at the active tier with the A715s at 1065 MHz, 37.5 to 39.5 with MIF at 3744, 41.3 with the DSU at 1800 and the A715s at 2367 too, against 35.9 with the A715s at 2367 alone; one thread's copy by q-register pairs 18.9, 23.1 (MIF), 32.3 (all three); std's memcpy (compiler-builtins' word loop) 13.1 to 23.4 on one thread, so a single copy is bound by the core's clock and its own loop before the memory. Stepped up by hand (1572, 1945, 2367 MHz), the A715s ran at 2367 MHz with MIF and the DSU at their tops and no divider event (`diag thermal`: slow seconds 0).
+   Knobs: `diag clock lift <kHz>` (the ceiling while interacting; 0 or anything under 1065 MHz: no lift), `diag clock hold <n>` and `diag clock gap <n>` (the two holds as shifts); `diag clock` shows the lift's state and how many windows ran lifted.
 4. **The X3's top:** 2914 MHz (3.7 W busy), 2556 (1.9 W) or 2049 (1 W) in the active profile; the top step buys 14 % more speed for twice the power.
 5. **The GPU's clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and the MIF Android pairs with it.
 6. **Sustained or burst:** 120 for as long as the heat allows, then sliding (smooth), or clocks chosen so a lower rate holds forever.

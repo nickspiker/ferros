@@ -1736,7 +1736,37 @@ struct Gov {
     asks: u64,
 }
 const X3_OPPS: [u32; 15] = [500_000, 880_000, 1_164_000, 1_298_000, 1_557_000, 1_745_000, 1_885_000, 2_049_000, 2_147_000, 2_294_000, 2_363_000, 2_556_000, 2_687_000, 2_850_000, 2_914_000];
-const A715_OPPS: [u32; 6] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000];
+const A715_OPPS: [u32; 15] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000, 1_221_000, 1_328_000, 1_418_000, 1_572_000, 1_836_000, 1_945_000, 2_130_000, 2_245_000, 2_367_000];
+/// The A715s' ceiling while nobody interacts (`interactive`): 1065 MHz, their active clock before the owner's lift (THERMAL.md decision 3, 2026-11-17: "lift the core cap, yes" during interaction).
+const A715_CALM_KHZ: u32 = 1_065_000;
+/// The clusters' ceiling while someone interacts (`diag clock lift <kHz>`; the A715s' whole table by default, 0 for no lift: the calm ceiling always). The X3 has no calm ceiling: its whole table either way.
+static GOV_LIFT_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2_367_000);
+/// How long the lift holds after the last input (a touch interrupt or an injected batch), as a right shift of the counter's frequency (`diag clock hold <n>`, 1: half a second). A real deadline: a finger lifted ends the input but not the frames it set going (a fling, a settle), whose first frames must not be drawn at the calm clock, and Photon's frames during a drag came 50 to 70 ms apart (2026-11-17), so the animation's own sign (`process::ANIM_AT`, frames 2^-4 s apart or closer) can take over only once the lifted clock has sped them up.
+static GOV_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+/// Windows the governor ran lifted, and lifts begun (`diag clock`).
+static mut GOV_LIFTED: [u64; 2] = [0; 2];
+static mut GOV_WAS_LIFTED: bool = false;
+
+/// Whether someone is interacting with the device now (the clock policy's lift): input within the hold (`GOV_HOLD`), or an animation's frames within the display's gap of one another the last 2^-`ANIM_GAP_LOG2` s (`process::ANIM_AT`, its own hold: the gap it was measured by, so the lift ends one frame interval after the frames stop).
+/// Read on the service loop's passes: the touch interrupt and every syscall's kick wake the kernel's core, so a lift begins at the pass after the input; the frames are seen at the pass after them (the governor's window at the latest, 2^-6 s).
+fn interactive(now: u64, f: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let input = crate::process::INPUT_AT.load(Relaxed);
+    let anim = crate::process::ANIM_AT.load(Relaxed);
+    let gap = f >> crate::process::ANIM_GAP_LOG2.load(Relaxed);
+    (input != 0 && now.wrapping_sub(input) < f >> GOV_HOLD.load(Relaxed)) || (anim != 0 && now.wrapping_sub(anim) < gap)
+}
+
+/// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `A715_CALM_KHZ`.
+fn gov_top(g: &Gov, lifted: bool) -> usize {
+    let cap = match (g.domain, lifted) {
+        (4, _) => u32::MAX,
+        (_, true) => GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed).max(A715_CALM_KHZ),
+        (_, false) => A715_CALM_KHZ,
+    };
+    // The highest point at or under the ceiling (the table starts at the floor, which every ceiling is above).
+    g.opps.iter().rposition(|&o| o <= cap).unwrap_or(0)
+}
 /// The shared tier is active while the governor asks more than these (the rest profile's X3 before the adaptive clock, and the A715s' middle).
 const X3_REST_KHZ: u32 = 2_049_000;
 const A715_REST_KHZ: u32 = 712_000;
@@ -1824,19 +1854,33 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         }
         return false;
     }
+    // The owner's lift (THERMAL.md decision 3): while someone interacts, the A715s' whole table; otherwise their calm ceiling, and a lift that ends brings them under it at once, inside a window too.
+    let lifted = interactive(now, f);
+    unsafe {
+        if lifted && !GOV_WAS_LIFTED {
+            GOV_LIFTED[1] += 1;
+        }
+        GOV_WAS_LIFTED = lifted;
+    }
     if el < f >> GOV_WIN.load(Relaxed) {
         // Inside a window a boost moves the clusters at once and leaves the window's measure to its end.
-        if boost {
-            let up = crate::smp::UP.load(Relaxed);
-            for g in govs.iter_mut().filter(|g| g.cores == 0 || g.cores & up != 0) {
-                let b = boost_at(g);
-                if g.at < b {
-                    g.level = g.opps[b];
-                    gov_ask(g, b, f);
-                }
+        let up = crate::smp::UP.load(Relaxed);
+        for g in govs.iter_mut().filter(|g| g.cores == 0 || g.cores & up != 0) {
+            let top = gov_top(g, lifted);
+            // WHY the min: a ceiling of the policy, not a guard on the table. Input jumps a cluster no higher than its calm ceiling (the X3: its top; the A715s: 1065 MHz, where input took them before the lift); above it the A715s climb by the load (a saturated window ramps a quarter, 1065 to 2367 MHz in three saturated windows, under 2^-4 s), not in one step: THERMAL.md measured one jump of the A715s from 1065 to 2367 MHz trip the battery-current divider and drop the X3 to 364 MHz.
+            let b = boost_at(g).min(gov_top(g, false));
+            if boost && g.at < b {
+                g.level = g.opps[b];
+                gov_ask(g, b, f);
+            } else if g.at > top {
+                g.level = g.opps[top];
+                gov_ask(g, top, f);
             }
         }
         return tier_active(govs);
+    }
+    if lifted {
+        unsafe { GOV_LIFTED[0] += 1 };
     }
     unsafe {
         GOV_AT = now;
@@ -1865,8 +1909,15 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         let ramp = rate + (rate >> ramp_s);
         let want = if g.sat != 0 && ramp > want { ramp } else { want };
         g.level = if want >= g.level { want } else { g.level - ((g.level - want) >> decay_s) };
-        if boost && g.level < g.opps[boost_at(g)] {
-            g.level = g.opps[boost_at(g)];
+        // WHY the mins: the policy's ceilings, as above.
+        let top = gov_top(g, lifted);
+        let b = boost_at(g).min(gov_top(g, false));
+        if boost && g.level < g.opps[b] {
+            g.level = g.opps[b];
+        }
+        // Over the ceiling (a lift ended, or a load that grew past it): at the ceiling, and the decay goes on from there.
+        if g.level > g.opps[top] {
+            g.level = g.opps[top];
         }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
         gov_ask(g, at, f);
@@ -1973,6 +2024,32 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
             gpu_rate(want != 3);
         }
     }
+    // The memory side of the lift (THERMAL.md decision 3): while someone interacts with the screen lit, MIF and the DSU at the tops of their tables, else the tier's own; not while ferros's thermal policy holds any domain down.
+    let lift = want != 3 && GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ && interactive(now, f) && !crate::thermal::throttled();
+    if lift != unsafe { SHARED_LIFTED } {
+        shared_lift(lift);
+    }
+}
+
+/// MIF and the DSU at the lift's rates while someone interacts (`clock_policy`), or back at the tier's.
+/// Measured 2026-11-17 on the Pro (membench, 2^24-byte buffers): with the A715s at 2367 MHz, four threads' copy 35.9 GB/s at the active tier's MIF 2028 and DSU 1197 MHz, 41.3 at MIF 3744 and DSU 1800; one thread's read 20.8 against 24.4; with the A715s at 1065, four threads' copy 32.5 against 39.5 at MIF 3744 alone. Both are their tables' tops (zuma.dtsi devfreq_mif and devfreq_dsu `freq_info`), which Android's memory-latency and DSU-latency governors reach under load.
+const SHARED_LIFT: [(u32, u32); 2] = [(0, 3_744_000), (5, 1_800_000)];
+static mut SHARED_LIFTED: bool = false;
+/// Times the memory side was lifted (`diag clock`).
+static mut SHARED_LIFTS: u64 = 0;
+fn shared_lift(on: bool) {
+    // Going up MIF first, coming down the DSU first, as the tiers order them; each request waited for by a rate read (`clock_profile`, why).
+    let order: [usize; 2] = if on { [0, 1] } else { [1, 0] };
+    for i in order {
+        let (d, lifted) = SHARED_LIFT[i];
+        let Some(khz) = (if on { Some(lifted) } else { profile_khz(d) }) else { continue };
+        let _ = crate::acpm::dvfs_set(d, khz);
+        let _ = crate::acpm::dvfs_get(d);
+    }
+    unsafe {
+        SHARED_LIFTED = on;
+        SHARED_LIFTS += on as u64;
+    }
 }
 static mut TIER_AT: u64 = 0;
 /// The GPU's clock at its top (G3D 890, G3DL2 900 MHz) or its floor (150 / 160 MHz), the L2 first going up and last going down (GPU.md "The GPU's clock"). At the top while a `gpu` process lives and the screen is lit; at the floor otherwise, the dark profile included (2026-11-10: the GPU's rails held ~40 mW with the screen off at its top, idle).
@@ -2015,6 +2092,8 @@ fn clock_profile(want: u8) {
     }
     let v: u64;
     unsafe {
+        // The tier's table set MIF and the DSU: the memory side's lift, if it was on, is to be asked again (`clock_policy`).
+        SHARED_LIFTED = false;
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
         CLOCK_STATE = want;
         CLOCK_SWITCHES += 1;
@@ -2024,7 +2103,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`).
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2038,6 +2117,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
                 g.asks = 0;
             }
             unsafe { TIER_RES = [0; 4] };
+            unsafe { GOV_LIFTED = [0; 2] };
             for b in &crate::process::INPUT_TO_FRAME {
                 b.store(0, Relaxed);
             }
@@ -2059,8 +2139,13 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"frames"), Some(n)) => GOV_SHOWN.store(n as u64, Relaxed),
         (Some(b"ramp"), Some(n)) => GOV_RAMP.store(n, Relaxed),
         (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
+        (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
+        (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
+        (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
         _ => {}
     }
+    let lifted = interactive(cntpct(), f);
+    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input and while frames come within f>>A#{} of each other; {} now; A#{} windows lifted, A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), if lifted { "lifted" } else { "calm" }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };

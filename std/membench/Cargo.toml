@@ -1,0 +1,21 @@
+[package]
+name = "membench"
+version = "0.1.0"
+edition = "2024"
+description = "Memory bandwidth on the device's A715s: copy (memmove), read and write over buffers past the caches, on one thread and on four, printed to the console (KERNEL.md Order item 8: the clock lift's memory side)"
+
+[[bin]]
+name = "membench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

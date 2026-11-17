@@ -1,0 +1,21 @@
+[package]
+name = "memcheck"
+version = "0.1.0"
+edition = "2024"
+description = "ferros_rt's memcpy, memmove and memset (mem.rs) against a byte-at-a-time reference on every length to 2^9, every overlap within 2^7 and every alignment within 2^4, on the device"
+
+[[bin]]
+name = "memcheck"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
