@@ -229,6 +229,53 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 cargo run -p ferros-bridge -- install ferros_kernel.signed
 ```
 
+## Over the fleet (designed 2026-11-17, not built)
+
+Owner, 2026-11-17: "I'm sure our bridge and commands would be easy to make thru Photons fleet identity network, thus LTE/WAN, WiFi/LAN rather than strictly thru a USB cable. Prolly can't fastboot over cellular tho..."
+And: "I'm sure we'll add profiles so no bridge over WAN for specific devices, like we keep the bridge in Photon disabled until you manually enable it."
+
+The bridge stays the bridge: the tool that connects a dev box to a device, whatever carries it.
+USB becomes one link among several.
+
+### The same commands, any link
+- The commands do not change: the cap-addressed `[cap][op][params]` of [ferros_pt/src/command.rs](../ferros_pt/src/command.rs), each one a complete VSF document, as are the replies.
+- Off the cable they ride the fleet's own channel: the FGTW peer network Photon already uses (LAN beacon, direct UDP, WAN), device to device first, fgtw.org never in the path ([PHOTON.md](PHOTON.md), Claude memories/feedback_fgtw_devices_first.md).
+- The channel's encrypted frames stay lean (counter, ciphertext, tag); VSF is for the assembled command and reply (Claude memories/feedback_vsf_not_for_framing.md).
+- The bridge picks the link: `FERROS_PORT` for USB as today, a fleet device name for the rest; a command means the same on either.
+
+### Who may send
+- **A device of the same fleet.** The sender is a member of the target's membership chain and signs each command with its device key; the target checks the signature against the chain it holds. A dev box takes part the way any device does: it runs Photon and is bound into the owner's fleet.
+- **Holding the bridge right on that target.** Being in the fleet is not enough. The right is granted on the target, per sending device, by the person present and attested there, and taken back the same way.
+- **Off until enabled by hand.** No device answers the bridge over the fleet, and no Photon sends it, until a person turns it on. The Photon app's side starts disabled, as the owner keeps it today.
+- **Only while the target is attested.** Before attest, or locked, the device holds no fleet key and is in no fleet, so the fleet bridge is closed; USB answers as it does today.
+- **Every command is signed and numbered.** A replayed or reordered command is refused. The unauthenticated development caps stay a USB-only development convenience; nothing reaches them over the fleet.
+- **Every command received over the fleet goes in the ledger** ([LEDGER.md](LEDGER.md)): which device sent it, which cap and op, when, and the answer.
+
+### Profiles
+The right carries a profile: which links and which caps that sender may use on that target.
+- Links: USB only, LAN (the same network segment), or anywhere (WAN, cellular).
+- Caps: from read only (`diag`, `beam`, `read`) up to the ones that change the device (`store`, restart, `reload`, `install`, `reboot`).
+- A device can refuse the bridge over WAN to everyone, whatever any right says. That is a setting of the device itself, so a lost or borrowed sender cannot widen it.
+- Profiles are settings in spec VSF, set from the identity and flowing to the device only (Claude memories/settings_identity_to_device_only.md).
+
+### A reload that does not come back
+A failed reload over the fleet cuts its own connection, with nobody at a cable to recover.
+- **`reload` (RAM) over the fleet arms a return.** The new kernel must rejoin the fleet and receive the sender's confirm before a deadline. If it doesn't, the device reboots into the kernel installed on storage (the stem's), which is known to boot. This deadline is a real one, so a timer is right here (Claude memories/feedback_no_polling.md).
+- **`install` over the fleet keeps the prior kernel.** The new stem entry is committed only after the new kernel has booted and been confirmed the same way; until then the next boot takes the prior entry.
+- The confirm is the sender's signed command, not the device's own report, so a kernel that boots but cannot reach the network still falls back.
+
+### What stays on the cable
+- fastboot and everything else in the bootloader: flashing partitions, slots, unlocking. These are the bootloader's own USB protocol, and nothing of ferros runs yet.
+- A device that never reaches the network after a fallback.
+- `dbg` / `dbg2`: they read the USB controller itself over EP0.
+- The development caps (`run`, `kist stow` thru the store, the unauthenticated dev set).
+
+### Open
+- B0. Whether a profile may ever allow `reload` and `install` over WAN, or LAN at most.
+- B1. The return deadline after a fleet reload, and the confirm's form (one signed command, or the sender's next ordinary command).
+- B2. Whether the March 2026 USB session design (Claude memories/project_usb_auth_design.md: Ed25519 challenge, X25519 session) is replaced by the same signed commands on USB, so there is one rule for every link.
+- B3. Where the right is granted: the target's Fleet page with the sender listed, or an NFC tap between the two.
+
 ## Known limitations
 - Polling only — no GIC interrupts on the device side; the bridge paces sends to match.
 - Single-TRB device model — no TRB rings yet; throughput is pacing-bound, not bandwidth-bound.
