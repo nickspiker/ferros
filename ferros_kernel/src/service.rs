@@ -2077,12 +2077,17 @@ fn clock_profile(want: u8) {
     let own = GOV_ON.load(core::sync::atomic::Ordering::Relaxed) && unsafe { CLOCK_STATE } != 0 && want != 3;
     // Each request answered before the next and before the loop may sleep: the clusters', MIF's and INT's rate requests take no reply (as Linux sends them), so five went out back to back and the loop went straight into `wfe` with the firmware still at work — and on battery (the charger cut) the X3 never woke from that `wfe` (2026-10-25, twice). A rate read takes a reply, and the firmware answers in order: its answer means the request before it is done. The longest wait goes into DIAG.
     // Each rate under the thermal policy's cap for its domain (thermal.rs `capped`), so a switch never undoes a cap.
+    // The memory side lifted (`shared_lift`) and the screen staying lit: MIF and the DSU are left where the lift put them, so a tier switch while someone interacts asks nothing of them (2026-11-17, b922: the tier switched 2973 times in 16 minutes and each switch set them to the tier's and the next pass back up, 3660 lifts in all, two ACPM requests each). Going dark the table applies and the lift ends.
+    let keep_shared = unsafe { SHARED_LIFTED } && want != 3;
     for &(d, khz) in table {
         if d == 4 || d == 3 {
             if own {
                 continue;
             }
             gov_sync(d, khz);
+        }
+        if keep_shared && SHARED_LIFT.iter().any(|&(sd, _)| sd == d) {
+            continue;
         }
         let t0 = cntpct();
         let _ = crate::acpm::dvfs_set(d, crate::thermal::capped(d, khz));
@@ -2092,8 +2097,8 @@ fn clock_profile(want: u8) {
     }
     let v: u64;
     unsafe {
-        // The tier's table set MIF and the DSU: the memory side's lift, if it was on, is to be asked again (`clock_policy`).
-        SHARED_LIFTED = false;
+        // Unless kept (above), the tier's table set MIF and the DSU: the memory side's lift is off until `clock_policy` asks it again.
+        SHARED_LIFTED = keep_shared;
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
         CLOCK_STATE = want;
         CLOCK_SWITCHES += 1;
@@ -2118,6 +2123,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
             }
             unsafe { TIER_RES = [0; 4] };
             unsafe { GOV_LIFTED = [0; 2] };
+            unsafe { SHARED_LIFTS = 0 };
             for b in &crate::process::INPUT_TO_FRAME {
                 b.store(0, Relaxed);
             }
