@@ -2,7 +2,7 @@
 //!
 //! The policy works only thru caps: the clock policy (service.rs `clock_profile`, `gpu_rate`) asks for each domain's rate thru `capped`, so a profile switch never undoes a cap (until 2026-11-12 the throttle set the X3 by hand and the next profile switch put it back).
 //! Two policies, `diag thermal policy step|smooth|off`; every boot starts at `step`:
-//! - step (the default, as since 2026-10-23): the hottest CPU zone at `AT` (95 °C) caps the X3 at 1.4 GHz; below `AT` less 10 the cap goes.
+//! - step (the default, as since 2026-10-23): the hottest CPU zone at `AT` (95 °C) caps the X3 at 1.4 GHz and (since the A715s' lift, 2026-11-17) the A715s at 1065 MHz; below `AT` less 10 the caps go.
 //! - smooth (built 2026-11-12, off by default, untested on the device): each controlled domain's cap moves every second by an amount that grows smoothly with how far its own zone sits from its control temperature (Android's passive trips), down while above, back up while below, between the domain's floor in zuma-cpu.dtsi and the rate the clock policy wants.
 //! - off: no cap at all (for measuring heat; the firmware's and the hardware's own protections stay).
 
@@ -65,6 +65,8 @@ pub const OFF: u8 = 2;
 pub static AT: AtomicU8 = AtomicU8::new(95);
 /// The X3's cap under the step policy: half its top rate (measured 2026-10-23, the core then counts ~1297 M dependent adds a second).
 const STEP_KHZ: u32 = 1_400_000;
+/// The A715s' cap under the step policy, with the X3's: their calm ceiling, 1065 MHz (service.rs `A715_CALM_KHZ`). Since the owner lifted their ceiling while someone interacts (2026-11-17, THERMAL.md decision 3: their top, 2367 MHz, is 1.5 W a core), a hot device takes them back to where they ran before the lift.
+const STEP_A715_KHZ: u32 = 1_065_000;
 
 /// The kernel's own core's clock as measured on each read (`measure_mhz`), the lowest since boot, and the rate the firmware holds for the X3 (acpm::dvfs_get), all MHz.
 static CORE_MHZ: AtomicU32 = AtomicU32::new(0);
@@ -235,17 +237,21 @@ pub fn poll() -> bool {
     true
 }
 
-/// The step policy: the hottest CPU zone (big, mid, little) at `AT` caps the X3 at STEP_KHZ, below `AT` less 10 the cap goes. `AT` is at least 20 (`diag thermal at` keeps it there), so the release point is never below 10.
+/// The step policy: the hottest CPU zone (big, mid, little) at `AT` caps the X3 at STEP_KHZ and the A715s at STEP_A715_KHZ, below `AT` less 10 the caps go. `AT` is at least 20 (`diag thermal at` keeps it there), so the release point is never below 10.
 fn step() {
     let cpu = TEMP[..3].iter().map(|t| t.load(Relaxed)).max().unwrap_or(0);
     let at = AT.load(Relaxed);
     let capped = CAP[0].load(Relaxed) != u32::MAX;
     if !capped && cpu >= at {
         CAP[0].store(STEP_KHZ, Relaxed);
+        CAP[1].store(STEP_A715_KHZ, Relaxed);
         apply(0);
+        apply(1);
     } else if capped && cpu < at - 10 {
         CAP[0].store(u32::MAX, Relaxed);
+        CAP[1].store(u32::MAX, Relaxed);
         apply(0);
+        apply(1);
     }
 }
 
