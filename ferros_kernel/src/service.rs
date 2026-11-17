@@ -1794,11 +1794,23 @@ static mut GOV_SHOWN_SEEN: u64 = 0;
 static mut GOV_SHOWN_AVG: u64 = 0;
 static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(96);
 
-/// Whether the shared domains should be at the active tier for what the governor asks of the clusters, the GPU's work, or the frames shown.
-fn tier_active(govs: &[Gov; 2]) -> bool {
+/// What asks the shared domains for the active tier now, one bit each (`TIER_CAUSES`): the governor asking the X3 over `X3_REST_KHZ` (bit 0) or the A715s over `A715_REST_KHZ` (bit 1), the GPU's sustained work (bit 2), the frames shown (bit 3). `clock_policy` adds input with the governor off (bit 4) and a PT transfer's hold (bit 5). None: rest, once the dwell has passed (`TIER_DWELL`).
+fn tier_active(govs: &[Gov; 2]) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
-    govs[0].opps[govs[0].at] > X3_REST_KHZ || govs[1].opps[govs[1].at] > A715_REST_KHZ || unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed) || unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)
+    (govs[0].opps[govs[0].at] > X3_REST_KHZ) as u8 | ((govs[1].opps[govs[1].at] > A715_REST_KHZ) as u8) << 1 | ((unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed)) as u8) << 2 | ((unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)) as u8) << 3
 }
+pub const TIER_CAUSES: usize = 6;
+const TIER_CAUSE_NAMES: [&str; TIER_CAUSES] = ["X3", "A715", "GPU", "frames", "input", "transfer"];
+/// The rest tier is taken only once nothing has asked for the active one for 2^-`TIER_DWELL` s (`diag clock dwell <n>`, 2: a quarter second; 0 no dwell, the tier follows its causes window by window as before 2026-11-17).
+/// A real deadline, checked on the service loop's passes: a switch is seven ACPM requests, each waited for by a rate read (`clock_profile`), and on b922 (2026-11-17) the tier switched 2973 times in 16 minutes, about three a second, its causes crossing their thresholds from one 2^-6 s window to the next.
+static TIER_DWELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// When something last asked for the active tier.
+static mut TIER_BUSY_AT: u64 = 0;
+/// The measure of the tiers' switching (`diag clock`): each switch to active by the causes that asked (a switch counts once under each cause it had), each tier's runs by length (bucket b: under 2^b ms, the last everything longer), and the ticks spent switching.
+static mut TIER_WHY: [u64; TIER_CAUSES] = [0; TIER_CAUSES];
+static mut TIER_RUNS: [[u64; 12]; 4] = [[0; 12]; 4];
+static mut TIER_SINCE: u64 = 0;
+static mut TIER_SWITCH_TICKS: u64 = 0;
 static mut GOV_WINDOWS: u64 = 0;
 static mut TIER_RES: [u64; 4] = [0; 4];
 /// Counter ticks the kernel's core has spent asleep in the service loop's `wfe`, added as each sleep ends.
@@ -1838,7 +1850,7 @@ fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
 }
 
 /// The governor's window: each cluster's share measured and its rate moved (`Gov`). `boost` puts both at their top. Returns whether the shared tier should be active for what the clusters ask or the GPU does.
-fn governor(now: u64, f: u64, boost: bool) -> bool {
+fn governor(now: u64, f: u64, boost: bool) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
     let el = now.wrapping_sub(unsafe { GOV_AT });
     let govs = unsafe { &mut *(&raw mut GOV) };
@@ -1852,7 +1864,7 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         for g in govs.iter_mut() {
             let _ = gov_share(g, 1);
         }
-        return false;
+        return 0;
     }
     // The owner's lift (THERMAL.md decision 3): while someone interacts, the A715s' whole table; otherwise their calm ceiling, and a lift that ends brings them under it at once, inside a window too.
     let lifted = interactive(now, f);
@@ -1999,8 +2011,29 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     let gov = GOV_ON.load(core::sync::atomic::Ordering::Relaxed);
     // The governor runs in every tier once the policy has applied one; in the dark the workers are down and only the X3 moves.
     // Governor off (or before the first switch): the tiers alone, active for a second after a touch as before 2026-11-13.
-    let busy = if gov && was != 0 { governor(now, f, (touched && !dark) || pt_busy) } else { input != 0 && now.wrapping_sub(input) < f };
-    let want = if dark { 3 } else if busy || pt_hold { 2 } else { 1 };
+    let causes = if gov && was != 0 { governor(now, f, (touched && !dark) || pt_busy) } else { ((input != 0 && now.wrapping_sub(input) < f) as u8) << 4 } | (pt_hold as u8) << 5;
+    if causes != 0 {
+        unsafe { TIER_BUSY_AT = now };
+    }
+    // Rest only once nothing has asked for active for the dwell (`TIER_DWELL`); up to active at once.
+    let dwell = TIER_DWELL.load(core::sync::atomic::Ordering::Relaxed);
+    let held = was == 2 && dwell != 0 && now.wrapping_sub(unsafe { TIER_BUSY_AT }) < f >> dwell;
+    let want = if dark { 3 } else if causes != 0 || held { 2 } else { 1 };
+    if want != was && was != 0 {
+        unsafe {
+            if want == 2 {
+                for (k, w) in (*(&raw mut TIER_WHY)).iter_mut().enumerate() {
+                    *w += (causes >> k & 1) as u64;
+                }
+            }
+            // The run that ends, by its length: bucket b holds runs under 2^b ms; the last, 2^11 ms and longer.
+            // WHY the min: a run has no upper end (a night at rest), and there are twelve buckets.
+            let ms = now.wrapping_sub(TIER_SINCE) * 1000 / f;
+            let b = (64 - ms.leading_zeros() as usize).min(11);
+            TIER_RUNS[was as usize][b] += 1;
+            TIER_SINCE = now;
+        }
+    }
     if was != 0 && unsafe { TIER_AT } != 0 {
         unsafe { TIER_RES[was as usize] += now.wrapping_sub(TIER_AT) };
     }
@@ -2015,7 +2048,9 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
                 core::hint::spin_loop();
             }
         }
+        let t_switch = cntpct();
         clock_profile(want);
+        unsafe { TIER_SWITCH_TICKS += cntpct().wrapping_sub(t_switch) };
         if want == 3 && workers_dark {
             crate::smp::stop_all();
         }
@@ -2108,7 +2143,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none).
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2124,6 +2159,9 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
             unsafe { TIER_RES = [0; 4] };
             unsafe { GOV_LIFTED = [0; 2] };
             unsafe { SHARED_LIFTS = 0 };
+            unsafe { TIER_WHY = [0; TIER_CAUSES] };
+            unsafe { TIER_RUNS = [[0; 12]; 4] };
+            unsafe { TIER_SWITCH_TICKS = 0 };
             for b in &crate::process::INPUT_TO_FRAME {
                 b.store(0, Relaxed);
             }
@@ -2148,6 +2186,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
         (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
+        (Some(b"dwell"), Some(n)) => TIER_DWELL.store(n, Relaxed),
         _ => {}
     }
     let lifted = interactive(cntpct(), f);
@@ -2156,6 +2195,22 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };
     out.extend_from_slice(alloc::format!("tiers, ms: rest A#{}, active A#{}, dark A#{}\n", ms(tr[1]), ms(tr[2]), ms(tr[3])).as_bytes());
+    let why = unsafe { TIER_WHY };
+    out.extend_from_slice(alloc::format!("tier dwell f>>A#{} (0 none); switches to active by cause:", TIER_DWELL.load(Relaxed)).as_bytes());
+    for (k, n) in why.iter().enumerate() {
+        out.extend_from_slice(alloc::format!(" {} A#{}", TIER_CAUSE_NAMES[k], n).as_bytes());
+    }
+    out.extend_from_slice(alloc::format!("; switching took A#{} us in all\n", unsafe { TIER_SWITCH_TICKS } * 1_000_000 / f).as_bytes());
+    let runs = unsafe { TIER_RUNS };
+    for (t, name) in [(1usize, "rest"), (2, "active")] {
+        out.extend_from_slice(alloc::format!("  {name} runs by ms:").as_bytes());
+        for (b, n) in runs[t].iter().enumerate() {
+            if *n != 0 {
+                out.extend_from_slice(alloc::format!(" <A#{}:A#{}", 1u64 << b, n).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
     for g in govs.iter() {
         let total: u64 = g.res.iter().sum::<u64>().max(1);
         let mean = g.res.iter().zip(g.opps).map(|(&t, &o)| t * (o / 1000) as u64).sum::<u64>() / total;
