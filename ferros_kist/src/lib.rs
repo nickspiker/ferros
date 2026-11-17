@@ -19,6 +19,8 @@ pub mod note;
 pub mod secret;
 /// A capsule's address and the hash its signature covers, both in one pass over its bytes (the kernel's kist launch).
 pub mod twin;
+/// An installed image's seal, by its image (until 2026-11-17) or by its address, and the move from one to the other (the kernel's spawns and launches).
+pub mod seal;
 
 use alloc::string::String;
 use alloc::vec::Vec;

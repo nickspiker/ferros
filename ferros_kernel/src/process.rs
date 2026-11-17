@@ -6689,15 +6689,39 @@ pub enum Grant<'a> {
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
 pub const IHI: usize = 0xFE0;
 
+/// Seals found only in the image form at a launch, each (old, new) to be moved to the address form by the service loop (`seal_moves`, service.rs `move_seals`). Under the kernel lock.
+static mut SEAL_MOVES: Vec<([u8; 32], [u8; 32])> = Vec::new();
+
+/// A masked image's seal checked against `sealed` (SANDBOX.md "Seal"; owner, 2026-11-17): by its address, `address`, which the caller computed from the bytes it is about to run on this same launch, so nothing runs on an address seal whose address was not checked then; else by its image (the old full pass over `code`), which then runs once more, and its move to the address form is queued. Takes the kernel lock for the queue unless held.
+pub fn seal_ok(sealed: &[u8], developer: &[u8; 32], hp: &[u8; 32], m: &crate::oracle::Modes, address: &[u8; 32], code: &[u8]) -> Result<(), &'static str> {
+    let key = crate::oracle::seal_key().ok_or("no system secret: cannot check a seal")?;
+    match ferros_kist::seal::check(sealed, &key, developer, hp, true, m, address, || ferros_kist::seal::by_image(&key, developer, hp, true, m, code)) {
+        ferros_kist::seal::Verdict::ByAddress => Ok(()),
+        ferros_kist::seal::Verdict::ByImage(old, new) => {
+            with_lock_held_or(|| {
+                let q = unsafe { &mut *(&raw mut SEAL_MOVES) };
+                if !q.iter().any(|e| e.0 == old) {
+                    q.push((old, new));
+                }
+            });
+            Ok(())
+        }
+        ferros_kist::seal::Verdict::No => Err("gate: masked capsule not installed (no seal)"),
+    }
+}
+
+/// The seal moves queued since the last look (`seal_ok`), for the service loop to write. Takes the kernel lock.
+pub fn seal_moves() -> Vec<([u8; 32], [u8; 32])> {
+    with_lock(|| core::mem::take(unsafe { &mut *(&raw mut SEAL_MOVES) }))
+}
+
 /// Spawn a signed capsule: it must pass the gate (oracle.rs); the oracle's ihi is written into the process's arc at `IHI` and the kernel keeps no copy. Then as `spawn`.
 pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant], sealed: &[u8]) -> Result<Outcome, &'static str> {
     let g = crate::oracle::gate(capsule)?;
     // Masked (sandboxed) code runs only if it was installed — its seal is in the vault's `sealed` list (`sealed`: 32-byte entries) — and then without re-checking: the checker ran once at install (SANDBOX.md, run and gun). Native dev code spawns unchecked here; a production build refuses it entirely.
     if g.masked {
-        let s = crate::oracle::seal(&g).ok_or("no system secret: cannot check a seal")?;
-        if !sealed.chunks_exact(32).any(|e| e == s) {
-            return Err("gate: masked capsule not installed (no seal)");
-        }
+        // The address from the very bytes the process is built from.
+        seal_ok(sealed, &g.developer_pubkey, &g.hp, &crate::oracle::modes_of(&g), blake3::hash(capsule).as_bytes(), &g.code)?;
     } else if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }
@@ -6711,10 +6735,9 @@ pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], gra
     let g = crate::oracle::gate_located(capsule, co, cl)?;
     let (exec_len, mode) = if masked {
         let m = crate::oracle::masked_modes(capsule, co, cl)?;
-        let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or("no system secret: cannot check a seal")?;
-        if !sealed.chunks_exact(32).any(|e| e == s) {
-            return Err("gate: masked capsule not installed (no seal)");
-        }
+        // The address from the bytes in the staging arc, which the process is built from.
+        let address = *blake3::hash(capsule).as_bytes();
+        seal_ok(sealed, &g.developer_pubkey, &g.hp, &m, &address, &capsule[co..co + cl])?;
         (m.text_len, m.fixed | (m.bti as u32) << 8 | (m.exact as u32) << 9)
     } else {
         if cfg!(ferros_production) {
@@ -6734,7 +6757,8 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
     }
     let mode = if g.exact { ferros_sandbox::Mode::Exact } else if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
     ferros_sandbox::check_image_with(&g.code[..g.text_len], mode, g.bti).map_err(|_| "install: masked code failed the sandbox checker")?;
-    crate::oracle::seal(&g).ok_or("no system secret: cannot seal")
+    // The address form (2026-11-17): the address of the bytes just gated and checked.
+    crate::oracle::seal_address(&g.developer_pubkey, &g.hp, true, &crate::oracle::modes_of(&g), blake3::hash(capsule).as_bytes()).ok_or("no system secret: cannot seal")
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
@@ -6978,19 +7002,21 @@ pub fn kist_masked(head: &[u8], total: usize) -> bool {
 }
 
 /// A masked kist's code where it lies in its staged capsule, gated, its modes read and its seal found in `sealed` (32-byte entries): SANDBOX.md's "spawn runs only sealed images", one BLAKE3 over the image and no checker. Returns the developer's key and identity for the ihi, and the modes.
-fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8], pre: Option<&KistHashes>) -> Result<(crate::oracle::Located, crate::oracle::Modes), KistFault> {
+/// `address` is the capsule's, already checked against its bytes in this arc on this launch (`spawn_kist`), so the seal is found by address with no pass over the image; a kist sealed before 2026-11-17 is checked by its image once more and its seal moved (`seal_ok`).
+fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8], pre: Option<&KistHashes>, address: &[u8; 32]) -> Result<(crate::oracle::Located, crate::oracle::Modes), KistFault> {
     use ferros_kist::launch::why;
     let t = crate::platform::cntpct();
     let g = crate::oracle::gate_located_with(capsule, co, cl, pre.map(|p| (&p.file, p.slot))).map_err(|e| (why::CHECKS, e))?;
     kist_time(KT_GATE, t);
     let t = crate::platform::cntpct();
     let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
-    let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or((why::OTHER, "no system secret: cannot check a seal"))?;
+    let r = seal_ok(sealed, &g.developer_pubkey, &g.hp, &m, address, &capsule[co..co + cl]);
     kist_time(KT_SEAL, t);
-    if !sealed.chunks_exact(32).any(|e| e == s) {
-        return Err((why::NOT_HERE, "gate: masked kist not stowed on this device (no seal)"));
+    match r {
+        Ok(()) => Ok((g, m)),
+        Err(e) if crate::oracle::seal_key().is_none() => Err((why::OTHER, e)),
+        Err(_) => Err((why::NOT_HERE, "gate: masked kist not stowed on this device (no seal)")),
     }
-    Ok((g, m))
 }
 
 /// A kist launch that did not start: why (`ferros_kist::launch::why`, or `KIST_ALREADY`), and the job's words for the console.
@@ -7046,7 +7072,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
         }
         let (co, cl, masked) = locate_code(capsule, total).map_err(|e| (why::READ, e))?;
         let (g, modes) = if masked {
-            let (g, m) = kist_sealed(capsule, co, cl, sealed, pre)?;
+            let (g, m) = kist_sealed(capsule, co, cl, sealed, pre, &address)?;
             (g, Some(m))
         } else {
             if cfg!(ferros_production) {
@@ -7336,9 +7362,9 @@ pub fn stow_check(arc: &Arc, total: usize, addr: &[u8; 32]) -> Result<(crate::or
 }
 
 /// The seal of a stow that passed `stow_check`: keyed by this device's system secret, so it is good on this device alone.
-pub fn stow_seal(arc: &Arc, g: &crate::oracle::Located, m: &crate::oracle::Modes, co: usize, cl: usize) -> Result<[u8; 32], u64> {
-    let code = unsafe { core::slice::from_raw_parts((arc.base + CODE + co) as *const u8, cl) };
-    crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, m, code).ok_or_else(|| {
+/// The address form (2026-11-17): `addr` is the capsule's, which `stow_check` held to the bytes in the arc it checked, and nothing has written the arc since.
+pub fn stow_seal(g: &crate::oracle::Located, m: &crate::oracle::Modes, addr: &[u8; 32]) -> Result<[u8; 32], u64> {
+    crate::oracle::seal_address(&g.developer_pubkey, &g.hp, true, m, addr).ok_or_else(|| {
         push_console(b"kist stow: no system secret: cannot seal\n");
         STOW_WHY_SECRET
     })
@@ -7683,7 +7709,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     let g = crate::oracle::gate(&capsule)?;
     spawn_step(4);
     // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck: every spawn holds the kernel lock while it reads and checks its capsule).
-    let r = spawn_checked(name, &g, &sealed, objects);
+    let r = spawn_checked(name, &g, &capsule, &sealed, objects);
     let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
     let t_end = crate::platform::cntpct();
     let kk = k();
@@ -7721,12 +7747,10 @@ fn spawn_step(step: u64) {
 }
 
 /// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
-fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
+fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, capsule: &[u8], sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     if g.masked {
-        let s = crate::oracle::seal(g).ok_or("no system secret: cannot check a seal")?;
-        if !sealed.chunks_exact(32).any(|e| e == s) {
-            return Err("gate: masked capsule not installed (no seal)");
-        }
+        // The address of the capsule the gate just copied the code out of, in the kernel heap where nothing else writes.
+        seal_ok(sealed, &g.developer_pubkey, &g.hp, &crate::oracle::modes_of(g), blake3::hash(capsule).as_bytes(), &g.code)?;
     } else if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }

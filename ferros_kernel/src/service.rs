@@ -585,7 +585,7 @@ fn stow_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             }
             Err(c) => c,
         },
-        Some((g, m, co, cl)) => match crate::process::stow_seal(&arc, &g, &m, co, cl) {
+        Some((g, m, _, _)) => match crate::process::stow_seal(&g, &m, &job.capsule) {
             Ok(seal) => {
                 job.arc = None;
                 crate::process::with_lock(|| crate::process::arc_free(arc));
@@ -1214,6 +1214,27 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
 
 /// A capsule the vault keeps in pieces (kvault.rs `set`, over `ferros_pieces::PIECE`), spawned without its bytes ever whole in the kernel heap: under the kernel lock, its length read, a staging arc taken from the frame pool and the pieces read straight into it one at a time (the heap holds one piece), then the gate where it lies and the process built from its code (`spawn_capsule_in_place`), and the staging arc given back. None when the capsule is not kept in pieces (stored before 2026-11-12, or under `PIECE`): the caller reads it whole as before.
 /// Why (2026-11-12, twice on the Pro, PREV_EXIT G#EE91): read whole, the display's 2.8 MB capsule was one 3 MB block of the heap and the gate's parse and clone two more, while a store put of it had needed the sealed copy and its staging, two more; with Mahere running, the 22 MiB heap had the bytes and no such holes.
+/// The seals found only in their image form at a launch (process.rs `seal_ok`), moved to the address form (SANDBOX.md "Seal"; owner, 2026-11-17): the new seal written beside the old one, the list read back, and only from a list read back holding the new seal is the old one dropped. A crash between the writes leaves the old seal listed until the new one is, so the image runs either way; a move whose old seal is gone (a release, a move before it) writes nothing.
+fn move_seals(store: &mut Option<ShimStore>) {
+    for (old, new) in crate::process::seal_moves() {
+        // Some(true) moved, Some(false) nothing left to move, None a write or its read back failed.
+        let moved = crate::process::with_lock(|| {
+            let s = store.as_mut()?;
+            let list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
+            let Some(both) = ferros_kist::seal::with_new(&list, &old, &new) else { return Some(false) };
+            s.set("sealed", &both).ok()?;
+            let back = s.get_by_key("sealed").ok().flatten()?;
+            let after = ferros_kist::seal::without_old(&back, &old, &new)?;
+            s.set("sealed", &after).ok().map(|_| true)
+        });
+        match moved {
+            Some(true) => crate::process::push_console(b"seal: an image's seal moved to the address form\n"),
+            Some(false) => {}
+            None => crate::process::push_console(b"seal: an image's seal not moved (its old seal kept; its next launch tries again)\n"),
+        }
+    }
+}
+
 fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
     let key = core::str::from_utf8(name).ok()?;
     // One hold of the lock from the length to the last piece, so the value read is the one the arc was sized for.
@@ -2719,6 +2740,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        move_seals(&mut store);
         if let Some(job) = kist_job.as_mut() {
             if let Some(r) = kist_step(job) {
                 let ms = (cntpct() - job.t0) * 1000 / cntfrq();
