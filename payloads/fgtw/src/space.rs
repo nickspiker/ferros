@@ -31,6 +31,10 @@ const P_HELD: u8 = 1;
 const P_ELSEWHERE: u8 = 2;
 const P_NO_EGG: u8 = 3;
 const P_KERNEL: u8 = 4;
+const P_MINT_HELD: u8 = 5;
+
+/// Set at build time (FGTW_NO_MINT=1): this build never mints a person key (`space_person`).
+const NO_MINT: bool = option_env!("FGTW_NO_MINT").is_some();
 /// How many timing samples the payload's own jitter egg takes (`jitter_egg`).
 const JITTER_SAMPLES: usize = 1 << 10;
 
@@ -694,7 +698,26 @@ impl Client {
         let Some((hp, fk)) = self.space_ready() else { return };
         let (me, grants) = (self.me, self.log.grants);
         let held = self.space.person.as_ref().map(|(k, m)| (k, *m));
-        let settled = fgtw::person::settle(&mut self.space.space, &hp, &fk, held, || person_eggs(grants, &fk), eagle(), &me);
+        // A build made with FGTW_NO_MINT set never mints a person key: settle's egg source gives nothing, so a would-be mint ends as "not minted" and nothing is written (owner, 2026-11-17: a device carrying another person's identity, where a mint needs that person's go).
+        let wanted = core::cell::Cell::new(false);
+        let settled = fgtw::person::settle(
+            &mut self.space.space,
+            &hp,
+            &fk,
+            held,
+            || {
+                wanted.set(true);
+                if NO_MINT { alloc::vec::Vec::new() } else { person_eggs(grants, &fk) }
+            },
+            eagle(),
+            &me,
+        );
+        if NO_MINT && wanted.get() && self.space.person_said != P_MINT_HELD {
+            self.space.person_said = P_MINT_HELD;
+            self.log.put(b"fgtw: a person key mint for this identity is held (built with FGTW_NO_MINT): it needs the owner's go");
+            self.log.line();
+            return;
+        }
         let s = match settled {
             Ok(s) => s,
             Err(e) => {
