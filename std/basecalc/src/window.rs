@@ -226,8 +226,14 @@ struct Pad {
 }
 
 impl Pad {
+    /// The keys placed for the frame's size, the base, the layer and the picker.
+    /// The hit map is sized with the frame here, so the host's look-up (fluor ferros `hit_under_cursor`, which takes the map's width and height as given) always indexes a map of the frame's size, even for a touch before the first frame is drawn.
     fn place(&mut self) {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        if self.hits.len() != self.size.0 * self.size.1 {
+            self.hits = vec![HIT_NONE; self.size.0 * self.size.1];
+        }
+        // No frame yet (the size comes with the first resize): nothing to place.
         if w == 0. {
             return;
         }
@@ -393,8 +399,8 @@ impl FluorApp<G2t16> for Pad {
             self.place();
         }
         let Some(layout) = self.layout else { return };
-        self.hits.clear();
-        self.hits.resize(w * h, HIT_NONE);
+        // The map starts each frame empty: the whole frame is drawn again (fluor's default damage).
+        self.hits.fill(HIT_NONE);
         let pressed = ctx.pressed_hit;
         let text = &mut *ctx.text;
         let mut canvas = Canvas::new(target, w, h, ctx.damage);
