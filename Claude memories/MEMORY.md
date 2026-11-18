@@ -7,6 +7,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no attribution](feedback_no_attribution.md) - "Built with Claude", never Co-Authored-By or authorship claims
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) - commit + push each verified step; own hunks only
 - [Feedback: reload the Pro freely](feedback_pro_reload_freely.md) - reloads/restarts/stores need no ask; unplugged = hands off
+- [Feedback: Harbor tmp is scratch](feedback_harbor_tmp_is_scratch.md) - owner clears it at will; agents build in scratchpads; device data in keys/<device>/
 - [Feedback: deploy sites freely](feedback_deploy_sites_ok.md) - fgtw.org, passless.org, ferros.org deploys need no go; keys/handles rules hold
 - [Feedback: don't SSH](feedback_no_ssh.md) - never SSH into another machine unless told to
 - [Feedback: no Google connectors](feedback_no_google_connectors.md) - owner doesn't use Google; ignore those auth notices
@@ -155,7 +156,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Pro flash paths](husky_flash_paths.md) - 64 MiB fastboot fails were the cable; prefix flash or Android dd as fallbacks
 - [pKVM resets on wipe](pkvm_resets_on_wipe.md) - `fastboot -w` re-enables pKVM; disable + check status after every wipe
 - [Android boot experiments trip rescue](android_boot_experiments_rescue_party.md) - one slot at a time; never factory reset
-- [husky factory partitions backup](husky_factory_partitions_backup.md) - persist/efs imaged 2026-10-19 to Harbor tmp; local only
+- [husky factory partitions backup](husky_factory_partitions_backup.md) - images lost with Harbor tmp 2026-11-17; re-dump into keys/husky/
 - [Bridge: debug build for two devices](bridge_debug_for_two_devices.md) - target/debug bridge for FERROS_BUS; check `diag log`
 - [Dev box network for device tests](devbox_network_for_phone_tests.md) - WiFi .156 not the DMX NIC; receiver sends first
 - [gs-google reference tree](gs_google_reference_tree.md) - Pixel kernel source at /mnt/Harbor/ferros-ref; grep it
