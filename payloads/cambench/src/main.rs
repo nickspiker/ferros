@@ -9,6 +9,8 @@
 //! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each; 3 the line length from 6320 clocks down, a new open each), +15 threads for whole frames (0: the four A715s),
 //! - optionally +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain).
 //! The driver's flag 128 keeps the sensor's phase detect and embedded data on in a windowed mode (off by default there: docs/CAMERA.md "The slit for real").
+//! A windowed mode on the main also runs detached and slim by default (the statistics pipeline off, loch0's paths alone each frame: docs/CAMERA.md "The slit runs"); the driver's eighth hand-spawn byte overrides it for an A/B.
+//! The sweeps (+14) open again in this process: with the vault's driver each open starts a fresh one; a driver spawned by hand serves one stream and refuses the next open, so a sweep of a hand-spawned driver is tools/cambench-sweep.sh (one driver an open).
 //! e.g. `00030400000000000000000002080000`: the main, a binned slit of 4 rows, 128 slits added into u16; `00010000000000000000000002040000`: the main binned at its default cut frame, 64 frames added (every byte of the 16 written, little-endian halves: rows 4 is `0400`).
 //!
 //! What it says, per open: the driver's answer and the view's shape; the sensor's data formats and its mode registers read back (CAPS); the sensor's own frame rate against the front end's (RATE); per frame the read and add time on each thread, frames skipped, the cores used and left; the driver's counters (STATS); the link's and the bus's bytes a second.
@@ -466,9 +468,9 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
             first_n = newest;
             last = newest - 1;
         }
-        // The oldest buffer is the next the engine writes: keep to the newest ring - 1.
-        // WHY the saturating subtraction: in the ring's first `ring - 2` frames every buffer written is safe, and newest + 2 - ring would wrap below zero; the max then keeps to the frames not yet read.
-        let from = (last + 1).max((newest + 2).saturating_sub(ring));
+        // The oldest buffer is the next the engine writes: keep to the newest ring - 2 (the one after it has its probe patterned for the frame after the next: payloads/camera `slit_turn`).
+        // WHY the saturating subtraction: in the ring's first `ring - 3` frames every buffer written is safe, and newest + 3 - ring would wrap below zero; the max then keeps to the frames not yet read.
+        let from = (last + 1).max((newest + 3).saturating_sub(ring));
         lost += from - (last + 1);
         for f in from..=newest {
             let at = v.base + ((f - 1) % ring) as usize * buf;
