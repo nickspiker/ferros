@@ -278,9 +278,9 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         } {
             continue;
         }
-        // Nothing to run: a frame given back wiped and freed (frames.rs `reclaim_step`, since 2026-11-18: no longer under the kernel lock at a process's end), or a frame of the background wipe (frames.rs, after a jump once a person is in), in place of the sleep, IRQs open meanwhile; the loop then looks for work again before the next frame.
+        // Nothing to run: a frame given back wiped and freed (frames.rs `reclaim_step`, since 2026-11-18: no longer under the kernel lock at a process's end), or a frame of the background wipe (frames.rs, after a jump once a person is in), or a free frame zeroed ahead of the takes (frames.rs `clean_step`), in place of the sleep, IRQs open meanwhile; the loop then looks for work again before the next frame.
         unsafe { core::arch::asm!("msr daifclr, #2") };
-        if crate::frames::reclaim_step() || crate::frames::wipe_step() {
+        if crate::frames::reclaim_step() || crate::frames::wipe_step() || crate::frames::clean_step() {
             continue;
         }
         unsafe { core::arch::asm!("msr daifset, #2") };

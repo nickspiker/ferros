@@ -147,6 +147,10 @@ fn pool() -> &'static mut Pool {
 /// Frame `f` taken (under the kernel lock): marked used, out of the tripwire, zeroed unless known clean.
 fn took(p: &mut Pool, f: usize, zeroed: bool) {
     let (w, b) = (f / 64, 1u64 << (f % 64));
+    // A clean frame taken: the frames kept clean ahead may be short now (`clean_step`).
+    if p.clean[w] & b != 0 {
+        CLEAN_LOW.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     p.used[w] |= b;
     p.armed[w] &= !b;
     p.free -= 1;
@@ -253,6 +257,44 @@ pub fn reclaim_step() -> bool {
     true
 }
 
+/// Free frames kept known clean ahead of the takes (`clean_step`): 2^7, 256 MiB, past the largest arc a spawn or an arc's growth asks for at once (a GPU block of 128 MiB, cambench's 72 MiB).
+const CLEAN_AHEAD: u32 = 1 << 7;
+/// Whether `clean_step` may have work: cleared when the frames known clean reach `CLEAN_AHEAD` or none is left to zero, set again by a take of a clean frame (`took`), so an idle worker looks without the kernel lock while there is nothing to do.
+static CLEAN_LOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// One free frame not known clean zeroed with the kernel lock let go, while fewer than `CLEAN_AHEAD` free frames are known clean: idle workers in place of their sleep (smp.rs), as the background wipe.
+/// Why (the Pro, 2026-11-18, `diag lock`): a frame never taken this boot is zeroed by its take under the kernel lock, so a spawn's arc held it 12.3 ms at boot, an arc's growth 3.5 ms and a kist's launch 3.2 ms; with frames zeroed ahead the takes find clean ones (`take_first`) and zero nothing.
+/// Not held or armed frames (the tripwire's), as `wipe_step`. False when there is nothing to do.
+pub fn clean_step() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !CLEAN_LOW.load(Relaxed) {
+        return false;
+    }
+    let f = crate::process::with_lock(|| {
+        let p = pool();
+        let clean: u32 = p.used.iter().zip(p.clean.iter()).map(|(&u, &c)| (!u & c).count_ones()).sum();
+        // The first free frame neither clean nor armed, below the pool's end.
+        let w = (0..WORDS).find(|&w| !(p.used[w] | p.clean[w] | p.armed[w]) != 0);
+        let f = w.map(|w| w * 64 + (!(p.used[w] | p.clean[w] | p.armed[w])).trailing_zeros() as usize);
+        let Some(f) = f.filter(|&f| f < p.total && clean < CLEAN_AHEAD) else {
+            CLEAN_LOW.store(false, Relaxed);
+            return None;
+        };
+        let w = f / 64;
+        // Out of the pool while it is zeroed: marked used, so no take finds it and a reset's scrub zeroes it with the rest.
+        p.used[w] |= 1 << (f % 64);
+        p.free -= 1;
+        Some(f)
+    });
+    let Some(f) = f else { return false };
+    zero(pa(f));
+    crate::process::with_lock(|| {
+        let p = pool();
+        reclaimed(p, f, false);
+    });
+    true
+}
+
 /// A free frame, zeroed, now taken; None when every frame is taken. The first free in the map's order, so the ranges ferros has used longest fill first.
 pub fn take() -> Option<usize> {
     take_first().or_else(|| if reclaim_all(pool()) { take_first() } else { None })
@@ -260,6 +302,12 @@ pub fn take() -> Option<usize> {
 
 fn take_first() -> Option<usize> {
     let p = pool();
+    // A frame known clean first (`clean_step` keeps some ready): its take zeroes nothing under the kernel lock. A clean frame is a real one (only `give` and the wipes mark one), so no bound is needed on it.
+    if let Some(w) = p.used.iter().zip(p.clean.iter()).position(|(&u, &c)| !u & c != 0) {
+        let f = w * 64 + (!p.used[w] & p.clean[w]).trailing_zeros() as usize;
+        took(p, f, true);
+        return Some(f);
+    }
     let w = p.used.iter().position(|&w| w != u64::MAX)?;
     let f = w * 64 + (!p.used[w]).trailing_zeros() as usize;
     if f >= p.total {
@@ -276,6 +324,12 @@ pub fn take_top() -> Option<usize> {
 
 fn take_top_first() -> Option<usize> {
     let p = pool();
+    // A frame known clean first, from the top, as `take_first` from the bottom.
+    if let Some(w) = (0..WORDS).rev().find(|&w| !p.used[w] & p.clean[w] != 0) {
+        let f = w * 64 + 63 - (!p.used[w] & p.clean[w]).leading_zeros() as usize;
+        took(p, f, true);
+        return Some(f);
+    }
     // The words from the last one that holds a frame down: bits past `total` in it are no frames, so they are counted taken here.
     let last = (p.total - 1) / 64;
     let past = if (p.total % 64) == 0 { 0 } else { u64::MAX << (p.total % 64) };
@@ -451,6 +505,8 @@ pub fn release_held() -> usize {
     }
     p.free += n;
     p.held_n = 0;
+    // Free and not clean: frames for `clean_step` to zero ahead.
+    CLEAN_LOW.store(true, core::sync::atomic::Ordering::Relaxed);
     n
 }
 
