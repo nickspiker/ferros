@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "disposition",
         // ---- Security ----
         Msg::AttestAtBoot => "attester au démarrage",
-        Msg::AttestAtBootArmed => "touche encore : attester au démarrage",
+        Msg::RetypeForAttestAtBoot => "Écris encore ton handle pour attester au démarrage.\nQui tiendra cet appareil tiendra ton identité.",
         Msg::AttestAtBootNote => "activé, l’appareil s’ouvre sans ton handle :\nqui le tient tient ton identité",
         Msg::TagAttest => "attester avec une étiquette",
         Msg::TagAdd => "ajouter une étiquette",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "une étiquette gardée atteste cet appareil sans ton handle :\nqui tient l’appareil et l’étiquette tient ton identité",
         Msg::TagRemove => "retirer",
         Msg::TagDenied => "Refusé. Cette étiquette n’ouvre pas cet appareil.",
+        Msg::TheyDontMatch => "Ils ne correspondent pas.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "le service d’identité ne fonctionne pas",
         Msg::DeckFetching => "pont : récupération du tien depuis ta flotte",

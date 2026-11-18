@@ -765,6 +765,16 @@ impl KVault {
         Ok(true)
     }
 
+    /// The retype gate (SYS_UNLOCK op 12; ahau_core::retype): whether `typed`, the seed of a handle typed again just now, is the seed of the person present.
+    /// The held seed is never opened: its tag is derived from it in registers (`held_derive`, the same `derive_key` as `retype::tag`), and the two tags are compared in time that does not depend on where they differ.
+    /// `Locked` while nobody is present.
+    pub fn retype_matches(&self, typed: &[u8; 32]) -> Result<bool, KvError> {
+        let mut held = crate::keys::held_derive(&self.id_keys()?.seed, ahau_core::retype::CONTEXT, &[]).ok_or(KvError::NoIra)?;
+        let same = ahau_core::retype::matches(&held, typed);
+        crate::keys::wipe_to_dram(&mut held);
+        Ok(same)
+    }
+
     /// Whether the person key is held (a person present and their identity service has handed it in).
     pub fn person_held(&self) -> bool {
         self.id.as_ref().is_some_and(|k| k.person.is_some())

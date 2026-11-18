@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "layout",
         // ---- Security ----
         Msg::AttestAtBoot => "attest at boot",
-        Msg::AttestAtBootArmed => "tap again: attest at boot",
+        Msg::RetypeForAttestAtBoot => "Type your handle again to attest at boot.\nWhoever holds this device then holds your identity.",
         Msg::AttestAtBootNote => "on, the device opens without your handle:\nwhoever holds it holds your identity",
         Msg::TagAttest => "attest with a tag",
         Msg::TagAdd => "add a tag",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "a kept tag attests this device without your handle:\nwhoever holds the device and the tag holds your identity",
         Msg::TagRemove => "remove",
         Msg::TagDenied => "Denied. This tag does not open this device.",
+        Msg::TheyDontMatch => "They don't match.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "the identity service is not running",
         Msg::DeckFetching => "deck: fetching yours from your fleet",

@@ -3068,6 +3068,14 @@ pub fn give_person_key(cap: u64, key: &[u8; 32]) -> bool {
     svc(nr::UNLOCK, cap, 10, off(key.as_ptr()), 0, 0) == 0
 }
 
+/// The retype gate (SYS_UNLOCK op 12, the Unlock right; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again. The kernel compares it with the seed of the person present and turns the setting on only when they are one; the reply, a VSF document (ahau_core::retype), lands in `out`. Its whole length, or None without the right or from a kernel before 2026-11-17 (whose SET_PREF still takes the setting, unchecked).
+pub fn attest_at_boot_on(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+    match svc(nr::UNLOCK, cap, 12, off(seed.as_ptr()), off(out.as_mut_ptr()), out.len() as u64) {
+        ERR => None,
+        n => Some(n as usize),
+    }
+}
+
 /// The unlocked identity's own entries on this device as one VSF document (section `identity_export`, an `entry` field per vault name: the name and its stored bytes), written into `buf`, for saving them to the fleet before a departure. The document's length, or None while locked or when it does not fit. Read a transfer at a time from offsets (op 5's x4): the document is built at offset 0 and kept until read to its end, and each call answers one transfer (4096 bytes) at most.
 pub fn export_identity(cap: u64, buf: &mut [u8]) -> Option<usize> {
     let mut at = 0;

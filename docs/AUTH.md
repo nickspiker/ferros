@@ -89,6 +89,16 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
   - **Never stuck** (2026-11-18): a boot that unlocks shows no attest screen only while fgtw holds the roots (ahau asks its state, op 1, before it decides; `ahau_core::attest_screen`).
     Unlocked and bound with fgtw holding none, the attest screen comes up over whatever started, and the handle typed (or a kept tag) unlocks again, hands the roots over and fgtw keeps them.
     Any way the keeps can still part (a reset between the kernel's keep and fgtw's, a write the vault refused, fgtw started while the setting was off) ends there, never in a device that cannot attest.
+  - **Turning it on takes the handle typed again** (the retype gate; owner, 2026-11-17: "require a handle to be typed in to enable attest at boot (since my toddler could do it without me)").
+    The Security page's checkbox asks the identity service for the keyboard (fgtw op 15 [5]); the attest screen's keyboard (ahau, kind 5) takes the person's own handle, shown as typed, with the warning in its prompt.
+    Enter derives the seed (ahau_core::identity_seed) and hands it to the kernel (`SYS_UNLOCK` op 12), which compares it with the seed of the person present: a one-way tag of each (`derive_key("ferros 2026-11-17 retype gate v0", seed)`), the held one made in registers so the held seed is never opened, compared in time that does not depend on where they differ (ahau_core::retype).
+    Only a match turns the setting on, and the kernel turns it on itself; a mismatch says "They don't match.", keeps the text to correct, and changes nothing.
+    The reply is a VSF document (section `attest_at_boot`: `error`, `reason`, `present`, `matched`, `on`; VSF-AUDIT.md "The reply form").
+    `SYS_SET_PREF` refuses to turn it on (it takes 0 only), so the plain settings write is no way around the gate; turning it off needs no handle (off is always safe).
+    Op 12 answers ahau alone (by name, never a kist, as do not disturb is fgtw's): fgtw holds the Unlock right and the seed all session, and must not switch it on with no handle typed.
+    The bridge (`diag pref`, a `device` document stored over USB) still sets anything: a development path, as BRIDGE.md's unsigned commands are.
+    The seed is kept at the next unlock that has it on (the next attest), as before; the gate decides only who may switch it.
+  - **The crypto-proper answer** (the stored roots sealed under a share the person's fleet holds, so an offline stolen device never unlocks by itself) and proof that a human typed the handle on this glass: PRESENCE.md, a design not built.
 - **Locking.** Only when power goes, or when the device switches OS. Every reset the kernel orders drops the key first, its bytes overwritten (`platform::before_reset`), because a warm reset keeps DRAM. There are no timers.
   - **How the kernel holds them** (2026-11-17): the seed, the identity's three vault keys and the person key only sealed under the wairua, opened in registers by lifted code (KEY_REGISTERS.md "Sealed under the wairua at rest"); the exceptions, with how long each touches memory, are listed there.
   - **What a lock wipes** (2026-11-17): the kernel overwrites the identity's keys, the seed and the person key in place and cleans the lines to DRAM (`keys::wipe_to_dram`), and rings the identity's bell (SYS_BELL 13, `BELL_IDENTITY`: the lock epoch, moved at every lock).
@@ -111,6 +121,7 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 | 9 | list the kept tags | how many; each the start of its id and when it was kept |
 | 10 | the person key from the identity service (Unlock right only; FACETS.md D1): 32 bytes, held beside the identity key and wiped with it at lock; the kernel derives each kist's alias from it | 0, or ERR while nobody is present |
 | 11 | the identity's doorbell: x2 a word in the caller's arc, 8-aligned; the state written there now (read live, so an unlock at boot is in it) and at every change, bits 0-2 as op 0 with a change count above bit 8, waking whatever of the process waits on it. One word a process (a second moves it); any number of processes | 0, or ERR with no vault |
+| 12 | the retype gate (the Unlock right, and only the attest screen's keyboard: ahau by name, never a kist; "Unlock at boot" above): the seed of the handle typed again, compared with the person present's; a match turns attest at boot on | the reply document's length (the document into the caller's buffer), or ERR when none could be made |
 
 ## Attest with a tag (owner, 2026-11-05 and 2026-11-11)
 

@@ -968,6 +968,14 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             Ok(false) => Ok(0),
             Err(_) => Err(()),
         },
+        // The retype gate (ahau_core::retype, process.rs op 12): 1 the seed typed again is the person present's, 0 it is not; Err while nobody is present. The log says which, never a byte of either seed.
+        (12, Some(s)) => match st.retype_matches(s) {
+            Ok(m) => {
+                crate::flashlog::line(if m { "attest at boot: the handle typed again matches the person present" } else { "attest at boot: the handle typed again does not match; nothing changed" });
+                Ok(m as u64)
+            }
+            Err(_) => Err(()),
+        },
         (3, _) => {
             st.bind().map_err(|_| ())?;
             crate::flashlog::line("identity bound: this device now opens only for it");

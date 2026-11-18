@@ -282,8 +282,8 @@ messages! {
     // ---- Security ----
     /// The checkbox: the device attests at boot without the handle typed ("attest", as the attest screen says it; owner, 2026-11-10: "always attest").
     AttestAtBoot,
-    /// The same checkbox armed by its first tap.
-    AttestAtBootArmed,
+    /// The keyboard's prompt when the checkbox is tapped on (the retype gate, docs/AUTH.md "Unlock at boot"): the person's own handle again, with what turning it on means. Two lines.
+    RetypeForAttestAtBoot,
     /// Two lines.
     AttestAtBootNote,
 
@@ -630,6 +630,8 @@ messages! {
     MintingFailed,
     /// A tag held to the attest screen that does not open the device: one refusal, no detail (AUTH.md "Attest with a tag").
     TagDenied,
+    /// A handle typed again that is not the one it must be (attest at boot's retype): nothing changed, the text kept to correct.
+    TheyDontMatch,
     ComputingKeys,
     IdentityServiceNotAnswering,
     // Its network page.

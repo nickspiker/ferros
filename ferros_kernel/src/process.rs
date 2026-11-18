@@ -6310,6 +6310,36 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         crate::keys::wipe_to_dram(&mut key);
                         r.unwrap_or(ERR)
                     }
+                    // Op 12, the retype gate (ahau_core::retype; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again, 32 bytes at x2; the reply document into x3, x4 its length.
+                    // Only a seed that is the person present's turns it on (`retype_matches`, compared in the kernel); anything else changes nothing. SYS_SET_PREF refuses to turn it on, so this is the one way a process does.
+                    // Returns the document's whole length (what fits of it is written), or ERR when no document could be made.
+                    // Only the attest screen's keyboard (ahau, by name and never a kist, as PREF_DND is fgtw's): the identity service holds the Unlock right and the seed all session, and must not be able to switch it on without the handle typed.
+                    12 if p.kist || p.name.as_slice() != b"ahau" => ERR,
+                    12 => {
+                        let mut seed = [0u8; 32];
+                        p.read_into(f.x[2], &mut seed);
+                        let r = unlock(12, Some(&seed));
+                        crate::keys::wipe_to_dram(&mut seed);
+                        use ahau_core::retype::{reply, Reply};
+                        let (answer, why) = match r {
+                            Ok(1) if pref(PREF_UNLOCK_AT_BOOT) == 1 => (Reply { error: false, present: true, matched: true, on: true }, "on already"),
+                            Ok(1) if keep_settings() => {
+                                set_pref_locked(PREF_UNLOCK_AT_BOOT, 1);
+                                (Reply { error: false, present: true, matched: true, on: true }, "on")
+                            }
+                            Ok(1) => (Reply { error: true, present: true, matched: true, on: false }, "the setting was not kept"),
+                            Ok(_) => (Reply { error: true, present: true, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "they do not match"),
+                            Err(()) => (Reply { error: true, present: false, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "no seed held: nobody present"),
+                        };
+                        match reply(answer, why, crate::settings::eagle_now()) {
+                            Some(doc) => {
+                                // WHY the min: x4 is the caller's buffer length; only what it holds is written.
+                                p.write(f.x[3], &doc[..doc.len().min(f.x[4] as usize)]);
+                                doc.len() as u64
+                            }
+                            None => ERR,
+                        }
+                    }
                     // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length) from offset x4, for saving them to the fleet before a departure; the document's whole length, or ERR while locked. With a vault process serving, it answers instead (`export_forward`).
                     5 => {
                         // Built at offset 0 and kept until read to its end, so the pieces of one read are one document (each build stamps its own time and provenance); one transfer a call, as the vault process answers.
@@ -6978,6 +7008,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = if index == PREF_DND { !p.kist && p.name.as_slice() == b"fgtw" } else { held };
             // WHY: the person's app scale is any app's to change (owner, 2026-11-20: "settings pages should modify that, same with apps"; every kist follows it, ferros_fluor), so a pinch inside a kist sets it for every kist: for this preference alone the display grant, which every kist holds (the implicit set), is the right.
             let held = held || (index == PREF_SCALE && matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Endpoint(e), r)) if e == endpoint(b"display") && r & RIGHT_SEND != 0));
+            // Attest at boot turns on only thru the retype gate (SYS_UNLOCK op 12: the handle typed again, compared with the person present's in the kernel); off is always safe and stays a plain set (owner, 2026-11-17: "my toddler could do it without me").
+            let held = held && !(index == PREF_UNLOCK_AT_BOOT && value != 0);
             // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
             let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
             f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {

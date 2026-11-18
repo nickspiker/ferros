@@ -1581,9 +1581,8 @@ struct Map {
     frame_seen: Option<u32>,
     /// A flight's trace (development builds): each step's zoom and turn left, as per mille of where they began, `|` between the frames drawn; said on the console as it lands.
     flight_trace: alloc::string::String,
-    /// Taps in a row on About's version line; the unlock-at-boot row armed by its first tap.
+    /// Taps in a row on About's version line.
     taps: u8,
-    armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
     /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and deck together switch it, and the display's answer is kept here.
@@ -3607,12 +3606,10 @@ impl Map {
                 radios(self, b, &mut y, &["Dvorak", "QWERTY"], now_l as usize, &|i| Choice::Layout(i as u8));
             }
             "security" => {
-                // Unlock at boot: off by default. Turning it on takes two taps, the first arming it with the reason it is off (AUTH.md: a stolen device then holds the identity).
+                // Unlock at boot: off by default. Turning it on asks for the person's handle again (the retype gate, AUTH.md "Unlock at boot": a stolen device then holds the identity, and a tap alone is a toddler's); off is one tap.
                 let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
-                // A checkbox; armed, its label asks for the second tap.
-                let armed = self.armed;
-                // Its words say attest, as the attest screen does (owner, 2026-11-10: "always attest").
-                mark(self, b, &mut y, 50, tr(if armed { Msg::AttestAtBootArmed } else { Msg::AttestAtBoot }), on, Some(Choice::UnlockAtBoot));
+                // A checkbox; its words say attest, as the attest screen does (owner, 2026-11-10: "always attest").
+                mark(self, b, &mut y, 50, tr(Msg::AttestAtBoot), on, Some(Choice::UnlockAtBoot));
                 notes(b, &mut y, tr(Msg::AttestAtBootNote));
             }
             "people" => {
@@ -5454,12 +5451,9 @@ impl Map {
                     return;
                 }
                 let row = self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4);
-                // Any other tap starts the version count again, and disarms unlock at boot.
+                // Any other tap starts the version count again.
                 if row != Some(Choice::Version) {
                     self.taps = 0;
-                }
-                if row != Some(Choice::UnlockAtBoot) {
-                    self.armed = false;
                 }
                 if row != Some(Choice::FleetRemove) {
                     self.fleet.confirm = false;
@@ -5516,15 +5510,12 @@ impl Map {
                         set(self, ferros_sys::PREF_HELM, if on { was | bit } else { was & !bit });
                     }
                     Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
-                    // Off in one tap; on in two, the first arming it with the warning.
+                    // Off in one tap. On only thru the retype gate (owner, 2026-11-17: "require a handle to be typed in to enable attest at boot (since my toddler could do it without me)"): the keyboard asks for the person's own handle again (fgtw op 15 [5], kind 5 on the attest screen's keyboard), which the kernel compares with the person present's and turns the setting on itself (SYS_UNLOCK op 12); the kernel refuses this page's plain set of it. The checkbox follows the setting as it changes.
                     Some(Choice::UnlockAtBoot) => {
                         if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 {
                             set(self, ferros_sys::PREF_UNLOCK_AT_BOOT, 0);
-                        } else if self.armed {
-                            set(self, ferros_sys::PREF_UNLOCK_AT_BOOT, 1);
-                            self.armed = false;
                         } else {
-                            self.armed = true;
+                            people_ask(&[15, 5]);
                         }
                     }
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
@@ -5998,7 +5989,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         frame_seen: None,
         flight_trace: alloc::string::String::new(),
         taps: 0,
-        armed: false,
         dev: false,
         hit_view: false,
         frames_on: false,
@@ -6240,6 +6230,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut labels = ferros_sys::pref(ferros_sys::PREF_LABELS);
     let mut theme_seen = ferros_sys::pref(ferros_sys::PREF_THEME);
     let mut scale_seen = ferros_sys::pref(ferros_sys::PREF_SCALE);
+    let mut unlock_boot_seen = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT);
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0i64, 0i64); 16];
@@ -6397,6 +6388,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let sc = ferros_sys::pref(ferros_sys::PREF_SCALE);
         if sc != scale_seen {
             scale_seen = sc;
+            map.draw();
+        }
+        // Attest at boot turned on by the kernel itself (the retype gate, SYS_UNLOCK op 12, while the keyboard had the glass), or off from the bridge: the Security page's checkbox follows.
+        let ub = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT);
+        if ub != unlock_boot_seen {
+            unlock_boot_seen = ub;
             map.draw();
         }
 

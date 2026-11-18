@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "tata letak",
         // ---- Security ----
         Msg::AttestAtBoot => "sahkan saat menyala",
-        Msg::AttestAtBootArmed => "ketuk lagi: sahkan saat menyala",
+        Msg::RetypeForAttestAtBoot => "Ketik handle-mu lagi untuk sahkan saat menyala.\nSiapa pun yang memegang perangkat ini memegang identitasmu.",
         Msg::AttestAtBootNote => "jika nyala, perangkat terbuka tanpa handle-mu:\nsiapa pun yang memegangnya memegang identitasmu",
         Msg::TagAttest => "sahkan dengan tag",
         Msg::TagAdd => "tambah tag",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "tag yang disimpan mengesahkan perangkat ini tanpa handle-mu:\nsiapa pun yang memegang perangkat dan tag-nya memegang identitasmu",
         Msg::TagRemove => "hapus",
         Msg::TagDenied => "Ditolak. Tag ini tidak membuka perangkat ini.",
+        Msg::TheyDontMatch => "Keduanya tidak cocok.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "layanan identitas tidak berjalan",
         Msg::DeckFetching => "dek: mengambil milikmu dari armadamu",

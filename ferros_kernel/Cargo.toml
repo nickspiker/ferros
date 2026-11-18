@@ -39,6 +39,8 @@ ferros_console = { path = "../ferros_console" }
 # The vault's large values in sealed pieces under a manifest (kvault.rs): none of them, nor twice it, in one block of the kernel heap.
 ferros_pieces = { path = "../ferros_pieces" }
 ihi = { path = "../../ihi", default-features = false }
+# The retype gate's compare and reply (SYS_UNLOCK op 11), written once with the attest screen that asks for it.
+ahau_core = { path = "../ahau_core" }
 vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
 # A kist's declared wants (KISTS.md), checked at every launch from the vault.
 ferros_kist = { path = "../ferros_kist" }

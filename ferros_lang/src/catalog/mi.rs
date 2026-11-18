@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "tahora",
         // ---- Security ----
         Msg::AttestAtBoot => "whakaū i te whakaohonga",
-        Msg::AttestAtBootArmed => "pāwhiri anō: whakaū i te whakaohonga",
+        Msg::RetypeForAttestAtBoot => "Tāurua anō tō handle kia whakaū i te whakaohonga.\nKo te tangata e pupuri ana i tēnei pūrere, kei a ia tō tuakiri.",
         Msg::AttestAtBootNote => "ki te kā, ka tuwhera te pūrere me te kore o tō handle:\nko te tangata e pupuri ana i a ia, kei a ia tō tuakiri",
         Msg::TagAttest => "whakaū ki tētahi tohu",
         Msg::TagAdd => "tāpiri tohu",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "ka whakaū tētahi tohu kua puritia i tēnei pūrere me te kore o tō handle:\nko te tangata e pupuri ana i te pūrere me te tohu, kei a ia tō tuakiri",
         Msg::TagRemove => "tangohia",
         Msg::TagDenied => "Kua whakakāhoretia. Kāore tēnei tohu e whakatuwhera i tēnei pūrere.",
+        Msg::TheyDontMatch => "Kāore e hāngai.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "kāore te ratonga tuakiri e rere ana",
         Msg::DeckFetching => "papa: e tiki ana i tōu mai i tō kāhui",

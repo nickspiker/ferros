@@ -27,7 +27,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `prox_wake` | unsigned | 0 off, 1 on | 0 |
 | `scope` | unsigned | 0 off, 1-6 the light scope's channel | 0 |
 | `layout` | unsigned | 0 Dvorak, 1 QWERTY with Q on the bottom row (honeycomb) | 0 |
-| `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the phone unlocks without typing) | 0 |
+| `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the device unlocks without typing). A process turns it on only thru the retype gate (AUTH.md "Unlock at boot": the handle typed again, compared in the kernel); SET_PREF takes 0 only | 0 |
 | `radios_off` | unsigned | the radios switched off, a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS (a tap on a status circle; the kernel stops that driver while its bit is set) | 0 |
 | `radios_before` | unsigned | the radios that were off when the quick row's "radios off" switched them all off (`radios_off`'s bits), put back by its next tap (QUICK.md) | 0 |
 | `sound` | unsigned | the sound mode, preference 39: 0 sound, 1 vibrate, 2 silent (the quick row) | 0 |

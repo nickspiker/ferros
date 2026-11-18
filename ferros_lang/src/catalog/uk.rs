@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "розкладка",
         // ---- Security ----
         Msg::AttestAtBoot => "засвідчення під час завантаження",
-        Msg::AttestAtBootArmed => "торкнись ще раз: засвідчення під час завантаження",
+        Msg::RetypeForAttestAtBoot => "Введи свій handle ще раз для засвідчення під час завантаження.\nХто тримає цей пристрій, той тримає твою ідентичність.",
         Msg::AttestAtBootNote => "увімк: пристрій відкривається без твого handle:\nхто тримає його, той тримає твою ідентичність",
         Msg::TagAttest => "засвідчення міткою",
         Msg::TagAdd => "додати мітку",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "збережена мітка засвідчує цей пристрій без твого handle:\nхто тримає пристрій і мітку, той тримає твою ідентичність",
         Msg::TagRemove => "видалити",
         Msg::TagDenied => "Відмовлено. Ця мітка не відкриває цей пристрій.",
+        Msg::TheyDontMatch => "Не збігаються.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "служба ідентичності не запущена",
         Msg::DeckFetching => "палуба: беру твою із флоту",

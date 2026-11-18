@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "układ",
         // ---- Security ----
         Msg::AttestAtBoot => "poświadczaj przy starcie",
-        Msg::AttestAtBootArmed => "dotknij ponownie: poświadczaj przy starcie",
+        Msg::RetypeForAttestAtBoot => "Wpisz ponownie swój handle, by poświadczać przy starcie.\nKto trzyma to urządzenie, ten ma twoją tożsamość.",
         Msg::AttestAtBootNote => "włączone, urządzenie otwiera się bez twojego handle:\nkto je trzyma, ten ma twoją tożsamość",
         Msg::TagAttest => "poświadczaj tagiem",
         Msg::TagAdd => "dodaj tag",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "zachowany tag poświadcza to urządzenie bez twojego handle:\nkto trzyma urządzenie i tag, ten ma twoją tożsamość",
         Msg::TagRemove => "usuń",
         Msg::TagDenied => "Odmowa. Ten tag nie otwiera tego urządzenia.",
+        Msg::TheyDontMatch => "Nie zgadzają się.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "usługa tożsamości nie działa",
         Msg::DeckFetching => "pokład: pobieranie twojego z floty",

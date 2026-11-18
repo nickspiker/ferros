@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "mpangilio",
         // ---- Security ----
         Msg::AttestAtBoot => "thibitisha wakati wa kuwasha",
-        Msg::AttestAtBootArmed => "gusa tena: thibitisha wakati wa kuwasha",
+        Msg::RetypeForAttestAtBoot => "Andika handle yako tena ili kuthibitisha wakati wa kuwasha.\nYeyote anayeshika kifaa hiki atashika utambulisho wako.",
         Msg::AttestAtBootNote => "ikiwashwa, kifaa hufunguka bila handle yako:\nyeyote anayekishika anashika utambulisho wako",
         Msg::TagAttest => "thibitisha kwa tagi",
         Msg::TagAdd => "ongeza tagi",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "tagi iliyohifadhiwa huthibitisha kifaa hiki bila handle yako:\nyeyote anayeshika kifaa na tagi anashika utambulisho wako",
         Msg::TagRemove => "ondoa",
         Msg::TagDenied => "Imekataliwa. Tagi hii haifungui kifaa hiki.",
+        Msg::TheyDontMatch => "Hazilingani.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "huduma ya utambulisho haifanyi kazi",
         Msg::DeckFetching => "sitaha: inaleta yako kutoka kundi lako",

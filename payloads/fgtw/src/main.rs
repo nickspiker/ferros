@@ -619,7 +619,7 @@ struct Client {
     select_waiting: Option<[u8; 32]>,
     /// The member that selected this device, once its select checked out: the green screen until the join completes.
     selected_by: Option<[u8; 32]>,
-    /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
+    /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10), 2 a person's handle and 3 the name given them (the People page), 4 a WiFi network's passphrase (the WiFi page's picker, `entry_net` its name), 5 the person's own handle again (the Security page's attest at boot). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
     /// With `entry` 4 (the WiFi page's picker, payloads/map, 2026-11-18): the network whose passphrase is wanted, its SSID's octets. The keyboard's host types the passphrase and hands it to the WiFi driver itself (pcie1 JOIN): the passphrase never passes thru here, nor thru the map.
     entry_net: Vec<u8>,
@@ -1904,6 +1904,11 @@ impl Client {
                         15 if got >= 3 && req[1] == 4 && (1..=32).contains(&req[2]) && 3 + req[2] as usize <= got => {
                             self.entry = 4;
                             self.entry_net = req[3..3 + req[2] as usize].to_vec();
+                            alloc::vec![0]
+                        }
+                        // 5: the person's own handle again, to turn attest at boot on (the Security page; docs/AUTH.md "Unlock at boot"). The keyboard's host compares it thru the kernel (SYS_UNLOCK op 12) and ends it with op 15 [0]; nothing of it comes here. (Kind 4 was the retype gate's on its branch; forge had given 4 to the WiFi passphrase first, so it is 5 since the merge of 2026-11-20.)
+                        15 if n >= 2 && req[1] == 5 => {
+                            self.entry = 5;
                             alloc::vec![0]
                         }
                         15 if n >= 2 && req[1] == 0 && self.entry == 3 => {

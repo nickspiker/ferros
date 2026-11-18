@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "लेआउट",
         // ---- Security ----
         Msg::AttestAtBoot => "बूट पर अटेस्ट",
-        Msg::AttestAtBootArmed => "फिर टैप करो: बूट पर अटेस्ट",
+        Msg::RetypeForAttestAtBoot => "बूट पर अटेस्ट के लिए अपना हैंडल फिर लिखो।\nतब जिसके हाथ में यह डिवाइस, उसके हाथ में तुम्हारी पहचान।",
         Msg::AttestAtBootNote => "चालू: डिवाइस तुम्हारे हैंडल के बिना खुलता है:\nजिसके हाथ में यह, उसके हाथ में तुम्हारी पहचान",
         Msg::TagAttest => "टैग से अटेस्ट",
         Msg::TagAdd => "टैग जोड़ो",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "सहेजा गया टैग इस डिवाइस को तुम्हारे हैंडल के बिना अटेस्ट करता है:\nजिसके हाथ में डिवाइस और टैग, उसके हाथ में तुम्हारी पहचान",
         Msg::TagRemove => "हटाओ",
         Msg::TagDenied => "मना। यह टैग इस डिवाइस को नहीं खोलता।",
+        Msg::TheyDontMatch => "ये मेल नहीं खाते।",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "पहचान सेवा नहीं चल रही",
         Msg::DeckFetching => "डेक: तुम्हारे बेड़े से तुम्हारा लाया जा रहा है",

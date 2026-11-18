@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "раскладка",
         // ---- Security ----
         Msg::AttestAtBoot => "аттестация при загрузке",
-        Msg::AttestAtBootArmed => "коснись ещё раз: аттестация при загрузке",
+        Msg::RetypeForAttestAtBoot => "Введи свой handle ещё раз для аттестации при загрузке.\nКто держит это устройство, тот держит твою личность.",
         Msg::AttestAtBootNote => "вкл: устройство открывается без твоего handle:\nкто держит его, тот держит твою личность",
         Msg::TagAttest => "аттестация меткой",
         Msg::TagAdd => "добавить метку",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "сохранённая метка аттестует это устройство без твоего handle:\nкто держит устройство и метку, тот держит твою личность",
         Msg::TagRemove => "удалить",
         Msg::TagDenied => "Отказано. Эта метка не открывает это устройство.",
+        Msg::TheyDontMatch => "Не совпадают.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "служба личности не запущена",
         Msg::DeckFetching => "палуба: загружаем твою из флота",

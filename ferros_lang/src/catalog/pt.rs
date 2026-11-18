@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "disposição",
         // ---- Security ----
         Msg::AttestAtBoot => "atestar ao iniciar",
-        Msg::AttestAtBootArmed => "toque de novo: atestar ao iniciar",
+        Msg::RetypeForAttestAtBoot => "Digite seu handle de novo para atestar ao iniciar.\nQuem tiver este dispositivo terá a sua identidade.",
         Msg::AttestAtBootNote => "ligado, o dispositivo abre sem o seu handle:\nquem o tiver tem a sua identidade",
         Msg::TagAttest => "atestar com uma etiqueta",
         Msg::TagAdd => "adicionar uma etiqueta",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "uma etiqueta guardada atesta este dispositivo sem o seu handle:\nquem tiver o dispositivo e a etiqueta tem a sua identidade",
         Msg::TagRemove => "remover",
         Msg::TagDenied => "Negado. Esta etiqueta não abre este dispositivo.",
+        Msg::TheyDontMatch => "Não conferem.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "o serviço de identidade não está rodando",
         Msg::DeckFetching => "convés: buscando o seu na sua frota",

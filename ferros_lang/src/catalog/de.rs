@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "Belegung",
         // ---- Security ----
         Msg::AttestAtBoot => "beim Start bezeugen",
-        Msg::AttestAtBootArmed => "noch einmal tippen: beim Start bezeugen",
+        Msg::RetypeForAttestAtBoot => "Tippe dein Handle noch einmal, um beim Start zu bezeugen.\nWer dieses Gerät dann hält, hält deine Identität.",
         Msg::AttestAtBootNote => "an, das Gerät öffnet sich ohne dein Handle:\nwer es hält, hält deine Identität",
         Msg::TagAttest => "mit einem Tag bezeugen",
         Msg::TagAdd => "Tag hinzufügen",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "ein behaltenes Tag bezeugt dieses Gerät ohne dein Handle:\nwer Gerät und Tag hält, hält deine Identität",
         Msg::TagRemove => "entfernen",
         Msg::TagDenied => "Abgewiesen. Dieses Tag öffnet dieses Gerät nicht.",
+        Msg::TheyDontMatch => "Sie stimmen nicht überein.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "der Identitätsdienst läuft nicht",
         Msg::DeckFetching => "Deck: deins wird von deiner Flotte geholt",

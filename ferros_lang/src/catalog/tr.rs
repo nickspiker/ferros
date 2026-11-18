@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "düzen",
         // ---- Security ----
         Msg::AttestAtBoot => "açılışta tasdikle",
-        Msg::AttestAtBootArmed => "tekrar dokun: açılışta tasdikle",
+        Msg::RetypeForAttestAtBoot => "Açılışta tasdik için handle'ını yeniden yaz.\nBu cihazı kim tutarsa kimliğini de o tutar.",
         Msg::AttestAtBootNote => "açıkken cihaz handle'ın olmadan açılır:\nonu kim tutarsa kimliğini de o tutar",
         Msg::TagAttest => "etiketle tasdikle",
         Msg::TagAdd => "etiket ekle",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "saklı bir etiket bu cihazı handle'ın olmadan tasdikler:\ncihazı ve etiketi kim tutarsa kimliğini de o tutar",
         Msg::TagRemove => "kaldır",
         Msg::TagDenied => "Reddedildi. Bu etiket bu cihazı açmaz.",
+        Msg::TheyDontMatch => "Eşleşmiyorlar.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "kimlik hizmeti çalışmıyor",
         Msg::DeckFetching => "güverte: seninki filondan getiriliyor",

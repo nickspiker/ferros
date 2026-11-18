@@ -2303,6 +2303,8 @@ impl Ahau {
                 let shown = printable(&self.pick.0[..self.pick.1]);
                 sx(ferros_lang::Say::PassphraseFor(core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("")))
             }
+            // The Security page's attest at boot: the person's own handle again (docs/AUTH.md "Unlock at boot").
+            Mode::Words(5) => tx(Msg::RetypeForAttestAtBoot),
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
@@ -2605,6 +2607,7 @@ impl Ahau {
                     match kind {
                         1 => b"ahau: words wanted: a new device's\n".as_slice(),
                         4 => b"ahau: words wanted: a WiFi passphrase (the WiFi page)\n",
+                        5 => b"ahau: words wanted: the person's own handle again (attest at boot)\n",
                         _ => b"ahau: words wanted: a person's handle (the People page)\n",
                     },
                 );
@@ -2729,7 +2732,7 @@ impl Ahau {
         }
     }
 
-    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a person's handle, 3 the name the person gives them, 4 a WiFi network's passphrase.
+    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a person's handle, 3 the name the person gives them, 4 a WiFi network's passphrase, 5 the person's own handle again (attest at boot).
     fn words_wanted(&self) -> u8 {
         self.words_asked().0
     }
@@ -2739,8 +2742,8 @@ impl Ahau {
         let mut o = [0u8; 2 + 32];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
         let mut name = [0u8; 32];
-        // A newcomer's words (1), a person's handle (2) and the name the person gives them (3): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 4 {
+        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4) and the person's own handle again for attest at boot (5): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 5 {
             return (0, (name, 0));
         }
         if o[0] == 4 {
@@ -2785,6 +2788,46 @@ impl Ahau {
             // A driver from before 2026-11-18 joins no other network while joined.
             (_, 3) => self.status(tx(ferros_lang::Msg::AlreadyOnNetwork).as_str()),
             _ => self.status(tx(ferros_lang::Msg::CouldNotKeepNetwork).as_str()),
+        }
+    }
+
+    /// Enter on the Security page's attest at boot (docs/AUTH.md "Unlock at boot"; the retype gate, ahau_core::retype): the person's own handle typed again, shown as typed (a handle is not a password).
+    /// Its seed goes to the kernel (SYS_UNLOCK op 12), which compares it with the seed of the person present and turns the setting on only when they are one; the seed is wiped once sent.
+    /// A match: the keyboard goes, the setting on. A mismatch: "They don't match.", the text kept to be corrected, nothing changed. Anything else (nobody present, a kernel before 2026-11-17, the setting not kept): the keyboard goes and the page shows the setting as it is.
+    fn retype_enter(&mut self) {
+        use ahau_core::retype::{read, REPLY_MAX};
+        if self.len == 0 {
+            return;
+        }
+        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
+        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
+            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
+            return;
+        };
+        let mut doc = [0u8; REPLY_MAX];
+        let n = ferros_sys::attest_at_boot_on(cap(self.grants, S_UNLOCK), &seed, &mut doc);
+        scrub(&mut seed);
+        let mut why = [0u8; 64];
+        // WHY the filter: the length is the kernel's whole document; one longer than the buffer was cut and is not read.
+        match n.filter(|&n| n <= doc.len()).and_then(|n| read(&doc[..n], &mut why)) {
+            Some((r, _)) if !r.error => {
+                console(self.grants, b"ahau: attest at boot on (the handle typed again is the person present's)\n");
+                self.end_words(true);
+            }
+            Some((r, _)) if r.present && !r.matched => {
+                console(self.grants, b"ahau: attest at boot: the handle typed again does not match; nothing changed\n");
+                self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
+            }
+            Some((_, w)) => {
+                console(self.grants, b"ahau: attest at boot not turned on: ");
+                console(self.grants, &why[..w]);
+                console(self.grants, b"\n");
+                self.end_words(true);
+            }
+            None => {
+                console(self.grants, b"ahau: attest at boot: the kernel gave no reply (one before 2026-11-17?)\n");
+                self.end_words(true);
+            }
         }
     }
 
@@ -2984,7 +3027,7 @@ impl Ahau {
     fn type_char(&mut self, c: char) {
         let limit = match self.mode {
             // A person's handle as a handle is typed; the name the person gives them, a line.
-            Mode::Words(2) => MAX_CHARS,
+            Mode::Words(2 | 5) => MAX_CHARS,
             Mode::Words(3) => 63,
             // A WiFi passphrase: WPA2's longest.
             Mode::Words(4) => 63,
@@ -3040,6 +3083,11 @@ impl Ahau {
             // A WiFi passphrase: enter hands it to the WiFi driver.
             Some(Event::Enter) if self.mode == Mode::Words(4) => {
                 self.wifi_enter();
+                return;
+            }
+            // The person's own handle again (attest at boot): enter hands it to the kernel to compare, as a person's handle is handed on.
+            Some(Event::Enter) if self.mode == Mode::Words(5) => {
+                self.retype_enter();
                 return;
             }
             // Words: enter sends them as typed (they hold no newline).

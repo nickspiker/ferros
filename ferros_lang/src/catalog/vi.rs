@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "bố cục",
         // ---- Security ----
         Msg::AttestAtBoot => "chứng thực khi khởi động",
-        Msg::AttestAtBootArmed => "chạm lần nữa: chứng thực khi khởi động",
+        Msg::RetypeForAttestAtBoot => "Gõ lại handle của bạn để chứng thực khi khởi động.\nAi cầm thiết bị này là cầm danh tính của bạn.",
         Msg::AttestAtBootNote => "khi bật, thiết bị mở mà không cần handle của bạn:\nai cầm nó là cầm danh tính của bạn",
         Msg::TagAttest => "chứng thực bằng thẻ",
         Msg::TagAdd => "thêm thẻ",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "thẻ đã lưu chứng thực thiết bị này mà không cần handle của bạn:\nai cầm thiết bị và thẻ là cầm danh tính của bạn",
         Msg::TagRemove => "gỡ",
         Msg::TagDenied => "Bị từ chối. Thẻ này không mở thiết bị này.",
+        Msg::TheyDontMatch => "Chúng không khớp.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "dịch vụ danh tính không chạy",
         Msg::DeckFetching => "boong: đang lấy của bạn từ đội",

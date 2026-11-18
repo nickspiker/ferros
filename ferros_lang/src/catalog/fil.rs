@@ -166,7 +166,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Layout => "ayos",
         // ---- Security ----
         Msg::AttestAtBoot => "magpatotoo sa pag-boot",
-        Msg::AttestAtBootArmed => "pindutin ulit: magpatotoo sa pag-boot",
+        Msg::RetypeForAttestAtBoot => "I-type ulit ang handle mo para magpatotoo sa pag-boot.\nSinumang may hawak ng device na ito, hawak ang pagkakakilanlan mo.",
         Msg::AttestAtBootNote => "kapag bukas, bubukas ang device nang wala ang handle mo:\nsinumang may hawak nito, hawak ang pagkakakilanlan mo",
         Msg::TagAttest => "patotohanan gamit ang tag",
         Msg::TagAdd => "magdagdag ng tag",
@@ -177,6 +177,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagNote => "pinatotohanan ng nakatagong tag ang device na ito nang wala ang handle mo:\nsinumang may hawak ng device at ng tag, hawak ang pagkakakilanlan mo",
         Msg::TagRemove => "alisin",
         Msg::TagDenied => "Tinanggihan. Hindi binubuksan ng tag na ito ang device na ito.",
+        Msg::TheyDontMatch => "Hindi sila magkatugma.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "hindi tumatakbo ang serbisyo ng pagkakakilanlan",
         Msg::DeckFetching => "kubyerta: kinukuha ang sa iyo mula sa armada mo",
