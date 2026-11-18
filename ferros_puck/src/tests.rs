@@ -202,7 +202,7 @@ fn the_display_refuses_bad_lists_whole() {
     bad[3 + 6 + 2 + 2] = theme::END;
     bad[3 + 6 + 2] = THEME;
     assert_eq!(check(&bad), Err(Refused::Value(0)));
-    // A marker that names no earlier curve.
+    // A marker that names no curve.
     let l = list(|w| {
         w.disc(0, 0, 100, RED).unwrap();
         w.marker(0, 0, 1, 10, RED).unwrap();

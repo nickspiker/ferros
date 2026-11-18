@@ -53,7 +53,7 @@ pub mod kind {
     pub const TEXT: u8 = 5;
     /// `[cx][cy][r u16][width u16][from u16][t0 i64][period u32][colour]`: an `ARC` whose sweep is `(now - t0) / period` of a turn (period in seconds), wrapping each period.
     pub const SWEEP: u8 = 6;
-    /// `[curve u8][t0 i64][t1 i64][r u16][colour]`: a dot of radius r on the `CURVE` op at index `curve` (an earlier op of this list), at the x that now takes on [t0, t1] mapped to [x0, x1]; nothing outside it.
+    /// `[curve u8][t0 i64][t1 i64][r u16][colour]`: a dot of radius r on the `CURVE` op at index `curve` (any op of this list: a marker is in front of its curve, so it usually comes before it), at the x that now takes on [t0, t1] mapped to [x0, x1]; nothing outside it.
     pub const MARKER: u8 = 7;
     /// `[cx][cy][size u16][colour][t i64][places u8]`: the moment t (Eagle oscillations) as wall time in the person's base and zone, `places` its digits after the first (the display's `fmt::moment`).
     pub const MOMENT: u8 = 8;
@@ -334,6 +334,9 @@ pub fn check(list: &[u8]) -> Result<Checked, Refused> {
     let mut at = 2;
     let mut anchored = false;
     let mut curves = 0u64;
+    // Which ops markers ride, each (its marker, its curve): checked once every op is read, since a marker is in front of its curve and so comes before it.
+    let mut rides = [(0u8, 0u8); OPS_MAX];
+    let mut nrides = 0;
     for i in 0..count {
         if at + 3 > list.len() {
             return Err(Refused::Length(i));
@@ -349,7 +352,10 @@ pub fn check(list: &[u8]) -> Result<Checked, Refused> {
         };
         match op {
             Op::Curve(_) => curves |= 1 << i,
-            Op::Marker { curve, .. } if curve >= i || curves >> curve & 1 == 0 => return Err(Refused::Value(i)),
+            Op::Marker { curve, .. } => {
+                rides[nrides] = (i, curve);
+                nrides += 1;
+            }
             _ => {}
         }
         anchored |= op.anchored();
@@ -357,6 +363,10 @@ pub fn check(list: &[u8]) -> Result<Checked, Refused> {
     }
     if at != list.len() {
         return Err(Refused::Trailing);
+    }
+    // WHY the bound on the shift: a curve index past 63 names no op of a list of at most OPS_MAX, and would shift past the mask.
+    if let Some(&(i, _)) = rides[..nrides].iter().find(|&&(_, c)| c as usize >= OPS_MAX || curves >> c & 1 == 0) {
+        return Err(Refused::Value(i));
     }
     Ok(Checked { count, anchored })
 }

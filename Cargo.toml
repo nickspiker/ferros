@@ -97,6 +97,7 @@ members = [
     "ferros_sky",
     "ferros_compass",
     "ferros_weather",
+    "ferros_faces",
     "photon_core",
     "payloads/ip",
     "payloads/modem",
