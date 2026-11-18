@@ -1,6 +1,6 @@
 #!/bin/bash
 # Lumis for a ferros device as a ferros process, a kist (docs/KISTS.md "Lumis", docs/CAMERA.md): the std/lumis package (Lumis's own core, the lumis_core library, under fluor's ferros host, with its platform layer for ferros) on the ferros target, std from the ferros-rust fork, then the flat image the kernel loads.
-# std/lumis names Lumis, fluor, vsf and kete by path (siblings of this tree), so Lumis's own manifest and lockfile stay as its Android build wants them; the only patch is libc with a ferros arm. Lumis's port lives on its branch `ferros-port` until merged: build from a tree whose sibling `lumis` is that branch (a farm of the siblings, as /mnt/Harbor/tmp/lumis-port).
+# std/lumis names Lumis, fluor, vsf and kete by path (siblings of this tree), so Lumis's own manifest and lockfile stay as its Android build wants them; the only patch is libc with a ferros arm. Since 2026-11-17 the port is on each sibling's main (lumis c2e67a3, chameleon e4fc880, vsf 1255a07), so the siblings build as checked out: no farm.
 # Pass extra cargo arguments after the script name.
 set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
