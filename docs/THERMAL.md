@@ -181,6 +181,13 @@ The panel stage on the GPU (GPU-KISTS.md's first choice) moves 4.6 G CPU cycles 
 
    With the lift the A715s spent 6.6 s of the scroll at 2367 MHz and no divider tripped in any run (`diag thermal`: slow seconds 0, every divider's status unchanged). Sharing the X3 and 2 ms slices bought about 1 ms on the scroll and nothing clear on the pinch; both stay off.
    The first build re-asked MIF and the DSU after every switch of the shared tier (2973 switches in 16 minutes on b922, 3660 lifts): a tier switch while lifted now leaves them where the lift put them.
+   **A running camera stream holds the lift too** (2026-11-17, branch clock-camera-lift; service.rs `camera_streaming`, `lift_causes`): Lumis draws each new camera image in 82 to 85 ms at the calm clock and 37 to 39 ms lifted, so its shown frames never came within the animation's gap and its preview stayed calm (CAMERA.md "The preview's split").
+   What holds it: the camera driver answered its front end's interrupt (the line `ispfe0`, process.rs `IRQ_ACKS`) within the last 2^-2 s, a quarter second, about four frames' gap at the init's 15 a second.
+   What releases it: a quarter second with no answered interrupt, which is the stream stopped, stalled or closed; the driver acks only after an interrupt it answered, never after a wait that timed out, so a stream that sits stuck releases it too.
+   No timer: the count is looked at on the service loop's passes like the rest of the lift.
+   The lift is a ceiling, as for input: the A715s climb above 1065 MHz only as the load asks, and the memory side lifts with it while the screen is lit.
+   A saturated A715 cluster was the other sign considered and not built: once lifted the saturation ends, so it would need a hold of its own to keep from flapping, and it would lift for any background load, which the decision kept calm.
+   Knob: `diag clock cam <n>` (the hold as a shift; 0: a camera stream holds nothing); `diag clock` names what holds the lift now (input, frames, camera) and how many windows the camera alone held.
 4. **The X3's top:** 2914 MHz (3.7 W busy), 2556 (1.9 W) or 2049 (1 W) in the active profile; the top step buys 14 % more speed for twice the power.
 5. **The GPU's clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and the MIF Android pairs with it.
 6. **Sustained or burst:** 120 for as long as the heat allows, then sliding (smooth), or clocks chosen so a lower rate holds forever.
