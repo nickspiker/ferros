@@ -3,7 +3,7 @@
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the old heap region (not read since 2026-11-11: the heap is the display's own arc, grown on demand), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the pucks' endpoint (serve; docs/PUCKS.md, puck.rs: the old heap region until 2026-11-17, not read since 2026-11-11), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -34,6 +34,7 @@
 //! - 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
 //! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
+//! - 73 `puck bind [count u8][count x (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on the `puck` endpoint (slot 9; puck.rs, docs/PUCKS.md); the system's alone. A scene circle with icon G#90 + j is that puck's circle; op 25 with that icon is its focus, its fuller face, still at the 10 Hz flips.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -54,6 +55,7 @@ mod modeset;
 mod neon;
 mod odt;
 mod quick;
+mod puck;
 use odt::{panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -105,9 +107,7 @@ const S_DMA0: u64 = 5;
 const S_DPP0: u64 = 6;
 const S_GPP0: u64 = 7;
 const S_FB: u64 = 8;
-/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); the slot stays so every later one keeps its number.
-#[allow(dead_code)]
-const S_HEAP: u64 = 9;
+/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); since 2026-11-17 the pucks' endpoint, served by puck.rs (`puck::S_PUCK`).
 const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
 const S_SRAMC0: u64 = 12;
@@ -3375,7 +3375,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7391,6 +7391,12 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
+        // 73 `puck bind [count u8][count × (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on `puck` (puck.rs; docs/PUCKS.md). The system's alone: [4] (`NOT_YOURS`) from anyone else.
+        if op == 73 {
+            let r = if system(h) { puck::bind(&msg[1..n]) } else { NOT_YOURS };
+            ferros_sys::reply(&tok, &[r]);
+            continue;
+        }
         // 56 `quick`: the quick row's state from the map (quick.rs `set`, QUICK.md). → [0][the slide's length u16].
         if op == 56 && n >= 15 {
             let r = quick::set(&msg[..15]);
@@ -7954,6 +7960,8 @@ fn server(grants: u64) -> ! {
         log.s(b"display: no receive thread\n");
         log.flush();
     }
+    // The pucks' lists arrive on their own endpoint (slot 9; puck.rs), each behind its kist's identity.
+    puck::start(grants);
     // Frame-start interrupts, and only those, on at DECON (the bootloader leaves every source enabled, INT_EN G#303011, with frame-done pending and never cleared); the pending bits cleared first; then the thread that takes them.
     pipe.wr(S_DECON, INT_EN, 0);
     pipe.wr(S_DECON, INT_PEND, !0);
@@ -8367,7 +8375,9 @@ fn server(grants: u64) -> ! {
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
                     // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
+                    // What each puck's circle shows of itself this frame (puck.rs `scene_end`: a held WATCH answered when it changes), gathered in the same pass.
                     if clip_k.is_none() {
+                        puck::scene_start();
                         let discs = hit::discs();
                         let mut n = 0;
                         for i in 0..scene_n {
@@ -8380,9 +8390,13 @@ fn server(grants: u64) -> ! {
                             if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                                 continue;
                             }
+                            if puck::is_puck(cir.icon) {
+                                puck::seen((cir.icon - puck::PUCK0) as usize, sr >> 8);
+                            }
                             discs[n] = (i as u16, sx, sy, sr);
                             n += 1;
                         }
+                        puck::scene_end();
                         let disc = region.map(|q| { let (gx, gy, gr, _) = ground(&q); (gx, gy, gr) });
                         hit::scene(n, disc);
                     }
@@ -8434,6 +8448,32 @@ fn server(grants: u64) -> ! {
                             let stroke = ferros_sys::theme::index() as i64;
                             let lit = cir.lit != 0;
                             let ri = sr;
+                            // A puck (puck.rs, docs/PUCKS.md): the list its kist sent, drawn into its circle front to back, the theme's plane under it; cached as an icon is while its key (its list, its anchored ops' moves, the base and zone, its focus) and the camera stay, drawn straight onto the glass otherwise.
+                            if puck::is_puck(cir.icon) {
+                                let j = (cir.icon - puck::PUCK0) as usize;
+                                let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                                let plane = th.plane & 0x00FF_FFFF;
+                                let key = [sr, puck::key(j) ^ stroke << 56, tc, ts, 0, cir.icon as i64];
+                                let d = (2 * ((sr >> 8) + 3)) as usize;
+                                let still = unsafe { LAST_KEY[i] == key };
+                                unsafe { LAST_KEY[i] = key };
+                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
+                                    let (spr, ext) = sprite(i, key, d, |px, d| {
+                                        let c = ((d as i64 / 2) << 8) | 128;
+                                        puck::draw_into(px, d, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts);
+                                        draw::disc(px, d, d, c, c, ri, plane);
+                                    });
+                                    scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
+                                } else {
+                                    let clip = draw::Rect::full(width, height).intersect(unsafe { draw::CLIP });
+                                    puck::draw_into(pixels, width, height, clip, j, sx, sy, ri, tc, ts);
+                                    scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
+                                }
+                                let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+                                unsafe { CUR_DMG = CUR_DMG.union(whole) };
+                                continue;
+                            }
                             // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
                             if cir.icon == WIDGET_SCOPE {
                                 // Turned as an icon is: the camera's turn, then the circle's own.
@@ -9149,6 +9189,10 @@ fn server(grants: u64) -> ! {
                 // Focus: [icon u8, 0 none][span µs u32][mode u8: bit 0 fold]. The focused widget is redrawn and flipped every frame; the span is the time the scope shows (2^-6 s to 4 s).
                 Some(25) if m.len() >= 6 => {
                     unsafe {
+                        // A puck gaining or losing the focus shows its other face (puck.rs): its circle drawn again.
+                        if puck::is_puck(FOCUS) || puck::is_puck(m[1]) {
+                            puck::changed();
+                        }
                         FOCUS = m[1];
                         SCOPE_SPAN_US = u32::from_le_bytes([m[2], m[3], m[4], m[5]]).clamp(15_625, 4_000_000);
                         SCOPE_FOLD = m.get(6).copied().unwrap_or(0) & 1 == 1;
@@ -9663,10 +9707,15 @@ fn server(grants: u64) -> ! {
             rebake_replay = false;
             replay(&mut handle);
         }
+        // A puck's picture changed (puck.rs `due`: a new list, a binding, its sweep or marker moved half a pixel): the deck's last frame drawn again, the pucks' sprites keyed afresh. Only when the deck is what shows; under an app the next frame of the deck draws them.
+        if puck::due() && !screen_off && unsafe { LAST_FRAME.1 > 0 && (*(&raw const APP)).is_none() } {
+            replay(&mut handle);
+        }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
         let flip_due = unsafe { CLIENT_DREW && TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
         // With a widget in focus the flips run at the panel's rate; the clock keeps 10 Hz, drawn into every phase at once (owner, 2026-10-25: the focused widget at full rate, everything else at 10).
-        let focus = unsafe { FOCUS } != 0;
+        // A puck in focus keeps the 10 Hz flips: its fuller face moves no faster than its sweeps and markers (puck.rs), so it is drawn when they move, never at the panel's rate.
+        let focus = unsafe { FOCUS } != 0 && !puck::is_puck(unsafe { FOCUS });
         // The clock itself in focus runs at the panel's rate too (its last place turns over ~35 times a second).
         let clock_focus = unsafe { FOCUS } == WIDGET_CLOCK;
         let clock_now = !focus || clock_focus || now() >= clock_slow_next;
@@ -10262,7 +10311,7 @@ fn server(grants: u64) -> ! {
         if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due && !bars_arm {
             // The focused widget at the panel's rate, everything else on the 10 Hz flips. In focus the timer is half a frame and `settle` (which holds a flip until the last one has started) does the pacing: a full frame's timer started after each flip's own work slipped a refresh now and then (100 a second, 2026-10-25).
             // (akita's flips at the panel's rate, tried 2026-11-08, showed phases before their insides were published: every column the circle's top row repeated down the screen, orange in a dev build. Back at 10 Hz until the phases are published in step with the flips: the owner's "proper rotating synchronous dither buffer".)
-            next_flip = now() + if unsafe { FOCUS } != 0 { freq() / 240 } else { freq() / 10 };
+            next_flip = now() + if unsafe { FOCUS } != 0 && !puck::is_puck(unsafe { FOCUS }) { freq() / 240 } else { freq() / 10 };
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
@@ -10280,7 +10329,7 @@ fn server(grants: u64) -> ! {
             frames += 1;
             FRAMES.store(frames, Ordering::Relaxed);
             // The 10 Hz flip waits a tenth of a second after the last bars armed, so none falls between the steps of a slide (a flip's present holds this thread until its frame starts: the next step's publish waited behind it, 2026-11-11). Once the bars stop changing the flips come back; a widget in focus keeps its own rate.
-            if unsafe { FOCUS } == 0 {
+            if unsafe { FOCUS } == 0 || puck::is_puck(unsafe { FOCUS }) {
                 next_flip = now() + freq() / 10;
             }
             if let Some((s, us)) = bars_step.take() {
