@@ -14,7 +14,8 @@ ferros_sys = { path = "../../ferros_sys" }
 ferros_detail = { path = "../../ferros_detail" }
 # The heap the links' detail documents are read in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
 ferros_heap = { path = "../../ferros_heap" }
-ferros_ledger = { path = "../../ferros_ledger" }
+# The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync, and their one-shot converter.
+ferros_kept = { path = "../../ferros_kept" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }
 # Kists (KISTS.md): the person's list for the kist circles, the first-launch question and the permission pages.

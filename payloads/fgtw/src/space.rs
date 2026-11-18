@@ -54,6 +54,8 @@ pub struct SpaceSync {
     said_slot: bool,
     /// The last join failed and said why: said again only once one has succeeded (a vault that refuses every 4 s would otherwise fill the console).
     said_join: bool,
+    /// The places and the view last said to be kept out of the sync (ferros_space::KeptOut: present, not a document this build reads): said again only when they change.
+    said_out: Vec<Vec<u8>>,
     /// The person's zone as last written to the kernel (SYS_ZONE op 4): None not yet, Some(None) the person has chosen none.
     zone_told: Option<Option<(bool, alloc::string::String)>>,
     said_zone: bool,
@@ -81,7 +83,7 @@ pub struct SpaceSync {
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None }
     }
 }
 
@@ -100,27 +102,31 @@ impl VaultCopy {
     }
 }
 
+/// A value read whole thru Store capability `c`: Ok(None) when absent, Err when refused (nobody present for the identity's names, or no grant), never one taken for the other.
+pub(crate) fn read_whole(c: u64, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    let mut piece = [0u8; STORE_PIECE];
+    let total = match ferros_sys::store_read_at(c, key, 0, &mut piece) {
+        ferros_sys::NOTHING => return Ok(None),
+        ERR => return Err(()),
+        n => n as usize,
+    };
+    let mut v = Vec::with_capacity(total);
+    loop {
+        // WHY the min: the last piece is shorter than a transfer.
+        let n = (total - v.len()).min(STORE_PIECE);
+        v.extend_from_slice(&piece[..n]);
+        if v.len() >= total {
+            return Ok(Some(v));
+        }
+        if ferros_sys::store_get_at(c, key, v.len(), &mut piece).is_none() {
+            return Err(());
+        }
+    }
+}
+
 impl ferros_space::Store for VaultCopy {
     fn get(&mut self, s: Scope, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-        let c = self.cap(s);
-        let mut piece = [0u8; STORE_PIECE];
-        let total = match ferros_sys::store_read_at(c, key, 0, &mut piece) {
-            ferros_sys::NOTHING => return Ok(None),
-            ERR => return Err(()),
-            n => n as usize,
-        };
-        let mut v = Vec::with_capacity(total);
-        loop {
-            // WHY the min: the last piece is shorter than a transfer.
-            let n = (total - v.len()).min(STORE_PIECE);
-            v.extend_from_slice(&piece[..n]);
-            if v.len() >= total {
-                return Ok(Some(v));
-            }
-            if ferros_sys::store_get_at(c, key, v.len(), &mut piece).is_none() {
-                return Err(());
-            }
-        }
+        read_whole(self.cap(s), key)
     }
 
     fn set(&mut self, s: Scope, key: &[u8], value: &[u8]) -> bool {
@@ -479,6 +485,18 @@ impl Client {
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
+                // A place or the view that is not a document this build reads (an old form the converter could not take, or another build's): left out of the sync, one line each when the set changes.
+                let out: Vec<Vec<u8>> = o.kept_out.iter().map(|k| k.key.clone()).collect();
+                if out != self.space.said_out {
+                    for k in &o.kept_out {
+                        self.log.put(b"fgtw: space: map.");
+                        self.log.put(&k.key);
+                        self.log.put(b" is left out of the sync (never read as removed): ");
+                        self.log.put(k.why.as_bytes());
+                        self.log.line();
+                    }
+                    self.space.said_out = out;
+                }
                 if o.wrote > 0 {
                     self.space.generation = self.space.generation.wrapping_add(1);
                     self.log.put(b"fgtw: space: ");
