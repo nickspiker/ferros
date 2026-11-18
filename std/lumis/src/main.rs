@@ -95,6 +95,8 @@ const DEV_OPEN: u8 = 1 << 3;
 const DEV_BIG_INTAKE: u8 = 1 << 6;
 /// The A510 cluster (husky cores 0 to 3), where the intake runs (lumis_core `set_intake_cores`) so the UI's draw keeps the A715s.
 const CORES_LITTLE: u64 = 0x000F;
+/// The A715 workers (husky cores 4 to 7), where a save encodes (lumis_core `set_save_cores`): a save is started from the intake on the A510s, and their shared NEON would hold up an AV1 encode.
+const CORES_WORKERS: u64 = 0x00F0;
 /// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^3 s, then 2^4 s (no further than the camera's longest: a long-exposure mode's frame takes its whole exposure in wall time), two frames each, each frame's exposure said beside the one asked.
 const DEV_SWEEP: u8 = 1 << 7;
 
@@ -1060,7 +1062,10 @@ fn main() {
         lumis_core::set_intake_cores(|| {
             sys::pin(CORES_LITTLE);
         }, 4);
-        println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI on the A715s");
+        lumis_core::set_save_cores(|| {
+            sys::pin(CORES_WORKERS);
+        });
+        println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     let vault = open_vault();
     if let Some(v) = &vault {
