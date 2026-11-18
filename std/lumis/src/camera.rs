@@ -23,6 +23,46 @@ pub const MODE_BLOCK: usize = 13;
 pub const OPEN_VIEW_CACHED: u8 = 1 << 0;
 /// A view reply's length when the open carried a mode block or asked for write-back: the ring's count and the slit's facts after the 48, and at 53 whether the view is write-back.
 pub const VIEW_REPLY_MODE: usize = 64;
+/// [OP_SLITS][after: u32 LE], a slit ring open: wait for a slit newer than `after`; the reply [`Slits`] (docs/CAMERA.md "The ring drained").
+pub const OP_SLITS: u8 = 9;
+/// The mode block's kind for a binned slit (docs/CAMERA.md "Modes, the bench and the slit"): `rows` rows across the sensor's middle at the binned mode's width, on the colour filter's period, the driver's windowed default (phase detect and embedded data off, the statistics pipeline detached, the slim program: "The slit runs", 2026-11-18).
+pub const KIND_SLIT: u8 = 3;
+/// A slit's rows: 64, the fewest that keep the main's link clean (56 and fewer set ERR_CRC_PH while frames still land; 2026-11-18), at the sensor's floor of about 1218 a second.
+pub const SLIT_ROWS: u16 = 1 << 6;
+/// The mode block of a binned slit of [`SLIT_ROWS`], every other field the driver's default (its frame the rows and 2^7 lines more, its integration set by SET, a ring of 2^8 buffers).
+pub fn slit_block() -> [u8; MODE_BLOCK] {
+    let mut b = [0u8; MODE_BLOCK];
+    b[0] = KIND_SLIT;
+    b[1..3].copy_from_slice(&SLIT_ROWS.to_le_bytes());
+    b
+}
+
+/// A SLITS answer: the newest slit's count, the ring's buffers, a buffer's bytes, a slit's rows, a line's bytes, its width; slit k is in buffer (k - 1) mod `ring`, its record (count, counter, Eagle ns, landed) right after its rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slits {
+    pub newest: u64,
+    pub ring: u64,
+    pub buffer: usize,
+    pub rows: usize,
+    pub line: usize,
+    pub width: usize,
+}
+
+/// A SLITS reply; None when it is not one (the driver ended: no slit came in its wait, or the camera closed).
+pub fn parse_slits(r: &[u8]) -> Option<Slits> {
+    if r.len() < 1 << 6 {
+        return None;
+    }
+    let w = |k: usize| u64::from_le_bytes(r[8 * k..8 * k + 8].try_into().unwrap());
+    Some(Slits { newest: w(0), ring: w(1), buffer: w(2) as usize, rows: w(3) as usize, line: w(4) as usize, width: w(5) as usize })
+}
+
+/// The slits a reader takes from a SLITS answer, after it took every slit up to `after`: those newer than `after` and among the newest half of the ring, as the range of their counts. The driver's rule is the newest ring - 2 (the two oldest buffers are the engine's next and the one patterned for the frame after it), at the answer; the reader reads them after it, while slits go on landing, so it keeps to half the ring: at the main's 1218 a second and 2^8 buffers, the oldest it takes has about 100 ms of slits to go before the engine comes round to it, and a slit is read in microseconds.
+pub fn slits_to_take(after: u64, s: &Slits) -> std::ops::RangeInclusive<u64> {
+    // WHY the max: the oldest slit to take is the newer of the one after `after` and the oldest in the ring's newest half; early in a run (`newest` under half the ring) that half reaches before slit 1, which the first term then is.
+    (after + 1).max((s.newest + 1).max(s.ring / 2) - s.ring / 2)..=s.newest
+}
+
 /// No buffer, in [`OP_MAP`]'s release byte.
 pub const NONE: u8 = 0xFF;
 /// An open's reply with the view: [0], the view's token (32 bytes at 1), the ring's buffers (33), the format (34), width and height (u16 at 36, 38), a line's bytes (u32 at 40), a buffer's bytes in the view (u32 at 44).
@@ -365,6 +405,26 @@ mod tests {
         h[48..56].copy_from_slice(&(2u64 << 24).to_le_bytes());
         let m = parse_map(&h).unwrap();
         assert_eq!((m.frame, m.buffer, m.offset), (f, 2, 2 << 24));
+    }
+
+    #[test]
+    fn slits_read_back_and_keep_to_the_newest_half() {
+        let mut r = [0u8; 64];
+        for (k, v) in [300u64, 256, 327680, 64, 5120, 4080, 0, 1].iter().enumerate() {
+            r[8 * k..8 * k + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let s = parse_slits(&r).unwrap();
+        assert_eq!(s, Slits { newest: 300, ring: 256, buffer: 327680, rows: 64, line: 5120, width: 4080 });
+        // Behind by more than half the ring: from the oldest of the newest 128.
+        assert_eq!(slits_to_take(10, &s), 173..=300);
+        // Close behind: from the one after the last taken.
+        assert_eq!(slits_to_take(290, &s), 291..=300);
+        // Early in a run, the newest under half the ring.
+        assert_eq!(slits_to_take(0, &Slits { newest: 5, ..s }), 1..=5);
+        // Nothing new.
+        assert!(slits_to_take(300, &s).is_empty());
+        let b = slit_block();
+        assert_eq!((b[0], u16::from_le_bytes([b[1], b[2]]), b[3..].iter().all(|&x| x == 0)), (KIND_SLIT, 64, true));
     }
 
     #[test]

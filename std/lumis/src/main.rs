@@ -20,7 +20,7 @@ use lumis_core::platform::{ConfigStore, PixelSurface};
 use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
-use lumis_core::shared_memory::{CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT, SHUTTER_NS_IDX};
+use lumis_core::shared_memory::{RawMode, CURRENT_MODE_IDX, CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT, SHUTTER_NS_IDX};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,56 @@ enum Source {
     View { base: usize, view: camera::View, held: u8 },
     /// Frames by copy at `BIN`, header and samples.
     Copy { buf: Vec<u8> },
+    /// A slit ring (Slitscan): slit k in buffer (k - 1) mod the ring, drained by SLITS (`slits` its shape, as the open and the last SLITS said), each slit's centre band copied out of the non-cacheable view into `band` (`SlitRows`). Every slit up to `after` was taken or passed over; `take` the ones still to take of the last answer; `lost` the slits written over while read, `skipped` those passed over as too old to read safely (Lumis behind by more than half the ring).
+    Slit { base: usize, slits: camera::Slits, after: u64, take: std::ops::RangeInclusive<u64>, band: Vec<u16>, lost: u64, skipped: u64 },
+}
+
+impl Source {
+    fn is_slit(&self) -> bool {
+        matches!(self, Source::Slit { .. })
+    }
+}
+
+/// What the camera service takes from its source: a whole frame, or a slit (its count and Eagle time from its record, and its centre band).
+enum Got<'a> {
+    Frame(camera::FrameHeader, Taken<'a>),
+    Slit { count: u64, time: i64, rows: SlitRows<'a> },
+}
+
+/// The rows of a slit lumis_core reads (`process_slit`: its centre period, the 2 x 2 cell's two rows binned), held as the four rows from `first`: whatever the period (2 or 4), its rows start on a multiple of it at the slit's middle, inside those four. A row outside them is a bug in that arithmetic, and the index fails.
+struct SlitRows<'a> {
+    band: &'a [u16],
+    first: usize,
+    width: usize,
+    /// The slit's own rows (the integrator centres its band on them).
+    rows: usize,
+}
+
+/// The rows a slit's band holds, from `SlitRows::first`.
+const BAND_ROWS: usize = 1 << 2;
+
+impl lumis_core::RowSource for SlitRows<'_> {
+    fn read_row(&self, y: usize, out: &mut [u16]) {
+        let r = y - self.first;
+        out.copy_from_slice(&self.band[r * self.width..(r + 1) * self.width]);
+    }
+}
+
+/// The camera opened again for whole frames, after a slit's open that failed or gave no slit ring (that one closed first): Lumis ends if it fails too, keeping what is encoded.
+fn reopen_whole(cam: &camera::Camera, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> Source {
+    match open(cam, false) {
+        Ok(s) => s,
+        Err(Refused::Why(why)) => {
+            keep_saves(vault, header);
+            lumis_core::platform::exit_because(&format!("camera {}: opened again for whole frames, it failed: {why}", cam.name));
+        }
+        Err(Refused::NoSlit) => unreachable!("a whole-frame open is never a slit's"),
+    }
+}
+
+/// Whether the integrator wants slits: Slitscan, and no calibration (its darks are whole frames).
+fn wants_slits(header: &[u64]) -> bool {
+    header[CURRENT_MODE_IDX] == RawMode::Slitscan as u64 && header[FLAGS_IDX] & CALIBRATING_BIT == 0
 }
 
 /// A frame's time in the camera service, for the console every 64: waiting on the driver, the integrator (which reads and unpacks the view's rows itself), the settings and saves after it, the whole turn (each summed, microseconds).
@@ -114,6 +164,8 @@ fn dev_input() -> (u8, Vec<u8>) {
 
 /// Development, the second knobs byte (after the whole mode block): the view asked for non-cacheable as before 0.2.18, to compare the two on a device (docs/CAMERA.md "A cacheable view").
 const DEV_UNCACHED: u8 = 1 << 0;
+/// Development, the second knobs byte: the first open is the slit's, and Lumis starts in Slitscan, sized from the camera's list (its whole readout), so one hand-spawned driver (which refuses a second open) drains slits.
+const DEV_SLIT: u8 = 1 << 1;
 /// The second knobs byte, 0 when the input is shorter.
 fn dev_knobs2() -> u8 {
     let mut b = [0u8; 1 << 5];
@@ -214,7 +266,7 @@ impl lumis_core::RowSource for ViewRows {
 
 impl Source {
     /// The next frame, its header and its rows, with the wait counted (and a copy's own unpacking, none for the view).
-    fn next(&mut self, t: &mut Turns) -> Option<(camera::FrameHeader, Taken<'_>)> {
+    fn next(&mut self, t: &mut Turns) -> Option<Got<'_>> {
         let t0 = std::time::Instant::now();
         match self {
             Source::View { base, view, held } => {
@@ -224,14 +276,49 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
+                Some(Got::Frame(m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
                 t.wait += t0.elapsed().as_micros() as u64;
                 let h = (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()?;
-                Some((h, Taken::Bytes(&buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()])))
+                Some(Got::Frame(h, Taken::Bytes(&buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()])))
             }
+            Source::Slit { base, slits, after, take, band, lost, skipped } => loop {
+                let Some(k) = take.next() else {
+                    // Every slit of the last answer taken: wait for newer ones. The count crosses as a u32 (SLITS' `after`), 40 days of slits at the main's 1218 a second.
+                    let mut q = [camera::OP_SLITS, 0, 0, 0, 0];
+                    q[1..5].copy_from_slice(&(*after as u32).to_le_bytes());
+                    let mut r = [0u8; 1 << 6];
+                    let t0 = std::time::Instant::now();
+                    let n = sys::call_live(CAMERA, &q, &mut r);
+                    t.wait += t0.elapsed().as_micros() as u64;
+                    *slits = (n != sys::ERR).then(|| camera::parse_slits(&r[..n as usize])).flatten()?;
+                    *take = camera::slits_to_take(*after, slits);
+                    *skipped += take.start() - (*after + 1);
+                    *after = slits.newest;
+                    continue;
+                };
+                let at = *base + ((k - 1) % slits.ring) as usize * slits.buffer;
+                let first = slits.rows / 2 / BAND_ROWS * BAND_ROWS;
+                band.resize(BAND_ROWS * slits.width, 0);
+                // A RAW10 line of the widest readout fits: 8160 samples are 10200 bytes.
+                let mut tmp = [0u8; 1 << 14];
+                for (r, out) in band.chunks_exact_mut(slits.width).enumerate() {
+                    let line = &mut tmp[..slits.line];
+                    copy_from_view(at + (first + r) * slits.line, line);
+                    camera::unpack_raw10(line, out);
+                }
+                // The slit's record, after its rows (count, counter, Eagle ns, landed): still k once its band is copied, so the engine did not come round to its buffer while it was read.
+                // SAFETY: the record's words are inside buffer (k - 1) mod the ring of the view (mapped read-only for the life of the open; the driver leaves a slit buffer 64 bytes past its rows for them, ferros_cam job `slit_bytes`), aligned (rows x line is a multiple of 8); read volatile, as the driver writes them under Lumis.
+                let rec = (at + slits.rows * slits.line) as *const u64;
+                let (count, time) = unsafe { (core::ptr::read_volatile(rec), core::ptr::read_volatile(rec.add(2)) as i64) };
+                if count != k {
+                    *lost += 1;
+                    continue;
+                }
+                return Some(Got::Slit { count: k, time, rows: SlitRows { band: &band[..], first, width: slits.width, rows: slits.rows } });
+            },
         }
     }
 }
@@ -370,21 +457,24 @@ fn set(what: u8, value: u64) -> bool {
 
 /// Lumis's camera service on ferros (Android: CameraInterface.kt and CameraProcessor): open the camera, build the integrator from its list entry and first frame, then a frame at a time into the integrator, applying the settings it answers, saving what it asks to save.
 /// A camera that fails ends Lumis, as Camera2's errors end Android's camera process.
-fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<Arc<kete::FlatStorage>>, opened: Arc<Mutex<Option<Opened>>>) {
-    let fail = |why: String| {
-        println!("lumis: camera {}: {why}", cam.name);
-        *opened.lock().unwrap() = Some(Opened::Failed(why));
-        // Sent behind while the camera opened: no menu to go back to, so Lumis ends (a window sent behind after this store finds the failure in its tick and ends there).
-        if BEHIND.load(Ordering::Acquire) {
-            close_camera(&cam.name);
-            lumis_core::platform::exit_because("sent behind");
-        }
-    };
-    // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
-    // A development spawn's input (`dev_input`): its knobs byte, then optionally the driver's mode block (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before.
+/// Why an open gave no stream Lumis reads.
+enum Refused {
+    /// Said on the console, the camera not open.
+    Why(String),
+    /// A slit asked for, and the driver opened the camera with no slit ring (one from before the slit, which reads the mode block's kind as no slit): the camera is open and must be closed before whole frames are asked for.
+    NoSlit,
+}
+
+/// The camera opened with the view (docs/CAMERA.md "The view"): whole sensor frames read in place, or with `slit` the binned slit's ring (docs/CAMERA.md "The ring drained"), drained by SLITS. A driver or kernel that gives no view answers a plain open, and frames come by copy at `BIN` (never for a slit).
+/// A development spawn's input (`dev_input`): its knobs byte, then optionally the driver's mode block (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before. A slit's open takes its own block.
+fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
     let mut ask = vec![camera::OP_OPEN, cam.id, camera::OPEN_VIEW];
     let (knobs, block) = dev_input();
-    if knobs & DEV_COPY != 0 {
+    if slit {
+        ask.extend_from_slice(&camera::slit_block());
+        // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
+        ask.push(0);
+    } else if knobs & DEV_COPY != 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
     } else {
@@ -400,33 +490,70 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut r = [0u8; 1 << 6];
     let n = sys::call_live(CAMERA, &ask, &mut r);
     match (n, r[0]) {
-        (sys::ERR, _) => return fail("the camera driver did not answer the open".into()),
+        (sys::ERR, _) => return Err(Refused::Why("the camera driver did not answer the open".into())),
         (_, 0) => {}
-        (_, 1) => return fail("the driver has no such camera".into()),
-        (_, 2) => return fail("another kist has this camera open".into()),
-        (_, k) => return fail(format!("the driver refused the open ({k})")),
+        (_, 1) => return Err(Refused::Why("the driver has no such camera".into())),
+        (_, 2) => return Err(Refused::Why("another kist has this camera open".into())),
+        (_, k) => return Err(Refused::Why(format!("the driver refused the open ({k})"))),
     }
-    // The view's token is kept in this process's memory for the life of the camera: the kernel answers its base from it.
-    let mut src = match camera::parse_view(&r[..n as usize]) {
+    // The view's token is kept in this process's memory for the life of the camera: the kernel answers its base from it (32 bytes an open).
+    match camera::parse_view(&r[..n as usize]) {
         Some(v) if v.format == camera::FORMAT_RAW10 => {
+            if slit && ((n as usize) < camera::VIEW_REPLY_MODE || r[52] != 1) {
+                return Err(Refused::NoSlit);
+            }
             let token = Box::leak(Box::new(v.token));
             let base = sys::dma(token);
             if base == sys::ERR {
-                return fail("the view's token was refused".into());
+                return Err(Refused::Why("the view's token was refused".into()));
+            }
+            if slit {
+                println!("lumis: camera {}: slits, a ring of {} buffers of {} x {} RAW10 at G#{base:X}", cam.name, u32::from_le_bytes(r[48..52].try_into().unwrap()), v.width, v.height);
+                let slits = camera::Slits { newest: 0, ring: u32::from_le_bytes(r[48..52].try_into().unwrap()) as u64, buffer: v.buffer, rows: v.height, line: v.line, width: v.width };
+                return Ok(Source::Slit { base: base as usize, slits, after: 0, take: 1..=0, band: Vec::new(), lost: 0, skipped: 0 });
             }
             println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at G#{base:X}, {}", cam.name, v.buffers, v.width, v.height, if v.cached { "write-back" } else { "non-cacheable" });
-            Source::View { base: base as usize, view: v, held: camera::NONE }
+            Ok(Source::View { base: base as usize, view: v, held: camera::NONE })
         }
-        Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),
+        Some(v) => Err(Refused::Why(format!("the view's format {} is not one Lumis reads", v.format))),
+        None if slit => Err(Refused::NoSlit),
         None => {
             println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
             // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
-            Source::Copy { buf: vec![0u8; camera::FRAME_HEADER + (1 << 23)] }
+            Ok(Source::Copy { buf: vec![0u8; camera::FRAME_HEADER + (1 << 23)] })
+        }
+    }
+}
+
+fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<Arc<kete::FlatStorage>>, opened: Arc<Mutex<Option<Opened>>>) {
+    let fail = |why: String| {
+        println!("lumis: camera {}: {why}", cam.name);
+        *opened.lock().unwrap() = Some(Opened::Failed(why));
+        // Sent behind while the camera opened: no menu to go back to, so Lumis ends (a window sent behind after this store finds the failure in its tick and ends there).
+        if BEHIND.load(Ordering::Acquire) {
+            close_camera(&cam.name);
+            lumis_core::platform::exit_because("sent behind");
+        }
+    };
+    let (knobs, _) = dev_input();
+    let dev_slit = dev_knobs2() & DEV_SLIT != 0;
+    let mut src = match open(&cam, dev_slit) {
+        Ok(s) => s,
+        Err(Refused::Why(why)) => return fail(why),
+        Err(Refused::NoSlit) => {
+            close_camera(&cam.name);
+            return fail("the development slit open: the driver gave no slit ring".into());
         }
     };
     let mut turns = Turns::default();
-    let Some((first, _)) = src.next(&mut turns) else {
-        return fail("no first frame".into());
+    let first = if dev_slit {
+        println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
+        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: cam.exposure_min, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0 }
+    } else {
+        let Some(Got::Frame(first, _)) = src.next(&mut turns) else {
+            return fail("no first frame".into());
+        };
+        first
     };
     println!("lumis: camera {}: first frame, {} x {} samples (bin {}), exposure {} us, gain {}/1024", cam.name, first.width, first.height, first.bin, first.exposure_ns / 1000, first.gain);
     // Sent behind while the camera opened: nothing framed and nothing to save, so the camera closes before the integrator's memory is taken.
@@ -469,6 +596,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if let Some(dark) = calibration {
         app::calibration_start(integrator, dark);
     }
+    if dev_slit {
+        integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
+    }
     *opened.lock().unwrap() = Some(Opened::Memory { ptr: integrator.get_shared_memory_ptr() as usize, bytes: app::shared_memory_bytes(first.width, first.height) });
     let gain_of = |iso: i32| (iso as f64 * camera::GAIN_UNITY as f64 / ISO_AT_UNITY) as u64;
     let focus_of = |diopters: f32| cam.focus_min as u64 + ((diopters as f64 / NEAREST_DIOPTERS) * (cam.focus_max - cam.focus_min) as f64) as u64;
@@ -492,16 +622,56 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut stay = Stay::Front;
     // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
     let mut quiet: Option<[u64; 2]> = None;
+    // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
+    let mut slit_ok = knobs & DEV_COPY == 0;
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
-        let Some((head, samples)) = src.next(&mut turns) else {
+        // Slitscan takes slits, every other mode whole frames: the camera is closed (the driver ends) and opened again for the other (owner, 2026-11-18: "Do wire it up so I get more than 30 lines per second"). The new driver starts at the init's settings, so the integrator's are sent again.
+        if slit_ok && wants_slits(&integrator.header) != src.is_slit() {
+            let slit = !src.is_slit();
+            report(&src, &mut turns, &cam.name);
+            keep_saves(vault.as_deref(), &mut *integrator.header);
+            close_camera(&cam.name);
+            println!("lumis: camera {}: {}", cam.name, if slit { "Slitscan: opening for slits" } else { "out of Slitscan: opening for whole frames" });
+            src = match open(&cam, slit) {
+                Ok(s) => match &s {
+                    Source::Slit { slits, .. } if slits.width != first.width => {
+                        println!("lumis: camera {}: its slits are {} wide, its frames {}: Slitscan takes whole frames", cam.name, slits.width, first.width);
+                        slit_ok = false;
+                        close_camera(&cam.name);
+                        reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
+                    }
+                    _ => s,
+                },
+                Err(Refused::NoSlit) => {
+                    println!("lumis: camera {}: the driver opened it with no slit ring (one from before the slit, or a camera with no slit mode): Slitscan takes whole frames", cam.name);
+                    slit_ok = false;
+                    close_camera(&cam.name);
+                    reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
+                }
+                Err(Refused::Why(why)) if slit => {
+                    println!("lumis: camera {}: the slit's open failed ({why}): Slitscan takes whole frames", cam.name);
+                    slit_ok = false;
+                    reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
+                }
+                Err(Refused::Why(why)) => {
+                    keep_saves(vault.as_deref(), &mut *integrator.header);
+                    lumis_core::platform::exit_because(&format!("camera {}: opened again for whole frames, it failed: {why}", cam.name));
+                }
+            };
+            sent = (-1, -1, -1.);
+            turns = Turns::default();
+        }
+        let Some(got) = src.next(&mut turns) else {
             // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
             keep_saves(vault.as_deref(), &mut *integrator.header);
             lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
         };
-        if head.width != first.width || head.height != first.height {
-            keep_saves(vault.as_deref(), &mut *integrator.header);
-            lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
+        if let Got::Frame(head, _) = &got {
+            if head.width != first.width || head.height != first.height {
+                keep_saves(vault.as_deref(), &mut *integrator.header);
+                lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
+            }
         }
         // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save or a calibration runs (it keeps capturing, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
         let flags = integrator.header[FLAGS_IDX];
@@ -543,12 +713,17 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             continue;
         }
         let t_integrate = std::time::Instant::now();
+        let (count, time) = match &got {
+            Got::Frame(head, _) => (head.count, head.time),
+            // The count crosses the console's arithmetic as a u32, as a frame's does (40 days of slits).
+            Got::Slit { count, time, .. } => (*count as u32, *time),
+        };
         if turns.first.is_none() {
-            turns.first = Some((head.count, head.time));
+            turns.first = Some((count, time));
             turns.images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
         }
-        turns.last = (head.count, head.time);
-        if !sweep.is_empty() {
+        turns.last = (count, time);
+        if let (false, Got::Frame(head, _)) = (sweep.is_empty(), &got) {
             // Each frame's exposure as the driver says it took it, beside the step asked two frames before it; then the next step's shutter into the integrator's header, which it hands back to be set.
             let step = sweep_frames / 2;
             let now = std::time::Instant::now();
@@ -561,9 +736,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sweep_last = now;
             sweep_frames += 1;
         }
-        let (iso, shutter_ns, focus) = match samples {
-            Taken::View(rows) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
-            Taken::Bytes(bytes) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
+        let (iso, shutter_ns, focus) = match got {
+            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
+            Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
+            // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
+            Got::Slit { rows, .. } => integrator.process_slit(&rows, rows.rows, sent.0, sent.1, sent.2),
         };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
@@ -593,7 +770,13 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 lumis_core::platform::exit_because("the development run ended");
             }
         }
-        if turns.n == 1 << 6 {
+        if src.is_slit() {
+            if turns.n == 1 << SLIT_LINE {
+                report(&src, &mut turns, &cam.name);
+            } else if turns.since.is_none() {
+                turns.since = Some(std::time::Instant::now());
+            }
+        } else if turns.n == 1 << 6 {
             let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
             println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, the integrator {} us (reading the view, unpacking and adding, lumis_core process_rows)", first.width, first.height, whole / 64, turns.wait / 64, turns.integrate / 64);
             // The driver's side of the same 64: its frames between the first and the last taken (the ones Lumis skipped are the rest), their period by its own Eagle clock, and what the integrator made of them.
@@ -608,6 +791,25 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             turns.since = Some(std::time::Instant::now());
         }
     }
+}
+
+/// Slits a console line, 2^12: about every 3.4 s at the main's 1218 a second.
+const SLIT_LINE: u32 = 12;
+
+/// A slit source's console line, for the slits since the last (`turns`), and those counted afresh: how often one was taken, the driver's wait and the integrator's share, the slits written over while read and those passed over as too old to read, the column's period by the driver's clock. Said at every `SLIT_LINE` slits and when Slitscan ends; nothing for whole frames, which say their own every 64.
+fn report(src: &Source, turns: &mut Turns, name: &str) {
+    let Source::Slit { lost, skipped, after, .. } = src else {
+        return;
+    };
+    if turns.n != 0 {
+        let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
+        let (c0, t0) = turns.first.unwrap_or(turns.last);
+        let span = (turns.last.0 - c0) as u64;
+        // WHY the max: one slit since the last line has no span; its period is said as 0.
+        let period_ns = (turns.last.1 - t0) as u64 / span.max(1);
+        println!("lumis: camera {name}: {after} slits so far; the last A#{} taken every A#{} us (the driver's answer A#{} us a slit, the integrator A#{} us), the sensor's slit every A#{} ns by the driver's clock; A#{lost} written over while read, A#{skipped} too old to read (Lumis behind by half the ring)", turns.n, whole / turns.n, turns.wait / turns.n, turns.integrate / turns.n, period_ns);
+    }
+    *turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
 }
 
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
