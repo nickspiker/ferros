@@ -29,15 +29,26 @@ use vsf::types::EtType;
 use vsf::VsfType;
 
 /// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way).
-pub const RIGHTS: [&str; 12] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people"];
+pub const RIGHTS: [&str; 13] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 12] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people"];
+pub const MEANS: [&str; 13] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
 pub const BE_YOU: u8 = 10;
 /// The person's people (docs/FACETS.md "People"): its code in [`RIGHTS`].
 pub const PEOPLE: u8 = 11;
+/// A puck's circle (docs/PUCKS.md, 2026-11-17): its code in [`RIGHTS`]. A capsule that declares it is a puck: a kist that lives on the deck as a live circle and is never opened, the declaration signed with the rest of the capsule (PUCKS.md question 5), so the deck knows a puck by what it declares, never by its name.
+/// It is never asked: it grants nothing but drawing into the puck's own circle (the display's `puck` endpoint, keyed by the caller's kist identity), and a puck holds no surface and no GPU memory in its place (the kernel's launch).
+/// Handed only to the kists that declare it, unlike the implicit set.
+pub const PUCK: u8 = 12;
+/// A surface of its own (the implicit right a puck is handed empty).
+pub const SURFACE: u8 = 2;
+
+/// Whether the person is ever asked for right `r`: every right but the implicit set and `PUCK`.
+pub fn asked_right(r: u8) -> bool {
+    !implicit(r) && r != PUCK
+}
 
 /// The implicit set, by code: the rights every kist is handed at launch without a question (owner, 2026-11-12, "Yes on the implicit set"): the screen, touch, a surface of its own, its own key sealed to this device (ira), its own vault domain, randomness, sound out. A kist the person chose to run needs a window, their touches in it, its own storage, randomness, its own key and sound; asking about those only teaches people to tap yes. The GPU is handed to every kist as well, and is no right (the kernel's `kist_gpu`). Every other right is asked once ([`Kist::unanswered`]). The codes are the same as before, so an answer the person gave one of these before 2026-11-12 keeps its meaning; it is simply no longer read.
 pub const IMPLICIT: [u8; 7] = [0, 1, 2, 3, 4, 5, 8];
@@ -939,11 +950,16 @@ impl Hidden {
 impl Want {
     /// Whether the person is asked for it: every right but the implicit set ([`IMPLICIT`]). A capsule from before 2026-11-12 still declares implicit rights; those are never shown, never asked, and handed whatever answer the list holds for them.
     pub fn asked(&self) -> bool {
-        !implicit(self.right)
+        asked_right(self.right)
     }
 }
 
 impl Kist {
+    /// Whether its capsule declares `PUCK`: a puck, a live circle on the deck never opened (docs/PUCKS.md).
+    pub fn is_puck(&self) -> bool {
+        self.wants.iter().any(|w| w.right == PUCK)
+    }
+
     /// Whether any asked want is still unanswered (the first-launch question is due). An implicit want needs no answer.
     pub fn unanswered(&self) -> bool {
         self.wants.iter().any(|w| w.asked() && w.answer.is_none())
@@ -1018,6 +1034,24 @@ mod tests {
         assert_eq!(k.kists[j].launch_codes(), Some(Vec::new()));
         assert!(IMPLICIT[..LEADING].iter().enumerate().all(|(i, &c)| c as usize == i));
         assert!(IMPLICIT.iter().all(|&c| (c as usize) < RIGHTS.len()));
+    }
+
+    #[test]
+    fn a_puck_is_known_by_its_declaration_and_never_asked() {
+        // The tide puck as declared: its circle, and GPS for its place (asked).
+        let tide = Decl { name: String::from("Tide"), wants: alloc::vec![(PUCK, String::from("its circle")), (6, String::from("the tide where you are"))] };
+        let mut k = Kists::default();
+        let i = k.stow([1; 32], [2; 32], [3; 32], &tide);
+        assert!(k.kists[i].is_puck());
+        assert_eq!(k.kists[i].wants.iter().filter(|w| w.asked()).count(), 1);
+        assert!(!asked_right(PUCK) && asked_right(6) && !asked_right(SURFACE));
+        // GPS said no to: the puck still launches, its circle handed, its GPS slot empty.
+        k.kists[i].wants[1].answer = Some((false, 1));
+        assert_eq!(k.kists[i].launch_codes(), Some(alloc::vec![PUCK, EMPTY]));
+        // A kist named Clock that declares nothing is no puck: the name is no identity.
+        let j = k.stow([4; 32], [5; 32], [3; 32], &Decl { name: String::from("Clock"), wants: Vec::new() });
+        assert!(!k.kists[j].is_puck());
+        assert_eq!(code("puck"), Some(PUCK));
     }
 
     #[test]

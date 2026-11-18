@@ -1015,7 +1015,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![
         Serve(b"display"),
         Hardware(b"decon0-main"), Hardware(b"decon0-win"), Hardware(b"decon0-wincon"), Hardware(b"dpu-dma0"), Hardware(b"dpp0"), Hardware(b"gpio-gpp0"),
-        Dma(b"display-fb"), Dma(b"display-heap"),
+        // 9: the display serves the pucks' endpoint here (docs/PUCKS.md, 2026-11-17): the slot held the display's old heap region, which the display has not read since 2026-11-11, and init's grants page is full.
+        Dma(b"display-fb"), Serve(b"puck"),
         Hardware(b"dsim0"), Hardware(b"dphy0"), Hardware(b"sramc0"), Hardware(b"hdrcomm0"),
         Serve(b"touch"), Hardware(b"usi2-spi"), Hardware(b"gpio-gpn0"),
         Use(b"display"), Use(b"touch"),

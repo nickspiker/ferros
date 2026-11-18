@@ -2765,6 +2765,17 @@ fn facets_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// The kernel's stamp ahead of every call on the `puck` endpoint (docs/PUCKS.md, 2026-11-17): the caller's kist identity as the gate found it at launch, its developer's Ed25519 key and its option (64 bytes), or zeros for a caller that is no kist (the display then finds no circle for it).
+/// Lean on purpose: a puck calls at each of its deadlines and, while its circle is in view, at its sensor's rate (the compass), so no alias is derived here as `facets_stamp` does.
+fn puck_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
+    let (developer, option) = p.gate.filter(|_| p.kist).unwrap_or(([0; 32], [0; 32]));
+    let mut out = Vec::with_capacity(64 + msg.len());
+    out.extend_from_slice(&developer);
+    out.extend_from_slice(&option);
+    out.extend_from_slice(&msg);
+    out
+}
+
 /// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
 /// A block's frames change only as it grows (`block_grow` appends; nothing takes one back while it is held), and a surface's never while it is held, so the regions alone name the frames for a caller: the service keys a client's address space by them.
 fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
@@ -3120,6 +3131,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     }
     // A call on the identity service's facets goes in behind the kernel's stamp of the kist that calls (`facets_stamp`).
     let msg = if kk.endpoints[ep].name == b"facets" { facets_stamp(p, msg) } else { msg };
+    // A call on the pucks' endpoint goes in behind the caller's kist identity (`puck_stamp`): the display keys a puck's circle by it, never by anything the puck says.
+    let msg = if kk.endpoints[ep].name == b"puck" { puck_stamp(p, msg) } else { msg };
     kk.endpoints[ep].queue.push_back((cur, msg));
     wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
@@ -6955,6 +6968,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "camera" => (Object::Endpoint(endpoint(b"camera")), RIGHT_SEND),
         // Be you and the person's people (docs/FACETS.md, 2026-11-13): a send right on the identity service's `facets` endpoint, either right the same one. The kernel stamps every call on it with the caller's kist identity and which of the two it was granted (`facets_stamp`), so the service answers each op by the grant and never by the caller's word.
         "be_you" | "people" => (Object::Endpoint(endpoint(b"facets")), RIGHT_SEND),
+        // A puck's circle (docs/PUCKS.md, 2026-11-17): a send right on the display's `puck` endpoint, every call on it stamped with the caller's kist identity (`puck_stamp`), so the display draws a puck's list only into the circle the deck gave that identity and no puck can name another's.
+        "puck" => (Object::Endpoint(endpoint(b"puck")), RIGHT_SEND),
         _ => return None,
     })
 }
@@ -7227,9 +7242,13 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
         // Which facets the person granted (an asked want answered yes, sent as its own code): stamped on the kist's calls on `facets`.
         let facets = wants.iter().zip(l.codes.iter()).fold(0u8, |m, (&w, &c)| m | ((w == c && c == ferros_kist::BE_YOU) as u8) | (((w == c && c == ferros_kist::PEOPLE) as u8) << 1));
         let gpu = kist_gpu();
+        // A puck (its capsule declares `puck`; docs/PUCKS.md) draws thru the display's list of ops and never shows a window: its surface and its GPU slots are empty, so a puck holds none of a surface's 32 MiB of frames, a surface slot of the sixteen, or a GPU block.
+        let puck = wants.contains(&ferros_kist::PUCK);
         let objects: Vec<(Object, u32)> = ferros_kist::slots(&wants)
             .iter()
             .filter_map(|s| match *s {
+                ferros_kist::Slot::Implicit(ferros_kist::SURFACE) if puck => Some((Object::Empty, 0)),
+                ferros_kist::Slot::Gpu(_) if puck => Some((Object::Empty, 0)),
                 ferros_kist::Slot::Implicit(c) => kist_object(c),
                 ferros_kist::Slot::Asked(i) => kist_object(l.codes[i]),
                 ferros_kist::Slot::Gpu(g) => Some(gpu[g as usize]),
