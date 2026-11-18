@@ -101,13 +101,24 @@ const CORES_WORKERS: u64 = 0x00F0;
 const DEV_SWEEP: u8 = 1 << 7;
 
 /// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
+/// A second knobs byte may follow the whole block (the input's fifteenth byte, `dev_knobs2`); the block stops before it.
 fn dev_input() -> (u8, Vec<u8>) {
-    let mut b = [0u8; 1 << 4];
+    let mut b = [0u8; 1 << 5];
     let n = sys::input(0, &mut b);
     match n {
         0 => (0, Vec::new()),
-        _ => (b[0], b[1..n].to_vec()),
+        // WHY the min: the input is the person's; past the block is the second knobs byte, not the driver's.
+        _ => (b[0], b[1..n.min(1 + camera::MODE_BLOCK)].to_vec()),
     }
+}
+
+/// Development, the second knobs byte (after the whole mode block): the view asked for non-cacheable as before 0.2.18, to compare the two on a device (docs/CAMERA.md "A cacheable view").
+const DEV_UNCACHED: u8 = 1 << 0;
+/// The second knobs byte, 0 when the input is shorter.
+fn dev_knobs2() -> u8 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b);
+    if n > 1 + camera::MODE_BLOCK { b[1 + camera::MODE_BLOCK] } else { 0 }
 }
 
 /// The UI probe's window: a line every 2^2 seconds.
@@ -175,18 +186,28 @@ enum Taken<'a> {
     Bytes(&'a [u8]),
 }
 
-/// A held frame in the view, read a row at a time by the integrator (lumis_core `RowSource`): each row copied out of the non-cacheable view in 64-byte loads into a buffer on the stack, then unpacked from RAW10. The rows are read from the integrator's own bands across the cores, each once, while the buffer stays held (it is given back at the next MAP).
+/// A held frame in the view, read a row at a time by the integrator (lumis_core `RowSource`): each row copied out of the non-cacheable view in 64-byte loads into a buffer on the stack, then unpacked from RAW10.
+/// A write-back view's rows are unpacked in place, thru the caches (docs/CAMERA.md "A cacheable view": the driver made the buffer's lines right as MAP handed it over).
+/// The rows are read from the integrator's own bands across the cores, each once, while the buffer stays held (it is given back at the next MAP).
 struct ViewRows {
     src: usize,
     line: usize,
+    cached: bool,
 }
 
 impl lumis_core::RowSource for ViewRows {
     fn read_row(&self, y: usize, out: &mut [u16]) {
+        let at = self.src + y * self.line;
+        if self.cached {
+            // SAFETY: row y of the held buffer, `line` bytes inside the view (mapped read-only for the life of the camera, the buffer this process's until the next MAP); nothing writes it while it is held.
+            let line = unsafe { std::slice::from_raw_parts(at as *const u8, self.line) };
+            camera::unpack_raw10(line, out);
+            return;
+        }
         // A RAW10 line of the widest readout fits: 8160 samples are 10200 bytes.
         let mut tmp = [0u8; 1 << 14];
         let line = &mut tmp[..self.line];
-        copy_from_view(self.src + y * self.line, line);
+        copy_from_view(at, line);
         camera::unpack_raw10(line, out);
     }
 }
@@ -203,7 +224,7 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line })))
+                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
@@ -366,9 +387,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if knobs & DEV_COPY != 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
-    } else if !block.is_empty() {
+    } else {
+        if !block.is_empty() {
+            println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        }
+        // The mode block whole (zeros past what the input gave: the init's mode, as no block is), then the view write-back (docs/CAMERA.md "A cacheable view"): the rows read thru the caches, 2.8 ms a frame on the A510s against 41.7 non-cacheable (cambench, the Pro, 2026-11-18).
         ask.extend_from_slice(&block);
-        println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        ask.resize(3 + camera::MODE_BLOCK, 0);
+        ask.push(if dev_knobs2() & DEV_UNCACHED != 0 { 0 } else { camera::OPEN_VIEW_CACHED });
     }
     // An open with a mode block is answered with 64 bytes (the ring's count and the slit's facts after the view's 48).
     let mut r = [0u8; 1 << 6];
@@ -388,7 +414,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             if base == sys::ERR {
                 return fail("the view's token was refused".into());
             }
-            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at {base:#x}", cam.name, v.buffers, v.width, v.height);
+            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at G#{base:X}, {}", cam.name, v.buffers, v.width, v.height, if v.cached { "write-back" } else { "non-cacheable" });
             Source::View { base: base as usize, view: v, held: camera::NONE }
         }
         Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),

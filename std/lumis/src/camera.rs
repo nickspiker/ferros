@@ -17,6 +17,12 @@ pub const OP_MAP: u8 = 5;
 pub const OP_RELEASE: u8 = 6;
 /// The third byte of an open that asks for the view.
 pub const OPEN_VIEW: u8 = 1;
+/// The mode block's bytes after an open's third (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2][cols: 2]); all zero is the init's mode, as no block is.
+pub const MODE_BLOCK: usize = 13;
+/// The open's byte after the mode block (its seventeenth), bit 0: the view write-back (payloads/camera `VIEW_CACHED`, docs/CAMERA.md "A cacheable view"). A driver from before reads no byte there and gives the non-cacheable view, as a kernel from before does.
+pub const OPEN_VIEW_CACHED: u8 = 1 << 0;
+/// A view reply's length when the open carried a mode block or asked for write-back: the ring's count and the slit's facts after the 48, and at 53 whether the view is write-back.
+pub const VIEW_REPLY_MODE: usize = 64;
 /// No buffer, in [`OP_MAP`]'s release byte.
 pub const NONE: u8 = 0xFF;
 /// An open's reply with the view: [0], the view's token (32 bytes at 1), the ring's buffers (33), the format (34), width and height (u16 at 36, 38), a line's bytes (u32 at 40), a buffer's bytes in the view (u32 at 44).
@@ -181,6 +187,8 @@ pub struct View {
     /// A line's bytes, and a buffer's place from the next one's in the view.
     pub line: usize,
     pub buffer: usize,
+    /// The view is mapped write-back (asked with [`OPEN_VIEW_CACHED`] after the mode block, answered 1 at 53 of a 64-byte reply): the driver has each buffer's lines cleaned and invalidated as MAP hands it over, so its rows are read in place thru the caches; else non-cacheable, read in 64-byte loads.
+    pub cached: bool,
 }
 
 /// The view from an open's reply; None for a plain open (`[0]` alone: the kernel or the driver gave none, and frames come by copy).
@@ -190,7 +198,7 @@ pub fn parse_view(r: &[u8]) -> Option<View> {
     }
     let u16_at = |k: usize| u16::from_le_bytes([r[k], r[k + 1]]) as usize;
     let u32_at = |k: usize| u32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]) as usize;
-    Some(View { token: r[1..33].try_into().unwrap(), buffers: r[33], format: r[34], width: u16_at(36), height: u16_at(38), line: u32_at(40), buffer: u32_at(44) })
+    Some(View { token: r[1..33].try_into().unwrap(), buffers: r[33], format: r[34], width: u16_at(36), height: u16_at(38), line: u32_at(40), buffer: u32_at(44), cached: r.len() >= VIEW_REPLY_MODE && r[53] == 1 })
 }
 
 /// A MAP's answer: the frame's header, the buffer that holds it (what the next MAP or a RELEASE gives back), and where its samples start in the view.
@@ -342,8 +350,14 @@ mod tests {
         r[40..44].copy_from_slice(&0x1400u32.to_le_bytes());
         r[44..48].copy_from_slice(&(1u32 << 24).to_le_bytes());
         let v = parse_view(&r).unwrap();
-        assert_eq!((v.token, v.buffers, v.format, v.width, v.height, v.line, v.buffer), ([7; 32], 4, FORMAT_RAW10, 4080, 3072, 0x1400, 1 << 24));
+        assert_eq!((v.token, v.buffers, v.format, v.width, v.height, v.line, v.buffer, v.cached), ([7; 32], 4, FORMAT_RAW10, 4080, 3072, 0x1400, 1 << 24, false));
         assert!(parse_view(&r[..1]).is_none());
+        // The 64-byte reply (a mode block, or write-back asked): 1 at 53 when the view is write-back.
+        let mut m = [0u8; VIEW_REPLY_MODE];
+        m[..VIEW_REPLY].copy_from_slice(&r);
+        assert!(!parse_view(&m).unwrap().cached);
+        m[53] = 1;
+        assert!(parse_view(&m).unwrap().cached);
         // A MAP's header (payloads/camera `header` at bin 1).
         let f = FrameHeader { count: 9, width: 4080, height: 3072, bin: 1, cfa: 0x49, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: 5 };
         let mut h = frame_header(&f);
