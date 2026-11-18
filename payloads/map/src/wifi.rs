@@ -426,9 +426,14 @@ impl Map {
         let half = self.w / 2;
         let (small, note) = (uu(5, 4), uu(7, 8));
         let f = ferros_sys::numbers(Style::Glyphs);
+        // Only the rows in the page's band (and a row past either edge) are sent: a frame's ops go in one call of at most 4 KiB (the display's batch, `Batch`), whose ops past it are dropped, the camera's among them, and sixteen networks with one's measures open would take most of it. A row out of the band is laid out (its height counts, as the page scrolls) and never drawn or tapped.
+        let (_, band_top, band_bottom) = self.bands();
+        let seen = move |y: i64| y > band_top - uu(3, 1) && y < band_bottom + uu(3, 1);
         let header = |b: &mut Batch, y: &mut i64, t: &str| {
             *y += uu(1, 2);
-            b.text(cx, *y, note as u16, dim(), 1, t);
+            if seen(*y) {
+                b.text(cx, *y, note as u16, dim(), 1, t);
+            }
             *y += uu(2, 1);
         };
         // A line of words, centred, wrapped at spaces to the page's width by the typeface's average advance (five eighths of its size), as `draw_page`'s rows are.
@@ -447,7 +452,9 @@ impl Map {
                 };
                 // WHY: a line that takes nothing (fewer than one character fits) would leave `rest` as it was and never end the loop. PROOF: every other case cuts at least one byte. A line takes at least its first character.
                 let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
-                b.text(cx, *y, small as u16, colour, 1, rest[..cut].trim_end());
+                if seen(*y) {
+                    b.text(cx, *y, small as u16, colour, 1, rest[..cut].trim_end());
+                }
                 rest = rest[cut..].trim_start();
                 if rest.is_empty() {
                     break;
@@ -459,14 +466,21 @@ impl Map {
         // A fact: its name right of the centre's left (white when it is the network picked), its value left of the centre's right; tappable across the page when `what` is given.
         let fact = |m: &mut Map, b: &mut Batch, y: &mut i64, name: &str, lit: bool, value: &str, what: Option<Act>| {
             let y0 = *y;
-            b.text(cx - uu(1, 1), *y, small as u16, if lit { white() } else { grey() }, 2, name);
-            b.text(cx + uu(1, 1), *y, small as u16, white(), 0, value);
             *y += uu(2, 1) + uu(1, 4);
+            if !seen(y0) {
+                return;
+            }
+            b.text(cx - uu(1, 1), y0, small as u16, if lit { white() } else { grey() }, 2, name);
+            b.text(cx + uu(1, 1), y0, small as u16, white(), 0, value);
             if let (true, Some(a)) = (hit, what) {
                 m.push_row(cx - half, cx + half, y0 - uu(2, 1), *y - uu(1, 4), Choice::Wifi(a));
             }
         };
         let button = |m: &mut Map, b: &mut Batch, y: &mut i64, t: &str, armed: bool, a: Act| {
+            if !seen(*y) {
+                *y += uu(3, 1);
+                return;
+            }
             let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
             let down = armed || m.pressed == Some(Choice::Wifi(a));
             b.button(cx, *y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { held } else { fill }, tl, br, white()], t);
@@ -485,7 +499,10 @@ impl Map {
             words(b, y, white(), tr(Msg::NoNetworkList));
             return;
         }
-        self.wifi_follow();
+        // The join followed only on the page drawn live (the layout passes and a neighbour's slide draw it too, and need not read the facts again).
+        if hit {
+            self.wifi_follow();
+        }
         let said = match self.wifi.said {
             Said::Nothing => None,
             Said::Typing(n) => Some(say(Say::TypeOnKeyboard(n.line().as_str()))),
