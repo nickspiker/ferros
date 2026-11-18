@@ -171,6 +171,8 @@ fn dev_input() -> (u8, Vec<u8>) {
 const DEV_UNCACHED: u8 = 1 << 0;
 /// Development, the second knobs byte: the first open is the slit's, and Lumis starts in Slitscan, sized from the camera's list (its whole readout), so one hand-spawned driver (which refuses a second open) drains slits.
 const DEV_SLIT: u8 = 1 << 1;
+/// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
+const DEV_SLIT_LATER: u8 = 1 << 2;
 /// The second knobs byte, 0 when the input is shorter.
 fn dev_knobs2() -> u8 {
     let mut b = [0u8; 1 << 5];
@@ -631,8 +633,13 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut slit_ok = knobs & DEV_COPY == 0;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
+    let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
+        if slit_later.is_some_and(|t| std::time::Instant::now() >= t) && integrator.header[CURRENT_MODE_IDX] != RawMode::Slitscan as u64 {
+            println!("lumis: development: Slitscan");
+            integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
+        }
         // Slitscan takes slits, every other mode whole frames: the camera is closed (the driver ends) and opened again for the other (owner, 2026-11-18: "Do wire it up so I get more than 30 lines per second"). The new driver starts at the init's settings, so the integrator's are sent again.
         if slit_ok && wants_slits(&integrator.header) != src.is_slit() {
             let slit = !src.is_slit();
