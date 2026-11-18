@@ -159,7 +159,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Pro flash paths](husky_flash_paths.md) - 64 MiB fastboot fails were the cable; prefix flash or Android dd as fallbacks
 - [pKVM resets on wipe](pkvm_resets_on_wipe.md) - `fastboot -w` re-enables pKVM; disable + check status after every wipe
 - [Android boot experiments trip rescue](android_boot_experiments_rescue_party.md) - one slot at a time; never factory reset
-- [husky factory partitions backup](husky_factory_partitions_backup.md) - images lost with Harbor tmp 2026-11-17; re-dump into keys/husky/
+- [husky factory partitions backup](husky_factory_partitions_backup.md) - re-dumped 2026-11-18 via `bridge part dump` into keys/<device>/partitions-2026-11-18/
 - [Bridge: debug build for two devices](bridge_debug_for_two_devices.md) - target/debug bridge for FERROS_BUS; check `diag log`
 - [Dev box network for device tests](devbox_network_for_phone_tests.md) - WiFi .156 not the DMX NIC; receiver sends first
 - [gs-google reference tree](gs_google_reference_tree.md) - Pixel kernel source at /mnt/Harbor/ferros-ref; grep it
