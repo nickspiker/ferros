@@ -124,16 +124,14 @@ fn draw_item(c: &Checklist, item: Item, label: &str) {
     let color = if !done { RED } else if c.interim & (1 << item as u8) != 0 { YELLOW } else { GREEN };
     let row = row_of(item);
     draw_circle(&c.panel, row, done, color);
-    // The label in Oxanium (text.rs), the row's text area cleared first so a redraw does not blend over the last one.
+    // The label in Oxanium (text.rs), front to back: the label and its suffix first, the row's black ground under them, each pixel of the row's text area written once (a redraw replaces the last one).
     let sf = surface(&c.panel);
     let (x, top) = ((LEFT + LABEL_COL * CHAR_W) as i32, (TOP + row * LINE_H) as i32);
-    sf.fill(x as usize, top as usize, c.panel.width.saturating_sub(x as usize + LEFT), LINE_H, 0);
-    let pen = sf.draw(x, top, label, color);
+    let w = c.panel.width.saturating_sub(x as usize + LEFT);
     let (text, len) = &c.suffix[item as usize];
-    if *len > 0 {
-        let pen = sf.draw(pen, top, " ", color);
-        sf.draw(pen, top, core::str::from_utf8(&text[..*len]).unwrap_or("?"), color);
-    }
+    let suffix = core::str::from_utf8(&text[..*len]).unwrap_or("?");
+    let runs: &[&str] = if *len > 0 { &[label, " ", suffix] } else { &[label] };
+    sf.line(x, top, w, LINE_H, runs, color, 0);
 }
 
 /// The panel as a surface for text.rs.
