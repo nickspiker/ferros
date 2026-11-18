@@ -339,6 +339,17 @@ The allocator is TLSF, the same source std processes run (`ferros_rt/src/tlsf.rs
 Large things stay out of it: a PT command over 1 MiB lands in its own 6 MiB region (`ptlink.rs` `BIG`); a vault value over 512 KiB is sealed and stored a piece at a time (`ferros_pieces`, `kvault.rs`); a restart streams a capsule in pieces into a staging arc and gates it there (`service.rs` `spawn_from_pieces`). Before that, storing and restarting the display's 2.8 MB capsule held five 3 MB blocks of the heap between them, and with Mahere running the heap had the bytes but not the holes: two panics on the Pro (PREV_EXIT G#EE91, 2026-11-12).
 `diag heap` reports it: the regions, in use and its peak, the free bytes and blocks and the largest, the free blocks by size (one line a power of two), and the last refused allocation. A refused allocation is recorded before it is answered (its size, alignment, the core, the return address into whoever asked, the heap then), and a panic carries it: r[6..8] of the report block, a line in the RAM log, and the next boot's flash log.
 
+### Text on the glass when things go south (2026-11-17)
+
+The owner, 2026-11-17: "Do we have any text dump panic hook code to show something on screen if shit goes south?" Until then a panic's report reached a person only over USB, on the next boot's DIAG.
+
+- **The glass console** (`ferros_glass`, host-tested): the 8x16 bitmap font scaled by the span over 2^9 (3 on the Pro, 2 on the 8a), word wrap at the screen's width, manual line returns, line by line down to the bottom margin. Past the bottom one row says `...`: a panic keeps its earliest lines (the headline and the message), the notices their latest. No allocation, no locks, no input that makes it panic.
+- **Which buffer:** the DPU's own registers (`display::scanned`): the full-screen window's layer, its DMA base, stride and format, after the PMU says the DPU is on. ABL's splash before the display server runs; the phase on the layer after, and then all four phases (G#8C00_0000, 16 MiB apart), in the panel's baked BGRA1010102 codes. Android's compressed layer after a jump is left alone. The frame goes at the panel's next TE (trigger armed, no wait).
+- **A kernel panic** (`platform::report_panic`): the report into the result block first, then the screen ("ferros panic", the message, file:line:column, the core and last crumb, the heap's last refusal), then a hold until a press of power or 32 s, then the warm reset. The first core to panic draws; another parks. A nested panic falls straight to the report and reset; a fault while the screen is up resets at once (`.Lexc_glass_reset`). Every other pet stops at the claim, so a hang in the screen resets within the watchdog's second. The kernel lock is taken if free, so the display server cannot redraw over it.
+- **A process that dies** by a fault or a panic: one line (`name: fault, ESR …, FAR …, PC +… in its arc`, or its last line for a panic) on the console and in the flash log, and on the glass when no display serves (it was the display, or none came up).
+- **A stalled boot:** 16 s after init started, the vault, usb or display not up is named on the console, in the flash log and on the glass.
+- **Development:** `diag panic test` panics on purpose; `diag glass <text>` puts a notice on the glass (`\n` a line return). Neither is in a production build.
+
 ---
 
 ## Where it runs on husky: the big core (2026-10-22)

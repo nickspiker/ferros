@@ -173,6 +173,14 @@ fn absent_wait(absent: &mut u64) {
     }
 }
 
+/// A copy of the roots on this process's stack overwritten in a way the compiler keeps, then a compiler fence, as `roots_thread` wipes its own: the screen's copies of a seed or proof once handed on.
+fn scrub(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Hands each new generation of the session's roots to fgtw (op 4), sleeping on ROOTS_GEN between, so the screen never waits on the hand-over.
 extern "C" fn roots_thread(grants: u64) -> ! {
     use core::sync::atomic::Ordering;
@@ -722,16 +730,17 @@ fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
 enum Mode {
     /// No identity in hand: the entry.
     Fresh,
-    /// The roots of this seed are in the vault; the identity service (fgtw) is looking the identity up.
-    Looking([u8; 32]),
+    /// The roots are with the identity service (fgtw), which is looking the identity up.
+    /// No mode holds the seed (2026-11-17): it is the identity service's alone once handed over.
+    Looking,
     /// The identity has a fleet: one of its devices adds this one with the words shown (or the tap); the screen closes when the fleet binds it.
-    Join([u8; 32]),
+    Join,
     /// A member selected this device (identity service state 10: its Fleet page's button or an NFC tap, `bind_select`), or the fleet bound it (state 2), and the fleet key has not come yet: the whole screen VSF RGB primary green, the selecting device's name when it is a select, nothing to type. The member's person presses Add once they see it green.
-    Bound([u8; 32]),
+    Bound,
     /// No fleet holds the handle: the permanence warning, and the handle again to mint.
-    Mint([u8; 32]),
+    Mint,
     /// No fleet device and no fgtw.org answer: nothing decided, the client keeps looking.
-    Grey([u8; 32]),
+    Grey,
     /// fgtw.org's chain for the handle is another identity's: enter starts over.
     Wrong,
     /// fgtw.org refused the binding request: this device is in another identity's fleet (fgtw verdict 9). Enter starts over.
@@ -758,9 +767,9 @@ struct Ahau {
     mode: Mode,
     /// Whether the device is bound to an identity (one identity per device, AUTH.md): its handle unlocks, any other is denied.
     bound: bool,
-    /// This session's last derived seed and proof (RAM only), so typing the same handle again (after `back`) skips the proof.
-    session_seed: Option<[u8; 32]>,
-    session_proof: Option<[u8; 32]>,
+    /// The person's wallpaper seed (`ahau_core::wallpaper_seed`, one way from the identity seed), made as the roots are handed over and sent to the display at attest (`attested`).
+    /// Until 2026-11-17 the screen kept the identity seed and the handle proof themselves for its whole run (`session_seed`, `session_proof`): the wallpaper is now made from this, a handle typed again takes its proof from the identity's space (`proof_for`), and the mint's retype is compared by the identity service (fgtw op 2), so nothing of the roots outlives their hand-over here.
+    wall: Option<[u8; 32]>,
     /// The roots are set but the client has not taken them yet (`send_roots`): the generation published to `roots_thread` (ROOTS_GEN), which ROOTS_TAKEN reaches once fgtw took them.
     roots_pending: bool,
     roots_gen: u64,
@@ -905,7 +914,7 @@ impl Ahau {
 
     /// The screen's background: green while bound and waiting for the fleet key, else black.
     fn bg(&self) -> u64 {
-        if matches!(self.mode, Mode::Bound(_)) { GREEN } else { 0 }
+        if matches!(self.mode, Mode::Bound) { GREEN } else { 0 }
     }
 
     fn clear_rows(&self, y0: usize, y1: usize) {
@@ -955,12 +964,12 @@ impl Ahau {
 
     /// Whether the screen takes a handle now: the first entry, and the mint's second. Elsewhere (looking, the words, no answer, wrong) there is no text box and keys type nothing.
     fn typing(&self) -> bool {
-        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_) | Mode::Networks | Mode::Pass)
+        matches!(self.mode, Mode::Fresh | Mode::Mint | Mode::Words(_) | Mode::Networks | Mode::Pass)
     }
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
     fn can_go_back(&self) -> bool {
-        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
+        matches!(self.mode, Mode::Looking | Mode::Join | Mode::Mint | Mode::Grey | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
     }
 
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
@@ -993,20 +1002,20 @@ impl Ahau {
         match self.mode {
             // Always "attest", bound or not (owner, 2026-11-10: "needs to say attest, not unlock. always attest"): the prompt above says whether the handle also binds this device.
             Mode::Fresh => Some(t(Msg::Attest)),
-            Mode::Mint(_) => Some(t(Msg::Mint)),
+            Mode::Mint => Some(t(Msg::Mint)),
             Mode::Wrong | Mode::Owned => Some(t(Msg::StartOver)),
             Mode::Words(_) => Some(t(Msg::Cancel)),
             Mode::Networks if self.joining => Some(t(Msg::JoiningButton)),
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
             Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some(t(Msg::Join)),
             Mode::Pass => None,
-            Mode::Looking(_) | Mode::Join(_) | Mode::Bound(_) | Mode::Grey(_) | Mode::Hosting | Mode::Keys | Mode::Networks => None,
+            Mode::Looking | Mode::Join | Mode::Bound | Mode::Grey | Mode::Hosting | Mode::Keys | Mode::Networks => None,
         }
     }
 
     fn button(&self) {
         // While joining there is no button, and its row is the words' band's (`words`): cleared here it cut a black band through them.
-        if matches!(self.mode, Mode::Join(_)) {
+        if matches!(self.mode, Mode::Join) {
             return;
         }
         // The whole row first, so a button that moved or went leaves nothing behind.
@@ -1117,7 +1126,7 @@ impl Ahau {
     fn words(&self) {
         let px = self.k(self.w / 30);
         let (y0, y1) = self.words_band();
-        if !matches!(self.mode, Mode::Join(_)) {
+        if !matches!(self.mode, Mode::Join) {
             if self.words_shown.replace(false) {
                 self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
                 self.present(y0, y1);
@@ -1278,10 +1287,9 @@ impl Ahau {
 
     /// While the identity is being looked up or joined: follow the client, from `client_thread`'s copy (nothing here calls fgtw). Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
-        let seed = match self.mode {
-            Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) | Mode::Bound(s) => s,
-            _ => return false,
-        };
+        if !matches!(self.mode, Mode::Looking | Mode::Join | Mode::Grey | Mode::Bound) {
+            return false;
+        }
         if self.roots_pending {
             if ROOTS_TAKEN.load(core::sync::atomic::Ordering::Acquire) != self.roots_gen {
                 return false;
@@ -1300,7 +1308,7 @@ impl Ahau {
         self.word_buf = c.words;
         self.word_len = c.words_len;
         let next = match c.state {
-            1 => Mode::Join(seed),
+            1 => Mode::Join,
             // Bound, the fleet key not here yet: green until it comes (until 2026-11-10 this was taken as attested, and a device picked from the nearby list went on without the key, past the person's confirm).
             2 => {
                 if !self.marked {
@@ -1308,7 +1316,7 @@ impl Ahau {
                     self.mark_member();
                     self.marked = true;
                 }
-                Mode::Bound(seed)
+                Mode::Bound
             }
             3 => {
                 console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
@@ -1319,25 +1327,25 @@ impl Ahau {
                 self.attested();
             }
             // Selected by a member (fgtw V_SELECTED, owner 2026-11-10): green with its name (the copy's words), nothing bound here; the join completes when the chain and the key come.
-            10 => Mode::Bound(seed),
-            5 => Mode::Mint(seed),
+            10 => Mode::Bound,
+            5 => Mode::Mint,
             6 => Mode::Wrong,
-            7 => Mode::Grey(seed),
+            7 => Mode::Grey,
             9 => Mode::Owned,
             _ => return false,
         };
-        if next == self.mode && (same_words || !matches!(next, Mode::Join(_))) {
+        if next == self.mode && (same_words || !matches!(next, Mode::Join)) {
             return false;
         }
         let changed = next != self.mode;
-        let was_bound = matches!(self.mode, Mode::Bound(_));
+        let was_bound = matches!(self.mode, Mode::Bound);
         self.mode = next;
         // This device's name in the fleet, for the join step (fgtw op 19: empty until the roots are in).
-        if matches!(next, Mode::Join(_)) && self.dev_name.1 == 0 && c.name_len > 0 {
+        if matches!(next, Mode::Join) && self.dev_name.1 == 0 && c.name_len > 0 {
             self.dev_name = (c.name, c.name_len);
         }
         // Into the bound screen, or out of it: the whole screen again on its new background.
-        if changed && (matches!(next, Mode::Bound(_)) || was_bound) {
+        if changed && (matches!(next, Mode::Bound) || was_bound) {
             self.all();
             return true;
         }
@@ -1353,8 +1361,9 @@ impl Ahau {
     /// Hand the roots to the identity service (fgtw) in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The hand-over is `roots_thread`'s, which waits for fgtw however long it takes; here the roots are only published to it, so the screen never freezes on it.
     fn send_roots(&mut self, seed: &[u8; 32], proof: &[u8; 32]) {
         use core::sync::atomic::Ordering;
-        self.session_seed = Some(*seed);
-        self.session_proof = Some(*proof);
+        // What the attest needs of the seed later, made one way now: the person's wallpaper.
+        // The seed and proof themselves stay only in ROOTS until fgtw takes them.
+        self.wall = Some(ahau_core::wallpaper_seed(seed));
         let roots = unsafe { &mut *(&raw mut ROOTS) };
         roots[..32].copy_from_slice(seed);
         roots[32..].copy_from_slice(proof);
@@ -1539,7 +1548,7 @@ impl Ahau {
         // No entry while nothing is typed: the words screen and the others between entries have no text box (owner, 2026-11-04).
         if !self.typing() {
             // While joining, these rows belong to the words' band (`words`): cleared here they cut a black band through the words (owner, 2026-11-09).
-            if !matches!(self.mode, Mode::Join(_)) {
+            if !matches!(self.mode, Mode::Join) {
                 self.surf()[r0..r1].fill(self.bg());
                 self.present(r0 / self.w, r1 / self.w);
             }
@@ -1612,7 +1621,7 @@ impl Ahau {
         self.surf().fill(self.bg());
         Front::fill64(window::PORCH, (self.w * self.h) as u64, self.bg());
         // The bound screen: green, its one line, nothing to type or press.
-        if matches!(self.mode, Mode::Bound(_)) {
+        if matches!(self.mode, Mode::Bound) {
             // Selected: the selecting device's name came in the copy's words (fgtw op 1); bound: none.
             let name = core::str::from_utf8(&self.word_buf[..self.word_len]).unwrap_or("");
             // Selected: who selected it (Photon's line), then that the keys follow, a line each.
@@ -2231,13 +2240,13 @@ impl Ahau {
             Mode::Fresh if self.bound => tx(Msg::TypeYourHandle),
             Mode::Fresh => tx(Msg::UnboundTypeToBind),
             // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
-            Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
-            Mode::Looking(_) => tx(Msg::FindingIdentity),
-            Mode::Join(_) => fl(Fleet::UseExistingDevice),
-            Mode::Bound(_) => fl(Fleet::BoundWaitingKeys),
-            Mode::Mint(_) => tx(Msg::MintPrompt),
-            Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
-            Mode::Grey(_) => tx(Msg::NoAnswerYet),
+            Mode::Looking if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
+            Mode::Looking => tx(Msg::FindingIdentity),
+            Mode::Join => fl(Fleet::UseExistingDevice),
+            Mode::Bound => fl(Fleet::BoundWaitingKeys),
+            Mode::Mint => tx(Msg::MintPrompt),
+            Mode::Grey if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
+            Mode::Grey => tx(Msg::NoAnswerYet),
             Mode::Wrong => tx(Msg::RecordMismatch),
             Mode::Owned => fl(Fleet::OwnedByOther),
             // The People page's add (docs/FACETS.md "People"): their handle, then the name the person gives them.
@@ -2291,20 +2300,20 @@ impl Ahau {
                 return;
             }
             Mode::Hosting | Mode::Keys => return,
-            Mode::Join(_) | Mode::Grey(_) => return,
+            Mode::Join | Mode::Grey => return,
             Mode::Wrong | Mode::Owned => {
                 self.mode = Mode::Fresh;
                 self.status(self.prompt().as_str());
                 self.words();
                 return;
             }
-            Mode::Looking(_) => return,
+            Mode::Looking => return,
             _ => {}
         }
         if self.chars == 0 {
             return;
         }
-        let seed = match core::str::from_utf8(&self.handle[..self.len]).ok().map(ahau_core::identity_seed) {
+        let mut seed = match core::str::from_utf8(&self.handle[..self.len]).ok().map(ahau_core::identity_seed) {
             Some(Ok(s)) => s,
             // Unreachable by construction: the encoder's table is generated from the keyboard's own characters (ahau_core build.rs), so a key without a code fails the build. Said on the console, not the screen.
             _ => {
@@ -2316,9 +2325,10 @@ impl Ahau {
         if self.mode == Mode::Fresh {
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
                 // Opened on a bound device: this is the identity the device belongs to.
-                ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => self.unlocked_known(seed),
+                ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => self.unlocked_known(&mut seed),
                 ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this device is not bound to a fleet yet: looking the identity up\n"),
                 ferros_sys::Unlock::Belongs => {
+                    scrub(&mut seed);
                     console(self.grants, b"ahau: refused: this device belongs to another identity\n");
                     // The handle stays as typed, the caret at its end (owner, 2026-11-11: "not have it clear the handle if you attest with a wrong letter, usually it's just one that needs fixed"): a handle is not a secret (owner, 2026-10-28), and the seed derived from it was never kept.
                     self.caret = self.len;
@@ -2332,27 +2342,35 @@ impl Ahau {
         }
         match self.mode {
             Mode::Fresh => {
-                // The same handle again this session (after `back`): its proof is cached in RAM, no second derivation.
-                let proof = if self.session_seed == Some(seed) { self.session_proof.unwrap() } else { self.proof_for(&seed, true) };
+                // The same handle again this session (after `back`) finds its proof in the identity's space, which the unlock above opened (`proof_for`): no second derivation, and no copy of the roots kept here (until 2026-11-17 the session's seed and proof were, for this).
+                let mut proof = self.proof_for(&seed, true);
                 // The roots to the client in RAM; it keeps them on disk only if unlock-at-boot is on.
                 self.send_roots(&seed, &proof);
+                scrub(&mut seed);
+                scrub(&mut proof);
                 console(self.grants, b"ahau: roots set; their thread hands them to fgtw\n");
                 self.wipe();
-                self.mode = Mode::Looking(seed);
+                self.mode = Mode::Looking;
                 self.status(self.prompt().as_str());
             }
-            Mode::Mint(first) => {
-                if !ahau_core::same(&first, &seed) {
-                    self.status(fl(ferros_lang::Fleet::HandlesDontMatch).as_str());
-                    return;
-                }
+            Mode::Mint => {
                 self.status(tx(ferros_lang::Msg::Minting).as_str());
                 self.entry();
                 self.show();
+                // The handle typed again goes to the identity service with the mint (fgtw op 2): it holds the roots handed over and compares the two; this screen kept no seed to compare with (2026-11-17).
+                let mut m = [0u8; 33];
+                m[0] = 2;
+                m[1..].copy_from_slice(&seed);
+                scrub(&mut seed);
                 let mut out = [0u8; 600];
-                let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[2], &mut out);
+                let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut out);
+                scrub(&mut m);
                 let r = if n == ferros_sys::ERR || n == 0 { 255 } else { out[0] };
                 match r {
+                    // Not the handle typed first: nothing minted; type it again.
+                    6 => {
+                        self.status(fl(ferros_lang::Fleet::HandlesDontMatch).as_str());
+                    }
                     0 => {
                         console(self.grants, b"ahau: minted; this device is the identity's first member\n");
                         self.mark_member();
@@ -2360,7 +2378,7 @@ impl Ahau {
                     }
                     4 => {
                         // Another device's genesis won the handle first: it has a fleet now.
-                        self.mode = Mode::Join(seed);
+                        self.mode = Mode::Join;
                         self.status(self.prompt().as_str());
                         // Its words come with `client_thread`'s next copy (the mint rang the doorbell).
                         self.words();
@@ -2373,7 +2391,7 @@ impl Ahau {
                     }
                 }
             }
-            _ => {}
+            _ => scrub(&mut seed),
         }
     }
 
@@ -2383,17 +2401,18 @@ impl Ahau {
         match ferros_sys::unlock_by_tag(cap(self.grants, S_UNLOCK), uid, &mut seed) {
             ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => {
                 console(self.grants, b"ahau: unlocked by a kept tag\n");
-                self.unlocked_known(seed)
+                self.unlocked_known(&mut seed)
             }
             ferros_sys::Unlock::Opened(_) => {
                 console(self.grants, b"ahau: unlocked by a kept tag; this device is not bound to a fleet yet: looking the identity up\n");
-                let proof = self.proof_for(&seed, true);
+                let mut proof = self.proof_for(&seed, true);
                 self.send_roots(&seed, &proof);
+                scrub(&mut seed);
+                scrub(&mut proof);
                 self.wipe();
-                self.mode = Mode::Looking(seed);
+                self.mode = Mode::Looking;
                 self.status(self.prompt().as_str());
                 self.entry();
-                seed.fill(0);
                 true
             }
             // One refusal for every way a tag does not open (AUTH.md): kept for nothing here, a record that does not open, another identity's.
@@ -2450,8 +2469,9 @@ impl Ahau {
     }
 
     /// The person's wallpaper (owner, 2026-11-07: handle entry unlocks it): their wallpaper seed to the display (op 42), which makes their wallpaper from it unless they set their own. The seed is one-way from their identity seed (BLAKE3's key derivation under a context of its own), so it shows nothing of the handle, and it is the same on every device of theirs and theirs alone. It is kept in their space (`ahau.wallpaper`) for a boot that unlocks without the handle being typed (`send_wallpaper`).
-    fn wallpaper(&self, seed: &[u8; 32]) {
-        let ws = ahau_core::wallpaper_seed(seed);
+    /// Takes the wallpaper seed itself (`ahau_core::wallpaper_seed`), made where the identity seed was in hand.
+    fn wallpaper(&self, ws: &[u8; 32]) {
+        let ws = *ws;
         // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the deck (owner, 2026-11-08: "should be milliseconds").
         let mut kept = [0u8; 32];
         let same = ferros_sys::store_get(cap(self.grants, S_AHAU), b"wallpaper", &mut kept) == Some(32) && kept == ws;
@@ -2462,14 +2482,17 @@ impl Ahau {
     }
 
     /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the identity service (fgtw) (made again until it takes them: it starts once the space is open), then this process ends.
-    fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
+    /// The caller's seed is overwritten here once handed over: this never returns, so the caller's frame (and its copy) would otherwise stay on the stack for the rest of the run.
+    fn unlocked_known(&mut self, seed: &mut [u8; 32]) -> ! {
         self.wipe();
         console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
         // The screen first, then the wallpaper's seed (the display loads it on a thread of its own and answers at once): the deck waits for neither (owner, 2026-11-08: "4 seconds from attest to showing homescreen ... should be milliseconds").
         window::done(self.display, self.base);
-        self.wallpaper(&seed);
-        let proof = self.proof_for(&seed, false);
-        self.send_roots(&seed, &proof);
+        self.wallpaper(&ahau_core::wallpaper_seed(seed));
+        let mut proof = self.proof_for(seed, false);
+        self.send_roots(seed, &proof);
+        scrub(seed);
+        scrub(&mut proof);
         // `roots_thread` hands them over; this waits on its word, no timer.
         loop {
             let t = ROOTS_TAKEN.load(core::sync::atomic::Ordering::Acquire);
@@ -2484,8 +2507,8 @@ impl Ahau {
     }
 
     fn attested(&mut self) -> ! {
-        if let Some(seed) = self.session_seed {
-            self.wallpaper(&seed);
+        if let Some(ws) = self.wall {
+            self.wallpaper(&ws);
         }
         console(self.grants, b"ahau: attested\n");
         self.host_words()
@@ -3305,7 +3328,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // Unlocked at boot (above): straight to the keyboard, the attest screen never shown.
     if at_boot {
@@ -3373,7 +3396,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             a.show_entry();
         }
         // While it looks for the identity, the status follows the network: "Waiting for connectivity." with no data link, the looking words once one is up (and back), redrawn only when that changes.
-        if matches!(a.mode, Mode::Looking(_) | Mode::Grey(_)) {
+        if matches!(a.mode, Mode::Looking | Mode::Grey) {
             let up = ferros_sys::data_link_up(&ferros_sys::facts());
             if link_up != Some(up) {
                 if link_up.is_some() {
@@ -3600,7 +3623,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     } else if !pulled && a.mode == Mode::Networks && y0 < a.kb.top as i64 && y0 - y > reach {
                         pulled = true;
                         a.net_close();
-                    } else if matches!(a.mode, Mode::Join(_)) && { let (b0, b1) = a.words_band(); (b0 as i64..b1 as i64).contains(&y0) } {
+                    } else if matches!(a.mode, Mode::Join) && { let (b0, b1) = a.words_band(); (b0 as i64..b1 as i64).contains(&y0) } {
                         a.scroll_words(y0, y);
                     } else {
                         a.drag_text(x0, y0, x);

@@ -767,10 +767,11 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     }
 }
 
-/// The base of a class's vault domains (process.rs `domain_keys`, VAULT-OUT.md): the device's from the ira, derived once; the person's from their unlock, None while locked.
+/// The base of the device's vault domains (process.rs `domain_keys`, VAULT-OUT.md), from the ira, derived once.
+/// The person's base is held sealed and never handed out: their domain keys come from `identity_domain_keys`, and this answers None for them.
 pub(crate) fn domain_base(identity: bool) -> Option<[u8; 32]> {
     if identity {
-        return unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain();
+        return None;
     }
     let base = unsafe { &mut *(&raw mut DEVICE_DOMAIN) };
     if base.is_none() {
@@ -780,6 +781,11 @@ pub(crate) fn domain_base(identity: bool) -> Option<[u8; 32]> {
 }
 const DEVICE_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 device vault domain";
 static mut DEVICE_DOMAIN: Option<[u8; 32]> = None;
+
+/// The person's domain keys under `prefix` (process.rs `domain_keys`), derived from their held domain key in registers (kvault `identity_domain_keys`); None while nobody is present.
+pub(crate) fn identity_domain_keys(prefix: &[u8], addr_context: &str, seal_context: &str) -> Option<[u8; 64]> {
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain_keys(prefix, addr_context, seal_context)
+}
 
 /// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the device switches OS, and a warm reset keeps DRAM).
 fn lock_before_reset() {
@@ -812,7 +818,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             Ok(0)
         }
         // The person key from the identity service (FACETS.md D1): held beside the identity's keys, wiped at lock. The log says that it came, never a byte of it.
-        (10, Some(k)) => match st.set_person(k) {
+        (10, Some(k)) => match st.set_person(&mut k.clone()) {
             Ok(true) => {
                 crate::flashlog::line("person key held: kists' aliases can be derived");
                 Ok(0)
@@ -832,7 +838,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
                 Ok(n) => n,
                 Err(_) => {
                     for d in drops.iter_mut() {
-                        d.fill(0);
+                        crate::keys::wipe_to_dram(d);
                     }
                     return Err(());
                 }
@@ -1457,6 +1463,8 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
         Ok(o) => {
             mark_ran(&o);
+            // From here the vault, usb and display have `glass::BOOT_DEADLINE_SHIFT` to come up (`glass::boot_watch`).
+            crate::glass::INIT_AT.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
             // The processes init started are its spawn syscalls, each handing out capabilities.
             if crate::process::alive() > 0 {
                 crate::checklist::mark(crate::checklist::Item::Syscall);
@@ -1804,18 +1812,51 @@ const A715_CALM_KHZ: u32 = 1_065_000;
 static GOV_LIFT_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2_367_000);
 /// How long the lift holds after the last input (a touch interrupt or an injected batch), as a right shift of the counter's frequency (`diag clock hold <n>`, 1: half a second). A real deadline: a finger lifted ends the input but not the frames it set going (a fling, a settle), whose first frames must not be drawn at the calm clock, and Photon's frames during a drag came 50 to 70 ms apart (2026-11-17), so the animation's own sign (`process::ANIM_AT`, frames 2^-4 s apart or closer) can take over only once the lifted clock has sped them up.
 static GOV_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
-/// Windows the governor ran lifted, and lifts begun (`diag clock`).
-static mut GOV_LIFTED: [u64; 2] = [0; 2];
+/// Windows the governor ran lifted, lifts begun, and windows lifted by a camera stream alone (`diag clock`).
+static mut GOV_LIFTED: [u64; 3] = [0; 3];
 static mut GOV_WAS_LIFTED: bool = false;
 
-/// Whether someone is interacting with the device now (the clock policy's lift): input within the hold (`GOV_HOLD`), or an animation's frames within the display's gap of one another the last 2^-`ANIM_GAP_LOG2` s (`process::ANIM_AT`, its own hold: the gap it was measured by, so the lift ends one frame interval after the frames stop).
-/// Read on the service loop's passes: the touch interrupt and every syscall's kick wake the kernel's core, so a lift begins at the pass after the input; the frames are seen at the pass after them (the governor's window at the latest, 2^-6 s).
-fn interactive(now: u64, f: u64) -> bool {
+/// How long a running camera stream holds the lift after the front end's last answered interrupt, as a right shift of the counter's frequency (`diag clock cam <n>`; 2: a quarter second; 0: the camera holds nothing).
+/// 2026-11-17, the Pro: Lumis draws each new camera image in 82 to 85 ms at the calm clock and 37 to 39 ms lifted, so its shown frames never came within the animation's gap and the preview stayed at the calm clock.
+/// A quarter second is about four frames' gap at the init's 15 a second, so the lift ends within about four frames of the stream stopping.
+static CAM_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// The camera front end's line (`ispfe0`) as an `IRQS` index plus one, found at the first look (0 not yet); its acks counted at the last look; and when they last moved (counter ticks, 0 never).
+static mut CAM_LINE: usize = 0;
+static mut CAM_ACKS_SEEN: u32 = 0;
+static mut CAM_AT: u64 = 0;
+
+/// Whether a camera stream runs: the camera driver answered its front end's interrupt (process.rs `IRQ_ACKS`, the line `ispfe0`) within the hold (`CAM_HOLD`).
+/// The driver acks the line only after an interrupt it answered, never after a wait that timed out, so a stalled or stopped stream stops the count and the hold runs out.
+/// Read on the service loop's passes like the rest of `interactive`: no timer of its own.
+fn camera_streaming(now: u64, f: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let hold = CAM_HOLD.load(Relaxed);
+    unsafe {
+        if CAM_LINE == 0 {
+            CAM_LINE = crate::process::IRQS.iter().position(|l| l.name == "ispfe0").unwrap() + 1;
+        }
+        let acks = crate::process::IRQ_ACKS[CAM_LINE - 1].load(Relaxed);
+        if acks != CAM_ACKS_SEEN {
+            CAM_ACKS_SEEN = acks;
+            CAM_AT = now;
+        }
+        hold != 0 && CAM_AT != 0 && now.wrapping_sub(CAM_AT) < f >> hold
+    }
+}
+
+/// What holds the clock policy's lift now, one bit each: input within the hold (bit 0, `GOV_HOLD`), an animation's frames within the display's gap of one another the last 2^-`ANIM_GAP_LOG2` s (bit 1, `process::ANIM_AT`, its own hold: the gap it was measured by, so the lift ends one frame interval after the frames stop), a running camera stream (bit 2, `camera_streaming`).
+/// Read on the service loop's passes: the touch interrupt and every syscall's kick wake the kernel's core, so a lift begins at the pass after the input; the frames and the camera's answers are seen at the pass after them (the governor's window at the latest, 2^-6 s).
+fn lift_causes(now: u64, f: u64) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
     let input = crate::process::INPUT_AT.load(Relaxed);
     let anim = crate::process::ANIM_AT.load(Relaxed);
     let gap = f >> crate::process::ANIM_GAP_LOG2.load(Relaxed);
-    (input != 0 && now.wrapping_sub(input) < f >> GOV_HOLD.load(Relaxed)) || (anim != 0 && now.wrapping_sub(anim) < gap)
+    (input != 0 && now.wrapping_sub(input) < f >> GOV_HOLD.load(Relaxed)) as u8 | ((anim != 0 && now.wrapping_sub(anim) < gap) as u8) << 1 | (camera_streaming(now, f) as u8) << 2
+}
+
+/// Whether someone is using the device now (the clock policy's lift): anything in `lift_causes`.
+fn interactive(now: u64, f: u64) -> bool {
+    lift_causes(now, f) != 0
 }
 
 /// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `A715_CALM_KHZ`.
@@ -1933,7 +1974,8 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         return 0;
     }
     // The owner's lift (THERMAL.md decision 3): while someone interacts, the A715s' whole table; otherwise their calm ceiling, and a lift that ends brings them under it at once, inside a window too.
-    let lifted = interactive(now, f);
+    let causes = lift_causes(now, f);
+    let lifted = causes != 0;
     unsafe {
         if lifted && !GOV_WAS_LIFTED {
             GOV_LIFTED[1] += 1;
@@ -1959,6 +2001,7 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
     }
     if lifted {
         unsafe { GOV_LIFTED[0] += 1 };
+        unsafe { GOV_LIFTED[2] += (causes == 4) as u64 };
     }
     unsafe {
         GOV_AT = now;
@@ -2228,7 +2271,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>` and `gap <n>` its holds as shifts (`interactive`); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none), `diag clock pipeline 0|1` its requests pipelined or each waited for.
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>`, `gap <n>` and `cam <n>` its holds as shifts (`lift_causes`; cam 0: a camera stream holds nothing); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none), `diag clock pipeline 0|1` its requests pipelined or each waited for.
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2242,7 +2285,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
                 g.asks = 0;
             }
             unsafe { TIER_RES = [0; 4] };
-            unsafe { GOV_LIFTED = [0; 2] };
+            unsafe { GOV_LIFTED = [0; 3] };
             unsafe { SHARED_LIFTS = 0 };
             unsafe { TIER_WHY = [0; TIER_CAUSES] };
             unsafe { TIER_RUNS = [[0; 12]; 4] };
@@ -2271,13 +2314,15 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
+        (Some(b"cam"), Some(n)) => CAM_HOLD.store(n, Relaxed),
         (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
         (Some(b"dwell"), Some(n)) => TIER_DWELL.store(n, Relaxed),
         (Some(b"pipeline"), Some(n)) => TIER_PIPELINE.store(n != 0, Relaxed),
         _ => {}
     }
-    let lifted = interactive(cntpct(), f);
-    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input and while frames come within f>>A#{} of each other; {} now; A#{} windows lifted, A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), if lifted { "lifted" } else { "calm" }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }).as_bytes());
+    let causes = lift_causes(cntpct(), f);
+    let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
+    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };
@@ -2644,6 +2689,8 @@ pub fn run(mut b: Boot) -> ! {
             }
             radios_applied = radios_off;
         }
+        // The vault, usb and display up once init has run 16 s, or said on the glass (glass.rs): two loads and a compare a pass until then.
+        crate::glass::boot_watch();
         // The vault process ended having served, or was killed with no successor (process.rs `vault_ended`, `VAULT_ON`): started again from its capsule at once, the store calls queued for it waiting meanwhile, never answered by the kernel's vault, which no longer holds what it keeps. One that will not start leaves the vault gone, its waiting calls refused.
         if crate::process::vault_wanted() && crate::process::with_lock(|| crate::process::named_alive_locked(&[b"vault"])) == 0 {
             let mut rep = alloc::vec::Vec::new();
@@ -3918,8 +3965,8 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" {
-                    // `diag keys [sleep|time|flip]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired (keys.rs).
+                if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" || cmd.params == b"keys idtime" {
+                    // `diag keys [sleep|time|flip|idtime]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired, the identity's held-key paths timed against the software ones with test values (keys.rs).
                     crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
@@ -4324,6 +4371,40 @@ pub fn run(mut b: Boot) -> ! {
                         core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
                     }
                     resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
+                if cmd.params == b"panic test" {
+                    // `diag panic test` (development builds; compiled out of a production build, which answers only a plain DIAG): a kernel panic on purpose, to see the panic screen (glass.rs): the text on the glass, held until a press of power or 32 s, then the report and the warm reset as for any panic.
+                    // No reply comes: the panic is the answer.
+                    crate::process::push_console(b"diag panic test: panicking on purpose\n");
+                    panic!("diag panic test: a panic asked for on purpose (a development build), to show the panic screen");
+                }
+                #[cfg(not(ferros_production))]
+                if let Some(text) = cmd.params.strip_prefix(b"glass ") {
+                    // `diag glass <text>` (development builds): a notice on the glass as a dead process's line goes there (glass.rs `notice`), drawn even while the display serves; `\n` in the text is a line return.
+                    // The display redraws over it only where its own content changes.
+                    let mut t = alloc::vec::Vec::with_capacity(text.len());
+                    let mut i = 0;
+                    while i < text.len() {
+                        // WHY `get`: the text is the host's, and a backslash may be its last byte.
+                        if text[i] == b'\\' && text.get(i + 1) == Some(&b'n') {
+                            t.push(b'\n');
+                            i += 2;
+                        } else {
+                            t.push(text[i]);
+                            i += 1;
+                        }
+                    }
+                    let shown = crate::process::with_lock(|| {
+                        crate::glass::notice(&t, true);
+                        crate::display::scanned().map(|s| (s.width, s.height, s.stride, s.iova, s.translates()))
+                    });
+                    resp.extend_from_slice(match shown {
+                        Some((w, h, st, a, tr)) => alloc::format!("glass: A#{w} x A#{h}, stride A#{st}, layer at G#{a:X}{}\n", if tr { ", translated" } else { "" }),
+                        None => alloc::string::String::from("glass: no buffer on the glass the console can write (the DPU off, or a compressed layer)\n"),
+                    }.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

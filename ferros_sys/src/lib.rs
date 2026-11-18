@@ -1115,6 +1115,10 @@ pub const BELL_FACTS: u64 = 6;
 pub const BELL_SURFACES: u64 = 9;
 /// The surface slots' bell source (`bell`, since 2026-11-12), for the holder of the `surfaces` region alone (the display server): the word is not a count but every slot's live generation, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 once it has ended, however it ended, or while the slot is free; `surface_generation`). A window shown on a surface under a generation its slot no longer holds belongs to a process that has ended.
 pub const BELL_SLOTS: u64 = 12;
+/// The identity's lock bell source (`bell`, since 2026-11-17): the word is the kernel's lock epoch, which moves at every lock of the identity (the lock op, an unlock that locks what was open first, a release).
+/// The identity service wipes what it holds of the identity when it moves.
+/// Any process may register a word for it: whether a person is present is fact 83 already.
+pub const BELL_IDENTITY: u64 = 13;
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;

@@ -1,0 +1,12 @@
+# A host test, kept out of the ferros workspace: the block layout of each lifted function in keyreg/keys.rs that holds the identity's keys (the held keys, KEY_REGISTERS.md "Sealed under the wairua at rest"), step for step in scalar Rust, checked against the blake3 crate and against the software derivations the kernel used before.
+# The lifted code itself runs only on the device; its known answers there are keys.rs `held_test`.
+[package]
+name = "keyreg-model"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+blake3 = "1"
