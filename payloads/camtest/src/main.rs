@@ -56,7 +56,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let ep = cap(g, 1);
     let buf = unsafe { &mut *(&raw mut BUF) };
     let t0 = ferros_sys::now();
-    let n = call(ep, &[0], &mut buf[..1 << 16]);
+    // The ladder (fourth byte 5) opens first: a driver spawned by hand ends after a LIST that leaves nothing open, and the OPEN behind it would then start the vault's driver, not the one under test (2026-11-17, b932: the first ladder ran on the stored driver).
+    let n = if arg(3) == 5 { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
     say!(g, "camtest: LIST A#{} bytes in A#{} ms\n", if n == ERR { 0 } else { n }, ferros_sys::us_since(t0) / 1000);
     if n == ERR {
         ferros_sys::exit(1);

@@ -4,18 +4,18 @@
 #
 # Steps, each its own command, each after the coordinator's go:
 #   tools/husky-hv-longexp.sh build              the oracle hv in front of Android's kernel, no ferros, footered and signed with the owner's AVB key: target/hv/boot_a_longexp.img
-#   tools/husky-hv-longexp.sh flash              that image to boot_a (from ferros by `bridge reboot fastboot`, or from Android by adb), then Android boots under it
+#   tools/husky-hv-longexp.sh flash <restore>    the good gate (<restore>, signed: /mnt/Harbor/Code/keys/husky/images/boot_forge_aa6d8ec3.img) to boot_b first, so a capture boot that fails falls back to a good slot; then the capture image to boot_a, and Android boots under it
 #   tools/husky-hv-longexp.sh start              waits for Android past the arming time, quiets the kernel console (pstore integrity), marks the start; then the owner, by hand: open Lumis, the main camera, shutter to 16 s, one shot, wait for it to land
 #   tools/husky-hv-longexp.sh end <out.log>      marks the end, flushes the console ring with a panic (a crash reset keeps it), waits for Android again, pulls the hv's lines, decodes them (tools/oracle-i2c): <out.log>, <out>.holds, <out>.xfers
-#   tools/husky-hv-longexp.sh restore <image>    the image boot_a held before (the coordinator names it: the signed gate with the flashed ferros), back to boot_a
+#   tools/husky-hv-longexp.sh restore <restore>  the good gate back to boot_a; the Pro boots ferros and the owner attests
 # The boot after the capture traps nothing (the hv's one-shot marker), so `end` reads the ring from a normal Android boot.
-# Nothing here writes anything but boot_a, and only in `flash` and `restore`.
+# Nothing here writes anything but boot_a and boot_b, and only in `flash` and `restore`; never a set-active.
 set -eu
 . /mnt/Harbor/Code/ferros/tools/lib/devices.sh
 cd "$(dirname "$0")/.."
 W=target/hv
 mkdir -p $W
-IMG=$W/boot_a_longexp.img
+IMG=${IMG:-$W/boot_a_longexp.img}
 # Android's kernel, as slot a runs it (the boot backup it was unpacked from went with Harbor tmp on 2026-11-17; the main checkout keeps the unpacked Image).
 LINUX=${LINUX:-/mnt/Harbor/Code/ferros/target/hv/Image}
 AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
@@ -24,11 +24,11 @@ AVB_TEMPLATE=${AVB_TEMPLATE:-/mnt/Harbor/Code/ferros/target/avb/boot.img}
 # Android's clock runs about 20 s behind the hv's counter (docs/oracle/CAMERA.md), so the oracle arms about 40 s into Android's uptime: past the camera service's boot probe, before anyone can open Lumis.
 ARM_MS=60000
 # fastboot's own words, all of them, and a stop on FAILED: a whole night of captures once ran on a stale build because a script hid a failed flash (Claude memories/husky_flash_paths.md; a 64 MiB send that fails is the cable).
-flash_boot_a() {
+flash_boot() {
     local out
-    out=$(fastboot flash boot_a "$1" 2>&1)
+    out=$(fastboot flash boot_$1 "$2" 2>&1)
     echo "$out"
-    if echo "$out" | grep -q FAILED || ! echo "$out" | grep -q OKAY; then echo "== boot_a NOT written"; exit 1; fi
+    if echo "$out" | grep -q FAILED || ! echo "$out" | grep -q OKAY; then echo "== boot_$1 NOT written"; exit 1; fi
 }
 usbserial() { adb devices | awk '$2=="device" && $1 !~ /[:.]/ {print $1; exit}'; }
 wait_android() {
@@ -54,15 +54,18 @@ build)
     ;;
 flash)
     [ -f "$IMG" ] || { echo "no $IMG: run build first"; exit 1; }
+    G=${2:?usage: $0 flash <restore image>}
+    [ -f "$G" ] || { echo "no $G"; exit 1; }
     # From ferros (the Pro on USB as 1209:4665): the bridge's fastboot; from Android: adb.
-    if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true
+    if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 ${BRIDGE:-/mnt/Harbor/Code/ferros/target/debug/ferros-bridge} reboot fastboot >/dev/null 2>&1 || true
     elif [ -n "$(usbserial)" ]; then adb -s "$(usbserial)" reboot bootloader || true; fi
     for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; tools/usb-kick.sh --if-wedged || true; done
     device_pin husky
     # No set-active: ABL boots slot a whatever fastboot says, and a set-active of b strands the phone in fastboot (Claude memories/husky_cold_slot_b.md).
-    flash_boot_a $IMG
+    flash_boot b "$G"
+    flash_boot a $IMG
     fastboot reboot >/dev/null 2>&1
-    echo "== boot_a holds the capture image; Android boots under the oracle (no gate, no ferros). Then: $0 start"
+    echo "== boot_b holds the good gate, boot_a the capture image; Android boots under the oracle (no gate, no ferros). Then: $0 start"
     ;;
 start)
     wait_android
@@ -96,7 +99,7 @@ restore)
     [ -n "$S" ] && { device_pin husky; adb -s "$S" reboot bootloader || true; }
     for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; tools/usb-kick.sh --if-wedged || true; done
     device_pin husky
-    flash_boot_a "$R"
+    flash_boot a "$R"
     fastboot reboot >/dev/null 2>&1
     echo "== boot_a restored from $R"
     ;;

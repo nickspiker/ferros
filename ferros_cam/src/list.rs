@@ -42,7 +42,7 @@ pub fn section(c: &Cam, idt: &[u8]) -> Result<vsf::file_format::VsfSection, IdtE
     put("rotation", u(c.rotation as u64));
     put("idt", abs.matrix.iter().map(|v| VsfType::f5(*v)).collect());
     put("sensitivity", sens.iter().map(|v| VsfType::f5(*v)).collect());
-    // Exposure: one line to the longest offered: past the init's frame where the camera's margin was measured, the frame and then the line lengthened (ferros_cam ccs `Timing::most_ns`; the main about 2.19 s, the ultrawide about 2.94 s); the init's own integration elsewhere.
+    // Exposure: one line to the longest offered: past the init's frame where the camera's margin was measured, the frame and then the line lengthened (ferros_cam ccs `Timing::most_ns`; the main and the ultrawide about 1.02 s, at the longest line time the front end took on the Pro); the init's own integration elsewhere.
     put("exposure_min", u(c.line_ps / 1000));
     put("exposure_max", u(c.listed_timing().most_ns()));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.

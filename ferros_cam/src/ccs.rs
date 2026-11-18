@@ -112,8 +112,10 @@ pub const COARSE_CAPS: u16 = COARSE_INTEGRATION_MIN;
 pub const LINES_MOST: u64 = (1 << 16) - 1;
 /// A stretched line's step in pixel clocks: every line length this sensor has run on ferros is a multiple of 2^4 (6320 the init's, 5888, 5632, 5376 and 4864 the 2026-11-16 sweep), so a stretched one is kept on that step (CCS states no step, and the main's limit block does not answer).
 pub const LLP_STEP: u64 = 1 << 4;
-/// The longest line offered: the most 16 bits hold, on the step.
+/// The longest line the 16 bits hold, on the step.
 pub const LLP_MOST: u64 = LINES_MOST & !(LLP_STEP - 1);
+/// The longest line time the front end has taken (ps): on the Pro (b932, 2026-11-17) the main's stream ran on at 30640 clocks a line (15.63 us, a 1 s exposure) and stopped at 61280 (31.26 us, 2 s), the frame begun and never ended. The limit is the front end's, so it is a time, not a clock count, and holds for every camera behind it until each is measured; between the two it is not measured. The value is the main's 30640 clocks at its 3.2237 us per 6320, rounded up so it gives back 30640 exactly.
+pub const LINE_PS_MOST: u64 = 15_628_825;
 
 /// An open camera's frame timing, what an exposure in nanoseconds turns into (`plan`).
 /// The line time is measured at the captured line length (`Cam::line_ps` at `Cam::llp`) and scales with the line length, the pixel clock being the PLL's (`frame_ps`).
@@ -142,6 +144,13 @@ pub struct Plan {
 }
 
 impl Timing {
+    /// The longest line offered (clocks, on the step): the front end's longest line time (`LINE_PS_MOST`) at this sensor's pixel clock, or the 16 bits, whichever is shorter.
+    pub fn llp_most(&self) -> u64 {
+        let front = (LINE_PS_MOST * self.captured_llp as u64 / self.line_ps) & !(LLP_STEP - 1);
+        // WHY the shorter: two ceilings, the register's 16 bits and the line time past which the front end stopped (b932); a line past either is one the sensor cannot hold or the stream does not survive.
+        if front < LLP_MOST { front } else { LLP_MOST }
+    }
+
     /// The line time at line length `llp` (ps).
     pub fn line_ps_at(&self, llp: u16) -> u64 {
         self.line_ps * llp as u64 / self.captured_llp as u64
@@ -158,7 +167,7 @@ impl Timing {
         if coarse + self.margin as u64 > self.fll as u64 { (coarse + self.margin as u64) as u16 } else { self.fll }
     }
 
-    /// The timing for an exposure of `ns`, in the order that changes the least: (0) the mode's own frame when the integration fits it; (1) the frame lengthened, to the 16 bits CCS gives it (the main: about 0.21 s); (2) with the vendor's shift, the frame and integration counted in 2^shift lines at the mode's line length (Android's way, `Lte`); (3) without one, the line lengthened on `LLP_STEP` to `LLP_MOST` (the main: about 2.19 s).
+    /// The timing for an exposure of `ns`, in the order that changes the least: (0) the mode's own frame when the integration fits it; (1) the frame lengthened, to the 16 bits CCS gives it (the main: about 0.21 s); (2) with the vendor's shift, the frame and integration counted in 2^shift lines at the mode's line length (Android's way, `Lte`); (3) without one, the line lengthened on `LLP_STEP` to `llp_most` (the main: about 1.02 s).
     /// None: shorter than the sensor's least integration, or longer than the most this camera takes (refused, never capped, as a gain past the range is).
     pub fn plan(&self, ns: u64) -> Option<Plan> {
         // WHY checked: `ns` is the caller's eight bytes (SET); past 2^64 / 1000 the product would wrap and read as a short exposure, which this refuses instead.
@@ -194,7 +203,7 @@ impl Timing {
         // The least line on the step whose `most` lines hold the exposure: llp >= ps x captured / (line_ps x most), rounded up to the step; in 128 bits, as ps x captured passes 64 for an exposure past about 48 minutes.
         let exact = (ps as u128 * self.captured_llp as u128).div_ceil(self.line_ps as u128 * most as u128);
         let llp = exact.div_ceil(LLP_STEP as u128) * LLP_STEP as u128;
-        if llp > LLP_MOST as u128 {
+        if llp > self.llp_most() as u128 {
             return None;
         }
         let c = ps / self.line_ps_at(llp as u16);
@@ -219,7 +228,7 @@ impl Timing {
         let most = LINES_MOST - self.margin as u64;
         match self.lte {
             Some(l) => (most << l.most) * self.line_ps_at(self.llp) / 1000,
-            None => most * self.line_ps_at(LLP_MOST as u16) / 1000,
+            None => most * self.line_ps_at(self.llp_most() as u16) / 1000,
         }
     }
 }
@@ -811,7 +820,7 @@ mod tests {
         Timing { line_ps: crate::MAIN_LINE_PS, captured_llp: 6320, llp: 6320, fll: 0x5372, coarse_min: 2, margin: 2, long: true, lte: None }
     }
 
-    /// Long exposures, step by step: inside the init's frame nothing but the integration moves; past it the frame grows to 16 bits (about 0.21 s); past that the line grows on its step to the most (about 2.19 s); past that refused. Every plan keeps the integration inside the frame by the sensor's margin, and gives back the exposure asked to within a line.
+    /// Long exposures, step by step: inside the init's frame nothing but the integration moves; past it the frame grows to 16 bits (about 0.21 s); past that the line grows on its step to the front end's longest line (about 1.02 s); past that refused (2 s stopped the stream on b932). Every plan keeps the integration inside the frame by the sensor's margin, and gives back the exposure asked to within a line.
     #[test]
     fn long_exposures_plan() {
         let t = main_timing();
@@ -828,29 +837,35 @@ mod tests {
         let edge = (LINES_MOST - 2) * crate::MAIN_LINE_PS / 1000;
         assert_eq!(t.plan(edge).unwrap().llp, 6320);
         assert!((210_000_000..212_000_000).contains(&edge), "{edge}");
-        // 1 s and 2 s: the line lengthened on its step, the frame at most 16 bits.
-        for ns in [212_000_000u64, 1_000_000_000, 2_000_000_000] {
+        // The main's longest line is the one the front end took on the Pro (30640 clocks, the 1 s step of b932).
+        assert_eq!(t.llp_most(), 30640);
+        // 0.5 s and 1 s: the line lengthened on its step, the frame at most 16 bits.
+        for ns in [212_000_000u64, 500_000_000, 1_000_000_000] {
             let p = t.plan(ns).unwrap();
-            assert!(p.llp > 6320 && p.llp as u64 % LLP_STEP == 0 && p.llp as u64 <= LLP_MOST, "{ns}: {p:?}");
+            assert!(p.llp > 6320 && p.llp as u64 % LLP_STEP == 0 && p.llp as u64 <= t.llp_most(), "{ns}: {p:?}");
             assert!(p.coarse as u64 + 2 <= p.fll as u64 && p.fll as u64 <= LINES_MOST, "{ns}: {p:?}");
             // The exposure given is the one asked, short of it by less than a line.
             let got = t.ns(&p);
             assert!(got <= ns && ns - got < t.line_ps_at(p.llp) / 1000 + 1, "{ns}: {got}");
         }
-        // The most offered, about 2.19 s, is taken; one more line is not.
+        // The plan the b932 ladder ran at 1024 ms: 65521 lines of 30640 clocks, 65519 of integration.
+        let p = t.plan(1_024_000_000).unwrap();
+        assert_eq!((p.llp, p.fll, p.coarse), (30640, 65521, 65519));
+        // The most offered, about 1.02 s, is taken; one more line is not; 2 s (where the stream stopped, at 61280 clocks) is refused.
         let most = t.most_ns();
-        assert!((2_180_000_000..2_200_000_000).contains(&most), "{most}");
+        assert!((1_020_000_000..1_030_000_000).contains(&most), "{most}");
         assert!(t.plan(most).is_some());
-        assert_eq!(t.plan(most + t.line_ps_at(LLP_MOST as u16) / 1000 + 1), None);
+        assert_eq!(t.plan(most + t.line_ps_at(t.llp_most() as u16) / 1000 + 1), None);
+        assert_eq!(t.plan(2_048_000_000), None);
         // 16 s takes the vendor's shift, which no camera has until the capture.
         assert_eq!(t.plan(16_000_000_000), None);
         // Under the sensor's least integration (2 lines), and a value that would wrap: refused.
         assert_eq!(t.plan(crate::MAIN_LINE_PS / 1000), None);
         assert_eq!(t.plan(u64::MAX), None);
-        // The frame periods: the init's 68.9 ms; at the most, 65535 lines of 33.4 us.
+        // The frame periods: the init's 68.9 ms; at the most, 65535 lines of 15.6 us.
         assert_eq!(t.frame_ps(&t.own(16)), 0x5372 * crate::MAIN_LINE_PS);
         let p = t.plan(most).unwrap();
-        assert!((2_180_000_000_000..2_200_000_000_000).contains(&t.frame_ps(&p)), "{}", t.frame_ps(&p));
+        assert!((1_020_000_000_000..1_030_000_000_000).contains(&t.frame_ps(&p)), "{}", t.frame_ps(&p));
     }
 
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.
@@ -877,10 +892,11 @@ mod tests {
         assert!(!f.long);
         assert_eq!(f.most_ns(), cams::FRONT.exposure_max_lines * cams::FRONT.line_ps / 1000);
         let m = cams::MAIN.listed_timing();
-        assert!(m.long && m.most_ns() > 2_000_000_000);
+        assert!(m.long && m.most_ns() > 1_000_000_000);
         let u = cams::ULTRAWIDE.listed_timing();
-        // The ultrawide: (65535 - 64) lines at 65520 clocks of its 9568-clock 6.56 us line, about 2.94 s.
-        assert!((2_930_000_000..2_950_000_000).contains(&u.most_ns()), "{}", u.most_ns());
+        // The ultrawide: (65535 - 64) lines at the front end's longest line time, 22784 clocks (its 9568-clock line is 6.56 us), about 1.02 s.
+        assert_eq!(u.llp_most(), 22784);
+        assert!((1_015_000_000..1_025_000_000).contains(&u.most_ns()), "{}", u.most_ns());
         let t = Timing { long: false, ..main_timing() };
         assert!(t.plan(t.most_ns()).is_some());
         assert_eq!(t.plan(t.most_ns() + crate::MAIN_LINE_PS / 1000 + 1), None);
