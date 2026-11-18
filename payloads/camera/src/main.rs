@@ -319,6 +319,10 @@ static FRAME_AT: AtomicU64 = AtomicU64::new(0);
 static RUN: AtomicU64 = AtomicU64::new(0);
 /// The front end's interrupts answered, and how many came on the line rather than on the thread's own tick (`TICK_US`).
 static ANSWERED: AtomicU64 = AtomicU64::new(0);
+/// Each acknowledged word's bits since the open and in the last answer (`ack_say`), by its place in the camera's list.
+const ACK_MOST: usize = 1 << 5;
+static ACK_OR: [AtomicU64; ACK_MOST] = [const { AtomicU64::new(0) }; ACK_MOST];
+static ACK_LAST: [AtomicU64; ACK_MOST] = [const { AtomicU64::new(0) }; ACK_MOST];
 static ON_LINE: AtomicU64 = AtomicU64::new(0);
 /// The image path's status words seen, or-ed over the run, for the console.
 static IMG_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -414,6 +418,8 @@ fn readout_say(g: u64, what: &str) {
 static LTE_MOST: AtomicU64 = AtomicU64::new(0);
 /// The readout test (`row_timing`), the hand spawn's third input byte 1: a device test only, as it keeps a core spinning thru the last part of each frame.
 static MEASURE: AtomicU64 = AtomicU64::new(0);
+/// A device test, the hand spawn's fifth byte: a side channel off at the sensor in any mode (bit 0 phase detect, bit 1 embedded data).
+static SIDE_TEST: AtomicU64 = AtomicU64::new(0);
 /// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
 static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 fn img_log_say(g: u64) {
@@ -639,9 +645,11 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
             WRAPS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    for &a in cam().ack.iter() {
+    for (k, &a) in cam().ack.iter().enumerate() {
         let v = rd(g, a);
         wr(g, a, v);
+        ACK_OR[k].fetch_or(v as u64, Ordering::Relaxed);
+        ACK_LAST[k].store(v as u64, Ordering::Relaxed);
     }
     IMG_SEEN.fetch_or(img as u64, Ordering::Relaxed);
     ANSWERED.fetch_add(1, Ordering::Relaxed);
@@ -1179,6 +1187,21 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             }
         }
     }
+    // A device test (the hand spawn's fifth byte, `SIDE_TEST`): one side channel off at the sensor in any mode, whole frames too (bit 0 phase detect, bit 1 embedded data), so a whole frame says which of the two the front end's SHORT_VB_FATAL follows.
+    let side = SIDE_TEST.load(Ordering::Relaxed);
+    if let (true, Some(sd)) = (side != 0, arr.side) {
+        let page = [(ccs::SAMSUNG_PAGE >> 8) as u8, ccs::SAMSUNG_PAGE as u8, (ccs::CCS_PAGE >> 8) as u8, ccs::CCS_PAGE as u8];
+        bus.write(c.addr, &page).map_err(Fail::Sensor)?;
+        bus.write(c.addr, c.hold).map_err(Fail::Sensor)?;
+        if let (true, Some(p)) = (side & 1 != 0, sd.pd) {
+            bus.write(c.addr, &[(p >> 8) as u8, p as u8, 0, 0]).map_err(Fail::Sensor)?;
+        }
+        if side & 2 != 0 {
+            bus.write(c.addr, &[(sd.emb >> 8) as u8, sd.emb as u8, 0, 0]).map_err(Fail::Sensor)?;
+        }
+        bus.write(c.addr, c.release).map_err(Fail::Sensor)?;
+        say!(g, "camera: side test: phase detect {}, embedded data {}\n", if side & 1 != 0 { "off" } else { "left" }, if side & 2 != 0 { "off" } else { "left" });
+    }
     // The job moved into the region, its geometry rewritten to the front end's (`fe`), then placed there: the ring and the program in the region's first frame, the outputs patterned.
     let m_ = job::relocate(&mut jb[..jn], pa, &l).map_err(Fail::Job)?;
     let (list_at, list_len) = job::list_piece(&jb[..jn]).map_err(Fail::Job)?;
@@ -1267,6 +1290,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     NOW_FORMAT.store(mode.map_or(10, |m| m.bits() as u64), Ordering::Relaxed);
     for x in [&LATE, &BUSY, &BUSY_MOST, &WRAPS] {
         x.store(0, Ordering::Relaxed);
+    }
+    for k in 0..ACK_MOST {
+        ACK_OR[k].store(0, Ordering::Relaxed);
+        ACK_LAST[k].store(0, Ordering::Relaxed);
     }
     // The engine's places: the copies, the descriptors' flags (the job's own: its first descriptor's).
     let first = unsafe { core::ptr::read_volatile(va as *const [u32; 4]) };
@@ -1416,6 +1443,7 @@ fn close(g: u64) {
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 5, 0, 0, 0);
     let c = cam();
     link_say(g);
+    ack_say(g);
     say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
@@ -1696,6 +1724,28 @@ fn late(g: u64) {
 }
 
 /// The camera's CSI link as it stands, said: at a stream that stopped (`late`) and at every close, so a run says which channels the sensor sent (frame starts per channel at +G#24) and whether the link took them whole (+G#14: G#20 ERR_CRC_PH).
+/// Every acknowledged status word's bits seen since the open (or) and in the last answer (last), and the PDMA engine's first 2^4 words as they stand: a stream whose frames begin and never end (a slit's third frame, 2026-11-17 night) says which block held its bits.
+fn ack_say(g: u64) {
+    // Eight words a line, so a line stays inside the console's 256 bytes.
+    for part in cam().ack.chunks(1 << 3).enumerate() {
+        let mut l = Line { b: [0; 256], n: 0 };
+        let _ = write!(l, "camera: acks (or/last):");
+        for (i, &a) in part.1.iter().enumerate() {
+            let k = (part.0 << 3) + i;
+            let (o, last) = (ACK_OR[k].load(Ordering::Relaxed), ACK_LAST[k].load(Ordering::Relaxed));
+            let _ = write!(l, " {:X}:{o:X}/{last:X}", a & 0xFFFFF);
+        }
+        let _ = write!(l, "\n");
+        console(g, &l.b[..l.n]);
+    }
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: engine words from +0:");
+    for k in 0..1 << 4 {
+        let _ = write!(l, " {:X}", rd(g, ferros_cam::PDMA + 4 * k));
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
     let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
@@ -1753,6 +1803,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     // The fourth, a device test of the ring's wrap only: log2 of the count to ask (`RING_TEST`; 0 the mode's).
     if input_len > 3 {
         RING_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 3) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 4 {
+        SIDE_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 4) as *const u8) } as u64, Ordering::Relaxed);
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
