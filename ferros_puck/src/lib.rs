@@ -555,7 +555,7 @@ pub fn q14(f: f32) -> i16 {
 pub mod call {
     /// `[LIST][variant u8][generation u32][list…]` → `[status]`: the puck's list for its resting circle (variant 0) or its circle in focus (variant 1, the fuller face; an empty list there means the resting one).
     pub const LIST: u8 = 0;
-    /// `[WATCH][seen u32]` → `[0][count u32][shown u8][focused u8][radius px u16]`: held until the circle's view moves past `seen` (shown on the glass or not, in focus or not, its size), a doorbell, never a poll.
+    /// `[WATCH][seen u32]` → `[0][count u32][shown u8][focused u8][radius px u32]`: held until the circle's view moves past `seen` (shown on the glass or not, in focus or not, its size), a doorbell, never a poll.
     pub const WATCH: u8 = 1;
     /// LIST's statuses.
     pub const OK: u8 = 0;
