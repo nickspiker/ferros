@@ -1448,6 +1448,18 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         }
         #[cfg(not(ferros_usb_capsule))]
         crate::process::push_console(b"home: no init in the vault, and this kernel carries no usb capsule (target/akita-usb.capsule.vsf)\n");
+        // The vault process too when the kernel image carries one (FERROS_VAULT_CAPSULE), never one from this vault: with no init the vault may be one this kernel cannot read, and the carried capsule is checked by its signature alone (native, no seal needed).
+        // So the bridge's `store get` reaches what the vault process keeps (the device's firmware, replays, camera inputs) before a fresh start, and `store put` after it lands there again (2026-11-18, the Pro: its kernel vault part-moved to VSF, the vault process's store untouched).
+        if !VAULT_CARRIED.is_empty() {
+            match crate::process::spawn_capsule(b"vault", VAULT_CARRIED, b"", &vault_grants(), &[]) {
+                Ok(o) => {
+                    mark_ran(&o);
+                    crate::process::console_flashlog(&o.console);
+                    crate::process::push_console(b"home: no init in the vault: the vault process from the kernel image\n");
+                }
+                Err(e) => crate::process::push_console(alloc::format!("home: no init in the vault, and the kernel image's vault refused: {e}\n").as_bytes()),
+            }
+        }
         return true;
     }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
