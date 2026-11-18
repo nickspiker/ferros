@@ -44,14 +44,85 @@ enum Source {
     Copy { buf: Vec<u8> },
 }
 
-/// A frame's time in the camera service, for the console every 64: waiting on the driver, unpacking out of the view, the integrator, the whole turn (each summed, microseconds).
+/// A frame's time in the camera service, for the console every 64: waiting on the driver, unpacking out of the view, the integrator, the settings and saves after it, the whole turn (each summed, microseconds).
+/// With the driver's own count and Eagle time of the first and last frame taken, so the line also says the sensor's period by the driver's clock and how many frames the driver wrote that Lumis never took (2026-11-17, the preview's split).
 #[derive(Default)]
 struct Turns {
     wait: u64,
     unpack: u64,
     integrate: u64,
+    after: u64,
     since: Option<std::time::Instant>,
     n: u64,
+    /// The driver's count and Eagle ns of the first frame of these 64 and of the last.
+    first: Option<(u32, i64)>,
+    last: (u32, i64),
+    /// The integrator's image counter at the first frame of these 64: the images it completed since.
+    images: u64,
+}
+
+/// The UI thread's side of the preview, said every 2^2 s while the camera screen is up (2026-11-17, the owner: "about 14 frames a second"; the split measured before anything is fixed).
+/// A pass is one fluor frame: Lumis's draw (`ui_frame`), then its convert into fluor's scratch (`render`); fluor's own ten-second line has its bake (present) and op 22 (show).
+/// A pass whose image counter moved draws the whole camera image (lumis_core draw_screen's full draw); any other repaints the controls' changing parts only, but posts the frame all the same, so it is converted, baked and shown whole.
+struct Probe {
+    since: std::time::Instant,
+    passes: u64,
+    /// Passes that found a new image, and the images completed that no pass drew (the counter moved by more than one between two passes).
+    fresh: u64,
+    unseen: u64,
+    /// `ui_frame`'s time on a fresh pass and on any other, summed (us).
+    draw_fresh: u64,
+    draw_other: u64,
+    /// The convert into fluor's scratch (`render`), summed (us), and how many.
+    convert: u64,
+    converts: u64,
+    /// The image counter the last pass saw, and the one at the window's start.
+    counter: Option<u64>,
+    counter_at: Option<u64>,
+}
+
+/// The UI probe's window: a line every 2^2 seconds.
+const PROBE_MS: u128 = 1 << 12;
+
+impl Probe {
+    fn new() -> Self {
+        Probe { since: std::time::Instant::now(), passes: 0, fresh: 0, unseen: 0, draw_fresh: 0, draw_other: 0, convert: 0, converts: 0, counter: None, counter_at: None }
+    }
+
+    /// One pass of the camera screen: the image counter as it read before the draw, and the draw's time.
+    fn pass(&mut self, counter: u64, us: u64) {
+        self.passes += 1;
+        self.counter_at.get_or_insert(counter);
+        match self.counter {
+            Some(c) if c == counter => self.draw_other += us,
+            Some(c) => {
+                self.fresh += 1;
+                self.unseen += counter - c - 1;
+                self.draw_fresh += us;
+            }
+            None => {
+                self.fresh += 1;
+                self.draw_fresh += us;
+            }
+        }
+        self.counter = Some(counter);
+        let ms = self.since.elapsed().as_millis();
+        if ms >= PROBE_MS {
+            // WHY: a window can hold no pass of a kind (no new image while the camera stalls, or every pass a new one), and its mean is then said as 0 instead of dividing by zero.
+            let mean = |t: u64, n: u64| if n == 0 { 0 } else { t / n };
+            let completed = counter - self.counter_at.unwrap_or(counter);
+            println!(
+                "lumis: preview, the last A#{ms} ms: A#{} passes, A#{} with a new image drawn whole, of A#{completed} images the camera completed (A#{} never drawn); Lumis's draw A#{} us a new image, A#{} us otherwise; the convert A#{} us a pass",
+                self.passes,
+                self.fresh,
+                self.unseen,
+                mean(self.draw_fresh, self.fresh),
+                mean(self.draw_other, self.passes - self.fresh),
+                mean(self.convert, self.converts)
+            );
+            *self = Probe { counter: self.counter, ..Probe::new() };
+        }
+    }
 }
 
 /// `len` bytes from the non-cacheable view at `src` into `dst`, 64 bytes a load (four NEON registers): each load of non-cacheable memory is its own bus transaction, and the camera driver measured 8-byte loads at 121 ms a frame against 14.4 ms (docs/CAMERA.md).
@@ -247,8 +318,21 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         *opened.lock().unwrap() = Some(Opened::Failed(why));
     };
     // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
-    let mut r = [0u8; camera::VIEW_REPLY];
-    let n = sys::call_live(CAMERA, &[camera::OP_OPEN, cam.id, camera::OPEN_VIEW], &mut r);
+    // A development spawn may hand the driver's mode block as its input (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before.
+    let mut ask = vec![camera::OP_OPEN, cam.id, camera::OPEN_VIEW];
+    let mut block = [0u8; 1 << 4];
+    let given = sys::input(0, &mut block);
+    // An input of G#FF alone asks for no view: frames by copy at `BIN`, the 6 MiB reply measured against the view.
+    if given == 1 && block[0] == 0xFF {
+        ask.truncate(2);
+        println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
+    } else if given != 0 {
+        ask.extend_from_slice(&block[..given]);
+        println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block[..given].iter().map(|b| format!("{b:02X}")).collect::<String>());
+    }
+    // An open with a mode block is answered with 64 bytes (the ring's count and the slit's facts after the view's 48).
+    let mut r = [0u8; 1 << 6];
+    let n = sys::call_live(CAMERA, &ask, &mut r);
     match (n, r[0]) {
         (sys::ERR, _) => return fail("the camera driver did not answer the open".into()),
         (_, 0) => {}
@@ -330,8 +414,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
         }
         let t_integrate = std::time::Instant::now();
+        if turns.first.is_none() {
+            turns.first = Some((head.count, head.time));
+            turns.images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
+        }
+        turns.last = (head.count, head.time);
         let (iso, shutter_ns, focus) = integrator.process_frame(samples, (iso(head.gain)) as i32, head.exposure_ns as i64, 0., false, head.width * 2);
-        turns.integrate += t_integrate.elapsed().as_micros() as u64;
+        let t_after = std::time::Instant::now();
+        turns.integrate += (t_after - t_integrate).as_micros() as u64;
         if iso != sent.0 && !set(camera::SET_GAIN, gain_of(iso)) {
             println!("lumis: the camera did not take gain {} (ISO {iso})", gain_of(iso));
         }
@@ -347,11 +437,19 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         integrator.try_save();
         keep_saves(vault.as_deref(), &mut *integrator.header);
+        turns.after += t_after.elapsed().as_micros() as u64;
         frames += 1;
         turns.n += 1;
         if turns.n == 1 << 6 {
             let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
             println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, unpacking {} us, the integrator {} us", first.width, first.height, whole / 64, turns.wait / 64, turns.unpack / 64, turns.integrate / 64);
+            // The driver's side of the same 64: its frames between the first and the last taken (the ones Lumis skipped are the rest), their period by its own Eagle clock, and what the integrator made of them.
+            let (c0, t0) = turns.first.unwrap_or(turns.last);
+            // 64 distinct frames of the driver lie between the first and the last, so the span is at least 63.
+            let span = (turns.last.0 - c0) as u64;
+            let period = (turns.last.1 - t0) as u64 / span / 1000;
+            let images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] - turns.images;
+            println!("lumis: camera: the sensor's period A#{period} us by the driver's clock; the driver wrote A#{} frames from the first of these 64 to the last, A#{} of them never taken; the settings and saves A#{} us a frame; A#{images} images completed; A#{} worker threads", span + 1, span + 1 - (1 << 6), turns.after / 64, rayon::current_num_threads());
             turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
         } else if turns.since.is_none() {
             turns.since = Some(std::time::Instant::now());
@@ -433,6 +531,8 @@ struct Lumis {
     changed: bool,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
     lut: [u32; 256],
+    /// The preview's split on the UI thread (`Probe`).
+    probe: Probe,
 }
 
 impl Lumis {
@@ -442,7 +542,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, lut }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -547,7 +647,10 @@ impl FluorApp<G2t16> for Lumis {
             }
             Screen::Opening => {}
             Screen::Camera(ui) => {
+                let counter = ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
+                let t = std::time::Instant::now();
                 app::ui_frame(ui, surface, Buttons::default(), UPRIGHT, self.finger);
+                self.probe.pass(counter, t.elapsed().as_micros() as u64);
                 if self.finger.is_some() {
                     self.down_sampled = true;
                 }
@@ -573,6 +676,7 @@ impl FluorApp<G2t16> for Lumis {
     fn render(&mut self, target: &mut [G2t16], ctx: &mut Context) {
         let Some(surface) = self.surface.as_ref() else { return };
         self.changed = false;
+        let t = std::time::Instant::now();
         let (w, lut) = (self.width, &self.lut);
         let (y0, y1) = (ctx.damage_clip.y0, ctx.damage_clip.y1);
         target[y0 * w..y1 * w].par_chunks_mut(w).zip(surface.pixels()[y0 * w * 3..y1 * w * 3].par_chunks(w * 3)).for_each(|(px, src)| {
@@ -580,6 +684,10 @@ impl FluorApp<G2t16> for Lumis {
                 *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
             }
         });
+        if matches!(self.screen, Screen::Camera(_)) {
+            self.probe.convert += t.elapsed().as_micros() as u64;
+            self.probe.converts += 1;
+        }
     }
 
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
