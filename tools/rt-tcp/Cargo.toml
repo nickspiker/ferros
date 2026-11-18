@@ -1,0 +1,9 @@
+[package]
+name = "rt-tcp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "ferros_rt's TCP client on the host: its own tcp.rs, lock.rs and time.rs, over Linux's futex and a fake ip server that holds and answers ops 4-7, 10, 11 and 14 as payloads/ip documents them; the tests count each op's calls, so a client that asks again and again fails."
+
+# Standalone: x86_64 Linux only (raw futex syscalls, rt-heap's), outside the ferros workspace's lock.
+[workspace]
