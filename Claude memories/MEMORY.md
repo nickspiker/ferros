@@ -50,6 +50,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 
 ## Vocabulary
 - [ferros vocabulary](ferros_vocabulary.md) - photon, beam, kist, stow, puck, the deck (Deck/Back), the hold, pandok, GPS
+- [Pucks draw squares](pucks_draw_squares.md) - display asks diameter + turn, puck answers G2t16 square; fresh clock puck replaces the wired one
 
 ## Owner decisions and design
 - [Owner directions 2026-10-27](owner_directions_2026_10_27.md) - windows, arcs, drivers out, attest at boot, HashMap rule

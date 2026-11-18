@@ -1,6 +1,6 @@
 # Pucks
 
-Status: proposed 2026-11-11 for the owner's review; nothing on the display, the map or init is built. Built: the tide engine, stations as VSF and a device probe of the data path ("What is built"). The owner, 2026-11-11: "tides on a puck (is that what we should call kists you can't open but are live like the clock and tide? Android calls them widgets I think?)". The kist catalog's order (Claude memories/kist_catalog.md): the clock first, then tides, then a few other simple ones, then Photon.
+Status: proposed 2026-11-11, drawing path decided 2026-11-18 (a square of pixels per circle, "How a puck draws"); nothing of it is built on the display, the map or init. Built: the tide engine, stations as VSF and a device probe of the data path ("What is built"). The owner, 2026-11-11: "tides on a puck (is that what we should call kists you can't open but are live like the clock and tide? Android calls them widgets I think?)". The kist catalog's order (Claude memories/kist_catalog.md): the clock first, then tides, then a few other simple ones, then Photon.
 
 ## What a puck is
 
@@ -24,71 +24,69 @@ The owner, 2026-11-12: "make sure the settings/items page lists kists and pucks 
 - Its refresh rides frames the display already makes: the 10 Hz temporal-dither flips redraw the clock's rectangle into the phase the flip shows, and without dithering a once-a-second check redraws it when its digits change. No timer of the clock's own.
 - So the clock is a puck in behaviour, drawn the first way below (the display knows its drawing). Two things do not carry over to other pucks: a name is not an identity (any developer's kist named Clock gets the display's clock face), and a puck that needs work done (the tide's engine) needs a process the clock never had.
 
-## How a puck draws
+## How a puck draws (owner, 2026-11-18)
 
-Three ways, each costed. "Frame" is a display frame; "the circle" is the puck's circle at whatever size the map's zoom gives it, from a few pixels to the whole screen.
+The owner, 2026-11-18, on the drawing-ops list: "What's wrong with supplying a diameter and having the kist return a square vector in sixteen bit that ferros will trim and place?" Nothing that outweighs what it gives, so that is the path. The display asks; the puck answers with pixels; nothing is parsed.
 
-| | (a) the display draws it from data | (b) the kist renders pixels into a surface | (c) the kist sends a list of drawing ops |
-|---|---|---|---|
-| what crosses | a few typed values (the clock: none) | the circle's pixels | a short list of ops in the circle's own units |
-| who knows the drawing | the display, per puck | the kist | the kist; the display knows only the ops |
-| a new puck needs | an OS update (display code) | nothing | nothing (until it needs an op the display lacks) |
-| sharp at every zoom | yes | only at the size rendered; a pinch needs a new render each frame or a scaled (blurred) copy | yes: the display draws the ops at the circle's size |
-| memory per puck | none | a surface at the largest size shown: a full-screen circle is 1344² pixels, about 14 MB at the working 8 bytes a pixel | the list (bytes) and the display's cached sprite of it, as an icon has today |
-| cost per frame, puck unchanged | the clock's: its region redrawn at the flips | the surface composed under, as any layer | the cached sprite, as an icon; only the time-anchored parts (below) redrawn at the flips |
-| cost when the picture changes | the display redraws it | the kist renders, then publishes (a mailbox swap) | the kist sends a new list (a call), the display re-rasterises it once |
-| what the display must trust | its own code | a buffer it composes, nothing parsed | a list it parses: bounded, every op checked, as the region ops are today |
+- **The ask**: the display tells a puck the circle it will be shown in: its diameter in pixels, its turn (the camera's turn and the circle's own, the gravity turn every circle has), the centre's sub-pixel offset, the theme, and whether it is focused. The puck renders a square of that diameter, already turned and at that phase, so the display places it without resampling when the two agree.
+- **The answer**: a square of 16-bit VSF RGB g2t pixels (fluor's `G2t16`, op 22's format 1: α and premultiplied darkness, the code 2^16 · tanh(v / 2^14) of the working value v, so white sits at about 0.76 of the code and the codes above it are headroom, to the working format's 16× white in light). A puck can show bright HDR (a gallery puck, a video) with nothing added. It draws with fluor, the one compositor, as any kist does: the house's squircles, glows and text, no second drawing vocabulary.
+- **Trim and place**: the display masks the square by the circle (its own C¹ edge), places it, and composes it `under` with everything else, a layer like any other (COMPOSITOR.md rules 0 to 5). What the puck drew outside its circle never reaches the glass, so the circle is the puck's whole right to the screen.
+- **A mailbox, so the screen never waits** (COMPOSITOR.md rule 1): the puck fills its back buffer and publishes it with one swap; the display takes the newest each frame. A puck slower than the frames drops its own frames, never the screen's.
+- **Nothing to parse**: the display reads a buffer it composes, never a list a puck wrote. The worst a puck can do is show an ugly picture inside its own circle.
 
-### Recommended: (c), with time-anchored ops and typed values
+### Scaling and turning between renders
 
-- **Any kist can be a puck** without the display learning it, which (a) cannot give: the clock's way does not scale past the handful of pucks ferros itself ships, and "no baked apps" says those are kists too.
-- **Sharp at every zoom for free.** The ops are in the circle's own units (the radius is 1, its up the circle's up), so the display draws them at whatever size the map flies the circle to, as it draws every other circle. (b) needs a fresh render from the kist for every zoom step, a process round trip per frame while a finger pinches, or a blurred copy, and a surface the size of the screen per puck.
-- **No timers in the puck.** Two kinds of op let the display move a puck's picture on its own clock, at the frames it already makes for the clock:
-  - **time-anchored ops**: a value that is a function of the display's now, given as its anchor and its rate (a sweep at `(now − t0) / period`, a marker at now along a curve that spans [t0, t1]);
-  - **typed values the display formats**: a moment (Eagle time) shown as wall time in the person's base and zone, a number with its unit in the person's base. A change of base, zone, daylight time or language then redraws every puck with no puck waking: the display already formats the clock this way.
-  With these the clock becomes a puck with a list of ops and no process: its rings are sweeps, its centre a moment.
-- **Refresh by push, nothing polled.** A puck sends a new list only when its picture changes in a way the ops above do not carry. The tide's words (the next high and low) change only when a high or a low passes: that moment is its one deadline, a wait until a time the content itself sets (about four a day), not an interval. Its station changes only when the person has moved far (below, the GPS question).
-- **Under compositing, unchanged.** The puck's picture is one more layer, composed front to back by `under` like an icon's sprite: cached while cold (COMPOSITOR.md rule 5: 64 frames unchanged), its time-anchored parts redrawn clipped at the flips the clock already rides. The ops themselves draw front to back as the region ops do.
-- **Cheap to carry.** The tide's curve as 64 heights with their slopes joined by cubic Hermite pieces is C¹ and within 0.13 mm of the true tide between samples (ferros_tide `Face`, its test); with a few text and shape ops a tide face is well under a 4 KiB call.
-- **(b) stays the door for what ops cannot say**: a camera preview, a map tile. It is COMPOSITOR.md's mailbox layer, built for apps already; a puck asking for a surface would be an app in a circle, decided when one needs it.
+- While a pinch or a turn moves a circle, the display asks again with the new diameter and turn every shown frame, the newest ask replacing any the puck has not taken yet. Meanwhile it draws the puck's newest square scaled and turned from the size and turn it was rendered at to the circle's now: continuous in the gesture (a C¹ resample), softer by how far the puck lags. When the puck catches up the factor is 1 and it is sharp again.
+- That is the whole balance: no rate the display sets, no limit. A puck as fast as the frames is sharp thru a pinch; a slow one is a little soft until the finger stops and its next square lands.
 
-### The ops, sketched (for the owner to cut)
+### When a puck renders
 
-A call from the puck to the display: `[op][generation u32][count]` then each op `[kind][len u16][body]`; coordinates Q14 of the radius from the centre; colours as the region ops take them (VSF RGB gamma 2 codes) or a theme index, so a puck can follow the theme. At most 2^6 ops and one call (4 KiB); anything past a bound, an unknown kind or a body of the wrong length refuses the whole list (the last good one stays).
+A puck renders only when its picture would change. Three things can say so; a puck takes the ones it needs:
+- **the ask** above (size, turn, theme, focus, the person's base, zone or language changed): pushed by the display, every puck;
+- **its own deadline**, a moment its content sets (the tide: the next high or low; a minute's digits: the next minute): a wait on that one moment, as a doorbell, never an interval;
+- **shown frames**, for a puck whose picture moves continuously (the clock's sweeping rings): it asks for the display's frame bell and renders once per shown frame while it is on the glass, 10 Hz at idle (the flips the clock rides today), the panel's rate while focused (op 25). A frame timer on shown frames, as post-lift motion is, so a skipped frame advances it rather than slowing it.
 
-- shapes: `disc`, `ring` (centre, radii, colour), `capsule` (two points, radius: the slider's track), `arc` (centre, radius, width, from and to as turns);
-- `curve`: n samples of value and slope over [x0, x1] with a value range, drawn as cubic Hermite pieces of a given width and colour, optionally filled to a baseline;
-- `text`: UTF-8, size and place in radius units, turned with the circle (op 19's renderer);
-- time-anchored: `sweep` (an arc whose end is at `(now − t0) / period` of a turn), `marker` (a dot on a `curve` at now, its x mapped from [t0, t1]);
-- typed values: `moment` (Eagle oscillations, shown as wall time in the person's base and zone: hours and minutes, or the clock's dozenal places), `number` (a value, its unit and how many places, in the person's base).
+A puck off the glass gets no asks and no frame bell: it renders nothing and spends no CPU, and its buffer can go.
+
+### The whole deck stays under a screen
+
+The circles on the deck never cover more than the screen (owner, 2026-11-18: "the total area of the entire deck is always less than the screen size so you'll never have a MASSIVE puck problem because it will be the only one drawing"). One puck zoomed to fill the glass is the only one on it; every other is off the glass and drawing nothing. So the pucks' pixels and their work together are bounded by about one screen's worth however many are stowed: the squares are 4/π of their circles and a circle cut by the glass's edge still has its whole square, so the bound is near two screens of pixels (1344 × 2992 at 8 bytes a pixel, about 31 MiB, per buffer), to be measured.
 
 ## What a tap does (owner's call)
 
 Choices, none built:
 0. Nothing: a puck shows, it does not act.
-1. Focus, as the clock has it: the map flies to the circle and the display gives it the panel's rate (op 25); the puck may send a second, fuller list for its focused state (the tide: the week's highs and lows; the clock: two more places, as now).
-2. A cycle of views, each tap the next list the puck sent.
+1. Focus, as the clock has it: the map flies to the circle and the display gives it the panel's rate (op 25); the puck, told it is focused, may show more (the tide: the week's highs and lows; the clock: two more places, as now).
+2. A cycle of views, each tap telling the puck to show its next.
 3. Open a page of its own: then it is an app, not a puck.
 
 The map already treats a tap on the clock as 1 (it never launches it); 1 keeps a puck a puck.
 
 ## Rights
 
-- **`puck`**: a send right to the display that draws only into its own circle. The right is the circle: init makes it at launch from the person's arrangement, so a puck can never name another circle, and holds no `display`, `touch` or `surface`. (How the display ties the right to the circle: an endpoint per puck, or the kernel telling the display the caller's capsule; question below.)
+- **`puck`**: the right to fill one mailbox the display shows in one circle. Init makes it at launch from the person's arrangement, so a puck can never name another circle, and holds no `display`, `touch` or `surface`. How the kernel hands the mailbox over and how it is tied to the circle is open (question 4).
 - **Its own vault domain**, as every kist has, for anything it keeps.
 - **Per puck, what its data needs**: the tide, a place (below); the clock, nothing.
-- **Declared in the signed capsule**: the `kist` section gains a flag `puck`, so the map knows a puck by its declaration, never by its name. The clock's capsule is then rebuilt with it, and the map's `widget("Clock")` goes.
+- **Declared in the signed capsule**: the `kist` section gains a flag `puck`, so the map knows a puck by its declaration, never by its name (question 5).
 
 ## Lifecycle
 
 - Pucks are live, so init launches every stowed puck once a person has attested (not at a tap), each with its granted rights, as it launches a kist today. One shot dead at lock, like every process.
-- A puck that ends abnormally glows stopped (KISTS.md "Kist states"), and its circle keeps its last list, said stale (dimmed) rather than wrong.
-- Memory: a puck's arc is small (tidetest's masked image is 246 KB, its heap 1 MiB), but N pucks are N processes.
+- A puck off the glass sleeps on its doorbell: no asks, no frames, no work (question 6).
+- A puck that ends abnormally glows stopped (KISTS.md "Kist states"), and its circle keeps its last square, dimmed as stale rather than wrong.
+- Memory: a puck's arc is small (tidetest's masked image is 246 KB, its heap 1 MiB) plus its two buffers at the size it is shown; N pucks are N processes.
+
+## The clock, built fresh
+
+The clock today is the display's own code (`WIDGET_CLOCK`, `clock_state`, the scope beside it), matched by name in the map, built to try out the deck's circles. It goes. A clock puck is built fresh on this path (owner, 2026-11-18: "ideally we just build this fresh and make another clock proper, then delete the weird wired in one"):
+- payloads/clock becomes a real process, flagged `puck` in its signed capsule, rendering its face with fluor into its mailbox: the rings on shown frames, the digits in the person's base;
+- once it shows the same face on the glass, the display's clock (`WIDGET_CLOCK`, `clock_state`, `clock_dirty`, `CLOCK_RECT` and its replay of the last camera op each second) and the map's `widget("Clock")` are deleted, and `widget` becomes puck where it means a puck;
+- the light scope (`WIDGET_SCOPE`) is the same kind of display-drawn circle; it moves to a puck or goes with the clock (question 11).
 
 ## The tide puck
 
 - **Its face**: the height now, rising or falling (an arrow, or the curve's slope at the marker), the day's curve with now on it, and the next high and the next low as moments with their heights, in the person's base. Colours in VSF RGB, picked by wavelength as the glows are (ferros_glow): the water's line and its fill are the owner's pick (question below).
-- **Its work**: once per deadline, `Face::at(tide, now)` (ferros_tide), then one list to the display. Nothing between.
+- **Its work**: once per deadline, `Face::at(tide, now)` (ferros_tide), then one square into its mailbox. Nothing between, unless an ask (a zoom, a turn) or the marker's next pixel calls for a new square.
 - **Its station**: the nearest in its catalog to the person's last fix, by the largest dot product of unit vectors (no seam at the antimeridian or the poles), on the device only. The place is never printed, logged, stored by the puck or sent.
 - **Its data rides with it, whole**: every station, inside the capsule (or one data file fetched whole), so no request ever names a station near the person. NOAA's 1374 harmonic stations at about 3.7 KB each are about 5 MB as station documents today; a compact set form (one document, constituents as a packed table) would be a fraction of that.
 
@@ -111,14 +109,19 @@ The map already treats a tap on the clock as 1 (it never launches it); 1 keeps a
 
 ## Open questions (owner)
 
-0. **The word.** Puck for a live, never-opened kist circle? And rename the code's `widget` where it means a puck. Answered 2026-11-12: puck, a kind of its own beside kists ("listed on the Deck" above); the code's rename rides with the `puck` flag (5).
-1. **The drawing path.** (c) as recommended, with time-anchored ops and display-formatted moments and numbers? Then the clock moves to it too (its capsule a list of ops, no display code of its own).
-2. **The op set.** Which of the sketched ops, and their bounds (2^6 ops, one 4 KiB call)?
-3. **A tap.** Nothing, focus (as the clock), a cycle of views, or a page?
-4. **Tying a puck to its circle.** A `puck` endpoint per puck made by init, or the kernel telling the display the calling capsule?
-5. **Declaring a puck.** A signed `puck` flag in the capsule's `kist` section, replacing the clock's match by name?
-6. **When pucks run.** Launched at attest and alive while a person is present, or only while their circle is on the glass?
-7. **The tide's place.** Claiming GPS turns its radio on. Should a puck read the last fix the GPS driver keeps (`gps.last`) without powering anything, by a new right ("last place", coarse), and follow it only when something else ran the GPS? Or claim GPS once at start and release at the first fix? Or the zone's principal place when there is no fix? Proposed in LOCATION.md (2026-11-11): a passive `place` right read from a place service that keeps the last place from GPS fixes and the serving cell, refreshed at most once an hour with the screen on.
-8. **The station set.** Ship all of NOAA's stations in the tide capsule (about 5 MB as documents, less once packed), or a region the person picks (a choice that names a region, never a place)? And which other sources (LINZ, TICON) once their licences are checked?
+Answered:
+- **0. The word.** Puck, a kind of its own beside kists (2026-11-12, "listed on the Deck" above); the code's `widget` is renamed with the `puck` flag.
+- **1. The drawing path.** The display asks with a diameter and the puck answers with a square of 16-bit VSF RGB g2t pixels, trimmed and placed by the display (2026-11-18, "How a puck draws").
+- **2. The op set.** None: there is no op list (2026-11-18).
+
+Still open:
+3. **A tap.** Nothing, focus (the map flies to it and the display gives it the panel's rate, as the clock has it; the puck told it is focused and free to show more), a cycle of views, or a page (then it is an app, not a puck)? Recommended: focus.
+4. **Tying a puck to its mailbox.** The kernel holds 16 surface slots today (`SURFACE_SLOTS`), shared with app windows. Pucks from those slots, or a pool of their own sized by the deck's bound (near two screens of pixels)? And the ask and the frame bell: one endpoint per puck made by init, or the kernel telling the display the calling capsule?
+5. **Declaring a puck.** A signed `puck` flag in the capsule's `kist` section, replacing the clock's match by name? Recommended: yes, and the fresh clock is the first capsule with it.
+6. **When pucks run.** Launched at attest and asleep while off the glass (a first square ready the moment a circle comes on), or launched only while their circle is on the glass (no process at all off it, a blank circle until its first square)? Recommended: at attest, asleep off the glass.
+7. **The tide's place.** Claiming GPS turns its radio on. A passive `place` right read from a place service that keeps the last place from GPS fixes and the serving cell (LOCATION.md, proposed 2026-11-11), claim GPS once at start, or the zone's principal place?
+8. **The station set.** All of NOAA's stations in the tide capsule (about 5 MB as documents, less once packed), or a region the person picks (a choice that names a region, never a place)? And which other sources (LINZ, TICON) once their licences are checked?
 9. **The tide's colours.** Wavelengths for the water's line, its fill below the line, and the marker.
-10. **Heights' datum.** Show heights above chart datum (MLLW, as NOAA prints them, where the lowest lows go below zero) or above mean sea level?
+10. **Heights' datum.** Above chart datum (MLLW, as NOAA prints them, where the lowest lows go below zero) or above mean sea level?
+11. **The light scope.** A puck of its own on this path, or gone with the display's clock?
+12. **The typeface.** fluor bundles Open Sans; the display's text is its own one typeface (SHELL.md). A puck's digits drawn with fluor's face, or the display's face shipped to kists?
