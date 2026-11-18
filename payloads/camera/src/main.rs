@@ -386,6 +386,44 @@ static LLP: AtomicU64 = AtomicU64::new(0);
 static PERIOD_PS: AtomicU64 = AtomicU64::new(0);
 static PERIOD_PREV_PS: AtomicU64 = AtomicU64::new(0);
 static PERIOD_AT: AtomicU64 = AtomicU64::new(0);
+/// The readout as memory sees it (owner, 2026-11-17: "measure the readout skew directly"), with `MEASURE` set: from the frame's first row landing in its buffer to its last row landing (counter ticks), the last, least and most, and how many, since the timing last changed; and frames whose rows were not both seen (missed). The front end cannot say it: its line fires once a frame at DMA_DONE, SOF and EOF already latched together (G#13), and once more for SHADOW_UPDATE (G#8) about 150 us later (the Pro, b933), so the rows are watched instead (`row_timing`).
+static READ: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+fn readout_reset() {
+    for (k, r) in READ.iter().enumerate() {
+        r.store(if k == 1 { u64::MAX } else { 0 }, Ordering::Relaxed);
+    }
+}
+/// The readout measured since the last reset, said.
+fn readout_say(g: u64, what: &str) {
+    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+    let n = READ[3].load(Ordering::Relaxed);
+    if n == 0 {
+        say!(g, "camera: readout {what}: no frame's first and last rows both seen (A#{} missed)\n", READ[4].load(Ordering::Relaxed));
+        return;
+    }
+    say!(g, "camera: readout {what} (the first row to the last landing in memory): last A#{} us, least A#{} us, most A#{} us over A#{n} frames; A#{} missed\n", us(READ[0].load(Ordering::Relaxed)), us(READ[1].load(Ordering::Relaxed)), us(READ[2].load(Ordering::Relaxed)), READ[4].load(Ordering::Relaxed));
+}
+/// The most shift the vendor's long exposure may take, for a device test of shifts past the most measured (the hand spawn's second input byte; 0: the table's).
+static LTE_MOST: AtomicU64 = AtomicU64::new(0);
+/// The readout test (`row_timing`), the hand spawn's third input byte 1: a device test only, as it keeps a core spinning thru the last part of each frame.
+static MEASURE: AtomicU64 = AtomicU64::new(0);
+/// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
+static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
+fn img_log_say(g: u64) {
+    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+    let first = IMG_LOG[0].load(Ordering::Relaxed) >> 8;
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the first answers' image status, us from the first:");
+    for e in IMG_LOG.iter() {
+        let v = e.load(Ordering::Relaxed);
+        if v == 0 {
+            break;
+        }
+        let _ = write!(l, " {:X}@{}", v & 0xFF, us((v >> 8) - first));
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
 /// Bits a sample on the link: 10, or 12 for the RAW12 attempt.
 static NOW_FORMAT: AtomicU64 = AtomicU64::new(10);
 /// The frame thread's time answering the front end (counter ticks, summed and the most in one answer) and frames whose buffer was not the one the ring named (a slit ring's: the frame's probe did not move, so it landed elsewhere, its descriptor released after the frame began).
@@ -569,6 +607,11 @@ fn slit_turn(n: u64) {
 fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let t0 = ferros_sys::now();
     let img = rd(g, ferros_cam::IMG_STATUS);
+    // The first answers' image status and their counter, for the console at the close (what each of a frame's interrupts carries, the readout's ends among them).
+    let k = ANSWERED.load(Ordering::Relaxed) as usize;
+    if k < IMG_LOG.len() {
+        IMG_LOG[k].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
+    }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
         // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
         let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
@@ -635,6 +678,8 @@ extern "C" fn frame_thread(g: u64) -> ! {
     let started = ferros_sys::now();
     // The line's last interrupt: a long exposure's frame leaves the line quiet for its whole period, which is not a stream that stopped.
     let mut last = started;
+    // Whether the last answer on the line was a frame's DMA_DONE: the readout watch waits for the answer after it (the frame's SHADOW_UPDATE, about 150 us later), as the front end must have that one answered too (b933: a watch begun at DMA_DONE left SHADOW_UPDATE unanswered for a period, and the next frame began and never ended).
+    let mut done_last = false;
     let ticks = |us: u64| ferros_sys::now() + ferros_sys::freq() * us / 1_000_000;
     loop {
         let wait = if ticking || ON_LINE.load(Ordering::Relaxed) == 0 { tick_us() } else { QUIET_US };
@@ -645,10 +690,16 @@ extern "C" fn frame_thread(g: u64) -> ! {
             ferros_sys::thread_exit(0);
         }
         if r == 0 {
+            let before = FRAMES.load(Ordering::Relaxed);
             answer(g, &mut idx, &mut enabled);
             last = ferros_sys::now();
             ON_LINE.fetch_add(1, Ordering::Relaxed);
             ferros_sys::irq_ack(line);
+            let done = FRAMES.load(Ordering::Relaxed) != before;
+            if MEASURE.load(Ordering::Relaxed) == 1 && done_last && !done && SLITS.load(Ordering::Relaxed) == 0 {
+                row_timing();
+            }
+            done_last = done;
         } else if ticking {
             answer(g, &mut idx, &mut enabled);
         } else if ON_LINE.load(Ordering::Relaxed) == 0 {
@@ -1264,9 +1315,11 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let (cmin, margin) = (u16::from_be_bytes([cw[0], cw[1]]), u16::from_be_bytes([cw[2], cw[3]]));
     // WHY the tests: the words are the sensor's; a margin not under the mode's own frame describes none (the main's limit block at G#1100 aliases to G#4140), and a least of 0 is taken as one line, the least SET ever took.
     let sane = read && margin < fll;
-    let timing = ccs::Timing { line_ps: c.line_ps, captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte };
+    let timing = ccs::Timing { line_ps: c.line_ps, captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
     say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
+    say!(g, "camera: {}: the vendor shift to A#{}{}; the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
+    readout_reset();
     if sane && arr.margin.is_some_and(|m| m != margin) {
         say!(g, "camera: {}: the sensor's margin is not the list's: the list's longest exposure is off by the difference\n", c.name);
     }
@@ -1333,6 +1386,8 @@ fn close(g: u64) {
             break;
         }
     }
+    readout_say(g, "at the close");
+    img_log_say(g);
     say!(g, "camera: closed after A#{} frames (A#{} answers, A#{} on the line{}); image status bits seen G#{:X}; switch off {}\n", FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), if TICKING.load(Ordering::Relaxed) == 1 { ", the rest on the tick" } else { "" }, IMG_SEEN.load(Ordering::Relaxed), if ok { "done" } else { "refused" });
     // The answer's cost: in all, and to its index write (the part the blanking must hold).
     // WHY the max: an open that never streamed has no answers, and its mean is read as 0 rather than divided by zero.
@@ -1602,6 +1657,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     // Spawned by hand with the input `01` (a test of a driver not yet stored): it stays between calls with nothing open, so a holder's LIST and the OPEN after it reach this driver, not the vault's (2026-11-17: a hand-spawned driver ended after camtest's LIST, and the OPEN started the stored one). It still ends at a CLOSE.
     let stay = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1;
+    // The second input byte, for a device test only: the most vendor shift to try (`LTE_MOST`; 0 the table's).
+    if input_len > 1 {
+        LTE_MOST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 2 {
+        MEASURE.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 2) as *const u8) } as u64, Ordering::Relaxed);
+    }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
@@ -1773,6 +1835,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         Some(p) => match exposure_set(&bus, c, &o.timing, &o.now, &p) {
                             Ok(()) => {
                                 if (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift) {
+                                    readout_say(g, "before");
+                                    readout_reset();
                                     period_set(o.timing.frame_ps(&p));
                                     say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, o.timing.frame_ps(&p) / 1_000_000_000);
                                 }
@@ -2060,5 +2124,44 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
 
+
+/// The readout, watched in memory (`MEASURE`, a device test): after a frame's DMA_DONE and the SHADOW_UPDATE answered after it, the buffer the next frame lands in (the one its descriptor names, `LAST_R`) gets the pattern in its first row's first word (its last row's probe is patterned already, `ring_turn`); the thread sleeps thru the part of the period no readout can reach, then watches both words until the last row lands. From the first row's landing to the last's is the readout (`READ`).
+/// Where a readout can start: if the vendor shift scaled the line and not only the counters, the readout would take the rows' share of the period (3072 of 40650 lines, 7.6 %, at the shifted 16 s), so the watch starts twice that share before the period ends, and gives up a quarter period after it.
+fn row_timing() {
+    let period = PERIOD_PS.load(Ordering::Relaxed) / 1_000_000;
+    let (rows, fll) = (ROWS.load(Ordering::Relaxed), FLL.load(Ordering::Relaxed));
+    // WHY the test: a frame of fewer than twice its rows in lines leaves no part of the period free of the readout, and the watch starts at once.
+    let quiet_us = if fll > rows << 1 { period * (fll - (rows << 1)) / fll } else { 0 };
+    let b = LAST_R.load(Ordering::Relaxed) as usize;
+    let first = (RING_VA.load(Ordering::Relaxed) as usize + b * BUF.load(Ordering::Relaxed) as usize) as *mut u64;
+    let last = probe_at(b);
+    unsafe { core::ptr::write_volatile(first, PATTERN) };
+    let (t0, hz) = (ferros_sys::now(), ferros_sys::freq());
+    ferros_sys::sleep_until(t0 + hz * quiet_us / 1_000_000);
+    let until = t0 + hz * (period + (period >> 2)) / 1_000_000;
+    let mut seen_first = 0u64;
+    loop {
+        let now = ferros_sys::now();
+        if seen_first == 0 && unsafe { core::ptr::read_volatile(first) } != PATTERN {
+            seen_first = now;
+        }
+        if unsafe { core::ptr::read_volatile(last) } != PATTERN {
+            if seen_first != 0 {
+                let d = now - seen_first;
+                READ[0].store(d, Ordering::Relaxed);
+                READ[1].fetch_min(d, Ordering::Relaxed);
+                READ[2].fetch_max(d, Ordering::Relaxed);
+                READ[3].fetch_add(1, Ordering::Relaxed);
+            } else {
+                READ[4].fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        if now >= until || RUN.load(Ordering::Acquire) != 1 {
+            READ[4].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
 ferros_sys::entry!(payload_main);

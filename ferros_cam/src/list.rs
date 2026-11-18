@@ -45,6 +45,9 @@ pub fn section(c: &Cam, idt: &[u8]) -> Result<vsf::file_format::VsfSection, IdtE
     // Exposure: one line to the longest offered: past the init's frame where the camera's margin was measured, the frame and then the line lengthened (ferros_cam ccs `Timing::most_ns`; the main and the ultrawide about 1.02 s, at the longest line time the front end took on the Pro); the init's own integration elsewhere.
     put("exposure_min", u(c.line_ps / 1000));
     put("exposure_max", u(c.listed_timing().most_ns()));
+    // The readout at the longest exposure (ns), first row to last, the rolling shutter's skew (owner, 2026-11-17: a camera that ever stretches its line says what its readout costs; the default route never does, so this is the mode's own).
+    let t = c.listed_timing();
+    put("readout", u(t.readout_ps(&t.own(1), c.height as u64) / 1000));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
     let (gmin, gmax) = crate::ccs::ARRAYS[c.id as usize].gain;
     put("gain_min", u(gmin));
@@ -89,7 +92,7 @@ mod tests {
             let floats = |name: &str| -> Vec<f32> { s.get_field(name).unwrap().values.iter().map(|v| if let VsfType::f5(x) = v { *x } else { panic!() }).collect() };
             assert_eq!(s.uint("id"), Some(c.id as u64));
             assert_eq!(s.text("name"), Some(c.name));
-            for f in ["facing", "width", "height", "cfa", "black", "white", "rotation", "exposure_min", "exposure_max", "gain_min", "gain_max", "focus_min", "focus_max"] {
+            for f in ["facing", "width", "height", "cfa", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
             let (m, sens) = (floats("idt"), floats("sensitivity"));

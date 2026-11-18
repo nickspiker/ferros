@@ -6,7 +6,7 @@
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
-//! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^6 ms, doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
+//! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 #![no_std]
 #![no_main]
 
@@ -90,7 +90,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     // A fourth byte of 5: the exposure walked past the init's frame (owner, 2026-11-17: Lumis to expose as long as on Android).
     if arg(3) == 5 {
-        long_ladder(g, ep, id, bin, arg(0), arg(5), t1);
+        long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
     let mut r = [0u8; 4];
     let n = call(ep, &[1, id], &mut r);
@@ -150,7 +150,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
 /// - the mean sample (every 16th binned sample, in 16ths), which should double with each step until it saturates;
 /// - the header's exposure, and the sensor's frame length, line length and integration read back (CAPS: G#0340, G#0342, G#0202), which should be what the driver's console line said it wrote.
 /// A step whose frames stop ends the run with the driver's own "no frame" line on the console; the close powers the module down, so the next open is a cold sensor (docs/CAMERA.md "Long exposures").
-fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, t1: u64) -> ! {
+fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_log2: u8, t1: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
     let mut r = [0u8; 4];
     let n = call(ep, &[1, id], &mut r);
@@ -183,7 +183,9 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, t1: u64)
     };
     let mut steps = [0u8; 1 << 5];
     let mut k = 0;
-    for e in 6..=top {
+    // The first step, 2^`bottom_log2` ms (6 if 0): a ladder of long steps need not walk up from 64 ms.
+    let bottom = if bottom_log2 == 0 { 6 } else { bottom_log2 };
+    for e in bottom..=top {
         steps[k] = e;
         k += 1;
     }
