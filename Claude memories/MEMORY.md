@@ -134,6 +134,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Baked present](baked_present.md) - colours baked into panel codes; the present is dither + pack, 1.17 cycles a pixel
 - [GPU online](gpu_online.md) - Mali-G715 CSF (payloads/gpu), Valhall compute, coherency; traps
 - [hv jump to ferros](hv_jump_to_ferros.md) - freeze Android, fresh ferros on the hv core; high bank taken after a jump (tripwire clean); ETE reads stall
+- [Stored capsules need the flashed kernel](stored_capsules_need_flashed_kernel.md) - capsules stored under a RAM kernel break cold boots + jumps until that kernel is flashed
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) - Android data newer only in the node chain; `diag part f2fs`
 - [Modem: registration, IP, driver](modem_uecap_registration.md) - Verizon LTE/NR + IP under ferros; uecap file service blocker
 - [GPS fix via on-chip engine](gps_onchip_fix.md) - BCM4776's own engine via a replayed gpsd session; payloads/gps
