@@ -14,5 +14,3 @@ vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The last fix's degrees thru vsf's position type (a rounding without std).
 libm = "0.2"
-# The map's old EWE runs, read by the one-shot converters only (upgrade.rs).
-ferros_ledger = { path = "../ferros_ledger" }

@@ -485,7 +485,7 @@ impl Client {
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
-                // A place or the view that is not a document this build reads (an old form the converter could not take, or another build's): left out of the sync, one line each when the set changes.
+                // A place or the view that is not a document this build reads (an old form the converting build could not take, or another build's): left out of the sync, one line each when the set changes.
                 let out: Vec<Vec<u8>> = o.kept_out.iter().map(|k| k.key.clone()).collect();
                 if out != self.space.said_out {
                     for k in &o.kept_out {

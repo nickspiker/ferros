@@ -404,35 +404,15 @@ enum Held<T> {
     Out(&'static str),
 }
 
-/// One value of the map's scope, for the converter (ferros_kept::upgrade).
-struct MapSlot<'a, S: Store> {
-    store: &'a mut S,
-    key: &'a [u8],
-}
-
-impl<S: Store> ferros_kept::upgrade::Slot for MapSlot<'_, S> {
-    fn read(&mut self) -> Result<Option<Vec<u8>>, ()> {
-        self.store.get(Scope::Map, self.key)
-    }
-    fn write(&mut self, bytes: &[u8]) -> bool {
-        self.store.set(Scope::Map, self.key, bytes)
-    }
-}
-
-/// A place or the view from the map's scope: absent, read, or present and not a document of this build (the caller keeps it out of the sync).
-/// An old form is made its document here first by the one-shot converter (`old`, ferros_kept::upgrade), the one the map's own start runs: fgtw's sync may come before the map has started. Nothing more is read when the value is a document already.
-fn held<T>(store: &mut impl Store, key: &[u8], now: i64, read: fn(&[u8]) -> Option<T>, old: fn(&[u8], i64) -> Option<Vec<u8>>) -> Result<Held<T>, ()> {
-    let Some(b) = store.get(Scope::Map, key)? else { return Ok(Held::Absent) };
-    if let Some(v) = read(&b) {
-        return Ok(Held::Read(v));
-    }
-    match ferros_kept::upgrade::upgrade(&mut MapSlot { store, key }, |d| read(d).is_some(), |o| old(o, now)) {
-        Ok(_) => match store.get(Scope::Map, key)?.as_deref().and_then(read) {
-            Some(v) => Ok(Held::Read(v)),
-            None => Ok(Held::Out("converted, then not readable")),
+/// A place or the view from the map's scope: absent, read, or present and not a document of this build (an old form left by a conversion that failed, or another build's; the caller keeps it out of the sync).
+fn held<T>(store: &mut impl Store, key: &[u8], read: fn(&[u8]) -> Option<T>) -> Result<Held<T>, ()> {
+    Ok(match store.get(Scope::Map, key)? {
+        None => Held::Absent,
+        Some(b) => match read(&b) {
+            Some(v) => Held::Read(v),
+            None => Held::Out("not a document this build reads"),
         },
-        Err(why) => Ok(Held::Out(why)),
-    }
+    })
 }
 
 fn ints(v: &[i64]) -> Vec<VsfType> {
@@ -539,8 +519,8 @@ struct Snapshot {
     out: Vec<KeptOut>,
 }
 
-/// Every fact the device's copy holds now, in `scope` for the arrangement (`now`: the Eagle time a converted place is stamped with).
-fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32], now: i64) -> Result<Snapshot, ()> {
+/// Every fact the device's copy holds now, in `scope` for the arrangement.
+fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32]) -> Result<Snapshot, ()> {
     let mut facts = Vec::new();
     for k in &list.kists {
         let id = kist_id(&k.developer, &k.option);
@@ -579,7 +559,7 @@ fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32
     for c in circles {
         let label = label_of(list, &c).unwrap_or("settings");
         let key = place_key(label);
-        match held(store, &key, now, ferros_kept::map::read_place, ferros_kept::upgrade::place)? {
+        match held(store, &key, ferros_kept::map::read_place)? {
             Held::Absent => {}
             Held::Read(p) => facts.push(Fact { kind: kind::PLACE, id: place_id(scope, &c), value: ints(&p), stamp: None }),
             Held::Out(why) => {
@@ -588,7 +568,7 @@ fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32
             }
         }
     }
-    match held(store, b"view", now, ferros_kept::map::read_view, ferros_kept::upgrade::view)? {
+    match held(store, b"view", ferros_kept::map::read_view)? {
         Held::Absent => {}
         Held::Read(v) => facts.push(Fact { kind: kind::VIEW, id: view_id(scope), value: ints(&v), stamp: None }),
         Held::Out(why) => {
@@ -786,7 +766,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if deck_sync(space, me) { FLEET } else { *me };
-        let Snapshot { mut facts, out_ids, out } = snapshot(&list, space, store, &scope, now).map_err(|_| "the map's places are not readable")?;
+        let Snapshot { mut facts, out_ids, out } = snapshot(&list, space, store, &scope).map_err(|_| "the map's places are not readable")?;
         kept_out = out;
         // A place or the view this device holds where the space holds a removal: the device's, stamped past the removal (owner, 2026-11-12, on the 8a: "sometimes that ferros logo just BOOP!").
         // A circle's place goes with its circle: an unstowed kist's is left alone by every device (`managed`), so a place's tombstone only ever came from a copy that lost its place while the circle stood, and it must not stick.
@@ -1262,28 +1242,22 @@ mod tests {
         v
     }
 
-    /// The first sync after the update, on a device whose copy an old build kept and synced: every place and the view are converted as the sync reads them (fgtw's sync may come before the map has started), each to the same values, and nothing reads as removed: the space does not change at all.
+    /// A device whose copy is still in the old forms (its conversion failed, or it skipped the converting build): every place and the view are kept out of the sync, nothing reads as removed, nothing is written over them, and the space does not change.
     #[test]
-    fn an_old_copy_converts_as_the_sync_reads_it_and_nothing_is_removed() {
+    fn an_old_copy_is_kept_out_and_nothing_is_removed() {
         let mut a = arranged_pro();
         let (mut sa, mut ba) = (Space::new(), Baseline::default());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
         let digest = sa.digest();
         let mut old = arranged_pro_old();
-        assert!(old.map.values().all(|v| read_place(v).is_none() && read_view(v).is_none()), "the old forms are not documents");
+        let held = old.map.clone();
+        assert!(held.values().all(|v| read_place(v).is_none() && read_view(v).is_none()), "the old forms are not documents");
         let o = sync(&mut sa, &mut ba, &mut old, &PRO, 2100).unwrap();
-        assert_eq!(o, Outcome::default(), "nothing kept out, nothing written from the space, nothing changed");
+        assert_eq!(o.kept_out.len(), 4, "three places and the view");
+        assert!(!o.space_changed && o.wrote == 0);
         assert_eq!(sa.digest(), digest);
         assert!(sa.entries().iter().all(|e| !e.gone));
-        assert_eq!(seen(&mut old), seen(&mut arranged_pro()), "every value converted, the same values");
-        // A fresh space from an old copy (a first sync ever, no baseline), a place from before turns among them: every place goes in, upright where it had no turn.
-        let mut old = arranged_pro_old();
-        old.map.insert(place_key("settings"), old_ewe(&[(-5 << 8, true), (7 << 8, true), (300, false)]));
-        let (mut sf, mut bf) = (Space::new(), Baseline::default());
-        let o = sync(&mut sf, &mut bf, &mut old, &PRO, 2200).unwrap();
-        assert!(o.kept_out.is_empty() && o.space_changed && o.wrote == 0);
-        assert_eq!(sf.get(kind::PLACE, &place_id(&FLEET, &Circle::Settings)).unwrap().value, ints(&[-5 << 8, 7 << 8, 300, ONE, 0]));
-        assert_eq!(sf.live(kind::PLACE).count(), 3);
+        assert_eq!(old.map, held, "nothing written over them");
     }
 
     /// A copy present but not a document this build reads (here a value no build wrote) is kept out of the sync: never read as the person removing it, never written over from the space, said in the outcome; the rest syncs as ever. Once it is a document again it is read.

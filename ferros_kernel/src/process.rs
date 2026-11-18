@@ -1599,7 +1599,7 @@ const SYS_NOTIFY: u64 = 43;
 const SYS_THREAD_NAME: u64 = 44;
 #[path = "notify.rs"]
 mod notify;
-pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report, PREFIX as NOTES_PREFIX};
+pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 pub const CALLER_KIST: u64 = 1 << 9;
 pub const ARC_GROW: u64 = 0;

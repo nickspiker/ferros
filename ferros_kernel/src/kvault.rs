@@ -276,41 +276,6 @@ impl ferros_pieces::Store for Pieces<'_> {
     }
 }
 
-/// The engine's stored bytes as they lie, under the seal: the envelope move's (`convert_device`), which needs no key.
-struct RawEngine<'a>(&'a mut Vault<Region, Region>);
-
-impl ferros_pieces::kv::convert::Raw for RawEngine<'_> {
-    type Error = manifestus::Error;
-    fn keys(&mut self) -> manifestus::Result<Vec<[u8; 32]>> {
-        self.0.live_keys()
-    }
-    fn get(&mut self, key: &[u8; 32]) -> manifestus::Result<Option<Vec<u8>>> {
-        self.0.get(key)
-    }
-    fn put(&mut self, key: &[u8; 32], value: &[u8]) -> manifestus::Result<()> {
-        self.0.put(key, value, now())
-    }
-}
-
-/// One class's values by name, opened and sealed: the move of the vault's own values (`move_one`).
-struct ClassValues<'a> {
-    kv: &'a mut KVault,
-    class: Class,
-}
-
-impl ferros_pieces::kv::convert::Values for ClassValues<'_> {
-    type Error = KvError;
-    fn get(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
-        self.kv.raw_get_in(self.class, name)
-    }
-    fn put(&mut self, name: &str, value: &[u8]) -> Result<(), KvError> {
-        self.kv.raw_put_in(self.class, name, value).map(|_| ())
-    }
-    fn wipe(&mut self, b: &mut [u8]) {
-        crate::keys::wipe_to_dram(b);
-    }
-}
-
 pub struct KVault {
     vault: Vault<Region, Region>,
     addr_key: [u8; 32],
@@ -322,10 +287,6 @@ pub struct KVault {
     bound: Option<bool>,
     /// Mirror A's first LBA, as `open` found it (`mirrors`).
     mirror_a: u64,
-    /// What the move to VSF said (`convert_device`, `convert_identity`), already in the flash log, for the console once the service runs (`take_notes`).
-    notes: Vec<String>,
-    /// Whether the service has taken the notes (the console is up).
-    console: bool,
 }
 
 impl KVault {
@@ -337,15 +298,7 @@ impl KVault {
         let (a, b) = mirrors()?;
         let mirror = Mirror::new(Region { base: a, blocks: REGION_BLOCKS }, Region { base: b, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
         let vault = Vault::open(mirror, RING_LOG2, now(), DeletePolicy::UnlinkOnly)?;
-        let mut kv = KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, bound: None, mirror_a: a, notes: Vec::new(), console: false };
-        kv.convert_device();
-        Ok(kv)
-    }
-
-    /// What the move to VSF said this boot, for the console (each line is in the flash log already); from now on its lines go to the console as they come.
-    pub fn take_notes(&mut self) -> Vec<String> {
-        self.console = true;
-        core::mem::take(&mut self.notes)
+        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, bound: None, mirror_a: a })
     }
 
     /// The identity's held keys, while one is unlocked.
@@ -720,8 +673,6 @@ impl KVault {
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
-        // The identity's own lists from before 2026-11-17, moved once into their documents now its key is in hand (`convert_identity`).
-        self.convert_identity();
         // One identity per device: a seed whose key opens no name list is not the bound identity's (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
         if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
             if self.bound()? {
@@ -1093,86 +1044,6 @@ impl KVault {
             self.vault.delete(&a, now())?;
         }
         Ok(ids.len() / 32)
-    }
-
-    // ── The one-shot move from the old forms (2026-11-17; docs/VSF-AUDIT.md P11 to P13): run at the first boot after the change and at that boot's first unlock, and deleted the same day once it has run on every device. ──
-
-    /// A line of the move: into the flash log now, and kept for the console (`take_notes`).
-    fn note(&mut self, line: String) {
-        crate::flashlog::line(&line);
-        // Before the service runs the console is not up: the RAM log now, the console when the service takes them; after, the console at once (an unlock's).
-        if self.console {
-            crate::process::push_console(alloc::format!("{line}\n").as_bytes());
-        } else {
-            crate::platform::pstore(alloc::format!("{line}\n").as_bytes());
-            self.notes.push(line);
-        }
-    }
-
-    /// One of the vault's own values in `class` moved into its document (`ferros_pieces::kv::convert::one`): left as it was, and said, when it is in neither form or does not write and read back.
-    fn move_one(&mut self, class: Class, name: &str, is_new: fn(&[u8]) -> bool, from_old: fn(&[u8], i64) -> Option<Vec<u8>>) -> bool {
-        use ferros_pieces::kv::convert::Moved;
-        let t = now();
-        let r = ferros_pieces::kv::convert::one(&mut ClassValues { kv: self, class }, name, is_new, |old| from_old(old, t));
-        match r {
-            Moved::Converted => true,
-            Moved::Absent | Moved::Already => false,
-            Moved::Left(why) => {
-                self.note(alloc::format!("kvault: the move to VSF left {name:?} as it was: {why}"));
-                false
-            }
-        }
-    }
-
-    /// At open: every stored envelope into its document (no key needed: each is moved sealed, as it lies), then the device class's own values into theirs. Before anything reads them: every reader takes only the documents.
-    fn convert_device(&mut self) {
-        use ferros_pieces::kv;
-        let t = now();
-        match kv::convert::envelopes(&mut RawEngine(&mut self.vault), t) {
-            Ok(w) => {
-                if w.wrapped > 0 || !w.left.is_empty() {
-                    self.note(alloc::format!("kvault: the move to VSF: {} sealed values wrapped in their documents, {} were already, {} left", w.wrapped, w.already, w.left.len()));
-                }
-                for (k, why) in w.left {
-                    self.note(alloc::format!("kvault: the move to VSF left the value at G#{:02X}{:02X}{:02X}{:02X} as it was: {why}", k[0], k[1], k[2], k[3]));
-                }
-            }
-            Err(e) => self.note(alloc::format!("kvault: the move to VSF could not list the vault's values ({e:?}); nothing wrapped, every old value left as it was")),
-        }
-        let mut moved = 0;
-        let values: [(&str, fn(&[u8]) -> bool, fn(&[u8], i64) -> Option<Vec<u8>>); 7] = [
-            (NAMES, |d| kv::names_of(d).is_some(), kv::convert::names),
-            (ID_ADDRS, |d| kv::entries_of(d).is_some(), kv::convert::entries),
-            (ID_SECRET, |d| kv::secret_of(d).is_some(), kv::convert::secret),
-            (ID_UNLOCK, |d| kv::unlock_of(d).is_some(), kv::convert::unlock),
-            (ID_BOUND, |d| kv::bound_of(d).is_some(), kv::convert::bound),
-            (GENESIS, |d| kv::genesis_of(d).is_some(), kv::convert::genesis),
-            (SEALED, |d| ferros_kist::seal::list_of(d).is_some(), ferros_kist::seal::list_from_old),
-        ];
-        for (name, is_new, from_old) in values {
-            moved += self.move_one(Class::Device, name, is_new, from_old) as usize;
-        }
-        // The address lists of every scope of the device class, and of the kept tags.
-        let prefixes: Vec<&str> = core::iter::once(TAGS).chain(crate::process::STORES.iter().map(|s| s.prefix)).filter(|p| class_of(p) == Class::Device).collect();
-        for p in prefixes {
-            moved += self.move_one(Class::Device, &Self::addrs_name(p), |d| kv::addresses_of(d).is_some(), kv::convert::addresses) as usize;
-        }
-        if moved > 0 {
-            self.note(alloc::format!("kvault: the move to VSF: {moved} of the device's own values in their documents"));
-        }
-    }
-
-    /// At unlock, once the identity's keys are held: its name list and the address lists of its scopes into their documents.
-    fn convert_identity(&mut self) {
-        use ferros_pieces::kv;
-        let mut moved = self.move_one(Class::Identity, ID_NAMES, |d| kv::names_of(d).is_some(), kv::convert::names) as usize;
-        let prefixes: Vec<&str> = core::iter::once(crate::process::NOTES_PREFIX).chain(crate::process::STORES.iter().map(|s| s.prefix)).filter(|p| class_of(p) == Class::Identity).collect();
-        for p in prefixes {
-            moved += self.move_one(Class::Identity, &Self::addrs_name(p), |d| kv::addresses_of(d).is_some(), kv::convert::addresses) as usize;
-        }
-        if moved > 0 {
-            self.note(alloc::format!("kvault: the move to VSF: {moved} of the identity's own values in their documents"));
-        }
     }
 
     /// `diag kv selftest`: put a 30 000-byte pattern, count the block I/O it costs, re-read every block the put appended (mirror A) and count how many still carry a valid seal, then get the value back and compare.

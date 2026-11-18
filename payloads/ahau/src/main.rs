@@ -598,46 +598,6 @@ fn keep_secret(grants: u64, kind: ferros_kept::secret::Kind, key: &[u8], value: 
     with_heap(|| ferros_kept::secret::build(kind, value, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(grants, S_AHAU), key, &doc)))
 }
 
-/// The one-shot converter has read both values (`upgrade_space`).
-static UPGRADED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// The one-shot converter (docs/VSF-AUDIT.md wave 0): the handle proof and the wallpaper seed kept before their documents (32 raw bytes each) made their documents, once the identity is open (its space refuses every read while locked, and this tries again at the next read); a value it cannot convert stays, said on the console.
-fn upgrade_space(grants: u64) {
-    use ferros_kept::secret::{parse, Kind};
-    use ferros_kept::upgrade::{secret, upgrade, Done};
-    if UPGRADED.load(core::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let c = cap(grants, S_AHAU);
-    let mut refused = false;
-    for (key, kind) in [(&b"proof"[..], Kind::HandleProof), (b"wallpaper", Kind::WallpaperSeed)] {
-        let read = || {
-            let mut b = [0u8; 1 << 8];
-            match ferros_sys::store_read_at(c, key, 0, &mut b) {
-                ferros_sys::NOTHING => Ok(None),
-                ferros_sys::ERR => Err(()),
-                // WHY the min: the vault copies at most the buffer; a value past it is neither form, and its cut bytes are refused alike.
-                n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
-            }
-        };
-        let done = with_heap(|| upgrade(&mut (read, |b: &[u8]| ferros_sys::store_set(c, key, b)), |d| parse(kind, d).is_some(), |o| secret(kind, o, ferros_sys::eagle_now())));
-        let mut l = Line::new();
-        match done {
-            Ok(Done::Converted) => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: ahau.{} is now its VSF document\n", core::str::from_utf8(key).unwrap_or("")));
-                console(grants, l.as_bytes());
-            }
-            Ok(_) => {}
-            Err("the vault refused the read") => refused = true,
-            Err(why) => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: ahau.{} was left as it was, not converted: {}\n", core::str::from_utf8(key).unwrap_or(""), why));
-                console(grants, l.as_bytes());
-            }
-        }
-    }
-    UPGRADED.store(!refused, core::sync::atomic::Ordering::Release);
-}
-
 /// ahau's region of the layer arena, past the quick pass's pixels (GPU_OUT, 6.5 MB): the circle's staged coordinates and the fine passes' sums.
 const GPU_STAGE: usize = 8 << 20;
 const GPU_SUMS: usize = 11 << 20;
@@ -2504,7 +2464,6 @@ impl Ahau {
 
     /// The handle proof for the unlocked identity: kept in its own sealed space after the first time (`ahau.proof`; the proof is public, it is what beacons and the registry carry), so a handle this device recognizes never computes it again. Otherwise computed on the X3 (about 5 s; 9.5 s on a worker core, 2026-10-31), the status saying so when `say`, and kept.
     fn proof_for(&mut self, seed: &[u8; 32], say: bool) -> [u8; 32] {
-        upgrade_space(self.grants);
         if let Some(p) = read_secret(self.grants, ferros_kept::secret::Kind::HandleProof, b"proof") {
             console(self.grants, b"ahau: handle proof from this identity's space (recognized)\n");
             return p;
@@ -2540,7 +2499,6 @@ impl Ahau {
     fn wallpaper(&self, ws: &[u8; 32]) {
         let ws = *ws;
         // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the deck (owner, 2026-11-08: "should be milliseconds").
-        upgrade_space(self.grants);
         let same = read_secret(self.grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper") == Some(ws);
         if !same && !keep_secret(self.grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper", &ws) {
             console(self.grants, b"ahau: the wallpaper seed was not kept\n");
@@ -3370,7 +3328,6 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if at_boot {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).
-        upgrade_space(grants);
         if let Some(ws) = read_secret(grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper") {
             send_wallpaper(cap(grants, S_DISPLAY), &ws);
         }

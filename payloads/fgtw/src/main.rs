@@ -629,8 +629,6 @@ struct Client {
     fgtw_asked_us: u64,
     /// The facets served to kists and the person's people (facets.rs).
     facets: facets::Facets,
-    /// The one-shot converter has read every root and the sponsor (`upgrade_disk`): not again this run.
-    upgraded: bool,
 }
 
 impl Client {
@@ -706,42 +704,6 @@ impl Client {
         v
     }
 
-    /// The one-shot converter (docs/VSF-AUDIT.md wave 0): the roots and the sponsor kept before their documents (32 raw bytes each, the sponsor's 19) made their documents, once the identity is open (they are identity class: while locked every read is refused, and the converter tries again at the next look). A value it cannot convert stays as it was, said once.
-    fn upgrade_disk(&mut self) {
-        use ferros_kept::secret::{parse, Kind};
-        use ferros_kept::upgrade::{secret, sponsor, upgrade};
-        if self.upgraded {
-            return;
-        }
-        let c = cap(self.log.grants, S_STORE);
-        let mut refused = false;
-        for (key, kind) in [(&b"identity_seed"[..], Some(Kind::IdentitySeed)), (b"handle_proof", Some(Kind::HandleProof)), (b"fleet_key", Some(Kind::FleetKey)), (b"sponsor", None)] {
-            let mut slot = (|| space::read_whole(c, key), |b: &[u8]| ferros_sys::store_set(c, key, b));
-            let done = match kind {
-                Some(k) => upgrade(&mut slot, |d| parse(k, d).is_some(), |o| secret(k, o, ferros_sys::eagle_now())),
-                None => upgrade(&mut slot, |d| ferros_kept::sponsor::parse(d).is_some(), |o| sponsor(o, ferros_sys::eagle_now())),
-            };
-            match done {
-                Ok(ferros_kept::upgrade::Done::Converted) => {
-                    self.log.put(b"fgtw: fgtw.");
-                    self.log.put(key);
-                    self.log.put(b" is now its VSF document");
-                    self.log.line();
-                }
-                Ok(_) => {}
-                Err("the vault refused the read") => refused = true,
-                Err(why) => {
-                    self.log.put(b"fgtw: fgtw.");
-                    self.log.put(key);
-                    self.log.put(b" was left as it was, not converted: ");
-                    self.log.put(why.as_bytes());
-                    self.log.line();
-                }
-            }
-        }
-        self.upgraded = !refused;
-    }
-
     /// Everything of the identity gone from the vault (unlock-at-boot off, or a wipe): the seed, proof, chain and fleet key. The handle itself was never on disk.
     fn forget_disk(&self) {
         for key in [&b"identity_seed"[..], b"handle_proof", b"chain", b"fleet_key"] {
@@ -756,7 +718,6 @@ impl Client {
     /// `load`, saying where the client stands only when `say` (the two-second look for roots is quiet until they appear).
     fn load_saying(&mut self, say: bool) {
         use ferros_kept::secret::Kind;
-        self.upgrade_disk();
         if self.given.is_none() {
             let mut g = [0u8; 1 << 8];
             // WHY the length check: the vault says the whole length and copies at most the buffer; a longer value is not a sponsor's document.
@@ -2346,7 +2307,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new(), upgraded: false };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 
