@@ -2500,7 +2500,8 @@ impl Map {
             m[at + 12] = a.icon;
             // The settings circle's name in the person's language (its `label` stays the English key its place is kept under); a kist's is its own. The op's field holds 16 bytes, cut at a character's edge (`fit`).
             let label = fit(if i == 0 { tr(Msg::Settings) } else { a.label }, 16).as_bytes();
-            let len = if labels || a.icon == 0 { label.len() } else { 0 };
+            // A puck's name always: the display shows it in the circle until the puck's first square (a puck waiting on its first tap's permissions, or not yet up).
+            let len = if labels || a.icon == 0 || (PUCK0..PUCK0 + PUCKS as u8).contains(&a.icon) { label.len() } else { 0 };
             m[at + 13] = len as u8;
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }

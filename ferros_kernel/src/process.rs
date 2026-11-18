@@ -8398,6 +8398,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     };
     // Its surface's owner alive from here: the display's bell says so before the process can show a window on it.
     surfaces_ring();
+    // And its square's, a puck's (2026-11-18, the 8a: `puck_take` rang the squares' bell before the process was in the table, so the newest puck's slot read as nobody's and the display drew nothing for it until another square came or went: only basecalc showed, the clock did not).
+    pucks_ring();
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);

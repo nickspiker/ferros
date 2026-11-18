@@ -1311,6 +1311,24 @@ fn text_turned_centre(pixels: &mut [Px], width: usize, height: usize, s: &str, c
     glyph_draw(g, pixels, width, height, s, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, px, turn, colour);
 }
 
+/// A puck with no square yet (waiting on its first tap's permissions, or not yet up): its name in its circle, turned with its face, as wide as a chord of three quarters of the circle allows, so the circle reads as that puck rather than an empty one (owner, 2026-11-18, on the 8a: "only the calculator puck shows").
+#[allow(clippy::too_many_arguments)]
+fn puck_name(px: &mut [Px], width: usize, height: usize, cir: &Circle, cx: i64, cy: i64, r: i64, tc: i64, ts: i64, colour: u32) {
+    let Ok(name) = core::str::from_utf8(&cir.label[..cir.len as usize]) else { return };
+    if name.is_empty() {
+        return;
+    }
+    let room = (r >> 8) as f32 * 1.5;
+    // WHY the floor: a name with no advance in the typeface would give a width of 0 to divide by.
+    let w = text_width(&Font, name, 100.).max(1.);
+    // As big as the chord allows, and never past a fifth of the circle's height: a smooth minimum, so the size does not kink as the circle grows.
+    let fit = room / w * 100.;
+    let cap = (r >> 8) as f32 * 0.4;
+    let size = fit * cap / libm::sqrtf(fit * fit + cap * cap);
+    text_turned_centre(px, width, height, name, (cx >> 8) as f32 + 0.5, (cy >> 8) as f32 + 0.5, size, (tc as f32 / 16384., ts as f32 / 16384.), 0xFF00_0000 | colour);
+    ALLOC.reset();
+}
+
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
@@ -8495,13 +8513,17 @@ fn server(grants: u64) -> ! {
                                 if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
                                     let (spr, ext) = sprite(i, key, d, |px, d| {
                                         let c = ((d as i64 / 2) << 8) | 128;
-                                        puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts);
+                                        if !puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts) {
+                                            puck_name(px, d, d, &cir, c, c, ri, tc, ts, th.text2);
+                                        }
                                         draw::disc(px, d, d, c, c, ri, plane);
                                     });
                                     scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
                                 } else {
                                     let clip = draw::Rect::full(width, height).intersect(unsafe { draw::CLIP });
-                                    puck::draw_into(pixels, width, clip, j, sx, sy, ri, tc, ts);
+                                    if !puck::draw_into(pixels, width, clip, j, sx, sy, ri, tc, ts) {
+                                        puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
+                                    }
                                     scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
                                 }
                                 let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
