@@ -6,6 +6,7 @@
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
+//! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 #![no_std]
 #![no_main]
 
@@ -55,7 +56,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let ep = cap(g, 1);
     let buf = unsafe { &mut *(&raw mut BUF) };
     let t0 = ferros_sys::now();
-    let n = call(ep, &[0], &mut buf[..1 << 16]);
+    // The ladder (fourth byte 5) opens first: a driver spawned by hand ends after a LIST that leaves nothing open, and the OPEN behind it would then start the vault's driver, not the one under test (2026-11-17, b932: the first ladder ran on the stored driver).
+    let n = if arg(3) == 5 { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
     say!(g, "camtest: LIST A#{} bytes in A#{} ms\n", if n == ERR { 0 } else { n }, ferros_sys::us_since(t0) / 1000);
     if n == ERR {
         ferros_sys::exit(1);
@@ -85,6 +87,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     // A fourth byte of 3: the gain's curve (owner, 2026-11-17: "the ISO doesn't do anything in lumis").
     if arg(3) == 3 {
         gain_curve(g, ep, id, bin, arg(0), arg(5), t1);
+    }
+    // A fourth byte of 5: the exposure walked past the init's frame (owner, 2026-11-17: Lumis to expose as long as on Android).
+    if arg(3) == 5 {
+        long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
     let mut r = [0u8; 4];
     let n = call(ep, &[1, id], &mut r);
@@ -135,6 +141,89 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// The exposure past the init's frame, step by step: OPEN, then 2^6 ms doubling to 2^`top_log2` ms (11 if 0) and back to 2^6 ms, each a SET and `per` frames (4 if 0) after two let pass (the hold lands at a frame's start, and the frame begun before it may still come), with:
+/// - the SET's answer (0 taken, 1 refused: past the list's longest);
+/// - the frames' spacing (us), which should follow the frame: the init's 68.9 ms until the exposure passes it, then the exposure and the sensor's margin;
+/// - the mean sample (every 16th binned sample, in 16ths), which should double with each step until it saturates;
+/// - the header's exposure, and the sensor's frame length, line length and integration read back (CAPS: G#0340, G#0342, G#0202), which should be what the driver's console line said it wrote.
+/// A step whose frames stop ends the run with the driver's own "no frame" line on the console; the close powers the module down, so the next open is a cold sensor (docs/CAMERA.md "Long exposures").
+fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_log2: u8, t1: u64) -> ! {
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    let mut r = [0u8; 4];
+    let n = call(ep, &[1, id], &mut r);
+    say!(g, "camtest: long exposures: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 {
+        ferros_sys::exit(1);
+    }
+    let set = |value: u64| -> u8 {
+        let mut m = [3u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut r = [0xEEu8; 1];
+        if call(ep, &m, &mut r) == ERR { 0xEE } else { r[0] }
+    };
+    let per = if per == 0 { 4 } else { per as u32 };
+    let top = if top_log2 == 0 { 11 } else { top_log2 };
+    // A frame's mean sample (every 16th binned sample, in 16ths) and the header's exposure (ns); None when no frame came.
+    let mut frame = || -> Option<(u64, u64)> {
+        let n = call(ep, &[2, bin], buf);
+        if n == ERR || n < 64 {
+            return None;
+        }
+        let samples = &buf[64..n as usize];
+        let (mut sum, mut cnt) = (0u64, 0u64);
+        for s in samples.chunks_exact(2).step_by(1 << 4) {
+            sum += u16::from_le_bytes([s[0], s[1]]) as u64;
+            cnt += 1;
+        }
+        // WHY the max: a reply of the header alone has no samples, and the mean would divide by zero and panic the process.
+        Some((sum * 16 / cnt.max(1), u64::from_le_bytes(buf[16..24].try_into().unwrap())))
+    };
+    let mut steps = [0u8; 1 << 5];
+    let mut k = 0;
+    // The first step, 2^`bottom_log2` ms (6 if 0): a ladder of long steps need not walk up from 64 ms.
+    let bottom = if bottom_log2 == 0 { 6 } else { bottom_log2 };
+    for e in bottom..=top {
+        steps[k] = e;
+        k += 1;
+    }
+    steps[k] = 6;
+    k += 1;
+    for &e in steps[..k].iter() {
+        let ms = 1u64 << e;
+        let a = set(ms * 1_000_000);
+        if a != 0 {
+            say!(g, "camtest: exposure A#{ms} ms: refused (A#{a})\n");
+            continue;
+        }
+        for _ in 0..2 {
+            if frame().is_none() {
+                say!(g, "camtest: exposure A#{ms} ms: no frame after the SET\n");
+                ferros_sys::exit(1);
+            }
+        }
+        let (mut sum, mut hdr, mut gaps) = (0u64, 0u64, 0u64);
+        let mut last = ferros_sys::now();
+        for _ in 0..per {
+            let Some((m, x)) = frame() else {
+                say!(g, "camtest: exposure A#{ms} ms: the frames stopped\n");
+                ferros_sys::exit(1);
+            };
+            let now = ferros_sys::now();
+            gaps += (now - last) * 1_000_000 / ferros_sys::freq();
+            last = now;
+            sum += m;
+            hdr = x;
+        }
+        let mut c = [0u8; 103];
+        let cn = call(ep, &[11], &mut c);
+        let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
+        say!(g, "camtest: exposure A#{ms} ms: header A#{} us; frames A#{} us apart; mean sample A#{} sixteenths; the sensor reads frame A#{} lines of A#{} clocks, integration A#{}{}\n", hdr / 1000, gaps / per as u64, sum / per as u64, be(38), be(40), be(67), if cn == ERR { " (CAPS failed)" } else { "" });
+    }
+    let n = call(ep, &[4], &mut r);
+    say!(g, "camtest: long exposures done; CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { r[0] as u64 });
     ferros_sys::exit(0)
 }
 
