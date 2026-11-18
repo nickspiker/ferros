@@ -146,6 +146,43 @@ pub fn rewrite(list: &mut [u8], from: &Geom, to: &Geom, scope: Scope) -> u32 {
     n as u32
 }
 
+/// The processing blocks' switches, what a windowed mode may turn off so loch0's frame goes to memory alone (docs/CAMERA.md "The slit's second blocker"): (register, the value written instead, the bit of the `detach` mask that asks it).
+/// Read off the slit deaths of 2026-11-17 night (`ack_say`): with a window, the bayer front-end context 3 (FC ctx3, G#1C33_7300) reports FC_ERROR (bit 7) and the LMP's bayer context 3 (G#1C35_00E8) FE_LMP_ERROR (bit 3), never their EOF, then loch0 SHORT_VB_FATAL; with whole frames neither errs. Both blocks are set up by the program for 4080 x 3072 (FC ctx3's size at G#1C33_7904, its statistics windows past G#1C33_7500, the LMP's thousands of words at G#1C35_4000), and geometry everywhere (`Scope::All`) did not save the slit.
+/// The values are Linux's close's (kernel camera_close.rs): G#1C33_7028 and G#1C33_B028 to 0 (the contexts' enables, 1 in the program), the crossbar words G#1C33_0C08 and G#1C33_0D08 to 2 (G#7C and 2 at the open, CPU 'before'), and G#1C34_0000 to 0 (1 in the program; the block at G#1C34 sized for the PD rows, G#1C34_0014 = 768 x 4080).
+pub const DETACH: [(u32, u32, u8); 5] = [(0x1C33_7028, 0, 1 << 0), (0x1C33_B028, 0, 1 << 1), (0x1C33_0C08, 2, 1 << 2), (0x1C33_0D08, 2, 1 << 2), (0x1C34_0000, 0, 1 << 3)];
+
+/// A write's value with the `mask`'s switches off (`DETACH`), or as it was.
+pub fn detached(reg: u32, v: u32, mask: u8) -> u32 {
+    for &(r, off, bit) in DETACH.iter() {
+        if r == reg && mask & bit != 0 {
+            return off;
+        }
+    }
+    v
+}
+
+/// The program's writes with the `mask`'s switches off (`DETACH`): how many words changed.
+pub fn detach(list: &mut [u8], mask: u8) -> u32 {
+    let mut changes = [(0usize, 0u32); 1 << 3];
+    let mut n = 0;
+    {
+        let snap: &[u8] = list;
+        writes(snap, &mut |i, reg| {
+            let v = w32(snap, i * 4);
+            let nv = detached(reg, v, mask);
+            // WHY the bound: `DETACH` names five registers and the main's program writes each at most once; one past the table is left as captured.
+            if nv != v && n < changes.len() {
+                changes[n] = (i, nv);
+                n += 1;
+            }
+        });
+    }
+    for &(i, v) in &changes[..n] {
+        list[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    n as u32
+}
+
 /// The slim per-frame program's reach: level 1 the image and PD paths (G#1C32: their DMA setup, addresses and requests, the frame's whole way into memory), level 2 also the processing blocks' request and go words the program ends with (G#1C33_7xxx, G#1C33_Bxxx, G#1C34_00xx).
 pub fn slim_reg(reg: u32, level: u8) -> bool {
     let l1 = (0x1C32_0000..0x1C33_0000).contains(&reg);
@@ -260,5 +297,26 @@ mod tests {
             println!("G#{:X}: G#{:X} -> G#{:X}", c.0, c.1, c.2);
         }
         assert!(changed.iter().any(|c| c.0 == 0x1C32_0474) && changed.iter().any(|c| c.0 == 0x1C05_0044));
+    }
+
+    /// The processing blocks' switches (`DETACH`): each bit changes only its own words, in the main's program (G#1C33_7028, G#1C33_B028, G#1C34_0000, once each) and its CPU 'before' writes (the crossbar's G#1C33_0C08 from G#7C; G#1C33_0D08 is 2 already); none of loch0's.
+    #[test]
+    fn detach_switches() {
+        assert_eq!(detached(0x1C33_7028, 1, 1), 0);
+        assert_eq!(detached(0x1C33_7028, 1, 2), 1);
+        assert_eq!(detached(0x1C33_0C08, 0x7C, 4), 2);
+        assert_eq!(detached(0x1C32_0474, 0x0C00_0FF0, 0xFF), 0x0C00_0FF0);
+        let Ok(jb) = std::fs::read("/mnt/Harbor/Code/ferros/target/cam/cam.pdma") else { return };
+        let (at, len) = job::list_piece(&jb).unwrap();
+        let orig = jb[at..at + len].to_vec();
+        for (mask, want) in [(1u8, 1u32), (2, 1), (4, 0), (8, 1), (0xF, 3)] {
+            let mut l = orig.clone();
+            assert_eq!(detach(&mut l, mask), want, "mask {mask}");
+        }
+        let Ok(b) = std::fs::read("/mnt/Harbor/Code/ferros/target/cam/cam.frame") else { return };
+        let (_, prog) = crate::inputs::split_bundle(&b).unwrap();
+        let p = crate::inputs::prog(prog).unwrap();
+        let n = p.before.iter().chain(p.after.iter()).filter(|&(a, v)| detached(a as u32, v, 4) != v).count();
+        assert_eq!(n, 1);
     }
 }

@@ -466,9 +466,9 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
             first_n = newest;
             last = newest - 1;
         }
-        // The oldest buffer is the next the engine writes: keep to the newest ring - 1.
-        // WHY the saturating subtraction: in the ring's first `ring - 2` frames every buffer written is safe, and newest + 2 - ring would wrap below zero; the max then keeps to the frames not yet read.
-        let from = (last + 1).max((newest + 2).saturating_sub(ring));
+        // The oldest buffer is the next the engine writes: keep to the newest ring - 2 (the one after it has its probe patterned for the frame after the next: payloads/camera `slit_turn`).
+        // WHY the saturating subtraction: in the ring's first `ring - 3` frames every buffer written is safe, and newest + 3 - ring would wrap below zero; the max then keeps to the frames not yet read.
+        let from = (last + 1).max((newest + 3).saturating_sub(ring));
         lost += from - (last + 1);
         for f in from..=newest {
             let at = v.base + ((f - 1) % ring) as usize * buf;

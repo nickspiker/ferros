@@ -420,6 +420,8 @@ static LTE_MOST: AtomicU64 = AtomicU64::new(0);
 static MEASURE: AtomicU64 = AtomicU64::new(0);
 /// A device test, the hand spawn's fifth byte: a side channel off at the sensor in any mode (bit 0 phase detect, bit 1 embedded data).
 static SIDE_TEST: AtomicU64 = AtomicU64::new(0);
+/// A device test, the hand spawn's eighth byte: the processing blocks' switches to turn off (ferros_cam geom `DETACH`: bit 0 FC ctx3, bit 1 the context at G#1C33_B000, bit 2 the crossbar, bit 3 the block at G#1C34).
+static DETACH: AtomicU64 = AtomicU64::new(0);
 /// Descriptors released ahead of the engine (the hand spawn's sixth byte, a device test; 0 or 1: one, as Linux's start does): the stream on releases this many, each DMA_DONE one more, so a late answer has this many frames of slack instead of the frame's blanking (camera-full-rate, 2026-11-18: every death so far was one answer later than the blanking, the kernel lock held elsewhere).
 static LEAD: AtomicU64 = AtomicU64::new(1);
 /// A late answer made on purpose (the hand spawn's seventh byte k, a device test; 0 none): every 2^8th frame's DMA_DONE answered 2^k us late, as a kernel lock held elsewhere makes it (the 2026-11-18 death: 3.3 ms behind a set_pref).
@@ -702,7 +704,7 @@ fn desc_for(e: u64, r: usize) {
     unsafe { core::ptr::write_volatile((DESC_VA.load(Ordering::Relaxed) + e * 16) as *mut [u32; 4], d) };
 }
 
-/// A frame's DMA_DONE with a slit ring (docs/CAMERA.md "The slit"): no choice and no hold, every descriptor named its buffer at the open (descriptor e buffer e mod the ring), so frame n lands in buffer (n - 1) mod the ring when its descriptor was released before it began. Its probe says whether it did (else it went where the last one did: `LATE`), its record is written after its rows (ferros_cam job `slit_bytes` leaves it 64 bytes: the frame's count, the counter at its DMA_DONE, its Eagle time, 1 when its probe moved), and the buffer the next descriptor names has its probe patterned before that descriptor is released (the consumer keeps clear of the oldest buffer: SLITS).
+/// A frame's DMA_DONE with a slit ring (docs/CAMERA.md "The slit"): no choice and no hold, every descriptor named its buffer at the open (descriptor e buffer e mod the ring), so frame n lands in buffer (n - 1) mod the ring when its descriptor was released before it began. Its probe says whether it did (else it went where the last one did: `LATE`), its record is written after its rows (ferros_cam job `slit_bytes` leaves it 64 bytes: the frame's count, the counter at its DMA_DONE, its Eagle time, 1 when its probe moved), and the buffer two frames on has its probe patterned (the next frame's buffer may be under the engine already: since 2026-11-18 the kernel releases its descriptor in the interrupt, before this thread runs, so that probe was patterned a frame earlier; the consumer keeps clear of the two oldest buffers: SLITS).
 fn slit_turn(n: u64) {
     let m = SLITS.load(Ordering::Relaxed) as usize;
     let b = ((n - 1) % m as u64) as usize;
@@ -717,7 +719,7 @@ fn slit_turn(n: u64) {
         core::ptr::write_volatile(rec.add(2), eagle_ns());
         core::ptr::write_volatile(rec.add(3), moved as u64);
     }
-    probe_pattern((n % m as u64) as usize);
+    probe_pattern(((n + 1) % m as u64) as usize);
     ferros_sys::dma_barrier();
 }
 
@@ -1368,6 +1370,12 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let m_ = job::relocate(&mut jb[..jn], pa, &l).map_err(Fail::Job)?;
     let (list_at, list_len) = job::list_piece(&jb[..jn]).map_err(Fail::Job)?;
     let regeom = if fe != from { geom::rewrite(&mut jb[list_at..list_at + list_len], &from, &fe, scope) } else { 0 };
+    // A device test (the hand spawn's eighth byte, `DETACH`): the processing blocks' switches off (ferros_cam geom `DETACH`), so loch0's frame goes to memory alone.
+    let detach = DETACH.load(Ordering::Relaxed) as u8;
+    if detach != 0 {
+        let k = geom::detach(&mut jb[list_at..list_at + list_len], detach);
+        say!(g, "camera: detach G#{detach:X}: A#{k} program words switched off; the CPU's crossbar words as Linux's close leaves them\n");
+    }
     let pieces = job::pieces(&jb[..jn]).map_err(Fail::Job)?;
     for &(old, at, len) in pieces.iter() {
         let dst = va + (old - job::OLD_JOB) as usize;
@@ -1429,7 +1437,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The CPU's setup writes before the engine starts, in the capture's order, their geometry the front end's; without them the engine applies the program and the frame writer stays idle (2026-10-20).
     let (mut n, mut cpu_geom) = (0, 0);
     let mut cpu = |a: usize, v: u32| {
-        let nv = geom::value(a as u32, v, &from, &fe, scope);
+        let nv = geom::detached(a as u32, geom::value(a as u32, v, &from, &fe, scope), detach);
         cpu_geom += (nv != v) as u32;
         wr(g, a, nv);
     };
@@ -1993,6 +2001,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 6 {
         LATE_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 6) as *const u8) } as u64, Ordering::Relaxed);
     }
+    if input_len > 7 {
+        DETACH.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 7) as *const u8) } as u64, Ordering::Relaxed);
+    }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
@@ -2403,7 +2414,7 @@ fn stats() -> [u8; 8 * STATS_WORDS] {
     out
 }
 
-/// SLITS' reply, the drain (docs/CAMERA.md "The ring drained"): little-endian u64s: the newest frame's count, the ring's buffers, a buffer's bytes, the rows, a line's bytes, the width, frames not where the ring put them, how many times the engine's index went round its ring. Frame n is in buffer (n - 1) mod the ring, at n's buffer times its bytes in the view; its record (`slit_turn`: count, counter, Eagle time, probe moved) right after the rows. The oldest buffer is the next the engine writes (its probe patterned as its descriptor is released), so a reader keeps to the newest ring - 1, and a slit whose record reads another count after its rows were copied was written over while read.
+/// SLITS' reply, the drain (docs/CAMERA.md "The ring drained"): little-endian u64s: the newest frame's count, the ring's buffers, a buffer's bytes, the rows, a line's bytes, the width, frames not where the ring put them, how many times the engine's index went round its ring. Frame n is in buffer (n - 1) mod the ring, at n's buffer times its bytes in the view; its record (`slit_turn`: count, counter, Eagle time, probe moved) right after the rows. The two oldest buffers are the next the engine writes and the one whose probe is patterned for the frame after (the kernel may release the next descriptor before this driver answers), so a reader keeps to the newest ring - 2, and a slit whose record reads another count after its rows were copied was written over while read.
 fn slits() -> [u8; 64] {
     let w: [u64; 8] = [
         FRAMES.load(Ordering::Acquire),
