@@ -1,8 +1,11 @@
 # DISPLAY-SCROLL: a scroll frame on the display side, and how to stop moving pixels
 
 Status: a design for the owner to decide from (the rule "display driver: design first").
-Nothing here is built.
 Written 2026-11-17, ferros forge at 8a993b59, fluor 6fc6ea5, Photon f209cf09.
+Built the same day (owner: "your call on the B and B+, I like both"; B first, as B+'s first step): option B (section 2) with knobs 0 and 1 as proposed, and recommendation step 1's split of op 22's call from the publish.
+- The display: op 22's 50-byte form (`Ring`, `ring_of`), the row map (`src_row`, `ring_cuts`, `layer_row`, the hit map's rows), op 5's byte 14 (`FEATURES`, bit 0: rings; byte 13 became the Escapes count on forge, op 76, so the features moved to 14 when this merged on 2026-11-20 and fluor's ferros-scroll-ring host must read 14), text ops refused into a ringed window; the stats line's app shows split into the call on the receive thread, the wait in the ring, the publish and the armed frame's wait, and a count of shows that came while the window's last show was still being read (knob 2, measured, not closed).
+- fluor (branch ferros-scroll-ring): `paint::ring` and the ferros host's ring, used only when op 5 says the display reads one.
+- Knob 14 is not built: on husky's HK3 (`PANEL_HOLDS`) a frame starts only when one is armed, so after a show's own frame no frame starts are counted until something arms again; counting N of them needs either armed frames of the phase on the glass, which delay an on-time app's next frame by a refresh, or a TE count without frames (the TE pin, gpp0-3, as an interrupt). The eighth of a second stays until the owner picks one.
 
 Photon's scroll frames on the Pro take about 17 ms; the target is 8.3 ms (120 a second).
 Two of the costs left are the display's side of the frame:

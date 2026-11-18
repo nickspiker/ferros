@@ -10,7 +10,7 @@
 //! - 2 `text [x i16][y baseline i16][px][colour][align: 0 left, 1 centre at x, 2 right edge at x][utf-8…]`: x and y signed (since 2026-11-05: the settings pages slide off either edge), so text may start off the screen and is clipped by pixel.
 //! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
 //! - 4 `present`: the frame goes to the panel (what nothing painted shows black). Reply byte 1 = whether DECON advanced.
-//! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32]`.
+//! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32][app in front u8][escapes unused u8][features u8]` (`FEATURES`).
 //! - 6 `brightness [dbv u16]`: the panel's DBV (196 = 2 nits … 3307 = 1000 nits; DISPLAY-HK3.md §4), through DSIM from this process.
 //! - 7 `refresh [hz u8]`: 60 or 120, the panel's own command set plus DSIM's command-TE timers.
 //! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
@@ -28,7 +28,7 @@
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
 //! - 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16 Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, centred together (COMPOSITOR.md "Controls").
-//! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47; bit 48 = no dither), by the optional format byte: 0 working values (gamma 2, white = Q14), 1 fluor's G2T16, both baked by the display every frame; 2 `BAKED`, already the panel's codes (bake.rs), presented as they are; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
+//! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47; bit 48 = no dither), by the optional format byte: 0 working values (gamma 2, white = Q14), 1 fluor's G2T16, both baked by the display every frame; 2 `BAKED`, already the panel's codes (bake.rs), presented as they are; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12) and the forms this display reads (byte 14, `FEATURES`: bit 0, the 50-byte form's ring; byte 13 is the Escapes the apps did not use, op 76).
 //! - 65 `bake` → [0][generation u32][k f32][m 9 × f32][g f32]: the bake a `BAKED` surface is made with (bake.rs, ferros_sys `window::bake`); a change of it is each window's event `EV_BAKE` (op 62).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! - 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
@@ -3644,6 +3644,92 @@ fn window_pixels(k: usize, width: usize, height: usize) -> &'static mut [u64] {
     surface(unsafe { PIXELS[k] } as usize, width, height)
 }
 
+/// What this display reads beyond the forms every client may send, op 5's byte 14 (a client of an older display gets 14 bytes and assumes none; byte 13 is the Escapes count, op 76): bit 0, a ring in op 22's 50-byte form (`Ring`).
+const FEATURES: u8 = 1;
+
+/// A window's scrolling pane as a ring of rows (op 22's 50-byte form; DISPLAY-SCROLL.md section 2, option B, 2026-11-17): screen row y inside the rect's rows and columns is read from surface row `y0 + (y − y0 + o) mod H`, H = y1 − y0, and every other pixel where it is.
+/// A scroll then moves the origin, never the pixels (fluor's ferros host, `paint::ring`, writes its damage thru the same map).
+/// Stated with every show: a show without the form has none (`NO_RING`), so nothing of it is held that its window did not just say; the idle fill reads thru the ring its window's last show named.
+#[derive(Clone, Copy)]
+struct Ring {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+    o: usize,
+}
+/// No ring: no row is inside it (y1 = 0), so every row is read where it is.
+const NO_RING: Ring = Ring { x0: 0, x1: 0, y0: 0, y1: 0, o: 0 };
+/// Each window's ring, by its surface (as `WINS`); written by op 22 on the render thread, read by the publish's threads while the render thread waits for them.
+static mut RINGS: [Ring; SURFACES] = [NO_RING; SURFACES];
+
+/// The ring op 22's 50-byte form names (`[x u16][y u16][w u16][h u16][origin u16]` at byte 40), or `NO_RING` for a shorter form or a height of 0.
+/// WHY the checks: the rect and the origin are the client's word, and the reader indexes the surface at `y0 + (y − y0 + o) mod H` for rows and columns inside the rect; a rect past the screen or an origin past its height would read past the surface (a panic in the display for every window).
+/// Such a ring is refused, read as none, and said on the console at every power of two.
+fn ring_of(m: &[u8], width: usize, height: usize) -> Ring {
+    if m.len() < 50 {
+        return NO_RING;
+    }
+    let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as usize;
+    let (x, y, w, h, o) = (v(40), v(42), v(44), v(46), v(48));
+    if h == 0 {
+        return NO_RING;
+    }
+    if w == 0 || x + w > width || y + h > height || o >= h {
+        let n = RING_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n & (n - 1) == 0 {
+            let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
+            l.s(b"display: a show's ring outside the screen or past its height (A#");
+            l.dec(n);
+            l.s(b" so far): read as none\n");
+            l.flush();
+        }
+        return NO_RING;
+    }
+    Ring { x0: x, x1: x + w, y0: y, y1: y + h, o }
+}
+static RING_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// The surface row screen row `y` of window `k`'s pixels is read from at column `x`: thru its ring inside the ring's rect, else `y`.
+/// One compare and one subtraction past the rect test (`y − y0 + o` is under 2H): a row's or a run's, never a pixel's, except in the hit map's rows, written only when the layout changes.
+#[inline]
+fn src_row(k: usize, y: usize, x: usize) -> usize {
+    let g = unsafe { RINGS[k] };
+    if y >= g.y0 && y < g.y1 && x >= g.x0 && x < g.x1 {
+        let (r, h) = (y - g.y0 + g.o, g.y1 - g.y0);
+        g.y0 + if r >= h { r - h } else { r }
+    } else {
+        y
+    }
+}
+
+/// Columns `a..b` of screen row `y` cut where any ring of the chain's windows starts or ends on that row, into `cuts` (the first `a`, the last `b`), so each run reads every window from one source row (`src_row` at the run's first column holds for the whole run).
+/// Returns how many cuts; one run, `a..b`, when no ring of the chain reaches the row.
+fn ring_cuts(chain: &[u8], order: &[(u8, u8, u8)], y: usize, a: usize, b: usize, cuts: &mut [usize; 2 * SURFACES + 2]) -> usize {
+    cuts[0] = a;
+    let mut n = 1;
+    for &i in chain {
+        let g = unsafe { RINGS[order[i as usize].0 as usize] };
+        if y < g.y0 || y >= g.y1 {
+            continue;
+        }
+        for e in [g.x0, g.x1] {
+            if e > a && e < b && !cuts[..n].contains(&e) {
+                // In order: each new edge goes in where it belongs.
+                let mut at = n;
+                while cuts[at - 1] > e {
+                    cuts[at] = cuts[at - 1];
+                    at -= 1;
+                }
+                cuts[at] = e;
+                n += 1;
+            }
+        }
+    }
+    cuts[n] = b;
+    n + 1
+}
+
 /// The windows up, frontmost first: (surface, window), at most one a slot.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
     let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0, back: false, full: false }); SURFACES];
@@ -3724,7 +3810,9 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
 }
 
 /// Window layer (surface `k`, its `format`) row `y`, columns `a..b`, into `out[a..b]` as baked pixels with their transparency (bits 49-62; the see-through bit, a see-through pixel's channels nothing whatever the client left under the bit): a baked surface's (`BAKED`) as they are, a working one's (format 0) and fluor's (`G2T16`) baked here, every frame (bake.rs): the work a baked surface spares the display.
+/// `a..b` is one run of `ring_cuts`: its source row is the window's ring's row for `y` (`src_row`).
 fn layer_row(k: usize, format: u8, y: usize, a: usize, b: usize, width: usize, height: usize, out: &mut [u64]) {
+    let y = src_row(k, y, a);
     let src = &window_pixels(k, width, height)[y * width + a..y * width + b];
     let dst = &mut out[a..b];
     if format == G2T16 {
@@ -4280,6 +4368,7 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
             ferros_sys::console(unsafe { PANIC_GRANTS }, s.as_bytes());
             panic!("no band for row {y}");
         };
+        let mut cuts = [0usize; 2 * SURFACES + 2];
         for sp in band.spans() {
             let (a, b) = ((sp.x0 as usize).max(xa), (sp.x1 as usize).min(xb));
             if a >= b {
@@ -4291,71 +4380,79 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                 px[a..b].fill(0);
                 continue;
             }
-            let layer = |i: u8| order[i as usize];
-            let plain = chain.iter().all(|&i| layer(i).1 == BAKED && layer(i).2 & MODE_MASK == 0);
-            // Working windows in Normal (format 0: the attest screen, the keyboard): opaque or see-through by the bit alone, as baked ones, so the same select once their rows are baked.
-            let select = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
-            let (k0, f0, m0) = layer(chain[0]);
-            let front = &window_pixels(k0 as usize, width, height)[y * width..(y + 1) * width];
-            if m0 & OPAQUE != 0 && f0 == BAKED && can_direct && a == xa && b == xb {
-                direct = Some(front);
-            } else if m0 & OPAQUE != 0 && f0 == BAKED {
-                px[a..b].copy_from_slice(&front[a..b]);
-            } else if m0 & OPAQUE != 0 {
-                // An opaque window not yet baked (a format 0 or 1 surface): baked here, every frame, what the old present did for every pixel.
-                layer_row(k0 as usize, f0, y, a, b, width, height, &mut px);
-            } else if plain {
-                // Baked windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
-                px[a..b].copy_from_slice(&front[a..b]);
-                for &i in &chain[1..] {
-                    let src = &window_pixels(layer(i).0 as usize, width, height)[y * width..(y + 1) * width];
-                    for x in a..b {
-                        let p = px[x];
-                        let m = (p >> 63).wrapping_neg();
-                        px[x] = (p & !m) | (src[x] & m);
-                    }
-                }
-                for p in &mut px[a..b] {
-                    *p &= ((*p >> 63) ^ 1).wrapping_neg();
-                }
-            } else if select {
-                // The same select over the chain's rows baked first (`layer_row`).
-                let rows = layer_rows();
-                for (n, &i) in chain.iter().enumerate() {
-                    let (k, f, _) = layer(i);
-                    layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
-                }
-                px[a..b].copy_from_slice(&rows[0][a..b]);
-                for row in &rows[1..chain.len()] {
-                    for x in a..b {
-                        let p = px[x];
-                        let m = (p >> 63).wrapping_neg();
-                        px[x] = (p & !m) | (row[x] & m);
-                    }
-                }
-                for p in &mut px[a..b] {
-                    *p &= ((*p >> 63) ^ 1).wrapping_neg();
-                }
-            } else {
-                // Each layer's row baked first (`layer_row`: as it is when its surface is baked), then folded front to back pixel by pixel.
-                let rows = layer_rows();
-                for (n, &i) in chain.iter().enumerate() {
-                    let (k, f, _) = layer(i);
-                    layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
-                }
-                for x in a..b {
-                    let mut acc = rows[0][x];
-                    let mut t = trans(acc);
-                    let mut mode = m0;
-                    for (n, &i) in chain.iter().enumerate().skip(1) {
-                        if t == 0 {
-                            break;
+            // The span in runs, cut where a window's ring starts or ends on this row (`ring_cuts`): in each run every window's row comes from one source row (`src_row`).
+            // One run, the span, without a ring.
+            let nc = ring_cuts(chain, order, y, a, b, &mut cuts);
+            for c in 0..nc - 1 {
+                let (a, b) = (cuts[c], cuts[c + 1]);
+                let layer = |i: u8| order[i as usize];
+                let plain = chain.iter().all(|&i| layer(i).1 == BAKED && layer(i).2 & MODE_MASK == 0);
+                // Working windows in Normal (format 0: the attest screen, the keyboard): opaque or see-through by the bit alone, as baked ones, so the same select once their rows are baked.
+                let select = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
+                let (k0, f0, m0) = layer(chain[0]);
+                let sy = src_row(k0 as usize, y, a);
+                let front = &window_pixels(k0 as usize, width, height)[sy * width..(sy + 1) * width];
+                if m0 & OPAQUE != 0 && f0 == BAKED && can_direct && a == xa && b == xb {
+                    direct = Some(front);
+                } else if m0 & OPAQUE != 0 && f0 == BAKED {
+                    px[a..b].copy_from_slice(&front[a..b]);
+                } else if m0 & OPAQUE != 0 {
+                    // An opaque window not yet baked (a format 0 or 1 surface): baked here, every frame, what the old present did for every pixel.
+                    layer_row(k0 as usize, f0, y, a, b, width, height, &mut px);
+                } else if plain {
+                    // Baked windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
+                    px[a..b].copy_from_slice(&front[a..b]);
+                    for &i in &chain[1..] {
+                        let si = src_row(layer(i).0 as usize, y, a);
+                        let src = &window_pixels(layer(i).0 as usize, width, height)[si * width..(si + 1) * width];
+                        for x in a..b {
+                            let p = px[x];
+                            let m = (p >> 63).wrapping_neg();
+                            px[x] = (p & !m) | (src[x] & m);
                         }
-                        (acc, t) = fold(acc, t, rows[n][x], mode);
-                        mode = layer(i).2;
                     }
-                    // What is still transparent at the end is over black: the premultiplied channels are the light, the transparency is spent.
-                    px[x] = acc & !(0x7FFF << 49);
+                    for p in &mut px[a..b] {
+                        *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                    }
+                } else if select {
+                    // The same select over the chain's rows baked first (`layer_row`).
+                    let rows = layer_rows();
+                    for (n, &i) in chain.iter().enumerate() {
+                        let (k, f, _) = layer(i);
+                        layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
+                    }
+                    px[a..b].copy_from_slice(&rows[0][a..b]);
+                    for row in &rows[1..chain.len()] {
+                        for x in a..b {
+                            let p = px[x];
+                            let m = (p >> 63).wrapping_neg();
+                            px[x] = (p & !m) | (row[x] & m);
+                        }
+                    }
+                    for p in &mut px[a..b] {
+                        *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                    }
+                } else {
+                    // Each layer's row baked first (`layer_row`: as it is when its surface is baked), then folded front to back pixel by pixel.
+                    let rows = layer_rows();
+                    for (n, &i) in chain.iter().enumerate() {
+                        let (k, f, _) = layer(i);
+                        layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
+                    }
+                    for x in a..b {
+                        let mut acc = rows[0][x];
+                        let mut t = trans(acc);
+                        let mut mode = m0;
+                        for (n, &i) in chain.iter().enumerate().skip(1) {
+                            if t == 0 {
+                                break;
+                            }
+                            (acc, t) = fold(acc, t, rows[n][x], mode);
+                            mode = layer(i).2;
+                        }
+                        // What is still transparent at the end is over black: the premultiplied channels are the light, the transparency is spent.
+                        px[x] = acc & !(0x7FFF << 49);
+                    }
                 }
             }
         }
@@ -7483,6 +7580,17 @@ static mut RING_MSG: [[u8; SLOT]; RING] = [[0; SLOT]; RING];
 static mut RING_LEN: [u16; RING] = [0; RING];
 static mut RING_REPLY: [[u8; 16]; RING] = [[0; 16]; RING];
 static mut RING_RLEN: [u8; RING] = [0; RING];
+/// When the receive thread took each slot's message in (counter ticks, as `recv` returned it): the render thread's take less this is the time it waited in the ring.
+static mut RING_AT: [u64; RING] = [0; RING];
+/// Op 22's call on the receive thread since the last stats line, counter ticks: how many, from `recv` returning it to its reply summed, and the longest (DISPLAY-SCROLL.md recommendation step 1: the call apart from the publish).
+/// A wait for room in the ring is inside it; the time before `recv` returns (the receive thread getting a core) is not, and is the client's call less this.
+static CALL22: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Op 22's shows taken by the render thread since the last stats line: how many, their wait in the ring summed (`RING_AT`, counter ticks), and how many the receive thread took in before the publish of the same window's show before them had ended (`READ_END`).
+static mut SHOW_QUEUE: [u64; 3] = [0; 3];
+/// Each window's last publish of a show: when it ended (counter ticks).
+/// A show received before it was made while the display still read that window's surface: the app's present for it wrote the surface during the read (the 28-byte and the ring forms are answered before the publish, DISPLAY-SCROLL.md knob 2).
+/// A lower bound: a present that began during the read but called after it ended is not counted.
+static mut READ_END: [u64; SURFACES] = [0; SURFACES];
 /// Slots consumed (the render thread advances it) and filled (the receive thread advances it); the difference is the queue.
 static RING_HEAD: AtomicU64 = AtomicU64::new(0);
 static RING_TAIL: AtomicU64 = AtomicU64::new(0);
@@ -7513,13 +7621,14 @@ extern "C" fn receive(grants: u64) -> ! {
         if n == ferros_sys::ERR || n == 0 || n > SLOT as u64 {
             continue;
         }
+        let t_in = now();
         let n = n as usize;
         let op = msg[0];
         // Whose surfaces the caller holds, asked of the kernel while its token is live (before the reply), for the ops that need it.
         let h = if names_surface(op) { caller_of(&tok) } else { 0 };
         if op == 5 {
             let (w, h) = unsafe { SCREEN_WH };
-            let mut out = [0u8; 14];
+            let mut out = [0u8; 15];
             out[0..2].copy_from_slice(&w.to_le_bytes());
             out[2..4].copy_from_slice(&h.to_le_bytes());
             out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
@@ -7527,6 +7636,8 @@ extern "C" fn receive(grants: u64) -> ! {
             out[12] = app_live() as u8;
             // 13: the Escapes the apps did not use, counted (op 76), its low byte: the deck tells by a change that the app in front was at its top already (PREF_HELM `BACK_OUT`).
             out[13] = ESC_UNUSED.load(Ordering::Relaxed) as u8;
+            // 14: the forms this display reads (`FEATURES`).
+            out[14] = FEATURES;
             ferros_sys::reply(&tok, &out);
             continue;
         }
@@ -7716,6 +7827,7 @@ extern "C" fn receive(grants: u64) -> ! {
             RING_MSG[slot][..n].copy_from_slice(&msg[..n]);
             RING_LEN[slot] = n as u16;
             RING_HOLDS[slot] = h;
+            RING_AT[slot] = t_in;
         }
         let done = RING_DONE[slot].load(Ordering::Acquire);
         if append {
@@ -7742,6 +7854,12 @@ extern "C" fn receive(grants: u64) -> ! {
         } else {
             // Replied before it is drawn: status 0, and "moved" for a frame as before.
             ferros_sys::reply(&tok, if frame { &[0, 1] } else { &[0] });
+        }
+        if op == 22 {
+            let t = now() - t_in;
+            CALL22[0].fetch_add(1, Ordering::Relaxed);
+            CALL22[1].fetch_add(t, Ordering::Relaxed);
+            CALL22[2].fetch_max(t, Ordering::Relaxed);
         }
     }
 }
@@ -9313,7 +9431,7 @@ fn server(grants: u64) -> ! {
                     log.flush();
                 }
                 Some(22) if m.len() >= 18 => {
-                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t; 2 baked, the panel's codes); then the forms below by their length: 27 bytes [changed x u16][y u16][w u16][h u16], 28 [mode u8], 36 [buf u64] (a mailbox's buffer, 0 none: the window's own surface), 40 [frame us u32] (the host's own time making this frame, its draw and its present: the frame counter's, op 72). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t; 2 baked, the panel's codes); then the forms below by their length: 27 bytes [changed x u16][y u16][w u16][h u16], 28 [mode u8], 36 [buf u64] (a mailbox's buffer, 0 none: the window's own surface), 40 [frame us u32] (the host's own time making this frame, its draw and its present: the frame counter's, op 72), 50 [ring x u16][y u16][w u16][h u16][origin u16] (its scrolling pane as a ring of rows, `Ring`; a height of 0 none; op 5 byte 14 bit 0 says this display reads it). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     last_interaction = now();
@@ -9330,6 +9448,7 @@ fn server(grants: u64) -> ! {
                                 w.format = if m.len() > 18 { m[18] } else { 0 };
                                 w.mode = if m.len() > 27 { m[27] } else { 0 };
                             }
+                            RINGS[sk] = ring_of(m, width, height);
                         },
                         // The input level while no app wants the keyboard (WINDOWS.md "The keyboard"): refused, nothing kept or published, so the keyboard never stands over the map or an app that did not ask (the system keyboard shows again when one does).
                         Some(_) if m[17] == ferros_sys::window::INPUT && keyboard::want().is_none() => out[0] = 3,
@@ -9340,6 +9459,9 @@ fn server(grants: u64) -> ! {
                             // The mailbox's buffer (the 36-byte form, [buf u64] after the mode byte): a live surface the window's pixels come from from this show on, else the window's own. The receive thread answers the call once this show is taken, so the buffer shown before it is no longer read and its owner may draw there again.
                             let pixels = if m.len() >= 36 { surface_of(u64::from_le_bytes(m[28..36].try_into().unwrap())).filter(|&b| live_gen(b) != 0).unwrap_or(sk) } else { sk };
                             unsafe { PIXELS[sk] = pixels as u8 };
+                            // The window's ring (the 50-byte form, `ring_of`), read by this show's publish and the idle fill after it; none for a shorter form.
+                            // A ring's change moves rows of its rect for the reader, which the host names in `changed` (the ring's rect with its damage).
+                            unsafe { RINGS[sk] = ring_of(m, width, height) };
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode && w.format == if m.len() > 18 { m[18] } else { 0 }) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             let t22 = now();
@@ -9379,6 +9501,7 @@ fn server(grants: u64) -> ! {
                             let hits = unsafe { HITS_STALE };
                             publish_app(dirty, &tabs, k, width, height, hits);
                             unsafe {
+                                READ_END[sk] = now();
                                 if hits && dirty.clip(width, height) == full {
                                     HITS_STALE = false;
                                 }
@@ -9438,7 +9561,8 @@ fn server(grants: u64) -> ! {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
                     let (x0, base, px, val) = (i16le(9), i16le(11), u16::from_le_bytes([m[13], m[14]]) as f32, u16::from_le_bytes([m[15], m[16]]) as u32);
                     match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
-                        Some(sk) if px >= 4.0 && px <= 512.0 => {
+                        // Not into a window whose last show named a ring (`RINGS`): the text is drawn at screen rows, which a ring's rows are not (DISPLAY-SCROLL.md: fluor's host, the one writer of rings, never draws text here).
+                        Some(sk) if px >= 4.0 && px <= 512.0 && unsafe { RINGS[sk].y1 } == 0 => {
                             let surf = surface(sk, width, height);
                             let t = core::str::from_utf8(&m[17..]).unwrap_or("");
                             let x0 = if *op == 29 {
@@ -10354,6 +10478,16 @@ fn server(grants: u64) -> ! {
                     if let Some(sk) = surface_of(u64::from_le_bytes(m[9..17].try_into().unwrap())) {
                         shows_on |= 1 << sk;
                     }
+                    // How long the show waited in the ring, from the receive thread taking it in to this thread taking it out (`SHOW_QUEUE`); and whether it came while this window's last show was still being published (`READ_END`): its present wrote the surface while the display read it (DISPLAY-SCROLL.md knob 2, measured, not closed).
+                    unsafe {
+                        SHOW_QUEUE[0] += 1;
+                        SHOW_QUEUE[1] += t_call - RING_AT[slot];
+                        if let Some(sk) = surface_of(u64::from_le_bytes(m[9..17].try_into().unwrap())) {
+                            if RING_AT[slot] < READ_END[sk] {
+                                SHOW_QUEUE[2] += 1;
+                            }
+                        }
+                    }
                 }
             }
             // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
@@ -10579,16 +10713,34 @@ fn server(grants: u64) -> ! {
                 tlog.dec(unsafe { SEC_US[3] } / 1000);
                 tlog.s(b" ms, in ");
                 tlog.dec(unsafe { SEC_US[4] });
-                // The apps' shows (op 22): how many, and each one's publish and its wait for the armed frame's start, mean ms.
+                // The apps' shows (op 22): how many; the call on the receive thread (from `recv` to the reply, mean and longest, `CALL22`), the wait in the ring until the render thread took it (`SHOW_QUEUE`), then each one's publish and its wait for the armed frame's start, mean us (DISPLAY-SCROLL.md recommendation step 1: the call apart from the publish).
+                // WHY the max(1) on each count: ten seconds with frames but no show (the map's alone) have no mean, and the division by their count of 0 would panic the display; the sums are 0 then, so the means print 0.
                 let n = unsafe { SHOW_US[0] }.max(1);
-                tlog.s(b" camera ops; app shows ");
+                let us = |t: u64| t * 1_000_000 / freq();
+                let calls = CALL22[0].swap(0, Ordering::Relaxed);
+                let (call_t, call_max) = (CALL22[1].swap(0, Ordering::Relaxed), CALL22[2].swap(0, Ordering::Relaxed));
+                let (queued, queue_t, during) = unsafe { (SHOW_QUEUE[0], SHOW_QUEUE[1], SHOW_QUEUE[2]) };
+                tlog.s(b" camera ops; app shows A#");
                 tlog.dec(unsafe { SHOW_US[0] });
-                tlog.s(b", publish ");
-                tlog.dec(unsafe { SHOW_US[1] } / n / 1000);
-                tlog.s(b" ms, waited for the armed frame ");
-                tlog.dec(unsafe { SHOW_US[2] } / n / 1000);
-                tlog.s(b" ms each");
-                unsafe { SHOW_US = [0; 3] };
+                tlog.s(b": call A#");
+                tlog.dec(us(call_t) / calls.max(1));
+                tlog.s(b" us (longest A#");
+                tlog.dec(us(call_max));
+                tlog.s(b" us, A#");
+                tlog.dec(calls);
+                tlog.s(b" calls), in the ring A#");
+                tlog.dec(us(queue_t) / queued.max(1));
+                tlog.s(b" us, publish A#");
+                tlog.dec(unsafe { SHOW_US[1] } / n);
+                tlog.s(b" us, waited for the armed frame A#");
+                tlog.dec(unsafe { SHOW_US[2] } / n);
+                tlog.s(b" us each; A#");
+                tlog.dec(during);
+                tlog.s(b" came while the window's last show was still being read");
+                unsafe {
+                    SHOW_US = [0; 3];
+                    SHOW_QUEUE = [0; 3];
+                }
                 // The hit map's rows (hit.rs) over these ten seconds: their time summed over the publishing threads, and how many.
                 tlog.s(b"; hit map ");
                 tlog.dec(hit::TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / freq());
