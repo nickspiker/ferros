@@ -101,7 +101,7 @@ The list is a VSF document (the house format for anything structured); a frame i
 | op | request | reply |
 |---|---|---|
 | 0 LIST | `[0]` | a VSF document, a section `camera` per camera the driver can stream whose inputs are in the vault (none: an empty document; "The other cameras") |
-| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2][cols: 2]` ("Modes, the bench and the slit") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, a slit's record offset at 56) |
+| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2][cols: 2]` ("Modes, the bench and the slit"), then optionally the view flags (bit 0: write-back, "A cacheable view") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, 1 at 53 for a write-back view, a slit's record offset at 56) |
 | 2 FRAME | `[2][bin]` | waits for the next frame: a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample, row by row |
 | 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 gain (1024 unity: the sensor's analogue gain alone, by its own CCS model read at the open, digital gain kept at one; past the analogue's most refused, "Gain"), 2 focus (the actuator's position) |
 | 4 CLOSE | `[4]` | the view taken back, the camera stops; it also stops when its holder ends |
@@ -779,6 +779,66 @@ Every open below armed its release (`the descriptor's release armed on the front
 - **The top**: about 106 frames a second at full binned size (line 5696 to 5760 clocks), the link's own limit at 5632; 105 a second held 155 s with a consumer reading and adding every frame.
 - **Heat** (`diag thermal` every 2^5 s, the room cool, no cap anywhere): at 96 a second the hottest zone 37 C to 53 at 32 s, 55, 57, 58, 58 at 160 s; at 105 a second 46 to 61, 64, 65, 65 C at 128 s, then falling to 48 C a minute after the close. The trips are 90 C (X3, A715s) and 95 (A510s).
 - **The one death on this kernel** (fll 3200, frame 4358): the frame thread woken 133 ms late, past a whole frame (the line stays masked until the thread's acknowledgement, so the armed action releases once), behind kernel lock holds of 130, 80, 61, 50 and 43 ms: the AoC firmware's pieces (`aoc.fw.N`) read from the vault under `with_lock` by the service loop's `sensor_step`, each time init's keeper restarted `sensors` (on a RAM-reloaded kernel the AoC never comes online, so every 64 s). With that loop stopped every run was clean. A hold past a frame period still stops the stream: those holds are the lock-holds work (branch lock-holds); the armed action moved the camera's limit from the blanking (0.4 ms at 96 a second) to a frame period (10 ms).
+
+## A cacheable view (2026-11-18, branch cam-cacheable; Lumis on branch lumis-cam-cacheable)
+
+The owner: "if we can actually get 60fps on ferros with the cam I'd be stupidly happy".
+The Lumis session measured its intake at 61.4 a second (kind 1, fll 5170): 53.5 ms a frame on the four A510s, 14.7 to 18.8 on the A715s (which starved the driver's frame thread), 42 to 51 on the X3, every row copied out of the non-cacheable view in 64-byte loads, each its own bus transaction.
+
+**Can the front end snoop instead?** Not as ferros runs it, and Linux never asks it to (the reference tree, /mnt/Harbor/ferros-ref/soc-gs):
+- On zuma only UFS (`zuma-ufs.dtsi:64`) and the JPEG block (`smfc`, `zuma.dtsi:1679`) are `dma-coherent`; no LWIS node is (`zuma-isp.dtsi`, `lwis_isp_fe` at line 164), and the ISPFE SysMMUs (`zuma-sysmmu.dtsi:475-547`) carry no shareability property.
+- The SysMMU v9 has the means: a shareable bit in its page entries (`drivers/iommu/samsung-iommu-v9.c:36` FLPD_SHAREABLE_FLAG, `:40` SLPD_SHAREABLE_FLAG), set only for IOMMU_CACHE mappings (`:606`, `:651`), which the DMA layer asks only for a dma-coherent device, and dropped for IOMMU_PRIV (`:693`); the heaps map uncached buffers non-shareable on purpose (`drivers/dma-buf/heaps/samsung/heap_dma_buf.c:107-112`). PCIe, UFS and the modem's DIT switch theirs in a SYSREG shareability word (`pcie-exynos-rc.h:227-238`); no such word is named for SYSREG_ISPFE (G#1C02_0000).
+- ferros runs the three ISPFE SysMMUs in bypass ("The view": frames land above 4 GiB with S2MPU faults 0), so the bit would need them translating, with page tables, on a path no Pixel kernel ever ran coherent. Not tried; cache maintenance instead.
+
+**What is built:**
+- The kernel maps the view Normal write-back, inner shareable, read-only for EL0 and EL2, never executable, when the driver asks (SYS_DMA x1 = 4 with x3 bit 63; cachemap `cam_view_map`'s `cached`); a kernel from before refuses the bit (it reads as frames past the run) and the driver asks again without it.
+- SYS_DMA x1 = 6 (process.rs `cam_lines`): bytes x2 to x2 + x3 of the driver's run (on `camera`) or of the view (on `camera-view`, by its holder) cleaned and invalidated to the point of coherency, a `dc civac` a line, by the kernel's own alias of the frames (read-write at EL2), with the kernel lock let go (`unlocked`); answered the counter's ticks it took.
+- The driver (payloads/camera): an OPEN asks for it in the byte after the whole mode block (`VIEW_FLAGS`, the seventeenth, bit 0), so a holder that asks a driver from before still gets the non-cacheable view; the 64-byte reply carries 1 at 53 when it was given (never for a slit ring, which has no hand-over). Each MAP cleans and invalidates the buffer it hands over (16 MiB, or 20 with the PD rows) before it answers; each release cleans and invalidates the buffer's probe line before reading it. Its ninth hand-spawn byte (1) skips the MAP's maintenance, a test only.
+- cambench +20: bit 0 the view write-back, bit 1 the frame threads on the A510s, bit 2 a check (16 lines a frame read again from DRAM after the kernel drops them, and compared).
+- Lumis 0.2.18 (std/lumis, branch lumis-cam-cacheable from lumis-damage 810a3fda): asks for the view write-back and unpacks its rows in place (no copy); a second knobs byte after the whole mode block (the input's fifteenth), bit 0 `DEV_UNCACHED`, asks for the non-cacheable view for the comparison.
+
+**Why it is right:** a buffer is handed over only after its frame's DMA_DONE (`ring_turn` makes it the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer, nor the newest while another is free).
+So once its lines are dropped at MAP, whatever a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone, and any line fetched after (by the holder, or by speculation) is the frame's.
+The lines are clean: nothing writes a camera frame thru a write-back alias after the region's take cleaned it (the view is read-only, the kernel's alias untouched until the frames go back), so the clean writes nothing back and the invalidate loses nothing.
+Clean and invalidate, not `dc ivac`: the range is found under the lock and maintained with it let go, and a run given back meanwhile may be another process's frames, whose dirty lines a clean writes out where an invalidate would drop them.
+The probe line at a release: the driver reads its probe non-cacheable, and the architecture does not promise a non-cacheable read sees DRAM while a core holds the line write-back (mismatched attributes), so a write while held could read as none.
+
+**Where the maintenance belongs, and why there:**
+- In the kernel, called by the driver at MAP: correctness stays with the driver and the kernel (a holder that skips nothing can read stale lines), and it is one call a frame.
+- Not EL0 `dc civac` thru SCTLR_EL2.UCI: the bit is global, every EL0 process would get `dc civac`, `dc cvac`, `dc cvau` and `ic ivau` on anything it can read (a flush-and-reload timer, help for row hammering), for no gain: the call is a few microseconds against 0.4 to 1.8 ms of lines.
+- Not the reader a call per row: cambench's check made one call a 5120-byte line at 680 ns, against about 2.8 ns a line in one call over a buffer (715 us for 16 MiB), so per row would cost about 2 ms of calls a frame. Per band (four calls, one a reading thread) would spread the lines over the readers but leave correctness to the kist; not done.
+- Tried and dropped: a driver thread making each new frame's buffer right as it landed, ahead of MAP. 36 to 50 of every 64 were done ahead, MAP still did 9 to 33 itself (the holder asked as the frame landed), the thread's own took 2.5 to 3.7 ms each with Lumis drawing, and the turns were no shorter.
+
+**Measured on the Pro** (cam-cacheable 2db55058 RAM-reloaded over a510-workers 40d28cee, b947, not attested; the main binned, kind 1, fll 5170, exposure 3000 lines: 16.28 ms, 61.4 a second by the driver's clock; the driver hand-spawned with input 01, every stream ended by its own close).
+
+cambench, 128 frames, four threads on the A510s, PD off (16 MiB buffers):
+
+| view | work | a frame | taken | the maintenance at MAP |
+|---|---|---|---|---|
+| non-cacheable | read every line | 41.7 ms | 23 a second, 199 skipped | none |
+| write-back | read every line | 2.8 ms | 61 a second, none skipped | 715 to 778 us on average, 799 at most |
+| write-back | read and u16 add | 9.4 ms (reading 1.4 ms a thread) | 61 a second, 1 skipped | 718 to 785 us, 818 at most |
+
+The check: 0 of 2048 sampled lines differed from DRAM with the maintenance; 0 of 2048 without it too (input `010000000000000001`): with four buffers and 48 MB read between a buffer's turns the old lines are gone from every cache by then, so this ring cannot show the hazard, which the architecture still allows (speculative fills, a smaller ring, a slower reader).
+
+Lumis 0.2.18, hand-spawned (`--use display --use touch --dma surface --ira --domain --entropy --use camera`), 32 s (`DEV_OPEN`), inputs `280100003214B80B0000000000` (the intake on the A510s) and `680100003214B80B0000000000` (bit 6: on the A715s), the non-cacheable runs with `0001` after them; every run about 1968 frames written by the driver, no error word, held buffers written over 0, crowded 0:
+
+| intake | view | the integrator a frame (first 64, last 64) | a turn (first, last) | taken (frames integrated of about 1968) | preview: new images drawn a second (second 4 s window, last) and Lumis's draw | the maintenance at MAP |
+|---|---|---|---|---|---|---|
+| A510s | non-cacheable | 53.3, 53.8 ms | 53.1, 53.9 ms | 18.6 a second (576) | 18.5, 18.5 (13.5 to 15.5 ms) | none |
+| A510s | write-back | 13.2, 17.2 ms | 16.2, 19.4 ms | 61 a second for the first 1300 frames, 48 to 52 at the end (1856) | 56, 26 (13.7 to 27 ms) | 1.1 to 1.7 ms on average, 7.4 at most |
+| A715s | non-cacheable | 7.5, 17.4 ms | 16.0, 18.8 ms | 61 a second, 50 to 53 at the end (1792) | 43, 21 (17 to 35 ms) | none |
+| A715s | write-back (three runs, one with `diag clock cammem on`) | 4.3 to 4.8, 10.4 to 11.2 ms | 16.0, 16.5 to 17.8 ms | 61 a second, 57 to 61 at the end (1920 each) | 45 to 51, 21 to 25 (14.6 to 33.5 ms) | 420 us for the first 200 frames, then 0.7 to 1.8 ms, 8.5 at most |
+
+- **The intake is no longer the wall**: write-back on the A715s takes 1920 of 1968 frames, the integrator 4.3 ms a frame where non-cacheable it was 7.5 to 19; on the A510s it keeps the sensor's 61 a second for about 20 s.
+- **Everything on the CPU slows as a run goes on**, by the same factor in every run: the A715 integrator 4.4 to 10.4 ms, the A510 integrator 13 to 17 (to 25 in one run), Lumis's draw 14.6 to 33 ms, the maintenance 0.42 to 1.6 ms, from about 3 to 8 s into the stream. Not ferros's governor (`diag clock`: the A715s asked 2367 MHz and the A510s 1704 the whole run), not the memory clocks (the same with `cammem on`, MIF 3744 and DSU 1800 held), no thermal cap set (the zones 62 to 66 C after a run, peaks of 89 to 93 C kept since the boot); `diag thermal`'s divider line reads CLKDIVSTEP bits seen on all three clusters (G#80000901 every bit seen). Unmeasured: the cores' real clock during a run (the hardware's divider steps, or the firmware's power limit). With it the preview falls from about 50 to about 25 new images a second.
+- **The non-cacheable A715 run did not starve the driver this time** (no "written while the kist held it", no late frame), the integrator 7.5 ms at first; it slowed to 17 ms with the rest.
+
+**If the front end writes a held buffer** (the Lumis session's "buffer 1 was written while the kist held it", then no frame for 2097 ms, with the A715s starved): `ring_turn` names a buffer neither held nor the newest while one is free (crowded 0 and none free 0 in every run above), so the ring's choice never names a held buffer; read from the code, the write happens only once the stream is already dying, a release missed (the frame thread late past a whole frame, the line masked so the armed action releases once, then LATE_CONFIG), where the engine writes outside the ring's choice. Not reproduced here. What a reader sees then:
+- non-cacheable: each line as DRAM holds it when read, old or new: a torn frame;
+- write-back: lines read before the write as they were (they stay in the caches), lines read after it from DRAM, new: the same torn frame; a line read twice reads the same both times. No worse: the view is read-only, so no dirty line can carry a reader's copy back over the front end's, and the release's probe check (its line dropped first) still counts the write.
+
+**To repeat:** `$B reload` the kernel; `tools/cambench-sweep.sh <out> 01 000100003214B80B00000000020800040000000007 fll 5170` (BIN the directory holding this branch's camera.bin and cambench.bin; the last byte 07: write-back, A510s, check); Lumis with the inputs above after the driver (`--name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0 --hw hsi2c3 --hw hsi2c2 --hw hsi2c4`, input 01).
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
