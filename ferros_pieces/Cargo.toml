@@ -8,3 +8,6 @@ description = "A large value in the kernel's vault as sealed pieces under a mani
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 vsf = { path = "../../vsf", default-features = false }
+
+[dev-dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }

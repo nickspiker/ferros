@@ -60,6 +60,8 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         crumb(0xC3);
         // Into the registers (keys.rs); this copy is wiped there, the one in `ira` at the end of the probe.
         crate::ira::keep_ira(&mut i);
+        // The flash log can seal now: what the kernel said since boot, held in the pre-boot buffer, goes to the flash (flashlog.rs).
+        crate::flashlog::flush();
     }
     let ira_fail = ira.err().unwrap_or(0);
     let ira_fp = ira.map(|i| fingerprint(ira_fp_context(), &i)).unwrap_or([0u8; 8]);
@@ -95,8 +97,8 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     crate::oracle::set_system_secret(ira);
     let _ = key;
 
-    const LKEY: &str = "genesis";
-    const MSG: &[u8] = b"FERROS-GENESIS-0";
+    // The genesis value: a `genesis` document (ferros_pieces::kv) since 2026-11-17, a text marker before (moved by kvault's open).
+    const LKEY: &str = crate::kvault::GENESIS;
     let mut kept: Option<ShimStore> = None;
     let t_open = crate::platform::cntpct();
     crate::platform::pstore(b"ferros: opening the vault\n");
@@ -109,14 +111,15 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
             p.opened = 1;
             crate::flashlog::line(&alloc::format!("kvault open ok in {} ms: {}", (crate::platform::cntpct() - t_open) / (crate::platform::cntfrq() / 1000), store.describe()));
             match store.get_by_key(LKEY) {
-                Ok(Some(v)) if v.as_slice() == MSG => p.verified = 1,
+                Ok(Some(v)) if ferros_pieces::kv::genesis_of(&v).is_some() => p.verified = 1,
                 Ok(other) => {
                     // A fresh (genesised) vault, or the genesis value missing: write it. Never a format: manifestus refuses to genesis over sealed blocks it cannot bootstrap.
                     crate::flashlog::line(&alloc::format!("kvault: genesis value {}, writing it", if other.is_some() { "wrong" } else { "absent" }));
-                    match store.set(LKEY, MSG) {
-                        Ok(_) => p.sealed = 1,
-                        Err(e) => {
-                            crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {e:?}"));
+                    let written = ferros_pieces::kv::genesis_document(crate::settings::eagle_now()).map(|doc| store.set(LKEY, &doc));
+                    match written {
+                        Some(Ok(_)) => p.sealed = 1,
+                        other => {
+                            crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {:?}", other.map(|r| r.map(|_| ()))));
                             p.stage = 2
                         }
                     }
@@ -196,7 +199,7 @@ pub fn next_boot_take(store: &mut ShimStore) -> Option<u32> {
     let section = vsf::schema::SectionBuilder::parse_document(next_boot_schema(), &doc, None).ok()?;
     let read = |name: &str| section.get_fields(name).first().and_then(|f| f.values.first()).and_then(|v| v.as_u64());
     let (mode, from) = (read("mode")?, read("from_boot")?);
-    let boot = crate::flashlog::boot() as u64;
+    let boot = crate::flashlog::boot();
     // WHY the boot == 0 test: 0 means no flash log this boot, where `boot - 1` would wrap.
     // PROOF: flashlog::boot is 0 before init or without a log, otherwise at least 1; `from` is the disk's and is only compared, never added to.
     if boot == 0 || from != boot - 1 {

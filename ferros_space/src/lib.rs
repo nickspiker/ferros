@@ -7,8 +7,8 @@
 //! | `KIST` | developer `ke`, option `hp` | capsule `hb`, name `a`, then per want (slot order) right `u`, reason `a` | a `kist` section of `kists.list` |
 //! | `ANSWER` | developer, option, right `u` | granted `u` (1 or 0); the entry's stamp is when | a want's answer in `kists.list`, or an unstowed kist's kept answer (its `kept` section) |
 //! | `DEFAULT` | right `u` | on `u` | `kists.list`'s `defaults` |
-//! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>` (EWE, the map's) |
-//! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
+//! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>`, a `place` document (ferros_kept::map) |
+//! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view`, a `view` document |
 //! | `DECK_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
@@ -66,8 +66,6 @@ pub mod kind {
 
 /// The scope of the fleet's shared arrangement.
 pub const FLEET: [u8; 32] = [0; 32];
-/// The map's turn and the place's turn in Q14 (payloads/map `ONE`).
-const ONE: i64 = 1 << 14;
 /// A vault name in the map's scope is at most 32 bytes, its label at most 26 after `place.` (payloads/map `place_key`).
 const LABEL_MAX: usize = 26;
 
@@ -378,7 +376,7 @@ pub fn people_for(space: &Space, developer: &[u8; 32], option: &[u8; 32]) -> Vec
     all.into_iter().filter(|p| picked.contains(&p.handle_proof)).collect()
 }
 
-// ── The map's own forms (payloads/map: `place_key`, `save_place`, `save_view`) ──
+// ── The map's own copy (payloads/map: `place_key`, `save_place`, `save_view`; the documents are ferros_kept::map's, the one definition) ──
 
 /// A circle's vault name in the map's scope: `place.` and its label, a space as an underscore, cut at 26 bytes.
 pub fn place_key(label: &str) -> Vec<u8> {
@@ -390,64 +388,31 @@ pub fn place_key(label: &str) -> Vec<u8> {
     k
 }
 
-fn zig(v: i64) -> u64 {
-    ((v << 1) ^ (v >> 63)) as u64
+/// A place or the view of the map's copy that the sync leaves out: present, but not a document this build reads (its vault name, and why).
+/// Never taken for absent: absent where the baseline had it would read as the person removing it, and that would go out over the whole fleet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeptOut {
+    pub key: Vec<u8>,
+    pub why: &'static str,
 }
 
-fn unzig(u: u64) -> i64 {
-    ((u >> 1) as i64) ^ -((u & 1) as i64)
+/// One value of the map's copy as the sync reads it.
+enum Held<T> {
+    Absent,
+    Read(T),
+    /// Present, but not a document this build reads: why.
+    Out(&'static str),
 }
 
-/// EWE integers, as the map keeps its places and view.
-fn ewe(values: &[u64]) -> Vec<u8> {
-    let mut b = [0u8; 64];
-    let mut n = 0;
-    for &v in values {
-        n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
-    }
-    b[..n].to_vec()
-}
-
-fn unewe(bytes: &[u8], most: usize) -> Vec<u64> {
-    let mut out = Vec::new();
-    let mut at = 0;
-    while out.len() < most {
-        match ferros_ledger::ewe::decode_u64(&bytes[at..]) {
-            Some((v, k)) => {
-                out.push(v);
-                at += k;
-            }
-            None => break,
-        }
-    }
-    out
-}
-
-/// A kept place as the map reads it: x, y (×256), radius, cos, sin (Q14); a place kept before turns existed (three values) stands upright. None for what the map would not take either.
-pub fn decode_place(bytes: &[u8]) -> Option<[i64; 5]> {
-    let v = unewe(bytes, 5);
-    if v.len() < 3 || v[2] == 0 || v[2] >= 1 << 16 {
-        return None;
-    }
-    let (c, s) = if v.len() == 5 { (unzig(v[3]), unzig(v[4])) } else { (ONE, 0) };
-    Some([unzig(v[0]), unzig(v[1]), v[2] as i64, c, s])
-}
-
-pub fn encode_place(p: &[i64; 5]) -> Vec<u8> {
-    ewe(&[zig(p[0]), zig(p[1]), p[2] as u64, zig(p[3]), zig(p[4])])
-}
-
-/// The view as the map keeps it: x, y, cos, sin.
-pub fn decode_view(bytes: &[u8]) -> Option<[i64; 4]> {
-    let v = unewe(bytes, 4);
-    if v.len() < 4 {
-        return None;
-    }
-    Some([unzig(v[0]), unzig(v[1]), unzig(v[2]), unzig(v[3])])
-}
-
-pub fn encode_view(v: &[i64; 4]) -> Vec<u8> {
-    ewe(&[zig(v[0]), zig(v[1]), zig(v[2]), zig(v[3])])
+/// A place or the view from the map's scope: absent, read, or present and not a document of this build (an old form left by a conversion that failed, or another build's; the caller keeps it out of the sync).
+fn held<T>(store: &mut impl Store, key: &[u8], read: fn(&[u8]) -> Option<T>) -> Result<Held<T>, ()> {
+    Ok(match store.get(Scope::Map, key)? {
+        None => Held::Absent,
+        Some(b) => match read(&b) {
+            Some(v) => Held::Read(v),
+            None => Held::Out("not a document this build reads"),
+        },
+    })
 }
 
 fn ints(v: &[i64]) -> Vec<VsfType> {
@@ -547,8 +512,15 @@ fn label_of<'a>(list: &'a Kists, c: &Circle) -> Option<&'a str> {
     }
 }
 
+/// What the device's copy holds now: every fact, in `scope` for the arrangement, and the places and view kept out of the sync (their ids for `managed`, and what each is).
+struct Snapshot {
+    facts: Vec<Fact>,
+    out_ids: Vec<Vec<VsfType>>,
+    out: Vec<KeptOut>,
+}
+
 /// Every fact the device's copy holds now, in `scope` for the arrangement.
-fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32]) -> Result<Vec<Fact>, ()> {
+fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32]) -> Result<Snapshot, ()> {
     let mut facts = Vec::new();
     for k in &list.kists {
         let id = kist_id(&k.developer, &k.option);
@@ -581,22 +553,38 @@ fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32
     for r in 0..RIGHTS.len() as u8 {
         facts.push(Fact { kind: kind::DEFAULT, id: default_id(r), value: vec![VsfType::u((list.defaults >> r & 1) as usize, false)], stamp: None });
     }
+    let (mut out_ids, mut out) = (Vec::new(), Vec::new());
     let mut circles = vec![Circle::Settings];
     circles.extend(list.kists.iter().map(|k| Circle::Kist(k.developer, k.option)));
     for c in circles {
         let label = label_of(list, &c).unwrap_or("settings");
-        if let Some(p) = store.get(Scope::Map, &place_key(label))?.as_deref().and_then(decode_place) {
-            facts.push(Fact { kind: kind::PLACE, id: place_id(scope, &c), value: ints(&p), stamp: None });
+        let key = place_key(label);
+        match held(store, &key, ferros_kept::map::read_place)? {
+            Held::Absent => {}
+            Held::Read(p) => facts.push(Fact { kind: kind::PLACE, id: place_id(scope, &c), value: ints(&p), stamp: None }),
+            Held::Out(why) => {
+                out_ids.push(place_id(scope, &c));
+                out.push(KeptOut { key, why });
+            }
         }
     }
-    if let Some(v) = store.get(Scope::Map, b"view")?.as_deref().and_then(decode_view) {
-        facts.push(Fact { kind: kind::VIEW, id: view_id(scope), value: ints(&v), stamp: None });
+    match held(store, b"view", ferros_kept::map::read_view)? {
+        Held::Absent => {}
+        Held::Read(v) => facts.push(Fact { kind: kind::VIEW, id: view_id(scope), value: ints(&v), stamp: None }),
+        Held::Out(why) => {
+            out_ids.push(view_id(scope));
+            out.push(KeptOut { key: b"view".to_vec(), why });
+        }
     }
-    Ok(facts)
+    Ok(Snapshot { facts, out_ids, out })
 }
 
 /// Which of the space's entries this device's copy mirrors: every kist and default; an answer for a want its kist declares here (an answer to a want an older capsule lacks waits in the space, untouched, for the update that brings it), or of a kist no longer in the list whose answers the list keeps (`kept`) or that is stowed nowhere (`live`: the kists the space holds live, read before the pass), so the person's answers forgotten on an unstow sheet go from the space and from every device's kept answers (docs/KISTS.md "The unstow sheet"); a place only in this device's scope and only for a circle it has; the view in its scope.
-fn managed(list: &Kists, live: &[([u8; 32], [u8; 32])], scope: &[u8; 32], k: u8, id: &[VsfType]) -> bool {
+/// A place or the view in `out` (present here, not a document this build reads: `snapshot`) is not mirrored at all, so its absence from the facts is never read as a removal and the space's value is never written over it.
+fn managed(list: &Kists, live: &[([u8; 32], [u8; 32])], scope: &[u8; 32], out: &[Vec<VsfType>], k: u8, id: &[VsfType]) -> bool {
+    if (k == kind::PLACE || k == kind::VIEW) && out.iter().any(|o| o.as_slice() == id) {
+        return false;
+    }
     match k {
         kind::KIST | kind::PIN => true,
         // A right this build cannot name (a later build's, on another device of the fleet): its default and every answer to it are left in the space as they are.
@@ -616,8 +604,10 @@ fn managed(list: &Kists, live: &[([u8; 32], [u8; 32])], scope: &[u8; 32], k: u8,
 }
 
 /// What a sync did.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Outcome {
+    /// The places and the view of this device's copy left out of the sync (present, not a document this build reads), for the identity service's line; empty when every one was read.
+    pub kept_out: Vec<KeptOut>,
     /// The space gained a change made on this device: it goes to the fleet.
     pub space_changed: bool,
     /// Writes made to the device's copy from the space: the map reads its places again.
@@ -626,8 +616,8 @@ pub struct Outcome {
     pub kinds: u16,
 }
 
-/// One write from the space applied to the device's copy (the list in hand; places and the view straight to the vault). False when the vault refused.
-fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl Store) -> bool {
+/// One write from the space applied to the device's copy (the list in hand; places and the view straight to the vault, as their documents stamped `now`). False when the vault refused.
+fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl Store, now: i64) -> bool {
     match w {
         Write::Set { kind: kind::KIST, id, value, .. } => {
             let (Some(d), Some(o), Some((capsule, name, wants))) = (id.first().and_then(k32), id.get(1).and_then(k32), kist_of(&value)) else { return true };
@@ -701,10 +691,11 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
             }
             true
         }
+        // A place whose radius the map does not take has no document (ferros_kept::map::place): the copy keeps what it has, and next pass offers it to the space.
         Write::Set { kind: kind::PLACE, id, value, .. } => match (place_of(&id), ints_of::<5>(&value)) {
-            (Some((_, c)), Some(p)) => match label_of(list, &c) {
-                Some(l) => store.set(Scope::Map, &place_key(l), &encode_place(&p)),
-                None => true,
+            (Some((_, c)), Some(p)) => match (label_of(list, &c), ferros_kept::map::place(&p, now)) {
+                (Some(l), Some(doc)) => store.set(Scope::Map, &place_key(l), &doc),
+                _ => true,
             },
             _ => true,
         },
@@ -712,8 +703,10 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
             Some(key) => store.remove(Scope::Map, &key),
             None => true,
         },
-        Write::Set { kind: kind::VIEW, value, .. } => match ints_of::<4>(&value) {
-            Some(v) => store.set(Scope::Map, b"view", &encode_view(&v)),
+        Write::Set { kind: kind::VIEW, value, .. } => match ints_of::<4>(&value).map(|v| ferros_kept::map::view(&v, now)) {
+            Some(Some(doc)) => store.set(Scope::Map, b"view", &doc),
+            // A view whose document does not build is not written: refused like a write the vault did not take.
+            Some(None) => false,
             None => true,
         },
         Write::Remove { kind: kind::VIEW, .. } => store.remove(Scope::Map, b"view"),
@@ -769,10 +762,12 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
     let start = space.digest();
     let mut wrote = 0;
     let mut kinds = 0u16;
+    let mut kept_out = Vec::new();
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if deck_sync(space, me) { FLEET } else { *me };
-        let mut facts = snapshot(&list, space, store, &scope).map_err(|_| "the map's places are not readable")?;
+        let Snapshot { mut facts, out_ids, out } = snapshot(&list, space, store, &scope).map_err(|_| "the map's places are not readable")?;
+        kept_out = out;
         // A place or the view this device holds where the space holds a removal: the device's, stamped past the removal (owner, 2026-11-12, on the 8a: "sometimes that ferros logo just BOOP!").
         // A circle's place goes with its circle: an unstowed kist's is left alone by every device (`managed`), so a place's tombstone only ever came from a copy that lost its place while the circle stood, and it must not stick.
         // Until this a place has no stamp of its own, so a removal stuck: the settings circle's (in the space since a copy lost it) took map.place.settings back out of the 8a's vault within 4 s of every save, the generation moved, and the map placed every circle again with settings at its seed, far off the deck and at whatever size it last had.
@@ -783,7 +778,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         }
         let before = base.clone();
         let live: Vec<([u8; 32], [u8; 32])> = space.entries().iter().filter(|e| e.kind == kind::KIST && !e.gone).filter_map(|e| Some((e.id.first().and_then(k32)?, e.id.get(1).and_then(k32)?))).collect();
-        let writes = reconcile(space, base, &facts, |k, id| managed(&list, &live, &scope, k, id), *me, now);
+        let writes = reconcile(space, base, &facts, |k, id| managed(&list, &live, &scope, &out_ids, k, id), *me, now);
         if writes.is_empty() {
             break;
         }
@@ -793,7 +788,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         for w in first.into_iter().chain(rest) {
             // Kinds are 0 to 9 (`kind`): a bit each in a u16.
             kinds |= 1 << match &w { Write::Set { kind, .. } | Write::Remove { kind, .. } => *kind };
-            if !apply(w, &mut list, &mut list_changed, store) {
+            if !apply(w, &mut list, &mut list_changed, store, now) {
                 *base = before;
                 return Err("the vault did not take a write");
             }
@@ -807,7 +802,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
             }
         }
     }
-    Ok(Outcome { space_changed: space.digest() != start, wrote, kinds })
+    Ok(Outcome { kept_out, space_changed: space.digest() != start, wrote, kinds })
 }
 
 /// The capsules the person's list names that this device lacks (`has` asks the device's `capsules.`), in list order: what the fetch must bring (docs/IDENTITY-SPACE.md "Capsules").
@@ -819,7 +814,24 @@ pub fn missing_capsules(list: &Kists, mut has: impl FnMut(&[u8; 32]) -> bool) ->
 mod tests {
     extern crate std;
     use super::*;
+    use ferros_kept::map::{read_place, read_view};
     use std::collections::BTreeMap;
+
+    const ONE: i64 = ferros_kept::map::ONE;
+
+    /// A place's document as the map writes it (stamped at some Eagle time: the sync reads what a document says, not when it was made).
+    fn encode_place(p: &[i64; 5]) -> Vec<u8> {
+        ferros_kept::map::place(p, 1 << 40).unwrap()
+    }
+
+    fn encode_view(v: &[i64; 4]) -> Vec<u8> {
+        ferros_kept::map::view(v, 1 << 40).unwrap()
+    }
+
+    /// The map's copy as what it says: each place and the view by name, its values (two copies made at different times say the same).
+    fn said(m: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<Vec<u8>, Vec<i64>> {
+        m.iter().map(|(k, v)| (k.clone(), if k == b"view" { read_view(v).unwrap().to_vec() } else { read_place(v).unwrap().to_vec() })).collect()
+    }
 
     /// A vault in memory: its two scopes by name. `locked` refuses every read, as a vault with nobody present does.
     #[derive(Default, Clone)]
@@ -885,8 +897,8 @@ mod tests {
     }
 
     /// The device's copy as the person sees it: the list (answers and defaults), every place and the view.
-    fn seen(v: &mut Vault) -> (Kists, BTreeMap<Vec<u8>, Vec<u8>>) {
-        (read_list(v).unwrap(), v.map.clone())
+    fn seen(v: &mut Vault) -> (Kists, BTreeMap<Vec<u8>, Vec<i64>>) {
+        (read_list(v).unwrap(), said(&v.map))
     }
 
     /// Sealed on one device, opened on another: the bytes that cross the fleet (or sit at fgtw.org).
@@ -959,7 +971,7 @@ mod tests {
         let (lp, mp) = seen(&mut arranged_pro());
         let (lf, mf) = seen(&mut fresh);
         assert_eq!(lf, lp, "the same kists, answers and defaults");
-        assert_eq!(mf, mp, "every place and the view, byte for byte");
+        assert_eq!(mf, mp, "every place and the view, the same values");
         assert!(lf.kists.iter().all(|k| !k.unanswered()), "nothing asked again");
         assert_eq!(missing_capsules(&lf, |_| false), vec![[0xA1; 32], [0xA2; 32]]);
         // Settled: a second sync moves nothing.
@@ -988,7 +1000,7 @@ mod tests {
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2401).unwrap();
         assert_eq!(seen(&mut a), seen(&mut b));
         assert_eq!(read_list(&mut a).unwrap().kists[1].wants[1].answer, Some((false, 2200)));
-        assert_eq!(decode_place(&a.map[&place_key("Mahere")]).unwrap()[0], 1 << 8);
+        assert_eq!(read_place(&a.map[&place_key("Mahere")]).unwrap()[0], 1 << 8);
         // The other device switches its deck sync off, then the Pro moves settings: the other keeps its own.
         set_deck_sync(&mut sb, &OTHER, false, 2500);
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2501).unwrap();
@@ -997,13 +1009,13 @@ mod tests {
         sa.merge(hand_over(&sb));
         sb.merge(hand_over(&sa));
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap();
-        assert_ne!(b.map[&place_key("settings")], a.map[&place_key("settings")], "opted out: its own arrangement");
+        assert_ne!(read_place(&b.map[&place_key("settings")]), read_place(&a.map[&place_key("settings")]),"opted out: its own arrangement");
         assert_eq!(read_list(&mut b).unwrap(), read_list(&mut a).unwrap(), "kists and answers still follow");
         // Its own arrangement is in the space too: reset that device and it comes back to its own, not the fleet's.
         let mut reset = Vault::default();
         let (mut sr, mut br) = (hand_over(&sb), Baseline::default());
         sync(&mut sr, &mut br, &mut reset, &OTHER, 2800).unwrap();
-        assert_eq!(reset.map, b.map);
+        assert_eq!(said(&reset.map), said(&b.map));
     }
 
     /// The 8a, 2026-11-12: the space held a removal of the settings circle's place (a copy had lost it while the circle stood), and the 8a's place for it was taken back out within one sync of every save. A place the device holds wins over a removal now: back in the space, kept on the device, and handed to a sibling.
@@ -1028,7 +1040,7 @@ mod tests {
         let mut b = Vault::default();
         let (mut sb, mut bb) = (hand_over(&sa), Baseline::default());
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2400).unwrap();
-        assert_eq!(b.map[&place_key("settings")], kept);
+        assert_eq!(read_place(&b.map[&place_key("settings")]), read_place(&kept));
     }
 
     /// Unstowed on one device: gone from the other too, the answers kept on both and in the space; stowed again later (the stower stamps when), it wins over the unstow's tombstone and asks nothing anywhere. Its source and version travel with it.
@@ -1195,16 +1207,88 @@ mod tests {
         assert!(sa.entries().iter().all(|e| !e.gone));
     }
 
-    /// The map's own form read and written alike: a place kept before turns stands upright; a cut label names the map's entry.
+    /// A cut label names the map's entry (the documents' own round trips are ferros_kept's tests).
     #[test]
-    fn the_maps_forms() {
-        let p = [-123456, 789, 4000, -ONE, 3];
-        assert_eq!(decode_place(&encode_place(&p)), Some(p));
-        assert_eq!(decode_place(&ewe(&[zig(5), zig(-6), 70])), Some([5, -6, 70, ONE, 0]));
-        assert_eq!(decode_place(&ewe(&[1, 2, 0])), None);
+    fn a_cut_label_names_the_maps_entry() {
         assert_eq!(place_key("a very long kist name that goes on"), b"place.a_very_long_kist_name_that".to_vec());
-        let v = [1, -2, 3, -4];
-        assert_eq!(decode_view(&encode_view(&v)), Some(v));
+    }
+
+    /// A place or the view as the map kept it before its documents (payloads/map `save_place`, `save_view`): zigzag EWE integers, built here exactly so.
+    fn old_ewe(signed: &[(i64, bool)]) -> Vec<u8> {
+        let mut b = [0u8; 64];
+        let mut n = 0;
+        for &(v, zigged) in signed {
+            n += ferros_ledger::ewe::encode_u64(&mut b[n..], if zigged { ((v << 1) ^ (v >> 63)) as u64 } else { v as u64 });
+        }
+        b[..n].to_vec()
+    }
+
+    fn old_place(p: &[i64; 5]) -> Vec<u8> {
+        old_ewe(&[(p[0], true), (p[1], true), (p[2], false), (p[3], true), (p[4], true)])
+    }
+
+    fn old_view(v: &[i64; 4]) -> Vec<u8> {
+        old_ewe(&[(v[0], true), (v[1], true), (v[2], true), (v[3], true)])
+    }
+
+    /// The Pro's arrangement as an old build kept it: the same places and view as `arranged_pro`, each in its old form.
+    fn arranged_pro_old() -> Vault {
+        let mut v = arranged_pro();
+        let keys: Vec<Vec<u8>> = v.map.keys().cloned().collect();
+        for k in keys {
+            let old = if k == b"view" { old_view(&read_view(&v.map[&k]).unwrap()) } else { old_place(&read_place(&v.map[&k]).unwrap()) };
+            v.map.insert(k, old);
+        }
+        v
+    }
+
+    /// A device whose copy is still in the old forms (its conversion failed, or it skipped the converting build): every place and the view are kept out of the sync, nothing reads as removed, nothing is written over them, and the space does not change.
+    #[test]
+    fn an_old_copy_is_kept_out_and_nothing_is_removed() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        let digest = sa.digest();
+        let mut old = arranged_pro_old();
+        let held = old.map.clone();
+        assert!(held.values().all(|v| read_place(v).is_none() && read_view(v).is_none()), "the old forms are not documents");
+        let o = sync(&mut sa, &mut ba, &mut old, &PRO, 2100).unwrap();
+        assert_eq!(o.kept_out.len(), 4, "three places and the view");
+        assert!(!o.space_changed && o.wrote == 0);
+        assert_eq!(sa.digest(), digest);
+        assert!(sa.entries().iter().all(|e| !e.gone));
+        assert_eq!(old.map, held, "nothing written over them");
+    }
+
+    /// A copy present but not a document this build reads (here a value no build wrote) is kept out of the sync: never read as the person removing it, never written over from the space, said in the outcome; the rest syncs as ever. Once it is a document again it is read.
+    #[test]
+    fn a_copy_that_is_not_a_document_is_kept_out_never_removed() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        let mahere = place_id(&FLEET, &Circle::Kist(MAHERE.0, MAHERE.1));
+        let (was, view_was) = (sa.get(kind::PLACE, &mahere).unwrap().clone(), sa.get(kind::VIEW, &view_id(&FLEET)).unwrap().clone());
+        a.set(Scope::Map, &place_key("Mahere"), b"not a place");
+        a.set(Scope::Map, b"view", &[1, 2, 3]);
+        // The person moves settings here at the same time: that still goes out.
+        a.set(Scope::Map, &place_key("settings"), &encode_place(&[0, 0, 300, 0, ONE]));
+        let o = sync(&mut sa, &mut ba, &mut a, &PRO, 2100).unwrap();
+        assert_eq!(o.kept_out.iter().map(|k| k.key.clone()).collect::<Vec<_>>(), vec![place_key("Mahere"), b"view".to_vec()]);
+        assert!(o.space_changed, "the move of settings went out");
+        assert_eq!(sa.get(kind::PLACE, &mahere), Some(&was), "Mahere's place stands in the space");
+        assert_eq!(sa.get(kind::VIEW, &view_id(&FLEET)), Some(&view_was), "and the view");
+        // A sibling moves Mahere: the space's newer value is not written over what this copy holds.
+        sa.put(Entry { kind: kind::PLACE, id: mahere.clone(), value: ints(&[7, 8, 90, ONE, 0]), updated: 3000, by: OTHER, gone: false });
+        let o = sync(&mut sa, &mut ba, &mut a, &PRO, 3100).unwrap();
+        assert_eq!(o.kept_out.len(), 2);
+        assert_eq!(a.map[&place_key("Mahere")], b"not a place".to_vec());
+        // Readable again: read, and the space's newer place is taken.
+        a.set(Scope::Map, &place_key("Mahere"), &encode_place(&[900 << 8, -40 << 8, 180, -ONE, 0]));
+        a.set(Scope::Map, b"view", &encode_view(&[12 << 8, -3 << 8, 11585, 11585]));
+        let o = sync(&mut sa, &mut ba, &mut a, &PRO, 3200).unwrap();
+        assert!(o.kept_out.is_empty());
+        assert_eq!(read_place(&a.map[&place_key("Mahere")]), Some([7, 8, 90, ONE, 0]));
+        assert!(sa.entries().iter().all(|e| !e.gone));
     }
 
     /// The person's zone: none until chosen; chosen on one device, it crosses the fleet sealed; the later choice wins even from a device whose clock runs behind; the device's own copy is never touched by the sync (identity to device only, by the identity service).
@@ -1388,7 +1472,7 @@ mod device_dump {
         for (k, v) in device.0.iter().filter(|(k, _)| k.0 == Scope::Map as u8) {
             let label = std::string::String::from_utf8_lossy(&k.1);
             match fresh.0.get(k) {
-                Some(w) if decode_place(w).is_some() && decode_place(w) == decode_place(v) || k.1 == b"view" && decode_view(w) == decode_view(v) => std::println!("  {label}: the same"),
+                Some(w) if ferros_kept::map::read_place(w).is_some() && ferros_kept::map::read_place(w) == ferros_kept::map::read_place(v) || k.1 == b"view" && ferros_kept::map::read_view(w) == ferros_kept::map::read_view(v) => std::println!("  {label}: the same"),
                 other => panic!("{label}: {:?} on the device, {:?} restored", v, other),
             }
         }

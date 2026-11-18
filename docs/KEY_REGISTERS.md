@@ -323,7 +323,7 @@ The owner, 2026-11-17: "if it stays closer to the CPU it's not only faster but i
 
 **The storage rule: sealed under the wairua at rest; plaintext only in registers.**
 A plaintext identity key held by the kernel is never stored to memory, cacheable or not.
-The kernel's held keys are the identity's seed, the three keys of its vault class (address, payload, domain) and the person key (kvault `IdKeys`).
+The kernel's held keys are the identity's seed, the three keys of its vault class (address, payload, domain), the person's ledger key (personal entries of the flash log, LEDGER.md "Classes") and the person key (kvault `IdKeys`).
 
 **How** (keyreg/keys.rs, the same derive, audit, freeze discipline as the ira and the wairua: safe Rust lifted by tools/keyreg-lift.sh, no stack, no spill, no call out):
 - A held key is `key XOR pad` beside its nonce (`keys::Held`, 64 bytes), the pad `derive_key("ferros 2026-11-17 identity at rest v0", wairua ‖ nonce)`, one compression made in registers from the wairua's two shares.
@@ -348,6 +348,7 @@ The kernel's held keys are the identity's seed, the three keys of its vault clas
 | Addresses of the identity's names in the kernel's vault, scoped addresses | address | register-only up to 128 bytes of name (`held_keyed`) | A longer name opens the key into memory for one hash (counted; no kernel name is that long). |
 | The place of an identity value kept in pieces | address | the place key derived register-only | The place key (derived from the address key) in memory for one vault operation on a value in pieces, wiped (`Place::wipe`). |
 | Sealing and opening the identity's values in the kernel's vault (the name list, migration, export) | payload | **not yet** (open question 14) | Opened into an XChaCha20-Poly1305 cipher for one seal or open, then wiped to DRAM: microseconds for the name list, up to milliseconds for a large value. |
+| Sealing the flash log's personal entries, and opening them for `diag log` while the person is present (flashlog.rs) | ledger | **not yet**, as payload | Opened into memory (`held_open`) for one entry's seal or one `diag log` answer, its subkeys and the cipher wiped when it is used: tens of microseconds for an entry. The system entries' key comes from the ira through `keys::derive` the same way, one derivation an entry. |
 | Keeping a tag (`tag_keep`) | seed | **not yet** | Opened for one XChaCha20-Poly1305 seal of 32 bytes, microseconds, wiped. |
 | Unlocking by a tag (`tag_unlock`) | seed | no: the seed comes out of the tag's record and goes to the attest screen (its design today) | Decrypted into memory, held, and copied to ahau. |
 | Unlock at boot (`ID_UNLOCK`) | seed | no: kept on UFS by the setting (its warning) | Read into memory at boot for the unlock, wiped. |

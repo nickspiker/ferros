@@ -1,8 +1,10 @@
 //! `ferros send <kist.capsule.vsf>`: stow a kist on a ferros device over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "how do we install kists over USB? Can we make a standard method so the end user doesn't have to get them from the [catalog]", "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow").
 //!
-//! The device does the checking, as it checks a kist from the directory: every egg of its signature against its developer's keys and the person's trust in them, then the kernel's gate, the sandbox checker and the seal. Nothing is stowed until the person says Stow on the device's screen. This tool carries the capsule in, offers it, follows the device's checks, and lets the USB link go once the offer waits on the person. It holds no development command (the capability it uses, `ferros.kist.offer`, is one a production build answers too).
+//! The device does the checking, as it checks a kist from the directory: every egg of its signature against its developer's keys and the person's trust in them, then the kernel's gate, the sandbox checker and the seal. Nothing is stowed until the person says Stow on the device's screen, or, on a device in developer mode, until every check has passed (below). This tool carries the capsule in, offers it, follows the device's checks, and lets the USB link go once the offer waits on the person. It holds no development command (the capability it uses, `ferros.kist.offer`, is one a production build answers too).
 //!
 //! **It never holds the link while the person decides** (owner, 2026-11-12: a stow left waiting on the Pro while the owner was in Mahere held the device's USB interface, and every other host tool was shut out). The claim on the interface is exclusive, and nothing the device does when the person answers reaches a host that holds no claim, so the only waits with no claim and no timer are the person's own: `ferros send` ends at "waiting on the person" (exit 3) with the link released, and `ferros sent <capsule>` asks the device once, at once, how that offer stands (the device keeps an offer's end until another offer replaces it). Meanwhile the device's Deck button is red (docs/NOTIFY.md "System questions"), and one tap on it opens the offer. A `ferros send` of a capsule the device is still asking about carries nothing again: it says so.
+//!
+//! **Developer mode** (docs/KISTS.md "Stowing", auto-stow; owner, 2026-11-17: "Should be a way to auto-stow in developer mode, just sayin'"): a device in developer mode (a development build, or Developer made a page on a release build) stows an offer that passes every check without the tap. The device decides; this tool asks for nothing. It then never says "waiting on the person": it follows the offer to its end and says "stowed automatically (developer mode)" (the state's `offer::AUTO` flag), exit 0 as any stow; `ferros sent` says the same of that offer afterwards. The exit code alone does not tell a tap from developer mode; the line does.
 //!
 //! The device: the first ferros device on USB (VID G#1209, PID G#4665), the one on bus `FERROS_BUS` (lsusb's number), or the one in socket `FERROS_PORT` (sysfs's `1-2.4`) when several are plugged in. Exit 0 stowed, 1 refused or failed, 2 cancelled, 3 waiting on the person (the link let go).
 //!
@@ -22,6 +24,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("send: offers a kist to the ferros device on USB and lets the link go once it waits on the person, who stows or cancels it on the device's screen (its Deck button turns red: a tap opens it).");
     eprintln!("sent: how that offer stands now: stowed, refused, cancelled, or still waiting.");
+    eprintln!("A device in developer mode stows an offer that passes every check without the tap: send then ends at \"stowed automatically (developer mode)\", exit 0.");
     eprintln!("Exit 0 stowed, 1 refused or failed, 2 cancelled, 3 waiting on the person.");
     eprintln!("FERROS_BUS=<bus number> or FERROS_PORT=<bus>-<port path> picks the device when more than one is plugged in.");
     exit(1);
@@ -65,7 +68,8 @@ fn tell(state: u8, why: u8, flags: u8) -> Option<i32> {
             return Some(WAITING);
         }
         offer::STOWED => {
-            say("stowed");
+            // The device in developer mode stowed it without the person's tap, every check passed (`offer::AUTO`; docs/KISTS.md "Stowing", auto-stow): the same exit, the line says how.
+            say(if flags & offer::AUTO != 0 { "stowed automatically (developer mode): every check passed, no tap asked" } else { "stowed" });
             return Some(STOWED);
         }
         offer::REFUSED => {
@@ -283,6 +287,8 @@ mod tests {
         assert_eq!(tell(offer::OFFERED, 0, 0), None);
         assert_eq!(tell(offer::CHECKING, 0, 0), None);
         assert_eq!(tell(offer::STOWED, 0, 0), Some(STOWED));
+        // Auto-stow (developer mode) ends as a stow does: exit 0, only the line differs.
+        assert_eq!(tell(offer::STOWED, 0, offer::AUTO | offer::NATIVE), Some(STOWED));
         assert_eq!(tell(offer::CANCELLED, 0, 0), Some(CANCELLED));
         assert_eq!(tell(offer::REFUSED, 1, 0), Some(FAILED));
         assert_eq!(tell(offer::GONE, 0, 0), Some(FAILED));

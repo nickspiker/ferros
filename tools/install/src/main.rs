@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::process::Command;
 
+use ferros_hal::ring::{gen_to_pos, KernelRingEntry, RingEntry};
 use ferros_layout::*;
 
 // ---------------------------------------------------------------------------
@@ -635,94 +636,15 @@ fn cmd_format(part: &Partition) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Genesis — write the initial spine entry
+// Genesis: write the initial spine entry
 // ---------------------------------------------------------------------------
 
-fn ewe_encode_u64(val: u64) -> (u8, Vec<u8>) {
-   if val <= 0xFF {
-      (b'3', vec![val as u8])
-   } else if val <= 0xFFFF {
-      (b'4', (val as u16).to_be_bytes().to_vec())
-   } else if val <= 0xFFFF_FFFF {
-      (b'5', (val as u32).to_be_bytes().to_vec())
-   } else {
-      (b'6', val.to_be_bytes().to_vec())
-   }
-}
-
-/// Decode a u64 from EWE at the given position. Returns (value, bytes_consumed).
-fn ewe_decode_u64(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
-   if pos + 2 > buf.len() || buf[pos] != b'u' {
-      return None;
-   }
-   match buf[pos + 1] {
-      b'3' if pos + 3 <= buf.len() => Some((buf[pos + 2] as u64, 3)),
-      b'4' if pos + 4 <= buf.len() => {
-         let v = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
-         Some((v as u64, 4))
-      }
-      b'5' if pos + 6 <= buf.len() => {
-         let v = u32::from_be_bytes(buf[pos + 2..pos + 6].try_into().ok()?);
-         Some((v as u64, 6))
-      }
-      b'6' if pos + 10 <= buf.len() => {
-         let v = u64::from_be_bytes(buf[pos + 2..pos + 10].try_into().ok()?);
-         Some((v as u64, 10))
-      }
-      _ => None,
-   }
-}
-
-/// Build a genesis spine entry as a VSF document in a 4KB block.
-fn build_genesis_entry() -> [u8; BLOCK_SIZE] {
-   let mut block = [0u8; BLOCK_SIZE];
-
-   let hash_prefix_len = 34; // 'h' 'p' [32 bytes]
-   let mut pos = hash_prefix_len;
-
-   // gen(u{0})
-   block[pos] = b'u';
-   pos += 1;
-   let (width_tag, payload) = ewe_encode_u64(0);
-   block[pos] = width_tag;
-   pos += 1;
-   block[pos..pos + payload.len()].copy_from_slice(&payload);
-   pos += payload.len();
-
-   // prev_hash(hp{BLAKE3([0;32])})
-   let genesis_prev = blake3::hash(&[0u8; 32]);
-   block[pos] = b'h';
-   pos += 1;
-   block[pos] = b'p';
-   pos += 1;
-   block[pos..pos + 32].copy_from_slice(genesis_prev.as_bytes());
-   pos += 32;
-
-   // plow(u{TRACT_BASE})
-   block[pos] = b'u';
-   pos += 1;
-   let (width_tag, payload) = ewe_encode_u64(TRACT_BASE as u64);
-   block[pos] = width_tag;
-   pos += 1;
-   block[pos..pos + payload.len()].copy_from_slice(&payload);
-   pos += payload.len();
-
-   // ledger_head(hp{BLAKE3([0;32])})
-   let genesis_ledger = blake3::hash(&[0u8; 32]);
-   block[pos] = b'h';
-   pos += 1;
-   block[pos] = b'p';
-   pos += 1;
-   block[pos..pos + 32].copy_from_slice(genesis_ledger.as_bytes());
-   pos += 32;
-
-   // Provenance hash over inner document
-   let entry_hash = blake3::hash(&block[hash_prefix_len..pos]);
-   block[0] = b'h';
-   block[1] = b'p';
-   block[2..34].copy_from_slice(entry_hash.as_bytes());
-
-   block
+/// The genesis spine entry as the kernel reads it: `ferros_hal::ring::RingEntry` (generation 0, previous hash all zeros, the plow at the tract's start), a complete VSF document built by the schema builders, stamped with `now` (Eagle oscillations).
+/// One definition writes and reads it, so what install puts on disk is what the device parses.
+fn genesis_entry(now: i64) -> io::Result<[u8; BLOCK_SIZE]> {
+   RingEntry::genesis(now)
+      .to_block()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "genesis spine entry did not build"))
 }
 
 fn cmd_genesis(part: &Partition) -> io::Result<()> {
@@ -738,10 +660,10 @@ fn cmd_genesis(part: &Partition) -> io::Result<()> {
       .write(true)
       .open(&part.raw_device)?;
 
-   let entry = build_genesis_entry();
-   let entry_hash = blake3::hash(&entry[34..]);
+   let entry = genesis_entry(vsf::eagle_time_oscillations())?;
 
-   let offset = block_to_bytes(SPINE_BASE);
+   let block = SPINE_BASE + gen_to_pos(0);
+   let offset = block_to_bytes(block);
    f.seek(SeekFrom::Start(offset))?;
    f.write_all(&entry)?;
    f.flush()?;
@@ -752,24 +674,27 @@ fn cmd_genesis(part: &Partition) -> io::Result<()> {
    f.read_exact(&mut readback)?;
 
    if readback != entry {
-      eprintln!("  Write-verify: FAILED — read-back does not match written data.");
+      eprintln!("  Write-verify: FAILED: read-back does not match written data.");
       eprintln!("  The disk may have bad sectors or the write was not flushed.");
       return Err(io::Error::new(io::ErrorKind::Other, "write-verify failed"));
    }
+   // The bytes on disk read back thru the device's own reader.
+   let read = RingEntry::from_block(&readback)
+      .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "genesis entry on disk does not parse"))?;
    println!("  Write-verify: OK");
 
    println!();
-   println!("  Genesis spine entry written at block {}", fmt_hex(SPINE_BASE as u64));
-   println!("  Generation:   0");
-   println!("  Plow:         {} (tract start)", fmt_hex(TRACT_BASE as u64));
-   println!("  Entry hash:   {}", hex::encode(entry_hash.as_bytes()));
-   println!("  Prev hash:    {} (genesis)", hex::encode(blake3::hash(&[0u8; 32]).as_bytes()));
+   println!("  Genesis spine entry written at block {}", fmt_hex(block as u64));
+   println!("  Generation:   A#{}", read.generation);
+   println!("  Plow:         {} (tract start)", fmt_hex(read.plow_position as u64));
+   println!("  Entry hash:   {}", hex::encode(&read.hp_hash));
+   println!("  Prev hash:    {} (genesis)", hex::encode(&read.prev_hash));
    println!();
    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Verify — scan the spine and decode entries
+// Verify: scan the spine and decode entries
 // ---------------------------------------------------------------------------
 
 fn cmd_verify(part: &Partition) -> io::Result<()> {
@@ -793,89 +718,34 @@ fn cmd_verify(part: &Partition) -> io::Result<()> {
          let mut block = [0u8; BLOCK_SIZE];
          f.read_exact(&mut block)?;
 
-         if block[0] != b'h' || block[1] != b'p' {
-            if !block.iter().all(|&b| b == 0) {
-               println!("  Slot {:>5}: unknown data (G#{:02X} G#{:02X})", i, block[0], block[1]);
-            }
+         if block.iter().all(|&b| b == 0) {
             continue;
          }
 
-         // Verify provenance hash
-         let stored_hash = &block[2..34];
-         let inner_start = 34;
-
-         // Find the end of meaningful data (scan for trailing zeros)
-         let mut inner_end = BLOCK_SIZE;
-         while inner_end > inner_start && block[inner_end - 1] == 0 {
-            inner_end -= 1;
+         // One hash span, the one the document's own provenance hash covers: the document's bytes (its `file_length`, the rest of the block being padding) with the hash's own 32 bytes read as zeros.
+         // The kernel's reader (`RingEntry::from_block`) checks exactly that span, so a slot is valid here only when it is valid there.
+         match RingEntry::from_block(&block) {
+            Some(e) => {
+               valid_count += 1;
+               highest_gen = Some(highest_gen.map_or(e.generation, |h: u64| h.max(e.generation)));
+               println!("  Slot A#{:<5}: VALID  gen=A#{}  plow={}", i, e.generation, fmt_hex(e.plow_position as u64));
+            }
+            None => println!("  Slot A#{:<5}: does not verify as a spine entry", i),
          }
-
-         let computed = blake3::hash(&block[inner_start..inner_end]);
-         let hash_valid = stored_hash == computed.as_bytes();
-
-         // Also try hashing the full remainder (as build_genesis_entry does)
-         let computed_full = blake3::hash(&block[inner_start..]);
-         let hash_valid_full = stored_hash == computed_full.as_bytes();
-
-         let valid = hash_valid || hash_valid_full;
-
-         // Decode generation from the inner document
-         let generation = ewe_decode_u64(&block, inner_start).map(|(v, _)| v);
-
-         // Decode plow position (skip gen + prev_hash to find it)
-         let plow = decode_plow(&block, inner_start);
-
-         valid_count += 1;
-         if let Some(g) = generation {
-            highest_gen = Some(highest_gen.map_or(g, |h: u64| h.max(g)));
-         }
-
-         print!("  Slot {:>5}: ", i);
-         if valid {
-            print!("VALID");
-         } else {
-            print!("HASH MISMATCH");
-         }
-         if let Some(g) = generation {
-            print!("  gen={}", g);
-         }
-         if let Some(p) = plow {
-            print!("  plow={}", fmt_hex(p));
-         }
-         println!();
       }
    }
 
    println!();
    if valid_count == 0 {
-      println!("  Spine is empty — partition needs genesis.");
+      println!("  Spine is empty: partition needs genesis.");
    } else {
-      println!("  Found {} entries.", valid_count);
+      println!("  Found A#{} entries.", valid_count);
       if let Some(g) = highest_gen {
-         println!("  Highest generation: {}", g);
+         println!("  Highest generation: A#{}", g);
       }
    }
    println!();
    Ok(())
-}
-
-/// Decode the plow field from a spine entry's inner document. Layout: gen(u{...}) prev_hash(hp{32}) plow(u{...})
-fn decode_plow(block: &[u8], inner_start: usize) -> Option<u64> {
-   let mut pos = inner_start;
-
-   // Skip generation: u + width_tag + payload
-   let (_, gen_len) = ewe_decode_u64(block, pos)?;
-   pos += gen_len;
-
-   // Skip prev_hash: 'h' 'p' [32 bytes] = 34
-   if pos + 34 > block.len() || block[pos] != b'h' || block[pos + 1] != b'p' {
-      return None;
-   }
-   pos += 34;
-
-   // Decode plow
-   let (val, _) = ewe_decode_u64(block, pos)?;
-   Some(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -927,122 +797,13 @@ fn parse_signed_kernel(path: &str) -> io::Result<SignedKernel> {
    Ok(SignedKernel { flat, hash, sig })
 }
 
-/// Build a stem (kernel ring) entry as a proper VSF document. Must match the format that ferros_seed's parse_kernel_entry() expects: RÅ< z(0) y(0) b(hlen) eu(0) hp(hash) n(5) > [ (generation:u(N)) (kernel_lba:u(N)) (kernel_size:u(N)) (kernel_hash:hp(32)) (kernel_sig:ge(64)) ]
-fn build_stem_entry(
-   generation: u64,
-   kernel_lba: u32,
-   kernel_size: u32,
-   kernel_hash: &[u8; 32],
-   kernel_sig: &[u8; 64],
-) -> [u8; BLOCK_SIZE] {
-   let mut block = [0u8; BLOCK_SIZE];
-   let mut pos = 0;
-
-   // --- VSF magic ---
-   let magic: [u8; 4] = [0x52, 0xC3, 0x85, 0x3C]; // RÅ<
-   block[pos..pos + 4].copy_from_slice(&magic);
-   pos += 4;
-
-   // z(0) — version
-   block[pos] = b'z'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 0; pos += 1;
-
-   // y(0) — backward compat version
-   block[pos] = b'y'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 0; pos += 1;
-
-   // b(header_len) — placeholder, fill in after header
-   let hlen_pos = pos;
-   block[pos] = b'b'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 0; pos += 1; // placeholder
-
-   // eu(0) — eagle time (0 = no time source on host)
-   block[pos] = b'e'; pos += 1;
-   block[pos] = b'u'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 0; pos += 1;
-
-   // hp(hash) — provenance hash placeholder (fill after body)
-   let _hp_pos = pos;
-   block[pos] = b'h'; pos += 1;
-   block[pos] = b'p'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 31; pos += 1; // EWE(31) = len-1
-   let hp_hash_pos = pos;
-   pos += 32; // 32 zero bytes = placeholder
-
-   // n(5) — field count
-   block[pos] = b'n'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 5; pos += 1;
-
-   // > — close header
-   block[pos] = 0x3E; pos += 1;
-
-   // Fill in header length (from after magic to close, exclusive)
-   let hlen = (pos - 4) as u8; // subtract magic length
-   block[hlen_pos + 2] = hlen;
-
-   // --- Body: [ fields ] ---
-   block[pos] = b'['; pos += 1;
-
-   // Helper: write a named field with u64 value
-   fn write_uint_field(block: &mut [u8], pos: &mut usize, name: &str, val: u64) {
-      block[*pos] = b'('; *pos += 1;
-      // d(name)
-      block[*pos] = b'd'; *pos += 1;
-      let (wt, pl) = ewe_encode_u64(name.len() as u64);
-      block[*pos] = wt; *pos += 1;
-      block[*pos..*pos + pl.len()].copy_from_slice(&pl); *pos += pl.len();
-      block[*pos..*pos + name.len()].copy_from_slice(name.as_bytes()); *pos += name.len();
-      block[*pos] = b':'; *pos += 1;
-      // u(val)
-      block[*pos] = b'u'; *pos += 1;
-      let (wt, pl) = ewe_encode_u64(val);
-      block[*pos] = wt; *pos += 1;
-      block[*pos..*pos + pl.len()].copy_from_slice(&pl); *pos += pl.len();
-      block[*pos] = b')'; *pos += 1;
-   }
-
-   write_uint_field(&mut block, &mut pos, "generation", generation);
-   write_uint_field(&mut block, &mut pos, "kernel_lba", kernel_lba as u64);
-   write_uint_field(&mut block, &mut pos, "kernel_size", kernel_size as u64);
-
-   // (kernel_hash: hp(32))
-   block[pos] = b'('; pos += 1;
-   block[pos] = b'd'; pos += 1;
-   let (wt, pl) = ewe_encode_u64(11); // "kernel_hash".len()
-   block[pos] = wt; pos += 1;
-   block[pos..pos + pl.len()].copy_from_slice(&pl); pos += pl.len();
-   block[pos..pos + 11].copy_from_slice(b"kernel_hash"); pos += 11;
-   block[pos] = b':'; pos += 1;
-   block[pos] = b'h'; pos += 1;
-   block[pos] = b'p'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 31; pos += 1; // EWE(31)
-   block[pos..pos + 32].copy_from_slice(kernel_hash); pos += 32;
-   block[pos] = b')'; pos += 1;
-
-   // (kernel_sig: ge(64))
-   block[pos] = b'('; pos += 1;
-   block[pos] = b'd'; pos += 1;
-   let (wt, pl) = ewe_encode_u64(10); // "kernel_sig".len()
-   block[pos] = wt; pos += 1;
-   block[pos..pos + pl.len()].copy_from_slice(&pl); pos += pl.len();
-   block[pos..pos + 10].copy_from_slice(b"kernel_sig"); pos += 10;
-   block[pos] = b':'; pos += 1;
-   block[pos] = b'g'; pos += 1;
-   block[pos] = b'e'; pos += 1;
-   block[pos] = b'3'; pos += 1; block[pos] = 63; pos += 1; // EWE(63)
-   block[pos..pos + 64].copy_from_slice(kernel_sig); pos += 64;
-   block[pos] = b')'; pos += 1;
-
-   block[pos] = b']'; pos += 1;
-
-   // Compute provenance hash: BLAKE3 of entire block with hp hash zeroed
-   let mut temp = block;
-   for i in 0..32 { temp[hp_hash_pos + i] = 0; }
-   let hash = blake3::hash(&temp);
-   block[hp_hash_pos..hp_hash_pos + 32].copy_from_slice(hash.as_bytes());
-
-   let _ = pos; // suppress unused warning
-   block
+/// The stem (kernel ring) entry for a signed kernel at `kernel_lba`, as the seed reads it: `ferros_hal::ring::KernelRingEntry`, a complete VSF document built by the schema builders, stamped with `now` (Eagle oscillations).
+/// One definition writes and reads it, so the seed parses exactly what install writes.
+fn stem_entry(generation: u64, kernel_lba: u32, signed: &SignedKernel, now: i64) -> io::Result<[u8; BLOCK_SIZE]> {
+   // The size fits: cmd_kernel refused a kernel past KERNEL_MAX_BLOCKS, far below 4 GiB.
+   KernelRingEntry::new(generation, kernel_lba, signed.flat.len() as u32, signed.hash, signed.sig, now)
+      .to_block()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stem entry did not build"))
 }
 
 fn cmd_kernel(part: &Partition, path: &str) -> io::Result<()> {
@@ -1102,17 +863,11 @@ fn cmd_kernel(part: &Partition, path: &str) -> io::Result<()> {
    }
    f.flush()?;
 
-   // Build and write stem entry at position 0 (generation 1)
-   let stem_entry = build_stem_entry(
-      1,
-      KERNEL_A_BASE,
-      signed.flat.len() as u32,
-      &signed.hash,
-      &signed.sig,
-   );
+   // Build and write stem entry at position 0 (generation 1, the stem's first)
+   let stem_entry = stem_entry(1, KERNEL_A_BASE, &signed, vsf::eagle_time_oscillations())?;
 
    let stem_offset = block_to_bytes(STEM_BASE);
-   println!("  Writing stem entry at block {} (generation 1)...", fmt_hex(STEM_BASE as u64));
+   println!("  Writing stem entry at block {} (generation A#1)...", fmt_hex(STEM_BASE as u64));
    f.seek(SeekFrom::Start(stem_offset))?;
    f.write_all(&stem_entry)?;
    f.flush()?;
@@ -1124,11 +879,16 @@ fn cmd_kernel(part: &Partition, path: &str) -> io::Result<()> {
    if stem_readback != stem_entry {
       return Err(io::Error::new(io::ErrorKind::Other, "Stem entry write-verify failed"));
    }
+   // The bytes on disk read back thru the seed's own reader, pointing at the kernel just written.
+   match KernelRingEntry::from_block(&stem_readback) {
+      Some(e) if e.generation == 1 && e.kernel_lba == KERNEL_A_BASE && e.kernel_hash == signed.hash && e.kernel_sig == signed.sig => {}
+      _ => return Err(io::Error::new(io::ErrorKind::Other, "Stem entry on disk does not read back as this kernel")),
+   }
    println!("  Write-verify: OK");
 
    println!();
    println!("  Kernel installed.");
-   println!("  Stem generation: 1");
+   println!("  Stem generation: A#1");
    println!("  Kernel slot A:   block {} ({} blocks)", fmt_hex(KERNEL_A_BASE as u64), kernel_blocks);
    println!("  Kernel slot B:   block {} (mirror)", fmt_hex(KERNEL_B_BASE as u64));
    println!();
@@ -1329,5 +1089,63 @@ fn main() {
          eprintln!("  Usage: ferros-install [install|info|format|genesis|verify|all]");
          std::process::exit(1);
       }
+   }
+}
+
+// ---------------------------------------------------------------------------
+// Host tests: what install writes, read by the device's own readers
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn stem_entry_reads_back_thru_the_seeds_reader() {
+      let flat = vec![0x5Au8; (1 << 20) + 3];
+      let hash = *blake3::hash(&flat).as_bytes();
+      let mut sig = [0u8; 64];
+      for (i, b) in sig.iter_mut().enumerate() {
+         *b = (i as u8) ^ 0xC3;
+      }
+      let signed = SignedKernel { flat, hash, sig };
+      let now = vsf::eagle_time_oscillations();
+
+      let blk = stem_entry(1, KERNEL_A_BASE, &signed, now).unwrap();
+      // The seed's reader: ferros_seed calls exactly this on the block it reads from the stem.
+      let e = KernelRingEntry::from_block(&blk).expect("the seed parses install's stem entry");
+      assert_eq!(e.generation, 1);
+      assert_eq!(e.kernel_lba, KERNEL_A_BASE);
+      assert_eq!(e.kernel_size as usize, signed.flat.len());
+      assert_eq!(e.kernel_hash, signed.hash);
+      assert_eq!(e.kernel_sig, signed.sig);
+      assert_eq!(e.eagle_time, now);
+      assert_eq!(&blk[..4], "RÅ<".as_bytes());
+      assert_ne!(e.hp_hash, [0u8; 32]);
+   }
+
+   #[test]
+   fn genesis_entry_reads_back_thru_the_kernels_reader() {
+      let now = vsf::eagle_time_oscillations();
+      let blk = genesis_entry(now).unwrap();
+      // The spine's reader: ferros_hal::ring::scan_ring calls exactly this on every slot it reads.
+      let e = RingEntry::from_block(&blk).expect("the kernel parses install's genesis entry");
+      assert_eq!(e.generation, 0);
+      assert_eq!(gen_to_pos(e.generation), 0);
+      assert_eq!(e.prev_hash, [0u8; 32]);
+      assert_eq!(e.hamt_root_hash, [0u8; 32]);
+      assert_eq!(e.hamt_root_lba, 0);
+      assert_eq!(e.plow_position, TRACT_BASE);
+      assert_eq!(e.eagle_time, now);
+      assert_eq!(&blk[..4], "RÅ<".as_bytes());
+      assert_ne!(e.hp_hash, [0u8; 32]);
+   }
+
+   #[test]
+   fn the_host_clock_is_eagle_time() {
+      // 2026-11 is a little over 57 years after the Eagle landed; a UNIX count read as Eagle time would be 56.
+      let year = 31_556_952i64 * vsf::OSCILLATIONS_PER_SECOND as i64;
+      let now = vsf::eagle_time_oscillations();
+      assert!(now > 57 * year && now < 64 * year, "{} is not Eagle time now", now);
    }
 }

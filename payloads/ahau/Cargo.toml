@@ -21,5 +21,7 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 tapuwae = { path = "../../../tapuwae", default-features = false, features = ["gpu"] }
 # VSF RGB's photopic luminance (through LMS), for the keys' rainbow: colours are VSF RGB, never sRGB (owner, 2026-11-01).
 vsf = { version = "0.11", path = "../../../vsf", default-features = false }
+# The handle proof and the wallpaper seed kept in the identity's space as VSF documents (docs/VSF-AUDIT.md P18).
+ferros_kept = { path = "../../ferros_kept" }
 # The attest button's squircle edge (a cube root) and the keys' hues (a cosine).
 libm = "0.2"

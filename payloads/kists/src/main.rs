@@ -25,6 +25,9 @@
 //! - 7 [developer 32][option 32]: what that kist kept for itself, its own vault domain (`ferros_sys::kist_domain_size`) → [0][bytes u64 LE][values u64 LE], or [1] refused (nobody present, no vault process).
 //! - 5 [capsule 32][1 Stow, 0 Cancel]: the person's answer to the offer on the glass → [0 taken, 1 no such offer waiting on them].
 //! - 6 [capsule 32]: the offer as the page shows it (`offer_reply`) → [0][length u64 LE][flags, bit 0 native][developer 32][version parts u8, each u64 LE][name length, name][developer's name length, name][wants n][per want: right, reason length, reason], or [1] when that capsule is no offer waiting on the person.
+//! - 8 [1 on, 0 off]: developer mode as the map has it (its Developer page there: always on a development build, after the twelve taps on a release build) → a VSF document in the reply form (ferros_kist::offer::developer: `error`, `why`, `on` as the stower has it now). Only a caller holding the Settings capability and not a kist is taken (SYS_CALLER); anyone else is answered `error` true and changes nothing.
+//!
+//! **Auto-stow** (docs/KISTS.md "Stowing"; owner, 2026-11-17: "Should be a way to auto-stow in developer mode, just sayin'"): in developer mode (`developer_mode`: a development build, or the map said so), an offer over USB that passes every check is stowed without the person's tap, on the tap's own path (`answer`), its end told to the kernel as STOWED with `offer::AUTO`, and a console and flash-log line naming the kist and its version. A refusal is a refusal as before. The decision is the stower's: no host asks for it.
 
 #![no_std]
 #![no_main]
@@ -125,6 +128,8 @@ struct Job {
     answer: Option<bool>,
     /// An unstow's choices from its sheet (`UNSTOW_*`; op 4's flags).
     unstow: u8,
+    /// An offer's Stow said by the stower itself, the device in developer mode (`developer_mode`; docs/KISTS.md "Stowing", auto-stow), not by the person's tap.
+    auto: bool,
 }
 
 /// An unstow's choices (op 4's flags byte; docs/KISTS.md "The unstow sheet"; owner, 2026-11-12: "ask if the user wants to clear data? and if so, what categories?"): what it kept for itself cleared (its own vault domain, dropped whole at once: gone means gone); the person's answers forgotten (everywhere only: they are the person's on every device); this device only (the kist left in the person's list and off this device's deck, `ferros_kist::Hidden`). No flags byte (a map from before) is none of them: today's unstow, everything kept, everywhere.
@@ -179,6 +184,18 @@ static KERNEL_WORD: AtomicU64 = AtomicU64::new(u64::MAX);
 static OFFER_WORD: AtomicU64 = AtomicU64::new(0);
 /// The grants page, for the threads.
 static GRANTS: AtomicU64 = AtomicU64::new(0);
+
+/// A development build (`FERROS_PRODUCTION` unset at build, as the map's and the display's `DEV`): developer mode always, as the map's Developer page is always there.
+const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Developer mode as the map last said it (op 8): on a release build, the twelve taps on About's version line made Developer a page (the map's `map.dev`, the person's, which only the map reads).
+/// Held in RAM only: the map says it again whenever it reaches a stower that started (again).
+static DEVELOPER: AtomicBool = AtomicBool::new(false);
+
+/// Whether the device is in developer mode, where an offer over USB that passes every check is stowed without the person's tap (docs/KISTS.md "Stowing", auto-stow; owner, 2026-11-17: "Should be a way to auto-stow in developer mode, just sayin'").
+/// The stower's own decision: nothing a host sends asks for it.
+fn developer_mode() -> bool {
+    DEV || DEVELOPER.load(Ordering::Acquire)
+}
 
 fn grants() -> u64 {
     GRANTS.load(Ordering::Relaxed)
@@ -287,6 +304,19 @@ fn refused(job: usize, r: &ferros_kist::capsule::Refused) -> u8 {
     }
 }
 
+/// An answer to the offer on the glass (`capsule`, or whichever offer is there for None): Stow or Cancel, the person's (op 5) or the stower's own in developer mode (`auto`); its job queued again for the worker, which stows or drops it (`offer_answer`). False when no such offer waits on an answer.
+fn answer(s: &mut State, capsule: Option<&[u8; 32]>, stow: bool, auto: bool) -> bool {
+    match s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.stage == STAGE_ASKING && capsule.is_none_or(|c| j.capsule == *c)) {
+        Some(j) => {
+            j.answer = Some(stow);
+            j.auto = auto;
+            j.stage = STAGE_QUEUED;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Room for one more job: the oldest finished one gives way. False when every slot is under way.
 fn make_room(s: &mut State) -> bool {
     if s.jobs.len() < JOBS_MAX {
@@ -365,7 +395,7 @@ fn serve(grants: u64) -> ! {
                     if !make_room(s) {
                         return 3;
                     }
-                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None, unstow: 0 });
+                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
                     0
                 });
                 reply(&tok, &[r]);
@@ -388,7 +418,7 @@ fn serve(grants: u64) -> ! {
                         if !make_room(s) {
                             return 3;
                         }
-                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: flags });
+                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: flags, auto: false });
                         0
                     }),
                 };
@@ -402,16 +432,28 @@ fn serve(grants: u64) -> ! {
             5 if got >= 34 => {
                 let capsule: [u8; 32] = m[1..33].try_into().unwrap();
                 let stow = m[33] == 1;
-                let r = with(|s| match s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.capsule == capsule && j.stage == STAGE_ASKING) {
-                    Some(j) => {
-                        j.answer = Some(stow);
-                        j.stage = STAGE_QUEUED;
-                        0
-                    }
-                    None => 1,
-                });
+                let r = if with(|s| answer(s, Some(&capsule), stow, false)) { 0 } else { 1 };
                 reply(&tok, &[r]);
                 if r == 0 {
+                    kick();
+                    ring();
+                }
+            }
+            // Developer mode as the map has it (ferros_kist::offer::developer; docs/KISTS.md "Stowing", auto-stow), from the system's settings alone (the map: the Settings capability, never a kist), answered in the reply form.
+            // Said on: an offer already on the glass is stowed now, as one checked after this is.
+            ferros_kist::offer::developer::OP if got >= 2 => {
+                let h = ferros_sys::caller(&tok).unwrap_or(0);
+                let settings = h & ferros_sys::CALLER_SETTINGS != 0 && h & ferros_sys::CALLER_KIST == 0;
+                if settings {
+                    DEVELOPER.store(m[1] == 1, Ordering::Release);
+                }
+                let r = ferros_kist::offer::developer::Reply { error: !settings, why: String::from(if settings { "taken" } else { "only the system's settings say this" }), on: developer_mode() };
+                match ferros_kist::offer::developer::build(&r, ferros_detail::eagle_now()) {
+                    Some(doc) => reply(&tok, &doc),
+                    None => reply(&tok, &[]),
+                }
+                if settings && developer_mode() && with(|s| answer(s, None, true, true)) {
+                    say(b"kists: developer mode: the offer waiting on the person is stowed without the tap\n");
                     kick();
                     ring();
                 }
@@ -749,7 +791,7 @@ fn restore_pass(grants: u64) {
             if !make_room(s) {
                 break;
             }
-            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: 0 });
+            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
             added = true;
         }
     });
@@ -860,7 +902,7 @@ extern "C" fn offer_watch(grants: u64) -> ! {
                 if !make_room(s) {
                     return Some(false);
                 }
-                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None, unstow: 0 });
+                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
                 Some(true)
             });
             match added {
@@ -911,7 +953,7 @@ fn offer(grants: u64, i: usize, job: &Job) {
     }
 }
 
-/// An offer's checks, as `bring` makes them for a capsule from the directory (SANDBOX.md's lifecycle, nothing skipped): the capsule read back from `capsules.` where the host put it and hashed as it passes (its blake3 must be the address offered, its length the one offered), its declaration, its version, every egg against the bundle it carries and the person's pin for its developer (`capsule::admit`), then the kernel's gate, checker and seal (`stow_check`; native code taken unchecked on a development build only). Ok(ASKING): on the glass, its job at `STAGE_ASKING` with what the page shows.
+/// An offer's checks, as `bring` makes them for a capsule from the directory (SANDBOX.md's lifecycle, nothing skipped): the capsule read back from `capsules.` where the host put it and hashed as it passes (its blake3 must be the address offered, its length the one offered), its declaration, its version, every egg against the bundle it carries and the person's pin for its developer (`capsule::admit`), then the kernel's gate, checker and seal (`stow_check`; native code taken unchecked on a development build only). Ok(ASKING): on the glass, its job at `STAGE_ASKING` with what the page shows. Ok(CHECKING) in developer mode: its job queued again with Stow as its answer (auto-stow), the state the host has unchanged until the stow ends.
 fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
     ferros_sys::offer::tell(cap(grants, S_STOW), &job.capsule, ferros_kist::offer::CHECKING, 0, 0);
     stage(i, STAGE_SIGNATURE, 0, job.total);
@@ -968,23 +1010,32 @@ fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
     say(&l);
     stage(i, STAGE_CODE, 0, job.total);
     let native = kernel_check(grants, i, &job.capsule, job.total, true)?;
+    // Every check has passed. In developer mode (docs/KISTS.md "Stowing", auto-stow) the stower says Stow itself, on the path the person's tap takes (`answer`): the job queued again with its answer, never on the glass, and the host told nothing new until it is stowed.
+    let auto = developer_mode();
     let mut l = Vec::new();
     l.extend_from_slice(b"kists: ");
     l.extend_from_slice(decl.name.as_bytes());
-    l.extend_from_slice(if native { b" offered: native code, taken unchecked (a development build); waiting on the person\n".as_slice() } else { b" offered: checked and sealed; waiting on the person\n" });
+    l.extend_from_slice(if native { b" offered: native code, taken unchecked (a development build); ".as_slice() } else { b" offered: checked and sealed; " });
+    l.extend_from_slice(if auto { b"stowing it without the tap (developer mode)\n".as_slice() } else { b"waiting on the person\n" });
     say(&l);
     with(|s| {
         if let Some(j) = s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.capsule == job.capsule) {
             j.offered = Some(Offered { decl, version, admitted, native });
-            j.stage = STAGE_ASKING;
             j.got = j.total;
+            j.stage = STAGE_ASKING;
+            if auto {
+                answer(s, Some(&job.capsule), true, true);
+            }
         }
     });
     ring();
+    if auto {
+        return Ok((ferros_kist::offer::CHECKING, 0));
+    }
     Ok((ferros_kist::offer::ASKING, if native { ferros_kist::offer::NATIVE } else { 0 }))
 }
 
-/// The person's answer to an offer: Stow puts it in their list (its developer's bundle pinned there at their first kist, as a stow from the directory does; an update keeps every answer for a right it still wants), Cancel drops its bytes and its job. Ok(STOWED or CANCELLED).
+/// The person's answer to an offer (or the stower's own Stow in developer mode, `Job::auto`, which goes to the kernel with `offer::AUTO`): Stow puts it in their list (its developer's bundle pinned there at their first kist, as a stow from the directory does; an update keeps every answer for a right it still wants), Cancel drops its bytes and its job. Ok(STOWED or CANCELLED).
 fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8), u8> {
     if !stow {
         drop_offered(grants, &job.capsule);
@@ -1009,7 +1060,7 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
     // Carried in over USB: no URL to fetch it again from (a restore finds it on the person's other devices or in the directory by its blake3); an update's old source names the old capsule.
     list.kists[k].source = None;
     list.kists[k].stowed = at;
-    list.kists[k].version = Some(o.version);
+    list.kists[k].version = Some(o.version.clone());
     if !ferros_kist::store::write(list_cap, &list, at) {
         return Err(WHY_VAULT);
     }
@@ -1018,12 +1069,23 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
         drop_capsule(grants, &old);
     }
     stage(i, STAGE_DONE, job.total, job.total);
-    let mut l = Vec::new();
-    l.extend_from_slice(b"kists: stowed ");
-    l.extend_from_slice(job.name.as_bytes());
-    l.extend_from_slice(b", the person said Stow\n");
-    say(&l);
-    Ok((ferros_kist::offer::STOWED, o.native as u8))
+    if job.auto {
+        // Developer mode's Stow: on the console and in the flash log (it survives a reset), with what was stowed, so a run without a tap still says what went in.
+        let mut l = String::new();
+        l.push_str("kist offer: stowed automatically (developer mode): ");
+        l.push_str(&job.name);
+        l.push_str(", version A#");
+        let _ = ferros_kist::write_version(&mut l, ferros_kist::tatau::Fmt::new(ferros_kist::tatau::Base::Arabic, ferros_kist::tatau::Style::Words), &o.version.0);
+        l.push('\n');
+        ferros_sys::console_flash(grants, l.as_bytes());
+    } else {
+        let mut l = Vec::new();
+        l.extend_from_slice(b"kists: stowed ");
+        l.extend_from_slice(job.name.as_bytes());
+        l.extend_from_slice(b", the person said Stow\n");
+        say(&l);
+    }
+    Ok((ferros_kist::offer::STOWED, o.native as u8 | if job.auto { ferros_kist::offer::AUTO } else { 0 }))
 }
 
 /// An offered capsule's bytes dropped (refused or cancelled), unless the person's list names it already (the same capsule offered again: their kist stays).

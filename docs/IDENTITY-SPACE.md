@@ -106,3 +106,13 @@ Kept in the vault after the first read, since partfs reads one 4 KiB block per U
 2. Store the new `fgtw`, `init` and `map` capsules (tools/husky-shell.sh), reboot, attest. The console shows `fgtw: space: …` lines; the Fleet page shows the switch.
 3. Arrange the deck (move and turn the circles), answer the kists' questions; wait for `fgtw.org holds ours`.
 4. With the owner's OK: the vault process's fresh start (payloads/vault FRESH, input 01). The network needs `wifi.fw`, `wifi.nvram`, `wifi.clm` (the device's) and `wifi.cred` (the person's) back before the pull can reach anything: by hand from Harbor until the refill exists (or cellular). Reboot, attest. The deck comes back in the same spots and turns; the kists are listed with their answers; their capsules come back with `ferros-bridge kist stow` until the capsule fetch exists. Device firmware is restored by hand from Harbor until the refill exists.
+
+### Run on the Pro, 2026-11-18
+
+A wipe the owner chose instead of converting the vault to VSF (owner: "You can nuke both.").
+- The device-only values were exported first (keys/husky/vault-export-2026-11-18/: GPS replays, WiFi and GPU firmware, AoC registry scripts, camera inputs); the identity's values were not exported (they are the space's to bring back).
+- `diag "vault fresh yes"` zeroed the kernel vault's two copies, the vault process's region start and the ledger's two copies; the next boot (b939) opened a blank kernel vault (0 live entries, 0 live blocks, genesis written) and a blank vault-process region; capsules stored fresh, the device values restored.
+- b940: ferros's own boot to the attest screen 983 ms (from its entry; ABL and the gate 24.6 s before it). A wrong handle typed on purpose: fgtw.org "not_found", refused, nothing minted.
+- The owner's handle: the handle proof 3.9 s on the X3 (memory-hard, by design); fgtw.org's chain (29 ops, this device at op 28) in 0.70 s; the fleet key from the fan-out; member of the fleet 5.6 s after the submit; the first pull (fgtw.org's copy, 48 facts) in 0.57 s; 32 writes to the deck (places, the view, kist answers, the list) and the person key opened, 6.2 s after the submit, 2.27 s after the proof.
+- The deck came back in the same spots. Clock was refetched from the directory; Lumis, Mahere and Photon came back by auto-stow (developer kists are not in the directory).
+- Not restored by the space: the kept NFC tag (the ring) and this device's wallpaper (wallgen ran out of heap writing it; branch wallgen-heap). Per-device state that should survive a wipe has no home in the space yet.

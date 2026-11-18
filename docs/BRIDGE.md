@@ -274,6 +274,7 @@ A failed reload over the fleet cuts its own connection, with nobody at a cable t
 - B0. Whether a profile may ever allow `reload` and `install` over WAN, or LAN at most.
 - B1. The return deadline after a fleet reload, and the confirm's form (one signed command, or the sender's next ordinary command).
 - B2. Whether the March 2026 USB session design (Claude memories/project_usb_auth_design.md: Ed25519 challenge, X25519 session) is replaced by the same signed commands on USB, so there is one rule for every link.
+  Once it is built, `diag log` needs the bridge right: until then whoever holds the cable reads the flash log opened (LEDGER.md "Reading it"), and the log's seal covers only a chip taken off the board.
 - B3. Where the right is granted: the target's Fleet page with the sender listed, or an NFC tap between the two.
 
 ## Known limitations

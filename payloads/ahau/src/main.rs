@@ -555,7 +555,7 @@ unsafe impl GlobalAlloc for Bump {
 static ALLOC: Bump = Bump;
 
 /// The heap as it stands, and back to it: everything allocated between is dropped by then (the GPU compile, a keystroke's graph and words; a bump heap that never went back would run out after a dozen handles).
-/// Who has the heap: 0 no one, 1 the mark's GPU compile (gpu_quick), 2 the handle proof. A mark and reset around the compile must not span the proof's buffer, and the proof's 24.9 MB must not find the compile's pieces in the way.
+/// Who has the heap: 0 no one, 1 the mark's GPU compile (gpu_quick), 2 the handle proof, 3 a vault document built or read (`with_heap`). A mark and reset around the compile must not span the proof's buffer, and the proof's 24.9 MB must not find the compile's pieces in the way.
 static HEAP_USE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// Whether the last pass was drawn on the GPU, for its console line.
 static GPU_DREW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -565,6 +565,37 @@ fn heap_mark() -> usize {
 }
 fn heap_reset(m: usize) {
     unsafe { HEAP_NEXT = m };
+}
+
+/// `f` with the heap held (HEAP_USE 3: a vault document built or read, ferros_kept's) and given back as it was after: whatever `f` allocated is gone by then, so it hands back only what lives on the stack. Waits for a GPU compile or the proof to finish with the heap first.
+fn with_heap<R>(f: impl FnOnce() -> R) -> R {
+    while HEAP_USE.compare_exchange(0, 3, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let mark = heap_mark();
+    let r = f();
+    heap_reset(mark);
+    HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
+    r
+}
+
+// ferros_sys keeps Eagle time's rate without vsf (`eagle_now`, the documents' stamp): the two must be the one definition.
+const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == vsf::OSCILLATIONS_PER_SECOND);
+
+/// A 32-byte value of the identity's space `ahau.` from its document (ferros_kept::secret: the handle proof `hP`, the wallpaper seed `hb`); None when absent, refused or not that document.
+fn read_secret(grants: u64, kind: ferros_kept::secret::Kind, key: &[u8]) -> Option<[u8; 32]> {
+    let mut b = [0u8; 1 << 8];
+    let n = ferros_sys::store_get(cap(grants, S_AHAU), key, &mut b)?;
+    // WHY: the vault says the whole length and copies at most the buffer; a longer value is not one of these documents, and reading past the copy would be the buffer's end.
+    if n > b.len() {
+        return None;
+    }
+    with_heap(|| ferros_kept::secret::parse(kind, &b[..n]))
+}
+
+/// A 32-byte value kept in `ahau.` as its document; true when the vault took it.
+fn keep_secret(grants: u64, kind: ferros_kept::secret::Kind, key: &[u8], value: &[u8; 32]) -> bool {
+    with_heap(|| ferros_kept::secret::build(kind, value, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(grants, S_AHAU), key, &doc)))
 }
 
 /// ahau's region of the layer arena, past the quick pass's pixels (GPU_OUT, 6.5 MB): the circle's staged coordinates and the fine passes' sums.
@@ -2288,10 +2319,6 @@ impl Ahau {
         publish_fresh_text(&[], true);
     }
 
-    fn put(&self, scope: u64, key: &[u8], value: &[u8]) -> bool {
-        ferros_sys::store_set(cap(self.grants, scope), key, value)
-    }
-
     /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a mint confirms; wrong starts over. A join or no answer has no button: the screen closes only when the fleet binds the device.
     fn attest(&mut self) {
         match self.mode {
@@ -2437,8 +2464,7 @@ impl Ahau {
 
     /// The handle proof for the unlocked identity: kept in its own sealed space after the first time (`ahau.proof`; the proof is public, it is what beacons and the registry carry), so a handle this device recognizes never computes it again. Otherwise computed on the X3 (about 5 s; 9.5 s on a worker core, 2026-10-31), the status saying so when `say`, and kept.
     fn proof_for(&mut self, seed: &[u8; 32], say: bool) -> [u8; 32] {
-        let mut p = [0u8; 32];
-        if ferros_sys::store_get(cap(self.grants, S_AHAU), b"proof", &mut p) == Some(32) {
+        if let Some(p) = read_secret(self.grants, ferros_kept::secret::Kind::HandleProof, b"proof") {
             console(self.grants, b"ahau: handle proof from this identity's space (recognized)\n");
             return p;
         }
@@ -2462,7 +2488,7 @@ impl Ahau {
         let mut l = Line::new();
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms on the X3\n"));
         console(self.grants, l.as_bytes());
-        if !self.put(S_AHAU, b"proof", &proof) {
+        if !keep_secret(self.grants, ferros_kept::secret::Kind::HandleProof, b"proof", &proof) {
             console(self.grants, b"ahau: could not keep the handle proof in the identity's space\n");
         }
         proof
@@ -2473,9 +2499,8 @@ impl Ahau {
     fn wallpaper(&self, ws: &[u8; 32]) {
         let ws = *ws;
         // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the deck (owner, 2026-11-08: "should be milliseconds").
-        let mut kept = [0u8; 32];
-        let same = ferros_sys::store_get(cap(self.grants, S_AHAU), b"wallpaper", &mut kept) == Some(32) && kept == ws;
-        if !same && !self.put(S_AHAU, b"wallpaper", &ws) {
+        let same = read_secret(self.grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper") == Some(ws);
+        if !same && !keep_secret(self.grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper", &ws) {
             console(self.grants, b"ahau: the wallpaper seed was not kept\n");
         }
         send_wallpaper(self.display, &ws);
@@ -3303,8 +3328,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if at_boot {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).
-        let mut ws = [0u8; 32];
-        if ferros_sys::store_get(cap(grants, S_AHAU), b"wallpaper", &mut ws) == Some(32) {
+        if let Some(ws) = read_secret(grants, ferros_kept::secret::Kind::WallpaperSeed, b"wallpaper") {
             send_wallpaper(cap(grants, S_DISPLAY), &ws);
         }
     }

@@ -6706,7 +6706,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         // Never 0, which is "not drawn yet".
         let key = key | 1;
         // The body's own key (`BODY`): what is drawn once and blit after (the vessel by its fill and size, and the art a radio shows switched off, or GPS's pin), never the words or numbers over it. With the orbs on, the measures they come from too.
-        let art = !(live && !switched_off) && matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc | Corner::Gps);
+        let art = OFF_ART && !(live && !switched_off) && matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc | Corner::Gps);
         let mut bkey = 0x9E37_79B9_7F4A_7C15u64 ^ ci as u64;
         let mut bmix = |v: u64| bkey = (bkey.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         bmix(fill.0.to_bits() as u64 | (fill.1.to_bits() as u64) << 32);
@@ -6772,7 +6772,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             }
         };
         let cut_b = |b: (i64, i64, i64, i64)| if drawing_body { cut(b) } else { (0, -1, 0, -1) };
-        // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off its field, GPS off its pin. Before: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`). for it, and its numbers are on its detail page. The clock and the battery keep theirs.
+        // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off or not running its name alone, plain text centred in the circle (owner, 2026-11-17: "For the radio icons, let's just put the plaintext in the circle rather than the waves for now when off. LTE, WiFi, etc."; its field and GPS's pin before, kept behind `OFF_ART`). Before 2026-11-09: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`), and its numbers are on its detail page. The clock and the battery keep theirs.
         {
             let mut lines = [Txt::new(); 9];
             let mut nl = 1;
@@ -6818,6 +6818,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             }
             let name: &str = match what {
                 Corner::Clock => time,
+                // Off, cellular has no technology to name: LTE, its usual short name (owner, 2026-11-17).
+                Corner::Cellular if !(live && !switched_off) => "LTE",
                 Corner::Cellular => match tech {
                     Some(14) => "LTE",
                     Some(20) => "NR",
@@ -6835,7 +6837,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             };
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
                 gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
-            } else if what == Corner::Gps && !(live && !switched_off) {
+            } else if OFF_ART && what == Corner::Gps && !(live && !switched_off) {
                 // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance (the orb crate's `pin_sd`, in the circle's radius, the one tools/tune's orbs page draws), so it is sharp at any size.
                 let (a, l) = (r * 0.3, r * 0.6);
                 // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
@@ -6849,7 +6851,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         body[i] = body[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
-            } else if matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) && !(live && !switched_off) {
+            } else if OFF_ART && matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) && !(live && !switched_off) {
                 // The radio's own field, switched off, in the ink and posterised to near black and white (owner, 2026-11-07): WiFi a single emitter's waves; Bluetooth the same waves from two poles side by side, interfering (owner, 2026-11-08: "like the wifi icon but has two poles instead of one"); cellular a mesh of emitters at random places, their ripples interfering; NFC the magnetic dipole's field lines, the figure-eight, its light falling off with the log of the distance. Posterised by tanh (the bands near flat, their edges C∞); faded out before the rim by the C∞ bump exp(1 − 1/(1 − t²)).
                 let ri = r * (1.0 - 2.0 * VESSEL_DEPTH);
                 let post = |v: f32| 0.5 + 0.5 * libm::tanhf((1 << 2) as f32 * v);
@@ -10431,6 +10433,10 @@ ferros_sys::entry!(display_main, grows HEAP_CEILING);
 
 /// The radios' orbs (`orb_look`, the console's orb grids): off since 2026-11-09 (owner: "I haven't thought thru what I want it to look like and get used to the numbers so switch to the most useful stats"), kept for when the look is decided.
 const ORBS: bool = false;
+
+/// The radios' art while off (their fields, GPS's pin; `console_draw`): off since 2026-11-17 (owner: "For the radio icons, let's just put the plaintext in the circle rather than the waves for now when off. LTE, WiFi, etc."), so a radio off shows its name alone, centred in its circle, as every one-line circle does.
+/// Kept for when the art comes back.
+const OFF_ART: bool = false;
 
 /// A radio's most useful measures for its circle, a line each after its name, as the battery shows its readings (owner, 2026-11-09): WiFi its signal, signal over noise, rate down and transmit power; cellular its reference signal's power, signal over interference (or noise), quality and signal; Bluetooth its transmit power; NFC its carrier; GPS (with no satellite to draw) the satellites in its fix and tracked, the best carrier to noise and its accuracy. WiFi not joined or cellular not registered says so first. Each measure only where its driver publishes it. Returns the line count.
 fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9], mut nl: usize) -> usize {

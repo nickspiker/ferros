@@ -194,10 +194,6 @@ impl Nonces for Entropy {
     }
 }
 
-/// manifestus needs a recorded time, not a clock: seconds since this boot, as the kernel's vault records.
-fn seconds() -> i64 {
-    (now() / freq()) as i64
-}
 
 struct Log {
     b: [u8; 512],
@@ -766,7 +762,7 @@ extern "C" fn work(_: u64) -> ! {
     say!("vault: block 0 blank {}, opening bounded at {} blocks a mirror", blank, bound);
     let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound });
     // Lazily (manifestus `open_lazy`): reads are served from the head's index at once, and the walk that finds what is live is stepped between requests (`settle_step`, below); every write finishes it first, so writes are as after an eager open. The eager open walked the whole index before serving anything: 10.7 s on the 8a with 462,713 live blocks (2026-11-12), and every reader waited behind it, the person's space at attest among them (the deck's kists list 4.9 s, the GPU's firmware, the wallpaper), which an attest in a boot's first seconds met as "four seconds to the deck".
-    let vault = match Vault::open_lazy(mirror, RING_LOG2, seconds(), DeletePolicy::UnlinkOnly) {
+    let vault = match Vault::open_lazy(mirror, RING_LOG2, eagle(), DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
         Err(e) => {
             say!("vault: the region did not open: {:?}", e);
@@ -775,7 +771,7 @@ extern "C" fn work(_: u64) -> ! {
     };
     let st = vault.engine_stats();
     say!("vault: tract {} blocks from {}, the window {} a mirror; generation {}, {} live blocks, plow {} reap {}{}", st.tract_blocks, vault.tract_base(), HALF, st.generation, st.live_blocks, st.plow, st.reap, if vault.settled() { "" } else { " (not settled: the walk that counts them follows, between requests)" });
-    let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
+    let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, eagle);
     store.set_clock(now);
     say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
     // The pieces' helpers, idle until a read hands them a batch (`Helpers`).
@@ -1129,6 +1125,8 @@ fn export_document(store: &mut St, doms: &[(&[u8], Domain)]) -> Option<Vec<u8>> 
 }
 
 /// Eagle time now, in oscillations (the kernel's settings.rs `eagle_now`, from the wall clock the kernel publishes): 0 until the kernel has read the PMIC's clock.
+/// What every manifestus commit and every head and list document of the store is stamped with (docs/VSF-AUDIT.md P14, 2026-11-17; seconds since the boot until then, stamped as if they were Eagle time).
+/// The kernel reads the clock before the vault opens and publishes it at the service's start, before this process is spawned, so 0 here means the clock could not be read: the Eagle epoch, every reader's "no clock", never a made-up time. manifestus records the time and never compares it.
 fn eagle() -> i64 {
     // The Eagle epoch (1969-07-20 20:17:40 UTC) in the wall clock's seconds.
     const EPOCH_UNIX: i128 = -14_182_940;

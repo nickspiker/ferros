@@ -267,11 +267,6 @@ fn radius_of(share: u32) -> i64 {
     isqrt(BASE_RADIUS * BASE_RADIUS * 4 * share as i64 / 1000)
 }
 
-/// Zigzag decode (the inverse of `save_place`'s zig).
-fn unzig(v: u64) -> i64 {
-    ((v >> 1) as i64) ^ -((v & 1) as i64)
-}
-
 fn isqrt(v: i64) -> i64 {
     if v <= 0 {
         return 0;
@@ -2255,58 +2250,43 @@ impl Map {
         6 + n
     }
 
-    /// The arrangement made by hand, from the vault: each circle's place as EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), the radius, and then (since the circles turn) its turn as cos and sin in Q14, zigzag; a place kept before turns existed has three and stays upright. Which circles it placed, a bit each (MAX is 16).
+    /// A small value of the map's scope whole: Ok(None) absent, Err refused.
+    /// A value past the buffer comes back cut to it: a place's, the view's and Developer's documents are each far shorter, so the cut bytes are refused as the whole would be.
+    fn read_small(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        let mut b = [0u8; 1 << 8];
+        match ferros_sys::store_read_at(cap(self.grants, S_STORE), key, 0, &mut b) {
+            ferros_sys::NOTHING => Ok(None),
+            ferros_sys::ERR => Err(()),
+            // WHY the min: the vault says the whole length and copies at most the buffer.
+            n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
+        }
+    }
+
+    /// The arrangement made by hand, from the vault: each circle's place as its document (ferros_kept::map, the one definition ferros_space syncs too): x and y in world units ×256, the radius, and its turn as cos and sin in Q14. Which circles it placed, a bit each (MAX is 16).
     fn load_places(&mut self) -> u32 {
         let mut loaded = 0u32;
         for i in 0..self.n {
             let mut key = [0u8; 32];
             let kl = self.place_key(i, &mut key);
-            let mut v = [0u8; 64];
-            let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), &key[..kl], &mut v) else { continue };
-            let v = &v[..n.min(64)];
-            let mut at = 0;
-            let mut vals = [0u64; 5];
-            let mut got = 0;
-            for slot in vals.iter_mut() {
-                match ferros_ledger::ewe::decode_u64(&v[at.min(v.len())..]) {
-                    Some((x, k)) => {
-                        *slot = x;
-                        at += k;
-                        got += 1;
-                    }
-                    None => break,
-                }
+            let Some([x, y, r, c, sn]) = self.read_small(&key[..kl]).ok().flatten().and_then(|d| ferros_kept::map::read_place(&d)) else { continue };
+            self.xs[i] = x;
+            self.ys[i] = y;
+            self.rs[i] = r;
+            if c.abs() <= ONE && sn.abs() <= ONE && c * c + sn * sn > ONE * ONE / 2 {
+                self.rc[i] = c;
+                self.rsn[i] = sn;
             }
-            let ok = got >= 3;
-            if ok && vals[2] > 0 && vals[2] < 65536 {
-                let unzig = |u: u64| ((u >> 1) as i64) ^ -((u & 1) as i64);
-                self.xs[i] = unzig(vals[0]);
-                self.ys[i] = unzig(vals[1]);
-                self.rs[i] = vals[2] as i64;
-                if got == 5 {
-                    let (c, sn) = (unzig(vals[3]), unzig(vals[4]));
-                    if c.abs() <= ONE && sn.abs() <= ONE && c * c + sn * sn > ONE * ONE / 2 {
-                        self.rc[i] = c;
-                        self.rsn[i] = sn;
-                    }
-                }
-                loaded |= 1 << i;
-            }
+            loaded |= 1 << i;
         }
         loaded
     }
 
-    /// Keep circle i's place in the vault.
+    /// Keep circle i's place in the vault, as its document.
     fn save_place(&self, i: usize) -> bool {
         let mut key = [0u8; 32];
         let kl = self.place_key(i, &mut key);
-        let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
-        let mut b = [0u8; 32];
-        let mut n = 0;
-        for v in [zig(self.xs[i]), zig(self.ys[i]), self.rs[i] as u64, zig(self.rc[i]), zig(self.rsn[i])] {
-            n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
-        }
-        ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &b[..n])
+        let Some(doc) = ferros_kept::map::place(&[self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]], ferros_sys::eagle_now()) else { return false };
+        ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &doc)
     }
 
     /// No two circles overlap: after circle `held` moved or grew, every overlapping pair is pushed apart along the line between their centres until they touch (with a hair of air), the held one never moving — so a push carries on through the neighbours (owner, 2026-10-22). A few rounds settle it; every circle that moved is redrawn and kept when the fingers lift.
@@ -2435,31 +2415,13 @@ impl Map {
         self.send_scene();
     }
 
-    /// The view — where the camera is and how the plane is turned — into the vault (`map.view`: zigzag x, y, c, s), so a restart shows the plane as it was left. The zoom is always one at a release (`renormalise`), so the scale is already in the radii.
+    /// The view, where the camera is and how the plane is turned, into the vault (`map.view`, its document: x, y, cos, sin), so a restart shows the plane as it was left. The zoom is always one at a release (`renormalise`), so the scale is already in the radii.
     fn save_view(&self) -> bool {
-        let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
-        let mut b = [0u8; 64];
-        let mut n = 0;
-        for v in [zig(self.cam.x), zig(self.cam.y), zig(self.cam.c), zig(self.cam.s)] {
-            n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
-        }
-        ferros_sys::store_set(cap(self.grants, S_STORE), b"view", &b[..n])
+        let Some(doc) = ferros_kept::map::view(&[self.cam.x, self.cam.y, self.cam.c, self.cam.s], ferros_sys::eagle_now()) else { return false };
+        ferros_sys::store_set(cap(self.grants, S_STORE), b"view", &doc)
     }
     fn load_view(&mut self) -> bool {
-        let mut v = [0u8; 64];
-        let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), b"view", &mut v) else { return false };
-        let n = (n as usize).min(v.len());
-        let mut vals = [0i64; 4];
-        let mut at = 0;
-        for slot in vals.iter_mut() {
-            match ferros_ledger::ewe::decode_u64(&v[at.min(n)..n]) {
-                Some((x, used)) => {
-                    *slot = unzig(x);
-                    at += used;
-                }
-                None => return false,
-            }
-        }
+        let Some(vals) = self.read_small(b"view").ok().flatten().and_then(|d| ferros_kept::map::read_view(&d)) else { return false };
         // A sane turn only: (c, s) near the unit circle in Q14.
         let len2 = vals[2] * vals[2] + vals[3] * vals[3];
         if !(ONE * ONE * 9 / 10..=ONE * ONE * 11 / 10).contains(&len2) {
@@ -5243,9 +5205,12 @@ impl Map {
                         // The twelfth tap on a release build: Developer is a page from now on, kept in the vault.
                         if self.taps == DEV_TAPS && !DEV && !self.dev {
                             self.dev = true;
-                            if !ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &[1]) {
+                            if !ferros_kept::map::developer(true, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &doc)) {
                                 console(self.grants, b"map: the vault did not take Developer\n");
                             }
+                            // Developer mode said to the stower at once (auto-stow, docs/KISTS.md "Stowing"); one not serving yet hears it from the watcher.
+                            stower::DEVELOPER.store(true, core::sync::atomic::Ordering::Release);
+                            let _ = stower::tell_developer(self.grants);
                         }
                     }
                     // Attest with a tag: an add started (the next tag held to the device is kept, `tag_add_thread`), or the one waiting cancelled.
@@ -5762,8 +5727,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     t_start[5] = now();
     // Developer, once the twelve taps made it a page (release builds; always one on development builds).
-    let mut dv = [0u8; 4];
-    map.dev = matches!(ferros_sys::store_get(cap(grants, S_STORE), b"dev", &mut dv), Some(n) if n >= 1 && dv[0] == 1);
+    map.dev = map.read_small(b"dev").ok().flatten().and_then(|d| ferros_kept::map::read_developer(&d)) == Some(true);
+    // Developer mode for the stower (docs/KISTS.md "Stowing", auto-stow): its watcher says it at the stower's first answer.
+    stower::DEVELOPER.store(DEV || map.dev, core::sync::atomic::Ordering::Release);
     let mut saved_view = map.cam;
     // The deck's resting view starts as the view it was left at.
     map.rest = map.cam;

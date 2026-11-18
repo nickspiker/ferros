@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -528,6 +528,9 @@ fn kernel_entropy(buf: &mut [u8]) {
     }
 }
 
+// ferros_sys keeps Eagle time's rate without vsf (`eagle_now`, the documents' stamp): the two must be the one definition.
+const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == vsf::OSCILLATIONS_PER_SECOND);
+
 /// Eagle oscillations now, from the kernel's UTC wall clock (0 until it has one; the app treats a zero stamp as a frame from a clockless device).
 fn eagle() -> i64 {
     match ferros_sys::utc_time() {
@@ -683,6 +686,24 @@ impl Client {
         }
     }
 
+    /// A 32-byte root kept as its document (ferros_kept::secret: the identity seed `hI`, the handle proof `hP`, the fleet key `kc`), only when unlock-at-boot is on (`persist_set`); the document's bytes wiped once handed to the vault.
+    fn persist_secret(&self, kind: ferros_kept::secret::Kind, key: &[u8], value: &[u8; 32]) -> bool {
+        let Some(mut doc) = ferros_kept::secret::build(kind, value, ferros_sys::eagle_now()) else { return false };
+        let ok = self.persist_set(key, &doc);
+        wipe(&mut doc);
+        ok
+    }
+
+    /// A 32-byte root from its document, None when absent, refused or not that document; the read's buffer wiped after.
+    fn get_secret(&self, kind: ferros_kept::secret::Kind, key: &[u8]) -> Option<[u8; 32]> {
+        let mut b = [0u8; 1 << 8];
+        let n = self.store_get(key, &mut b);
+        // WHY: the vault says the value's whole length and copies at most the buffer; a longer one is not a root's document, and reading past the copy would be the buffer's end.
+        let v = n.filter(|&n| n <= b.len()).and_then(|n| ferros_kept::secret::parse(kind, &b[..n]));
+        wipe(&mut b);
+        v
+    }
+
     /// Everything of the identity gone from the vault (unlock-at-boot off, or a wipe): the seed, proof, chain and fleet key. The handle itself was never on disk.
     fn forget_disk(&self) {
         for key in [&b"identity_seed"[..], b"handle_proof", b"chain", b"fleet_key"] {
@@ -696,26 +717,27 @@ impl Client {
 
     /// `load`, saying where the client stands only when `say` (the two-second look for roots is quiet until they appear).
     fn load_saying(&mut self, say: bool) {
-        let mut b = [0u8; 32];
+        use ferros_kept::secret::Kind;
         if self.given.is_none() {
-            let mut g = [0u8; 19];
-            if self.store_get(b"sponsor", &mut g) == Some(19) && (g[0] == 4 || g[0] == 6) {
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&g[1..17]);
-                self.given = Some(Addr { fam: g[0], ip, port: u16::from_be_bytes([g[17], g[18]]) });
+            let mut g = [0u8; 1 << 8];
+            // WHY the length check: the vault says the whole length and copies at most the buffer; a longer value is not a sponsor's document.
+            if let Some((fam, ip, port)) = self.store_get(b"sponsor", &mut g).filter(|&n| n <= g.len()).and_then(|n| ferros_kept::sponsor::parse(&g[..n])) {
+                self.given = Some(Addr { fam, ip, port });
             }
         }
-        if self.store_get(b"identity_seed", &mut b) == Some(32) {
+        if let Some(mut b) = self.get_secret(Kind::IdentitySeed, b"identity_seed") {
             self.identity_seed = Some(b);
+            wipe(&mut b);
         }
-        if self.store_get(b"handle_proof", &mut b) == Some(32) {
+        if let Some(mut b) = self.get_secret(Kind::HandleProof, b"handle_proof") {
             self.hp = Some(b);
+            wipe(&mut b);
         }
-        if self.store_get(b"fleet_key", &mut b) == Some(32) {
+        if let Some(mut b) = self.get_secret(Kind::FleetKey, b"fleet_key") {
             self.fleet_key = Some(b);
+            wipe(&mut b);
         }
-        // The buffer they came thru, and the lock epoch they belong to (kept on disk only with unlock at boot, read while this identity is unlocked).
-        wipe(&mut b);
+        // The lock epoch they belong to (kept on disk only with unlock at boot, read while this identity is unlocked).
         self.lock_epoch = ID_BELL.load(Ordering::Acquire);
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
@@ -958,7 +980,7 @@ impl Client {
         }
         if let Some(k) = recovered {
             self.fleet_key = Some(k);
-            self.persist_set(b"fleet_key", &k);
+            self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &k);
             self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
             self.log.line();
             self.add_key();
@@ -1317,7 +1339,7 @@ impl Client {
                 match key {
                     Ok((_, k)) => {
                         self.fleet_key = Some(k);
-                        self.persist_set(b"fleet_key", &k);
+                        self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &k);
                         self.log.put(b"fgtw: the fleet key is founded and ours");
                     }
                     Err(e) => {
@@ -1555,7 +1577,7 @@ impl Client {
                         self.log.line();
                         if self.fleet_key != Some(key) {
                             self.fleet_key = Some(key);
-                            self.persist_set(b"fleet_key", &key);
+                            self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &key);
                             // A key that arrives while the Fleet page shows opens the add flow there.
                             self.add_key();
                         }
@@ -1892,8 +1914,8 @@ impl Client {
                     if !self.persist {
                         self.forget_disk();
                     }
-                    self.persist_set(b"identity_seed", &seed);
-                    self.persist_set(b"handle_proof", &hp);
+                    self.persist_secret(ferros_kept::secret::Kind::IdentitySeed, b"identity_seed", &seed);
+                    self.persist_secret(ferros_kept::secret::Kind::HandleProof, b"handle_proof", &hp);
                     self.identity_seed = Some(seed);
                     self.hp = Some(hp);
                     wipe(&mut seed);

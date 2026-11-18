@@ -1,96 +1,76 @@
-//! Pre-boot buffer — fixed ring in BSS for early kernel events.
+//! The pre-boot buffer (BOOT.md "Pre-Boot Log Buffer", LEDGER.md "Boot sequence"): system entries made before the ledger can seal them, held in RAM and written, sealed and in order, the moment it can.
 //!
-//! Before the ledger daemon is initialized, events are buffered here. Raw serialized entries, unchained (no prev_hash linking). On ledger init, the buffer is flushed into the chain as entries 0..N.
-//!
-//! The buffer is a fixed-size ring: overwrites oldest on full. No alloc, no heap — pure BSS.
+//! Nothing reaches the flash unsealed (owner, 2026-11-17), and the seal needs the ira, which the kernel derives after the UFS link is up: what the kernel says before then waits here.
+//! A fixed ring of `N` slots in the kernel's static memory: when it is full the oldest is overwritten and counted, and the count is written as the ledger's own entry when the buffer is drained.
+//! A boot that dies before the drain is covered by the glass console and the RAM log (ramoops), not the flash log.
+//! Personal entries never wait here: one made while nobody is present is dropped (LEDGER.md "Classes").
 
-use crate::event::Event;
+use alloc::string::String;
 
-/// Max events in the pre-boot buffer.
-pub const PREBOOT_CAPACITY: usize = 64;
+use crate::category::Category;
 
-/// A buffered pre-boot event (just the event, chain linking happens at flush).
-pub struct PrebootBuffer {
-    events: [Option<Event>; PREBOOT_CAPACITY],
-    /// Write position (next slot to write).
-    write_pos: usize,
-    /// Number of events stored (saturates at PREBOOT_CAPACITY).
-    count: usize,
-    /// Total events ever written (including overwritten).
-    total_written: u64,
+/// One entry waiting: what it says and when it was said (the counter's tick, kept only in RAM: the entry's Eagle time is worked out from it when it is written, if the clock has been read by then).
+pub struct Pending {
+    pub tick: u64,
+    pub category: Category,
+    pub writer: String,
+    pub words: String,
 }
 
-impl PrebootBuffer {
-    /// Create an empty buffer. Must be const for static init.
+/// The buffer: `N` slots, a power of two.
+pub struct Preboot<const N: usize> {
+    slots: [Option<Pending>; N],
+    /// The next slot to fill.
+    next: usize,
+    /// How many slots hold an entry.
+    held: usize,
+    /// Entries overwritten before they could be written.
+    lost: u64,
+}
+
+impl<const N: usize> Preboot<N> {
     pub const fn new() -> Self {
-        // Can't use [None; N] for non-Copy Option<Event>, so we do this:
-        Self {
-            events: [
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-            ],
-            write_pos: 0,
-            count: 0,
-            total_written: 0,
-        }
+        Preboot { slots: [const { None }; N], next: 0, held: 0, lost: 0 }
     }
 
-    /// Buffer an event for later chain insertion.
-    pub fn push(&mut self, event: Event) {
-        self.events[self.write_pos] = Some(event);
-        self.write_pos = (self.write_pos + 1) % PREBOOT_CAPACITY;
-        if self.count < PREBOOT_CAPACITY {
-            self.count += 1;
-        }
-        self.total_written += 1;
-    }
-
-    /// Number of events currently buffered.
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    /// Whether the buffer is empty.
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Whether any events were overwritten (ring wrapped).
-    pub fn overflowed(&self) -> bool {
-        self.total_written > PREBOOT_CAPACITY as u64
-    }
-
-    /// Total events ever pushed (including overwritten).
-    pub fn total_written(&self) -> u64 {
-        self.total_written
-    }
-
-    /// Drain all buffered events in order (oldest first). Returns events as an iterator-like callback pattern (no alloc).
-    ///
-    /// After drain, the buffer is empty.
-    pub fn drain(&mut self, mut f: impl FnMut(Event)) {
-        if self.count == 0 {
-            return;
-        }
-
-        // Start position: if ring wrapped, start at write_pos (oldest surviving). If not wrapped, start at 0.
-        let start = if self.count == PREBOOT_CAPACITY {
-            self.write_pos // oldest surviving entry
+    /// Hold an entry; the oldest goes when the buffer is full.
+    pub fn push(&mut self, p: Pending) {
+        if self.slots[self.next].is_some() {
+            self.lost += 1;
         } else {
-            0
-        };
+            self.held += 1;
+        }
+        self.slots[self.next] = Some(p);
+        self.next = (self.next + 1) % N;
+    }
 
-        for i in 0..self.count {
-            let idx = (start + i) % PREBOOT_CAPACITY;
-            if let Some(event) = self.events[idx].take() {
-                f(event);
+    pub fn len(&self) -> usize {
+        self.held
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held == 0
+    }
+
+    /// Hand every held entry to `f`, oldest first, and empty the buffer.
+    /// Returns how many were overwritten before this drain.
+    pub fn drain(&mut self, mut f: impl FnMut(Pending)) -> u64 {
+        // The oldest is at `next` once the ring has wrapped, else at slot 0 (empty slots are passed over either way).
+        for k in 0..N {
+            if let Some(p) = self.slots[(self.next + k) % N].take() {
+                f(p);
             }
         }
+        self.next = 0;
+        self.held = 0;
+        let lost = self.lost;
+        self.lost = 0;
+        lost
+    }
+}
 
-        self.count = 0;
-        self.write_pos = 0;
+impl<const N: usize> Default for Preboot<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }

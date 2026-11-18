@@ -99,6 +99,42 @@ pub fn without_old(list: &[u8], old: &[u8; 32], new: &[u8; 32]) -> Option<Vec<u8
     Some(list.chunks_exact(32).filter(|e| *e != old).flatten().copied().collect())
 }
 
+/// The list as the kernel's vault keeps it (`sealed`; docs/VSF-AUDIT.md P12, 2026-11-17): a VSF document, section `seals`, a `seal` field per installed image, each its 32-byte seal as `mb` (a keyed BLAKE3, under the OS-only seal key).
+/// Until 2026-11-17 the vault kept the seals as bare bytes, 32 each, concatenated, which is still how the checks here take the list in memory.
+const SECTION: &str = "seals";
+const SEAL: &str = "seal";
+
+fn list_schema() -> vsf::schema::SectionSchema {
+    // `mb` has no constraint of its own in vsf's schema; every value is held to it on the way out (`list_of`).
+    vsf::schema::SectionSchema::new(SECTION).field(SEAL, vsf::schema::TypeConstraint::Any)
+}
+
+/// The list's document (`now`: Eagle time in oscillations, 0 when the clock is not known). None when the bytes are not whole seals.
+pub fn list_document(list: &[u8], now: i64) -> Option<Vec<u8>> {
+    if list.len() % 32 != 0 {
+        return None;
+    }
+    let mut b = list_schema().build();
+    for s in list.chunks_exact(32) {
+        b = b.append_multi(SEAL, alloc::vec![vsf::VsfType::mb(s.to_vec())]).ok()?;
+    }
+    let section = b.encode().ok()?;
+    vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_unboxed(SECTION, section).build().ok()
+}
+
+/// The seals out of the list's document, concatenated; None for anything that is not one, which a caller must never take for an empty list (a seal added over it would drop every other).
+pub fn list_of(doc: &[u8]) -> Option<Vec<u8>> {
+    let s = vsf::schema::SectionBuilder::parse_document(list_schema(), doc, None).ok()?;
+    let mut out = Vec::new();
+    for v in s.get_fields(SEAL).iter().flat_map(|f| f.values.iter()) {
+        match v {
+            vsf::VsfType::mb(b) if b.len() == 32 => out.extend_from_slice(b),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +229,38 @@ mod tests {
         let addr2 = *blake3::hash(&changed).as_bytes();
         assert_eq!(check(&list, &KEY, &DEV, &OPT, true, &M, &addr2, || by_image(&KEY, &DEV, &OPT, true, &M, &changed)), Verdict::No);
         let _ = vec![0u8];
+    }
+
+    const NOW: i64 = 1 << 50;
+
+    #[test]
+    fn the_list_document_reads_back() {
+        let list: Vec<u8> = [[1u8; 32], [2; 32], [3; 32]].concat();
+        assert_eq!(list_of(&list_document(&list, NOW).unwrap()).unwrap(), list);
+        assert_eq!(list_of(&list_document(&[], NOW).unwrap()).unwrap(), Vec::<u8>::new());
+        assert!(list_document(&[1; 33], NOW).is_none());
+    }
+
+    #[test]
+    fn every_image_on_a_kept_list_still_runs() {
+        // An address seal, an image seal not moved yet, another kist's address seal.
+        let code = image();
+        let addr = *blake3::hash(&code).as_bytes();
+        let moved = by_address(&KEY, &DEV, &OPT, true, &M, &addr);
+        let other_code: Vec<u8> = (0..4096u32).map(|i| (i * 13) as u8).collect();
+        let unmoved = by_image(&KEY, &OPT, &DEV, true, &M, &other_code);
+        let third = by_address(&KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32]);
+        let old: Vec<u8> = [moved, unmoved, third].concat();
+        let doc = list_document(&old, NOW).unwrap();
+        let list = list_of(&doc).unwrap();
+        assert_eq!(list, old, "the seals keep their order and bytes");
+        assert_eq!(check(&list, &KEY, &DEV, &OPT, true, &M, &addr, || unreachable!()), Verdict::ByAddress);
+        let other_addr = *blake3::hash(&other_code).as_bytes();
+        assert!(matches!(check(&list, &KEY, &OPT, &DEV, true, &M, &other_addr, || unmoved), Verdict::ByImage(..)));
+        assert_eq!(check(&list, &KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32], || [0; 32]), Verdict::ByAddress);
+        // Bare seals are not a list document: the reader never takes them for one, empty or not.
+        assert_eq!(list_of(&old), None);
+        assert_eq!(list_of(&[]), None);
+        assert!(list_document(&old[..95], NOW).is_none());
     }
 }

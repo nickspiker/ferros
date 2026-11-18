@@ -182,8 +182,9 @@ impl InternalNode {
     /// - `bitmap`: single u (32-bit presence mask)
     /// - `child_hashes`: multi-valued, popcount(bitmap) × hp(32 bytes)
     /// - `child_lbas`: multi-valued, popcount(bitmap) × u
-    pub fn to_block(&self) -> [u8; BLOCK_SIZE] {
-        let qtimer = crate::qtimer::read_qtimer();
+    ///
+    /// Stamped with `now`, Eagle oscillations from the caller's clock (the header's `e6`).
+    pub fn to_block(&self, now: i64) -> [u8; BLOCK_SIZE] {
 
         let mut section = VsfSection::new("hamt.node");
         section.add_field("bitmap", VsfType::u(self.bitmap as usize, false));
@@ -202,9 +203,9 @@ impl InternalNode {
             .collect();
         section.add_field_multi("child_lbas", lbas);
 
+        // The library's own version: a pinned older one (7) is refused by every reader since VSF 9.
         let builder = VsfBuilder::new()
-            .version(7, 7)
-            .creation_time_oscillations(qtimer as i64)
+            .creation_time_oscillations(now)
             .provenance_only()
             .add_section_direct(section);
 
@@ -232,8 +233,10 @@ impl InternalNode {
         for f in &section.fields {
             match f.name.as_str() {
                 "bitmap" => {
-                    if let Some(VsfType::u(v, _)) = f.values.first() {
-                        bitmap = *v as u32;
+                    // The decoder hands back the sized form (u3, u5, ...), never the writer's `u`, so read it by value.
+                    // WHY try_from: the value is read from disk; a bitmap past 32 bits is no node, and `as u32` would hide it.
+                    if let Some(v) = f.values.first().and_then(|v| v.as_u64()) {
+                        bitmap = u32::try_from(v).ok()?;
                     }
                 }
                 "child_hashes" => {
@@ -249,8 +252,9 @@ impl InternalNode {
                 }
                 "child_lbas" => {
                     for v in &f.values {
-                        if let VsfType::u(n, _) = v {
-                            child_lbas.push(*n as u32);
+                        // WHY try_from: as the bitmap, an LBA past 32 bits is no block on this device.
+                        if let Some(n) = v.as_u64() {
+                            child_lbas.push(u32::try_from(n).ok()?);
                         }
                     }
                 }
@@ -342,13 +346,13 @@ impl InternalNode {
 /// - `content`: v(b'b', bytes) — raw inline bytes
 ///
 /// The vsf header's own hp field is the file integrity hash (auto-computed by the builder); it is separate from the `provenance_key` which is the HAMT lookup key.
-pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8]) -> Option<[u8; BLOCK_SIZE]> {
+/// Stamped with `now`, Eagle oscillations from the caller's clock (the header's `e6`).
+pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8], now: i64) -> Option<[u8; BLOCK_SIZE]> {
     if content.len() > BLOCK_SIZE - 256 {
         // Conservative budget — header + field framing eats ~200B; leave headroom.
         return None;
     }
 
-    let qtimer = crate::qtimer::read_qtimer();
     let body_hash = blake3::hash(content);
 
     let mut section = VsfSection::new("vault.lone");
@@ -356,9 +360,9 @@ pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8]) -> Option<[u8; 
     section.add_field("body_hash", VsfType::hp(body_hash.as_bytes().to_vec()));
     section.add_field("content", VsfType::v(b'b', content.to_vec()));
 
+    // The library's own version: a pinned older one (7) is refused by every reader since VSF 9.
     let builder = VsfBuilder::new()
-        .version(7, 7)
-        .creation_time_oscillations(qtimer as i64)
+        .creation_time_oscillations(now)
         .provenance_only()
         .add_section_direct(section);
 
@@ -473,9 +477,9 @@ pub fn identify_block(blk: &[u8; BLOCK_SIZE]) -> NodeKind {
 // Write helper
 // ---------------------------------------------------------------------------
 
-/// Serialize a node, write it via BlockIO, return its BlockRef. The hash is the kernel block hash (full 4KB BLAKE3 with hp zeroed).
-fn write_node(io: &mut impl BlockIO, node: &InternalNode) -> Option<BlockRef> {
-    let blk = node.to_block();
+/// Serialize a node stamped with `now` (Eagle oscillations), write it via BlockIO, return its BlockRef. The hash is the kernel block hash (full 4KB BLAKE3 with hp zeroed).
+fn write_node(io: &mut impl BlockIO, node: &InternalNode, now: i64) -> Option<BlockRef> {
+    let blk = node.to_block(now);
     let hash = block_hash(&blk)?;
     let lba = io.write_block(&blk)?;
     Some(BlockRef { hash, lba })
@@ -545,11 +549,13 @@ struct PathEntry {
 /// `leaf_ref` is the BlockRef of an already-written leaf (lone, direct, or chained). `leaf_provenance` is the key (provenance hash from the leaf body).
 ///
 /// The caller is responsible for writing the leaf block to storage first. This function writes new internal nodes via `io.write_block()` and returns the new root (hash, lba).
+/// Every node it writes is stamped with `now`, Eagle oscillations from the caller's clock.
 pub fn insert(
     io: &mut impl BlockIO,
     root: &BlockRef,
     leaf_ref: BlockRef,
     leaf_provenance: &[u8; 32],
+    now: i64,
 ) -> Option<BlockRef> {
     // Collect path from root to insertion point
     let mut path: Vec<PathEntry> = Vec::new();
@@ -601,12 +607,13 @@ pub fn insert(
                                 .with_child(existing_bit, existing_ref)
                                 .with_child(new_bit, leaf_ref);
 
-                            let mut child_ref = write_node(io, &split_node)?;
+                            let mut child_ref = write_node(io, &split_node, now)?;
 
                             for entry in path.iter().rev() {
                                 child_ref = write_node(
                                     io,
                                     &entry.node.with_child(entry.bit, child_ref),
+                                    now,
                                 )?;
                             }
 
@@ -629,7 +636,7 @@ pub fn insert(
     let mut child_ref = leaf_ref;
 
     for entry in path.iter().rev() {
-        child_ref = write_node(io, &entry.node.with_child(entry.bit, child_ref))?;
+        child_ref = write_node(io, &entry.node.with_child(entry.bit, child_ref), now)?;
     }
 
     Some(child_ref)
@@ -643,10 +650,12 @@ fn leaf_provenance_or_zero(blk: &[u8; BLOCK_SIZE]) -> [u8; 32] {
 /// Remove a key from the HAMT. Returns new root reference.
 ///
 /// Uses COW: rebuilds the path without the leaf. Returns None if key not found or on I/O error.
+/// Every node it writes is stamped with `now`, Eagle oscillations from the caller's clock.
 pub fn remove(
     io: &mut impl BlockIO,
     root: &BlockRef,
     key: &[u8; 32],
+    now: i64,
 ) -> Option<BlockRef> {
     // Collect path from root to the leaf
     let mut path: Vec<PathEntry> = Vec::new();
@@ -694,13 +703,42 @@ pub fn remove(
 
     // If a node ends up with exactly one child, we could collapse it, but for simplicity we keep single-child nodes. The plow cleanup can optimize this during rotation.
 
-    let mut child_ref = write_node(io, &path[last].node.without_child(path[last].bit))?;
+    let mut child_ref = write_node(io, &path[last].node.without_child(path[last].bit), now)?;
 
     // Continue up the path
     for i in (0..last).rev() {
         let updated = path[i].node.with_child(path[i].bit, child_ref);
-        child_ref = write_node(io, &updated)?;
+        child_ref = write_node(io, &updated, now)?;
     }
 
     Some(child_ref)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vsf::types::EtType;
+
+    const NOW: i64 = 0x0123_4567_89AB_CDEF;
+
+    /// The creation time a block's header carries.
+    fn stamp(blk: &[u8; BLOCK_SIZE]) -> Option<VsfType> {
+        open_header(blk)?.creation_time
+    }
+
+    #[test]
+    fn nodes_and_leaves_carry_the_callers_eagle_time() {
+        let child = BlockRef { hash: [9u8; 32], lba: 0xC_0001 };
+        let blk = InternalNode::empty().with_child(3, child).to_block(NOW);
+        assert_eq!(stamp(&blk), Some(VsfType::e(EtType::e6(NOW))));
+        let hash = block_hash(&blk).unwrap();
+        let back = InternalNode::from_block(&blk, &hash).expect("node parses");
+        assert_eq!(back.get_child(3), Some(child));
+
+        let leaf = lone_leaf_to_block(&[5u8; 32], b"inline", NOW).unwrap();
+        assert_eq!(stamp(&leaf), Some(VsfType::e(EtType::e6(NOW))));
+        let (prov, _, content) = parse_lone_leaf(&leaf).expect("leaf parses");
+        assert_eq!(prov, [5u8; 32]);
+        assert_eq!(content, b"inline");
+    }
 }
