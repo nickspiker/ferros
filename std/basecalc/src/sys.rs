@@ -40,3 +40,22 @@ pub fn ira_key(slot: u64, domain: &str) -> Option<[u8; 32]> {
     let r = svc(IRA, cap(slot), off(domain.as_ptr()), domain.len() as u64, off(out.as_mut_ptr()), 0);
     (r == 32).then_some(out)
 }
+
+/// A call on the endpoint at grant `slot` (SYS_CALL, ferros_sys `call`): the reply's length, or `ERR`.
+pub fn call(slot: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
+    svc(1, cap(slot), off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
+}
+
+/// The kernel's failure answer.
+pub const ERR: u64 = u64::MAX;
+
+/// The region at grant `slot`: its base (past a square's porch), x1 = 0 (SYS_DMA, ferros_sys `dma`).
+pub fn dma(slot: u64) -> u64 {
+    svc(7, cap(slot), 0, 0, 0, 0)
+}
+
+/// This puck's square resized to hold `bytes` past its porch (SYS_DMA x1 = 6, ferros_sys `puck_size`): the bytes it holds after, or None.
+pub fn puck_size(slot: u64, bytes: u64) -> Option<u64> {
+    let n = svc(7, cap(slot), 6, bytes, 0, 0);
+    (n != ERR && n < 64 << 20).then_some(n)
+}

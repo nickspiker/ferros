@@ -207,28 +207,33 @@ fn tail(text: &mut TextRenderer, runs: Vec<Run>, width: f32, size: f32) -> Vec<(
     line
 }
 
-/// The pad's window.
-struct Pad {
-    calc: Calc,
+/// The pad's window (and the basecalc puck's face, puck.rs).
+pub(crate) struct Pad {
+    pub(crate) calc: Calc,
     /// The app's circle as the display last told it (`on_safe_area`); until then the display's way of working it out.
-    circle: Option<Circle>,
-    layout: Option<Layout>,
-    placed: Vec<Placed>,
+    pub(crate) circle: Option<Circle>,
+    pub(crate) layout: Option<Layout>,
+    pub(crate) placed: Vec<Placed>,
     /// The keys as the last frame drew them: the hit map's ids index this, so a tap answers to the key the person saw even when a key before it in the same pass placed the keys again.
-    drawn: Vec<Placed>,
+    pub(crate) drawn: Vec<Placed>,
     /// Each placed key's label size, measured once a layout (0: not yet).
-    sizes: Vec<f32>,
-    hits: Vec<HitId>,
-    size: (usize, usize),
-    shown: paint::Shown,
+    pub(crate) sizes: Vec<f32>,
+    pub(crate) hits: Vec<HitId>,
+    pub(crate) size: (usize, usize),
+    pub(crate) shown: paint::Shown,
     /// The vault's writer thread, when the vault opened.
-    vault: Option<Sender<Vec<u8>>>,
+    pub(crate) vault: Option<Sender<Vec<u8>>>,
 }
 
 impl Pad {
+    /// A pad with nothing placed yet (the first frame's size places it), its vault's writer when the vault opened.
+    pub(crate) fn new(calc: Calc, vault: Option<Sender<Vec<u8>>>) -> Pad {
+        Pad { calc, circle: None, layout: None, placed: Vec::new(), drawn: Vec::new(), sizes: Vec::new(), hits: Vec::new(), size: (0, 0), shown: paint::Shown::default(), vault }
+    }
+
     /// The keys placed for the frame's size, the base, the layer and the picker.
     /// The hit map is sized with the frame here, so the host's look-up (fluor ferros `hit_under_cursor`, which takes the map's width and height as given) always indexes a map of the frame's size, even for a touch before the first frame is drawn.
-    fn place(&mut self) {
+    pub(crate) fn place(&mut self) {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         if self.hits.len() != self.size.0 * self.size.1 {
             self.hits = vec![HIT_NONE; self.size.0 * self.size.1];
@@ -245,7 +250,7 @@ impl Pad {
     }
 
     /// The settings and the history to the vault's writer, stamped now.
-    fn save(&self) {
+    pub(crate) fn save(&self) {
         let Some(vault) = &self.vault else { return };
         match self.calc.saved().build(vsf::types::eagle_time::eagle_time_oscillations()) {
             Ok(doc) => {
@@ -394,23 +399,8 @@ impl FluorApp<G2t16> for Pad {
 
     fn render(&mut self, target: &mut [G2t16], ctx: &mut Context) {
         let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
-        if (w, h) != self.size {
-            self.size = (w, h);
-            self.place();
-        }
-        let Some(layout) = self.layout else { return };
-        // The map starts each frame empty: the whole frame is drawn again (fluor's default damage).
-        self.hits.fill(HIT_NONE);
         let pressed = ctx.pressed_hit;
-        let text = &mut *ctx.text;
-        let mut canvas = Canvas::new(target, w, h, ctx.damage);
-        // Front to back (AGENT.md "Compositing"): the text in front of everything, then each key (its label in front of its body), then the ground behind it all.
-        self.draw_display(&mut canvas, text, &layout);
-        for i in 0..self.placed.len() {
-            self.draw_key(i, &mut canvas, text, pressed, &layout);
-        }
-        paint::fill_rect(&mut canvas, 0, 0, w as isize, h as isize, colour(GROUND), None, None);
-        self.drawn.clone_from(&self.placed);
+        self.draw_all(target, w, h, &mut *ctx.text, pressed, ctx.damage);
     }
 
     fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
@@ -426,8 +416,29 @@ impl FluorApp<G2t16> for Pad {
     }
 }
 
+impl Pad {
+    /// The whole pad into `target` (`w` × `h`), the keys' tap areas into the hit map: the window's frame, and the basecalc puck's square (puck.rs).
+    pub(crate) fn draw_all(&mut self, target: &mut [G2t16], w: usize, h: usize, text: &mut TextRenderer, pressed: HitId, damage: &mut fluor::canvas::Damage) {
+        if (w, h) != self.size {
+            self.size = (w, h);
+            self.place();
+        }
+        let Some(layout) = self.layout else { return };
+        // The map starts each frame empty: the whole frame is drawn again (fluor's default damage).
+        self.hits.fill(HIT_NONE);
+        let mut canvas = Canvas::new(target, w, h, damage);
+        // Front to back (AGENT.md "Compositing"): the text in front of everything, then each key (its label in front of its body), then the ground behind it all.
+        self.draw_display(&mut canvas, text, &layout);
+        for i in 0..self.placed.len() {
+            self.draw_key(i, &mut canvas, text, pressed, &layout);
+        }
+        paint::fill_rect(&mut canvas, 0, 0, w as isize, h as isize, colour(GROUND), None, None);
+        self.drawn.clone_from(&self.placed);
+    }
+}
+
 /// The kist's vault domain: its key from the kist's ira, the store the kernel scopes to the kist (slot 5). None without either: basecalc then keeps nothing this launch, and says so.
-fn open_vault() -> Option<Arc<kete::FlatStorage>> {
+pub(crate) fn open_vault() -> Option<Arc<kete::FlatStorage>> {
     let Some(secret) = sys::ira_key(IRA, "basecalc vault") else {
         println!("basecalc: no ira key (slot {IRA}): nothing is kept this launch");
         return None;
@@ -442,7 +453,7 @@ fn open_vault() -> Option<Arc<kete::FlatStorage>> {
 }
 
 /// What the vault kept, run again (`Calc::restore`), or a fresh calculator.
-fn restore(vault: &kete::FlatStorage) -> Calc {
+pub(crate) fn restore(vault: &kete::FlatStorage) -> Calc {
     match vault.read_device(store::NAME) {
         Ok(Some(doc)) => match Saved::parse(&doc) {
             Ok(saved) => {
@@ -464,7 +475,7 @@ fn restore(vault: &kete::FlatStorage) -> Calc {
 }
 
 /// The vault's writer: each document as it comes, only the newest when several wait, so a run of quick changes is one write.
-fn writer(vault: Arc<kete::FlatStorage>) -> Sender<Vec<u8>> {
+pub(crate) fn writer(vault: Arc<kete::FlatStorage>) -> Sender<Vec<u8>> {
     let (tx, rx) = channel::<Vec<u8>>();
     let spawned = std::thread::Builder::new().name("basecalc-vault".into()).spawn(move || {
         while let Ok(mut doc) = rx.recv() {
@@ -490,7 +501,7 @@ pub fn main() {
     println!("basecalc: basecalc {} on ferros, {} grants", env!("CARGO_PKG_VERSION"), sys::grant_count());
     let vault = open_vault();
     let calc = vault.as_deref().map(restore).unwrap_or_default();
-    let pad = Pad { calc, circle: None, layout: None, placed: Vec::new(), drawn: Vec::new(), sizes: Vec::new(), hits: Vec::new(), size: (0, 0), shown: paint::Shown::default(), vault: vault.map(writer) };
+    let pad = Pad::new(calc, vault.map(writer));
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
     match fluor::host::ferros::run_app(pad, caps, 1.0, None) {
         Ok(()) => println!("basecalc: closed"),

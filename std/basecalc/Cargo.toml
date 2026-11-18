@@ -1,6 +1,6 @@
 [package]
 name = "basecalc-ferros"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "basecalc on ferros as a kist: the owner's calculator (basecalc's own engine: bases 2 to 36, complex numbers, adjustable precision, trig, logs, constants) behind a scientific keypad whose digit block follows the base, under fluor's ferros host, its settings and history as VSF in the kist's vault domain (docs/KISTS.md \"basecalc\", tools/basecalc-build.sh)."
 license = "GPL-3.0"
@@ -31,6 +31,8 @@ kete = { path = "../../../kete" }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 
 [features]
+# basecalc as a puck on the deck (src/puck.rs, docs/PUCKS.md): the pad drawn into the puck's square, its keys pressed by the taps that pass thru.
+puck = []
 # The display's safe area (FluorApp::on_safe_area): needs fluor with the safe-area branch merged (fluor 9d362b9); without it the circle is worked out the display's way (layout::panel_circle).
 safe-area = []
 
