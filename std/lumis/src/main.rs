@@ -87,6 +87,8 @@ struct Probe {
 const DEV_WHOLE: u8 = 1 << 0;
 /// Frames by copy at `BIN` instead of the view (the 6 MiB reply measured against it).
 const DEV_COPY: u8 = 1 << 1;
+/// Development: the scratch path even with the display baking (no `bakes_own`), for comparing the two on a device.
+const DEV_SCRATCH: u8 = 1 << 2;
 
 /// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
 fn dev_input() -> (u8, Vec<u8>) {
@@ -693,7 +695,7 @@ struct Lumis {
     changed: bool,
     /// On the camera screen, a pass that drew no new image and nothing whole: the controls' parts lumis_core repainted (its partial draw), the only rects converted and shown (redraw on change; the owner's go, 2026-11-17). Empty with `changed` false: nothing to show.
     parts: Vec<fluor::canvas::PixelRect>,
-    /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`).
+    /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`, `DEV_SCRATCH`).
     knobs: u8,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
     lut: [u32; 256],
@@ -930,7 +932,7 @@ impl FluorApp<G2t16> for Lumis {
 
     /// With the display baking, Lumis's frame goes from its own RGB888 buffer straight into the surface in the display's codes (`present_baked`): fluor neither clears nor renders a scratch nor bakes it.
     fn bakes_own(&self) -> bool {
-        self.surface.is_some()
+        self.surface.is_some() && self.knobs & DEV_SCRATCH == 0
     }
 
     /// One changed rect, baked: each pixel's three bytes as the 16-bit g2t codes they are (the `lut`'s darkness from white), opaque, thru the display's own `Bake::row`, rows across the worker cores. The same codes the host's bake of `render`'s G2t16 pixels gives, bit for bit (fluor host::panel `baking_codes_equals_baking_the_opaque_frame`), in one pass from Lumis's buffer.
