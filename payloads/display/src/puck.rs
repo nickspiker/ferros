@@ -383,6 +383,12 @@ pub fn largest_r() -> i64 {
     unsafe { (*(&raw const GEOM)).iter().zip((*(&raw const SEEN)).iter()).filter(|(_, v)| v.shown).map(|(g, _)| g.2).max().unwrap_or(0) }
 }
 
+/// `draw_into`'s rows: a circle's box is at most the panel's width plus its edge, inside the clip; the widest panel ferros drives is under 2^11.
+const ROW_MAX: usize = 1 << 11;
+static mut ROW: [u64; ROW_MAX] = [0; ROW_MAX];
+static mut BAKED: [u64; ROW_MAX] = [0; ROW_MAX];
+static mut COV: [f32; ROW_MAX] = [0.; ROW_MAX];
+
 /// Draw puck j's square into `px` (w × h, inside `clip`): the circle at (cx, cy) radius r (Q8 pixels), its face turned (fc, fs) Q14, each pixel sampled from the square (bilinear, the turn between the square's and the face's undone, its size to the circle's), trimmed by the circle's edge and baked, under what is there. False when the puck has handed no square yet (the caller shows its plane).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_into(px: &mut [Px], w: usize, clip: draw::Rect, j: usize, cx: i64, cy: i64, r: i64, fc: i64, fs: i64) -> bool {
@@ -414,9 +420,10 @@ pub fn draw_into(px: &mut [Px], w: usize, clip: draw::Rect, j: usize, cx: i64, c
         return true;
     }
     let n = (x1 - x0) as usize;
-    let mut row = alloc::vec![0u64; n];
-    let mut baked = alloc::vec![0u64; n];
-    let mut cov = alloc::vec![0f32; n];
+    // The rows in fixed buffers, nothing on the heap: this process's heap is a bump that only the text draws reset, so a deck with no words on it (no labels) never gave back three rows a puck redraw, and the display ran out of memory 16 minutes into the 8a's first pucks (2026-11-18, "memory allocation of 5272 bytes failed"). Only the render thread draws pucks.
+    // SAFETY: the render thread alone calls `draw_into` (the scene and its sprites), so nothing else holds these.
+    let (row, baked, cov): (&mut [u64; ROW_MAX], &mut [u64; ROW_MAX], &mut [f32; ROW_MAX]) = unsafe { (&mut *(&raw mut ROW), &mut *(&raw mut BAKED), &mut *(&raw mut COV)) };
+    let (row, baked, cov) = (&mut row[..n], &mut baked[..n], &mut cov[..n]);
     // WHY the bounds: a pixel at the circle's rim, turned and scaled into the square, lands up to a pixel past its side (and anywhere past it while the circle is turned or sized since the square was drawn); past the side is nothing.
     let at = |x: i32, y: i32| -> u64 { if x >= 0 && y >= 0 && (x as usize) < d && (y as usize) < d { src[y as usize * d + x as usize] } else { 0 } };
     let bake = crate::bake::now();
@@ -444,7 +451,7 @@ pub fn draw_into(px: &mut [Px], w: usize, clip: draw::Rect, j: usize, cx: i64, c
             };
             row[q] = lane(48) | lane(32) | lane(16) | lane(0);
         }
-        bake.g2t_row(&row, &mut baked);
+        bake.g2t_row(row, baked);
         let base = y as usize * w;
         for q in 0..n {
             let a = row[q] >> 48;
