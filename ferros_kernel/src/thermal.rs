@@ -240,14 +240,15 @@ pub fn poll() -> bool {
 }
 
 /// The hardware's clocks and throttles a second (docs/CAMERA.md "The slowdown", `diag thermal trace`): what the firmware holds, what the PLLs and dividers are set to, the clock dividers' status, MPMM's levels, the PMIC's warning pins, and the CPU zones, kept for the last 2^7 seconds, so a run's slowdown can be laid beside each.
-/// Fields: 0 the second (uptime), 1 the kernel's core measured (MHz), 2-7 the firmware's MIF, CPUCL0, CPUCL1, CPUCL2, DSU, BCI (MHz; 0 unless `TRACE_ACPM`), 8-10 BIG MID LITTLE (C), 11-13 CLKDIVSTEP_STAT of CPUCL0, 1, 2, 14-17 SYSREG_CPUCL0's LIT, MID, BIG MPMM and MPMMEN, 18-19 GPA9 and GPA10's data (the warning pins: GPA9 bit 4 SMPL_WARN_L, 5 and 6 VDROOP1/2; GPA10 bits 0-3 the A715s' and the X3's OCP and soft OCP warnings), 20-23 PLL_CON3 of CPUCL0, DSU, CPUCL1, CPUCL2, 24-27 their dividers, 28-31 their muxes, 32 the service-loop passes in the second that read CPUCL0's CLKDIVSTEP_STAT with bit 31 set and 33 all that read it (`sample_dividers`). G#EEEEEEEE: not readable then (its cluster may be down).
+/// Fields: 0 the second (uptime), 1 the kernel's core measured (MHz), 2-7 the firmware's MIF, CPUCL0, CPUCL1, CPUCL2, DSU, BCI (MHz; 0 unless `TRACE_ACPM`), 8-10 BIG MID LITTLE (C), 11-13 CLKDIVSTEP_STAT of CPUCL0, 1, 2, 14-17 SYSREG_CPUCL0's LIT, MID, BIG MPMM and MPMMEN, 18-19 GPA9 and GPA10's data (the warning pins: GPA9 bit 4 SMPL_WARN_L, 5 and 6 VDROOP1/2; GPA10 bits 0-3 the A715s' and the X3's OCP and soft OCP warnings), 20-23 PLL_CON3 of CPUCL0, DSU, CPUCL1, CPUCL2, 24-27 their dividers, 28-31 their muxes, 32 the service-loop passes in the second that read CPUCL0's CLKDIVSTEP_STAT with bit 31 set and 33 all that read it (`sample_dividers`), 34-36 the battery gauge's last sample (%, cell mV, current mA, charging positive; read every 2 s), 37 GPA9's CON word (whether its data word reads the SMPL_WARN pin: zuma-pmic.dtsi has GPA9 bit 4 as SMPL_WARN_R_L). G#EEEEEEEE: not readable then (its cluster may be down).
 const TRACE_N: usize = 1 << 7;
-const TRACE_F: usize = 34;
+const TRACE_F: usize = 38;
 static mut TRACE: [[u32; TRACE_F]; TRACE_N] = [[0; TRACE_F]; TRACE_N];
 static TRACE_AT: AtomicU64 = AtomicU64::new(0);
 /// SYSREG_CPUCL0's MPMM words (gs_tmu_v3.h: LIT, MID, BIG, MPMMEN) and GPIO_ALIVE's GPA9 and GPA10 data words (pinctrl-gs.c).
 const MPMM: [usize; 4] = [0x29C2_1408, 0x29C2_140C, 0x29C2_1410, 0x29C2_1414];
 const WARN_PINS: [usize; 2] = [0x154D_0104, 0x154D_0124];
+const GPA9_CON: usize = 0x154D_0100;
 /// PLL_CON3, the divider and the mux of CPUCL0, the DSU, CPUCL1, CPUCL2 (cmucal-sfr.c, cmucal-node.c), and which divider block's readability each needs (`div_readable`).
 const PLL: [(usize, usize, usize, usize); 4] = [(0x29C0_014C, 0x29C0_1834, 0x29C0_1008, 0), (0x29C0_018C, 0x29C0_1848, 0x29C0_100C, 0), (0x29D0_010C, 0x29D0_1804, 0x29D0_1000, 1), (0x29D8_010C, 0x29D8_1804, 0x29D8_1000, 2)];
 const UNREAD: u32 = 0xEEEE_EEEE;
@@ -296,6 +297,11 @@ fn trace_second(mhz: u32) {
     }
     r[32] = DIV0_STEPPED.swap(0, Relaxed);
     r[33] = DIV0_PASSES.swap(0, Relaxed);
+    let g = crate::service::gauge_last();
+    r[34] = g[0] as u32;
+    r[35] = (g[2] / 1000) as u32;
+    r[36] = (g[3] as i64 / 1000) as i32 as u32;
+    r[37] = rd(GPA9_CON);
     let at = TRACE_AT.fetch_add(1, Relaxed) as usize;
     unsafe { (*(&raw mut TRACE))[at % TRACE_N] = r };
 }
@@ -315,14 +321,14 @@ pub fn report_trace(out: &mut alloc::vec::Vec<u8>, n: usize) {
     let at = TRACE_AT.load(Relaxed) as usize;
     // WHY the min: the ring keeps TRACE_N seconds and has been filled `at` times; asking more prints what there is.
     let n = n.min(TRACE_N).min(at);
-    out.extend_from_slice(b"s, X3 measured MHz | firmware MHz: MIF CL0 CL1 CL2 DSU BCI | C: BIG MID LIT | CLKDIVSTEP_STAT CL0 CL1 CL2 | MPMM LIT MID BIG EN | pins GPA9 GPA10 | PLL MHz CL0 DSU CL1 CL2 (divider, mux words) | CL0 passes stepped of passes\n");
+    out.extend_from_slice(b"s, X3 measured MHz | firmware MHz: MIF CL0 CL1 CL2 DSU BCI | C: BIG MID LIT | CLKDIVSTEP_STAT CL0 CL1 CL2 | MPMM LIT MID BIG EN | pins GPA9 GPA10 | PLL MHz CL0 DSU CL1 CL2 (divider, mux words) | CL0 passes stepped of passes | battery %, mV, mA | GPA9 CON\n");
     for i in at - n..at {
         let r = unsafe { (*(&raw const TRACE))[i % TRACE_N] };
         out.extend_from_slice(format!("A#{} A#{} | A#{} A#{} A#{} A#{} A#{} A#{} | A#{} A#{} A#{} | G#{:X} G#{:X} G#{:X} | G#{:X} G#{:X} G#{:X} G#{:X} | G#{:X} G#{:X} |", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18], r[19]).as_bytes());
         for k in 0..4 {
             out.extend_from_slice(format!(" A#{} (G#{:X} G#{:X})", pll_mhz(r[20 + k]), r[24 + k], r[28 + k]).as_bytes());
         }
-        out.extend_from_slice(format!(" | A#{} of A#{}", r[32], r[33]).as_bytes());
+        out.extend_from_slice(format!(" | A#{} of A#{} | A#{} A#{} A#{} | G#{:X}", r[32], r[33], r[34], r[35], r[36] as i32, r[37]).as_bytes());
         out.push(b'\n');
     }
 }

@@ -2515,6 +2515,11 @@ fn bell_facts() {
     }
 }
 
+/// The gauge's last sample (facts 1-4: %, hundredths of a degree, cell uV, current uA with charging positive), for the heat trace (thermal.rs `trace_second`), on the service loop's own core as `gauge_poll` writes it.
+pub fn gauge_last() -> [u64; 4] {
+    unsafe { (*(&raw const GAUGE)).0 }
+}
+
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
