@@ -648,6 +648,34 @@ messages! {
     WifiNotAnswering,
     AlreadyOnNetwork,
     CouldNotKeepNetwork,
+    // ---- the WiFi page's picker (payloads/map wifi.rs, 2026-11-18): its headings, its buttons, a network's facts and what the page says ----
+    NetworksInRange,
+    NetworksRemembered,
+    /// The button that asks the keyboard for a network's passphrase.
+    TypePassphrase,
+    /// The same for a network remembered: its passphrase typed again.
+    NewPassphrase,
+    /// A remembered network's button, and its first tap (two taps forget it).
+    Forget,
+    TapAgainForget,
+    /// A network's facts: how many access points answered under its name, its security, when this device last joined it.
+    AccessPoints,
+    Security,
+    LastJoined,
+    NotJoinedYet,
+    /// Whose list keeps a remembered network: the person's (joined while they were attested), the device's (joined while nobody was).
+    KeptForYou,
+    KeptForDevice,
+    /// A network's security, short (WPA2, WPA3, WEP stay).
+    SecurityOpen,
+    SecurityOther,
+    JoinsWpa2Only,
+    /// Under the remembered networks: kept on this device only (whether they should travel with the person is the owner's question).
+    NetworksKeptNote,
+    /// A WiFi driver (or a grant) from before the picker: no list.
+    NoNetworkList,
+    NotRemembered,
+    CouldNotForget,
 
     // ---- the honeycomb keyboard's bar (attest screen, hive): short, they sit on keys ----
     KeyMap,
@@ -715,6 +743,11 @@ pub enum Say<'a> {
     SecurityUnsupported(&'a str),
     DidNotAnswer(&'a str),
     RefusedPassphrase(&'a str),
+    // ---- the WiFi page's picker ----
+    /// The keyboard asked for this network's passphrase.
+    TypeOnKeyboard(&'a str),
+    JoinedNet(&'a str),
+    Forgotten(&'a str),
     /// A passphrase's length, in characters.
     PassphraseLength { min: u64, max: u64 },
 }

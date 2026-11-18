@@ -26,6 +26,8 @@ mod quick;
 /// Notes on the deck (docs/NOTIFY.md): the kernel's list, the glows, the resting view, the Deck button, the live takeover.
 mod notes;
 mod typed;
+/// The WiFi page's picker (docs/WIFI.md "The picker"): the networks in range and remembered, a pick, the passphrase on the keyboard, the join, a network forgotten.
+mod wifi;
 /// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
 mod camera;
 
@@ -80,8 +82,8 @@ const S_LAUNCH: u64 = 7;
 const S_STOWER: u64 = 8;
 /// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
 const S_NFC: u64 = 9;
-/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11).
-const S_TORCH: u64 = 10;
+/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11), 10 until it granted use wlan before it (2026-11-18, `wifi::S_WLAN`; an init from before leaves 11 empty, and the torch circle is dimmed until init is stored too).
+const S_TORCH: u64 = 11;
 
 /// The NFC page's "add a tag", as the main loop sets it: 0 not adding, else which add this is (counted from 1), so a tag answered for an add that has since ended is never kept. `tag_add_thread` holds the NFC driver's TAG while it is set and keeps the tag it is answered with (SYS_UNLOCK op 7, under Settings), then writes the outcome to TAG_DONE: the add's count << 2, then 1 kept, 2 kept already, 3 not kept. The main loop reads TAG_DONE each pass (a word, no call), as it reads the GPS copy.
 static TAG_ADD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1095,6 +1097,8 @@ enum Choice {
     /// The NFC page's "add a tag" (or its cancel while it waits), and a kept tag's remove (its place in the list), attest with a tag (AUTH.md).
     TagAdd,
     TagRemove(u8),
+    /// The WiFi page's picker (wifi.rs): a network's row, its buttons.
+    Wifi(wifi::Act),
     /// A live note's page (notes.rs `live_page`, docs/NOTIFY.md "The live takeover"): Answer opens its kist at the note, Decline lets it go.
     LiveAnswer,
     LiveDecline,
@@ -1620,6 +1624,8 @@ struct Map {
     tags: [ferros_sys::KeptTag; 1 << 4],
     ntags: usize,
     tag_said: u64,
+    /// The WiFi page's picker (wifi.rs).
+    wifi: wifi::Picker,
     /// How many adds this map has started (`TAG_ADD`'s values).
     tag_adds: u64,
     /// The kist this map last asked init to launch and was told "started" (ferros_kist::launch::STARTED), with the kists' bell count as it stood then (KISTS_WORD): a launch the kernel did not start after all comes back with a later count (ferros_sys::not_started), and only that one is said. Dropped once it is said.
@@ -3727,6 +3733,10 @@ impl Map {
                     mark(self, b, &mut y, 50, tr(Msg::On), !off, Some(Choice::Switch(k as u8)));
                 }
                 fact(b, &mut y, tr(Msg::State), link_state(k, state));
+                // WiFi: the networks, to pick and join or forget (wifi.rs), first under the switch.
+                if k == 1 {
+                    self.wifi_rows(b, &mut y, cx, hit);
+                }
                 let f = ferros_sys::numbers(Style::Glyphs);
                 // Everything the driver publishes (docs/RADIO-CONTROLS.md): its eight slots, then its tracks, grouped (signal, channel, link, counters, motion); tracked satellites listed on their own; then its names and addresses (the detail, read with the Settings capability), then its knobs.
                 let mut words = [ferros_sys::MEASURE_NONE; 8 + ferros_sys::TRACKS_MAX];
@@ -5411,6 +5421,7 @@ impl Map {
                         self.tag_said = 0;
                         self.tags_read();
                     }
+                    Some(Choice::Wifi(a)) => self.wifi_tap(a),
                     // A neighbour's title: that page, coming in from its side and settling as a swipe does.
                     Some(Choice::Link(k)) => {
                         // Connections' row: that link's own page, straight there.
@@ -5848,6 +5859,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         tags: [ferros_sys::KeptTag::default(); 1 << 4],
         ntags: 0,
         tag_said: 0,
+        wifi: wifi::Picker::new(),
         tag_adds: 0,
         unstow_armed: None,
         person_armed: None,
@@ -6120,6 +6132,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The NFC page's "add a tag" (`tag_add_thread`): asleep until an add starts.
     static mut TAG_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(tag_add_thread, unsafe { &mut *(&raw mut TAG_STACK) }, grants);
+    // The WiFi page's list (`wifi::watch`, asleep while the page does not show) and its requests (`wifi::asker`).
+    static mut WIFI_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(wifi::watch, unsafe { &mut *(&raw mut WIFI_STACK) }, grants);
+    static mut WIFI_ASK_STACK: [u8; 1 << 13] = [0; 1 << 13];
+    ferros_sys::thread_spawn(wifi::asker, unsafe { &mut *(&raw mut WIFI_ASK_STACK) }, grants);
     // The quick row's slow calls (the torch, the identity service's do not disturb), on a thread of their own (quick.rs `worker`).
     static mut QUICK_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(quick::worker, unsafe { &mut *(&raw mut QUICK_STACK) }, grants);
@@ -6290,6 +6307,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let open = matches!(map.view, View::Open(_));
         let page = PAGES[map.page];
         let mut page_dirty = false;
+        // The WiFi page's picker (wifi.rs): its watch follows the page; a new list, or a request's reply, draws it again.
+        page_dirty |= wifi::pass(&mut map, open && page == "WiFi") && open && page == "WiFi";
         // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim.
         if let Some((seq, v)) = gps_take(gps_seen) {
             gps_seen = seq;
