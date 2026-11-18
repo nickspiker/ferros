@@ -3383,8 +3383,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
 }
 
 /// `SYS_VAULT` op 0: the `skip`-th entry of the kernel's vault that belongs in the vault process (a scope's, not one the kernel keeps, its class open), with its domain's keys: the one exception to keys only against a live call (VAULT-OUT.md, migration), once per old entry. None left: the pending mark is cleared.
-fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
-    let Some(Ok(names)) = unsafe { STORE_KEYS }.map(|keys| keys()) else { return ERR };
+/// `names` the kernel's vault's, listed with the kernel lock let go (SYS_VAULT); the keys derived and written under it.
+fn migrate_next(p: &Process, names: Vec<alloc::string::String>, skip: usize, buf: u64, len: usize) -> u64 {
     let mut seen = 0;
     for name in names {
         let Some(sc) = scope_of(&name) else { continue };
@@ -3412,38 +3412,26 @@ fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
     NOTHING
 }
 
-/// `SYS_VAULT` op 1: an old entry's value from `offset` (fetched once, kept until another is asked for or it moves).
-fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize) -> u64 {
+/// `SYS_VAULT` op 1: an old entry's value from `offset` (fetched once, kept until another is asked for or it moves). `got` the vault's answer when the cache did not hold it, read with the kernel lock let go (SYS_VAULT).
+fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize, got: Option<Result<Option<Vec<u8>>, ()>>) -> u64 {
     if scope_of(name).is_none() {
         return ERR;
     }
     let cache = unsafe { &mut *(&raw mut MIGRATE_CACHE) };
-    if cache.as_ref().is_none_or(|(k, _)| k != name.as_bytes()) {
-        *cache = match unsafe { STORE }.map(|store| store(name, None)) {
-            Some(Ok(Some(v))) => Some((name.as_bytes().to_vec(), v)),
-            Some(Ok(None)) => return NOTHING,
-            _ => return ERR,
+    if let Some(got) = got {
+        *cache = match got {
+            Ok(Some(v)) => Some((name.as_bytes().to_vec(), v)),
+            Ok(None) => return NOTHING,
+            Err(()) => return ERR,
         };
     }
-    let Some((_, v)) = cache.as_ref() else { return ERR };
+    // The cache this name's or nothing: no vault to read from (`STORE` unset) leaves it as it was.
+    let Some((_, v)) = cache.as_ref().filter(|(k, _)| k == name.as_bytes()) else { return ERR };
     // WHY: the offset is the vault process's and may lie past the end (nothing to copy then).
     let from = offset.min(v.len());
     let to = (offset + len).min(v.len());
     p.write(buf, &v[from..to]);
     v.len() as u64
-}
-
-/// `SYS_VAULT` op 2: an old entry the vault process has written and committed, removed from the kernel's vault.
-fn migrate_done(name: &str) -> u64 {
-    let Some(sc) = scope_of(name) else { return ERR };
-    unsafe { *(&raw mut MIGRATE_CACHE) = None };
-    // Said apart from the removal's own line ("store remove ... (process)", which a process's delete also writes): this entry lives on in the vault process, under a scope a kernel without it will not look in.
-    crate::flashlog::line(&alloc::format!("store moved {name:?} into the vault process, scope {}", sc.name));
-    match unsafe { STORE_REMOVE }.map(|rm| rm(name)) {
-        Some(Ok(true)) => 0,
-        Some(Ok(false)) => NOTHING,
-        _ => ERR,
-    }
 }
 
 /// A bridge `store put` (service.rs) of a name the vault process holds: it waits in the kernel's vault until the vault process takes it.
@@ -4666,10 +4654,41 @@ fn el0_trap(f: &mut Frame) -> u64 {
             } else if !ok || len > STORE_MAX {
                 ERR
             } else {
+                // Each op's vault call made with the kernel lock let go (`unlocked`, under the vault's own lock), the caller found again after it: at a boot the listing waited 46 ms for the vault's lock behind the AoC's firmware (2026-11-18, `diag lock`). The domain keys and the read's cache stay under the kernel lock.
+                let (skip, buf) = (f.x[2] as usize, f.x[4]);
                 match op {
-                    0 => migrate_next(p, f.x[2] as usize, f.x[4], len),
-                    1 => migrate_read(p, &name(), offset, f.x[4], len),
-                    2 => migrate_done(&name()),
+                    0 => {
+                        let names = unlocked(|| unsafe { STORE_KEYS }.map(|keys| keys()));
+                        match (names, proc_of(cur)) {
+                            (Some(Ok(names)), Some(p)) => migrate_next(p, names, skip, buf, len),
+                            _ => ERR,
+                        }
+                    }
+                    1 => {
+                        let name = name();
+                        let miss = scope_of(&name).is_some() && unsafe { (*(&raw const MIGRATE_CACHE)).as_ref() }.is_none_or(|(k, _)| k != name.as_bytes());
+                        let got = if miss { unlocked(|| unsafe { STORE }.map(|store| store(&name, None))) } else { None };
+                        match proc_of(cur) {
+                            Some(p) => migrate_read(p, &name, offset, buf, len, got),
+                            None => ERR,
+                        }
+                    }
+                    2 => {
+                        let name = name();
+                        match scope_of(&name) {
+                            Some(sc) => {
+                                unsafe { *(&raw mut MIGRATE_CACHE) = None };
+                                // Said apart from the removal's own line ("store remove ... (process)", which a process's delete also writes): this entry lives on in the vault process, under a scope a kernel without it will not look in.
+                                crate::flashlog::line(&alloc::format!("store moved {name:?} into the vault process, scope {}", sc.name));
+                                match unlocked(|| unsafe { STORE_REMOVE }.map(|rm| rm(&name))) {
+                                    Some(Ok(true)) => 0,
+                                    Some(Ok(false)) => NOTHING,
+                                    _ => ERR,
+                                }
+                            }
+                            None => ERR,
+                        }
+                    }
                     _ => ERR,
                 }
             };
