@@ -403,7 +403,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let (min_iso, max_iso) = (iso(cam.gain_min), iso(cam.gain_max));
     // The first open's seed (Android: the one-shot AE's metered values, or the calibration's extremes): the driver's own exposure and gain, as its first frame says.
     let (seed_iso, seed_shutter) = match calibration {
-        Some(dark) => (max_iso, if dark { cam.exposure_max } else { cam.exposure_min } as f64),
+        // A dark map opens at lumis_core's dark seed (16 s, Android's longest) or the camera's longest if shorter: the combined driver offers years (the main's shift modes), and a calibration must not open on one. The shutter control keeps the whole range.
+        Some(dark) => (max_iso, if dark { (cam.exposure_max as f64).min(app::DARK_CALIBRATION_SHUTTER_NS) } else { cam.exposure_min as f64 }),
         None => (iso(first.gain), first.exposure_ns as f64),
     };
     let setup = CameraSetup {
