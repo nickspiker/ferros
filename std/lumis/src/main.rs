@@ -927,6 +927,38 @@ impl FluorApp<G2t16> for Lumis {
     fn opaque(&self) -> bool {
         true
     }
+
+    /// With the display baking, Lumis's frame goes from its own RGB888 buffer straight into the surface in the display's codes (`present_baked`): fluor neither clears nor renders a scratch nor bakes it.
+    fn bakes_own(&self) -> bool {
+        self.surface.is_some()
+    }
+
+    /// One changed rect, baked: each pixel's three bytes as the 16-bit g2t codes they are (the `lut`'s darkness from white), opaque, thru the display's own `Bake::row`, rows across the worker cores. The same codes the host's bake of `render`'s G2t16 pixels gives, bit for bit (fluor host::panel `baking_codes_equals_baking_the_opaque_frame`), in one pass from Lumis's buffer.
+    fn present_baked(&mut self, rect: fluor::canvas::PixelRect, rows: &mut [u64], stride: usize, fx: usize, bake: &fluor::host::panel::Bake) {
+        let Some(surface) = self.surface.as_ref() else { return };
+        self.changed = false;
+        let t = std::time::Instant::now();
+        let w = self.width;
+        // A byte's code: the darkness the lut holds, from white.
+        let code: [u16; 256] = core::array::from_fn(|v| (G2t16::ONE - self.lut[v]) as u16);
+        // The opaque lane: the transparency 16384 - 65535 / 4, in bits 49-62.
+        let opaque = ((16384 - (G2t16::ONE >> 2)) << 1) as u16;
+        let src = surface.pixels();
+        rows.par_chunks_mut(stride).enumerate().for_each(|(k, row)| {
+            let line = &src[(rect.y0 + k) * w * 3..];
+            bake.row(
+                |i| {
+                    let p = (rect.x0 + i) * 3;
+                    ([code[line[p] as usize], code[line[p + 1] as usize], code[line[p + 2] as usize]], opaque)
+                },
+                &mut row[fx + rect.x0..fx + rect.x1],
+            );
+        });
+        if matches!(self.screen, Screen::Camera(_)) {
+            self.probe.convert += t.elapsed().as_micros() as u64;
+            self.probe.converts += 1;
+        }
+    }
 }
 
 /// The driver's camera list, or the reason there is none (each said on the console; the menu then lists no camera).
