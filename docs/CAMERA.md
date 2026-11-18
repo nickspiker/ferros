@@ -840,6 +840,55 @@ Lumis 0.2.18, hand-spawned (`--use display --use touch --dma surface --ira --dom
 
 **To repeat:** `$B reload` the kernel; `tools/cambench-sweep.sh <out> 01 000100003214B80B00000000020800040000000007 fll 5170` (BIN the directory holding this branch's camera.bin and cambench.bin; the last byte 07: write-back, A510s, check); Lumis with the inputs above after the driver (`--name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0 --hw hsi2c3 --hw hsi2c2 --hw hsi2c4`, input 01).
 
+## The slowdown, measured (2026-11-18, branch slowdown-probe)
+
+"Everything on the CPU slows as a run goes on" (the section above) is two things, neither of them the camera's.
+Measured on the Pro, not attested, the driver hand-spawned with input 01, every stream ended by its own close; the kernel cam-cacheable plus the trace below, RAM-reloaded (b949, then b952).
+
+**The tools added:**
+- corebench's watch (input byte 0 = 3): one probe pinned to each core asked (u16 mask), every 2^-4 s its real clock (PMU cycles over the counter), adds and NEON flops a cycle, and dependent-load chases in its own L2, the shared L3 (4 MiB) and DRAM (64 MiB); a line a measure each second. An optional no-camera load (a u16 mask: each core streams 16 MiB into u16 sums).
+- cambench's window line every 64 frames: the work a frame, and per frame thread its PMU clock over its own busy time, instructions and backend stalls a cycle, L2 and L3 refills.
+- `diag thermal trace [n]` (thermal.rs): each second the zones, the PLL_CON3 rate of CPUCL0, the DSU, CPUCL1 and CPUCL2 (24.576 MHz x M / (P x 2^S)), the three CLKDIVSTEP_STAT words, SYSREG_CPUCL0's MPMM words, the PMIC warning pins (GPA9, GPA10), and how many service-loop passes that second read CPUCL0's CLKDIVSTEP_STAT with bit 31 set (about 2000 passes a second).
+
+**One: ferros's governor, flat, not a slowdown.** cambench, write-back, three A715 threads, u16 add, 2048 frames (33.5 s):
+
+| clocks | work a frame | the threads' real clock | the MAP's maintenance |
+|---|---|---|---|
+| held at the tops (`diag dvfs policy off`, A715 2367, A510 1704, X3 2914, MIF 3744, DSU 1800) | 2.16 ms, first window to last | 2413 MHz | 394 us |
+| the governor | 6.3 to 7.7 ms from the first window | 440 to 780 MHz (the PLL agrees) | 620 to 740 us |
+| the governor, the view non-cacheable | 7.1 to 9.6 ms | 540 to 780 MHz | none |
+| held, non-cacheable | 4.26 ms | 2390 MHz | none |
+
+- The governor aims each cluster's busiest core at 4/5 busy (service.rs `Gov`). Three threads busy about 7 ms of a 16.4 ms frame never reach that, so the A715s sit at or near their floor, 402 MHz. The camera's lift raises their ceiling, not their floor. cambench still took all 61 frames a second, none skipped.
+- The "the A715s asked 2367 MHz" of the section above was the USB diag's own boost: every diag's transfer puts both clusters at their top, and `diag clock`'s "asked" shows it. Its residency showed a time-weighted mean of 524 MHz for the run.
+- With every clock held, nothing slows: 2.16 ms a frame for 2048 frames, the A510 run below 3.69 ms for 2048. The die reached only 49 C and 61 C.
+
+**Two: a hardware clock divider on CPUCL0 (the A510s and the DSU) as the die heats.** Lumis 0.2.18, the intake on the A510s (input `280100003214B80B0000000000`), governed, 32 s (twice, the second with the watch's probes):
+
+| seconds into the stream | 1-4 | 5-8 | 9-12 | 13-16 | 17-20 | 21-24 | 25-28 | 29-32 |
+|---|---|---|---|---|---|---|---|---|
+| new images drawn a second (run 2) | 22 (start) | 55 | 41 | 34 | 31 | 29 | 28 | 27 |
+| Lumis's draw a new image (ms) | 14.0 | 13.8 | 19.2 | 23.6 | 25.1 | 27.1 | 29.0 | 30.2 |
+| CPUCL0 passes stepped (of about 2000 a second) | 0 | 0 to 22 % | 26 to 37 % | 32 to 40 % | 35 to 47 % | 36 to 54 % | 44 to 53 % | 50 to 52 % |
+| LITTLE zone (C) | 66 to 83 | 85 to 87 | 85 to 90 | 85 to 90 | 85 to 90 | 86 to 90 | 86 to 90 | 89 to 91 |
+
+- The steps begin within a second or two of the LITTLE zone reaching 85 to 87 C (the stream's fifth second), grow while it stays there, and stop with the stream (18 % the second it closed at 72 C, 0 at 66 C). Stepping, CPUCL0's CLKDIVSTEP_STAT reads G#80000801; at rest, G#101. CPUCL1's read G#80000801 too in five of the hot seconds (1 Hz reads); CPUCL2's (the X3, at 880 MHz, BIG 79 C) never did.
+- The PLLs held their rates thru the steps: A715 2367, DSU 1800 (and in run 1 the firmware's rates agreed, MIF 3744). A divider downstream of the PLL is invisible to both. One coincidence to untangle: in both runs the governor lifted the A510s from 1098 to 1704 MHz in the same second the steps began (their intake saturating as it slowed, or the lift adding the current that trips it); four A510s held at 1704 MHz on a cool die (61 C, below) never stepped.
+- The cores' clocks barely moved (the probes' PMU cycles: the A715s 2400 to 2000-2300 MHz, the A510s about 1100-1300 as governed). The memory side slowed: dependent-load latency on the A715s L3 88 to 250-330 ns, DRAM 166 to 400-550 ns; on the A510s DRAM 275 to 700 ns. The DSU (the L3 and the cores' way to DRAM) is clocked from CMU_CPUCL0, so its divider slows every cluster at once, the X3's display included. That is why everything slowed by the same factor.
+- The heat: MID and LITTLE went from 48 C to 85-90 C in about 6 s, with the A715s at 2367 MHz (Lumis's UI threads, 1.5 W a core) and the A510s at 1704.
+- Not the camera's traffic: cambench on four A510s at 1719 MHz with everything held at the top, 33 s, 61 C at most: not one stepped pass, 3.69 ms a frame from the first window to the last.
+- Not MPMM: SYSREG_CPUCL0's MPMM words read 0 in every second (MPMMEN 0: Linux sends ACPM the levels at probe, ferros never does). The warning pins read GPA9 G#11 and GPA10 G#0 in every second read (a 1 Hz read can miss a pulse).
+
+**Open:** whether CPUCL0's divider answers heat (a TMU trip routed to it, or ACPM's own early throttle) or the current that heat brings (the A510-and-DSU rail's warning; the reference tree names only SMPL_WARN as CPUCL0's filter). The test: heat the die with no camera (the watch's load on the A715s at 2367), then drop the load. If the steps stop at once, it is the current; if they last while the die stays hot, it is the heat. Read `diag thermal hw`'s trip counts before and after.
+
+**What it means for 60 fps:** clock is not the answer. The top clocks are what heat the die into the divider. The levers, each to be measured:
+- Lumis's UI and draw off the A715s' top rate.
+- A cap on the A715s during a stream (their table from 1836 MHz down).
+- The intake placement: the A510s at 1.1-1.3 GHz did the intake.
+- The governor's floor under a frame-paced load: cambench keeps 61 a second at 402-780 MHz, so the floor matters only for latency.
+
+A reload with this kernel's first trace build (every divider word read every pass, six ACPM rate reads a second) found ACPM answering nothing and the device reset 35 s later (b950, the kernel's core between the clock policy and the heat step, crumb G#D7). The build committed reads only CPUCL0's word every pass and asks ACPM nothing extra.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.

@@ -188,6 +188,7 @@ pub fn set_policy(p: u8) {
 pub fn poll() -> bool {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let (f, now) = (cntfrq(), cntpct());
+    sample_dividers();
     let last = LAST.load(Relaxed);
     if last != 0 && now.wrapping_sub(last) < f {
         return false;
@@ -226,6 +227,7 @@ pub fn poll() -> bool {
             DIV_SEEN[k].fetch_or(s, Relaxed);
         }
     }
+    trace_second(mhz);
     match POLICY.load(Relaxed) {
         STEP => step(),
         SMOOTH => smooth(),
@@ -235,6 +237,94 @@ pub fn poll() -> bool {
         CAPPED_S.fetch_add(1, Relaxed);
     }
     true
+}
+
+/// The hardware's clocks and throttles a second (docs/CAMERA.md "The slowdown", `diag thermal trace`): what the firmware holds, what the PLLs and dividers are set to, the clock dividers' status, MPMM's levels, the PMIC's warning pins, and the CPU zones, kept for the last 2^7 seconds, so a run's slowdown can be laid beside each.
+/// Fields: 0 the second (uptime), 1 the kernel's core measured (MHz), 2-7 the firmware's MIF, CPUCL0, CPUCL1, CPUCL2, DSU, BCI (MHz; 0 unless `TRACE_ACPM`), 8-10 BIG MID LITTLE (C), 11-13 CLKDIVSTEP_STAT of CPUCL0, 1, 2, 14-17 SYSREG_CPUCL0's LIT, MID, BIG MPMM and MPMMEN, 18-19 GPA9 and GPA10's data (the warning pins: GPA9 bit 4 SMPL_WARN_L, 5 and 6 VDROOP1/2; GPA10 bits 0-3 the A715s' and the X3's OCP and soft OCP warnings), 20-23 PLL_CON3 of CPUCL0, DSU, CPUCL1, CPUCL2, 24-27 their dividers, 28-31 their muxes, 32 the service-loop passes in the second that read CPUCL0's CLKDIVSTEP_STAT with bit 31 set and 33 all that read it (`sample_dividers`). G#EEEEEEEE: not readable then (its cluster may be down).
+const TRACE_N: usize = 1 << 7;
+const TRACE_F: usize = 34;
+static mut TRACE: [[u32; TRACE_F]; TRACE_N] = [[0; TRACE_F]; TRACE_N];
+static TRACE_AT: AtomicU64 = AtomicU64::new(0);
+/// SYSREG_CPUCL0's MPMM words (gs_tmu_v3.h: LIT, MID, BIG, MPMMEN) and GPIO_ALIVE's GPA9 and GPA10 data words (pinctrl-gs.c).
+const MPMM: [usize; 4] = [0x29C2_1408, 0x29C2_140C, 0x29C2_1410, 0x29C2_1414];
+const WARN_PINS: [usize; 2] = [0x154D_0104, 0x154D_0124];
+/// PLL_CON3, the divider and the mux of CPUCL0, the DSU, CPUCL1, CPUCL2 (cmucal-sfr.c, cmucal-node.c), and which divider block's readability each needs (`div_readable`).
+const PLL: [(usize, usize, usize, usize); 4] = [(0x29C0_014C, 0x29C0_1834, 0x29C0_1008, 0), (0x29C0_018C, 0x29C0_1848, 0x29C0_100C, 0), (0x29D0_010C, 0x29D0_1804, 0x29D0_1000, 1), (0x29D8_010C, 0x29D8_1804, 0x29D8_1000, 2)];
+const UNREAD: u32 = 0xEEEE_EEEE;
+/// Whether the trace asks the firmware for its six rates each second (fields 2-7; off: they read 0).
+const TRACE_ACPM: bool = false;
+
+/// CPUCL0's divider status read on every service-loop pass, not once a second (2026-11-18: it read G#80000801 in one second of a Lumis run and G#101 in the seconds round it, so a step lasts less than a second): the passes that read it and those that found bit 31 set (the step's bit as seen), since the last second's trace took them.
+static DIV0_PASSES: AtomicU32 = AtomicU32::new(0);
+static DIV0_STEPPED: AtomicU32 = AtomicU32::new(0);
+
+/// CPUCL0's block alone (it holds the DSU and is on while any core is): a build that also read CPUCL1's and CPUCL2's every pass (behind `div_readable`) died 35 s after its reload with the kernel's core inside the service loop's clock and heat step (crumb G#D7, 2026-11-18, b950), cause not proven; their once-a-second reads have run since boot in every kernel.
+fn sample_dividers() {
+    let s = rd(DIV[0].0 + DIV[0].1);
+    DIV0_PASSES.fetch_add(1, Relaxed);
+    DIV0_STEPPED.fetch_add(s >> 31, Relaxed);
+    DIV_SEEN[0].fetch_or(s, Relaxed);
+}
+
+fn trace_second(mhz: u32) {
+    let mut r = [0u32; TRACE_F];
+    r[0] = (cntpct() / cntfrq()) as u32;
+    r[1] = mhz;
+    // Fields 2-7 (the firmware's rates) are no longer asked a second: six more ACPM calls a second rode beside the build whose reload found ACPM answering nothing (b950); the PLL words below carry the clusters' and the DSU's rates. `TRACE_ACPM` asks them again.
+    if TRACE_ACPM {
+        for (k, d) in [0u32, 2, 3, 4, 5, 6].into_iter().enumerate() {
+            r[2 + k] = crate::acpm::dvfs_get(d).map(|v| v / 1000).unwrap_or(UNREAD);
+        }
+    }
+    for z in 0..3 {
+        r[8 + z] = TEMP[z].load(Relaxed) as u32;
+    }
+    for k in 0..3 {
+        r[11 + k] = if div_readable(k) { rd(DIV[k].0 + DIV[k].1) } else { UNREAD };
+    }
+    for (k, &a) in MPMM.iter().enumerate() {
+        r[14 + k] = rd(a);
+    }
+    for (k, &a) in WARN_PINS.iter().enumerate() {
+        r[18 + k] = rd(a);
+    }
+    for (k, &(pll, div, mux, need)) in PLL.iter().enumerate() {
+        let ok = div_readable(need);
+        r[20 + k] = if ok { rd(pll) } else { UNREAD };
+        r[24 + k] = if ok { rd(div) } else { UNREAD };
+        r[28 + k] = if ok { rd(mux) } else { UNREAD };
+    }
+    r[32] = DIV0_STEPPED.swap(0, Relaxed);
+    r[33] = DIV0_PASSES.swap(0, Relaxed);
+    let at = TRACE_AT.fetch_add(1, Relaxed) as usize;
+    unsafe { (*(&raw mut TRACE))[at % TRACE_N] = r };
+}
+
+/// A PLL_CON3 word's rate, MHz: 24.576 MHz x M / (P x 2^S) (M bits 16-25, P bits 8-13, S bits 0-2; ra.c), 0 when P is 0 or the word unread.
+fn pll_mhz(w: u32) -> u32 {
+    let (m, p, s) = ((w >> 16) & 0x3FF, (w >> 8) & 0x3F, w & 7);
+    if w == UNREAD || p == 0 {
+        return 0;
+    }
+    (24_576 * m as u64 / ((p as u64) << s) / 1000) as u32
+}
+
+/// `diag thermal trace [n]`: the last n seconds of the trace (all kept, 2^7, when n is not given), oldest first.
+pub fn report_trace(out: &mut alloc::vec::Vec<u8>, n: usize) {
+    use alloc::format;
+    let at = TRACE_AT.load(Relaxed) as usize;
+    // WHY the min: the ring keeps TRACE_N seconds and has been filled `at` times; asking more prints what there is.
+    let n = n.min(TRACE_N).min(at);
+    out.extend_from_slice(b"s, X3 measured MHz | firmware MHz: MIF CL0 CL1 CL2 DSU BCI | C: BIG MID LIT | CLKDIVSTEP_STAT CL0 CL1 CL2 | MPMM LIT MID BIG EN | pins GPA9 GPA10 | PLL MHz CL0 DSU CL1 CL2 (divider, mux words) | CL0 passes stepped of passes\n");
+    for i in at - n..at {
+        let r = unsafe { (*(&raw const TRACE))[i % TRACE_N] };
+        out.extend_from_slice(format!("A#{} A#{} | A#{} A#{} A#{} A#{} A#{} A#{} | A#{} A#{} A#{} | G#{:X} G#{:X} G#{:X} | G#{:X} G#{:X} G#{:X} G#{:X} | G#{:X} G#{:X} |", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18], r[19]).as_bytes());
+        for k in 0..4 {
+            out.extend_from_slice(format!(" A#{} (G#{:X} G#{:X})", pll_mhz(r[20 + k]), r[24 + k], r[28 + k]).as_bytes());
+        }
+        out.extend_from_slice(format!(" | A#{} of A#{}", r[32], r[33]).as_bytes());
+        out.push(b'\n');
+    }
 }
 
 /// The step policy: the hottest CPU zone (big, mid, little) at `AT` caps the X3 at STEP_KHZ and the A715s at STEP_A715_KHZ, below `AT` less 10 the caps go. `AT` is at least 20 (`diag thermal at` keeps it there), so the release point is never below 10.

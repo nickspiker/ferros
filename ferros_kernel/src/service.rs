@@ -4049,7 +4049,14 @@ pub fn run(mut b: Boot) -> ! {
                         b" policy smooth" => crate::thermal::set_policy(crate::thermal::SMOOTH),
                         b" policy off" => crate::thermal::set_policy(crate::thermal::OFF),
                         b"" => {}
-                        _ => resp.extend_from_slice(b"thermal [init | hw | reset | policy step|smooth|off | at <C>]\n"),
+                        t if t.starts_with(b" trace") => {
+                            // `diag thermal trace [n]`: the last n seconds of the hardware's clocks and throttles (thermal.rs `report_trace`), then nothing else.
+                            let n = core::str::from_utf8(&t[6..]).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(usize::MAX);
+                            crate::thermal::report_trace(&mut resp, n);
+                            queue_pt_response(&mut pt_out_data, &resp);
+                            continue;
+                        }
+                        _ => resp.extend_from_slice(b"thermal [init | hw | reset | trace [n] | policy step|smooth|off | at <C>]\n"),
                     }
                     crate::thermal::report(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
