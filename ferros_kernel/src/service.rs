@@ -767,10 +767,11 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     }
 }
 
-/// The base of a class's vault domains (process.rs `domain_keys`, VAULT-OUT.md): the device's from the ira, derived once; the person's from their unlock, None while locked.
+/// The base of the device's vault domains (process.rs `domain_keys`, VAULT-OUT.md), from the ira, derived once.
+/// The person's base is held sealed and never handed out: their domain keys come from `identity_domain_keys`, and this answers None for them.
 pub(crate) fn domain_base(identity: bool) -> Option<[u8; 32]> {
     if identity {
-        return unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain();
+        return None;
     }
     let base = unsafe { &mut *(&raw mut DEVICE_DOMAIN) };
     if base.is_none() {
@@ -780,6 +781,11 @@ pub(crate) fn domain_base(identity: bool) -> Option<[u8; 32]> {
 }
 const DEVICE_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 device vault domain";
 static mut DEVICE_DOMAIN: Option<[u8; 32]> = None;
+
+/// The person's domain keys under `prefix` (process.rs `domain_keys`), derived from their held domain key in registers (kvault `identity_domain_keys`); None while nobody is present.
+pub(crate) fn identity_domain_keys(prefix: &[u8], addr_context: &str, seal_context: &str) -> Option<[u8; 64]> {
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain_keys(prefix, addr_context, seal_context)
+}
 
 /// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the device switches OS, and a warm reset keeps DRAM).
 fn lock_before_reset() {
@@ -812,7 +818,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             Ok(0)
         }
         // The person key from the identity service (FACETS.md D1): held beside the identity's keys, wiped at lock. The log says that it came, never a byte of it.
-        (10, Some(k)) => match st.set_person(k) {
+        (10, Some(k)) => match st.set_person(&mut k.clone()) {
             Ok(true) => {
                 crate::flashlog::line("person key held: kists' aliases can be derived");
                 Ok(0)

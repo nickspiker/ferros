@@ -2728,7 +2728,7 @@ fn gpu_drain(epoch: u64) {
 fn facets_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(97 + msg.len());
     let (developer, option) = p.gate.filter(|_| p.kist).unwrap_or(([0; 32], [0; 32]));
-    let present = unsafe { DOMAIN_BASE }.and_then(|b| b(true)).map(|mut k| crate::keys::wipe_to_dram(&mut k)).is_some();
+    let present = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
     let alias = match p.gate {
         Some((d, o)) if p.kist => crate::service::alias(&d, &o).map(|mut s| {
             let mut sk = ed25519_dalek::SigningKey::from_bytes(&s);
@@ -2938,7 +2938,7 @@ pub const REPLY_MAX: usize = 1 << 23;
 const VAULT_EP: &[u8] = b"vault";
 /// Names under a scope that stay in the kernel's vault because the kernel reads them itself (aoc.rs: the AoC firmware): never forwarded, never migrated.
 const KERNEL_HELD: [&str; 1] = ["aoc.fw."];
-/// The domain bases, registered by the vault's owner (service.rs): (the identity's?) -> the class's base key, None while that class is locked.
+/// The device's domain base, registered by the vault's owner (service.rs): (the identity's?) -> the base key; always None for the person's, whose base is held sealed (`domain_keys` asks the kernel's vault for their keys instead).
 pub static mut DOMAIN_BASE: Option<fn(bool) -> Option<[u8; 32]>> = None;
 const DOMAIN_ADDR_CONTEXT: &str = "ferros 2026-11-07 vault domain address";
 const DOMAIN_SEAL_CONTEXT: &str = "ferros 2026-11-07 vault domain seal";
@@ -3057,6 +3057,10 @@ fn scope_of(name: &str) -> Option<&'static StoreScope> {
 
 /// A scope's domain keys in one class (the kernel derives every key; the vault process seals with them, VAULT-OUT.md): the address key, then the sealing key. None while the class is locked. A kist's own domain is a "scope" of `KIST_DOMAIN_PREFIX` and its name, in the person's class.
 fn domain_keys(prefix: &[u8], identity: bool) -> Option<[u8; 64]> {
+    // The person's: from their domain key held under the wairua, derived in registers (KEY_REGISTERS.md "Sealed under the wairua at rest"); the same bytes as the software derivation below.
+    if identity {
+        return crate::service::identity_domain_keys(prefix, DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT);
+    }
     let mut base = unsafe { DOMAIN_BASE }?(identity)?;
     let mut out = [0u8; 64];
     for (i, ctx) in [DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT].iter().enumerate() {
@@ -6926,7 +6930,7 @@ fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
         return refuse("a malformed request, or a right outside the vocabulary");
     }
     let kk = k();
-    if unsafe { DOMAIN_BASE }.and_then(|b| b(true)).is_none() {
+    if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
         return refuse("nobody is present: a kist runs only for an attested person");
     }
     // A stop (the person's Stop on the kist's card, owner 2026-11-12; docs/KISTS.md "The deck and the card"): the running kist killed, one shot dead, and nothing launched. No record is kept, as for a relaunch's kill: the person's own act, so its circle goes to not running, not stopped. Ahead of the launch slot, so a launch still streaming never holds a stop back.

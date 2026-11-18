@@ -18,8 +18,8 @@ use vsf::VsfType;
 /// The largest piece: 512 KiB. A put holds a sealed piece, its staged furrows and, for a while, the piece it replaces, each a block of about this size; a read holds a piece and manifestus's bounce for it.
 pub const PIECE: usize = 1 << 19;
 
-/// The context deriving a store's pieces key from its address key.
-const KEY_CONTEXT: &str = "ferros 2026-11-12 kernel vault pieces";
+/// The context deriving a store's pieces key from its address key: public for a store whose address key is held where only it can derive (the kernel's identity class, `Place::from_key`).
+pub const KEY_CONTEXT: &str = "ferros 2026-11-12 kernel vault pieces";
 /// The manifest: a VSF document with one section.
 const SECTION: &str = "pieces";
 const LENGTH: &str = "length";
@@ -56,6 +56,20 @@ impl<'a> Place<'a> {
     /// The place of `name` in a store whose names hash under `addr_key`.
     pub fn new(addr_key: &[u8; 32], name: &'a [u8]) -> Self {
         Place { key: blake3::derive_key(KEY_CONTEXT, addr_key), name }
+    }
+
+    /// The place of `name` from its pieces key itself (`derive_key(KEY_CONTEXT, addr_key)`, made where the address key is held: the kernel's identity class, whose address key never lies in memory).
+    pub fn from_key(key: &[u8; 32], name: &'a [u8]) -> Self {
+        Place { key: *key, name }
+    }
+
+    /// The pieces key overwritten in a way the compiler keeps, once the place's one operation is done (a key derived from an identity's address key: the kernel wipes it).
+    pub fn wipe(&mut self) {
+        for b in self.key.iter_mut() {
+            // SAFETY: a write thru a valid &mut u8.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 
     /// The manifest's address: 0, then the name.
@@ -293,6 +307,17 @@ mod tests {
     }
 
     const KEY: [u8; 32] = [7; 32];
+
+    /// A place made from its pieces key (the kernel's identity class, which derives the key from its held address key) is the place made from the address key, and a wiped one holds no key.
+    #[test]
+    fn a_place_from_its_key_is_the_same_place() {
+        let a = Place::new(&KEY, b"kists.list");
+        let mut b = Place::from_key(&blake3::derive_key(KEY_CONTEXT, &KEY), b"kists.list");
+        assert_eq!(a.manifest(), b.manifest());
+        assert_eq!(a.piece(3, 5), b.piece(3, 5));
+        b.wipe();
+        assert_eq!(b.key, [0; 32]);
+    }
 
     /// `n` bytes no two pieces of which are alike (BLAKE3's output stream from `seed`).
     fn value(n: usize, seed: u8) -> Vec<u8> {

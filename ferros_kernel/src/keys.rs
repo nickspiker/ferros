@@ -23,6 +23,20 @@ unsafe extern "C" {
     fn keyreg_remask(slot: u32, mask: &[u64; 4]);
     fn keyreg_clear();
     fn keyreg_scrub();
+    fn keyreg_hold(rest: &[u64; 4], plain: &[u64; 4], nonce: &[u64; 4], out: &mut Held);
+    fn keyreg_held_open(rest: &[u64; 4], h: &Held, out: &mut Out4);
+    fn keyreg_held_derive(rest: &[u64; 4], h: &Held, context_key: &[u64; 4], msg: &[u64; 8], len: u32, sealed_out: u32, nonce: &[u64; 4], out: &mut Held);
+    fn keyreg_held_keyed(rest: &[u64; 4], h: &Held, msg: &[u64; 16], len: u32, out: &mut Out4);
+    fn keyreg_id_root(rest: &[u64; 4], id_context: &[u64; 4], device_secret: &[u64; 4], seed: &[u64; 4], nonce: &[u64; 4], out: &mut Held);
+}
+
+/// One of the identity's keys as the kernel keeps it (keyreg/keys.rs, KEY_REGISTERS.md "Sealed under the wairua at rest"): XOR a pad made in registers from the wairua and `nonce`, fresh for every seal.
+/// Only the lifted code opens it, in registers; what it gives back is a derived value or another held key.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct Held {
+    ct: [u64; 4],
+    nonce: [u64; 4],
 }
 
 pub const IRA: u32 = 0;
@@ -519,25 +533,34 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     true
 }
 
-/// `blake3::derive_key(context, secret)` for the secret in `slot`. None if it is not held.
-pub fn derive(slot: u32, context: &str) -> Option<[u8; 32]> {
-    if !ensure() || held() & (1 << slot) == 0 {
-        return None;
+/// This core holds the secrets in `which` (bit 0 ira, bit 1 wairua), each checked against its tag just now; a bad copy is repaired from another core or gives nothing, never a wrong key.
+fn ready(which: u32) -> bool {
+    if !ensure() || held() & which != which {
+        return false;
     }
-    // Checked before every derive (they are rare: process ira keys, the capability key, the nonce seed, the fingerprint); a bad copy gives nothing, never a wrong key.
+    // Checked before every use (they are rare: process ira keys, the capability key, the nonce seed, the fingerprint, the identity's held keys).
     lock();
-    let ok = held() & (1 << slot) != 0 && check_here(1 << slot);
+    let ok = held() & which == which && check_here(which);
     unlock();
     if !ok {
         // Repaired from another core in microseconds when one is awake; a sixty-fourth of a second at most, then nothing.
         let until = crate::platform::cntpct() + crate::platform::cntfrq() / 64;
-        while held() & (1 << slot) == 0 && crate::platform::cntpct() < until {
+        while held() & which != which && crate::platform::cntpct() < until {
             serve();
             core::hint::spin_loop();
         }
-        if held() & (1 << slot) == 0 {
-            return None;
+        if held() & which != which {
+            return false;
         }
+    }
+    true
+}
+
+/// `blake3::derive_key(context, secret)` for the secret in `slot`.
+/// None if it is not held.
+pub fn derive(slot: u32, context: &str) -> Option<[u8; 32]> {
+    if !ready(1 << slot) {
+        return None;
     }
     let ck = context_key(context);
     let mut out = Out4([0; 4]);
@@ -571,6 +594,205 @@ pub fn stream(context: &str, msg: &[u8], out: &mut [u8]) -> bool {
         chunk.copy_from_slice(&bb[..chunk.len()]);
     }
     true
+}
+
+/// The pads' public context (keyreg/keys.rs `pad!`): derive_key(REST, wairua ‖ nonce).
+const REST: &str = "ferros 2026-11-17 identity at rest v0";
+/// The seals made this boot: word 0 of every nonce, so no two seals under one wairua share a pad (the wairua is drawn fresh each power session, and the counter starts again with it).
+static REST_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Held keys opened into memory because the register-only code could not take them (a message past two blocks, an AEAD under the key): `diag keys` says how many, and each site is listed in KEY_REGISTERS.md.
+pub static HELD_OPENED: AtomicU32 = AtomicU32::new(0);
+/// The held functions' known answers (`held_test`, run in `self_test` with test values in the registers): 0 not run, 1 passed, else the failing check + 1.
+/// While it has not passed, no key is held and every held call gives nothing: an unlock is refused, never made with a wrong key.
+static HELD_TEST: AtomicU32 = AtomicU32::new(0);
+
+fn rest_nonce() -> [u64; 4] {
+    [REST_N.fetch_add(1, Ordering::Relaxed), crate::platform::cntpct(), me() as u64, 0]
+}
+
+/// Up to `N` words of `msg`, little-endian, zero past its end (BLAKE3's padding of a short block).
+fn msg_words<const N: usize>(msg: &[u8]) -> [u64; N] {
+    let mut w = [0u64; N];
+    for (k, c) in msg.chunks(8).enumerate() {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        w[k] = u64::from_le_bytes(b);
+    }
+    w
+}
+
+/// The wairua held and checked, and the held functions' known answers passed.
+fn held_ready(which: u32) -> bool {
+    HELD_TEST.load(Ordering::Acquire) == 1 && ready(which)
+}
+
+/// Hold a key that arrived in memory (the seed the attest screen typed, the person key the identity service opened): sealed in registers, `plain` wiped to DRAM. None (and `plain` wiped) without the wairua.
+pub fn hold(plain: &mut [u8; 32]) -> Option<Held> {
+    if !held_ready(2) {
+        wipe_to_dram(plain);
+        return None;
+    }
+    let rk = context_key(REST);
+    let mut w = words(plain);
+    wipe_to_dram(plain);
+    let mut h = Held { ct: [0; 4], nonce: rest_nonce() };
+    let n = h.nonce;
+    sealed(|| unsafe { keyreg_hold(&rk, &w, &n, &mut h) });
+    wipe_words(&mut w);
+    to_dram(w.as_ptr() as usize, 32);
+    Some(h)
+}
+
+/// A held key opened into memory: for what cannot run in registers yet (each caller listed in KEY_REGISTERS.md, counted in `HELD_OPENED`).
+/// The caller wipes it with `wipe_to_dram` as soon as it is used.
+pub fn held_open(h: &Held) -> Option<[u8; 32]> {
+    if !held_ready(2) {
+        return None;
+    }
+    HELD_OPENED.fetch_add(1, Ordering::Relaxed);
+    let rk = context_key(REST);
+    let mut o = Out4([0; 4]);
+    sealed(|| unsafe { keyreg_held_open(&rk, h, &mut o) });
+    let k: [u8; 32] = le(&o.0);
+    wipe_words(&mut o.0);
+    Some(k)
+}
+
+/// `blake3::derive_key(context, key ‖ msg)` for a held key, the key opened only in registers when `msg` is at most 64 bytes (two blocks); the result in the clear, for a value handed on (a kist's alias, a domain's keys, the wallpaper seed).
+pub fn held_derive(h: &Held, context: &str, msg: &[u8]) -> Option<[u8; 32]> {
+    let out = derive_out(h, context, msg, false)?;
+    Some(le(&out.ct))
+}
+
+/// `held_derive` whose result is held in turn (the identity's three vault keys from its root at unlock): no plaintext of either key is stored.
+pub fn held_rederive(h: &Held, context: &str, msg: &[u8]) -> Option<Held> {
+    derive_out(h, context, msg, true)
+}
+
+fn derive_out(h: &Held, context: &str, msg: &[u8], sealed_out: bool) -> Option<Held> {
+    // WHY the length: the register-only code takes the key and at most 64 bytes after it (two BLAKE3 blocks); a longer message opens the key into memory for the software hash, counted (no caller sends one: the kernel's longest is a kist domain's prefix, 37 bytes).
+    if msg.len() > 64 {
+        let mut k = held_open(h)?;
+        let mut hs = blake3::Hasher::new_derive_key(context);
+        hs.update(&k);
+        hs.update(msg);
+        let mut d = *hs.finalize().as_bytes();
+        wipe_value_to_dram(&mut hs);
+        wipe_to_dram(&mut k);
+        return if sealed_out { hold(&mut d) } else { Some(Held { ct: words(&d), nonce: [0; 4] }) };
+    }
+    if !held_ready(2) {
+        return None;
+    }
+    let (rk, ck) = (context_key(REST), context_key(context));
+    let m = msg_words::<8>(msg);
+    let n = rest_nonce();
+    let mut out = Held { ct: [0; 4], nonce: [0; 4] };
+    sealed(|| unsafe { keyreg_held_derive(&rk, h, &ck, &m, msg.len() as u32, sealed_out as u32, &n, &mut out) });
+    Some(out)
+}
+
+/// `blake3::keyed_hash(key, msg)` for a held key (the identity's vault addresses), the key opened only in registers when `msg` is at most 128 bytes (two blocks).
+pub fn held_keyed(h: &Held, msg: &[u8]) -> Option<[u8; 32]> {
+    // WHY the length: two blocks are what the register-only code takes; a longer name opens the key into memory for the software hash, counted.
+    if msg.len() > 128 {
+        let mut k = held_open(h)?;
+        let mut hs = blake3::Hasher::new_keyed(&k);
+        hs.update(msg);
+        let d = *hs.finalize().as_bytes();
+        wipe_value_to_dram(&mut hs);
+        wipe_to_dram(&mut k);
+        return Some(d);
+    }
+    if !held_ready(2) {
+        return None;
+    }
+    let rk = context_key(REST);
+    let m = msg_words::<16>(msg);
+    let mut o = Out4([0; 4]);
+    sealed(|| unsafe { keyreg_held_keyed(&rk, h, &m, msg.len() as u32, &mut o) });
+    Some(le(&o.0))
+}
+
+/// The identity's root at unlock (kvault `unlock`), held: `keyed_hash(derive_key(id_context, ira), device_secret ‖ seed)`, the ira's key and the root formed only in registers.
+/// None without the ira or the wairua.
+pub fn id_root(id_context: &str, device_secret: &[u8; 32], seed: &[u8; 32]) -> Option<Held> {
+    if !held_ready(3) {
+        return None;
+    }
+    let (rk, ck) = (context_key(REST), context_key(id_context));
+    let (mut d, mut s) = (words(device_secret), words(seed));
+    let n = rest_nonce();
+    let mut out = Held { ct: [0; 4], nonce: [0; 4] };
+    sealed(|| unsafe { keyreg_id_root(&rk, &ck, &d, &s, &n, &mut out) });
+    wipe_words(&mut d);
+    wipe_words(&mut s);
+    to_dram(d.as_ptr() as usize, 32);
+    to_dram(s.as_ptr() as usize, 32);
+    Some(out)
+}
+
+/// The held functions against the blake3 crate with test values in the registers (never a real secret: `self_test` runs before the first one is set). 1 passed, else the failing check + 1.
+fn held_test(tw: &[u8; 32], ti: &[u8; 32]) -> u32 {
+    let rk = context_key(REST);
+    let ctx = "ferros keyreg held self-test v0";
+    let ck = context_key(ctx);
+    let plain: [u8; 32] = core::array::from_fn(|k| (k as u8).wrapping_mul(13).wrapping_add(5));
+    let msg: [u8; 128] = core::array::from_fn(|k| (k as u8).wrapping_mul(7).wrapping_add(1));
+    let n1 = [1u64, 2, 3, 4];
+    let n2 = [5u64, 6, 7, 8];
+    let mut h = Held { ct: [0; 4], nonce: [0; 4] };
+    sealed(|| unsafe { keyreg_hold(&rk, &words(&plain), &n1, &mut h) });
+    // The pad is derive_key(REST, wairua ‖ nonce).
+    let mut pm = [0u8; 64];
+    pm[..32].copy_from_slice(tw);
+    pm[32..].copy_from_slice(&bytes(&n1));
+    let pad = blake3::derive_key(REST, &pm);
+    let want: [u8; 32] = core::array::from_fn(|k| plain[k] ^ pad[k]);
+    if le::<4, 32>(&h.ct) != want || h.nonce != n1 {
+        return 2;
+    }
+    let mut o = Out4([0; 4]);
+    sealed(|| unsafe { keyreg_held_open(&rk, &h, &mut o) });
+    if le::<4, 32>(&o.0) != plain {
+        return 3;
+    }
+    // Derive, one block and two, in the clear and held.
+    for (k, len) in [0usize, 5, 32, 37, 64].into_iter().enumerate() {
+        let mut hs = blake3::Hasher::new_derive_key(ctx);
+        hs.update(&plain);
+        hs.update(&msg[..len]);
+        let want = *hs.finalize().as_bytes();
+        let m = msg_words::<8>(&msg[..len]);
+        let mut out = Held { ct: [0; 4], nonce: [0; 4] };
+        sealed(|| unsafe { keyreg_held_derive(&rk, &h, &ck, &m, len as u32, 0, &n2, &mut out) });
+        if le::<4, 32>(&out.ct) != want {
+            return 4 + 2 * k as u32;
+        }
+        sealed(|| unsafe { keyreg_held_derive(&rk, &h, &ck, &m, len as u32, 1, &n2, &mut out) });
+        sealed(|| unsafe { keyreg_held_open(&rk, &out, &mut o) });
+        if le::<4, 32>(&o.0) != want {
+            return 5 + 2 * k as u32;
+        }
+    }
+    // Keyed, empty, one block and two.
+    for (k, len) in [0usize, 10, 64, 65, 128].into_iter().enumerate() {
+        let want = *blake3::keyed_hash(&plain, &msg[..len]).as_bytes();
+        sealed(|| unsafe { keyreg_held_keyed(&rk, &h, &msg_words::<16>(&msg[..len]), len as u32, &mut o) });
+        if le::<4, 32>(&o.0) != want {
+            return 14 + k as u32;
+        }
+    }
+    // The unlock's root: keyed_hash(derive_key(ctx, ira), secret ‖ seed).
+    let (ds, sd) = (msg_words::<4>(&msg[..32]), msg_words::<4>(&msg[32..64]));
+    let mut root = Held { ct: [0; 4], nonce: [0; 4] };
+    sealed(|| unsafe { keyreg_id_root(&rk, &ck, &ds, &sd, &n2, &mut root) });
+    sealed(|| unsafe { keyreg_held_open(&rk, &root, &mut o) });
+    if le::<4, 32>(&o.0) != *blake3::keyed_hash(&blake3::derive_key(ctx, ti), &msg[..64]).as_bytes() {
+        return 19;
+    }
+    wipe_words(&mut o.0);
+    1
 }
 
 /// Before this core stops running ferros (CPU0 at the hop; a core about to power down): leave the secrets sealed for the cores that will, and clear this core's registers.
@@ -632,6 +854,8 @@ fn self_test() -> u32 {
             fail = 4 + block as u32;
         }
     }
+    // The identity's held keys' functions, with the same test values: their own result, so a failure there refuses the identity's unlock and leaves the ira and the wairua held.
+    HELD_TEST.store(held_test(&tw, &ti), Ordering::Release);
     // Seal, clear, unseal with fresh masks: the derive must still match.
     let nonce = [7u8; 32];
     let (ks, _, _) = seal_keys(&nonce);
@@ -718,7 +942,104 @@ pub fn diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         wipe_words(&mut s.0);
         out.extend_from_slice(alloc::format!("core {}: cycles per call: lifted derive A#{}, whole derive A#{}, stream block A#{}\n", me(), (t1 - t0) / N, (t2 - t1) / N, (t3 - t2) / N).as_bytes());
     }
+    if params == b"idtime" && held() & 3 == 3 && HELD_TEST.load(Ordering::Acquire) == 1 {
+        // The identity's held keys' paths against the software ones they replaced, in this core's cycles (KEY_REGISTERS.md "Sealed under the wairua at rest"), with test values only: never the person's keys, nothing of the vault's.
+        let cyc = || -> u64 {
+            let c: u64;
+            unsafe { core::arch::asm!("isb", "mrs {}, pmccntr_el0", out(reg) c, options(nomem, nostack)) };
+            c
+        };
+        const N: u64 = 1 << 10;
+        let plain = [0xA5u8; 32];
+        let msg = [0x5Au8; 64];
+        let ctx = "ferros keyreg idtime v0";
+        let per = |t0: u64, t1: u64| (t1 - t0) / N;
+        let mut t = plain;
+        let Some(h) = hold(&mut t) else { return };
+        let (rk, ck) = (context_key(REST), context_key(ctx));
+        let mut r = Held { ct: [0; 4], nonce: [0; 4] };
+        let mut sink = 0u8;
+        // Two blocks (a kist's alias: the person key, the developer key, the option).
+        let m8 = msg_words::<8>(&msg);
+        let n = rest_nonce();
+        let a0 = cyc();
+        for _ in 0..N {
+            sealed(|| unsafe { keyreg_held_derive(&rk, &h, &ck, &m8, 64, 0, &n, &mut r) });
+        }
+        let a1 = cyc();
+        for _ in 0..N {
+            sink ^= held_derive(&h, ctx, &msg).map_or(0, |d| d[0]);
+        }
+        let a2 = cyc();
+        for _ in 0..N {
+            sink ^= blake3::Hasher::new_derive_key(ctx).update(&plain).update(&msg).finalize().as_bytes()[0];
+        }
+        let a3 = cyc();
+        out.extend_from_slice(alloc::format!("core {}: alias (derive, 96 bytes): lifted A#{}, whole A#{}, today's software A#{} cycles\n", me(), per(a0, a1), per(a1, a2), per(a2, a3)).as_bytes());
+        // One block (a scope's domain key: the domain key and a 5-byte prefix).
+        let b0 = cyc();
+        for _ in 0..N {
+            sink ^= held_derive(&h, ctx, &msg[..5]).map_or(0, |d| d[0]);
+        }
+        let b1 = cyc();
+        for _ in 0..N {
+            sink ^= blake3::Hasher::new_derive_key(ctx).update(&plain).update(&msg[..5]).finalize().as_bytes()[0];
+        }
+        let b2 = cyc();
+        out.extend_from_slice(alloc::format!("  domain key (derive, 37 bytes): whole A#{}, today's A#{}\n", per(b0, b1), per(b1, b2)).as_bytes());
+        // A vault address (keyed, a 10-byte name).
+        let c0 = cyc();
+        for _ in 0..N {
+            sink ^= held_keyed(&h, &msg[..10]).map_or(0, |d| d[0]);
+        }
+        let c1 = cyc();
+        for _ in 0..N {
+            sink ^= blake3::keyed_hash(&plain, &msg[..10]).as_bytes()[0];
+        }
+        let c2 = cyc();
+        out.extend_from_slice(alloc::format!("  vault address (keyed, 10 bytes): whole A#{}, today's A#{}\n", per(c0, c1), per(c1, c2)).as_bytes());
+        // Hold and the fallback's open.
+        let d0 = cyc();
+        for _ in 0..N {
+            let mut t = plain;
+            sink ^= hold(&mut t).map_or(0, |x| x.ct[0] as u8);
+        }
+        let d1 = cyc();
+        for _ in 0..N {
+            sink ^= held_open(&h).map_or(0, |d| d[0]);
+        }
+        let d2 = cyc();
+        HELD_OPENED.fetch_sub(N as u32, Ordering::Relaxed);
+        out.extend_from_slice(alloc::format!("  hold A#{}, open into memory A#{}\n", per(d0, d1), per(d1, d2)).as_bytes());
+        // The unlock's chain: the root from the ira, the three vault keys, the seed held; against today's (the base from the ira's derive, a keyed hash, three derive_keys, all in memory).
+        // Neither uses the vault's own contexts.
+        let e0 = cyc();
+        for _ in 0..N {
+            if let Some(k) = id_root(ctx, &plain, &plain) {
+                for c in ["ferros keyreg idtime a", "ferros keyreg idtime b", "ferros keyreg idtime c"] {
+                    sink ^= held_rederive(&k, c, &[]).map_or(0, |x| x.ct[0] as u8);
+                }
+            }
+            let mut t = plain;
+            sink ^= hold(&mut t).map_or(0, |x| x.ct[0] as u8);
+        }
+        let e1 = cyc();
+        for _ in 0..N {
+            if let Some(mut base) = derive(IRA, ctx) {
+                let mut k = *blake3::Hasher::new_keyed(&base).update(&plain).update(&plain).finalize().as_bytes();
+                for c in ["ferros keyreg idtime a", "ferros keyreg idtime b", "ferros keyreg idtime c"] {
+                    sink ^= blake3::derive_key(c, &k)[0];
+                }
+                wipe(&mut base);
+                wipe(&mut k);
+            }
+        }
+        let e2 = cyc();
+        out.extend_from_slice(alloc::format!("  unlock chain (root, three keys, the seed held): whole A#{}, today's A#{}\n", per(e0, e1), per(e1, e2)).as_bytes());
+        core::hint::black_box(sink);
+    }
     let test = TEST.load(Ordering::Acquire);
+    out.extend_from_slice(alloc::format!("held keys: self-test {}, opened into memory A#{}\n", match HELD_TEST.load(Ordering::Acquire) { 0 => "not run".into(), 1 => "passed".into(), f => alloc::format!("FAILED at {}", f - 1) }, HELD_OPENED.load(Ordering::Relaxed)).as_bytes());
     out.extend_from_slice(alloc::format!("self-test {}  generation {}  present {}{}  blob waits for G#{:X}  asking G#{:X}  weak masks {}  bad blobs {}  check fails {}  tag fixes {}\n", match test { 0 => "not run".into(), 1 => "passed".into(), f => alloc::format!("FAILED at {}", f - 1) }, GEN.load(Ordering::Acquire), if PRESENT.load(Ordering::Acquire) & 1 != 0 { "ira " } else { "" }, if PRESENT.load(Ordering::Acquire) & 2 != 0 { "wairua" } else { "" }, WANT.load(Ordering::Acquire), ASKING.load(Ordering::Acquire), WEAK_MASKS.load(Ordering::Relaxed), BAD_BLOBS.load(Ordering::Relaxed), CHECK_FAILS.load(Ordering::Relaxed), TAG_FIXES.load(Ordering::Relaxed)).as_bytes());
     for (k, h) in HELD.iter().enumerate() {
         let g = h.load(Ordering::Acquire);
