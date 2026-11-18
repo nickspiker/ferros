@@ -232,6 +232,163 @@ Neither secret has a RAM copy any more. KOHI and vault boot hand theirs over the
 
 `SYS_ENTROPY` blocks are not checked one by one; the quarter-second check covers them.
 
+## The identity's keys in the kernel alone (design, 2026-11-17; step 0 built, the rest not)
+
+The owner, 2026-11-17: "As long as all this is priveliged and in the kernel so once we lock it there's ZERO way someone can get into those keys (as far as we know, proofs are obviously ideal but we get what we get)".
+"Those keys" are the identity's roots (the identity seed and the handle proof, which ahau derives from the typed handle) and two random keys: the fleet key (fgtw recovers it from the fleet's fan-out) and the person key (one per identity, kept in the identity space sealed under the fleet key, FACETS.md D0).
+
+### Where they are now (after branch key-custody-lock)
+
+- **ahau** derives the seed from the handle and the proof from the seed, unlocks (SYS_UNLOCK op 1), hands both to fgtw (op 4) and overwrites every copy it made; its modes and fields hold none of them any more.
+  A tag unlock (op 6) hands the seed from the kernel to ahau.
+- **fgtw** holds the seed, the proof, the fleet key and the person key in its own memory for as long as the person is present, and wipes them when the kernel locks (the identity bell, `BELL_IDENTITY`) or when other roots come.
+  Its wipe is volatile writes and a compiler fence: the zeros may sit in a dirty cache line, and copies the code made by value (each `let (Some(hp), Some(seed)) = (self.hp, self.identity_seed)`, the fgtw crate's own temporaries, freed heap) stay in its arc until the process ends.
+- **The kernel** (kvault) holds the seed (for `tag_keep`), the three keys of the identity's vault class and the person key (handed in by fgtw, op 10), and derives each kist's alias from the person key.
+  Since step 0 below (2026-11-17) it holds each of them only sealed under the wairua, opened in registers ("Sealed under the wairua at rest").
+  At lock it overwrites them in place and cleans the lines to DRAM (`keys::wipe_to_dram`).
+- **The vault process** sees `fgtw.identity_seed`, `fgtw.handle_proof` and `fgtw.fleet_key` in the clear while unlock at boot keeps them (they are identity-class vault entries it seals and caches).
+
+### The proposal
+
+fgtw asks the kernel to sign, seal, open and derive, and never holds the seed, the fleet key or the person key.
+The kernel keeps them beside the identity's vault keys (`IdKeys`), wipes them all at lock, and answers only for the identity present.
+The calls are new SYS_UNLOCK ops (or a syscall of their own) behind a right fgtw alone holds (open question 4).
+
+**What fgtw does with them today, and the call that would replace each:**
+
+| fgtw today (payloads/fgtw, the fgtw crate) | Key | Kernel call |
+|---|---|---|
+| `join::adopt_chain` (`genesis_identity_matches`), `bindreq_list`'s check of each request's co-signature, the v2 genesis in `ensure_member` (it carries the identity's public key, no identity signature) | seed | `identity_public` → Ed25519(seed)'s public key, 32 bytes |
+| `join::bind_request` and `bindreq_put`: the binding request co-signed by Ed25519(seed) (the registry's anti-spam gate) | seed | `identity_sign_bindreq(device key, hp, t, tap commitment)`: the kernel builds `bind_signing_bytes` itself and signs them; it signs nothing else (no general signing oracle) |
+| `pair::device_name_default(device, seed)`: every device's two-word name (the Fleet page, op 19, the green screen, `say_device`) | seed | `identity_name(device key)` → the 8 bytes the name is made from |
+| `pair::masked_device_words(device, seed)`: the pairing words, shown and matched (`show_words`, op 1, the add machine) | seed | `identity_word_mask` → `word_mask(seed)`, 32 one-way bytes; the XOR with a device key and the words stay in EL0 |
+| `fanout_open` (`join::open_fanout`, `client::recover_fleet_key`): this device's wrap opened with its X25519 secret and the seed | seed, device key | `fleet_open(hp, kfp, wraps)`: the kernel finds this device's wrap by its commitment, derives the wrap key, decrypts, checks the fingerprint and keeps the fleet key; it answers the fingerprint only |
+| `mint_fleet_key`: a fresh fleet key, wrapped to each member | seed | `fleet_mint` (drawn from KOHI and kept) then `fleet_wrap(hp, members)` → the wraps |
+| `fanout_grow_held` (add.rs `Grow`): the held key wrapped again to a grown member set | seed, fleet key | `fleet_wrap(hp, members)` |
+| `fgtw::space::seal` / `open` under `space_key(fleet key)`: the identity space kept, pushed to siblings, put to and pulled from fgtw.org | fleet key | `fleet_seal(SPACE, aad, doc)` / `fleet_open_doc(SPACE, aad, sealed)`, or a per-document key (open question 1) |
+| `person::find` / `settle` (space.rs `space_person`, `space_person_local`): the person fact opened, minted, sealed again under a new fleet key | fleet key, person key | `person_open(sealed fact)` → its id and mint stamp, the key kept by the kernel; `person_mint` → a sealed fact (the eggs: KOHI, the jitter egg EL0 hands in, the fleet key, all inside); `person_reseal(sealed fact)` under the current fleet key |
+| SYS_UNLOCK op 10 (the person key handed in) | person key | gone: the kernel opened it itself |
+| `person_eggs` (the fleet key's bytes as one egg of the person key's mint) | fleet key | inside `person_mint` |
+| `persist_set` of the seed, the proof and the fleet key while unlock at boot is on | seed, fleet key | the kernel keeps the fleet key beside `ID_UNLOCK` (the kept seed) in its own vault, which the vault process never reads (`KERNEL_HELD`'s rule) |
+| the add machine (fgtw::flow `Add`, `kept::read_add`) built with the seed for names and words | seed | built with the word mask and a name call instead (a change to the fgtw crate) |
+
+**What stays in EL0:**
+- the handle proof: public by design (beacons, the registry, `ahau.proof` in the identity space); fgtw passes it in to the calls that bind it;
+- the chain, its fold and the members, the protocol machines, Photon Transport, fgtw.org's HTTP;
+- the device keys (`DeviceKeys` from `ira_key("fgtw device")`: Ed25519, Falcon, SPHINCS+), which sign PT frames and fleet ops (but see open question 0);
+- the one-way values the calls answer: the identity's public key, fleet key fingerprints, person key ids, device names, the word mask;
+- the space's plaintext (the person's kists, places, answers), which fgtw syncs into this device's vault anyway;
+- each kist's alias seed, which the kernel hands to that kist alone (SYS_IRA's alias bit, as now);
+- ahau, which reads the handle as it is typed, so the seed exists in its memory until the unlock (op 1) and is overwritten there; with this design it would no longer hand the seed to fgtw at all, only the proof, and a tag unlock (op 6) would stop returning the seed (ahau takes the proof from `ahau.proof`).
+
+**The cost in kernel code.**
+The kernel already links what these calls compute with: BLAKE3 with its XOF, XChaCha20-Poly1305, Ed25519's key expansion, SHA-512 and its field and scalar arithmetic (curve25519-dalek, for the facets stamp and capsule checks), about 50 KB of the 1.37 MB of text in the current Pixel build.
+What is new: Ed25519 signing (another SHA-512 pass and a scalar product, a few KB), the X25519 ladder if the kernel wraps with its own ephemeral keys (a few KB, the field arithmetic already there), and the handlers, a fleet key slot and the person fact's seal (about 4 to 8 KB).
+So about 10 to 20 KB, around 1 % of the kernel's text, and 64 bytes of RAM.
+The time: everything but the space's seal is microseconds.
+The space document is up to 1 MiB, and the kernel's XChaCha20-Poly1305 (the portable backend: the kernel is built without `chacha20_force_neon`) opens about 309 MB/s on the X3: about 3 ms, too long under the kernel lock (a 300 µs hold already showed in `diag lock`, kvault `bound`), hence open question 1.
+
+**What it protects, by the threat model (harm, not observation; `threat_model_harm_not_observation`).**
+- The fleet key and the person key are the unforgeability: with the fleet key one writes the person's space (kists stowed on all their devices, a person key of one's own choosing, so every kist alias of theirs); with the person key one derives every alias and speaks to kists as the person.
+  Kept in the kernel, no EL0 bug, leak or compromised process can carry them away: a disclosure of fgtw's memory, a console or crash report, a copy kept past the lock.
+  What a compromised fgtw still has is the calls, on this device, only while the person is present; a lock ends it at once, and nothing of the keys is left in EL0 to wipe.
+- After a lock nothing of the identity is anywhere a process can read, and the kernel's copies are zeros in DRAM.
+
+**What it does not protect.**
+- The seed's secrecy is the handle's: the seed is BLAKE3 of the handle's `x` encoding (ahau_core), milliseconds to compute, and the fgtw crate says the same of it (fleet.rs: "a PUBLIC function of the handle").
+  Whoever knows the handle has the seed whatever the kernel does; the kernel only keeps it out of process memory.
+  The bind request's co-signature is a knowledge gate, not ownership (photon docs/fleet-identity-remediation.md).
+- The fan-out: a wrap's key is BLAKE3 over the X25519 shared secret of this device's key and the seed.
+  fgtw keeps the device's Ed25519 key, whose scalar is that X25519 secret (`fanout_open`'s `to_scalar_bytes`).
+  So a compromised fgtw that also knows the handle opens this device's wraps itself, and the fleet key is in EL0 again, unless the X25519 half moves into the kernel too (open question 0).
+  The same holds for `fleet_wrap`: if EL0 made the ephemeral keys and handed the kernel the shared secrets, it could open the wraps it got back; the kernel makes them itself.
+- The calls themselves: while the person is present, whatever fgtw may ask, a compromised fgtw may ask (open a space, sign a binding request, mint a person fact over a missing one).
+  The kernel bounds when and where, not what.
+- The kernel itself (EL2) is the trust; a kernel bug that reads arbitrary memory reads the keys.
+
+**What a locked device still exposes.**
+- Nothing of the keys in the kernel's vault keys or fgtw (wiped in place, cleaned to DRAM).
+  Residue a lock does not reach: BLAKE3's and the ciphers' frames on kernel stacks at the moment of derivation (as for the ira, "Still in DRAM" above), and kernel heap buffers wiped with a plain `fill` (the IPC path's `deliver`, which carries the person's domain keys in a forwarded store call's stamp: the hot path, left as it was).
+- EL0 frames: whatever a process copied stays in its arc until it ends; a frame given back is zeroed (frames.rs `give`), so a process that ends at lock leaves nothing (open question 7).
+- Cold RAM while unlocked: since step 0 the kernel's held keys lie in DRAM only sealed under the wairua, so a power cut or a watchdog reset leaves ciphertext whose pad died with the registers (if a warm reset clears them: open question 13).
+  What still lies in the clear, and for how long, is the table in "Sealed under the wairua at rest"; fgtw's copies (the seed, the fleet key, the person key) stay in the clear in its arc until the proposal above is built.
+- DMA: the S2MPU fences hold the modem (HSI1), the WiFi chip (HSI2) and BLK_MISC's masters (AUTH.md "Radios while locked").
+  Masters a process programs are not fenced from the kernel's frames: the GPU's MMU (payloads/gpu), the camera front end with its SYSMMUs in bypass on contiguous frames (process.rs `cam_ask`), the UFS controller.
+  A compromised driver of one of them reaches any DRAM, the kernel's keys included, while the person is present (open question 10).
+- At rest: unlock at boot keeps the seed (`ID_UNLOCK`) on UFS, and today the vault process keeps fgtw's roots and fleet key too; that is the setting's own warning.
+
+### Sealed under the wairua at rest (step 0, built 2026-11-17)
+
+The owner, 2026-11-17: "if it stays closer to the CPU it's not only faster but it's harder to fuck with externally" and "you send something from RAM, now it goes over an external wire I can stick a clip on".
+
+**The storage rule: sealed under the wairua at rest; plaintext only in registers.**
+A plaintext identity key held by the kernel is never stored to memory, cacheable or not.
+The kernel's held keys are the identity's seed, the three keys of its vault class (address, payload, domain) and the person key (kvault `IdKeys`).
+
+**How** (keyreg/keys.rs, the same derive, audit, freeze discipline as the ira and the wairua: safe Rust lifted by tools/keyreg-lift.sh, no stack, no spill, no call out):
+- A held key is `key XOR pad` beside its nonce (`keys::Held`, 64 bytes), the pad `derive_key("ferros 2026-11-17 identity at rest v0", wairua ‖ nonce)`, one compression made in registers from the wairua's two shares.
+  The nonce is new for every seal (a counter, the clock and the core), so no two seals share a pad under one wairua; the wairua is new each power session.
+- The lifted functions open a held key in registers, use it, and give back a derived value or another held key:
+  `keyreg_hold` (seal a key that arrived in memory), `keyreg_held_derive` (`derive_key(context, key ‖ msg)`, msg up to 64 bytes, the result in the clear or held), `keyreg_held_keyed` (`keyed_hash(key, msg)`, msg up to 128 bytes), `keyreg_id_root` (the unlock's root from the ira, held), and `keyreg_held_open`, the one function that stores a plaintext, for the uses below that cannot run in registers yet (counted, `diag keys`: "opened into memory").
+- Each call masks interrupts, checks the wairua against its tag (and the ira for the root), and scrubs the caller-saved registers before it unmasks, as every key call does.
+- Known answers: `keys::held_test` runs in the self-test with test values in the registers, each function against the blake3 crate. A failure leaves the ira and the wairua held and refuses every held call, so no identity unlocks rather than one with a wrong key.
+  On the host, tools/keyreg-model holds each function's block layout to the blake3 crate and to the derivations the kernel made before (the person's stored data depends on them): the unlock's keys, the alias's known answer, the domain keys of a scope and of a kist.
+- The derived values are the same bytes as before: nothing stored changes.
+
+**Per operation** (the kernel's uses of the held keys):
+
+| Operation | Key | Register-only? | What touches memory, and for how long |
+|---|---|---|---|
+| Unlock: the ira's identity key, the root, the three vault keys | ira, root, address, payload, domain | register-only (`id_root`, `held_rederive`) | The inputs: the seed as the attest screen sends it (the syscall's copy, wiped at once) and the device-only secret (device class: read from the kernel's vault into a heap buffer and a stack copy, wiped when the unlock ends, microseconds). |
+| The seed held | seed | register-only seal (`hold`) | The copy it arrives in, wiped at once. |
+| The wallpaper seed | seed | register-only (`held_derive`) | The wallpaper seed itself goes to wallgen, as before (one way from the seed). |
+| A kist's alias: SYS_IRA's alias bit, the facets stamp | person | register-only (`held_derive`, two blocks) | The alias is a per-kist value the kist is given anyway; the facets stamp makes its Ed25519 public key in software (SHA-512 and a scalar product, tens of microseconds), then wipes the alias and the signing key. |
+| The person key handed in (op 10) | person | held at once (`hold`); a key handed in again is told apart by a one-way id derived in registers | Its copies from fgtw (the syscall's stack array, the service's clone), wiped within microseconds. fgtw itself holds it in the clear (the proposal above). |
+| The person's domain keys (every store call of theirs, migration, export) | domain | register-only (`held_derive`: a scope's prefix in one block, a kist's 37-byte prefix in two) | The domain keys go to the vault process in the call's stamp, by design (VAULT-OUT.md): EL0 holds them for the call. |
+| Addresses of the identity's names in the kernel's vault, scoped addresses | address | register-only up to 128 bytes of name (`held_keyed`) | A longer name opens the key into memory for one hash (counted; no kernel name is that long). |
+| The place of an identity value kept in pieces | address | the place key derived register-only | The place key (derived from the address key) in memory for one vault operation on a value in pieces, wiped (`Place::wipe`). |
+| Sealing and opening the identity's values in the kernel's vault (the name list, migration, export) | payload | **not yet** (open question 14) | Opened into an XChaCha20-Poly1305 cipher for one seal or open, then wiped to DRAM: microseconds for the name list, up to milliseconds for a large value. |
+| Keeping a tag (`tag_keep`) | seed | **not yet** | Opened for one XChaCha20-Poly1305 seal of 32 bytes, microseconds, wiped. |
+| Unlocking by a tag (`tag_unlock`) | seed | no: the seed comes out of the tag's record and goes to the attest screen (its design today) | Decrypted into memory, held, and copied to ahau. |
+| Unlock at boot (`ID_UNLOCK`) | seed | no: kept on UFS by the setting (its warning) | Read into memory at boot for the unlock, wiped. |
+| Lock | all | | The sealed keys overwritten in place and cleaned to DRAM. |
+
+Not in the rule: the device's own keys (the device class's address key and cipher, the device domain base), which derive from the ira and are open from boot; and the identity's keys outside the kernel (fgtw's, the vault process's domain keys, the aliases kists hold).
+
+**The cost** (cycles on the X3; `diag keys idtime` measures each against the software path it replaced, with test values only).
+Not measured yet (a device run waits for the owner); estimated from the measured parts, a compression about 420 cycles, a checked derive 1,245, the context hash about 1,100 when it is not cached (the held calls take their context keys from the cache; the software paths hashed the context every time):
+
+| Path | Held (compressions: check, pad, work) | Software before |
+|---|---|---|
+| A kist's alias (96 bytes) | 4: about 1,900 | context hash and 2 compressions: about 2,000 |
+| A domain key (one block) | 3: about 1,400 | context hash and 1: about 1,600 |
+| A vault address (keyed, one block) | 3: about 1,400 | 1 compression: about 500 |
+| Holding a key | 2: about 900 | none (a copy) |
+| The unlock's chain (root, three keys, the seed held) | 19: about 8,000 | a checked derive, a keyed hash and three derive_keys: about 6,500 |
+
+The address is the one path that costs more (about three times a compression it was), and it runs only in the kernel's own vault, which since the vault process holds almost nothing of the person's.
+Kernel text: 1,373,796 to 1,392,252 bytes (the five lifted functions are about 1,170 instructions, 4.7 KB, of it; the rest the wrappers, the known answers and `diag keys idtime`).
+
+### Open questions
+
+0. The fan-out's X25519: either the kernel holds the device's Ed25519 key as well (derived from the ira as `ira_key("fgtw device")` derives it), and PT frames and fleet ops are signed thru it, or each device gets a kernel-only X25519 key for its wrap, a change to the fan-out's format across Photon.
+   Without one of these the fleet key is only as kernel-held as the handle is unknown.
+1. The space's seal: a per-document key wrapped under the fleet key, EL0 doing the bulk (a change to the space's sealed format; a leaked document key opens one document), or the bulk on a kernel worker outside the lock.
+2. The handle proof: listed among the roots, but public (beacons, the registry, `ahau.proof`). Keep it in EL0?
+3. Is the seed worth the calls, given that it is a function of the handle? The alternative: the kernel keeps only the two random keys (fleet, person), and fgtw keeps the seed until the lock, as now.
+4. The right: a new one for fgtw alone, apart from Unlock (which ahau and init also hold).
+5. The scope of the calls: only kernel-built binding request bytes are signed, only named purposes are sealed and opened; is any general call needed (fstate, which Photon seals under the fleet key, is not on ferros yet)?
+6. The fgtw crate takes the keys as bytes (`&[u8; 32]`) thruout; it needs trait objects for the identity's and the fleet's operations (Photon on other platforms implements them with the bytes, ferros with the calls). The crate is another session's: a branch there.
+7. At lock, end fgtw (its frames are zeroed on the way back to the pool) as well as, or instead of, the in-process wipe.
+8. Unlock at boot: the fleet key kept by the kernel beside `ID_UNLOCK`, the vault process never seeing it.
+9. ~~Holding the keys in DRAM sealed under the wairua (registers), unsealed per use~~ **answered, built for the kernel's held keys (step 0, 2026-11-17):** the rule is "sealed under the wairua at rest; plaintext only in registers", and "Sealed under the wairua at rest" below has, per operation, what runs register-only, what still touches memory and for how long, and what is not done yet. With the proposal built, the fleet key joins them on the same terms (its seals and opens of the space are the larger values open question 1 is about).
+10. Fencing the kernel's key frames from the masters processes program (GPU, camera, UFS), or keeping the keys out of the frames those masters can reach.
+11. The race between ahau's unlock and fgtw's op 4: fgtw takes the epoch at op 4, so a lock between the two would be missed; nothing locks in that window today, and with a lock op in use ahau should hand over the epoch it unlocked at.
+12. The IPC path's message wipe (`deliver`, a plain `fill` on every message): a volatile wipe of the store stamps alone, or of every message.
+13. Whether a warm reset (the watchdog's, an EL3 reset) clears the registers that hold the wairua's shares: the pointer-authentication keys and the dead EL1 bank reset to architecturally UNKNOWN values, never measured on husky. If one survives with DRAM, the held keys are as open as before after such a reset; `diag keyreg` on a warm reset would tell.
+14. XChaCha20-Poly1305 in lifted code (the identity's payload key and `tag_keep`): ChaCha20's rounds are NEON-friendly, Poly1305's 130-bit products are GPR work; together several times the BLAKE3 code, and the values they run over are the vault's (bytes to megabytes), so only the key schedule could stay in registers.
+15. One check for several held uses in a row: every held call checks the wairua against its tag first (about 420 cycles), and a store call of the person's derives two domain keys, so it checks twice.
+
 ## Open Questions (remaining)
 
 - ~~**Exact NEON pinning in Rust**~~ — **answered.** Tier 2 on rustc 1.94.0, `-O`, `aarch64-unknown-none`: no spill (see Proven Result). Re-verify on toolchain bump via the CI canary.

@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -104,6 +104,57 @@ extern "C" fn net_watch(grants: u64) -> ! {
         NET_BELL.fetch_add(1, Ordering::AcqRel);
         ferros_sys::wake(&NET_BELL, 1);
     }
+}
+
+/// The identity's lock bell (kernel SYS_BELL `BELL_IDENTITY`, 2026-11-17): the kernel writes its lock epoch here and wakes `id_watch` whenever it moves (the identity locked: the lock op, an unlock that locks what was open first, a release).
+/// The loop compares it with the epoch the roots in hand were taken at (`Client::lock_epoch`) and wipes what it holds of the identity when they differ (`locked_out`).
+/// Owner, 2026-11-17: "once we lock it there's ZERO way someone can get into those keys".
+static ID_BELL: AtomicU64 = AtomicU64::new(0);
+/// `id_watch`'s stack: it only waits and rings, nothing allocated.
+static ID_STACK: Region<{ 1 << 14 }> = Region(UnsafeCell::new([0; 1 << 14]));
+
+/// The identity's lock watcher: asleep on `ID_BELL` until the kernel moves it, then rings the loop (`NET_BELL`), which does the wipe on its own thread.
+/// A doorbell, never a poll.
+extern "C" fn id_watch(_: u64) -> ! {
+    loop {
+        let e = ID_BELL.load(Ordering::Acquire);
+        ferros_sys::wait_world(&ID_BELL, e, 0);
+        NET_BELL.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&NET_BELL, 1);
+    }
+}
+
+/// Bytes of the identity's (its roots, the fleet key, the person key) overwritten in a way the compiler keeps, then a compiler fence so nothing after moves before them: ahau's `roots_thread` wipe.
+/// The kernel also cleans the lines to DRAM (keys.rs `wipe_to_dram`); EL0 cannot, so these zeros may sit in a dirty cache line for a while (docs/KEY_REGISTERS.md "The identity's keys in the kernel alone").
+pub(crate) fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// A key held as an option: its bytes overwritten where they lie, then None.
+pub(crate) fn wipe_key(k: &mut Option<[u8; 32]>) {
+    if let Some(b) = k.as_mut() {
+        wipe(b);
+    }
+    *k = None;
+}
+
+/// A value that holds the roots by value (the add and departure machines keep the identity seed and the handle proof in themselves, fgtw::flow): dropped where it lies, its bytes overwritten, then None.
+/// Setting the option to None or replacing it moves or drops the value and leaves its bytes in place.
+pub(crate) fn wipe_slot<T>(slot: &mut Option<T>) {
+    let p = slot as *mut Option<T>;
+    // SAFETY: the value is dropped in place once, its bytes then overwritten and a None written over them without reading or dropping them; nothing reads the slot in between (`&mut` holds it).
+    unsafe {
+        core::ptr::drop_in_place(p);
+        let b = p as *mut u8;
+        for k in 0..core::mem::size_of::<Option<T>>() {
+            core::ptr::write_volatile(b.add(k), 0);
+        }
+        core::ptr::write(p, None);
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 core::arch::global_asm!(
@@ -508,6 +559,8 @@ struct Client {
     hp: Option<[u8; 32]>,
     bound: bool,
     fleet_key: Option<[u8; 32]>,
+    /// The kernel's lock epoch (`ID_BELL`) when the roots in hand were taken (op 4, op 3, the vault at start): once the bell moves past it the identity was locked, and what is held of it goes (`locked_out`).
+    lock_epoch: u64,
     /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
     members: Vec<[u8; 32]>,
     /// The chain's ops said on the console so far (`note_members`): its whole history the first time this run adopts one, then each op added after.
@@ -661,6 +714,9 @@ impl Client {
         if self.store_get(b"fleet_key", &mut b) == Some(32) {
             self.fleet_key = Some(b);
         }
+        // The buffer they came thru, and the lock epoch they belong to (kept on disk only with unlock at boot, read while this identity is unlocked).
+        wipe(&mut b);
+        self.lock_epoch = ID_BELL.load(Ordering::Acquire);
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
             // Read whole, piece by piece, exactly its own size (one transfer holds at most 4096 bytes, and a fleet chain grows past that; a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run).
@@ -1087,18 +1143,22 @@ impl Client {
     }
 
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
+    /// The vault is not touched.
+    /// The roots, the fleet key and the person key are overwritten where they lie (`wipe_key`), and so are the add and departure machines, which keep the roots in themselves (`wipe_slot`): until 2026-11-17 each was only set to None, its bytes left in RAM.
     fn forget_identity(&mut self) {
+        wipe_slot(&mut self.dep.m);
         self.dep = depart::Departing::new();
         // The bindings made for this identity and any add under way go with it; a be you still held is refused, the waits for be you are kept (facets.rs `facets_forget`).
         self.facets_forget();
+        wipe_slot(&mut self.add.m);
         self.add.reset();
         if self.radios_on {
             self.radios(None);
         }
-        self.identity_seed = None;
-        self.hp = None;
+        wipe_key(&mut self.identity_seed);
+        wipe_key(&mut self.hp);
         self.bound = false;
-        self.fleet_key = None;
+        wipe_key(&mut self.fleet_key);
         self.members.clear();
         self.offered.clear();
         self.select_waiting = None;
@@ -1109,9 +1169,22 @@ impl Client {
         self.verdict = V_NONE;
         // The person key's bytes overwritten before the space state goes (docs/FACETS.md D0: RAM only, as the roots).
         if let Some((k, _)) = self.space.person.as_mut() {
-            k.fill(0);
+            wipe(k);
         }
         self.space = space::SpaceSync::new();
+    }
+
+    /// The kernel locked the identity (its bell moved past the epoch the roots were taken at): everything held of it wiped from RAM and this service back to no identity in hand, as at start with nothing kept, the vault untouched (it is sealed now anyway).
+    /// The next roots come from the attest screen as at any attest (op 4).
+    fn locked_out(&mut self, epoch: u64) {
+        let held = self.identity_seed.is_some() || self.hp.is_some() || self.fleet_key.is_some() || self.space.person.is_some();
+        self.lock_epoch = epoch;
+        if !held {
+            return;
+        }
+        self.forget_identity();
+        self.log.put(b"fgtw: the kernel locked the identity: its roots, the fleet key and the person key wiped from RAM; no identity in hand");
+        self.log.line();
     }
 
     /// fgtw's transport for this call, starting from the address resolved last.
@@ -1572,6 +1645,14 @@ impl Client {
         v4[..4].copy_from_slice(&join::BEACON_V4);
         self.udp.join(4, v4);
         self.udp.join(6, join::BEACON_V6);
+        // The identity's lock bell before anything of the identity is read (`load` takes the epoch it belongs to): the kernel writes the epoch now and at every lock.
+        if ferros_sys::bell(ferros_sys::BELL_IDENTITY, &ID_BELL) {
+            // SAFETY: the watcher's stack, given to it alone, once.
+            ferros_sys::thread_spawn(id_watch, unsafe { &mut *ID_STACK.0.get() }, 0);
+        } else {
+            self.log.put(b"fgtw: no identity lock bell (a kernel from before 2026-11-17): a lock leaves the roots, the fleet key and the person key here until this service ends");
+            self.log.line();
+        }
         self.read_persist();
         if !self.persist {
             self.forget_disk();
@@ -1590,6 +1671,12 @@ impl Client {
             let mut busy = false;
             // The bell's count before this pass looks: a ring while it runs ends the idle wait at once.
             let bell_seen = NET_BELL.load(Ordering::Acquire);
+            // The identity locked since the roots in hand were taken: nothing of it is held past this point (`locked_out`).
+            // First in the pass, so no step below uses what the lock took away.
+            let epoch = ID_BELL.load(Ordering::Acquire);
+            if epoch != self.lock_epoch {
+                self.locked_out(epoch);
+            }
             let watch = NET_FLAGS.load(Ordering::Acquire);
             // The ports to read: those the watch named since the last pass, or both every pass without a watch.
             let news = if watch == NO_WATCH { 3 } else { NET_PORTS.swap(0, Ordering::AcqRel) };
@@ -1767,9 +1854,17 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
-                // Op 2: mint (the attest screen, after the permanence warning and the retype) → [result: 0 minted, else why not], then the state as op 1 gives it.
+                // Op 2: mint (the attest screen, after the permanence warning and the retype), `[2][the retyped handle's seed 32]` → [result: 0 minted, 6 the retyped handle is not the one handed over (nothing minted), else why not], then the state as op 1 gives it.
+                // The attest screen keeps no seed of its own past the hand-over (2026-11-17), so the two are compared here, in time that does not depend on where they differ, and the retyped seed is wiped from the message.
                 if n >= 1 && req[0] == 2 {
-                    let r = self.mint();
+                    // WHY the length: another process's message; the seed is sliced out of it at fixed offsets.
+                    let same = got >= 33 && self.identity_seed.as_ref().is_some_and(|s| s.iter().zip(&req[1..33]).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0);
+                    wipe(&mut req[1..33]);
+                    let r = match (self.identity_seed.is_some(), same) {
+                        (false, _) => 1,
+                        (true, true) => self.mint(),
+                        (true, false) => 6,
+                    };
                     reply.push(r);
                 }
                 // Op 3: the attest screen replaced the roots on disk (a new handle on a device that was not yet bound): forget the old identity and look the new one up from the vault.
@@ -1790,6 +1885,8 @@ impl Client {
                     let mut hp = [0u8; 32];
                     seed.copy_from_slice(&req[1..33]);
                     hp.copy_from_slice(&req[33..65]);
+                    // The message's copy wiped at once; the locals once they are in `self`.
+                    wipe(&mut req[1..65]);
                     self.forget_identity();
                     self.read_persist();
                     if !self.persist {
@@ -1799,6 +1896,10 @@ impl Client {
                     self.persist_set(b"handle_proof", &hp);
                     self.identity_seed = Some(seed);
                     self.hp = Some(hp);
+                    wipe(&mut seed);
+                    wipe(&mut hp);
+                    // The epoch these roots belong to: the attest screen unlocked (which moved the epoch and wrote it here) before it handed them over, so a bell read now is past any lock that came before them.
+                    self.lock_epoch = ID_BELL.load(Ordering::Acquire);
                     self.verdict = V_LOOKING;
                     self.last_lookup_us = 0;
                     self.fgtw_asked_us = 0;
@@ -2184,7 +2285,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

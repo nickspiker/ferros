@@ -1583,7 +1583,7 @@ const SYS_ZONE: u64 = 35;
 const SYS_LANG: u64 = 36;
 /// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
-/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
+/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. `BELL_IDENTITY` (13, 2026-11-17), for anyone: the identity's lock epoch (`LOCK_EPOCH`), no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start, a kist starts, or a kist ends any way, its waiters woken → 0. Op 2: the kists alive (owner, 2026-11-11: their circles glow running, stopped or not running), x1 the Settings token, x2/x3 a buffer and its length → how many (all of them; whole ones past the buffer are not written), each a capsule's address (32 bytes) of a process the kist job started that is not ending (`kists_live`). ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
@@ -2728,11 +2728,14 @@ fn gpu_drain(epoch: u64) {
 fn facets_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(97 + msg.len());
     let (developer, option) = p.gate.filter(|_| p.kist).unwrap_or(([0; 32], [0; 32]));
-    let present = unsafe { DOMAIN_BASE }.and_then(|b| b(true)).map(|mut k| k.fill(0)).is_some();
+    let present = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
     let alias = match p.gate {
         Some((d, o)) if p.kist => crate::service::alias(&d, &o).map(|mut s| {
-            let pk = ed25519_dalek::SigningKey::from_bytes(&s).verifying_key().to_bytes();
-            s.fill(0);
+            let mut sk = ed25519_dalek::SigningKey::from_bytes(&s);
+            let pk = sk.verifying_key().to_bytes();
+            // The signing key holds the seed by value and wipes nothing when dropped.
+            crate::keys::wipe_value_to_dram(&mut sk);
+            crate::keys::wipe_to_dram(&mut s);
             pk
         }),
         _ => None,
@@ -2935,7 +2938,7 @@ pub const REPLY_MAX: usize = 1 << 23;
 const VAULT_EP: &[u8] = b"vault";
 /// Names under a scope that stay in the kernel's vault because the kernel reads them itself (aoc.rs: the AoC firmware): never forwarded, never migrated.
 const KERNEL_HELD: [&str; 1] = ["aoc.fw."];
-/// The domain bases, registered by the vault's owner (service.rs): (the identity's?) -> the class's base key, None while that class is locked.
+/// The device's domain base, registered by the vault's owner (service.rs): (the identity's?) -> the base key; always None for the person's, whose base is held sealed (`domain_keys` asks the kernel's vault for their keys instead).
 pub static mut DOMAIN_BASE: Option<fn(bool) -> Option<[u8; 32]>> = None;
 const DOMAIN_ADDR_CONTEXT: &str = "ferros 2026-11-07 vault domain address";
 const DOMAIN_SEAL_CONTEXT: &str = "ferros 2026-11-07 vault domain seal";
@@ -3002,7 +3005,7 @@ pub fn vault_refuse_locked() -> usize {
         let q = &mut k().endpoints[ep].queue;
         if q.iter().any(|c| c.0 == KERNEL_CALLER) {
             for c in q.iter_mut().filter(|c| c.0 == KERNEL_CALLER) {
-                c.1.fill(0);
+                crate::keys::wipe_to_dram(&mut c.1);
             }
             q.retain(|c| c.0 != KERNEL_CALLER);
             kernel_answered(Err(()));
@@ -3054,6 +3057,10 @@ fn scope_of(name: &str) -> Option<&'static StoreScope> {
 
 /// A scope's domain keys in one class (the kernel derives every key; the vault process seals with them, VAULT-OUT.md): the address key, then the sealing key. None while the class is locked. A kist's own domain is a "scope" of `KIST_DOMAIN_PREFIX` and its name, in the person's class.
 fn domain_keys(prefix: &[u8], identity: bool) -> Option<[u8; 64]> {
+    // The person's: from their domain key held under the wairua, derived in registers (KEY_REGISTERS.md "Sealed under the wairua at rest"); the same bytes as the software derivation below.
+    if identity {
+        return crate::service::identity_domain_keys(prefix, DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT);
+    }
     let mut base = unsafe { DOMAIN_BASE }?(identity)?;
     let mut out = [0u8; 64];
     for (i, ctx) in [DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT].iter().enumerate() {
@@ -3061,8 +3068,10 @@ fn domain_keys(prefix: &[u8], identity: bool) -> Option<[u8; 64]> {
         h.update(&base);
         h.update(prefix);
         out[i << 5..(i + 1) << 5].copy_from_slice(h.finalize().as_bytes());
+        // The hasher's buffer holds the base.
+        crate::keys::wipe_value_to_dram(&mut h);
     }
-    base.fill(0);
+    crate::keys::wipe_to_dram(&mut base);
     Some(out)
 }
 
@@ -3109,20 +3118,20 @@ fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
         let Some(mut keys) = domain_keys(sc.prefix.as_bytes(), identity) else { continue };
         if seen < skip {
             seen += 1;
-            keys.fill(0);
+            crate::keys::wipe_to_dram(&mut keys);
             continue;
         }
         let mut out = Vec::with_capacity(66 + name.len());
         out.push(identity as u8);
         out.extend_from_slice(&keys);
-        keys.fill(0);
+        crate::keys::wipe_to_dram(&mut keys);
         out.push(sc.prefix.len() as u8);
         out.extend_from_slice(name.as_bytes());
         let n = out.len();
         if n <= len {
             p.write(buf, &out);
         }
-        out.fill(0);
+        crate::keys::wipe_to_dram(&mut out);
         return if n <= len { n as u64 } else { ERR };
     }
     MIGRATE_PENDING.store(false, core::sync::atomic::Ordering::Release);
@@ -3346,14 +3355,14 @@ fn tag_syscall(p: &Process, f: &Frame) -> u64 {
             if r.is_ok_and(|n| n != NOTHING) {
                 p.write(f.x[4], &seed);
             }
-            seed.fill(0);
-            uid.fill(0);
+            crate::keys::wipe_to_dram(&mut seed);
+            crate::keys::wipe_to_dram(&mut uid);
             r.unwrap_or(ERR)
         }
         7 if uid_len(f.x[3]) => {
             let mut uid = p.read(f.x[2], f.x[3] as usize);
             let r = tag(TagOp::Keep(&uid));
-            uid.fill(0);
+            crate::keys::wipe_to_dram(&mut uid);
             r.unwrap_or(ERR)
         }
         8 if f.x[3] == 0 => tag(TagOp::Forget(None)).unwrap_or(ERR),
@@ -3421,12 +3430,12 @@ fn stamp_domains(op: u8, domains: &[(&[u8], bool)], name: &[u8], rest: &[u8]) ->
             if op == VOP_LIST && identity {
                 continue;
             }
-            msg.fill(0);
+            crate::keys::wipe_to_dram(&mut msg);
             return None;
         };
         msg.push(identity as u8);
         msg.extend_from_slice(&keys);
-        keys.fill(0);
+        crate::keys::wipe_to_dram(&mut keys);
         msg[at_count] += 1;
     }
     msg.push(name.len() as u8);
@@ -3459,7 +3468,7 @@ pub fn vault_call(mut msg: Vec<u8>) -> bool {
     with_lock(|| {
         let c = kernel_call();
         let Some(ep) = vault_ep().filter(|_| !c.0) else {
-            msg.fill(0);
+            crate::keys::wipe_to_dram(&mut msg);
             return false;
         };
         *c = (true, None);
@@ -4512,6 +4521,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
         SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
             f.x[0] = tag_syscall(p, f);
+            // An unlock by tag locks whatever was open first.
+            identity_bell();
             0
         }
         SYS_UNLOCK => {
@@ -4522,9 +4533,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0 => unlock(0, None).unwrap_or(ERR),
                     1 => {
                         let mut seed = [0u8; 32];
-                        seed.copy_from_slice(&p.read(f.x[2], 32));
+                        // Read straight into the array: `read` would leave a heap copy of the seed behind.
+                        p.read_into(f.x[2], &mut seed);
                         let r = unlock(1, Some(&seed));
-                        seed.fill(0);
+                        crate::keys::wipe_to_dram(&mut seed);
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
@@ -4533,7 +4545,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         let mut key = [0u8; 32];
                         p.read_into(f.x[2], &mut key);
                         let r = unlock(10, Some(&key));
-                        key.fill(0);
+                        crate::keys::wipe_to_dram(&mut key);
                         r.unwrap_or(ERR)
                     }
                     // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length) from offset x4, for saving them to the fleet before a departure; the document's whole length, or ERR while locked. With a vault process serving, it answers instead (`export_forward`).
@@ -4563,6 +4575,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 },
                 _ => ERR,
             };
+            // The lock op, an unlock (it locks what was open first) and a release move the lock epoch: the identity service hears it at once.
+            identity_bell();
             0
         }
         SYS_PT => {
@@ -4887,6 +4901,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else if source == BELL_SLOTS && holds_surfaces(p) {
                 bell_register(p, pi, source, f.x[1], SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_IDENTITY {
+                bell_register(p, pi, source, f.x[1], LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire) as u64)
             } else {
                 ERR
             };
@@ -5087,7 +5103,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     match alias {
                         Some(mut a) => {
                             p.write(f.x[3], &a);
-                            a.fill(0);
+                            crate::keys::wipe_to_dram(&mut a);
                             ALIASES_GIVEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             crate::flashlog::line(&alloc::format!("alias given to the kist {who}"));
                             32
@@ -5686,7 +5702,7 @@ fn fail_orphaned_calls() {
             if caller == KERNEL_CALLER {
                 // The kernel's own call, queued for a vault that ended: its stamp (domain keys) wiped, the service loop told.
                 for q in k().endpoints[ep].queue.iter_mut().filter(|q| q.0 == KERNEL_CALLER) {
-                    q.1.fill(0);
+                    crate::keys::wipe_to_dram(&mut q.1);
                 }
                 k().endpoints[ep].queue.retain(|q| q.0 != KERNEL_CALLER);
                 kernel_answered(Err(()));
@@ -5730,7 +5746,13 @@ const BELL_OFFERS: usize = 10;
 const BELL_NOTES: usize = 11;
 /// The surface slots' (2026-11-12), for the holder of the `surfaces` region: its word is `SLOTS_LIVE`, four bits a slot, no count. `BELL_SURFACES` stays in its old form (slots 0 to 3) for a display from before.
 const BELL_SLOTS: usize = 12;
-const BELLS: usize = 13;
+/// The identity's lock (2026-11-17; owner: "once we lock it there's ZERO way someone can get into those keys"): its word is `LOCK_EPOCH`, moved at every lock of the identity (kvault `lock`: the lock op, the person leaving, an unlock that locks what was open first, a release), rung by `identity_bell`.
+/// The identity service wipes the roots, the person key and the fleet key it holds when it moves (payloads/fgtw `locked_out`).
+/// No capability: whether a person is present is fact 83, anyone's to read, and the epoch says no more than when that changed.
+pub const BELL_IDENTITY: usize = 13;
+const BELLS: usize = 14;
+/// The lock epoch last rung into the identity's bell (`identity_bell`).
+static IDENTITY_RUNG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
@@ -6131,6 +6153,16 @@ fn bell_ring(source: usize, value: u64) {
                 }
             }
         }
+    }
+}
+
+/// The identity's bell rung when its lock epoch moved since it last rang (`BELL_IDENTITY`): after every SYS_UNLOCK call, tag ops included, the only syscalls that lock.
+/// Under the kernel lock.
+/// A lock the kernel makes on its own way to a reset (service.rs `lock_before_reset`) rings nothing: nothing runs after it.
+fn identity_bell() {
+    let e = LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    if IDENTITY_RUNG.swap(e, core::sync::atomic::Ordering::AcqRel) != e {
+        bell_ring(BELL_IDENTITY, e as u64);
     }
 }
 
@@ -6898,7 +6930,7 @@ fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
         return refuse("a malformed request, or a right outside the vocabulary");
     }
     let kk = k();
-    if unsafe { DOMAIN_BASE }.and_then(|b| b(true)).is_none() {
+    if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
         return refuse("nobody is present: a kist runs only for an attested person");
     }
     // A stop (the person's Stop on the kist's card, owner 2026-11-12; docs/KISTS.md "The deck and the card"): the running kist killed, one shot dead, and nothing launched. No record is kept, as for a relaunch's kill: the person's own act, so its circle goes to not running, not stopped. Ahead of the launch slot, so a launch still streaming never holds a stop back.
