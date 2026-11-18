@@ -181,6 +181,9 @@ fn up() -> bool {
         return false;
     }
     FE_ON.store(true, Ordering::Release);
+    if BTS.load(Ordering::Relaxed) {
+        bts_linux();
+    }
     crate::flashlog::line("camera: on, the front end's clocks");
     crate::camera::fe_clocks(&mut rep);
     phy_isolation_bypass();
@@ -192,6 +195,30 @@ fn up() -> bool {
     HELD.store(true, Ordering::Release);
     crate::flashlog::line(&alloc::format!("camera: on in A#{} ms, module A#{want}, S2MPUs G#{fenced:X} (1 fenced)", ms_since(t0)));
     true
+}
+
+/// Whether the switch's on sets the front end's four bus traffic shapers as Linux's boot does (`diag clock cambts on|off`, off by default: a test of whether the front end's writes lose to the cores' reads without them; camera-full-rate, 2026-11-17).
+pub static BTS: AtomicBool = AtomicBool::new(false);
+/// The front end's bus traffic shapers (zuma-bts.dtsi bts_ispfe0 to 3, G#26C4_8180 on, G#80 apart; soc-gs drivers/bts exynos-btsopsgs.c `set_ipbts`), each with its `default` scenario's values: AxQoS 12 read and write, overriding the master's (RCON/WCON bit 8, value at bit 12), shaping on (CON bit 0); outstanding reads and writes (RBLK_UPPER/WBLK_UPPER low half: G#26, G#FFFF, G#FFFF, G#FFFF and G#40, G#40, G#40, G#8); urgency on (CON bit 23) at G#20 in each of the four channels' bytes (TIMEOUT_R0 +8, TIMEOUT_W0 +G#10). Only the defined words are touched.
+const BTS_ISPFE: usize = 0x26C4_8180;
+const BTS_RMO: [u32; 4] = [0x26, 0xFFFF, 0xFFFF, 0xFFFF];
+const BTS_WMO: [u32; 4] = [0x40, 0x40, 0x40, 0x8];
+fn bts_linux() {
+    let mut said = alloc::string::String::new();
+    for k in 0..4 {
+        let b = BTS_ISPFE + (k << 7);
+        let before = [rd(b), rd(b + 0x8), rd(b + 0x10), rd(b + 0x20), rd(b + 0x24), rd(b + 0x40), rd(b + 0x44)];
+        wr(b + 0x20, before[3] & !(0xF << 12) | 1 << 8 | 0xC << 12);
+        wr(b + 0x40, before[5] & !(0xF << 12) | 1 << 8 | 0xC << 12);
+        wr(b, rd(b) | 1);
+        wr(b + 0x24, before[4] & !0xFFFF | BTS_RMO[k]);
+        wr(b + 0x44, before[6] & !0xFFFF | BTS_WMO[k]);
+        wr(b + 0x8, 0x2020_2020);
+        wr(b + 0x10, 0x2020_2020);
+        wr(b, rd(b) & !(1 << 7) | 1 << 23);
+        said.push_str(&alloc::format!(" ispfe{k} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} to G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X};", before[0], before[1], before[2], before[3], before[4], before[5], before[6], rd(b), rd(b + 0x8), rd(b + 0x10), rd(b + 0x20), rd(b + 0x24), rd(b + 0x40), rd(b + 0x44)));
+    }
+    crate::flashlog::line(&alloc::format!("camera: the front end's traffic shapers (CON, TIMEOUT_R0, TIMEOUT_W0, RCON, RBLK, WCON, WBLK) as Linux's boot sets them:{said}"));
 }
 
 /// The D-PHY's isolation bypass, once per boot (the bit stays set until reset; repeated in a second `cam pdma` its EL3 write never returned, 2026-10-21). Set thru the PMU's atomic alias, as Linux sets it, with no read of the PMU: camera.rs `phy_isolation_bypass` read the register directly first, the pattern that left the next EL3 call hanging (its viewfinder's `display::adopt`, 2026-10-21).

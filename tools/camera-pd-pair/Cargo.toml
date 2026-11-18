@@ -1,0 +1,10 @@
+[package]
+name = "camera-pd-pair"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: a frame of the main camera and its phase-detect rows, as the driver's SNAP kept them and ferros-bridge read them, into one VSF (docs/CAMERA.md \"Phase detect as data\")"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }

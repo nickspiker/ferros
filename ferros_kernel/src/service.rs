@@ -2218,7 +2218,9 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     let input = crate::process::INPUT_AT.load(core::sync::atomic::Ordering::Relaxed);
     let touched = input != unsafe { GOV_INPUT };
     unsafe { GOV_INPUT = input };
-    let dark = !pt_hold && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
+    // The camera's switch on: the memory side stays where it is put for the whole open, below (`CAM_MEM`).
+    let cam = CAM_MEM.load(core::sync::atomic::Ordering::Relaxed) && crate::camera_power::held();
+    let dark = !pt_hold && !cam && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
     let was = unsafe { CLOCK_STATE };
     let gov = GOV_ON.load(core::sync::atomic::Ordering::Relaxed);
     // The governor runs in every tier once the policy has applied one; in the dark the workers are down and only the X3 moves.
@@ -2230,7 +2232,7 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     // Rest only once nothing has asked for active for the dwell (`TIER_DWELL`); up to active at once.
     let dwell = TIER_DWELL.load(core::sync::atomic::Ordering::Relaxed);
     let held = was == 2 && dwell != 0 && now.wrapping_sub(unsafe { TIER_BUSY_AT }) < f >> dwell;
-    let want = if dark { 3 } else if causes != 0 || held { 2 } else { 1 };
+    let want = if dark { 3 } else if causes != 0 || held || cam { 2 } else { 1 };
     if want != was && was != 0 {
         unsafe {
             if want == 2 {
@@ -2272,7 +2274,8 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         }
     }
     // The memory side of the lift (THERMAL.md decision 3): while someone interacts with the screen lit, MIF and the DSU at the tops of their tables, else the tier's own; not while ferros's thermal policy holds any domain down.
-    let lift = want != 3 && GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ && interactive(now, f) && !crate::thermal::throttled();
+    // While the camera's switch is on the lift holds from the switch's on to its off, thru heat and quiet alike (`CAM_MEM`): a change of the memory's clock under a stream is the change the front end's writes cannot ride out.
+    let lift = cam || (want != 3 && GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ && interactive(now, f) && !crate::thermal::throttled());
     if lift != unsafe { SHARED_LIFTED } {
         shared_lift(lift);
     }
@@ -2281,6 +2284,9 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
 /// MIF and the DSU at the lift's rates while someone interacts (`clock_policy`), or back at the tier's.
 /// Measured 2026-11-17 on the Pro (membench, 2^24-byte buffers): with the A715s at 2367 MHz, four threads' copy 35.9 GB/s at the active tier's MIF 2028 and DSU 1197 MHz, 41.3 at MIF 3744 and DSU 1800; one thread's read 20.8 against 24.4; with the A715s at 1065, four threads' copy 32.5 against 39.5 at MIF 3744 alone. Both are their tables' tops (zuma.dtsi devfreq_mif and devfreq_dsu `freq_info`), which Android's memory-latency and DSU-latency governors reach under load.
 const SHARED_LIFT: [(u32, u32); 2] = [(0, 3_744_000), (5, 1_800_000)];
+/// Whether the camera's switch holds the memory side (`diag clock cammem on|off`, off by default): while the switch is on, the tier stays active (never rest or dark, so INT stays at its 356 MHz) and MIF and the DSU at the lift's rates, from before the sensor streams until after it stops.
+/// A suspect of 2026-11-17 (a MIF change mid-stream stopping the front end), not the cause found: the deaths measured on 2026-11-18 were the descriptor's release behind the kernel lock (camera_power.rs `ferros_cam_fast`), at 36 C with 2194 lifts before them; kept off unless a run says otherwise.
+pub static CAM_MEM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut SHARED_LIFTED: bool = false;
 /// Times the memory side was lifted (`diag clock`).
 static mut SHARED_LIFTS: u64 = 0;
@@ -2374,7 +2380,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>`, `gap <n>` and `cam <n>` its holds as shifts (`lift_causes`; cam 0: a camera stream holds nothing); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none), `diag clock pipeline 0|1` its requests pipelined or each waited for.
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`); `diag clock lift <kHz>` the A715s' ceiling while interacting (0: no lift), `hold <n>`, `gap <n>` and `cam <n>` its holds as shifts (`lift_causes`; cam 0: a camera stream holds nothing); `diag clock dwell <n>` the shared tier's dwell before rest (`TIER_DWELL`, 0 none), `diag clock pipeline 0|1` its requests pipelined or each waited for; `diag clock cammem on|off` whether the camera's switch holds the memory side (`CAM_MEM`), `cambts on|off` whether its on sets the front end's bus shapers, `camfast on|off` whether armed actions run (irqarm.rs `ON`: the camera arms its descriptor release on its line; off for an A/B).
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -2418,6 +2424,9 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
         (Some(b"cam"), Some(n)) => CAM_HOLD.store(n, Relaxed),
+        (Some(b"cammem"), _) => CAM_MEM.store(words.get(2) == Some(&&b"on"[..]), Relaxed),
+        (Some(b"cambts"), _) => crate::camera_power::BTS.store(words.get(2) == Some(&&b"on"[..]), Relaxed),
+        (Some(b"camfast"), _) => crate::irqarm::ON.store(words.get(2) == Some(&&b"on"[..]), Relaxed),
         (Some(b"gap"), Some(n)) => crate::process::ANIM_GAP_LOG2.store(n, Relaxed),
         (Some(b"dwell"), Some(n)) => TIER_DWELL.store(n, Relaxed),
         (Some(b"pipeline"), Some(n)) => TIER_PIPELINE.store(n != 0, Relaxed),
@@ -2425,7 +2434,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     }
     let causes = lift_causes(cntpct(), f);
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
-    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts\n", GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }).as_bytes());
+    out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };

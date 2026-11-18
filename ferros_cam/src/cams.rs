@@ -46,6 +46,8 @@ pub struct Cam {
     pub skip: [u64; SLOTS],
     /// A line's time in picoseconds (0: not known, exposure not offered), the init's integration and the longest the endpoint offers, in lines.
     pub line_ps: u64,
+    /// The captured init's line length in pixel clocks (CCS line_length_pck), the line `line_ps` was measured at: a longer line takes proportionally longer (ferros_cam ccs `Timing`).
+    pub llp: u16,
     pub exposure_lines: u64,
     pub exposure_max_lines: u64,
     /// The 2 x 2 cell's channels, two bits each, top left first (0 R, 1 G, 2 B); black and white; quarter turns clockwise to stand upright.
@@ -106,6 +108,7 @@ pub const MAIN: Cam = Cam {
     sizes: job::MAIN_SLOT_BYTES,
     skip: job::NO_SKIP,
     line_ps: crate::MAIN_LINE_PS,
+    llp: 6320,
     exposure_lines: crate::MAIN_EXPOSURE_MAX_LINES,
     exposure_max_lines: crate::MAIN_EXPOSURE_MAX_LINES,
     cfa: cfa(1, 2, 0, 1),
@@ -145,6 +148,7 @@ pub const ULTRAWIDE: Cam = Cam {
     sizes: job::UW_SLOT_BYTES,
     skip: job::UW_SLOT_SKIP,
     line_ps: 6_561_622,
+    llp: 9568,
     exposure_lines: 4124,
     exposure_max_lines: 5081 - (1 << 6),
     cfa: cfa(2, 1, 1, 0),
@@ -185,6 +189,7 @@ pub const FRONT: Cam = Cam {
     sizes: job::FRONT_SLOT_BYTES,
     skip: job::NO_SKIP,
     line_ps: 8_350_202,
+    llp: 8448,
     exposure_lines: 1712,
     exposure_max_lines: 1712,
     cfa: cfa(1, 0, 2, 1),
@@ -222,6 +227,7 @@ pub const TELE: Cam = Cam {
     sizes: [0; SLOTS],
     skip: job::NO_SKIP,
     line_ps: 0,
+    llp: 5568,
     exposure_lines: 2232,
     exposure_max_lines: 2232,
     cfa: cfa(2, 1, 1, 0),

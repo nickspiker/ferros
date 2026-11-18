@@ -1055,6 +1055,9 @@ impl Client {
                 K::Declare => b": keys declared by ",
                 K::Lock => b": locked out ",
                 K::Unlock => b": unlocked ",
+                // fgtw 5ce096e (owner, 2026-11-18): a member locked out a device that is not a member, a Photon on the alias alone (a ferros Photon among them), lost, stolen or gone without signing out; it has no unlock, and any device list naming it is refused wherever it is checked (fgtw::alias_devices::check).
+                // Nothing else here changes with it: it is never a member, so the fold, the add and the departure (members only) are as they were; the crate refuses the lists.
+                K::LockListed => b": locked out for good (outside the fleet, on the alias) ",
             });
             self.say_device(&op.device_pubkey, seed);
             if op.signer_pubkey != op.device_pubkey {

@@ -78,6 +78,7 @@ mod trusty;
 mod camera_close;
 #[cfg(feature = "pixel8")]
 mod camera_power;
+mod irqarm;
 #[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]
@@ -648,6 +649,11 @@ _m1_entry:
     b.eq    .Lirq_key
     cmp     x0, #32
     b.lo    .Lirq_eoi
+    adrp    x1, __irq_armed
+    add     x1, x1, :lo12:__irq_armed
+    ldrb    w1, [x1, x0]
+    cbnz    w1, .Lirq_armed
+.Lirq_spi:
     lsr     x2, x0, #5
     and     x3, x0, #31
     mov     w1, #1
@@ -801,6 +807,69 @@ _m1_entry:
     ldp     x4, x5, [sp, #0]
     add     sp, sp, #672
     b       .Lirq_eoi
+// A line its driver armed (irqarm.rs, SYS_IRQ_ARM; `__irq_armed` non-zero): its armed register operations run here, before the line is masked and its driver woken (`ferros_irq_armed`, x0 the INTID), so they never wait for the kernel lock or a core (2026-11-18: the camera's descriptor release, a wake 3.3 ms behind a set_pref's hold stopped the stream at 96 a second).
+// Saved as `.Lirq_prof` saves (Rust may use any caller-saved register, the vector registers among them); x0, the INTID, kept for the line's own path after it (`.Lirq_spi`). It never takes the kernel lock.
+.Lirq_armed:
+    sub     sp, sp, #672
+    stp     x4, x5, [sp, #0]
+    stp     x6, x7, [sp, #16]
+    stp     x8, x9, [sp, #32]
+    stp     x10, x11, [sp, #48]
+    stp     x12, x13, [sp, #64]
+    stp     x14, x15, [sp, #80]
+    stp     x16, x17, [sp, #96]
+    stp     x18, x29, [sp, #112]
+    stp     x30, x0, [sp, #128]
+    stp     q0, q1, [sp, #160]
+    stp     q2, q3, [sp, #192]
+    stp     q4, q5, [sp, #224]
+    stp     q6, q7, [sp, #256]
+    stp     q8, q9, [sp, #288]
+    stp     q10, q11, [sp, #320]
+    stp     q12, q13, [sp, #352]
+    stp     q14, q15, [sp, #384]
+    stp     q16, q17, [sp, #416]
+    stp     q18, q19, [sp, #448]
+    stp     q20, q21, [sp, #480]
+    stp     q22, q23, [sp, #512]
+    stp     q24, q25, [sp, #544]
+    stp     q26, q27, [sp, #576]
+    stp     q28, q29, [sp, #608]
+    stp     q30, q31, [sp, #640]
+    mrs     x9, fpcr
+    mrs     x10, fpsr
+    stp     x9, x10, [sp, #144]
+    bl      ferros_irq_armed
+    ldp     x9, x10, [sp, #144]
+    msr     fpcr, x9
+    msr     fpsr, x10
+    ldp     q0, q1, [sp, #160]
+    ldp     q2, q3, [sp, #192]
+    ldp     q4, q5, [sp, #224]
+    ldp     q6, q7, [sp, #256]
+    ldp     q8, q9, [sp, #288]
+    ldp     q10, q11, [sp, #320]
+    ldp     q12, q13, [sp, #352]
+    ldp     q14, q15, [sp, #384]
+    ldp     q16, q17, [sp, #416]
+    ldp     q18, q19, [sp, #448]
+    ldp     q20, q21, [sp, #480]
+    ldp     q22, q23, [sp, #512]
+    ldp     q24, q25, [sp, #544]
+    ldp     q26, q27, [sp, #576]
+    ldp     q28, q29, [sp, #608]
+    ldp     q30, q31, [sp, #640]
+    ldp     x30, x0, [sp, #128]
+    ldp     x18, x29, [sp, #112]
+    ldp     x16, x17, [sp, #96]
+    ldp     x14, x15, [sp, #80]
+    ldp     x12, x13, [sp, #64]
+    ldp     x10, x11, [sp, #48]
+    ldp     x8, x9, [sp, #32]
+    ldp     x6, x7, [sp, #16]
+    ldp     x4, x5, [sp, #0]
+    add     sp, sp, #672
+    b       .Lirq_spi
 // SGI 2: dump where this core is (process.rs `diag core`): the interrupted ELR/SPSR, both stack pointers, and x0-x3 as saved at entry.
 .Lirq_dump:
     adrp    x1, __core_dump

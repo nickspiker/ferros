@@ -6,7 +6,11 @@
 //! - +2 a slit's rows (u16), +4 the frame in lines (u16; 0 the driver's default, FFFF the mode's own), +6 the integration in lines (u16; 0 the driver's 16),
 //! - +8 the driver's flags (payloads/camera `F_*`: 1 RAW12, 2 mid-stream, 4 PD path, 8 geometry everywhere, 16 slim program, 32 slim level 2, 64 front end left as captured), +9 a slit ring's buffers as a power of two (0: 2^8), +10 the line length (u16; 0 the mode's),
 //! - +12 the work per frame: 0 map only (the capture's ceiling), 1 read every line out of the view (64-byte loads), 2 read and add into u16 sums folded into u32 every 64 frames, 3 read and add into u32 sums,
-//! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each), +15 threads for whole frames (0: the four A715s).
+//! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each; 3 the line length from 6320 clocks down, a new open each), +15 threads for whole frames (0: the four A715s),
+//! - optionally +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain).
+//! The driver's flag 128 keeps the sensor's phase detect and embedded data on in a windowed mode (off by default there: docs/CAMERA.md "The slit for real").
+//! A windowed mode on the main also runs detached and slim by default (the statistics pipeline off, loch0's paths alone each frame: docs/CAMERA.md "The slit runs"); the driver's eighth hand-spawn byte overrides it for an A/B.
+//! The sweeps (+14) open again in this process: with the vault's driver each open starts a fresh one; a driver spawned by hand serves one stream and refuses the next open, so a sweep of a hand-spawned driver is tools/cambench-sweep.sh (one driver an open).
 //! e.g. `00030400000000000000000002080000`: the main, a binned slit of 4 rows, 128 slits added into u16; `00010000000000000000000002040000`: the main binned at its default cut frame, 64 frames added (every byte of the 16 written, little-endian halves: rows 4 is `0400`).
 //!
 //! What it says, per open: the driver's answer and the view's shape; the sensor's data formats and its mode registers read back (CAPS); the sensor's own frame rate against the front end's (RATE); per frame the read and add time on each thread, frames skipped, the cores used and left; the driver's counters (STATS); the link's and the bus's bytes a second.
@@ -70,11 +74,12 @@ struct Args {
     work: u8,
     frames: u32,
     sweep: u8,
+    cols: u16,
 }
 
 impl Args {
-    fn open_msg(&self) -> [u8; 14] {
-        let mut m = [0u8; 14];
+    fn open_msg(&self) -> [u8; 16] {
+        let mut m = [0u8; 16];
         m[0] = OP_OPEN;
         m[1] = self.id;
         m[2] = 1;
@@ -85,6 +90,7 @@ impl Args {
         m[10] = self.flags;
         m[11] = self.ring;
         m[12..14].copy_from_slice(&self.llp.to_le_bytes());
+        m[14..16].copy_from_slice(&self.cols.to_le_bytes());
         m
     }
 }
@@ -443,7 +449,7 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
         return false;
     };
     let hz = ferros_sys::freq();
-    let (mut last, mut got, mut lost, mut wrong, mut calls) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut last, mut got, mut lost, mut wrong, mut calls, mut wraps) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut read_t, mut add_t) = (0u64, 0u64);
     let mut r = [0u8; 64];
     let t0 = ferros_sys::now();
@@ -462,9 +468,9 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
             first_n = newest;
             last = newest - 1;
         }
-        // The oldest buffer is the next the engine writes: keep to the newest ring - 1.
-        // WHY the saturating subtraction: in the ring's first `ring - 2` frames every buffer written is safe, and newest + 2 - ring would wrap below zero; the max then keeps to the frames not yet read.
-        let from = (last + 1).max((newest + 2).saturating_sub(ring));
+        // The oldest buffer is the next the engine writes: keep to the newest ring - 2 (the one after it has its probe patterned for the frame after the next: payloads/camera `slit_turn`).
+        // WHY the saturating subtraction: in the ring's first `ring - 3` frames every buffer written is safe, and newest + 3 - ring would wrap below zero; the max then keeps to the frames not yet read.
+        let from = (last + 1).max((newest + 3).saturating_sub(ring));
         lost += from - (last + 1);
         for f in from..=newest {
             let at = v.base + ((f - 1) % ring) as usize * buf;
@@ -492,10 +498,7 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
             got += 1;
         }
         last = newest;
-        if end == 1 {
-            say!(g, "cambench: the driver's long ring ended\n");
-            break;
-        }
+        wraps = end;
     }
     if got == 0 {
         say!(g, "cambench: no slit taken\n");
@@ -504,7 +507,7 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
     // A slit taken means at least one SLITS call between t0 and now: the span is never none.
     let span = ferros_sys::now() - t0;
     let us = |t: u64| t * 1_000_000 / hz;
-    say!(g, "cambench: A#{got} slits in A#{} ms (A#{} a second), A#{calls} SLITS calls; lost to the ring A#{lost}, read over A#{wrong}; per slit reading and unpacking A#{} ns, adding A#{} ns\n", us(span) / 1000, got * hz / span, us(read_t * 1000 / got), us(add_t * 1000 / got));
+    say!(g, "cambench: A#{got} slits in A#{} ms (A#{} a second), A#{calls} SLITS calls; lost to the ring A#{lost}, read over A#{wrong}; the engine ring round A#{wraps} times; per slit reading and unpacking A#{} ns, adding A#{} ns\n", us(span) / 1000, got * hz / span, us(read_t * 1000 / got), us(add_t * 1000 / got));
     true
 }
 
@@ -516,7 +519,9 @@ fn run(g: u64, ep: u64, a: &Args) -> Option<u16> {
     let ok = if v.slit { slits(g, ep, a, &v) } else { frames(g, ep, a, &v, sensor16) };
     stats(g, ep);
     close(g, ep);
-    (ok && sensor16 != 0 && fe16 != 0).then_some(v.h as u16)
+    // A slit's sweep goes on while the sensor streams, whatever the front end took: its RATE is the sensor's floor at each step (2026-11-17 night: the front end takes two slit frames and stops, SHORT_VB_FATAL, at any frame length).
+    let streamed = if v.slit { sensor16 != 0 } else { ok && sensor16 != 0 && fe16 != 0 };
+    streamed.then_some(v.h as u16)
 }
 
 #[unsafe(no_mangle)]
@@ -529,7 +534,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         // WHY the min: the byte is the person's; more threads than the A715s (and the workers' stacks) are not there to start.
         n => n.min(THREADS_MOST),
     };
-    let a = Args { id: b(0), kind: b(1), rows: h(2), fll: h(4), exposure: h(6), flags: b(8), ring: b(9), llp: h(10), work: b(12), frames: if b(13) == 0 { 1 << 6 } else { b(13) as u32 * 16 }, sweep: b(14) };
+    // Past the 16 bytes: +16 the window's columns (u16; 0 the mode's width), +18 the frames' count moved left this many bits (a slit run of 4080 << 6, 261120 slits, is 3.6 min at 1212 a second: the drain).
+    // WHY the min: the shift is the person's byte, and past 12 the count leaves the u32.
+    let frames = if b(13) == 0 { 1 << 6 } else { b(13) as u32 * 16 } << b(18).min(12);
+    let a = Args { id: b(0), kind: b(1), rows: h(2), fll: h(4), exposure: h(6), flags: b(8), ring: b(9), llp: h(10), work: b(12), frames, sweep: b(14), cols: h(16) };
     ferros_sys::pin(1 << 4);
     THREADS.store(threads as u64, Ordering::Relaxed);
     for k in 1..threads {
@@ -568,6 +576,16 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 say!(g, "cambench: sweep: a frame of A#{fll} lines (A#{blank} past the rows)\n");
                 if run(g, ep, &Args { fll, exposure, ..a }).is_none() {
                     say!(g, "cambench: sweep: stopped at a frame of A#{fll} lines\n");
+                    break;
+                }
+            }
+        }
+        // The line from the init's 6320 clocks down (the main's: 5888 the front end's least at the whole width on 2026-11-16, about 5370 the sensor's), each a new open at the frame asked; with a narrow window (+16) the line's pixels on the link fall, so the sensor's row time and the front end's own pixel rate show apart: RATE's sensor rate times the frame's lines is the line the sensor really ran, the front end's beside it. Ends at the first that does not stream.
+        3 => {
+            for llp in [6320u16, 5888, 5376, 4864, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 768, 512] {
+                say!(g, "cambench: sweep: a line of A#{llp} clocks\n");
+                if run(g, ep, &Args { llp, ..a }).is_none() {
+                    say!(g, "cambench: sweep: stopped at a line of A#{llp} clocks\n");
                     break;
                 }
             }
