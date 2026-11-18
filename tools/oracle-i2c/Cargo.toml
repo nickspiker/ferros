@@ -1,0 +1,10 @@
+[package]
+name = "oracle-i2c"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: an hv oracle capture of an Exynos HS-I2C controller turned back into I2C transfers, and a sensor's CCS writes read out of them (tools/oracle-decode-hsi2c.py in Rust, plus the hold digest)"
+
+[workspace]
+
+[dependencies]
+blake3 = "1"

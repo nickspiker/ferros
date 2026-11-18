@@ -142,17 +142,27 @@ pub fn list_piece(job: &[u8]) -> Result<(usize, usize), Error> {
 
 /// The words of the program (a `list_piece`'s bytes) that write the image body's address register and its high half (`IMAGE_REG`, `IMAGE_REG` + 4), as word indices into it: each copy of the program the ring gets names its own buffer there (docs/CAMERA.md "The view"). An error when the program writes either not exactly once.
 pub fn image_words(list: &[u8]) -> Result<(usize, usize), Error> {
+    reg_words(list, IMAGE_REG)
+}
+
+/// The words that write loch0's PD path address (`PD_REG` and its high half), as `image_words` finds the image's: each ring buffer gets its frame's phase-detect rows beside its image (owner, 2026-11-17: phase detect as data, one MAP giving both; docs/CAMERA.md "Phase detect as data").
+pub fn pd_words(list: &[u8]) -> Result<(usize, usize), Error> {
+    reg_words(list, PD_REG)
+}
+
+/// The one write of address register `reg` and the one of its high half in a program, as word indices.
+fn reg_words(list: &[u8], reg: u32) -> Result<(usize, usize), Error> {
     let words = list.len() / 4;
     let (mut lo, mut hi) = ([0usize; 2], [0usize; 2]);
     let (mut nl, mut nh) = (0, 0);
-    each_write(words, &|i| w32(list, i * 4), &mut |i, reg| {
+    each_write(words, &|i| w32(list, i * 4), &mut |i, r| {
         // WHY the bounds: a second write of either is counted but not kept; the count refuses it below.
-        if reg == IMAGE_REG {
+        if r == reg {
             if nl < 2 {
                 lo[nl] = i;
             }
             nl += 1;
-        } else if reg == IMAGE_REG + 4 {
+        } else if r == reg + 4 {
             if nh < 2 {
                 hi[nh] = i;
             }
@@ -521,6 +531,18 @@ mod tests {
         assert_eq!((lo, hi), (2, 5));
         let img = 0x9_2000_0000 + main_ring(4).slots[OLD_SLOT_IMAGE].0;
         assert_eq!((w32(&job, at + lo * 4), w32(&job, at + hi * 4)), (img as u32, (img >> 32) as u32));
+    }
+
+    /// The local job's program writes loch0's PD path address once and its high half once, as it does the image's: so every ring buffer can carry its frame's PD rows (`pd_words`).
+    #[test]
+    fn the_local_pd_words() {
+        let Ok(mut job) = std::fs::read("/mnt/Harbor/Code/ferros/target/cam/cam.pdma") else { return };
+        relocate(&mut job, 0xA000_0000, &main_ring(4)).unwrap();
+        let (at, len) = list_piece(&job).unwrap();
+        let (lo, hi) = pd_words(&job[at..at + len]).unwrap();
+        let pd = 0xA000_0000 + main_ring(4).slots[OLD_SLOT_PD].0;
+        assert_eq!((w32(&job, at + lo * 4), w32(&job, at + hi * 4)), (pd as u32, 0));
+        println!("PD words {lo} and {hi} of the program");
     }
 
     /// The local job, when it is on this machine (target/cam/cam.pdma, the main camera's, list 2): every address it names lands in the region, in the slots the layout measured.
