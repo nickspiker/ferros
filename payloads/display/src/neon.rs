@@ -401,6 +401,36 @@ pub unsafe fn under2(dst: *mut u64, src: *const u64) {
     }
 }
 
+/// Eight baked pixels of `N` layers composed front to back, fluor's `under` on premultiplied codes (DISPLAY-SCROLL.md section 5, B+'s one pass; only the start-up bench runs it yet, `under_bench`): the first layer is the accumulator, each layer after it adds its channels times what is still transparent (Q14), and the transparency is the product with its own.
+/// A layer pixel's transparency is bits 49-62 (Q14), the whole when bit 63 (see-through) is set, and a see-through pixel's channels count as nothing whatever lies under the bit (`working`).
+/// Out: the channels, and the transparency in bits 49-63 as `fold` leaves it (all of it, 16384, is bit 63 alone: see-through).
+/// No early-out: the walk's ends (an opaque tile, an empty one) are B+'s per tile, never per pixel.
+/// The channels add without saturating: premultiplied layers sum to at most one whole (`under_pm`).
+#[inline(always)]
+pub unsafe fn under_walk8<const N: usize>(layers: &[*const u64; N], dst: *mut u64) {
+    unsafe {
+        let (low14, whole) = (vdupq_n_u16(0x3FFF), vdupq_n_u16(16384));
+        // A layer's eight pixels as four lanes of eight (R, G, B, the top sixteen bits), its see-through mask, its transparency.
+        let take = |p: *const u64| {
+            let v = vld4q_u16(p as *const u16);
+            let see = vreinterpretq_u16_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(v.3)));
+            let t = vbslq_u16(see, whole, vandq_u16(vshrq_n_u16::<1>(v.3), low14));
+            (vbicq_u16(v.0, see), vbicq_u16(v.1, see), vbicq_u16(v.2, see), t)
+        };
+        // a · t >> 14, eight lanes.
+        let mul14 = |a: uint16x8_t, t: uint16x8_t| vshrn_high_n_u32::<14>(vshrn_n_u32::<14>(vmull_u16(vget_low_u16(a), vget_low_u16(t))), vmull_high_u16(a, t));
+        let (mut r, mut g, mut b, mut t) = take(layers[0]);
+        for k in 1..N {
+            let (lr, lg, lb, lt) = take(layers[k]);
+            r = vaddq_u16(r, mul14(lr, t));
+            g = vaddq_u16(g, mul14(lg, t));
+            b = vaddq_u16(b, mul14(lb, t));
+            t = mul14(t, lt);
+        }
+        vst4q_u16(dst as *mut u16, uint16x8x4_t(r, g, b, vshlq_n_u16::<1>(t)));
+    }
+}
+
 /// Two pixels as an opaque layer at opacity `a` (16-bit coverage, 65535 whole): each colour lane c · a / 65535 (rounded as `under2` divides), the alpha lane a. A flight's page image (COMPOSITOR.md "The flight, prerendered"), made opaque first by composing it over the wallpaper or black, at the flight's progress.
 #[inline(always)]
 pub unsafe fn opaque_at2(p: *mut u64, a: u16) {

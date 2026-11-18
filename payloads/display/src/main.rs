@@ -5881,6 +5881,109 @@ fn present_bench(width: usize, log: &mut Log) {
     log.flush();
 }
 
+/// B+'s compose measured once at start beside the present's bench (DISPLAY-SCROLL.md section 5, "Bench before building"): the `under` walk of two layers (the content over the noise) and three (the chrome, the content, the noise) on baked pixels in NEON (`neon::under_walk8`), 64 rows of the screen's width warm in the caches, each eight times and the fastest kept, in the core's own cycles a pixel; then each with the present after it (`present_app16`), the whole of B+'s per-pixel work.
+/// The layers are made to be like Photon's: the content a quarter see-through, a quarter opaque and half partly covered (text's edges), the chrome see-through but an eighth, the noise opaque.
+/// Every walk is checked against the scalar walk (`under_pm`, as `fold` does Normal), and the count of pixels that differ is said with the numbers (0 is the bar).
+fn under_bench(width: usize, log: &mut Log) {
+    let (rows, w) = (1usize << 6, width & !15);
+    let n = rows * width;
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    // A baked pixel of transparency t (Q14; 16384 see-through) with premultiplied channels: each at most the covered part of the top code.
+    let px = |r: u64, t: u64| -> u64 {
+        if t == 16384 {
+            return 1 << 63 | (r & 0xFFFF_FFFF_FFFF);
+        }
+        let cover = 16384 - t;
+        let ch = |sh: u32| ((r >> sh & 0xFFFF) * cover >> 14) << sh;
+        ch(0) | ch(16) | ch(32) | t << 49
+    };
+    let mut chrome = alloc::vec![0u64; n];
+    let mut content = alloc::vec![0u64; n];
+    let mut noise = alloc::vec![0u64; n];
+    for i in 0..n {
+        let (a, b, c) = (next(), next(), next());
+        chrome[i] = if a >> 61 == 0 { px(a, b >> 50) } else { px(a, 16384) };
+        content[i] = match b >> 62 {
+            0 => px(b, 16384),
+            1 => px(b, 0),
+            _ => px(b, c >> 50),
+        };
+        noise[i] = px(c, 0);
+    }
+    let mut out = alloc::vec![0u64; n];
+    let mut row = alloc::vec![0u32; width];
+    let cm = neon::Chans::new(7);
+    let best = |f: &mut dyn FnMut()| -> u64 {
+        (0..8)
+            .map(|_| {
+                let c0 = ferros_sys::pmu::cycles();
+                f();
+                ferros_sys::pmu::cycles() - c0
+            })
+            .min()
+            .unwrap_or(0)
+    };
+    let per = |c: u64| c * 100 / (rows * w) as u64;
+    // The scalar walk, front to back, as `fold` does Normal.
+    let reference = |ls: &[&[u64]], i: usize| -> u64 {
+        let take = |p: u64| (if p >> 63 != 0 { 0 } else { p & 0xFFFF_FFFF_FFFF }, trans(p));
+        let (mut acc, mut t) = take(ls[0][i]);
+        for l in &ls[1..] {
+            let (c, lt) = take(l[i]);
+            (acc, t) = under_pm(acc, t, c, lt);
+        }
+        acc | t << 49
+    };
+    let mut walk = |ls: &[&[u64]], present: bool| -> (u64, u64) {
+        let c = best(&mut || unsafe {
+            for y in 0..rows {
+                let (t0, t1) = neon::row_thresholds_at(y, 0, 0);
+                for x in (0..w).step_by(16) {
+                    let i = y * width + x;
+                    for h in [0usize, 8] {
+                        match ls.len() {
+                            2 => neon::under_walk8::<2>(&[ls[0].as_ptr().add(i + h), ls[1].as_ptr().add(i + h)], out.as_mut_ptr().add(i + h)),
+                            _ => neon::under_walk8::<3>(&[ls[0].as_ptr().add(i + h), ls[1].as_ptr().add(i + h), ls[2].as_ptr().add(i + h)], out.as_mut_ptr().add(i + h)),
+                        }
+                    }
+                    if present {
+                        neon::present_app16(out.as_ptr().add(i), row.as_mut_ptr().add(x), t0, t1, cm);
+                    }
+                }
+            }
+        });
+        let wrong = (0..rows).flat_map(|y| (0..w).map(move |x| y * width + x)).filter(|&i| out[i] != reference(ls, i)).count() as u64;
+        (c, wrong)
+    };
+    let (two, two_wrong) = walk(&[&content, &noise], false);
+    let (three, three_wrong) = walk(&[&chrome, &content, &noise], false);
+    let (two_p, _) = walk(&[&content, &noise], true);
+    let (three_p, _) = walk(&[&chrome, &content, &noise], true);
+    let dec2 = |log: &mut Log, v: u64| {
+        log.dec(v / 100);
+        log.s(b".");
+        log.s(&[b'0' + (v / 10 % 10) as u8, b'0' + (v % 10) as u8]);
+    };
+    log.s(b"display: under bench (B+, 64 rows warm, cycles a pixel): two layers ");
+    dec2(log, per(two));
+    log.s(b", three ");
+    dec2(log, per(three));
+    log.s(b"; with the present after, two ");
+    dec2(log, per(two_p));
+    log.s(b", three ");
+    dec2(log, per(three_p));
+    log.s(b"; pixels unlike the scalar walk A#");
+    log.dec(two_wrong + three_wrong);
+    log.s(b"\n");
+    log.flush();
+}
+
 /// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers, and from its source once the brightness settles (`wall_refresh`); the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
 fn rebake(width: usize, height: usize) {
     let decode = icon_decode();
@@ -8347,10 +8450,11 @@ fn server(grants: u64) -> ! {
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
-    // The present before and after the bake, measured on this core once (development builds), its scratch freed with the frame's.
+    // The present before and after the bake, and B+'s under walk (`under_bench`), measured on this core once (development builds), their scratch freed with the frame's.
     if DEV {
         ferros_sys::sleep_until(now() + freq() / 1000);
         present_bench(width, &mut log);
+        under_bench(width, &mut log);
         ALLOC.reset();
     }
     // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen says when it opens (op 42).
