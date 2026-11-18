@@ -36,20 +36,78 @@ fn addr(source: &[u8; 32], number: u8) -> [u8; 32] {
     *blake3::Hasher::new_derive_key(ADDR_CONTEXT).update(source).update(&[number]).finalize().as_bytes()
 }
 
-/// A note kept in the vault (`doc`) or gone from it (None). A vault that refuses says so on the console: the note stands in RAM, unkept.
+/// A note kept in the vault (`doc`) or gone from it (None), queued under the kernel lock and written with it let go, under the vault's lock alone (`flush_held`, `flush`). A vault that refuses says so in the flash log: the note stands in RAM, unkept.
 /// A system question (source `note::SYSTEM`) is never written: it lasts as long as what asks it (an offer, an open sheet, a device asking), none of which outlives the map or the device restarting, and the map posts again whatever still waits (docs/NOTIFY.md "System questions"). Its removal still goes to the vault, for one a kernel from before kept.
+/// Until 2026-11-18 written here, under the kernel lock: a note's write waited for the vault's lock behind the service loop's reads (the AoC's firmware held it 149 ms), every core waiting with it.
 fn keep(source: &[u8; 32], number: u8, doc: Option<&[u8]>) {
     if *source == note::SYSTEM && doc.is_some() {
         return;
     }
+    if unsafe { STORE_ADDR }.is_none() {
+        return;
+    }
+    unsafe { (*(&raw mut OUT)).push((addr(source, number), doc.map(|d| d.to_vec()))) };
+}
+
+/// Note writes made under the kernel lock (`keep`), oldest first, waiting to be written with it let go. Under the kernel lock.
+static mut OUT: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::new();
+/// Whether a core is writing `OUT`'s notes now: one writer at a time, which takes the queue again until it finds it empty, so the writes land in the order they were made. Under the kernel lock.
+static mut FLUSHING: bool = false;
+
+/// `batch` into the vault, each write under the vault's lock (service.rs `store_addr`). Not holding the kernel lock.
+fn write_out(batch: Vec<([u8; 32], Option<Vec<u8>>)>) {
     let Some(store) = (unsafe { STORE_ADDR }) else { return };
-    let a = addr(source, number);
-    let ok = match doc {
-        Some(d) => store(PREFIX, &a, AddrOp::Set(d)).is_ok(),
-        None => store(PREFIX, &a, AddrOp::Remove).is_ok(),
-    };
-    if !ok {
-        crate::flashlog::line("notify: the vault did not take a note's change");
+    for (a, doc) in batch {
+        let ok = match doc {
+            Some(d) => store(PREFIX, &a, AddrOp::Set(&d)).is_ok(),
+            None => store(PREFIX, &a, AddrOp::Remove).is_ok(),
+        };
+        if !ok {
+            crate::flashlog::line("notify: the vault did not take a note's change");
+        }
+    }
+}
+
+/// The trap's end, holding the kernel lock (process.rs `ferros_el0_trap`): the notes' writes made meanwhile, with the lock let go (`unlocked`: only the queue's own bytes in the heap, no table, no process memory), before the caller goes on.
+/// A core that finds another writing leaves its writes to it: the writer takes the queue again under the lock before it stops.
+pub(super) fn flush_held() {
+    unsafe {
+        if FLUSHING || (*(&raw const OUT)).is_empty() {
+            return;
+        }
+        FLUSHING = true;
+        loop {
+            let batch = core::mem::take(&mut *(&raw mut OUT));
+            if batch.is_empty() {
+                break;
+            }
+            unlocked(|| write_out(batch));
+        }
+        FLUSHING = false;
+    }
+}
+
+/// `flush_held` for a caller not holding the kernel lock (the development commands, service.rs).
+fn flush() {
+    if !with_lock(|| unsafe {
+        let go = !FLUSHING && !(*(&raw const OUT)).is_empty();
+        FLUSHING |= go;
+        go
+    }) {
+        return;
+    }
+    loop {
+        let batch = with_lock(|| unsafe {
+            let b = core::mem::take(&mut *(&raw mut OUT));
+            if b.is_empty() {
+                FLUSHING = false;
+            }
+            b
+        });
+        if batch.is_empty() {
+            return;
+        }
+        write_out(batch);
     }
 }
 
@@ -60,6 +118,7 @@ fn ring() -> u64 {
 }
 
 /// The person's notes in RAM while one is present, loaded once an unlock; nothing while nobody is (wiped, with what each kist had opened and its budget). Then every note past its deadline dropped. Under the kernel lock.
+/// The load is made before, with the kernel lock let go (`preload_held`, `preload`); one made here, under the lock, is the fallback for an identity locked and unlocked again during that read, which it then discarded.
 fn ensure() {
     let present = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
     unsafe {
@@ -74,18 +133,37 @@ fn ensure() {
             return;
         }
         if !LOADED {
-            LOADED = true;
-            load();
+            install(read_kept(), crate::process::LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire));
         }
     }
     expire();
 }
 
-/// Every note kept for the person, read from the vault in the order they were posted.
-fn load() {
-    let Some(store) = (unsafe { STORE_ADDR }) else { return };
-    let Ok(Some(list)) = store(PREFIX, &[0; 32], AddrOp::List) else { return };
+/// Whether the person's notes are still to be read from the vault, and the identity's lock count they would be read under. Under the kernel lock (an unlock and a lock hold it).
+fn wants_load() -> Option<u32> {
+    (crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) && !unsafe { LOADED }).then(|| crate::process::LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire))
+}
+
+/// SYS_NOTIFY's start, holding the kernel lock, before the syscall takes any reference into the tables (process.rs `ferros_el0_trap`): the person's notes read with the lock let go (`unlocked`: the vault under its own lock, the notes into the heap).
+/// Until 2026-11-18 read under the kernel lock at the first op: 71 ms at a boot, waiting for the vault's lock behind a capsule's read.
+pub(super) fn preload_held() {
+    let Some(epoch) = wants_load() else { return };
+    let got = unlocked(read_kept);
+    install(got, epoch);
+}
+
+/// `preload_held` for a caller not holding the kernel lock.
+fn preload() {
+    let Some(epoch) = with_lock(wants_load) else { return };
+    let got = read_kept();
+    with_lock(|| install(got, epoch));
+}
+
+/// Every note kept for the person, read from the vault in the order they were posted; a system question a kernel from before kept removed. Not holding the kernel lock but in `ensure`'s fallback: each read under the vault's lock.
+fn read_kept() -> Vec<Note> {
     let mut got: Vec<Note> = Vec::new();
+    let Some(store) = (unsafe { STORE_ADDR }) else { return got };
+    let Ok(Some(list)) = store(PREFIX, &[0; 32], AddrOp::List) else { return got };
     for c in list.chunks_exact(32) {
         let a: [u8; 32] = c.try_into().unwrap();
         // A record that does not read as a note (a vault from a later kernel, a torn write) is not shown; it stays until the person's next look at its kist removes it by its address.
@@ -101,6 +179,17 @@ fn load() {
         }
     }
     got.sort_by_key(|n| n.posted.unwrap_or(0));
+    got
+}
+
+/// The notes read (`read_kept`) into RAM, under the kernel lock: only while the person they were read for is still present (no lock of the identity since, `epoch`) and nothing loaded them meanwhile; otherwise they go unused.
+fn install(got: Vec<Note>, epoch: u32) {
+    unsafe {
+        if LOADED || !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) || crate::process::LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire) != epoch {
+            return;
+        }
+        LOADED = true;
+    }
     for n in got {
         let seq = ring();
         notes().push(Kept { note: n, seq });
@@ -109,7 +198,6 @@ fn load() {
         crate::flashlog::line(&alloc::format!("notify: A#{} notes waiting on the person, from the vault", notes().len()));
     }
 }
-
 /// Notes past their deadline gone, from RAM and the vault, and the bell rung if any went.
 fn expire() {
     let now = crate::settings::eagle_now();
@@ -322,19 +410,23 @@ pub(super) fn syscall(f: &mut Frame, p: &Process, pi: usize) {
 
 /// The development command's post (`diag "notify …"`, service.rs): a note from the system on behalf of `source`, of `kind`, with `words`. The number | kind << 8, or NOTHING / ERR as op 0. Takes the kernel lock.
 pub fn post_system(source: [u8; 32], kind: u8, person: bool, words: &str) -> u64 {
-    with_lock(|| {
+    preload();
+    let r = with_lock(|| {
         ensure();
         let n = Note { kind, person: person.then_some([1; 32]), words: Some(alloc::string::String::from(words)), count: 1, ..Default::default() };
         match note::build(&n, crate::settings::eagle_now()) {
             Some(doc) => post(source, &doc, None),
             None => ERR,
         }
-    })
+    });
+    flush();
+    r
 }
 
 /// `diag "notify"`: the notes waiting and the kists alive (by name and capsule's first bytes, to name one in a post). Takes the kernel lock.
 pub fn report() -> alloc::string::String {
-    with_lock(|| {
+    preload();
+    let s = with_lock(|| {
         ensure();
         let mut s = alloc::format!("notify: A#{} notes waiting\n", notes().len());
         for k in notes().iter() {
@@ -348,7 +440,9 @@ pub fn report() -> alloc::string::String {
             }
         }
         s
-    })
+    });
+    flush();
+    s
 }
 
 /// A kind's name for the console.
@@ -393,8 +487,11 @@ pub fn kist_named(name: &[u8]) -> Option<[u8; 32]> {
 
 /// `diag "notify clear <kist>"`: every note of that kist gone, as if the person had looked. How many went. Takes the kernel lock.
 pub fn clear(source: [u8; 32]) -> u64 {
-    with_lock(|| {
+    preload();
+    let r = with_lock(|| {
         ensure();
         seen(&source, 0xFF, false)
-    })
+    });
+    flush();
+    r
 }

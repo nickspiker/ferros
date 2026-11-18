@@ -143,6 +143,8 @@ fn unlock() {
     HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
+    // The flash log lines this core said while it held the lock, written now that every other core may go on (flashlog.rs `deferred`).
+    crate::flashlog::deferred();
 }
 
 /// A lock site word as text (`proc* line A#2033`): the four bytes of the file's name it keeps, then the line.
@@ -169,6 +171,11 @@ pub fn site_text_of(w: u64) -> alloc::string::String {
 /// Per core: the storage locks it holds, bit r for rank r.
 static RANKS: [core::sync::atomic::AtomicU32; 16] = [const { core::sync::atomic::AtomicU32::new(0) }; 16];
 
+/// Whether this core holds a storage lock of rank `r` or above.
+pub fn ranks_from(r: u32) -> bool {
+    RANKS[core()].load(core::sync::atomic::Ordering::Relaxed) >> r != 0
+}
+
 /// A storage lock (above): a spinlock with its rank, its holder and its measures.
 pub struct Rank {
     rank: u32,
@@ -190,6 +197,11 @@ impl Rank {
     const fn new(rank: u32, name: &'static str) -> Self {
         use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
         Rank { rank, name, word: AtomicBool::new(false), holder: AtomicUsize::new(0), at: AtomicU64::new(0), site: AtomicU64::new(0), holds: AtomicU64::new(0), max: AtomicU64::new(0), max_site: AtomicU64::new(0), kernel_waits: [const { AtomicU64::new(0) }; 4] }
+    }
+
+    /// Its rank (above).
+    pub fn rank(&self) -> u32 {
+        self.rank
     }
 
     /// Whether this core holds it.
@@ -3938,8 +3950,9 @@ pub struct PowerSwitch {
 /// Since 2026-11-18 also:
 /// - the sensors' (sensorlink.rs `power`): it sets one atomic for the service loop (`START`) and touches no hardware at all; the AoC's start it asks for is the service loop's, on this same core.
 /// - the camera's (camera_power.rs; 43 ms of the kernel lock at an open, `diag lock`), kept under the lock until now because its region's fence, under the kernel lock on any core (`cam_ask`, `cam_free`), writes the S2MPUs the switch also writes. The fence and the region it follows now have a lock of their own (`FENCE`), which both sides take, so the lock that kept them apart is no longer the kernel's; the S2MPUs sit in the front end's domain, which the switch brings on once and never gates again (`FE_ON`), so a fence from another core never finds it down. The rest of the switch is the camera PMIC's bus (hsi2c_14, shared with the torch, whose switch is refused while this one holds it, both on the kernel's core), ACPM (the kernel's core alone), the domain's EL3 calls (the pd gating pass, the kernel's core alone), and the front end's clocks, sysmmus, engine and receiver, which no path under the kernel lock touches.
-/// Not the USB link's, the display's, the panel's nor android's: unaudited, they keep the lock.
-const SWITCH_UNLOCKED: [&str; 8] = ["gps", "nfc", "bt", "touch", "amp", "torch", "sensors", "camera"];
+/// - the USB link's (ptlink.rs `power`; 11 ms of the kernel lock at a reload's boot, `diag lock`, the eUSB2 PHY's and the repeater's waits): its link reset, the one piece of the lock's state it touches, is taken under the lock inside it (`with_lock_held_or`); the rest is hsi2c_11 (the TCPC and the repeater, which only the kernel's core reaches: the battery gauge's polls and the diag commands are the service loop's), ACPM (the kernel's core only, as for the camera's), the eUSB2 PHY, the controller's DCTL and HSI0's S2MPU and SYSMMU, which nothing else in the kernel writes after boot.
+/// Not the display's (`dpu`: EL3 calls into the PMU, which a via-EL3 grant's SYS_MMIO on another core also makes), the panel's (its reset line shares GPA6_CON with the volume-up key's pin mode) nor android's: unaudited, they keep the lock.
+const SWITCH_UNLOCKED: [&str; 9] = ["gps", "nfc", "bt", "touch", "amp", "torch", "sensors", "camera", "usb"];
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
@@ -4267,6 +4280,10 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     }
     // What this hold is (devsched `WHAT`, `diag lock`): the syscall, its x1's low byte, the thread.
     crate::devsched::WHAT.store(1 << 63 | (f.x[8] & 0xFF) | (f.x[1] & 0xFF) << 8 | (cur_get().unwrap_or(0xFFFF) as u64 & 0xFFFF) << 16, core::sync::atomic::Ordering::Relaxed);
+    // SYS_NOTIFY's first op of an unlock reads the person's notes from the vault: here, before `el0_trap` takes any reference into the tables, with the lock let go (notify.rs `preload_held`); a process ended meanwhile is drained at `el0_trap`'s entry.
+    if f.x[8] == SYS_NOTIFY && (f.esr >> 26) & 0x3F == 0x15 {
+        notify::preload_held();
+    }
     let r = el0_trap(f);
     // A kept setting changed (`keep_settings`): the document as it stands, snapshotted under the lock, then written with the lock let go and interrupts open (`unlocked`: no table is touched, only the document in the heap, under the vault's lock), before the caller goes on.
     // A write that failed answers ERR, to the thread that asked if it is still the one here (the four calls that ask never switch).
@@ -4282,6 +4299,8 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             }
         }
     }
+    // The notes' vault writes this syscall made (notify.rs `keep`), the same way.
+    notify::flush_held();
     unlock();
     crate::prof::leave();
     if r == 0 {
@@ -6672,7 +6691,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         kk.console.push(b'\n');
         pstore_since(at);
-        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Under the kernel lock, which the log's UFS commands need.
+        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Said under the kernel lock, written once this core lets it go (flashlog.rs `deferred`).
         crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
         let last = p.words.clone();
         vault_ended(p, value);

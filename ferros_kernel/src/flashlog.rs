@@ -2,7 +2,7 @@
 //!
 //! Every line is a ledger entry (ferros_ledger): a complete VSF document with the boot, the Eagle time, the writer, a category and the words, sealed, and chained by BLAKE3 to the entry before.
 //! The region is in the ferros partition from 1 GiB + 64 MiB in: two copies of 2^14 blocks (64 MiB each), a ring that wraps; the head is found by the chain, a torn last write is named and skipped (ferros_ledger::ring).
-//! An entry is on the flash, in both copies and the first read back, before `line` returns.
+//! An entry is on the flash, in both copies and the first read back, before `line` returns; one said while the kernel lock is held, once that core lets the lock go (`deferred`).
 //!
 //! Sealing (LEDGER.md "Classes"): a system entry under a key derived from the ira (`system_key`, the one place it is made), a personal entry under the attested person's ledger key (`set_personal`, from kvault's unlock).
 //! Nothing reaches the flash unsealed: what is said before the ira is held waits in the pre-boot buffer (and goes to the RAM log), and is written, sealed and in order, the moment the ira is up (`flush`, from vault boot).
@@ -174,7 +174,7 @@ pub fn boot() -> u64 {
 
 /// One line of the kernel's words, category `text`.
 /// Under the flash log's own lock (process.rs `LOG`), each block a command under the UFS lock: the ring's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block").
-/// Until 2026-11-18 under the kernel lock, so every core waited out each line (to 0.66 ms, `diag lock`); a line from a syscall still holds the kernel lock while it is written.
+/// Until 2026-11-18 under the kernel lock, so every core waited out each line (to 0.66 ms, `diag lock`); a line said holding the kernel lock (a syscall's) is written once its core lets the lock go (`DEFERRED`).
 pub fn line(text: &str) {
     put(category::TEXT, "kernel", text)
 }
@@ -189,12 +189,36 @@ pub fn personal(text: &str) {
     put(category::PERSON_TEXT, "kernel", text)
 }
 
+/// Per core: the lines said while it held the kernel lock (a syscall's, a process's end), with the counter at each, written once it lets the lock go (`deferred`, from process.rs `unlock`). Touched by its own core only, which holds the kernel lock while it adds one.
+/// Why (the Pro, 2026-11-18, `diag lock`): each line is a UFS write and its read back, 0.7 to 1.3 ms, and written under the kernel lock every core waited it out: a process's end held the lock 1.0 to 1.56 ms, a driver's kept console line 1 ms. Now only the core that said it waits, and the line keeps the time it was said at.
+static mut DEFERRED: [Vec<(Category, String, String, u64)>; 16] = [const { Vec::new() }; 16];
+
 fn put(c: Category, writer: &str, words: &str) {
-    crate::process::LOG.with(|| put_locked(c, writer, words))
+    let tick = crate::platform::cntpct();
+    let me = crate::process::core();
+    if crate::process::holder() == me + 1 {
+        unsafe { (*(&raw mut DEFERRED))[me].push((c, writer.into(), words.into(), tick)) };
+        return;
+    }
+    crate::process::LOG.with(|| put_locked(c, writer, words, tick))
 }
 
-fn put_locked(c: Category, writer: &str, words: &str) {
-    let tick = crate::platform::cntpct();
+/// The lines this core said under the kernel lock (`DEFERRED`), in the order said, now that it let the lock go (process.rs `unlock`, after the lock is free). Not while it holds the flash log's lock or a storage lock above it (a ring append under way, or the UFS): they wait for its next unlock.
+pub fn deferred() {
+    let me = crate::process::core();
+    let q = unsafe { &mut (*(&raw mut DEFERRED))[me] };
+    if q.is_empty() || crate::process::ranks_from(crate::process::LOG.rank()) {
+        return;
+    }
+    let lines = core::mem::take(q);
+    crate::process::LOG.with(|| {
+        for (c, writer, words, tick) in lines {
+            put_locked(c, &writer, &words, tick);
+        }
+    })
+}
+
+fn put_locked(c: Category, writer: &str, words: &str, tick: u64) {
     match c.class {
         Class::Personal => {
             // Never the RAM log, never the pre-boot buffer: the person's words go sealed to the flash or nowhere.
