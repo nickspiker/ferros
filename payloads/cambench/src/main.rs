@@ -23,12 +23,12 @@ use ferros_cam::raw;
 use ferros_sys::{call, cap, console, ERR};
 
 struct Line {
-    b: [u8; 256],
+    b: [u8; 512],
     n: usize,
 }
 impl Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // WHY the min: a formatted line longer than the 256-byte buffer would index past it and panic the process; the console gets the line cut instead.
+        // WHY the min: a formatted line longer than the 512-byte buffer would index past it and panic the process; the console gets the line cut instead.
         let k = s.len().min(self.b.len() - self.n);
         self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
         self.n += k;
@@ -37,7 +37,7 @@ impl Write for Line {
 }
 macro_rules! say {
     ($g:expr, $($t:tt)*) => {{
-        let mut l = Line { b: [0; 256], n: 0 };
+        let mut l = Line { b: [0; 512], n: 0 };
         let _ = write!(l, $($t)*);
         console($g, &l.b[..l.n]);
     }};
@@ -165,6 +165,7 @@ fn part(k: usize, src: usize) {
     let fold = FOLD.load(Ordering::Relaxed) == 1;
     let (a16, a32) = (ACC16.load(Ordering::Relaxed) as *mut u16, ACC32.load(Ordering::Relaxed) as *mut u32);
     let (mut rt, mut at) = (0u64, 0u64);
+    let pm0 = pmu_now();
     for y in k * rows / threads..(k + 1) * rows / threads {
         let t = ferros_sys::now();
         let l = read_line(k, src + y * line, line);
@@ -188,6 +189,30 @@ fn part(k: usize, src: usize) {
     }
     READ_T[k].fetch_add(rt, Ordering::Relaxed);
     ADD_T[k].fetch_add(at, Ordering::Relaxed);
+    let pm1 = pmu_now();
+    for (s, (a, b)) in PMU_T[k].iter().zip(pm0.iter().zip(pm1.iter())) {
+        s.fetch_add(b - a, Ordering::Relaxed);
+    }
+    BUSY_T[k].fetch_add(rt + at, Ordering::Relaxed);
+}
+
+/// The PMU counts a thread takes over its shares (docs/CAMERA.md "The slowdown"): the cycles, then the events `pmu_program` sets: instructions, backend stall cycles, L2 refills, L3 refills.
+const PMU_N: usize = 5;
+const PMU_EVENTS: [u32; PMU_N - 1] = [ferros_sys::pmu::INST_RETIRED, ferros_sys::pmu::STALL_BACKEND, 0x17, 0x2A];
+static PMU_T: [[AtomicU64; PMU_N]; THREADS_MOST] = [const { [const { AtomicU64::new(0) }; PMU_N] }; THREADS_MOST];
+/// Each thread's counter ticks in its shares (reading and adding): the time its cycles are over.
+static BUSY_T: [AtomicU64; THREADS_MOST] = [const { AtomicU64::new(0) }; THREADS_MOST];
+
+/// This core's event counters set to `PMU_EVENTS` (each thread on its own core, pinned, before its first share).
+fn pmu_program() {
+    for (n, &e) in PMU_EVENTS.iter().enumerate() {
+        ferros_sys::pmu::program(n as u32, e);
+    }
+}
+
+fn pmu_now() -> [u64; PMU_N] {
+    use ferros_sys::pmu::{cycles, read};
+    [cycles(), read(0), read(1), read(2), read(3)]
 }
 /// The frame's width (the RAW12 add's sample count).
 static COLS: AtomicU64 = AtomicU64::new(0);
@@ -195,6 +220,9 @@ static COLS: AtomicU64 = AtomicU64::new(0);
 extern "C" fn worker(k: u64) -> ! {
     // One A715 each (the cores `CORES_WORKERS` names: 4 to 7), the main thread on the first.
     ferros_sys::pin(1 << (FIRST_CORE.load(Ordering::Relaxed) + k));
+    // A sleep so the next run lands on the pinned core, whose counters these are.
+    ferros_sys::sleep_until(ferros_sys::now() + (ferros_sys::freq() >> 10));
+    pmu_program();
     let mut seen = 0;
     loop {
         let job = JOB.load(Ordering::Acquire);
@@ -317,7 +345,7 @@ fn caps(g: u64, ep: u64) {
     }
     let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
     let count = (c[1] & 0xF) as usize;
-    let mut l = Line { b: [0; 256], n: 0 };
+    let mut l = Line { b: [0; 512], n: 0 };
     let _ = write!(l, "cambench: CAPS: data format model G#{:02X} G#{:02X}, A#{count} formats:", c[0], c[1]);
     for k in 0..count {
         let _ = write!(l, " G#{:04X}", be(2 + 2 * k));
@@ -367,6 +395,32 @@ fn close(g: u64, ep: u64) {
     }
 }
 
+/// Every 64 frames (docs/CAMERA.md "The slowdown"): the work a frame over the window, the MAP's wait, the frames skipped, and per thread its real clock (its cycles over its shares' time), instructions a cycle, backend stalls a cycle, and L2 and L3 refills a frame. `pm` and `busy` hold the counts at the window's start and are moved on.
+/// `w`: the work's ticks and its most, the MAP's ticks, the frames skipped, the ticks since the open, the frames in the window.
+fn window(g: u64, got: u64, pm: &mut [[u64; PMU_N]; THREADS_MOST], busy: &mut [u64; THREADS_MOST], w: (u64, u64, u64, u64, u64, u64)) {
+    let hz = ferros_sys::freq();
+    let us = |t: u64| t * 1_000_000 / hz;
+    let (work, most, map, skip, since, n) = w;
+    let mut l = Line { b: [0; 512], n: 0 };
+    // n is 64 (a window ends every 64 frames), never none.
+    let _ = write!(l, "cambench: window to frame A#{got} (A#{} ms in): work A#{} us a frame (most A#{}), MAP A#{} us, skipped A#{skip};", us(since) / 1000, us(work / n), us(most), us(map / n));
+    for k in 0..THREADS.load(Ordering::Relaxed) as usize {
+        let now: [u64; PMU_N] = core::array::from_fn(|e| PMU_T[k][e].load(Ordering::Relaxed));
+        let b = BUSY_T[k].load(Ordering::Relaxed);
+        let d: [u64; PMU_N] = core::array::from_fn(|e| now[e] - pm[k][e]);
+        let bt = b - busy[k];
+        pm[k] = now;
+        busy[k] = b;
+        // WHY the zero: a thread given no rows (more threads than rows) has no time and no cycles.
+        if bt == 0 || d[0] == 0 {
+            continue;
+        }
+        let _ = write!(l, " t{k} A#{} MHz ipc A#{} stall A#{} L2r A#{}k L3r A#{}k;", d[0] * hz / bt / 1_000_000, d[1] * 256 / d[0], d[2] * 256 / d[0], d[3] / n / 1000, d[4] / n / 1000);
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
+
 /// Whole frames: MAP each, read and add it across the threads, and say what it cost. True when the stream ran.
 fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
     let blocks = raw::blocks(v.w);
@@ -393,8 +447,14 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
     let (mut held, mut got, mut skipped, mut last) = (0xFFu8, 0u64, 0u64, 0u32);
     let (mut work_t, mut work_most, mut first_t, mut last_t) = (0u64, 0u64, 0u64, 0u64);
     let (mut differ, mut checked, mut check_t) = (0u64, 0u64, 0u64);
+    pmu_program();
+    let (mut win_t, mut win_most, mut win_map, mut win_skip, mut win_k0) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut win_pm = [[0u64; PMU_N]; THREADS_MOST];
+    let mut win_busy = [0u64; THREADS_MOST];
+    let t_open = ferros_sys::now();
     let mut h = [0u8; 64];
     for k in 0..a.frames {
+        let t_map = ferros_sys::now();
         let n = call(ep, &[OP_MAP, held], &mut h);
         if n == ERR || n < 64 {
             say!(g, "cambench: MAP A#{k}: no frame (G#{:X})\n", n);
@@ -402,11 +462,13 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
         }
         let now = ferros_sys::now();
         held = h[40];
+        win_map += now - t_map;
         let count = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
         if k == 0 {
             first_t = now;
         } else {
             skipped += count.wrapping_sub(last).wrapping_sub(1) as u64;
+            win_skip += count.wrapping_sub(last).wrapping_sub(1) as u64;
         }
         last = count;
         last_t = now;
@@ -429,6 +491,12 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
             let t = ferros_sys::now() - now;
             work_t += t;
             work_most = work_most.max(t);
+            win_t += t;
+            win_most = win_most.max(t);
+            if got % 64 == 0 {
+                window(g, got, &mut win_pm, &mut win_busy, (win_t, win_most, win_map, win_skip, now - t_open, got - win_k0));
+                (win_t, win_most, win_map, win_skip, win_k0) = (0, 0, 0, 0, got);
+            }
             if a.check {
                 let (d, t) = check(v, src, k);
                 differ += d as u64;
