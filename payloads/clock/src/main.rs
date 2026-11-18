@@ -255,9 +255,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if let Some(glyphs) = common::glyphs() {
                 let t0 = ferros_sys::now();
                 let r = common::rt::show_with(link, &v, |px, d, turn| face(px, d, turn, &tm, th, glyphs));
-                // The first squares and every 64th after: its side, how long the face and the hand-over took, and the display's answer (a measure for the 8a, 2026-11-18).
+                // The first squares and every 1024th after (about every 100 s at the flips): its side, how long the face and the hand-over took, and the display's answer (a measure for the 8a, 2026-11-18).
                 shown += 1;
-                if shown <= 4 || shown % 64 == 0 {
+                if shown <= 4 || shown % 1024 == 0 {
                     let mut l = [0u8; 96];
                     let n = line(&mut l, &[b"clock: square ", &dec(shown), b": ", &dec(v.d as u64), b" px in ", &dec(ferros_sys::us_since(t0)), b" us, answer ", &dec(r.map_or(9, |s| s as u64)), b"\n"]);
                     common::say(grants, &l[..n]);

@@ -9738,18 +9738,23 @@ fn server(grants: u64) -> ! {
             rebake_replay = false;
             replay(&mut handle);
         }
-        // The pucks (puck.rs): an app in front hides every puck's circle and the deck coming back shows them (`covered`); a square handed over is taken (`due`), or gravity turned the faces by half a pixel at the largest puck's rim (`regravity`): the deck's last frame drawn again, the pucks' sprites keyed afresh. Only when the deck is what shows; under an app the next frame of the deck draws them.
+        // The pucks (puck.rs): an app in front hides every puck's circle and the deck coming back shows them (`covered`); gravity turns the pucks' faces by themselves (`regravity`: their views told, their boxes owed to every phase); a binding, a puck gone or, without the flips, a new square (`due`): the deck's last frame drawn again, the pucks' sprites keyed afresh. Only when the deck is what shows; under an app the next frame of the deck draws them.
         let app_up = unsafe { (*(&raw const APP)).is_some() };
         puck::covered(app_up || screen_off);
-        let puck_due = puck::due();
+        // With the temporal flips a new square is drawn into each phase at its flip, the puck's box alone (below, `puck::phase_due`); without them only a whole redraw carries it.
+        let flips = unsafe { TEMPORAL } && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
+        let puck_due = puck::due(!flips);
         // The last frame, or when the glows or the scene have come since and emptied it, the last plain deck frame (`LAST_DECK`), drawn with the scene and glows as they are now.
-        if (puck_due | puck::regravity(unsafe { GRAV_TURN })) && !screen_off && !app_up {
+        puck::regravity(unsafe { GRAV_TURN });
+        if puck_due && !screen_off && !app_up {
             if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
                 unsafe { LAST_FRAME = LAST_DECK };
             }
             if unsafe { LAST_FRAME.1 > 0 } {
                 puck::count(3);
                 replay(&mut handle);
+                // A whole frame: every phase gets every puck's newest square as it is published.
+                puck::phase_drew(0, true);
             }
         }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
@@ -9821,6 +9826,34 @@ fn server(grants: u64) -> ! {
                         CLIP_US = [0; 2];
                         CLOCK_PART_US = [0; 2];
                     }
+                }
+            }
+        }
+        // The pucks between frames (puck.rs): when this pass will flip, each puck whose newest square the phase about to show does not hold yet is drawn again there, its box alone (`draw::CLIP`, `CLIP_PHASE`, as the clock's wedges were), so a square costs its own circle's pixels, not the deck's (the 8a, 2026-11-18: a whole redraw per square was 35 to 46 ms of scene and 34 to 41 ms of publish at about ten squares a second).
+        if flip_due && !screen_off && unsafe { (*(&raw const APP)).is_none() } {
+            if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
+                unsafe { LAST_FRAME = LAST_DECK };
+            }
+            if unsafe { LAST_FRAME.1 > 0 } {
+                let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                let mut boxes = [draw::Rect::EMPTY; puck::N];
+                let nb = puck::phase_due(k, width, height, &mut boxes);
+                let t_box = now();
+                for clip in boxes[..nb].iter().filter(|c| !c.is_empty()) {
+                    puck::count(4);
+                    unsafe {
+                        draw::CLIP = *clip;
+                        CLIP_PHASE = Some(k);
+                    }
+                    replay(&mut handle);
+                    unsafe {
+                        CLIP_PHASE = None;
+                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                    }
+                }
+                if nb > 0 {
+                    puck::phase_drew(k, false);
+                    puck::count_us(ferros_sys::us_since(t_box));
                 }
             }
         }
@@ -10158,6 +10191,11 @@ fn server(grants: u64) -> ! {
                 tlog.dec(pc[2]);
                 tlog.s(b" told, replays ");
                 tlog.dec(pc[3]);
+                tlog.s(b" whole and ");
+                tlog.dec(pc[4]);
+                tlog.s(b" of a box (");
+                tlog.dec(if pc[4] > 0 { pc[5] / pc[4] } else { 0 });
+                tlog.s(b" us each)");
                 tlog.s(b"; last frame held ");
                 tlog.dec(unsafe { LAST_FRAME.1 } as u64);
                 tlog.s(b" bytes, last emptied by op ");

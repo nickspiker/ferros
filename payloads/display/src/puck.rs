@@ -280,7 +280,7 @@ extern "C" fn receive(grants: u64) -> ! {
                 }
                 e.pending = Some((sq, tok));
                 unlock();
-                DIRTY.store(true, Ordering::Release);
+                // The render thread takes it at its next pass (`due`); drawn into the phases at the flips, not a whole frame.
                 ring_bell();
             }
             _ => {
@@ -347,8 +347,8 @@ pub fn frame() {
     unlock();
 }
 
-/// The top of a render pass: every square handed over is taken (from here on this server reads it, and its puck may draw elsewhere: answered), and a square whose puck has ended is dropped. Whether a puck's picture changed since the last frame (the render thread draws the frame again when so).
-pub fn due() -> bool {
+/// The top of a render pass: every square handed over is taken (from here on this server reads it, and its puck may draw elsewhere: answered), and a square whose puck has ended is dropped. Whether the deck must be drawn again whole (a binding, a puck gone, or `whole`: a new square too, for a display with no flips to carry it); a new square alone is otherwise drawn into each phase at its flip (`phase_due`), the puck's box alone.
+pub fn due(whole: bool) -> bool {
     let mut any = DIRTY.swap(false, Ordering::AcqRel);
     let es = lock();
     for e in es.iter_mut() {
@@ -357,7 +357,7 @@ pub fn due() -> bool {
             e.seq = e.seq.wrapping_add(1);
             ferros_sys::reply(&tok, &[call::OK]);
             count(0);
-            any = true;
+            any |= whole;
         }
         if e.cur.is_some_and(|sq| !live(&sq)) {
             e.cur = None;
@@ -488,23 +488,45 @@ pub fn covered(now: bool) {
 /// The gravity turn the pucks' faces were last drawn at.
 static mut GRAV_DRAWN: Option<(i64, i64)> = None;
 
-/// Whether gravity has turned the faces by half a pixel at the largest puck's rim since they were last drawn (then they are drawn again, and each puck hears its new turn from the scene).
-pub fn regravity(turn: Option<(i64, i64)>) -> bool {
+/// Gravity turned the faces by half a pixel at the largest puck's rim since they were last drawn: each puck on the glass hears its new turn, and its box is owed to every phase (its sprite turns with it), drawn at the flips as a new square is, never the whole deck (the 8a, 2026-11-18: gravity moved by that much on nearly every pass and each was a whole redraw). Only the pucks turn by gravity.
+pub fn regravity(turn: Option<(i64, i64)>) {
     let was = unsafe { GRAV_DRAWN };
-    let (Some((c, s)), Some((pc, ps))) = (turn, was) else {
-        unsafe { GRAV_DRAWN = turn };
-        return turn != was && largest_r() > 0;
-    };
-    // sin of the angle between them, Q28, times the radius (Q8): past half a pixel (2^27 · 2^8) the faces would draw differently.
-    if (c * ps - s * pc).abs() * largest_r() >= 1 << 35 {
-        unsafe { GRAV_DRAWN = turn };
-        return true;
+    let Some((c, s)) = turn else { return };
+    if let Some((pc, ps)) = was {
+        // sin of the angle between them, Q28, times the radius (Q8): under half a pixel (2^27 · 2^8) the faces draw the same.
+        if (c * ps - s * pc).abs() * largest_r() < 1 << 35 {
+            return;
+        }
     }
-    false
+    unsafe { GRAV_DRAWN = turn };
+    let bound = unsafe { &*(&raw const BOUND) };
+    let es = lock();
+    for j in 0..N {
+        let shown = unsafe { SEEN[j].shown };
+        if bound[j] == [0; 64] || !shown {
+            continue;
+        }
+        unsafe {
+            SEEN[j].c = c as i16;
+            SEEN[j].s = s as i16;
+            GEOM[j].3 = c;
+            GEOM[j].4 = s;
+            for p in 0..4 {
+                PHASE_SEQ[p][j] = 0;
+            }
+        }
+        if let Some(e) = es.iter_mut().find(|e| e.id == bound[j]) {
+            e.view.c = c as i16;
+            e.view.s = s as i16;
+            tell(e);
+            count(2);
+        }
+    }
+    unlock();
 }
 
-/// What the pucks did since the last read (`counts`): squares taken, frames told, views told, replays they caused. For the display's ten-second line.
-static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// What the pucks did since the last read (`counts`): squares taken, frames told, views told, whole redraws they caused, boxes drawn into a phase at its flip. For the display's ten-second line.
+static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// One more of count `k`.
 pub fn count(k: usize) {
@@ -512,6 +534,55 @@ pub fn count(k: usize) {
 }
 
 /// The counts since the last read, each back to zero.
-pub fn counts() -> [u64; 4] {
+pub fn counts() -> [u64; 6] {
     core::array::from_fn(|k| COUNTS[k].swap(0, Ordering::Relaxed))
+}
+
+/// The square each dither phase holds of each puck (its `seq`, 0 nothing known): what a flip still owes a phase.
+static mut PHASE_SEQ: [[u32; N]; 4] = [[0; N]; 4];
+
+/// The boxes phase `k` lacks before it is shown: each bound puck on the glass whose newest square that phase does not hold yet, the circle's box with a margin for its edge (Q8 geometry of the last scene). How many, into `out`.
+pub fn phase_due(k: usize, width: usize, height: usize, out: &mut [draw::Rect; N]) -> usize {
+    let bound = unsafe { &*(&raw const BOUND) };
+    let seen = unsafe { &*(&raw const SEEN) };
+    let geom = unsafe { &*(&raw const GEOM) };
+    let es = lock();
+    let mut n = 0;
+    for j in 0..N {
+        if bound[j] == [0; 64] || !seen[j].shown {
+            continue;
+        }
+        let Some(e) = es.iter().find(|e| e.id == bound[j]) else { continue };
+        if e.cur.is_some() && unsafe { PHASE_SEQ[k][j] } != e.seq {
+            let (sx, sy, sr, _, _) = geom[j];
+            out[n] = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+            n += 1;
+        }
+    }
+    unlock();
+    n
+}
+
+/// Phase `k` now holds every bound puck's newest square (drawn into it by the flip), or every phase does (`all`: a whole frame was published).
+pub fn phase_drew(k: usize, all: bool) {
+    let bound = unsafe { &*(&raw const BOUND) };
+    let es = lock();
+    for j in 0..N {
+        let s = es.iter().find(|e| e.id == bound[j] && bound[j] != [0; 64]).map_or(0, |e| e.seq);
+        unsafe {
+            if all {
+                for p in 0..4 {
+                    PHASE_SEQ[p][j] = s;
+                }
+            } else {
+                PHASE_SEQ[k][j] = s;
+            }
+        }
+    }
+    unlock();
+}
+
+/// `us` more of the boxes' drawing time (count 5).
+pub fn count_us(us: u64) {
+    COUNTS[5].fetch_add(us, Ordering::Relaxed);
 }
