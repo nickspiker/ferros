@@ -22,6 +22,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no polling](feedback_no_polling.md) - push or doorbell; a timer only for a proven real deadline
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) - one branchless path; owner picks
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
+- [Feedback: painter's needs a proof](feedback_painters_needs_proof.md) - any last-writer-wins write (pixels or hits) needs WHY/PROOF, else front to back
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) - no sRGB/OKLab/709; photopic match via VSF's LMS function
 - [Feedback: no web encodings](feedback_no_web_encodings.md) - no base64/JSON ferros-side; sole exception the eSIM SGP.22 client
 - [Feedback: VSF not for framing](feedback_vsf_not_for_framing.md) - encrypted transport frames lean; VSF for control + the assembled payload

@@ -66,3 +66,10 @@ const DMA: u64 = 7;
 pub fn dma(token: &[u8; 32]) -> u64 {
     svc(DMA, off(token.as_ptr()), 0, 0, 0, 0)
 }
+
+const INPUT: u64 = 8;
+
+/// The spawn input's bytes from `start` into `buf` (ferros_sys `input`): how many were copied, 0 past the end or for a process spawned with none (a kist opened from the map).
+pub fn input(start: u64, buf: &mut [u8]) -> usize {
+    svc(INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
+}
