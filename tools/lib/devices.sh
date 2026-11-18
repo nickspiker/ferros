@@ -61,7 +61,18 @@ fastboot() {
             return
             ;;
     esac
-    local p
+    local p a
+    # husky never switches slots from fastboot: ABL boots the UFS boot LUN's slot whatever devinfo says, and `--set-active` marks that slot de-activated, so ABL sits in fastboot every boot after (BOOT.md, 2026-10-23).
+    if [ "$FERROS_DEVICE" = husky ]; then
+        for a in "$@"; do
+            case "$a" in
+                --set-active* | set_active)
+                    echo "fastboot $*: no slot switch on husky (it strands the device in fastboot): refused" >&2
+                    return 1
+                    ;;
+            esac
+        done
+    fi
     # A bounded ask: fastboot waits for an absent serial forever, and then this would hang rather than refuse.
     p=$(timeout 15 fastboot -s "$ANDROID_SERIAL" getvar product 2>&1 | awk '/^product:/ {print $2}')
     if [ "$p" != "$FERROS_DEVICE" ]; then

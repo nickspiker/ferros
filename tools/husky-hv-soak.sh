@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Overnight soak of Android under the hv (HV.md, the Mahere freeze that stopped reproducing on 2026-10-18): every few minutes launch Mahere, pan, screen off and on, stop it; after any freeze wait for the watchdog reboot, keep the frozen run's pstore log with the hv's stats timeline, go on. At the deadline, put stock Android back on slot a (the boot_a backup, slot a active) so the morning starts without the hv.
+# Overnight soak of Android under the hv (HV.md, the Mahere freeze that stopped reproducing on 2026-10-18): every few minutes launch Mahere, pan, screen off and on, stop it; after any freeze wait for the watchdog reboot, keep the frozen run's pstore log with the hv's stats timeline, go on. At the deadline, put stock Android back on the booting slot (the boot_a backup, no slot switch) so the morning starts without the hv.
 # Usage: tools/husky-hv-soak.sh <stop at HH:MM (24 h)>   e.g. 06:30
 set -u
 # Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
@@ -32,15 +32,17 @@ while ! past_stop; do
   grep -a "ferros hv stats" "$L" | tail -3 | cut -c1-300
   for i in $(seq 60); do [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break; sleep 3; done; sleep 30
 done
-log "soak over: $n rounds, $freezes freezes. Restoring stock Android on slot a."
+log "soak over: $n rounds, $freezes freezes. Restoring stock Android on the booting slot."
 for attempt in 1 2 3; do
   if adb devices 2>/dev/null | grep -qE "device$"; then adb reboot bootloader; fi
   for i in $(seq 60); do lsusb -d 18d1:4ee0 >/dev/null 2>&1 && break; sleep 3; done
   if lsusb -d 18d1:4ee0 >/dev/null 2>&1; then
-    timeout 120 fastboot flash boot_a $BACKUP 2>&1 | grep -E "OKAY|FAIL" | tail -1
-    timeout 30 fastboot --set-active=a 2>&1 | tail -1; timeout 30 fastboot reboot >/dev/null 2>&1
+    # The booting slot, never a slot switch: `fastboot --set-active` strands husky in fastboot (BOOT.md, 2026-10-23).
+    SLOT=$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')
+    timeout 120 fastboot flash "boot_$SLOT" $BACKUP 2>&1 | grep -E "OKAY|FAIL" | tail -1
+    timeout 30 fastboot reboot >/dev/null 2>&1
     for i in $(seq 80); do sleep 3; adb devices 2>/dev/null | grep -qE "device$|unauthorized" && { log "stock Android back on adb"; adb shell 'su -c "dmesg | grep -m1 -E \"started at EL\""' 2>/dev/null; exit 0; }; done
   fi
   log "restore attempt $attempt did not complete (usb: $(lsusb | grep -oE '1209:4665|18d1:[0-9a-f]+' | head -1)); waiting"; sleep 120
 done
-log "RESTORE FAILED: slot a still has the hv; hold Vol Up + Vol Down at the Google text for fastboot, then tools/husky-restore-android.sh"
+log "RESTORE FAILED: the booting slot still has the hv; hold Vol Up + Vol Down at the Google text for fastboot, then tools/husky-restore-android.sh"

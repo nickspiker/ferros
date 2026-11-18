@@ -8,8 +8,8 @@ metadata:
 **Layout:** slot b = ferros cold boot (only `boot_b` replaced; other b partitions stock, `product_b` empty), slot a = Android + handoff kernel (dev host, escape hatch). Pre-flash slot-b backups: `/mnt/Harbor/tmp/husky-backup-2026-10-14/`. See [[husky_linux_handoff_oracle]].
 
 **Commands:**
-- `tools/husky-cold.sh`: build, reach fastboot from anywhere (adb / `bridge reboot fastboot`), flash boot_b, set b active, boot, wait for 1209:4665, DIAG.
-- `tools/husky-cold.sh --android`: back to slot a in about 40 s.
+- `tools/husky-cold.sh` (since 2026-11-18): build the gate, sign it (`avb-footer`, template target/avb/boot.img), keep it with its blake3 in keys/husky/images, reach fastboot from anywhere, flash the booting slot, boot, check ABL's slot, then flash the other slot with the same image. No set-active anywhere; tools/lib/devices.sh refuses it on husky.
+- `tools/husky-cold.sh --android`: Android once thru the gate's `diag android` door.
 - Iterate with `bridge reload <objcopy'd ferros_cold.bin>`: copy stub, same link base, about 3 s.
 - `bridge diag ufs` runs the old cold UFS link-startup probe on demand.
 

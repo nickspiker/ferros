@@ -1,26 +1,42 @@
 . /mnt/Harbor/Code/ferros/tools/lib/profile.sh
 #!/usr/bin/env bash
-# Boot ferros straight from the bootloader on slot b (pure cold boot, no Linux) and drive it over USB.
+# Build the hv gate with this ferros packed in, sign it, keep it, and flash it onto both of husky's boot slots, the booting slot first.
 #
-# Slot a stays Android + the handoff kernel (dev host and escape hatch); slot b's boot partition holds ferros. ABL loads the boot.img kernel at G#8008_0000 (the cold link base, ferros_kernel/aarch64-pixel8.ld) with the MMU off and jumps to it; ferros arms its fault sink + watchdogs, tunes the eUSB repeater and serves Photon Transport on USB (ferros_kernel/src/service.rs). It brings up the disk itself (cold_ufs.rs) and marks slot b successful in devinfo (slot.rs), so a plain reset or power cycle boots ferros again; every exit except a plain `bridge reboot` goes to fastboot, where this script (or you) decides what boots next.
+# Both slots carry the same signed gate (HV.md: the slots stay identical): ABL loads it, the gate shows "Ready?", power (or 1 s on a dev build) = ferros, volume down = Android once (BOOT.md "As built on husky").
+# ABL boots the slot of the UFS boot LUN whatever devinfo says, and `fastboot --set-active` strands husky in fastboot (BOOT.md, 2026-10-23), so nothing here switches slots: the booting slot (`getvar current-slot`) is flashed and booted first, and only once it has booted ferros does the other slot get the same image.
+# If the new build dies on the booting slot, ABL counts its retries down and falls back to the other slot, which still holds the last good build (the A/B fallback, proven 2026-10-28).
 #
-# No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). `--android` is the only way back to slot a: slot b no longer falls back on its own.
+# Signing (BOOT.md "Signed and unlocked"): `ferros-mkimg avb-footer` makes the gate a whole boot partition with its own vbmeta, signed with the owner's key, which the device's top-level vbmeta already chains `boot` to.
+# The template is a boot partition signed earlier (target/avb/boot.img, else the newest image kept below): it gives the partition size, Google's boot properties and the rollback index; its own contents do not matter.
+# The key goes in by path only and is never printed.
+# Every image flashed is kept with its blake3 in keys/husky/images/ (`<name>.img` + `<name>.img.b3`), so any of them can go back on with `tools/husky-cold.sh <kept image>`.
+#
+# No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset).
 #
 # Usage:
-#   tools/husky-cold.sh            build, flash slot b (the gate + this ferros, signed), boot it, and only once slot b boots ferros flash slot a and boot the home slot (FERROS_BOTH_AT_ONCE=1: both at once, as before; FERROS_SLOT_B_ONLY=1: slot b only, slot a left as it is)
-#   tools/husky-cold.sh <img>      same with a prebuilt boot image
-#   tools/husky-cold.sh --android  leave ferros: fastboot, make a active, reboot into Android
-#   tools/husky-cold.sh --read     last ferros report, from Android's dmesg (slot a handoff kernel prints the ramoops block)
+#   tools/husky-cold.sh              build, sign, keep, flash the booting slot, boot it, then the other slot (FERROS_BOTH_AT_ONCE=1: both slots, one boot; FERROS_ONE_SLOT=1: the booting slot only)
+#   tools/husky-cold.sh <img>        same with a prebuilt gate image (signed here), or a kept signed partition image (flashed as is, after its blake3 is checked)
+#   tools/husky-cold.sh --android    leave ferros for Android once, by the gate's own door (`bridge diag android`), no slot switch
+#   tools/husky-cold.sh --read       last ferros report, from Android's dmesg
 # Iterate without reflashing: `ferros-bridge reload target/aarch64-unknown-none/release/ferros_kernel.bin` (objcopy'd flat image).
 set -euo pipefail
 # Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
 . /mnt/Harbor/Code/ferros/tools/lib/devices.sh
 device_pin husky || exit 1
 
+for v in FERROS_SLOT_B_ONLY FERROS_NO_SLOT_A FERROS_PURE_B FERROS_UNSIGNED; do
+    if [ -n "${!v:-}" ]; then
+        echo "$v is gone (2026-11-18): slot b cannot be chosen without a slot switch, and every flash is the signed gate; FERROS_ONE_SLOT=1 flashes the booting slot only" >&2
+        exit 2
+    fi
+done
+
 REPO=/mnt/Harbor/Code/ferros
 BRIDGE=$REPO/target/debug/ferros-bridge
-ELF=$REPO/target/aarch64-unknown-none/release/ferros_kernel
-IMG=$REPO/target/aarch64-unknown-none/release/ferros_cold.img
+MKIMG=$REPO/target/debug/ferros-mkimg
+AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
+KEEP=/mnt/Harbor/Code/keys/husky/images
+AVB_TEMPLATE=${AVB_TEMPLATE:-$REPO/target/avb/boot.img}
 # Other devices may share this host's adb (2026-10-23: a Pixel 3a); every adb call here means the husky. Its serial is read live, never written down.
 husky() {
     if [ -z "${ANDROID_SERIAL:-}" ]; then
@@ -51,7 +67,7 @@ to_fastboot() {
         adb reboot bootloader
     fi
     for _ in $(seq 60); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
-    echo "no fastboot after the Android route either — the device needs hands (Power+VolDown)" >&2
+    echo "no fastboot after the Android route either: the device needs hands (Power+VolDown)" >&2
     exit 1
 }
 
@@ -69,62 +85,12 @@ read_report() {
     echo "bootreason: $(adb shell getprop ro.boot.bootreason | tr -d '\r')"
 }
 
-case "${1:-}" in
-    --read)
-        read_report
-        exit 0
-        ;;
-    --android)
-        to_fastboot
-        fastboot --set-active=a >/dev/null 2>&1
-        fastboot reboot >/dev/null 2>&1
-        android_up && echo "== Android on slot a" || { echo "Android did not come up" >&2; exit 1; }
-        read_report
-        exit 0
-        ;;
-esac
-
-if [ -n "${1:-}" ]; then
-    IMG=$1
-else
-    ( cd "$REPO" && cargo build -p ferros_kernel --target aarch64-unknown-none --release "${PROFILE_FLAGS[@]}" && cargo build -q -p ferros-bridge )
-    ( cd "$REPO" && cargo run -q -p ferros-mkimg -- boot "$ELF" --pad 16 -o "$IMG" )
-fi
-echo "== image: $IMG ($(stat -c%s "$IMG") bytes)"
-# Slot a mirrors slot b (BOOT.md "Dual Boot"): its boot image is the hv gate with this same ferros packed in (tools/husky-hv.sh), so every boot of either slot lands on "Ready?" — power or 1 s (dev) = ferros, volume down = Android once — and a reboot from Android comes back to ferros instead of staying in Android (owner, 2026-10-22). FERROS_NO_SLOT_A=1 leaves slot a as it is (an oracle capture build, say).
-HV_IMG=""
-if [ "${FERROS_NO_SLOT_A:-0}" != 1 ]; then
-    ( cd "$REPO" && tools/husky-hv.sh >/dev/null ) && HV_IMG=$REPO/target/hv/boot_a_hv.img || echo "== slot a gate image failed to build; slot a left as it is"
-fi
-
-# Signed with the owner's AVB key when it is there (BOOT.md, "Signed and unlocked"): the gate as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names that key, both made by one command from the installed build's Google images. Without the key (or with FERROS_UNSIGNED=1) the gate goes on bare, as before; ABL logs the verification error and boots it, unlocked.
-AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
-AVB_ZIP=${AVB_ZIP:-/mnt/Harbor/tmp/husky-factory/husky-cp1a.260505.005/image-husky-cp1a.260505.005.zip}
-# The slot's own dtbo, vendor_boot, vendor_kernel_boot and init_boot (`<name>_a.img`): the top vbmeta hashes those as installed and chains init_boot to the owner's key, so both slots verify end to end (BOOT.md). Must be what the device carries: the 2026-10-30 snapshot of slot a (the post-wipe Magisk init_boot; the rest as on 2026-10-28), also mirrored onto slot b.
-AVB_INSTALLED=${AVB_INSTALLED:-/mnt/Harbor/tmp/husky-backup-2026-10-30}
-SIGNED=""
-if [ -n "$HV_IMG" ] && [ -f "$AVB_KEY" ] && [ "${FERROS_UNSIGNED:-0}" != 1 ]; then
-    G=$(mktemp -d)
-    INST=""
-    [ -f "$AVB_INSTALLED/init_boot_a.img" ] && INST="--installed $AVB_INSTALLED --google-init-boot $G/init_boot.img --out-init-boot $REPO/target/avb/init_boot.img"
-    if unzip -q -o "$AVB_ZIP" vbmeta.img boot.img init_boot.img -d "$G" && ( cd "$REPO" && cargo build -q -p ferros-mkimg ) && mkdir -p "$REPO/target/avb" \
-        && OUT=$("$REPO/target/debug/ferros-mkimg" avb-sign --key "$AVB_KEY" --google-vbmeta "$G/vbmeta.img" --google-boot "$G/boot.img" --gate "$HV_IMG" $INST --out-vbmeta "$REPO/target/avb/vbmeta.img" --out-boot "$REPO/target/avb/boot.img" 2>&1); then
-        SIGNED=1
-    fi
-    echo "${OUT:-}" | grep -E "^boot|^key|failed" | sed 's/^/   avb: /' || true
-    rm -rf "$G"
-    [ -n "$SIGNED" ] && HV_IMG=$REPO/target/avb/boot.img || echo "== signing failed; the gate goes on unsigned"
-fi
-
-to_fastboot
-HOME_SLOT=$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')
-
 # Wait for the boot after a `fastboot reboot`: 0 = ferros on USB, 1 = fastboot, 2 = Android, 3 = nothing for $1 seconds.
 wait_boot() {
     local t0 limit=$1
     t0=$(date +%s)
     while :; do
-        # With FERROS_BUS set (two ferros devices on the host) only that bus counts: the other device answered at once and the slot b check ran against a Pro still booting (2026-11-10).
+        # With FERROS_BUS set (two ferros devices on the host) only that bus counts: the other device answered at once and the slot check ran against a Pro still booting (2026-11-10).
         # FERROS_PORT (the sysfs name, e.g. 1-2.2) picks the socket when both devices share a bus behind a hub (2026-11-12).
         if { [ -n "${FERROS_PORT:-}" ] && [ "$(cat /sys/bus/usb/devices/$FERROS_PORT/idProduct 2>/dev/null)" = 4665 ]; } || { [ -z "${FERROS_PORT:-}" ] && lsusb -d 1209:4665 2>/dev/null | grep -q "^Bus 0*${FERROS_BUS:-[0-9]*} "; }; then
             echo "== ferros on USB after $(( $(date +%s) - t0 ))s"
@@ -156,51 +122,126 @@ booted_slot() {
     rm -f "$f"
 }
 
-if [ -z "$HV_IMG" ] || [ "${FERROS_PURE_B:-0}" = 1 ] || [ "${FERROS_BOTH_AT_ONCE:-0}" = 1 ]; then
-    # One pass, both slots at once (FERROS_BOTH_AT_ONCE=1, or a slot-b-only bare image): the old flow.
-    if [ -n "$HV_IMG" ] && [ "${FERROS_PURE_B:-0}" != 1 ]; then
-        fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
+# fastboot's own verdict on every write (Claude memories/husky_flash_paths.md: a night of captures once ran on a stale build behind a failed flash the script hid).
+flash() {
+    local out
+    out=$(fastboot flash "$1" "$2" 2>&1) || true
+    echo "$out" | grep -E "Sending|Writing|FAIL" | sed "s/^/   $1: /"
+    if echo "$out" | grep -q FAIL || ! echo "$out" | grep -q "^Writing.*OKAY"; then
+        echo "== $1 was NOT written" >&2
+        return 1
+    fi
+}
+
+case "${1:-}" in
+    --read)
+        read_report
+        exit 0
+        ;;
+    --android)
+        # The gate's development door: `diag android` leaves the marker and resets; the gate then boots Android once (BOOT.md "Back to Android"). From fastboot, boot the gate first.
+        if fastboot devices | grep -q .; then
+            fastboot reboot >/dev/null 2>&1
+            wait_boot 600 || { echo "ferros did not come up to take the request" >&2; exit 1; }
+        fi
+        timeout 60 "$BRIDGE" diag android >/dev/null 2>&1 || true
+        android_up && echo "== Android up" || { echo "Android did not come up" >&2; exit 1; }
+        read_report
+        exit 0
+        ;;
+esac
+
+( cd "$REPO" && cargo build -q -p ferros-mkimg && cargo build -q -p ferros-bridge )
+if [ -n "${1:-}" ]; then
+    GATE=$1
+else
+    # The hv gate with this ferros packed in (tools/husky-hv.sh), the image both slots boot.
+    ( cd "$REPO" && tools/husky-hv.sh >/dev/null )
+    GATE=$REPO/target/hv/boot_a_hv.img
+fi
+[ -f "$GATE" ] || { echo "no image at $GATE" >&2; exit 1; }
+mkdir -p "$KEEP"
+
+# The template: target/avb/boot.img, else the newest kept image (each is a signed partition with the same size and properties).
+if [ ! -f "$AVB_TEMPLATE" ]; then
+    AVB_TEMPLATE=$(ls -t "$KEEP"/*.img 2>/dev/null | head -1)
+    [ -n "$AVB_TEMPLATE" ] || { echo "no signing template: neither target/avb/boot.img nor a kept image in $KEEP" >&2; exit 1; }
+fi
+PART_SIZE=$(stat -c%s "$AVB_TEMPLATE")
+
+if [ "$(stat -c%s "$GATE")" = "$PART_SIZE" ]; then
+    # Already a whole signed partition: a kept image goes back on as it is, its blake3 checked first.
+    PART=$GATE
+    if [ -f "$PART.b3" ]; then
+        ( cd "$(dirname "$PART")" && b3sum -c --quiet "$(basename "$PART").b3" ) || { echo "$PART does not match its blake3" >&2; exit 1; }
+        echo "== kept image: $PART (blake3 checked)"
     else
-        fastboot flash boot_b "$IMG"
+        echo "== whole-partition image with no .b3 beside it: $PART, flashed as is"
     fi
-    [ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
-    if [ -n "$SIGNED" ]; then
-        for s in a b; do fastboot flash "vbmeta_$s" "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed "s/^/   vbmeta $s: /"; done
+else
+    [ -f "$AVB_KEY" ] || { echo "no AVB key at $AVB_KEY: refusing to flash an unsigned gate" >&2; exit 1; }
+    BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD | tr '/' '-')
+    COMMIT=$(git -C "$REPO" rev-parse --short=8 HEAD)
+    git -C "$REPO" diff --quiet HEAD -- || COMMIT=${COMMIT}_dirty
+    TMP=$KEEP/.signing.img
+    rm -f "$TMP"
+    if ! "$MKIMG" avb-footer --key "$AVB_KEY" --google-boot "$AVB_TEMPLATE" --image "$GATE" -o "$TMP" 2>&1 | sed 's/^/   avb: /' || [ ! -s "$TMP" ]; then
+        echo "== signing failed; nothing flashed" >&2
+        rm -f "$TMP"
+        exit 1
     fi
-    # Re-written as active so a stray de-activated bit on it is cleared (the other slot's is cleared by ferros when it marks, slot.rs).
-    fastboot --set-active="$HOME_SLOT" >/dev/null 2>&1 || true
+    # The name carries the build and the start of the image's own blake3: every signing has a fresh salt, so the same build signed twice is two images.
+    B3=$(b3sum --no-names "$TMP")
+    NAME=boot_${BRANCH}_${COMMIT}_${B3:0:8}.img
+    mv "$TMP" "$KEEP/$NAME"
+    echo "$B3  $NAME" > "$KEEP/$NAME.b3"
+    PART=$KEEP/$NAME
+    echo "== kept: $PART (blake3 ${B3:0:16}..)"
+fi
+
+to_fastboot
+HOME_SLOT=$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')
+case "$HOME_SLOT" in
+    a) OTHER=b ;;
+    b) OTHER=a ;;
+    *) echo "fastboot did not name the current slot ('$HOME_SLOT')" >&2; exit 1 ;;
+esac
+echo "== booting slot: $HOME_SLOT"
+
+if [ "${FERROS_BOTH_AT_ONCE:-0}" = 1 ]; then
+    flash "boot_$HOME_SLOT" "$PART"
+    flash "boot_$OTHER" "$PART"
     fastboot reboot
-    if wait_boot 600; then sleep 1; "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"; exit 0; fi
+    if wait_boot 600; then sleep 1; "$BRIDGE" diag 2>/dev/null || echo "(diag failed: retry $BRIDGE diag)"; exit 0; fi
     exit 1
 fi
 
-# Slot b first, slot a only once b has booted (BOOT.md "write slot B, verify, only then slot A"): a build that dies early stops here, with slot a still the last good one. If b fails, ABL counts its retries down and falls back to slot a by itself (the A/B fallback, proven 2026-10-28), so no hands are needed either way.
-fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
-[ -n "$SIGNED" ] && fastboot flash vbmeta_b "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   vbmeta b: /'
-fastboot --set-active=b >/dev/null 2>&1
+# The booting slot first, the other slot only once it has booted ferros (BOOT.md "write slot B, verify, only then slot A"): a build that dies early stops here, with the other slot still the last good one.
+flash "boot_$HOME_SLOT" "$PART"
 fastboot reboot
-wait_boot 900 || true
-SLOT=$(booted_slot)
-if [ "$SLOT" != b ]; then
-    echo "== slot b did not boot ferros (ABL booted slot '${SLOT:-?}'); slot a left as it was" >&2
+if wait_boot 900; then
+    SLOT=$(booted_slot)
+    if [ "$SLOT" != "$HOME_SLOT" ]; then
+        echo "== slot $HOME_SLOT did not boot ferros (ABL booted slot '${SLOT:-?}'); slot $OTHER left as it was" >&2
+        exit 1
+    fi
+else
+    echo "== no ferros from slot $HOME_SLOT (an Android-only gate, or the build died); slot $OTHER left as it was" >&2
     exit 1
 fi
-# FERROS_SLOT_B_ONLY=1: stop here, slot a as it was (an Android left on it for captures, say) — the gate on b, verified.
-if [ "${FERROS_SLOT_B_ONLY:-0}" = 1 ]; then
-    echo "== slot b boots this build; slot a left as it was (FERROS_SLOT_B_ONLY)"
+if [ "${FERROS_ONE_SLOT:-0}" = 1 ]; then
+    echo "== slot $HOME_SLOT boots this build; slot $OTHER left as it was (FERROS_ONE_SLOT)"
     "$BRIDGE" diag 2>/dev/null | head -3 || true
     exit 0
 fi
-echo "== slot b boots this build; now slot a"
+echo "== slot $HOME_SLOT boots this build; now slot $OTHER"
 to_fastboot
-fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
-[ -n "$SIGNED" ] && fastboot flash vbmeta_a "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   vbmeta a: /'
-fastboot --set-active="$HOME_SLOT" >/dev/null 2>&1 || true
+flash "boot_$OTHER" "$PART"
 fastboot reboot
 if wait_boot 600; then
-    echo "== both slots carry this build; slot $(booted_slot) booted"
+    echo "== both slots carry $(basename "$PART"); slot $(booted_slot) booted"
     sleep 1
-    "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"
+    "$BRIDGE" diag 2>/dev/null || echo "(diag failed: retry $BRIDGE diag)"
     exit 0
 fi
 exit 1

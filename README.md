@@ -207,7 +207,7 @@ cargo build -p ferros_kernel --target aarch64-unknown-none --release
 ```bash
 tools/husky-cold.sh
 ```
-This builds the image, flashes slot b (the gate plus ferros, signed), boots it, then flashes slot a. `tools/husky-cold.sh --android` makes slot a active and goes back to Android.
+This builds the gate with ferros packed in, signs it with the owner's AVB key, keeps it with its blake3, flashes the slot the bootloader boots, boots it, then flashes the other slot with the same image. It never switches slots. `tools/husky-cold.sh --android` goes back to Android once, thru the gate.
 
 **Hot-reload (no reboot needed):**
 ```bash
