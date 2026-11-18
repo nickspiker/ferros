@@ -15,6 +15,9 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
+/// The kernel vault's own documents and the envelope its sealed values are kept in.
+pub mod kv;
+
 /// The largest piece: 512 KiB. A put holds a sealed piece, its staged furrows and, for a while, the piece it replaces, each a block of about this size; a read holds a piece and manifestus's bounce for it.
 pub const PIECE: usize = 1 << 19;
 

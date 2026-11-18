@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
 ferros_spi = { path = "../../ferros_spi" }
+# The last fix kept as a VSF document (docs/VSF-AUDIT.md P15: the place as `w`, when it came as `e`), and its one-shot converter.
+ferros_kept = { path = "../../ferros_kept" }
+# The heap that document is built and read in.
+ferros_heap = { path = "../../ferros_heap" }

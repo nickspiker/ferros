@@ -13,8 +13,11 @@ path = "src/lib.rs"
 fgtw = { path = "../../fgtw", default-features = false, features = ["profile"] }
 vsf = { path = "../../vsf", default-features = false }
 ferros_kist = { path = "../ferros_kist" }
-ferros_ledger = { path = "../ferros_ledger" }
+# The device copy's documents (the map's places and view), one definition with the map, and their one-shot converters.
+ferros_kept = { path = "../ferros_kept" }
 
 [dev-dependencies]
+# The map's old forms (EWE runs) built exactly as the old map wrote them, for the tests that an old copy never reads as a removal.
+ferros_ledger = { path = "../ferros_ledger" }
 # The host test seals and opens the space between two vaults as the devices do (the seal is fgtw's `fanout`, its nonce the OS's with `std`).
 fgtw = { path = "../../fgtw", default-features = false, features = ["std", "fanout"] }

@@ -144,6 +144,13 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 
 /// Read the RTC and set the base; returns the unix seconds read.
 pub fn sync() -> Result<u64, u32> {
+    let unix = sync_early()?;
+    crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
+    Ok(unix)
+}
+
+/// Read the RTC and set the base, telling no process: the boot's read before the vault opens (main.rs), so the vault's commits and documents carry the real Eagle time from the first (kvault `now`, settings.rs `eagle_now`); the service's first `sync` hands it to the processes.
+pub fn sync_early() -> Result<u64, u32> {
     let (y, mo, d, h, mi, s) = read()?;
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 {
         return Err(u32::MAX);
@@ -153,7 +160,6 @@ pub fn sync() -> Result<u64, u32> {
     let base = (unix * f).wrapping_sub(now);
     BASE.store(base, Ordering::Release);
     READ_AT.store(now, Ordering::Relaxed);
-    crate::process::set_wall(base, packed());
     Ok(unix)
 }
 

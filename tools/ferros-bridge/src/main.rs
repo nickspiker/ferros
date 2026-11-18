@@ -15,6 +15,9 @@ mod ledger;
 /// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
 #[path = "../../../ferros_detail/src/network.rs"]
 mod network;
+/// A sponsor placed by hand, the document payloads/fgtw reads from `fgtw.sponsor` (shared by path: it uses only vsf and alloc).
+#[path = "../../../ferros_kept/src/sponsor.rs"]
+mod sponsor;
 mod usb;
 
 use ferros_pt::packet::Complete;
@@ -70,6 +73,7 @@ fn usage() {
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
+    eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
     eprintln!("  kist stow <capsule.vsf>  Development fallback: a kist straight into the attested person's list, no check by the device's stower and no Stow on its screen (unattended loops). Stow a kist with `ferros send <capsule.vsf>` (tools/ferros-send), the checked path");
@@ -282,6 +286,29 @@ async fn main() {
                 std::process::exit(1);
             });
             println!("credential document: {} bytes", doc.len());
+        }
+        "sponsor" => {
+            // sponsor <address> <port> <out.vsf>: the sponsor document the identity service reads from `fgtw.sponsor` (ferros_kept sponsor.rs: section `sponsor`, the address as `ni` or `nj`, the port as `np`), for a `store put fgtw.sponsor @out.vsf`.
+            let (Some(Ok(ip)), Some(Ok(port)), Some(out)) = (args.get(2).map(|a| a.parse::<std::net::IpAddr>()), args.get(3).map(|p| p.parse::<u16>()), args.get(4)) else {
+                eprintln!("Usage: ferros-bridge sponsor <address> <port> <out.vsf>");
+                std::process::exit(1);
+            };
+            let addr = match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let mut b = [0u8; 16];
+                    b[..4].copy_from_slice(&v4.octets());
+                    (4, b, port)
+                }
+                std::net::IpAddr::V6(v6) => (6, v6.octets(), port),
+            };
+            let doc = sponsor::build(&addr, vsf::eagle_time_oscillations()).expect("a family of 4 or 6 always builds");
+            // Read back as fgtw reads it before it is written out.
+            assert_eq!(sponsor::parse(&doc), Some(addr), "the sponsor document does not read back");
+            std::fs::write(out, &doc).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                std::process::exit(1);
+            });
+            println!("sponsor document: {} bytes", doc.len());
         }
         "capsule" => {
             // capsule <code.bin> <out.vsf>: write a signed capsule (e.g. for `store put init @out.vsf`, which the cold boot spawns as its first process).

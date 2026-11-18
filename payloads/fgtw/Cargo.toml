@@ -23,3 +23,5 @@ sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 vsf = { path = "../../../vsf", default-features = false, features = ["x-full"] }
 # The person's identity space (space.rs): ferros's vocabulary for fgtw::space and the sync with this device's copy.
 ferros_space = { path = "../../ferros_space" }
+# The roots and the sponsor kept in the vault as VSF documents (docs/VSF-AUDIT.md P18, P19), and their one-shot converters.
+ferros_kept = { path = "../../ferros_kept" }

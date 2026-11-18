@@ -97,8 +97,8 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     crate::oracle::set_system_secret(ira);
     let _ = key;
 
-    const LKEY: &str = "genesis";
-    const MSG: &[u8] = b"FERROS-GENESIS-0";
+    // The genesis value: a `genesis` document (ferros_pieces::kv) since 2026-11-17, a text marker before (moved by kvault's open).
+    const LKEY: &str = crate::kvault::GENESIS;
     let mut kept: Option<ShimStore> = None;
     let t_open = crate::platform::cntpct();
     crate::platform::pstore(b"ferros: opening the vault\n");
@@ -111,14 +111,15 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
             p.opened = 1;
             crate::flashlog::line(&alloc::format!("kvault open ok in {} ms: {}", (crate::platform::cntpct() - t_open) / (crate::platform::cntfrq() / 1000), store.describe()));
             match store.get_by_key(LKEY) {
-                Ok(Some(v)) if v.as_slice() == MSG => p.verified = 1,
+                Ok(Some(v)) if ferros_pieces::kv::genesis_of(&v).is_some() => p.verified = 1,
                 Ok(other) => {
                     // A fresh (genesised) vault, or the genesis value missing: write it. Never a format: manifestus refuses to genesis over sealed blocks it cannot bootstrap.
                     crate::flashlog::line(&alloc::format!("kvault: genesis value {}, writing it", if other.is_some() { "wrong" } else { "absent" }));
-                    match store.set(LKEY, MSG) {
-                        Ok(_) => p.sealed = 1,
-                        Err(e) => {
-                            crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {e:?}"));
+                    let written = ferros_pieces::kv::genesis_document(crate::settings::eagle_now()).map(|doc| store.set(LKEY, &doc));
+                    match written {
+                        Some(Ok(_)) => p.sealed = 1,
+                        other => {
+                            crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {:?}", other.map(|r| r.map(|_| ()))));
                             p.stage = 2
                         }
                     }
