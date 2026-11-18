@@ -9,7 +9,8 @@
 //! No GPU service (after a jump), no arena or a screen too big for wallgen's region: nothing is drawn or kept, and it says so; the display shows no wallpaper.
 //! It packs the picture as a VSF visual (one plane, VSF RGB, gamma2tanh at 16 bits, as tools/wallpaper writes a person's own), stores it as `wallpaper.made` in pieces and then its key, and asks the display to show it (op 44).
 //!
-//! The heap is 120 MiB, inside the 128 MiB arc the kernel gives it either way (arcs are powers of two): the frame is the arena's now, so the heap holds the compiles (the refine's graph and words, a few MB, gone after), the marks and their list, then the samples (24 MB) and the document: writing it holds four copies of the samples at its peak (the packed tensor, the section the builder keeps, the bytes written, and the provenance hash's zeroed copy). 60 MiB failed at the write, and 96 MiB on the Pro the night of 2026-11-07 (the builder's output grew by doubling, 48 MB at its last step; vsf now sizes it once).
+//! The heap is 248 MiB, inside the 256 MiB arc the kernel gives it either way (arcs are powers of two): the frame is the arena's now, so the heap holds the compiles (the refine's graph and words, a few MB, gone after), the marks and their list, then the samples (24 MB) and the document: writing it holds four copies of the samples at its peak (the packed tensor, the section the builder keeps, the bytes written, and the provenance hash's zeroed copy). 60 MiB failed at the write, and 96 MiB on the Pro the night of 2026-11-07 (the builder's output grew by doubling, 48 MB at its last step; vsf now sizes it once).
+//! 120 MiB (a 128 MiB arc) stopped being enough: on the Pro after its fresh start (2026-11-18) the write died at "memory allocation of 24127750 bytes failed" (one copy of the 1344x2992 samples), twice, and no wallpaper was made; which copy is new in vsf's writer is not measured yet, so the arc doubled rather than the format changed.
 //!
 //! Grant slots: 0 console, 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 the layer arena. Input: the wallpaper seed.
 #![no_std]
@@ -21,7 +22,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use ferros_sys::{call, cap, console, freq, now, ERR};
 
-const HEAP_BYTES: usize = 120 << 20;
+const HEAP_BYTES: usize = 248 << 20;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
