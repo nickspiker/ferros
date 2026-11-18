@@ -420,6 +420,12 @@ static LTE_MOST: AtomicU64 = AtomicU64::new(0);
 static MEASURE: AtomicU64 = AtomicU64::new(0);
 /// A device test, the hand spawn's fifth byte: a side channel off at the sensor in any mode (bit 0 phase detect, bit 1 embedded data).
 static SIDE_TEST: AtomicU64 = AtomicU64::new(0);
+/// Descriptors released ahead of the engine (the hand spawn's sixth byte, a device test; 0 or 1: one, as Linux's start does): the stream on releases this many, each DMA_DONE one more, so a late answer has this many frames of slack instead of the frame's blanking (camera-full-rate, 2026-11-18: every death so far was one answer later than the blanking, the kernel lock held elsewhere).
+static LEAD: AtomicU64 = AtomicU64::new(1);
+/// A late answer made on purpose (the hand spawn's seventh byte k, a device test; 0 none): every 2^8th frame's DMA_DONE answered 2^k us late, as a kernel lock held elsewhere makes it (the 2026-11-18 death: 3.3 ms behind a set_pref).
+static LATE_TEST: AtomicU64 = AtomicU64::new(0);
+/// The engine's place (+G#14) read at the first 2^3 DMA_DONE answers before the index write, against the index then: whether the engine runs one released program a frame (its place one frame behind the index with a lead of two) or every released program at once.
+static PLACE_LOG: [AtomicU64; 1 << 3] = [const { AtomicU64::new(0) }; 1 << 3];
 /// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
 static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 fn img_log_say(g: u64) {
@@ -436,6 +442,14 @@ fn img_log_say(g: u64) {
     }
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
+    let mut p = Line { b: [0; 256], n: 0 };
+    let _ = write!(p, "camera: lead A#{}; the engine's place against the index at the first DMA_DONEs:", LEAD.load(Ordering::Relaxed));
+    for e in PLACE_LOG.iter() {
+        let v = e.load(Ordering::Relaxed);
+        let _ = write!(p, " G#{:X}/G#{:X}", v >> 32, v & 0xFFFF_FFFF);
+    }
+    let _ = write!(p, "\n");
+    console(g, &p.b[..p.n]);
 }
 /// The last 2^8 answers, for the console when a stream stops (camera-full-rate, 2026-11-17: which interrupt came last and how late): per answer the counter at its start (above bit 8) and the image status (low byte); and the index it wrote (low 16 bits, G#FFFF none) with the answer's ticks above.
 static TL: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
@@ -736,6 +750,12 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         LAG_HIST[((64 - us.leading_zeros()) as usize).min(15)].fetch_add(1, Ordering::Relaxed);
     }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
+        let late = LATE_TEST.load(Ordering::Relaxed);
+        // WHY the bound: the byte is the person's; a shift of 64 or more is no number of microseconds, and past 2^20 (a second) the test is a stall, not a late answer.
+        // Bit 7 set: the index on time and the acknowledgements late instead (below), which says whether the index alone is the deadline.
+        if late != 0 && late <= 20 && (FRAMES.load(Ordering::Relaxed) + 1) & 0xFF == 0 {
+            ferros_sys::delay_us(1 << late);
+        }
         // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
         let n = FRAMES.load(Ordering::Relaxed) + 1;
         if SLITS.load(Ordering::Relaxed) != 0 {
@@ -745,6 +765,10 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         }
         // The next descriptor, round the ring as the engine's own place goes round it (`RING`): the index is never the engine's place while a frame is owed, so the stream runs as long as it is answered.
         let count = RING_N.load(Ordering::Relaxed) as u32;
+        let done = IDX[0].load(Ordering::Relaxed) as usize;
+        if done < PLACE_LOG.len() {
+            PLACE_LOG[done].store((rd(g, ferros_cam::PDMA + 0x14) as u64) << 32 | *idx as u64, Ordering::Relaxed);
+        }
         *idx = (*idx + STEP) & (count - 1);
         wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
         wrote = *idx as u64;
@@ -754,6 +778,10 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         IDX[2].fetch_max(t, Ordering::Relaxed);
         if *idx == 0 {
             WRAPS.fetch_add(1, Ordering::Relaxed);
+        }
+        let late = LATE_TEST.load(Ordering::Relaxed) & 0x7F;
+        if LATE_TEST.load(Ordering::Relaxed) & 0x80 != 0 && late != 0 && late <= 20 && (FRAMES.load(Ordering::Relaxed) + 1) & 0xFF == 0 {
+            ferros_sys::delay_us(1 << late);
         }
     }
     let mut err = 0u64;
@@ -809,7 +837,7 @@ extern "C" fn frame_thread(g: u64) -> ! {
     while RUN.load(Ordering::Acquire) == 0 {
         ferros_sys::wait(&RUN, 0, 0);
     }
-    let (mut idx, mut enabled, mut ticking) = (STEP, false, false);
+    let (mut idx, mut enabled, mut ticking) = (STEP * LEAD.load(Ordering::Relaxed) as u32, false, false);
     let started = ferros_sys::now();
     // The line's last interrupt: a long exposure's frame leaves the line quiet for its whole period, which is not a stream that stopped.
     let mut last = started;
@@ -1471,6 +1499,21 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     LAST_R.store(0, Ordering::Relaxed);
     STATE.store(1 << QUEUED, Ordering::Release);
     RING_BUFS.store(if slit { 0 } else { ring as u64 }, Ordering::Release);
+    // A lead past one: descriptors 1 up to it named now as each DMA_DONE names the next (`ring_turn`), released with the first at stream on. Before any frame, so no buffer is found landed (and none counted unseen).
+    // WHY the bound: the byte is the person's; a lead past a sixteenth of the ring's descriptors would release the engine's whole ring at once.
+    let lead = LEAD.load(Ordering::Relaxed);
+    if lead > slots >> 4 {
+        return Err(Fail::Inputs("a lead past a sixteenth of the engine's descriptors"));
+    }
+    if !slit {
+        for e in 1..lead {
+            ring_turn(0, Some(e));
+        }
+        UNSEEN.store(0, Ordering::Relaxed);
+    }
+    for p in PLACE_LOG.iter() {
+        p.store(0, Ordering::Relaxed);
+    }
     ferros_sys::dma_barrier();
     step!(g, "camera: open step: the engine starting\n");
     wr(g, pd + 0x2C, 1);
@@ -1544,8 +1587,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     err_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
-    // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
-    wr(g, pd + ferros_cam::PDMA_INDEX, STEP);
+    // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start), or the lead's first descriptors (`LEAD`).
+    wr(g, pd + ferros_cam::PDMA_INDEX, STEP * LEAD.load(Ordering::Relaxed) as u32);
     RUN.store(1, Ordering::Release);
     ferros_sys::wake(&RUN, 1);
     step!(g, "camera: streaming A#{} ms after the open (open step: stream on)\n", ferros_sys::us_since(t0) / 1000);
@@ -1932,6 +1975,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     if input_len > 4 {
         SIDE_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 4) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 5 {
+        // WHY the max: 0 means the default lead of one, as the other test bytes' 0 means the default.
+        LEAD.store((unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 5) as *const u8) } as u64).max(1), Ordering::Relaxed);
+    }
+    if input_len > 6 {
+        LATE_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 6) as *const u8) } as u64, Ordering::Relaxed);
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
