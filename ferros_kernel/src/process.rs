@@ -1809,8 +1809,13 @@ fn irq_storm_check(i: usize, intid: u32, who: &[u8]) -> u32 {
     was | storm
 }
 
+/// Acks per line, by `IRQS` index: a driver acks only after an interrupt it answered, never on a wait that timed out, so a count that moves is a device delivering.
+/// The clock policy reads the camera's (`ispfe0`, the front end's frame clock) as the sign of a running stream (service.rs `camera_streaming`).
+pub static IRQ_ACKS: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+
 /// `irq_ack` for line `i`, guarded: unmasked unless it has stormed (the unmask of a stormed line writes 0 to GICD_ISENABLER, which changes nothing: no branch), 0, or ERR once it has.
 fn irq_ack_guarded(i: usize, intid: u32, who: &[u8]) -> u64 {
+    IRQ_ACKS[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let stormed = irq_storm_check(i, intid, who);
     crate::killswitch::unmask_spi_if(intid, stormed ^ 1);
     (stormed as u64).wrapping_neg()
