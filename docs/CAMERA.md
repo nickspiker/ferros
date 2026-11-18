@@ -724,6 +724,26 @@ Where the shape may live: the CPU's 'after' writes to loch0's image path, in ord
 - **The camera arms**, after stream on's first index write: `TEST_BITS G#20424 G#10` (DMA_DONE), `TEST_EQ G#90014 G#90010` (every released program run), `ADVANCE G#90010 16 count - 1`; disarms (or the switch's off does) before its close. Its "write only if the engine still reads ours" stays as in (a).
 - **More than (a)**: the syscall, its validator (host-testable as a pure function over the op words and the grant), the table and its three disarm paths, the byte table in `.Lirq`, ferros_sys's wrapper and a KERNEL.md entry: about 250 lines more, half a day with host tests, and one more surface to audit (a process's register write at interrupt time, inside its own grant: what SYS_MMIO_WRITE already lets it do, only earlier). Other drivers with a blanking-sized deadline (the display's DECON trigger, audio's DMA ring) could use it as is.
 
+### On the Pro with (b), 2026-11-18 (camera-full-rate 82deb020 RAM-reloaded over forge 0cada073, not attested; the driver hand-spawned, cambench, nothing stored)
+
+Every open below armed its release (`the descriptor's release armed on the front end's line`); the close counts the DMA_DONEs the kernel released before the frame thread answered. The consumer is cambench reading every frame out of the view and adding it into u16 sums on three A715 threads.
+
+| mode (main, binned 4080 x 3072) | frames | rate (sensor / taken) | released by the armed action | errors | consumer |
+|---|---|---|---|---|---|
+| init's (camtest `4001`) | 64 | 15 (66.5 ms) | 65 of 65 | none | camtest MAP |
+| fll 3200, every 256th answer 2 ms late (injected) | 1124 | 96 | 1124 of 1124 | none (dies at 256 with `camfast off`: LATE_CONFIG) | map only |
+| fll 3200 | 16424 (170 s) | 96 / 96 | 16424 of 16424 | none | 6.2 ms of work a frame, 2 skipped |
+| fll 3328 | 8260 | 95 / 95 | 8260 of 8260 | none | 0 skipped |
+| fll 4096 | 8245 | 77 / 77 | 8245 of 8245 | none | 3 skipped |
+| fll 3200, line 5888 clocks | 8271 | 102 / 103 | 8271 of 8271 | none | 1 skipped |
+| fll 3200, line 5760 | 16436 (155 s) | 105 / 106 | 16436 of 16436 | none | 6.0 ms a frame, 3 skipped |
+| fll 3200, line 5696 | 1138 | 106 / 107 | all | none | 1 skipped |
+| fll 3200, line 5632 | 1 | 107 / 0 | | the link's ERR_CRC_PH (+G#14 = G#20): the sensor's line too short for the link | |
+
+- **The top**: about 106 frames a second at full binned size (line 5696 to 5760 clocks), the link's own limit at 5632; 105 a second held 155 s with a consumer reading and adding every frame.
+- **Heat** (`diag thermal` every 2^5 s, the room cool, no cap anywhere): at 96 a second the hottest zone 37 C to 53 at 32 s, 55, 57, 58, 58 at 160 s; at 105 a second 46 to 61, 64, 65, 65 C at 128 s, then falling to 48 C a minute after the close. The trips are 90 C (X3, A715s) and 95 (A510s).
+- **The one death on this kernel** (fll 3200, frame 4358): the frame thread woken 133 ms late, past a whole frame (the line stays masked until the thread's acknowledgement, so the armed action releases once), behind kernel lock holds of 130, 80, 61, 50 and 43 ms: the AoC firmware's pieces (`aoc.fw.N`) read from the vault under `with_lock` by the service loop's `sensor_step`, each time init's keeper restarted `sensors` (on a RAM-reloaded kernel the AoC never comes online, so every 64 s). With that loop stopped every run was clean. A hold past a frame period still stops the stream: those holds are the lock-holds work (branch lock-holds); the armed action moved the camera's limit from the blanking (0.4 ms at 96 a second) to a frame period (10 ms).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
