@@ -197,6 +197,32 @@ fn up() -> bool {
     true
 }
 
+/// The descriptor release in the interrupt (`ferros_cam_fast`, `diag clock camfast on|off`, on by default), and what it did: releases made, DMA_DONEs it left to the driver (the engine still running a program, or no ring), and the counter at the last release.
+pub static FAST: AtomicBool = AtomicBool::new(true);
+pub static FAST_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The camera front end's interrupt, taken on whichever core it lands, before its line is masked and its driver woken (main.rs `.Lirq_cam`; never the kernel lock): on a frame's DMA_DONE with every released program run (the engine's place at the index), the next descriptor released, `(index + 16) & (count - 1)` as the driver writes it.
+/// Why here (camera-full-rate, 2026-11-18, the Pro attested at 96 a second): the next frame's program must be released inside the frame's blanking (403 us at 96 a second, 57 ms at 15) or loch0 reports LATE_CONFIG and the next frame begins and never ends; the driver's wake waits for the kernel lock, and a set_pref held it 3.3 ms (ispfe0 interrupt to wake 3297 us), the stream's death; held 36 to 148 ms elsewhere the same boot. A 2 ms late index killed the stream every time, the acknowledgements 2 ms late with the index on time never.
+/// The driver names the descriptor a frame ahead and writes the index only when it still reads its own (payloads/camera `answer`), so with or without this the engine is released once a frame.
+/// Only while the switch holds the front end (its clocks on: `down` clears HELD before anything goes off); the line is the driver's grant alone and masked from here until its acknowledgement, so no second DMA_DONE is taken before the driver has answered the first.
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_cam_fast() {
+    if !HELD.load(Ordering::Acquire) || !FAST.load(Ordering::Relaxed) {
+        return;
+    }
+    if rd(ferros_cam::IMG_STATUS) & ferros_cam::IMG_DMA_DONE == 0 {
+        return;
+    }
+    let (idx, place, count) = (rd(PDMA + ferros_cam::PDMA_INDEX), rd(PDMA + 0x14), rd(PDMA + ferros_cam::PDMA_COUNT));
+    // WHY the tests: the count is the driver's register and the index its last write; a program still running (its place behind the index) or a count no ring has (not a power of two: the mask would be wrong) is left to the driver, as before this path.
+    if place != idx || !count.is_power_of_two() {
+        FAST_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    wr(PDMA + ferros_cam::PDMA_INDEX, (idx + 16) & (count - 1));
+    FAST_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+    FAST_COUNTS[2].store(crate::platform::cntpct(), Ordering::Relaxed);
+}
+
 /// Whether the switch's on sets the front end's four bus traffic shapers as Linux's boot does (`diag clock cambts on|off`, off by default: a test of whether the front end's writes lose to the cores' reads without them; camera-full-rate, 2026-11-17).
 pub static BTS: AtomicBool = AtomicBool::new(false);
 /// The front end's bus traffic shapers (zuma-bts.dtsi bts_ispfe0 to 3, G#26C4_8180 on, G#80 apart; soc-gs drivers/bts exynos-btsopsgs.c `set_ipbts`), each with its `default` scenario's values: AxQoS 12 read and write, overriding the master's (RCON/WCON bit 8, value at bit 12), shaping on (CON bit 0); outstanding reads and writes (RBLK_UPPER/WBLK_UPPER low half: G#26, G#FFFF, G#FFFF, G#FFFF and G#40, G#40, G#40, G#8); urgency on (CON bit 23) at G#20 in each of the four channels' bytes (TIMEOUT_R0 +8, TIMEOUT_W0 +G#10). Only the defined words are touched.
