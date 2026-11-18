@@ -1,6 +1,6 @@
 # Pucks
 
-Status: proposed 2026-11-11 for the owner's review; nothing on the display, the map or init is built. Built: the tide engine, stations as VSF and a device probe of the data path ("What is built"). The owner, 2026-11-11: "tides on a puck (is that what we should call kists you can't open but are live like the clock and tide? Android calls them widgets I think?)". The kist catalog's order (Claude memories/kist_catalog.md): the clock first, then tides, then a few other simple ones, then Photon.
+Status: built 2026-11-17 on the owner's go ("plus a tide puck"; "GPS, compass, shit that's useful! Pucks! I'm DOWN!"), way (c) below, with six pucks; not yet run on a device ("Built 2026-11-17"). Proposed 2026-11-11; the tide engine, stations as VSF and a device probe of the data path built then ("What is built"). The owner, 2026-11-11: "tides on a puck (is that what we should call kists you can't open but are live like the clock and tide? Android calls them widgets I think?)". The kist catalog's order (Claude memories/kist_catalog.md): the clock first, then tides, then a few other simple ones, then Photon.
 
 ## What a puck is
 
@@ -102,6 +102,50 @@ The map already treats a tap on the clock as 1 (it never launches it); 1 keeps a
 - **Stations as VSF** (ferros_tide `station`, feature `vsf`): a station document (`station`: id, name, position as a Dymaxion `w`, datum, msl_um, source, licence; a `constituent` section each: name, amplitude_um, phase_q32) and a catalog (`catalog`, then `station`: id, name, position), every value read by name and type marker.
 - **tools/tide-station** (host): NOAA's JSON to a station document, the catalog from NOAA's list or from documents, `show`, `predict`. fetch.sh fetches with curl; fixtures.sh writes ferros_tide/stations/ (the four stations and their catalog).
 - **payloads/tidetest**: the data path on the device without drawing and without anyone's place: the bundled catalog and documents parsed, each station found as the nearest to its own place, its face computed, each step timed. Builds (payload-check passes) and passes the sandbox checker masked (48569 words, 0 refused). Not run on a device yet.
+
+## Built 2026-11-17
+
+Every open question below has a built answer now, each the proposal above unless said; each is still the owner's to change.
+
+### The framework
+
+- **The list** (`ferros_puck`): the wire form and ops of "The ops, sketched", with these settled: coordinates Q14 of the radius; colours five bytes, a VSF RGB gamma-2 triple or a theme slot (text, text2, plane, ring, lit), each with its opacity; at most 2^6 ops in 3968 bytes (one 4 KiB call with the kernel's stamp); `CURVE` carries a `turn` (a moon's terminator, a dial); a `MARKER` may name a curve later in the list (it is in front of it); text at most 2^6 bytes. `check` refuses a list whole; `draw` draws front to back thru a target's `under`, every shape a signed distance thru one C¹ edge (smoothstep across the edge pixel) times the circle's own edge, so the circle is the clip; `next_change` is when a sweep or marker next moves half a pixel. `fmt`: a moment as the clock writes it (twelve-hour h:mm am/pm; dozenal places, trailing zils dropped; hex seconds of the day), a number in base 10, 12 or 16 with its unit's symbol (units are symbols, not words).
+- **Who may draw where** (question 4): neither of the two proposed. The kernel stamps every call on a new `puck` endpoint with the caller's kist identity (its developer key and option, as the gate found them: `puck_stamp`), the display keeps each list under that identity, and the deck binds identities to circles (display op 73, the system's alone). No puck can name a circle, and none needs one of its own.
+- **Declaring a puck** (question 5): the signed want `puck` (right 12 in `ferros_kist::RIGHTS`), never asked, handed only to a capsule that declares it; the kernel hands such a kist an empty surface and empty GPU slots (a puck holds no 32 MiB surface, none of the sixteen surface slots, no GPU block). The deck knows a puck by it, never by its name; the clock keeps its name match until its capsule declares `puck` (question 1's clock half: not moved yet, the display still draws it).
+- **The display** (puck.rs): serves `puck` on slot 9 (init's old heap slot, unread since 2026-11-11: init's grants page stays at 108) on its own thread: LIST `[0][variant][generation u32][list]` (variant 0 at rest, 1 in focus), WATCH `[1][seen u32]` held until the circle is shown or hidden, gains or loses the focus, or changes size class. Icon G#90 + j is the deck's j-th puck, drawn from its list with the theme's plane under it, cached as an icon's sprite while nothing it shows moves, drawn again only at a new list, a focus change or its anchored ops' next half pixel (checked each pass of the render thread, which wakes at least once a second). A puck in focus keeps the 10 Hz flips.
+- **The deck** (the map): binds its pucks at every scene, launches each answered puck once a person is present (question 6: at attest, alive while a person is), never on a tap; a tap gives focus (question 3, choice 1): the camera flies to it, its fuller face shows, and any tap takes the focus back. An unanswered puck's tap asks its wants as a kist's does.
+- **The puck's side** (`ferros_puck::rt`, feature `sys`): its sends, the view's watch, one wait until its content's own deadline or a view change, never an interval.
+
+### The location step (question 7)
+
+The place-bound pucks (tide, sun, moon, compass, weather) share one: the ~10 km cell of the last GPS fix (ferros_weather's grid: rows 2^-12 of a turn of latitude, each row cut into 1 + floor(4096 cos(lat)) columns, a place always under 7 km from its cell's centre), kept in the puck's own vault domain as a VSF document (`place`: row, column, when), so a start has its place without the radio; a fresh fix only when the person granted the puck GPS, its circle is shown and the kept cell is older than 2^12 s, the claim released at the first fix or after 2^7 s (LOCATION.md's policy). The finer fix never leaves the process's memory. Without GPS granted there is no place yet: LOCATION.md's passive `place` right (not built) is where a picked or cell-derived place would come from.
+
+### The pucks
+
+| puck | engine and accuracy | refresh (its content's own deadline) | wants |
+|---|---|---|---|
+| tide | ferros_tide (NOAA's 37 constituents; NOAA tables within 2.1 min and 1.3 cm printed, 3.3 min and 3.0 cm live) | the next high or low, or now riding off its day's curve | puck, gps |
+| sun | ferros_sky, Meeus ch. 25 and 15 (USNO within 0.46 min) | any crossing of the sun's levels, noon, the day's end | puck, gps |
+| moon | ferros_sky, Meeus ch. 47 (whole tables), 48, 49 (USNO's 2026 quarters within 0.78 min, rise and set within 0.48 min) | rise, set, the next quarter, the day's end, the shown percent turning over | puck, gps |
+| compass | ferros_compass, WMM2025 (all 100 NOAA test values: D and I within 0.005°) | the magnetometers' own 2^6 ms, only while shown (no sensor doorbell yet) | puck, gps |
+| GPS | the driver's FIX, SATS and WATCH thru the existing `gps` right and claim | the driver's own doorbell, only while in focus (the radio on only then) | puck, gps |
+| weather | MET Norway thru fgtw.org (branch `pucks-weather`, not deployed) | the forecast's next hour or update, only while shown | puck, gps, udp |
+
+- **The tide's station**: the nearest in the bundled catalog by the largest dot product of unit vectors, one station, never a blend (a tide's phase changes across a coast; an average of two stations is no tide anywhere; NOAA's own practice is one reference station per place), its name and distance shown in focus. The owner's inksurf picks its station by a hard-coded id (Bremerton) and has no location code; its engine is the same method on that one station, so the puck uses ferros_tide (validated at four stations, datum handling, stations as VSF) and takes inksurf's look (ferros_faces::tide): the fixed LAT..HAT scale (here mean sea level plus and less the sum of the amplitudes), water filled under the curve, the high's words below the water and the low's above it, nights behind it.
+- **Faces** (ferros_faces): no human words but a station's name; every list within one call (the largest, the moon in focus, 10 ops in 1260 bytes).
+- **Capsules**: tools/pucks-kist.sh, masked, signed by the ferros project key (a commons); options minted 2026-11-17.
+
+### What changes on the device
+
+Stored together with a flash of the matching kernel (memory stored_capsules_need_flashed_kernel): the kernel (the `puck` right, its stamp, slot 9, facts 88-89), and the capsules display, map, init, kists (ferros_kist's new right: init lays out a puck's slots, the stower reads its wants) and sensors (the magnetometers); fgtw rebuilds with the changed ferros_kist but nothing of it depends on it. Then the six pucks are stowed like any kist.
+
+### Not built
+
+- A doorbell on a sensor sample (the compass waits the sample period while shown).
+- A picked place, and LOCATION.md's passive `place` right.
+- The weather answer signed by fgtw.org's key.
+- The clock as a list of ops (the display still draws it by name).
+- The full NOAA station set (question 8): the capsule carries the four fixtures.
 
 ## Sources and licences
 
