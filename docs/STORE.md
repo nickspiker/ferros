@@ -84,6 +84,41 @@ A person still arranges things; an arrangement is just never the place a thing l
 Both kinds of arrangement are items themselves (kinds "find" and "collection"), so they sync and can be found like anything else.
 Changing how things are arranged never moves anything, so it is always cheap and always undoable: that is the "morphable into a different arrangement/ordering" the owner asked for.
 
+### Trees on demand (owner, 2026-11-17)
+
+> Yes, I LOVE trees! So many trees. tree by when and then who and then where, or tree by where, states first, like the list goes but yes, deciding at creation time? yeahnah.
+
+The tree stays; the filing goes.
+A tree is a view the person picks, computed from the cards, never a place an item lives:
+
+- **A view is an ordered list of facets.** "When, then who, then where" opens years, then the people in that year, then the places those people were; "where, then when" opens states first, then the years in each.
+  Reorder the list and the same items regrow into a different tree at once, nothing moved.
+- **Each facet has its own natural levels**, so one facet is a tree by itself:
+  - when: year, month, day, hour;
+  - where: country, state, city, place (from the GPS, behind attest as the GPS is);
+  - who: the person, then their device;
+  - made by: the kist, then its kind;
+  - kind: the kind, then its own facts (a save's game and slot, a photo's camera and lens).
+- **Branches show counts and only exist where items do**: no empty folders, ever.
+- **Recognition, not recall**: a short list of branches to tap is what folders were good at, and it stays.
+  What goes is the decision made at creation, which is wrong for every way of finding but one.
+- **Facets are captured, never typed**: time, device, who, place and kist come from the system when the item is kept (the card, part 2); nobody files anything.
+- **A view kept is a kept find** with its facet order, and can sit on the deck as a circle.
+
+### Done before, and why it did not stick
+
+Others tried parts of this; none had what ferros has:
+- **The Semantic File System** (MIT, 1991): directories computed from attribute queries, in any order. Closest to the trees above, never more than research.
+- **BeOS's BFS** (1996): indexed attributes and live queries, but every file still had one place in a tree, which stayed primary.
+- **The Newton's soups** (1993): no files at all, an object store found by query. Gone with the Newton.
+- **WinFS** (Microsoft, 2003 to 2006): an item store with schemas and relations, cancelled before it shipped.
+- **Lifestreams** (Yale, 1996): everything on one time line, narrowed by filters.
+- **Perkeep** (formerly Camlistore): content-addressed blobs with attributes and search, no hierarchy; small.
+- **Spotlight's smart folders, photo libraries by date, people and place, mail labels**: the idea won inside apps and as search over a tree, never as the store itself.
+
+What sank them: every program already spoke paths, so the tree stayed underneath; attributes had to be typed by people, who did not; and indexes cost on every write.
+ferros has none of those: kists never had paths (part 4, "Open and save, without paths"), the system knows who, which device, when and where at the moment an item is kept, and the vault is content-addressed with VSF cards that carry their own types.
+
 ### Five everyday things
 
 **A photo.**
