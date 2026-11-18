@@ -1598,8 +1598,10 @@ fn period_set(ps: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
+    // Spawned by hand with the input `01` (a test of a driver not yet stored): it stays between calls with nothing open, so a holder's LIST and the OPEN after it reach this driver, not the vault's (2026-11-17: a hand-spawned driver ended after camtest's LIST, and the OPEN started the stored one). It still ends at a CLOSE.
+    let stay = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1;
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
@@ -1617,7 +1619,11 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
         poll = true;
         if got == NOTHING {
             match &open_cam {
-                // Nothing open and nothing waiting: end (a call after this look starts another driver, process.rs `ON_DEMAND`).
+                // Nothing open and nothing waiting: end (a call after this look starts another driver, process.rs `ON_DEMAND`), unless spawned to stay: then the next receive waits.
+                None if stay => {
+                    poll = false;
+                    continue;
+                }
                 None => ferros_sys::exit(0),
                 Some(o) => {
                     // Open: wait for a call until the holder's deadline (a word nothing rings, so a slit's thousand frames a second do not wake this thread). A holder gone quiet past `UNASKED_US` is gone.
