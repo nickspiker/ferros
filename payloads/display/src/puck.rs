@@ -331,6 +331,7 @@ pub fn scene_end() {
         if a.shown != n.shown || a.large != n.large || a.d != n.d || turned {
             e.view = n;
             tell(e);
+            count(2);
         }
     }
     unlock();
@@ -341,6 +342,7 @@ pub fn frame() {
     let es = lock();
     for e in es.iter_mut().filter(|e| e.frames && e.view.shown && e.held.is_some()) {
         tell(e);
+        count(1);
     }
     unlock();
 }
@@ -354,6 +356,7 @@ pub fn due() -> bool {
             e.cur = Some(sq);
             e.seq = e.seq.wrapping_add(1);
             ferros_sys::reply(&tok, &[call::OK]);
+            count(0);
             any = true;
         }
         if e.cur.is_some_and(|sq| !live(&sq)) {
@@ -491,4 +494,17 @@ pub fn regravity(turn: Option<(i64, i64)>) -> bool {
         return true;
     }
     false
+}
+
+/// What the pucks did since the last read (`counts`): squares taken, frames told, views told, replays they caused. For the display's ten-second line.
+static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// One more of count `k`.
+pub fn count(k: usize) {
+    COUNTS[k].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The counts since the last read, each back to zero.
+pub fn counts() -> [u64; 4] {
+    core::array::from_fn(|k| COUNTS[k].swap(0, Ordering::Relaxed))
 }

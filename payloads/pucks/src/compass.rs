@@ -112,4 +112,5 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
 }
 
-ferros_sys::entry!(payload_main);
+// The arc grows on demand to 2^26 (64 MiB of addresses): the scratch its square is drawn in before it goes thru the handle, as large as its circle asks (ferros_puck::rt `scratch`; at most two squares of `SIDE_MAX` fill the slot, one fills half of this).
+ferros_sys::entry!(payload_main, grows 1 << 26);

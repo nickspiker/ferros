@@ -155,13 +155,37 @@ pub fn bell() -> u64 {
     BELL.load(Ordering::Acquire)
 }
 
-/// The square: its pixels' base (past the porch), the bytes its slot holds, and the square the display has now (offset, bytes), which is never drawn into.
+/// The square: the bytes its slot holds (past the porch), the square the display has now (offset, bytes), which is never drawn into; and the scratch the face is drawn in first, at the top of the puck's own arc (arc offset, bytes).
+/// A masked puck reaches its slot only thru its handle (SANDBOX.md "Handles": every plain address is folded into the arc, so a pointer to the slot's address writes the arc's own first page), so the face is drawn in the arc and copied in (`Handle::write_words`); native code runs the same instructions.
 struct Held {
-    base: u64,
     held: u64,
     shown: Option<(u64, u64)>,
+    scratch: (usize, usize),
 }
-static mut HELD: Held = Held { base: 0, held: 0, shown: None };
+static mut HELD: Held = Held { held: 0, shown: None, scratch: (0, 0) };
+/// The square's slot as a handle: a puck's surface slot (ferros_kist `slots`).
+type Square = ferros_sys::Handle<{ ferros_sys::kist::SURFACE }>;
+/// The porch every slot starts with (cachemap SURFACE_PORCH): offsets in a SHOW are past it.
+const PORCH: u64 = 64;
+
+/// The scratch at least `bytes` long: the arc grown at its top (the scratch is always the arc's last bytes, nothing else of the puck grows it), or given back down to twice what is needed when it holds more than eight times it. None when the kernel refuses the growth.
+fn scratch(h: &mut Held, bytes: usize) -> Option<&'static mut [u64]> {
+    if h.scratch.1 < bytes {
+        let (top, was) = ferros_sys::arc::grow(bytes - h.scratch.1).ok()?;
+        // The first growth starts the scratch; a later one extends it in place (the arc's top was the scratch's end).
+        if h.scratch.1 == 0 || h.scratch.0 + h.scratch.1 != was {
+            h.scratch = (was, top - was);
+        } else {
+            h.scratch.1 = top - h.scratch.0;
+        }
+    } else if h.scratch.1 > 8 * bytes {
+        if let Ok((top, _)) = ferros_sys::arc::shrink(h.scratch.0 + 2 * bytes) {
+            h.scratch.1 = top - h.scratch.0;
+        }
+    }
+    // SAFETY: [scratch.0, scratch.0 + scratch.1) is the arc's own top, grown for this alone and zeroed by the kernel; nothing else of the process holds it.
+    Some(unsafe { core::slice::from_raw_parts_mut((ferros_sys::arc_base() as usize + h.scratch.0) as *mut u64, bytes / 8) })
+}
 
 /// Where the next square of `bytes` goes: at the slot's start when that clears the one the display has, else just past it (the two never overlap, so the display reads a whole square while the next is drawn).
 fn next_offset(shown: Option<(u64, u64)>, bytes: u64) -> u64 {
@@ -183,14 +207,6 @@ pub fn show_with(link: Link, v: &View, paint: impl FnOnce(&mut [u64], usize, (f3
         return None;
     }
     let h = unsafe { &mut *(&raw mut HELD) };
-    if h.base == 0 {
-        h.base = ferros_sys::dma(cap(link.grants, link.square));
-        if h.base == ferros_sys::ERR {
-            h.base = 0;
-            ferros_sys::console(link.grants, b"puck: no square (a kernel from before 2026-11-18?)\n");
-            return None;
-        }
-    }
     // WHY the bound: the side is the display's word; past `SIDE_MAX` two squares would not fit the slot.
     let d = v.d.min(crate::SIDE_MAX) as u64;
     let bytes = d * d * 8;
@@ -201,11 +217,15 @@ pub fn show_with(link: Link, v: &View, paint: impl FnOnce(&mut [u64], usize, (f3
             None => return Some(call::REFUSED),
         }
     }
-    // SAFETY: [base + off, base + off + bytes) lies inside the frames this puck's slot holds (`held`, the kernel's answer), which no one else writes; the display reads only the square it was last handed, which `next_offset` keeps clear of.
-    let px = unsafe { core::slice::from_raw_parts_mut((h.base + off) as *mut u64, (d * d) as usize) };
+    let Some(px) = scratch(h, bytes as usize) else {
+        ferros_sys::console(link.grants, b"puck: no room in its arc to draw a square that size\n");
+        return Some(call::REFUSED);
+    };
     let turn = (v.c as f32 / 16384., v.s as f32 / 16384.);
     px.fill(0);
     paint(px, d as usize, turn);
+    // Into the slot thru its handle, past the porch: [off, off + bytes) lies inside the frames the slot holds (`held`, the kernel's answer), which nothing else writes, and clear of the square the display reads (`next_offset`).
+    Square::write_words(PORCH + off, px);
     let mut m = [0u8; 11];
     m[0] = call::SHOW;
     m[1..5].copy_from_slice(&(off as u32).to_le_bytes());

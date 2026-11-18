@@ -245,6 +245,7 @@ fn face(px: &mut [u64], d: usize, (tc, ts): (f32, f32), tm: &Time, th: &ferros_s
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let link = common::start(grants, true);
+    let mut shown = 0u64;
     loop {
         let seen = common::rt::bell();
         let v = common::rt::view();
@@ -252,8 +253,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let tm = time(v.large);
             let th = ferros_sys::theme::current();
             if let Some(glyphs) = common::glyphs() {
-                if common::rt::show_with(link, &v, |px, d, turn| face(px, d, turn, &tm, th, glyphs)) == Some(ferros_puck::call::REFUSED) {
-                    common::say(grants, b"clock: the display refused a square\n");
+                let t0 = ferros_sys::now();
+                let r = common::rt::show_with(link, &v, |px, d, turn| face(px, d, turn, &tm, th, glyphs));
+                // The first squares and every 64th after: its side, how long the face and the hand-over took, and the display's answer (a measure for the 8a, 2026-11-18).
+                shown += 1;
+                if shown <= 4 || shown % 64 == 0 {
+                    let mut l = [0u8; 96];
+                    let n = line(&mut l, &[b"clock: square ", &dec(shown), b": ", &dec(v.d as u64), b" px in ", &dec(ferros_sys::us_since(t0)), b" us, answer ", &dec(r.map_or(9, |s| s as u64)), b"\n"]);
+                    common::say(grants, &l[..n]);
                 }
             }
         }
@@ -262,4 +269,35 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
 }
 
-ferros_sys::entry!(payload_main);
+// The arc grows on demand to 2^26 (64 MiB of addresses): the scratch its square is drawn in before it goes thru the handle, as large as its circle asks (ferros_puck::rt `scratch`; at most two squares of `SIDE_MAX` fill the slot, one fills half of this).
+ferros_sys::entry!(payload_main, grows 1 << 26);
+
+/// `v` in decimal digits, for a console line.
+fn dec(v: u64) -> alloc::vec::Vec<u8> {
+    let mut d = alloc::vec::Vec::new();
+    let mut v = v;
+    loop {
+        d.push(b'0' + (v % 10) as u8);
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    d.reverse();
+    d
+}
+
+/// The parts one after another into `out`; how many bytes.
+fn line(out: &mut [u8], parts: &[&[u8]]) -> usize {
+    let mut n = 0;
+    for p in parts {
+        for &b in *p {
+            // WHY the bound: the line is cut at its buffer rather than written past it.
+            if n < out.len() {
+                out[n] = b;
+                n += 1;
+            }
+        }
+    }
+    n
+}

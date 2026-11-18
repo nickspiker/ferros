@@ -749,6 +749,10 @@ static mut CLIP_PHASE: Option<usize> = None;
 static mut CLIP_MASK: u32 = 0;
 /// The last frame a client sent — a camera op alone, or a batch holding one (the map's: `begin`, its overlay, the camera with the keep flag) — as it came: the clock's redraws replay it.
 static mut LAST_FRAME: ([u8; SLOT], usize) = ([0; SLOT], 0);
+/// The last plain deck frame (a batch from `begin`, or a camera op alone) as the map sent it, never emptied by the glows or the scene changing (ops 57, 12, 13, 17 empty `LAST_FRAME` until the next frame): what the pucks' squares are drawn again with when `LAST_FRAME` is empty, the camera as the map last showed it, the scene and glows as they are now (the 8a, 2026-11-18: the map sent glows with no frame after them, and the pucks' squares stopped reaching the glass).
+static mut LAST_DECK: ([u8; SLOT], usize) = ([0; SLOT], 0);
+/// The op that last emptied `LAST_FRAME` (a measure, 2026-11-18: the pucks' squares stopped reaching the glass on the 8a while nothing drew the deck again).
+static LAST_FRAME_CLEARED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether a batch (op 15) holds a camera op.
 fn batch_has_camera(m: &[u8]) -> bool {
@@ -8165,6 +8169,7 @@ fn server(grants: u64) -> ! {
                 Some(12) => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(12, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe {
@@ -8175,6 +8180,7 @@ fn server(grants: u64) -> ! {
                 Some(13) if m.len() >= 2 => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(13, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
@@ -8199,6 +8205,7 @@ fn server(grants: u64) -> ! {
                 Some(57) if m.len() >= 2 => {
                     // Circles' states (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(57, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
@@ -9397,6 +9404,7 @@ fn server(grants: u64) -> ! {
                 Some(17) if m.len() >= 12 => {
                     unsafe {
                         LAST_FRAME.1 = 0;
+                        LAST_FRAME_CLEARED.store(17, Ordering::Relaxed);
                         SCENE_GEN = SCENE_GEN.wrapping_add(1);
                     }
                     let i = m[1] as usize;
@@ -9734,8 +9742,15 @@ fn server(grants: u64) -> ! {
         let app_up = unsafe { (*(&raw const APP)).is_some() };
         puck::covered(app_up || screen_off);
         let puck_due = puck::due();
-        if (puck_due | puck::regravity(unsafe { GRAV_TURN })) && !screen_off && unsafe { LAST_FRAME.1 > 0 } && !app_up {
-            replay(&mut handle);
+        // The last frame, or when the glows or the scene have come since and emptied it, the last plain deck frame (`LAST_DECK`), drawn with the scene and glows as they are now.
+        if (puck_due | puck::regravity(unsafe { GRAV_TURN })) && !screen_off && !app_up {
+            if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
+                unsafe { LAST_FRAME = LAST_DECK };
+            }
+            if unsafe { LAST_FRAME.1 > 0 } {
+                puck::count(3);
+                replay(&mut handle);
+            }
         }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
         let flip_due = unsafe { CLIENT_DREW && TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
@@ -10015,6 +10030,12 @@ fn server(grants: u64) -> ! {
                     let lf = &mut *(&raw mut LAST_FRAME);
                     lf.0[..m.len()].copy_from_slice(m);
                     lf.1 = m.len();
+                    // A plain deck frame (no page, no region: its batch opens with `begin`) kept for the pucks as well.
+                    if m.first() == Some(&14) || m.get(3) == Some(&1) {
+                        let ld = &mut *(&raw mut LAST_DECK);
+                        ld.0[..m.len()].copy_from_slice(m);
+                        ld.1 = m.len();
+                    }
                 }
             }
             if dsi_op {
@@ -10127,6 +10148,20 @@ fn server(grants: u64) -> ! {
                 tlog.dec(unsafe { PASSES[1] });
                 tlog.s(b", for an owed phase ");
                 tlog.dec(unsafe { PASSES[2] });
+                // The pucks since the last line (puck.rs `COUNTS`): squares handed over and taken, the frames told to the pucks that move, the views told, the replays they caused.
+                let pc = puck::counts();
+                tlog.s(b"; pucks: squares ");
+                tlog.dec(pc[0]);
+                tlog.s(b" taken, frames ");
+                tlog.dec(pc[1]);
+                tlog.s(b" told, views ");
+                tlog.dec(pc[2]);
+                tlog.s(b" told, replays ");
+                tlog.dec(pc[3]);
+                tlog.s(b"; last frame held ");
+                tlog.dec(unsafe { LAST_FRAME.1 } as u64);
+                tlog.s(b" bytes, last emptied by op ");
+                tlog.dec(LAST_FRAME_CLEARED.load(Ordering::Relaxed) as u64);
                 tlog.s(b"\n");
                 tlog.flush();
                 unsafe { PASSES = [0; 3] };

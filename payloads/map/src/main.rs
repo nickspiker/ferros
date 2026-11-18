@@ -1929,14 +1929,22 @@ impl Map {
     /// The person's list read again, and the kist circles made to match it when a kist came or went (a stow over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
     fn refresh_circles(&mut self) {
         let was = self.placed();
+        // Each circle's icon and name as the display has them: a kist stowed over itself (the clock's version 1, a puck, over its version 0, a plain kist) keeps the count and changes the icon.
+        let looks: Vec<(u8, alloc::string::String)> = (0..self.n).map(|i| { let s = self.spec(i); (s.icon, alloc::string::String::from(s.label)) }).collect();
         if !self.reload_kists() {
             return;
         }
         // WHY: the arrays hold MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         if n == self.n {
-            // As many circles, but a circle may hold another kist now (one unstowed, another stowed): its state follows, drawn with the next frame as a new scene is.
-            let _ = self.send_states(false);
+            // As many circles, but a circle may hold another kist now (one unstowed, another stowed, or a kist stowed over itself as a puck): the scene again when any circle looks different (its icon or its name; 2026-11-18 on the 8a, the clock puck stowed over the clock kist stayed a plain circle and never drew), else its state alone, drawn with the next frame.
+            if (0..n).any(|i| { let s = self.spec(i); looks[i].0 != s.icon || looks[i].1 != s.label }) {
+                self.send_scene();
+                self.draw();
+            } else if self.send_states(false) && !self.app_front {
+                // A frame after the glows, as wherever else they are sent: the display draws nothing again from its last frame once states have come (op 57 empties it, display `LAST_FRAME`), so without one a puck's squares never reached the glass until the next touch (the 8a, 2026-11-18).
+                self.draw();
+            }
             // A puck may hold another place in the list now: the bindings sent again, a new one launched.
             self.send_pucks();
             return;
@@ -2174,6 +2182,14 @@ impl Map {
         let mut live = [0u8; 32 * MAX];
         if let Some(k) = ferros_sys::not_started::live(cap(self.grants, S_SETTINGS), &mut live) {
             self.live = Some(live.chunks_exact(32).take(k).map(|c| c.try_into().unwrap()).collect());
+        }
+        // A puck that ended is up no more (2026-11-18 on the 8a: a puck stowed over its running self kept the old process, and one that ended was never started again): launched again by `send_pucks` unless it stopped on a fault, which waits for a tap on its circle, so a broken puck never runs in a loop.
+        if let Some(live) = self.live.as_ref() {
+            let before = self.pucks_up.len();
+            self.pucks_up.retain(|c| live.contains(c));
+            if self.pucks_up.len() != before {
+                self.send_pucks();
+            }
         }
         if self.send_states(false) && !self.app_front {
             self.draw();
@@ -2515,7 +2531,7 @@ impl Map {
         call(self.display, &m[..2 + 64 * n], &mut r);
         for i in 1..self.n {
             let Some(k) = self.kist(i) else { continue };
-            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) {
+            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) {
                 self.launch(i);
             }
         }
@@ -4987,7 +5003,10 @@ impl Map {
                         let capsule = k.capsule;
                         // A puck answered (docs/PUCKS.md "What a tap does"; owner, 2026-11-18: "Tap/drag with one finger moves it, with two scales/rotates and a simple tap passes thru so we can make our dozenal calculator work too"): never opened; the tap goes to the puck itself (display op 74, which knows where the circle was drawn and its face's turn), launched first if it is not up.
                         if k.is_puck() && !k.unanswered() {
-                            if !self.pucks_up.contains(&capsule) {
+                            // A tap on a puck that is not up starts it (one that stopped on a fault included: the tap is the person asking again).
+                            if !self.pucks_up.contains(&capsule) || self.live.as_ref().is_some_and(|l| !l.contains(&capsule)) {
+                                self.stopped.retain(|s| s.0 != capsule);
+                                self.pucks_up.retain(|c| *c != capsule);
                                 self.launch(i);
                             }
                             // WHY the casts: a tap that placed a finger on a circle is on the glass, so its pixel fits a u16.
