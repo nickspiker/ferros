@@ -4,10 +4,11 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
+//! A fourth byte of 6 sweeps the main's vendor shift, each forced (SET 3), from the seventh byte to the sixth, 16 lines of 2^shift each, the first byte frames a step (1 if 0) after two let pass (`0108000600140A`: shifts 10 to 20).
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
-//! A fourth byte of 6 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000600` the main: one pair at about a metre; `100000060000FF06` the rack, each held about 64 s).
+//! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `100000080000FF06` the rack, each held about 64 s).
 #![no_std]
 #![no_main]
 
@@ -58,7 +59,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
     let t0 = ferros_sys::now();
     // The ladder (fourth byte 5) opens first: a driver spawned by hand ends after a LIST that leaves nothing open, and the OPEN behind it would then start the vault's driver, not the one under test (2026-11-17, b932: the first ladder ran on the stored driver).
-    let n = if arg(3) == 5 { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
+    let n = if matches!(arg(3), 5 | 6) { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
     say!(g, "camtest: LIST A#{} bytes in A#{} ms\n", if n == ERR { 0 } else { n }, ferros_sys::us_since(t0) / 1000);
     if n == ERR {
         ferros_sys::exit(1);
@@ -89,12 +90,16 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 3 {
         gain_curve(g, ep, id, bin, arg(0), arg(5), t1);
     }
+    // A fourth byte of 6: the vendor shift's reach on the main, each shift forced (the sixth byte the last, the seventh the first).
+    if arg(3) == 6 {
+        shift_sweep(g, ep, arg(0), arg(5), arg(6), t1);
+    }
     // A fourth byte of 5: the exposure walked past the init's frame (owner, 2026-11-17: Lumis to expose as long as on Android).
     if arg(3) == 5 {
         long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
-    // A fourth byte of 6: an image and its phase-detect rows kept as a pair (owner, 2026-11-17: phase detect as data).
-    if arg(3) == 6 {
+    // A fourth byte of 8: an image and its phase-detect rows kept as a pair (owner, 2026-11-17: phase detect as data).
+    if arg(3) == 8 {
         snap_pair(g, ep, id, arg(0), arg(5), arg(6), t1);
     }
     let mut r = [0u8; 4];
@@ -232,6 +237,65 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_l
     ferros_sys::exit(0)
 }
 
+
+/// The main's line time (ps, ferros_cam `MAIN_LINE_PS`, measured on the Pro b933): the shift sweep asks each exposure in lines of it.
+const MAIN_LINE_PS: u64 = 3_148_916;
+
+/// How far the vendor shift reaches (owner, 2026-11-17: "no artificial exposure cap anywhere"): OPEN the main, then for each shift `bottom` to `top`, SET 3 forces it and the exposure is 16 lines of 2^shift (the frame the larger of 18 of them and the mode's own 21362 lines), so each step is short until the shift is large; two frames let pass, then `per` (1 if 0) with their spacing and mean, and the sensor's frame and integration read back. A shift the field does not hold shows as a spacing that is not the driver's "a frame every" line, or as frames that stop (the run ends there).
+fn shift_sweep(g: u64, ep: u64, per: u8, top: u8, bottom: u8, t1: u64) -> ! {
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    let mut r = [0u8; 4];
+    let n = call(ep, &[1, 0], &mut r);
+    say!(g, "camtest: shift sweep: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 {
+        ferros_sys::exit(1);
+    }
+    let set = |what: u8, value: u64| -> u8 {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut r = [0xEEu8; 1];
+        if call(ep, &m, &mut r) == ERR { 0xEE } else { r[0] }
+    };
+    let per = if per == 0 { 1 } else { per as u32 };
+    for s in bottom..=top {
+        // 16 lines of 2^s, and a nanosecond more so the division lands on 16.
+        let ns = ((16u64 << s) * MAIN_LINE_PS).div_ceil(1000);
+        let (a, b) = (set(3, s as u64), set(0, ns));
+        if a != 0 || b != 0 {
+            say!(g, "camtest: shift A#{s}: refused (A#{a} A#{b})\n");
+            continue;
+        }
+        let mut last = ferros_sys::now();
+        let (mut gaps, mut sum) = (0u64, 0u64);
+        for k in 0..2 + per {
+            let n = call(ep, &[2, 8], buf);
+            if n == ERR || n < 64 {
+                say!(g, "camtest: shift A#{s}: the frames stopped\n");
+                ferros_sys::exit(1);
+            }
+            let now = ferros_sys::now();
+            if k >= 2 {
+                gaps += (now - last) * 1_000_000 / ferros_sys::freq();
+                let samples = &buf[64..n as usize];
+                let (mut s16, mut cnt) = (0u64, 0u64);
+                for x in samples.chunks_exact(2).step_by(1 << 4) {
+                    s16 += u16::from_le_bytes([x[0], x[1]]) as u64;
+                    cnt += 1;
+                }
+                // WHY the max: a reply of the header alone has no samples, and the mean would divide by zero.
+                sum += s16 * 16 / cnt.max(1);
+            }
+            last = now;
+        }
+        let mut c = [0u8; 103];
+        let cn = call(ep, &[11], &mut c);
+        let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
+        say!(g, "camtest: shift A#{s}: exposure A#{} us asked; frames A#{} us apart; mean A#{} sixteenths; the sensor reads frame A#{} / line A#{} / integration A#{}{}\n", ns / 1000, gaps / per as u64, sum / per as u64, be(38), be(40), be(67), if cn == ERR { " (CAPS failed)" } else { "" });
+    }
+    let n = call(ep, &[4], &mut r);
+    say!(g, "camtest: shift sweep done; CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
 /// Rows of the frame's middle the noise test reads (one green-red row pair at a time is not split: an even count), and the most samples a row holds.
 const NOISE_ROWS: usize = 1 << 6;
 const ROW_MOST: usize = 1 << 13;

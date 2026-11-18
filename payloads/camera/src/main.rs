@@ -14,7 +14,7 @@
 //! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`.
 //! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
-//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus. `[0]` taken, `[1]` outside the range.
+//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 3 (a device test) the vendor shift every later exposure takes (0 the least that fits). `[0]` taken, `[1]` outside the range.
 //! - `4` CLOSE: the view taken back, the stream stopped, the switch off, `[0]`, and the driver ends; its frames go back to the pool wiped.
 //! - `5` MAP + the buffer to give back (G#FF none), with the view: waits for a frame newer than the last mapped and holds its buffer; the frame's 64-byte header (bin 1, the buffer at +40), the samples read in place thru the view (docs/CAMERA.md "The view").
 //! - `6` RELEASE + buffer: the held buffer given back; `[0]`, `[1]` when it was not held.
@@ -749,6 +749,8 @@ struct Open {
     /// The sensor's frame timing (ferros_cam ccs `Timing`: the mode's line and frame, the integration's least and margin as the sensor answered them) and what its exposure now set it to (`Plan`).
     timing: ccs::Timing,
     now: ccs::Plan,
+    /// A device test's forced vendor shift (SET 3; 0: the plan's least): every exposure SET after it at exactly that shift (ferros_cam ccs `Timing::plan_shift`), to find how far the shift field reaches.
+    force: u8,
     /// The sensor's settings now (the gain code, the lens's target) and the frame counted at the last FRAME or MAP request.
     gain: u64,
     focus: u64,
@@ -1366,7 +1368,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1910,7 +1912,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 let bus = Bus::of(g, c);
                 let r = match what {
                     // Exposure (ns): the plan the sensor's timing makes of it (ferros_cam ccs `Timing::plan`: inside the mode's frame, else the frame lengthened, else the line), refused past the longest, never capped.
-                    0 => match o.timing.plan(value) {
+                    0 => match if o.force != 0 { o.timing.plan_shift(value, o.force) } else { o.timing.plan(value) } {
                         Some(p) => match exposure_set(&bus, c, &o.timing, &o.now, &p) {
                             Ok(()) => {
                                 if (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift) {
@@ -1946,6 +1948,11 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         None if o.gain_model.is_none() && value == ccs::UNITY => 0,
                         _ => 1,
                     },
+                    // A device test (owner, 2026-11-17: "no artificial exposure cap anywhere"): the shift every following exposure takes (0: the least that fits), to find the shift field's reach.
+                    3 => {
+                        o.force = value as u8;
+                        0
+                    }
                     2 if c.focus.1 != 0 && (c.focus.0..=c.focus.1).contains(&value) && focus_set(&bus, c, value).is_ok() => {
                         o.focus = value;
                         NOW_FOCUS.store(value, Ordering::Relaxed);

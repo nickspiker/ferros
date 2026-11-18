@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The main camera's image and its phase-detect rows, held as a pair by payloads/camera's SNAP (camtest's fourth byte 6), pulled by physical address while camtest holds the buffer, and packed into one VSF visual (docs/CAMERA.md "Phase detect as data").
+# The main camera's image and its phase-detect rows, held as a pair by payloads/camera's SNAP (camtest's fourth byte 8), pulled by physical address while camtest holds the buffer, and packed into one VSF visual (docs/CAMERA.md "Phase detect as data").
 # Usage: tools/camera-pd-pair.sh <out prefix> "<camtest's PAIR line>"
 #   the line as the console has it: `camtest: PAIR A#k image G#.. pd G#.. count A#.. exposure_ns A#.. gain A#.. focus A#.. eagle_ns A#.. status A#..`
 # Output: <prefix>.image.raw10 and <prefix>.pd.raw10 (as the front end wrote them), <prefix>.vsf (tools/camera-pd-pair: the sensor plane and a `phase` plane), and their blake3.
