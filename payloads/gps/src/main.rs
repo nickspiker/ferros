@@ -642,7 +642,7 @@ static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == ferros_kept::vsf::OSCILLATIONS_PER_SECOND);
 
 /// A small value of the driver's scope whole: Ok(None) absent, Err refused.
-/// A value past the buffer comes back cut to it: no last fix in either form is near that long, so what a reader makes of the cut bytes is the same refusal it would make of the whole.
+/// A value past the buffer comes back cut to it: no last fix document is near that long, so the cut bytes are refused as the whole would be.
 fn read_small(store: u64, key: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
     let mut b = [0u8; 1 << 8];
     match ferros_sys::store_read_at(store, key, 0, &mut b) {
@@ -650,17 +650,6 @@ fn read_small(store: u64, key: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, ()>
         ferros_sys::ERR => Err(()),
         // WHY the min: the vault says the whole length and copies at most the buffer.
         n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
-    }
-}
-
-/// The one-shot converter (docs/VSF-AUDIT.md wave 0): `gps.last` as the driver kept it before its document (two i32, 8 bytes) made its document, once, before anything reads it; a value it cannot convert stays, said on the console.
-fn upgrade_last(grants: u64, store: u64) {
-    use ferros_kept::upgrade::{gps_last, upgrade, Done};
-    let mut slot = (|| read_small(store, b"last"), |b: &[u8]| store_set(store, b"last", b));
-    match upgrade(&mut slot, |d| ferros_kept::gps::parse(d).is_some(), |o| gps_last(o, ferros_sys::eagle_now())) {
-        Ok(Done::Converted) => console(grants, b"gps: gps.last is now its VSF document\n"),
-        Ok(_) => {}
-        Err(why) => say!(grants, "gps: gps.last was left as it was, not converted: {}\n", why),
     }
 }
 
@@ -740,7 +729,6 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         scrub(grants, store, b"replay.sky");
         ferros_sys::exit(0);
     }
-    upgrade_last(grants, store);
     let last = read_last(store);
     // The aid's place (owner, 2026-11-11: "can't we figure that out from the orbital data anyway?"; the chip picks its sky from where it is told it is, and a zeroed place points it at the wrong one for 5-8 minutes): the person's own last fix; else the zone in effect's principal place (kernel zone.rs, the zones document's city: never anyone's place, only which part of the Earth); else none, the replay's zeroed one.
     // Arc-seconds to 2^-23 degrees: × 2^23 / 3600, in i64 (a latitude of 90° is 2^28.3 in 2^-23 degrees, the product fits).

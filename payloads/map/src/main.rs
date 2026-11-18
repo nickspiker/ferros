@@ -2219,7 +2219,7 @@ impl Map {
     }
 
     /// A small value of the map's scope whole: Ok(None) absent, Err refused.
-    /// A value past the buffer comes back cut to it: a place, the view and Developer are each far shorter in any form, so what a reader makes of the cut bytes is the same refusal it would make of the whole.
+    /// A value past the buffer comes back cut to it: a place's, the view's and Developer's documents are each far shorter, so the cut bytes are refused as the whole would be.
     fn read_small(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
         let mut b = [0u8; 1 << 8];
         match ferros_sys::store_read_at(cap(self.grants, S_STORE), key, 0, &mut b) {
@@ -2228,34 +2228,6 @@ impl Map {
             // WHY the min: the vault says the whole length and copies at most the buffer.
             n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
         }
-    }
-
-    /// The one-shot converter (docs/VSF-AUDIT.md wave 0), before the map reads its copy: each circle's place, the view and Developer as the map kept them before their documents (EWE runs; one byte) made their documents (ferros_kept::upgrade, the converter ferros_space's sync runs too as it reads them). A value it cannot convert stays, said on the console, and the map reads it as no value.
-    fn upgrade_copy(&self) {
-        use ferros_kept::upgrade::{developer, place, upgrade, view, Done};
-        let c = cap(self.grants, S_STORE);
-        let one = |key: &[u8], is_new: fn(&[u8]) -> bool, old: fn(&[u8], i64) -> Option<Vec<u8>>| {
-            let mut slot = (|| self.read_small(key), |b: &[u8]| ferros_sys::store_set(c, key, b));
-            let mut l = Line::new();
-            let name = core::str::from_utf8(key).unwrap_or("");
-            match upgrade(&mut slot, is_new, |o| old(o, ferros_sys::eagle_now())) {
-                Ok(Done::Converted) => {
-                    let _ = write!(l, "map: map.{name} is now its VSF document\n");
-                }
-                Ok(_) => return,
-                Err(why) => {
-                    let _ = write!(l, "map: map.{name} was left as it was, not converted: {why}\n");
-                }
-            }
-            console(self.grants, l.as_str().as_bytes());
-        };
-        for i in 0..self.n {
-            let mut key = [0u8; 32];
-            let kl = self.place_key(i, &mut key);
-            one(&key[..kl], |d| ferros_kept::map::read_place(d).is_some(), place);
-        }
-        one(b"view", |d| ferros_kept::map::read_view(d).is_some(), view);
-        one(b"dev", |d| ferros_kept::map::read_developer(d).is_some(), developer);
     }
 
     /// The arrangement made by hand, from the vault: each circle's place as its document (ferros_kept::map, the one definition ferros_space syncs too): x and y in world units ×256, the radius, and its turn as cos and sin in Q14. Which circles it placed, a bit each (MAX is 16).
@@ -5639,8 +5611,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut r = [0u8; 4];
         map.frames_on = call(map.display, &[72, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
     }
-    // Old forms of the map's copy made their documents before anything here reads it.
-    map.upgrade_copy();
     let kept = map.load_places_near();
     t_start[3] = now();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).

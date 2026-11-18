@@ -14,7 +14,7 @@ ferros_sys = { path = "../../ferros_sys" }
 ferros_detail = { path = "../../ferros_detail" }
 # The heap the links' detail documents are read in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
 ferros_heap = { path = "../../ferros_heap" }
-# The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync, and their one-shot converter.
+# The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync.
 ferros_kept = { path = "../../ferros_kept" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }

@@ -156,7 +156,7 @@ impl Gpu {
 const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == vsf::OSCILLATIONS_PER_SECOND);
 
 /// A small value of the `map.` scope whole: Ok(None) absent, Err refused.
-/// A value past the buffer comes back cut to it: the made key is far shorter in either form, so what a reader makes of the cut bytes is the same refusal it would make of the whole.
+/// A value past the buffer comes back cut to it: the made key's document is far shorter, so the cut bytes are refused as the whole would be.
 fn read_small(store: u64, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
     let mut b = [0u8; 1 << 8];
     match ferros_sys::store_read_at(store, key, 0, &mut b) {
@@ -170,18 +170,6 @@ fn read_small(store: u64, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
 /// What the kept wallpaper was made from (`wallpaper.made.key`'s document: BLAKE3 of the seed and the screen's size).
 fn made_key(store: u64) -> Option<[u8; 32]> {
     ferros_kept::secret::parse(ferros_kept::secret::Kind::WallpaperMade, &read_small(store, b"wallpaper.made.key").ok()??)
-}
-
-/// The one-shot converter (docs/VSF-AUDIT.md wave 0): `wallpaper.made.key` as wallgen kept it before its document (32 raw bytes) made its document, once, before it is read; a value it cannot convert stays, said on the console.
-fn upgrade_key(store: u64) {
-    use ferros_kept::secret::{parse, Kind};
-    use ferros_kept::upgrade::{secret, upgrade, Done};
-    let mut slot = (|| read_small(store, b"wallpaper.made.key"), |b: &[u8]| ferros_sys::store_set(store, b"wallpaper.made.key", b));
-    match upgrade(&mut slot, |d| parse(Kind::WallpaperMade, d).is_some(), |o| secret(Kind::WallpaperMade, o, ferros_sys::eagle_now())) {
-        Ok(Done::Converted) => say!("wallgen: wallpaper.made.key is now its VSF document"),
-        Ok(_) => {}
-        Err(why) => say!("wallgen: wallpaper.made.key was left as it was, not converted: {}", why),
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -210,7 +198,6 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
     kh.update(&(w as u32).to_le_bytes());
     kh.update(&(h as u32).to_le_bytes());
     let key = *kh.finalize().as_bytes();
-    upgrade_key(store);
     if made_key(store) == Some(key) {
         say!("wallgen: this device already keeps the person's wallpaper for this screen");
         ferros_sys::exit(0);

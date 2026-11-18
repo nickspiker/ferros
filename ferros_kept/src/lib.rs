@@ -14,6 +14,7 @@
 //! | `fgtw.sponsor` | `sponsor` | `address` `ni` or `nj`, `port` `np` |
 //!
 //! Every maker takes the Eagle time to stamp (`ferros_sys::eagle_now` on the device: 0 before the kernel has read the clock), so all of it runs on the host's tests.
+//! Only these documents are read: the old forms (raw bytes, EWE runs, fixed-width structs) were converted once by the build before this one, and a value still in one reads as no value.
 
 #![no_std]
 
@@ -23,7 +24,6 @@ pub mod gps;
 pub mod map;
 pub mod secret;
 pub mod sponsor;
-pub mod upgrade;
 
 pub use vsf;
 

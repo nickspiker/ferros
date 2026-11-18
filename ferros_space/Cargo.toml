@@ -13,7 +13,7 @@ path = "src/lib.rs"
 fgtw = { path = "../../fgtw", default-features = false, features = ["profile"] }
 vsf = { path = "../../vsf", default-features = false }
 ferros_kist = { path = "../ferros_kist" }
-# The device copy's documents (the map's places and view), one definition with the map, and their one-shot converters.
+# The device copy's documents (the map's places and view), one definition with the map.
 ferros_kept = { path = "../ferros_kept" }
 
 [dev-dependencies]
