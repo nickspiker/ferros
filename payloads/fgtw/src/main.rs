@@ -717,7 +717,7 @@ impl Client {
 
     /// Unlock at boot as the kernel has it now, followed (`ferros_kept::secret::follow`): turned on (the Security page), the roots, the fleet key and the chain in hand are kept now, each as its document, so the next boot finds them; turned off, everything of the identity goes from the disk at once (off is always safe; AUTH.md).
     /// Nothing when it has not changed.
-    /// The kernel keeps its own seed at the next unlock that has the setting on, a typed or tagged attest; that unlock hands the roots here (op 4), which keeps them as well.
+    /// The kernel keeps its own seed at the retype gate's match (SYS_UNLOCK op 12, `retype_keep`) and at a typed attest with the setting on (a tag unlock never keeps it); that unlock hands the roots here (op 4), which keeps them as well.
     fn follow_persist(&mut self) {
         use ferros_kept::secret::{Follow, Kind};
         let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
@@ -1756,7 +1756,7 @@ impl Client {
             if epoch != self.lock_epoch {
                 self.locked_out(epoch);
             }
-            // Unlock at boot switched since the last pass (the Security page, either way): the disk follows at once.
+            // Unlock at boot switched since the last pass (the retype gate turns it on in the kernel; the Security page turns it off): the disk follows at once.
             // A changed preference wakes every word wait in the system (kernel `write_pref_all`), the idle wait at the end of this loop among them, so the pass comes with the change.
             self.follow_persist();
             let watch = NET_FLAGS.load(Ordering::Acquire);

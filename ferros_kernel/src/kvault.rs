@@ -775,6 +775,19 @@ impl KVault {
         Ok(same)
     }
 
+    /// The retype gate's keep (SYS_UNLOCK op 12): when `typed` is the seed of the person present (`retype_matches`), the seed is kept for unlock at boot now (`ID_UNLOCK`, its `unlock` document sealed in the device class, as `unlock` keeps it), so turning the setting on takes effect at the next boot with no attest typed in between.
+    /// Ok(false) and nothing written for any other seed; `Locked` while nobody is present.
+    /// The only writer of the kept seed besides a typed attest's `unlock` with the setting on: a tag's unlock never keeps it (`tag_unlock`; owner, 2026-11-18: "no tags").
+    pub fn retype_keep(&mut self, typed: &[u8; 32]) -> Result<bool, KvError> {
+        if !self.retype_matches(typed)? {
+            return Ok(false);
+        }
+        let mut doc = ferros_pieces::kv::unlock_document(typed, now()).ok_or(KvError::Document("the kept seed"))?;
+        let r = self.raw_put(ID_UNLOCK, &doc);
+        crate::keys::wipe_to_dram(&mut doc);
+        r.map(|_| true)
+    }
+
     /// Whether the person key is held (a person present and their identity service has handed it in).
     pub fn person_held(&self) -> bool {
         self.id.as_ref().is_some_and(|k| k.person.is_some())
@@ -1005,7 +1018,8 @@ impl KVault {
     }
 
     /// Unlock by tag (the attest screen, AUTH.md): the record kept under the tag's id opened with its seal key, and its seed unlocked exactly as a typed handle's is (`unlock`, the same binding rule: a bound device opens only its own identity). The seed is returned for the attest screen to hand to the identity service, as it would the one it derived. `Open` for a tag kept for nothing here or a record that does not open (one refusal, no detail).
-    pub fn tag_unlock(&mut self, uid: &[u8], keep: bool) -> Result<[u8; 32], KvError> {
+    /// A tag never keeps the seed for unlock at boot, whatever the setting (owner, 2026-11-18: "no tags"): the kept seed is written only by a typed attest with the setting on (`unlock`) and by the retype gate (`retype_keep`), both from a handle typed on the glass.
+    pub fn tag_unlock(&mut self, uid: &[u8]) -> Result<[u8; 32], KvError> {
         let (id, mut key) = self.tag_keys(uid)?;
         let record = self.get_addr(TAGS, &id)?.and_then(|d| Self::tag_record(&d));
         let Some((_, mut sealed)) = record else {
@@ -1028,7 +1042,7 @@ impl KVault {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&sealed);
         crate::keys::wipe_to_dram(&mut sealed);
-        match self.unlock(&seed, keep) {
+        match self.unlock(&seed, false) {
             Ok(()) => Ok(seed),
             Err(e) => {
                 crate::keys::wipe_to_dram(&mut seed);

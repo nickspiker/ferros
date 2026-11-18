@@ -6311,7 +6311,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     // Op 12, the retype gate (ahau_core::retype; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again, 32 bytes at x2; the reply document into x3, x4 its length.
-                    // Only a seed that is the person present's turns it on (`retype_matches`, compared in the kernel); anything else changes nothing. SYS_SET_PREF refuses to turn it on, so this is the one way a process does.
+                    // Only a seed that is the person present's turns it on (`retype_keep`, compared in the kernel), and the kernel keeps that seed for unlock at boot at once, so the next boot unlocks with no attest typed in between; anything else changes nothing. No tag reaches this: a tag unlock (ops 6 to 9) never keeps the seed nor sets the setting (owner, 2026-11-18: "no tags"). SYS_SET_PREF refuses to turn it on, so this is the one way a process does.
                     // Returns the document's whole length (what fits of it is written), or ERR when no document could be made.
                     // Only the attest screen's keyboard (ahau, by name and never a kist, as PREF_DND is fgtw's): the identity service holds the Unlock right and the seed all session, and must not be able to switch it on without the handle typed.
                     12 if p.kist || p.name.as_slice() != b"ahau" => ERR,
@@ -6328,6 +6328,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 (Reply { error: false, present: true, matched: true, on: true }, "on")
                             }
                             Ok(1) => (Reply { error: true, present: true, matched: true, on: false }, "the setting was not kept"),
+                            Ok(2) => (Reply { error: true, present: true, matched: true, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "the seed could not be kept"),
                             Ok(_) => (Reply { error: true, present: true, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "they do not match"),
                             Err(()) => (Reply { error: true, present: false, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "no seed held: nobody present"),
                         };

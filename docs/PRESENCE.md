@@ -225,5 +225,5 @@ What none of this changes:
 8. **The tag's cost on every touch** (a): about three compressions a record (the check, the pad, the hash), around 1,400 cycles on the X3 (KEY_REGISTERS.md's table), for every record of every touch, all session, whether or not a prompt is open.
    Or tag only while a prompt is open, which needs the kernel to know when one is (it does: `presence_open`), and leaves the rest of the session's touches untagged.
 9. **The retype gate once (a) is built**: op 11 takes a seed today; it would take the submission instead, and the seed-only form goes the same day (no compatibility path for a weaker form).
-10. **The kept seed's timing** (b and today): the seed is kept at the next unlock that has the setting on (the next typed attest), not when the setting turns on, because fgtw keeps its roots on disk only when the roots are handed to it.
-    With (b) the share request needs the seed sealed at once; fgtw then writes its roots when it sees the setting turn on, not only at op 4.
+10. **The window between the two keeps** (b and today): since 2026-11-18 the kernel keeps its seed at the retype (`retype_keep`) and fgtw keeps the roots at its next pass (`follow_persist`); a power cut between them boots unlocked with no roots for fgtw.
+    With (b) the seed is sealed under the share in the same kernel call; should the kernel also hold fgtw's roots (KEY_REGISTERS.md "The identity's keys in the kernel alone"), so one write keeps everything?

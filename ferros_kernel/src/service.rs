@@ -968,13 +968,17 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             Ok(false) => Ok(0),
             Err(_) => Err(()),
         },
-        // The retype gate (ahau_core::retype, process.rs op 12): 1 the seed typed again is the person present's, 0 it is not; Err while nobody is present. The log says which, never a byte of either seed.
-        (12, Some(s)) => match st.retype_matches(s) {
+        // The retype gate (ahau_core::retype, process.rs op 12): 1 the seed typed again is the person present's and is now kept for unlock at boot (`retype_keep`), 0 it is not and nothing was written, 2 it is but could not be kept; Err while nobody is present. The log says which, never a byte of either seed.
+        (12, Some(s)) => match st.retype_keep(s) {
             Ok(m) => {
-                crate::flashlog::line(if m { "attest at boot: the handle typed again matches the person present" } else { "attest at boot: the handle typed again does not match; nothing changed" });
+                crate::flashlog::line(if m { "attest at boot: the handle typed again matches the person present; the seed kept for the next boot" } else { "attest at boot: the handle typed again does not match; nothing changed" });
                 Ok(m as u64)
             }
-            Err(_) => Err(()),
+            Err(crate::kvault::KvError::Locked) => Err(()),
+            Err(e) => {
+                crate::flashlog::line(&alloc::format!("attest at boot: the handle typed again matches, but the seed could not be kept: {e:?}"));
+                Ok(2)
+            }
         },
         (3, _) => {
             st.bind().map_err(|_| ())?;
@@ -1023,7 +1027,7 @@ fn store_tag_held(op: crate::process::TagOp) -> Result<u64, ()> {
     use crate::process::TagOp;
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match op {
-        TagOp::Unlock(uid, out) => match st.tag_unlock(uid, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1) {
+        TagOp::Unlock(uid, out) => match st.tag_unlock(uid) {
             Ok(seed) => {
                 *out = seed;
                 crate::flashlog::line("identity unlocked by a kept tag");
