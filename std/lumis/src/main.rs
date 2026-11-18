@@ -81,6 +81,21 @@ struct Probe {
     counter_at: Option<u64>,
 }
 
+/// The development knobs, the spawn input's first byte: every pass shown whole as before the redraw-on-change (to measure its win in the same build).
+const DEV_WHOLE: u8 = 1 << 0;
+/// Frames by copy at `BIN` instead of the view (the 6 MiB reply measured against it).
+const DEV_COPY: u8 = 1 << 1;
+
+/// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
+fn dev_input() -> (u8, Vec<u8>) {
+    let mut b = [0u8; 1 << 4];
+    let n = sys::input(0, &mut b);
+    match n {
+        0 => (0, Vec::new()),
+        _ => (b[0], b[1..n].to_vec()),
+    }
+}
+
 /// The UI probe's window: a line every 2^2 seconds.
 const PROBE_MS: u128 = 1 << 12;
 
@@ -318,17 +333,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         *opened.lock().unwrap() = Some(Opened::Failed(why));
     };
     // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
-    // A development spawn may hand the driver's mode block as its input (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before.
+    // A development spawn's input (`dev_input`): its knobs byte, then optionally the driver's mode block (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before.
     let mut ask = vec![camera::OP_OPEN, cam.id, camera::OPEN_VIEW];
-    let mut block = [0u8; 1 << 4];
-    let given = sys::input(0, &mut block);
-    // An input of G#FF alone asks for no view: frames by copy at `BIN`, the 6 MiB reply measured against the view.
-    if given == 1 && block[0] == 0xFF {
+    let (knobs, block) = dev_input();
+    if knobs & DEV_COPY != 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
-    } else if given != 0 {
-        ask.extend_from_slice(&block[..given]);
-        println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block[..given].iter().map(|b| format!("{b:02X}")).collect::<String>());
+    } else if !block.is_empty() {
+        ask.extend_from_slice(&block);
+        println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
     }
     // An open with a mode block is answered with 64 bytes (the ring's count and the slit's facts after the view's 48).
     let mut r = [0u8; 1 << 6];
@@ -505,6 +518,45 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
     }
 }
 
+/// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
+/// Overlapping ones made one, so the host gets disjoint rects (fluor `DamageRects`), at most four.
+fn partial_parts(ui: &lumis_core::UserInterface) -> Vec<fluor::canvas::PixelRect> {
+    use fluor::canvas::PixelRect;
+    let mut parts = vec![
+        PixelRect::new(ui.left_label_x, ui.left_label_y, ui.left_label_end_x, ui.left_label_end_y),
+        PixelRect::new(ui.right_label_x, ui.right_label_y, ui.right_label_end_x, ui.right_label_end_y),
+    ];
+    if let Some(&(x, y, ex, ey)) = ui.counter_areas.first() {
+        let mut c = PixelRect::new(x, y, ex, ey);
+        for &(x, y, ex, ey) in &ui.counter_areas[1..] {
+            c = c.union(PixelRect::new(x, y, ex, ey));
+        }
+        parts.push(c);
+    }
+    if ui.slider_thickness > 0. && ui.exposure_time_ms > 0 {
+        // The band is the slider's line widened by its thickness each side, the dot's cup inside it; a float below zero casts to 0, and the host cuts the rect at the frame.
+        let t = ui.slider_thickness;
+        let (xa, xb) = (ui.slider_start_x.min(ui.slider_end_x), ui.slider_start_x.max(ui.slider_end_x));
+        let (ya, yb) = (ui.slider_start_y.min(ui.slider_end_y), ui.slider_start_y.max(ui.slider_end_y));
+        parts.push(PixelRect::new((xa - t) as usize, (ya - t) as usize, (xb + t) as usize + 1, (yb + t) as usize + 1));
+    }
+    parts.retain(|r| !r.is_empty());
+    // Overlapping parts joined until none overlap.
+    let overlap = |a: &PixelRect, b: &PixelRect| a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+    let mut k = 0;
+    while k < parts.len() {
+        match (k + 1..parts.len()).find(|&j| overlap(&parts[k], &parts[j])) {
+            Some(j) => {
+                let b = parts.swap_remove(j);
+                parts[k] = parts[k].union(b);
+                k = 0;
+            }
+            None => k += 1,
+        }
+    }
+    parts
+}
+
 /// Where Lumis is: Android's UserInterface.kt states.
 enum Screen {
     Menu,
@@ -529,6 +581,10 @@ struct Lumis {
     pending_up: bool,
     /// Lumis posted a frame since the last show: the next draw converts it whole from Lumis's own buffer straight into fluor's scratch (no copy of the frame here: neither its bytes nor its pixels, 44 MB on the Pro).
     changed: bool,
+    /// On the camera screen, a pass that drew no new image and nothing whole: the controls' parts lumis_core repainted (its partial draw), the only rects converted and shown (redraw on change; the owner's go, 2026-11-17). Empty with `changed` false: nothing to show.
+    parts: Vec<fluor::canvas::PixelRect>,
+    /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`).
+    knobs: u8,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
     lut: [u32; 256],
     /// The preview's split on the UI thread (`Probe`).
@@ -542,7 +598,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -626,6 +682,8 @@ impl FluorApp<G2t16> for Lumis {
                     let ui = app::ui_new(SharedMemory::view(ptr as *mut u64, bytes), self.width as u32, self.height as u32);
                     self.finger = None;
                     self.screen = Screen::Camera(ui);
+                    // Its first draw is whole whatever its counters say (draw_screen finds the menu's corner pixel and draws everything).
+                    self.changed = true;
                 }
                 Some(Opened::Failed(why)) => {
                     println!("lumis: back to the menu ({why})");
@@ -647,10 +705,31 @@ impl FluorApp<G2t16> for Lumis {
             }
             Screen::Opening => {}
             Screen::Camera(ui) => {
-                let counter = ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
+                use lumis_core::shared_memory::{CALIBRATING_BIT, CAL_SHOW_RESULT_BIT, FLAGS_IDX};
+                // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
+                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid);
                 let t = std::time::Instant::now();
                 app::ui_frame(ui, surface, Buttons::default(), UPRIGHT, self.finger);
-                self.probe.pass(counter, t.elapsed().as_micros() as u64);
+                self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
+                // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
+                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own), and a turn of the device (the gravity here is a constant).
+                let whole = ui.previous_image_counter != before.0
+                    || ui.previous_exposure_start != before.1
+                    || ui.previous_histogram_counter != before.2
+                    || ui.previous_hold_present
+                    || before.3
+                    || ui.header[FLAGS_IDX] & (CALIBRATING_BIT | CAL_SHOW_RESULT_BIT) != 0
+                    || before.4
+                    || ui.last_touch_valid
+                    || self.finger.is_some();
+                self.parts.clear();
+                if surface.take_posted() {
+                    if whole || self.knobs & DEV_WHOLE != 0 {
+                        self.changed = true;
+                    } else if ui.controls_visible {
+                        self.parts = partial_parts(ui);
+                    }
+                }
                 if self.finger.is_some() {
                     self.down_sampled = true;
                 }
@@ -661,14 +740,23 @@ impl FluorApp<G2t16> for Lumis {
                 }
             }
         }
-        self.changed |= surface.take_posted();
-        self.changed
+        // The camera screen took its post above; the menu's (and the first camera pass after the opening, `changed` set there) are whole.
+        if !matches!(self.screen, Screen::Camera(_)) {
+            self.changed |= surface.take_posted();
+        }
+        self.changed || !self.parts.is_empty()
     }
 
-    /// The whole frame when Lumis posted one, nothing otherwise (a touch that drew nothing shows nothing new; fluor's default, the whole viewport, would clear the scratch for a frame never converted).
-    fn damage_rect(&mut self, viewport: fluor::geom::Viewport) -> Option<fluor::canvas::PixelRect> {
-        let h = if self.changed { viewport.height_px as usize } else { 0 };
-        Some(fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, h))
+    /// The whole frame when Lumis drew it whole, the controls' repainted parts when it drew only those, nothing otherwise (a touch that drew nothing shows nothing new; fluor's default, the whole viewport, would clear the scratch for a frame never converted).
+    fn damage_rects(&mut self, viewport: fluor::geom::Viewport, out: &mut [fluor::canvas::PixelRect; fluor::canvas::DAMAGE_RECTS]) -> usize {
+        if self.changed {
+            out[0] = fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize);
+            return 1;
+        }
+        for (o, r) in out.iter_mut().zip(&self.parts) {
+            *o = *r;
+        }
+        self.parts.len()
     }
 
     /// Lumis's frame (gamma-2 bytes) into fluor's pixels, the rows of the damage clip, straight from Lumis's buffer, a row per task on the worker cores. The frame is opaque everywhere, so every pixel is written and nothing lies under it.
@@ -678,12 +766,14 @@ impl FluorApp<G2t16> for Lumis {
         self.changed = false;
         let t = std::time::Instant::now();
         let (w, lut) = (self.width, &self.lut);
-        let (y0, y1) = (ctx.damage_clip.y0, ctx.damage_clip.y1);
-        target[y0 * w..y1 * w].par_chunks_mut(w).zip(surface.pixels()[y0 * w * 3..y1 * w * 3].par_chunks(w * 3)).for_each(|(px, src)| {
-            for (p, rgb) in px.iter_mut().zip(src.chunks_exact(3)) {
-                *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
-            }
-        });
+        // Each damage rect (the host cut them at the frame), its rows across the workers.
+        for &fluor::canvas::PixelRect { x0, y0, x1, y1 } in ctx.damage_rects() {
+            target[y0 * w..y1 * w].par_chunks_mut(w).zip(surface.pixels()[y0 * w * 3..y1 * w * 3].par_chunks(w * 3)).for_each(|(px, src)| {
+                for (p, rgb) in px[x0..x1].iter_mut().zip(src[x0 * 3..x1 * 3].chunks_exact(3)) {
+                    *p = G2t16::from_channels(G2t16::ONE, [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize]]);
+                }
+            });
+        }
         if matches!(self.screen, Screen::Camera(_)) {
             self.probe.convert += t.elapsed().as_micros() as u64;
             self.probe.converts += 1;
