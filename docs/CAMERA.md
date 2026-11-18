@@ -533,6 +533,26 @@ Then the ultrawide (`04080005010B`, to 2^11 ms), then Lumis hand-spawned (above,
 - In ferros: `ARRAYS[0].lte` = G#0702, G#0704, at 8, most 6. At the binned mode's 3.22 us line shift 6 reaches 13.5 s with the line untouched; 16 s is shift 6 with the line at about 7500 clocks (3.8 us, well under the front end's 15.6 us); the list offers to shift 6 at the longest line, about 65.5 s. The ultrawide (Sony) has no shift: its own capture would be on hsi2c_3.
 - **Not known yet, and the next device test:** whether the 2 s stop of b932 was the line (31.3 us) or the frame (2 s). Android's front end takes a 16 s frame, but its HAL may set something ferros does not. camtest `0408000500` and then the sixth byte 14 (to 16 s) on the main: 2 s now runs at shift 1 on the 3.22 us line, so a stop there says the frame period, not the line.
 
+**The shift on the Pro, 2026-11-17 night** (b933, forge aa6d8ec3's gate, the owner attested; the driver and camtest hand-spawned, nothing stored). camtest `0408000500`, then `04080005000E` (the sixth byte is the top; `040800050E` names camera G#0E and is refused), every step running, the module powered down at the close:
+
+| asked | plan | frames apart | mean (16ths, black 1024) | the sensor reads (frame / line / integration) |
+|---|---|---|---|---|
+| 64 ms | own frame | 67.3 ms | 1371 | 21362 / 6320 / 19852 |
+| 128 ms | frame lengthened | 102.6 ms (the change inside the 4) | 1718 | 39707 / 6320 / 39705 |
+| 256 ms | shift 1 | 250.1 ms | 2445 | 39707 / 6320 / 39705 |
+| 512 ms | shift 2 | 500.2 ms | 3625 | same |
+| 1 s | shift 3 | 998.3 ms | 5632 | same |
+| 2 s | shift 4 | 2003 ms | 8158 | same |
+| 4 s | shift 5 | 4003 ms | 11864 | same |
+| 8 s | shift 6 | 8004 ms | 14366 | same |
+| 16 s | shift 6, line 7664 | 16004 ms | 15480 | 65487 / 7664 / 65485 |
+| 64 ms again | own frame | 69.3 ms | 1338 | 21362 / 6320 / 19852 |
+
+- **16 s runs.** The shift moves mid-stream in the hold, the sensor reads its frame and integration back in shifted units, and the front end takes 16 s frames: so b932's 2 s stop was the 31.3 us line, not the frame period. The ladder before it (`0408000500`) ran the same to 2 s.
+- The mean doubles a step to 1 s and then bends toward the ceiling (16368, 1023 a sample): the scene saturates, not the exposure.
+- Once, at 8 s, the frame thread's quiet look found image status G#1 for 131 ms and answered it; the stream ran on, so a begun frame is ordinary in a long period and not by itself the death of b932.
+- **The main's line time is 2.3 % short of what ferros uses.** Every long step's spacing is 0.977 of the period asked (2003/2048, 4003/4096, 8004/8192, 16004/16384), and the 16 s step's 16.004 s over 65487 lines of 2^6 at 7664 clocks gives 3.1489 us at 6320 clocks: exactly 6320 clocks of the PLL at 24.576 MHz / 3 x 245 (2007.04 MHz), the clock the ultrawide's line was already derived from, not the 24 MHz the October reading assumed (`MAIN_LINE_PS` 3.2237 us). The 64 ms frames, 67.3 ms apart, agree (21362 x 3.1489 us = 67.27 ms). So every exposure ferros has reported for the main is 2.3 % long; not changed yet (the owner's call, with the front end's line cap rederived from it).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
