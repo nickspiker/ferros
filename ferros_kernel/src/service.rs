@@ -4595,9 +4595,26 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 if cmd.params == b"log" || cmd.params.starts_with(b"log ") {
-                    // `diag log [KiB]`: the last 16 KiB of the flash text log (flashlog.rs), or the last KiB asked for (up to 256: a reply's room).
-                    let kib = core::str::from_utf8(&cmd.params[3..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256);
-                    resp.extend_from_slice(&crate::flashlog::tail(kib * 1024));
+                    // The flash log (flashlog.rs, LEDGER.md "Reading it"). Until signed bridge commands exist (BRIDGE.md B2) this needs no right: whoever holds the cable reads the log opened; it should need the bridge right once B2 is built.
+                    let arg = core::str::from_utf8(&cmd.params[3..]).unwrap_or("").trim();
+                    let mut w = arg.split_whitespace();
+                    let num = |t: Option<&str>| t.and_then(|t| t.parse::<u32>().ok());
+                    match w.next() {
+                        // `diag "log legacy <first> [count]"`: the old text log's raw blocks, for the bridge's one-shot converter; `diag "log legacy erase <first> [count]"`: those blocks zeroed and read back.
+                        // WHY the clamp on count: the host's number; a reply holds 2^6 blocks (256 KiB), and an erase step holds the kernel lock per block, 2^6 at a time.
+                        Some("legacy") => match w.next() {
+                            Some("erase") => {
+                                let first = num(w.next()).unwrap_or(0);
+                                let n = crate::flashlog::legacy_erase(first, num(w.next()).unwrap_or(crate::flashlog::LEGACY_STEP).clamp(1, crate::flashlog::LEGACY_STEP));
+                                resp.extend_from_slice(alloc::format!("old log: A#{n} blocks from A#{first} zeroed and read back\n").as_bytes());
+                            }
+                            first => resp.extend_from_slice(&crate::flashlog::legacy_blocks(num(first).unwrap_or(0), num(w.next()).unwrap_or(crate::flashlog::LEGACY_STEP).clamp(1, crate::flashlog::LEGACY_STEP))),
+                        },
+                        Some("bench") => resp.extend_from_slice(crate::flashlog::bench().as_bytes()),
+                        // `diag log [n]`: the newest n entries (2^8 if none asked), as VSF documents the bridge renders; at most a reply's room (256 KiB less a KiB), the newest kept.
+                        // WHY the clamp: the host's number; the ring holds about 2^17 entries a copy, and the room cuts the answer anyway.
+                        n => resp.extend_from_slice(&crate::flashlog::answer(num(n).unwrap_or(1 << 8).clamp(1, 1 << 17) as usize, (1 << 18) - (1 << 10))),
+                    }
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

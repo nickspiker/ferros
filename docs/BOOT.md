@@ -408,6 +408,10 @@ When the ledger server starts (Stage 8):
   - Pre-boot buffer released
 ```
 
+As built (2026-11-17, LEDGER.md "Stage 0 as built"): the kernel keeps the ledger's flash ring itself (flashlog.rs), opened right after the UFS link is up.
+The pre-boot buffer (ferros_ledger `preboot`, 2^6 entries in the kernel's static memory) holds what the kernel says until the ira is held, because nothing reaches the flash unsealed; vault boot's `flashlog::flush` then writes it, sealed and chained after the ring's head, and every line after that is on the flash before its call returns.
+A boot that dies between the UFS link and the ira is covered by the glass console and the ramoops report, where every waiting line also goes.
+
 ---
 
 ## Hot Reload vs Cold Boot

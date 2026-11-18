@@ -3,10 +3,17 @@ name = "ferros_ledger"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Append-only event chain — BLAKE3-chained VSF entries, capability-gated"
+description = "The ledger (LEDGER.md): every entry a complete VSF document, sealed, chained by BLAKE3, kept in a flash ring that wraps"
 
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
+# The entries are VSF documents built and read with vsf's schema builders; `x-full` so a person's words in any script encode without std (the owner's call for ferros text, as ferros_idea and fgtw take it).
+vsf = { path = "../../vsf", default-features = false, features = ["x-full"], optional = true }
+# The seal: XChaCha20-Poly1305, the house AEAD.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 
 [features]
 default = []
+# The ledger itself: entries, the flash ring, the pre-boot buffer and the views `diag log` answers with.
+# Off by default so the EWE helpers stay free of alloc for the payloads that take only those (ferros_pt, map, usb, ferros_space).
+ring = ["dep:vsf", "dep:chacha20poly1305"]

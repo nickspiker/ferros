@@ -4,10 +4,14 @@
 //
 //   pt_send(link, data), pt_recv(link) → Vec<u8>: ferros-link's (tools/ferros-link, shared with ferros-send), the DATA blast each way
 //
+// ledger.rs ── the flash log: `diag log` rendered (`--raw` its VSF documents), log-render <file>, log-legacy <out> [--erase] (the old text log converted once)
+//
 // usb.rs ── UsbLink is ferros-link's (VID G#1209, PID G#4665, FERROS_BUS); here only the development vendor requests on EP0: read_dbg, read_dbg2, gate
 
 extern crate alloc;
 mod input;
+/// The flash log: `diag log` rendered, `log-render`, `log-legacy` (LEDGER.md "Reading it").
+mod ledger;
 /// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
 #[path = "../../../ferros_detail/src/network.rs"]
 mod network;
@@ -49,6 +53,9 @@ fn usage() {
     eprintln!("Commands:");
     eprintln!("  status       Check if device is connected");
     eprintln!("  diag         Retrieve boot diagnostics from device");
+    eprintln!("  diag log [--raw] | diag \"log <n>\"  The flash log's newest entries (256 or n) as lines; --raw writes its VSF documents");
+    eprintln!("  log-render <file.vsf>  A saved `diag log --raw` answer or a converted old log, as lines");
+    eprintln!("  log-legacy <out.vsf> [--erase]  The old 2026-10-20 text log as ledger_legacy documents, once; --erase zeroes it on the device after the file checks");
     eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
     eprintln!("  echo         PT echo test — send pattern, verify round-trip");
     eprintln!("  send <hex>   Send hex bytes via PT transfer");
@@ -86,7 +93,12 @@ async fn main() {
     match args[1].as_str() {
         "status" => cmd_status().await,
         // `diag ufs` runs the cold boot's UFS link-startup probe (long report).
-        "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[])).await,
+        // `diag log [n]` is rendered as lines (`--raw`: its VSF documents as they came).
+        "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[]), args.iter().any(|a| a == "--raw")).await,
+        // log-render <file.vsf>: a saved `diag log --raw` answer or a converted old log, as lines.
+        "log-render" if args.len() >= 3 => ledger::cmd_render(&args[2]),
+        // log-legacy <out.vsf> [--erase]: the 2026-10-20 text log, converted once (ledger.rs).
+        "log-legacy" => ledger::cmd_legacy(&args[2..]).await,
         "read" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU: on husky a direct PMU read makes the next EL3 call hang)");
@@ -879,7 +891,7 @@ fn tri_state(v: u32) -> &'static str {
     }
 }
 
-async fn cmd_diag(params: &[u8]) {
+async fn cmd_diag(params: &[u8], raw: bool) {
     let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
@@ -910,6 +922,10 @@ async fn cmd_diag(params: &[u8]) {
     match pt_recv(&link).await {
         Ok(data) => {
             eprintln!("Received {} bytes", data.len());
+            if ledger::is_entries(params) {
+                ledger::show(&data, raw);
+                return;
+            }
             let _ = io::stdout().write_all(&data);
             let _ = io::stdout().flush();
         }

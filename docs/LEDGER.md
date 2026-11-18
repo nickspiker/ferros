@@ -5,6 +5,129 @@
 
 ---
 
+## Stage 0 as built: the flash ring (2026-11-17)
+
+The flash log (ferros_kernel/src/flashlog.rs) is the ledger's first running part: every line is an entry, kept in a ring on the flash outside the vault, so it works with the vault broken.
+The format, the ring and the seal are ferros_ledger (`--features ring`); the kernel gives it blocks, keys and the clock.
+What the rest of this document specifies and stage 0 does not do yet is listed at the end of this section.
+
+### Entry format (as built)
+
+Every entry is one complete VSF document, built with `VsfBuilder` and vsf's schema builders, nothing pushed by hand:
+
+```
+RÅ< z y b l [e6: Eagle time] hp: provenance n (ledger o b n) >
+[ (seq: u) (boot: u) (prev: hp) (class: u) (key: hp) (nonce: mb) (tag: mp) (sealed: vX) ]
+
+sealed, once opened: [ (category: d) (writer: x) (words: x) ]   section `ledger_payload`
+```
+
+- `seq`: the entry's number in the ring's one chain, from 0. `boot`: the boot that wrote it. Both VSF's auto-sized `u` (EWE): `u3` + 1 byte for small numbers, growing as needed, no fixed width anywhere.
+- `prev`: the provenance hash of the entry before; the first ever names BLAKE3 of 32 zero bytes. The header's `hp` is this entry's hash, the one the next names.
+- The Eagle time is the header's creation time (`e6`, oscillations). Before the device has read its clock this boot (the RTC is read at service start) the header has no time at all: VSF's way for a device that cannot know the time. Never a counter, never UNIX time.
+- `class`: which key the entry is sealed under (0 system, 1 personal; the next table). `key`: that key's public id (BLAKE3 `derive_key` of a key-id context over the key), so a reader knows whether it holds the key before it tries.
+- `nonce` (24 bytes, `mb`), `tag` (16 bytes, `mp`), `sealed` (`v` wrap `X`, XChaCha20-Poly1305): the seal, each in a typed field of its own.
+- The seal's associated data is a `ledger_bind` section of `seq`, `boot`, `prev`, `class`, `key` and the time, so none of them can be moved onto another entry's ciphertext.
+- The nonce is synthetic: keyed BLAKE3 (a subkey of the seal key) over the bound fields and the plaintext, cut to 24 bytes. No entropy is needed (an entry can be sealed before the wairua is drawn), and the same nonce only comes again for the same words under the same open fields, which the chain never repeats.
+- The category, the writer and the words are sealed: on the flash only the class, the place in the chain and the time are in the clear.
+
+The integrity is VSF's provenance hash over the whole document, then the chain over the hashes, then the AEAD over the payload: three layers, each checked on every read.
+
+### Classes
+
+The category decides the class (owner, 2026-11-17):
+
+| Category | Class | What | Sealed under |
+|---|---|---|---|
+| `text` | system | the kernel's lines, and a process's console lines it asked to keep (`line`, `line_from`): stage 0's every existing caller | the ira's ledger key |
+| `ledger` | system | the ledger's own notes: a torn last write found at open, the pre-boot buffer overrun | the ira's ledger key |
+| `bench` | system | `diag "log bench"`'s timed entries | the ira's ledger key |
+| `person.text` | personal | lines about the person: today the alias given to a kist (which kists they use) | the person's ledger key |
+| the spec's tree, when built (stage 1): `kernel.*`, `usb.*`, `vault.*`, `ringfs.*`, `vsf` | system | boot steps, clocks, lock holds, devices, storage | the ira's ledger key |
+| `photon.*`, `token.*`, `app.<cap_hash>` | personal | peers, messages, identity, kists' own entries | the person's ledger key |
+
+- **System** entries are sealed under a key derived from the ira (`flashlog.rs` `system_key`, the one place it is made, context `ferros 2026-11-17 ledger system seal v0`): readable by this device at any boot, with the vault broken or nobody attested; unreadable off it. Never the identity's keys. The coordinator chose this root pending the owner's word; changing it is a change to `system_key` alone.
+- **Personal** entries are sealed under the attested identity's ledger key (kvault `IdKeys.ledger`, from the identity root under `ferros 2026-11-17 identity ledger v0`, held sealed under the wairua, handed to the flash log at unlock and taken back at lock): readable only while that person is present.
+- A personal line with no diagnostic value is not logged at all. A refusal the system has to diagnose is a system line with the person's part left out (the alias refusal names no kist).
+- A personal entry made while nobody is attested is **dropped, and counted** (`diag log`'s state). Not held for the next attest: the next person may be someone else, and an entry held in RAM would then be sealed to them.
+
+### The flash ring
+
+- Where: the ferros partition from 1 GiB + 64 MiB in (right after the old text log), two copies of 2^14 blocks of 4 KiB: copy A at 0, its mirror B at 2^14. About 160 thousand entries a copy at today's line lengths.
+- A block holds complete entry documents back to back; what follows the last is unwritten space (zeros), never parsed. There is no header, no index and no bookkeeping structure on the flash at all: the only things in the region are entries.
+- Writing, write-verify-then-mirror: the entry goes into the head block in RAM, the whole block is written to A, read back and compared, then written to B. Only then does `line` return: an entry is on the flash, in both copies, before the call returns.
+- Wrapping: an entry that does not fit in the head block starts the next block, which drops the oldest block's entries. Nothing stops when the ring is full.
+- Words too long for one block go as several entries, in order.
+- The head, found by the chain: blocks are written in ring order, so the first entry's `seq` rises from block 0 to the head block and drops after it. A binary search finds the head block in about log2(2^14) reads (28 block reads for 2^10 blocks a copy on the host bench, both copies read); then from its last entry the chain decides, forward for as long as the next block's first entry names it as `prev`. A block damaged in both copies on the way falls back to reading every block.
+- Every entry is checked against its provenance hash, A first, B where A fails, and it must follow the one before (`seq` + 1, `prev`): every entry either copy holds whole is kept.
+- A torn write: A is written whole before B is touched, so a write cut off leaves the entry damaged in one copy and absent from the other. At the end of the head block (or as the start of the block after it) that is the torn last write: named (`Torn`), skipped, and the next entry goes in its place. Nothing earlier is lost.
+- Damage anywhere else is named, never passed over: the block and byte, what failed (`Corrupt`, `OneCopy`), and the gap or break it leaves in the chain (`SeqGap`, `ChainBreak`).
+
+### The pre-boot buffer and the clock
+
+- Nothing reaches the flash unsealed. The kernel opens the ring right after the UFS link is up (finding the head needs no key: the hashes are over the sealed documents), but sealing needs the ira, which vault boot derives a few steps later.
+- What the kernel says before then waits in the pre-boot buffer (ferros_ledger `preboot`, 2^6 entries in the kernel's static memory, the oldest overwritten and counted) and goes to the RAM log as before. The moment the ira is held (`flashlog::flush` from vault boot) the buffer is written, sealed and in order; an overrun is written as a `ledger` entry.
+- A boot that dies in that window (the UFS link up, the ira not yet derived) is covered by the glass console and the ramoops report, not the flash log.
+- A waiting entry keeps the counter tick it was made at, in RAM only; when it is written its Eagle time is worked out from that tick if the clock has been read by then, else it carries none.
+- Entries made after the ira and before the RTC is read (service start) carry no time. Their order is the chain's; their boot is in `boot`.
+
+### Reading it
+
+- `ferros-bridge diag log` (or `diag "log <n>"`): the newest 2^8 (or n) entries, at most a reply's room, rendered as `b<boot> <local wall time> <writer>: <words>`. The Eagle time becomes the host's local time for display only; a category other than `text` is shown in brackets; an entry made before the clock shows `(no clock yet)`.
+- `--raw` writes the answer's VSF documents as they came; `ferros-bridge log-render <file>` renders a saved one.
+- The answer is a run of complete VSF documents: `ledger_state` first (this boot, the next `seq`, the head block, the pre-boot buffer, personal entries dropped, writes failed, whether a person is present), then each entry as stored followed by `ledger_open` (its hash, category, writer, words) when this device holds its key now, and `ledger_finding` documents for everything found wrong, by block and byte, with a `kind` number and the words. A system entry that does not open under this device's key is a finding (`Shut`); a personal entry with nobody present is shown as sealed.
+- **Until signed bridge commands exist (BRIDGE.md B2), whoever holds the USB cable reads the log opened.** The kernel opens the entries for the answer. The seal covers a chip taken off the board, not the cable. `diag log` should need the bridge right once B2 is built.
+
+### The old text log
+
+The 2026-10-20 stopgap (1 GiB in, 2^14 blocks, a fixed-width header and plain `b<boot> t<ms> <text>` lines) is converted once and never parsed again (AGENT.md: no compatibility reader for a text encoding):
+- `ferros-bridge log-legacy <out.vsf>` reads its raw blocks (`diag "log legacy <first> <count>"`; the kernel hands out blocks and parses nothing), keeps each line as a `ledger_legacy` document (`seq`, `prev`, `boot`, `since_boot_ms`, `words`: typed fields, chained like entries, the conversion's time in the header), checks the file it wrote, and with `--erase` zeroes the old blocks on the device (`diag "log legacy erase"`, each block read back).
+- `since_boot_ms` is the old line's counter milliseconds, kept as the number it was: those lines had no Eagle time and none is made up for them.
+- The kernel reads one thing of the old region on its own: the header's boot count, once, while the ring holds no entry, so boot numbers go on (b930, b931, ...). Once the ring has an entry, its `boot` is the count; once the old log is erased there is nothing to read.
+- The converted file is the device's data: keep it with the device's (keys/<device>/), not in a repository.
+
+### What an entry costs
+
+Measured on the host (x86-64, release, `cargo run --release -p ferros_ledger --features ring --example bench`):
+
+| | old line | entry |
+|---|---|---|
+| CPU | 0.15 us (format, copy) | 16 us (seal key, seal, document, hash); 14 us to verify and open |
+| bytes | 69 | 409 |
+| block I/O | 2 writes (tail block, header) | 2 writes and 1 read (A, read back, B) |
+
+The device measure is `ferros-bridge diag "log bench"`: the old line's work and its two block writes, the seal key from the ira, the seal and document, and a whole append (writing 2^3 `bench` entries).
+The I/O dominates on the device (the old line's two writes under the kernel lock took up to 0.66 ms, `diag lock`); the entry adds a block read and tens of microseconds of CPU.
+The kernel's text grew by 207 KB, most of it vsf's `x-full` text tables and NFC (every script of every language encodes in a sealed line).
+
+### Where stage 0 stops
+
+- `writer_cap` and `writer_sig` are not populated: there are no writer keys or ledger caps yet. The writer is named (`writer`, sealed).
+- One chain over the whole ring, not one per category, and no `cat_seq`: the category is sealed, so per-category order is not visible on the flash. A reader groups by category after opening.
+- The kernel is the ledger's only writer and keeps it itself; the userspace ledger server, its caps and its category registry are not built.
+- The words are text (`x`). Stage 1 moves the busiest lines to typed fields (below).
+
+### Stage 1: the busiest lines, as typed fields
+
+The ten sites that write most, by how often their path runs, and the fields each would carry instead of words (every number `u` or `i`, every time `e6`, every duration in oscillations, every name `d`):
+
+| Site | Today's words | Category | Typed fields |
+|---|---|---|---|
+| process.rs:5390, a process's console line kept (`line_from`, camera and the drivers) | the driver's own text | `kernel.console` until each driver has its own | per driver: `step` (u), `status` (u), the driver's values; the writer stays the process |
+| devsched.rs:172, lock held long | holds, the last tick and its microseconds, the holder | `kernel.lock` | `holds` (u), `last_at` (e6), `held` (u, oscillations), `syscall` (u), `op` (u), `thread` (u) |
+| service.rs:3122, heartbeat | up seconds, USB commands, slices | `kernel.heartbeat` | `up` (u, oscillations), `usb_cmds` (u), `slices` (five u) |
+| pd.rs:84/93/133/297, power-domain steps after a jump | domain and step | `kernel.power` | `domain` (d), `step` (u), `status` (u), `serror` (u0) |
+| camera_power.rs:84-259, camera on and off | module, steps, time taken, S2MPUs | `device.camera` | `module` (u), `step` (u), `took` (u, oscillations), `s2mpu_fenced` (u), `result` (u) |
+| process.rs:6289/6351, a process ended or faulted | name, exit value, last line | `kernel.process` | `name` (d), `exit` (u), `esr` (u), `far` (u), `pc` (u), `last_words` (x) |
+| service.rs:1259-1363, restart and on-demand starts | name, capsule bytes, outcome | `kernel.process` | `name` (d), `step` (u), `bytes` (u), `result` (u) |
+| service.rs:2424-2437, USB TCPC role | role, cc, power, switch | `usb.tcpc` | `role` (u), `cc` (u), `power` (u), `switch` (u), `alert` (u) |
+| service.rs:2883-2917 and 3301-3372, kist offers and long commands | bytes, status, milliseconds | `kernel.kist` | `bytes` (u), `status` (u), `took` (u, oscillations), `why` (u) |
+| process.rs:1807/3756/5638, an interrupt storm or a syscall buffer trapped | line, process, offsets | `kernel.trap` | `syscall` (u), `op` (u), `offset` (u), `address` (u), `length` (u), `pc` (u), `lr` (u), `thread` (u), `intid` (u) |
+
+The boot's own lines (`boot cold`, `bootloader saw`, `kvault open ok in N ms`, the S2MPU fences, the zone) are rarer but every boot has them: `kernel.boot` with `kind` (u: cold, reload, jump), `took` (u, oscillations), `generation` (u), `values` (u), `fenced` (u) per S2MPU.
+
+---
+
 ## Philosophy
 
 A log is not a debugging convenience. It is a **formal record of system events** — capability-gated, cryptographically ordered, append-only, and killswitch-ready by construction.
@@ -343,6 +466,9 @@ Worst case: lose one in-flight entry
 ---
 
 ## Encryption at Rest
+
+As built (stage 0, above): XChaCha20-Poly1305 under a system key from the ira or the person's ledger key, by the entry's class; the nonce and tag in typed fields, the provenance hash over the sealed form.
+The `boot_key` design below (per-boot fresh) would leave a past boot's entries unreadable at the next; the flash log has to be read across boots, so its system key is the device's own and the same every boot.
 
 VSF handles this. Not the Ledger server. Not a separate layer.
 
