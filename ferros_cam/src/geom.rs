@@ -151,6 +151,16 @@ pub fn rewrite(list: &mut [u8], from: &Geom, to: &Geom, scope: Scope) -> u32 {
 /// The values are Linux's close's (kernel camera_close.rs): G#1C33_7028 and G#1C33_B028 to 0 (the contexts' enables, 1 in the program), the crossbar words G#1C33_0C08 and G#1C33_0D08 to 2 (G#7C and 2 at the open, CPU 'before'), and G#1C34_0000 to 0 (1 in the program; the block at G#1C34 sized for the PD rows, G#1C34_0014 = 768 x 4080).
 pub const DETACH: [(u32, u32, u8); 5] = [(0x1C33_7028, 0, 1 << 0), (0x1C33_B028, 0, 1 << 1), (0x1C33_0C08, 2, 1 << 2), (0x1C33_0D08, 2, 1 << 2), (0x1C34_0000, 0, 1 << 3)];
 
+/// An open's processing-block switches off (`DETACH`) and whether it runs the slim program: `over` the driver's override byte (0 the defaults; with G#80 its low four bits the switches exactly and `asked` the program), `windowed` a slit or an x window, `main` the main camera (the only one measured), `asked` the open's own slim flag.
+/// The defaults, as measured on the Pro (2026-11-18): a windowed mode on the main detached (FC ctx3 off: windowed, it erred and loch0 stalled on SHORT_VB_FATAL) and slim (detached, the full program missed a slit's blanking, LATE_CONFIG; detached and slim, 261120 slits at 1230 a second, none lost); whole frames, and the other cameras, as asked.
+pub fn shape(over: u8, windowed: bool, main: bool, asked: bool) -> (u8, bool) {
+    match (over & 0x80 != 0, windowed && main) {
+        (true, _) => (over & 0xF, asked),
+        (false, true) => (1, true),
+        (false, false) => (0, asked),
+    }
+}
+
 /// A write's value with the `mask`'s switches off (`DETACH`), or as it was.
 pub fn detached(reg: u32, v: u32, mask: u8) -> u32 {
     for &(r, off, bit) in DETACH.iter() {
@@ -300,6 +310,18 @@ mod tests {
     }
 
     /// The processing blocks' switches (`DETACH`): each bit changes only its own words, in the main's program (G#1C33_7028, G#1C33_B028, G#1C34_0000, once each) and its CPU 'before' writes (the crossbar's G#1C33_0C08 from G#7C; G#1C33_0D08 is 2 already); none of loch0's.
+    #[test]
+    fn windowed_defaults() {
+        // Defaults: the main windowed detached and slim; whole frames and the ultrawide as asked.
+        assert_eq!(shape(0, true, true, false), (1, true));
+        assert_eq!(shape(0, false, true, false), (0, false));
+        assert_eq!(shape(0, false, true, true), (0, true));
+        assert_eq!(shape(0, true, false, false), (0, false));
+        // The override: G#80 nothing switched, the program as asked; G#8F every switch.
+        assert_eq!(shape(0x80, true, true, false), (0, false));
+        assert_eq!(shape(0x8F, false, true, true), (0xF, true));
+    }
+
     #[test]
     fn detach_switches() {
         assert_eq!(detached(0x1C33_7028, 1, 1), 0);

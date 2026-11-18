@@ -420,7 +420,7 @@ static LTE_MOST: AtomicU64 = AtomicU64::new(0);
 static MEASURE: AtomicU64 = AtomicU64::new(0);
 /// A device test, the hand spawn's fifth byte: a side channel off at the sensor in any mode (bit 0 phase detect, bit 1 embedded data).
 static SIDE_TEST: AtomicU64 = AtomicU64::new(0);
-/// A device test, the hand spawn's eighth byte: the processing blocks' switches to turn off (ferros_cam geom `DETACH`: bit 0 FC ctx3, bit 1 the context at G#1C33_B000, bit 2 the crossbar, bit 3 the block at G#1C34).
+/// The hand spawn's eighth byte (`Spec::shape`): 0 the defaults (a windowed mode on the main detached and slim); with G#80 an A/B override, its low four bits the processing blocks' switches exactly (ferros_cam geom `DETACH`: bit 0 FC ctx3, bit 1 the context at G#1C33_B000, bit 2 the crossbar, bit 3 the block at G#1C34) and the program the open's flags ask.
 static DETACH: AtomicU64 = AtomicU64::new(0);
 /// Descriptors released ahead of the engine (the hand spawn's sixth byte, a device test; 0 or 1: one, as Linux's start does): the stream on releases this many, each DMA_DONE one more, so a late answer has this many frames of slack instead of the frame's blanking (camera-full-rate, 2026-11-18: every death so far was one answer later than the blanking, the kernel lock held elsewhere).
 static LEAD: AtomicU64 = AtomicU64::new(1);
@@ -1149,6 +1149,14 @@ impl Spec {
     fn slit(&self) -> bool {
         matches!(self.kind, K_SLIT | K_SLIT_FULL)
     }
+    /// A mode with its own window (a slit, or an x window), as against a whole frame.
+    fn windowed(&self) -> bool {
+        self.slit() || self.cols != 0
+    }
+    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults are the main's alone: the switches are read off its program, and the ultrawide's slim program took one frame (2026-11-16).
+    fn shape(&self, main: bool) -> (u8, bool) {
+        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed(), main, self.flags & F_SLIM != 0)
+    }
 }
 
 /// The sensor's mode for `s` (None: the init's, untouched), built from the init's own (`ccs::Mode::captured`).
@@ -1265,7 +1273,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let fe = if s.flags & F_KEEP_FE != 0 { from } else { to };
     let scope = if s.flags & F_ALL != 0 { geom::Scope::All } else { geom::Scope::Core };
     let slit = s.slit() && s.flags & F_KEEP_FE == 0;
-    let slim = s.flags & F_SLIM != 0;
+    let (detach, slim) = s.shape(c.id == 0);
     let slim_level = if s.flags & F_SLIM2 != 0 { 2 } else { 1 };
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
@@ -1391,11 +1399,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let m_ = job::relocate(&mut jb[..jn], pa, &l).map_err(Fail::Job)?;
     let (list_at, list_len) = job::list_piece(&jb[..jn]).map_err(Fail::Job)?;
     let regeom = if fe != from { geom::rewrite(&mut jb[list_at..list_at + list_len], &from, &fe, scope) } else { 0 };
-    // A device test (the hand spawn's eighth byte, `DETACH`): the processing blocks' switches off (ferros_cam geom `DETACH`), so loch0's frame goes to memory alone.
-    let detach = DETACH.load(Ordering::Relaxed) as u8;
+    // The processing blocks' switches off (ferros_cam geom `DETACH`, `Spec::shape`: a windowed mode's default), so loch0's frame goes to memory alone.
     if detach != 0 {
         let k = geom::detach(&mut jb[list_at..list_at + list_len], detach);
-        say!(g, "camera: detach G#{detach:X}: A#{k} program words switched off; the CPU's crossbar words as Linux's close leaves them\n");
+        say!(g, "camera: detach G#{detach:X}: A#{k} program words switched off; the CPU's crossbar words as Linux's close leaves them; the {} program each frame\n", if slim { "slim" } else { "full" });
     }
     let pieces = job::pieces(&jb[..jn]).map_err(Fail::Job)?;
     for &(old, at, len) in pieces.iter() {
@@ -2034,6 +2041,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut open_cam: Option<Open> = None;
+    // A driver spawned to stay that has closed its one stream (`stay`): it refuses the next open.
+    let mut closed_once = false;
     // Binning's measures, for the console every 64 frames served.
     let (mut served, mut bin_us, mut since) = (0u64, 0u64, ferros_sys::now());
     // The first receive waits (the call that started this driver is queued already; one spawned by hand waits for its first); after it, a look, so a driver with nothing open and nothing waiting ends.
@@ -2079,6 +2088,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     1
                 } else if open_cam.is_some() {
                     2
+                } else if closed_once {
+                    // A hand-spawned driver that stays: its frame thread ended with its first stream, so a second open is refused here rather than reaching the vault's driver (cambench's sweeps fell thru to it, 2026-11-18); a sweep spawns a driver a step (tools/cambench-sweep.sh).
+                    say!(g, "camera: this hand-spawned driver has closed its one stream; spawn another for the next open\n");
+                    4
                 } else {
                     let c = c.unwrap();
                     match open(g, c, &Spec::of(&msg, got as usize)) {
@@ -2248,7 +2261,12 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     close(g);
                 }
                 reply(&token, &[0]);
-                ferros_sys::exit(0);
+                // Spawned to stay: it stays, closed, so the calls after it (a sweep's next OPEN) reach this driver and are refused, never the vault's.
+                if !stay {
+                    ferros_sys::exit(0);
+                }
+                open_cam = None;
+                closed_once = true;
             }
             // MAP `[5][release]`: the buffer `release` names given back (G#FF none), then the newest written frame past the last one handed out, held until it is given back (here, or by RELEASE, or at the close): the reply its header (`header`, bin 1: the buffer at +40, its place in the view at +48), the samples read in place thru the view.
             5 => {
