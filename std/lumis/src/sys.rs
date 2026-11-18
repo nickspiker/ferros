@@ -69,6 +69,13 @@ pub fn dma(token: &[u8; 32]) -> u64 {
 
 const INPUT: u64 = 8;
 
+const PIN: u64 = 20;
+
+/// The cores this thread may run on from now (husky: the A510s G#000F, the A715 workers G#00F0, the X3 G#0100); threads it spawns later inherit it. A mask whose cores are not up falls back to any core.
+pub fn pin(mask: u64) -> u64 {
+    svc(PIN, mask, 0, 0, 0, 0)
+}
+
 /// The spawn input's bytes from `start` into `buf` (ferros_sys `input`): how many were copied, 0 past the end or for a process spawned with none (a kist opened from the map).
 pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
