@@ -14,8 +14,9 @@
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection, [6] no memory for its buffers (the arc could not grow).
 //! - 5 TCP SEND: handle, data (up to 4094 bytes: a call carries 4096, process.rs SYS_CALL) → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
 //! - 6 TCP RECV: handle, wait, most (u32 BE) → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection (or a request shorter than its 7 bytes). The data is what the connection has taken in, up to `most` and at most 2^18 bytes (`RECV_MAX`, the kernel's largest reply), so the caller's reply buffer holds 1 + most (the kernel cuts a reply at the caller's length). With `wait` 1 to 255 (seconds) the call is held while the connection has nothing new: answered as data lands, as its state changes (it opens, the peer closes, it fails), or when the wait runs out (then its state and no data); 0 answers at once. A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand.
+//!   The deadline form (2026-11-18, ferros_rt::tcp): eight more bytes after `most`, a deadline on the counter (u64 BE, the ticks `cntvct_el0` counts; 0 at once, u64::MAX until something changes), hold the call to exactly then in place of the wait byte's seconds. Its state byte carries why a failed connection failed in its high four bits: 4 | 1 << 4 a reset (while connecting: refused), 4 | 2 << 4 unanswered (the eighth retransmission expiry, or the SYN's). A client that sends the deadline puts 255 in the wait byte, so an ip from before holds it 255 s instead of answering at once again and again.
 //!
-//! Held receives: up to sixteen at once (`HELDN`), the oldest answered as things stand when a ninth comes. While nobody is present each is answered with nothing, as any request would be.
+//! Held UDP receives: up to sixteen at once (`HELDN`), the oldest answered as things stand when a seventeenth comes. A connection's held calls have places of their own, one receive and one wait for room a connection (`TcpHeld`), so no reader pushes another out; a second of the same kind on one connection answers the first as things stand. While nobody is present each is answered with nothing, as any request would be. A connection with a held call is asked about however long ip sleeps, so idle reaping never takes it.
 //! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
 //!
 //! No op carries a version: every caller is in this repo or Mahere's and changes with it (owner, 2026-11-11: "No existing callers yet, so no need to version it").
@@ -36,6 +37,7 @@
 //!   - Eight held at once (`WATCHN`), a table of their own: a second watch with the same id answers the first as things stand, a ninth the oldest.
 //! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first: it is latched for the id).
 //! - 13 UNWATCH: id (u32 BE) → [0]: the reader is gone (a socket dropped): its watch answered as things stand, its KICKs dropped, its reader entries retired, so no datagram waits for it. A reader no watch of its id has named for 64 s is retired the same way at the next datagram (a process that ended).
+//! - 14 TCP ROOM: handle, want (u32 BE), deadline (u64 BE, counter ticks; 0 at once) → [state, room (u32 BE)]: the state byte as op 6's deadline form says it, and the free bytes of the send buffer; [5] not a connection (or a request shorter than its 14 bytes). Held while the room is under `want` (at most the buffer's 256 KiB) and the connection is connecting, open or closed by the peer and not closed by its app: answered when that much is free, the state changes, the app closes, or the deadline passes (2026-11-18, ferros_rt::tcp: a writer whose op 5 found the buffer full waits here, where fgtw's post sleeps a millisecond and sends again).
 //!
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
@@ -180,8 +182,11 @@ struct Ip {
     backoff: u32,
     /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
     mode: u8,
-    /// Receives held until something comes (ops 2 and 6 with a wait), answered by `answer_held`.
+    /// UDP receives held until something comes (op 2 with a wait), answered by `answer_held`.
     held: [Held; HELDN],
+    /// Each connection's held receive (op 6 with a wait) and held wait for room (op 14), answered by `answer_held` too: statics, not the 64 KiB stack.
+    rd: &'static mut [TcpHeld; TCPN],
+    wr: &'static mut [TcpHeld; TCPN],
     /// Stamps the holds in arrival order: the oldest gives way when all are taken.
     held_seq: u32,
     /// Watches held until something changes (op 11), answered by `answer_watches`; KICKs (op 12) that came before their watch, the oldest giving way.
@@ -448,25 +453,36 @@ extern "C" fn ring_thread(grants: u64) -> ! {
     }
 }
 
-/// Held receives at once: sixteen, a reader on each of the connections, or eight UDP readers (as many as the ports kept for them) and eight connections.
+/// Held UDP receives at once: sixteen, twice the eight ports kept for them. A connection's held calls have places of their own (`TcpHeld`), so no UDP reader ever pushes one out.
 const HELDN: usize = 1 << 4;
 
-/// One held receive: its reply token, when its wait runs out, and what it waits on (a UDP port, or a TCP connection's handle when `tcp`, with the connection's state when it was held and the most data its reader takes).
+/// One held UDP receive (op 2): its reply token, when its wait runs out, the port it waits on and its reader.
 #[derive(Clone, Copy)]
 struct Held {
     used: bool,
-    tcp: bool,
     port: u16,
-    handle: u8,
-    state: u8,
-    most: u32,
-    /// A UDP receive's reader (op 2's id: a watch's, `pins`), or None.
+    /// The receive's reader (op 2's id: a watch's, `pins`), or None.
     id: Option<u32>,
     seq: u32,
     until: u64,
     tok: [u8; 32],
 }
-const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, state: 0, most: 0, id: None, seq: 0, until: 0, tok: [0; 32] };
+const HELD_FREE: Held = Held { used: false, port: 0, id: None, seq: 0, until: 0, tok: [0; 32] };
+
+/// A call held on a connection: its receive (op 6, `Ip::rd`) or its wait for room to send (op 14, `Ip::wr`), one of each a connection (2026-11-18, ferros_rt::tcp: a std app reads on one thread and writes on another).
+/// Until 2026-11-18 a held receive took one of the sixteen places the UDP receives share, so a seventeenth reader answered the oldest early, and a reader that held again pushed out the next: a ring of calls with nothing to say.
+/// `state`: the connection's state when held (any change answers it). `most`: the data a receive takes. `want`: the room a wait for room asks for. `long`: the request was a deadline form, whose state byte says why a connection failed (`tcp_state`). `until`: the deadline on the counter (u64::MAX none).
+#[derive(Clone, Copy)]
+struct TcpHeld {
+    used: bool,
+    long: bool,
+    state: u8,
+    most: u32,
+    want: u32,
+    until: u64,
+    tok: [u8; 32],
+}
+const TCP_HELD_FREE: TcpHeld = TcpHeld { used: false, long: false, state: 0, most: 0, want: 0, until: 0, tok: [0; 32] };
 
 /// Watches held at once (op 11): eight, one a reading process is enough (Photon's reactor, fgtw's doorbell helper, a blocking reader waiting out an absence), with room; a table of their own, so the receives' sixteen never push one out.
 const WATCHN: usize = 1 << 3;
@@ -1017,6 +1033,9 @@ impl Ip {
             t = t.min(c.rto_t);
         }
         for h in self.held.iter().filter(|h| h.used) {
+            t = t.min(h.until);
+        }
+        for h in self.rd.iter().chain(self.wr.iter()).filter(|h| h.used) {
             t = t.min(h.until);
         }
         for w in self.watches.iter().filter(|w| w.used) {
@@ -2529,8 +2548,16 @@ impl Ip {
         self.res.cache.conn(fam, &addr, false, now());
     }
 
-    /// Connection `i` freed: its report on the console, its block given back.
+    /// Connection `i` freed: its report on the console, its block given back, and its held calls answered "not a connection" now (the slot may open again for another app before the pass looks at them).
     fn tcp_free(&mut self, i: usize, why: u8) {
+        let gone = [5u8];
+        for h in [self.rd[i], self.wr[i]] {
+            if h.used {
+                svc(REPLY, self.off(h.tok.as_ptr()), self.off(gone.as_ptr()), 1, 0, 0);
+            }
+        }
+        self.rd[i] = TCP_HELD_FREE;
+        self.wr[i] = TCP_HELD_FREE;
         self.report(i, why);
         let blk = self.tcb[i].blk;
         if blk != NO_BLOCK {
@@ -2857,8 +2884,8 @@ impl Ip {
                 self.tcp_free(i, WHY_LINGER);
                 continue;
             }
-            // Abandoned: a reset to the peer if it was open (it stops sending), then the slot is free.
-            if t.wrapping_sub(c.touched) > 32 * self.freq {
+            // Abandoned: a reset to the peer if it was open (it stops sending), then the slot is free. A call held on it is its app asking, however long ip slept: the pass that wakes after a long idle sleep runs this before `answer_held` would mark it touched (a reader held on a quiet WebSocket, 2026-11-18).
+            if t.wrapping_sub(c.touched) > 32 * self.freq && !self.rd[i].used && !self.wr[i].used {
                 if c.state == 2 || c.state == 3 {
                     self.tcp_out(i, RST | ACK, c.snd_nxt, &[]);
                 }
@@ -3109,15 +3136,22 @@ impl Ip {
         21 + n
     }
 
-    /// Connection `i`'s state and what it has taken in, `most` bytes at most, into `out` (op 6's answer). A read that reopens a window shrunk under half says so at once (`ferros_tcp::window_update_due`), or a sender held back by it would wait for its persist timer.
-    fn tcp_take(&mut self, i: usize, out: &mut [u8], most: u32) -> usize {
+    /// Connection `i`'s state byte in a reply (ops 6 and 14): 1 connecting, 2 open, 3 the peer closed, 4 failed. In the deadline forms (`long`) a failed connection says why in the high four bits: 1 reset (a refusal, while connecting), 2 unanswered (what it sent went unanswered thru every retransmission), so a client tells a refused connect from a timed-out one.
+    fn tcp_state(&self, i: usize, long: bool) -> u8 {
         let c = &self.tcb[i];
-        out[0] = match c.state {
+        match c.state {
             1 => 1,
             2 => 2,
             3 => 3,
+            _ if long => 4 | c.why << 4,
             _ => 4,
-        };
+        }
+    }
+
+    /// Connection `i`'s state and what it has taken in, `most` bytes at most, into `out` (op 6's answer; `long` its deadline form, `tcp_state`). A read that reopens a window shrunk under half says so at once (`ferros_tcp::window_update_due`), or a sender held back by it would wait for its persist timer.
+    fn tcp_take(&mut self, i: usize, out: &mut [u8], most: u32, long: bool) -> usize {
+        out[0] = self.tcp_state(i, long);
+        let c = &self.tcb[i];
         // WHY the mins: only what is in order is the app's, `most` is what it asked for, and `out` holds `RECV_MAX` after the state byte.
         let n = (c.rx_len as usize).min(most as usize).min(out.len() - 1);
         if n == 0 {
@@ -3137,10 +3171,16 @@ impl Ip {
         1 + n
     }
 
-    /// Hold a receive (`tok` its reply token) until the counter passes `until` (u64::MAX: until something comes): on UDP `port`, or on connection `handle` when `tcp` (`most` the data its reader takes). A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
-    fn hold(&mut self, tcp: bool, port: u16, handle: u8, until: u64, most: u32, id: Option<u32>, tok: &[u8; 32], out: &mut [u8]) {
-        let same = if tcp { (0..HELDN).find(|&k| self.held[k].used && self.held[k].tcp && self.held[k].handle == handle) } else { None };
-        let k = match same.or_else(|| (0..HELDN).find(|&k| !self.held[k].used)) {
+    /// Connection `i`'s send room (op 14's answer): its state byte (`tcp_state`, `long`) and the free bytes of its send buffer (u32 BE).
+    fn tcp_room(&self, i: usize, out: &mut [u8], long: bool) -> usize {
+        out[0] = self.tcp_state(i, long);
+        out[1..5].copy_from_slice(&(TXB as u32 - self.tcb[i].tx_len).to_be_bytes());
+        5
+    }
+
+    /// Hold a UDP receive (`tok` its reply token) on `port` until the counter passes `until` (u64::MAX: until something comes). With every slot taken the oldest is answered first as things stand.
+    fn hold(&mut self, port: u16, until: u64, id: Option<u32>, tok: &[u8; 32], out: &mut [u8]) {
+        let k = match (0..HELDN).find(|&k| !self.held[k].used) {
             Some(k) => k,
             None => (0..HELDN).min_by_key(|&k| self.held[k].seq).unwrap(),
         };
@@ -3148,32 +3188,52 @@ impl Ip {
             self.answer(k, out);
         }
         self.held_seq = self.held_seq.wrapping_add(1);
-        let state = if tcp { self.tcb[handle as usize].state } else { 0 };
-        self.held[k] = Held { used: true, tcp, port, handle, state, most, id, seq: self.held_seq, until, tok: *tok };
+        self.held[k] = Held { used: true, port, id, seq: self.held_seq, until, tok: *tok };
     }
 
-    /// Answer hold `k` as things stand (a connection's state and data, or the port's next datagram or nothing), and free it.
+    /// Hold a call on connection `i` (`tok` its reply token): its receive (`room` false, op 6, `most` the data it takes) or its wait for room (`room`, op 14, `want` the room it asks for), until the counter passes `until` (u64::MAX: until something changes). A call of the same kind already held on the connection is answered first as things stand: one reader and one writer a connection.
+    fn hold_tcp(&mut self, i: usize, room: bool, most: u32, want: u32, until: u64, long: bool, tok: &[u8; 32], out: &mut [u8]) {
+        if if room { self.wr[i].used } else { self.rd[i].used } {
+            self.answer_tcp(i, room, out);
+        }
+        let h = TcpHeld { used: true, long, state: self.tcb[i].state, most, want, until, tok: *tok };
+        if room {
+            self.wr[i] = h;
+        } else {
+            self.rd[i] = h;
+        }
+    }
+
+    /// Answer UDP hold `k` as things stand (the port's next datagram or nothing), and free it.
     fn answer(&mut self, k: usize, out: &mut [u8]) {
         let h = self.held[k];
         self.held[k] = HELD_FREE;
+        let l = if self.person { self.udp_take(h.port, h.id, out) } else { 0 };
+        svc(REPLY, self.off(h.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
+    }
+
+    /// Answer connection `i`'s held receive (`room` false) or wait for room (`room`) as things stand, and free it. Nothing while nobody is present, as any request would be answered.
+    fn answer_tcp(&mut self, i: usize, room: bool, out: &mut [u8]) {
+        let h = if room { self.wr[i] } else { self.rd[i] };
+        if room {
+            self.wr[i] = TCP_HELD_FREE;
+        } else {
+            self.rd[i] = TCP_HELD_FREE;
+        }
         let l = if !self.person {
             0
-        } else if h.tcp {
-            let i = h.handle as usize;
-            if self.tcb[i].state == 0 {
-                out[0] = 5;
-                1
-            } else {
-                self.tcb[i].touched = now();
-                self.tcp_take(i, out, h.most)
-            }
+        } else if self.tcb[i].state == 0 {
+            out[0] = 5;
+            1
         } else {
-            self.udp_take(h.port, h.id, out)
+            self.tcb[i].touched = now();
+            if room { self.tcp_room(i, out, h.long) } else { self.tcp_take(i, out, h.most, h.long) }
         };
         svc(REPLY, self.off(h.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
     }
 
-    /// Each pass: every held receive that has something now (a datagram for its port; data on its connection, or its state changed since the hold: opened, closed by the peer, failed, gone), or whose wait ran out, or all of them while nobody is present, answered. A connection waited on counts as asked about. Returns whether any was.
+    /// Each pass: every held call that has something now, or whose wait ran out, or all of them while nobody is present, answered.
+    /// A UDP receive: a datagram for its port. A connection's receive: data on it, or its state changed since the hold (opened, closed by the peer, failed, gone). A wait for room: the room it asked for free, or the state changed, or the app closed its side. A connection waited on counts as asked about. Returns whether any was.
     fn answer_held(&mut self, out: &mut [u8]) -> bool {
         let t = now();
         let mut any = false;
@@ -3182,20 +3242,30 @@ impl Ip {
             if !h.used {
                 continue;
             }
-            let ready = !self.person
-                || t > h.until
-                || if h.tcp {
-                    let c = &self.tcb[h.handle as usize];
-                    c.state != h.state || c.state >= 3 || c.rx_len > 0
-                } else {
-                    let who = self.who(h.id, h.port);
-                    (0..QN).any(|i| self.takeable(i, h.port, who))
-                };
-            if ready {
+            let who = self.who(h.id, h.port);
+            if !self.person || t > h.until || (0..QN).any(|i| self.takeable(i, h.port, who)) {
                 self.answer(k, out);
                 any = true;
-            } else if h.tcp {
-                self.tcb[h.handle as usize].touched = t;
+            }
+        }
+        for i in 0..TCPN {
+            let c = self.tcb[i];
+            let (r, w) = (self.rd[i], self.wr[i]);
+            if r.used {
+                if !self.person || t > r.until || c.state != r.state || c.state >= 3 || c.rx_len > 0 {
+                    self.answer_tcp(i, false, out);
+                    any = true;
+                } else {
+                    self.tcb[i].touched = t;
+                }
+            }
+            if w.used {
+                if !self.person || t > w.until || c.state != w.state || c.state == 4 || c.fin_queued || TXB as u32 - c.tx_len >= w.want {
+                    self.answer_tcp(i, true, out);
+                    any = true;
+                } else {
+                    self.tcb[i].touched = t;
+                }
             }
         }
         any
@@ -3337,7 +3407,7 @@ impl Ip {
                     _ => None,
                 };
                 if let (0, Some(until)) = (n, until) {
-                    self.hold(false, port, 0, until, 0, id, tok, out);
+                    self.hold(port, until, id, tok, out);
                     return None;
                 }
                 return Some(n);
@@ -3372,12 +3442,40 @@ impl Ip {
                 self.tcb[i].touched = now();
                 // WHY the min: the caller's most, held to what one reply carries.
                 let most = u32::from_be_bytes([m[3], m[4], m[5], m[6]]).min(RECV_MAX as u32);
+                // The deadline form (8 bytes after `most`, counter ticks: 0 at once, u64::MAX until something changes) holds to exactly then in place of the wait byte's seconds, and its state byte says why a connection failed (`tcp_state`).
+                let long = m.len() >= 15;
+                let until = if long {
+                    match u64::from_be_bytes(m[7..15].try_into().unwrap()) {
+                        0 => None,
+                        d => Some(d),
+                    }
+                } else {
+                    (m[2] > 0).then(|| now() + m[2] as u64 * self.freq)
+                };
                 let c = &self.tcb[i];
-                if c.rx_len == 0 && (c.state == 1 || c.state == 2) && m[2] > 0 {
-                    self.hold(true, 0, i as u8, now() + m[2] as u64 * self.freq, most, None, tok, out);
+                if let (0, 1 | 2, Some(until)) = (c.rx_len, c.state, until) {
+                    self.hold_tcp(i, false, most, 0, until, long, tok, out);
                     return None;
                 }
-                return Some(self.tcp_take(i, out, most));
+                return Some(self.tcp_take(i, out, most, long));
+            }
+            Some(14) => {
+                // WHY the checks: the request is the caller's; shorter than its 14 bytes, or a handle past the table, is no connection.
+                let i = if m.len() >= 14 { m[1] as usize } else { TCPN };
+                if i >= TCPN || self.tcb[i].state == 0 {
+                    out[0] = 5;
+                    return Some(1);
+                }
+                self.tcb[i].touched = now();
+                // WHY the min: the room never passes the send buffer's size, so a want past it would hold until the deadline.
+                let want = u32::from_be_bytes([m[2], m[3], m[4], m[5]]).min(TXB as u32);
+                let until = u64::from_be_bytes(m[6..14].try_into().unwrap());
+                let c = &self.tcb[i];
+                if until != 0 && TXB as u32 - c.tx_len < want && (1..=3).contains(&c.state) && !c.fin_queued {
+                    self.hold_tcp(i, true, 0, want, until, true, tok, out);
+                    return None;
+                }
+                return Some(self.tcp_room(i, out, true));
             }
             _ => {}
         }
@@ -3548,6 +3646,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     static mut BIG: [[u8; REASM_MAX]; BIGN] = [[0; REASM_MAX]; BIGN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
     static mut TCBS: [Tcb; TCPN] = [TCB_FREE; TCPN];
+    // Each connection's held receive and held wait for room (`TcpHeld`).
+    static mut RD: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
+    static mut WR: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
     static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
     // The frames batched for the WiFi driver's next exchange (`Ip::txb`): a call carries 4096 bytes.
     static mut TXB: [u8; MSG_MAX] = [0; MSG_MAX];
@@ -3621,6 +3722,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         backoff: 0,
         mode: 0,
         held: [HELD_FREE; HELDN],
+        rd: unsafe { &mut *(&raw mut RD) },
+        wr: unsafe { &mut *(&raw mut WR) },
         held_seq: 0,
         watches: [WATCH_FREE; WATCHN],
         kicks: [None; WATCHN],

@@ -89,19 +89,36 @@ const DEV_WHOLE: u8 = 1 << 0;
 const DEV_COPY: u8 = 1 << 1;
 /// Development: the scratch path even with the display baking (no `bakes_own`), for comparing the two on a device.
 const DEV_SCRATCH: u8 = 1 << 2;
-/// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 to 6 (8 s to 1024 s).
+/// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 and 5 (8 s to 64 s).
 const DEV_OPEN: u8 = 1 << 3;
+/// Development: the intake stays on the A715 workers with the UI (as before 0.2.17) instead of its own threads on the A510s, to compare the two on a device.
+const DEV_BIG_INTAKE: u8 = 1 << 6;
+/// The A510 cluster (husky cores 0 to 3), where the intake runs (lumis_core `set_intake_cores`) so the UI's draw keeps the A715s.
+const CORES_LITTLE: u64 = 0x000F;
+/// The A715 workers (husky cores 4 to 7), where a save encodes (lumis_core `set_save_cores`): a save is started from the intake on the A510s, and their shared NEON would hold up an AV1 encode.
+const CORES_WORKERS: u64 = 0x00F0;
 /// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^3 s, then 2^4 s (no further than the camera's longest: a long-exposure mode's frame takes its whole exposure in wall time), two frames each, each frame's exposure said beside the one asked.
 const DEV_SWEEP: u8 = 1 << 7;
 
 /// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
+/// A second knobs byte may follow the whole block (the input's fifteenth byte, `dev_knobs2`); the block stops before it.
 fn dev_input() -> (u8, Vec<u8>) {
-    let mut b = [0u8; 1 << 4];
+    let mut b = [0u8; 1 << 5];
     let n = sys::input(0, &mut b);
     match n {
         0 => (0, Vec::new()),
-        _ => (b[0], b[1..n].to_vec()),
+        // WHY the min: the input is the person's; past the block is the second knobs byte, not the driver's.
+        _ => (b[0], b[1..n.min(1 + camera::MODE_BLOCK)].to_vec()),
     }
+}
+
+/// Development, the second knobs byte (after the whole mode block): the view asked for non-cacheable as before 0.2.18, to compare the two on a device (docs/CAMERA.md "A cacheable view").
+const DEV_UNCACHED: u8 = 1 << 0;
+/// The second knobs byte, 0 when the input is shorter.
+fn dev_knobs2() -> u8 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b);
+    if n > 1 + camera::MODE_BLOCK { b[1 + camera::MODE_BLOCK] } else { 0 }
 }
 
 /// The UI probe's window: a line every 2^2 seconds.
@@ -169,18 +186,28 @@ enum Taken<'a> {
     Bytes(&'a [u8]),
 }
 
-/// A held frame in the view, read a row at a time by the integrator (lumis_core `RowSource`): each row copied out of the non-cacheable view in 64-byte loads into a buffer on the stack, then unpacked from RAW10. The rows are read from the integrator's own bands across the cores, each once, while the buffer stays held (it is given back at the next MAP).
+/// A held frame in the view, read a row at a time by the integrator (lumis_core `RowSource`): each row copied out of the non-cacheable view in 64-byte loads into a buffer on the stack, then unpacked from RAW10.
+/// A write-back view's rows are unpacked in place, thru the caches (docs/CAMERA.md "A cacheable view": the driver made the buffer's lines right as MAP handed it over).
+/// The rows are read from the integrator's own bands across the cores, each once, while the buffer stays held (it is given back at the next MAP).
 struct ViewRows {
     src: usize,
     line: usize,
+    cached: bool,
 }
 
 impl lumis_core::RowSource for ViewRows {
     fn read_row(&self, y: usize, out: &mut [u16]) {
+        let at = self.src + y * self.line;
+        if self.cached {
+            // SAFETY: row y of the held buffer, `line` bytes inside the view (mapped read-only for the life of the camera, the buffer this process's until the next MAP); nothing writes it while it is held.
+            let line = unsafe { std::slice::from_raw_parts(at as *const u8, self.line) };
+            camera::unpack_raw10(line, out);
+            return;
+        }
         // A RAW10 line of the widest readout fits: 8160 samples are 10200 bytes.
         let mut tmp = [0u8; 1 << 14];
         let line = &mut tmp[..self.line];
-        copy_from_view(self.src + y * self.line, line);
+        copy_from_view(at, line);
         camera::unpack_raw10(line, out);
     }
 }
@@ -197,7 +224,7 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line })))
+                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
@@ -360,9 +387,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if knobs & DEV_COPY != 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
-    } else if !block.is_empty() {
+    } else {
+        if !block.is_empty() {
+            println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        }
+        // The mode block whole (zeros past what the input gave: the init's mode, as no block is), then the view write-back (docs/CAMERA.md "A cacheable view"): the rows read thru the caches, 2.8 ms a frame on the A510s against 41.7 non-cacheable (cambench, the Pro, 2026-11-18).
         ask.extend_from_slice(&block);
-        println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        ask.resize(3 + camera::MODE_BLOCK, 0);
+        ask.push(if dev_knobs2() & DEV_UNCACHED != 0 { 0 } else { camera::OPEN_VIEW_CACHED });
     }
     // An open with a mode block is answered with 64 bytes (the ring's count and the slit's facts after the view's 48).
     let mut r = [0u8; 1 << 6];
@@ -382,7 +414,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             if base == sys::ERR {
                 return fail("the view's token was refused".into());
             }
-            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at {base:#x}", cam.name, v.buffers, v.width, v.height);
+            println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at G#{base:X}, {}", cam.name, v.buffers, v.width, v.height, if v.cached { "write-back" } else { "non-cacheable" });
             Source::View { base: base as usize, view: v, held: camera::NONE }
         }
         Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),
@@ -444,7 +476,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
-    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 7) + 3)));
+    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 3) + 3)));
     let run_start = std::time::Instant::now();
     let sweep: Vec<f64> = if knobs & DEV_OPEN != 0 && knobs & DEV_SWEEP != 0 {
         (0..9).map(|k| (2f64).powi(-13 + 2 * k)).chain([(1 << 4) as f64]).map(|s| s * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
@@ -671,7 +703,7 @@ fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> !
 
 /// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
 /// Overlapping ones made one, so the host gets disjoint rects (fluor `DamageRects`), at most four.
-fn partial_parts(ui: &lumis_core::UserInterface) -> Vec<fluor::canvas::PixelRect> {
+fn partial_parts(ui: &lumis_core::UserInterface, camera: Option<fluor::canvas::PixelRect>) -> Vec<fluor::canvas::PixelRect> {
     use fluor::canvas::PixelRect;
     let mut parts = vec![
         PixelRect::new(ui.left_label_x, ui.left_label_y, ui.left_label_end_x, ui.left_label_end_y),
@@ -691,6 +723,8 @@ fn partial_parts(ui: &lumis_core::UserInterface) -> Vec<fluor::canvas::PixelRect
         let (ya, yb) = (ui.slider_start_y.min(ui.slider_end_y), ui.slider_start_y.max(ui.slider_end_y));
         parts.push(PixelRect::new((xa - t) as usize, (ya - t) as usize, (xb + t) as usize + 1, (yb + t) as usize + 1));
     }
+    // A new image's own rect (lumis_core screen::camera_rect), beside the controls that tick with it.
+    parts.extend(camera);
     parts.retain(|r| !r.is_empty());
     // Overlapping parts joined until none overlap.
     let overlap = |a: &PixelRect, b: &PixelRect| a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
@@ -704,6 +738,12 @@ fn partial_parts(ui: &lumis_core::UserInterface) -> Vec<fluor::canvas::PixelRect
             }
             None => k += 1,
         }
+    }
+    // The host takes at most DAMAGE_RECTS (fluor canvas): any past that join the last kept, a larger rect than needed but never one missed.
+    while parts.len() > fluor::canvas::DAMAGE_RECTS {
+        let b = parts.pop().unwrap();
+        let last = parts.len() - 1;
+        parts[last] = parts[last].union(b);
     }
     parts
 }
@@ -901,9 +941,9 @@ impl FluorApp<G2t16> for Lumis {
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
                 // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own), and a turn of the device (the gravity here is a constant).
-                let whole = ui.previous_image_counter != before.0
-                    || ui.previous_exposure_start != before.1
-                    || ui.previous_histogram_counter != before.2
+                // A new image (its counter, or the exposure's start that moves with it at every completion) is the camera's rect and the controls that tick (`partial_parts` with `camera_rect`): the bars around the image hold controls that did not move. Anything else that moved draws whole.
+                let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
+                let other = ui.previous_histogram_counter != before.2
                     || ui.previous_hold_present
                     || before.3
                     || ui.header[FLAGS_IDX] & (CALIBRATING_BIT | CAL_SHOW_RESULT_BIT) != 0
@@ -912,10 +952,13 @@ impl FluorApp<G2t16> for Lumis {
                     || self.finger.is_some();
                 self.parts.clear();
                 if surface.take_posted() {
-                    if whole || self.knobs & DEV_WHOLE != 0 {
+                    let camera = lumis_core::ui::screen::camera_rect(ui).map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1));
+                    if other || self.knobs & DEV_WHOLE != 0 || (new_image && camera.is_none()) {
                         self.changed = true;
+                    } else if new_image {
+                        self.parts = partial_parts(ui, camera);
                     } else if ui.controls_visible {
-                        self.parts = partial_parts(ui);
+                        self.parts = partial_parts(ui, None);
                     }
                 }
                 if self.finger.is_some() {
@@ -1040,6 +1083,16 @@ fn main() {
     }));
     let _ = log::set_logger(&Console).map(|()| log::set_max_level(log::LevelFilter::Info));
     println!("lumis: Lumis {} on ferros, {} grants", env!("CARGO_PKG_VERSION"), sys::grant_count());
+    // The intake on the A510s (four threads, one a core) unless the knobs keep it with the UI.
+    if dev_input().0 & DEV_BIG_INTAKE == 0 {
+        lumis_core::set_intake_cores(|| {
+            sys::pin(CORES_LITTLE);
+        }, 4);
+        lumis_core::set_save_cores(|| {
+            sys::pin(CORES_WORKERS);
+        });
+        println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
+    }
     let vault = open_vault();
     if let Some(v) = &vault {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));

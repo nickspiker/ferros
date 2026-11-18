@@ -4,12 +4,16 @@
 //!
 //! The word at offset 4 is the image's flags: bit 0, its heap grows on demand (SYS_ARC, docs/ARCS.md step 2), so the kernel maps a small heap at spawn and the declared one is a ceiling (since 2026-11-11; 0 before, a reservation). The header at offset 8 is what the kernel reads before the process runs (process.rs `image_tail`) and what the runtime reads after: `ferrosRT`, then five words — the zeroed tail (.bss + 16 + heap), the TLS image size, the TLS block size, the TLS alignment, the heap size — every one an absolute number the linker script computed (ferros.ld).
 
+#[cfg(feature = "runtime")]
 use core::alloc::Layout;
+#[cfg(feature = "runtime")]
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sys::{self, nr};
 
+// The entry and everything only it calls are the runtime's alone (feature `runtime`): an app's own copy of this crate beside std's (a library for its clients, `tcp`) links no second `_entry`.
+#[cfg(feature = "runtime")]
 global_asm!(
     r#"
     .section .text.entry, "ax"
@@ -63,6 +67,7 @@ pub fn header() -> Header {
 }
 
 /// The grants page's arc offset.
+/// A copy of this crate built without `runtime` (an app's own, beside std's) never runs the entry and answers 0, which is where the kernel puts the grants page (process.rs: arc offsets 0 to CODE), so its `cap` is right too.
 pub fn grants() -> u64 {
     GRANTS.load(Ordering::Relaxed)
 }
@@ -92,11 +97,13 @@ pub fn exit(code: i32) -> ! {
     }
 }
 
+#[cfg(feature = "runtime")]
 unsafe extern "C" {
     static __bss_end: u8;
     fn main(argc: i32, argv: *const *const u8) -> i32;
 }
 
+#[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn __ferros_start(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { sys::relocate() };
@@ -124,6 +131,7 @@ unsafe extern "C" fn __ferros_start(grants: u64, input: u64, input_len: u64) -> 
     unsafe { asm!("mov sp, {top}", "b {main}", top = in(reg) top, main = sym rt_main, options(noreturn, nostack)) }
 }
 
+#[cfg(feature = "runtime")]
 extern "C" fn rt_main() -> ! {
     let code = unsafe { main(0, core::ptr::null()) };
     exit(code)
