@@ -3,13 +3,15 @@ name = "ferros_puck"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Pucks (docs/PUCKS.md): the list of drawing ops a puck sends the display for its circle, written by the puck and checked and drawn by the display, front to back with under. no_std, libm."
+description = "Pucks (docs/PUCKS.md): the drawing ops a puck writes for its face and draws into its own square of G2t16 pixels, front to back with under, and its calls to the display that trims and places the square. no_std, libm."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 libm = "0.2"
+# The typeface: a puck draws its words into its square in the display's own face (square.rs).
+ferros_glyphs = { path = "../ferros_glyphs" }
 # The puck's side on the device (`rt`): its calls to the display, its view's doorbell, Eagle time from the kernel's clock.
 ferros_sys = { path = "../ferros_sys", optional = true }
 # The place a puck keeps: the ~10 km cell and its VSF document.

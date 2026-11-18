@@ -22,7 +22,7 @@ const SATS_MAX: usize = 1 << 6;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants);
+    let link = common::start(grants, false);
     let gps = cap(grants, common::S_GPS);
     let mut signals = [Signal::default(); SIGNALS];
     let mut n = 0usize;
@@ -30,9 +30,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     loop {
         let seen = common::rt::bell();
         let v = common::rt::view();
-        if v.focused && claim::claim(claim::GPS, gps) {
+        if v.large && claim::claim(claim::GPS, gps) {
             let mut count = 0u32;
-            while common::rt::view().focused {
+            while common::rt::view().large {
                 let mut f = [0u8; 33];
                 if call_live(gps, &[0], &mut f) >= 33 && f[0] == 1 {
                     let age_ms = u32::from_le_bytes(f[5..9].try_into().unwrap()) as f64;
@@ -67,7 +67,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let sky = Sky { signals: &signals[..n], fix, live: false };
         common::show(link, |w, focus| face(w, &sky, focus));
         // At rest nothing changes until the view does: no deadline.
-        common::rt::wait(seen, None);
+        common::wait(seen, None);
     }
 }
 

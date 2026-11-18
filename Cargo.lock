@@ -77,7 +77,7 @@ dependencies = [
  "honeycomb",
  "ihi 0.0.48",
  "unicode-normalization",
- "vsf 0.6.42",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -449,6 +449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "colored"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
+dependencies = [
+ "lazy_static",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -772,8 +782,14 @@ name = "ferros-bridge"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chrono",
  "ed25519-dalek",
+ "ferros-link",
+ "ferros_inject",
+ "ferros_kist",
+ "ferros_ledger",
  "ferros_pt",
+ "fgtw",
  "nunc-time",
  "nusb",
  "tokio",
@@ -792,7 +808,18 @@ name = "ferros-install"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_hal",
  "ferros_layout",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros-link"
+version = "0.1.0"
+dependencies = [
+ "ferros_pt",
+ "nusb",
+ "tokio",
 ]
 
 [[package]]
@@ -805,6 +832,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-compact",
+ "ferros_kist",
  "flate2",
  "lz4_flex",
  "rand",
@@ -819,12 +847,39 @@ version = "0.1.0"
 dependencies = [
  "ahau_core",
  "blake3",
+ "ferros_kept",
+ "ferros_lang",
  "ferros_sys",
  "honeycomb",
  "ihi 0.0.48",
  "libm",
  "tapuwae",
+ "tatau",
  "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros-payload-aliastest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-amp"
+version = "0.1.0"
+dependencies = [
+ "ferros_spi",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-audio"
+version = "0.1.0"
+dependencies = [
+ "ferros_spi",
+ "ferros_sys",
 ]
 
 [[package]]
@@ -843,7 +898,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-buftrap"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-cambench"
+version = "0.1.0"
+dependencies = [
+ "ferros_cam",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-camera"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_cam",
+ "ferros_heap",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-camtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-capture"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-clock"
+version = "0.1.0"
+dependencies = [
+ "ferros_glyphs",
+ "ferros_heap",
+ "ferros_puck",
+ "ferros_sky",
+ "ferros_sys",
+ "libm",
+]
+
+[[package]]
+name = "ferros-payload-copybench"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
@@ -853,12 +959,19 @@ dependencies = [
 name = "ferros-payload-display"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ferros_dsc",
  "ferros_dsi",
+ "ferros_glow",
+ "ferros_lang",
+ "ferros_puck",
  "ferros_sys",
  "fluor",
  "libm",
+ "orb",
  "swash",
+ "tatau",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -884,8 +997,11 @@ dependencies = [
 name = "ferros-payload-fgtw"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ed25519-dalek",
  "ferros_heap",
+ "ferros_kept",
+ "ferros_space",
  "ferros_sys",
  "fgtw",
  "photon_core",
@@ -908,14 +1024,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferros-payload-gnss"
+name = "ferros-payload-gps"
 version = "0.1.0"
 dependencies = [
+ "ferros_heap",
+ "ferros_kept",
+ "ferros_spi",
  "ferros_sys",
 ]
 
 [[package]]
-name = "ferros-payload-gnsstest"
+name = "ferros-payload-gpstest"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
@@ -955,6 +1074,7 @@ version = "0.1.0"
 name = "ferros-payload-hive"
 version = "0.1.0"
 dependencies = [
+ "ferros_lang",
  "ferros_sys",
  "honeycomb",
 ]
@@ -970,6 +1090,18 @@ dependencies = [
 name = "ferros-payload-init"
 version = "0.1.0"
 dependencies = [
+ "ferros_heap",
+ "ferros_kist",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-inject"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_inject",
  "ferros_sys",
 ]
 
@@ -990,10 +1122,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-kists"
+version = "0.1.0"
+dependencies = [
+ "ferros_detail",
+ "ferros_heap",
+ "ferros_kist",
+ "ferros_sys",
+ "fgtw",
+]
+
+[[package]]
 name = "ferros-payload-map"
 version = "0.1.0"
 dependencies = [
- "ferros_ledger",
+ "ferros_detail",
+ "ferros_glow",
+ "ferros_heap",
+ "ferros_kept",
+ "ferros_kist",
+ "ferros_lang",
  "ferros_sys",
  "libm",
  "tatau",
@@ -1014,6 +1162,7 @@ dependencies = [
 name = "ferros-payload-modem"
 version = "0.1.0"
 dependencies = [
+ "ferros_detail",
  "ferros_heap",
  "ferros_sys",
 ]
@@ -1037,6 +1186,8 @@ name = "ferros-payload-pcie1"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_detail",
+ "ferros_heap",
  "ferros_sys",
 ]
 
@@ -1061,6 +1212,24 @@ dependencies = [
  "rand_core",
  "sha2",
  "sha2-asm",
+]
+
+[[package]]
+name = "ferros-payload-pucks"
+version = "0.1.0"
+dependencies = [
+ "ferros_compass",
+ "ferros_faces",
+ "ferros_glyphs",
+ "ferros_heap",
+ "ferros_kist",
+ "ferros_puck",
+ "ferros_sky",
+ "ferros_sys",
+ "ferros_tide",
+ "ferros_weather",
+ "libm",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1112,6 +1281,13 @@ name = "ferros-payload-spinner"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-stackprobe"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-switchtest"
 version = "0.1.0"
 dependencies = [
@@ -1142,9 +1318,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-torch"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-touch"
 version = "0.1.0"
 dependencies = [
+ "ferros_spi",
  "ferros_sys",
 ]
 
@@ -1202,8 +1386,52 @@ name = "ferros-payload-usbprobe"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-vault"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_store",
+ "ferros_sys",
+ "manifestus",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros-payload-vaultbench"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20 0.9.1",
+ "chacha20poly1305 0.10.1",
+ "ferros_sys",
+ "poly1305 0.8.0",
+]
+
+[[package]]
+name = "ferros-payload-vaulttest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-vendorprobe"
 version = "0.1.0"
+
+[[package]]
+name = "ferros-payload-wallgen"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_kept",
+ "ferros_sys",
+ "vsf 0.11.0",
+ "wallpaper",
+]
 
 [[package]]
 name = "ferros-payload-wdtfire"
@@ -1224,11 +1452,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-send"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros-link",
+ "ferros_kist",
+ "ferros_pt",
+ "tokio",
+]
+
+[[package]]
+name = "ferros_cam"
+version = "0.1.0"
+dependencies = [
+ "vsf 0.11.0",
+]
+
+[[package]]
 name = "ferros_cell"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "libm",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_compass"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "ferros_console"
+version = "0.1.0"
+
+[[package]]
+name = "ferros_detail"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_sys",
  "vsf 0.11.0",
 ]
 
@@ -1253,8 +1519,36 @@ name = "ferros_f2fs"
 version = "0.1.0"
 
 [[package]]
+name = "ferros_faces"
+version = "0.1.0"
+dependencies = [
+ "ferros_compass",
+ "ferros_puck",
+ "ferros_sky",
+ "ferros_tide",
+ "ferros_weather",
+ "libm",
+]
+
+[[package]]
 name = "ferros_glass"
 version = "0.1.0"
+
+[[package]]
+name = "ferros_glow"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_glyphs"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "swash",
+]
 
 [[package]]
 name = "ferros_hal"
@@ -1282,28 +1576,81 @@ name = "ferros_hv"
 version = "0.1.0"
 
 [[package]]
+name = "ferros_idea"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fgtw",
+ "unicode-normalization",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_inject"
+version = "0.1.0"
+dependencies = [
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_kept"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libm",
+ "vsf 0.11.0",
+]
+
+[[package]]
 name = "ferros_kernel"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek",
+ "ferros_cam",
+ "ferros_console",
  "ferros_ext4",
  "ferros_f2fs",
  "ferros_glass",
  "ferros_hal",
  "ferros_hal_m1",
  "ferros_heap",
+ "ferros_kist",
  "ferros_layout",
  "ferros_ledger",
+ "ferros_pieces",
  "ferros_pt",
  "ferros_sandbox",
+ "ferros_spi",
+ "ferros_tz",
  "ferros_vault",
  "fontdue",
  "ihi 0.0.48",
  "manifestus",
  "tatau",
  "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_kist"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_sys",
+ "fgtw",
+ "tatau",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_lang"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_sys",
+ "fgtw",
+ "tatau",
 ]
 
 [[package]]
@@ -1315,6 +1662,17 @@ name = "ferros_ledger"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chacha20poly1305 0.10.1",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_pieces"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305 0.10.1",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1323,6 +1681,16 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_ledger",
+]
+
+[[package]]
+name = "ferros_puck"
+version = "0.1.0"
+dependencies = [
+ "ferros_glyphs",
+ "ferros_sys",
+ "ferros_weather",
+ "libm",
 ]
 
 [[package]]
@@ -1338,6 +1706,38 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi 0.0.3",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_sky"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "ferros_space"
+version = "0.1.0"
+dependencies = [
+ "ferros_kept",
+ "ferros_kist",
+ "ferros_ledger",
+ "fgtw",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_spi"
+version = "0.1.0"
+
+[[package]]
+name = "ferros_store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305 0.10.1",
+ "manifestus",
  "vsf 0.11.0",
 ]
 
@@ -1362,6 +1762,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_tz"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_vault"
 version = "0.1.0"
 dependencies = [
@@ -1371,6 +1775,15 @@ dependencies = [
  "rand",
  "voca 0.0.0",
  "vsf 0.4.2",
+]
+
+[[package]]
+name = "ferros_weather"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libm",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1385,6 +1798,7 @@ dependencies = [
  "fn-dsa-vrfy",
  "num-bigint",
  "rand",
+ "rand_chacha",
  "voca 0.0.1",
  "vsf 0.11.0",
  "x25519-dalek",
@@ -1843,7 +2257,7 @@ dependencies = [
  "i256",
  "sha2",
  "sha3",
- "vsf 0.6.42",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -2417,6 +2831,15 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "orb"
+version = "0.1.0"
+dependencies = [
+ "fluor",
+ "libm",
+ "vsf 0.11.0",
+]
 
 [[package]]
 name = "parking_lot"
@@ -3329,23 +3752,6 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.6.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits",
- "unicode-normalization",
-]
-
-[[package]]
-name = "vsf"
 version = "0.11.0"
 dependencies = [
  "aes-gcm",
@@ -3353,6 +3759,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305 0.10.1",
  "chrono",
+ "colored",
  "ed25519-dalek",
  "hex",
  "i256",
@@ -3361,7 +3768,17 @@ dependencies = [
  "num-traits",
  "rand",
  "spin",
+ "unicode-normalization",
  "x25519-dalek",
+]
+
+[[package]]
+name = "wallpaper"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "valhall",
+ "vsf 0.11.0",
 ]
 
 [[package]]

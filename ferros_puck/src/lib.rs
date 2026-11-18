@@ -15,6 +15,7 @@
 
 pub mod draw;
 pub mod fmt;
+pub mod square;
 #[cfg(feature = "sys")]
 pub mod rt;
 #[cfg(test)]
@@ -564,19 +565,25 @@ pub fn q14(f: f32) -> i16 {
     libm::roundf(f * ONE as f32) as i16
 }
 
-/// The puck endpoint's calls (the display serves them on `puck`; the kernel puts the caller's kist identity ahead of each, so a puck can only ever name its own circle).
+/// The puck endpoint's calls (the display serves them on `puck`; the kernel puts the caller's kist identity and its square ahead of each, so a puck can only ever name its own circle and its own pixels).
 pub mod call {
-    /// `[LIST][variant u8][generation u32][list…]` → `[status]`: the puck's list for its resting circle (variant 0) or its circle in focus (variant 1, the fuller face; an empty list there means the resting one).
-    pub const LIST: u8 = 0;
-    /// `[WATCH][seen u32]` → `[0][count u32][shown u8][focused u8][radius px u32]`: held until the circle's view moves past `seen` (shown on the glass or not, in focus or not, its size), a doorbell, never a poll.
+    /// `[WATCH][seen u32][wants u8]` → `[0][count u32][shown u8][large u8][d u16][c i16][s i16][taps u8][taps × (x i16, y i16)]`: held until the circle's view moves past `seen`, a doorbell, never a poll.
+    /// The view is what the display asks the puck to draw: whether its circle is on the glass, whether it is large (at least half the panel's width across: room for the fuller face), its diameter in pixels and its turn (cos, sin, Q14: the gravity turn, or the camera's and the circle's own), and the taps that passed thru to it since, each in Q14 of the radius from the centre in the face's own frame (x right, y down its up).
+    /// `wants` bit 0 (`FRAMES`): answered at every frame the deck shows while the circle is on the glass, for a puck whose picture moves continuously (the clock's rings); without it, only when the view changes or a tap comes.
     pub const WATCH: u8 = 1;
-    /// LIST's statuses.
+    /// `[SHOW][offset u32][d u16][c i16][s i16]` → `[status]`: the puck's square, `d` pixels a side drawn at turn (c, s), lies `offset` bytes past the porch of its slot (G2t16 pixels, row by row). Answered once the display has taken it: from then on the display reads that square alone until the next SHOW, so the puck draws its next one anywhere else in its slot.
+    pub const SHOW: u8 = 2;
+    /// WATCH's `wants`: every shown frame.
+    pub const FRAMES: u8 = 1;
+    /// The most taps one WATCH answer carries (more between two watches: the oldest kept).
+    pub const TAPS: usize = 1 << 3;
+    /// SHOW's statuses.
     pub const OK: u8 = 0;
-    /// The list was refused (`check`); the last good one stays.
+    /// The square was refused: past the slot's frames, no square held, or a malformed call.
     pub const REFUSED: u8 = 1;
-    /// No circle on the deck is this puck's (it is not stowed here, or the deck has not bound it yet): kept for when it is.
+    /// No circle on the deck is this puck's (it is not stowed here, or the deck has not bound it yet).
     pub const NOT_ON_DECK: u8 = 2;
-    /// The variant for the circle at rest and in focus.
-    pub const REST: u8 = 0;
-    pub const FOCUS: u8 = 1;
 }
+
+/// The most pixels a side of a square has: two of them must fit the slot's 64 MiB at 8 bytes a pixel past its 64-byte porch (ferros_sys PUCK_BYTES), so a circle shown larger than this is drawn from its square scaled.
+pub const SIDE_MAX: u16 = (1 << 11) - 1;

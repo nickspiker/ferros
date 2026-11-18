@@ -1221,35 +1221,19 @@ fn group_of(kind: u16) -> usize {
     }
 }
 
-/// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Stowed like any app (payloads/clock, tools/clock-kist.sh), never launched.
-fn widget(name: &str) -> Option<u8> {
-    name.eq_ignore_ascii_case("Clock").then_some(CLOCK_FACE)
-}
-
-/// The display's clock face as a scene icon (display `WIDGET_CLOCK`, G#80).
-const CLOCK_FACE: u8 = 1 << 7;
-
-/// The display's first puck icon (display puck.rs `PUCK0`): the j-th puck of the person's list is drawn for icon `PUCK0 + j`, from the list of ops its kist sends (docs/PUCKS.md).
+/// The display's first puck icon (display puck.rs `PUCK0`): the j-th puck of the person's list is drawn for icon `PUCK0 + j`, from the square its kist draws (docs/PUCKS.md).
 const PUCK0: u8 = 0x90;
 /// How many pucks the display draws (puck.rs `N`); a puck past them is a plain circle.
 const PUCKS: usize = 1 << 4;
 
-/// The scene icon of the kist at `ki` in the person's list when it is a puck: a capsule that declares `puck` (ferros_kist `PUCK`), the j-th such, `PUCK0 + j`; else the clock by its name as before (`widget`, until its capsule declares `puck`); else None.
+/// The scene icon of the kist at `ki` in the person's list when it is a puck: a capsule that declares `puck` (ferros_kist `PUCK`; never its name: until 2026-11-18 a kist named Clock got the display's own clock face), the j-th such, `PUCK0 + j`; else None.
 fn puck_icon(ks: &[ferros_kist::Kist], ki: usize) -> Option<u8> {
     let k = &ks[ki];
-    if k.is_puck() {
-        let j = ks[..ki].iter().filter(|k| k.is_puck()).count();
-        return (j < PUCKS).then(|| PUCK0 + j as u8);
+    if !k.is_puck() {
+        return None;
     }
-    widget(&k.name)
-}
-
-/// What a puck's circle shows, by the display's icon for it (`puck_icon`), for its card on the Deck.
-fn puck_shows(icon: u8) -> Msg {
-    match icon {
-        CLOCK_FACE => Msg::TheTime,
-        _ => Msg::Unknown,
-    }
+    let j = ks[..ki].iter().filter(|k| k.is_puck()).count();
+    (j < PUCKS).then(|| PUCK0 + j as u8)
 }
 
 /// Why a kist did not start, or stopped after it started (ferros_kist::launch::why), in the person's words: under its open circle (`ask_page`) and on its card.
@@ -1526,8 +1510,6 @@ struct Map {
     front_kist: Option<[u8; 32]>,
     /// The pucks launched since the person attested, by capsule (docs/PUCKS.md: a puck lives while a person is present, launched once, never by a tap).
     pucks_up: alloc::vec::Vec<[u8; 32]>,
-    /// The puck in focus (its scene icon), its fuller face (display op 25): a tap on it gives it the focus, a tap anywhere else takes it back.
-    puck_focus: Option<u8>,
     /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
     n: usize,
     /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
@@ -2049,12 +2031,9 @@ impl Map {
         ok
     }
 
-    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
+    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A puck is launched like any kist and is never brought to the front (docs/PUCKS.md). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
     fn launch(&mut self, i: usize) -> u8 {
         let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_STOWED };
-        if widget(&k.name).is_some() && !k.is_puck() {
-            return ferros_kist::launch::RUNNING;
-        }
         let puck = k.is_puck();
         let mut m = [0u8; 33];
         m[0] = ferros_kist::launch::OP_LAUNCH;
@@ -2521,18 +2500,7 @@ impl Map {
         self.send_pucks();
     }
 
-    /// The puck in focus gives it back (display op 25, nothing in focus): its resting face, the camera where the tap found it.
-    fn unfocus_puck(&mut self) {
-        self.puck_focus = None;
-        let mut r = [0u8; 4];
-        call(self.display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
-        if let Some(to) = self.back.take() {
-            self.fly(to);
-        }
-        self.draw();
-    }
-
-    /// The pucks to the display and up (docs/PUCKS.md): display op 73 binds each puck's kist identity to its scene icon (`puck_icon`: the j-th puck of the list, `PUCK0 + j`), so the list that kist sends on `puck` is drawn in that circle and nowhere else; then each puck not yet up is launched by init with its granted rights, once a person is present (the map runs only then), never on a tap. A puck whose wants are not answered waits for its circle's tap, which asks them as a kist's does.
+    /// The pucks to the display and up (docs/PUCKS.md): display op 73 binds each puck's kist identity to its scene icon (`puck_icon`: the j-th puck of the list, `PUCK0 + j`), so the square that kist hands over on `puck` is drawn in that circle and nowhere else; then each puck not yet up is launched by init with its granted rights, once a person is present (the map runs only then), never on a tap. A puck whose wants are not answered waits for its circle's tap, which asks them as a kist's does.
     fn send_pucks(&mut self) {
         let mut m = [0u8; 2 + 64 * PUCKS];
         m[0] = 73;
@@ -2555,7 +2523,7 @@ impl Map {
 
     /// Circle `i`'s state as its glow (ferros_glow, display op 57; owner, 2026-11-11, on the Pro: "glow is good! you can nix the test circles and use those colours for realzies"), with the count of things waiting on the person. The settings circle is the system's own, 703 nm (owner: "For the ferros settings specifically, I think 703nm"). A kist circle, from what the kernel last said (`kists_rang`), first that matches:
     /// - for you (400 nm): something waits on the person for it (`waiting`; nothing adds to it yet, there are no notifications).
-    /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
+    /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind).
     /// - stopped (600 nm): the kernel keeps a record for it (ferros_sys::not_started): its last process ended by a fault, a panic or a kill from outside, or its last launch did not start; gone once it starts again.
     /// - not running (a ring of darkness): stowed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
     /// Before the kernel has said (a kernel without op 2), a kist circle has no state: the theme's glow as before.
@@ -2564,9 +2532,6 @@ impl Map {
         let Some(k) = self.kist(i) else { return (Glow::System, 0) };
         if let Some(w) = self.waiting.iter().find(|w| w.0 == k.capsule).filter(|w| w.1 > 0) {
             return (Glow::ForYou, w.1);
-        }
-        if widget(&k.name).is_some() && !k.is_puck() {
-            return (Glow::Running, 0);
         }
         let Some(live) = self.live.as_ref() else { return (Glow::None, 0) };
         if live.contains(&k.capsule) {
@@ -4300,9 +4265,8 @@ impl Map {
                     y -= uu(3, 4);
                     row(self, b, &mut y, note, grey(), tr(if puck.is_some() { Msg::KindPuck } else { Msg::KindKist }), None);
                     let st = self.kist_state(&k.capsule);
-                    if let Some(icon) = puck {
-                        // A puck: what its circle shows (the clock: the time), then its rights and its remove. It is never opened, so it has no state to stop.
-                        fact(b, &mut y, tr(Msg::Shows), tr(puck_shows(icon)));
+                    if puck.is_some() {
+                        // A puck: its rights and its remove. It is never opened, so it has no state to stop.
                     } else {
                         // Who made it: the developer's name as their first kist here gave it (the person's pin), and always their key's first bytes, which is who they are.
                         let mut d = Line::new();
@@ -5015,38 +4979,25 @@ impl Map {
                 // A kist stowed or removed since: its circle comes or goes before the tap is placed.
                 self.refresh_circles();
                 let hit = self.hit(sx, sy);
-                // A puck in focus loses it to any tap but one on itself (that one is the puck's own below): its resting face back, the camera where it was.
-                if let Some(icon) = self.puck_focus {
-                    let on_it = hit.is_some_and(|i| i > 0 && puck_icon(&self.kists.kists, i - 1) == Some(icon));
-                    if !on_it {
-                        self.unfocus_puck();
-                        return;
-                    }
-                }
                 if let Some(i) = hit {
                     // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list read again first: another of the person's devices may have answered meanwhile.
                     if i > 0 {
                         self.reload_kists();
                         let Some(k) = self.kist(i) else { return };
                         let capsule = k.capsule;
-                        // A puck answered (docs/PUCKS.md "What a tap does", choice 1, focus): never opened; the camera flies to it and it shows its fuller face (display op 25 with its icon) until a tap anywhere takes the focus back. Launched first if it is not up (it ended, or its wants were answered just now).
+                        // A puck answered (docs/PUCKS.md "What a tap does"; owner, 2026-11-18: "Tap/drag with one finger moves it, with two scales/rotates and a simple tap passes thru so we can make our dozenal calculator work too"): never opened; the tap goes to the puck itself (display op 74, which knows where the circle was drawn and its face's turn), launched first if it is not up.
                         if k.is_puck() && !k.unanswered() {
                             if !self.pucks_up.contains(&capsule) {
                                 self.launch(i);
                             }
-                            match (self.puck_focus, puck_icon(&self.kists.kists, i - 1)) {
-                                (Some(_), _) => self.unfocus_puck(),
-                                (None, Some(icon)) => {
-                                    self.puck_focus = Some(icon);
-                                    let mut r = [0u8; 4];
-                                    call(self.display, &[25, icon, 0, 0, 0, 0, 0], &mut r);
-                                    self.back = Some(self.cam);
-                                    let to = self.at(i);
-                                    self.fly(to);
-                                    self.draw();
-                                }
-                                (None, None) => {}
-                            }
+                            // WHY the casts: a tap that placed a finger on a circle is on the glass, so its pixel fits a u16.
+                            let mut m = [0u8; 6];
+                            m[0] = 74;
+                            m[1] = i as u8;
+                            m[2..4].copy_from_slice(&(sx as u16).to_le_bytes());
+                            m[4..6].copy_from_slice(&(sy as u16).to_le_bytes());
+                            let mut r = [0u8; 1];
+                            call(self.display, &m, &mut r);
                             return;
                         }
                         // A stop it has not said yet (it crashed while the person was elsewhere, `stopped`): this tap opens the circle on that, once, and the next tap launches.
@@ -5339,7 +5290,7 @@ impl Map {
                     }
                     // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the stower (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
                     // A kist's Unstow: its sheet, in the card's place, at its top, at the design's defaults; what it kept for itself counted by the stower meanwhile (stower.rs `size_ask`, drawn when it comes).
-                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| widget(&kist.name).is_none() && !kist.is_puck()) => {
+                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| !kist.is_puck()) => {
                         let kist = &self.kists.kists[k as usize];
                         self.sheet = Some(Sheet { capsule: kist.capsule, keep_data: false, keep_made: true, keep_answers: true, here_only: false });
                         if self.sheet_size.is_none_or(|s| s.0 != kist.capsule) {
@@ -5655,7 +5606,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         recent: alloc::vec::Vec::new(),
         front_kist: None,
         pucks_up: alloc::vec::Vec::new(),
-        puck_focus: None,
         n,
         kists,
         ask: 0,

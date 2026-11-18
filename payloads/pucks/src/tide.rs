@@ -31,7 +31,7 @@ struct Using {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants);
+    let link = common::start(grants, false);
     common::start_place(grants);
     let Ok(catalog) = Catalog::parse(bundled::CATALOG) else {
         common::say(grants, b"tide: the bundled catalog does not read\n");
@@ -66,7 +66,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             // No place yet (GPS not granted, or no fix so far): the circle shows its sky alone until one comes.
             _ => common::show(link, |w, _| ferros_faces::sky(w).map(|_| ())),
         }
-        common::rt::wait(seen, deadline);
+        common::wait(seen, deadline);
     }
 }
 

@@ -14,7 +14,7 @@ use ferros_sky::SunDay;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants);
+    let link = common::start(grants, false);
     common::start_place(grants);
     loop {
         let seen = common::rt::bell();
@@ -28,7 +28,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             _ => common::show(link, |w, _| ferros_faces::sky(w).map(|_| ())),
         }
-        common::rt::wait(seen, deadline);
+        common::wait(seen, deadline);
     }
 }
 

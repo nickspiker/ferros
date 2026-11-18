@@ -1,8 +1,9 @@
-//! A puck's side on the device (feature `sys`): its calls to the display, its view's doorbell, Eagle time, a GPS fix when granted, and its place kept as VSF.
+//! A puck's side on the device (feature `sys`): its calls to the display, its view's doorbell, its square, Eagle time, a GPS fix when granted, and its place kept as VSF.
 //!
-//! The shape of every puck: build its lists from its engine at now, send them, then sleep in one wait until the earliest of its content's own next deadline and a change of its circle's view (`View`), never on an interval.
-//! The view comes from a held WATCH on the display (a thread of its own, `watch`): the display answers it when the circle is shown or hidden, gains or loses the focus, or changes size class.
-//! The place: a GPS fix taken only when the person granted GPS (a claim, released at the first fix or after `FIX_GIVE_UP_S`), rounded to the ~10 km cell (ferros_weather's grid) before it is kept, and kept in the puck's own vault domain as a VSF document so the next start has it without the radio; the finer fix never leaves the process's memory and is never logged.
+//! The shape of every puck: while its circle is on the glass, build its face's list from its engine at now, draw it into its square at the size and turn the display asked for (`show`), hand the square over; then sleep in one wait until the earliest of its content's own next deadline, the next moment its time-anchored ops move half a pixel, and a change of its circle's view (`View`), never on an interval.
+//! The view comes from a held WATCH on the display (a thread of its own, `watch`): the display answers it when the circle is shown or hidden, changes size or turns, when a tap passes thru to it, and, for a puck that asked for them, at every frame the deck shows.
+//! A puck whose circle is not on the glass draws nothing.
+//! The place: a GPS fix taken only when the person granted GPS (a claim, released at the first fix or after `FIX_GIVE_UP_S`), rounded to the ~10 km cell (ferros_weather's grid) before it is kept, and kept in the puck's own vault domain as a VSF document; the finer fix never leaves the process's memory.
 
 use crate::{call, OSC};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,46 +26,66 @@ pub fn ticks_at(at: i64) -> u64 {
     now() + ahead
 }
 
-/// The puck's link to the display: the slot of its `puck` right.
+/// The puck's link to the display: the slot of its `puck` right, and the slot of its square (its surface's, `ferros_sys::kist::SURFACE`).
 #[derive(Clone, Copy)]
 pub struct Link {
     pub grants: u64,
     pub slot: u64,
+    pub square: u64,
 }
 
-impl Link {
-    /// Send a list for the circle at rest (`call::REST`) or in focus (`call::FOCUS`); the display's status (`call::OK`, `REFUSED`, `NOT_ON_DECK`).
-    pub fn send(&self, variant: u8, generation: u32, list: &[u8]) -> u8 {
-        let mut m = [0u8; 6 + crate::LIST_MAX];
-        m[0] = call::LIST;
-        m[1] = variant;
-        m[2..6].copy_from_slice(&generation.to_le_bytes());
-        m[6..6 + list.len()].copy_from_slice(list);
-        let mut r = [0u8; 1];
-        let n = ferros_sys::call(cap(self.grants, self.slot), &m[..6 + list.len()], &mut r);
-        if n == ferros_sys::ERR || n == 0 { call::REFUSED } else { r[0] }
-    }
-}
-
-/// The circle's view as the display last said it: (count, shown, focused, radius in pixels).
+/// The circle's view as the display last said it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct View {
     pub count: u32,
+    /// On the glass.
     pub shown: bool,
-    pub focused: bool,
-    pub r_px: u32,
+    /// At least half the panel's width across: room for the fuller face.
+    pub large: bool,
+    /// Its diameter in pixels, the side of the square to draw.
+    pub d: u16,
+    /// Its turn, Q14 (cos, sin).
+    pub c: i16,
+    pub s: i16,
 }
 
-/// The view, packed: count in the low 32 bits, shown bit 32, focused bit 33; the radius beside it.
+/// The view, packed: count in bits 0-31, d in 32-47, shown bit 48, large bit 49; the turn beside it (c in 0-15, s in 16-31).
 static VIEW: AtomicU64 = AtomicU64::new(0);
-static R_PX: AtomicU64 = AtomicU64::new(0);
+static TURN: AtomicU64 = AtomicU64::new(1 << 14);
 /// Rung by anything the main loop should wake for besides the view (a fix, a fetch): its count moves.
 static BELL: AtomicU64 = AtomicU64::new(0);
+/// What the watch asks for (`call::FRAMES`), set before `watch`.
+static WANTS: AtomicU64 = AtomicU64::new(0);
 
 /// The view now.
 pub fn view() -> View {
     let v = VIEW.load(Ordering::Acquire);
-    View { count: v as u32, shown: v >> 32 & 1 == 1, focused: v >> 33 & 1 == 1, r_px: R_PX.load(Ordering::Acquire) as u32 }
+    let t = TURN.load(Ordering::Acquire);
+    View { count: v as u32, d: (v >> 32) as u16, shown: v >> 48 & 1 == 1, large: v >> 49 & 1 == 1, c: t as u16 as i16, s: (t >> 16) as u16 as i16 }
+}
+
+/// Taps that passed thru to the circle and are not yet taken: (x, y) in Q14 of the radius, in the face's own frame. A ring the watch thread fills and `taps` empties; the oldest go when it is full.
+static TAPS: [AtomicU64; call::TAPS] = [const { AtomicU64::new(0) }; call::TAPS];
+static TAPS_IN: AtomicU64 = AtomicU64::new(0);
+static TAPS_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// The taps since the last call, oldest first, into `out`; how many.
+pub fn taps(out: &mut [(i16, i16); call::TAPS]) -> usize {
+    let end = TAPS_IN.load(Ordering::Acquire);
+    let mut at = TAPS_OUT.load(Ordering::Acquire);
+    // The ring holds the last `TAPS`: anything older was overwritten.
+    if end - at > call::TAPS as u64 {
+        at = end - call::TAPS as u64;
+    }
+    let mut n = 0;
+    while at < end {
+        let t = TAPS[at as usize % call::TAPS].load(Ordering::Acquire);
+        out[n] = (t as u16 as i16, (t >> 16) as u16 as i16);
+        n += 1;
+        at += 1;
+    }
+    TAPS_OUT.store(end, Ordering::Release);
+    n
 }
 
 /// Wake the main loop (a worker thread finished something the face shows).
@@ -75,40 +96,52 @@ pub fn ring() {
 }
 
 static mut WATCH_STACK: [u8; 1 << 13] = [0; 1 << 13];
-static mut WATCH_LINK: Link = Link { grants: 0, slot: 0 };
+static mut WATCH_LINK: Link = Link { grants: 0, slot: 0, square: 0 };
 
 extern "C" fn watcher(_: u64) -> ! {
     let link = unsafe { WATCH_LINK };
     let mut seen = 0u32;
     loop {
-        let mut m = [0u8; 5];
+        let mut m = [0u8; 6];
         m[0] = call::WATCH;
         m[1..5].copy_from_slice(&seen.to_le_bytes());
-        let mut r = [0u8; 11];
+        m[5] = WANTS.load(Ordering::Acquire) as u8;
+        let mut r = [0u8; 14 + 4 * call::TAPS];
         let n = ferros_sys::call(cap(link.grants, link.slot), &m, &mut r);
         // No display, or none that knows this puck: the view stays as it was and the puck runs on its deadlines alone; asking again would only spin.
-        if n == ferros_sys::ERR || n < 11 || r[0] != 0 {
+        if n == ferros_sys::ERR || n < 14 || r[0] != 0 {
             ferros_sys::console(link.grants, b"puck: the display does not answer the view's watch; following deadlines only\n");
             loop {
                 ferros_sys::sleep_until(u64::MAX);
             }
         }
         seen = u32::from_le_bytes(r[1..5].try_into().unwrap());
-        R_PX.store(u32::from_le_bytes(r[7..11].try_into().unwrap()) as u64, Ordering::Release);
-        VIEW.store(seen as u64 | (r[5] as u64 & 1) << 32 | (r[6] as u64 & 1) << 33, Ordering::Release);
+        let d = u16::from_le_bytes([r[7], r[8]]);
+        TURN.store(u16::from_le_bytes([r[9], r[10]]) as u64 | (u16::from_le_bytes([r[11], r[12]]) as u64) << 16, Ordering::Release);
+        VIEW.store(seen as u64 | (d as u64) << 32 | (r[5] as u64 & 1) << 48 | (r[6] as u64 & 1) << 49, Ordering::Release);
+        // WHY the bound: the count is the display's word and the reply holds at most `TAPS`.
+        let k = (r[13] as usize).min(call::TAPS).min((n as usize - 14) / 4);
+        for j in 0..k {
+            let at = 14 + 4 * j;
+            let t = u16::from_le_bytes([r[at], r[at + 1]]) as u64 | (u16::from_le_bytes([r[at + 2], r[at + 3]]) as u64) << 16;
+            let i = TAPS_IN.load(Ordering::Acquire);
+            TAPS[i as usize % call::TAPS].store(t, Ordering::Release);
+            TAPS_IN.store(i + 1, Ordering::Release);
+        }
         ring();
     }
 }
 
-/// Start the view's watch (once).
-pub fn watch(link: Link) {
+/// Start the view's watch (once); `frames` asks for every frame the deck shows while the circle is on the glass (`call::FRAMES`).
+pub fn watch(link: Link, frames: bool) {
     unsafe { WATCH_LINK = link };
+    WANTS.store(if frames { call::FRAMES as u64 } else { 0 }, Ordering::Release);
     if ferros_sys::thread_spawn(watcher, unsafe { &mut *(&raw mut WATCH_STACK) }, 0) != 0 {
         ferros_sys::console(link.grants, b"puck: no watch thread; following deadlines only\n");
     }
 }
 
-/// Sleep until the bell moves past `seen` (a view change, a worker's result) or Eagle time `deadline` (None: no deadline). Returns the bell's count.
+/// Sleep until the bell moves past `seen` (a view change, a tap, a frame, a worker's result) or Eagle time `deadline` (None: no deadline). Returns the bell's count.
 pub fn wait(seen: u64, deadline: Option<i64>) -> u64 {
     let until = deadline.map_or(u64::MAX, ticks_at);
     if BELL.load(Ordering::Acquire) == seen {
@@ -120,6 +153,84 @@ pub fn wait(seen: u64, deadline: Option<i64>) -> u64 {
 /// The bell's count now (the `seen` the next `wait` takes).
 pub fn bell() -> u64 {
     BELL.load(Ordering::Acquire)
+}
+
+/// The square: its pixels' base (past the porch), the bytes its slot holds, and the square the display has now (offset, bytes), which is never drawn into.
+struct Held {
+    base: u64,
+    held: u64,
+    shown: Option<(u64, u64)>,
+}
+static mut HELD: Held = Held { base: 0, held: 0, shown: None };
+
+/// Where the next square of `bytes` goes: at the slot's start when that clears the one the display has, else just past it (the two never overlap, so the display reads a whole square while the next is drawn).
+fn next_offset(shown: Option<(u64, u64)>, bytes: u64) -> u64 {
+    match shown {
+        Some((off, len)) if off < bytes => (off + len + 63) & !63,
+        _ => 0,
+    }
+}
+
+/// Draw `list` into the square at the view's size and turn and hand it to the display. Nothing while the circle is not on the glass. The display's status (`call::OK`, `REFUSED`, `NOT_ON_DECK`), or None when nothing was drawn.
+pub fn show(link: Link, v: &View, list: &[u8], theme: &crate::square::Theme, glyphs: &mut ferros_glyphs::Glyphs) -> Option<u8> {
+    let ctx = crate::draw::Ctx { now: eagle_now().unwrap_or(0), zone: ferros_sys::zone(), base: ferros_sys::device_base() };
+    show_with(link, v, |px, d, turn| crate::square::paint(px, d, turn, list, &ctx, theme, glyphs))
+}
+
+/// `show` for a puck that draws its square itself: `paint(pixels, d, turn)` fills the `d` × `d` square (cleared to nothing first) at the view's turn.
+pub fn show_with(link: Link, v: &View, paint: impl FnOnce(&mut [u64], usize, (f32, f32))) -> Option<u8> {
+    if !v.shown || v.d == 0 {
+        return None;
+    }
+    let h = unsafe { &mut *(&raw mut HELD) };
+    if h.base == 0 {
+        h.base = ferros_sys::dma(cap(link.grants, link.square));
+        if h.base == ferros_sys::ERR {
+            h.base = 0;
+            ferros_sys::console(link.grants, b"puck: no square (a kernel from before 2026-11-18?)\n");
+            return None;
+        }
+    }
+    // WHY the bound: the side is the display's word; past `SIDE_MAX` two squares would not fit the slot.
+    let d = v.d.min(crate::SIDE_MAX) as u64;
+    let bytes = d * d * 8;
+    let off = next_offset(h.shown, bytes);
+    if off + bytes > h.held {
+        match ferros_sys::puck_size(cap(link.grants, link.square), off + bytes) {
+            Some(n) => h.held = n,
+            None => return Some(call::REFUSED),
+        }
+    }
+    // SAFETY: [base + off, base + off + bytes) lies inside the frames this puck's slot holds (`held`, the kernel's answer), which no one else writes; the display reads only the square it was last handed, which `next_offset` keeps clear of.
+    let px = unsafe { core::slice::from_raw_parts_mut((h.base + off) as *mut u64, (d * d) as usize) };
+    let turn = (v.c as f32 / 16384., v.s as f32 / 16384.);
+    px.fill(0);
+    paint(px, d as usize, turn);
+    let mut m = [0u8; 11];
+    m[0] = call::SHOW;
+    m[1..5].copy_from_slice(&(off as u32).to_le_bytes());
+    m[5..7].copy_from_slice(&(d as u16).to_le_bytes());
+    m[7..9].copy_from_slice(&v.c.to_le_bytes());
+    m[9..11].copy_from_slice(&v.s.to_le_bytes());
+    let mut r = [0u8; 1];
+    let n = ferros_sys::call(cap(link.grants, link.slot), &m, &mut r);
+    let status = if n == ferros_sys::ERR || n == 0 { call::REFUSED } else { r[0] };
+    if status == call::OK {
+        h.shown = Some((off, bytes));
+        // The slot back down once the display holds a square at its start and the slot is more than four times what two squares of this size need: a circle pinched small gives its frames back, without a resize at every step of the pinch.
+        if off == 0 && h.held > 8 * bytes {
+            if let Some(n) = ferros_sys::puck_size(cap(link.grants, link.square), 2 * bytes) {
+                h.held = n;
+            }
+        }
+    }
+    Some(status)
+}
+
+/// The theme's colours a list may name, from the person's theme now (text, text2, plane, ring, lit).
+pub fn theme() -> crate::square::Theme {
+    let t = ferros_sys::theme::current();
+    [t.text, t.text2, t.plane, t.ring, t.lit]
 }
 
 /// How long a fix is waited for before the claim is given up (WHY a deadline: indoors the chip has gone 300 s with no fix, GPS.md, and a puck's refresh must not hold the radio for that; LOCATION.md's 128 s).

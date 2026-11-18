@@ -286,3 +286,28 @@ fn a_turned_curve_turns_about_the_centre() {
     assert_eq!(g.at(110, 128).1, Some(BLUE));
     assert_eq!(g.at(146, 128).0, 0.);
 }
+
+#[test]
+fn a_square_holds_its_face_over_its_plane_in_g2t16() {
+    // A white disc of half the radius at the centre, a mid-grey plane: the centre is the disc, opaque white's g2t code (2^16 tanh(1)), the corner the plane, nothing transparent anywhere.
+    let mut buf = [0u8; LIST_MAX];
+    let mut w = Writer::new(&mut buf);
+    w.disc(0, 0, (ONE / 2) as u16, Colour::rgb(255, 255, 255)).unwrap();
+    let list = w.bytes().to_vec();
+    let d = 64;
+    let mut px = vec![1u64; d * d];
+    let mut glyphs = ferros_glyphs::Glyphs::with_arena(ferros_glyphs::FONT, 1 << 12).unwrap();
+    let theme = [0xF0F0F0, 0x9A9A9A, 0x808080, 0x8A8A8A, 0xFFA000];
+    let ctx = Ctx { now: 0, zone: 0, base: 10 };
+    square::paint(&mut px, d, (1., 0.), &list, &ctx, &theme, &mut glyphs);
+    let white_dark = 65535 - (libm::tanhf(1.) * 65536.) as u64;
+    let grey_dark = 65535 - (libm::tanhf(128. / 255.) * 65536.) as u64;
+    let centre = px[(d / 2) * d + d / 2];
+    assert_eq!(centre >> 48, 0xFFFF);
+    assert!(((centre >> 32) & 0xFFFF).abs_diff(white_dark) <= 1, "centre {centre:X}");
+    let corner = px[0];
+    assert_eq!(corner >> 48, 0xFFFF);
+    assert!(((corner >> 32) & 0xFFFF).abs_diff(grey_dark) <= 1, "corner {corner:X}");
+    // Every pixel opaque: the plane fills the square under the face.
+    assert!(px.iter().all(|p| p >> 48 == 0xFFFF));
+}

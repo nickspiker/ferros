@@ -52,7 +52,7 @@ fn load(domain: u64) -> Option<Calibration> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants);
+    let link = common::start(grants, false);
     common::start_place(grants);
     let domain = ferros_sys::cap(grants, common::S_DOMAIN);
     let kept = load(domain);
@@ -91,7 +91,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             _ => None,
         };
         // Half a pixel at the dial's rim (0.84 of the radius): a smaller move changes nothing on the glass. WHY the floor of a pixel: before the display has said the circle's size it is 0, and the step would divide by it.
-        let step = 1. / (2. * 0.84 * (v.r_px.max(1)) as f64);
+        let step = 1. / (2. * 0.84 * ((v.d as u32 / 2).max(1)) as f64);
         let moved = match (heading, shown_heading) {
             (Some(a), Some(b)) => {
                 let d = a - b - core::f64::consts::TAU * libm::floor((a - b) / core::f64::consts::TAU);
@@ -108,7 +108,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             (true, Some(t)) => Some(t + (SAMPLE_S * ferros_puck::OSC as f64) as i64),
             _ => None,
         };
-        common::rt::wait(seen, deadline);
+        common::wait(seen, deadline);
     }
 }
 

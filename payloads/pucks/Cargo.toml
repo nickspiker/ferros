@@ -33,6 +33,8 @@ path = "src/weather.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }
 ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
+# The typeface each puck draws its words in (the display's own).
+ferros_glyphs = { path = "../../ferros_glyphs" }
 ferros_faces = { path = "../../ferros_faces" }
 ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
 ferros_sky = { path = "../../ferros_sky" }

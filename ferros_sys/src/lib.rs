@@ -1119,6 +1119,8 @@ pub const BELL_SLOTS: u64 = 12;
 /// The identity service wipes what it holds of the identity when it moves.
 /// Any process may register a word for it: whether a person is present is fact 83 already.
 pub const BELL_IDENTITY: u64 = 13;
+/// The pucks' squares (2026-11-18, docs/PUCKS.md), for the holder of the `surfaces` region (the display): bits 4j to 4j + 3 square slot j's generation (1 to 15) while its puck lives, 0 otherwise ([`surface_generation`] reads it the same way).
+pub const BELL_PUCKS: u64 = 14;
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;
@@ -1126,6 +1128,13 @@ pub const SURFACE_SLOTS: usize = 16;
 pub const SURFACE_BYTES: usize = 32 << 20;
 /// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
 pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
+
+/// How many pucks may hold a square at once (2026-11-18, docs/PUCKS.md; the kernel's cachemap PUCK_SLOTS): slot j at `PUCKS_WINDOW + j * PUCK_BYTES`.
+pub const PUCK_SLOTS: usize = 16;
+/// One square slot's addresses (the kernel's PUCK_SIZE): its frames are only what its puck asked for (`puck_size`).
+pub const PUCK_BYTES: usize = 64 << 20;
+/// The pucks' window, the kernel's cachemap PUCK_VA: where the display reads the squares (it holds the surfaces' window and runs native).
+pub const PUCKS_WINDOW: u64 = 0x50_4000_0000;
 
 /// The most GPU memory one client may hold (the kernel's cachemap GPU_BLOCK_MOST, 2026-11-13): its GPU block, frames of the pool on demand, asked for by `gpu_block_ask`.
 pub const GPU_BLOCK_MOST: usize = 512 << 20;
@@ -2047,6 +2056,12 @@ pub fn dma_size(cap: u64, most: u64) -> Option<u64> {
 pub fn gpu_block_ask(cap: u64, log: u32) -> Option<u64> {
     let n = svc(nr::DMA, cap, 2, log as u64, 0, 0);
     (n != ERR && n <= GPU_BLOCK_MOST as u64).then_some(n)
+}
+
+/// Ask the kernel to resize this puck's square (the grant at `cap`: a puck's surface slot, docs/PUCKS.md) to hold `bytes` past its porch, larger or smaller, in whole frames of the pool; its base (`dma`) never moves. The bytes it holds after, or None: not the caller's square, past `PUCK_BYTES`, more than the pool can give (the console says which), or a kernel from before 2026-11-18.
+pub fn puck_size(cap: u64, bytes: u64) -> Option<u64> {
+    let n = svc(nr::DMA, cap, 6, bytes, 0, 0);
+    (n != ERR && n < PUCK_BYTES as u64).then_some(n)
 }
 
 /// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.

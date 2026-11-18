@@ -4,9 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+# The clock, a puck (docs/PUCKS.md): its face drawn into its own square, shared code with ferros's other pucks (payloads/pucks/src/common.rs).
 [[bin]]
 name = "clock"
 path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+ferros_heap = { path = "../../ferros_heap" }
+ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
+ferros_glyphs = { path = "../../ferros_glyphs" }
+# common.rs names the sky engine for its place helpers (unused by the clock).
+ferros_sky = { path = "../../ferros_sky" }
+libm = "0.2"

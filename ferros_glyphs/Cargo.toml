@@ -1,0 +1,10 @@
+[package]
+name = "ferros_glyphs"
+version = "0.1.0"
+edition.workspace = true
+description = "ferros's one typeface (Oxanium +glyphs) as 16-bit coverage, turned at any angle: the display's text and every puck's (docs/PUCKS.md)"
+
+[dependencies]
+# Text: swash in no_std (its libm feature), native f32, outlines transformed before rasterising, so text turns at any angle.
+swash = { version = "0.2.9", default-features = false, features = ["scale", "render", "libm"] }
+libm = "0.2"
