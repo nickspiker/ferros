@@ -382,6 +382,9 @@ static COLS: AtomicU64 = AtomicU64::new(cams::W_MOST as u64);
 static LINE: AtomicU64 = AtomicU64::new(cams::STRIDE_MOST as u64);
 static SLIM: AtomicU64 = AtomicU64::new(0);
 static PD_ON: AtomicU64 = AtomicU64::new(1);
+/// Where a ring buffer holds its frame's phase-detect rows (bytes past the buffer's start; 0 none: a slit, or the PD path off) and how many (the main's 768, at the image's line), so MAP's header hands both (docs/CAMERA.md "Phase detect as data").
+static PD_OFF: AtomicU64 = AtomicU64::new(0);
+static PD_ROWS: AtomicU64 = AtomicU64::new(0);
 static SLITS: AtomicU64 = AtomicU64::new(0);
 /// The sensor's frame length and line length now (the mode's, or as the last exposure moved them), for STATS.
 static FLL: AtomicU64 = AtomicU64::new(0);
@@ -1071,7 +1074,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let slim_level = if s.flags & F_SLIM2 != 0 { 2 } else { 1 };
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
-    let buf = if slit { job::slit_bytes(fe.h as u64, fe.stride as u64) } else { job::buffer_bytes(fe.h as u64, fe.stride as u64) };
+    // The PD path on (the init's mode, or asked): each ring buffer holds its frame's PD rows right after its image (owner, 2026-11-17: phase detect as data, one MAP giving both; docs/CAMERA.md "Phase detect as data"), the main's 768 lines at the image's stride past its 3072, so a buffer is 20 MiB, not 16. `pd_off` the rows' place in the buffer, 0 none.
+    let pd_on = s.kind == K_CAPTURED || s.flags & F_PD != 0;
+    let pd_off = if pd_on && !slit { fe.h as u64 * fe.stride as u64 } else { 0 };
+    let buf = if slit { job::slit_bytes(fe.h as u64, fe.stride as u64) } else if pd_off != 0 { job::buffer_bytes(fe.h as u64 + fe.pd_h as u64, fe.stride as u64) } else { job::buffer_bytes(fe.h as u64, fe.stride as u64) };
     // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14); measured on the Pro on 2026-11-15 to work above 4 GiB too (the front end drives the high address halves in bypass), where it is taken when nothing lower is free. A vault entry `cam.region` reading `high` asks higher first.
     // The job's region with an image ring (`RINGS`, the most that fits first; a slit ring its own count) of `buf`-byte buffers, and the engine's area past it (`engine_bytes`).
     let mut hint = [0u8; 8];
@@ -1186,18 +1192,25 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The program's copies in the engine's area, copy b naming buffer b where the program writes the image body's address (ferros_cam job `image_words`); everything else in them the job's own, moved. Full copies every `PROG_STRIDE`, then the slim ones (geom `slim`) every `SLIM_STRIDE`.
     let long = l.bytes as usize;
     let (w_lo, w_hi) = job::image_words(&jb[list_at..list_at + list_len]).map_err(Fail::Job)?;
+    // With the PD rows in the ring (`pd_off`), also where the program writes loch0's PD path address (`pd_words`): each copy names its buffer past its image.
+    let pd_w = if pd_off != 0 { Some(job::pd_words(&jb[list_at..list_at + list_len]).map_err(Fail::Job)?) } else { None };
     if list_len > PROG_STRIDE {
         return Err(Fail::Inputs("the job's program is longer than a copy's room"));
     }
     let ring_off = l.slots[job::OLD_SLOT_IMAGE].0 as usize;
     let buf_pa = |b: usize| pa + (ring_off + b * buf as usize) as u64;
     let (n_full, n_slim) = copies(ring);
-    let put = |dst: usize, words: &[u8], lo: usize, hi: usize, b: usize| {
+    let put = |dst: usize, words: &[u8], lo: usize, hi: usize, pd: Option<(usize, usize)>, b: usize| {
+        let pd_pa = buf_pa(b) + pd_off;
         for i in 0..words.len() / 4 {
             let w = if i == lo {
                 buf_pa(b) as u32
             } else if i == hi {
                 (buf_pa(b) >> 32) as u32
+            } else if pd.is_some_and(|p| p.0 == i) {
+                pd_pa as u32
+            } else if pd.is_some_and(|p| p.1 == i) {
+                (pd_pa >> 32) as u32
             } else {
                 u32::from_le_bytes(words[i * 4..i * 4 + 4].try_into().unwrap())
             };
@@ -1205,7 +1218,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     };
     for b in 0..n_full {
-        put(va + long + PROG_AT + b * PROG_STRIDE, &jb[list_at..list_at + list_len], w_lo, w_hi, b);
+        put(va + long + PROG_AT + b * PROG_STRIDE, &jb[list_at..list_at + list_len], w_lo, w_hi, pd_w, b);
     }
     let slim_at = PROG_AT + n_full * PROG_STRIDE;
     let mut slim_len = 0;
@@ -1213,8 +1226,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         let mut sl = [0u8; SLIM_STRIDE];
         slim_len = geom::slim(&jb[list_at..list_at + list_len], slim_level, &mut sl).ok_or(Fail::Inputs("the slim program is longer than a copy's room"))?;
         let (s_lo, s_hi) = job::image_words(&sl[..slim_len]).map_err(Fail::Job)?;
+        let s_pd = if pd_off != 0 { Some(job::pd_words(&sl[..slim_len]).map_err(Fail::Job)?) } else { None };
         for b in 0..n_slim {
-            put(va + long + slim_at + b * SLIM_STRIDE, &sl[..slim_len], s_lo, s_hi, b);
+            put(va + long + slim_at + b * SLIM_STRIDE, &sl[..slim_len], s_lo, s_hi, s_pd, b);
         }
     }
     ferros_sys::dma_barrier();
@@ -1239,7 +1253,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);
     SLIM.store(slim as u64, Ordering::Relaxed);
-    PD_ON.store((s.kind == K_CAPTURED || s.flags & F_PD != 0) as u64, Ordering::Relaxed);
+    PD_ON.store(pd_on as u64, Ordering::Relaxed);
+    PD_OFF.store(pd_off, Ordering::Relaxed);
+    PD_ROWS.store(if pd_off != 0 { fe.pd_h as u64 } else { 0 }, Ordering::Relaxed);
     SLITS.store(if slit { ring as u64 } else { 0 }, Ordering::Relaxed);
     NOW_FORMAT.store(mode.map_or(10, |m| m.bits() as u64), Ordering::Relaxed);
     for x in [&LATE, &BUSY, &BUSY_MOST, &WRAPS] {
@@ -1556,71 +1572,36 @@ fn header(h: &mut [u8], b: usize, bin: usize) {
         h[41] = 1;
         h[44..48].copy_from_slice(&(LINE.load(Ordering::Relaxed) as u32).to_le_bytes());
         h[48..56].copy_from_slice(&(b as u64 * BUF.load(Ordering::Relaxed)).to_le_bytes());
+        // The frame's phase-detect rows in the same buffer: their place past its start (u32, 0 none) and their rows (u16), at the image's width and line.
+        h[56..60].copy_from_slice(&(PD_OFF.load(Ordering::Relaxed) as u32).to_le_bytes());
+        h[60..62].copy_from_slice(&(PD_ROWS.load(Ordering::Relaxed) as u16).to_le_bytes());
     }
 }
 
-/// SNAP's reply past the frame's header: the image buffer's physical address, the PD copy's, the PD rows, width and line bytes, a status (bit 0 the next frame began writing the PD rows while they were copied: torn; bit 1 no buffer was free for the copy), the copy's microseconds.
-const SNAP_REPLY: usize = HEADER + 40;
+/// SNAP's reply past the frame's header: the image's physical address, its PD rows' (the same buffer, `PD_OFF` past it), the PD rows, width and line bytes, a status (bit 0: the PD rows' first 64 bytes still the open's pattern, so the PD path never wrote this buffer).
+const SNAP_REPLY: usize = HEADER + 32;
 
-/// An image and its phase-detect rows kept as one pair (owner, 2026-11-17: phase detect as data, "split-image and microprism" from its left and right halves; docs/CAMERA.md "Phase detect as data"): the next frame's buffer held (`HOLD_BIN`, until the close), a second free buffer held for the copy, loch0's PD output (slot 0, the PD path's 4080 x 768 RAW10 at the image's stride) copied into it at once after the frame's DMA_DONE, while the sensor is in its vertical blanking (57 ms of the init's 67 ms frame), before the next frame's PD rows begin landing in the slot.
-/// The pair is then read by physical address (the reply carries both; `ferros-bridge read`, tools/camera-pd-pair.sh) while the holder keeps the camera open. Only the init's mode with its PD path on (every other mode has loch0's PD path off) and a ring of three or more.
-fn snap(o: &Open, out: &mut [u8; SNAP_REPLY]) -> bool {
-    let c = cam();
-    if !o.captured || PD_ON.load(Ordering::Relaxed) == 0 || o.ring < 3 {
+/// An image and its phase-detect rows as one pair for the host (owner, 2026-11-17: phase detect as data; docs/CAMERA.md "Phase detect as data"): the next frame's buffer held as a MAP holds it (`HOLD_KIST`: given back by the next SNAP or MAP, by RELEASE, or at the close), its image and its PD rows (every ring buffer carries its frame's, `PD_OFF`) said by physical address, so `ferros-bridge read` pulls both while the holder keeps it (tools/camera-pd-pair.sh). Only with the PD rows in the ring (the init's mode, or the PD path asked) and a ring of two or more.
+fn snap(g: u64, o: &mut Open, out: &mut [u8; SNAP_REPLY]) -> bool {
+    let pd_off = PD_OFF.load(Ordering::Relaxed);
+    if pd_off == 0 || o.ring < 2 {
         return false;
     }
-    let Some(b) = wait_hold(HOLD_BIN, FRAMES.load(Ordering::Acquire)) else { return false };
-    let t0 = ferros_sys::now();
-    let n = FRAMES.load(Ordering::Acquire);
-    // The copy's buffer: neither held, nor with the engine, nor the newest; taken in the same compare-and-swap as the frame thread's turn, so the engine is never given it.
-    let all = (1u64 << o.ring) - 1;
-    let mut p = None;
-    loop {
-        let s = STATE.load(Ordering::Acquire);
-        let held = s & 0xFFFF;
-        let holds = (held | held >> 8) & 0xFF;
-        let free = all & !(holds | (s >> QUEUED) & 0xFF | newest_of(s).map_or(0, |k| 1 << k));
-        if free == 0 {
-            break;
-        }
-        let k = free.trailing_zeros();
-        if STATE.compare_exchange(s, s | 1 << (HOLD_BIN + k), Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            p = Some(k as usize);
-            break;
-        }
+    if let Some((b, _)) = o.held {
+        release(g, o, b);
     }
-    let (rows, stride) = (c.height / 4, c.stride);
-    let src = o.va + o.l.slots[job::OLD_SLOT_PD].0 as usize;
-    let mut status = 0u32;
-    let mut copy_us = 0;
-    match p {
-        Some(p) => {
-            let dst = image(o, p);
-            for i in 0..rows * stride / 64 {
-                // SAFETY: the PD slot holds `rows` lines of `stride` (its extent measured to +G#3BFF00 of G#3C0000) inside the region, and buffer p (16 MiB) holds them; both 64-byte aligned (the slot and the buffer start on frames, the stride is G#1400).
-                unsafe {
-                    let v = core::arch::aarch64::vld1q_u8_x4((src + i * 64) as *const u8);
-                    core::arch::aarch64::vst1q_u8_x4((dst + i * 64) as *mut u8, v);
-                }
-            }
-            copy_us = ferros_sys::us_since(t0);
-            // The first PD row again: the next frame writes the slot top down, so a first row unchanged after the copy is a copy no row of the next frame reached; a newer frame counted says the same the other way.
-            let a = unsafe { core::ptr::read_volatile(src as *const [u64; 8]) };
-            let d = unsafe { core::ptr::read_volatile(dst as *const [u64; 8]) };
-            if a != d || FRAMES.load(Ordering::Acquire) != n {
-                status |= 1;
-            }
-            out[HEADER + 8..HEADER + 16].copy_from_slice(&(o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + (p as u64) * BUF.load(Ordering::Relaxed)).to_le_bytes());
-        }
-        None => status |= 2,
-    }
+    let Some(b) = wait_hold(HOLD_KIST, FRAMES.load(Ordering::Acquire)) else { return false };
+    o.given = B_COUNT[b].load(Ordering::Relaxed);
+    o.held = Some((b, probe_read(b)));
+    let buf_pa = o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + b as u64 * BUF.load(Ordering::Relaxed);
+    let pd_first = unsafe { core::ptr::read_volatile((image(o, b) + pd_off as usize) as *const [u64; 8]) };
     header(&mut out[..HEADER], b, 1);
-    out[HEADER..HEADER + 8].copy_from_slice(&(o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + (b as u64) * BUF.load(Ordering::Relaxed)).to_le_bytes());
-    out[HEADER + 16..HEADER + 20].copy_from_slice(&(rows as u32).to_le_bytes());
-    out[HEADER + 20..HEADER + 24].copy_from_slice(&(c.width as u32).to_le_bytes());
-    out[HEADER + 24..HEADER + 28].copy_from_slice(&(stride as u32).to_le_bytes());
-    out[HEADER + 28..HEADER + 32].copy_from_slice(&status.to_le_bytes());
-    out[HEADER + 32..HEADER + 40].copy_from_slice(&copy_us.to_le_bytes());
+    out[HEADER..HEADER + 8].copy_from_slice(&buf_pa.to_le_bytes());
+    out[HEADER + 8..HEADER + 16].copy_from_slice(&(buf_pa + pd_off).to_le_bytes());
+    out[HEADER + 16..HEADER + 20].copy_from_slice(&(PD_ROWS.load(Ordering::Relaxed) as u32).to_le_bytes());
+    out[HEADER + 20..HEADER + 24].copy_from_slice(&(COLS.load(Ordering::Relaxed) as u32).to_le_bytes());
+    out[HEADER + 24..HEADER + 28].copy_from_slice(&(LINE.load(Ordering::Relaxed) as u32).to_le_bytes());
+    out[HEADER + 28..HEADER + 32].copy_from_slice(&((pd_first == [PATTERN; 8]) as u32).to_le_bytes());
     true
 }
 
@@ -2100,20 +2081,20 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 }
                 reply(&token, &caps(g));
             }
-            // SNAP `[12]`: the next frame and its phase-detect rows kept as a pair until the close (`snap`): the frame's header (bin 1), then the pair's addresses and shape; empty when this open cannot (not the init's mode with its PD path, a ring under three, no frame).
+            // SNAP `[12]`: the next frame held with its phase-detect rows, as a MAP holds it (`snap`): the frame's header (bin 1), then both physical addresses and the PD rows' shape; empty when this open cannot (no PD rows in the ring, a ring of one, no frame).
             12 => {
-                let Some(o) = open_cam.as_ref() else {
+                let Some(o) = open_cam.as_mut() else {
                     reply(&token, &[]);
                     continue;
                 };
                 let mut out = [0u8; SNAP_REPLY];
-                if !snap(o, &mut out) {
-                    say!(g, "camera: SNAP refused (the init's mode with its PD path and a ring of three or more only) or no frame came\n");
+                if !snap(g, o, &mut out) {
+                    say!(g, "camera: SNAP refused (the PD rows in the ring and a ring of two or more only) or no frame came\n");
                     reply(&token, &[]);
                     continue;
                 }
                 let w = |k: usize| u64::from_le_bytes(out[HEADER + k..HEADER + k + 8].try_into().unwrap());
-                say!(g, "camera: SNAP frame A#{}: image at G#{:X} (A#{} x A#{} RAW10, G#{:X} a line), its PD rows copied to G#{:X} (A#{} x A#{}, G#{:X} a line) in A#{} us, status G#{:X} (1 torn, 2 no buffer); both held until the close\n", u32::from_le_bytes(out[0..4].try_into().unwrap()), w(0), COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed), LINE.load(Ordering::Relaxed), w(8), w(16) as u32, (w(16) >> 32) as u32, w(24) as u32, w(32), (w(24) >> 32) as u32);
+                say!(g, "camera: SNAP frame A#{}: image at G#{:X} (A#{} x A#{} RAW10, G#{:X} a line), its PD rows at G#{:X} (A#{} rows), status G#{:X} (1 the PD rows never written); held as a MAP holds\n", u32::from_le_bytes(out[0..4].try_into().unwrap()), w(0), COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed), LINE.load(Ordering::Relaxed), w(8), w(16) as u32, (w(24) >> 32) as u32);
                 reply(&token, &out);
             }
             _ => {

@@ -7,7 +7,7 @@
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
-//! A fourth byte of 6 keeps an image and its phase-detect rows as a pair (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's position's high byte (G#38 if 0), the seventh the hold as 2^n s (7 if 0) while the host reads the pair by address (`1000000600` the main: 16 frames, then SNAP, held about 2 minutes).
+//! A fourth byte of 6 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000600` the main: one pair at about a metre; `100000060000FF06` the rack, each held about 64 s).
 #![no_std]
 #![no_main]
 
@@ -518,7 +518,8 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
     ferros_sys::exit(0)
 }
 
-/// The pair (docs/CAMERA.md "Phase detect as data"): OPEN the camera in its init's mode (the PD path on), the lens to `focus_hi` << 8 when given (G#3800, about a metre, else), `settle` frames by copy at bin 8 to let the lens land (16 if 0), then SNAP: the driver keeps the next frame and a copy of its PD rows, held until the close, and says both addresses. This holds the camera 2^`hold_log2` s (2^7 if 0) for the host to read them (tools/camera-pd-pair.sh), then CLOSEs.
+/// The pairs (docs/CAMERA.md "Phase detect as data"): OPEN the camera in its init's mode (its PD rows in every ring buffer), then per focus target: SET the lens, `settle` frames by copy at bin 8 to let it land (16 if 0), SNAP (the driver holds the next frame's buffer, image and PD rows, and says both addresses), and hold it 2^`hold_log2` s (about; 2^7 if 0) for the host to read (tools/camera-pd-pair.sh); the next SNAP gives the last back.
+/// `focus_hi` the lens's target's high byte (G#38, about a metre, if 0); G#FF a rack: G#1000 to G#7000 in steps of G#1000, seven pairs.
 fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, t1: u64) -> ! {
     let mut r = [0u8; 4];
     let n = call(ep, &[1, id], &mut r);
@@ -526,40 +527,44 @@ fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, t
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
     }
-    if focus_hi != 0 {
+    let one = [(if focus_hi == 0 { 0x38 } else { focus_hi } as u64) << 8];
+    let rack = [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000];
+    let targets: &[u64] = if focus_hi == 0xFF { &rack } else { &one };
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    // WHY the min: the byte is the person's, and a shift past 43 would leave the u64; 2^10 (about 18 min) is more than any read of a pair takes.
+    let hold_us = 1u64 << (if hold_log2 == 0 { 7 } else { hold_log2.min(10) } as u64 + 20);
+    for (k, &focus) in targets.iter().enumerate() {
         let mut m = [3u8, 2, 0, 0, 0, 0, 0, 0, 0, 0];
-        m[2..10].copy_from_slice(&((focus_hi as u64) << 8).to_le_bytes());
+        m[2..10].copy_from_slice(&focus.to_le_bytes());
         let mut a = [0xEEu8; 1];
         let n = call(ep, &m, &mut a);
-        say!(g, "camtest: focus G#{:X}: answered A#{}\n", (focus_hi as u64) << 8, if n == ERR { 0xEE } else { a[0] });
-    }
-    let buf = unsafe { &mut *(&raw mut BUF) };
-    for _ in 0..if settle == 0 { 16 } else { settle } {
-        if call(ep, &[2, 8], buf) == ERR {
-            say!(g, "camtest: no frame while settling\n");
+        say!(g, "camtest: pair A#{k}: focus G#{focus:X}: answered A#{}\n", if n == ERR { 0xEE } else { a[0] });
+        for _ in 0..if settle == 0 { 16 } else { settle } {
+            if call(ep, &[2, 8], buf) == ERR {
+                say!(g, "camtest: no frame while settling\n");
+                ferros_sys::exit(1);
+            }
+        }
+        let mut s = [0u8; 96];
+        let n = call(ep, &[12], &mut s);
+        if n == ERR || n < 96 {
+            say!(g, "camtest: SNAP gave nothing (G#{:X}): the driver's console line says why\n", n);
+            let _ = call(ep, &[4], &mut r);
             ferros_sys::exit(1);
         }
-    }
-    let mut s = [0u8; 104];
-    let n = call(ep, &[12], &mut s);
-    if n == ERR || n < 104 {
-        say!(g, "camtest: SNAP gave nothing (G#{:X}): the driver's console line says why\n", n);
-        let _ = call(ep, &[4], &mut r);
-        ferros_sys::exit(1);
-    }
-    let w = |k: usize| u64::from_le_bytes(s[k..k + 8].try_into().unwrap());
-    say!(g, "camtest: SNAP frame A#{} exposure A#{} us gain A#{} focus G#{:X}: image G#{:X}, PD G#{:X}, status G#{:X}; holding the camera 2^A#{} s for the host\n", u32::from_le_bytes(s[0..4].try_into().unwrap()), w(16) / 1000, u32::from_le_bytes(s[24..28].try_into().unwrap()), u32::from_le_bytes(s[28..32].try_into().unwrap()), w(64), w(72), w(92) as u32, if hold_log2 == 0 { 7 } else { hold_log2 });
-    // STATS every 2^22 us meanwhile: the holder's quiet past 2^22 us ends the open (payloads/camera `UNASKED_US`), and a held pair must outlive the host's reads.
-    // WHY the min: the byte is the person's, and a shift past 43 would leave the u64; 2^10 (about 18 min) is more than any read of the pair takes.
-    let hold_us = 1u64 << (if hold_log2 == 0 { 7 } else { hold_log2.min(10) } as u64 + 20);
-    let start = ferros_sys::now();
-    let mut st = [0u8; 208];
-    while ferros_sys::us_since(start) < hold_us {
-        ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() * (1 << 21) / 1_000_000);
-        let _ = call(ep, &[8], &mut st);
+        let w = |k: usize| u64::from_le_bytes(s[k..k + 8].try_into().unwrap());
+        // The line the host's pull reads (tools/camera-pd-pair.sh): every field it packs, in order.
+        say!(g, "camtest: PAIR A#{k} image G#{:X} pd G#{:X} count A#{} exposure_ns A#{} gain A#{} focus A#{} eagle_ns A#{} status A#{}\n", w(64), w(72), u32::from_le_bytes(s[0..4].try_into().unwrap()), w(16), u32::from_le_bytes(s[24..28].try_into().unwrap()), u32::from_le_bytes(s[28..32].try_into().unwrap()), w(32), w(92) as u32);
+        // STATS every 2^21 us meanwhile: the holder's quiet past 2^22 us ends the open (payloads/camera `UNASKED_US`), and a held pair must outlive the host's reads.
+        let start = ferros_sys::now();
+        let mut st = [0u8; 208];
+        while ferros_sys::us_since(start) < hold_us {
+            ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() * (1 << 21) / 1_000_000);
+            let _ = call(ep, &[8], &mut st);
+        }
     }
     let n = call(ep, &[4], &mut r);
-    say!(g, "camtest: CLOSE G#{:X}; the pair is gone with the region\n", if n == ERR { 0xEEE } else { r[0] as u64 });
+    say!(g, "camtest: CLOSE G#{:X}; the pairs are gone with the region\n", if n == ERR { 0xEEE } else { r[0] as u64 });
     ferros_sys::exit(0)
 }
 
