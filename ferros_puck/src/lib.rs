@@ -47,7 +47,7 @@ pub mod kind {
     pub const ARC: u8 = 2;
     /// `[ax i16][ay i16][bx i16][by i16][r u16][colour]`: every point within r of the segment (the slider's track).
     pub const CAPSULE: u8 = 3;
-    /// `[x0 i16][x1 i16][yb i16][yt i16][vlo i32][vhi i32][width u16][line colour][fill colour][n u8]` then n × `[value i32][slope i32]`: n samples of a value and its slope (value units per the whole span x0..x1) at even steps from x0 to x1, joined by cubic Hermite pieces (C¹, each sample at its true slope); vlo maps to yb and vhi to yt; drawn as a line of `width` and, unless the fill's tag is `NONE`, filled from the line to yb.
+    /// `[x0 i16][x1 i16][yb i16][yt i16][vlo i32][vhi i32][width u16][line colour][fill colour][n u8][turn u16]` then n × `[value i32][slope i32]`: n samples of a value and its slope (value units per the whole span x0..x1) at even steps from x0 to x1, joined by cubic Hermite pieces (C¹, each sample at its true slope); vlo maps to yb and vhi to yt; drawn as a line of `width` and, unless the fill's tag is `NONE`, filled from the line to yb.
     pub const CURVE: u8 = 4;
     /// `[cx i16][cy i16][size u16][colour][utf8]`: words a human reads, centred on (cx, cy), `size` the glyphs' height in Q14 of the radius, turned with the circle.
     pub const TEXT: u8 = 5;
@@ -161,6 +161,8 @@ pub struct Curve<'a> {
     pub vhi: i32,
     pub width: u16,
     pub line: Colour,
+    /// The curve's frame turned clockwise about the circle's centre, Q16 of a turn (0: x along the circle's right): a moon's terminator toward its lit limb, a dial's scale.
+    pub turn: u16,
     pub fill: Option<Colour>,
     /// n × 8 bytes: value i32, slope i32.
     samples: &'a [u8],
@@ -229,7 +231,7 @@ const fn fixed_len(k: u8) -> usize {
         kind::RING => 13,
         kind::ARC => 17,
         kind::CAPSULE => 15,
-        kind::CURVE => 29,
+        kind::CURVE => 31,
         kind::TEXT => 11,
         kind::SWEEP => 27,
         kind::MARKER => 24,
@@ -258,7 +260,7 @@ impl<'a> Op<'a> {
                 if !(2..=SAMPLES_MAX).contains(&n) || b.len() != need + 8 * n {
                     return None;
                 }
-                let c = Curve { x0: i16_at(b, 0), x1: i16_at(b, 2), yb: i16_at(b, 4), yt: i16_at(b, 6), vlo: i32_at(b, 8), vhi: i32_at(b, 12), width: u16_at(b, 16), line: col(18)?, fill: Colour::read(&b[23..28])?, samples: &b[need..] };
+                let c = Curve { x0: i16_at(b, 0), x1: i16_at(b, 2), yb: i16_at(b, 4), yt: i16_at(b, 6), vlo: i32_at(b, 8), vhi: i32_at(b, 12), width: u16_at(b, 16), line: col(18)?, fill: Colour::read(&b[23..28])?, turn: u16_at(b, 29), samples: &b[need..] };
                 (c.x0 < c.x1 && c.vlo < c.vhi && c.yb != c.yt).then_some(Op::Curve(c))
             }
             kind::TEXT => {
@@ -443,9 +445,9 @@ impl<'a> Writer<'a> {
     }
     /// A curve of `samples` (value, slope per the whole span) from x0 to x1; vlo maps to yb, vhi to yt; a line of `width` (0: none) and the fill to yb (None: none).
     #[allow(clippy::too_many_arguments)]
-    pub fn curve(&mut self, x0: i16, x1: i16, yb: i16, yt: i16, vlo: i32, vhi: i32, width: u16, line: Colour, fill: Option<Colour>, samples: &[(i32, i32)]) -> Result<u8, Full> {
+    pub fn curve(&mut self, x0: i16, x1: i16, yb: i16, yt: i16, vlo: i32, vhi: i32, width: u16, line: Colour, fill: Option<Colour>, turn: u16, samples: &[(i32, i32)]) -> Result<u8, Full> {
         assert!((2..=SAMPLES_MAX).contains(&samples.len()), "a curve takes 2 to SAMPLES_MAX samples");
-        self.op(kind::CURVE, 29 + 8 * samples.len(), |b| {
+        self.op(kind::CURVE, 31 + 8 * samples.len(), |b| {
             put_i16(b, 0, x0);
             put_i16(b, 2, x1);
             put_i16(b, 4, yb);
@@ -459,9 +461,10 @@ impl<'a> Writer<'a> {
                 None => b[23..28].copy_from_slice(&[NONE, 0, 0, 0, 0]),
             }
             b[28] = samples.len() as u8;
+            put_u16(b, 29, turn);
             for (k, (v, m)) in samples.iter().enumerate() {
-                b[29 + 8 * k..33 + 8 * k].copy_from_slice(&v.to_le_bytes());
-                b[33 + 8 * k..37 + 8 * k].copy_from_slice(&m.to_le_bytes());
+                b[31 + 8 * k..35 + 8 * k].copy_from_slice(&v.to_le_bytes());
+                b[35 + 8 * k..39 + 8 * k].copy_from_slice(&m.to_le_bytes());
             }
         })
     }

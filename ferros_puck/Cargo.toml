@@ -12,6 +12,8 @@ path = "src/lib.rs"
 libm = "0.2"
 # The puck's side on the device (`rt`): its calls to the display, its view's doorbell, Eagle time from the kernel's clock.
 ferros_sys = { path = "../ferros_sys", optional = true }
+# The place a puck keeps: the ~10 km cell and its VSF document.
+ferros_weather = { path = "../ferros_weather", optional = true }
 
 [features]
-sys = ["dep:ferros_sys"]
+sys = ["dep:ferros_sys", "dep:ferros_weather"]

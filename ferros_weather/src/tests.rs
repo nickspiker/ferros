@@ -224,3 +224,16 @@ fn the_workers_documents_are_read() {
     assert_eq!(f.next_deadline(f.now.time + HOUR / 16), f.next_update);
     assert!(f.next_update < f.hours[0].time && f.hours[0].time == f.now.time + HOUR);
 }
+
+#[test]
+fn a_kept_place_round_trips_and_refuses_damage() {
+    let c = Cell::of(-36.8485, 174.7633).unwrap();
+    let doc = kept_build(c, 5 << 40, 6 << 40).unwrap();
+    assert_eq!(kept_parse(&doc), Ok((c, 5 << 40)));
+    let mut bad = doc.clone();
+    let at = bad.len() - 2;
+    bad[at] ^= 1;
+    assert!(kept_parse(&bad).is_err());
+    // Another document is no place.
+    assert!(kept_parse(&Ask { cell: c, day_start: 0 }.build(1).unwrap()).is_err());
+}

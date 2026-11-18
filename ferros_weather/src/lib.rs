@@ -327,3 +327,23 @@ fn signed(s: &VsfSection, name: &str) -> Option<i64> {
 fn eagle(s: &VsfSection, name: &str) -> Option<i64> {
     value(s, name, |v| v.as_eagle())
 }
+
+/// The place a puck keeps in its own vault domain (docs/PUCKS.md, the location step): the ~10 km cell of its last fix and when that fix was, never anything finer, so the next start has a place without the radio.
+/// A complete VSF document, section `place`: `row` (i), `column` (u), `when` (e).
+pub const KEPT: &str = "place";
+
+/// The kept place as a document stamped `made`.
+pub fn kept_build(cell: Cell, when: i64, made: i64) -> Result<Vec<u8>, String> {
+    let mut s = VsfSection::new(KEPT);
+    s.add_field("row", VsfType::i(cell.row as isize));
+    s.add_field("column", VsfType::u(cell.column as usize, false));
+    s.add_field("when", time(when));
+    vsf::VsfBuilder::new().creation_time_oscillations(made).provenance_only().add_section_direct(s).build()
+}
+
+/// The kept place read back by its fields' names and types, refused whole on anything else.
+pub fn kept_parse(doc: &[u8]) -> Result<(Cell, i64), &'static str> {
+    let sections = verified(doc)?;
+    let s = only(&sections, KEPT)?;
+    Ok((cell(s)?, eagle(s, "when").ok_or("a place without its when")?))
+}

@@ -125,6 +125,12 @@ fn arc(t: &mut impl Target, g: &Geom, cx: f32, cy: f32, rm: f32, hw: f32, from: 
     });
 }
 
+/// A Q16 turn as (cos, sin), clockwise on the glass (y down).
+fn turn_cs(turn: u16) -> (f32, f32) {
+    let th = turn as f32 * (2. * core::f32::consts::PI / 65536.);
+    (cosf(th), sinf(th))
+}
+
 /// The point on curve `cv` (in pixels, local) at s in [0, 1] of its span, and its slope dy/dx there.
 fn curve_point(g: &Geom, cv: &Curve, s: f32) -> (f32, f32, f32) {
     let (x0, x1) = (g.len(cv.x0 as f32), g.len(cv.x1 as f32));
@@ -142,8 +148,13 @@ fn curve(t: &mut impl Target, g: &Geom, cv: &Curve) {
     let (hx, hy) = ((x1 - x0) * 0.5, libm::fabsf(yb - yt) * 0.5);
     // The curve may leave its box between samples (a Hermite piece overshoots), so the reach is the whole circle's height: the circle's mask bounds it anyway.
     let reach = sqrtf(hx * hx + hy * hy) + hw + g.r;
+    let (tc, ts) = turn_cs(cv.turn);
+    // The box's centre in the circle's frame (the curve's frame turned clockwise by `turn`).
+    let (mx, my) = (mx * tc - my * ts, mx * ts + my * tc);
     let down = if yb > yt { 1. } else { -1. };
     shade(t, g, mx, my, reach, |put, x, y| {
+        // The pixel in the curve's own frame: turned back.
+        let (x, y) = (x * tc + y * ts, -x * ts + y * tc);
         let s = (x - x0) / (x1 - x0);
         if !(0. ..=1.).contains(&s) {
             return;
@@ -215,6 +226,8 @@ pub fn draw(list: &[u8], g: &Geom, ctx: &Ctx, t: &mut impl Target) {
                 }
                 let s = ((ctx.now - t0) as f64 / (t1 - t0) as f64) as f32;
                 let (mx, my, _) = curve_point(g, &cv, s);
+                let (tc, ts) = turn_cs(cv.turn);
+                let (mx, my) = (mx * tc - my * ts, mx * ts + my * tc);
                 let r = g.len(r as f32);
                 shade(t, g, mx, my, r + 1., |put, x, y| put(edge(sqrtf((x - mx) * (x - mx) + (y - my) * (y - my)) - r), c));
             }

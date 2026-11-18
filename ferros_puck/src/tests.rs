@@ -119,7 +119,7 @@ fn a_curve_passes_thru_its_samples_and_fills_to_its_base() {
     // A straight line from (-1/2, 0) to (1/2, 0) as values 0..100 over [0, 200], slope 0: at height 1/2 of its box.
     let samples = [(100, 0), (100, 0), (100, 0)];
     let l = list(|w| {
-        w.curve(-(ONE / 2) as i16, (ONE / 2) as i16, (ONE / 2) as i16, -(ONE / 2) as i16, 0, 200, (ONE / 32) as u16, RED, Some(BLUE), &samples).unwrap();
+        w.curve(-(ONE / 2) as i16, (ONE / 2) as i16, (ONE / 2) as i16, -(ONE / 2) as i16, 0, 200, (ONE / 32) as u16, RED, Some(BLUE), 0, &samples).unwrap();
     });
     check(&l).unwrap();
     let mut g = Grid::new(256, 256);
@@ -130,7 +130,7 @@ fn a_curve_passes_thru_its_samples_and_fills_to_its_base() {
     assert_eq!(g.at(128, 100).0, 0.);
     assert_eq!(g.at(128, 185).0, 0.);
     // A rising Hermite piece: values 0 then 200 with the slopes of the straight line between them (200 a span) is that straight line.
-    let cv = Curve { x0: 0, x1: 1, yb: 0, yt: 1, vlo: 0, vhi: 1, width: 0, line: RED, fill: None, samples: &[0, 0, 0, 0, 200, 0, 0, 0, 200, 0, 0, 0, 200, 0, 0, 0] };
+    let cv = Curve { x0: 0, x1: 1, yb: 0, yt: 1, vlo: 0, vhi: 1, width: 0, line: RED, fill: None, turn: 0, samples: &[0, 0, 0, 0, 200, 0, 0, 0, 200, 0, 0, 0, 200, 0, 0, 0] };
     for k in 0..=16 {
         let s = k as f32 / 16.;
         let (v, dv) = cv.at(s);
@@ -143,7 +143,7 @@ fn a_marker_rides_its_curve_at_now() {
     let samples = [(0, 0), (0, 0)];
     let day = 86400 * OSC;
     let l = list(|w| {
-        let c = w.curve(-(ONE / 2) as i16, (ONE / 2) as i16, 0, -(ONE / 2) as i16, -1, 1, 0, RED, None, &samples).unwrap();
+        let c = w.curve(-(ONE / 2) as i16, (ONE / 2) as i16, 0, -(ONE / 2) as i16, -1, 1, 0, RED, None, 0, &samples).unwrap();
         w.marker(c, 0, day, (ONE / 16) as u16, BLUE).unwrap();
     });
     assert!(check(&l).unwrap().anchored);
@@ -271,4 +271,18 @@ fn values_reach_the_target_as_words_at_their_place() {
     assert!((g.texts[0].0 - 78.).abs() < 1e-3 && (g.texts[0].1 - 128.).abs() < 1e-3);
     assert!((g.texts[0].2 - 12.5).abs() < 1e-3);
     assert_eq!(g.texts[1].3, "3m");
+}
+
+#[test]
+fn a_turned_curve_turns_about_the_centre() {
+    // The flat line of the first curve test at y = 0, turned a quarter clockwise: it runs down the middle, its fill (which was below it) now to its left.
+    let samples = [(100, 0), (100, 0)];
+    let l = list(|w| {
+        w.curve(-(ONE / 2) as i16, (ONE / 2) as i16, (ONE / 2) as i16, -(ONE / 2) as i16, 0, 200, (ONE / 32) as u16, RED, Some(BLUE), 1 << 14, &samples).unwrap();
+    });
+    let mut g = Grid::new(256, 256);
+    draw(&l, &G, &CTX, &mut g);
+    assert_eq!(g.at(128, 100).1, Some(RED));
+    assert_eq!(g.at(110, 128).1, Some(BLUE));
+    assert_eq!(g.at(146, 128).0, 0.);
 }
