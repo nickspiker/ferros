@@ -1,0 +1,25 @@
+[package]
+name = "tcptest"
+version = "0.1.0"
+edition = "2024"
+description = "ferros_rt's TCP client on the device (docs/STD-TARGET.md \"TCP\"): resolve fgtw.org thru the ip server, GET /status on port 80, a second connection's read held across the threads, the deadline form"
+
+[dependencies]
+# The runtime as a library beside std's own copy: its clients (tcp) without its entry and symbols (`runtime` off), which std's copy gives the link.
+ferros-rt = { path = "../../ferros_rt", default-features = false }
+
+[[bin]]
+name = "tcptest"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
