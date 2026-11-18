@@ -351,6 +351,10 @@ impl FluorApp<Px> for Ferros {
     fn on_focus_changed(&mut self, focused: bool) {
         self.app.on_focus_changed(focused)
     }
+    // The display's safe area (EV_SAFE: the great circle), handed on so Photon lays itself out inside it.
+    fn on_safe_area(&mut self, area: fluor::host::app::SafeArea) {
+        self.app.on_safe_area(area)
+    }
     fn on_window_rect_changed(&mut self, x: i32, y: i32, w: u32, h: u32) {
         self.app.on_window_rect_changed(x, y, w, h)
     }
