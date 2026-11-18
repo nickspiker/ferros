@@ -55,7 +55,7 @@ fn personal_key() -> Option<SealKey> {
 
 /// From kvault: the person's ledger key at unlock (Some), gone at lock (None).
 pub fn set_personal(h: Option<crate::keys::Held>) {
-    crate::process::with_lock_held_or(|| {
+    crate::process::LOG.with(|| {
         let p = unsafe { &mut *(&raw mut PERSONAL) };
         if let Some(old) = p.as_mut() {
             crate::keys::wipe_value_to_dram(old);
@@ -81,20 +81,25 @@ fn feed() {
 }
 
 impl Blocks for Ufs {
+    // Each block a command holding the UFS lock (process.rs `UFS`), its copy in or out with it: the controller has one data block, which a vault read on another core shares.
     fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> bool {
         feed();
-        let u = UfsController::new(UFS_BASE);
-        if u.read_block_lun(self.lun, self.base + block) != 0 || u.last_response_status() != 0 {
-            return false;
-        }
-        out.copy_from_slice(u.data_buffer());
-        true
+        crate::process::UFS.with(|| {
+            let u = UfsController::new(UFS_BASE);
+            if u.read_block_lun(self.lun, self.base + block) != 0 || u.last_response_status() != 0 {
+                return false;
+            }
+            out.copy_from_slice(u.data_buffer());
+            true
+        })
     }
     fn write(&mut self, block: u32, data: &[u8; BLOCK]) -> bool {
         feed();
-        let u = UfsController::new(UFS_BASE);
-        u.data_buffer_mut().copy_from_slice(data);
-        u.write_block_lun(self.lun, self.base + block) == 0 && u.last_response_status() == 0
+        crate::process::UFS.with(|| {
+            let u = UfsController::new(UFS_BASE);
+            u.data_buffer_mut().copy_from_slice(data);
+            u.write_block_lun(self.lun, self.base + block) == 0 && u.last_response_status() == 0
+        })
     }
 }
 
@@ -135,7 +140,7 @@ pub fn init() -> bool {
     if blocks < OFFSET + 2 * HALF {
         return false;
     }
-    crate::process::with_lock_held_or(|| {
+    crate::process::LOG.with(|| {
         let mut dev = Ufs { lun: 0, base: first + OFFSET };
         let (ring, findings) = Ring::open(&mut dev, HALF);
         let boot = match ring.last_boot() {
@@ -168,7 +173,8 @@ pub fn boot() -> u64 {
 }
 
 /// One line of the kernel's words, category `text`.
-/// Under the kernel lock: the ring's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block").
+/// Under the flash log's own lock (process.rs `LOG`), each block a command under the UFS lock: the ring's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block").
+/// Until 2026-11-18 under the kernel lock, so every core waited out each line (to 0.66 ms, `diag lock`); a line from a syscall still holds the kernel lock while it is written.
 pub fn line(text: &str) {
     put(category::TEXT, "kernel", text)
 }
@@ -184,7 +190,7 @@ pub fn personal(text: &str) {
 }
 
 fn put(c: Category, writer: &str, words: &str) {
-    crate::process::with_lock_held_or(|| put_locked(c, writer, words))
+    crate::process::LOG.with(|| put_locked(c, writer, words))
 }
 
 fn put_locked(c: Category, writer: &str, words: &str) {
@@ -237,7 +243,7 @@ fn write(s: &mut State, key: &SealKey, c: Category, writer: &str, words: &str, t
 
 /// From vault boot, once the ira is held: what waited in the pre-boot buffer goes to the flash now, sealed.
 pub fn flush() {
-    crate::process::with_lock_held_or(|| {
+    crate::process::LOG.with(|| {
         if let Some((s, key)) = state().and_then(|s| system_key().map(|k| (s, k))) {
             drain(s, &key);
         }
@@ -248,7 +254,7 @@ pub fn flush() {
 /// Each entry as stored, then opened when this device holds its key now (system: the ira; personal: the person present); a system entry that does not open is named.
 /// Until signed bridge commands exist (BRIDGE.md B2) whoever holds the USB cable reads this opened: the seal covers a chip taken off the board, not the cable (LEDGER.md).
 pub fn answer(n: usize, room: usize) -> Vec<u8> {
-    crate::process::with_lock_held_or(|| answer_locked(n, room))
+    crate::process::LOG.with(|| answer_locked(n, room))
 }
 
 fn answer_locked(n: usize, room: usize) -> Vec<u8> {
@@ -325,7 +331,7 @@ fn legacy_range(first: u32, count: u32) -> core::ops::Range<u32> {
 
 /// `diag "log legacy <first> <count>"`: blocks of the old text log as they are on the flash, for the bridge's converter (never parsed here).
 pub fn legacy_blocks(first: u32, count: u32) -> Vec<u8> {
-    crate::process::with_lock_held_or(|| {
+    crate::process::LOG.with(|| {
         let Some(s) = state() else { return Vec::new() };
         let mut dev = Ufs { lun: 0, base: s.part + OLD_OFFSET };
         let mut out = Vec::new();
@@ -341,11 +347,11 @@ pub fn legacy_blocks(first: u32, count: u32) -> Vec<u8> {
 }
 
 /// `diag "log legacy erase <first> <count>"`: zero blocks of the old text log, each read back.
-/// Returns how many were zeroed and verified; the bridge goes on in steps so the kernel lock is never held for long.
+/// Returns how many were zeroed and verified; the bridge goes on in steps so the flash log's lock is never held for long.
 pub fn legacy_erase(first: u32, count: u32) -> u32 {
     let mut done = 0u32;
     for k in legacy_range(first, count) {
-        let ok = crate::process::with_lock_held_or(|| {
+        let ok = crate::process::LOG.with(|| {
             let Some(s) = state() else { return false };
             let mut dev = Ufs { lun: 0, base: s.part + OLD_OFFSET };
             let zero = [0u8; BLOCK];
@@ -363,7 +369,7 @@ pub fn legacy_erase(first: u32, count: u32) -> u32 {
 /// `diag "log bench"`: what an entry costs on this device against the old line, in microseconds a piece (A#).
 /// The old line's work (format and copy) and its two block writes; the entry's key, seal and document, and its write (A, read back, B) as 2^3 real `bench` entries.
 pub fn bench() -> String {
-    crate::process::with_lock_held_or(bench_locked)
+    crate::process::LOG.with(bench_locked)
 }
 
 fn bench_locked() -> String {

@@ -216,7 +216,8 @@ pub fn table_stale() {
 pub fn step(store: &mut Option<crate::vault_boot::ShimStore>) {
     // Only with a vault open: before it, the read is not yet possible, and the table stays stale for the pass after.
     if store.is_some() && TABLE_STALE.swap(false, Ordering::AcqRel) {
-        let doc = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("zones").ok().flatten()));
+        // The vault's lock alone (process.rs `VAULT`): a read of the vault, the kernel lock free for the other cores meanwhile.
+        let doc = crate::process::VAULT.with(|| store.as_mut().and_then(|s| s.get_by_key("zones").ok().flatten()));
         let t = doc.as_deref().and_then(read_table);
         crate::flashlog::line(&match &t {
             Some(t) => alloc::format!("zones: A#{} zones, A#{} mobile country codes", t.ids.len(), t.mcc.len()),
@@ -266,7 +267,8 @@ pub fn step(store: &mut Option<crate::vault_boot::ShimStore>) {
             BY_POSITION => "GPS, the nearest principal place",
             _ => "nothing: none found",
         }));
-        let kept = crate::settings::document(None).is_some_and(|d| crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok())));
+        // The document snapshotted under the kernel lock, written under the vault's (service.rs `keep_settings_now`).
+        let kept = crate::service::keep_settings_now();
         if !kept {
             crate::flashlog::line("zone found: NOT kept (the vault refused the settings document)");
         }

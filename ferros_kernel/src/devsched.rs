@@ -98,6 +98,10 @@ pub fn hold(at: u64, held: u64, site: u64) -> bool {
 /// `diag "lock reset"`: the hold counts zeroed (the alarm's count and the ring's records stay).
 pub fn lock_reset() {
     HIST.iter().chain(BY_NR.iter().flatten()).chain(BY_SITE.iter().flatten()).for_each(|a| a.store(0, Relaxed));
+    // The storage locks' measures with them (process.rs `Rank`).
+    for r in crate::process::RANKED {
+        r.reset();
+    }
 }
 
 /// The syscall names `lock_report` prints (process.rs's numbers).
@@ -157,6 +161,11 @@ pub fn lock_report(out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(alloc::format!("  t{} A#{} us: {}\n", h[0].load(Relaxed) / (f / 1000), us(h[1].load(Relaxed)), what_text(h[3].load(Relaxed), h[2].load(Relaxed))).as_bytes());
     }
     out.extend_from_slice(alloc::format!("alarms (A#{} us or more) since boot: A#{}\n", us(f >> 7), ALARMS.load(Relaxed)).as_bytes());
+    // The storage locks under the kernel lock (process.rs `Rank`, 2026-11-18): each one's holds and longest, and the waits for it a core made holding the kernel lock, which every other core may have waited out too.
+    out.extend_from_slice(b"storage locks (rank order under the kernel lock):\n");
+    for r in crate::process::RANKED {
+        out.extend_from_slice(r.report().as_bytes());
+    }
 }
 
 /// The service loop's pass: an alarm hold since the last pass goes to the flash log, the last of them with what held it (one line a pass, so a burst of them costs one line).

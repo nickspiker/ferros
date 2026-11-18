@@ -25,8 +25,8 @@ static NEXT: AtomicU8 = AtomicU8::new(0);
 static MODULE: AtomicU8 = AtomicU8::new(0);
 /// The front end's domain was brought on by this switch this boot (and is never gated again: the boot's gating skips it, pd.rs `gate_at_boot`).
 static FE_ON: AtomicBool = AtomicBool::new(false);
-/// The frames the camera driver holds: one run, its physical start and length in bytes (0 while none), set by process.rs `cam_ask` and `cam_free` under the kernel lock.
-pub static REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The frames the camera driver holds: one run, its physical start and length in bytes (0 while none), set by process.rs `cam_ask` and `cam_free` thru `set_region`, under the fence's lock (process.rs `FENCE`), where every fence reads them.
+static REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The PMU's atomic set alias (exynos-pmu-if.c `exynos_pmu_set_bit_atomic`: offset | G#C000, the bit's index as the value), thru EL3, as Linux sets a bit of a PMU register below G#4000 without reading it.
 const PMU: u64 = 0x1546_0000;
@@ -205,17 +205,21 @@ fn phy_isolation_bypass() {
 }
 
 /// The front end's S2MPUs to the frames the driver holds now (`REGION`), or to nothing. Only while the domain is on (an access with it down poisons EL3).
+/// Under the fence's lock (process.rs `FENCE`, 2026-11-18): this switch runs with the kernel lock let go (process.rs `SWITCH_UNLOCKED`), on the kernel's core, while `cam_ask` and `cam_free` change the region under the kernel lock on any core; the S2MPUs' programming and the region it follows are one at a time under this lock alone, and whichever of them fences last reads the region as it last was.
 fn fence_now() -> u32 {
-    let (pa, len) = (REGION[0].load(Ordering::Acquire) as usize, REGION[1].load(Ordering::Acquire) as usize);
-    crate::s2mpu::fence_cam(pa, len)
+    crate::process::FENCE.with(|| {
+        let (pa, len) = (REGION[0].load(Ordering::Relaxed) as usize, REGION[1].load(Ordering::Relaxed) as usize);
+        crate::s2mpu::fence_cam(pa, len)
+    })
 }
 
-/// The driver's frames changed (taken or given back, process.rs, under the kernel lock): the fence follows them while the domain is on. A region taken before the switch is on is fenced when it comes on.
-pub fn region_changed() -> u32 {
-    if !fe_on() {
-        return 0;
-    }
-    fence_now()
+/// The driver's frames changed (taken, `len` their bytes, or given back, `len` 0: process.rs `cam_ask`, `cam_free`, under the kernel lock): the region set and, while the domain is on, the fence made to follow it, both under the fence's lock. A region taken before the switch is on is fenced when it comes on (`up` sets `FE_ON` before its fence, so one of the two always fences the region as it last was). The S2MPUs' answer, 0 while the domain is off.
+pub fn set_region(pa: usize, len: usize) -> u32 {
+    crate::process::FENCE.with(|| {
+        REGION[0].store(pa as u64, Ordering::Relaxed);
+        REGION[1].store(len as u64, Ordering::Relaxed);
+        if fe_on() { crate::s2mpu::fence_cam(pa, len) } else { 0 }
+    })
 }
 
 fn down() -> bool {
@@ -249,7 +253,7 @@ fn down() -> bool {
             wr(PDMA + ferros_cam::PDMA_BASE_LO, 0);
             steps.push_str(" engine stopped, close replayed;");
         }
-        let f = crate::s2mpu::fence_cam(0, 0);
+        let f = crate::process::FENCE.with(|| crate::s2mpu::fence_cam(0, 0));
         steps.push_str(&alloc::format!(" S2MPUs shut G#{f:X};"));
     }
     match crate::camera::module(m) {
