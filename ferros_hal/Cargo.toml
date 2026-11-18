@@ -7,6 +7,8 @@ description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer
 
 [dependencies]
 ferros_layout = { path = "../ferros_layout" }
+# The 8x16 bitmap font, shared with the glass console.
+ferros_glass = { path = "../ferros_glass" }
 vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 

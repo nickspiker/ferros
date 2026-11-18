@@ -1463,6 +1463,8 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
         Ok(o) => {
             mark_ran(&o);
+            // From here the vault, usb and display have `glass::BOOT_DEADLINE_SHIFT` to come up (`glass::boot_watch`).
+            crate::glass::INIT_AT.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
             // The processes init started are its spawn syscalls, each handing out capabilities.
             if crate::process::alive() > 0 {
                 crate::checklist::mark(crate::checklist::Item::Syscall);
@@ -2650,6 +2652,8 @@ pub fn run(mut b: Boot) -> ! {
             }
             radios_applied = radios_off;
         }
+        // The vault, usb and display up once init has run 16 s, or said on the glass (glass.rs): two loads and a compare a pass until then.
+        crate::glass::boot_watch();
         // The vault process ended having served, or was killed with no successor (process.rs `vault_ended`, `VAULT_ON`): started again from its capsule at once, the store calls queued for it waiting meanwhile, never answered by the kernel's vault, which no longer holds what it keeps. One that will not start leaves the vault gone, its waiting calls refused.
         if crate::process::vault_wanted() && crate::process::with_lock(|| crate::process::named_alive_locked(&[b"vault"])) == 0 {
             let mut rep = alloc::vec::Vec::new();
@@ -4330,6 +4334,40 @@ pub fn run(mut b: Boot) -> ! {
                         core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
                     }
                     resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
+                if cmd.params == b"panic test" {
+                    // `diag panic test` (development builds; compiled out of a production build, which answers only a plain DIAG): a kernel panic on purpose, to see the panic screen (glass.rs): the text on the glass, held until a press of power or 32 s, then the report and the warm reset as for any panic.
+                    // No reply comes: the panic is the answer.
+                    crate::process::push_console(b"diag panic test: panicking on purpose\n");
+                    panic!("diag panic test: a panic asked for on purpose (a development build), to show the panic screen");
+                }
+                #[cfg(not(ferros_production))]
+                if let Some(text) = cmd.params.strip_prefix(b"glass ") {
+                    // `diag glass <text>` (development builds): a notice on the glass as a dead process's line goes there (glass.rs `notice`), drawn even while the display serves; `\n` in the text is a line return.
+                    // The display redraws over it only where its own content changes.
+                    let mut t = alloc::vec::Vec::with_capacity(text.len());
+                    let mut i = 0;
+                    while i < text.len() {
+                        // WHY `get`: the text is the host's, and a backslash may be its last byte.
+                        if text[i] == b'\\' && text.get(i + 1) == Some(&b'n') {
+                            t.push(b'\n');
+                            i += 2;
+                        } else {
+                            t.push(text[i]);
+                            i += 1;
+                        }
+                    }
+                    let shown = crate::process::with_lock(|| {
+                        crate::glass::notice(&t, true);
+                        crate::display::scanned().map(|s| (s.width, s.height, s.stride, s.iova, s.translates()))
+                    });
+                    resp.extend_from_slice(match shown {
+                        Some((w, h, st, a, tr)) => alloc::format!("glass: A#{w} x A#{h}, stride A#{st}, layer at G#{a:X}{}\n", if tr { ", translated" } else { "" }),
+                        None => alloc::string::String::from("glass: no buffer on the glass the console can write (the DPU off, or a compressed layer)\n"),
+                    }.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

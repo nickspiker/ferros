@@ -2012,6 +2012,18 @@ fn wake_word_waiters() {
 
 /// Run `f` with the kernel lock held — the service loop's way into the vault, which is part of the kernel's locked state (syscalls reach it with the lock held; KERNEL.md "Cores"). Inside `f`, only the `_held` variants of lock-taking functions.
 #[track_caller]
+/// The panic's take of the kernel lock (platform.rs `report_panic`): once, if it is free, never waited for, never given back.
+/// Every syscall on every core then waits at the lock, so nothing redraws over the panic's screen (the display server flips and draws thru syscalls) until the reset.
+/// A lock held already (by the panicking core, or another) is left as it is.
+pub fn seize_for_panic() -> bool {
+    use core::sync::atomic::Ordering;
+    let took = LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
+    if took {
+        HOLDER.store(core() + 1, Ordering::Relaxed);
+    }
+    took
+}
+
 pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
     lock();
     let r = f();
@@ -4058,6 +4070,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
         // Not a syscall: the process faulted. It ends; the kernel carries on. Its full state goes to the console first (ESR, ELR/FAR/SP as arc offsets, every register), so a fault is debuggable from the console alone.
         let v = FAULT | ec << 40 | (f.elr.wrapping_sub(base) & 0xFF_FFFF) << 16 | (f.far.wrapping_sub(base) & 0xFFFF);
         fault_report(f, base);
+        // The whole of ESR, FAR and the PC for `end_process`'s line on the glass (the exit value keeps only parts of them).
+        unsafe { *(&raw mut LAST_FAULT) = Some((f.esr, f.far, f.elr.wrapping_sub(base))) };
         return end(f, v);
     }
     let p = proc_of(cur).unwrap();
@@ -5682,6 +5696,16 @@ fn has_receiver(ep: usize) -> bool {
     s != 0 && k().procs.iter().flatten().any(|p| !p.dying && p.epoch == s)
 }
 
+/// Whether `name` is up (glass.rs `boot_watch`): an endpoint of that name has a live process that has received on it (the vault, the display); with no such endpoint (usb serves none: it hands PT to the kernel), a live process of that name.
+/// Under the kernel lock.
+pub fn up_locked(name: &[u8]) -> bool {
+    let kk = k();
+    match kk.endpoints.iter().position(|e| e.name == name) {
+        Some(ep) => has_receiver(ep),
+        None => kk.procs.iter().flatten().any(|p| p.name == name && !p.dying),
+    }
+}
+
 /// After a process ends: each CALL_LIVE caller still queued on an endpoint nobody can serve any more gets ERR.
 fn fail_orphaned_calls() {
     let kk = k();
@@ -6225,6 +6249,36 @@ fn link_emptied(name: &[u8]) {
 
 /// Bumped whenever a process is made, ends or is killed: what the service loop watches to act on the process table changing (the GPU's clock, service.rs), with no poll.
 pub static PROCS_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The fault a process is ending by, whole (ESR, FAR, PC as an offset into its arc), from the EL0 trap's fault branch to `end_process` in the same call.
+/// Under the kernel lock.
+static mut LAST_FAULT: Option<(u64, u64, u64)> = None;
+
+/// A process that died by a fault or a panic, in one line (owner, 2026-11-17: when things go south, say so on the glass): on the console, in the flash log, and on the glass when no display serves to show anything else (the display itself the one that died, or never up), written there straight (glass.rs `notice`).
+/// While a display serves, the glass is its own: a line written under it would stay in the phases its compose-once marks say hold only the background.
+/// Under the kernel lock; a death is rare, never the hot path.
+fn death_line(name: &[u8], value: u64, last: &[u8]) {
+    let who = core::str::from_utf8(name).unwrap_or("?");
+    let fault = unsafe { (*(&raw mut LAST_FAULT)).take() };
+    let line = if value >> 56 == FAULT >> 56 {
+        match fault {
+            Some((esr, far, pc)) => alloc::format!("{who}: fault, ESR G#{esr:X}, FAR G#{far:X}, PC +G#{pc:X} in its arc"),
+            None => alloc::format!("{who}: fault, exit G#{value:016X}"),
+        }
+    } else if value == 0xDEAD || value == 101 {
+        alloc::format!("{who}: panicked, its last line: {}", core::str::from_utf8(last).unwrap_or("(not text)").trim_end())
+    } else {
+        return;
+    };
+    let kk = k();
+    let at = kk.console.pos();
+    kk.console.extend_from_slice(line.as_bytes());
+    kk.console.push(b'\n');
+    pstore_since(at);
+    crate::flashlog::line(&line);
+    let display_serving = name != b"display" && up_locked(b"display");
+    crate::glass::notice(line.as_bytes(), !display_serving);
+}
+
 fn end_process(pi: usize, cur: usize, value: u64) {
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // akita bring-up: a process ending (the usb process is the only one there) resets plainly in a FERROS_PROBE=8 build, so it reads apart from the power-up probes 81-85 (board.rs).
@@ -6283,7 +6337,9 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         pstore_since(at);
         // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Under the kernel lock, which the log's UFS commands need.
         crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
+        let last = p.words.clone();
         vault_ended(p, value);
+        death_line(&name, value, &last);
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {
