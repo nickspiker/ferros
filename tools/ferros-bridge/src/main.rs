@@ -18,6 +18,8 @@ mod network;
 /// A sponsor placed by hand, the document payloads/fgtw reads from `fgtw.sponsor` (shared by path: it uses only vsf and alloc).
 #[path = "../../../ferros_kept/src/sponsor.rs"]
 mod sponsor;
+/// `part`: partitions block for block off the device, read-only (the per-unit backups).
+mod part;
 mod usb;
 
 use ferros_pt::packet::Complete;
@@ -72,6 +74,7 @@ fn usage() {
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
+    eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
     eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
@@ -122,6 +125,8 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        // part list | dump <name> <out> | gpt <lu> <primary> <backup>: Android's partitions read block for block thru the development `diag lun`, for the per-unit backups (part.rs).
+        "part" => part::cmd(&args[2..]).await,
         // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
         "input" => input::cmd(&args[2..]).await,
         // kist stow <capsule.vsf>: the development fallback (KISTS.md "Stowing"): a signed kist capsule kept in the vault and added to the attested person's list with no check by the device's stower and no Stow on its screen, for unattended loops. `ferros send` (tools/ferros-send) is the checked path every script uses.
