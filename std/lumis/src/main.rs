@@ -89,8 +89,12 @@ const DEV_WHOLE: u8 = 1 << 0;
 const DEV_COPY: u8 = 1 << 1;
 /// Development: the scratch path even with the display baking (no `bakes_own`), for comparing the two on a device.
 const DEV_SCRATCH: u8 = 1 << 2;
-/// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 to 6 (8 s to 1024 s).
+/// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 and 5 (8 s to 64 s).
 const DEV_OPEN: u8 = 1 << 3;
+/// Development: the intake stays on the A715 workers with the UI (as before 0.2.17) instead of its own threads on the A510s, to compare the two on a device.
+const DEV_BIG_INTAKE: u8 = 1 << 6;
+/// The A510 cluster (husky cores 0 to 3), where the intake runs (lumis_core `set_intake_cores`) so the UI's draw keeps the A715s.
+const CORES_LITTLE: u64 = 0x000F;
 /// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^3 s, then 2^4 s (no further than the camera's longest: a long-exposure mode's frame takes its whole exposure in wall time), two frames each, each frame's exposure said beside the one asked.
 const DEV_SWEEP: u8 = 1 << 7;
 
@@ -444,7 +448,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
-    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 7) + 3)));
+    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 3) + 3)));
     let run_start = std::time::Instant::now();
     let sweep: Vec<f64> = if knobs & DEV_OPEN != 0 && knobs & DEV_SWEEP != 0 {
         (0..9).map(|k| (2f64).powi(-13 + 2 * k)).chain([(1 << 4) as f64]).map(|s| s * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
@@ -1051,6 +1055,13 @@ fn main() {
     }));
     let _ = log::set_logger(&Console).map(|()| log::set_max_level(log::LevelFilter::Info));
     println!("lumis: Lumis {} on ferros, {} grants", env!("CARGO_PKG_VERSION"), sys::grant_count());
+    // The intake on the A510s (four threads, one a core) unless the knobs keep it with the UI.
+    if dev_input().0 & DEV_BIG_INTAKE == 0 {
+        lumis_core::set_intake_cores(|| {
+            sys::pin(CORES_LITTLE);
+        }, 4);
+        println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI on the A715s");
+    }
     let vault = open_vault();
     if let Some(v) = &vault {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));
