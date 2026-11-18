@@ -20,8 +20,14 @@ use lumis_core::platform::{ConfigStore, PixelSurface};
 use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
+use lumis_core::shared_memory::{CALIBRATING_BIT, CAL_FINALIZE_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Whether the window is behind (the person went to the deck or another kist is in front): fluor's `Event::Focused(false)`, cleared by `Focused(true)`.
+/// The UI sets it; the camera thread reads it at each frame and decides whether Lumis stays (owner, 2026-11-17: "lumis, if we're framing up and we go to the deck, should go bye bye, unless I'm doing a continuous save").
+static BEHIND: AtomicBool = AtomicBool::new(false);
 
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
@@ -331,6 +337,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let fail = |why: String| {
         println!("lumis: camera {}: {why}", cam.name);
         *opened.lock().unwrap() = Some(Opened::Failed(why));
+        // Sent behind while the camera opened: no menu to go back to, so Lumis ends (a window sent behind after this store finds the failure in its tick and ends there).
+        if BEHIND.load(Ordering::Acquire) {
+            close_camera(&cam.name);
+            lumis_core::platform::exit_because("sent behind");
+        }
     };
     // The open asks for the view (docs/CAMERA.md "The view"): whole sensor frames read in place. A driver or kernel that gives none answers a plain open, and frames come by copy at `BIN`.
     // A development spawn's input (`dev_input`): its knobs byte, then optionally the driver's mode block (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before.
@@ -376,6 +387,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         return fail("no first frame".into());
     };
     println!("lumis: camera {}: first frame, {} x {} samples (bin {}), exposure {} us, gain {}/1024", cam.name, first.width, first.height, first.bin, first.exposure_ns / 1000, first.gain);
+    // Sent behind while the camera opened: nothing framed and nothing to save, so the camera closes before the integrator's memory is taken.
+    if BEHIND.load(Ordering::Acquire) {
+        close_camera(&cam.name);
+        lumis_core::platform::exit_because("sent behind");
+    }
     let iso = |gain: u32| gain as f64 * ISO_AT_UNITY / camera::GAIN_UNITY as f64;
     let (min_iso, max_iso) = (iso(cam.gain_min), iso(cam.gain_max));
     // The first open's seed (Android: the one-shot AE's metered values, or the calibration's extremes): the driver's own exposure and gain, as its first frame says.
@@ -415,6 +431,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
+    // What this thread last said of the window, so each change is said once.
+    let mut stay = Stay::Front;
+    // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
+    let mut quiet: Option<[u64; 2]> = None;
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
         let Some((head, samples)) = src.next(&mut turns) else {
@@ -425,6 +445,43 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         if head.width != first.width || head.height != first.height {
             keep_saves(vault.as_deref(), &mut *integrator.header);
             lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
+        }
+        // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save runs (it keeps capturing and saving, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
+        let flags = integrator.header[FLAGS_IDX];
+        let behind = BEHIND.load(Ordering::Acquire);
+        let continuous = flags & CONTINUOUS_SAVE_BIT != 0;
+        let now = match (behind, continuous, in_flight(flags)) {
+            (false, _, _) => Stay::Front,
+            (true, true, _) => Stay::Continuous,
+            (true, false, true) => Stay::Finishing,
+            (true, false, false) => leave(&cam.name, vault.as_deref(), &mut *integrator.header),
+        };
+        if now != stay {
+            match now {
+                Stay::Front => println!("lumis: in front again: carrying on"),
+                Stay::Continuous => println!("lumis: sent behind during a continuous save: staying for the save, capturing and saving, drawing nothing; Lumis ends if the save ends while behind"),
+                Stay::Finishing => println!("lumis: sent behind with a save on its way: finishing it, then Lumis ends"),
+            }
+            stay = now;
+        }
+        let heartbeat = [integrator.header[HEARTBEAT_SECS_IDX], integrator.header[HEARTBEAT_NANOS_IDX]];
+        if behind {
+            quiet = Some(heartbeat);
+        } else if quiet != Some(heartbeat) {
+            quiet = None;
+        }
+        // A continuous save integrates on: the integrator never ends Lumis on a quiet UI while one runs.
+        // Otherwise, behind (or in front again before the UI has drawn), nothing is integrated: the save on its way is the image already made, so it is started if asked for and not yet begun, kept when encoded, and Lumis leaves once nothing is left on its way.
+        if !continuous && quiet.is_some() {
+            integrator.try_save();
+            if integrator.check_and_finalize_calibration() {
+                println!("lumis: calibration finalized");
+            }
+            keep_saves(vault.as_deref(), &mut *integrator.header);
+            if behind && !in_flight(integrator.header[FLAGS_IDX]) {
+                leave(&cam.name, vault.as_deref(), &mut *integrator.header);
+            }
+            continue;
         }
         let t_integrate = std::time::Instant::now();
         if turns.first.is_none() {
@@ -516,6 +573,41 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
         // A calibration map is not a photo: it never counts (as on Android).
         app::save_done(header, kept && !name.starts_with("cal_"));
     }
+}
+
+/// What the camera thread does with the window behind, said on the console as it changes.
+#[derive(Clone, Copy, PartialEq)]
+enum Stay {
+    /// In front: Lumis as always.
+    Front,
+    /// Behind during a continuous save: capturing and saving on, nothing drawn.
+    Continuous,
+    /// Behind with a save on its way: that save finished and kept, then Lumis ends.
+    Finishing,
+}
+
+/// Whether a save the person asked for is still on its way, by the integrator's flags: a single save asked for and not yet begun (MANUAL_SAVE_BIT, which try_save starts from the image already made), one encoding or encoded and not yet kept (CURRENTLY_SAVING, cleared by `keep_saves` once the vault has it), or a calibration whose finish was tapped (CAL_FINALIZE_BIT while CALIBRATING_BIT).
+/// A calibration still accumulating, or an exposure still integrating with no save asked for, is not on its way: nothing was asked to be kept.
+fn in_flight(flags: u64) -> bool {
+    flags & (MANUAL_SAVE_BIT | CURRENTLY_SAVING) != 0 || flags & (CALIBRATING_BIT | CAL_FINALIZE_BIT) == CALIBRATING_BIT | CAL_FINALIZE_BIT
+}
+
+/// The driver's CLOSE (docs/CAMERA.md, op 4): the view taken back, the stream stopped, the module powered down, and the driver ends.
+/// Said by the camera thread (or before it reads any frame), so nothing reads the view after the driver takes it back.
+fn close_camera(name: &str) {
+    let mut r = [0u8; 4];
+    if sys::call_live(CAMERA, &[camera::OP_CLOSE], &mut r) == sys::ERR {
+        println!("lumis: camera {name}: the CLOSE was not answered; the driver closes when Lumis ends");
+    } else {
+        println!("lumis: camera {name}: closed");
+    }
+}
+
+/// Lumis sent behind with no continuous save running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so.
+fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> ! {
+    keep_saves(vault, header);
+    close_camera(name);
+    lumis_core::platform::exit_because("sent behind");
 }
 
 /// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
@@ -618,6 +710,25 @@ impl Lumis {
         }
     }
 
+    /// The window sent behind or brought to the front (fluor's `Event::Focused`, from the display's EV_BEHIND and EV_FRONT).
+    /// Behind on the menu, Lumis ends at once: no camera is open and nothing is on its way.
+    /// Behind with the camera opening or open, the camera thread decides at its next frame: it closes the camera and ends Lumis, unless a continuous save runs or a save is on its way (`Stay`).
+    /// The finger is let go either way, so a touch held when the window went behind is not taken as a tap when it comes back.
+    fn focus(&mut self, focused: bool) {
+        BEHIND.store(!focused, Ordering::Release);
+        self.finger = None;
+        self.down_sampled = false;
+        self.pending_up = false;
+        if focused {
+            // Back in front: the frame shown whole (fluor draws the first frame back whole; Lumis's buffer still holds what it last drew).
+            self.changed = true;
+            return;
+        }
+        if matches!(self.screen, Screen::Menu) {
+            lumis_core::platform::exit_because("sent behind");
+        }
+    }
+
 }
 
 impl FluorApp<G2t16> for Lumis {
@@ -640,6 +751,10 @@ impl FluorApp<G2t16> for Lumis {
     }
 
     fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
+        if let Event::Focused(focused) = event {
+            self.focus(*focused);
+            return EventResponse::Handled;
+        }
         // Android's MotionEvent actions, as Lumis's menu reads them.
         let (action, at) = match event {
             Event::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => (0, (ctx.cursor_x as f32, ctx.cursor_y as f32)),
@@ -693,6 +808,13 @@ impl FluorApp<G2t16> for Lumis {
                 None => {}
             }
         }
+        // Behind: nothing drawn. A camera that failed to open while behind left only the menu, which ends Lumis as going behind on it does; a camera open is the camera thread's to end or keep.
+        if BEHIND.load(Ordering::Acquire) {
+            if matches!(self.screen, Screen::Menu) {
+                lumis_core::platform::exit_because("sent behind");
+            }
+            return false;
+        }
         let Some(surface) = self.surface.as_ref() else { return false };
         match &mut self.screen {
             Screen::Menu => {
@@ -705,7 +827,7 @@ impl FluorApp<G2t16> for Lumis {
             }
             Screen::Opening => {}
             Screen::Camera(ui) => {
-                use lumis_core::shared_memory::{CALIBRATING_BIT, CAL_SHOW_RESULT_BIT, FLAGS_IDX};
+                use lumis_core::shared_memory::CAL_SHOW_RESULT_BIT;
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
                 let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid);
                 let t = std::time::Instant::now();
