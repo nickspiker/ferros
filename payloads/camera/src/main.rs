@@ -25,6 +25,7 @@
 //! - `11` CAPS (a camera open): the sensor's data formats (CCS G#00C0, its descriptors from G#00C2), its integration limits (G#1004) and the mode registers read back (`caps`).
 //!
 //! OPEN's mode block (docs/CAMERA.md "Modes, the bench and the slit"; owner, 2026-11-15: "straight as fast as possible full frame 1:1 and 2x binned for all back cams ... Then I want the slitscan wired up"): after `[1][id][view]`, `[kind][rows: u16][fll: u16][exposure: u16][flags][ring: log2][line length: u16]`, every field optional (`Spec`).
+//! After the whole block (its `[cols: u16]` too) one byte of view flags (`VIEW_FLAGS`): bit 0 the view write-back (docs/CAMERA.md "A cacheable view").
 //! The mode is written inside the sensor's hold after its init and before stream on, the front end's geometry rewritten to match (ferros_cam ccs, geom), its buffers sized to the mode's frame.
 //! A holder that ends without closing: its waiting FRAME's reply fails, or 2^22 us pass with nobody asking; either closes. The kernel takes the view back when either ends.
 #![no_std]
@@ -958,7 +959,7 @@ struct Open {
     probed: bool,
     /// The view was given to the holder (an OPEN that asked for it).
     view: bool,
-    /// The view is mapped write-back (docs/CAMERA.md "A cacheable view"; the OPEN's view byte with `VIEW_CACHED`): every buffer handed over by MAP has its lines cleaned and invalidated first (`lines`), and a held buffer's probe line before its release reads it.
+    /// The view is mapped write-back (docs/CAMERA.md "A cacheable view"; the OPEN's `VIEW_FLAGS` byte with `VIEW_CACHED`): every buffer handed over by MAP has its lines cleaned and invalidated first (`lines`), and a held buffer's probe line before its release reads it.
     cached: bool,
     /// The maintenance's ticks at MAP (summed and the most, for the console every 64).
     inv_sum: u64,
@@ -1923,9 +1924,12 @@ fn bin_frame(o: &Open, bin: usize, b: usize) -> usize {
 /// An OPEN that asked for the view write-back (`VIEW_CACHED`) gets the 64 bytes too, and 1 at 53 when it was given so (0: non-cacheable, a kernel from before or a slit ring).
 const VIEW_REPLY: usize = 48;
 const VIEW_REPLY_MODE: usize = 64;
-/// The OPEN's view byte (`[1][id][view]`): bit 0 the view; bit 1 (2026-11-18, docs/CAMERA.md "A cacheable view") mapped write-back, each buffer's lines cleaned and invalidated by the kernel as MAP hands it over, so the holder reads it thru its caches.
+/// The OPEN's view byte (`[1][id][view]`): bit 0 the view.
 const VIEW_ASKED: u8 = 1 << 0;
-const VIEW_CACHED: u8 = 1 << 1;
+/// The OPEN's byte after the whole mode block (`VIEW_FLAGS`, its seventeenth), bit 0 (2026-11-18, docs/CAMERA.md "A cacheable view"): the view mapped write-back, each buffer's lines cleaned and invalidated by the kernel as MAP hands it over, so the holder reads it thru its caches.
+/// There, not in the view byte, so a holder that asks it of a driver from before gets the non-cacheable view (that driver reads no byte past the block) rather than none.
+const VIEW_FLAGS: usize = 16;
+const VIEW_CACHED: u8 = 1 << 0;
 /// A device test only (the hand spawn's ninth input byte 1): a write-back view's buffers handed over by MAP without their maintenance, to show what a reader sees without it (stale lines from the last time round the ring).
 static NO_LINES: AtomicU64 = AtomicU64::new(0);
 
@@ -2154,7 +2158,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         let n = o.l.slots[job::OLD_SLOT_IMAGE].1 / job::FRAME;
                         let mut t = [0u8; 32];
                         // Write-back when asked, but never for a slit ring: its buffers have no holds, so no hand-over at which to make them right (SLITS).
-                        let want = msg[2] & VIEW_CACHED != 0 && SLITS.load(Ordering::Relaxed) == 0;
+                        let want = got as usize > VIEW_FLAGS && msg[VIEW_FLAGS] & VIEW_CACHED != 0 && SLITS.load(Ordering::Relaxed) == 0;
                         let mut give = |cached: bool| ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32 | (cached as u64) << 63, ferros_sys::off(t.as_mut_ptr()));
                         let mut base = give(want);
                         o.cached = want && base != ERR;

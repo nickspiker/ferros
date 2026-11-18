@@ -84,11 +84,13 @@ struct Args {
 static FIRST_CORE: AtomicU64 = AtomicU64::new(4);
 
 impl Args {
-    fn open_msg(&self) -> [u8; 16] {
-        let mut m = [0u8; 16];
+    fn open_msg(&self) -> [u8; 17] {
+        let mut m = [0u8; 17];
         m[0] = OP_OPEN;
         m[1] = self.id;
-        m[2] = 1 | (self.cached as u8) << 1;
+        m[2] = 1;
+        // The view flags after the whole block (payloads/camera `VIEW_FLAGS`): bit 0 write-back.
+        m[16] = self.cached as u8;
         m[3] = self.kind;
         m[4..6].copy_from_slice(&self.rows.to_le_bytes());
         m[6..8].copy_from_slice(&self.fll.to_le_bytes());
