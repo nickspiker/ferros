@@ -81,6 +81,10 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
   4. A wait for the device to be bound to that identity (op 0, bound), then the map. Both read the identity class.
 - **Unlock at boot** (`device.unlock_at_boot`, opt-in, warned): while it is on, the kernel keeps the seed in the device class and unlocks at boot, before init starts. Off, the kept seed is deleted at boot. It and the kept tags are independent: with it on a tag is never needed (the device is unlocked before the attest screen would show), switching it off leaves the tags kept, and a release deletes both.
 - **Locking.** Only when power goes, or when the device switches OS. Every reset the kernel orders drops the key first, its bytes overwritten (`platform::before_reset`), because a warm reset keeps DRAM. There are no timers.
+  - **What a lock wipes** (2026-11-17): the kernel overwrites the identity's keys, the seed and the person key in place and cleans the lines to DRAM (`keys::wipe_to_dram`), and rings the identity's bell (SYS_BELL 13, `BELL_IDENTITY`: the lock epoch, moved at every lock).
+    The identity service (fgtw) hears it and overwrites the roots, the fleet key and the person key it holds, and goes back to no identity in hand without touching the vault.
+    The attest screen (ahau) keeps no copy of the roots once fgtw has them.
+    Moving these keys into the kernel alone: KEY_REGISTERS.md "The identity's keys in the kernel alone".
 - **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and fgtw (the identity service) hold; ops 7 to 9 also with Settings (the map's settings pages, which keep tags and hold no right to unlock):
 
 | Op | Does | Returns |
@@ -107,7 +111,7 @@ The owner keeps a plain NTAG-type tag (NFC-A, Type 2, a 7-byte UID, no crypto of
 - The seal key: BLAKE3 `derive_key("ferros 2026-11-11 tag unlock v0", device key ‖ device-only secret ‖ UID)`. The device-only secret too, as the identity key takes it, so the chips' published values and the tag are not enough without this device's own 32 bytes, and a release (which renews the secret) leaves any record it missed unopenable.
 - The record is VSF (section `tag_unlock`): `added`, the Eagle time it was kept, and `seal`, the identity seed sealed with XChaCha20-Poly1305 under the seal key, a fresh 24-byte nonce from the kernel's entropy in front, the tag's id as associated data. The vault seals the record again under the device class, as every entry.
 - The inner seal is what binds the record to the tag. Without its check a wrong tag would give a garbage seed, and on a device not bound yet a garbage seed opens (makes) a junk identity space; with it, a wrong tag is a clean refusal.
-- To seal a seed the kernel needs it when a tag is kept, from the settings page, which never sees the seed. So while a person is present the kernel holds their seed beside the identity key, and wipes both when it locks. The identity service holds the same seed in RAM for as long.
+- To seal a seed the kernel needs it when a tag is kept, from the settings page, which never sees the seed. So while a person is present the kernel holds their seed beside the identity key, and wipes both when it locks. The identity service holds the same seed in RAM for as long, and wipes it when the kernel locks (its bell).
 
 **Keeping a tag** (the map, the NFC page, reached from Connections' NFC row or the NFC console circle): "add a tag" turns the page into a reader for one tag. The NFC driver's next unlock tag is kept (op 7) for the identity present, and the page says so. The tap on the page is the consent (above, "An NFC tap is consent"). The page lists the kept tags, each by the first four bytes of its id and when it was kept, each with "remove" (op 8); under them the warning, as attest at boot's: whoever holds the device and the tag holds the identity.
 
