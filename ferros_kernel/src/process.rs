@@ -2189,6 +2189,8 @@ const TORCH_DUTY_REACH: i8 = 120;
 const TORCH_TIMEOUT_STEPS: u8 = 10 * (1 << 4) + 1;
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"; ferros_sys::audio is its one encoding), a device setting (the speakers are this device's): 0 never set (the audio service's default, two octaves under full scale), 1-255 dimmest to loudest, a 16th of an octave of amplitude a step. Kept in the device document as `volume`.
 pub const PREF_VOLUME: usize = 46;
+/// Preference 47: what the helm's buttons do (ferros_sys PREF_HELM and its bits), a person's choice kept in the device document as `helm`, 0 every default.
+pub const PREF_HELM: usize = 47;
 /// How many preferences there are: the first block's 32 and the second's 16.
 const PREF_COUNT: usize = 48;
 
@@ -2342,6 +2344,8 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SOUND => value < SOUNDS,
         PREF_DND => value <= 1,
         PREF_RADIOS_BEFORE => value < 1 << 5,
+        // Five choices, a bit each (ferros_sys `helm`).
+        PREF_HELM => value < 1 << 5,
         PREF_TORCH_LEVEL => true,
         PREF_TORCH_STROBE => value <= TORCH_STROBE_STEPS,
         PREF_TORCH_DUTY => (value as i8).unsigned_abs() <= TORCH_DUTY_REACH as u8,

@@ -49,6 +49,26 @@ messages! {
     PageSecurity,
     /// The page listing everything on the deck as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
     PageDeck,
+    /// The helm's page (owner, 2026-11-18: "a settings addition to choose what back and home do"): what Deck and Back do, tapped and swiped, in a kist and on the deck; then its rows' titles and their choices.
+    PageHelm,
+    HelmBackTap,
+    HelmBackSwipe,
+    HelmBackSwipeDeck,
+    HelmDeckSwipe,
+    HelmDeckSwipeDeck,
+    /// Back's tap: up a level to the kist's top and no further (the default), or up and then out to the deck.
+    HelmUpTop,
+    HelmUpOut,
+    /// Back's swipe in a kist: the kist before (the most recent, the default), or forward: the redo of the last step back, the Again key to the kist (owner: "like a redo or a forward browser navigation").
+    HelmRecent,
+    HelmForward,
+    /// On the deck: every circle gathered into a cluster, all touching (Back's tap scatters them back).
+    HelmCluster,
+    /// Deck's swipe in a kist: the controls hidden or shown (the default), or out to the deck.
+    HelmControls,
+    HelmToDeck,
+    /// Deck's swipe on the deck: every circle in view (the default).
+    HelmFit,
     PagePermissions,
     PageFleet,
     PagePower,

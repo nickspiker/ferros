@@ -753,6 +753,8 @@ static mut LAST_FRAME: ([u8; SLOT], usize) = ([0; SLOT], 0);
 static mut LAST_DECK: ([u8; SLOT], usize) = ([0; SLOT], 0);
 /// The op that last emptied `LAST_FRAME` (a measure, 2026-11-18: the pucks' squares stopped reaching the glass on the 8a while nothing drew the deck again).
 static LAST_FRAME_CLEARED: AtomicU32 = AtomicU32::new(0);
+/// Back's Escapes the apps did not use (op 76), counted; its low byte rides on op 5.
+static ESC_UNUSED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether a batch (op 15) holds a camera op.
 fn batch_has_camera(m: &[u8]) -> bool {
@@ -3412,7 +3414,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7388,13 +7390,24 @@ extern "C" fn receive(grants: u64) -> ! {
         let h = if names_surface(op) { caller_of(&tok) } else { 0 };
         if op == 5 {
             let (w, h) = unsafe { SCREEN_WH };
-            let mut out = [0u8; 13];
+            let mut out = [0u8; 14];
             out[0..2].copy_from_slice(&w.to_le_bytes());
             out[2..4].copy_from_slice(&h.to_le_bytes());
             out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
             out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
             out[12] = app_live() as u8;
+            // 13: the Escapes the apps did not use, counted (op 76), its low byte: the deck tells by a change that the app in front was at its top already (PREF_HELM `BACK_OUT`).
+            out[13] = ESC_UNUSED.load(Ordering::Relaxed) as u8;
             ferros_sys::reply(&tok, &out);
+            continue;
+        }
+        // 76 `escape unused [base u64]`: the app on that surface was handed Back's Escape and did not use it, at its top already (fluor's ferros host, owner 2026-11-18): counted for the deck (op 5 byte 13). Only the surface's holder; anyone else's word is not counted. → [0], or [4] `NOT_YOURS`.
+        if op == 76 && n >= 9 {
+            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
+            if mine.is_some() {
+                ESC_UNUSED.fetch_add(1, Ordering::Relaxed);
+            }
+            ferros_sys::reply(&tok, &[if mine.is_some() { 0 } else { NOT_YOURS }]);
             continue;
         }
         if op == 27 && n >= 13 {

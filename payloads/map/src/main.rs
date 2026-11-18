@@ -229,6 +229,78 @@ const ONE: i64 = 1 << 14;
 const SPRING: f64 = core::f64::consts::LN_2;
 
 /// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
+/// Circles of radii `r` packed into a cluster, every one touching (owner, 2026-11-18: "cluster best fit all touching"): the largest first at the centre, the next beside it, and each after where it touches two placed ones nearest the cluster's middle without overlapping any (every tangent pair tried, both sides: n ≤ `MAX`, so n³ tries are nothing). Each centre, in the radii's units, the cluster's area-weighted middle at the origin.
+fn pack(r: &[f64]) -> alloc::vec::Vec<(f64, f64)> {
+    let n = r.len();
+    let mut order: alloc::vec::Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| r[b].partial_cmp(&r[a]).unwrap_or(core::cmp::Ordering::Equal));
+    let mut at = alloc::vec![(0f64, 0f64); n];
+    let mut placed: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for (k, &i) in order.iter().enumerate() {
+        if k == 1 {
+            at[i] = (r[order[0]] + r[i], 0.);
+        } else if k > 1 {
+            // The middle so far, weighted by area, where the cluster pulls toward.
+            let (mut mx, mut my, mut mw) = (0., 0., 0.);
+            for &j in &placed {
+                let w = r[j] * r[j];
+                mx += at[j].0 * w;
+                my += at[j].1 * w;
+                mw += w;
+            }
+            let (mx, my) = (mx / mw, my / mw);
+            let mut best: Option<((f64, f64), f64)> = None;
+            for (pa, &a) in placed.iter().enumerate() {
+                for &b in &placed[pa + 1..] {
+                    // Where circle i touches both a and b: the two crossings of the circles about a and b of radii r_a + r_i and r_b + r_i.
+                    let (ax, ay, bx, by) = (at[a].0, at[a].1, at[b].0, at[b].1);
+                    let (ra, rb) = (r[a] + r[i], r[b] + r[i]);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let d2 = dx * dx + dy * dy;
+                    let d = libm::sqrt(d2);
+                    if d == 0. || d > ra + rb {
+                        continue;
+                    }
+                    let along = (ra * ra - rb * rb + d2) / (2. * d);
+                    let h2 = ra * ra - along * along;
+                    if h2 < 0. {
+                        continue;
+                    }
+                    let h = libm::sqrt(h2);
+                    let (px, py) = (ax + dx * along / d, ay + dy * along / d);
+                    for s in [-1., 1.] {
+                        let c = (px - s * dy * h / d, py + s * dx * h / d);
+                        // Clear of every circle placed (a millionth of a radius of slack for the tangents themselves).
+                        let clear = placed.iter().all(|&j| { let (ex, ey) = (c.0 - at[j].0, c.1 - at[j].1); ex * ex + ey * ey >= (r[j] + r[i]) * (r[j] + r[i]) * (1. - 1e-6) });
+                        if clear {
+                            let score = (c.0 - mx) * (c.0 - mx) + (c.1 - my) * (c.1 - my);
+                            if best.is_none_or(|(_, s0)| score < s0) {
+                                best = Some((c, score));
+                            }
+                        }
+                    }
+                }
+            }
+            // No pair leaves room (never with these sizes): beside the largest, on its far side from the middle.
+            at[i] = best.map_or((at[order[0]].0 - r[order[0]] - r[i], at[order[0]].1), |(c, _)| c);
+        }
+        placed.push(i);
+    }
+    let (mut mx, mut my, mut mw) = (0., 0., 0.);
+    for i in 0..n {
+        let w = r[i] * r[i];
+        mx += at[i].0 * w;
+        my += at[i].1 * w;
+        mw += w;
+    }
+    if mw > 0. {
+        for p in at.iter_mut() {
+            *p = (p.0 - mx / mw, p.1 - my / mw);
+        }
+    }
+    at
+}
+
 fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
     spring_at(x0, v0, t, SPRING)
 }
@@ -947,6 +1019,8 @@ enum Choice {
     ScopeSet(u8),
     /// The keyboard's layout (honeycomb::LAYOUTS: 0 Dvorak, 1 QWERTY).
     Layout(u8),
+    /// A helm choice (the Deck and Back page): the bit of PREF_HELM and whether it is set (ferros_sys `helm`).
+    Helm(u8, bool),
     UnlockAtBoot,
     ProxWake,
     /// About's version line: twelve taps in a row and Developer is a page.
@@ -1027,7 +1101,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 22] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+const PAGES: [&str; 23] = ["appearance", "units", "keyboard", "security", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -1058,6 +1132,7 @@ fn page_title(key: &'static str) -> &'static str {
         "keyboard" => Msg::PageKeyboard,
         "security" => Msg::PageSecurity,
         "deck" => Msg::PageDeck,
+        "helm" => Msg::PageHelm,
         "permissions" => Msg::PagePermissions,
         "fleet" => Msg::PageFleet,
         "people" => Msg::PagePeople,
@@ -1508,6 +1583,12 @@ struct Map {
     recent: alloc::vec::Vec<[u8; 32]>,
     /// The kist this map brought to the front last, while it is still in front (None once the map has the glass again).
     front_kist: Option<[u8; 32]>,
+    /// The deck's circles gathered (owner, 2026-11-18: "for swiping back on the deck, would be nice to make all the circles cluster best fit all touching, and tapping on back reverses back to whatever scatter they were in"): each circle's place in the scatter it came from (world ×256) and the camera then; None while scattered.
+    scatter: Option<(alloc::vec::Vec<(i64, i64)>, Cam)>,
+    /// The display's count of unused Escapes when Back last sent one to the app in front (`escapes_unused`), for PREF_HELM `BACK_OUT`.
+    escape_sent: Option<u8>,
+    /// The circles on their way (`gather`, `scatter_back`): from, to (world ×256), the shown frames so far, and whether this is the way back.
+    gathering: Option<(alloc::vec::Vec<(i64, i64)>, alloc::vec::Vec<(i64, i64)>, i32, bool)>,
     /// The pucks launched since the person attested, by capsule (docs/PUCKS.md: a puck lives while a person is present, launched once, never by a tap).
     pucks_up: alloc::vec::Vec<[u8; 32]>,
     /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
@@ -3348,6 +3429,25 @@ impl Map {
                     y += uu(4, 1);
                 }
             }
+            // What Deck and Back do (owner, 2026-11-18: "a settings addition to choose what back and home do"; WINDOWS.md "The helm"): a choice per gesture, each a pair, the default first (PREF_HELM, 0 every default).
+            "helm" => {
+                let helm = ferros_sys::pref(ferros_sys::PREF_HELM);
+                use ferros_sys::helm::*;
+                let rows: [(Msg, u8, [Msg; 2]); 5] = [
+                    (Msg::HelmBackTap, BACK_OUT, [Msg::HelmUpTop, Msg::HelmUpOut]),
+                    (Msg::HelmBackSwipe, BACK_SWIPE_FORWARD, [Msg::HelmRecent, Msg::HelmForward]),
+                    (Msg::HelmBackSwipeDeck, BACK_SWIPE_DECK_RECENT, [Msg::HelmCluster, Msg::HelmRecent]),
+                    (Msg::HelmDeckSwipe, DECK_SWIPE_OUT, [Msg::HelmControls, Msg::HelmToDeck]),
+                    (Msg::HelmDeckSwipeDeck, DECK_SWIPE_DECK_CLUSTER, [Msg::HelmFit, Msg::HelmCluster]),
+                ];
+                for (title, bit, choices) in rows {
+                    b.text(cx, y, note as u16, dim(), 1, tr(title));
+                    y += uu(2, 1);
+                    let names = [tr(choices[0]), tr(choices[1])];
+                    radios(self, b, &mut y, &names, (helm & bit != 0) as usize, &|v| Choice::Helm(bit, v == 1));
+                    y += uu(1, 1);
+                }
+            }
             "keyboard" => {
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::Layout));
                 y += uu(2, 1);
@@ -4802,7 +4902,8 @@ impl Map {
             self.pan = if v == 0. { None } else { Some((ux, uy, v, rx - ix, ry - iy)) };
         }
         let flying = self.step_cam();
-        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
+        let gathering = self.step_gather();
+        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying || gathering
     }
 
     /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and deck: the display's answer kept for the checkbox, and said on the console.
@@ -4887,6 +4988,78 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
+    /// The deck's circles gathered into a cluster, every one touching (`pack`), about the area-weighted middle of where they stand, the scatter kept for Back's tap (`scatter_back`); each goes on the plane's spring, a shown frame a step (`step_gather`), and the camera fits them once they land. Already gathered: the camera fits them again.
+    fn gather(&mut self) -> &'static str {
+        if self.scatter.is_some() && self.gathering.is_none() {
+            self.deck_fly();
+            return "map: deck: the cluster in view";
+        }
+        let n = self.n;
+        let r: alloc::vec::Vec<f64> = (0..n).map(|i| self.rs[i] as f64).collect();
+        let (mut mx, mut my, mut mw) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let w = r[i] * r[i];
+            mx += self.xs[i] as f64 * w;
+            my += self.ys[i] as f64 * w;
+            mw += w;
+        }
+        // WHY the floor: a deck of circles all of radius 0 has no middle to divide by (never: every circle has a radius of at least 1).
+        let mw = mw.max(1.);
+        let (mx, my) = (mx / mw, my / mw);
+        let from: alloc::vec::Vec<(i64, i64)> = (0..n).map(|i| (self.xs[i], self.ys[i])).collect();
+        // World units to ×256: the positions are kept at 256 to a unit, the radii in units.
+        let to: alloc::vec::Vec<(i64, i64)> = pack(&r).iter().map(|p| (libm::round(mx + p.0 * 256.) as i64, libm::round(my + p.1 * 256.) as i64)).collect();
+        if self.scatter.is_none() {
+            self.scatter = Some((from.clone(), self.cam));
+        }
+        self.gathering = Some((from, to, 0, false));
+        self.settling = true;
+        "map: back: the circles gathered, touching"
+    }
+
+    /// Back's tap on a gathered deck: every circle back to where it stood before (`gather`), the camera with them. Whether there was a scatter to go back to.
+    fn scatter_back(&mut self) -> bool {
+        let Some((to, cam)) = self.scatter.take() else { return false };
+        let from: alloc::vec::Vec<(i64, i64)> = (0..self.n).map(|i| (self.xs[i], self.ys[i])).collect();
+        // A circle stowed or unstowed since: as many as both know.
+        let k = from.len().min(to.len());
+        self.gathering = Some((from[..k].to_vec(), to[..k].to_vec(), 0, true));
+        self.fly(cam);
+        self.settling = true;
+        true
+    }
+
+    /// One shown frame of the circles on their way: each at its target plus the plane's spring of its offset (C¹ from rest, no timer: `spring`, as a flight's), sent to the display (op 17). Whether any is still a half pixel or more from its place; landed, a gather fits the camera to the cluster.
+    fn step_gather(&mut self) -> bool {
+        let Some((from, to, t, back)) = self.gathering.take() else { return false };
+        let t = t + 1;
+        let z = self.cam.z as f64;
+        let mut still = false;
+        for i in 0..from.len().min(self.n) {
+            let (ox, oy) = ((from[i].0 - to[i].0) as f64, (from[i].1 - to[i].1) as f64);
+            let (x, vx) = spring(ox, 0., t);
+            let (y, vy) = spring(oy, 0., t);
+            self.xs[i] = to[i].0 + libm::round(x) as i64;
+            self.ys[i] = to[i].1 + libm::round(y) as i64;
+            self.send_move(i);
+            // On the screen: world ×256 at 16.16 pixels a unit, as `step_cam` measures.
+            let px = |v: f64| v.abs() * z / (1u64 << 24) as f64;
+            still |= px(x) >= 0.5 || px(y) >= 0.5 || px(vx) >= 0.5 || px(vy) >= 0.5;
+        }
+        if still {
+            self.gathering = Some((from, to, t, back));
+        } else {
+            for i in 0..to.len().min(self.n) {
+                (self.xs[i], self.ys[i]) = to[i];
+                self.send_move(i);
+            }
+            if !back {
+                self.deck_fly();
+            }
+        }
+        still
+    }
+
     /// Deck's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
     fn full_switch(&mut self) -> Option<bool> {
         let mut r = [0u8; 4];
@@ -4939,6 +5112,15 @@ impl Map {
             return "map: deck: the map already";
         }
         if self.app_front {
+            // Out to the deck at the kist's top, when the person chose it (PREF_HELM `BACK_OUT`): the Escape sent last went unused (the display's count of them moved since, op 5 byte 13), so the kist was at its top already and this tap takes it behind. The first tap at the top is the kist's, the next one the deck's.
+            let out = ferros_sys::pref(ferros_sys::PREF_HELM) & ferros_sys::helm::BACK_OUT != 0;
+            if out && self.escape_sent.is_some_and(|c| self.escapes_unused() != Some(c)) {
+                self.escape_sent = None;
+                if self.send_behind(true) {
+                    return "map: back: at the kist's top, out to the deck";
+                }
+            }
+            self.escape_sent = self.escapes_unused();
             if ferros_sys::window::key(self.display, ferros_sys::window::KEY_ESCAPE).is_some() {
                 return "map: back: Escape to the app in front";
             }
@@ -4946,7 +5128,18 @@ impl Map {
             self.app_front = false;
             self.front_kist = None;
         }
+        // A gathered deck: the circles back where they stood (`scatter_back`).
+        if self.view == View::Map && self.scatter_back() {
+            return "map: back: the circles back where they stood";
+        }
         self.back_step()
+    }
+
+    /// The display's count of the Escapes apps did not use (op 5 byte 13), or None from a display before it.
+    fn escapes_unused(&self) -> Option<u8> {
+        let mut r = [0u8; 16];
+        let n = call(self.display, &[5], &mut r);
+        (n >= 14 && n != ferros_sys::ERR).then_some(r[13])
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -5116,6 +5309,10 @@ impl Map {
                         self.send_scene();
                     }
                     Some(Choice::Layout(i)) => set(self, ferros_sys::PREF_LAYOUT, i),
+                    Some(Choice::Helm(bit, on)) => {
+                        let was = ferros_sys::pref(ferros_sys::PREF_HELM);
+                        set(self, ferros_sys::PREF_HELM, if on { was | bit } else { was & !bit });
+                    }
                     Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
                     // Off in one tap; on in two, the first arming it with the warning.
                     Some(Choice::UnlockAtBoot) => {
@@ -5625,6 +5822,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         app_front: false,
         recent: alloc::vec::Vec::new(),
         front_kist: None,
+        scatter: None,
+        escape_sent: None,
+        gathering: None,
         pucks_up: alloc::vec::Vec::new(),
         n,
         kists,
@@ -6489,7 +6689,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 if !corner_done && inward > reach && inward > across.abs() {
                     corner_done = true;
                     // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Deck's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
-                    let said = if corner == 8 {
+                    // As the person chose (Settings, Deck and Back: PREF_HELM, owner 2026-11-18), each default as built on 2026-11-11.
+                    let helm = ferros_sys::pref(ferros_sys::PREF_HELM);
+                    use ferros_sys::helm::*;
+                    let said = if corner == 8 && map.app_front && helm & DECK_SWIPE_OUT != 0 && map.send_behind(true) {
+                        "map: deck: the app in front behind (Deck's swipe set to the deck)"
+                    } else if corner == 8 {
                         match map.full_switch() {
                             Some(true) => {
                                 // The quick row goes with the console (`quick::Quick::shut`).
@@ -6497,11 +6702,17 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 "map: deck: full screen, the controls hidden"
                             }
                             Some(false) => "map: deck: full screen off, the controls shown",
+                            None if helm & DECK_SWIPE_DECK_CLUSTER != 0 => map.gather(),
                             None => {
                                 map.deck_fly();
                                 "map: deck: every circle in view, turned to fit them largest"
                             }
                         }
+                    } else if map.app_front && helm & BACK_SWIPE_FORWARD != 0 {
+                        // Forward, the redo of the last step back (owner: "like a redo or a forward browser navigation"): the Again key to the app in front.
+                        if ferros_sys::window::key(map.display, ferros_sys::window::KEY_AGAIN).is_some() { "map: back: forward to the app in front" } else { map.flip() }
+                    } else if !map.app_front && map.view == View::Map && helm & BACK_SWIPE_DECK_RECENT == 0 {
+                        map.gather()
                     } else {
                         map.flip()
                     };
@@ -6716,6 +6927,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.ys[i] += dy;
                     map.send_move(i);
                     map.arranged[i] = true;
+                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    map.scatter = None;
                     move_us += ferros_sys::us_since(t_m);
                     let t_p = now();
                     map.push_apart(i);
@@ -6755,6 +6968,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                     map.send_move(i);
                     map.arranged[i] = true;
+                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    map.scatter = None;
                     map.push_apart(i);
                     scene_moved = true;
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {

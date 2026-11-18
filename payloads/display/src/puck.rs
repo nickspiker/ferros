@@ -427,46 +427,73 @@ pub fn draw_into(px: &mut [Px], w: usize, clip: draw::Rect, j: usize, cx: i64, c
     // WHY the bounds: a pixel at the circle's rim, turned and scaled into the square, lands up to a pixel past its side (and anywhere past it while the circle is turned or sized since the square was drawn); past the side is nothing.
     let at = |x: i32, y: i32| -> u64 { if x >= 0 && y >= 0 && (x as usize) < d && (y as usize) < d { src[y as usize * d + x as usize] } else { 0 } };
     let bake = crate::bake::now();
+    // The square's coordinates step along a row by fixed amounts (the turn and the scale are the row's), Q16: one multiply-add a pixel, as `draw::icon` samples (2026-11-18, the 8a: the float sampler with a square root a pixel took 30 ms for the clock's 606-pixel circle at every box).
+    let q16 = |v: f32| (v * 65536.) as i64;
+    let (du, dv) = (q16(kc * k), q16(ks * k));
+    let (rin, rout) = (rf - 1., rf + 1.);
     for y in y0..y1 {
-        for (q, x) in (x0..x1).enumerate() {
-            let (dx, dy) = (x as f32 + 0.5 - cxf, y as f32 + 0.5 - cyf);
-            let dist = libm::sqrtf(dx * dx + dy * dy);
-            let c = ferros_puck::draw::edge(dist - rf);
-            cov[q] = c;
-            if c <= 0. {
-                row[q] = 0;
-                continue;
-            }
-            // Into the square: turned from the face to the square, scaled, from its centre; bilinear between its four nearest pixels (premultiplied α and darkness interpolate linearly).
-            let (u, v) = ((dx * kc - dy * ks) * k + half - 0.5, (dx * ks + dy * kc) * k + half - 0.5);
-            let (iu, iv) = (libm::floorf(u), libm::floorf(v));
-            let (fu, fv) = (u - iu, v - iv);
-            let (iu, iv) = (iu as i32, iv as i32);
-            let (p00, p10, p01, p11) = (at(iu, iv), at(iu + 1, iv), at(iu, iv + 1), at(iu + 1, iv + 1));
-            let lane = |sh: u32| -> u64 {
-                let g = |p: u64| (p >> sh & 0xFFFF) as f32;
-                let top = g(p00) + (g(p10) - g(p00)) * fu;
-                let bot = g(p01) + (g(p11) - g(p01)) * fu;
-                (((top + (bot - top) * fv) + 0.5) as u64) << sh
-            };
-            row[q] = lane(48) | lane(32) | lane(16) | lane(0);
+        let dy = y as f32 + 0.5 - cyf;
+        // The row's reach outside the edge and its span wholly inside it, from the circle: two roots a row, not one a pixel.
+        let reach2 = rout * rout - dy * dy;
+        if reach2 <= 0. {
+            continue;
         }
-        bake.g2t_row(row, baked);
+        let reach = libm::sqrtf(reach2);
+        let inner2 = rin * rin - dy * dy;
+        let inner = if inner2 > 0. { libm::sqrtf(inner2) } else { -1. };
+        let xa = (libm::floorf(cxf - reach) as i32).max(x0);
+        let xb = (libm::ceilf(cxf + reach) as i32).min(x1);
+        if xa >= xb {
+            continue;
+        }
+        let (qa, qb) = ((xa - x0) as usize, (xb - x0) as usize);
+        let dx0 = xa as f32 + 0.5 - cxf;
+        let mut u = q16((dx0 * kc - dy * ks) * k + half - 0.5);
+        let mut v = q16((dx0 * ks + dy * kc) * k + half - 0.5);
+        for q in qa..qb {
+            let dx = (x0 + q as i32) as f32 + 0.5 - cxf;
+            // Wholly inside: coverage 1, no root; near the edge, the C¹ edge of the distance.
+            cov[q] = if dx.abs() < inner { 1. } else { ferros_puck::draw::edge(libm::sqrtf(dx * dx + dy * dy) - rf) };
+            if cov[q] <= 0. {
+                row[q] = 0;
+            } else {
+                let (iu, iv) = ((u >> 16) as i32, (v >> 16) as i32);
+                let (fu, fv) = ((u >> 8 & 0xFF) as u64, (v >> 8 & 0xFF) as u64);
+                row[q] = bilerp(at(iu, iv), at(iu + 1, iv), at(iu, iv + 1), at(iu + 1, iv + 1), fu, fv);
+            }
+            u += du;
+            v += dv;
+        }
+        bake.g2t_row(&row[qa..qb], &mut baked[qa..qb]);
         let base = y as usize * w;
-        for q in 0..n {
+        for q in qa..qb {
             let a = row[q] >> 48;
             if a == 0 || cov[q] <= 0. {
                 continue;
             }
-            // Baked light with the square's own α (the light of a premultiplied code is premultiplied, as the canvas holds it: the windows' decode, main.rs `layer_row`), then every lane trimmed by the circle's edge.
+            // Baked light with the square's own α (the light of a premultiplied code is premultiplied, as the canvas holds it: the windows' decode, main.rs `layer_row`), then every lane trimmed by the circle's edge where it is partly covered.
             let p = a << 48 | (baked[q] & 0xFFFF_FFFF_FFFF);
-            let e = (cov[q] * 65535.) as u64;
-            let t = (0..4).fold(0u64, |v, k| v | ((p >> (16 * k) & 0xFFFF) * e + 0x7FFF) / 0xFFFF << (16 * k));
+            let t = if cov[q] >= 1. {
+                p
+            } else {
+                let e = (cov[q] * 65535.) as u64;
+                (0..4).fold(0u64, |v, k| v | ((p >> (16 * k) & 0xFFFF) * e + 0x7FFF) / 0xFFFF << (16 * k))
+            };
             let i = base + x0 as usize + q;
             px[i] = draw::under(px[i], t);
         }
     }
     true
+}
+
+/// Bilinear between four G2t16 pixels, two lanes per multiply (α and G, then R and B, each pair riding one word's two 32-bit halves); `fu`, `fv` in 256ths (as draw.rs `bilerp` for the canvas).
+#[inline(always)]
+fn bilerp(p00: u64, p10: u64, p01: u64, p11: u64, fu: u64, fv: u64) -> u64 {
+    let (w00, w10, w01, w11) = ((256 - fu) * (256 - fv) >> 8, fu * (256 - fv) >> 8, (256 - fu) * fv >> 8, fu * fv >> 8);
+    const M: u64 = 0x0000_FFFF_0000_FFFF;
+    let rb = (p00 & M) * w00 + (p10 & M) * w10 + (p01 & M) * w01 + (p11 & M) * w11;
+    let ga = (p00 >> 16 & M) * w00 + (p10 >> 16 & M) * w10 + (p01 >> 16 & M) * w01 + (p11 >> 16 & M) * w11;
+    (rb >> 8 & M) | (ga >> 8 & M) << 16
 }
 
 /// Whether the deck is covered (an app in front, the screen off) as last said: while it is, no puck's circle is on the glass.
