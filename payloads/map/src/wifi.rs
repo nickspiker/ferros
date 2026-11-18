@@ -259,9 +259,16 @@ fn parse(b: &[u8]) -> Option<(bool, Vec<Net>, Vec<Kept>)> {
     Some((scanning, nets, kept))
 }
 
+/// WiFi switched off by its status circle (preference 15, bit 1 in the facts' order).
+fn switched_off() -> bool {
+    ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> 1 & 1 == 1
+}
+
 /// The main loop's turn, once a pass: the watch started or stopped as the page shows or goes, the list taken when the watch moved, a request's reply taken. True when the page needs drawing again.
 pub fn pass(map: &mut Map, page_shown: bool) -> bool {
     use core::sync::atomic::Ordering;
+    // WiFi switched off (its status circle, preference 15 bit 1): no driver runs, so nothing is watched; the page says it is off.
+    let page_shown = page_shown && !switched_off();
     let mut dirty = false;
     let p = &mut map.wifi;
     if page_shown != p.shown {
@@ -410,6 +417,10 @@ impl Map {
 
     /// The picker's rows on the WiFi page, from `y` on: the networks in range, each a row (its name, and its signal or "connected"), the one picked with its measures and buttons under it; then the networks remembered and not in range; what the page says of the last thing done at the top. In the page's own look (`draw_page`'s rows, facts, buttons and headings).
     pub(super) fn wifi_rows(&mut self, b: &mut Batch, y: &mut i64, cx: i64, hit: bool) {
+        // Switched off: the switch and the state above say so, and there is nothing to pick from.
+        if switched_off() {
+            return;
+        }
         let uq = self.unit();
         let uu = |n: i64, d: i64| n * uq / (d << 8);
         let half = self.w / 2;
