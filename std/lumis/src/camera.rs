@@ -64,6 +64,10 @@ pub struct Camera {
     pub gain_max: u32,
     pub focus_min: u32,
     pub focus_max: u32,
+    /// The optics (the driver's list since 2026-11-17, Android's Camera2 values; 0 from a driver before, which Lumis's page shows as unknown): the sensor's size and the focal length in mm, the f-number.
+    pub sensor_mm: (f32, f32),
+    pub focal_mm: f32,
+    pub f_number: f32,
 }
 
 /// The list's document, read. A section that misses a field is not a camera Lumis can show, so it is left out and said (a driver bug, not the person's).
@@ -80,6 +84,8 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
             }).collect()
         };
         let u = |name: &str| s.uint(name);
+        // A one-value float field, 0 when absent.
+        let one = |name: &str| floats(name).and_then(|v| v.first().copied()).unwrap_or(0.);
         let cam = (|| {
             let idt: [f32; 9] = floats("idt")?.try_into().ok()?;
             let sensitivity: [f32; 3] = floats("sensitivity")?.try_into().ok()?;
@@ -101,6 +107,10 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 gain_max: u("gain_max")? as u32,
                 focus_min: u("focus_min")? as u32,
                 focus_max: u("focus_max")? as u32,
+                // Optional: a driver from before has none, and the page then shows the optics as unknown.
+                sensor_mm: (one("sensor_width_mm"), one("sensor_height_mm")),
+                focal_mm: one("focal_mm"),
+                f_number: one("f_number"),
             })
         })();
         match cam {
@@ -284,6 +294,10 @@ mod tests {
             ("gain_max".to_string(), vec![VsfType::u5(1 << 14)]),
             ("focus_min".to_string(), vec![VsfType::u4(1 << 11)]),
             ("focus_max".to_string(), vec![VsfType::u4(0x7800)]),
+            ("sensor_width_mm".to_string(), f(&[9.792])),
+            ("sensor_height_mm".to_string(), f(&[7.3728])),
+            ("focal_mm".to_string(), f(&[6.9])),
+            ("f_number".to_string(), f(&[1.68])),
         ];
         let mut b = vsf::VsfBuilder::new();
         let mut s = vsf::file_format::VsfSection::new("camera");
@@ -304,6 +318,7 @@ mod tests {
         assert_eq!((c.id, c.name.as_str(), c.width, c.height, c.black, c.white, c.rotation), (0, "main", 4080, 3072, 64, 1023, 1));
         assert_eq!(c.cfa & 3, 1);
         assert_eq!(c.idt[4], 1.);
+        assert_eq!((c.sensor_mm, c.focal_mm, c.f_number), ((9.792, 7.3728), 6.9, 1.68));
     }
 
     #[test]

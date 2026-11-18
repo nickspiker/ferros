@@ -116,6 +116,7 @@ The list is a VSF document (the house format for anything structured); a frame i
 The ids: 0 the main (boitata), 1 the ultrawide (oksoko), 2 the front (dokkaebi), 3 the tele (kraken); each is also the `camera` switch's module (ferros_cam cams).
 
 A `camera` section's fields: `id` (u), `name` (a: main, ultrawide, front), `facing` (u: 0 away from the person, 1 toward), `width` and `height` (u: the readout), `cfa` (u: the 2 x 2 cell's channels, 2 bits each, top left first, 0 R 1 G 2 B: husky's main G B / R G is G#49), `black` and `white` (u), `rotation` (u: quarter turns clockwise to stand it upright; husky's main 1), `idt` (nine f5: the Absolute IDT's matrix, row-major, camera to VSF RGB), `sensitivity` (three f5), `exposure_min`, `exposure_max` (u, ns), `gain_min`, `gain_max` (u, 1024 unity), `focus_min`, `focus_max` (u; both 0 where focus is not offered).
+Since 2026-11-17 (owner: "Missing lens stats on the Lumis page") also the optics, each Android's Camera2 value as Lumis recorded it on the Pro (ferros_cam optics): `sensor_width_mm`, `sensor_height_mm` (f5: SENSOR_INFO_PHYSICAL_SIZE from Lumis's enumeration, Lumis docs/google-bug-tele-maxres-fov.md; the front's derived from its recorded 35 mm equivalent), `focal_mm` and `f_number` (f5: LENS_FOCAL_LENGTH and LENS_APERTURE from each camera's calibration capture of 2026-10-21). Main 9.792 x 7.3728 mm, 6.9 mm, f/1.68; ultrawide 6.4 x 4.8, 2.23, f/1.95; front 4.6846 x 3.3378 (derived), 2.74, f/2.2; tele 5.6448 x 4.2336, 18.0, f/2.8. Not recorded anywhere found, so not listed: the nearest focus distance (Lumis keeps its own 8 dioptres for the main's slider) and stabilisation (the main's OIS part is on its bus, ferros does not drive it). Lumis 0.2.12 (std/lumis) reads them, a driver without them giving zeros (shown as unknown); its page then draws each sensor, its field of view, pixel size, focal length and aperture.
 The IDT is the device's calibration (husky's main: `pixel 8 pro calibration data/derived/cam2-main.idt.vsf`), kept in the vault beside the sensor's init, never in a kist: `cam.<key>.idt` (the `.idt.vsf` file as it is: `cam.boitata.idt`, `cam.oksoko.idt`, `cam.dokkaebi.idt`, `cam.kraken.idt` from cam2-main, cam3-ultrawide, cam7-front, cam4-tele).
 Since 2026-11-15 the driver reads it there at every LIST and carries its Absolute entry's matrix and sensitivity in that camera's section (ferros_cam list); a camera whose IDT is absent is not listed.
 Until then the main's was not read from the vault at all: the driver's build.rs read the repository's file and built the list in.
@@ -465,6 +466,28 @@ Lumis sends ISO as gain in 1024ths of one (ISO 100 = 1024) and holds it inside t
 - **The input-referred noise keeps falling thru 160x**: a gain after the ADC multiplies everything already quantised, so its noise grows exactly with it (x2 a doubling, x1.25 from 128x to 160x); measured x1.67 from 64x to 128x and x1.10 from 128x to 160x. So the gain is still applied before the noise floor there: analogue to the stated 160x, and **the main's ceiling stays 1024 to 163840** (ISO 100 to 16000).
 - The caveat the test cannot close: a sensor whose ADC has more bits than its RAW10 output, with digital gain applied before the cut to 10 bits, shows no empty codes until that gain passes the extra bits; the noise growth above still argues against it up to 160x.
 - **The ultrawide** (dark, 128 us): noise 7, 8, 11, 16 sixteenths at 1x, 2x, 4x, 8x and 77 at 64x (x4.8 from 8x to 64x, against x8 for a gain after the ADC); every code near the mean holding samples at 64x (43 of 43); lit (its init's exposure) the same, no empty codes to 64x. **Its ceiling: 1024 to 65536** (ISO 100 to 6400), now in `ARRAYS`, so Lumis's ISO works on it too. (The console ring dropped the 11x to 45x lines of its dark run; the runs are in /mnt/Harbor/tmp/camtrials/runs.)
+
+## The preview's split (2026-11-17), measured on the Pro
+
+The owner: Lumis's preview about 14 frames a second.
+Lumis (std/lumis, branch preview-split) hand-spawned on the Pro (forge 9eaa7afa, attested), no ira or vault domain (nothing stored), the main camera, about 50 s a run; its probe says every 2^2 s the UI's passes, the passes with a new image, the images never drawn, Lumis's draw and the convert; its camera line every 64 frames the sensor's period by the driver's clock and the frames never taken; fluor's line the bake (present) and op 22; `diag clock` the A715s' clock.
+
+**The path**: sensor, the driver's ring (the view; the 6 MiB reply is no longer on the path), Lumis's camera thread (MAP, copy out of the view and unpack to 16 bits, the integrator's whole finalize every frame at exposure 0), then the UI thread (Lumis's CPU draw of the camera image into an RGB888 frame of the panel's size, the convert to G2t16, fluor's clear and bake, op 22, the display's publish).
+The two threads overlap, but share one rayon pool of four on the four A715s with the display's publish workers and the driver's frame thread.
+
+**The init's mode** (67.27 ms, 14.87 a second):
+- The camera thread takes every frame: waiting 14 to 41 ms, unpacking 10 to 26, the integrator 15 to 30.
+- Lumis's draw of a new image: 37 to 85 ms, in two states. Passes 35 in 4.2 s, every one a new image, draw 82 to 85 ms: 8.4 new images a second, 27 of 61 never drawn. Or passes 115, 58 new, draw 37 to 39 ms: 14 a second, 2 to 3 never drawn.
+- The two states are the kernel's A715 lift (service.rs `interactive`): 2367 MHz while shown frames come within 2^-4 s of each other, else 1065 MHz. At 85 ms a draw the frames come too far apart, the clock stays calm and the draw stays slow; the ratio of the draws is the ratio of the clocks.
+- Every pass whole (before redraw on change): fluor draw 44 to 68 ms a frame, present (bake) 11.3 to 15.8 ms, clear 4.7 to 5.9, Lumis's convert 4.2 to 6.6; the display's publish 9 to 10 ms a show.
+- Redraw on change: present 5.0 to 7.7 ms and convert 0.8 to 3.3 ms a pass on average; new images drawn the same (34 to 55 of 60 in 4.1 s): the draw decides them.
+
+**The binned cut** (kind 1):
+- fll 4096 (77 a second) and fll 3328 (94): the stream dies in 2 to 3 s under Lumis (`no frame in A#2097 ms`, image status G#1), three times of three, as the 96-a-second deaths in an attested session.
+- fll 7168 (22.57 ms, 44.3 a second), redraw on change: the camera thread is the wall, 52.6 to 57 ms a frame (waiting under 1 ms, unpacking 15 to 27, the integrator 28 to 41): 17.5 images a second, 80 to 97 of every 160 of the driver's frames never taken.
+- Lumis draws 33 to 39 of those 70 to 77 images in 4.1 s (8.5 a second), every pass a new image, the draw 58 to 70 ms, fluor's present 24 to 27 ms; the A715s at 1065 MHz, busy 256 of 256 (1588 saturated windows), never lifted.
+
+**So, for 120**: the sensor's 15 is a wall only with nothing else in the way; above it, at the A715s' calm clock, the camera thread caps at about 18 and Lumis's draw at 8 to 14. Ranked: Lumis's draw (a develop at panel size straight to the panel's codes, or the GPU), the camera thread's intake (cambench's NEON read-and-add from the view, 7 to 9 ms a frame at 96 measured), the lift's trap (a camera stream or a busy cluster is an animation too), the stream's death above 44 a second in an attested session, then the bake and the publish.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
