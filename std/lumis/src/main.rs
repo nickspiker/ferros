@@ -678,10 +678,23 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             turns = Turns::default();
             reopened = Some((t_close, std::time::Instant::now()));
         }
-        let Some(got) = src.next(&mut turns) else {
-            // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
-            keep_saves(vault.as_deref(), &mut *integrator.header);
-            lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
+        let slit_now = src.is_slit();
+        let got = match src.next(&mut turns) {
+            Some(got) => got,
+            // A slit stream that ends (the Pro, 2026-11-18: a stored driver from before the detached slit stops after one; the forge driver's at 1296 and 3236 slits on LATE_CONFIG) ends that driver, not Lumis: whole frames are opened (no CLOSE: the driver closed itself, and a call would start a stored one on demand only to close it), and Slitscan takes its band from them.
+            None if slit_now => {
+                println!("lumis: camera {}: the slits stopped (the driver ended); whole frames again, and Slitscan takes its band from them", cam.name);
+                slit_ok = false;
+                src = reopen_whole(&cam, vault.as_deref(), &mut *integrator.header);
+                sent = (-1, -1, -1.);
+                turns = Turns::default();
+                continue;
+            }
+            None => {
+                // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
+                keep_saves(vault.as_deref(), &mut *integrator.header);
+                lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
+            }
         };
         if let Some((t_close, t_open)) = reopened.take() {
             println!("lumis: camera {}: reopened: the OPEN answered A#{} ms after the CLOSE began, the first {} A#{} ms after it", cam.name, (t_open - t_close).as_millis(), if src_is_slit(&got) { "slit" } else { "frame" }, t_close.elapsed().as_millis());
