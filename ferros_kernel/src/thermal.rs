@@ -103,7 +103,7 @@ fn on_x3() -> bool {
 fn div_readable(k: usize) -> bool {
     match k {
         0 => true,
-        1 => crate::smp::UP.load(Relaxed) != 0,
+        1 => crate::smp::UP.load(Relaxed) & crate::smp::BIG_WORKERS != 0,
         2 => on_x3(),
         _ => rd(PD_G3D_STATUS) & 1 == 1,
     }

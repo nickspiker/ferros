@@ -1889,7 +1889,7 @@ struct Gov {
     domain: u32,
     /// The operating points, kHz, lowest first (zuma-b0-ipop.dts `pixel_em`, cpu8 and cpu4): the X3's whole table; the A715s' up to 1065 MHz, their active clock until the owner picks (THERMAL.md decision 3; 2367 trips the clock divider).
     opps: &'static [u32],
-    /// The cores: bit k for worker k (smp.rs), or 0 for the kernel's own core.
+    /// The cores: bit c for worker core c (MPIDR Aff1, smp.rs `UP`), or 0 for the kernel's own core.
     cores: u32,
     /// What the load asks, kHz: up at once, down an eighth of the way a window.
     level: u32,
@@ -1900,8 +1900,8 @@ struct Gov {
     last: u32,
     /// Windows in a row with the busy share at 7/8 or more.
     sat: u32,
-    /// Each core's idle ticks at the window's start.
-    idle: [u64; 4],
+    /// Each core's idle ticks (the A510s': busy ticks) at the window's start, by Aff1 (the kernel's core in slot 0 for the X3's).
+    idle: [u64; 8],
     /// Counter ticks spent at each operating point (since boot or `diag clock reset`).
     res: [u64; 16],
     /// Rate requests sent.
@@ -1911,6 +1911,10 @@ const X3_OPPS: [u32; 15] = [500_000, 880_000, 1_164_000, 1_298_000, 1_557_000, 1
 const A715_OPPS: [u32; 15] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000, 1_221_000, 1_328_000, 1_418_000, 1_572_000, 1_836_000, 1_945_000, 2_130_000, 2_245_000, 2_367_000];
 /// The A715s' ceiling while nobody interacts (`interactive`): 1065 MHz, their active clock before the owner's lift (THERMAL.md decision 3, 2026-11-17: "lift the core cap, yes" during interaction).
 const A715_CALM_KHZ: u32 = 1_065_000;
+/// The A510s' operating points, kHz (zuma-b0-ipop.dts `pixel_em` cpu0; zuma-cpu.dtsi cpufreq_domain0 324 to 1704 MHz, and under 324 the device resets: POWER.md "Floors are real").
+const A510_OPPS: [u32; 10] = [324_000, 610_000, 820_000, 955_000, 1_098_000, 1_197_000, 1_328_000, 1_425_000, 1_548_000, 1_704_000];
+/// The A510s' ceiling while nobody interacts: 1425 MHz, the boot's and the active tier's rate for them, the last point before the energy model's cliff (57 to 155 at 1548 MHz in `pixel_em`, THERMAL.md). While lifted their whole table, as the A715s' (`GOV_LIFT_KHZ` above the A715s' calm, or no lift at all).
+const A510_CALM_KHZ: u32 = 1_425_000;
 /// The clusters' ceiling while someone interacts (`diag clock lift <kHz>`; the A715s' whole table by default, 0 for no lift: the calm ceiling always). The X3 has no calm ceiling: its whole table either way.
 static GOV_LIFT_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2_367_000);
 /// How long the lift holds after the last input (a touch interrupt or an injected batch), as a right shift of the counter's frequency (`diag clock hold <n>`, 1: half a second). A real deadline: a finger lifted ends the input but not the frames it set going (a fling, a settle), whose first frames must not be drawn at the calm clock, and Photon's frames during a drag came 50 to 70 ms apart (2026-11-17), so the animation's own sign (`process::ANIM_AT`, frames 2^-4 s apart or closer) can take over only once the lifted clock has sped them up.
@@ -1962,10 +1966,12 @@ fn interactive(now: u64, f: u64) -> bool {
     lift_causes(now, f) != 0
 }
 
-/// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `A715_CALM_KHZ`.
+/// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
 fn gov_top(g: &Gov, lifted: bool) -> usize {
     let cap = match (g.domain, lifted) {
         (4, _) => u32::MAX,
+        (2, true) if GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ => u32::MAX,
+        (2, _) => A510_CALM_KHZ,
         (_, true) => GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed).max(A715_CALM_KHZ),
         (_, false) => A715_CALM_KHZ,
     };
@@ -1975,9 +1981,12 @@ fn gov_top(g: &Gov, lifted: bool) -> usize {
 /// The shared tier is active while the governor asks more than these (the rest profile's X3 before the adaptive clock, and the A715s' middle).
 const X3_REST_KHZ: u32 = 2_049_000;
 const A715_REST_KHZ: u32 = 712_000;
-static mut GOV: [Gov; 2] = [
-    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 4], res: [0; 16], asks: 0 },
-    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 4], res: [0; 16], asks: 0 },
+/// The A510s' middle, likewise: over it they ask the active tier too (their cluster shares the DSU and MIF with the others).
+const A510_REST_KHZ: u32 = 955_000;
+static mut GOV: [Gov; 3] = [
+    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
+    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF0, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
+    Gov { domain: 2, opps: &A510_OPPS, cores: 0xF, level: 324_000, at: 0, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
 ];
 /// Whether the governor runs (`diag clock gov on|off`; off, the X3 and the A715s follow the tier tables as before 2026-11-13).
 static GOV_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
@@ -1999,13 +2008,13 @@ static mut GOV_SHOWN_SEEN: u64 = 0;
 static mut GOV_SHOWN_AVG: u64 = 0;
 static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(192);
 
-/// What asks the shared domains for the active tier now, one bit each (`TIER_CAUSES`): the governor asking the X3 over `X3_REST_KHZ` (bit 0) or the A715s over `A715_REST_KHZ` (bit 1), the GPU's sustained work (bit 2), the frames shown (bit 3). `clock_policy` adds input with the governor off (bit 4) and a PT transfer's hold (bit 5). None: rest, once the dwell has passed (`TIER_DWELL`).
-fn tier_active(govs: &[Gov; 2]) -> u8 {
+/// What asks the shared domains for the active tier now, one bit each (`TIER_CAUSES`): the governor asking the X3 over `X3_REST_KHZ` (bit 0) or the A715s over `A715_REST_KHZ` (bit 1), the GPU's sustained work (bit 2), the frames shown (bit 3), the A510s over `A510_REST_KHZ` (bit 6). `clock_policy` adds input with the governor off (bit 4) and a PT transfer's hold (bit 5). None: rest, once the dwell has passed (`TIER_DWELL`).
+fn tier_active(govs: &[Gov; 3]) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
-    (govs[0].opps[govs[0].at] > X3_REST_KHZ) as u8 | ((govs[1].opps[govs[1].at] > A715_REST_KHZ) as u8) << 1 | ((unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed)) as u8) << 2 | ((unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)) as u8) << 3
+    (govs[0].opps[govs[0].at] > X3_REST_KHZ) as u8 | ((govs[1].opps[govs[1].at] > A715_REST_KHZ) as u8) << 1 | ((unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed)) as u8) << 2 | ((unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)) as u8) << 3 | ((govs[2].opps[govs[2].at] > A510_REST_KHZ) as u8) << 6
 }
-pub const TIER_CAUSES: usize = 6;
-const TIER_CAUSE_NAMES: [&str; TIER_CAUSES] = ["X3", "A715", "GPU", "frames", "input", "transfer"];
+pub const TIER_CAUSES: usize = 7;
+const TIER_CAUSE_NAMES: [&str; TIER_CAUSES] = ["X3", "A715", "GPU", "frames", "input", "transfer", "A510"];
 /// The rest tier is taken only once nothing has asked for the active one for 2^-`TIER_DWELL` s (`diag clock dwell <n>`; 0, the default, no dwell: the tier follows its causes window by window).
 /// A real deadline, checked on the service loop's passes: a switch is seven ACPM requests, each waited for by a rate read (`clock_profile`), and on b922 (2026-11-17) the tier switched 2973 times in 16 minutes, about three a second, its causes crossing their thresholds from one 2^-6 s window to the next. Measured on b923 at rest (Photon in front, 64 s each, the frames threshold at 96): no dwell 128 switches with the active tier 14 % of the time, 2^-2 s 66 switches at 51 %, 2^-1 s 45 at 71 %: the causes come in bursts about a second apart, so a dwell halves the switches only by holding MIF and the DSU up most of the time (about 0.36 W). Kept as a knob.
 static TIER_DWELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2041,25 +2050,32 @@ fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
     use core::sync::atomic::Ordering::Relaxed;
     let up = crate::smp::UP.load(Relaxed);
     let mut share = None;
-    for k in 0..4 {
-        if g.cores == 0 && k != 0 {
+    // The kernel's core alone (its idle ticks in slot 0), or each of the cluster's cores by Aff1.
+    for c in 0..8 {
+        if g.cores == 0 && c != 0 {
             break;
         }
-        let idle = if g.cores == 0 { X3_IDLE_TICKS.load(Relaxed) } else { crate::smp::IDLE_TICKS[k].load(Relaxed) };
-        let slept = idle.wrapping_sub(g.idle[k]);
-        g.idle[k] = idle;
-        if g.cores != 0 && (g.cores & up) & 1 << k == 0 {
+        if g.cores != 0 && g.cores >> c & 1 == 0 {
             continue;
         }
-        // WHY the min: a sleep is added when it ends, so one begun in the window before lands whole in this one and can be longer than the window; the busy time would then wrap to a huge number.
-        let busy = el - slept.min(el);
+        // The A510s by the time they ran threads (smp.rs `busy`, a run still going counted as it goes: they sleep until an event, and a long sleep not yet ended would read as busy); the others by the time they slept.
+        let little = g.domain == 2;
+        let mark = if g.cores == 0 { X3_IDLE_TICKS.load(Relaxed) } else if little { crate::smp::busy(c, cntpct()) } else { crate::smp::IDLE_TICKS[c].load(Relaxed) };
+        // WHY saturating, and the max, for the A510s: `smp::busy` can read a pass that ended between its two loads as not yet counted, under the mark the last window took with that pass still going; the count must not go back (it would wrap to a whole window busy), so the mark holds and the time lands in the next window.
+        let d = if little { mark.saturating_sub(g.idle[c]) } else { mark.wrapping_sub(g.idle[c]) };
+        g.idle[c] = if little { g.idle[c].max(mark) } else { mark };
+        if g.cores != 0 && up >> c & 1 == 0 {
+            continue;
+        }
+        // WHY the mins: a sleep (or a run) is added when it ends, so one begun in the window before lands whole in this one and can be longer than the window; the busy time would then wrap to a huge number, or the share pass 256.
+        let busy = if little { d.min(el) } else { el - d.min(el) };
         let s = (busy * 256 / el) as u32;
         share = Some(share.map_or(s, |m: u32| m.max(s)));
     }
     share
 }
 
-/// The governor's window: each cluster's share measured and its rate moved (`Gov`). `boost` puts both at their top. Returns whether the shared tier should be active for what the clusters ask or the GPU does.
+/// The governor's window: each cluster's share measured and its rate moved (`Gov`). `boost` puts the X3 and the A715s at their top (never the A510s, which follow their pinned threads' load alone). Returns whether the shared tier should be active for what the clusters ask or the GPU does.
 fn governor(now: u64, f: u64, boost: bool) -> u8 {
     use core::sync::atomic::Ordering::Relaxed;
     let el = now.wrapping_sub(unsafe { GOV_AT });
@@ -2092,7 +2108,8 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
             let top = gov_top(g, lifted);
             // WHY the min: a ceiling of the policy, not a guard on the table. Input jumps a cluster no higher than its calm ceiling (the X3: its top; the A715s: 1065 MHz, where input took them before the lift); above it the A715s climb by the load (a saturated window ramps a quarter, 1065 to 2367 MHz in three saturated windows, under 2^-4 s), not in one step: THERMAL.md measured one jump of the A715s from 1065 to 2367 MHz trip the battery-current divider and drop the X3 to 364 MHz.
             let b = boost_at(g).min(gov_top(g, false));
-            if boost && g.at < b {
+            // The A510s are never boosted: they run only pinned threads, and their clock follows those threads' load alone.
+            if boost && g.domain != 2 && g.at < b {
                 g.level = g.opps[b];
                 gov_ask(g, b, f);
             } else if g.at > top {
@@ -2136,7 +2153,7 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         // WHY the mins: the policy's ceilings, as above.
         let top = gov_top(g, lifted);
         let b = boost_at(g).min(gov_top(g, false));
-        if boost && g.level < g.opps[b] {
+        if boost && g.domain != 2 && g.level < g.opps[b] {
             g.level = g.opps[b];
         }
         // Over the ceiling (a lift ended, or a load that grew past it): at the ceiling, and the decay goes on from there.
@@ -2147,6 +2164,11 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         gov_ask(g, at, f);
     }
     tier_active(govs)
+}
+
+/// Whether the governor sets `domain` rather than the tier tables: the X3 and the A715s always; the A510s only while the kernel runs on the X3, as then they run only pinned threads (smp.rs). With the kernel on CPU0 (akita, a FERROS_X3=0 build) the A510s' cluster is the kernel's own and keeps the tiers' rates, as before.
+fn gov_owns(domain: u32) -> bool {
+    domain != 2 || crate::process::kernel_mask() == crate::process::MASK_BIG
 }
 
 /// The operating point input boosts a cluster to: `GOV_BOOST` points under its top (0: the top).
@@ -2179,7 +2201,7 @@ pub fn profile_khz(domain: u32) -> Option<u32> {
         return unsafe { GPU_CLOCKED }.then_some(if state == 3 { 150_000 } else { 890_000 });
     }
     if state != 0 && GOV_ON.load(core::sync::atomic::Ordering::Relaxed) {
-        if let Some(g) = unsafe { (*(&raw const GOV)).iter().find(|g| g.domain == domain) } {
+        if let Some(g) = unsafe { (*(&raw const GOV)).iter().find(|g| g.domain == domain && gov_owns(domain)) } {
             return Some(g.opps[g.at]);
         }
     }
@@ -2258,7 +2280,7 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         if was == 3 && workers_dark {
             crate::smp::launch_all();
             let t0 = cntpct();
-            while crate::smp::UP.load(core::sync::atomic::Ordering::Acquire) != 0xF && cntpct().wrapping_sub(t0) < f / 20 {
+            while crate::smp::UP.load(core::sync::atomic::Ordering::Acquire) & crate::smp::launched() != crate::smp::launched() && cntpct().wrapping_sub(t0) < f / 20 {
                 core::hint::spin_loop();
             }
         }
@@ -2337,7 +2359,7 @@ fn clock_profile(want: u8) {
     let mut last = None;
     let t0 = cntpct();
     for &(d, khz) in table {
-        if d == 4 || d == 3 {
+        if d == 4 || d == 3 || (d == 2 && gov_owns(2)) {
             if own {
                 continue;
             }
@@ -2458,7 +2480,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     for g in govs.iter() {
         let total: u64 = g.res.iter().sum::<u64>().max(1);
         let mean = g.res.iter().zip(g.opps).map(|(&t, &o)| t * (o / 1000) as u64).sum::<u64>() / total;
-        out.extend_from_slice(alloc::format!("{}: asked A#{} MHz (level A#{}), busy last A#{}/256, average A#{}/256, saturated A#{}, A#{} requests, time-weighted mean A#{} MHz\n  ms at each:", if g.domain == 4 { "X3" } else { "A715" }, g.opps[g.at] / 1000, g.level / 1000, g.last, g.avg, g.sat, g.asks, mean).as_bytes());
+        out.extend_from_slice(alloc::format!("{}: asked A#{} MHz (level A#{}), busy last A#{}/256, average A#{}/256, saturated A#{}, A#{} requests, time-weighted mean A#{} MHz\n  ms at each:", match g.domain { 4 => "X3", 3 => "A715", _ => "A510" }, g.opps[g.at] / 1000, g.level / 1000, g.last, g.avg, g.sat, g.asks, mean).as_bytes());
         for (i, &o) in g.opps.iter().enumerate() {
             out.extend_from_slice(alloc::format!(" A#{}:A#{}", o / 1000, ms(g.res[i])).as_bytes());
         }
@@ -3348,18 +3370,18 @@ pub fn run(mut b: Boot) -> ! {
             let mut threads = alloc::vec::Vec::new();
             crate::process::threads_report(&mut threads);
             platform::pstore(&threads);
-            let w = |k: usize| crate::smp::IDLE_WAKES[k].load(core::sync::atomic::Ordering::Relaxed);
-            platform::pstore(alloc::format!("workers: up G#{:X}, idle wakes [{}, {}, {}, {}]; x3 parked {}\n", crate::smp::up_mask(), w(0), w(1), w(2), w(3), crate::x3::parked()).as_bytes());
+            let w: alloc::vec::Vec<u64> = crate::smp::IDLE_WAKES.iter().map(|w| w.load(core::sync::atomic::Ordering::Relaxed)).collect();
+            platform::pstore(alloc::format!("workers: up G#{:X} (bit = core), idle wakes by core {:?}; x3 parked {}\n", crate::smp::up_mask(), w, crate::x3::parked()).as_bytes());
             // Per core, the hand-off words the next cold boot overwrites (the fourth jump of 2026-11-03: the X3 and two workers took their entries and were never heard from): the worker's progress (G#FD60_0B00, low byte the step: 1 arrived, 2 GIC armed, 3 EL0 on, 4-6 loop passes, 8 first slice), its arrival in Rust (0B80), and the hv's two trace words (0C00, 0C80), all in counter ticks.
             for c in 0..9usize {
                 let r = |base: usize| unsafe { core::ptr::read_volatile((base + c * 8) as *const u64) };
                 platform::pstore(alloc::format!("core {}: step {} at G#{:X}, arrived G#{:X}, hv G#{:X} G#{:X}\n", c, r(0xFD60_0B00) & 0xFF, r(0xFD60_0B00) & !0xFF, r(0xFD60_0B80), r(0xFD60_0C00), r(0xFD60_0C80)).as_bytes());
             }
-            // The hand-over blocks the X3 (G#819F_F100) and the workers (G#819F_F200 + k * G#80) read with their MMU off, beside this core's own registers: the jump freezes Android's CPUs but not its DMA masters, so a block that differs from what was written says a device wrote into ferros's memory (the theory for the 2026-11-03 jumps whose cores died before their first Rust line).
+            // The hand-over blocks the X3 (G#819F_F100) and the workers (G#819F_F200 + (core XOR 4) * G#80) read with their MMU off, beside this core's own registers: the jump freezes Android's CPUs but not its DMA masters, so a block that differs from what was written says a device wrote into ferros's memory (the theory for the 2026-11-03 jumps whose cores died before their first Rust line).
             let (mair, tcr, ttbr, sctlr, hcr): (u64, u64, u64, u64, u64);
             unsafe { core::arch::asm!("mrs {a}, mair_el2", "mrs {b}, tcr_el2", "mrs {c}, ttbr0_el2", "mrs {d}, sctlr_el2", "mrs {e}, hcr_el2", a = out(reg) mair, b = out(reg) tcr, c = out(reg) ttbr, d = out(reg) sctlr, e = out(reg) hcr) };
             platform::pstore(alloc::format!("live: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X}\n", mair, tcr, ttbr, sctlr, hcr).as_bytes());
-            for (name, base) in [("x3", 0x819F_F100usize), ("w0", 0x819F_F200), ("w1", 0x819F_F280), ("w2", 0x819F_F300), ("w3", 0x819F_F380)] {
+            for (name, base) in [("x3", 0x819F_F100usize), ("c4", 0x819F_F200), ("c5", 0x819F_F280), ("c6", 0x819F_F300), ("c7", 0x819F_F380), ("c0", 0x819F_F400), ("c1", 0x819F_F480), ("c2", 0x819F_F500), ("c3", 0x819F_F580)] {
                 let r = |o: usize| unsafe { core::ptr::read_volatile((base + o) as *const u64) };
                 platform::pstore(alloc::format!("{}: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X} vbar G#{:X} cptr G#{:X} stack G#{:X} cnthctl G#{:X}\n", name, r(0), r(8), r(16), r(24), r(32), r(40), r(48), r(56), r(88)).as_bytes());
             }
@@ -4698,6 +4720,20 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"smp little off" || cmd.params == b"smp little on" {
+                    // `diag smp little off|on`: the A510s switched off (and kept off by later launches) or started again, for their idle cost; threads pinned there run on the other cores meanwhile (process.rs `may_run`: a mask with no core up runs anywhere).
+                    let on = cmd.params == b"smp little on";
+                    crate::smp::LITTLE_ON.store(on, core::sync::atomic::Ordering::Relaxed);
+                    if on {
+                        crate::smp::launch_all();
+                    } else {
+                        crate::smp::stop(crate::smp::LITTLE);
+                    }
+                    let (up, _) = crate::smp::report();
+                    resp.extend_from_slice(alloc::format!("workers up G#{up:X} (bit = core)\n").as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"smp off" || cmd.params == b"smp on" {
                     // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
                     if cmd.params == b"smp off" {
@@ -4847,7 +4883,7 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"PT_PROC_CMDS=", st.proc_cmds);
                 // The heat (thermal.rs `diag`): the hottest zone, °C, and which; the X3's uncapped rate in MHz while the policy caps it (0 = not); the kernel's core's clock measured, the firmware's rate for the X3, the slow and firmware-capped seconds, the X3's divider bits seen.
                 crate::thermal::diag(&mut resp);
-                for k in 4..9 {
+                for k in 0..9 {
                     append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
                 }
                 append_hex(&mut resp, b"SPSR_MASKED=", crate::process::SPSR_MASKED.load(core::sync::atomic::Ordering::Relaxed) as u32);
@@ -4874,15 +4910,18 @@ pub fn run(mut b: Boot) -> ! {
                     for (k, v) in on.iter().enumerate() {
                         append_hex(&mut resp, alloc::format!("SMP_ON_{k}=").as_bytes(), *v as u32);
                     }
-                    for (k, s) in crate::process::SLICES.iter().enumerate().filter(|(k, _)| (4..=8).contains(k)) {
+                    for (k, s) in crate::process::SLICES.iter().enumerate().filter(|(k, _)| *k <= 8) {
                         append_hex(&mut resp, alloc::format!("SLICES_C{k}=").as_bytes(), s.load(core::sync::atomic::Ordering::Relaxed) as u32);
                     }
                     append_hex(&mut resp, b"LOCK_SPINS=", crate::process::LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed) as u32);
                     for (k, w) in crate::smp::IDLE_WAKES.iter().enumerate() {
-                        append_hex(&mut resp, alloc::format!("IDLE_WAKES_C{}=", k + 4).as_bytes(), w.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                        append_hex(&mut resp, alloc::format!("IDLE_WAKES_C{}=", k).as_bytes(), w.load(core::sync::atomic::Ordering::Relaxed) as u32);
                     }
                     // Why idle cores take the lock: the queue count, the interrupt flag, and how far off the next deadline is (signed ms; negative = already passed, which would make every core look on every event-stream tick).
                     append_hex(&mut resp, b"IDLE_RUNNABLE_N=", crate::process::RUNNABLE_N.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    append_hex(&mut resp, b"IDLE_RUNNABLE_LITTLE=", crate::process::RUNNABLE_LITTLE.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    // CTR_EL0 as the weakest of every core that has run ferros (cachemap `CTR_ALL`: IDC bit 28, DIC bit 29).
+                    append_hex(&mut resp, b"SMP_CTR_ALL=", crate::cachemap::CTR_ALL.load(core::sync::atomic::Ordering::Relaxed) as u32);
                     append_hex(&mut resp, b"IDLE_IRQ_ANY=", unsafe { core::ptr::read_volatile(&raw const crate::process::__irq_any) } as u32);
                     let nw = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Relaxed);
                     let now = cntpct();

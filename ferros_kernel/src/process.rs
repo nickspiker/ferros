@@ -443,15 +443,20 @@ fn frame_check(f: &mut Frame) {
 pub static SLICES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 /// How many threads the run queue holds, readable without the lock: an idle core looks here before it takes the lock (five cores taking the lock on every `sev` contended it 100,000 times in a few seconds, 2026-10-23).
 pub static RUNNABLE_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// How many queued threads an A510 may run (`may_run`), readable without the lock: an idle A510 looks only when this is not zero (smp.rs), so with nothing pinned there the A510s never take the lock. Counted only while an A510 is up.
+pub static RUNNABLE_LITTLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn runnable_sync() {
-    RUNNABLE_N.store(k().runnable.len(), core::sync::atomic::Ordering::Release);
+    let q = &k().runnable;
+    RUNNABLE_N.store(q.len(), core::sync::atomic::Ordering::Release);
+    let little = if cores_up() & MASK_LITTLE == 0 { 0 } else { q.iter().filter(|&&t| mask_of(t) & MASK_LITTLE != 0).count() };
+    RUNNABLE_LITTLE.store(little, core::sync::atomic::Ordering::Release);
 }
 /// Wake every other core: `sev` for one in `wfe` (the kernel's core, on the event stream) and SGI 1 to all others for the workers in `wfi` (smp.rs idle loop). ICC_SGI1R_EL1 with IRM (bit 40) = every core but this one.
 pub fn kick(mask: u16) {
     unsafe {
         core::arch::asm!("sev");
         // Only when a worker may run it: the render thread, pinned to the X3, sat in the queue whenever the X3 was busy, and every kick for it woke four cores to find nothing (2026-10-23).
-        if mask & MASK_WORKERS != 0 || mask & cores_up() == 0 {
+        if mask & (MASK_WORKERS | MASK_LITTLE) != 0 || mask & cores_up() == 0 {
             core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (1u64 << 40) | (1u64 << 24));
         }
     }
@@ -646,7 +651,7 @@ fn make_way(t: usize) {
     let mut longest = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
     for c in 0..16 {
         // Not this core: its thread is the waker, in the kernel now, and if it blocks next this core takes the woken thread itself; an SGI to itself would land on whatever it switched to.
-        if (m & (MASK_WORKERS | kernel_mask())) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
+        if (m & (MASK_WORKERS | MASK_LITTLE | kernel_mask())) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
             continue;
         }
         let Some(r) = cur[c] else { continue };
@@ -1176,15 +1181,17 @@ pub fn pin_key(name: &[u8]) -> u64 {
 }
 /// The A715s (cores 4-7): where processes run unless they ask otherwise.
 pub const MASK_WORKERS: u16 = 0x00F0;
+/// The A510s (cores 0-3, 2026-11-18): only threads that pin there run there (`ferros_sys::CORES_LITTLE`), at their cluster's own clock (service.rs `governor`).
+pub const MASK_LITTLE: u16 = 0x000F;
 /// The X3 (core 8): the kernel's core, for the one real compute path (the display's render thread) and otherwise idle between service-loop passes.
 pub const MASK_BIG: u16 = 0x0100;
 /// The kernel's core as a mask: the X3 when the kernel moved there (board::x3), else CPU0, where it stayed. "Big" means this core: a thread pinned to the X3 runs here, and the kernel-side switches (SYS_POWER) are served here. Until 2026-11-06 it was the X3 always, so with the kernel on CPU0 (akita, or husky's FERROS_X3=0) a pinned thread waited for a core that never started and every power switch was refused.
 pub fn kernel_mask() -> u16 {
     if crate::board::x3() { MASK_BIG } else { 0x0001 }
 }
-/// The cores that are up: the kernel's, and the workers smp.rs reports.
+/// The cores that are up: the kernel's, and the workers smp.rs reports (its mask is by core already: bit = MPIDR Aff1).
 fn cores_up() -> u16 {
-    kernel_mask() | ((crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16) << 4)
+    kernel_mask() | crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16
 }
 
 /// The most of a process's last console line kept for its end's flash log line (`Process::words`).

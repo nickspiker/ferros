@@ -543,11 +543,16 @@ pub fn from_android() -> bool {
     FROM_ANDROID.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether core `aff1` (MPIDR Aff1) waits on the hv's mailbox: parked there by the jump from Android, powered, for `start_core` to send on.
+pub fn on_mailbox(aff1: usize) -> bool {
+    jumped() && unsafe { read_volatile((crate::board::hv_mailbox() + aff1 * 32 + 16) as *const u64) } == 1
+}
+
 /// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. A core that is not parked there (Android had it off) gets PSCI CPU_ON.
 pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
     // A core Android had already taken offline is not on the mailbox: PSCI CPU_ON below, Linux's own way back from its own offline.
     let slot = crate::board::hv_mailbox() + aff1 * 32;
-    if jumped() && unsafe { read_volatile((slot + 16) as *const u64) } == 1 {
+    if on_mailbox(aff1) {
         unsafe {
             write_volatile((0xFD60_0C80usize + aff1 * 8) as *mut u64, cntpct() | 1);
             write_volatile((slot + 8) as *mut u64, ctx);
@@ -591,16 +596,16 @@ pub fn mark_trail(m: u8) {
 }
 
 /// The low two bits say how far: 1 into Rust, before `cpu_inform_clear`'s firmware call; 2 past it (`note_arrival_step(2)`). The seventh jump of 2026-11-03: the X3 took its entry with an intact hand-over block and never wrote the arrival, and that call came first.
-/// The last session's hand-off words for cores 4-8, into the pstore ring before this boot starts any core over them (no heap yet): per core the arrival word (G#11-G#17: the entry step it reached; a counter: Rust, low bits 1 or 2) and the hv's two trace words. The ninth jump of 2026-11-03 froze at its first TRNG call with the X3 launched, and the cold boot after it overwrote the X3's marks.
+/// The last session's hand-off words for cores 0-8, into the pstore ring before this boot starts any core over them (no heap yet): per core the arrival word (G#11-G#17: the entry step it reached; a counter: Rust, low bits 1 or 2) and the hv's two trace words. The ninth jump of 2026-11-03 froze at its first TRNG call with the X3 launched, and the cold boot after it overwrote the X3's marks.
 pub fn pstore_prev_handoff() {
-    let mut line = [0u8; 5 * 60 + 32];
+    let mut line = [0u8; 9 * 60 + 32];
     let mut n = 0;
     let mut put = |b: &[u8], n: &mut usize| {
         line[*n..*n + b.len()].copy_from_slice(b);
         *n += b.len();
     };
     put(b"ferros: last session's hand-off:", &mut n);
-    for c in 4..9usize {
+    for c in 0..9usize {
         put(&[b' ', b'c', b'0' + c as u8], &mut n);
         for base in [0xFD60_0B80usize, 0xFD60_0C80, 0xFD60_0C00] {
             let v = unsafe { read_volatile((base + c * 8) as *const u64) };
