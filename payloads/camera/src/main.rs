@@ -958,6 +958,11 @@ struct Open {
     probed: bool,
     /// The view was given to the holder (an OPEN that asked for it).
     view: bool,
+    /// The view is mapped write-back (docs/CAMERA.md "A cacheable view"; the OPEN's view byte with `VIEW_CACHED`): every buffer handed over by MAP has its lines cleaned and invalidated first (`lines`), and a held buffer's probe line before its release reads it.
+    cached: bool,
+    /// The maintenance's ticks at MAP (summed and the most, for the console every 64).
+    inv_sum: u64,
+    inv_max: u64,
     /// The count of the last frame handed to the kist (MAP), the buffer it holds and that buffer's probe as handed out, to tell at its release whether anything wrote it meanwhile.
     given: u64,
     held: Option<(usize, [u64; 8])>,
@@ -1613,7 +1618,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1915,14 +1920,30 @@ fn bin_frame(o: &Open, bin: usize, b: usize) -> usize {
 
 /// An OPEN's reply with the view: `[0]`, the view's token (32 bytes, at 1), the ring's buffers (33), the format (34: 1 MIPI RAW10, 2 RAW12), width and height (u16 at 36, 38), a line's bytes (u32 at 40), a buffer's bytes in the view (u32 at 44).
 /// An OPEN that carried a mode block gets `VIEW_REPLY_MODE` bytes: also the ring's buffers as a u32 (at 48: a slit ring's hundreds), 1 for a slit ring (52), the record's place in a slit buffer (u32 at 56: its rows' bytes); an OPEN without one the 48 bytes Lumis reads.
+/// An OPEN that asked for the view write-back (`VIEW_CACHED`) gets the 64 bytes too, and 1 at 53 when it was given so (0: non-cacheable, a kernel from before or a slit ring).
 const VIEW_REPLY: usize = 48;
 const VIEW_REPLY_MODE: usize = 64;
+/// The OPEN's view byte (`[1][id][view]`): bit 0 the view; bit 1 (2026-11-18, docs/CAMERA.md "A cacheable view") mapped write-back, each buffer's lines cleaned and invalidated by the kernel as MAP hands it over, so the holder reads it thru its caches.
+const VIEW_ASKED: u8 = 1 << 0;
+const VIEW_CACHED: u8 = 1 << 1;
+/// A device test only (the hand spawn's ninth input byte 1): a write-back view's buffers handed over by MAP without their maintenance, to show what a reader sees without it (stale lines from the last time round the ring).
+static NO_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes `at` to `at + len` of ring buffer `b` cleaned and invalidated in every core's caches by the kernel (SYS_DMA x1 = 6, process.rs `cam_lines`), for a write-back view (docs/CAMERA.md "A cacheable view"): the counter's ticks it took.
+fn lines(g: u64, o: &Open, b: usize, at: usize, len: usize) -> u64 {
+    let off = RING_VA.load(Ordering::Relaxed) as usize - o.va + b * BUF.load(Ordering::Relaxed) as usize + at;
+    ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 6, off as u64, len as u64, 0)
+}
 
 /// The kist's held buffer given back: its hold cleared, and its probe compared with what it read when handed out, which tells whether anything wrote the buffer while it was held (the ring's promise: never; counted, and said the first time).
+/// With a write-back view the probe's line is dropped from the caches first: the holder read it thru them, and a non-cacheable read meeting the line a core kept is not promised to see DRAM (the architecture's mismatched attributes), so a write while held could read as none.
 fn release(g: u64, o: &mut Open, b: usize) {
     let Some((h, then)) = o.held else { return };
     if h != b {
         return;
+    }
+    if o.cached {
+        lines(g, o, b, probe_off(), 64);
     }
     if probe_read(b) != then {
         o.overwritten += 1;
@@ -2033,6 +2054,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 7 {
         DETACH.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 7) as *const u8) } as u64, Ordering::Relaxed);
     }
+    if input_len > 8 {
+        NO_LINES.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 8) as *const u8) } as u64, Ordering::Relaxed);
+    }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
@@ -2121,16 +2145,27 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 out[0] = r;
                 let mut len = 1;
                 if let (0, Some(o)) = (r, open_cam.as_mut()) {
-                    if got >= 3 && msg[2] == 1 && o.ring < VIEW_LEAST {
+                    let asked = got >= 3 && msg[2] & VIEW_ASKED != 0;
+                    if asked && o.ring < VIEW_LEAST {
                         say!(g, "camera: no view: the pool gave a ring of one buffer; frames by copy only\n");
-                    } else if got >= 3 && msg[2] == 1 {
+                    } else if asked {
                         // The image slot whole: a ring of whole frames, or a slit ring rounded up to whole frames of the pool (ferros_cam job `with_image`).
                         let first = o.l.slots[job::OLD_SLOT_IMAGE].0 / job::FRAME;
                         let n = o.l.slots[job::OLD_SLOT_IMAGE].1 / job::FRAME;
                         let mut t = [0u8; 32];
-                        let base = ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32, ferros_sys::off(t.as_mut_ptr()));
+                        // Write-back when asked, but never for a slit ring: its buffers have no holds, so no hand-over at which to make them right (SLITS).
+                        let want = msg[2] & VIEW_CACHED != 0 && SLITS.load(Ordering::Relaxed) == 0;
+                        let mut give = |cached: bool| ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32 | (cached as u64) << 63, ferros_sys::off(t.as_mut_ptr()));
+                        let mut base = give(want);
+                        o.cached = want && base != ERR;
+                        // A kernel from before the write-back view refuses the bit (it reads as frames past the run): the view as before.
+                        if want && base == ERR {
+                            say!(g, "camera: the kernel gave no write-back view; asking for the non-cacheable one\n");
+                            base = give(false);
+                        }
                         if base != ERR {
                             o.view = true;
+                            out[53] = o.cached as u8;
                             out[1..33].copy_from_slice(&t);
                             out[33] = o.ring as u8;
                             out[34] = if NOW_FORMAT.load(Ordering::Relaxed) == 12 { 2 } else { 1 };
@@ -2141,7 +2176,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                             out[48..52].copy_from_slice(&(o.ring as u32).to_le_bytes());
                             out[52] = (SLITS.load(Ordering::Relaxed) != 0) as u8;
                             out[56..60].copy_from_slice(&((ROWS.load(Ordering::Relaxed) * LINE.load(Ordering::Relaxed)) as u32).to_le_bytes());
-                            len = if got > 3 { VIEW_REPLY_MODE } else { VIEW_REPLY };
+                            len = if got > 3 || want { VIEW_REPLY_MODE } else { VIEW_REPLY };
                             t.fill(0);
                             say!(g, "camera: the view of A#{} buffers given to the holder\n", o.ring);
                         } else {
@@ -2295,6 +2330,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 let n = FRAMES.load(Ordering::Acquire);
                 o.asked_at = n;
                 o.given = B_COUNT[b].load(Ordering::Relaxed);
+                // A write-back view: the buffer's lines dropped from every core's caches before the holder hears of it (docs/CAMERA.md "A cacheable view").
+                // Its frame's DMA_DONE came before the hold (`ring_turn` makes a buffer the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer), so what a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone and the holder reads this frame.
+                if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 {
+                    let t = lines(g, o, b, 0, BUF.load(Ordering::Relaxed) as usize);
+                    o.inv_sum += t;
+                    o.inv_max = o.inv_max.max(t);
+                }
                 o.held = Some((b, probe_read(b)));
                 let mut h = [0u8; HEADER];
                 header(&mut h, b, 1);
@@ -2305,7 +2347,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 if o.maps % 64 == 0 {
                     let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
                     say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
-                    (o.lat_sum, o.lat_max) = (0, 0);
+                    if o.cached {
+                        say!(g, "camera: the write-back view's maintenance at MAP (A#{} bytes a buffer): A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), us(o.inv_sum / 64), us(o.inv_max));
+                    }
+                    (o.lat_sum, o.lat_max, o.inv_sum, o.inv_max) = (0, 0, 0, 0);
                 }
                 if reply(&token, &h) == ERR {
                     say!(g, "camera: a MAP's reply failed; its holder is gone\n");

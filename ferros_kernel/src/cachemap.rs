@@ -180,9 +180,11 @@ pub const CAM_VIEW_VA: (usize, usize) = (CAM_VA.1, CAM_GIB + GIB);
 const _: () = assert!(CAM_VIEW_VA.0 == CAM_VA.1 && (CAM_VIEW_VA.1 - 1) / GIB == CAM_VA.0 / GIB && CAM_VIEW_VA.0 % MIB2 == 0, "the camera's view: in the camera's GiB, past the driver's window");
 
 /// The camera's view: the block at `va` maps frame `pa`, Normal non-cacheable, EL0 read-only (AP[2], which binds EL2 too in the VHE regime, so the kernel never writes thru it either: process.rs `dma_span` leaves the view out), never executable. Then `surface_unmapped` over what changed.
-pub fn cam_view_map(va: usize, pa: usize) {
+/// With `cached` (2026-11-18, docs/CAMERA.md "A cacheable view") Normal write-back inner shareable instead, the same rights: the front end still does not snoop, so the driver has each buffer's lines cleaned and invalidated as it hands the buffer to the holder (process.rs `cam_lines`), and nothing the cores kept or fetched while the front end wrote it is read.
+/// Every alias of these frames is then cacheable or non-cacheable by role: the kernel's own (write-back, `frame_block`), the driver's window (non-cacheable, `cam_map`) and this one; the lines a write-back reader brings in are clean (nobody writes thru a write-back alias of a camera frame after the region's take cleaned it), so dropping them loses nothing.
+pub fn cam_view_map(va: usize, pa: usize, cached: bool) {
     let e = unsafe { &mut (*(&raw mut L2_CAM)).0[(va / MIB2) % 512] };
-    *e = dma_pool(vhe(), pa, BLOCK) | AP_RO;
+    *e = if cached { pool(vhe(), pa, BLOCK) | UXN | AP_RO } else { dma_pool(vhe(), pa, BLOCK) | AP_RO };
 }
 
 /// The most GPU memory one client may hold (2026-11-13, the coordinator's call, the owner may resize it: a power of two of at least a frame): its block, frames of the pool on demand (process.rs `block_grow`). Mahere at the 8a's 1080 x 2400 names up to 376 cells of a MiB at full detail, which 384 MiB would not quite hold beside its frame regions; 512 MiB does.

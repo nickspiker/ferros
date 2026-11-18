@@ -2745,9 +2745,11 @@ struct CamView {
     driver: u64,
     first: usize,
     n: usize,
+    /// Mapped write-back (cachemap `cam_view_map`'s `cached`, docs/CAMERA.md "A cacheable view"), else non-cacheable.
+    cached: bool,
 }
 /// Under the kernel lock.
-static mut CAM_VIEW: CamView = CamView { holder: 0, driver: 0, first: 0, n: 0 };
+static mut CAM_VIEW: CamView = CamView { holder: 0, driver: 0, first: 0, n: 0, cached: false };
 /// The most frames the view may show: its window.
 const CAM_VIEW_FRAMES: usize = (crate::cachemap::CAM_VIEW_VA.1 - crate::cachemap::CAM_VIEW_VA.0) / crate::frames::FRAME;
 fn cam_view_index() -> usize {
@@ -2755,7 +2757,8 @@ fn cam_view_index() -> usize {
 }
 
 /// SYS_DMA x1 = 4 on the `camera` region, the driver's alone: the process waiting on the reply token at arc offset `reply_off` (the caller of the OPEN being answered) is given a read-only view of frames `first` to `first + n` of the driver's run (the image ring), a capability of its own for the `camera-view` region, whose token is written at `out_off` in the driver's arc for its reply to carry; a view held already, by anyone, is taken back first (`cam_view_drop`). The view's base, which the holder also gets from SYS_DMA on its token. ERR, said on the console: the caller holds no run, the frames are past it or past the view's window, the token answers no process. Under the lock.
-fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64) -> u64 {
+/// With `cached` the view is mapped write-back (docs/CAMERA.md "A cacheable view"), its buffers made right by `cam_lines` as the driver hands each one over.
+fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64, cached: bool) -> u64 {
     let c = unsafe { &*(&raw const CAM) };
     let say = |what: &str| {
         let line = alloc::format!("camera view: {}: {what}\n", core::str::from_utf8(&p.name).unwrap_or("?"));
@@ -2787,15 +2790,15 @@ fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64) 
     cam_view_drop("given anew");
     let (first, n) = (first as usize, n as usize);
     for j in 0..n {
-        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(c.first + first + j));
+        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(c.first + first + j), cached);
     }
     crate::cachemap::surface_unmapped(crate::cachemap::CAM_VIEW_VA.0, n * crate::frames::FRAME);
     let vi = cam_view_index();
     let t = mint(Object::Dma(vi), RIGHT_SEND, q.epoch);
     q.cspace.push(CapEntry { token: t, object: Object::Dma(vi), rights: RIGHT_SEND });
-    unsafe { *(&raw mut CAM_VIEW) = CamView { holder: q.epoch, driver: p.epoch, first, n } };
+    unsafe { *(&raw mut CAM_VIEW) = CamView { holder: q.epoch, driver: p.epoch, first, n, cached } };
     p.write(out_off, &t);
-    say(&alloc::format!("A#{n} frames of its run from A#{first} shown read-only to {} at G#{:X}", core::str::from_utf8(&q.name).unwrap_or("?"), crate::cachemap::CAM_VIEW_VA.0));
+    say(&alloc::format!("A#{n} frames of its run from A#{first} shown read-only{} to {} at G#{:X}", if cached { ", write-back" } else { "" }, core::str::from_utf8(&q.name).unwrap_or("?"), crate::cachemap::CAM_VIEW_VA.0));
     crate::cachemap::CAM_VIEW_VA.0 as u64
 }
 
@@ -2808,7 +2811,7 @@ fn cam_view_drop(why: &str) {
     // The blank frame was taken when the view was given (`cam_view_give`), so it is there.
     let blank = unsafe { SURFACE_BLANK }.expect("camera view: the blank frame its give took");
     for j in 0..v.n {
-        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(blank));
+        crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(blank), false);
     }
     crate::cachemap::surface_unmapped(crate::cachemap::CAM_VIEW_VA.0, v.n * crate::frames::FRAME);
     let vi = cam_view_index();
@@ -2818,7 +2821,48 @@ fn cam_view_drop(why: &str) {
     }
     let line = alloc::format!("camera view: taken back ({why}), A#{} frames\n", v.n);
     kk.console.extend_from_slice(line.as_bytes());
-    *v = CamView { holder: 0, driver: 0, first: 0, n: 0 };
+    *v = CamView { holder: 0, driver: 0, first: 0, n: 0, cached: false };
+}
+
+/// SYS_DMA x1 = 6 (2026-11-18, docs/CAMERA.md "A cacheable view"): bytes `off` to `off + len` of the camera's frames cleaned and invalidated to the point of coherency (`dc civac` a line), then a barrier; on the `camera` region by the driver (offsets in its run), on `camera-view` by the holder (offsets in the view).
+/// The driver calls it over a buffer as it hands the buffer to the holder (its MAP), after the frame's DMA_DONE: the front end does not snoop, so a line any core kept from an earlier read of the buffer, or fetched by speculation while the front end wrote it, is dropped, and the holder's write-back reads see DRAM.
+/// The lines are clean (no write-back alias of a camera frame is written after the region's take cleaned it), so the clean writes nothing back and the invalidate loses nothing.
+/// Clean and invalidate, never invalidate alone (`dc ivac`): the range's frames are found under the lock and maintained with it let go (`unlocked`, so a buffer's 2^18 lines hold nobody up), and a run given back meanwhile may be another process's frames by then, whose dirty lines a clean writes out where an invalidate would discard them.
+/// By the kernel's own alias (the frames at their own address, `frame_block`, read-write at EL2), not the view's, which is read-only to EL2 too; a run lies in one range of the pool, so its addresses are side by side.
+/// Answers the counter's ticks it took (the cost, for the driver's console line); ERR when the caller holds neither or the range is not inside it.
+fn cam_lines(epoch: u64, view: bool, off: u64, len: u64) -> u64 {
+    let c = unsafe { &*(&raw const CAM) };
+    let v = unsafe { &*(&raw const CAM_VIEW) };
+    let (first, n) = if view {
+        if v.holder != epoch || v.holder == 0 {
+            return ERR;
+        }
+        (c.first + v.first, v.n)
+    } else {
+        if c.owner != epoch || c.n == 0 {
+            return ERR;
+        }
+        (c.first, c.n)
+    };
+    // WHY: the offset and length are the process's; a line past its frames would be another process's memory, or an address the kernel's map does not hold (a fault at EL2, under no lock but with the kernel's state mid-syscall).
+    // The sum is tested only after both are known under the size, so it cannot wrap.
+    let size = (n * crate::frames::FRAME) as u64;
+    if off >= size || len > size || off + len > size {
+        return ERR;
+    }
+    let a = crate::frames::pa(first) + off as usize;
+    let len = len as usize;
+    unlocked(|| {
+        let t0 = crate::platform::cntpct();
+        let mut x = a & !63;
+        unsafe { core::arch::asm!("dsb sy") };
+        while x < a + len {
+            unsafe { core::arch::asm!("dc civac, {x}", x = in(reg) x) };
+            x += 64;
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        crate::platform::cntpct() - t0
+    })
 }
 
 /// The camera's run back to the pool when its holder ends (`end_process`, `kill_locked`): the front end's S2MPUs shut first while its domain is on (the engine may still be writing: a holder that ended mid-stream leaves the switch on until the service loop's next pass), the window unmapped and every TLB told, then each frame wiped as it goes back (frames.rs `give`). Under the lock.
@@ -5886,7 +5930,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, cur, f.x[2], f.x[3] & 1 == 1),
                 // x1 = 4 (2026-11-15, docs/CAMERA.md "The view"): the driver gives the caller of the OPEN it is answering (its reply token at arc offset x2) a read-only view of x3's frames of its run (low half the first, high half how many), the holder's token written at arc offset x4; answered the view's base (`cam_view_give`). x1 = 5: the view taken back, at the driver's close (`cam_view_drop`) → 0.
-                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 4 => cam_view_give(p, f.x[2], f.x[3] & 0xFFFF_FFFF, f.x[3] >> 32, f.x[4]),
+                // x3 bit 63 (2026-11-18, docs/CAMERA.md "A cacheable view"): the view mapped write-back (a kernel from before refuses the bit as frames past the run, and the driver asks again without it).
+                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 4 => cam_view_give(p, f.x[2], f.x[3] & 0xFFFF_FFFF, (f.x[3] >> 32) & 0x7FFF_FFFF, f.x[4], f.x[3] >> 63 == 1),
+                // x1 = 6 (2026-11-18): bytes x2 to x2 + x3 of the driver's run (on `camera`) or of the view (on `camera-view`, its holder) cleaned and invalidated, with the lock let go; answered the ticks it took (`cam_lines`).
+                Some(Object::Dma(i)) if (DMA[i].name == "camera" || DMA[i].name == "camera-view") && f.x[1] == 6 => cam_lines(p.epoch, DMA[i].name == "camera-view", f.x[2], f.x[3]),
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 5 && unsafe { (*(&raw const CAM_VIEW)).driver } == p.epoch => {
                     cam_view_drop("the driver closed");
                     0
