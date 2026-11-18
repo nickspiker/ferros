@@ -1217,7 +1217,7 @@ pub fn pet() {
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 88]);
+pub struct Facts(pub [u64; 90]);
 
 /// The bootloader's lock state (`Facts::boot_lock`; FLASHER.md step 7: re-locking ends setup, leaving it unlocked is the person's known choice).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1338,6 +1338,12 @@ impl Facts {
         };
         let (c0, c1, c2, g0, g1, g2) = (w(20)?, w(21)?, w(22)?, w(23)?, w(24)?, w(25)?);
         Some(([c0[0], c0[1], c1[0], c1[1], c2[0], c2[1]], [g0[0], g0[1], g1[0], g1[1], g2[0], g2[1]], seq))
+    }
+    /// The magnetic field as the AoC last reported it (facts 88 and 89, 2026-11-17: the fused magnetometers, µT, the device's axes, uncalibrated for hard iron: ferros_compass calibrates), and how many samples have come (a new one when it moves).
+    pub fn magnetic(&self) -> Option<([f32; 3], u32)> {
+        let (xy, z) = (self.get(88)?, self.get(89)?);
+        let n = (z >> 32) as u32;
+        (n != 0).then(|| ([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)], n))
     }
     /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the device whatever its own rate.
     pub fn gravity_pair(&self) -> Option<(([f32; 3], u64), ([f32; 3], u64))> {
@@ -1532,6 +1538,9 @@ pub mod sensor_block {
     pub const SCOPE_FMT: usize = 19;
     pub const SCOPE_N: usize = 20;
     pub const SCOPE_MASK: usize = 21;
+    /// The magnetic field (the compass puck): x | y << 32 (f32 bits, µT), then z | sample count << 32.
+    pub const MAG_XY: usize = 22;
+    pub const MAG_Z: usize = 23;
     pub const SCOPE: usize = 32;
     pub const SCOPE_LEN: usize = 65536;
     /// The block's size in u64 words.
@@ -1629,8 +1638,10 @@ pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    let mut b = [0u8; 704];
-    svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
+    // Unknown (all ones) where a kernel from before writes fewer facts than this build reads (88 before 2026-11-17).
+    let mut b = [0xFFu8; 720];
+    // Thru a mutable pointer: the kernel writes the buffer, and an immutable one may be read as the constant it was made.
+    svc(nr::FACTS, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }
 

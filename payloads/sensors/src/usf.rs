@@ -401,6 +401,7 @@ static mut GRAVITY: (u64, u64) = (0, 0);
 static mut PAIR: [u64; 6] = [0; 6];
 static mut SPECTRAL: [u64; 7] = [0; 7];
 static mut PROX: [u64; 3] = [0; 3];
+static mut MAG: (u64, u64) = (0, 0);
 static mut SCOPE_FMT: u64 = 0;
 static mut SCOPE_N: u64 = 0;
 static mut SCOPE_MASK: u64 = 0x20;
@@ -426,6 +427,8 @@ pub fn publish() {
         for i in 0..3 {
             put(sb::PROX + i, PROX[i]);
         }
+        put(sb::MAG_XY, MAG.0);
+        put(sb::MAG_Z, MAG.1);
         put(sb::SCOPE_FMT, SCOPE_FMT);
         put(sb::SCOPE_N, SCOPE_N);
         put(sb::SCOPE_MASK, SCOPE_MASK);
@@ -455,6 +458,12 @@ fn sample(p: &[u8]) {
             PROX[1] = w(2) | w(6) << 32;
             let n = (PROX[2] >> 32).wrapping_add(1).max(1);
             PROX[2] = w(7) | n << 32;
+        }
+        if ty == 6 && size >= 12 {
+            // The magnetometers (type 6, fused): three f32, µT, the newest sample, and how many have come (the compass puck, 2026-11-17).
+            // WHY the floor of one: the count is the "a sample has come" flag the kernel reads (zero: none yet), so its wrap past 2^32 skips zero.
+            let n = (MAG.1 >> 32) as u32;
+            MAG = (w(0) | w(1) << 32, w(2) | (n.wrapping_add(1).max(1) as u64) << 32);
         }
         if ty != 22 || size < 12 {
             return;

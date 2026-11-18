@@ -1546,8 +1546,13 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     }
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
-        use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};
+        use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, MAG_XY, MAG_Z, PAIR, PROX, SPECTRAL};
         let w = |i: usize| word(i).unwrap_or(0);
+        // 88-89 the magnetic field, once a sample has come (its count in z's high half; the compass puck, 2026-11-17).
+        if w(MAG_Z) >> 32 != 0 {
+            v[88] = w(MAG_XY);
+            v[89] = w(MAG_Z);
+        }
         if w(GRAVITY_Z) >> 32 != 0 {
             v[12] = w(GRAVITY_XY);
             v[13] = w(GRAVITY_Z);
