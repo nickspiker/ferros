@@ -41,6 +41,8 @@ Exynos USI HS-I2C in auto mode, the same block `ferros_kernel/src/hsi2c.rs` alre
 - **Arm after boot, mark from Android.** The hv's counter tracks the kernel's printk clock closely, so `_ARM_AFTER_MS=60000` skips the boot probe. `echo "<3>ferros-mark: ..." > /dev/kmsg` lands in the same console ring as the hv's lines, so the decoder shows exactly where the app opened and closed.
 - One chatty bus still starves a shared cap: capture one bus at a time.
 - Identical consecutive accesses collapse into a `rep N` line (the decoder replays them). That did not help on this controller, whose poll alternates between registers; the quiet list is what worked.
+- **One sensor alone** (2026-11-17): `FERROS_HV_ORACLE_I2C_TARGET=G#3D` logs an HS-I2C controller's accesses only while its ADDR word selects that target, and only the four that carry a transfer (ADDR and AUTO_CONF writes, TX writes, RX reads). On the main's bus the lens and OIS polling are seven of every eight transfers after stream on, so a long session (a 16 s exposure) fits the ring with the cap off. `tools/oracle-i2c` decodes in Rust as `oracle-decode-hsi2c.py` does, with the same integrity line, and `--holds G#3D` prints each grouped-parameter hold on one line (docs/CAMERA.md "Long exposures").
+- **The main's per-frame hold** under Android is G#0702 = 0, G#0704 = 0 (Samsung's frame and integration shifts, a long exposure's), G#020E, G#0204, G#0202 and G#0340, every frame (cam-open3).
 
 ## Capture recipe (main camera)
 

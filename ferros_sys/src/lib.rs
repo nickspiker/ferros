@@ -64,6 +64,7 @@ pub mod nr {
     pub const OFFER: u64 = 41;
     pub const CALLER: u64 = 42;
     pub const NOTIFY: u64 = 43;
+    pub const IRQ_ARM: u64 = 45;
 }
 
 /// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
@@ -1993,6 +1994,11 @@ pub fn irq_wait_world(cap: u64, deadline: u64) -> u64 {
 /// The device is handled: unmask its line.
 pub fn irq_ack(cap: u64) -> u64 {
     svc(nr::IRQ_ACK, cap, 0, 0, 0, 0)
+}
+
+/// Arm the line `line` grants with register operations inside the hardware grant `hw` (offsets from its start), encoded by ferros_layout irqarm `encode`, run by the kernel each time the line fires, before the line is masked and this driver woken, without the kernel lock (docs/KERNEL.md "Armed actions"); empty `program` disarms. 0, or ERR when the kernel refuses it (a register outside the grant, an unknown operation, a bad mask, too many, a grant no armed action may touch). Disarmed by the kernel when this process ends or turns a power switch off.
+pub fn irq_arm(line: u64, hw: u64, program: &[u8]) -> u64 {
+    svc(nr::IRQ_ARM, line, hw, off(program.as_ptr()), program.len() as u64, 0)
 }
 
 /// The cores this thread may run on from now (`CORES_*`; 0 = the workers). Threads it spawns later inherit it.

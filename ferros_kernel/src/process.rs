@@ -1600,6 +1600,8 @@ const SYS_CALLER: u64 = 42;
 const SYS_NOTIFY: u64 = 43;
 /// thread_name(name, len): the calling thread names itself (2026-11-14: "Photon.9: FAULT" did not say which of Photon's threads it was); std passes its thread's name (`thread::Builder::name`). x0/x1 the name in the caller's arc; its first 16 bytes are kept, and a fault's console line carries them (`fault_report`). No capability: a thread names only itself, and the name is only ever printed. → 0. A kernel from before answers ERR (no such syscall), which ferros_rt ignores.
 const SYS_THREAD_NAME: u64 = 44;
+/// Arm the caller's interrupt line (x0, an `Irq` token) with a program of register operations inside one of its hardware grants (x1, a `Hardware` token), x2 and x3 the program's address and bytes (ferros_layout irqarm; 0 bytes disarms): run at each interrupt before the line is masked and its waiter woken, without the kernel lock (irqarm.rs; docs/KERNEL.md "Armed actions").
+const SYS_IRQ_ARM: u64 = 45;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
@@ -1842,6 +1844,7 @@ pub fn irqs_report(out: &mut Vec<u8>) {
         }
         out.extend_from_slice(alloc::format!("{} (INTID A#{}): A#{acks} unmasks, A#{} still asserted, longest run A#{}{}\n", l.name, l.intid, IRQ_ASSERTED[i].load(Relaxed), IRQ_LONGEST[i].load(Relaxed), if IRQ_STORMED[i].load(Relaxed) != 0 { ", STORMED: masked" } else { "" }).as_bytes());
     }
+    crate::irqarm::report(out);
 }
 
 /// When a touch interrupt was last taken by the touch driver, or an injected batch handed to it (counter ticks; 0 never): the adaptive clock raises the clusters at once on a change (service.rs `governor`).
@@ -4337,6 +4340,36 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
         }
+        SYS_IRQ_ARM => {
+            let (lt, ht) = (p.read(f.x[0], 32), p.read(f.x[1], 32));
+            let line = p.lookup(&lt).map(|i| p.cspace[i].object);
+            let hw = p.lookup(&ht).map(|i| p.cspace[i].object);
+            f.x[0] = match (line, hw) {
+                (Some(Object::Irq(i)), _) if f.x[3] == 0 => {
+                    crate::irqarm::disarm(i, IRQS[i].intid);
+                    0
+                }
+                (Some(Object::Irq(i)), Some(Object::Hardware(g))) => {
+                    let h = &HARDWARE[g];
+                    // Checked once here, never at the interrupt: a grant only EL3 may write, a DMA fence (the kernel's), or a PCIe window (a read never answered would wedge the core taking the interrupt) is refused; then the program against the grant's size (ferros_layout irqarm `check`: whole registers inside it, known operations, sane masks).
+                    // WHY the length test: x3 is the caller's; past the most a program can be it is refused before anything is read.
+                    if f.x[3] as usize > ferros_layout::irqarm::OPS_MOST * ferros_layout::irqarm::OP_BYTES || h.via_el3 || crate::s2mpu::is_fence(h.base) || crate::pcie_guard::link_of(h.base).is_some() || crate::pcie_guard::link_of(h.base + h.size - 4).is_some() {
+                        ERR
+                    } else {
+                        let bytes = p.read(f.x[2], f.x[3] as usize);
+                        match ferros_layout::irqarm::check(&bytes, h.size) {
+                            Ok((ops, n)) => {
+                                crate::irqarm::arm(i, IRQS[i].intid, h.base, &ops[..n], p.epoch);
+                                0
+                            }
+                            Err(_) => ERR,
+                        }
+                    }
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_IRQ_WAIT | SYS_IRQ_ACK => {
             let token = p.read(f.x[0], 32);
             match p.lookup(&token).map(|i| p.cspace[i].object) {
@@ -4688,6 +4721,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     // Only the switches in `SWITCH_UNLOCKED` (whose hardware nothing under the lock touches from another core); the rest keep the lock, as the camera's must while its region's fence (`cam_ask`, `cam_free`, under the lock on any core) writes the front end's S2MPUs its switch powers.
                     let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
                     let epoch = p.epoch;
+                    // A switch going off: every line this process armed disarmed first, so no armed action touches a block whose clocks or power go (irqarm.rs).
+                    if !on {
+                        crate::irqarm::disarm_epoch(epoch);
+                    }
                     if free {
                         unlock();
                         // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
@@ -6533,6 +6570,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         surfaces_free(p.epoch);
         regions_free(p.epoch);
         pucks_free(p.epoch);
+        crate::irqarm::disarm_epoch(p.epoch);
         cam_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
@@ -6847,6 +6885,7 @@ fn kill_locked(name: &[u8]) -> bool {
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     regions_free(kk.procs[i].as_ref().unwrap().epoch);
     pucks_free(kk.procs[i].as_ref().unwrap().epoch);
+    crate::irqarm::disarm_epoch(kk.procs[i].as_ref().unwrap().epoch);
     cam_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);

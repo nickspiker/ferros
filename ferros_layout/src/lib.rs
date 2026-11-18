@@ -4,7 +4,10 @@
 //!
 //! Edit these constants to resize rings or move regions. All crates import from here — one edit, one rebuild.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
+
+/// Armed actions on a driver's interrupt line (SYS_IRQ_ARM): the encoding and its check.
+pub mod irqarm;
 
 // ---------------------------------------------------------------------------
 // Block geometry
