@@ -11,7 +11,7 @@ use ferros_kist::note::{self, Note, Poster, LIVE, PERSONAL, POSTS, STATUS, WAITI
 /// A record of op 3: [source 32][number u8][kind u8][asked u8][flags u8: bit 0 names a person, bit 1 has a target][count u32 LE][seq u64 LE, the notes' bell count it was posted at][deadline i64 LE, Eagle oscillations, 0 none].
 pub const REC: usize = 56;
 /// The vault prefix (kvault `IDENTITY`): reserved (NUL first), so no process's store scope reaches it, and identity class.
-const PREFIX: &str = "\0notes.";
+pub const PREFIX: &str = "\0notes.";
 const ADDR_CONTEXT: &str = "ferros 2026-11-12 note address";
 
 struct Kept {

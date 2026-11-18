@@ -1096,7 +1096,7 @@ fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
         crate::process::push_console(b"home: no wallgen capsule in the vault; no wallpaper is made (the display draws none itself)\n");
         return;
     };
-    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+    let sealed = seals_for_launch(store);
     use crate::process::Grant::*;
     match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display"), Use(b"gpu"), Dma(b"layers-32")], &sealed) {
         Ok(o) => {
@@ -1226,12 +1226,12 @@ fn move_seals(store: &mut Option<ShimStore>) {
         // Some(true) moved, Some(false) nothing left to move, None a write or its read back failed.
         let moved = crate::process::with_lock(|| {
             let s = store.as_mut()?;
-            let list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
+            let list = seals_read(s).ok()?;
             let Some(both) = ferros_kist::seal::with_new(&list, &old, &new) else { return Some(false) };
-            s.set("sealed", &both).ok()?;
-            let back = s.get_by_key("sealed").ok().flatten()?;
+            seals_write(s, &both).ok()?;
+            let back = seals_read(s).ok()?;
             let after = ferros_kist::seal::without_old(&back, &old, &new)?;
-            s.set("sealed", &after).ok().map(|_| true)
+            seals_write(s, &after).ok().map(|_| true)
         });
         match moved {
             Some(true) => crate::process::push_console(b"seal: an image's seal moved to the address form\n"),
@@ -1239,6 +1239,44 @@ fn move_seals(store: &mut Option<ShimStore>) {
             None => crate::process::push_console(b"seal: an image's seal not moved (its old seal kept; its next launch tries again)\n"),
         }
     }
+}
+
+/// The seals of the installed masked images as the vault keeps them (`kvault::SEALED`, a `seals` document since 2026-11-17, ferros_kist::seal `list_document`): Ok(the seals, 32 bytes each, concatenated, as the checks take them; none when there is no list), Err(why) when there is a list that is not its document.
+/// Such a list is never taken for an empty one where a seal is added: the write would drop every other seal.
+fn seals_read(s: &mut ShimStore) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    match s.get_by_key(crate::kvault::SEALED) {
+        Ok(None) => Ok(alloc::vec::Vec::new()),
+        Ok(Some(doc)) => ferros_kist::seal::list_of(&doc).ok_or("the seals list is not its document"),
+        Err(_) => Err("the seals list could not be read"),
+    }
+}
+
+/// The seals written as their document.
+fn seals_write(s: &mut ShimStore, list: &[u8]) -> Result<(), &'static str> {
+    let doc = ferros_kist::seal::list_document(list, crate::settings::eagle_now()).ok_or("the seals list did not build")?;
+    s.set(crate::kvault::SEALED, &doc).map(|_| ()).map_err(|_| "the vault did not keep the seals list")
+}
+
+/// The seals for a launch, read under the kernel lock: none when there is no vault, or a list that does not read (said on the console, the flash log saying why since the open: kvault's move to VSF), so a masked image is then refused as not installed and nothing is written over the list.
+fn seals_for_launch(store: &mut Option<ShimStore>) -> alloc::vec::Vec<u8> {
+    match crate::process::with_lock(|| store.as_mut().map(seals_read)) {
+        Some(Ok(list)) => list,
+        Some(Err(why)) => {
+            crate::process::push_console(alloc::format!("seal: {why}; no masked image runs until it reads (the flash log says why)\n").as_bytes());
+            alloc::vec::Vec::new()
+        }
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// A seal added to the list (an install, a stow's check), unless it is there already: refused, the list untouched, when the list does not read.
+fn seal_add(s: &mut ShimStore, seal: &[u8; 32]) -> Result<(), &'static str> {
+    let mut list = seals_read(s)?;
+    if list.chunks_exact(32).any(|e| e == seal) {
+        return Ok(());
+    }
+    list.extend_from_slice(seal);
+    seals_write(s, &list)
 }
 
 fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
@@ -1291,7 +1329,7 @@ fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
 /// `restart` with an input for each process started (its spawn input, as `bridge spawn` gives one): the radio switches start the modem and WiFi drivers once with their power-down input (`off`, G#F0) to take their chips down.
 fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: &mut alloc::vec::Vec<u8>) {
     // Vault reads under the kernel lock (the vault's one owner at a time); the spawns below take it themselves.
-    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+    let sealed = seals_for_launch(store);
     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
         let Some(grants) = shell_grants(name) else {
             rep.extend_from_slice(b"not a shell process: ");
@@ -1420,7 +1458,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return true;
     };
-    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+    let sealed = seals_for_launch(store);
     // The vault process first (VAULT-OUT.md, decision 0), so it is serving when the processes init starts ask for what they keep; until it is, the kernel's vault answers them. From the capsule the kernel image carries (FERROS_VAULT_CAPSULE at build), else the `vault` entry of the kernel's own vault (kept by the kernel: never forwarded, never moved). Neither: every store call is the kernel's vault's, as before.
     let mut vault_up = false;
     if !VAULT_CARRIED.is_empty() {
@@ -2494,6 +2532,12 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x39);
     // The wall clock (rtc.rs): read now, so the first process to ask has it.
     let _ = crate::rtc::sync();
+    // What the vault's move to VSF said at its open (kvault `convert_device`, each line in the flash log already), on the console now it is up.
+    if let Some(s) = store.as_mut() {
+        for l in s.take_notes() {
+            crate::process::push_console(alloc::format!("{l}\n").as_bytes());
+        }
+    }
     let freq = cntfrq();
     let mut t_heartbeat = cntpct();
     // The AoC's start, idle until the `sensors` switch asks for it (sensorlink.rs START).
@@ -2939,7 +2983,7 @@ pub fn run(mut b: Boot) -> ! {
                     KistWhy::Stow(i) => i.capsule,
                 };
                 // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
-                let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+                let sealed = seals_for_launch(&mut store);
                 let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false, twin: None, hash_ticks: 0 };
                 if kist_call(&job) {
                     kist_tell(&job, crate::process::STOW_READING, 0);
@@ -2991,11 +3035,7 @@ pub fn run(mut b: Boot) -> ! {
                     (KistWhy::Stow(i), Ok(KistDone::Sealed(seal))) => {
                         let kept = crate::process::with_lock(|| {
                             let Some(s) = store.as_mut() else { return false };
-                            let mut list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
-                            if !list.chunks_exact(32).any(|e| e == seal) {
-                                list.extend_from_slice(&seal);
-                            }
-                            s.set("sealed", &list).is_ok()
+                            seal_add(s, &seal).is_ok()
                         });
                         crate::process::stow_tell(i, if kept { crate::process::STOW_DONE } else { crate::process::STOW_REFUSED }, if kept { 0 } else { crate::process::STOW_WHY_KEPT });
                         if kept {
@@ -5269,7 +5309,7 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     let input = &pr[at.min(pr.len())..];
                     // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
-                    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+                    let sealed = seals_for_launch(&mut store);
                     let nm = if name.is_empty() { b"proc" } else { name };
                     let spawned = match staged {
                         Some((arc, total, received, co, cl)) if received == total => crate::process::spawn_capsule_staged(nm, arc, total, co, cl, input, &grants),
@@ -5305,20 +5345,18 @@ pub fn run(mut b: Boot) -> ! {
                 if run_ok && run_size > 0 {
                     let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                     let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
-                        (Ok(seal), Some(store)) => {
-                            let mut list = crate::process::with_lock(|| store.get_by_key("sealed").ok().flatten()).unwrap_or_default();
-                            if !list.chunks_exact(32).any(|e| e == seal) {
-                                list.extend_from_slice(&seal);
+                        (Ok(seal), Some(store)) => match crate::process::with_lock(|| seal_add(store, &seal)) {
+                            Ok(()) => {
+                                let mut r = alloc::vec![0u8];
+                                r.extend_from_slice(&seal);
+                                r
                             }
-                            match crate::process::with_lock(|| store.set("sealed", &list)) {
-                                Ok(_) => {
-                                    let mut r = alloc::vec![0u8];
-                                    r.extend_from_slice(&seal);
-                                    r
-                                }
-                                Err(_) => alloc::vec::Vec::from(&b"ERR:install: vault write failed"[..]),
+                            Err(why) => {
+                                let mut r = alloc::vec::Vec::from(&b"ERR:install: "[..]);
+                                r.extend_from_slice(why.as_bytes());
+                                r
                             }
-                        }
+                        },
                         (Ok(_), None) => alloc::vec::Vec::from(&b"ERR:install: no vault"[..]),
                         (Err(e), _) => {
                             let mut r = alloc::vec::Vec::from(&b"ERR:"[..]);

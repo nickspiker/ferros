@@ -2311,6 +2311,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
     checklist::step(checklist::Step::Log);
+    // The wall clock before the vault opens (docs/VSF-AUDIT.md P10, 2026-11-17): every commit and document the vault writes is stamped with Eagle time from it (kvault `now`). A failed read leaves it unknown (0, the Eagle epoch: settings.rs), never made up; the service reads it again at its start and every hour.
+    let clock = rtc::sync_early();
+    if link_up {
+        flashlog::line(&match clock {
+            Ok(unix) => alloc::format!("wall clock read before the vault opens: A#{unix} s past 1970 (UTC), stamped as Eagle time"),
+            Err(e) => alloc::format!("wall clock NOT read before the vault opens (G#{e:X}): its commits are stamped 0, the Eagle epoch, until the service reads it"),
+        });
+    }
     // akita too since 2026-11-06: its ira's sources read alike across eight boots (`diag "ira sources"`), its ira under its own context (ira.rs), its vault in its own ferros partition (ufs_device::locate; refused without one). Not with no link: the ira's sources include a read of the flash (devinfo), which could then wait past the cluster watchdog.
     let (probe, mut store) = if board::akita() && !link_up { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
     // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.

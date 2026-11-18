@@ -1599,7 +1599,7 @@ const SYS_NOTIFY: u64 = 43;
 const SYS_THREAD_NAME: u64 = 44;
 #[path = "notify.rs"]
 mod notify;
-pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
+pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report, PREFIX as NOTES_PREFIX};
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 pub const CALLER_KIST: u64 = 1 << 9;
 pub const ARC_GROW: u64 = 0;
@@ -7806,7 +7806,8 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     spawn_step(1);
     let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
     spawn_step(2);
-    let sealed = read(b"sealed").unwrap_or_default();
+    // The seals list, a `seals` document since 2026-11-17 (service.rs `seals_read`): one that does not read is none here, and a masked image is refused as not installed (the flash log says why since the vault's open).
+    let sealed = read(crate::kvault::SEALED.as_bytes()).and_then(|d| ferros_kist::seal::list_of(&d)).unwrap_or_default();
     let t_read = crate::platform::cntpct();
     spawn_step(3);
     let g = crate::oracle::gate(&capsule)?;
