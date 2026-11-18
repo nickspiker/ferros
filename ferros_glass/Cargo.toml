@@ -1,0 +1,9 @@
+[package]
+name = "ferros_glass"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The glass console: text straight onto whatever buffer the panel scans, for when nothing else can put it there (a kernel panic, a process that died with the display, a boot that stalled). The 8x16 bitmap font, word wrap at the screen's width, manual line returns, line by line down to the bottom. No allocation, no locks, no panic on any input. no_std."
+
+[lib]
+path = "src/lib.rs"

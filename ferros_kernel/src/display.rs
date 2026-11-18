@@ -553,6 +553,108 @@ pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     Some(Panel { fb: phys0 as usize, width, rows: contig_rows, stride, up, cntfrq, dpp: dpp_base })
 }
 
+/// The pixel layouts the glass console writes (glass.rs), by the layer DMA's format field (RDMA_IN_CTRL_0 bits 8-13, cal_9865 regs-dpp.h).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pixels {
+    /// 4: u32 G#00RRGGBB (Samsung's BGRX8888, bytes B G R X): the kernel's painter after `adopt`, and the display server's 8-bit path.
+    Bgrx8,
+    /// 7: bytes X R G B (Samsung's XRGB8888): ABL's splash as ABL leaves it.
+    Xrgb8,
+    /// 19: B[31:22] G[21:12] R[11:2] A[1:0], the panel's own baked codes (the display server's four phases).
+    Bgra10,
+}
+
+/// The buffer the DPU is scanning, as its own registers say (`scanned`): where the glass console writes when nothing else can.
+#[derive(Clone, Copy)]
+pub struct Scanned {
+    /// The layer DMA's address of its first pixel (an IOVA: physical while the SYSMMU's translation is off, as ABL and the display server leave it).
+    pub iova: u64,
+    pub width: usize,
+    pub height: usize,
+    /// Row pitch in pixels.
+    pub stride: usize,
+    pub pixels: Pixels,
+    /// The DPU SYSMMU in front of the layer, and whether it translates.
+    sysmmu: usize,
+    translates: bool,
+    win: usize,
+}
+
+/// The buffer on the glass, found from the DPU's own registers and nothing assumed: the first enabled window that covers the whole raster with an unscaled layer (as `adopt` picks it), its DMA's base, offset, stride and format.
+/// Reads only, all of them words `adopt` and the display server read on every boot (never a secure word, dpu_power_secure_registers): the PMU's power words first, plainly, so a powered-down DPU is never touched.
+/// None when the DPU is off, no window qualifies, or the layer is compressed, rotated or in a format the glass console does not write (Android's AFBC layer after a jump, before the display server takes the pipe).
+pub fn scanned() -> Option<Scanned> {
+    if !dpu_on() || rd(DECON0 + DECON_VERSION) != DECON_V7_6 {
+        return None;
+    }
+    let mut enabled = 0u32;
+    let mut screen_end = 0u32;
+    for w in 0..8 {
+        if rd(DECON_WINCON + w * 0x1000) & 1 == 1 {
+            enabled |= 1 << w;
+            let end = rd(DECON_WIN + w * 0x1000 + 0x10);
+            if (end & 0x3FFF) >= (screen_end & 0x3FFF) && (end >> 16) >= (screen_end >> 16) {
+                screen_end = end;
+            }
+        }
+    }
+    for w in 0..8 {
+        if enabled & (1 << w) == 0 {
+            continue;
+        }
+        let ch = (rd(DECON_WINCON + w * 0x1000) >> 4) & 0xF;
+        let Some((dma, sysmmu)) = dpp(ch) else { continue };
+        let start = rd(DECON_WIN + w * 0x1000 + 0xC);
+        let end = rd(DECON_WIN + w * 0x1000 + 0x10);
+        let img = rd(dma + RDMA_IMG_SIZE);
+        let unscaled = (img & 0xFFFF) == (end & 0x3FFF) + 1 && (img >> 16) == ((end >> 16) & 0x3FFF) + 1;
+        if start != 0 || end != screen_end || !unscaled {
+            continue;
+        }
+        let ctrl = rd(dma + RDMA_IN_CTRL_0);
+        if ctrl & (IDMA_COMP_MASK | IDMA_ROT_MASK) != 0 {
+            return None;
+        }
+        let pixels = match (ctrl & IDMA_IMG_FORMAT_MASK) >> 8 {
+            4 => Pixels::Bgrx8,
+            7 => Pixels::Xrgb8,
+            19 => Pixels::Bgra10,
+            _ => return None,
+        };
+        let (width, height) = ((img & 0xFFFF) as usize, (img >> 16) as usize);
+        let stride = rd(dma + RDMA_SRC_WIDTH) as usize;
+        let off = rd(dma + RDMA_SRC_OFFSET);
+        let first = ((off >> 16) as usize) * stride + (off & 0xFFFF) as usize;
+        // WHY: the geometry is the hardware's word; a stride shorter than a row would put rows over one another.
+        if stride < width {
+            return None;
+        }
+        let iova = rd(dma + RDMA_BASEADDR_P0) as u64 + first as u64 * 4;
+        let translates = rd(sysmmu + 0x8000) & 1 != 0;
+        return Some(Scanned { iova, width, height, stride, pixels, sysmmu, translates, win: w });
+    }
+    None
+}
+
+impl Scanned {
+    /// The physical address of the buffer's byte `iova`: itself with the SYSMMU's translation off; else its walk, None where nothing is mapped.
+    pub fn phys(&self, iova: u64) -> Option<u64> {
+        if self.translates { iova_to_phys(self.sysmmu, iova) } else { Some(iova) }
+    }
+    pub fn translates(&self) -> bool {
+        self.translates
+    }
+
+    /// Send the buffer to the panel at its next TE, and leave the trigger armed: the window's and the global shadow update, the TE trigger unmasked (as `present_nowait`; the display server's `arm`).
+    /// No wait: DECON's FRAME_COUNT does not move on this pipe (payloads/display `frame_no`), and an idle panel's TE can be a second apart.
+    /// Armed, DECON sends a frame each TE until something masks it, which is what akita's panel needs to keep a picture (docs/AK3B.md).
+    pub fn arm(&self) {
+        wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | SHD_REG_UP_REQ_GLOBAL | SHD_REG_UP_REQ_CMP | (1 << self.win));
+        let t = rd(DECON0 + TRIG_CON);
+        wr(DECON0 + TRIG_CON, (t & !HW_TRIG_MASK_DECON) | HW_TRIG_EN);
+    }
+}
+
 impl Panel {
     /// A console over the panel's contiguous rows (margins clear the rounded corners and the camera hole).
     ///

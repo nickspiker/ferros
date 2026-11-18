@@ -16,7 +16,61 @@ pub static LAST_CRUMB: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// Panic → ramoops report + PSCI warm reset (the pixel8 `#[panic_handler]`, both boot paths).
 /// Slots (kernel print names): r[3]/0x18 `mbr_sig` := G#EE00 | last crumb; r[1]/0x08 `link_up` := first decimal number in the panic message (e.g. the failed allocation size), 0 if none; r[2]/0x10 := the heap (`heap_word`), all FF if its lock was held; r[4]/0x20 `read..verify` := line (u32 LE) + column byte; r[5]/0x28 `wrote_ok` := sync exception count; 0xA0 `pattern-readback` := last 8 bytes of the panicking file's path + first 8 bytes of the message.
 /// The kernel heap's last refused allocation since boot, if any (ferros_heap kernel.rs `Fail`), in r[6..8]: 0x30 its size | the core it was asked on << 56, 0x38 the return address into whoever asked (`aarch64-linux-gnu-addr2line -e ferros_kernel`), 0x40 the largest free block then | log2 of the alignment << 56. The same, in words, goes to the RAM log (`pstore`) before the reset, and the next boot's flash log names it (`previous_end`).
+///
+/// Since 2026-11-17 the panic is also on the glass (glass.rs): the report first, so whatever the screen does the next boot has it; then the text into the buffer the DPU scans; then a hold until a press of power or 32 s (`glass::hold`); then the reset.
+/// - **One core draws:** the first core to panic claims the screen (`glass::claim`); another core that panics meanwhile parks, and the first one's reset ends it.
+/// - **A nested panic** (this core panicking again, in the screen's formatting or drawing) falls straight thru: the report if it was not yet written, then the reset.
+/// - **A fault** while the screen is up resets at once (main.rs `.Lexc_glass_reset`).
+/// - **Nothing else pets the watchdogs** from the claim on (`starve_watchdogs`): the hold pets them itself, so a hang anywhere, the screen's own included, resets within the watchdog's second.
+/// - **The kernel lock** is taken if it is free, once, never waited for (`process::seize_for_panic`): every syscall then stops at the lock, so the display server cannot flip or redraw over the text; a lock this or another core holds is left as it is.
+/// - No allocation and no wait on any lock anywhere on the way.
 pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
+    let core = {
+        let mpidr: u64;
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+        (mpidr >> 8) & 0xF
+    };
+    match crate::glass::claim(core + 1) {
+        Ok(()) => {}
+        Err(c) if c == core + 1 => {
+            if !REPORTED.load(core::sync::atomic::Ordering::Acquire) {
+                record_panic(info, core);
+            }
+            panic_reset()
+        }
+        Err(_) => loop {
+            unsafe { core::arch::asm!("wfe") };
+        },
+    }
+    starve_watchdogs();
+    crate::process::seize_for_panic();
+    record_panic(info, core);
+    REPORTED.store(true, core::sync::atomic::Ordering::Release);
+    if crate::glass::panic_screen(info, core, LAST_CRUMB.load(core::sync::atomic::Ordering::Relaxed)) {
+        crate::glass::hold();
+    }
+    panic_reset()
+}
+
+/// The panic's report is in the result block (`record_panic` ran to its end): a nested panic leaves it as it is.
+static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PSCI SYSTEM_RESET, warm: the result block survives for the next boot.
+/// A waiting SError is taken first, or EL3 would bounce the call (`take_serror`).
+fn panic_reset() -> ! {
+    take_serror();
+    unsafe {
+        core::arch::asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
+/// The panic into the ramoops result block (the slots above) and the heap's refusal into the RAM log, cleaned to DRAM.
+fn record_panic(info: &core::panic::PanicInfo, core: u64) {
     let mut head = Buf::<64>::new();
     let _ = core::fmt::write(&mut head, format_args!("{}", info.message()));
     // First decimal run in the message.
@@ -36,11 +90,6 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
     };
     // The heap's last refusal: what was asked, on which core, for whom, and the largest free block then, which tells fragmentation (the largest under the size with the free bytes over it) from exhaustion. A panic from a refused allocation names it; any other panic carries the last refusal since boot, if there was one.
     let fail = ferros_heap::kernel::LockedTlsf::last_fail();
-    let core = {
-        let mpidr: u64;
-        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
-        (mpidr >> 8) & 0xF
-    };
     if fail.size != 0 {
         let mut text = Buf::<{ 1 << 8 }>::new();
         let _ = core::fmt::write(&mut text, format_args!("kernel heap refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}; then A#{} in use, A#{} free in A#{} blocks, the largest A#{}; panic: {}\n", fail.size, fail.align, core, fail.caller, fail.in_use, fail.free, fail.free_blocks, fail.largest, info.message()));
@@ -71,12 +120,6 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
         core::ptr::copy_nonoverlapping(t.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
         core::arch::asm!("dsb sy");
-        core::arch::asm!(
-            "mov w0, #0x0009",
-            "movk w0, #0x8400, lsl #16",
-            "smc #0",
-            options(nomem, nostack, noreturn),
-        );
     }
 }
 
@@ -206,6 +249,15 @@ pub fn wdt_rate() -> (u32, u64) {
     PET_HOLD.store(false, Relaxed);
     pet_watchdogs();
     (c0.wrapping_sub(c1), t1.wrapping_sub(t0) * 1_000_000 / cntfrq())
+}
+
+/// The panic screen's pet (glass.rs `hold`): both watchdogs reloaded whatever stops every other pet (the panic stopped them all), and the last pet stamped, so a worker's stall catcher does not take the held screen for a stall.
+pub fn pet_for_panic() {
+    LAST_PET.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    for &wdt in &WATCHDOGS {
+        // SAFETY: the cluster watchdogs' counter registers (WTCNT, +8), which every pet writes.
+        unsafe { write_volatile((wdt + 0x08) as *mut u32, WDT_COUNT) };
+    }
 }
 
 pub fn pet_watchdogs() {

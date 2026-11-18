@@ -42,6 +42,8 @@ mod ptlink;
 mod sensorlink;
 #[cfg(feature = "pixel8")]
 mod display;
+#[cfg(feature = "pixel8")]
+mod glass;
 mod dpu_power;
 mod panel_power;
 #[cfg(feature = "pixel8")]
@@ -1161,6 +1163,12 @@ ferros_el0_resume:
     str     x1, [x0]
     // Fault sink (shim path): if __exc_sink is armed (a ramoops result block), record the FIRST sync fault into the block's hardcoded print slots — ELR@+0xA0, FAR@+0xA8 (the 16-byte hexdump), ESR@+0x20 (the r[4] byte fields), count@+0x28 (r[5]) — stamp the magic, and warm-reset via PSCI so DRAM survives and the next Linux boot prints it. Skipping the faulting instruction (the default below) only produces garbage state, so on the shim path a fault is terminal by design. Cold/m1 builds leave the sink at 0 and keep the skip-and-count behaviour.
     stp     x2, x3, [sp, #-16]!
+    // A fault while a panic's screen is drawn or held (glass.rs; `__glass_core` set): its report is already in the block, so the reset comes at once.
+    // Skipping the faulting instruction (below) would run the screen on with garbage, and the sink's guard on +G#A0 sends every fault there once a report or the vault's boot result has written that slot.
+    adrp    x0, __glass_core
+    add     x0, x0, :lo12:__glass_core
+    ldr     x0, [x0]
+    cbnz    x0, .Lexc_glass_reset
     adrp    x0, __exc_sink
     add     x0, x0, :lo12:__exc_sink
     ldr     x0, [x0]
@@ -1218,6 +1226,12 @@ ferros_el0_resume:
 .Lexc_ret:
     ldp     x0, x1, [sp], #16
     eret
+// PSCI SYSTEM_RESET, warm: DRAM and the panic's report survive.
+.Lexc_glass_reset:
+    mov     w0, #0x0009
+    movk    w0, #0x8400, lsl #16
+    smc     #0
+    b       .Lexc_glass_reset
 
 // SError (asynchronous): increment count, do NOT advance ELR (fault is async), just eret — the exception entry consumed the pending SError.
 .Lexc_serror:
@@ -1280,6 +1294,10 @@ static mut __boot_el: u64 = 0;
 /// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).
 #[unsafe(no_mangle)]
 pub static mut __exc_sink: u64 = 0;
+/// The core drawing or holding a panic's screen, plus one; 0 none (glass.rs `claim`, platform.rs `report_panic`).
+/// The fault vector reads it as `__glass_core`: a fault while it is set resets at once (`.Lexc_glass_reset`).
+#[unsafe(export_name = "__glass_core")]
+pub static GLASS_CORE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[unsafe(no_mangle)]
 static mut __boot_sctlr: u64 = 0;
 

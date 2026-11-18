@@ -1253,10 +1253,15 @@ name = "ferros_f2fs"
 version = "0.1.0"
 
 [[package]]
+name = "ferros_glass"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_glass",
  "ferros_layout",
  "vsf 0.11.0",
 ]
@@ -1285,6 +1290,7 @@ dependencies = [
  "ed25519-dalek",
  "ferros_ext4",
  "ferros_f2fs",
+ "ferros_glass",
  "ferros_hal",
  "ferros_hal_m1",
  "ferros_heap",
