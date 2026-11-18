@@ -333,12 +333,16 @@ fn tick_us() -> u64 {
 }
 /// With the line working, the longest the frame thread waits on it before it looks whether it was asked to stop: two of the main camera's frame periods (67.8 ms each), four of the ultrawide's, so it wakes on its own only once the stream has stopped, and a close never waits on a line that will not fire again.
 const QUIET_US: u64 = 1 << 17;
-/// The ring's descriptors and the index's step. The job's own ring has 1024, and an index written back to 0 after its last stops the front end for good (the Pro, 2026-11-14: no frame after the 1025th), so the engine gets a ring of its own, every descriptor the job's first, in a frame past the job's region: 2^14 of them, about 18 minutes at 14.7 frames a second, if the count register holds it (`RING_JOB` otherwise).
+/// The engine's ring: its count register and its index are both in bytes of the ring, a descriptor is `STEP` (16) bytes, and the engine's own read place wraps at the count (docs/CAMERA.md "The ring drained"): so the ring holds count / 16 descriptors, and the index goes round it, `(index + 16) mod count`, as Android's HAL writes it (count G#3E8, the index G#3E0 then G#8: the oracle capture uw-pdma-raw, 2026-10-22).
+/// Read as descriptors until 2026-11-17, the index never wrapped: the engine went on past it unreleased, reading descriptor slots ferros had stopped writing, and Lumis's held buffers were written over from the front end's 1024th frame on (count 2^14: 1024 slots; the Pro, 2026-11-17, the preview-split run: none over in 938 frames, 21 by 1091, 386 by 2194). And an index written as 0 while the engine's place was 0 (2026-11-14, the job's count 1024: 64 slots) stopped it for good after the 1025th frame, both the same model.
+/// `RING` for whole frames (1024 descriptors), `RING_SLIT` for slits (4096); `RING_JOB` (64), the job's own ring, if the count register holds neither.
 const RING: u64 = 1 << 14;
 const RING_JOB: u64 = 1 << 10;
 const STEP: u32 = 0x10;
-/// The descriptors the engine was given (`RING`, or `RING_JOB` when the count register did not hold `RING`).
+/// The count the engine was given (bytes: `RING`, `RING_SLIT` or `RING_JOB`), its descriptors a sixteenth of it.
 static RING_N: AtomicU64 = AtomicU64::new(RING_JOB);
+/// A device test of the wrap (the hand spawn's fourth input byte, log2 of the count to ask instead; 0 none): a count of 2^8 goes round every 16 frames.
+static RING_TEST: AtomicU64 = AtomicU64::new(0);
 
 static mut FRAME_STACK: [u8; 1 << 15] = [0; 1 << 15];
 
@@ -435,8 +439,8 @@ static IDX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static QUIET_FOUND: AtomicU64 = AtomicU64::new(0);
 static QUIET_SEEN: AtomicU64 = AtomicU64::new(0);
 static LATE: AtomicU64 = AtomicU64::new(0);
-/// Set when the long ring's last descriptor was given: the stream ends there (`RING`).
-static RING_END: AtomicU64 = AtomicU64::new(0);
+/// Times the index went round the ring (`RING`): a stream past them is the drain working.
+static WRAPS: AtomicU64 = AtomicU64::new(0);
 
 /// The ring's state, one word so either thread changes it whole (compare-and-swap): bits 0-7 the buffers the kist holds, 8-15 the buffers the driver bins from, 16-23 the buffers released to the engine whose frame has not been seen yet, 24-27 the newest written buffer, bit 28 set once there is one.
 static STATE: AtomicU64 = AtomicU64::new(0);
@@ -614,25 +618,22 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
         // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
-        let more = *idx < RING_N.load(Ordering::Relaxed) as u32 * STEP;
         let n = FRAMES.load(Ordering::Relaxed) + 1;
         if SLITS.load(Ordering::Relaxed) != 0 {
             slit_turn(n);
         } else {
-            ring_turn(n, more.then_some((*idx / STEP) as u64));
+            ring_turn(n, Some((*idx / STEP) as u64));
         }
-        // The next descriptor. Never round the ring: back to 0 the front end stops for good (`RING`). At the ring's end the index is left where it is, the console says so, and the stream ends with its last descriptor (the FRAME that finds no frame closes).
-        if more {
-            *idx += STEP;
-            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
-            let t = ferros_sys::now() - t0;
-            IDX[0].fetch_add(1, Ordering::Relaxed);
-            IDX[1].fetch_add(t, Ordering::Relaxed);
-            IDX[2].fetch_max(t, Ordering::Relaxed);
-            if *idx == RING_N.load(Ordering::Relaxed) as u32 * STEP {
-                RING_END.store(1, Ordering::Relaxed);
-                say!(g, "camera: the ring's last descriptor given after A#{} frames\n", FRAMES.load(Ordering::Relaxed) + 1);
-            }
+        // The next descriptor, round the ring as the engine's own place goes round it (`RING`): the index is never the engine's place while a frame is owed, so the stream runs as long as it is answered.
+        let count = RING_N.load(Ordering::Relaxed) as u32;
+        *idx = (*idx + STEP) & (count - 1);
+        wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
+        let t = ferros_sys::now() - t0;
+        IDX[0].fetch_add(1, Ordering::Relaxed);
+        IDX[1].fetch_add(t, Ordering::Relaxed);
+        IDX[2].fetch_max(t, Ordering::Relaxed);
+        if *idx == 0 {
+            WRAPS.fetch_add(1, Ordering::Relaxed);
         }
     }
     for &a in cam().ack.iter() {
@@ -737,8 +738,9 @@ const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 
 /// The open camera.
 struct Open {
-    /// Where this process reads the region (its physical start went into the job), and the region's layout with its image ring of `ring` buffers.
+    /// Where this process reads the region and where it lies (its physical start went into the job), and the region's layout with its image ring of `ring` buffers.
     va: usize,
+    pa: u64,
     l: job::Layout,
     ring: usize,
     /// The sensor's frame timing (ferros_cam ccs `Timing`: the mode's line and frame, the integration's least and margin as the sensor answered them) and what its exposure now set it to (`Plan`).
@@ -894,7 +896,8 @@ enum Fail {
 
 /// What an OPEN asks of the sensor (docs/CAMERA.md "Modes, the bench and the slit"): its mode block after `[1][id][view]`, every field optional, a shorter OPEN taking the defaults (the init's mode untouched, as every open before the bench).
 /// `kind`: 0 the init's mode (Android's binned), 1 the binned mode with its frame and integration cut, 2 the 1:1 readout (a guess until a capture), 3 a binned slit, 4 a 1:1 slit.
-/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells), `fll` the frame in lines (0: the rows and `BLANK` more; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's).
+/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells), `fll` the frame in lines (0: the rows and `BLANK` more; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's), `cols` the window's output columns across the middle (0: the mode's whole width; on 2^4, ferros_cam ccs `Mode::cols`).
+/// A windowed mode (a slit, or `cols` set) turns the sensor's phase detect and embedded data off in its hold (ferros_cam ccs `Side`), unless `F_LOUD`: both are laid out for the whole binned frame.
 #[derive(Clone, Copy)]
 struct Spec {
     kind: u8,
@@ -904,6 +907,7 @@ struct Spec {
     flags: u8,
     ring: u8,
     llp: u16,
+    cols: u16,
 }
 const K_CAPTURED: u8 = 0;
 const K_BINNED: u8 = 1;
@@ -923,6 +927,8 @@ const F_SLIM: u8 = 1 << 4;
 const F_SLIM2: u8 = 1 << 5;
 /// The front end left at the captured geometry (the sensor's mode alone changes: October's slit experiments).
 const F_KEEP_FE: u8 = 1 << 6;
+/// A windowed mode keeps the sensor's phase detect and embedded data as the init left them (the 2026-11-16 slits' way: ERR_CRC_PH, one frame an open).
+const F_LOUD: u8 = 1 << 7;
 /// `fll`'s word for the mode's own frame length.
 const FLL_OWN: u16 = 0xFFFF;
 /// Lines of frame past a mode's rows when `fll` is 0: a 4-row slit ran at 96 lines and stopped at 68 (2026-10-21), so 2^7 past the rows holds the slit with room; a whole frame gets 2^8.
@@ -932,7 +938,7 @@ const EXPOSURE: u16 = 1 << 4;
 /// A slit ring's buffers: 2^8 by default (a binned 4-row slit's 32 KiB each, 8 MiB), at most 2^12 (the slim copies' 4 MiB).
 const SLIT_RING: u8 = 8;
 const SLIT_RING_MOST: u8 = 12;
-/// The long ring's descriptors for a slit: 2^16 (1 MiB; 54 s at 1212 slits a second), if the count register holds it (`RING` else, `RING_JOB` last).
+/// The engine ring's count for a slit: 2^16 bytes, 4096 descriptors (`RING`), so every slit ring (to 2^12 buffers) divides them; if the count register holds it (`RING` else, `RING_JOB` last). The index goes round it: the stream runs as long as it is answered.
 const RING_SLIT: u64 = 1 << 16;
 
 impl Spec {
@@ -940,7 +946,7 @@ impl Spec {
         // WHY the length test: the block is optional and the message's tail past `got` is the last call's bytes, not this one's.
         let b = |k: usize| if k < got { msg[k] } else { 0 };
         let h = |k: usize| u16::from_le_bytes([b(k), b(k + 1)]);
-        Spec { kind: b(3), rows: h(4), fll: h(6), exposure: h(8), flags: b(10), ring: b(11), llp: h(12) }
+        Spec { kind: b(3), rows: h(4), fll: h(6), exposure: h(8), flags: b(10), ring: b(11), llp: h(12), cols: h(14) }
     }
     fn slit(&self) -> bool {
         matches!(self.kind, K_SLIT | K_SLIT_FULL)
@@ -970,6 +976,12 @@ fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
     let mut m = if s.slit() { base.slit(a, rows, fll, exp) } else { base.timed(fll, exp) }.map_err(Fail::Mode)?;
     if s.llp != 0 {
         m.llp = s.llp;
+    }
+    if s.cols != 0 {
+        m = m.cols(a, s.cols).map_err(Fail::Mode)?;
+    }
+    if (s.slit() || s.cols != 0) && s.flags & F_LOUD == 0 {
+        m = m.quiet();
     }
     if s.flags & F_RAW12 != 0 {
         m = m.raw12();
@@ -1147,7 +1159,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     let arr = &ccs::ARRAYS[c.id as usize];
     if let Some(m) = mode {
-        say!(g, "camera: mode A#{}: A#{} x A#{} (x G#{:X} to G#{:X}, y G#{:X} to G#{:X}, increments A#{} A#{}, binning G#{:02X}{:02X}), frame A#{} lines of A#{} clocks, integration A#{} lines, format G#{:X}{}\n", s.kind, m.x_out, m.y_out, m.x_start, m.x_end, m.y_start, m.y_end, m.inc[0], m.inc[2], m.binning[0], m.binning[1], m.fll, m.llp, m.coarse, m.format, if s.flags & F_MID != 0 { "; written after the first frame" } else { "" });
+        say!(g, "camera: mode A#{}: A#{} x A#{} (x G#{:X} to G#{:X}, y G#{:X} to G#{:X}, increments A#{} A#{}, binning G#{:02X}{:02X}), frame A#{} lines of A#{} clocks, integration A#{} lines, format G#{:X}; the sensor's phase detect and embedded data {}{}\n", s.kind, m.x_out, m.y_out, m.x_start, m.x_end, m.y_start, m.y_end, m.inc[0], m.inc[2], m.binning[0], m.binning[1], m.fll, m.llp, m.coarse, m.format, if m.quiet { "off" } else { "as the init left them" }, if s.flags & F_MID != 0 { "; written after the first frame" } else { "" });
         if s.flags & F_MID == 0 {
             for wr_ in m.writes(arr, c).iter() {
                 bus.write(c.addr, wr_).map_err(Fail::Sensor)?;
@@ -1230,7 +1242,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     PD_ON.store((s.kind == K_CAPTURED || s.flags & F_PD != 0) as u64, Ordering::Relaxed);
     SLITS.store(if slit { ring as u64 } else { 0 }, Ordering::Relaxed);
     NOW_FORMAT.store(mode.map_or(10, |m| m.bits() as u64), Ordering::Relaxed);
-    for x in [&LATE, &BUSY, &BUSY_MOST, &RING_END] {
+    for x in [&LATE, &BUSY, &BUSY_MOST, &WRAPS] {
         x.store(0, Ordering::Relaxed);
     }
     // The engine's places: the copies, the descriptors' flags (the job's own: its first descriptor's).
@@ -1243,7 +1255,13 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     RING_VA.store((va + ring_off) as u64, Ordering::Relaxed);
     // The engine, exactly as a camera open starts it, its long ring at the engine's area: the count asked for read back, the next smaller tried, the job's own ring at the region's start last (`RING_JOB`).
     let pd = ferros_cam::PDMA;
-    let want = if slit { RING_SLIT } else { RING };
+    let want = match RING_TEST.load(Ordering::Relaxed) {
+        0 if slit => RING_SLIT,
+        0 => RING,
+        // WHY the range: the byte is the person's; under 2^5 the ring holds one descriptor (the index would be the engine's place at once), past 2^16 the shift leaves the count register's measured reach (and past 63 it overflows).
+        k @ 5..=16 => 1 << k,
+        _ => return Err(Fail::Inputs("a ring test count outside 2^5 to 2^16")),
+    };
     let mut ring_n = RING_JOB;
     let mut ring_pa = pa;
     for k in [want, RING] {
@@ -1253,10 +1271,15 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             break;
         }
     }
+    // The ring's descriptors: a sixteenth of the count (`RING`). A slit ring's buffers must divide them, so slot e's buffer (e mod the buffers) is frame e + 1's in every round of the ring.
+    let slots = ring_n / STEP as u64;
+    if slit && slots % ring as u64 != 0 {
+        return Err(Fail::Inputs("the engine's ring holds fewer descriptors than the slit ring has buffers"));
+    }
     RING_N.store(ring_n, Ordering::Relaxed);
     DESC_VA.store((va + (ring_pa - pa) as usize) as u64, Ordering::Relaxed);
     // Every descriptor named at once: a slit ring's for good (descriptor e buffer e mod the ring), an image ring's as the frame thread will rewrite each before it is released (`ring_turn`), all naming buffer 0 meanwhile.
-    for e in 0..ring_n {
+    for e in 0..slots {
         desc_for(e, if slit { (e % ring as u64) as usize } else { 0 });
     }
     // The image ring's state, its first buffer given to descriptor 0 (released with the stream below): every buffer patterned above, so its probe shows the frame that lands.
@@ -1301,7 +1324,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     let refused = REFUSED.load(Ordering::Relaxed);
-    say!(g, "camera: engine started (ring G#{ring_pa:X}, A#{ring_n} descriptors{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
+    say!(g, "camera: engine started (ring G#{ring_pa:X}, count A#{ring_n}, A#{slots} descriptors round which the index goes{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
     // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered; elsewhere it stays where it rests (the ultrawide's actuator never answered ferros, the front's range is not measured).
     let focus = if c.focus.1 != 0 { 0x3800 } else { 0 };
     // The sensor's frame timing, for exposures (ferros_cam ccs `Timing`): the mode's line and frame (the init's own where no mode was asked), and the integration's least and margin as the sensor answers them (CCS G#1004 and G#1006), read here, never assumed.
@@ -1327,7 +1350,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, l, ring, timing, now, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1369,6 +1392,8 @@ fn close(g: u64) {
     // The view taken back first (SYS_DMA x1 = 5): its blocks the blank frame, the holder's token dead, before the stream stops. Nothing when none was given.
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 5, 0, 0, 0);
     let c = cam();
+    link_say(g);
+    say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
     // The frame thread stopped before the switch stops the engine: it is in a wait of at most `QUIET_US` (or the tick), and answers no more once it sees this. Bounded at twice that, so a thread that never answers cannot keep the switch on.
@@ -1534,6 +1559,71 @@ fn header(h: &mut [u8], b: usize, bin: usize) {
     }
 }
 
+/// SNAP's reply past the frame's header: the image buffer's physical address, the PD copy's, the PD rows, width and line bytes, a status (bit 0 the next frame began writing the PD rows while they were copied: torn; bit 1 no buffer was free for the copy), the copy's microseconds.
+const SNAP_REPLY: usize = HEADER + 40;
+
+/// An image and its phase-detect rows kept as one pair (owner, 2026-11-17: phase detect as data, "split-image and microprism" from its left and right halves; docs/CAMERA.md "Phase detect as data"): the next frame's buffer held (`HOLD_BIN`, until the close), a second free buffer held for the copy, loch0's PD output (slot 0, the PD path's 4080 x 768 RAW10 at the image's stride) copied into it at once after the frame's DMA_DONE, while the sensor is in its vertical blanking (57 ms of the init's 67 ms frame), before the next frame's PD rows begin landing in the slot.
+/// The pair is then read by physical address (the reply carries both; `ferros-bridge read`, tools/camera-pd-pair.sh) while the holder keeps the camera open. Only the init's mode with its PD path on (every other mode has loch0's PD path off) and a ring of three or more.
+fn snap(o: &Open, out: &mut [u8; SNAP_REPLY]) -> bool {
+    let c = cam();
+    if !o.captured || PD_ON.load(Ordering::Relaxed) == 0 || o.ring < 3 {
+        return false;
+    }
+    let Some(b) = wait_hold(HOLD_BIN, FRAMES.load(Ordering::Acquire)) else { return false };
+    let t0 = ferros_sys::now();
+    let n = FRAMES.load(Ordering::Acquire);
+    // The copy's buffer: neither held, nor with the engine, nor the newest; taken in the same compare-and-swap as the frame thread's turn, so the engine is never given it.
+    let all = (1u64 << o.ring) - 1;
+    let mut p = None;
+    loop {
+        let s = STATE.load(Ordering::Acquire);
+        let held = s & 0xFFFF;
+        let holds = (held | held >> 8) & 0xFF;
+        let free = all & !(holds | (s >> QUEUED) & 0xFF | newest_of(s).map_or(0, |k| 1 << k));
+        if free == 0 {
+            break;
+        }
+        let k = free.trailing_zeros();
+        if STATE.compare_exchange(s, s | 1 << (HOLD_BIN + k), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            p = Some(k as usize);
+            break;
+        }
+    }
+    let (rows, stride) = (c.height / 4, c.stride);
+    let src = o.va + o.l.slots[job::OLD_SLOT_PD].0 as usize;
+    let mut status = 0u32;
+    let mut copy_us = 0;
+    match p {
+        Some(p) => {
+            let dst = image(o, p);
+            for i in 0..rows * stride / 64 {
+                // SAFETY: the PD slot holds `rows` lines of `stride` (its extent measured to +G#3BFF00 of G#3C0000) inside the region, and buffer p (16 MiB) holds them; both 64-byte aligned (the slot and the buffer start on frames, the stride is G#1400).
+                unsafe {
+                    let v = core::arch::aarch64::vld1q_u8_x4((src + i * 64) as *const u8);
+                    core::arch::aarch64::vst1q_u8_x4((dst + i * 64) as *mut u8, v);
+                }
+            }
+            copy_us = ferros_sys::us_since(t0);
+            // The first PD row again: the next frame writes the slot top down, so a first row unchanged after the copy is a copy no row of the next frame reached; a newer frame counted says the same the other way.
+            let a = unsafe { core::ptr::read_volatile(src as *const [u64; 8]) };
+            let d = unsafe { core::ptr::read_volatile(dst as *const [u64; 8]) };
+            if a != d || FRAMES.load(Ordering::Acquire) != n {
+                status |= 1;
+            }
+            out[HEADER + 8..HEADER + 16].copy_from_slice(&(o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + (p as u64) * BUF.load(Ordering::Relaxed)).to_le_bytes());
+        }
+        None => status |= 2,
+    }
+    header(&mut out[..HEADER], b, 1);
+    out[HEADER..HEADER + 8].copy_from_slice(&(o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + (b as u64) * BUF.load(Ordering::Relaxed)).to_le_bytes());
+    out[HEADER + 16..HEADER + 20].copy_from_slice(&(rows as u32).to_le_bytes());
+    out[HEADER + 20..HEADER + 24].copy_from_slice(&(c.width as u32).to_le_bytes());
+    out[HEADER + 24..HEADER + 28].copy_from_slice(&(stride as u32).to_le_bytes());
+    out[HEADER + 28..HEADER + 32].copy_from_slice(&status.to_le_bytes());
+    out[HEADER + 32..HEADER + 40].copy_from_slice(&copy_us.to_le_bytes());
+    true
+}
+
 /// The newest written buffer, held for `bit` (`HOLD_KIST` or `HOLD_BIN`) when its frame's count is past `after`: one compare-and-swap with the frame thread's turn, so a buffer is never both held and given to the engine. None when the newest is not past `after` (or there is none yet).
 fn hold_newest(bit: u32, after: u64) -> Option<usize> {
     loop {
@@ -1615,6 +1705,10 @@ fn release(g: u64, o: &mut Open, b: usize) {
 /// No frame came in `late_us`: said with the words that tell why.
 fn late(g: u64) {
     say!(g, "camera: no frame in A#{} ms (A#{} so far; A#{} answers, A#{} on the line; image status bits seen G#{:X}; ring frames unseen A#{}); closing\n", late_us() / 1000, FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), IMG_SEEN.load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed));
+}
+
+/// The camera's CSI link as it stands, said: at a stream that stopped (`late`) and at every close, so a run says which channels the sensor sent (frame starts per channel at +G#24) and whether the link took them whole (+G#14: G#20 ERR_CRC_PH).
+fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
     let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
     let link = a & !0xFFFF;
@@ -1663,6 +1757,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     if input_len > 2 {
         MEASURE.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 2) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    // The fourth, a device test of the ring's wrap only: log2 of the count to ask (`RING_TEST`; 0 the mode's).
+    if input_len > 3 {
+        RING_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 3) as *const u8) } as u64, Ordering::Relaxed);
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
@@ -2002,6 +2100,22 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 }
                 reply(&token, &caps(g));
             }
+            // SNAP `[12]`: the next frame and its phase-detect rows kept as a pair until the close (`snap`): the frame's header (bin 1), then the pair's addresses and shape; empty when this open cannot (not the init's mode with its PD path, a ring under three, no frame).
+            12 => {
+                let Some(o) = open_cam.as_ref() else {
+                    reply(&token, &[]);
+                    continue;
+                };
+                let mut out = [0u8; SNAP_REPLY];
+                if !snap(o, &mut out) {
+                    say!(g, "camera: SNAP refused (the init's mode with its PD path and a ring of three or more only) or no frame came\n");
+                    reply(&token, &[]);
+                    continue;
+                }
+                let w = |k: usize| u64::from_le_bytes(out[HEADER + k..HEADER + k + 8].try_into().unwrap());
+                say!(g, "camera: SNAP frame A#{}: image at G#{:X} (A#{} x A#{} RAW10, G#{:X} a line), its PD rows copied to G#{:X} (A#{} x A#{}, G#{:X} a line) in A#{} us, status G#{:X} (1 torn, 2 no buffer); both held until the close\n", u32::from_le_bytes(out[0..4].try_into().unwrap()), w(0), COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed), LINE.load(Ordering::Relaxed), w(8), w(16) as u32, (w(16) >> 32) as u32, w(24) as u32, w(32), (w(24) >> 32) as u32);
+                reply(&token, &out);
+            }
             _ => {
                 reply(&token, &[]);
             }
@@ -2015,7 +2129,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
 
 // ---------------------------------------------------------------- the bench's ops
 
-/// STATS' reply: little-endian u64s, in order: frames the front end wrote (DMA_DONE), answers, answers on the line, the frame thread's ticks answering and the most in one answer, slit frames not where the ring put them, ring frames whose buffer was not found, the long ring's descriptors and whether its last was given, the counter now and its frequency, register accesses refused, the image status bits seen, the frame's rows, width, line bytes and a buffer's bytes, the slit ring's buffers (0 none), the mode's frame and line length, the integration (lines), bits a sample, whether the slim program runs, whether the PD path is on, whether the frame thread answers on its tick, when the open began (the counter).
+/// STATS' reply: little-endian u64s, in order: frames the front end wrote (DMA_DONE), answers, answers on the line, the frame thread's ticks answering and the most in one answer, slit frames not where the ring put them, ring frames whose buffer was not found, the engine ring's count (bytes, a sixteenth of it descriptors) and how many times the index went round it, the counter now and its frequency, register accesses refused, the image status bits seen, the frame's rows, width, line bytes and a buffer's bytes, the slit ring's buffers (0 none), the mode's frame and line length, the integration (lines), bits a sample, whether the slim program runs, whether the PD path is on, whether the frame thread answers on its tick, when the open began (the counter).
 const STATS_WORDS: usize = 26;
 fn stats() -> [u8; 8 * STATS_WORDS] {
     let w: [u64; STATS_WORDS] = [
@@ -2027,7 +2141,7 @@ fn stats() -> [u8; 8 * STATS_WORDS] {
         LATE.load(Ordering::Relaxed),
         UNSEEN.load(Ordering::Relaxed),
         RING_N.load(Ordering::Relaxed),
-        RING_END.load(Ordering::Relaxed),
+        WRAPS.load(Ordering::Relaxed),
         ferros_sys::now(),
         ferros_sys::freq(),
         REFUSED.load(Ordering::Relaxed),
@@ -2053,7 +2167,7 @@ fn stats() -> [u8; 8 * STATS_WORDS] {
     out
 }
 
-/// SLITS' reply: little-endian u64s: the newest frame's count, the ring's buffers, a buffer's bytes, the rows, a line's bytes, the width, frames not where the ring put them, whether the long ring's last descriptor was given. Frame n is in buffer (n - 1) mod the ring, at n's buffer times its bytes in the view; its record (`slit_turn`: count, counter, Eagle time, probe moved) right after the rows. The oldest buffer is the next the engine writes (its probe patterned as its descriptor is released), so a reader keeps to the newest ring - 1.
+/// SLITS' reply, the drain (docs/CAMERA.md "The ring drained"): little-endian u64s: the newest frame's count, the ring's buffers, a buffer's bytes, the rows, a line's bytes, the width, frames not where the ring put them, how many times the engine's index went round its ring. Frame n is in buffer (n - 1) mod the ring, at n's buffer times its bytes in the view; its record (`slit_turn`: count, counter, Eagle time, probe moved) right after the rows. The oldest buffer is the next the engine writes (its probe patterned as its descriptor is released), so a reader keeps to the newest ring - 1, and a slit whose record reads another count after its rows were copied was written over while read.
 fn slits() -> [u8; 64] {
     let w: [u64; 8] = [
         FRAMES.load(Ordering::Acquire),
@@ -2063,7 +2177,7 @@ fn slits() -> [u8; 64] {
         LINE.load(Ordering::Relaxed),
         COLS.load(Ordering::Relaxed),
         LATE.load(Ordering::Relaxed),
-        RING_END.load(Ordering::Relaxed),
+        WRAPS.load(Ordering::Relaxed),
     ];
     let mut out = [0u8; 64];
     for (k, v) in w.iter().enumerate() {

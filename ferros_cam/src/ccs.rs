@@ -69,6 +69,8 @@ pub struct Array {
     pub margin: Option<u16>,
     /// The vendor's long-exposure shift (`Lte`), once a capture of Android's own long exposure shows how it is written; None until then.
     pub lte: Option<Lte>,
+    /// The sensor's side channels (`Side`): phase detect and embedded data, which a windowed mode turns off at the sensor; None where not known.
+    pub side: Option<Side>,
 }
 
 /// A sensor vendor's long-exposure shift: the frame and the integration each counted in units of 2^shift lines, past the 16 bits of CCS frame_length_lines and coarse_integration_time (owner, 2026-11-17: "this needs done", up to 16 s on the main as on Android).
@@ -91,18 +93,31 @@ impl Lte {
     }
 }
 
+/// A sensor's side channels on its CSI link besides the image: phase detect (the PD rows, the main's channel 1, 4080 x 768) and embedded data (channel 2, 4 lines on the main).
+/// Both are laid out for the whole binned frame (the main's PD block says 768 rows whatever the window), so a mode with its own window (a slit, a narrower x) turns both off at the sensor (owner, 2026-11-17: "phase detect off at the sensor" for slits, kept for whole frames).
+/// Read off the captured inits by diffing, not guessed (docs/CAMERA.md "The slit for real"):
+/// - embedded data: G#0118 is two bytes, an enable (1) and the line count, the count matching each camera's link exactly (the main and the tele G#0104 with 4 embedded lines on the link, G#40FF0 at link +G#64; the front G#0102 with 2, G#20F00); off is G#0000;
+/// - phase detect: the main's G#0720 to G#072E, G#0720 = 1 beside a block that describes the PD channel (G#0728/G#072A = 2040 x 768, G#072C/G#072E = 508 x 768: the 768 is the link's channel 1 height, G#3000FF0), written the same in the binned and the 1:1 inits; off is G#0720 = 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Side {
+    /// Phase detect's enable word (16 bits, 0 off), where known.
+    pub pd: Option<u16>,
+    /// Embedded data's control word (16 bits: enable byte and lines; 0 off).
+    pub emb: u16,
+}
+
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
     // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03). Offered: the analogue range alone, 1024 to 163840 (owner, 2026-11-17: digital gain is after the ADC, so analogue only); the noise test (camtest 4, b915) puts the real analogue at the stated 160x: no empty codes at any step, and the dark noise grows 1.67 times from 64x to 128x and 1.10 from 128x to 160x (2 and 1.25 if the gain were after the ADC).
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b897): 2 and 2.
     // Its long-exposure shift, Android's own at 16 s (the capture of 2026-11-17, Lumis on Android in its 8160 x 6144 mode, integrity 0): G#0702 and G#0704 both carry the shift in their high byte, written in every hold beside the integration and frame, which count in 2^shift lines (frame = integration + 36 in those units); 0, then 3, then 6 at 16 s, mid-stream, no stream off or on around it, the line length untouched. 6 is the most Android showed; 7 (16 s) and 8 (32 s) ran on ferros at the mode's line (b933: frames 16.4 s and 32.8 s apart, the sensor reading back its shifted counters and the line 6320), so 8 is the most offered (52.8 s) until the owner picks a cap.
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 8 }) },
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 8 }), side: Some(Side { pd: Some(0x0720), emb: 0x0118 }) },
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64.
-    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: None },
+    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: None, side: None },
     // The front has never answered ferros, the tele never streamed: neither margin read.
-    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None },
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None },
+    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
 ];
 
 // ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
@@ -283,6 +298,8 @@ pub struct Mode {
     pub format: u16,
     /// Output pixels per array pixel on each axis' inverse: 2 for the binned modes, 1 for 1:1.
     pub bin: u16,
+    /// The side channels (`Side`) turned off at the sensor in the hold: phase detect and embedded data, for a mode whose window is not the init's.
+    pub quiet: bool,
 }
 
 /// The registers `Mode::captured` reads back out of an init, and their widths.
@@ -363,6 +380,8 @@ pub enum Error {
     NoFullMode,
     /// A slit of no rows, an odd count, or one past the readout.
     Rows(u16),
+    /// A window of no columns, one not on 2^4 columns (the RAW10 groups and the front end's line), or one past the readout.
+    Cols(u16),
     /// The integration (lines) does not fit the frame (lines) with its margin: CCS asks coarse <= frame_length_lines - max_margin, and the 2026-10-20 slit ran the init's 21342 lines in frames of 68 to 576.
     Integration(u16, u16),
     /// A frame shorter than the rows it carries.
@@ -396,6 +415,7 @@ impl Mode {
             coarse: g(COARSE_INTEGRATION)?,
             format: opt(CSI_DATA_FORMAT),
             bin: 2,
+            quiet: false,
         })
     }
 
@@ -478,6 +498,39 @@ impl Mode {
         Ok(())
     }
 
+    /// Address units per output column: the x increment the init set, or the binning times the unit (the Sony part).
+    pub fn units_per_col(&self, a: &Array) -> u16 {
+        if a.incs { self.inc[0] } else { self.bin * a.unit }
+    }
+
+    /// The window narrowed to `cols` output columns across the array's middle, started on the colour filter's period as a slit's rows are (`slit`), so the mosaic keeps its phase: fewer pixels a line on the link, for a shorter line (owner, 2026-11-17: "stupid fast", the link the ceiling, not the sensor).
+    /// `cols` on 2^4 (whole RAW10 groups of four, and a line the front end takes in 20-byte steps), at most the mode's own width.
+    pub fn cols(&self, a: &Array, cols: u16) -> Result<Mode, Error> {
+        if cols == 0 || cols % (1 << 4) != 0 || cols > self.x_out {
+            return Err(Error::Cols(cols));
+        }
+        let mut m = *self;
+        let span = cols * self.units_per_col(a);
+        let period = a.period * a.unit;
+        let width = self.x_end + 1 - self.x_start;
+        let off = ((width - span) / 2 + period / 2) / period * period;
+        m.x_start = self.x_start + off;
+        m.x_end = m.x_start + span - 1;
+        m.x_out = cols;
+        if a.crop {
+            m.crop[0] = 0;
+            m.crop[2] = cols;
+        }
+        Ok(m)
+    }
+
+    /// Phase detect and embedded data off at the sensor (`Side`), for a mode whose window is not the init's: both are laid out for the whole binned frame.
+    pub fn quiet(&self) -> Mode {
+        let mut m = *self;
+        m.quiet = true;
+        m
+    }
+
     /// RAW12 instead of RAW10 (the sensor's data format; the receiver's data type and the front end's stride follow it: `crate::geom`).
     pub fn raw12(&self) -> Mode {
         let mut m = *self;
@@ -526,6 +579,14 @@ impl Mode {
         w.push16(X_OUTPUT_SIZE, self.x_out);
         w.push16(Y_OUTPUT_SIZE, self.y_out);
         w.push16(COARSE_INTEGRATION, self.coarse);
+        if self.quiet {
+            if let Some(s) = a.side {
+                w.push16(s.emb, 0);
+                if let Some(p) = s.pd {
+                    w.push16(p, 0);
+                }
+            }
+        }
         w.push_raw(c.release);
         w
     }
@@ -779,6 +840,57 @@ mod tests {
             assert_eq!(w[0], c.hold);
             assert!(w.contains(&&[0x09u8, 0x00, 1, 0x22, 8][..]));
         }
+    }
+
+    /// A quiet mode turns phase detect and embedded data off inside the hold, after the mode's registers and before the release; a mode left loud writes neither. The main's PD block and embedded word are read off its init as the side channels say (`Side`).
+    #[test]
+    fn side_channels_off_in_the_hold() {
+        let Some(init) = local("cam.frame") else { return };
+        let (a, c) = (&ARRAYS[0], &cams::MAIN);
+        let m = Mode::captured(&init, a).unwrap();
+        assert!(!m.quiet);
+        let loud: Vec<Vec<u8>> = m.slit(a, 4, 132, 16).unwrap().writes(a, c).iter().map(|w| w.to_vec()).collect();
+        assert!(!loud.iter().any(|w| w[..2] == [0x07, 0x20] || w[..2] == [0x01, 0x18]));
+        let s = m.slit(a, 4, 132, 16).unwrap().quiet();
+        let ws = s.writes(a, c);
+        let w: Vec<&[u8]> = ws.iter().collect();
+        let n = w.len();
+        assert_eq!(w[n - 3], &[0x01, 0x18, 0, 0]);
+        assert_eq!(w[n - 2], &[0x07, 0x20, 0, 0]);
+        assert_eq!(w[n - 1], c.release);
+        assert!(n <= WRITES_MOST);
+        // The init's own: embedded data on with 4 lines (the link's channel 2: G#40FF0), phase detect on with its 768-row block (the link's channel 1: G#3000FF0).
+        let mut emb = None;
+        let mut pd = None;
+        for rec in crate::inputs::records(&init) {
+            let Ok(crate::inputs::Rec::Write(w)) = rec else { continue };
+            match w {
+                [0x01, 0x18, d @ ..] => emb = Some(d.to_vec()),
+                [0x07, 0x2A, d @ ..] => pd = Some(d.to_vec()),
+                _ => {}
+            }
+        }
+        assert_eq!(emb.as_deref(), Some(&[0x01, 0x04][..]));
+        assert_eq!(pd.as_deref(), Some(&[0x03, 0x00][..]));
+    }
+
+    /// An x window lies on the period, centred, `cols` wide; a width off 2^4 or past the readout is refused.
+    #[test]
+    fn columns_centre_on_the_period() {
+        let Some(init) = local("cam.frame") else { return };
+        let a = &ARRAYS[0];
+        let m = Mode::captured(&init, a).unwrap();
+        for cols in [16u16, 256, 1280, 2048, 4080] {
+            let s = m.cols(a, cols).unwrap();
+            assert_eq!(s.x_end + 1 - s.x_start, cols * 4);
+            assert_eq!((s.x_start - m.x_start) % 8, 0);
+            let centre = (s.x_start as i32 + s.x_end as i32 + 1) / 2;
+            let middle = (m.x_start as i32 + m.x_end as i32 + 1) / 2;
+            assert!((centre - middle).abs() <= 4, "cols {cols}");
+            assert_eq!((s.x_out, s.y_out), (cols, m.y_out));
+        }
+        assert_eq!(m.cols(a, 1288), Err(Error::Cols(1288)));
+        assert_eq!(m.cols(a, 4096), Err(Error::Cols(4096)));
     }
 
     /// The main's line time scales the frame: the captured mode's 21362 lines at 3.1489 us are its measured 67.3 ms; a 132-line slit is about 426 us of lines (the sensor kept a floor of about 825 us on 2026-10-21).

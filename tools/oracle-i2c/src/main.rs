@@ -3,9 +3,11 @@
 //! Input: the flushed console (console-ramoops-0), or its `ferros hv: S2 <pa> <R|W><bytes> <value>` lines (HV.md, the register oracle); `ferros hv: S2 rep <N>` repeats the access before it N more times; `ferros-mark: ...` lines written from Android pass thru as `# MARK ...`.
 //! Register map as ferros_kernel hsi2c.rs has it: TX_DATA G#34, RX_DATA G#38, AUTO_CONF G#44 (length bits 0-15, READ bit 16, RUN bit 31), ADDR G#70 (the 7-bit target at bits 10-16).
 //!
-//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D]
+//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table]
 //! - Transfers (the default): `G#3D W 02 02 53 5E`, one a line; a transfer longer than `--max-bytes` as its first four bytes, its length and its blake3 (a sensor's settings upload is vendor firmware: its size and identity stay checkable, its bytes stay out of any file meant for the repository).
 //! - `--holds T`: target T's writes as 16-bit CCS register and data: every hold (G#0104 = 1 ... G#0104 = 0) on one line, `hold: 0702=0000 0704=0000 0202=535E 0340=5372`; every write outside a hold on its own line (stream on and off, mode changes); Samsung's indirect window (G#6028, G#602A, G#6F12) said as the page address it writes; reads as `R`. What a long exposure writes is then read straight off it (docs/CAMERA.md "Long exposures").
+//! - `--flat` (with `--holds T`): every write to T one 16-bit word a line at its resolved address, `2001_8D3E=000C` (the page G#FCFC selects, or the indirect window), so two inits diff with sort and join: docs/CAMERA.md "The slit for real" found the side channels this way.
+//! - `--table`: the input is an init table (`cam.<key>.init`, or the init inside a `cam.frame` bundle), not a capture, read as transfers to `--holds T`.
 //! Integrity on stderr: transfers whose byte count is not the length their AUTO_CONF run was programmed with (lines lost from the console ring: never replay such a transfer; memory feedback_oracle_capture_integrity).
 
 use std::fmt::Write as _;
@@ -132,6 +134,84 @@ fn bytes(d: &[u8], max: Option<usize>) -> String {
     s
 }
 
+/// An init table (`cam.<key>.init`, or the init inside a 'CFRM' bundle: ferros_cam inputs) as transfers to `target`, so a captured init and a table read the same way.
+/// Records: `W` len (u16 BE) and the bytes; `R` count (u16 BE) and a two-byte register; `D` microseconds (u32 BE); a table that stops parsing panics at the byte (never a guess).
+fn table(raw: &[u8], target: u8) -> Vec<Item> {
+    let t = if raw.len() >= 8 && &raw[..4] == b"CFRM" { &raw[8..8 + u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize] } else { raw };
+    let mut items = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        match t[i] {
+            b'W' => {
+                let n = u16::from_be_bytes([t[i + 1], t[i + 2]]) as usize;
+                items.push(Item::Xfer(Xfer { target, read: false, data: t[i + 3..i + 3 + n].to_vec(), expect: Some(n) }));
+                i += 3 + n;
+            }
+            b'R' => {
+                items.push(Item::Xfer(Xfer { target, read: false, data: t[i + 3..i + 5].to_vec(), expect: Some(2) }));
+                i += 5;
+            }
+            b'D' => i += 5,
+            _ => panic!("the table stops parsing at byte {i}"),
+        }
+    }
+    items
+}
+
+/// One sensor's writes with every address resolved, one 16-bit word a line in order (`2001_8D3E=000C`), so two inits diff with sort and join: a direct write lands at the page G#FCFC selects (G#4000 until one is selected), a write thru the indirect window (G#6028, G#602A, G#6F12) at the window's address, and a run of data bytes advances the address by two a word (one byte alone stays a byte, `4000_0104=01`).
+/// An upload longer than `max` is one line, its first word's address, its length and its blake3, as the default output says it.
+fn flat(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut page, mut hi, mut lo) = (0x4000u16, 0u16, 0u16);
+    for it in items {
+        let x = match it {
+            Item::Mark(m) => {
+                out.push(format!("# MARK {m}"));
+                continue;
+            }
+            Item::Xfer(x) if x.target == target && !x.read && x.data.len() >= 3 => x,
+            Item::Xfer(_) => continue,
+        };
+        let a = u16::from_be_bytes([x.data[0], x.data[1]]);
+        let d = &x.data[2..];
+        let v = if d.len() >= 2 { u16::from_be_bytes([d[0], d[1]]) } else { d[0] as u16 };
+        let at: u32 = match a {
+            0xFCFC => {
+                page = v;
+                continue;
+            }
+            0x6028 => {
+                hi = v;
+                continue;
+            }
+            0x602A => {
+                lo = v;
+                continue;
+            }
+            0x6F12 => {
+                let at = (hi as u32) << 16 | lo as u32;
+                lo = lo.wrapping_add(d.len() as u16);
+                at
+            }
+            _ => (page as u32) << 16 | a as u32,
+        };
+        if max.is_some_and(|m| d.len() > m) {
+            out.push(format!("{:04X}_{:04X}=[{} bytes, blake3 {}]", at >> 16, at & 0xFFFF, d.len(), &blake3::hash(d).to_hex()[..16]));
+            continue;
+        }
+        if d.len() == 1 {
+            out.push(format!("{:04X}_{:04X}={:02X}", at >> 16, at & 0xFFFF, d[0]));
+            continue;
+        }
+        for (k, w) in d.chunks(2).enumerate() {
+            let p = at + 2 * k as u32;
+            let s = if w.len() == 2 { format!("{:04X}", u16::from_be_bytes([w[0], w[1]])) } else { format!("{:02X}", w[0]) };
+            out.push(format!("{:04X}_{:04X}={s}", p >> 16, p & 0xFFFF));
+        }
+    }
+    out
+}
+
 /// One sensor's writes as CCS registers: holds on one line each, the rest a line each.
 fn holds(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
     let mut out = Vec::new();
@@ -203,9 +283,18 @@ fn holds(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut path, mut base, mut max, mut focus) = (None, 0x1088_0000u64, None, None);
+    let (mut flat_out, mut is_table) = (false, false);
     let mut k = 0;
     while k < args.len() {
         match args[k].as_str() {
+            "--flat" => {
+                flat_out = true;
+                k += 1;
+            }
+            "--table" => {
+                is_table = true;
+                k += 1;
+            }
             "--base" => {
                 base = args.get(k + 1).and_then(|s| hex(s)).expect("--base G#<controller>");
                 k += 2;
@@ -225,11 +314,11 @@ fn main() {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D]");
+        eprintln!("usage: oracle-i2c <capture.log or init table> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table]");
         std::process::exit(2);
     };
     let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let items = transfers(&accesses(&String::from_utf8_lossy(&raw)), base);
+    let items = if is_table { table(&raw, focus.expect("--table needs --holds G#<target> or --flat with --holds")) } else { transfers(&accesses(&String::from_utf8_lossy(&raw)), base) };
     let mut bad = 0usize;
     let mut targets: Vec<u8> = Vec::new();
     let mut n = 0usize;
@@ -245,6 +334,7 @@ fn main() {
         }
     }
     let lines = match focus {
+        Some(t) if flat_out => flat(&items, t, max),
         Some(t) => holds(&items, t, max),
         None => items
             .iter()
@@ -303,5 +393,19 @@ mod tests {
         let h = holds(&items, 0x3D, None);
         assert_eq!(h, vec!["# MARK sixteen seconds", "hold: 0702=0700 0202=0000", "W 0100=0103"]);
         assert!(items.iter().all(|i| !matches!(i, Item::Xfer(x) if x.expect != Some(x.data.len()))));
+    }
+
+    /// An init table read flat: a direct write on the CCS page until G#FCFC moves it, the page after, the indirect window's words at its address in two-byte steps, a byte write alone.
+    #[test]
+    fn a_table_reads_flat() {
+        let mut t = Vec::new();
+        for w in [&[0x07u8, 0x20, 0x00, 0x01][..], &[0xFC, 0xFC, 0x20, 0x01], &[0x8D, 0x3E, 0x00, 0x0C], &[0x60, 0x28, 0x20, 0x00], &[0x60, 0x2A, 0x12, 0xEC], &[0x6F, 0x12, 0x20, 0x21, 0x30, 0x00], &[0x01, 0x04, 0x01]] {
+            t.push(b'W');
+            t.extend_from_slice(&(w.len() as u16).to_be_bytes());
+            t.extend_from_slice(w);
+        }
+        t.extend_from_slice(&[b'D', 0, 0, 0, 1, b'R', 0, 2, 0x00, 0x05]);
+        let items = table(&t, 0x3D);
+        assert_eq!(flat(&items, 0x3D, None), vec!["4000_0720=0001", "2001_8D3E=000C", "2000_12EC=2021", "2000_12EE=3000", "2001_0104=01"]);
     }
 }
