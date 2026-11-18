@@ -2,7 +2,8 @@
 # Build a payload as a sandboxed image (SANDBOX.md): every crate — the payload, core, alloc, compiler_builtins — compiled from source to assembly (nightly -Z build-std), rewritten by ferros-mask into the allowed forms, assembled (llvm-mc), linked with the payload's own linker script (ld.lld), and refused unless the sandbox checker accepts every instruction.
 # Usage: tools/ferros-masked-build.sh <payload dir under payloads/> [bin name]   → target/masked/<bin>/<bin>.bin (flat image) and .elf
 set -euo pipefail
-REPO=/mnt/Harbor/Code/ferros
+# FERROS_REPO: another checkout to build from (a worktree, thru a farm of links to its siblings: cargo is run with --manifest-path, so a linked path is kept as given); FERROS_MASKED_OUT: where the images go (default target/masked of the checkout); FERROS_MASK: the ferros-mask binary (default the checkout's target/debug).
+REPO=${FERROS_REPO:-/mnt/Harbor/Code/ferros}
 # --fixed K anywhere after the payload: fixed mode at arc size 2^K (SANDBOX.md, "Modes"): every address made safe by `bfi x26, xN, #0, #K`, the capsule sealed at that size; without it, ring mode.
 FIXED=""
 ARGS=()
@@ -11,13 +12,13 @@ set -- "${ARGS[@]}"
 P=$1
 BIN=${2:-$1}
 CRATE=$(grep -m1 '^name' "$REPO/payloads/$P/Cargo.toml" | sed 's/.*"\(.*\)"/\1/')
-OUT=$REPO/target/masked/$BIN
+OUT=${FERROS_MASKED_OUT:-$REPO/target/masked}/$BIN
 TD=$OUT/build
 mkdir -p "$OUT/s"
 # The codegen rules come from the target itself (targets/aarch64-ferros.json): the process ABI's reserved registers and the CPU's measured features are properties of the target, so core, alloc and compiler_builtins inherit them by being built for it.
 # They used to be scraped out of .cargo/config.toml with sed. That worked, but a change to the shape of that line would have silently produced a different feature set — and a core built without x27/x28 reserved breaks the masking invariant (KERNEL.md: the arc base and mask must hold at *every* instruction, which callee-saved does not give).
 TARGET=$REPO/targets/aarch64-ferros.json
-( cd "$REPO" && RUSTFLAGS="-C codegen-units=1 -C llvm-args=-aarch64-enable-compress-jump-tables=false --emit=asm,link${BTI:+ -Z branch-protection=bti}" cargo +nightly build -q -p "$CRATE" --target "$TARGET" --release -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
+( cd "$REPO" && RUSTFLAGS="-C codegen-units=1 -C llvm-args=-aarch64-enable-compress-jump-tables=false --emit=asm,link${BTI:+ -Z branch-protection=bti}" cargo +nightly build -q --manifest-path "$REPO/Cargo.toml" -p "$CRATE" --target "$TARGET" --release -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
 DEPS=$TD/aarch64-ferros/release/deps
 # The payload's own (post-LTO) module holds everything it uses; compiler_builtins is never part of LTO.
 SRCS=$(ls -t "$DEPS"/${BIN}-*.s | head -1; ls -t "$DEPS"/compiler_builtins-*.s | head -1)
@@ -26,7 +27,7 @@ ATTR="+neon,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fullfp16,+fp16fml,+i8
 OBJS=()
 for s in $SRCS; do
     b=$(basename "$s" .s)
-    "$REPO/target/debug/ferros-mask" "$s" "$OUT/s/$b.s" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact}
+    "${FERROS_MASK:-$REPO/target/debug/ferros-mask}" "$s" "$OUT/s/$b.s" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact}
     llvm-mc -triple=aarch64-unknown-none -mattr=$ATTR -filetype=obj -o "$OUT/s/$b.o" "$OUT/s/$b.s"
     OBJS+=("$OUT/s/$b.o")
 done
@@ -38,7 +39,7 @@ aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
 stat -c %s "$OUT/$BIN.text" > "$OUT/$BIN.textlen"
-( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact} ) | tee "$OUT/scan.txt"
+( cd "$REPO" && cargo run -q --manifest-path "$REPO/Cargo.toml" -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact} ) | tee "$OUT/scan.txt"
 if [ -n "${BTI:-}" ]; then touch "$OUT/$BIN.bti"; else rm -f "$OUT/$BIN.bti"; fi
 if [ -n "${EXACT:-}" ]; then touch "$OUT/$BIN.exact"; else rm -f "$OUT/$BIN.exact"; fi
 # Fixed mode: the arc is exactly 2^K, so the image, its zeroed tail, the grants page and the 64 KiB stack must fit (process.rs `build`: CODE + image + tail + STACK).
