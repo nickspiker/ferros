@@ -24,10 +24,20 @@ pub const EINVAL: c_int = 22;
 pub const ERANGE: c_int = 34;
 pub const ENOPROTOOPT: c_int = 92;
 
+// A C stream, opaque: the C a std image may link (GMP, MPFR and MPC under rug, for basecalc's kist) declares its stream functions over it, and the crates binding them (gmp-mpfr-sys) spell the pointer `*mut libc::FILE`. There are no streams on ferros; the type is a name for the pointer.
+extern_ty! {
+    pub enum FILE {}
+}
+
 // The C allocator: ferros_rt (the std runtime, linked into every std image) defines these over the process heap, for the C in the graph (PQClean) and the crates that call them by name (rav1d).
 extern "C" {
     pub fn malloc(size: size_t) -> *mut c_void;
     pub fn calloc(count: size_t, size: size_t) -> *mut c_void;
     pub fn realloc(p: *mut c_void, size: size_t) -> *mut c_void;
     pub fn free(p: *mut c_void);
+}
+
+// C's abort, for the crates that call it by name (rug's random-state guards): no process-wide C library defines it, so an image that links such a crate defines it itself (basecalc's kist, std/basecalc/src/cshim.rs: the process ends as std's abort ends it); any other fails at link, loud.
+extern "C" {
+    pub fn abort() -> !;
 }
