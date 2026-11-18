@@ -832,7 +832,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
                 Ok(n) => n,
                 Err(_) => {
                     for d in drops.iter_mut() {
-                        d.fill(0);
+                        crate::keys::wipe_to_dram(d);
                     }
                     return Err(());
                 }

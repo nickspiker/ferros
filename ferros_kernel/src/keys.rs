@@ -73,11 +73,39 @@ fn wipe_words(w: &mut [u64]) {
     }
 }
 /// A whole value overwritten (a blake3 hasher holds its key in its state).
-fn wipe_value<T>(v: &mut T) {
+pub(crate) fn wipe_value<T>(v: &mut T) {
     let p = v as *mut T as *mut u8;
     for k in 0..core::mem::size_of::<T>() {
         unsafe { core::ptr::write_volatile(p.add(k), 0) };
     }
+}
+
+/// The identity's material overwritten and the zeros pushed out to DRAM (owner, 2026-11-17: the identity's roots and the person key, once locked, gone from the device as far as we know): volatile writes the compiler keeps, a compiler fence so nothing after is moved before them, then each cache line the bytes span cleaned to the point of coherency and a `dsb sy`.
+/// Without the clean the zeros sit in a dirty line while DRAM still holds the key until that line is evicted, and a cold read of DRAM (power cut before the eviction) finds it.
+/// Every wipe of identity material goes thru here: the seed, the identity's keys and their derivation's intermediates, the person key, the aliases and the person's domain keys (kvault.rs, process.rs, service.rs).
+pub fn wipe_to_dram(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    to_dram(b.as_ptr() as usize, b.len());
+}
+
+/// `wipe_to_dram` for a whole value of any type (a cipher's key schedule, an `IdKeys`).
+pub(crate) fn wipe_value_to_dram<T>(v: &mut T) {
+    wipe_value(v);
+    to_dram(v as *mut T as usize, core::mem::size_of::<T>());
+}
+
+/// The lines over `[at, at + len)` cleaned to the point of coherency after a compiler fence, between two `dsb sy` (frames.rs `clean_invalidate`'s order): the stores done before the clean, the clean done before anything after. 64-byte lines, as frames.rs steps them.
+fn to_dram(at: usize, len: usize) {
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
+    let mut x = at & !63;
+    while x < at + len {
+        unsafe { core::arch::asm!("dc cvac, {x}", x = in(reg) x, options(nostack)) };
+        x += 64;
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
 }
 
 /// The dead stack below this frame zeroed (4 KiB, interrupts masked; a worker's stack is 128 KiB and this runs shallow in it): blake3's own frames held the seal key while it hashed, and a blob in DRAM beside a stale copy of its key would be no seal at all.

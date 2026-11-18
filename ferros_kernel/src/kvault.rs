@@ -111,7 +111,10 @@ fn alias_seed(person: &[u8; 32], developer: &[u8; 32], option: &[u8; 32]) -> [u8
     h.update(person);
     h.update(developer);
     h.update(option);
-    *h.finalize().as_bytes()
+    let seed = *h.finalize().as_bytes();
+    // The hasher's buffer holds the person key.
+    crate::keys::wipe_value_to_dram(&mut h);
+    seed
 }
 
 /// Whether this kernel's derivation gives fgtw's known answer (fgtw src/alias.rs `seed_known_answer`: the 96 bytes 0 to 95), for `diag identity`.
@@ -534,7 +537,11 @@ impl KVault {
         self.lock();
         let mut secret = [0u8; 32];
         match self.raw_get(ID_SECRET)? {
-            Some(s) if s.len() == 32 => secret.copy_from_slice(&s),
+            // The vault's copy of the device-only secret wiped once taken: it is half of what the identity key is made from.
+            Some(mut s) if s.len() == 32 => {
+                secret.copy_from_slice(&s);
+                crate::keys::wipe_to_dram(&mut s);
+            }
             _ => {
                 if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
                     return Err(KvError::NoIra);
@@ -547,15 +554,18 @@ impl KVault {
         h.update(&secret);
         h.update(seed);
         let mut k = *h.finalize().as_bytes();
-        let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
-        let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
-        let domain = blake3::derive_key(ID_DOMAIN_CONTEXT, &k);
+        // The hasher holds the keyed base in its state.
+        crate::keys::wipe_value_to_dram(&mut h);
+        let mut addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
+        let mut payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
+        let mut domain = blake3::derive_key(ID_DOMAIN_CONTEXT, &k);
         self.id = Some(IdKeys { addr_key, payload_key, domain, seed: *seed, person: None });
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
-        for b in [&mut secret, &mut base, &mut k] {
-            b.fill(0);
+        // The locals the keys were made in, now copied into `id`.
+        for b in [&mut secret, &mut base, &mut k, &mut addr_key, &mut payload_key, &mut domain] {
+            crate::keys::wipe_to_dram(b);
         }
         // One identity per device: a seed whose key opens no name list is not the bound identity's (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
         if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
@@ -575,21 +585,17 @@ impl KVault {
         Ok(())
     }
 
-    /// Lock the identity: its keys dropped, their bytes overwritten first. What it had stored stays sealed on disk.
+    /// Lock the identity: its keys dropped, their bytes overwritten first, in place (`keys::wipe_to_dram`).
+    /// What it had stored stays sealed on disk.
+    /// In place, never taken out first: `Option::take` moved the keys into a copy and wiped that, while the bytes in `self.id` stayed where they were, its `None` written into the person key's tag alone (until 2026-11-17).
     pub fn lock(&mut self) {
         PERSON.store(false, core::sync::atomic::Ordering::Release);
-        // The vault process drops what it holds of the person's when it sees this change (the stamp carries it).
+        // The vault process drops what it holds of the person's when it sees this change (the stamp carries it); the identity service learns it from its bell (process.rs `identity_bell`).
         crate::process::LOCK_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Release);
-        if let Some(mut k) = self.id.take() {
-            k.addr_key.fill(0);
-            k.payload_key.fill(0);
-            k.domain.fill(0);
-            k.seed.fill(0);
-            if let Some(p) = k.person.as_mut() {
-                p.fill(0);
-            }
-            core::hint::black_box(&k);
+        if let Some(k) = self.id.as_mut() {
+            crate::keys::wipe_value_to_dram(k);
         }
+        self.id = None;
     }
 
     pub fn unlocked(&self) -> bool {
@@ -603,7 +609,7 @@ impl KVault {
             return Ok(false);
         }
         if let Some(p) = id.person.as_mut() {
-            p.fill(0);
+            crate::keys::wipe_to_dram(p);
         }
         id.person = Some(*key);
         Ok(true)
@@ -720,11 +726,13 @@ impl KVault {
     /// At boot, once the settings are loaded: with unlock at boot on, the kept seed's identity unlocks now (true when it did); off, a kept seed is deleted.
     pub fn boot_unlock(&mut self, on: bool) -> Result<bool, KvError> {
         match (on, self.raw_get(ID_UNLOCK)?) {
-            (true, Some(s)) if s.len() == 32 => {
+            (true, Some(mut s)) if s.len() == 32 => {
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&s);
+                // The vault's copy of the kept seed, as the one it is copied into.
+                crate::keys::wipe_to_dram(&mut s);
                 let r = self.unlock(&seed, false);
-                seed.fill(0);
+                crate::keys::wipe_to_dram(&mut seed);
                 r.map(|_| true)
             }
             (false, Some(_)) => {
@@ -745,8 +753,8 @@ impl KVault {
         let mut dev = crate::ira::derive(TAG_DEVICE_CONTEXT).ok_or(KvError::NoIra)?;
         let id = *blake3::Hasher::new_derive_key(TAG_ID_CONTEXT).update(&dev).update(uid).finalize().as_bytes();
         let key = *blake3::Hasher::new_derive_key(TAG_SEAL_CONTEXT).update(&dev).update(&secret).update(uid).finalize().as_bytes();
-        dev.fill(0);
-        secret.fill(0);
+        crate::keys::wipe_to_dram(&mut dev);
+        crate::keys::wipe_to_dram(&mut secret);
         Ok((id, key))
     }
 
@@ -775,18 +783,20 @@ impl KVault {
         let mut seed = seed?;
         let (id, mut key) = self.tag_keys(uid)?;
         if self.get_addr(TAGS, &id)?.is_some() {
-            key.fill(0);
-            seed.fill(0);
+            crate::keys::wipe_to_dram(&mut key);
+            crate::keys::wipe_to_dram(&mut seed);
             return Ok(false);
         }
         let n = self.nonce.next_nonce();
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        // A cipher keeps its key by value and does not wipe it when dropped: wiped here once used.
+        let mut cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
         let mut sealed = Vec::with_capacity(TAG_SEALED);
         sealed.extend_from_slice(&n[..]);
         sealed.extend_from_slice(&seed);
         let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), &id, &mut sealed[24..]);
-        key.fill(0);
-        seed.fill(0);
+        crate::keys::wipe_value_to_dram(&mut cipher);
+        crate::keys::wipe_to_dram(&mut key);
+        crate::keys::wipe_to_dram(&mut seed);
         sealed.extend_from_slice(&tag.map_err(|_| KvError::Seal)?);
         let now = crate::settings::eagle_now();
         let section = Self::tag_schema().build().set(TAG_ADDED, vsf::VsfType::e(vsf::EtType::e6(now))).and_then(|b| b.set(TAG_SEAL, vsf::VsfType::v(b'e', sealed))).and_then(|b| b.encode()).map_err(|_| KvError::Seal)?;
@@ -800,26 +810,29 @@ impl KVault {
         let (id, mut key) = self.tag_keys(uid)?;
         let record = self.get_addr(TAGS, &id)?.and_then(|d| Self::tag_record(&d));
         let Some((_, mut sealed)) = record else {
-            key.fill(0);
+            crate::keys::wipe_to_dram(&mut key);
             return Err(KvError::Open);
         };
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-        key.fill(0);
+        // Its key wiped once used, as `tag_keep`'s.
+        let mut cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        crate::keys::wipe_to_dram(&mut key);
         let mut n = [0u8; 24];
         n.copy_from_slice(&sealed[..24]);
         sealed.drain(..24);
+        let opened = cipher.decrypt_in_place(XNonce::from_slice(&n), &id, &mut sealed);
+        crate::keys::wipe_value_to_dram(&mut cipher);
         // The AEAD's check is what binds the record to the tag: a wrong one is a clean refusal here, never a garbage seed (which, on a device not bound yet, would open and make a junk identity space).
-        if cipher.decrypt_in_place(XNonce::from_slice(&n), &id, &mut sealed).is_err() {
-            sealed.fill(0);
+        if opened.is_err() {
+            crate::keys::wipe_to_dram(&mut sealed);
             return Err(KvError::Open);
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&sealed);
-        sealed.fill(0);
+        crate::keys::wipe_to_dram(&mut sealed);
         match self.unlock(&seed, keep) {
             Ok(()) => Ok(seed),
             Err(e) => {
-                seed.fill(0);
+                crate::keys::wipe_to_dram(&mut seed);
                 Err(e)
             }
         }
