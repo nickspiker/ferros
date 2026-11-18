@@ -182,6 +182,10 @@ pub const OPERATORS: [[Key; 2]; 5] = [
     [Key::Back, Key::Clear],
 ];
 
+/// The settings: the layer key, the angle unit and the precision's two keys, in the settings row's cells 0, 1, 2 and 4 (the precision itself shows in cell 3).
+/// The hook for "settings on the circle's back" (a proposed convention, not built: a turn of the circle shows a kist's settings, another turns it back): these are what would move there, and this list is the one place that says which keys they are.
+pub const SETTINGS: [(usize, Key); 4] = [(0, Key::Second), (1, Key::Angle), (2, Key::Fewer), (4, Key::More)];
+
 /// The quick bases along the top: binary, octal, decimal, dozenal, hex and base 36; every other base is in the picker.
 pub const QUICK_BASES: [u8; 6] = [2, 8, 10, 12, 16, 36];
 

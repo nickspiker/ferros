@@ -51,7 +51,7 @@ pub fn panel_circle(w: f32, h: f32) -> Circle {
 }
 
 /// A smooth minimum: below both `a` and `b`, by about `k` / 2 where they meet, C-infinity everywhere (AGENT.md "GUI Continuity": a row's width follows the chord into the frame's width with no kink as the window's size moves).
-fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
+pub fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
     (a + b - ((a - b) * (a - b) + k * k).sqrt()) * 0.5
 }
 
@@ -198,7 +198,7 @@ impl Layout {
             out.push(Placed { key, rect: cell, face: chosen(on, Face::Control) });
         }
         let settings = self.row(self.settings, 5);
-        for (i, key) in [(0, Key::Second), (1, Key::Angle), (2, Key::Fewer), (4, Key::More)] {
+        for (i, key) in keys::SETTINGS {
             out.push(Placed { key, rect: settings[i], face: chosen(key == Key::Second && second, Face::Control) });
         }
         if picking {

@@ -47,5 +47,9 @@ opt-level = 3
 
 [workspace]
 
+[patch.crates-io]
+# libc with a ferros arm (the C scalar types, for the crates that spell their types through it: rug and gmp-mpfr-sys among them), on every target so the host's tests and the ferros build share one lockfile.
+libc = { path = "../../../ferros-libc" }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
