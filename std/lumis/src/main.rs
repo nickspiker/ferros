@@ -20,7 +20,7 @@ use lumis_core::platform::{ConfigStore, PixelSurface};
 use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
-use lumis_core::shared_memory::{CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT};
+use lumis_core::shared_memory::{CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT, SHUTTER_NS_IDX};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,10 @@ const DEV_WHOLE: u8 = 1 << 0;
 const DEV_COPY: u8 = 1 << 1;
 /// Development: the scratch path even with the display baking (no `bakes_own`), for comparing the two on a device.
 const DEV_SCRATCH: u8 = 1 << 2;
+/// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 to 6 (8 s to 1024 s).
+const DEV_OPEN: u8 = 1 << 3;
+/// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^5 s (and no further than the camera's longest), two frames each, each frame's exposure said beside the one asked.
+const DEV_SWEEP: u8 = 1 << 7;
 
 /// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
 fn dev_input() -> (u8, Vec<u8>) {
@@ -439,6 +443,19 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
+    // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
+    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 7) + 3)));
+    let run_start = std::time::Instant::now();
+    let sweep: Vec<f64> = if knobs & DEV_OPEN != 0 && knobs & DEV_SWEEP != 0 {
+        (0..10).map(|k| (2f64).powi(-13 + 2 * k) * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
+    } else {
+        Vec::new()
+    };
+    let mut sweep_frames = 0usize;
+    let mut sweep_last = std::time::Instant::now();
+    if let Some(r) = run {
+        println!("lumis: development run of {} s{}", r.as_secs(), if sweep.is_empty() { String::new() } else { format!(", sweeping the shutter over {} steps", sweep.len()) });
+    }
     // What this thread last said of the window, so each change is said once.
     let mut stay = Stay::Front;
     // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
@@ -499,6 +516,19 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             turns.images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
         }
         turns.last = (head.count, head.time);
+        if !sweep.is_empty() {
+            // Each frame's exposure as the driver says it took it, beside the step asked two frames before it; then the next step's shutter into the integrator's header, which it hands back to be set.
+            let step = sweep_frames / 2;
+            let now = std::time::Instant::now();
+            if step < sweep.len() {
+                println!("lumis: sweep: frame {} took {} ns (asked {} ns), {} ms after the last", head.count, head.exposure_ns, sweep[step] as u64, (now - sweep_last).as_millis());
+                integrator.header[SHUTTER_NS_IDX] = sweep[step].to_bits();
+            } else if sweep_frames == 2 * sweep.len() {
+                println!("lumis: sweep: done after {} frames", sweep_frames);
+            }
+            sweep_last = now;
+            sweep_frames += 1;
+        }
         let (iso, shutter_ns, focus) = match samples {
             Taken::View(rows) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
             Taken::Bytes(bytes) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
@@ -523,6 +553,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         turns.after += t_after.elapsed().as_micros() as u64;
         frames += 1;
         turns.n += 1;
+        if let Some(r) = run {
+            if run_start.elapsed() >= r {
+                println!("lumis: development run of {} s ended after {frames} frames", r.as_secs());
+                keep_saves(vault.as_deref(), &mut *integrator.header);
+                close_camera(&cam.name);
+                lumis_core::platform::exit_because("the development run ended");
+            }
+        }
         if turns.n == 1 << 6 {
             let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
             println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, the integrator {} us (reading the view, unpacking and adding, lumis_core process_rows)", first.width, first.height, whole / 64, turns.wait / 64, turns.integrate / 64);
@@ -686,6 +724,8 @@ struct Lumis {
     screen: Screen,
     menu: Option<Box<MainMenu>>,
     menu_dirty: bool,
+    /// `DEV_OPEN` has opened its camera (once a launch).
+    dev_opened: bool,
     surface: Option<PixelSurface>,
     opened: Arc<Mutex<Option<Opened>>>,
     /// The finger, in frame pixels, and the camera UI's tap bookkeeping (UserInterface.kt: a tap shorter than a frame still reaches a draw as a down before its up).
@@ -711,7 +751,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -838,6 +878,11 @@ impl FluorApp<G2t16> for Lumis {
         }
         let Some(surface) = self.surface.as_ref() else { return false };
         match &mut self.screen {
+            Screen::Menu if self.knobs & DEV_OPEN != 0 && !self.dev_opened && !self.cameras.is_empty() => {
+                self.dev_opened = true;
+                self.open(0, None);
+                return true;
+            }
             Screen::Menu => {
                 if self.menu_dirty {
                     self.menu_dirty = false;
