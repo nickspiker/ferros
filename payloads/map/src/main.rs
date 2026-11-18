@@ -4518,6 +4518,7 @@ impl Map {
                 for puck in [false, true] {
                     for (ki, k) in ks.iter().enumerate().filter(|(ki, _)| puck_icon(&ks, *ki).is_some() == puck) {
                         let what = Some(Choice::Card(ki as u8));
+                        let y_top = y;
                         row(self, b, &mut y, uu(3, 2), white(), &k.name, what);
                         y -= uu(3, 4);
                         let mut l = Line::new();
@@ -4527,6 +4528,16 @@ impl Map {
                             l.s(tr(s));
                         }
                         row(self, b, &mut y, note, grey(), l.as_str(), what);
+                        // Its circle's own picture at the row's left (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): the display draws scene circle ki + 1 (op 77), its icon, or a puck's square as it is now.
+                        let ir = uu(3, 2);
+                        let (ix, iy) = (cx - half + ir + uu(1, 2), (y_top + y) / 2 - uu(1, 2));
+                        let mut m = [0u8; 8];
+                        m[0] = 77;
+                        m[1..3].copy_from_slice(&(ix as i16).to_le_bytes());
+                        m[3..5].copy_from_slice(&(iy as i16).to_le_bytes());
+                        m[5..7].copy_from_slice(&(ir as u16).to_le_bytes());
+                        m[7] = (ki + 1) as u8;
+                        b.op(&m);
                         // A restore or an unstow of it under way, or one that failed.
                         if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE) {
                             progress(self, b, &mut y, j);

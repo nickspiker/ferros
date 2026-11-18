@@ -696,6 +696,8 @@ fn icon_decode() -> [u16; 256] {
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
 /// The ferros mark's number, one past the bundle's five (counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`); the bundle carries no raster of it.
 const ICON_FERROS: u8 = 6;
+/// The app icons' mip chains, once built (the server's start): what a page draws a kist's icon from (op 77).
+static mut MIPS: Option<&'static [draw::Mips]> = None;
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
 fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
@@ -2457,6 +2459,34 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 paint::fill_rect(&mut c, x, y, w, h, 0xFF00_0000 | colour(9), None, None);
             }
             Some(draw::Rect { x0: x as i32, y0: y as i32, x1: (x + w.max(1)) as i32, y1: (y + h.max(1)) as i32 })
+        }
+        // 77 `icon [cx i16][cy i16][r u16][scene index u8]`: scene circle i's own picture, upright, in a circle of radius r at (cx, cy) on the page (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): its bundle icon, the ferros mark, a puck's square as it is now (its name's plane until it has one), else the theme's fill.
+        Some(77) if m.len() >= 8 => {
+            let (x, y, r, i) = (i16le(1), i16le(3), u16le(5), m[7] as usize);
+            // WHY the bound: the index is the client's, and the scene holds SCENE_N circles.
+            if i >= unsafe { SCENE_N } {
+                return None;
+            }
+            let cir = unsafe { SCENE[i] };
+            let (cx, cy, rr) = ((x << 8) + 128, (y << 8) + 128, r << 8);
+            let th = ferros_sys::theme::current();
+            if let Some(px) = px {
+                let full = draw::Rect::full(width, height);
+                if puck::is_puck(cir.icon) {
+                    if !puck::draw_into(px, width, full, (cir.icon - puck::PUCK0) as usize, cx, cy, rr, 1 << 14, 0) {
+                        draw::disc(px, width, height, cx, cy, rr, th.plane & 0x00FF_FFFF);
+                    }
+                } else if cir.icon == ICON_FERROS {
+                    draw::logo(px, width, height, cx, cy, rr, 1 << 14, 0, true);
+                    draw::disc(px, width, height, cx, cy, rr, 0);
+                // WHY `get`: the icon is the map's word (1 to the bundle's count, 0 none); a kist with no bundle icon (0, or one this display does not carry) falls to the plain fill below.
+                } else if let Some(mp) = unsafe { MIPS }.and_then(|v| v.get((cir.icon as usize).wrapping_sub(1))) {
+                    draw::icon(px, width, height, cx, cy, rr, 1 << 14, 0, mp);
+                } else {
+                    draw::disc(px, width, height, cx, cy, rr, th.ring & 0x00FF_FFFF);
+                }
+            }
+            Some(draw::Rect { x0: (x - r - 2) as i32, y0: (y - r - 2) as i32, x1: (x + r + 3) as i32, y1: (y + r + 3) as i32 })
         }
         Some(16) if m.len() >= 11 => {
             let (x, y, r) = (i16le(1), i16le(3), u16le(5));
@@ -7818,6 +7848,7 @@ fn server(grants: u64) -> ! {
         }
         v.leak()
     };
+    unsafe { MIPS = Some(mips) };
     heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
