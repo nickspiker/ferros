@@ -672,9 +672,35 @@ The coordinator's lead was the front end's frame-shape words that geom's rewrite
 1. Detach on whole frames, the control: driver `0100000000000001` (FC ctx3 off), cambench `00010000800C00000000000000040000` (fll 3200, 64 frames): loch0 should run at 97 a second with FC ctx3's word 0. If frames stop, detaching breaks loch0 itself: then `...02`, `...04`, `...08` each alone to find the switch that does.
 2. The slit, detached: the same driver input, cambench `00034000000000000000000002080000` (64 rows, PD and embedded off); then driver `010000000000000F` (every switch). Expect frames past the second, SLITS at the sensor's 1218 a second, loch0's error word 0.
 3. If it streams: the rows sweep (`00030000000000000000000002080100`, 64 down to 2, may stall by design), the frame sweep at the narrowest that streamed (`...02080200`): the front end's rate against the sensor's at each step.
-4. The drain: the best slit with the run's +18 byte 6, `0003400000000000000000000208000000000006` (261120 slits, 3.6 minutes at 1218 a second, 2^8 buffers): lost 0, read over 0, the engine ring round about 64 times.
+4. The drain: the best slit with the run's +18 byte 6, `00034000000000000000000002FF0000000006` (261120 slits, 3.6 minutes at 1218 a second, 2^8 buffers): lost 0, read over 0, the engine ring round about 64 times.
 5. The line: the 1280-column window, detached, with the line sweep, `000100000000000000000000020403000005`; then 640 columns (`...0280`): RATE gives the sensor's line at each step, the front end's beside it; the link at 1280 columns of RAW10 and a 1 us line is about 1.6 GB/s, the ceiling planned around.
 6. If any detached slit streams, a 4-row slit (`00030400...02080000`) once: 4 rows kept ERR_CRC_PH even quiet, so expected not to.
+
+### The slit runs (the Pro, 2026-11-18, camera-full-rate 82deb020's kernel RAM-reloaded, armed actions on; this branch's driver at f4263c9a hand-spawned, cambench, nothing stored)
+
+Logs: the session's scratchpad (runs-slit2/r*). Every DMA_DONE of every run was released by the kernel's armed action, before the frame thread (the close's count equal to the DMA_DONEs).
+
+**The slit streams.** Two fixes together:
+- **Detached** (`DETACH` bit 0, FC ctx3's enable G#1C33_7028 to 0): SHORT_VB_FATAL is gone. On whole frames the same switch is harmless (fll 3200: 98 a second, 64 frames, FC ctx3's and the LMP's words 0: the statistics pipeline idle).
+- **The slim program** (flag G#10, loch0's paths alone each frame): detached alone, a 64-row slit ran 1270 frames (about 1 s at 1230 a second) and died on LATE_CONFIG (G#10): the full program (6620 bytes, 1447 writes, 3048 LUT words) does not fit a slit's 403 us blanking every time. Slim, or a longer frame (320 lines, 1004 a second), both ran clean.
+- So the slit recipe is: driver eighth byte 1 (to become the default for windowed modes), OPEN flags G#10, PD and embedded off (quiet).
+
+**Rows** (each its own driver; detached, slim, fll rows + 128): 64, 56, 48, 32 and 16 rows all stream at the sensor's own floor, 1218 to 1229 a second on its counter, the front end 1208 to 1218 beside it, 0 lost; 64 rows keeps the link clean (+14 G#0), 56 rows and fewer set ERR_CRC_PH (G#20) on the link while frames still land; 8 and 4 rows take no frame (loch0 G#404: SENSOR_RESOL_MISMATCH and STREAM_ERROR, the sensor not sending what it was asked). The slit's floor is the sensor's frame of about 262 lines (825 us), whatever the rows, and the front end keeps up with it.
+- A trap found on the way: a hand-spawned driver still ends at a CLOSE, so a cambench sweep's second and later opens went to the vault's stored driver (no detach, no quiet, an older close line). The rows sweep of this morning past its first step, and every sweep step of 2026-11-17 night past its first, ran the stored driver; the sensor's counter numbers stand, the front end's verdicts for those steps do not. The rows above were rerun one driver an open.
+
+**The drain: done.** 64 rows, detached, slim, u16 add on one thread: **261120 slits in 212 s, 1230 a second, lost to the ring 0, read over 0, the engine's ring round 64 times**, 262391 DMA_DONEs all released by the kernel, the frame thread 82 us an answer (1062 the most). Reading and unpacking a slit 292 us, adding 213 us. A slit run lasts as long as it is drained.
+
+**The line, toward a million** (whole frames, detached, slim, 3328-line frames, one driver an open):
+| window | line asked (clocks) | sensor / front end a second | rows a second | link |
+|---|---|---|---|---|
+| 4080 | 5888 | 102 / 100 (103 mapped) | 340k | 1598 MB/s |
+| 4080 | 5376 | no frame, ERR_CRC_PH | | the link's limit |
+| 1280 | 5888 | 102 / 100 | 340k | 501 MB/s |
+| 1280 | 5376 | 111 / 109 | 369k | 548 MB/s |
+| 1280 | 4096 and 2048 | 115 / 113 (117 mapped) | 383k | 566 MB/s |
+- **The ceiling is the sensor's row time**: asked 2048 or 4096 clocks it reads them back but runs about 2.61 us a binned row (about 5240 clocks), so this mode tops out near 383k rows a second, at any width. The full width meets the link first (5376 clocks: 1.6 GB/s of RAW10 and the packets fail); a narrow window frees the link but the sensor's row does not get shorter.
+- So a million lines a second is not in the binned mode: its row costs 2.6 us however few columns are read. Where it could be: a mode whose row reads fewer sensor rows (the 1:1 readout's rows, a vertically binned-only mode), unknown until the 1:1 capture; or slits counted as lines of the sensor's whole frame (1230 slits a second of 262 lines is 322k).
+- With the front end detached and slim it is no longer a ceiling anywhere measured: it took every frame and slit the sensor sent.
 
 ## Full rate (2026-11-17 night, branch camera-full-rate): built, device runs pending
 
