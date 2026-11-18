@@ -119,6 +119,30 @@ pub fn take(seen: u32) -> Option<(u32, Stower)> {
     with(|x| x.clone()).map(|i| (s, i))
 }
 
+/// Developer mode as the map has it (a development build, or Developer made a page by the twelve taps, `map.dev`): set by the main loop before the watcher starts and at the twelfth tap, said to the stower by `tell_developer` (docs/KISTS.md "Stowing", auto-stow).
+pub static DEVELOPER: AtomicBool = AtomicBool::new(false);
+
+/// Developer mode said to the stower (its op 8; ferros_kist::offer::developer), which then stows an offer over USB that passes every check without the person's tap.
+/// The stower's answer is a VSF document in the reply form; Some(developer mode as the stower has it now), None when it is not serving or refused it (said on the console).
+pub fn tell_developer(grants: u64) -> Option<bool> {
+    let on = DEVELOPER.load(Ordering::Acquire);
+    let mut out = [0u8; ferros_kist::offer::developer::MAX];
+    let n = ferros_sys::call_live(cap(grants, S_STOWER), &[ferros_kist::offer::developer::OP, on as u8], &mut out);
+    if n == ERR {
+        return None;
+    }
+    // WHY: the length is the stower's, at most what the buffer took.
+    let r = ferros_kist::offer::developer::parse(&out[..(n as usize).min(out.len())]);
+    let mut l = Line::new();
+    let _ = match &r {
+        Some(r) if !r.error => write!(l, "map: the stower has developer mode {}\n", if r.on { "on: an offer over USB that passes its checks is stowed without the tap" } else { "off" }),
+        Some(r) => write!(l, "map: the stower did not take developer mode: {}\n", r.why),
+        None => write!(l, "map: the stower's answer to developer mode does not read\n"),
+    };
+    ferros_sys::console(grants, l.as_str().as_bytes());
+    r.filter(|r| !r.error).map(|r| r.on)
+}
+
 /// An op to the stower, its one-byte answer (None when it is not serving: it starts once a person has attested).
 pub fn ask(grants: u64, msg: &[u8]) -> Option<u8> {
     let mut r = [0u8; 4];
@@ -276,11 +300,14 @@ pub extern "C" fn watch(grants: u64) -> ! {
     // The directory generation the rows were last read at.
     let mut rows_gen: Option<u32> = None;
     let mut out = [0u8; 4096];
+    // Whether developer mode was said to the stower serving now: said at the first answer after it was not serving, since a stower that started (again) holds none.
+    let mut told = false;
     loop {
         let mut m = [0u8; 5];
         m[1..].copy_from_slice(&count.to_le_bytes());
         let n = ferros_sys::call_live(svc, &m, &mut out);
         if n == ERR || n < 7 {
+            told = false;
             sleep_until(now() + absent);
             if absent < freq() {
                 absent <<= 1;
@@ -288,6 +315,9 @@ pub extern "C" fn watch(grants: u64) -> ! {
             continue;
         }
         absent = freq() >> 6;
+        if !told {
+            told = tell_developer(grants).is_some();
+        }
         let was = snap.dir_state;
         // WHY: the length is the stower's, at most what the buffer took.
         if !read_status(&out[..(n as usize).min(out.len())], &mut snap) {

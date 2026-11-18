@@ -152,6 +152,9 @@ pub mod offer {
     }
     /// Flags beside the state: bit 0 its code is native, unchecked machine code, which only a development build stows (SANDBOX.md: production refuses it).
     pub const NATIVE: u8 = 1;
+    /// Flags bit 1, beside STOWED: stowed without the person's tap, the device in developer mode (docs/KISTS.md "Stowing", auto-stow; owner, 2026-11-17: "Should be a way to auto-stow in developer mode, just sayin'").
+    /// Every check passed as it does before a tap; the stower then said Stow itself, on the same path as the person's Stow.
+    pub const AUTO: u8 = 1 << 1;
     /// The part of a capsule one command carries (the bridge's `store` part form took the same): under the kernel's 6 MiB receive region with room for the command's head.
     pub const PART: usize = 1 << 22;
     /// The longest the kernel holds a host's read of an offer's state before it answers with the state unchanged, in seconds: the USB driver gives up on a kernel reply after 16 (payloads/usb `give_up`), so a hold must end well inside it, and the host asks again at once (a held call with a lease, never a timer of the host's).
@@ -211,6 +214,74 @@ pub mod offer {
             why::NATIVE_HERE => "it is unchecked native code, which a production build does not stow",
             why::NOT_CLEARED => "it is off the deck, but what it kept for itself could not be cleared",
             _ => "something went wrong",
+        }
+    }
+
+    /// Developer mode, as the map tells the stower (payloads/kists op 8; docs/KISTS.md "Stowing", auto-stow), and the stower's answer.
+    /// The request is [8][1 on, 0 off]; the answer a complete VSF document in the reply form (docs/VSF-AUDIT.md "The reply form"), one section `developer`: `error` (u0, true when the stower did not take it), `why` (ASCII, a few words saying why), `on` (u0, developer mode as the stower has it now).
+    pub mod developer {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
+        use vsf::VsfType;
+
+        /// The stower's op.
+        pub const OP: u8 = 8;
+        /// The section's name.
+        pub const SECTION: &str = "developer";
+        /// The most bytes an answer may have: two booleans and a line of words, with room.
+        pub const MAX: usize = 1 << 9;
+        /// The most bytes of `why`.
+        pub const WHY_MAX: usize = 1 << 6;
+
+        /// The answer's fields.
+        #[derive(Clone, PartialEq, Debug)]
+        pub struct Reply {
+            pub error: bool,
+            pub why: String,
+            pub on: bool,
+        }
+
+        fn schema() -> SectionSchema {
+            SectionSchema::new(SECTION).field("error", TypeConstraint::AnyUnsigned).field("why", TypeConstraint::AsciiText).field("on", TypeConstraint::AnyUnsigned)
+        }
+
+        /// The answer as a complete VSF file made at `made` (Eagle time). None when `why` is past `WHY_MAX` or not ASCII.
+        pub fn build(r: &Reply, made: i64) -> Option<Vec<u8>> {
+            if r.why.len() > WHY_MAX {
+                return None;
+            }
+            let section = schema()
+                .build()
+                .set("error", VsfType::u0(r.error))
+                .ok()?
+                .set("why", VsfType::a(vsf::Ascii::new(r.why.clone()).ok()?))
+                .ok()?
+                .set("on", VsfType::u0(r.on))
+                .ok()?
+                .encode()
+                .ok()?;
+            let doc = vsf::VsfBuilder::new().creation_time_oscillations(made).provenance_only().add_unboxed(String::from(SECTION), section).build().ok()?;
+            (doc.len() <= MAX).then_some(doc)
+        }
+
+        /// The answer read back: None for anything not of this shape (each boolean a `u0`, the words ASCII within `WHY_MAX`).
+        pub fn parse(doc: &[u8]) -> Option<Reply> {
+            // WHY the bound: the document is the stower's, read in the map's heap; past MAX it is no answer of this shape.
+            if doc.len() > MAX {
+                return None;
+            }
+            let s = SectionBuilder::parse_document(schema(), doc, None).ok()?;
+            let first = |name: &str| s.get_fields(name).first().and_then(|f| f.values.first()).cloned();
+            let flag = |name: &str| match first(name) {
+                Some(VsfType::u0(b)) => Some(b),
+                _ => None,
+            };
+            let why = match first("why") {
+                Some(VsfType::a(a)) if a.len() <= WHY_MAX => String::from(&*a),
+                _ => return None,
+            };
+            Some(Reply { error: flag("error")?, why, on: flag("on")? })
         }
     }
 
@@ -962,6 +1033,22 @@ mod tests {
 
     fn decl() -> Decl {
         Decl { name: String::from("Mahere"), wants: alloc::vec![(0, String::from("to draw the map")), (6, String::from("to show where you are"))] }
+    }
+
+    /// The stower's answer to developer mode (op 8) is a complete VSF document in the reply form: both booleans and the words come back as built, and anything else is refused whole.
+    #[test]
+    fn developer_reply_round_trips() {
+        use offer::developer::{build, parse, Reply, WHY_MAX};
+        for (error, why, on) in [(false, "taken", true), (false, "taken", false), (true, "only the system's settings say this", false)] {
+            let r = Reply { error, why: String::from(why), on };
+            let doc = build(&r, 1 << 40).unwrap();
+            assert_eq!(parse(&doc), Some(r));
+        }
+        let long = Reply { error: true, why: "w".repeat(WHY_MAX + 1), on: false };
+        assert!(build(&long, 1).is_none());
+        assert!(parse(b"not a document").is_none());
+        // The flags beside a state stay apart: auto-stow never reads as native code.
+        assert_eq!(offer::NATIVE & offer::AUTO, 0);
     }
 
     #[test]

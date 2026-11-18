@@ -5142,6 +5142,9 @@ impl Map {
                             if !ferros_kept::map::developer(true, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &doc)) {
                                 console(self.grants, b"map: the vault did not take Developer\n");
                             }
+                            // Developer mode said to the stower at once (auto-stow, docs/KISTS.md "Stowing"); one not serving yet hears it from the watcher.
+                            stower::DEVELOPER.store(true, core::sync::atomic::Ordering::Release);
+                            let _ = stower::tell_developer(self.grants);
                         }
                     }
                     // Attest with a tag: an add started (the next tag held to the device is kept, `tag_add_thread`), or the one waiting cancelled.
@@ -5659,6 +5662,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     t_start[5] = now();
     // Developer, once the twelve taps made it a page (release builds; always one on development builds).
     map.dev = map.read_small(b"dev").ok().flatten().and_then(|d| ferros_kept::map::read_developer(&d)) == Some(true);
+    // Developer mode for the stower (docs/KISTS.md "Stowing", auto-stow): its watcher says it at the stower's first answer.
+    stower::DEVELOPER.store(DEV || map.dev, core::sync::atomic::Ordering::Release);
     let mut saved_view = map.cam;
     // The deck's resting view starts as the view it was left at.
     map.rest = map.cam;
