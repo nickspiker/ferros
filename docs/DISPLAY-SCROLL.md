@@ -101,7 +101,7 @@ Photon already names its overlays this way for one frame; the display applies th
 
 The phase holds the composite, not the window, so a shifted row also moves everything composed in front of or behind the window there:
 - **The system's front layers.**
-  - The glass's edge and corners, the camera hole, the console's circles and the helm's wedges are composed into the same words (`glass_front`, `bars_over`).
+  - The glass's edge and corners, the camera hole, the console's circles and the helm's wedges are composed into the same words (`glass_front`, `bars_front`).
   - The rows the glass plan touches (`GLASS_ROWS`: a mask column, an edge pixel, a bar or the hole) are never shifted; inside the pane they are published as today.
   - On husky those are the chrome rows at the top and the bottom; a pane that reaches into them republishes those rows only.
 - **Other windows.**
