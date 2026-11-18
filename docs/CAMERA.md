@@ -680,9 +680,9 @@ Where the shape may live: the CPU's 'after' writes to loch0's image path, in ord
 
 ### The fix, two shapes (the owner's choice)
 
-**(a) Built** (camera-full-rate 10944891, not yet run): `.Lirq_cam` (INTID 511 only, registers saved as `.Lirq_prof` saves) calls camera_power.rs `ferros_cam_fast` before the line is masked and the driver woken, never the lock: on DMA_DONE (G#1C32_0424 bit 4) with the engine's place (+G#14) at its index (+G#10) it writes `(index + 16) & (count - 1)`. The driver names each descriptor a frame ahead and writes the index only while the engine still reads its own, so it runs unchanged on a kernel without the path. Slack: about a frame period (10 ms at 96 a second, 66 ms at 15) instead of the blanking. 121 lines (kernel 103, driver 18).
+**(a) Built, then replaced by (b)** (camera-full-rate 10944891, never run): `.Lirq_cam` (INTID 511 only, registers saved as `.Lirq_prof` saves) calls camera_power.rs `ferros_cam_fast` before the line is masked and the driver woken, never the lock: on DMA_DONE (G#1C32_0424 bit 4) with the engine's place (+G#14) at its index (+G#10) it writes `(index + 16) & (count - 1)`. The driver names each descriptor a frame ahead and writes the index only while the engine still reads its own, so it runs unchanged on a kernel without the path. Slack: about a frame period (10 ms at 96 a second, 66 ms at 15) instead of the blanking. 121 lines (kernel 103, driver 18).
 
-**(b) A generic armed action** (sketched, not built): a driver arms a small bounded program on its own granted line; the kernel runs it at interrupt time, lock-free; no camera logic in the kernel.
+**(b) A generic armed action, the owner's choice ("Go for B!", 2026-11-18), built** (docs/KERNEL.md "Armed actions"; disarmed at the process's end and its power switch's off, not at a regrant: init holds every grant): a driver arms a small bounded program on its own granted line; the kernel runs it at interrupt time, lock-free; no camera logic in the kernel.
 - **The call**: `SYS_IRQ_ARM` (a new number): x0 the line's token, x1 a hardware grant's token, x2 and x3 the program (address, bytes; 0 bytes disarms). ferros_sys `irq_arm(line, hw, &[Op])`.
 - **The ops** (16 bytes each: op, offset, a, b; at most 2^2 of them, run in order, the first failed test ends the run):
   - `TEST_BITS off mask`: go on only if `read(off) & mask != 0`;

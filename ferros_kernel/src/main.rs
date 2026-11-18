@@ -78,6 +78,7 @@ mod trusty;
 mod camera_close;
 #[cfg(feature = "pixel8")]
 mod camera_power;
+mod irqarm;
 #[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]
@@ -648,8 +649,10 @@ _m1_entry:
     b.eq    .Lirq_key
     cmp     x0, #32
     b.lo    .Lirq_eoi
-    cmp     x0, #511
-    b.eq    .Lirq_cam
+    adrp    x1, __irq_armed
+    add     x1, x1, :lo12:__irq_armed
+    ldrb    w1, [x1, x0]
+    cbnz    w1, .Lirq_armed
 .Lirq_spi:
     lsr     x2, x0, #5
     and     x3, x0, #31
@@ -804,9 +807,9 @@ _m1_entry:
     ldp     x4, x5, [sp, #0]
     add     sp, sp, #672
     b       .Lirq_eoi
-// The camera front end's line (INTID 511, process.rs IRQS `ispfe0`): its next PDMA descriptor released here, before the line is masked and its driver woken (camera_power.rs `ferros_cam_fast`), so the release never waits for the kernel lock or a core: the frame's blanking is the deadline (2026-11-18: a wake 3.3 ms behind a set_pref's hold stopped the stream at 96 a second).
+// A line its driver armed (irqarm.rs, SYS_IRQ_ARM; `__irq_armed` non-zero): its armed register operations run here, before the line is masked and its driver woken (`ferros_irq_armed`, x0 the INTID), so they never wait for the kernel lock or a core (2026-11-18: the camera's descriptor release, a wake 3.3 ms behind a set_pref's hold stopped the stream at 96 a second).
 // Saved as `.Lirq_prof` saves (Rust may use any caller-saved register, the vector registers among them); x0, the INTID, kept for the line's own path after it (`.Lirq_spi`). It never takes the kernel lock.
-.Lirq_cam:
+.Lirq_armed:
     sub     sp, sp, #672
     stp     x4, x5, [sp, #0]
     stp     x6, x7, [sp, #16]
@@ -836,7 +839,7 @@ _m1_entry:
     mrs     x9, fpcr
     mrs     x10, fpsr
     stp     x9, x10, [sp, #144]
-    bl      ferros_cam_fast
+    bl      ferros_irq_armed
     ldp     x9, x10, [sp, #144]
     msr     fpcr, x9
     msr     fpsr, x10

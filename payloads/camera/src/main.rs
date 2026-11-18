@@ -721,6 +721,27 @@ fn slit_turn(n: u64) {
     ferros_sys::dma_barrier();
 }
 
+/// The front end's grant's start (`grant_of`): the armed program's offsets are from it.
+const FE_BASE: usize = 0x1C30_0000;
+/// Whether the kernel took the armed program at this open (`arm`), for the close's line.
+static ARMED: AtomicU64 = AtomicU64::new(0);
+
+/// The next descriptor's release armed on the front end's line (SYS_IRQ_ARM, docs/KERNEL.md "Armed actions"): at each interrupt the kernel, before it masks the line and wakes the frame thread and without its lock, tests loch0's DMA_DONE, tests that the engine ran every released program (its place at its index), and advances the index round the ring as `answer` does. The release then never waits for the lock or a core (2026-11-18: the wake 3.3 ms behind a set_pref's hold, a release 2 ms late, both stopped the stream with LATE_CONFIG). `answer` writes the index only while the engine still reads its own, so a kernel that refuses (or lacks) the call leaves the release to the frame thread, as before.
+fn arm(g: u64) {
+    use ferros_layout::irqarm::{encode, Op, ADVANCE, OPS_MOST, OP_BYTES, TEST_BITS, TEST_EQ};
+    let index = (ferros_cam::PDMA + ferros_cam::PDMA_INDEX - FE_BASE) as u32;
+    let ops = [
+        Op { op: TEST_BITS, off: (ferros_cam::IMG_STATUS - FE_BASE) as u32, a: ferros_cam::IMG_DMA_DONE, b: 0 },
+        Op { op: TEST_EQ, off: (ferros_cam::PDMA + 0x14 - FE_BASE) as u32, a: 0, b: index },
+        Op { op: ADVANCE, off: index, a: STEP, b: RING_N.load(Ordering::Relaxed) as u32 - 1 },
+    ];
+    let mut b = [0u8; OPS_MOST * OP_BYTES];
+    let n = encode(&ops, &mut b);
+    let r = ferros_sys::irq_arm(cap(g, S_IRQ), cap(g, S_FE), &b[..n]);
+    ARMED.store((r == 0) as u64, Ordering::Relaxed);
+    say!(g, "camera: the descriptor's release {}\n", if r == 0 { "armed on the front end's line (the kernel releases it at the interrupt)" } else { "not armed (the kernel refused or lacks SYS_IRQ_ARM): the frame thread releases it" });
+}
+
 /// The front end answered once: loch0's image status read; on a frame's DMA_DONE the ring's turn (`ring_turn`) and the engine's index advanced at once; then every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and the frame counted.
 /// The index first (2026-11-16, kernlock): the next descriptor must be released before the next frame begins, so the frame's blanking (128 lines, about 400 us, at the main's 96 a second) has to hold the interrupt's wake and everything the answer does before the index write; with the 56 acknowledgements ahead of it (about 170 us of register syscalls) the stream lost every other frame and stopped.
 /// The acknowledgements clear the front end's status words (loch0's image status among them, read again there); the descriptor engine has its own index, so the order between the two is not the front end's.
@@ -1598,6 +1619,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start), or the lead's first descriptors (`LEAD`).
+    arm(g);
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP * LEAD.load(Ordering::Relaxed) as u32);
     RUN.store(1, Ordering::Release);
     ferros_sys::wake(&RUN, 1);
