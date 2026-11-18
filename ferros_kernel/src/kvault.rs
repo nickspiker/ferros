@@ -169,6 +169,14 @@ fn feed() {
     }
 }
 
+/// Every block of the vault is read and written holding `VAULT` once the vault is shared (process.rs `VAULT_SHARED`): the vault's state is one owner's at a time, and a path that reached a block without it is a missed one, said here with a panic the first time it runs rather than left a rare race.
+/// And each command holding `UFS`, the controller's one command at a time with its data block, taken for the command and its copy only, so another core's flash log line or vault process's run waits one block at most.
+fn vault_held() {
+    if crate::process::VAULT_SHARED.load(core::sync::atomic::Ordering::Relaxed) && !crate::process::VAULT.mine() {
+        panic!("kvault: a block reached without the vault lock");
+    }
+}
+
 impl BlockDev for Region {
     fn block_count(&self) -> u64 {
         self.blocks
@@ -177,26 +185,37 @@ impl BlockDev for Region {
         if lba >= self.blocks {
             return Err(manifestus::Error::Bounds(lba));
         }
+        vault_held();
         // The watchdogs fed every 2^6 block reads or writes, by count (`feed`): a loop over many values (a list's deletes, an export, manifestus's whole scan of a blank pair) never goes a second unfed, wherever its blocks lie.
         // Until 2026-11-18 only a read whose block number was a multiple of 1024 fed them and writes never did, so a long run of scattered reads and writes went unfed (VSF-AUDIT wave 0, the converter build that did not boot on the Pro).
         feed();
         READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let u = UfsController::new(UFS_BASE);
-        if u.read_block_lun(0, (self.base + lba) as u32) != 0 || u.last_response_status() != 0 {
+        let ok = crate::process::UFS.with(|| {
+            let u = UfsController::new(UFS_BASE);
+            if u.read_block_lun(0, (self.base + lba) as u32) != 0 || u.last_response_status() != 0 {
+                return false;
+            }
+            buf.copy_from_slice(u.data_buffer());
+            true
+        });
+        if !ok {
             return Err(manifestus::Error::Corrupt(alloc::format!("UFS read failed at region block {lba}")));
         }
-        buf.copy_from_slice(u.data_buffer());
         Ok(())
     }
     fn write(&mut self, lba: u64, buf: &Block) -> manifestus::Result<()> {
         if lba >= self.blocks {
             return Err(manifestus::Error::Bounds(lba));
         }
+        vault_held();
         feed();
         WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let u = UfsController::new(UFS_BASE);
-        u.data_buffer_mut().copy_from_slice(buf);
-        if u.write_block_lun(0, (self.base + lba) as u32) != 0 || u.last_response_status() != 0 {
+        let ok = crate::process::UFS.with(|| {
+            let u = UfsController::new(UFS_BASE);
+            u.data_buffer_mut().copy_from_slice(buf);
+            u.write_block_lun(0, (self.base + lba) as u32) == 0 && u.last_response_status() == 0
+        });
+        if !ok {
             return Err(manifestus::Error::Corrupt(alloc::format!("UFS write failed at region block {lba}")));
         }
         Ok(())
@@ -292,8 +311,10 @@ pub struct KVault {
     cipher: XChaCha20Poly1305,
     nonce: crate::wairua::TrngNonce,
     /// The unlocked identity, while one is: dropped when power goes or the device switches to another OS (`lock`).
+    /// Written only holding both the kernel lock and the vault's (process.rs `VAULT`), so read holding either (service.rs `SPAWN_STORE`): the domain keys and a kist's alias read it under the kernel lock alone.
     id: Option<IdKeys>,
     /// Whether an identity's fleet has bound this device, once read (`bound`), kept in step by `bind` and `release`, the only writers of the mark: init asks 64 times a second while it waits for a person, and each read of the mark from the flash held the kernel lock about 300 us (2026-11-16, `diag lock`).
+    /// As `id`: written holding both locks, read holding either (`bound_known`, init's poll under the kernel lock alone).
     bound: Option<bool>,
     /// Mirror A's first LBA, as `open` found it (`mirrors`).
     mirror_a: u64,
@@ -767,6 +788,11 @@ impl KVault {
         out[..32].copy_from_slice(&crate::keys::held_derive(d, addr_context, prefix)?);
         out[32..].copy_from_slice(&crate::keys::held_derive(d, seal_context, prefix)?);
         Some(out)
+    }
+
+    /// The bound mark as kept in memory, without reading the vault: None until `bound` has read it once.
+    pub fn bound_known(&self) -> Option<bool> {
+        self.bound
     }
 
     /// Whether an identity's fleet has bound this device.

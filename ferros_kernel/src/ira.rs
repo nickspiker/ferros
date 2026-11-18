@@ -199,6 +199,10 @@ pub fn derive(context: &str) -> Option<[u8; 32]> {
 
 /// devinfo's identity records (UFS LUN 3, 4 KiB LBA 6, after the 128-byte slot header): "DIUS" records of [total u32][key length u32][key NUL][value NUL], total = key length + value length. Returns "key=value\n" lines for the keys below, in this order, each that is present; None unless psn, dsn and imei1 all are.
 fn read_devinfo_identity() -> Option<alloc::vec::Vec<u8>> {
+    // The controller's data block read in place: the UFS lock (process.rs `UFS`) for the whole read.
+    crate::process::UFS.with(read_devinfo_identity_held)
+}
+fn read_devinfo_identity_held() -> Option<alloc::vec::Vec<u8>> {
     const KEYS: [&[u8]; 12] = [b"psn", b"dsn", b"imei1", b"imei2", b"wlan_mac1", b"bt_addr", b"pcbcfg", b"devcfg", b"sku", b"psku", b"coo", b"dpc"];
     let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
     let mut ok = false;
@@ -253,6 +257,9 @@ fn read_devinfo_identity() -> Option<alloc::vec::Vec<u8>> {
 
 /// The UFS device's serial-number string (device descriptor iSerialNumber at G#16 → string descriptor, UTF-16), raw bytes after the 2-byte header.
 fn read_ufs_serial() -> Option<alloc::vec::Vec<u8>> {
+    crate::process::UFS.with(read_ufs_serial_held)
+}
+fn read_ufs_serial_held() -> Option<alloc::vec::Vec<u8>> {
     use ferros_hal::ufs::{upiu, UfsController};
     let ufs = UfsController::new(0x1320_0000);
     let (dev, dev_len, ocs) = ufs.read_descriptor(upiu::DESC_DEVICE, 0);

@@ -79,6 +79,12 @@ fn site_word(l: &core::panic::Location) -> u64 {
 #[track_caller]
 fn lock() {
     use core::sync::atomic::Ordering;
+    // The order (`Rank`): a core holding a storage lock never takes the kernel lock, or a syscall on another core holding the kernel lock and waiting for that storage lock would wait for ever.
+    // Said the first time a path does it, with its place, rather than as a rare hang.
+    let ranks = RANKS[core()].load(Ordering::Relaxed);
+    if ranks != 0 {
+        panic!("lock order: the kernel lock taken at {} while this core holds storage locks G#{ranks:X}", site_text_of(site_word(core::panic::Location::caller())));
+    }
     if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
         // The wait is timed only when there is one: the uncontended take reads no counter.
@@ -137,6 +143,204 @@ fn unlock() {
     HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
+    // The flash log lines this core said while it held the lock, written now that every other core may go on (flashlog.rs `deferred`).
+    crate::flashlog::deferred();
+}
+
+/// A lock site word as text (`proc* line A#2033`): the four bytes of the file's name it keeps, then the line.
+pub fn site_text_of(w: u64) -> alloc::string::String {
+    let tag: alloc::string::String = ((w >> 24) as u32).to_le_bytes().iter().map(|&c| if c.is_ascii_graphic() { c as char } else { '?' }).collect();
+    alloc::format!("{tag}* line A#{}", w & 0xFF_FFFF)
+}
+
+// ---------------------------------------------------------------- the storage locks (2026-11-18, lock-holds)
+//
+// The kernel lock held the vault, the flash log and the UFS as well as the tables, so a capsule read (24 to 148 ms), the AoC's firmware (43 to 130 ms a piece) or a settings write (3.3 ms) stopped every core's syscalls for its whole length, and a camera stream at 96 a second died behind them (`diag lock`, the Pro, 2026-11-16 and 2026-11-18).
+// Each of those now has a lock of its own, ranked under the kernel lock:
+// - rank 1, `VAULT`: the kernel's vault (kvault's KVault: manifestus's state, the names, the seals, the seal keys' use), every read and write of it;
+// - rank 2, `PART`: the partition reader's open file (partfs.rs `part_call`, the modem driver's firmware and NV);
+// - rank 3, `LOG`: the flash log's ring, its pre-boot buffer and its personal key;
+// - rank 4, `UFS`: the UFS controller, one command at a time with its data block and the run bounce (`UFS_RUN`), and the link's hibernate;
+// - rank 5, `FENCE`: the camera front end's S2MPU fence and the region it follows (camera_power.rs).
+// The order is the kernel lock, then the ranks upward.
+// A core holding one never takes the kernel lock or a lower rank: `lock` and `Rank::take` panic on it, so a wrong order shows the first time its path runs, with its place, never as a rare deadlock.
+// Each is taken again freely on the core that holds it (`Rank::with`), as `with_lock_held_or` is.
+// What this buys: the service loop reads the vault holding `VAULT` alone, so the other cores' syscalls go on, and a syscall that needs the vault or the UFS lets the kernel lock go first (`unlocked`).
+// A syscall that still takes one of them under the kernel lock waits for its holder with every other core waiting behind it: those waits are counted (`Rank::kernel_waits`, `diag lock`), the measure of what is left to move.
+
+/// Per core: the storage locks it holds, bit r for rank r.
+static RANKS: [core::sync::atomic::AtomicU32; 16] = [const { core::sync::atomic::AtomicU32::new(0) }; 16];
+
+/// Whether this core holds a storage lock of rank `r` or above.
+pub fn ranks_from(r: u32) -> bool {
+    RANKS[core()].load(core::sync::atomic::Ordering::Relaxed) >> r != 0
+}
+
+/// A storage lock (above): a spinlock with its rank, its holder and its measures.
+pub struct Rank {
+    rank: u32,
+    pub name: &'static str,
+    word: core::sync::atomic::AtomicBool,
+    /// The core holding it, plus one (0: free).
+    holder: core::sync::atomic::AtomicUsize,
+    at: core::sync::atomic::AtomicU64,
+    site: core::sync::atomic::AtomicU64,
+    /// Holds since boot, the longest (ticks) and where it was taken.
+    pub holds: core::sync::atomic::AtomicU64,
+    pub max: core::sync::atomic::AtomicU64,
+    pub max_site: core::sync::atomic::AtomicU64,
+    /// Waits for it made by a core holding the kernel lock: how many, ticks in all, the longest, and the site the longest waited from. Each of those ticks every other core may have waited too.
+    pub kernel_waits: [core::sync::atomic::AtomicU64; 4],
+}
+
+impl Rank {
+    const fn new(rank: u32, name: &'static str) -> Self {
+        use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+        Rank { rank, name, word: AtomicBool::new(false), holder: AtomicUsize::new(0), at: AtomicU64::new(0), site: AtomicU64::new(0), holds: AtomicU64::new(0), max: AtomicU64::new(0), max_site: AtomicU64::new(0), kernel_waits: [const { AtomicU64::new(0) }; 4] }
+    }
+
+    /// Its rank (above).
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// Whether this core holds it.
+    pub fn mine(&self) -> bool {
+        self.holder.load(core::sync::atomic::Ordering::Relaxed) == core() + 1
+    }
+
+    #[track_caller]
+    fn take(&self) {
+        use core::sync::atomic::Ordering::{Acquire, Relaxed};
+        let c = core();
+        let site = site_word(core::panic::Location::caller());
+        // A higher rank held here: taking this one now is the wrong order (above).
+        let ranks = RANKS[c].load(Relaxed);
+        if ranks >> (self.rank + 1) != 0 {
+            panic!("lock order: {} (rank {}) taken at {} while this core holds G#{ranks:X}", self.name, self.rank, site_text_of(site));
+        }
+        if self.word.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+            let t0 = crate::platform::cntpct();
+            let mut spins = 0u32;
+            // Test, then test-and-set, as the kernel lock spins.
+            while self.word.load(Relaxed) || self.word.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+                core::hint::spin_loop();
+                // WHY wrapping: as the kernel lock's spin, a count past 2^32 turns only feeds the every-4096th look.
+                spins = spins.wrapping_add(1);
+                if (spins & 0xFFF) == 0 {
+                    crate::platform::stall_check();
+                }
+            }
+            if HOLDER.load(Relaxed) == c + 1 {
+                let waited = crate::platform::cntpct() - t0;
+                let w = &self.kernel_waits;
+                w[0].fetch_add(1, Relaxed);
+                w[1].fetch_add(waited, Relaxed);
+                if waited > w[2].load(Relaxed) {
+                    w[2].store(waited, Relaxed);
+                    w[3].store(site, Relaxed);
+                }
+            }
+        }
+        self.holder.store(c + 1, Relaxed);
+        self.site.store(site, Relaxed);
+        self.at.store(crate::platform::cntpct(), Relaxed);
+        RANKS[c].fetch_or(1 << self.rank, Relaxed);
+    }
+
+    fn give(&self) {
+        use core::sync::atomic::Ordering::{Relaxed, Release};
+        let held = crate::platform::cntpct().wrapping_sub(self.at.load(Relaxed));
+        self.holds.fetch_add(1, Relaxed);
+        if held > self.max.load(Relaxed) {
+            self.max.store(held, Relaxed);
+            self.max_site.store(self.site.load(Relaxed), Relaxed);
+        }
+        RANKS[core()].fetch_and(!(1 << self.rank), Relaxed);
+        self.holder.store(0, Relaxed);
+        self.word.store(false, Release);
+    }
+
+    /// `f` holding this lock, taken now unless this core holds it already.
+    #[track_caller]
+    pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
+        if self.mine() {
+            return f();
+        }
+        self.take();
+        let r = f();
+        self.give();
+        r
+    }
+
+    /// `diag lock`'s line for it.
+    pub fn report(&self) -> alloc::string::String {
+        use core::sync::atomic::Ordering::Relaxed;
+        let us = |t: u64| t * 1_000_000 / crate::platform::cntfrq();
+        let w = &self.kernel_waits;
+        alloc::format!(
+            "  {}: A#{} holds, longest A#{} us at {}; waited for under the kernel lock A#{} times, A#{} us in all, longest A#{} us at {}\n",
+            self.name,
+            self.holds.load(Relaxed),
+            us(self.max.load(Relaxed)),
+            site_text_of(self.max_site.load(Relaxed)),
+            w[0].load(Relaxed),
+            us(w[1].load(Relaxed)),
+            us(w[2].load(Relaxed)),
+            site_text_of(w[3].load(Relaxed))
+        )
+    }
+
+    /// `diag "lock reset"`: its measures zeroed.
+    pub fn reset(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        for a in [&self.holds, &self.max, &self.max_site].into_iter().chain(self.kernel_waits.iter()) {
+            a.store(0, Relaxed);
+        }
+    }
+}
+
+/// The kernel's vault (rank 1).
+pub static VAULT: Rank = Rank::new(1, "vault");
+/// The partition reader (rank 2).
+pub static PART: Rank = Rank::new(2, "partition files");
+/// The flash log (rank 3).
+pub static LOG: Rank = Rank::new(3, "flash log");
+/// The UFS controller (rank 4).
+pub static UFS: Rank = Rank::new(4, "ufs");
+/// The camera front end's S2MPU fence (rank 5).
+pub static FENCE: Rank = Rank::new(5, "camera fence");
+/// Every storage lock, for `diag lock`.
+pub static RANKED: [&Rank; 5] = [&VAULT, &PART, &LOG, &UFS, &FENCE];
+
+/// From the moment the service loop lends its vault to the syscalls (service.rs `run`), other cores reach it, and every read or write of its blocks holds `VAULT` (kvault.rs `Region`, which panics otherwise). Before, the boot is one core's alone.
+pub static VAULT_SHARED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Inside a syscall: `work` with the kernel lock let go and interrupts open, the lock taken back before this returns (the SYS_POWER pattern of 2026-11-16, made one).
+/// What the caller must keep to: no reference into the kernel's tables taken before this (`p`, `t`, an entry of `k()`) is used after it, since another core may change or move them meanwhile (a spawn grows the process table); `work` reads and writes no process's memory (an arc can shrink or give back frames under it from another thread), only kernel buffers.
+/// What holds meanwhile: the calling thread stays current on this core, so its process's arc is neither freed (only its last thread's drain frees it) nor moved (`hold_try` waits for its threads to leave the cores); its process may be killed meanwhile, and the trap drains it at its next entry as for any thread that ran on while its process ended elsewhere.
+/// An interrupt taken here at EL2 marks its line pending and returns; a slice tick taken here is re-armed at the trap's end; a yield asked of this core meanwhile, or a hold of the thread's process (SGI 3 both, which parks nothing at EL2), is asked again once the interrupts are masked, so it is pending at the eret and the thread parks there as if it had come with them masked.
+#[track_caller]
+fn unlocked<R>(work: impl FnOnce() -> R) -> R {
+    use core::sync::atomic::Ordering::Relaxed;
+    let what = crate::devsched::WHAT.load(Relaxed);
+    let any_before = unsafe { core::ptr::read_volatile(&raw const __irq_any) };
+    unlock();
+    unsafe { core::arch::asm!("msr daifclr, #2") };
+    let r = work();
+    unsafe { core::arch::asm!("msr daifset, #2") };
+    lock();
+    crate::devsched::WHAT.store(what, Relaxed);
+    let c = core();
+    // The same for a hold of this thread's process asked meanwhile (`hold`, an arc to move or change: SGI 3 too), which waits for the thread to leave the core and would otherwise wait for its next trap or its slice's end.
+    let held = cur_get().and_then(proc_of).is_some_and(|p| p.hold.is_some());
+    // And for a device line gone pending meanwhile (`__irq_any`, perhaps on this core, where it was taken at EL2 and parked nothing): with the interrupts masked it would have parked the thread at the eret, so the line's waiter was looked for at once; the thread parks there now as it would have.
+    let line = any_before == 0 && unsafe { core::ptr::read_volatile(&raw const __irq_any) } != 0;
+    if YIELD[c].load(Relaxed) != 0 || held || line {
+        // SGI 3 to this core, as `make_room` sends it.
+        unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
+    }
+    r
 }
 /// This core's index: MPIDR Aff1 (husky: 0-3 the A510s, 4-7 the A715s, 8 the X3).
 pub fn core() -> usize {
@@ -1528,7 +1732,7 @@ const SYS_INPUT: u64 = 8;
 const SYS_SLEEP: u64 = 9;
 /// Start a signed capsule from the vault as a new process, handing it copies of some of the caller's own capabilities (never more rights than the caller holds; reply capabilities do not pass). x0/x1: request offset and length in the caller's arc, [name len][name][vault key len][vault key][token count][tokens, 32 bytes each]. The child is queued, not entered: the caller carries on. Returns 0, or ERR with the reason on the console.
 const SYS_SPAWN: u64 = 10;
-/// Change a device preference: x0 the Settings capability's token offset, x1 which preference, x2 its new value. The kernel checks the value, keeps it in the vault through `PREF_STORE`, and rewrites it in every live process's preferences block at once. Returns 0 or ERR.
+/// Change a device preference: x0 the Settings capability's token offset, x1 which preference, x2 its new value. The kernel checks the value, keeps it in the vault (`keep_settings`: written at the trap's end, the kernel lock let go), and rewrites it in every live process's preferences block at once. Returns 0 or ERR.
 const SYS_SET_PREF: u64 = 11;
 /// SYS_SET_PREF x1 bit 8: the value applied to every process's block but not kept in the vault (a slider while the finger is down).
 const PREF_LIVE: u64 = 1 << 8;
@@ -1635,8 +1839,26 @@ pub const CONTROL_CLOCK: usize = 6;
 pub const CONTROL_ZONE: usize = 1;
 pub static CONTROL: [[core::sync::atomic::AtomicU64; CONTROLS]; CONTROL_LINKS] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; CONTROLS] }; CONTROL_LINKS];
 pub static CONTROL_GEN: [core::sync::atomic::AtomicU64; CONTROL_LINKS] = [const { core::sync::atomic::AtomicU64::new(0) }; CONTROL_LINKS];
-/// Keeps the settings document as it now stands (the knobs and the zone with it): → stored. Registered by whoever owns the vault (service.rs), as PREF_STORE.
-pub static mut CONTROL_STORE: Option<fn() -> bool> = None;
+/// Writes the settings document (the preferences, the knobs, the zone and the language) into the vault: (the document, its generation) -> kept, a write older than one already kept answered kept without writing. Registered by whoever owns the vault (service.rs `settings_write`), which takes the vault's lock for it.
+pub static mut SETTINGS_WRITE: Option<fn(&[u8], u64) -> bool> = None;
+/// The settings document's snapshots, counted under the kernel lock (`settings_snapshot`), so their writes, made later without it, land in the order the changes were made: a write never puts an older document over a newer one.
+static SETTINGS_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per core: the syscall it runs changed a kept setting (`keep_settings`), so the trap keeps the document once the kernel lock is let go (`ferros_el0_trap`).
+static KEEP_ASKED: [core::sync::atomic::AtomicBool; 16] = [const { core::sync::atomic::AtomicBool::new(false) }; 16];
+
+/// The settings document as it stands now and its generation, for a write without the kernel lock (`SETTINGS_WRITE`). With the kernel lock held: the preferences, the zone and the language it reads are the kernel's state.
+pub fn settings_snapshot() -> Option<(Vec<u8>, u64)> {
+    let doc = crate::settings::document(None)?;
+    Some((doc, SETTINGS_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1))
+}
+
+/// A syscall changed a setting that is kept (SYS_SET_PREF, SYS_CONTROL, SYS_ZONE, SYS_LANG): the document is snapshotted at the trap's end and written once the kernel lock is let go (`ferros_el0_trap`), before the caller goes on, so the change is on the flash when its call returns, as before.
+/// Until 2026-11-18 the write was made here, under the kernel lock: 3.3 ms of a UFS commit after a tap on the map, every core waiting (`diag lock`).
+/// Whether there is a vault to keep it in; a write that then fails answers the caller ERR, the setting applied but not kept (before, a refused write left it unapplied: undoing it now would race the changes after it).
+fn keep_settings() -> bool {
+    KEEP_ASKED[core()].store(true, core::sync::atomic::Ordering::Relaxed);
+    unsafe { SETTINGS_WRITE }.is_some()
+}
 /// The largest detail document a link keeps.
 pub const DETAIL_MAX: usize = 1 << 10;
 /// The detail documents and their lengths, touched only under the kernel lock (inside a syscall).
@@ -1662,8 +1884,11 @@ pub fn ufs_run_range() -> (usize, usize) {
     let a = (&raw const UFS_RUN) as usize;
     (a, a + (ferros_hal::ufs::RUN_MAX << 12))
 }
-/// `out.len() / 4096` consecutive blocks (1 to RUN_MAX) of `lun` from `lba` into `out` thru the run bounce: one UFS command once the PRDT stride is known (learned here at the first run, as SYS_BLOCK learns it), else a block a command. Whether every command completed. The caller holds the kernel lock, as every UFS command must (a syscall holds it): partfs.rs reads Android's partitions with it (the modem's 98 MB firmware went a block a command until 2026-11-11).
+/// `out.len() / 4096` consecutive blocks (1 to RUN_MAX) of `lun` from `lba` into `out` thru the run bounce: one UFS command once the PRDT stride is known (learned here at the first run, as SYS_BLOCK learns it), else a block a command. Whether every command completed. Under the UFS lock (`UFS`), as every UFS command is, the copy out of the bounce with it: partfs.rs reads Android's partitions with it (the modem's 98 MB firmware went a block a command until 2026-11-11).
 pub fn ufs_read_run(lun: u8, lba: u32, out: &mut [u8]) -> bool {
+    UFS.with(|| ufs_read_run_held(lun, lba, out))
+}
+fn ufs_read_run_held(lun: u8, lba: u32, out: &mut [u8]) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let n = out.len() >> 12;
     let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
@@ -1684,6 +1909,8 @@ pub fn ufs_runs_on() -> bool {
 }
 /// SYS_BLOCK's measure (`diag "ufs runs"`, owner 2026-11-08: "24MB from the vault should be imperceptibly fast"): calls, blocks and timer ticks inside the call (the command or commands and the copy), reads then writes; then the reads' ticks in the UFS command alone, and the reads' commands of at least MOVING_BLOCKS blocks.
 pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+/// The owner's fresh start is zeroing the flash (service.rs `vault fresh`): every SYS_BLOCK refused from then to its reset, since the block calls no longer hold the kernel lock that keeps the other cores out while it runs.
+pub static BLOCKS_SHUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -1976,8 +2203,6 @@ pub fn pref(index: usize) -> u8 {
 }
 static mut PREFS_NOW: [u8; PREF_COUNT] = [0; PREF_COUNT];
 
-/// Keeps a changed preference in the vault: (preference, value) -> stored. Registered by whoever owns the vault (service.rs).
-pub static mut PREF_STORE: Option<fn(usize, u8) -> bool> = None;
 
 /// Set a preference in kernel memory and in every live process (no persistence: the caller has done that, or the value came from the vault).
 pub fn set_pref(index: usize, value: u8) {
@@ -2021,8 +2246,6 @@ fn wake_word_waiters() {
     }
 }
 
-/// Run `f` with the kernel lock held — the service loop's way into the vault, which is part of the kernel's locked state (syscalls reach it with the lock held; KERNEL.md "Cores"). Inside `f`, only the `_held` variants of lock-taking functions.
-#[track_caller]
 /// The panic's take of the kernel lock (platform.rs `report_panic`): once, if it is free, never waited for, never given back.
 /// Every syscall on every core then waits at the lock, so nothing redraws over the panic's screen (the display server flips and draws thru syscalls) until the reset.
 /// A lock held already (by the panicking core, or another) is left as it is.
@@ -2035,6 +2258,10 @@ pub fn seize_for_panic() -> bool {
     took
 }
 
+/// Run `f` with the kernel lock held: the service loop's way into the kernel's tables. Inside `f`, only the `_held` variants of lock-taking functions.
+/// The vault, the flash log and the UFS have locks of their own since 2026-11-18 (`Rank`): a closure that touches only them takes those, not this.
+/// `#[track_caller]` names the hold by the caller's line: from 2026-11-17 (the panic screen's `seize_for_panic` put between the attribute and this function) to 2026-11-18 every hold taken here read as one site, process.rs's own line inside it, in `diag lock`.
+#[track_caller]
 pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
     lock();
     let r = f();
@@ -2042,7 +2269,7 @@ pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `f` under the kernel lock, whether or not this core already holds it (a syscall does; the service loop does not): for code both reach, such as the flash log.
+/// `f` under the kernel lock, whether or not this core already holds it (a syscall does; the service loop does not): for code both reach, such as a seal move's queue (`seal_ok`). Never from under a storage lock (`Rank`): there it panics when it must take the lock.
 #[track_caller]
 pub fn with_lock_held_or<R>(f: impl FnOnce() -> R) -> R {
     if HOLDER.load(core::sync::atomic::Ordering::Relaxed) == core() + 1 {
@@ -2434,8 +2661,9 @@ const CAM_RESERVE: usize = 1 << 5;
 /// The top of the low 4 GiB: a run asked to lie under it (SYS_DMA x1 = 3, x3 bit 0) for a device whose high address bits may not reach DRAM.
 const LOW_4GIB: usize = 1 << 32;
 
-/// SYS_DMA x1 = 3 on the `camera` region: the caller takes `n` frames side by side (frames.rs `take_run`; under 4 GiB when `low`), zeroed, cleaned out of the caches (the front end writes them by DMA, the driver reads them non-cacheable), mapped in the camera's window from its start, and fenced (camera_power.rs `region_changed`). Answers the run's physical start, which the driver writes into its job (ferros_cam job). A caller already holding a run of at least `n` frames gets its start again. ERR, with why on the console: another process holds it, past the window, the pool without such a run. Under the lock.
-fn cam_ask(p: &Process, n: u64, low: bool) -> u64 {
+/// SYS_DMA x1 = 3 on the `camera` region: the caller takes `n` frames side by side (frames.rs `take_run_unzeroed`; under 4 GiB when `low`), zeroed, cleaned out of the caches (the front end writes them by DMA, the driver reads them non-cacheable), mapped in the camera's window from its start, and fenced (camera_power.rs `set_region`). Answers the run's physical start, which the driver writes into its job (ferros_cam job). A caller already holding a run of at least `n` frames gets its start again. ERR, with why on the console: another process holds it, past the window, the pool without such a run.
+/// Called under the kernel lock (a syscall's), which it lets go while the frames are zeroed and cleaned (2026-11-18, `unlocked`: 4.8 ms of it at a camera open, `diag lock`): they are taken from the pool first, so no one else can be given them, and the region is reserved for the caller with no frames yet, so no other process takes it meanwhile and the caller's own end frees nothing of it (`cam_free` passes a region of no frames by); they are mapped and fenced once the lock is back, and given back then if the caller ended meanwhile. `p` is not used after the lock is let go.
+fn cam_ask(p: &Process, cur: usize, n: u64, low: bool) -> u64 {
     let c = unsafe { &mut *(&raw mut CAM) };
     let t0 = crate::platform::cntpct();
     let say = |what: &str| {
@@ -2463,22 +2691,50 @@ fn cam_ask(p: &Process, n: u64, low: bool) -> u64 {
         say("the pool would be left too few frames");
         return ERR;
     }
-    let Some(first) = crate::frames::take_run(n, if low { LOW_4GIB } else { usize::MAX }) else {
+    let Some((first, dirty)) = crate::frames::take_run_unzeroed(n, if low { LOW_4GIB } else { usize::MAX }) else {
         say("no run of free frames that long");
         return ERR;
     };
+    // Reserved: the caller's, with no frames yet.
+    let epoch = p.epoch;
+    *c = Cam { owner: epoch, first, n: 0 };
+    let name = p.name.clone();
+    let t_lock = crate::platform::cntpct();
+    unlocked(|| {
+        for f in first..first + n {
+            // A frame not known clean zeroed here, as a take zeroes it (under the lock, until 2026-11-18); then every line cleaned and invalidated (the front end writes it by DMA, the driver reads it non-cacheable).
+            if dirty[f - first] {
+                crate::frames::wipe(f);
+            }
+            crate::frames::clean_invalidate(f);
+        }
+    });
+    let t_back = crate::platform::cntpct();
+    let c = unsafe { &mut *(&raw mut CAM) };
+    let say = |what: &str| {
+        let line = alloc::format!("camera region: {} asked for A#{n} frames{}: {what}; A#{} MiB of the pool free\n", core::str::from_utf8(&name).unwrap_or("?"), if low { " under 4 GiB" } else { "" }, (crate::frames::free() * crate::frames::FRAME) >> 20);
+        k().console.extend_from_slice(line.as_bytes());
+    };
+    // The caller ended meanwhile (its `cam_free` passed the reserved region by): the frames go back and the region is free again.
+    if !proc_of(cur).is_some_and(|q| q.epoch == epoch && !q.dying) {
+        if c.owner == epoch {
+            *c = Cam { owner: 0, first: 0, n: 0 };
+        }
+        for f in first..first + n {
+            crate::frames::give(f);
+        }
+        say("its process ended while the frames were made ready; given back");
+        return ERR;
+    }
     for f in first..first + n {
-        crate::frames::clean_invalidate(f);
         crate::cachemap::cam_map(crate::cachemap::CAM_VA.0 + (f - first) * crate::frames::FRAME, Some(crate::frames::pa(f)));
     }
     crate::cachemap::surface_unmapped(crate::cachemap::CAM_VA.0, n * crate::frames::FRAME);
-    *c = Cam { owner: p.epoch, first, n };
+    *c = Cam { owner: epoch, first, n };
     let pa = crate::frames::pa(first);
-    crate::camera_power::REGION[0].store(pa as u64, core::sync::atomic::Ordering::Release);
-    crate::camera_power::REGION[1].store((n * crate::frames::FRAME) as u64, core::sync::atomic::Ordering::Release);
-    let fenced = crate::camera_power::region_changed();
-    let us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / crate::platform::cntfrq();
-    say(&alloc::format!("given at G#{pa:X}, taken and cleaned in A#{us} us, S2MPUs G#{fenced:X} (0 while the switch is off)"));
+    let fenced = crate::camera_power::set_region(pa, n * crate::frames::FRAME);
+    let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
+    say(&alloc::format!("given at G#{pa:X}, taken and cleaned in A#{} us (A#{} us of it with the kernel lock let go), S2MPUs G#{fenced:X} (0 while the switch is off)", us(t0, crate::platform::cntpct()), us(t_lock, t_back)));
     pa as u64
 }
 
@@ -2577,9 +2833,7 @@ fn cam_free(epoch: u64) {
     if c.owner != epoch || c.n == 0 {
         return;
     }
-    crate::camera_power::REGION[1].store(0, core::sync::atomic::Ordering::Release);
-    crate::camera_power::REGION[0].store(0, core::sync::atomic::Ordering::Release);
-    let shut = crate::camera_power::region_changed();
+    let shut = crate::camera_power::set_region(0, 0);
     for j in 0..c.n {
         crate::cachemap::cam_map(crate::cachemap::CAM_VA.0 + j * crate::frames::FRAME, None);
     }
@@ -3323,8 +3577,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
 }
 
 /// `SYS_VAULT` op 0: the `skip`-th entry of the kernel's vault that belongs in the vault process (a scope's, not one the kernel keeps, its class open), with its domain's keys: the one exception to keys only against a live call (VAULT-OUT.md, migration), once per old entry. None left: the pending mark is cleared.
-fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
-    let Some(Ok(names)) = unsafe { STORE_KEYS }.map(|keys| keys()) else { return ERR };
+/// `names` the kernel's vault's, listed with the kernel lock let go (SYS_VAULT); the keys derived and written under it.
+fn migrate_next(p: &Process, names: Vec<alloc::string::String>, skip: usize, buf: u64, len: usize) -> u64 {
     let mut seen = 0;
     for name in names {
         let Some(sc) = scope_of(&name) else { continue };
@@ -3352,38 +3606,26 @@ fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
     NOTHING
 }
 
-/// `SYS_VAULT` op 1: an old entry's value from `offset` (fetched once, kept until another is asked for or it moves).
-fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize) -> u64 {
+/// `SYS_VAULT` op 1: an old entry's value from `offset` (fetched once, kept until another is asked for or it moves). `got` the vault's answer when the cache did not hold it, read with the kernel lock let go (SYS_VAULT).
+fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize, got: Option<Result<Option<Vec<u8>>, ()>>) -> u64 {
     if scope_of(name).is_none() {
         return ERR;
     }
     let cache = unsafe { &mut *(&raw mut MIGRATE_CACHE) };
-    if cache.as_ref().is_none_or(|(k, _)| k != name.as_bytes()) {
-        *cache = match unsafe { STORE }.map(|store| store(name, None)) {
-            Some(Ok(Some(v))) => Some((name.as_bytes().to_vec(), v)),
-            Some(Ok(None)) => return NOTHING,
-            _ => return ERR,
+    if let Some(got) = got {
+        *cache = match got {
+            Ok(Some(v)) => Some((name.as_bytes().to_vec(), v)),
+            Ok(None) => return NOTHING,
+            Err(()) => return ERR,
         };
     }
-    let Some((_, v)) = cache.as_ref() else { return ERR };
+    // The cache this name's or nothing: no vault to read from (`STORE` unset) leaves it as it was.
+    let Some((_, v)) = cache.as_ref().filter(|(k, _)| k == name.as_bytes()) else { return ERR };
     // WHY: the offset is the vault process's and may lie past the end (nothing to copy then).
     let from = offset.min(v.len());
     let to = (offset + len).min(v.len());
     p.write(buf, &v[from..to]);
     v.len() as u64
-}
-
-/// `SYS_VAULT` op 2: an old entry the vault process has written and committed, removed from the kernel's vault.
-fn migrate_done(name: &str) -> u64 {
-    let Some(sc) = scope_of(name) else { return ERR };
-    unsafe { *(&raw mut MIGRATE_CACHE) = None };
-    // Said apart from the removal's own line ("store remove ... (process)", which a process's delete also writes): this entry lives on in the vault process, under a scope a kernel without it will not look in.
-    crate::flashlog::line(&alloc::format!("store moved {name:?} into the vault process, scope {}", sc.name));
-    match unsafe { STORE_REMOVE }.map(|rm| rm(name)) {
-        Some(Ok(true)) => 0,
-        Some(Ok(false)) => NOTHING,
-        _ => ERR,
-    }
 }
 
 /// A bridge `store put` (service.rs) of a name the vault process holds: it waits in the kernel's vault until the vault process takes it.
@@ -3886,8 +4128,13 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-/// The switches SYS_POWER and `power_offs_apply` run with the kernel lock let go (2026-11-16, kernlock): each a kernel-side sequence for a device whose driver reaches it only thru lock-free register syscalls, and whose hardware no path under the lock touches from another core. Bluetooth's is pcie1's too (off before WL_REG_ON is cycled): it held the lock 19.5 ms twice in a camera stream. Not the camera's (its region's S2MPU fence), the USB link's, the sensors', the display's, the panel's nor android's: unaudited, they keep the lock.
-const SWITCH_UNLOCKED: [&str; 6] = ["gps", "nfc", "bt", "touch", "amp", "torch"];
+/// The switches SYS_POWER and `power_offs_apply` run with the kernel lock let go (2026-11-16, kernlock): each a kernel-side sequence for a device whose driver reaches it only thru lock-free register syscalls, and whose hardware no path under the lock touches from another core. Bluetooth's is pcie1's too (off before WL_REG_ON is cycled): it held the lock 19.5 ms twice in a camera stream.
+/// Since 2026-11-18 also:
+/// - the sensors' (sensorlink.rs `power`): it sets one atomic for the service loop (`START`) and touches no hardware at all; the AoC's start it asks for is the service loop's, on this same core.
+/// - the camera's (camera_power.rs; 43 ms of the kernel lock at an open, `diag lock`), kept under the lock until now because its region's fence, under the kernel lock on any core (`cam_ask`, `cam_free`), writes the S2MPUs the switch also writes. The fence and the region it follows now have a lock of their own (`FENCE`), which both sides take, so the lock that kept them apart is no longer the kernel's; the S2MPUs sit in the front end's domain, which the switch brings on once and never gates again (`FE_ON`), so a fence from another core never finds it down. The rest of the switch is the camera PMIC's bus (hsi2c_14, shared with the torch, whose switch is refused while this one holds it, both on the kernel's core), ACPM (the kernel's core alone), the domain's EL3 calls (the pd gating pass, the kernel's core alone), and the front end's clocks, sysmmus, engine and receiver, which no path under the kernel lock touches.
+/// - the USB link's (ptlink.rs `power`; 11 ms of the kernel lock at a reload's boot, `diag lock`, the eUSB2 PHY's and the repeater's waits): its link reset, the one piece of the lock's state it touches, is taken under the lock inside it (`with_lock_held_or`); the rest is hsi2c_11 (the TCPC and the repeater, which only the kernel's core reaches: the battery gauge's polls and the diag commands are the service loop's), ACPM (the kernel's core only, as for the camera's), the eUSB2 PHY, the controller's DCTL and HSI0's S2MPU and SYSMMU, which nothing else in the kernel writes after boot.
+/// Not the display's (`dpu`: EL3 calls into the PMU, which a via-EL3 grant's SYS_MMIO on another core also makes), the panel's (its reset line shares GPA6_CON with the volume-up key's pin mode) nor android's: unaudited, they keep the lock.
+const SWITCH_UNLOCKED: [&str; 9] = ["gps", "nfc", "bt", "touch", "amp", "torch", "sensors", "camera", "usb"];
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
@@ -4215,7 +4462,27 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     }
     // What this hold is (devsched `WHAT`, `diag lock`): the syscall, its x1's low byte, the thread.
     crate::devsched::WHAT.store(1 << 63 | (f.x[8] & 0xFF) | (f.x[1] & 0xFF) << 8 | (cur_get().unwrap_or(0xFFFF) as u64 & 0xFFFF) << 16, core::sync::atomic::Ordering::Relaxed);
+    // SYS_NOTIFY's first op of an unlock reads the person's notes from the vault: here, before `el0_trap` takes any reference into the tables, with the lock let go (notify.rs `preload_held`); a process ended meanwhile is drained at `el0_trap`'s entry.
+    if f.x[8] == SYS_NOTIFY && (f.esr >> 26) & 0x3F == 0x15 {
+        notify::preload_held();
+    }
     let r = el0_trap(f);
+    // A kept setting changed (`keep_settings`): the document as it stands, snapshotted under the lock, then written with the lock let go and interrupts open (`unlocked`: no table is touched, only the document in the heap, under the vault's lock), before the caller goes on.
+    // A write that failed answers ERR, to the thread that asked if it is still the one here (the four calls that ask never switch).
+    if KEEP_ASKED[core()].swap(false, core::sync::atomic::Ordering::Relaxed) {
+        if let Some((doc, at)) = settings_snapshot() {
+            let asker = cur_get();
+            let ok = unlocked(|| unsafe { SETTINGS_WRITE }.is_some_and(|w| w(&doc, at)));
+            if !ok {
+                k().console.extend_from_slice(b"settings: the document was not kept (the vault refused the write)\n");
+                if asker.is_some() && cur_get() == asker && r == 0 {
+                    f.x[0] = ERR;
+                }
+            }
+        }
+    }
+    // The notes' vault writes this syscall made (notify.rs `keep`), the same way.
+    notify::flush_held();
     unlock();
     crate::prof::leave();
     if r == 0 {
@@ -4504,31 +4771,50 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             let (write, timed, count, at, buf) = (f.x[1] & 1 != 0, f.x[1] & 2 != 0, (f.x[1] >> 8) & 0xFFFF, f.x[2], f.x[3]);
             f.x[0] = match (window, crate::ufs_device::part()) {
+                // The owner's fresh start is zeroing the flash (service.rs `vault fresh`): nothing more is read or written before its reset.
+                _ if BLOCKS_SHUT.load(core::sync::atomic::Ordering::SeqCst) => ERR,
                 // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
                 (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
                     use core::sync::atomic::Ordering::Relaxed;
-                    let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
                     let base = (first as u64 + w.offset + at) as u32;
                     let n = count as usize;
-                    let run = (&raw mut UFS_RUN) as usize;
-                    let bytes = unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) };
+                    // The command runs with the kernel lock let go (2026-11-18, `unlocked`: it held every core up to 1.2 ms a run, `diag lock`), under the UFS lock, which the run bounce is one with.
+                    // The caller's memory is read and written only under the kernel lock (another of its threads may shrink its arc or give frames back meanwhile), so the bytes go thru a copy in the kernel heap on either side: about 50 us a MiB under the kernel lock, against the command's whole length before.
+                    let command = move |data: Option<&[u8]>, out: Option<&mut Vec<u8>>| -> (bool, u64) {
+                        let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        let run = (&raw mut UFS_RUN) as usize;
+                        // The PRDT's stride, learned at the first access of more than one block (`probe_prdt_stride`, the run buffer its scratch): until it is known a run goes a block a command.
+                        if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+                            u.probe_prdt_stride(0, base, run);
+                        }
+                        // SAFETY: the bounce holds RUN_MAX blocks and n is at most BLOCK_MAX (RUN_MAX), checked above; it is touched only under the UFS lock, held here.
+                        let bytes = unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) };
+                        if let Some(d) = data {
+                            bytes.copy_from_slice(d);
+                            return (u.write_run_lun(0, base, n, run), crate::platform::cntpct());
+                        }
+                        let ok = u.read_run_lun(0, base, n, run);
+                        let t = crate::platform::cntpct();
+                        if let (true, Some(o)) = (ok, out) {
+                            o.extend_from_slice(bytes);
+                        }
+                        (ok, t)
+                    };
                     let t0 = crate::platform::cntpct();
-                    // The PRDT's stride, learned at the first access of more than one block (`probe_prdt_stride`, the run buffer its scratch): until it is known a run goes a block a command.
-                    if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
-                        u.probe_prdt_stride(0, base, run);
-                    }
                     let (ok, t_cmd) = if write {
-                        p.read_into(buf, bytes);
-                        (u.write_run_lun(0, base, n, run), crate::platform::cntpct())
+                        let mut data = alloc::vec![0u8; n << 12];
+                        p.read_into(buf, &mut data);
+                        unlocked(|| UFS.with(|| command(Some(&data), None)))
                     } else {
                         if count >= MOVING_BLOCKS {
                             crate::ptlink::MOVING_AT.store(t0, Relaxed);
                             BLOCK_STATS[7].fetch_add(1, Relaxed);
                         }
-                        let ok = u.read_run_lun(0, base, n, run);
-                        let t = crate::platform::cntpct();
-                        if ok {
-                            p.write_from(buf, bytes);
+                        let mut data = Vec::with_capacity(n << 12);
+                        let (ok, t) = unlocked(|| UFS.with(|| command(None, Some(&mut data))));
+                        // The caller found again: the process table may have moved meanwhile.
+                        if let (true, Some(p)) = (ok, proc_of(cur)) {
+                            p.write_from(buf, &data);
                         }
                         BLOCK_STATS[6].fetch_add(t - t0, Relaxed);
                         (ok, t)
@@ -4562,10 +4848,41 @@ fn el0_trap(f: &mut Frame) -> u64 {
             } else if !ok || len > STORE_MAX {
                 ERR
             } else {
+                // Each op's vault call made with the kernel lock let go (`unlocked`, under the vault's own lock), the caller found again after it: at a boot the listing waited 46 ms for the vault's lock behind the AoC's firmware (2026-11-18, `diag lock`). The domain keys and the read's cache stay under the kernel lock.
+                let (skip, buf) = (f.x[2] as usize, f.x[4]);
                 match op {
-                    0 => migrate_next(p, f.x[2] as usize, f.x[4], len),
-                    1 => migrate_read(p, &name(), offset, f.x[4], len),
-                    2 => migrate_done(&name()),
+                    0 => {
+                        let names = unlocked(|| unsafe { STORE_KEYS }.map(|keys| keys()));
+                        match (names, proc_of(cur)) {
+                            (Some(Ok(names)), Some(p)) => migrate_next(p, names, skip, buf, len),
+                            _ => ERR,
+                        }
+                    }
+                    1 => {
+                        let name = name();
+                        let miss = scope_of(&name).is_some() && unsafe { (*(&raw const MIGRATE_CACHE)).as_ref() }.is_none_or(|(k, _)| k != name.as_bytes());
+                        let got = if miss { unlocked(|| unsafe { STORE }.map(|store| store(&name, None))) } else { None };
+                        match proc_of(cur) {
+                            Some(p) => migrate_read(p, &name, offset, buf, len, got),
+                            None => ERR,
+                        }
+                    }
+                    2 => {
+                        let name = name();
+                        match scope_of(&name) {
+                            Some(sc) => {
+                                unsafe { *(&raw mut MIGRATE_CACHE) = None };
+                                // Said apart from the removal's own line ("store remove ... (process)", which a process's delete also writes): this entry lives on in the vault process, under a scope a kernel without it will not look in.
+                                crate::flashlog::line(&alloc::format!("store moved {name:?} into the vault process, scope {}", sc.name));
+                                match unlocked(|| unsafe { STORE_REMOVE }.map(|rm| rm(&name))) {
+                                    Some(Ok(true)) => 0,
+                                    Some(Ok(false)) => NOTHING,
+                                    _ => ERR,
+                                }
+                            }
+                            None => ERR,
+                        }
+                    }
                     _ => ERR,
                 }
             };
@@ -4717,24 +5034,16 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         f.x[1] == 1
                     };
                     // An audited switch runs with the kernel lock let go (2026-11-16, `diag lock`: the camera's on held it 42 to 66 ms, Bluetooth's for pcie1 19.5 ms twice, and a camera stream 400 us from its deadline died behind them): a switch is hardware sequences with their waits.
-                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (no `process` state; the flash log takes the lock itself); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
-                    // Only the switches in `SWITCH_UNLOCKED` (whose hardware nothing under the lock touches from another core); the rest keep the lock, as the camera's must while its region's fence (`cam_ask`, `cam_free`, under the lock on any core) writes the front end's S2MPUs its switch powers.
+                    // Why that is safe: every switch runs on the kernel's core only (this syscall is refused anywhere else; the service loop's `power_offs_apply` is on the same core), so two never overlap; the switches keep their state in their own statics and touch none of the lock's (no `process` state; the flash log takes its own, `LOG`); the caller's thread stays on this core, so its process is not freed meanwhile, and `p` is not used again after the lock is taken back (a spawn on another core may move the process table).
+                    // Only the switches in `SWITCH_UNLOCKED` (whose hardware nothing under the lock touches from another core; the camera's fence has its own lock since 2026-11-18); the rest keep the lock.
                     let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
                     let epoch = p.epoch;
                     // A switch going off: every line this process armed disarmed first, so no armed action touches a block whose clocks or power go (irqarm.rs).
                     if !on {
                         crate::irqarm::disarm_epoch(epoch);
                     }
-                    if free {
-                        unlock();
-                        // Interrupts open meanwhile too: the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long (an interrupt taken here at EL2 sets its line pending and returns; the eret back to EL0 restores from the saved frame, not from ELR, and a slice tick taken here is re-armed below).
-                        unsafe { core::arch::asm!("msr daifclr, #2") };
-                    }
-                    let ok = (POWERS[i].set)(on);
-                    if free {
-                        unsafe { core::arch::asm!("msr daifset, #2") };
-                        lock();
-                    }
+                    // Interrupts open meanwhile too (`unlocked`): the kernel's core takes every granted line by default, and a switch's waits with them masked held a device's interrupt off as long.
+                    let ok = if free { unlocked(|| (POWERS[i].set)(on)) } else { (POWERS[i].set)(on) };
                     if ok {
                         power_owned(i, if on { epoch } else { 0 });
                         // Its process ended on another core meanwhile (`kill_locked` found its thread here and left it `dying`): what it switched on is turned off as for any other ending.
@@ -4943,7 +5252,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     ERR
                 } else {
                     crate::rtc::set_tz_held(z);
-                    if unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false) {
+                    if keep_settings() {
                         CONTROL_GEN[link].fetch_add(1, Relaxed);
                         0
                     } else {
@@ -4954,7 +5263,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             } else {
                 let was = CONTROL[link][slot].swap(word, Relaxed);
                 let kept = crate::settings::KNOBS.iter().any(|k| k.1 == link && k.2 == slot);
-                if kept && !unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false) {
+                if kept && !keep_settings() {
                     CONTROL[link][slot].store(was, Relaxed);
                     ERR
                 } else {
@@ -4996,7 +5305,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 let token = p.read(at, 32);
                 matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
             };
-            let keep = || unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false);
+            let keep = || keep_settings();
             // An id named by the caller: WHY the bound, the length is the caller's and an id is at most zone::ID_MAX bytes; a longer one is refused, not cut.
             let id = |at: u64, len: u64| if len as usize <= crate::zone::ID_MAX { crate::zone::Id::new(&p.read(at, len as usize)) } else { None };
             f.x[0] = match f.x[0] {
@@ -5255,7 +5564,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 let token = p.read(at, 32);
                 matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
             };
-            let keep = || unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false);
+            let keep = || keep_settings();
             // WHY `valid`: the code is the caller's, and is kept in the vault and handed to every process as two bytes; one that is no packed three letters is refused, not cut.
             f.x[0] = match f.x[0] {
                 0 if settings(f.x[1]) && crate::lang::valid(f.x[2]) => {
@@ -5444,8 +5753,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let (index, value, live) = ((f.x[1] & 0xFF) as usize, f.x[2] as u8, f.x[1] & PREF_LIVE != 0);
             // Do not disturb is the identity's (PREF_DND): only its service writes it (as SYS_LANG op 2 the language), by name and never a kist, no Settings needed; a Settings holder never does (a device setting is never written into an identity's preference, SETTINGS.md).
             let held = if index == PREF_DND { !p.kist && p.name.as_slice() == b"fgtw" } else { held };
-            f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false)) {
+            // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
+            let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
+            f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {
                 set_pref_locked(index, value);
+                if !live {
+                    keep_settings();
+                }
                 0
             } else {
                 ERR
@@ -5515,18 +5829,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
             // x2 bit 0: only if no live process has this name — init's keepers start a driver again this way (NOTHING: it is running), never a second beside one that is alive but not serving yet.
             let shown = if name.is_empty() { &key } else { &name };
-            if f.x[2] & 1 != 0 && k().procs.iter().flatten().any(|q| q.name == *shown && !q.dying) {
+            let once = f.x[2] & 1 != 0;
+            if once && named_live(shown) {
                 f.x[0] = NOTHING;
             } else {
-                let r = if bad { Err("spawn: a token the caller does not hold (or a reply/console)") } else { spawn_queued(shown, &key, &objects) };
+                // `spawn_queued` lets the kernel lock go for the capsule's read, its checks and its code's copy: `p` is not used after it.
+                let held = p.cspace.len();
+                let r = if bad { Err("spawn: a token the caller does not hold (or a reply/console)") } else { spawn_queued(shown, &key, &objects, once) };
                 let kk = k();
                 match r {
-                    Ok(_) => f.x[0] = 0,
+                    Ok(Some(_)) => f.x[0] = 0,
+                    // Started meanwhile by another spawn of the same name, while the lock was let go.
+                    Ok(None) => f.x[0] = NOTHING,
                     Err(e) => {
                         kk.console.extend_from_slice(b"spawn refused: ");
                         kk.console.extend_from_slice(e.as_bytes());
                         if bad {
-                            kk.console.extend_from_slice(alloc::format!(" (the request's token {bad_at} of {n}; the caller holds {})", p.cspace.len()).as_bytes());
+                            kk.console.extend_from_slice(alloc::format!(" (the request's token {bad_at} of {n}; the caller holds {held})").as_bytes());
                         }
                         kk.console.push(b'\n');
                         f.x[0] = ERR;
@@ -5627,12 +5946,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     f.x[0] = n as u64;
                     0
                 }
-                // Files on a partition, read only (partfs.rs `part_call`), answered at once under the lock this syscall holds.
+                // Files on a partition, read only (partfs.rs `part_call`), answered at once.
+                // Read with the kernel lock let go (2026-11-18): a 1 MiB chunk of the modem's firmware is UFS commands and an ext4 walk, milliseconds every other core waited out while the modem driver read its 98 MB.
+                // The open file is the partition reader's own lock's (`PART`); the request was copied out before and the reply goes into the caller's memory only once the kernel lock is back (`unlocked`).
                 Some((Object::Part(i), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    let reply = crate::partfs::part_call(PARTS[i], &msg, (f.x[4] & !CALL_LIVE) as usize);
-                    let n = reply.len().min((f.x[4] & !CALL_LIVE) as usize);
-                    p.write(f.x[3], &reply[..n]);
+                    let cap = (f.x[4] & !CALL_LIVE) as usize;
+                    let reply = unlocked(|| PART.with(|| crate::partfs::part_call(PARTS[i], &msg, cap)));
+                    let n = reply.len().min(cap);
+                    // The caller found again: the process table may have moved meanwhile.
+                    if let Some(p) = proc_of(cur) {
+                        p.write(f.x[3], &reply[..n]);
+                    }
                     f.x[0] = n as u64;
                     0
                 }
@@ -5750,7 +6075,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // x1 = 6 (2026-11-18, docs/PUCKS.md): the caller's puck square resized to hold x2 bytes past its porch (`puck_ask`), answered the bytes it holds after; ERR, said on the console, when it is not the caller's, past the slot, or more than the pool can give.
                 Some(Object::Dma(i)) if DMA[i].name == "puck" && f.x[1] == 6 => puck_ask(p, i, f.x[2]),
                 // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
-                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, f.x[2], f.x[3] & 1 == 1),
+                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, cur, f.x[2], f.x[3] & 1 == 1),
                 // x1 = 4 (2026-11-15, docs/CAMERA.md "The view"): the driver gives the caller of the OPEN it is answering (its reply token at arc offset x2) a read-only view of x3's frames of its run (low half the first, high half how many), the holder's token written at arc offset x4; answered the view's base (`cam_view_give`). x1 = 5: the view taken back, at the driver's close (`cam_view_drop`) → 0.
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 4 => cam_view_give(p, f.x[2], f.x[3] & 0xFFFF_FFFF, f.x[3] >> 32, f.x[4]),
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 5 && unsafe { (*(&raw const CAM_VIEW)).driver } == p.epoch => {
@@ -6586,7 +6911,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         kk.console.push(b'\n');
         pstore_since(at);
-        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Under the kernel lock, which the log's UFS commands need.
+        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Said under the kernel lock, written once this core lets it go (flashlog.rs `deferred`).
         crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
         let last = p.words.clone();
         vault_ended(p, value);
@@ -7125,7 +7450,25 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
             return Err(e);
         }
     };
-    let built = build(name, code, input, &objects, ihi, masked, exec_len, fixed);
+    // The arc taken under the lock, the code copied into it with the lock let go (2026-11-18: a capsule's code is up to megabytes; the arc is no process's until `build_from`, so nothing else reaches it), then the process made under the lock again.
+    if cap_key().is_none() {
+        unlock();
+        return Err("no wairua: refusing to mint capabilities");
+    }
+    let arc = match arc_for(code, input.len(), masked, fixed) {
+        Ok(a) => a,
+        Err(e) => {
+            unlock();
+            return Err(e);
+        }
+    };
+    unlock();
+    // SAFETY: the arc was just taken for this image (`arc_for` sized it past CODE plus the code's length) and is no process's yet.
+    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
+    spawn_step(9);
+    lock();
+    // A refused build made nothing that holds the arc: it goes back to the pool.
+    let built = build_from(name, arc, code.len(), input, &objects, ihi, masked, exec_len, fixed >> 8 & 1 == 1).inspect_err(|_| arc_free(arc));
     launch(built, input.len())
 }
 
@@ -7862,17 +8205,16 @@ fn image_tail_ceiling(code: &[u8]) -> usize {
     (w(16) + w(48)).min(1 << 30)
 }
 
-/// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
-fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32) -> Result<(usize, Arc, usize), &'static str> {
-    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
-    let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
+/// A process's arc (its making is `arc_for`, the code's copy, then `build_from`; the copy with the kernel lock let go since 2026-11-18, `spawn`, `spawn_build`): the image's header read, the arc sized for its code, its zeroed tail, `inline` bytes of input, the stack's guard and the stack, taken from the pool (fixed mode's exact 2^K, exact mode's limit set). Under the kernel lock (the arc pool). The caller copies the code in at CODE.
+fn arc_for(code: &[u8], inline: usize, masked: bool, fixed: u32) -> Result<Arc, &'static str> {
+    // `inline`: the whole input lies in the arc (a bridge: pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     // No header, no spawn (owner, 2026-11-09): without it the .bss is unknown, and the arc sized from the file alone put the stack on the process's own statics (the display and bt, 2026-11-08). Every payload carries it (ferros_sys::entry!, tools/payload-check.sh).
     if !has_image_header(code) {
         return Err("spawn: the image has no header (ferros_sys::entry!), so its .bss is unknown");
     }
     let tail = image_tail(code);
-    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages), bit 9 exact mode.
-    let (fixed, bti, exact) = (fixed & 0xFF, fixed >> 8 & 1 == 1, fixed >> 9 & 1 == 1);
+    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages, `build_from`'s), bit 9 exact mode.
+    let (fixed, exact) = (fixed & 0xFF, fixed >> 9 & 1 == 1);
     let need = CODE + code.len() + tail + inline + STACK_GUARD + STACK;
     // The most it may grow to (SYS_ARC): its whole declared heap; the same as `need` for an image whose heap does not grow.
     let ceiling = need - tail + image_tail_ceiling(code);
@@ -7887,12 +8229,10 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     if exact {
         arc.limit = (need + 15) & !15;
     }
-    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
-    spawn_step(9);
-    build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len, bti)
+    Ok(arc)
 }
 
-/// The process in an arc that already holds its code at the code offset (`build` copied it; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
+/// The process in an arc that already holds its code at the code offset (`spawn` and `spawn_build` copied it, with the kernel lock let go; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
 fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, bti: bool) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     if !has_image_header(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len.min(56)) }) {
@@ -8065,21 +8405,35 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     Ok((me, arc, in_off))
 }
 
-/// `SYS_SPAWN`'s work: the capsule by vault key through the gate (and, masked, its seal), then a process holding `objects`, queued to run.
-fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
+/// `SYS_SPAWN`'s work: the capsule by vault key thru the gate (and, masked, its seal), then a process holding `objects`, queued to run. Ok(None): `once`, and a live process of that name started meanwhile.
+/// Called with the kernel lock held (a syscall's), which it lets go for all that is not the tables (2026-11-18, `unlocked`): the capsule's and the seals' reads (under the vault's lock: 24 to 148 ms for a capsule, `diag lock`), the gate, the seal and the ihi (signatures and hashes over the capsule, about 7 ms), and the code's copy into its arc. It holds the kernel lock again for the arc's taking and the process's making (`arc_for`, `build_from`): the arc pool and the tables.
+/// The caller's `p` and `t` are used by neither it nor the caller after it.
+fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)], once: bool) -> Result<Option<usize>, &'static str> {
     let read = unsafe { CAPSULES }.ok_or("spawn: no vault to read capsules from")?;
     let t0 = crate::platform::cntpct();
-    spawn_step(1);
-    let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
-    spawn_step(2);
-    // The seals list, a `seals` document since 2026-11-17 (service.rs `seals_read`): one that does not read is none here, and a masked image is refused as not installed (the flash log says why since the vault's open).
-    let sealed = read(crate::kvault::SEALED.as_bytes()).and_then(|d| ferros_kist::seal::list_of(&d)).unwrap_or_default();
-    let t_read = crate::platform::cntpct();
-    spawn_step(3);
-    let g = crate::oracle::gate(&capsule)?;
-    spawn_step(4);
-    // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck: every spawn holds the kernel lock while it reads and checks its capsule).
-    let r = spawn_checked(name, &g, &capsule, &sealed, objects);
+    // Read and checked with the lock let go: nothing here touches the kernel's tables (the vault has its own lock, the gate and the seal work on the heap's copies, and a seal still to move is queued under the kernel lock taken for that alone, `seal_ok`).
+    let checked = unlocked(|| -> Result<(Vec<u8>, crate::oracle::Gated, [u8; 32], u64), &'static str> {
+        spawn_step(1);
+        let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
+        spawn_step(2);
+        // The seals list, a `seals` document since 2026-11-17 (service.rs `seals_read`): one that does not read is none here, and a masked image is refused as not installed (the flash log says why since the vault's open).
+        let sealed = read(crate::kvault::SEALED.as_bytes()).and_then(|d| ferros_kist::seal::list_of(&d)).unwrap_or_default();
+        let t_read = crate::platform::cntpct();
+        spawn_step(3);
+        let g = crate::oracle::gate(&capsule)?;
+        spawn_step(4);
+        let ihi = spawn_checked(&g, &capsule, &sealed)?;
+        Ok((capsule, g, ihi, t_read))
+    });
+    let r = match &checked {
+        Ok((_, g, ihi, _)) => spawn_build(name, g, *ihi, objects, once),
+        Err(e) => Err(*e),
+    };
+    // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck).
+    let (len, t_read) = match &checked {
+        Ok((c, _, _, t)) => (c.len(), *t),
+        Err(_) => (0, crate::platform::cntpct()),
+    };
     let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
     let t_end = crate::platform::cntpct();
     let kk = k();
@@ -8092,7 +8446,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     kk.console.extend_from_slice(b" kernel: spawned ");
     kk.console.extend_from_slice(name);
     kk.console.extend_from_slice(b": capsule A#");
-    push_dec(&mut kk.console, capsule.len() as u64);
+    push_dec(&mut kk.console, len as u64);
     kk.console.extend_from_slice(b" bytes read in A#");
     push_dec(&mut kk.console, us(t0, t_read));
     kk.console.extend_from_slice(b" us, gate and build A#");
@@ -8116,8 +8470,8 @@ fn spawn_step(step: u64) {
     }
 }
 
-/// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
-fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, capsule: &[u8], sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
+/// `spawn_queued` past the gate, with the kernel lock let go: the seal of a masked capsule, then the ihi.
+fn spawn_checked(g: &crate::oracle::Gated, capsule: &[u8], sealed: &[u8]) -> Result<[u8; 32], &'static str> {
     if g.masked {
         // The address of the capsule the gate just copied the code out of, in the kernel heap where nothing else writes.
         seal_ok(sealed, &g.developer_pubkey, &g.hp, &crate::oracle::modes_of(g), blake3::hash(capsule).as_bytes(), &g.code)?;
@@ -8127,11 +8481,37 @@ fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, capsule: &[u8], sealed: 
     spawn_step(5);
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
     spawn_step(6);
-    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)?;
+    Ok(ihi)
+}
+
+/// Whether a live process (not ending) has this name. Under the kernel lock.
+fn named_live(name: &[u8]) -> bool {
+    k().procs.iter().flatten().any(|q| q.name == *name && !q.dying)
+}
+
+/// `spawn_queued`'s process from its checked image, the kernel lock held on entry and on return: the arc taken (`arc_for`), the code copied into it with the lock let go (the arc is no process's yet, so nothing else reaches it), then the process made in it and queued (`build_from`). Ok(None) when `once` and a process of that name came alive meanwhile.
+fn spawn_build(name: &[u8], g: &crate::oracle::Gated, ihi: [u8; 32], objects: &[(Object, u32)], once: bool) -> Result<Option<usize>, &'static str> {
+    if once && named_live(name) {
+        return Ok(None);
+    }
+    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
+    let arc = arc_for(&g.code, 0, g.masked, g.fixed | (g.exact as u32) << 9)?;
+    unlocked(|| {
+        // SAFETY: the arc was just taken for this image (`arc_for` sized it past CODE plus the code's length) and is no process's until `build_from` below, so nothing else reads or writes it meanwhile.
+        unsafe { core::ptr::copy_nonoverlapping(g.code.as_ptr(), (arc.base + CODE) as *mut u8, g.code.len()) };
+        spawn_step(9);
+    });
+    // A spawn of the same name may have run its whole course while the copy did: still one at a time under `once`.
+    if once && named_live(name) {
+        arc_free(arc);
+        return Ok(None);
+    }
+    // A refused build made nothing that holds the arc (its refusals all come before the process is in the table): it goes back to the pool.
+    let (me, _, _) = build_from(name, arc, g.code.len(), b"", objects, Some(ihi), g.masked, g.text_len, g.bti).inspect_err(|_| arc_free(arc))?;
     spawn_step(10);
     enqueue_back(me);
     spawn_step(11);
-    Ok(me)
+    Ok(Some(me))
 }
 
 /// A granted region as a handle (SANDBOX.md, "Handles"): its base and its mask, for masked code to reach it as `base + (offset & mask)`. A region is maskable when it is a power of two in size and aligned to it; an MMIO block of any other size (20 KiB, 52 KiB, 3.5 MiB) gets no handle and is reached through the kernel's mmio calls instead, never rounded up over its neighbours. A grant that is not a region, or a region that cannot be masked, is (0, 0): native code reaches it as it always has, masked code cannot.
@@ -8177,8 +8557,11 @@ pub fn spawn_capsule_no_ihi(name: &[u8], capsule: &[u8], input: &[u8], grants: &
 
 /// Zero `count` blocks of the ferros partition from block `at` of it, a run at a time through the run bounce, the watchdogs fed at every run: the owner's fresh start (service.rs `vault fresh`).
 /// Whether every run was written; it stops at the first refusal.
-/// The caller holds the kernel lock, so no other UFS command runs between the runs.
+/// Under the UFS lock (`UFS`) for the whole of it, so no other UFS command runs between the runs or writes the bounce they share.
 pub fn zero_blocks(at: u64, count: u64) -> bool {
+    UFS.with(|| zero_blocks_held(at, count))
+}
+fn zero_blocks_held(at: u64, count: u64) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let Some((first, blocks)) = crate::ufs_device::part() else { return false };
     // WHY the bound: the regions are the kernel's own constants, but the partition is the GPT's; a region past its end would zero whatever follows the partition.

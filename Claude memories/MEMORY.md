@@ -4,7 +4,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Public except keys and handles](public_except_keys_and_handles.md) - keys + handles never in any repo (memory IS the repo)
 - [Secrets: canonical keys dir](secrets_canonical_keys_dir.md) - every secret in /mnt/Harbor/Code/keys only; never GitHub
 - [Feedback: AVB key freedom](feedback_avb_key_freedom.md) - use keys/avb.vsf freely while it stays VSF in Code/keys
-- [Feedback: no attribution](feedback_no_attribution.md) - "Built with Claude", never Co-Authored-By or authorship claims
+- [Feedback: no attribution](feedback_no_attribution.md) - "Built with Claude <version>" (e.g. Opus 5.5); never Co-Authored-By or authorship claims
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) - commit + push each verified step; own hunks only
 - [Feedback: reload the Pro freely](feedback_pro_reload_freely.md) - reloads/restarts/stores need no ask; unplugged = hands off
 - [Pro and 8a unlock at boot](pro_unlocks_at_boot.md) - since 2026-11-17 no handle after reloads/flashes on either; Pro overnight flashes OK
