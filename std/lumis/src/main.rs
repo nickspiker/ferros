@@ -91,7 +91,7 @@ const DEV_COPY: u8 = 1 << 1;
 const DEV_SCRATCH: u8 = 1 << 2;
 /// Development: open the first camera at once, no tap (a device with no identity attested gives every touch to the attest screen), and end through the camera's own close after 2^(n + 3) seconds, n the knobs' bits 4 to 6 (8 s to 1024 s).
 const DEV_OPEN: u8 = 1 << 3;
-/// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^5 s (and no further than the camera's longest), two frames each, each frame's exposure said beside the one asked.
+/// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^3 s, then 2^4 s (no further than the camera's longest: a long-exposure mode's frame takes its whole exposure in wall time), two frames each, each frame's exposure said beside the one asked.
 const DEV_SWEEP: u8 = 1 << 7;
 
 /// The spawn input as the knobs byte and the mode block after it: (0, none) for a process spawned with none (a kist opened from the map).
@@ -447,7 +447,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 7) + 3)));
     let run_start = std::time::Instant::now();
     let sweep: Vec<f64> = if knobs & DEV_OPEN != 0 && knobs & DEV_SWEEP != 0 {
-        (0..10).map(|k| (2f64).powi(-13 + 2 * k) * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
+        (0..9).map(|k| (2f64).powi(-13 + 2 * k)).chain([(1 << 4) as f64]).map(|s| s * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
     } else {
         Vec::new()
     };
