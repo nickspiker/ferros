@@ -164,10 +164,23 @@ impl Timing {
         Plan { llp: self.llp, fll: self.fll, coarse, shift: 0 }
     }
 
-    /// The frame for `coarse` lines of integration at shift 0 or more (CCS: coarse <= frame_length_lines - margin, both in the shift's units).
-    /// WHY the choice of the larger: the frame has two floors, the mode's own frame (its rows and the blanking the front end needs: 128 lines on the ultrawide, 2026-11-16) and the integration plus the sensor's margin; it is the larger of the two, never cut under either.
-    fn frame(&self, coarse: u64) -> u16 {
-        if coarse + self.margin as u64 > self.fll as u64 { (coarse + self.margin as u64) as u16 } else { self.fll }
+    /// The frame for `coarse` integration in units of 2^`shift` lines (CCS: coarse <= frame_length_lines - margin, both in those units).
+    /// WHY the choice of the larger: the frame has two floors, the mode's own frame in real lines (its rows and the blanking the front end needs: 128 lines on the ultrawide, 2026-11-16), here in the shift's units rounded up, and the integration plus the sensor's margin; it is the larger of the two, never cut under either.
+    fn frame(&self, coarse: u64, shift: u8) -> u16 {
+        let floor = (self.fll as u64).div_ceil(1 << shift);
+        if coarse + self.margin as u64 > floor { (coarse + self.margin as u64) as u16 } else { floor as u16 }
+    }
+
+    /// A device test of the shift field's reach (owner, 2026-11-17: "no artificial exposure cap anywhere"): `ns` at exactly `shift`, the mode's line, whatever the least shift would be; None when the integration does not fit 16 bits at that shift or falls under the sensor's least, or the camera has no shift.
+    pub fn plan_shift(&self, ns: u64, shift: u8) -> Option<Plan> {
+        self.lte?;
+        // WHY checked: `ns` is the caller's eight bytes, as in `plan`, and `shift` its byte: past 63 a shift of 64 bits has no meaning, and is refused.
+        let lines = ns.checked_mul(1000)? / self.line_ps_at(self.llp);
+        let c = lines.checked_shr(shift as u32)?;
+        if c < self.coarse_min as u64 || c > LINES_MOST - self.margin as u64 {
+            return None;
+        }
+        Some(Plan { llp: self.llp, fll: self.frame(c, shift), coarse: c as u16, shift })
     }
 
     /// The timing for an exposure of `ns`, in the order that changes the least: (0) the mode's own frame when the integration fits it; (1) the frame lengthened, to the 16 bits CCS gives it (the main: about 0.21 s); (2) with the vendor's shift, the frame and integration counted in 2^shift lines at the mode's line length (Android's way, `Lte`); (3) without one, the line lengthened on `LLP_STEP` to `llp_most` (the main: about 1.02 s).
@@ -189,7 +202,7 @@ impl Timing {
         // The most integration 16 bits of frame hold with the margin.
         let most = LINES_MOST - self.margin as u64;
         if lines <= most {
-            return Some(Plan { llp: self.llp, fll: self.frame(lines), coarse: lines as u16, shift: 0 });
+            return Some(Plan { llp: self.llp, fll: self.frame(lines, 0), coarse: lines as u16, shift: 0 });
         }
         // With the vendor's shift: the least shift that brings the integration under 16 bits at the mode's line (Android's choice on 2026-11-17: shift 3 for an exposure 3 needs, 6 at 16 s, the line untouched). The shift scales the sensor's counters only: the line, and with it the readout, stay the mode's (owner, 2026-11-17: "keep the readout clean").
         let mut shift = 0u8;
@@ -198,7 +211,7 @@ impl Timing {
             while shift <= l.most {
                 let c = lines >> shift;
                 if c <= most {
-                    return Some(Plan { llp: self.llp, fll: self.frame(c), coarse: c as u16, shift });
+                    return Some(Plan { llp: self.llp, fll: self.frame(c, shift), coarse: c as u16, shift });
                 }
                 shift += 1;
             }
@@ -215,7 +228,7 @@ impl Timing {
             return None;
         }
         let c = (ps / self.line_ps_at(llp as u16)) >> shift;
-        Some(Plan { llp: llp as u16, fll: self.frame(c), coarse: c as u16, shift })
+        Some(Plan { llp: llp as u16, fll: self.frame(c, shift), coarse: c as u16, shift })
     }
 
     /// The exposure a plan gives (ns): its integration's lines, shifted, at its line's time.
@@ -932,6 +945,20 @@ mod tests {
         assert!(ts.readout_ps(&p, 3072) > 11_000_000_000, "{}", ts.readout_ps(&p, 3072));
     }
 
+
+    /// The forced shift of the reach test: 16 lines of integration at shift 12 on the main is a frame of 18 (the mode's 21362 lines are 6 at that shift), at the mode's line; under the least (one line at shift 16) refused; no shift on a camera without one.
+    #[test]
+    fn a_forced_shift() {
+        let t = Timing { fll: 0x5372, coarse_min: 2, ..cams::MAIN.listed_timing() };
+        let ns = (16u64 << 12) * t.line_ps_at(6320) / 1000 + 1;
+        assert_eq!(t.plan_shift(ns, 12), Some(Plan { llp: 6320, fll: 18, coarse: 16, shift: 12 }));
+        assert_eq!(t.plan_shift(ns, 16), None);
+        assert_eq!(t.plan_shift(ns, 200), None);
+        assert_eq!(cams::ULTRAWIDE.listed_timing().plan_shift(ns, 1), None);
+        // At shift 9 the mode's frame is the floor: 21362 lines are 42 of 2^9.
+        let p = t.plan_shift((16u64 << 9) * t.line_ps_at(6320) / 1000 + 1, 9).unwrap();
+        assert_eq!((p.fll, p.coarse), (42, 16));
+    }
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
     #[test]
     fn short_cameras_keep_their_frame() {
