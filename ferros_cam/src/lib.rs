@@ -48,8 +48,8 @@ pub const PDMA_BASE_HI: usize = 0x08;
 pub const PDMA_COUNT: usize = 0x0C;
 pub const PDMA_INDEX: usize = 0x10;
 
-/// The main sensor's frame and line timing as measured (docs/oracle/CAMERA.md "Many runs in one boot"): 30 frames in 2.034 s, a 67.8 ms period, and 3.2237 µs a line (68.8 ms of integration over 21342 lines).
-pub const MAIN_LINE_PS: u64 = 3_223_700;
+/// The main sensor's line time at its init's 6320-clock line: 3.1489 us, the PLL at 24.576 MHz / 3 x 245 (2007.04 MHz), measured on the Pro (b933, 2026-11-17) from the long-exposure ladder's frame spacings (16.004 s over 65487 lines of 2^6 at 7664 clocks) and the init's frames 67.3 ms apart (21362 lines). Until then 3.2237 us, read in October from a 24 MHz reference and a one-frame-resolution count (30 frames in 2.034 s): 2.3 % long (docs/CAMERA.md "Long exposures").
+pub const MAIN_LINE_PS: u64 = 3_148_916;
 /// The init's frame length in lines (CCS frame_length_lines G#0340 = G#5372) and its longest integration (G#535E, 21342 lines): the exposure cannot pass the frame.
 pub const MAIN_FRAME_LINES: u64 = 0x5372;
 pub const MAIN_EXPOSURE_MAX_LINES: u64 = 0x535E;

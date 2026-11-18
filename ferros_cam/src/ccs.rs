@@ -115,8 +115,8 @@ pub const LINES_MOST: u64 = (1 << 16) - 1;
 pub const LLP_STEP: u64 = 1 << 4;
 /// The longest line the 16 bits hold, on the step.
 pub const LLP_MOST: u64 = LINES_MOST & !(LLP_STEP - 1);
-/// The longest line time the front end has taken (ps): on the Pro (b932, 2026-11-17) the main's stream ran on at 30640 clocks a line (15.63 us, a 1 s exposure) and stopped at 61280 (31.26 us, 2 s), the frame begun and never ended. The limit is the front end's, so it is a time, not a clock count, and holds for every camera behind it until each is measured; between the two it is not measured. The value is the main's 30640 clocks at its 3.2237 us per 6320, rounded up so it gives back 30640 exactly.
-pub const LINE_PS_MOST: u64 = 15_628_825;
+/// The longest line time the front end has taken (ps): on the Pro (b932, 2026-11-17) the main's stream ran on at 30640 clocks a line (15.27 us, a 1 s exposure) and stopped at 61280 (30.53 us, 2 s), the frame begun and never ended. The limit is the front end's, so it is a time, not a clock count, and holds for every camera behind it until each is measured; between the two it is not measured. The value is the main's 30640 clocks at its 3.1489 us per 6320 (`MAIN_LINE_PS`), rounded up so it gives back 30640 exactly.
+pub const LINE_PS_MOST: u64 = 15_266_264;
 
 /// An open camera's frame timing, what an exposure in nanoseconds turns into (`plan`).
 /// The line time is measured at the captured line length (`Cam::line_ps` at `Cam::llp`) and scales with the line length, the pixel clock being the PLL's (`frame_ps`).
@@ -771,7 +771,7 @@ mod tests {
         }
     }
 
-    /// The main's line time scales the frame: the captured mode's 21362 lines at 3.2237 us are its measured 68.9 ms; a 132-line slit is about 426 us of lines (the sensor kept a floor of about 825 us on 2026-10-21).
+    /// The main's line time scales the frame: the captured mode's 21362 lines at 3.1489 us are its measured 67.3 ms; a 132-line slit is about 426 us of lines (the sensor kept a floor of about 825 us on 2026-10-21).
     #[test]
     fn gain_models() {
         let caps = |min: u16, max: u16, step: u16, m: [i16; 4]| {
@@ -835,14 +835,14 @@ mod tests {
         // 100 ms: the frame lengthened, the line not.
         let p = t.plan(100_000_000).unwrap();
         assert_eq!((p.llp, p.fll as u64), (6320, p.coarse as u64 + 2));
-        // The most 16 bits of frame give at the init's line: about 0.211 s.
+        // The most 16 bits of frame give at the init's line: about 0.206 s.
         let edge = (LINES_MOST - 2) * crate::MAIN_LINE_PS / 1000;
         assert_eq!(t.plan(edge).unwrap().llp, 6320);
-        assert!((210_000_000..212_000_000).contains(&edge), "{edge}");
+        assert!((205_000_000..208_000_000).contains(&edge), "{edge}");
         // The main's longest line is the one the front end took on the Pro (30640 clocks, the 1 s step of b932).
         assert_eq!(t.llp_most(), 30640);
         // 0.5 s and 1 s: the line lengthened on its step, the frame at most 16 bits.
-        for ns in [212_000_000u64, 500_000_000, 1_000_000_000] {
+        for ns in [208_000_000u64, 500_000_000, 1_000_000_000] {
             let p = t.plan(ns).unwrap();
             assert!(p.llp > 6320 && p.llp as u64 % LLP_STEP == 0 && p.llp as u64 <= t.llp_most(), "{ns}: {p:?}");
             assert!(p.coarse as u64 + 2 <= p.fll as u64 && p.fll as u64 <= LINES_MOST, "{ns}: {p:?}");
@@ -850,12 +850,12 @@ mod tests {
             let got = t.ns(&p);
             assert!(got <= ns && ns - got < t.line_ps_at(p.llp) / 1000 + 1, "{ns}: {got}");
         }
-        // The plan the b932 ladder ran at 1024 ms: 65521 lines of 30640 clocks, 65519 of integration.
-        let p = t.plan(1_024_000_000).unwrap();
-        assert_eq!((p.llp, p.fll, p.coarse), (30640, 65521, 65519));
-        // The most offered, about 1.02 s, is taken; one more line is not; 2 s (where the stream stopped, at 61280 clocks) is refused.
+        // A second: the longest line, 65503 lines of 15.27 us.
+        let p = t.plan(1_000_000_000).unwrap();
+        assert_eq!((p.llp, p.fll, p.coarse), (30640, 65505, 65503));
+        // The most offered, about 1.000 s, is taken; one more line is not; 2 s (where the stream stopped, at 61280 clocks) is refused.
         let most = t.most_ns();
-        assert!((1_020_000_000..1_030_000_000).contains(&most), "{most}");
+        assert!((1_000_000_000..1_001_000_000).contains(&most), "{most}");
         assert!(t.plan(most).is_some());
         assert_eq!(t.plan(most + t.line_ps_at(t.llp_most() as u16) / 1000 + 1), None);
         assert_eq!(t.plan(2_048_000_000), None);
@@ -864,10 +864,10 @@ mod tests {
         // Under the sensor's least integration (2 lines), and a value that would wrap: refused.
         assert_eq!(t.plan(crate::MAIN_LINE_PS / 1000), None);
         assert_eq!(t.plan(u64::MAX), None);
-        // The frame periods: the init's 68.9 ms; at the most, 65535 lines of 15.6 us.
+        // The frame periods: the init's 67.3 ms; at the most, 65535 lines of 15.27 us.
         assert_eq!(t.frame_ps(&t.own(16)), 0x5372 * crate::MAIN_LINE_PS);
         let p = t.plan(most).unwrap();
-        assert!((1_020_000_000_000..1_030_000_000_000).contains(&t.frame_ps(&p)), "{}", t.frame_ps(&p));
+        assert!((1_000_000_000_000..1_001_000_000_000).contains(&t.frame_ps(&p)), "{}", t.frame_ps(&p));
     }
 
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.
@@ -883,11 +883,11 @@ mod tests {
         assert_eq!(l.word(7), 0x0700);
         // A second takes shift 3: 310200 lines over 8 is under 16 bits, over 4 is not.
         assert_eq!(t.plan(1_000_000_000).unwrap().shift, 3);
-        // The most: 65533 lines of 2^7 at the longest line (15.63 us), about 131 s.
-        assert!((131_000_000_000..131_200_000_000).contains(&t.most_ns()), "{}", t.most_ns());
+        // The most: 65533 lines of 2^7 at the longest line (15.27 us), about 128 s.
+        assert!((128_000_000_000..128_100_000_000).contains(&t.most_ns()), "{}", t.most_ns());
     }
 
-    /// The main's own shift (the 16 s capture, 2026-11-17: high byte, 6 the most seen): at its binned line (3.22 us) 6 stops short of 16 s (13.5 s), so 16 s is shift 6 with the line lengthened a little; 4 s is shift 5 at its own line.
+    /// The main's own shift (the 16 s capture, 2026-11-17: high byte, 6 the most seen): at its binned line (3.15 us) 6 stops short of 16 s (13.2 s), so 16 s is shift 6 with the line lengthened a little; 4 s is shift 5 at its own line.
     #[test]
     fn the_mains_shift() {
         let t = Timing { lte: ARRAYS[0].lte, ..main_timing() };
@@ -901,11 +901,11 @@ mod tests {
         assert_eq!(ARRAYS[0].lte.unwrap().word(6), 0x0600);
         let p = t.plan(4_000_000_000).unwrap();
         assert_eq!((p.llp, p.shift), (6320, 5));
-        // 13.5 s, shift 6 at the binned line, is the last with the line untouched.
+        // 13 s, shift 6 at the binned line, is under the last with the line untouched (13.2 s).
         let p = t.plan(13_000_000_000).unwrap();
         assert_eq!((p.llp, p.shift), (6320, 6));
-        // The most: 65533 lines of 2^6 at the longest line, about 65.5 s.
-        assert!((65_500_000_000..65_600_000_000).contains(&t.most_ns()), "{}", t.most_ns());
+        // The most: 65533 lines of 2^6 at the longest line, about 64.0 s.
+        assert!((64_000_000_000..64_100_000_000).contains(&t.most_ns()), "{}", t.most_ns());
     }
 
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
@@ -917,12 +917,12 @@ mod tests {
         let m = cams::MAIN.listed_timing();
         assert!(m.long && m.most_ns() > 1_000_000_000);
         let u = cams::ULTRAWIDE.listed_timing();
-        // The ultrawide: (65535 - 64) lines at the front end's longest line time, 22784 clocks (its 9568-clock line is 6.56 us), about 1.02 s.
-        assert_eq!(u.llp_most(), 22784);
-        assert!((1_015_000_000..1_025_000_000).contains(&u.most_ns()), "{}", u.most_ns());
+        // The ultrawide: (65535 - 64) lines at the front end's longest line time, 22256 clocks (its 9568-clock line is 6.56 us), about 1.0 s.
+        assert_eq!(u.llp_most(), 22256);
+        assert!((995_000_000..1_005_000_000).contains(&u.most_ns()), "{}", u.most_ns());
         let t = Timing { long: false, ..main_timing() };
         assert!(t.plan(t.most_ns()).is_some());
-        assert_eq!(t.plan(t.most_ns() + crate::MAIN_LINE_PS / 1000 + 1), None);
+        assert_eq!(t.plan(t.most_ns() + 2 * crate::MAIN_LINE_PS / 1000), None);
     }
 
     #[test]
@@ -931,7 +931,7 @@ mod tests {
         let a = &ARRAYS[0];
         let m = Mode::captured(&init, a).unwrap();
         let ps = frame_ps(&m, m.llp, crate::MAIN_LINE_PS);
-        assert!((68_000_000_000..69_500_000_000).contains(&ps), "{ps}");
+        assert!((67_000_000_000..67_500_000_000).contains(&ps), "{ps}");
         let s = m.slit(a, 4, 132, 16).unwrap();
         println!("slit frame {} ns", frame_ps(&s, m.llp, crate::MAIN_LINE_PS) / 1000);
     }
