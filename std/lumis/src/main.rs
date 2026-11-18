@@ -92,6 +92,11 @@ fn reopen_whole(cam: &camera::Camera, vault: Option<&kete::FlatStorage>, header:
     }
 }
 
+/// Whether what was taken is a slit.
+fn src_is_slit(got: &Got) -> bool {
+    matches!(got, Got::Slit { .. })
+}
+
 /// Whether the integrator wants slits: Slitscan, and no calibration (its darks are whole frames).
 fn wants_slits(header: &[u64]) -> bool {
     header[CURRENT_MODE_IDX] == RawMode::Slitscan as u64 && header[FLAGS_IDX] & CALIBRATING_BIT == 0
@@ -624,11 +629,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut quiet: Option<[u64; 2]> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
     let mut slit_ok = knobs & DEV_COPY == 0;
+    // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
+    let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
         // Slitscan takes slits, every other mode whole frames: the camera is closed (the driver ends) and opened again for the other (owner, 2026-11-18: "Do wire it up so I get more than 30 lines per second"). The new driver starts at the init's settings, so the integrator's are sent again.
         if slit_ok && wants_slits(&integrator.header) != src.is_slit() {
             let slit = !src.is_slit();
+            let t_close = std::time::Instant::now();
             report(&src, &mut turns, &cam.name);
             keep_saves(vault.as_deref(), &mut *integrator.header);
             close_camera(&cam.name);
@@ -661,12 +669,16 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             };
             sent = (-1, -1, -1.);
             turns = Turns::default();
+            reopened = Some((t_close, std::time::Instant::now()));
         }
         let Some(got) = src.next(&mut turns) else {
             // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
             keep_saves(vault.as_deref(), &mut *integrator.header);
             lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
         };
+        if let Some((t_close, t_open)) = reopened.take() {
+            println!("lumis: camera {}: reopened: the OPEN answered A#{} ms after the CLOSE began, the first {} A#{} ms after it", cam.name, (t_open - t_close).as_millis(), if src_is_slit(&got) { "slit" } else { "frame" }, t_close.elapsed().as_millis());
+        }
         if let Got::Frame(head, _) = &got {
             if head.width != first.width || head.height != first.height {
                 keep_saves(vault.as_deref(), &mut *integrator.header);
