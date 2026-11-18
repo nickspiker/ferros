@@ -81,6 +81,12 @@ fn schema() -> SectionSchema {
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
 pub fn eagle_now() -> i64 {
+    eagle_at(crate::platform::cntpct())
+}
+
+/// Eagle time at counter tick `tick` (this boot's counter), from the RTC's base; 0 until the RTC has been read.
+/// The flash log works out an entry's time from the tick it was made at when it waited in the pre-boot buffer (flashlog.rs).
+pub fn eagle_at(tick: u64) -> i64 {
     use core::sync::atomic::Ordering;
     const EPOCH_UNIX: i128 = -14_182_940;
     let base = crate::rtc::BASE.load(Ordering::Relaxed);
@@ -88,7 +94,7 @@ pub fn eagle_now() -> i64 {
         return 0;
     }
     let hz = crate::platform::cntfrq() as i128;
-    let t = (base as i128) + crate::platform::cntpct() as i128;
+    let t = (base as i128) + tick as i128;
     let ops = vsf::OSCILLATIONS_PER_SECOND as i128;
     let (secs, ticks) = (t / hz, t % hz);
     ((secs - EPOCH_UNIX) * ops + ticks * ops / hz) as i64

@@ -9,7 +9,8 @@
 //! No GPU service (after a jump), no arena or a screen too big for wallgen's region: nothing is drawn or kept, and it says so; the display shows no wallpaper.
 //! It packs the picture as a VSF visual (one plane, VSF RGB, gamma2tanh at 16 bits, as tools/wallpaper writes a person's own), stores it as `wallpaper.made` in pieces and then its key, and asks the display to show it (op 44).
 //!
-//! The heap is 120 MiB, inside the 128 MiB arc the kernel gives it either way (arcs are powers of two): the frame is the arena's now, so the heap holds the compiles (the refine's graph and words, a few MB, gone after), the marks and their list, then the samples (24 MB) and the document: writing it holds four copies of the samples at its peak (the packed tensor, the section the builder keeps, the bytes written, and the provenance hash's zeroed copy). 60 MiB failed at the write, and 96 MiB on the Pro the night of 2026-11-07 (the builder's output grew by doubling, 48 MB at its last step; vsf now sizes it once).
+//! The heap is 248 MiB, inside the 256 MiB arc the kernel gives it either way (arcs are powers of two): the frame is the arena's now, so the heap holds the compiles (the refine's graph and words, a few MB, gone after), the marks and their list, then the samples (24 MB) and the document: writing it holds four copies of the samples at its peak (the packed tensor, the section the builder keeps, the bytes written, and the provenance hash's zeroed copy). 60 MiB failed at the write, and 96 MiB on the Pro the night of 2026-11-07 (the builder's output grew by doubling, 48 MB at its last step; vsf now sizes it once).
+//! 120 MiB (a 128 MiB arc) stopped being enough: on the Pro after its fresh start (2026-11-18) the write died at "memory allocation of 24127750 bytes failed" (one copy of the 1344x2992 samples), twice, and no wallpaper was made; which copy is new in vsf's writer is not measured yet, so the arc doubled rather than the format changed.
 //!
 //! Grant slots: 0 console, 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 the layer arena. Input: the wallpaper seed.
 #![no_std]
@@ -21,7 +22,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use ferros_sys::{call, cap, console, freq, now, ERR};
 
-const HEAP_BYTES: usize = 120 << 20;
+const HEAP_BYTES: usize = 248 << 20;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
@@ -152,6 +153,26 @@ impl Gpu {
     }
 }
 
+// ferros_sys keeps Eagle time's rate without vsf (`eagle_now`, the documents' stamp): the two must be the one definition.
+const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == vsf::OSCILLATIONS_PER_SECOND);
+
+/// A small value of the `map.` scope whole: Ok(None) absent, Err refused.
+/// A value past the buffer comes back cut to it: the made key's document is far shorter, so the cut bytes are refused as the whole would be.
+fn read_small(store: u64, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    let mut b = [0u8; 1 << 8];
+    match ferros_sys::store_read_at(store, key, 0, &mut b) {
+        ferros_sys::NOTHING => Ok(None),
+        ERR => Err(()),
+        // WHY the min: the vault says the whole length and copies at most the buffer.
+        n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
+    }
+}
+
+/// What the kept wallpaper was made from (`wallpaper.made.key`'s document: BLAKE3 of the seed and the screen's size).
+fn made_key(store: u64) -> Option<[u8; 32]> {
+    ferros_kept::secret::parse(ferros_kept::secret::Kind::WallpaperMade, &read_small(store, b"wallpaper.made.key").ok()??)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -178,8 +199,7 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
     kh.update(&(w as u32).to_le_bytes());
     kh.update(&(h as u32).to_le_bytes());
     let key = *kh.finalize().as_bytes();
-    let mut have = [0u8; 32];
-    if ferros_sys::store_get(store, b"wallpaper.made.key", &mut have) == Some(32) && have == key {
+    if made_key(store) == Some(key) {
         say!("wallgen: this device already keeps the person's wallpaper for this screen");
         ferros_sys::exit(0);
     }
@@ -313,7 +333,11 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
         }
         off = end;
     }
-    if !ferros_sys::store_set(store, b"wallpaper.made.key", &key) {
+    let Some(doc) = ferros_kept::secret::build(ferros_kept::secret::Kind::WallpaperMade, &key, ferros_sys::eagle_now()) else {
+        say!("wallgen: the key's document did not build");
+        ferros_sys::exit(1);
+    };
+    if !ferros_sys::store_set(store, b"wallpaper.made.key", &doc) {
         say!("wallgen: the vault refused the key");
         ferros_sys::exit(1);
     }

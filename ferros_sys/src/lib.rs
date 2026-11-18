@@ -1604,6 +1604,20 @@ pub fn utc_time() -> Option<(i64, u64, u64)> {
     Some(((t / hz) as i64, t % hz, hz))
 }
 
+/// Eagle time's oscillations in one second: the hydrogen-1 hyperfine periods (vsf's `OSCILLATIONS_PER_SECOND`, the definition, kept here so this crate needs no vsf; a payload that has both checks they agree at build).
+pub const EAGLE_OSCILLATIONS_PER_SECOND: u64 = 1_420_407_826;
+
+/// The Eagle epoch (1969-07-20 20:17:40 UTC) in the wall clock's seconds since 1970 (vsf's `EAGLE_EPOCH_UNIX_SECS`).
+const EAGLE_EPOCH_UNIX: i128 = -14_182_940;
+
+/// Eagle time now, in oscillations, from the wall clock the kernel publishes (`utc_time`): the one conversion every process stamps its documents with (the kernel's settings.rs `eagle_now` is the same).
+/// 0, the Eagle epoch, until the kernel has read the PMIC's clock: the convention settings.rs uses for "no clock" (a document then says it was made at the epoch); never a counter.
+pub fn eagle_now() -> i64 {
+    let Some((secs, ticks, hz)) = utc_time() else { return 0 };
+    let ops = EAGLE_OSCILLATIONS_PER_SECOND as i128;
+    ((secs as i128 - EAGLE_EPOCH_UNIX) * ops + ticks as i128 * ops / hz as i128) as i64
+}
+
 /// Write `value` under `key` in a Store capability's vault scope; true when the vault took it.
 pub fn store_set(cap: u64, key: &[u8], value: &[u8]) -> bool {
     svc(nr::STORE, cap, 1 | (value.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(value.as_ptr())) == 0

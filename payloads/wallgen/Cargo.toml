@@ -15,3 +15,5 @@ ferros_heap = { path = "../../ferros_heap" }
 wallpaper = { path = "../../wallpaper", features = ["gpu"] }
 vsf = { path = "../../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
+# The made wallpaper's key kept as a VSF document (docs/VSF-AUDIT.md P18).
+ferros_kept = { path = "../../ferros_kept" }

@@ -2,7 +2,7 @@
 //!
 //! The kernel keeps only what a process cannot do: the chip's three rails (ACPM), the SPI port's clocks and USI mode, and the lines' pin modes, behind the `gps` power capability (`SYS_POWER`, kernel gps.rs `power`). Everything else is here, through MMIO grants: the port's registers, and the data bits of the four lines (HOST_REQ gpa5-3, MCU_REQ gpp4-3, MCU_RESP gph3-2, nSTANDBY gph3-3).
 //!
-//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture (the patch download, the second firmware stage, the configuration, the aiding), played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`), else the zone in effect's principal place (2026-11-11), else none. Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` whenever it moves (every change hits disk; nothing is written on the way out).
+//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture (the patch download, the second firmware stage, the configuration, the aiding), played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`), else the zone in effect's principal place (2026-11-11), else none. Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` whenever it moves, a VSF document of its place and when it came (ferros_kept::gps) (every change hits disk; nothing is written on the way out).
 //!
 //! Spawn: ferros-bridge spawn gps.bin <flags> --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req
 //! Grant slots, in that order: 0 console, 1 the `gps` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay. Bit 1: scrub the replays of the capture's place and end. Bit 2: with the zone's place as the aid, also write the zone's width into the uncertainty candidate (`Aid`), the on-device test of that field.
@@ -20,6 +20,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::cell::UnsafeCell;
 use core::fmt::Write;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_get_at, store_set, store_set_at, NOTHING};
 
@@ -624,15 +627,50 @@ fn say_kinds(grants: u64) {
     console(grants, &l.b[..l.n]);
 }
 
+/// The heap the last fix's document is built and read in (vsf's builders allocate): a few KiB at most for one small document, so 64 KiB in .bss is ample.
+const HEAP_BYTES: usize = 64 << 10;
+
+#[repr(C, align(16))]
+struct Region<const N: usize>(UnsafeCell<[u8; N]>);
+unsafe impl<const N: usize> Sync for Region<N> {}
+static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
+
+#[global_allocator]
+static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+
+// ferros_sys keeps Eagle time's rate without vsf (`eagle_now`, the documents' stamp): the two must be the one definition.
+const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == ferros_kept::vsf::OSCILLATIONS_PER_SECOND);
+
+/// A small value of the driver's scope whole: Ok(None) absent, Err refused.
+/// A value past the buffer comes back cut to it: no last fix document is near that long, so the cut bytes are refused as the whole would be.
+fn read_small(store: u64, key: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    let mut b = [0u8; 1 << 8];
+    match ferros_sys::store_read_at(store, key, 0, &mut b) {
+        NOTHING => Ok(None),
+        ferros_sys::ERR => Err(()),
+        // WHY the min: the vault says the whole length and copies at most the buffer.
+        n => Ok(Some(b[..(n as usize).min(b.len())].to_vec())),
+    }
+}
+
+/// The last fix kept (`gps.last`'s document): latitude and longitude in 2^-23 degrees.
+fn read_last(store: u64) -> Option<(i32, i32)> {
+    let doc = read_small(store, b"last").ok()??;
+    ferros_kept::gps::parse(&doc).map(|(lat, lon, _)| (lat, lon))
+}
+
 fn keep_last(grants: u64, d: &Deframer) {
     if d.fixes == 0 {
         return;
     }
-    let mut v = [0u8; 8];
-    v[..4].copy_from_slice(&d.fix.lat.to_le_bytes());
-    v[4..].copy_from_slice(&d.fix.lon.to_le_bytes());
+    // When the fix came on the real clock: now, less the counter ticks since it was decoded; none while the kernel has not read the clock (never a made-up time).
+    let when = ferros_sys::utc_time().map(|_| ferros_sys::eagle_now() - (now().wrapping_sub(d.fix_at) as i128 * ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND as i128 / freq() as i128) as i64);
+    let Some(doc) = ferros_kept::gps::build(d.fix.lat, d.fix.lon, when, ferros_sys::eagle_now()) else {
+        console(grants, b"gps: the last fix was not kept: its document did not build\n");
+        return;
+    };
     // Said when refused, not silent (2026-11-10: the Pro started with no `gps.last` after a day of fixes, so whether these writes land is the question).
-    if !store_set(cap(grants, S_STORE), b"last", &v) {
+    if !store_set(cap(grants, S_STORE), b"last", &doc) {
         console(grants, b"gps: the last fix was not kept: the vault refused gps.last\n");
     }
 }
@@ -680,6 +718,7 @@ fn scrub(grants: u64, store: u64, key: &[u8]) {
 pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Linked -pie: the image's own relocations first, before anything reaches a vtable.
     unsafe { ferros_sys::relocate() };
+    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     let chip = Chip::new(grants);
     let sky = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
     let key: &[u8] = if sky { b"replay.sky" } else { b"replay" };
@@ -690,8 +729,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         scrub(grants, store, b"replay.sky");
         ferros_sys::exit(0);
     }
-    let mut last = [0u8; 8];
-    let last = (ferros_sys::store_get(store, b"last", &mut last) == Some(8)).then(|| (i32::from_le_bytes([last[0], last[1], last[2], last[3]]), i32::from_le_bytes([last[4], last[5], last[6], last[7]])));
+    let last = read_last(store);
     // The aid's place (owner, 2026-11-11: "can't we figure that out from the orbital data anyway?"; the chip picks its sky from where it is told it is, and a zeroed place points it at the wrong one for 5-8 minutes): the person's own last fix; else the zone in effect's principal place (kernel zone.rs, the zones document's city: never anyone's place, only which part of the Earth); else none, the replay's zeroed one.
     // Arc-seconds to 2^-23 degrees: × 2^23 / 3600, in i64 (a latitude of 90° is 2^28.3 in 2^-23 degrees, the product fits).
     let zone = if last.is_none() { ferros_sys::zone::place().map(|(la, lo)| ((la as i64 * (1 << 23) / 3600) as i32, (lo as i64 * (1 << 23) / 3600) as i32)) } else { None };

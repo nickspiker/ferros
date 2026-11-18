@@ -5124,11 +5124,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             p.write(f.x[3], &a);
                             crate::keys::wipe_to_dram(&mut a);
                             ALIASES_GIVEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            crate::flashlog::line(&alloc::format!("alias given to the kist {who}"));
+                            // Which kists the person uses is theirs: a personal entry, sealed under their key (LEDGER.md "Classes").
+                            crate::flashlog::personal(&alloc::format!("alias given to the kist {who}"));
                             32
                         }
                         None => {
-                            crate::flashlog::line(&alloc::format!("alias refused to {who}: {}", if p.gate.is_none() || !p.kist { "not a kist launched by the kist job" } else { "nobody present, or no person key handed in yet" }));
+                            // A refusal is the system's to diagnose, often with nobody present: a system entry, the kist's name left out (which kists the person has is theirs), a process that is no kist named.
+                            if p.gate.is_none() || !p.kist {
+                                crate::flashlog::line(&alloc::format!("alias refused to {who}: not a kist launched by the kist job"));
+                            } else {
+                                crate::flashlog::line("alias refused to a kist: nobody present, or no person key handed in yet");
+                            }
                             ERR
                         }
                     }
@@ -5379,8 +5385,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     pstore_since(at);
                     // CONSOLE_FLASH in the reply length: the text goes to the flash log too, the line that survives a reset and a decayed DRAM (2026-11-16: a camera open died after its switch with nothing of its later steps kept). For a driver's few lines a session; each costs a flash-log write under this lock (up to 0.66 ms, `diag lock`).
                     if f.x[4] & CONSOLE_FLASH != 0 {
-                        let text = alloc::format!("{}: {}", alloc::string::String::from_utf8_lossy(&p.name), alloc::string::String::from_utf8_lossy(msg));
-                        crate::flashlog::line(text.trim_end());
+                        // The process is the entry's writer, its words the entry's words.
+                        let text = alloc::string::String::from_utf8_lossy(msg);
+                        crate::flashlog::line_from(&alloc::string::String::from_utf8_lossy(&p.name), text.trim_end());
                     }
                     let n = 2usize.min((f.x[4] & !(CONSOLE_FLASH | CALL_LIVE)) as usize);
                     p.write(f.x[3], &b"ok"[..n]);
@@ -7806,7 +7813,8 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     spawn_step(1);
     let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
     spawn_step(2);
-    let sealed = read(b"sealed").unwrap_or_default();
+    // The seals list, a `seals` document since 2026-11-17 (service.rs `seals_read`): one that does not read is none here, and a masked image is refused as not installed (the flash log says why since the vault's open).
+    let sealed = read(crate::kvault::SEALED.as_bytes()).and_then(|d| ferros_kist::seal::list_of(&d)).unwrap_or_default();
     let t_read = crate::platform::cntpct();
     spawn_step(3);
     let g = crate::oracle::gate(&capsule)?;
@@ -7905,4 +7913,35 @@ pub fn spawn_capsule_no_ihi(name: &[u8], capsule: &[u8], input: &[u8], grants: &
         return Err("gate: production refuses unmasked native code");
     }
     spawn(name, &g.code, input, grants, None, false, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
+}
+
+/// Zero `count` blocks of the ferros partition from block `at` of it, a run at a time through the run bounce, the watchdogs fed at every run: the owner's fresh start (service.rs `vault fresh`).
+/// Whether every run was written; it stops at the first refusal.
+/// The caller holds the kernel lock, so no other UFS command runs between the runs.
+pub fn zero_blocks(at: u64, count: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some((first, blocks)) = crate::ufs_device::part() else { return false };
+    // WHY the bound: the regions are the kernel's own constants, but the partition is the GPT's; a region past its end would zero whatever follows the partition.
+    // PROOF of no overflow: at and count are below 2^32 (block numbers of a partition the GPT gives as u32).
+    if at + count > blocks as u64 {
+        return false;
+    }
+    let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+    let run = (&raw mut UFS_RUN) as usize;
+    if ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+        u.probe_prdt_stride(0, (first as u64 + at) as u32, run);
+    }
+    // After the probe, which uses the bounce as its scratch.
+    unsafe { core::ptr::write_bytes(run as *mut u8, 0, ferros_hal::ufs::RUN_MAX << 12) };
+    let mut k = 0u64;
+    while k < count {
+        // WHY the smaller: the last run is what is left of the region, the others BLOCK_MAX.
+        let n = if count - k < BLOCK_MAX { count - k } else { BLOCK_MAX };
+        crate::platform::pet_watchdogs();
+        if !u.write_run_lun(0, (first as u64 + at + k) as u32, n as usize, run) {
+            return false;
+        }
+        k += n;
+    }
+    true
 }

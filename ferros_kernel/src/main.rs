@@ -6,7 +6,7 @@
 //
 // ferros_pt/ ── Photon Transport (no_std, optional alloc) ├── lib.rs ── is_data_packet(), is_control_packet(), re-exports ├── packet.rs ── packet encode/decode │   TAG_SPEC='S', TAG_ACK='A', TAG_NAK='N', TAG_DONE='D', TAG_FIN='F' │   struct Spec, Ack, Nak, Complete { sid, fields... } │   encode_data(), decode_data() — per-chunk BLAKE3 hash ├── transfer.rs ── transfer state machines │   struct InboundTransfer { data, received bitmap, expected_count } │     ::new(), handle_data(), all_received(), finish() → COMPLETE/NAK │   struct OutboundTransfer { data, next_seq, count, psize } │     ::start(), start_vec(), next_data_packet(), encode_fin() │   BitmapWord = u64, outbound_bitmap_words() └── command.rs ── cap-addressed command protocol [cap:32][op:1][params...], dev caps via BLAKE3 caps: DIAG, MEM, RELOAD enum Op { Read, Write, Exec }
 //
-// ferros_ledger/ ── append-only event chain (no_std) ├── lib.rs ── re-exports ├── ewe.rs ── EWE variable-width integer encoding │   encode_u64(), decode_u64(), encode_lean(), decode_lean() │   encode_seq(), decode_seq(), seq_width() ├── chain.rs ── BLAKE3 hash chain ├── entry.rs ── ledger entry (VSF document structure) ├── event.rs ── typed boot/USB/SD events ├── category.rs ── log category tree └── preboot.rs ── pre-ledger ring buffer
+// ferros_ledger/ ── the ledger (no_std, LEDGER.md) ├── ewe.rs ── EWE variable-width integer encoding (PT, the map) ├── category.rs ── categories and their class (system, personal) ├── entry.rs ── one entry: a sealed, chained VSF document ├── ring.rs ── the flash ring: two copies, head by the chain, torn writes named ├── preboot.rs ── the pre-boot buffer └── view.rs ── `diag log`'s documents and their render
 //
 // ferros_vault/ ── persistent object store (no_std) ├── lib.rs ── re-exports ├── device.rs ── Device trait, DeviceError, DeviceIoKind ├── hash.rs ── BLAKE3 hashing utilities ├── anchor.rs ── root anchor / superblock ├── boot.rs ── boot sequence validation ├── capability.rs ── capability tokens ├── commit.rs ── atomic commit protocol ├── failure.rs ── failure modes and recovery ├── mesh.rs ── object mesh topology ├── object.rs ── stored objects ├── platform.rs ── platform abstraction └── store.rs ── key-value store
 //
@@ -2311,6 +2311,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
     checklist::step(checklist::Step::Log);
+    // The wall clock before the vault opens (docs/VSF-AUDIT.md P10, 2026-11-17): every commit and document the vault writes is stamped with Eagle time from it (kvault `now`). A failed read leaves it unknown (0, the Eagle epoch: settings.rs), never made up; the service reads it again at its start and every hour.
+    let clock = rtc::sync_early();
+    if link_up {
+        flashlog::line(&match clock {
+            Ok(unix) => alloc::format!("wall clock read before the vault opens: A#{unix} s past 1970 (UTC), stamped as Eagle time"),
+            Err(e) => alloc::format!("wall clock NOT read before the vault opens (G#{e:X}): its commits are stamped 0, the Eagle epoch, until the service reads it"),
+        });
+    }
     // akita too since 2026-11-06: its ira's sources read alike across eight boots (`diag "ira sources"`), its ira under its own context (ira.rs), its vault in its own ferros partition (ufs_device::locate; refused without one). Not with no link: the ira's sources include a read of the flash (devinfo), which could then wait past the cluster watchdog.
     let (probe, mut store) = if board::akita() && !link_up { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
     // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.

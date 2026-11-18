@@ -150,7 +150,7 @@ Read from the vendor's own reader (vendor.radio.protocol.sit.stream.so, `Protoco
 **Nothing survives a session today.**
 - The GPS driver runs only while something claims GPS (GPS.md "On demand"); when the claims go to none the kernel kills it and its power switch turns off with it: the chip's three rails off, nSTANDBY low (its only power and reset line).
 - The chip's firmware is a RAM patch, downloaded at every power-up (the replay's first 554 records, 3.3 s), so nothing the chip learned is in it at the next start.
-- What the driver keeps is the last fix's place (`gps.last`, identity class, 8 bytes: latitude and longitude, no time, no error). The time comes from the RTC. No ephemeris, almanac or LTO of the device's own is kept anywhere.
+- What the driver keeps is the last fix's place (`gps.last`, identity class): one VSF document (ferros_kept gps.rs, section `last_fix`), the place as `at` (`w`) and when the fix came as `when` (`e`, only when the clock was read), no error. The time comes from the RTC. No ephemeris, almanac or LTO of the device's own is kept anywhere.
 - The replay (`gps.replay`) still carries the capture night's LTO, from 2026-10-25: past its 7 days, it now helps nothing, and the session starts as `gps.replay.sky` would.
 
 **So a fix an hour after the last one costs the same as one a week after**: about 92 s from the last fix's place (measured without LTO), minutes from the zone's place. The four-hour life of a broadcast ephemeris is never used, because the chip forgets it at power-off.

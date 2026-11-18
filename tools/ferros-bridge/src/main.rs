@@ -4,13 +4,22 @@
 //
 //   pt_send(link, data), pt_recv(link) → Vec<u8>: ferros-link's (tools/ferros-link, shared with ferros-send), the DATA blast each way
 //
+// ledger.rs ── the flash log: `diag log` rendered (`--raw` its VSF documents), log-render <file>, log-legacy <out> [--erase] (the old text log converted once)
+//
 // usb.rs ── UsbLink is ferros-link's (VID G#1209, PID G#4665, FERROS_BUS); here only the development vendor requests on EP0: read_dbg, read_dbg2, gate
 
 extern crate alloc;
 mod input;
+/// The flash log: `diag log` rendered, `log-render`, `log-legacy` (LEDGER.md "Reading it").
+mod ledger;
 /// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
 #[path = "../../../ferros_detail/src/network.rs"]
 mod network;
+/// A sponsor placed by hand, the document payloads/fgtw reads from `fgtw.sponsor` (shared by path: it uses only vsf and alloc).
+#[path = "../../../ferros_kept/src/sponsor.rs"]
+mod sponsor;
+/// `part`: partitions block for block off the device, read-only (the per-unit backups).
+mod part;
 mod usb;
 
 use ferros_pt::packet::Complete;
@@ -49,6 +58,9 @@ fn usage() {
     eprintln!("Commands:");
     eprintln!("  status       Check if device is connected");
     eprintln!("  diag         Retrieve boot diagnostics from device");
+    eprintln!("  diag log [--raw] | diag \"log <n>\"  The flash log's newest entries (256 or n) as lines; --raw writes its VSF documents");
+    eprintln!("  log-render <file.vsf>  A saved `diag log --raw` answer or a converted old log, as lines");
+    eprintln!("  log-legacy <out.vsf> [--erase]  The old 2026-10-20 text log as ledger_legacy documents, once; --erase zeroes it on the device after the file checks");
     eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
     eprintln!("  echo         PT echo test — send pattern, verify round-trip");
     eprintln!("  send <hex>   Send hex bytes via PT transfer");
@@ -62,7 +74,9 @@ fn usage() {
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
+    eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
+    eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
     eprintln!("  kist stow <capsule.vsf>  Development fallback: a kist straight into the attested person's list, no check by the device's stower and no Stow on its screen (unattended loops). Stow a kist with `ferros send <capsule.vsf>` (tools/ferros-send), the checked path");
@@ -86,7 +100,12 @@ async fn main() {
     match args[1].as_str() {
         "status" => cmd_status().await,
         // `diag ufs` runs the cold boot's UFS link-startup probe (long report).
-        "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[])).await,
+        // `diag log [n]` is rendered as lines (`--raw`: its VSF documents as they came).
+        "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[]), args.iter().any(|a| a == "--raw")).await,
+        // log-render <file.vsf>: a saved `diag log --raw` answer or a converted old log, as lines.
+        "log-render" if args.len() >= 3 => ledger::cmd_render(&args[2]),
+        // log-legacy <out.vsf> [--erase]: the 2026-10-20 text log, converted once (ledger.rs).
+        "log-legacy" => ledger::cmd_legacy(&args[2..]).await,
         "read" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU: on husky a direct PMU read makes the next EL3 call hang)");
@@ -106,6 +125,8 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        // part list | dump <name> <out> | gpt <lu> <primary> <backup>: Android's partitions read block for block thru the development `diag lun`, for the per-unit backups (part.rs).
+        "part" => part::cmd(&args[2..]).await,
         // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
         "input" => input::cmd(&args[2..]).await,
         // kist stow <capsule.vsf>: the development fallback (KISTS.md "Stowing"): a signed kist capsule kept in the vault and added to the attested person's list with no check by the device's stower and no Stow on its screen, for unattended loops. `ferros send` (tools/ferros-send) is the checked path every script uses.
@@ -270,6 +291,29 @@ async fn main() {
                 std::process::exit(1);
             });
             println!("credential document: {} bytes", doc.len());
+        }
+        "sponsor" => {
+            // sponsor <address> <port> <out.vsf>: the sponsor document the identity service reads from `fgtw.sponsor` (ferros_kept sponsor.rs: section `sponsor`, the address as `ni` or `nj`, the port as `np`), for a `store put fgtw.sponsor @out.vsf`.
+            let (Some(Ok(ip)), Some(Ok(port)), Some(out)) = (args.get(2).map(|a| a.parse::<std::net::IpAddr>()), args.get(3).map(|p| p.parse::<u16>()), args.get(4)) else {
+                eprintln!("Usage: ferros-bridge sponsor <address> <port> <out.vsf>");
+                std::process::exit(1);
+            };
+            let addr = match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let mut b = [0u8; 16];
+                    b[..4].copy_from_slice(&v4.octets());
+                    (4, b, port)
+                }
+                std::net::IpAddr::V6(v6) => (6, v6.octets(), port),
+            };
+            let doc = sponsor::build(&addr, vsf::eagle_time_oscillations()).expect("a family of 4 or 6 always builds");
+            // Read back as fgtw reads it before it is written out.
+            assert_eq!(sponsor::parse(&doc), Some(addr), "the sponsor document does not read back");
+            std::fs::write(out, &doc).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                std::process::exit(1);
+            });
+            println!("sponsor document: {} bytes", doc.len());
         }
         "capsule" => {
             // capsule <code.bin> <out.vsf>: write a signed capsule (e.g. for `store put init @out.vsf`, which the cold boot spawns as its first process).
@@ -879,7 +923,7 @@ fn tri_state(v: u32) -> &'static str {
     }
 }
 
-async fn cmd_diag(params: &[u8]) {
+async fn cmd_diag(params: &[u8], raw: bool) {
     let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
@@ -910,6 +954,10 @@ async fn cmd_diag(params: &[u8]) {
     match pt_recv(&link).await {
         Ok(data) => {
             eprintln!("Received {} bytes", data.len());
+            if ledger::is_entries(params) {
+                ledger::show(&data, raw);
+                return;
+            }
             let _ = io::stdout().write_all(&data);
             let _ = io::stdout().flush();
         }

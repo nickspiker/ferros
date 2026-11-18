@@ -4,6 +4,8 @@ Every link's numbers, names and knobs, from its driver to its page in settings (
 
 The console's circles stay orbs without words (they draw the measures); a link's page in settings is the only place with numbers and knobs, reached by dragging its circle toward the centre (or tapping a circle that is no switch: USB, the clock, the battery), or from Connections. Every pixel of the dash is some circle's (QUICK.md "The dash's zones").
 
+What a radio's circle shows today (display `console_draw`): on, its name and its most useful measures as lines of text (since 2026-11-09, the orbs off behind `ORBS`), GPS its satellites' rings; off (switched off, or its driver not running), its name alone, plain text centred in the circle and sized by it: LTE, WiFi, BT, NFC, GPS, USB (owner, 2026-11-17: "For the radio icons, let's just put the plaintext in the circle rather than the waves for now when off. LTE, WiFi, etc."). The fields drawn while off until then (WiFi's waves, Bluetooth's two poles, cellular's mesh, NFC's dipole, GPS's pin) are kept behind `OFF_ART`. The label is picked by the circle's kind, the tap and the hit map unchanged.
+
 ## Three ways out of a driver, one way in
 
 A driver says what it knows three ways, each kept by the kernel, which reads none of it:
