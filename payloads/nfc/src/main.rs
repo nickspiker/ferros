@@ -571,13 +571,14 @@ impl Nfc {
             // ST's proprietary notifications (G#6F): not ours to act on, but counted and said (`st_notes`), since a chip that stops reading may say so only here.
             (3, 0xF, _) => {
                 self.st_notes += 1;
-                // WHY the min: a notification may be shorter than the 8 bytes kept (a 3-byte header and nothing), and copying 8 from it would panic; a longer one keeps its start. The 16 said below is the console line's length, not a bound (n is at most the packet's 258).
+                // WHY the min: a notification may be shorter than the 8 bytes kept (a 3-byte header and nothing), and copying 8 from it would panic; a longer one keeps its start. The 64 said below is the console line's room (128 hex digits in its 512 bytes), not a bound (n is at most the packet's 258).
+                // Said whole up to 64 bytes since 2026-11-18: the reload's second notification (`6F 02 16 31 20 00 82 06 01 ...`, 25 bytes) was cut at 16, and it is the one a cold boot does not send.
                 let k = n.min(self.st_last.len());
                 self.st_last = [0; 8];
                 self.st_last[..k].copy_from_slice(&p[..k]);
                 if self.st_said < ST_SAY {
                     self.st_said += 1;
-                    say!(self.grants, "nfc: ST notification {}\n", Hex(&p[..n.min(16)]));
+                    say!(self.grants, "nfc: ST notification {}\n", Hex(&p[..n.min(64)]));
                 }
             }
             _ => say!(self.grants, "nfc: {}\n", Hex(&p[..n])),

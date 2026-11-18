@@ -87,6 +87,21 @@ Measured on the Pro:
 
 Still open (b919, the fixed driver after a RAM reload): every reset pulse gives the chip's boot notification (reason 1) and two ST notifications (`6F 02 14 31 20 00 07 07 00 23 F7 …`, `6F 02 16 31 20 00 82 06 01 …`), then CORE_RESET goes unanswered for the whole 2 s, so on a reload the chip is never up and no tag is read. Not the reference clock's pad: CLKOUT1 (G#1546_3E84) reads G#0001_0000 after the reload, and bit 0 is a disable (Linux's cal-if `ra_enable_clkout` clears it to enable, sets it to disable), so that is the output on, TCXO selected, gated by the chip's clock request; a poke of bit 0 on 2026-11-17 was undone 32 s later, with no retry in between. Next: the same reading and the two ST notifications on a cold boot, where the chip answers CORE_RESET in about 10 ms.
 
+**Cold boot against reload, the notifications (2026-11-18, from console captures of 2026-11-17, their NFC and modem lines kept in keys/husky/captures/nfc-cold-vs-reload-2026-11-17.txt; no device run):**
+
+| | cold boot (2026-11-17 evening, t25 s) | reload (b930, t2303 s, three pulses) |
+|---|---|---|
+| after the pulse | reset notification, reason 01 | reset notification, reason 01 |
+| ST's first | `6F 02 14 31 20 00 07 07 00 23 F7 00 00 00 F5 83` | the same (its byte before 83 F4 to F6) |
+| next | reset notification, reason 02: CORE_RESET answered, 3 ms after the first | `6F 02 0B 31 20 00 81 06 01 00 00 00 ..` (twice) or `6F 02 16 31 20 00 82 06 01 00 00 00 5C 97 82 09 ..` (once), then nothing to CORE_RESET for 2 s |
+| the modem's CP at the pulse | off (the modem process read `PS_HOLD 0 ... PHONE_ACTIVE 0` before powering it, at t28 s, after NFC was up at t25.5 s) | on, left running by the kernel before the reload (`PS_HOLD 1 CP_WRST_N 1 PHONE_ACTIVE 1`, boot_stage G#3FFF; the reload's crowbar takes only its PCIe link down), until the modem process cycled it at t2308.4 s, after all three pulses |
+
+A later pulse in the same reload session (t2717.9 s, the CP up again under ferros's own modem process) gave the same 81 notification; the capture ends there.
+The 81 and 82 notifications are what a cold boot never sent before CORE_RESET was answered, and every pulse that sent one had the CP powered.
+Not yet proven: whether the CP (and with it the SIM, which the ST54L reaches over SWP: host G#81 is the UICC in libnfc-hal-st.conf) is what holds the chip, or something else a reload leaves.
+What would decide it (each needs a device run): on a cold session with the modem up, kill and respawn `nfc` (a pulse with the CP live, which no cold boot has done yet): a reason-02 answer clears the CP, an 81 or 82 and silence points at it; and a reload with the CP off at the pulse.
+ST notifications are said whole up to 64 bytes since 2026-11-18 (the 82 one was cut at 16).
+
 What the driver does since:
 - A command waits two seconds for its response, the NCI stack's command-complete timeout (libnfc-nci NFC_CMD_CMPL_TIMEOUT).
 - A command left unanswered, a bring-up that failed, and a CORE_RESET notification outside the bring-up (the chip resetting by itself, which loses its discovery) all bring the chip up again from a reset pulse (the `nfc` power switch on again: the kernel's pulse, as at the start; `Nfc::restart`), never with NCI commands alone.
