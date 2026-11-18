@@ -20,7 +20,7 @@
 //
 // ufs_cal.rs ── zuma M-PHY/UNIPRO link calibration (port of Samsung ufs-cal-if) pre_link(), post_link(), pre_pmc_hs_b() region bases (STD/HCI/UNIPRO/PMA), udelay() CRITICAL: clear HCI_FORCE_HCS auto clock-stop enables before ANY PMA access — the auto-gate bus-hangs the AP
 //
-// ring.rs ── vault root ring on UFS (spec in RING.md) (implementation pending)
+// ring.rs ── the spine (vault root ring) and stem (kernel ring) entries as VSF documents, portable (ferros-install writes them on the host), plus the aarch64 UFS scan and write (spec in RING.md) struct RingEntry ::schema(), to_block(), from_block(blk), genesis(now), next(now) struct KernelRingEntry ::new(.., now), schema(), to_block(), from_block(blk)
 //
 // hsi2c.rs ── Exynos HSI2C (USI-I2C) master, polling/auto-mode (port of i2c-exynos5.c, hardware-proven on Pixel 8 hsi2c_11) struct Hsi2c { base } ::new(base), init() — MASTER+AUTO_MODE, reuses ABL timing (no SW_RST) ::xfer(addr, buf, is_read, stop) → Result<(), trans_status> ::read_reg(addr, reg) → Result<u8, u32>, write_reg(addr, reg, val) PIXEL8_HSI2C11_BASE (G#10CB0000), PIXEL8_EUSB_REPEATER_ADDR (G#3E)
 
@@ -38,23 +38,34 @@ extern crate alloc;
 pub mod usb_trait;
 pub use usb_trait::{UsbBulk, UsbEvent};
 
+// The hardware modules (MMIO, system registers, barriers) are aarch64 only.
+// The rest (the ring entry and HAMT documents, the DTB and framebuffer helpers) build on any target, so a host tool (ferros-install) and host tests use the very code the device runs.
+#[cfg(target_arch = "aarch64")]
 pub mod mmio;
+#[cfg(target_arch = "aarch64")]
 pub mod uart;
 pub mod fb;
 pub mod dtb;
+#[cfg(target_arch = "aarch64")]
 pub mod ufs;
+#[cfg(target_arch = "aarch64")]
 pub mod ufs_cal;
+#[cfg(target_arch = "aarch64")]
 pub mod qtimer;            // aarch64 QTIMER read (moved here from old vsf_mini.rs)
 pub mod ring;
+#[cfg(target_arch = "aarch64")]
 pub mod gic;
+#[cfg(target_arch = "aarch64")]
 pub mod hyp;
 pub mod pstore;
+#[cfg(target_arch = "aarch64")]
 pub mod hsi2c;
 
 // Modules requiring alloc
 #[cfg(feature = "alloc")]
 pub mod console;
 // The DWC3 driver needs no allocator: the kernel and the USB driver process (payloads/usb, no heap) both link it.
+#[cfg(target_arch = "aarch64")]
 pub mod usb;
 #[cfg(feature = "alloc")]
 pub mod hamt;
