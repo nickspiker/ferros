@@ -2532,12 +2532,6 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x39);
     // The wall clock (rtc.rs): read now, so the first process to ask has it.
     let _ = crate::rtc::sync();
-    // What the vault's move to VSF said at its open (kvault `convert_device`, each line in the flash log already), on the console now it is up.
-    if let Some(s) = store.as_mut() {
-        for l in s.take_notes() {
-            crate::process::push_console(alloc::format!("{l}\n").as_bytes());
-        }
-    }
     let freq = cntfrq();
     let mut t_heartbeat = cntpct();
     // The AoC's start, idle until the `sensors` switch asks for it (sensorlink.rs START).

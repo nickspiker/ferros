@@ -135,11 +135,6 @@ pub fn list_of(doc: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The one-shot move of the vault's old list (2026-11-17): the bare seals, 32 bytes each, as their document; None for bytes that are not whole seals (the old value is then left where it is).
-pub fn list_from_old(old: &[u8], now: i64) -> Option<Vec<u8>> {
-    list_document(old, now)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn an_old_list_converts_and_every_image_on_it_still_runs() {
-        // The vault's `sealed` as the kernel kept it before 2026-11-17: an address seal, an image seal not moved yet, another kist's address seal, concatenated.
+    fn every_image_on_a_kept_list_still_runs() {
+        // An address seal, an image seal not moved yet, another kist's address seal.
         let code = image();
         let addr = *blake3::hash(&code).as_bytes();
         let moved = by_address(&KEY, &DEV, &OPT, true, &M, &addr);
@@ -256,17 +251,16 @@ mod tests {
         let unmoved = by_image(&KEY, &OPT, &DEV, true, &M, &other_code);
         let third = by_address(&KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32]);
         let old: Vec<u8> = [moved, unmoved, third].concat();
-        let doc = list_from_old(&old, NOW).unwrap();
+        let doc = list_document(&old, NOW).unwrap();
         let list = list_of(&doc).unwrap();
         assert_eq!(list, old, "the seals keep their order and bytes");
         assert_eq!(check(&list, &KEY, &DEV, &OPT, true, &M, &addr, || unreachable!()), Verdict::ByAddress);
         let other_addr = *blake3::hash(&other_code).as_bytes();
         assert!(matches!(check(&list, &KEY, &OPT, &DEV, true, &M, &other_addr, || unmoved), Verdict::ByImage(..)));
         assert_eq!(check(&list, &KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32], || [0; 32]), Verdict::ByAddress);
-        // The old bytes themselves are not a list document: the reader never takes them for one, empty or not.
+        // Bare seals are not a list document: the reader never takes them for one, empty or not.
         assert_eq!(list_of(&old), None);
         assert_eq!(list_of(&[]), None);
-        // What was never whole seals is not converted.
-        assert!(list_from_old(&old[..95], NOW).is_none());
+        assert!(list_document(&old[..95], NOW).is_none());
     }
 }
