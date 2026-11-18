@@ -7,7 +7,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no attribution](feedback_no_attribution.md) - "Built with Claude", never Co-Authored-By or authorship claims
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) - commit + push each verified step; own hunks only
 - [Feedback: reload the Pro freely](feedback_pro_reload_freely.md) - reloads/restarts/stores need no ask; unplugged = hands off
-- [Pro unlocks at boot](pro_unlocks_at_boot.md) - since 2026-11-17 the Pro needs no handle after reloads/flashes; overnight flashes OK; 8a does not
+- [Pro and 8a unlock at boot](pro_unlocks_at_boot.md) - since 2026-11-17 no handle after reloads/flashes on either; Pro overnight flashes OK
 - [Feedback: Harbor tmp is scratch](feedback_harbor_tmp_is_scratch.md) - owner clears it at will; agents build in scratchpads; device data in keys/<device>/
 - [Feedback: deploy sites freely](feedback_deploy_sites_ok.md) - fgtw.org, passless.org, ferros.org deploys need no go; keys/handles rules hold
 - [Feedback: don't SSH](feedback_no_ssh.md) - never SSH into another machine unless told to
