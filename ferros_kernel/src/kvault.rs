@@ -62,6 +62,8 @@ const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
 /// The base the kernel derives the person's vault domains from (process.rs `domain_keys`, VAULT-OUT.md): one per unlock, wiped at lock.
 const ID_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 identity vault domain";
 const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
+/// The person's ledger key, from the identity root as the vault keys are (`IdKeys.ledger`).
+const ID_LEDGER_CONTEXT: &str = "ferros 2026-11-17 identity ledger v0";
 /// Attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-05: a plain NTAG-type tag in his glasses opens the device without the handle typed, and nothing is remembered without the tag). One record per kept tag, in the device class, kept by its id (a hash of its UID, never the UID) as an address under this reserved prefix (`set_addr`), so the address list is the list of kept tags and nothing names them.
 const TAGS: &str = "\0tag.";
 /// The ira-derived device key a tag's id and seal key are made from (`tag_keys`): derived in the kernel, the ira never handed out (keys in registers).
@@ -100,6 +102,8 @@ struct IdKeys {
     /// The identity seed itself, held only while the person is present so a tag can be kept from the settings page (`tag_keep`), which never sees the seed.
     /// Wiped with the keys at `lock`.
     seed: crate::keys::Held,
+    /// The person's ledger key (LEDGER.md "Classes"): personal entries of the flash log are sealed under it, so they open only while this person is present (flashlog.rs `set_personal`).
+    ledger: crate::keys::Held,
     /// The person key (FACETS.md D0, D1): handed in by the identity service once it opens it from the fleet's space (SYS_UNLOCK op 10), the root every kist's alias is derived from here (`alias`), with its one-way id (`PERSON_ID_CONTEXT`), which tells a key handed in again from a new one.
     /// None until then; wiped with the keys at `lock`.
     person: Option<(crate::keys::Held, [u8; 32])>,
@@ -615,6 +619,7 @@ impl KVault {
                 addr_key: crate::keys::held_rederive(&root, ID_ADDR_CONTEXT, &[])?,
                 payload_key: crate::keys::held_rederive(&root, ID_PAYLOAD_CONTEXT, &[])?,
                 domain: crate::keys::held_rederive(&root, ID_DOMAIN_CONTEXT, &[])?,
+                ledger: crate::keys::held_rederive(&root, ID_LEDGER_CONTEXT, &[])?,
                 seed: crate::keys::hold(&mut seed.clone())?,
                 person: None,
             };
@@ -622,6 +627,7 @@ impl KVault {
         })();
         crate::keys::wipe_to_dram(&mut secret);
         self.id = Some(made.ok_or(KvError::NoIra)?);
+        crate::flashlog::set_personal(self.id.as_ref().map(|k| k.ledger));
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
@@ -652,6 +658,7 @@ impl KVault {
         PERSON.store(false, core::sync::atomic::Ordering::Release);
         // The vault process drops what it holds of the person's when it sees this change (the stamp carries it); the identity service learns it from its bell (process.rs `identity_bell`).
         crate::process::LOCK_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Release);
+        crate::flashlog::set_personal(None);
         if let Some(k) = self.id.as_mut() {
             crate::keys::wipe_value_to_dram(k);
         }

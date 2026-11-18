@@ -1,66 +1,61 @@
-//! Ledger categories — typed namespaces for event chains.
+//! The categories an entry is filed under, and the class each one is sealed under (LEDGER.md "Classes").
 //!
-//! Each category maintains its own independent BLAKE3 hash chain, sequence counter, and capability scope.
+//! The category decides the class (owner, 2026-11-17): a system entry (boot steps, clocks, lock holds, process ends, anything not about the person) is sealed under a key from the ira and opens at any boot on this device; a personal entry (which kists were opened, aliases, peers, places, anything about the person) is sealed under the attested identity's key and opens only while that person is present.
+//! LEDGER.md keeps the one table of every category and its class; this file is that table in code, and a test holds the two names to VSF's rules for a name.
 
-/// Ledger category identifier.
-///
-/// Categories form a tree. Each leaf has an independent chain. The `as_bytes()` representation is the canonical category path used in entry encoding.
+/// Which key an entry is sealed under.
+/// Its number is what the entry carries in the open (`class`), so a reader knows which key to try without opening anything.
+/// The numbers are on the flash: append new classes, never renumber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Category {
-    // -- Kernel --
-    KernelBoot = 0x01,
-    KernelIpc = 0x02,
-    KernelMemory = 0x03,
-    KernelCapability = 0x04,
-    KernelKill = 0x05,
-
-    // -- USB --
-    UsbPhy = 0x10,
-    UsbDwc3 = 0x11,
-    UsbEnumeration = 0x12,
-    UsbPt = 0x13,
-
-    // -- Photon --
-    PhotonTransport = 0x20,
-    PhotonToken = 0x21,
-    PhotonMessages = 0x22,
-
-    // -- TOKEN --
-    TokenAttestation = 0x30,
-    TokenAuth = 0x31,
-
-    // -- Vault (Ring FS) --
-    VaultBoot = 0x40,
-    VaultWrite = 0x41,
-    VaultRepair = 0x42,
-
-    // -- VSF --
-    Vsf = 0x50,
+pub enum Class {
+    /// Sealed under a key derived from the device's ira: readable by this device at any boot, with the vault broken or nobody attested; unreadable off it.
+    System = 0,
+    /// Sealed under the attested identity's ledger key: readable only while that person is present.
+    Personal = 1,
 }
 
-impl Category {
-    /// Canonical path bytes for this category (used in entry identity section).
-    pub fn as_bytes(self) -> &'static [u8] {
-        match self {
-            Self::KernelBoot => b"Kernel.Boot",
-            Self::KernelIpc => b"Kernel.IPC",
-            Self::KernelMemory => b"Kernel.Memory",
-            Self::KernelCapability => b"Kernel.Capability",
-            Self::KernelKill => b"Kernel.Kill",
-            Self::UsbPhy => b"USB.PHY",
-            Self::UsbDwc3 => b"USB.DWC3",
-            Self::UsbEnumeration => b"USB.Enumeration",
-            Self::UsbPt => b"USB.PT",
-            Self::PhotonTransport => b"Photon.Transport",
-            Self::PhotonToken => b"Photon.TOKEN",
-            Self::PhotonMessages => b"Photon.Messages",
-            Self::TokenAttestation => b"TOKEN.Attestation",
-            Self::TokenAuth => b"TOKEN.Auth",
-            Self::VaultBoot => b"Vault.Boot",
-            Self::VaultWrite => b"Vault.Write",
-            Self::VaultRepair => b"Vault.Repair",
-            Self::Vsf => b"VSF",
+impl Class {
+    pub fn number(self) -> u64 {
+        self as u64
+    }
+
+    pub fn from_number(n: u64) -> Option<Class> {
+        match n {
+            0 => Some(Class::System),
+            1 => Some(Class::Personal),
+            _ => None,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::System => "system",
+            Class::Personal => "personal",
+        }
+    }
+}
+
+/// A category: its name (a VSF name, sealed inside the entry) and the class it is sealed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Category {
+    pub name: &'static str,
+    pub class: Class,
+}
+
+/// A line of the kernel's words, as `flashlog::line` has always taken it (stage 0: every existing caller).
+pub const TEXT: Category = Category { name: "text", class: Class::System };
+/// A line of words about the person (which kist was given an alias, and the like): sealed under the person's key.
+pub const PERSON_TEXT: Category = Category { name: "person.text", class: Class::Personal };
+/// The ledger's own notes: the pre-boot buffer overrun, and what the open found wrong (a torn last write, skipped).
+pub const LEDGER: Category = Category { name: "ledger", class: Class::System };
+/// `diag "log bench"`'s timed entries.
+pub const BENCH: Category = Category { name: "bench", class: Class::System };
+
+/// Every category this build writes.
+/// A name read back that is not here is shown as it is: a newer writer's category is still a category.
+pub const ALL: [Category; 4] = [TEXT, PERSON_TEXT, LEDGER, BENCH];
+
+/// The category of a name read back, if this build knows it.
+pub fn find(name: &str) -> Option<Category> {
+    ALL.iter().copied().find(|c| c.name == name)
 }

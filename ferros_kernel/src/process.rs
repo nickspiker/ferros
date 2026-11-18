@@ -5124,11 +5124,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             p.write(f.x[3], &a);
                             crate::keys::wipe_to_dram(&mut a);
                             ALIASES_GIVEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            crate::flashlog::line(&alloc::format!("alias given to the kist {who}"));
+                            // Which kists the person uses is theirs: a personal entry, sealed under their key (LEDGER.md "Classes").
+                            crate::flashlog::personal(&alloc::format!("alias given to the kist {who}"));
                             32
                         }
                         None => {
-                            crate::flashlog::line(&alloc::format!("alias refused to {who}: {}", if p.gate.is_none() || !p.kist { "not a kist launched by the kist job" } else { "nobody present, or no person key handed in yet" }));
+                            // A refusal is the system's to diagnose, often with nobody present: a system entry, the kist's name left out (which kists the person has is theirs), a process that is no kist named.
+                            if p.gate.is_none() || !p.kist {
+                                crate::flashlog::line(&alloc::format!("alias refused to {who}: not a kist launched by the kist job"));
+                            } else {
+                                crate::flashlog::line("alias refused to a kist: nobody present, or no person key handed in yet");
+                            }
                             ERR
                         }
                     }
@@ -5379,8 +5385,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     pstore_since(at);
                     // CONSOLE_FLASH in the reply length: the text goes to the flash log too, the line that survives a reset and a decayed DRAM (2026-11-16: a camera open died after its switch with nothing of its later steps kept). For a driver's few lines a session; each costs a flash-log write under this lock (up to 0.66 ms, `diag lock`).
                     if f.x[4] & CONSOLE_FLASH != 0 {
-                        let text = alloc::format!("{}: {}", alloc::string::String::from_utf8_lossy(&p.name), alloc::string::String::from_utf8_lossy(msg));
-                        crate::flashlog::line(text.trim_end());
+                        // The process is the entry's writer, its words the entry's words.
+                        let text = alloc::string::String::from_utf8_lossy(msg);
+                        crate::flashlog::line_from(&alloc::string::String::from_utf8_lossy(&p.name), text.trim_end());
                     }
                     let n = 2usize.min((f.x[4] & !(CONSOLE_FLASH | CALL_LIVE)) as usize);
                     p.write(f.x[3], &b"ok"[..n]);

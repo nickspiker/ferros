@@ -60,6 +60,8 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         crumb(0xC3);
         // Into the registers (keys.rs); this copy is wiped there, the one in `ira` at the end of the probe.
         crate::ira::keep_ira(&mut i);
+        // The flash log can seal now: what the kernel said since boot, held in the pre-boot buffer, goes to the flash (flashlog.rs).
+        crate::flashlog::flush();
     }
     let ira_fail = ira.err().unwrap_or(0);
     let ira_fp = ira.map(|i| fingerprint(ira_fp_context(), &i)).unwrap_or([0u8; 8]);
@@ -196,7 +198,7 @@ pub fn next_boot_take(store: &mut ShimStore) -> Option<u32> {
     let section = vsf::schema::SectionBuilder::parse_document(next_boot_schema(), &doc, None).ok()?;
     let read = |name: &str| section.get_fields(name).first().and_then(|f| f.values.first()).and_then(|v| v.as_u64());
     let (mode, from) = (read("mode")?, read("from_boot")?);
-    let boot = crate::flashlog::boot() as u64;
+    let boot = crate::flashlog::boot();
     // WHY the boot == 0 test: 0 means no flash log this boot, where `boot - 1` would wrap.
     // PROOF: flashlog::boot is 0 before init or without a log, otherwise at least 1; `from` is the disk's and is only compared, never added to.
     if boot == 0 || from != boot - 1 {
