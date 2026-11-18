@@ -885,11 +885,22 @@ Measured on the Pro, not attested, the driver hand-spawned with input 01, every 
 - CPUCL1, CPUCL2, the GPU and the TPU each get OCP, VDROOP and SMPL filters. CPUCL0, the A510s with the DSU, gets the SMPL filter alone.
 - So the one source wired to CPUCL0's divider is SMPL_WARN: the main PMIC's warning that the battery's voltage has sagged under its level. It is the same line every cluster's divider hears, which fits CPUCL1's status stepping in the same seconds.
 - No TMU trip, ACPM thermal path or DSU source is named for it. ACPM's thermal governor caps through DVFS, and the PLLs never moved.
-- Linux programs the level: `smpl_ctrl = <0xA8>`, 3.1 V, 200 mV hysteresis, no debounce (zuma-shusky-bcl.dtsi). ferros never writes SMPL_WARN_CTRL, so the level is whatever the PMIC or the bootloader leaves. `diag thermal hw` reads it (main PMIC G#16); not read yet.
-- Its pin is GPA9 bit 4, SMPL_WARN_R_L, active low (zuma-pmic.dtsi:38). The trace's once-a-second GPA9 data read never saw it low in 27 stepping seconds. Either the warning pulses far shorter than half the time while the divider holds its step longer, or the data word does not show the pin in the function the pin is in. The trace now also keeps GPA9's CON word, and the gauge's voltage and current a second.
-- THERMAL.md "The X3 at 364 MHz" saw the same divider answer a current step at once: the A715s raised from 1065 to 2367 MHz, about 5.2 W more, put the X3 at 2914 / 8.
-- The Lumis runs held the A715s at 2367 MHz for 30 s, about 6 W for the four. A die going from 48 to 90 C draws more leakage current at the same clocks. The likely reading is a battery sagging under that current, worse as the die heats: the current that heat brings, not a thermal trip.
-- **Untested, and the next slot's first measure:** the gauge's voltage and current a second beside the stepped share; SMPL_WARN_CTRL's level; and heat with no camera (the watch's load on the four A715s at 2367), then the load dropped. If the steps stop at once, it is the current.
+
+**Measured instead (b954, 81-82 % battery, the host's port charging): heat, a cluster at a time, at about 88 C; not the battery.**
+- SMPL_WARN_CTRL reads G#68: 2.9 V, below Linux's 3.1 V. OCP_WARN is off on B2M, B3M and B7M (G#0).
+- GPA9's CON word is G#2: pin 4 is an input, so the data bit shows SMPL_WARN_R_L. It never read low.
+- Under 2.4 A of load the cell never fell under 3.93 V, so neither SMPL level was ever near. Setting Linux's 3.1 V could change nothing, and was not tried.
+- **No camera, the watch's load on all eight workers, every clock at its top, 40 s:**
+  - CPUCL0 began stepping the second LITTLE reached 88 C (it read 86 the second before, with nothing stepped). It climbed over 15 s to 50-77 % of passes, with LITTLE at 84-91.
+  - CPUCL2, the X3's, stepped in exactly the five seconds BIG read 88-90 C. The X3 ran only the kernel, and measured 365 MHz (2914 / 8) in those seconds.
+  - CPUCL1 never stepped there (MID at most 87). In the Lumis runs it stepped whenever MID read 88-90.
+  - Each cluster's divider follows its own zone, which a shared electrical warning would not do.
+  - The load's end stopped the steps within the second, but the zones fell under 85 C within that second too.
+  - ACPM's trip counters stayed 0 (ferros never sends TMU_IPC_INIT), and the PLLs never moved. A thermal path into CLKDIVSTEP that the reference tree does not name.
+- **Lumis with the intake on the A715s** (input bit 6), governed, 32 s:
+  - New images 53 a second falling to 27, the draw 14.5 to 28-30 ms, the integrator 4.3 to 9.9 ms.
+  - CPUCL0 stepped from LITTLE's 87 C, CPUCL1 from MID's 88.
+  - The stream died at frame 1783, 29 s in ("no frame in 2129 ms", the A715s starved the frame thread, as the section above saw once); the driver closed itself.
 
 **The governor: what it sees, and a proposal (not built).**
 - **What it sees:** each 64th of a second it takes the busiest core's awake share and moves the level toward the running rate x the averaged share x 5/4, aiming at 4/5 busy (service.rs `Gov`).
@@ -902,6 +913,12 @@ Measured on the Pro, not attested, the driver hand-spawned with input 01, every 
   - cambench's measured points bracket the cost: 2.16 ms a frame at 2413 MHz, 7 ms at about 480. The work is memory-bound, so at 1572 it should land nearer 3 ms than 3.2 (cycles a frame fall with the clock: 5.2 M at 2413, 3.4 M at 480).
   - The test before any build: `diag clock lift 1572000` and the A510-intake Lumis run again, read for the stepped share and the preview's new images a second (55 falling to 27 today).
 - **No floor is proposed:** a frame-paced consumer that keeps up at the floor (cambench) loses only latency. Lumis's intake keeps up on the A510s.
+- **The test, run (b954): `diag clock lift 1572000`, Lumis with the intake on the A510s, governed, 32 s.**
+  - Not one CPUCL0 step. The zones peaked at 79-80 C, not 90.
+  - New images held at 39 a second from the second window to the last (55 falling to 27 at 2367).
+  - Lumis's draw held at 19.8 ms (13.8 rising to 30). The integrator held 13.0-13.3 ms, with 1920 of 1968 frames integrated (1856 and 1728 at 2367).
+  - The MAP's maintenance held at 427-433 us. The A510s stayed at 1097 MHz.
+  - The ceiling buys a steady preview at about 70 % of the cold start's rate, for about 4 W less on the A715s. The lift went back to 2367000 after the run; the ceiling during a stream is the owner's choice to build.
 
 A reload with this kernel's first trace build (every divider word read every pass, six ACPM rate reads a second) found ACPM answering nothing and the device reset 35 s later (b950, the kernel's core between the clock policy and the heat step, crumb G#D7). The build committed reads only CPUCL0's word every pass and asks ACPM nothing extra.
 
