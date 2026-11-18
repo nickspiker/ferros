@@ -45,6 +45,44 @@ pub const TIME: &str = "time";
 pub const CATEGORY: &str = "category";
 pub const WRITER: &str = "writer";
 pub const WORDS: &str = "words";
+/// How many characters of the writer and words the text table did not hold and `lean` replaced (absent when none).
+pub const REFUSED: &str = "refused";
+
+/// What stands for a character the text table does not hold: `?`, which it does hold.
+/// The entry's `refused` says how many stand in, so a typed `?` and a stand-in are told apart by count.
+pub const MARKER: char = '?';
+
+/// Text as the ledger stores every text field, with the lean table (vsf `x-compact`, owner 2026-11-17: "lean on text"):
+/// - every character in the compact table: `x`, Huffman-coded;
+/// - else, all ASCII (the table lacks `^` and the control characters but tab and newline): `a`, byte for byte, nothing lost;
+/// - else: `x`, each character outside the table replaced by `MARKER`.
+/// Returns the value and how many characters were replaced: nothing is ever dropped, and nothing replaced without being counted.
+pub fn lean(s: &str) -> (VsfType, u64) {
+    if s.chars().all(vsf::x_text::compact::holds) {
+        return (VsfType::x(s.to_string()), 0);
+    }
+    if let Ok(a) = vsf::types::Ascii::new(s) {
+        return (VsfType::a(a), 0);
+    }
+    let mut refused = 0u64;
+    let t: String = s
+        .chars()
+        .map(|c| {
+            if vsf::x_text::compact::holds(c) {
+                c
+            } else {
+                refused += 1;
+                MARKER
+            }
+        })
+        .collect();
+    (VsfType::x(t), refused)
+}
+
+/// A stored text field: `x` or `a` (`lean`).
+pub fn text_constraint() -> TypeConstraint {
+    TypeConstraint::OneOf(alloc::vec![TypeConstraint::Utf8Text, TypeConstraint::AsciiText])
+}
 
 /// The wrap byte of the sealed payload: XChaCha20-Poly1305 (vsf crypto_algorithms WRAP_XCHACHA20POLY1305), its nonce and tag in fields of their own.
 pub const WRAP: u8 = b'X';
@@ -159,7 +197,7 @@ pub fn schema() -> SectionSchema {
 
 /// The sealed section: the category, the writer, the words.
 pub fn payload_schema() -> SectionSchema {
-    SectionSchema::new(PAYLOAD).field(CATEGORY, TypeConstraint::DictKey).field(WRITER, TypeConstraint::Utf8Text).field(WORDS, TypeConstraint::Utf8Text)
+    SectionSchema::new(PAYLOAD).field(CATEGORY, TypeConstraint::DictKey).field(WRITER, text_constraint()).field(WORDS, text_constraint()).field(REFUSED, TypeConstraint::AnyUnsigned)
 }
 
 fn bind_schema() -> SectionSchema {
@@ -201,11 +239,13 @@ pub struct Payload {
     pub category: String,
     pub writer: String,
     pub words: String,
+    /// Read back: how many characters of the writer and words were outside the text table and stand as `MARKER` (0 when writing: `build` counts them).
+    pub refused: u64,
 }
 
 impl Payload {
     pub fn new(category: Category, writer: &str, words: &str) -> Payload {
-        Payload { category: category.name.to_string(), writer: writer.to_string(), words: words.to_string() }
+        Payload { category: category.name.to_string(), writer: writer.to_string(), words: words.to_string(), refused: 0 }
     }
 }
 
@@ -261,13 +301,13 @@ fn cipher(key: &SealKey) -> XChaCha20Poly1305 {
 pub fn build(place: &Place, class: Class, key: &SealKey, payload: &Payload) -> Result<Vec<u8>, Error> {
     let category = vsf::types::Ascii::new(payload.category.as_str()).map_err(|_| Error::Build("a category name that is not ASCII".to_string()))?;
     vsf::validate_name(category.as_str()).map_err(Error::Build)?;
-    let mut plain = payload_schema()
-        .build()
-        .set(CATEGORY, VsfType::d(category))
-        .and_then(|b| b.set(WRITER, VsfType::x(payload.writer.clone())))
-        .and_then(|b| b.set(WORDS, VsfType::x(payload.words.clone())))
-        .and_then(|b| b.encode())
-        .map_err(schema_err)?;
+    let (writer, r0) = lean(&payload.writer);
+    let (words, r1) = lean(&payload.words);
+    let mut b = payload_schema().build().set(CATEGORY, VsfType::d(category)).and_then(|b| b.set(WRITER, writer)).and_then(|b| b.set(WORDS, words)).map_err(schema_err)?;
+    if r0 + r1 > 0 {
+        b = b.set(REFUSED, uint(r0 + r1)).map_err(schema_err)?;
+    }
+    let mut plain = b.encode().map_err(schema_err)?;
     let ad = bind(place, class.number(), key.id())?;
     let nonce = synthetic_nonce(key, &ad, &plain);
     let mut c = cipher(key);
@@ -375,7 +415,7 @@ pub fn open(s: &Stored, key: &SealKey) -> Result<Payload, Error> {
         }
         let p = SectionBuilder::parse(payload_schema(), &buf).map_err(schema_err)?;
         let text = |name: &str| p.get_value::<String>(name).map_err(schema_err);
-        Ok(Payload { category: text(CATEGORY)?, writer: text(WRITER)?, words: text(WORDS)? })
+        Ok(Payload { category: text(CATEGORY)?, writer: text(WRITER)?, words: text(WORDS)?, refused: p.get_value::<u64>(REFUSED).unwrap_or(0) })
     })();
     // The plaintext wiped on every path, opened or not.
     wipe_vec(&mut buf);

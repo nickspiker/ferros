@@ -19,8 +19,13 @@ Every entry is one complete VSF document, built with `VsfBuilder` and vsf's sche
 RÅ< z y b l [e6: Eagle time] hp: provenance n (ledger o b n) >
 [ (seq: u) (boot: u) (prev: hp) (class: u) (key: hp) (nonce: mb) (tag: mp) (sealed: vX) ]
 
-sealed, once opened: [ (category: d) (writer: x) (words: x) ]   section `ledger_payload`
+sealed, once opened: [ (category: d) (writer: x|a) (words: x|a) (refused: u, when any) ]   section `ledger_payload`
 ```
+
+**The words, lean** (owner, 2026-11-17: "lean on text"): every text field takes vsf's `x-compact` table, 712 characters (printable ASCII but `^`, tab and newline, 49 of Latin-1's 96, some of Latin Extended-A, the Russian and Ukrainian alphabets, and the commonest of several other scripts), about 10 KB in the kernel (ferros_ledger `entry::lean`):
+- every character in the table: `x`, Huffman-coded;
+- else, if the text is all ASCII (the table lacks `^`, which the kernel's lines use for powers of two, and most control characters): `a`, byte for byte, nothing lost;
+- else each character outside the table is replaced by the marker `?` and counted: the entry's `refused` holds how many (absent when none), and the render says `(A#n characters outside the text table, shown as ?)`. A refused character is never dropped silently. A `?` that was typed and one that stands in are told apart only by the count.
 
 - `seq`: the entry's number in the ring's one chain, from 0. `boot`: the boot that wrote it. Both VSF's auto-sized `u` (EWE): `u3` + 1 byte for small numbers, growing as needed, no fixed width anywhere.
 - `prev`: the provenance hash of the entry before; the first ever names BLAKE3 of 32 zero bytes. The header's `hp` is this entry's hash, the one the next names.
@@ -54,6 +59,7 @@ The category decides the class (owner, 2026-11-17):
 ### The flash ring
 
 - Where: the ferros partition from 1 GiB + 64 MiB in (right after the old text log), two copies of 2^14 blocks of 4 KiB: copy A at 0, its mirror B at 2^14. About 160 thousand entries a copy at today's line lengths.
+  The owner approved this place on 2026-11-17 ("Ledger, yes, ring is OK"): a new on-disk location, between the old log (1 GiB) and the vault's mirrors (2 GiB), in space nothing else used.
 - A block holds complete entry documents back to back; what follows the last is unwritten space (zeros), never parsed. There is no header, no index and no bookkeeping structure on the flash at all: the only things in the region are entries.
 - Writing, write-verify-then-mirror: the entry goes into the head block in RAM, the whole block is written to A, read back and compared, then written to B. Only then does `line` return: an entry is on the flash, in both copies, before the call returns.
 - Wrapping: an entry that does not fit in the head block starts the next block, which drops the oldest block's entries. Nothing stops when the ring is full.
@@ -92,20 +98,20 @@ Measured on the host (x86-64, release, `cargo run --release -p ferros_ledger --f
 
 | | old line | entry |
 |---|---|---|
-| CPU | 0.15 us (format, copy) | 16 us (seal key, seal, document, hash); 14 us to verify and open |
-| bytes | 69 | 409 |
+| CPU | 0.13 us (format, copy) | 16 us (seal key, seal, document, hash); 12 us to verify and open |
+| bytes | 69 | 413 |
 | block I/O | 2 writes (tail block, header) | 2 writes and 1 read (A, read back, B) |
 
 The device measure is `ferros-bridge diag "log bench"`: the old line's work and its two block writes, the seal key from the ira, the seal and document, and a whole append (writing 2^3 `bench` entries).
 The I/O dominates on the device (the old line's two writes under the kernel lock took up to 0.66 ms, `diag lock`); the entry adds a block read and tens of microseconds of CPU.
-The kernel's text grew by 207 KB, most of it vsf's `x-full` text tables and NFC (every script of every language encodes in a sealed line).
+The kernel grew by 89 KB (text 84 KB, data 5 KB) over the build before the ledger: vsf's schema builders and parser where the kernel did not use them yet, the seal, the ring, and the 10 KB `x-compact` table. With `x-full` (every script, NFC) it was 207 KB of text.
 
 ### Where stage 0 stops
 
 - `writer_cap` and `writer_sig` are not populated: there are no writer keys or ledger caps yet. The writer is named (`writer`, sealed).
 - One chain over the whole ring, not one per category, and no `cat_seq`: the category is sealed, so per-category order is not visible on the flash. A reader groups by category after opening.
 - The kernel is the ledger's only writer and keeps it itself; the userspace ledger server, its caps and its category registry are not built.
-- The words are text (`x`). Stage 1 moves the busiest lines to typed fields (below).
+- The words are text (`x`, or `a` where the lean table lacks an ASCII character). Stage 1 moves the busiest lines to typed fields (below).
 
 ### Stage 1: the busiest lines, as typed fields
 

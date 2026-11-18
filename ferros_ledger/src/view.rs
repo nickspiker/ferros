@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::{VsfBuilder, VsfType};
 
-use crate::entry::{self, uint, Error, Hash, Payload, Stored};
+use crate::entry::{self, lean, uint, Error, Hash, Payload, Stored};
 use crate::ring::{Finding, Why, MIRROR, PRIMARY};
 
 pub const OPEN: &str = "ledger_open";
@@ -44,8 +44,9 @@ fn open_schema() -> SectionSchema {
     SectionSchema::new(OPEN)
         .field(ENTRY, TypeConstraint::Blake3Provenance)
         .field(entry::CATEGORY, TypeConstraint::DictKey)
-        .field(entry::WRITER, TypeConstraint::Utf8Text)
-        .field(entry::WORDS, TypeConstraint::Utf8Text)
+        .field(entry::WRITER, entry::text_constraint())
+        .field(entry::WORDS, entry::text_constraint())
+        .field(entry::REFUSED, TypeConstraint::AnyUnsigned)
 }
 
 fn finding_schema() -> SectionSchema {
@@ -55,7 +56,7 @@ fn finding_schema() -> SectionSchema {
         .field(KIND, TypeConstraint::AnyUnsigned)
         .field(COPY, TypeConstraint::AnyUnsigned)
         .field(SEQ, TypeConstraint::AnyUnsigned)
-        .field(WHY, TypeConstraint::Utf8Text)
+        .field(WHY, entry::text_constraint())
 }
 
 fn state_schema() -> SectionSchema {
@@ -78,7 +79,8 @@ pub fn legacy_schema() -> SectionSchema {
         .field(entry::PREV, TypeConstraint::Blake3Provenance)
         .field(entry::BOOT, TypeConstraint::AnyUnsigned)
         .field(SINCE, TypeConstraint::AnyUnsigned)
-        .field(entry::WORDS, TypeConstraint::Utf8Text)
+        .field(entry::WORDS, entry::text_constraint())
+        .field(entry::REFUSED, TypeConstraint::AnyUnsigned)
 }
 
 fn doc(time: Option<i64>, name: &str, section: Result<Vec<u8>, vsf::schema::ValidationError>) -> Result<Vec<u8>, Error> {
@@ -93,13 +95,17 @@ fn doc(time: Option<i64>, name: &str, section: Result<Vec<u8>, vsf::schema::Vali
 /// An entry opened: its hash names the entry it opens (the stored document just before it in the answer).
 pub fn opened(s: &Stored, p: &Payload) -> Result<Vec<u8>, Error> {
     let category = vsf::types::Ascii::new(p.category.as_str()).map_err(|_| Error::Build("a category name that is not ASCII".into()))?;
-    let section = open_schema()
+    // What was read back is in the table already (or ASCII), so `lean` replaces nothing here; the entry's own count goes on.
+    let mut b = open_schema()
         .build()
         .set(ENTRY, VsfType::hp(s.hash.to_vec()))
         .and_then(|b| b.set(entry::CATEGORY, VsfType::d(category)))
-        .and_then(|b| b.set(entry::WRITER, VsfType::x(p.writer.clone())))
-        .and_then(|b| b.set(entry::WORDS, VsfType::x(p.words.clone())))
-        .and_then(|b| b.encode());
+        .and_then(|b| b.set(entry::WRITER, lean(&p.writer).0))
+        .and_then(|b| b.set(entry::WORDS, lean(&p.words).0));
+    if p.refused > 0 {
+        b = b.and_then(|b| b.set(entry::REFUSED, uint(p.refused)));
+    }
+    let section = b.and_then(|b| b.encode());
     doc(s.place.time, OPEN, section)
 }
 
@@ -153,7 +159,7 @@ pub fn finding(f: &Finding, seq: Option<u64>, time: Option<i64>) -> Result<Vec<u
     if let Some(s) = seq {
         b = b.and_then(|b| b.set(SEQ, uint(s)));
     }
-    let section = b.and_then(|b| b.set(WHY, VsfType::x(f.why.to_string()))).and_then(|b| b.encode());
+    let section = b.and_then(|b| b.set(WHY, lean(&f.why.to_string()).0)).and_then(|b| b.encode());
     doc(time, FINDING, section)
 }
 
@@ -188,15 +194,18 @@ pub fn state(s: &State, time: Option<i64>) -> Result<Vec<u8>, Error> {
 
 /// One line of the old log as a document, chained to the one before (`prev`; the genesis hash for the first). `time` is when it was converted.
 pub fn legacy(seq: u64, prev: &Hash, boot: u64, since_boot_ms: u64, words: &str, time: Option<i64>) -> Result<Vec<u8>, Error> {
-    let section = legacy_schema()
+    let (words, refused) = lean(words);
+    let mut b = legacy_schema()
         .build()
         .set(entry::SEQ, uint(seq))
         .and_then(|b| b.set(entry::PREV, VsfType::hp(prev.to_vec())))
         .and_then(|b| b.set(entry::BOOT, uint(boot)))
         .and_then(|b| b.set(SINCE, uint(since_boot_ms)))
-        .and_then(|b| b.set(entry::WORDS, VsfType::x(words.to_string())))
-        .and_then(|b| b.encode());
-    doc(time, LEGACY, section)
+        .and_then(|b| b.set(entry::WORDS, words));
+    if refused > 0 {
+        b = b.and_then(|b| b.set(entry::REFUSED, uint(refused)));
+    }
+    doc(time, LEGACY, b.and_then(|b| b.encode()))
 }
 
 /// The complete documents in a run of them, in order.
@@ -231,6 +240,14 @@ fn section_of(d: &[u8]) -> Result<(String, Option<i64>, &[u8], Hash), Error> {
 
 fn text(s: &SectionBuilder, name: &str) -> String {
     s.get_value::<String>(name).unwrap_or_default()
+}
+
+/// Words with the count of characters the text table did not hold, when there were any.
+fn with_refused(words: String, refused: Option<u64>) -> String {
+    match refused {
+        Some(n) if n > 0 => format!("{words} (A#{n} characters outside the text table, shown as {})", entry::MARKER),
+        _ => words,
+    }
 }
 
 fn num(s: &SectionBuilder, name: &str) -> Option<u64> {
@@ -303,7 +320,7 @@ fn render_docs(docs: &[&[u8]], wall: &dyn Fn(i64) -> String) -> Vec<String> {
                         if n == OPEN {
                             if let Ok(o) = SectionBuilder::parse(open_schema(), b) {
                                 if o.get_value::<[u8; 32]>(ENTRY).ok() == Some(s.hash) {
-                                    p = Some((text(&o, entry::CATEGORY), text(&o, entry::WRITER), text(&o, entry::WORDS)));
+                                    p = Some((text(&o, entry::CATEGORY), text(&o, entry::WRITER), with_refused(text(&o, entry::WORDS), num(&o, entry::REFUSED))));
                                     k += 1;
                                 }
                             }
@@ -340,7 +357,7 @@ fn render_docs(docs: &[&[u8]], wall: &dyn Fn(i64) -> String) -> Vec<String> {
                 Err(e) => lines.push(format!("!! a state that does not read: {e}")),
             },
             LEGACY => match SectionBuilder::parse(legacy_schema(), body) {
-                Ok(l) => lines.push(format!("b{} (old log, A#{} ms after the counter started) {}", num(&l, entry::BOOT).unwrap_or(0), num(&l, SINCE).unwrap_or(0), text(&l, entry::WORDS))),
+                Ok(l) => lines.push(format!("b{} (old log, A#{} ms after the counter started) {}", num(&l, entry::BOOT).unwrap_or(0), num(&l, SINCE).unwrap_or(0), with_refused(text(&l, entry::WORDS), num(&l, entry::REFUSED)))),
                 Err(e) => lines.push(format!("!! an old-log line that does not read: {e}")),
             },
             other => lines.push(format!("!! a VSF document of A#{} bytes with a section `{other}`: not the ledger's", d.len())),

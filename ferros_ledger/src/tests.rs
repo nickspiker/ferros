@@ -475,3 +475,25 @@ fn legacy_lines_chain() {
     bad[k] ^= 1;
     assert!(view::check_legacy(&bad).is_err());
 }
+
+#[test]
+fn lean_text_replaces_and_counts() {
+    let words = |w: &str| {
+        let s = entry::parse(&entry::build(&entry::Place { seq: 0, boot: 1, prev: entry::genesis(), time: None }, Class::System, &sys(), &Payload::new(category::TEXT, "kernel", w)).unwrap()).unwrap();
+        let p = entry::open(&s, &sys()).unwrap();
+        (p.words, p.refused)
+    };
+    // In the compact table: as it was.
+    assert_eq!(words("camera: on, café, привет"), ("camera: on, café, привет".to_string(), 0));
+    // ASCII the table lacks (`^`): stored as ASCII, nothing lost.
+    assert_eq!(words("lock held long: holds of 2^-7 s"), ("lock held long: holds of 2^-7 s".to_string(), 0));
+    // Outside the table and not ASCII: each such character becomes the marker, and is counted.
+    assert_eq!(words("2^10 us → done µs"), ("2?10 us ? done ?s".to_string(), 3));
+    // The render says so.
+    let place = entry::Place { seq: 0, boot: 1, prev: entry::genesis(), time: None };
+    let doc = entry::build(&place, Class::System, &sys(), &Payload::new(category::TEXT, "kernel", "a → b")).unwrap();
+    let s = entry::parse(&doc).unwrap();
+    let mut run = doc.clone();
+    run.extend_from_slice(&view::opened(&s, &entry::open(&s, &sys()).unwrap()).unwrap());
+    assert_eq!(view::render(&run, &|_| String::new()), vec!["b1 (no clock yet) kernel: a ? b (A#1 characters outside the text table, shown as ?)".to_string()]);
+}

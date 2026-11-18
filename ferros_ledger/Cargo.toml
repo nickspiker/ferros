@@ -7,8 +7,9 @@ description = "The ledger (LEDGER.md): every entry a complete VSF document, seal
 
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
-# The entries are VSF documents built and read with vsf's schema builders; `x-full` so a person's words in any script encode without std (the owner's call for ferros text, as ferros_idea and fgtw take it).
-vsf = { path = "../../vsf", default-features = false, features = ["x-full"], optional = true }
+# The entries are VSF documents built and read with vsf's schema builders.
+# `x-compact` for the words (owner, 2026-11-17: "lean on text"): 712 characters (printable ASCII but `^`, some Latin, Cyrillic and others), 10 KB in the kernel; a character outside it is replaced by a marker and counted (entry.rs `lean`), never dropped silently.
+vsf = { path = "../../vsf", default-features = false, features = ["x-compact"], optional = true }
 # The seal: XChaCha20-Poly1305, the house AEAD.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 
