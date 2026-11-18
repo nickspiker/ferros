@@ -431,6 +431,119 @@ fn img_log_say(g: u64) {
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
 }
+/// The last 2^8 answers, for the console when a stream stops (camera-full-rate, 2026-11-17: which interrupt came last and how late): per answer the counter at its start (above bit 8) and the image status (low byte); and the index it wrote (low 16 bits, G#FFFF none) with the answer's ticks above.
+static TL: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
+static TL_IDX: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
+/// From a frame's DMA_DONE answer to its SHADOW_UPDATE answer (the engine running the released program, and the wake), counter ticks: answers counted, summed, the most, and a histogram in powers of two of microseconds.
+static LAG: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAG_HIST: [AtomicU64; 1 << 4] = [const { AtomicU64::new(0) }; 1 << 4];
+/// Between successive DMA_DONE answers (ticks): the least and the most, against the frame period (a late answer shows as one long gap and one short one).
+static GAP: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+/// The counter at the last DMA_DONE answer (0 none since the open).
+static DONE_T: AtomicU64 = AtomicU64::new(0);
+fn tl_reset() {
+    for e in TL.iter().chain(TL_IDX.iter()).chain(LAG.iter()).chain(LAG_HIST.iter()) {
+        e.store(0, Ordering::Relaxed);
+    }
+    GAP[0].store(u64::MAX, Ordering::Relaxed);
+    GAP[1].store(0, Ordering::Relaxed);
+    DONE_T.store(0, Ordering::Relaxed);
+}
+/// The last 2^5 answers said (us after the one before, status, index written), then the lag and gap measures.
+fn tl_say(g: u64) {
+    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+    let n = ANSWERED.load(Ordering::Relaxed) as usize;
+    // WHY saturating: an open with fewer than 2^5 answers starts at its first.
+    let k0 = n.saturating_sub(1 << 5);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the last answers (us after the one before, status, index written, !error words):");
+    let mut prev = TL[k0 & 0xFF].load(Ordering::Relaxed) >> 8;
+    for k in k0..n {
+        let (v, x) = (TL[k & 0xFF].load(Ordering::Relaxed), TL_IDX[k & 0xFF].load(Ordering::Relaxed));
+        let _ = write!(l, " {}:{:X}", us((v >> 8) - prev), v & 0xFF);
+        if x & 0xFFFF != 0xFFFF {
+            let _ = write!(l, ":{:X}", x & 0xFFFF);
+        }
+        let e = TL_ERR[k & 0xFF].load(Ordering::Relaxed);
+        if e != 0 {
+            let _ = write!(l, "!{e:X}");
+        }
+        prev = v >> 8;
+        if l.n > 224 {
+            let _ = write!(l, "\n");
+            console(g, &l.b[..l.n]);
+            l.n = 0;
+        }
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+    let c = LAG[0].load(Ordering::Relaxed);
+    let mut h = Line { b: [0; 256], n: 0 };
+    // WHY the max: an open with no frame pair has no lags, its mean read as 0 rather than divided by zero.
+    let _ = write!(h, "camera: DMA_DONE to SHADOW_UPDATE: A#{c} frames, A#{} us on average, A#{} us the most; by 2^k us:", us(LAG[1].load(Ordering::Relaxed)) / c.max(1), us(LAG[2].load(Ordering::Relaxed)));
+    for (k, e) in LAG_HIST.iter().enumerate() {
+        let v = e.load(Ordering::Relaxed);
+        if v != 0 {
+            let _ = write!(h, " {k}:{v}");
+        }
+    }
+    let _ = write!(h, "; DMA_DONE gaps A#{} to A#{} us\n", us(GAP[0].load(Ordering::Relaxed)), us(GAP[1].load(Ordering::Relaxed)));
+    console(g, &h.b[..h.n]);
+}
+/// The PDMA engine's first 2^5 words, said (a stream that stopped: where the engine is and what it reports).
+fn pdma_say(g: u64, what: &str) {
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: PDMA {what}:");
+    for k in 0..1usize << 5 {
+        let _ = write!(l, " {:X}", rd(g, ferros_cam::PDMA + 4 * k));
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
+/// Every acknowledged word's bits, ORed over the open (ferros_cam cams `ack`, in its order): the error words among them (loch0's image and PD paths' IMG_ERR at +G#438 and +G#2038: SHORT_VB bit 1, EBUF_OVERFLOW bit 3, LATE_CONFIG bit 4, WDMA bit 5) are read and cleared every answer, so this is the only record of what they said.
+static ACK_OR: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
+/// Per answer (the timeline's index), loch0's image path's error word (low 16 bits) and its PD path's (bits 16 to 31), as the acknowledgement read them.
+static TL_ERR: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
+/// The first answer whose error words were not 0: its frame count + 1 (0 none) and the words.
+static ERR_FIRST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The error words' addresses (zuma-isp-event-info.dtsi isp_fe_loch0_csis_core_img_err and pd_err) and the image and error words' overflow words (the same event latched again while still pending: an interrupt missed).
+const IMG_ERR: usize = 0x1C32_0438;
+const PD_ERR: usize = 0x1C32_2038;
+const IMG_OVF: usize = 0x1C32_0428;
+const IMG_ERR_OVF: usize = 0x1C32_043C;
+fn ack_reset() {
+    for e in ACK_OR.iter().chain(TL_ERR.iter()).chain(ERR_FIRST.iter()) {
+        e.store(0, Ordering::Relaxed);
+    }
+}
+/// What the front end said over the open and says now: the answers' timeline (`tl_say`), every acknowledged word that ever held bits, the first error, the overflow words, the engine's words.
+fn fe_say(g: u64, what: &str) {
+    tl_say(g);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: {what}: acknowledged words that held bits:");
+    for (j, &a) in cam().ack.iter().enumerate() {
+        let v = ACK_OR[j].load(Ordering::Relaxed);
+        if v != 0 {
+            let _ = write!(l, " {:X}={v:X}", a & 0xF_FFFF);
+        }
+        if l.n > 224 {
+            let _ = write!(l, "\n");
+            console(g, &l.b[..l.n]);
+            l.n = 0;
+        }
+    }
+    match ERR_FIRST[0].load(Ordering::Relaxed) {
+        0 => {
+            let _ = write!(l, "; no error word ever set");
+        }
+        f => {
+            let _ = write!(l, "; the first error at frame A#{} (G#{:X})", f - 1, ERR_FIRST[1].load(Ordering::Relaxed));
+        }
+    }
+    let _ = write!(l, "; overflow words: image G#{:X}, errors G#{:X}\n", rd(g, IMG_OVF), rd(g, IMG_ERR_OVF));
+    console(g, &l.b[..l.n]);
+    pdma_say(g, what);
+}
 /// Bits a sample on the link: 10, or 12 for the RAW12 attempt.
 static NOW_FORMAT: AtomicU64 = AtomicU64::new(10);
 /// The frame thread's time answering the front end (counter ticks, summed and the most in one answer) and frames whose buffer was not the one the ring named (a slit ring's: the frame's probe did not move, so it landed elsewhere, its descriptor released after the frame began).
@@ -619,6 +732,26 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     if k < IMG_LOG.len() {
         IMG_LOG[k].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
     }
+    TL[k & 0xFF].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
+    let mut wrote = 0xFFFFu64;
+    let last_done = DONE_T.load(Ordering::Relaxed);
+    // The answer before this one. WHY wrapping: the first answer (k 0) looks at slot 255, still 0 then.
+    let before = TL[k.wrapping_sub(1) & 0xFF].load(Ordering::Relaxed);
+    if img & ferros_cam::IMG_DMA_DONE != 0 {
+        if last_done != 0 {
+            GAP[0].fetch_min(t0 - last_done, Ordering::Relaxed);
+            GAP[1].fetch_max(t0 - last_done, Ordering::Relaxed);
+        }
+        DONE_T.store(t0, Ordering::Relaxed);
+    } else if img & ferros_cam::IMG_SHADOW != 0 && last_done != 0 && before & ferros_cam::IMG_DMA_DONE as u64 != 0 {
+        let d = t0 - last_done;
+        LAG[0].fetch_add(1, Ordering::Relaxed);
+        LAG[1].fetch_add(d, Ordering::Relaxed);
+        LAG[2].fetch_max(d, Ordering::Relaxed);
+        let us = d * 1_000_000 / ferros_sys::freq();
+        // WHY the min: the histogram has 2^4 bins, a lag of 2^15 us or more lands in the last.
+        LAG_HIST[((64 - us.leading_zeros()) as usize).min(15)].fetch_add(1, Ordering::Relaxed);
+    }
     if img & ferros_cam::IMG_DMA_DONE != 0 {
         // The buffer this frame landed in, and the next descriptor's buffer: the descriptor released by the index write below is the one at the index now.
         let n = FRAMES.load(Ordering::Relaxed) + 1;
@@ -631,6 +764,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         let count = RING_N.load(Ordering::Relaxed) as u32;
         *idx = (*idx + STEP) & (count - 1);
         wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, *idx);
+        wrote = *idx as u64;
         let t = ferros_sys::now() - t0;
         IDX[0].fetch_add(1, Ordering::Relaxed);
         IDX[1].fetch_add(t, Ordering::Relaxed);
@@ -639,9 +773,21 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
             WRAPS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    for &a in cam().ack.iter() {
+    let mut err = 0u64;
+    for (j, &a) in cam().ack.iter().enumerate() {
         let v = rd(g, a);
         wr(g, a, v);
+        ACK_OR[j].fetch_or(v as u64, Ordering::Relaxed);
+        if a == IMG_ERR {
+            err |= v as u64 & 0xFFFF;
+        } else if a == PD_ERR {
+            err |= (v as u64 & 0xFFFF) << 16;
+        }
+    }
+    TL_ERR[k & 0xFF].store(err, Ordering::Relaxed);
+    if err != 0 && ERR_FIRST[0].load(Ordering::Relaxed) == 0 {
+        ERR_FIRST[1].store(err, Ordering::Relaxed);
+        ERR_FIRST[0].store(FRAMES.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     IMG_SEEN.fetch_or(img as u64, Ordering::Relaxed);
     ANSWERED.fetch_add(1, Ordering::Relaxed);
@@ -663,6 +809,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     }
     let t = ferros_sys::now() - t0;
     BUSY.fetch_add(t, Ordering::Relaxed);
+    TL_IDX[k & 0xFF].store(wrote | t << 16, Ordering::Relaxed);
     BUSY_MOST.fetch_max(t, Ordering::Relaxed);
 }
 
@@ -718,6 +865,7 @@ extern "C" fn frame_thread(g: u64) -> ! {
             if cmn | img != 0 {
                 if QUIET_FOUND.fetch_add(1, Ordering::Relaxed) == 0 {
                     say!(g, "camera: the line quiet A#{} us with the front end waiting (aggregate G#{cmn:X}, image G#{img:X}, engine G#{:X} index G#{:X}, our index G#{idx:X}); answered\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
+                    fe_say(g, "the line quiet");
                 }
                 answer(g, &mut idx, &mut enabled);
             } else if ferros_sys::us_since(last) > QUIET_US + (period_ps() << 1) / 1_000_000 && QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -1384,6 +1532,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     FRAMES.store(0, Ordering::Release);
+    tl_reset();
+    ack_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
@@ -1411,6 +1561,7 @@ fn close(g: u64) {
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 5, 0, 0, 0);
     let c = cam();
     link_say(g);
+    fe_say(g, "at the close");
     say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
