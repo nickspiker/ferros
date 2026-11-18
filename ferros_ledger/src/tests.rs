@@ -497,3 +497,40 @@ fn lean_text_replaces_and_counts() {
     run.extend_from_slice(&view::opened(&s, &entry::open(&s, &sys()).unwrap()).unwrap());
     assert_eq!(view::render(&run, &|_| String::new()), vec!["b1 (no clock yet) kernel: a ? b (A#1 characters outside the text table, shown as ?)".to_string()]);
 }
+
+/// Old data in every block (what a region held before the ledger): not bytes the ring can parse.
+fn old_data(m: &mut Mem) {
+    for (k, b) in m.blocks.iter_mut().enumerate() {
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = (k as u32).wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 40_503) as u8 | 1;
+        }
+    }
+}
+
+#[test]
+fn a_region_of_old_data_is_never_read_whole() {
+    // 2026-11-18: the open fell back to reading every block when block 0 held no entry; over a region that held old data that was the whole region at every boot.
+    let half = 1u32 << 10;
+    let mut m = Mem::new(half);
+    old_data(&mut m);
+    let (mut r, f) = Ring::open(&mut m, half);
+    assert!(r.is_empty());
+    assert!(f.iter().any(|f| f.block == 0 && f.why == Why::NotARing), "{f:?}");
+    assert!(m.reads <= 2, "the open read A#{} blocks", m.reads);
+    // The ring starts afresh at block 0 and writes over the old data as it goes; the next open finds its head without reading the region whole.
+    let n = 200u64;
+    for i in 0..n {
+        put(&mut r, &mut m, i);
+    }
+    let head = r.head_block();
+    assert!(head > 1, "the entries span blocks");
+    m.reads = 0;
+    let (r2, f2) = Ring::open(&mut m, half);
+    assert_eq!(r2.head_block(), head);
+    assert_eq!(r2.next_seq(), n);
+    assert!(!f2.iter().any(|f| matches!(f.why, Why::Corrupt(_) | Why::NotARing)), "{f2:?}");
+    // A binary search (2 copies a probe of up to 2^4 blocks a step) and the chain's few blocks: far below the region's 2^11.
+    assert!(m.reads < 1 << 9, "the open read A#{} blocks of A#{}", m.reads, 2 * half);
+    let items = r2.newest(&mut m, n as usize);
+    assert_eq!(entries(&items).len(), n as usize);
+}

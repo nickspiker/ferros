@@ -9,7 +9,7 @@
 //!
 //! Finding the head at open: blocks are written in ring order, so the first entry's sequence number rises from block 0 up to the head block and drops after it (the older lap).
 //! A binary search on "this block's first entry is at least block 0's" finds the head block in about log2(half) block reads; the chain then decides: from the last entry of that block, forward for as long as the next block's first entry names it as `prev`.
-//! A block whose copies both hold something that is not an entry falls back to reading every block.
+//! A block whose copies both hold something that is not an entry is judged by the blocks just after it (`search`); the region is never read whole, and a block 0 that holds no entry means the region is not a ring yet: it starts afresh there.
 //!
 //! A torn write: a write cut off leaves at most the block being written damaged in one copy (A is written whole before B is touched).
 //! Entries are checked one by one against their provenance hash, A first, B where A fails, so every entry either copy holds whole is kept; what neither holds whole is named, never passed over in silence.
@@ -51,6 +51,8 @@ pub enum Why {
     Unreadable { copy: u8 },
     /// An entry that verifies but whose seal does not open under the key this device holds for its class (found by the reader that opens, not by the ring).
     Shut(Error),
+    /// Block 0 holds something in either copy but no entry: the region was not a ring (what it held before the ledger, or block 0 damaged in both copies); the ring starts afresh at block 0.
+    NotARing,
 }
 
 /// A finding, where it was.
@@ -248,20 +250,14 @@ impl Ring {
             // Blocks are written in order from block 0: an empty block 0 is a ring never written.
             return (empty, findings);
         }
-        let head = match b0.first_seq() {
-            Some(s0) => search(dev, half, s0),
-            None => None,
+        // Block 0 holds no entry in either copy: not a ring (a region that held something else before the ledger, or block 0 damaged in both copies).
+        // It is never read whole looking for one (2026-11-18: that was a read of 2^15 blocks at every boot); the ring starts afresh at block 0, written over as it goes, and what block 0 held is named.
+        let Some(s0) = b0.first_seq() else {
+            findings.extend(b0.findings);
+            findings.push(Finding { block: 0, at: 0, why: Why::NotARing });
+            return (empty, findings);
         };
-        let head = match head {
-            Some(h) => h,
-            None => match scan(dev, half) {
-                Some(h) => h,
-                None => {
-                    findings.extend(b0.findings);
-                    return (empty, findings);
-                }
-            },
-        };
+        let head = search(dev, half, s0);
         // The chain decides: forward from the candidate for as long as the next block's first entry follows the last.
         let mut k = head;
         let mut blk = load(dev, half, k, usize::MAX);
@@ -464,8 +460,10 @@ fn torn_after<D: Blocks>(dev: &mut D, half: u32, head: u32) -> Option<Finding> {
 }
 
 /// The head block by binary search: the last block whose first entry is at least block 0's (`s0`).
-/// None if a block on the way is damaged in both copies (the caller then reads every block).
-fn search<D: Blocks>(dev: &mut D, half: u32, s0: u64) -> Option<u32> {
+/// A block on the way that holds no entry in either copy (damage, or what the region held before the ledger) is judged by the next block that does hold one or is blank, at most `PROBE` blocks on: an entry of this lap means the lap goes on past the damage, a blank block or an older entry means it ends before it.
+/// Nothing found within `PROBE` blocks: old data past the head, not part of this lap (a fresh, zeroed region is the expected state; one that held something else is written over as the ring goes).
+/// The search never reads the whole region (2026-11-18: falling back to every block was 2^15 reads at each boot over a region that held old data).
+fn search<D: Blocks>(dev: &mut D, half: u32, s0: u64) -> u32 {
     // Invariant: block lo is in the current lap; every block at or past hi is not.
     let (mut lo, mut hi) = (0u32, half);
     while hi - lo > 1 {
@@ -474,7 +472,7 @@ fn search<D: Blocks>(dev: &mut D, half: u32, s0: u64) -> Option<u32> {
         let current = match b.first_seq() {
             Some(s) => s >= s0,
             None if b.empty => false,
-            None => return None,
+            None => judged_past(dev, half, mid, hi, s0),
         };
         if current {
             lo = mid;
@@ -482,18 +480,24 @@ fn search<D: Blocks>(dev: &mut D, half: u32, s0: u64) -> Option<u32> {
             hi = mid;
         }
     }
-    Some(lo)
+    lo
 }
 
-/// The head block by reading every block: the one whose first entry is newest.
-fn scan<D: Blocks>(dev: &mut D, half: u32) -> Option<u32> {
-    let mut best: Option<(u64, u32)> = None;
-    for k in 0..half {
-        if let Some(s) = load(dev, half, k, 1).first_seq() {
-            if best.is_none_or(|(b, _)| s > b) {
-                best = Some((s, k));
-            }
+/// How far `search` looks past a block that holds no entry: 2^4 blocks.
+const PROBE: u32 = 1 << 4;
+
+/// Whether the lap goes on past block `k`, which holds no entry: the first block after it (below `hi`, at most `PROBE` on) that holds an entry of this lap says yes; a blank one, an older entry, or none within reach says no.
+fn judged_past<D: Blocks>(dev: &mut D, half: u32, k: u32, hi: u32, s0: u64) -> bool {
+    // WHY the smaller: the probe stops at the search's upper bound or PROBE blocks on, whichever comes first; PROOF of no overflow: k < hi <= half <= 2^31 and PROBE is 2^4.
+    let end = if k + 1 + PROBE < hi { k + 1 + PROBE } else { hi };
+    for n in k + 1..end {
+        let b = load(dev, half, n, 1);
+        if let Some(s) = b.first_seq() {
+            return s >= s0;
+        }
+        if b.empty {
+            return false;
         }
     }
-    best.map(|b| b.1)
+    false
 }

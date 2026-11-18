@@ -1419,33 +1419,35 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             crate::process::push_console(alloc::format!("rescue: the vault's {name} replaced by the kernel's known-good capsule ({})\n", if r.is_ok() { "ok" } else { "failed" }).as_bytes());
         }
     }
-    // akita (board.rs) without `init` in its vault (its first boots, or no vault): the USB process alone, from the native capsule this kernel carries, so the bridge reaches the device and can store the shell. With `init` stored, akita takes husky's path below (since 2026-11-08: its vault and ira since 2026-11-06; init leaves out the drivers whose hardware is not husky's there, payloads/init `unfit`).
-    let akita_bare = crate::board::akita() && crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())).is_none();
-    if akita_bare {
+    // Any board without `init` in its vault (a fresh start, `vault fresh`, or akita's first boots): the USB process alone, from the native capsule this kernel carries (target/akita-usb.capsule.vsf, the usb payload whatever the board), so the bridge reaches the device and can store the shell.
+    // With `init` stored, the path below.
+    // husky too since 2026-11-18 (the owner's fresh start of both devices): before, a husky vault without init came up with no USB at all.
+    let bare = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())).is_none();
+    if bare {
         #[cfg(ferros_usb_capsule)]
         // Without a vault there is no ira and so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
         match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g)) {
             Some(Ok(o)) => {
                 mark_ran(&o);
-                crate::process::push_console(b"home: akita, the usb process from the kernel's capsule\n");
+                crate::process::push_console(b"home: no init in the vault: the usb process from the kernel's capsule\n");
                 crate::checklist::dot(0);
                 crate::board::probe(7);
                 crate::board::probe_starve(9);
                 crate::process::console_flashlog(&o.console);
             }
             Some(Err(e)) => {
-                crate::process::push_console(b"home: akita, usb refused: ");
+                crate::process::push_console(b"home: no init in the vault, and usb refused: ");
                 crate::board::probe(71);
                 crate::process::push_console(e.as_bytes());
                 crate::process::push_console(b"\n");
             }
             None => {
-                crate::process::push_console(b"home: akita, no usb grants\n");
+                crate::process::push_console(b"home: no init in the vault, and no usb grants\n");
                 crate::board::probe(72);
             }
         }
         #[cfg(not(ferros_usb_capsule))]
-        crate::process::push_console(b"home: akita, but this kernel carries no usb capsule (target/akita-usb.capsule.vsf)\n");
+        crate::process::push_console(b"home: no init in the vault, and this kernel carries no usb capsule (target/akita-usb.capsule.vsf)\n");
         return true;
     }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
@@ -4385,6 +4387,33 @@ pub fn run(mut b: Boot) -> ! {
                     resp.extend_from_slice(out.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
+                }
+                if cmd.params == b"vault fresh yes" {
+                    // `diag "vault fresh yes"` (development builds; the owner's word, 2026-11-18: "wipe both devices' vaults and start fresh", "You can nuke both"): every vault and the ledger start over.
+                    // Zeroed, under the kernel lock so nothing else reaches the flash in between: the ledger's ring (both copies), the kernel vault's two mirror regions (manifestus genesises a blank pair at the next open), and the first MIRROR blocks of each half of the vault process's window (its own fresh start, payloads/vault FRESH).
+                    // Then a plain reset at once, inside the lock: nothing may write to a zeroed region before the next boot opens it afresh (a commit there would leave a region manifestus neither opens nor genesises).
+                    // No reply: the host sees the device go and come back; the next boot's flash log says "kvault: genesis value absent, writing it".
+                    // What it destroys is everything stored on this device, the person's data and every capsule; the next boot has no init, so it brings up only the USB process the kernel carries (start_home), for the bridge to store the shell again.
+                    #[cfg(not(ferros_production))]
+                    {
+                        crate::process::push_console(b"vault fresh: zeroing the ledger, the kernel vault and the vault process's region, then a reset\n");
+                        crate::flashlog::line("vault fresh: the owner's fresh start; zeroing the ledger, the kernel vault and the vault process's region, then a reset");
+                        crate::process::with_lock(|| {
+                            let (l, ln) = crate::flashlog::ring_region();
+                            let (k, kn) = crate::kvault::regions();
+                            let w = crate::process::WINDOWS[0].offset;
+                            // The vault process's two halves (payloads/vault: HALF 2^21 blocks apart, MIRROR 2^17 blocks zeroed by its own FRESH).
+                            // A refused run stops the zeroing where it is; the reset follows either way, and the next boot says what it found (a vault that neither opens nor genesises names itself in the flash log).
+                            let _ = crate::process::zero_blocks(l, ln) && crate::process::zero_blocks(k, kn) && crate::process::zero_blocks(w, 1 << 17) && crate::process::zero_blocks(w + (1 << 21), 1 << 17);
+                            platform::reboot()
+                        });
+                    }
+                    #[cfg(ferros_production)]
+                    {
+                        resp.extend_from_slice(b"vault fresh: not on a production build\n");
+                        queue_pt_response(&mut pt_out_data, &resp);
+                        continue;
+                    }
                 }
                 if cmd.params == b"kv selftest" {
                     // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).

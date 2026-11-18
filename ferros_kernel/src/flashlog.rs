@@ -70,8 +70,19 @@ struct Ufs {
     base: u32,
 }
 
+/// Block operations on the ring since the watchdogs were last fed (`feed`).
+static OPS: AtomicU64 = AtomicU64::new(0);
+
+/// Feed the watchdogs every 2^6 of the ring's block operations: opening the ring reads blocks with nothing else feeding them, so it feeds them itself, far inside their one-second window (platform.rs WDT_COUNT). 2026-11-18: an unfed open over a region holding old data is one suspect in the converter build's boot that never came up on the Pro.
+fn feed() {
+    if OPS.fetch_add(1, Ordering::Relaxed) & ((1 << 6) - 1) == 0 {
+        crate::platform::pet_watchdogs();
+    }
+}
+
 impl Blocks for Ufs {
     fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> bool {
+        feed();
         let u = UfsController::new(UFS_BASE);
         if u.read_block_lun(self.lun, self.base + block) != 0 || u.last_response_status() != 0 {
             return false;
@@ -80,6 +91,7 @@ impl Blocks for Ufs {
         true
     }
     fn write(&mut self, block: u32, data: &[u8; BLOCK]) -> bool {
+        feed();
         let u = UfsController::new(UFS_BASE);
         u.data_buffer_mut().copy_from_slice(data);
         u.write_block_lun(self.lun, self.base + block) == 0 && u.last_response_status() == 0
@@ -409,4 +421,9 @@ fn bench_locked() -> String {
         len,
         if io_ok { "" } else { "; a write or read FAILED" }
     )
+}
+
+/// The ring's region in the ferros partition (first block, blocks: both copies), for the owner's fresh start (service.rs `vault fresh`), which zeroes it: a zeroed region is a ring never written.
+pub fn ring_region() -> (u64, u64) {
+    (OFFSET as u64, 2 * HALF as u64)
 }
