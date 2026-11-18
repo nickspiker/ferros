@@ -138,7 +138,8 @@ pub fn power(on: bool) -> bool {
         // akita bring-up: a square on the glass after each step (checklist::dot), the last one lit is where it stopped.
         crate::checklist::dot(1);
         crate::board::probe(81);
-        reset();
+        // The link's state is the kernel lock's (the service loop takes the inbox under it): the reset under it, whether this switch runs with the lock let go (SYS_POWER, `SWITCH_UNLOCKED`) or held.
+        crate::process::with_lock_held_or(reset);
         crate::checklist::dot(2);
         crate::board::probe(82);
         crate::service::tcpc_usb_switch(true);

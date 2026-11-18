@@ -267,7 +267,7 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
         }
         ferros_pt::Op::Read if params.is_empty() => {
             let mut out = alloc::vec![0u8];
-            match crate::process::with_lock(|| store.as_mut().map(|s| s.keys())) {
+            match vault(|| store.as_mut().map(|s| s.keys())) {
                 Some(Ok(keys)) => {
                     for k in keys {
                         out.extend_from_slice(k.as_bytes());
@@ -369,7 +369,7 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
     };
     match job {
         VaultJob::Get { full, got } => match value {
-            NOTHING => return Some(crate::process::with_lock(|| store_command(store.as_mut(), ferros_pt::Op::Read, full.as_bytes()))),
+            NOTHING => return Some(crate::process::with_lock(|| vault(|| store_command(store.as_mut(), ferros_pt::Op::Read, full.as_bytes())))),
             ERR => return Some(alloc::vec![2]),
             // The reply is built whole in the kernel's heap, and copied once more as it goes out: held to the limit the kernel's vault keeps for the same reason (STORE_VALUE_MAX).
             whole if whole as usize > STORE_VALUE_MAX => return Some(alloc::vec![5]),
@@ -404,7 +404,7 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
         VaultJob::Remove { full } => {
             return Some(match value {
                 0 => alloc::vec![0],
-                NOTHING => crate::process::with_lock(|| store_command(store.as_mut(), ferros_pt::Op::Exec, full.as_bytes())),
+                NOTHING => crate::process::with_lock(|| vault(|| store_command(store.as_mut(), ferros_pt::Op::Exec, full.as_bytes()))),
                 _ => alloc::vec![2],
             });
         }
@@ -716,7 +716,17 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
 
 /// Shim entry with the USB service: adopt UFS, arm the safety nets, probe the vault, then serve PT over USB until told to leave.
 /// The service loop's vault, lent to `SYS_SPAWN` (process.rs `CAPSULES`) for reading capsules by key: `run` never returns, so the pointer stays good for the rest of the boot.
+///
+/// Who may touch it (2026-11-18, process.rs "the storage locks"): every read or write of the vault holds `VAULT`, from the service loop alone (`vault`) or from a syscall under the kernel lock; kvault.rs's blocks panic otherwise.
+/// The unlocked identity's state in memory (kvault's `id` and the bound mark's cache) is written only holding both the kernel lock and `VAULT` (an unlock, a lock, a bind, a release, the person key, the mark's first read), so it may be read holding either: the domain keys, a kist's alias and init's identity poll read it under the kernel lock alone, and never wait for a long vault read; the service loop reads whether a person is present from kvault's `PERSON`, kept beside it.
 static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
+
+/// `f` holding the vault's lock (process.rs `VAULT`) and not the kernel lock: the service loop's way into its vault since 2026-11-18, so the other cores' syscalls go on while it reads a capsule or the AoC's firmware (24 to 148 ms under the kernel lock before, `diag lock`).
+/// Never for a closure that touches the kernel's tables (the process table, an arc, the preferences): that takes `with_lock` first, then this inside it.
+#[track_caller]
+fn vault<R>(f: impl FnOnce() -> R) -> R {
+    crate::process::VAULT.with(f)
+}
 
 /// Android from within ferros, behind an attest (owner, 2026-11-01 and 2026-11-04: "launch Android from within ferros so it's gated behind an attest", from the deck). The device's opt-in, the vault's device-class `android.allowed` (one byte, 1), as the service loop read it at start: 2 allowed, 1 not, 0 not read yet (SYS_FACTS 82, so the map shows the Android circle only on a device that allows it). Written by the opt-in (the disclaimer, next) and for now from the host.
 pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -738,23 +748,36 @@ pub fn android_request(on: bool) -> bool {
     ok
 }
 
-/// `SYS_SET_PREF`'s persistence: a preference into the device vault under its key (SETTINGS.md).
-fn store_pref(index: usize, value: u8) -> bool {
-    if !crate::settings::FIELDS.iter().any(|&(_, i)| i == index) {
-        return false;
-    }
-    let Some(doc) = crate::settings::document(Some((index, value))) else { return false };
-    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, &doc).is_ok()).unwrap_or(false) }
+/// The settings document (SETTINGS.md: the preferences, the radio knobs, the zone, the language) into the device vault, holding the vault's lock and not the kernel lock: `doc` and its generation `at` from process.rs `settings_snapshot`, taken under the kernel lock where the change was made.
+/// A document older than one already kept is not written (answered kept: the newer one carries its change), so writes made out of order on different cores never put an older state over a newer one.
+/// Registered as process.rs `SETTINGS_WRITE` (the trap's end of SYS_SET_PREF, SYS_CONTROL, SYS_ZONE and SYS_LANG), and the service loop's own writes go thru it (`keep_settings_now`).
+fn settings_write(doc: &[u8], at: u64) -> bool {
+    vault(|| {
+        let kept = unsafe { &mut *(&raw mut SETTINGS_KEPT) };
+        if at <= *kept {
+            return true;
+        }
+        let ok = unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, doc).is_ok()).unwrap_or(false) };
+        if ok {
+            *kept = at;
+        }
+        ok
+    })
 }
+/// The newest settings document's generation on the flash (`settings_write`). Under the vault's lock.
+static mut SETTINGS_KEPT: u64 = 0;
 
-/// The settings document as it stands (the radio knobs and the zone with it: SYS_CONTROL), into the vault.
-fn store_document() -> bool {
-    let Some(doc) = crate::settings::document(None) else { return false };
-    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, &doc).is_ok()).unwrap_or(false) }
+/// The service loop's write of the settings document as it stands: the snapshot under the kernel lock, the write under the vault's alone. Whether it was kept.
+pub(crate) fn keep_settings_now() -> bool {
+    crate::process::with_lock(crate::process::settings_snapshot).is_some_and(|(doc, at)| settings_write(&doc, at))
 }
 
 /// `SYS_STORE`'s vault: the kernel has already checked the capability and prefixed the key with its scope.
+/// Under the kernel lock (the syscall's) and the vault's, as each of the syscalls' ways into the vault below (`SPAWN_STORE`).
 fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    vault(|| store_scoped_held(key, value))
+}
+fn store_scoped_held(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match value {
         Some(v) => {
@@ -783,11 +806,13 @@ const DEVICE_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 device vault domain";
 static mut DEVICE_DOMAIN: Option<[u8; 32]> = None;
 
 /// The person's domain keys under `prefix` (process.rs `domain_keys`), derived from their held domain key in registers (kvault `identity_domain_keys`); None while nobody is present.
+/// Under the kernel lock alone (a syscall's): the identity's keys in memory, which are written only holding both locks (`SPAWN_STORE`), so this never waits for a vault read on another core.
 pub(crate) fn identity_domain_keys(prefix: &[u8], addr_context: &str, seal_context: &str) -> Option<[u8; 64]> {
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain_keys(prefix, addr_context, seal_context)
 }
 
 /// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the device switches OS, and a warm reset keeps DRAM).
+/// Without the locks: a reset path (platform.rs `before_reset`), on a core that may hold either, which must never wait; nothing runs after it but the reset.
 fn lock_before_reset() {
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
         st.lock();
@@ -795,7 +820,19 @@ fn lock_before_reset() {
 }
 
 /// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound), 1 unlocks from a seed (the number of entries the identity has on this device, or NOTHING: the device is bound to another identity), 2 locks, 3 binds the device to the unlocked identity, 4 releases it (every identity entry deleted).
+/// Op 0 (init asks 64 times a second while it waits for a person) reads the identity's state in memory under the kernel lock alone (`SPAWN_STORE`), the vault read only for the bound mark's first read; every other op holds the vault's lock too, as it writes the vault or that state.
 fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
+    if op == 0 {
+        let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+        let bound = match st.bound_known() {
+            Some(b) => b,
+            None => vault(|| st.bound().unwrap_or(false)),
+        };
+        return Ok(st.unlocked() as u64 | (bound as u64) << 1 | (st.person_held() as u64) << 2);
+    }
+    vault(|| store_unlock_held(op, seed))
+}
+fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match (op, seed) {
         (1, Some(s)) => match st.unlock(s, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1) {
@@ -845,7 +882,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             };
             crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted from the kernel's vault, the device-only secret renewed; {} of the person's domains to drop in the vault process", drops.len()));
             // The person's zone goes with them (zone.rs): this device's own choice rules again.
-            let _ = crate::zone::set_identity(None, || crate::settings::document(None).is_some_and(|d| st.set(crate::settings::KEY, &d).is_ok()));
+            let _ = crate::zone::set_identity(None, || crate::process::settings_snapshot().is_some_and(|(d, g)| settings_write(&d, g)));
             unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
@@ -861,6 +898,9 @@ pub(crate) fn alias(developer: &[u8; 32], option: &[u8; 32]) -> Option<[u8; 32]>
 
 /// Attest with a tag (AUTH.md; SYS_UNLOCK ops 6-9, process.rs `tag_syscall`). The flash log names a tag only by the start of its id (a keyed hash of its UID, kvault `TAG_ID_CONTEXT`), never by its UID.
 fn store_tag(op: crate::process::TagOp) -> Result<u64, ()> {
+    vault(|| store_tag_held(op))
+}
+fn store_tag_held(op: crate::process::TagOp) -> Result<u64, ()> {
     use crate::process::TagOp;
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match op {
@@ -908,8 +948,7 @@ fn store_tag(op: crate::process::TagOp) -> Result<u64, ()> {
 
 /// The identity's own entries on this device as one VSF document, for the identity service to seal into its fleet before a departure (SYS_UNLOCK op 5; the Fleet page's "save first"): section `identity_export`, one `entry` field per vault name, its values the name (`d`) and the stored bytes (`v'r'`). None while locked.
 fn store_export() -> Option<alloc::vec::Vec<u8>> {
-    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?;
-    let entries = st.identity_export().ok()?;
+    let entries = vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_export().ok())?;
     let mut section = vsf::VsfSection::new("identity_export");
     for (name, value) in &entries {
         // A name is a `d`, ASCII: one that is not cannot be carried, and the export fails whole rather than leaving it behind unsaid.
@@ -923,17 +962,21 @@ fn store_export() -> Option<alloc::vec::Vec<u8>> {
     vsf::VsfBuilder::new().creation_time_oscillations(crate::settings::eagle_now()).provenance_only().add_section_direct(section).build().ok()
 }
 fn store_remove(key: &str) -> Result<bool, ()> {
-    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
-    crate::flashlog::line(&alloc::format!("store remove {key:?} (process)"));
-    st.remove_key(key).map_err(|_| ())
+    vault(|| {
+        let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+        crate::flashlog::line(&alloc::format!("store remove {key:?} (process)"));
+        st.remove_key(key).map_err(|_| ())
+    })
 }
 
 fn store_keys() -> Result<alloc::vec::Vec<alloc::string::String>, ()> {
-    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
-    st.keys().map_err(|_| ())
+    vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?.keys().map_err(|_| ()))
 }
 
 fn store_addr(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    vault(|| store_addr_held(prefix, addr, op))
+}
+fn store_addr_held(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
     use crate::process::AddrOp;
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match op {
@@ -944,9 +987,10 @@ fn store_addr(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) -> Resu
     }
 }
 
+/// Holding the vault's lock; since 2026-11-18 SYS_SPAWN calls it with the kernel lock let go (process.rs `spawn_queued`).
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
-    match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k) } {
+    match vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut() }.map(|s| s.get_by_key(k)))? {
         Ok(v) => v,
         // A read that failed is not an absent key: say which (2026-10-24, touch "not in the vault" at boot, found by a restart minutes later).
         Err(e) => {
@@ -1091,8 +1135,8 @@ pub fn wallgen_after_unlock(seed: [u8; 32]) {
 
 /// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device, on the GPU, and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 a 32 MiB block of the layer arena, its own (GPU-KISTS.md plan step 0: the picture drawn only by the GPU service; plan step 1: the block wallgen's alone). Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
 fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
-    // Under the kernel lock, as every UFS command must be: the vault process drives the same controller from the workers (SYS_BLOCK), and a read outside the lock collided with its moves at an attest and wedged the link (2026-11-07).
-    let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten())) else {
+    // Under the vault's lock, each block under the UFS lock, as every UFS command must be: the vault process drives the same controller from the workers (SYS_BLOCK), and a read outside the lock collided with its moves at an attest and wedged the link (2026-11-07).
+    let Some(capsule) = vault(|| store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten())) else {
         crate::process::push_console(b"home: no wallgen capsule in the vault; no wallpaper is made (the display draws none itself)\n");
         return;
     };
@@ -1224,7 +1268,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
 fn move_seals(store: &mut Option<ShimStore>) {
     for (old, new) in crate::process::seal_moves() {
         // Some(true) moved, Some(false) nothing left to move, None a write or its read back failed.
-        let moved = crate::process::with_lock(|| {
+        let moved = vault(|| {
             let s = store.as_mut()?;
             let list = seals_read(s).ok()?;
             let Some(both) = ferros_kist::seal::with_new(&list, &old, &new) else { return Some(false) };
@@ -1257,9 +1301,9 @@ fn seals_write(s: &mut ShimStore, list: &[u8]) -> Result<(), &'static str> {
     s.set(crate::kvault::SEALED, &doc).map(|_| ()).map_err(|_| "the vault did not keep the seals list")
 }
 
-/// The seals for a launch, read under the kernel lock: none when there is no vault, or a list that does not read (said on the console, the flash log saying why since the open: kvault's move to VSF), so a masked image is then refused as not installed and nothing is written over the list.
+/// The seals for a launch, read under the vault's lock: none when there is no vault, or a list that does not read (said on the console, the flash log saying why since the open: kvault's move to VSF), so a masked image is then refused as not installed and nothing is written over the list.
 fn seals_for_launch(store: &mut Option<ShimStore>) -> alloc::vec::Vec<u8> {
-    match crate::process::with_lock(|| store.as_mut().map(seals_read)) {
+    match vault(|| store.as_mut().map(seals_read)) {
         Some(Ok(list)) => list,
         Some(Err(why)) => {
             crate::process::push_console(alloc::format!("seal: {why}; no masked image runs until it reads (the flash log says why)\n").as_bytes());
@@ -1281,29 +1325,36 @@ fn seal_add(s: &mut ShimStore, seal: &[u8; 32]) -> Result<(), &'static str> {
 
 fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
     let key = core::str::from_utf8(name).ok()?;
-    // One hold of the lock from the length to the last piece, so the value read is the one the arc was sized for.
-    let staged = crate::process::with_lock(|| -> Option<Result<(crate::process::Arc, usize), &'static str>> {
-        let s = store.as_mut()?;
-        let total = s.pieces_len(key).ok().flatten()?;
-        let need = crate::process::CODE + total;
-        let Some(arc) = crate::process::arc_alloc_room(need, need, false) else {
-            return Some(Err("the arc pool has no room to stage the capsule"));
-        };
-        let at = arc.base + crate::process::CODE;
-        // SAFETY: the sink writes [at + offset, at + offset + len) for pieces whose lengths sum to `total` (ferros_pieces::read holds each piece to its length from the manifest read under this same lock hold), inside the arc just taken, which is the kernel's alone until it is freed.
-        match s.read_pieces(key, |off, bytes| unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (at + off) as *mut u8, bytes.len()) }) {
-            Ok(Some(_)) => Some(Ok((arc, total))),
-            r => {
-                crate::flashlog::line(&alloc::format!("restart {key}: reading its pieces failed: {r:?}"));
-                crate::process::arc_free(arc);
-                Some(Err("the capsule's pieces did not read"))
-            }
-        }
-    })?;
-    let (arc, total) = match staged {
-        Ok(x) => x,
-        Err(e) => return Some(Err(e)),
+    // Three holds, none of the kernel lock across a read (2026-11-18; one hold of the kernel lock from the length to the last piece before, 24 ms for pcie1's 633 KB and 148 ms at the most, `diag lock`): the length under the vault's lock, the staging arc under the kernel lock, the pieces into it under the vault's lock again.
+    let total = vault(|| store.as_mut()?.pieces_len(key).ok().flatten())?;
+    let need = crate::process::CODE + total;
+    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(need, need, false)) else {
+        return Some(Err("the arc pool has no room to stage the capsule"));
     };
+    let at = arc.base + crate::process::CODE;
+    // WHY the bound: the length was read in a hold of the vault's lock before this one, and a store put of the same name between the two may have made the value longer than the arc was sized for.
+    // PROOF it is needed: without it a longer value's pieces would be copied past [CODE, CODE + total) of the staging arc, over frames another arc holds.
+    let mut over = false;
+    let r = vault(|| {
+        store.as_mut().map(|s| {
+            s.read_pieces(key, |off, bytes| {
+                if off + bytes.len() > total {
+                    over = true;
+                    return;
+                }
+                // SAFETY: [at + off, at + off + len) lies inside [CODE, CODE + total) of the staging arc (the bound above), which is the kernel's alone until it is freed.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (at + off) as *mut u8, bytes.len()) }
+            })
+        })
+    });
+    match r {
+        Some(Ok(Some(n))) if n == total && !over => {}
+        r => {
+            crate::flashlog::line(&alloc::format!("restart {key}: reading its pieces failed: {r:?}{}", if over { " (the value grew past the length read first)" } else { "" }));
+            crate::process::with_lock(|| crate::process::arc_free(arc));
+            return Some(Err("the capsule's pieces did not read"));
+        }
+    }
     crate::flashlog::line(&alloc::format!("restart {key}: capsule {total} bytes from its pieces; spawning"));
     // SAFETY: the staging arc's [CODE, CODE + total) holds the capsule just read; nothing else holds the arc until it is freed below.
     let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + crate::process::CODE) as *mut u8, total) };
@@ -1328,7 +1379,7 @@ fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
 
 /// `restart` with an input for each process started (its spawn input, as `bridge spawn` gives one): the radio switches start the modem and WiFi drivers once with their power-down input (`off`, G#F0) to take their chips down.
 fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: &mut alloc::vec::Vec<u8>) {
-    // Vault reads under the kernel lock (the vault's one owner at a time); the spawns below take it themselves.
+    // Vault reads under the vault's lock (`vault`: the vault's one owner at a time, the kernel lock free meanwhile); the spawns below take the kernel lock themselves.
     let sealed = seals_for_launch(store);
     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
         let Some(grants) = shell_grants(name) else {
@@ -1338,9 +1389,9 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
             continue;
         };
         // What reads the person's space starts only when init's `wait_person` would start it (owner, 2026-11-04: "Attest should ONLY load attest", and "if it's not attached to an identity, not usable"): fgtw once a person has attested, the map once the device is also bound to that identity. A restart does not get around either. A vault that cannot say whether it is bound counts as not bound.
-        let person = store.as_mut().is_some_and(|s| s.unlocked());
-        // Under the kernel lock: `bound` reads the vault (a UFS command), and processes run on the other cores.
-        let attached = person && crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.bound().unwrap_or(false)));
+        let person = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
+        // Under both locks: `bound` reads the vault (a UFS command) the first time and keeps the mark, state the kernel lock's readers read without the vault's (`SPAWN_STORE`).
+        let attached = person && crate::process::with_lock(|| vault(|| store.as_mut().is_some_and(|s| s.bound().unwrap_or(false))));
         let refused: Option<&[u8]> = match name {
             b"fgtw" if !person => Some(b"not started, nobody has attested: "),
             b"gps" if !person => Some(b"not started, GPS is locked until a person attests: "),
@@ -1381,7 +1432,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
             continue;
         }
         // The vault restarts from the stored capsule (the development loop pushes one), else from the one the kernel image carries.
-        let stored = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
+        let stored = vault(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
         let Some(capsule) = stored.or_else(|| (name == b"vault" && !VAULT_CARRIED.is_empty()).then(|| VAULT_CARRIED.to_vec())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
@@ -1415,14 +1466,14 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     #[cfg(ferros_rescue)]
     if let Some(s) = store.as_mut() {
         for (name, bytes) in [("usb", include_bytes!("../../target/rescue-usb.capsule.vsf") as &[u8]), ("pcie1", include_bytes!("../../target/rescue-pcie1.capsule.vsf") as &[u8]), ("bt", include_bytes!("../../target/rescue-bt.capsule.vsf") as &[u8])] {
-            let r = s.set(name, bytes);
+            let r = vault(|| s.set(name, bytes));
             crate::process::push_console(alloc::format!("rescue: the vault's {name} replaced by the kernel's known-good capsule ({})\n", if r.is_ok() { "ok" } else { "failed" }).as_bytes());
         }
     }
     // Any board without `init` in its vault (a fresh start, `vault fresh`, or akita's first boots): the USB process alone, from the native capsule this kernel carries (target/akita-usb.capsule.vsf, the usb payload whatever the board), so the bridge reaches the device and can store the shell.
     // With `init` stored, the path below.
     // husky too since 2026-11-18 (the owner's fresh start of both devices): before, a husky vault without init came up with no USB at all.
-    let bare = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())).is_none();
+    let bare = vault(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())).is_none();
     if bare {
         #[cfg(ferros_usb_capsule)]
         // Without a vault there is no ira and so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
@@ -1463,12 +1514,12 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         return true;
     }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
-    // Under the kernel lock, as every UFS command (nothing else runs yet, but the rule has no exceptions).
-    if crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten())).is_some() {
+    // Under the vault's lock, as every vault read once it is shared (nothing else runs yet, but the rule has no exceptions).
+    if vault(|| store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten())).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");
         return false;
     }
-    let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())) else {
+    let Some(capsule) = vault(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return true;
     };
@@ -1487,7 +1538,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         }
     }
     if !vault_up {
-        if let Some(vc) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten())) {
+        if let Some(vc) = vault(|| store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten())) {
             match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
                 Ok(o) => {
                     mark_ran(&o);
@@ -1499,7 +1550,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     }
     // The GPU service, from its capsule in the vault, with its own grants (`gpu_grants`): before init, so it serves before the attest screen asks it. Not after a jump from Android: Android ran the GPU, and the attest screen draws on the CPU without it (init skipped it there too).
     if !platform::jumped() {
-        match crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("gpu").ok().flatten())) {
+        match vault(|| store.as_mut().and_then(|s| s.get_by_key("gpu").ok().flatten())) {
             Some(gc) => match crate::process::spawn_capsule(b"gpu", &gc, b"", &gpu_grants(), &sealed) {
                 Ok(o) => {
                     mark_ran(&o);
@@ -2458,7 +2509,7 @@ fn gauge_poll() {
             // The vault's key count only every 64 s: it reads the flash, and every 2 s it woke the UFS link out of hibernate (POWER.md).
             if VAULT_KEYS.load(core::sync::atomic::Ordering::Relaxed) == u64::MAX || now.wrapping_sub(VAULT_KEYS_AT.load(core::sync::atomic::Ordering::Relaxed)) > 64 * f {
                 VAULT_KEYS_AT.store(now, core::sync::atomic::Ordering::Relaxed);
-                if let Some(keys) = crate::process::with_lock(|| (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok())) {
+                if let Some(keys) = vault(|| (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok())) {
                     VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -2506,9 +2557,10 @@ pub fn run(mut b: Boot) -> ! {
     let mut store = b.store.take();
     unsafe {
         SPAWN_STORE = &raw mut store;
+        // From here other cores reach the vault (the syscalls above), so every read or write of it holds `VAULT` (kvault.rs panics on a block reached without it).
+        crate::process::VAULT_SHARED.store(true, core::sync::atomic::Ordering::Release);
         crate::process::CAPSULES = Some(read_capsule);
-        crate::process::PREF_STORE = Some(store_pref);
-        crate::process::CONTROL_STORE = Some(store_document);
+        crate::process::SETTINGS_WRITE = Some(settings_write);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
         // The last boot's end, if the fault sink or the panic reporter recorded one, into the flash log: a reboot should never be silent.
@@ -2707,7 +2759,7 @@ pub fn run(mut b: Boot) -> ! {
     }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
-        let yes = matches!(st.get_by_key("android.allowed"), Ok(Some(v)) if v.as_slice() == [1]);
+        let yes = vault(|| matches!(st.get_by_key("android.allowed"), Ok(Some(v)) if v.as_slice() == [1]));
         ANDROID_ALLOWED.store(if yes { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
     }
     platform::mark(0x3A);
@@ -2719,6 +2771,12 @@ pub fn run(mut b: Boot) -> ! {
         crate::pcie_guard::release_stuck();
         // The power switches a process left on when it ended (one shot dead, no cleanup of its own): turned off here, on the kernel's core.
         crate::process::power_offs_apply();
+        // Frames given back, wiped and freed with the kernel lock let go (frames.rs `reclaim_step`): up to 2^3 a pass (about a millisecond of this core), the idle workers taking the rest; with none up (the dark, alone) this is the only taker.
+        for _ in 0..1 << 3 {
+            if !crate::frames::reclaim_step() {
+                break;
+            }
+        }
         // A person unlocked: wallgen, once (`spawn_wallgen`).
         if let Some(seed) = unsafe { (*(&raw mut WALLGEN_SEED)).take() } {
             spawn_wallgen(&mut store, &seed);
@@ -2764,7 +2822,7 @@ pub fn run(mut b: Boot) -> ! {
                 crate::flashlog::line(&alloc::format!("vault process not started again ({said}): gone, A#{n} waiting calls refused"));
             }
         }
-        let person = store.as_ref().is_some_and(|s| s.unlocked());
+        let person = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
         // The deck is up: idle workers may now zero the frames Android left (frames.rs, after a jump only), and the flash log says once when they are done.
         if person {
             crate::frames::wipe_allow();
@@ -2878,9 +2936,9 @@ pub fn run(mut b: Boot) -> ! {
         }
         // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
-        if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked()) {
-            // Under the kernel lock, as every UFS command (devinfo is written while processes still run).
-            let r = crate::process::with_lock(|| crate::slot::set_active(0));
+        if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+            // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
+            let r = crate::slot::set_active(0);
             unsafe {
                 let p = 0xFD60_0FF8usize as *mut u64;
                 core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
@@ -2999,7 +3057,7 @@ pub fn run(mut b: Boot) -> ! {
                     KistWhy::Launch(l) => l.capsule,
                     KistWhy::Stow(i) => i.capsule,
                 };
-                // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
+                // The seals a masked kist's launch is checked against, read once for the job under the vault's lock, as every vault read.
                 let sealed = seals_for_launch(&mut store);
                 let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false, twin: None, hash_ticks: 0 };
                 if kist_call(&job) {
@@ -3050,7 +3108,7 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     // Checked and sealed (SANDBOX.md "Lifecycle"): the seal joins the vault's `sealed` list, which every masked spawn reads; the stower is told once it is kept.
                     (KistWhy::Stow(i), Ok(KistDone::Sealed(seal))) => {
-                        let kept = crate::process::with_lock(|| {
+                        let kept = vault(|| {
                             let Some(s) = store.as_mut() else { return false };
                             seal_add(s, &seal).is_ok()
                         });
@@ -3143,9 +3201,9 @@ pub fn run(mut b: Boot) -> ! {
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), if platform::jumped() { 0 } else { 16 * cntfrq() });
         platform::crumb(0xD7);
         clock_policy(false, now.wrapping_sub(t_boot));
-        // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
+        // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the UFS lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
-            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
+            crate::process::UFS.with(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
         }
         // The SoC's heat and the thermal policy, once a second (thermal.rs); the facts' bell after each read.
         if crate::thermal::poll() {
@@ -3164,9 +3222,9 @@ pub fn run(mut b: Boot) -> ! {
             crate::checklist::step(crate::checklist::Step::Init);
             crate::checklist::close();
             // The boot's length to the disk as well, for the next power-on's ring.
-            // Under the kernel lock, as every store access once processes run: the USB and other processes drive the flash from the other cores (unlocked, this write hung the device black on 2026-11-05).
+            // Under the vault's lock, as every store access once processes run: the USB and other processes drive the flash from the other cores (unlocked, this write hung the device black on 2026-11-05).
             if let Some(doc) = crate::checklist::span_document() {
-                let _ = crate::process::with_lock(|| store.as_mut().map(|s| s.set(crate::checklist::SPAN_KEY, &doc).is_ok()));
+                let _ = vault(|| store.as_mut().map(|s| s.set(crate::checklist::SPAN_KEY, &doc).is_ok()));
             }
         }
 
@@ -3214,7 +3272,8 @@ pub fn run(mut b: Boot) -> ! {
         }
         if !matches!(sensor_boot, SensorBoot::Done) {
             let st = &raw mut store;
-            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+            // The vault's lock alone (`vault`): a piece of the AoC's firmware is 2 MiB, 43 to 130 ms of reads that held the kernel lock until 2026-11-18, every 64 s on a reloaded kernel where the AoC never comes online (`diag lock`, the camera's 96 a second dying behind them).
+            let mut get = |k: &str| vault(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
             sensor_boot = sensor_step(core::mem::replace(&mut sensor_boot, SensorBoot::Done), now, &mut get);
         }
         // Give one runnable process a time slice (it comes back at the latest when the slice timer fires), unless a command from the USB process waits: that runs first. `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
@@ -3360,7 +3419,7 @@ pub fn run(mut b: Boot) -> ! {
                     r.extend_from_slice(words.as_bytes());
                     r
                 };
-                let person = store.as_ref().is_some_and(|s| s.unlocked());
+                let person = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
                 // WHY each length check: the parameters are the host's (external input).
                 let capsule: Option<[u8; 32]> = cmd.params.get(..32).map(|c| c.try_into().unwrap());
                 match (cmd.op, capsule) {
@@ -3443,8 +3502,8 @@ pub fn run(mut b: Boot) -> ! {
                     // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
                     let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
                     let (lun, first, count) = (it.next().unwrap_or(3).min(7) as u8, it.next().unwrap_or(6), it.next().unwrap_or(1).min(8));
-                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
-                    crate::process::with_lock(|| {
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::UFS.with(|| {
                         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
                         let hex = b"0123456789ABCDEF";
                         for lba in first..first + count {
@@ -3478,8 +3537,8 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params.starts_with(b"bootlun ") {
                     // `diag bootlun <1|2>`: write the UFS device's bBootLunEn attribute (1 = Boot LU A, 2 = Boot LU B) and read it back. The ROM boots the bootloader chain from that LU, and the bootloader's "boot slot" follows the LU's letter before devinfo is read (its log: "ufshc: bBootLunEn 0x2" then "boot slot: b"; devinfo's active flag gets re-synced to it). Only 1 or 2 are accepted: 0 disables boot.
-                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
-                    crate::process::with_lock(|| {
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::UFS.with(|| {
                         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
                         let before = ufs.read_attribute(0x00, 0);
                         let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
@@ -3505,7 +3564,7 @@ pub fn run(mut b: Boot) -> ! {
                         continue;
                     }
                     // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
-                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::process::with_lock(|| crate::slot::set_active(0)) };
+                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
                     // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
                     unsafe {
                         let p = 0xFD60_0FF8usize as *mut u64;
@@ -3541,8 +3600,8 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"devinfo" {
                     // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
-                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
-                    crate::process::with_lock(|| {
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::UFS.with(|| {
                         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
                         let mut ok = false;
                         for _ in 0..4 {
@@ -3564,8 +3623,8 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"ufsdesc" {
                     // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
-                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
-                    crate::process::with_lock(|| {
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::UFS.with(|| {
                         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
                         let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
                         resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
@@ -3758,8 +3817,8 @@ pub fn run(mut b: Boot) -> ! {
                     if store.is_none() {
                         resp.extend_from_slice(b"no disk on this boot\n");
                     } else {
-                        // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
-                        crate::process::with_lock(|| {
+                        // Under the UFS lock (process.rs `UFS`), as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                        crate::process::UFS.with(|| {
                             let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
                             // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
                             let mut ocs = 0xFF;
@@ -3996,11 +4055,11 @@ pub fn run(mut b: Boot) -> ! {
                         let r = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
                         let f = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
                         match (slot, r, f) {
-                            (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::process::with_lock(|| crate::slot::set_word(s, r, f))).as_bytes()),
+                            (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::slot::set_word(s, r, f)).as_bytes()),
                             _ => resp.extend_from_slice(b"slot word <a|b> <retries hex> <flags hex>\n"),
                         }
                     }
-                    match crate::process::with_lock(crate::slot::words) {
+                    match crate::slot::words() {
                         Some([a, b]) => resp.extend_from_slice(alloc::format!("slot a G#{a:04X}  slot b G#{b:04X}\n").as_bytes()),
                         None => resp.extend_from_slice(b"devinfo not readable\n"),
                     }
@@ -4196,7 +4255,7 @@ pub fn run(mut b: Boot) -> ! {
                         },
                         _ => false,
                     };
-                    let kept = ok && crate::settings::document(None).is_some_and(|d| crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok())));
+                    let kept = ok && keep_settings_now();
                     resp.extend_from_slice(alloc::format!("pref {name}: {}\n", if !ok { "refused" } else if kept { "set and kept" } else { "set, NOT kept" }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
@@ -4419,14 +4478,20 @@ pub fn run(mut b: Boot) -> ! {
                     {
                         crate::process::push_console(b"vault fresh: zeroing the ledger, the kernel vault and the vault process's region, then a reset\n");
                         crate::flashlog::line("vault fresh: the owner's fresh start; zeroing the ledger, the kernel vault and the vault process's region, then a reset");
+                        // Since 2026-11-18 the flash and the vault have locks of their own: all of them held to the reset (the kernel's, the vault's, the flash log's, each block's zeroing under the UFS lock), and the vault process's block calls refused from here (`BLOCKS_SHUT`), which no longer take the kernel lock.
+                        crate::process::BLOCKS_SHUT.store(true, core::sync::atomic::Ordering::SeqCst);
                         crate::process::with_lock(|| {
-                            let (l, ln) = crate::flashlog::ring_region();
-                            let (k, kn) = crate::kvault::regions();
-                            let w = crate::process::WINDOWS[0].offset;
-                            // The vault process's two halves (payloads/vault: HALF 2^21 blocks apart, MIRROR 2^17 blocks zeroed by its own FRESH).
-                            // A refused run stops the zeroing where it is; the reset follows either way, and the next boot says what it found (a vault that neither opens nor genesises names itself in the flash log).
-                            let _ = crate::process::zero_blocks(l, ln) && crate::process::zero_blocks(k, kn) && crate::process::zero_blocks(w, 1 << 17) && crate::process::zero_blocks(w + (1 << 21), 1 << 17);
-                            platform::reboot()
+                            crate::process::VAULT.with(|| {
+                                crate::process::LOG.with(|| {
+                                    let (l, ln) = crate::flashlog::ring_region();
+                                    let (k, kn) = crate::kvault::regions();
+                                    let w = crate::process::WINDOWS[0].offset;
+                                    // The vault process's two halves (payloads/vault: HALF 2^21 blocks apart, MIRROR 2^17 blocks zeroed by its own FRESH).
+                                    // A refused run stops the zeroing where it is; the reset follows either way, and the next boot says what it found (a vault that neither opens nor genesises names itself in the flash log).
+                                    let _ = crate::process::UFS.with(|| crate::process::zero_blocks(l, ln) && crate::process::zero_blocks(k, kn) && crate::process::zero_blocks(w, 1 << 17) && crate::process::zero_blocks(w + (1 << 21), 1 << 17));
+                                    platform::reboot()
+                                })
+                            })
                         });
                     }
                     #[cfg(ferros_production)]
@@ -4438,7 +4503,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"kv selftest" {
                     // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
-                    match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
+                    match vault(|| store.as_mut().map(|s| s.selftest())) {
                         Some(t) => resp.extend_from_slice(t.as_bytes()),
                         None => resp.extend_from_slice(b"no vault open\n"),
                     }
@@ -4947,9 +5012,9 @@ pub fn run(mut b: Boot) -> ! {
                         job_due = cntpct() + lease;
                     }
                     Some(Err(resp)) => queue_pt_response(&mut pt_out_data, &resp),
-                    // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
+                    // Under the kernel lock and the vault's (one owner at a time): a stored settings document is applied to the preferences at once, the kernel's state.
                     None => {
-                        let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
+                        let resp = crate::process::with_lock(|| vault(|| store_command(store.as_mut(), cmd.op, cmd.params)));
                         // Absent from the kernel's vault, a name of a scope this kernel does not know may be in the vault process (`foreign_job`).
                         match if resp == [1] { foreign_job(cmd.op, cmd.params) } else { None } {
                             Some(job) => {
@@ -5261,7 +5326,7 @@ pub fn run(mut b: Boot) -> ! {
                     platform::crumb(0xA6);
                     // The workers off first: the copy below rewrites the kernel under them (smp.rs).
                     ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
-                    crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
+                    crate::process::UFS.with(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
                     // A profiler run stopped, its timer off on this core (the workers' go with them): the next kernel meets no tick.
                     crate::prof::shutdown();
                     crate::smp::stop_all();
@@ -5406,7 +5471,7 @@ pub fn run(mut b: Boot) -> ! {
                 if run_ok && run_size > 0 {
                     let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                     let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
-                        (Ok(seal), Some(store)) => match crate::process::with_lock(|| seal_add(store, &seal)) {
+                        (Ok(seal), Some(store)) => match vault(|| seal_add(store, &seal)) {
                             Ok(()) => {
                                 let mut r = alloc::vec![0u8];
                                 r.extend_from_slice(&seal);
@@ -5461,7 +5526,7 @@ pub fn run(mut b: Boot) -> ! {
                     report(&b, EXIT_FASTBOOT);
                     // From a jumped session the stamped mode never reaches the bootloader (platform.rs `reboot_to_bootloader`; 2026-11-15, the Pro's b875: the ROM's USB recovery, then ferros again): the wish goes into the vault and a plain reset lands in ferros cold, which takes the cold path at once (main.rs, vault_boot `next_boot_take`).
                     let jumped = platform::jumped();
-                    let kept = jumped && crate::process::with_lock(|| store.as_mut().map(|s| crate::vault_boot::next_boot_keep(s, platform::REBOOT_MODE_BOOTLOADER))) == Some(true);
+                    let kept = jumped && vault(|| store.as_mut().map(|s| crate::vault_boot::next_boot_keep(s, platform::REBOOT_MODE_BOOTLOADER))) == Some(true);
                     crate::flashlog::line(if !jumped {
                         "reboot fastboot: a cold session, the mode G#FC stamped thru EL3, then the watchdogs"
                     } else if kept {

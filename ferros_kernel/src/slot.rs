@@ -81,6 +81,10 @@ fn read_devinfo(ufs: &UfsController) -> Option<alloc::vec::Vec<u8>> {
 
 /// Mark the slot this boot came from as successful. `dtb_addr` must be ABL's DTB pointer (a real boot, not a RELOAD); the UFS link must be up.
 pub fn mark_booted_slot(dtb_addr: u64) -> SlotMark {
+    // Every devinfo read and write here holds the UFS lock (process.rs `UFS`): the controller is one command at a time, and these use its data block between commands.
+    crate::process::UFS.with(|| mark_booted_slot_held(dtb_addr))
+}
+fn mark_booted_slot_held(dtb_addr: u64) -> SlotMark {
     let mut m = SlotMark { slot: 0xFF, before: 0, after: 0, result: 0 };
     let slot = match booted_slot(dtb_addr) {
         Ok(s) => s,
@@ -138,6 +142,9 @@ pub fn mark_booted_slot(dtb_addr: u64) -> SlotMark {
 
 /// Set one slot's word as ABL reads it (`diag slot word`, the A/B fallback test): retries left and flags, nothing else in devinfo touched. Refuses unknown flags; read back after writing. Development: what Android's boot control and ferros's marking do in steps, done in one.
 pub fn set_word(slot: usize, retries: u8, flags: u8) -> u32 {
+    crate::process::UFS.with(|| set_word_held(slot, retries, flags))
+}
+fn set_word_held(slot: usize, retries: u8, flags: u8) -> u32 {
     if slot > 1 || flags & !FLAG_KNOWN != 0 {
         return BAD_FORMAT;
     }
@@ -161,6 +168,9 @@ pub fn set_word(slot: usize, retries: u8, flags: u8) -> u32 {
 
 /// Both slots' words as they are now (retries | flags << 8), for `diag slot`.
 pub fn words() -> Option<[u32; 2]> {
+    crate::process::UFS.with(words_held)
+}
+fn words_held() -> Option<[u32; 2]> {
     let ufs = UfsController::new(UFS_BASE);
     let b = read_devinfo(&ufs)?;
     Some([b[SLOT_WORDS] as u32 | (b[SLOT_WORDS + 1] as u32) << 8, b[SLOT_WORDS + 4] as u32 | (b[SLOT_WORDS + 5] as u32) << 8])
@@ -168,6 +178,9 @@ pub fn words() -> Option<[u32; 2]> {
 
 /// Make `slot` (0 = a, 1 = b) the one ABL boots next: its active flag set with 3 retries (what `fastboot --set-active` writes), the other slot's active flag cleared, everything else byte for byte; verified by reading back. The gate's Android choice (ready.rs) uses it for slot a before a reset. Returns a result code as `mark_booted_slot` does.
 pub fn set_active(slot: usize) -> u32 {
+    crate::process::UFS.with(|| set_active_held(slot))
+}
+fn set_active_held(slot: usize) -> u32 {
     if slot > 1 {
         return BAD_FORMAT;
     }

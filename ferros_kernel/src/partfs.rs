@@ -18,9 +18,9 @@ pub struct Part {
     pub last: u64,
 }
 
-/// Find a partition by GPT name on LUs 0-7. Its reads go under the kernel lock, as every UFS command must while processes use the vault.
+/// Find a partition by GPT name on LUs 0-7. Its reads hold the UFS lock (process.rs `UFS`), as every UFS command must while processes use the vault: they read the controller's one data block between commands.
 pub fn find(name: &str) -> Option<Part> {
-    crate::process::with_lock_held_or(|| find_locked(name))
+    crate::process::UFS.with(|| find_locked(name))
 }
 
 fn find_locked(name: &str) -> Option<Part> {
@@ -67,7 +67,7 @@ fn find_locked(name: &str) -> Option<Part> {
 
 /// The extents of a logical partition inside `super` (Android's dynamic partitions, liblp metadata_format.h), read-only: the geometry at byte 4096 (magic "gDla"), slot 0's metadata header at byte 12288 (magic "0PLA": tables descriptors at 80 partitions, 92 extents, each {offset, count, entry size}, the tables after the header), the partition entry by name (name[36], attributes, first extent, extent count, group), and its extents (u64 sectors, u32 type, u64 first sector, u32 source; 512-byte sectors). Each extent must be linear, on `super` itself, 4 KiB aligned; anything else is refused, not guessed at. The metadata's checksums are not checked: it is read only to find an ext4 filesystem that checks itself.
 pub fn logical_extents(name: &str) -> Result<Vec<Part>, String> {
-    crate::process::with_lock_held_or(|| logical_extents_locked(name))
+    crate::process::UFS.with(|| logical_extents_locked(name))
 }
 
 fn logical_extents_locked(name: &str) -> Result<Vec<Part>, String> {
@@ -148,7 +148,7 @@ pub fn find_logical(name: &str) -> Result<Part, String> {
 
 /// `diag "part vermagic <logical>"`: the first `vermagic=` string in a logical partition's raw blocks, across all its extents — the kernel the modules in it were built for (every .ko carries one). Read-only; no filesystem is mounted, so a partition laid out in many extents (vendor_dlkm_a is) needs no extent-aware mount.
 pub fn vermagic(rep: &mut Vec<u8>, name: &str) {
-    crate::process::with_lock_held_or(|| vermagic_locked(rep, name))
+    crate::process::UFS.with(|| vermagic_locked(rep, name))
 }
 
 fn vermagic_locked(rep: &mut Vec<u8>, name: &str) {
@@ -237,8 +237,8 @@ impl ferros_ext4::Disk for PartDisk {
             let Some((lun, lba, left)) = self.lba_run(block + k as u64) else { return Err(ferros_ext4::Error::Corrupt) };
             let m = ((whole - k) as u64).min(left).min(ferros_hal::ufs::RUN_MAX as u64) as usize;
             let chunk = &mut buf[k << 12..(k + m) << 12];
-            // Under the kernel lock, as the vault's commands are (a syscall holds it): the modem service reads files here while processes use the vault.
-            if !crate::process::with_lock_held_or(|| crate::process::ufs_read_run(lun, lba as u32, chunk)) {
+            // Under the UFS lock, as the vault's commands are: the modem service reads files here while processes use the vault.
+            if !crate::process::UFS.with(|| crate::process::ufs_read_run(lun, lba as u32, chunk)) {
                 return Err(ferros_ext4::Error::Io);
             }
             k += m;
@@ -248,7 +248,7 @@ impl ferros_ext4::Disk for PartDisk {
             let ufs = &mut self.ufs;
             let tail = &mut buf[whole << 12..];
             let n = tail.len();
-            let ok = crate::process::with_lock_held_or(|| {
+            let ok = crate::process::UFS.with(|| {
                 let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
                 if ok {
                     tail.copy_from_slice(&ufs.data_buffer()[..n]);
@@ -266,10 +266,10 @@ impl ferros_ext4::Disk for PartDisk {
 impl ferros_f2fs::Disk for PartDisk {
     fn read_block(&mut self, block: u64, buf: &mut [u8; ferros_f2fs::BLOCK]) -> Result<(), ferros_f2fs::Error> {
         let Some((lun, lba)) = self.lba(block) else { return Err(ferros_f2fs::Error::Corrupt) };
-        // One UFS command under the kernel lock, as in the ext4 reader above.
+        // One UFS command under the UFS lock, as in the ext4 reader above.
         let ufs = &mut self.ufs;
 
-        let ok = crate::process::with_lock_held_or(|| {
+        let ok = crate::process::UFS.with(|| {
             let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
             if ok {
                 buf.copy_from_slice(&ufs.data_buffer()[..ferros_f2fs::BLOCK]);
@@ -331,7 +331,7 @@ impl Mount {
 
 /// A partition's AVB `vbmeta`, read-only (`diag part avb <name>`, BOOT.md "Locked-bootloader endgame"): behind the AVB footer in its last 64 bytes (a partition that carries its own, as `boot`, `vendor_boot`, `dtbo` do), or at its start (a `vbmeta_*` partition). What the owner's re-signed top-level `vbmeta` must copy, so it vouches for the build actually installed rather than a factory image's.
 pub fn avb_vbmeta(name: &str) -> Result<Vec<u8>, String> {
-    crate::process::with_lock_held_or(|| avb_vbmeta_locked(name))
+    crate::process::UFS.with(|| avb_vbmeta_locked(name))
 }
 
 fn avb_vbmeta_locked(name: &str) -> Result<Vec<u8>, String> {
@@ -388,12 +388,12 @@ enum Open {
 }
 static mut PART_OPEN: Option<(&'static str, Vec<u8>, Open)> = None;
 
-/// The largest chunk one read returns while reads go a block a command: 64 KiB keeps each call's hold on the kernel lock to a couple of milliseconds (a 1 MiB chunk held it ~30 ms, a stall for every other process while the modem driver read its 98 MB image).
+/// The largest chunk one read returns while reads go a block a command: 64 KiB keeps each call's hold on the UFS (the kernel lock until 2026-11-18) to a couple of milliseconds (a 1 MiB chunk held it ~30 ms, a stall for every other process while the modem driver read its 98 MB image).
 const PART_CHUNK: usize = 1 << 16;
 /// The largest chunk once reads go in runs (`process::ufs_runs_on`): 1 MiB, one UFS command (RUN_MAX blocks), about the lock hold 64 KiB a block a command had.
 const PART_CHUNK_RUNS: usize = ferros_hal::ufs::RUN_MAX << 12;
 
-/// One request on partition `part` (the caller holds the kernel lock, as a syscall does): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and `PART_CHUNK` allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
+/// One request on partition `part` (the caller holds the partition reader's lock, process.rs `PART`, and not the kernel lock since 2026-11-18): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and `PART_CHUNK` allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
 pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
     let (op, off, path) = match req.first() {
         Some(1) => (1, 0u64, &req[1..]),
