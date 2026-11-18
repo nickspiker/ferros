@@ -20,13 +20,13 @@ use lumis_core::platform::{ConfigStore, PixelSurface};
 use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
-use lumis_core::shared_memory::{CALIBRATING_BIT, CAL_FINALIZE_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT};
+use lumis_core::shared_memory::{CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Whether the window is behind (the person went to the deck or another kist is in front): fluor's `Event::Focused(false)`, cleared by `Focused(true)`.
-/// The UI sets it; the camera thread reads it at each frame and decides whether Lumis stays (owner, 2026-11-17: "lumis, if we're framing up and we go to the deck, should go bye bye, unless I'm doing a continuous save").
+/// The UI sets it; the camera thread reads it at each frame and decides whether Lumis stays (owner, 2026-11-17: "lumis, if we're framing up and we go to the deck, should go bye bye, unless I'm doing a continuous save"; and of a calibration, "Basically if continuous save or cal is on").
 static BEHIND: AtomicBool = AtomicBool::new(false);
 
 const DISPLAY: u64 = 1;
@@ -388,7 +388,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     };
     println!("lumis: camera {}: first frame, {} x {} samples (bin {}), exposure {} us, gain {}/1024", cam.name, first.width, first.height, first.bin, first.exposure_ns / 1000, first.gain);
     // Sent behind while the camera opened: nothing framed and nothing to save, so the camera closes before the integrator's memory is taken.
-    if BEHIND.load(Ordering::Acquire) {
+    // A calibration asked for stays: once begun, it runs behind as a continuous save does (`kept`).
+    if BEHIND.load(Ordering::Acquire) && calibration.is_none() {
         close_camera(&cam.name);
         lumis_core::platform::exit_because("sent behind");
     }
@@ -446,13 +447,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             keep_saves(vault.as_deref(), &mut *integrator.header);
             lumis_core::platform::exit_because(&format!("camera {}: a frame of {} x {} after {} x {}: the integrator is sized for the first", cam.name, head.width, head.height, first.width, first.height));
         }
-        // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save runs (it keeps capturing and saving, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
+        // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save or a calibration runs (it keeps capturing, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
         let flags = integrator.header[FLAGS_IDX];
         let behind = BEHIND.load(Ordering::Acquire);
-        let continuous = flags & CONTINUOUS_SAVE_BIT != 0;
-        let now = match (behind, continuous, in_flight(flags)) {
+        let kept = kept(flags);
+        let now = match (behind, kept, in_flight(flags)) {
             (false, _, _) => Stay::Front,
-            (true, true, _) => Stay::Continuous,
+            (true, true, _) if flags & CONTINUOUS_SAVE_BIT != 0 => Stay::Continuous,
+            (true, true, _) => Stay::Calibrating,
             (true, false, true) => Stay::Finishing,
             (true, false, false) => leave(&cam.name, vault.as_deref(), &mut *integrator.header),
         };
@@ -460,6 +462,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             match now {
                 Stay::Front => println!("lumis: in front again: carrying on"),
                 Stay::Continuous => println!("lumis: sent behind during a continuous save: staying for the save, capturing and saving, drawing nothing; Lumis ends if the save ends while behind"),
+                Stay::Calibrating => println!("lumis: sent behind during a calibration: staying for it, capturing, drawing nothing; Lumis ends if it ends while behind"),
                 Stay::Finishing => println!("lumis: sent behind with a save on its way: finishing it, then Lumis ends"),
             }
             stay = now;
@@ -470,9 +473,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         } else if quiet != Some(heartbeat) {
             quiet = None;
         }
-        // A continuous save integrates on: the integrator never ends Lumis on a quiet UI while one runs.
+        // A continuous save or a calibration integrates on: the integrator never ends Lumis on a quiet UI while either runs (lumis ferros-cal-behind).
         // Otherwise, behind (or in front again before the UI has drawn), nothing is integrated: the save on its way is the image already made, so it is started if asked for and not yet begun, kept when encoded, and Lumis leaves once nothing is left on its way.
-        if !continuous && quiet.is_some() {
+        if !kept && quiet.is_some() {
             integrator.try_save();
             if integrator.check_and_finalize_calibration() {
                 println!("lumis: calibration finalized");
@@ -582,14 +585,22 @@ enum Stay {
     Front,
     /// Behind during a continuous save: capturing and saving on, nothing drawn.
     Continuous,
+    /// Behind during a calibration: capturing on, nothing drawn.
+    Calibrating,
     /// Behind with a save on its way: that save finished and kept, then Lumis ends.
     Finishing,
 }
 
-/// Whether a save the person asked for is still on its way, by the integrator's flags: a single save asked for and not yet begun (MANUAL_SAVE_BIT, which try_save starts from the image already made), one encoding or encoded and not yet kept (CURRENTLY_SAVING, cleared by `keep_saves` once the vault has it), or a calibration whose finish was tapped (CAL_FINALIZE_BIT while CALIBRATING_BIT).
-/// A calibration still accumulating, or an exposure still integrating with no save asked for, is not on its way: nothing was asked to be kept.
+/// Whether Lumis stays behind for as long as it runs: a continuous save or a calibration (owner, 2026-11-17: "Basically if continuous save or cal is on"), the same bits lumis_core's integrator keeps the camera alive on with the UI quiet (lumis ferros-cal-behind).
+/// A calibration whose finish was tapped holds CALIBRATING_BIT until its maps are written, so it stays thru its own save.
+fn kept(flags: u64) -> bool {
+    flags & (CONTINUOUS_SAVE_BIT | CALIBRATING_BIT) != 0
+}
+
+/// Whether a save the person asked for is still on its way, by the integrator's flags: a single save asked for and not yet begun (MANUAL_SAVE_BIT, which try_save starts from the image already made), or one encoding or encoded and not yet kept (CURRENTLY_SAVING, cleared by `keep_saves` once the vault has it).
+/// An exposure still integrating with no save asked for is not on its way: nothing was asked to be kept.
 fn in_flight(flags: u64) -> bool {
-    flags & (MANUAL_SAVE_BIT | CURRENTLY_SAVING) != 0 || flags & (CALIBRATING_BIT | CAL_FINALIZE_BIT) == CALIBRATING_BIT | CAL_FINALIZE_BIT
+    flags & (MANUAL_SAVE_BIT | CURRENTLY_SAVING) != 0
 }
 
 /// The driver's CLOSE (docs/CAMERA.md, op 4): the view taken back, the stream stopped, the module powered down, and the driver ends.
@@ -603,7 +614,7 @@ fn close_camera(name: &str) {
     }
 }
 
-/// Lumis sent behind with no continuous save running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so.
+/// Lumis sent behind with no continuous save or calibration running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so.
 fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> ! {
     keep_saves(vault, header);
     close_camera(name);
@@ -712,7 +723,7 @@ impl Lumis {
 
     /// The window sent behind or brought to the front (fluor's `Event::Focused`, from the display's EV_BEHIND and EV_FRONT).
     /// Behind on the menu, Lumis ends at once: no camera is open and nothing is on its way.
-    /// Behind with the camera opening or open, the camera thread decides at its next frame: it closes the camera and ends Lumis, unless a continuous save runs or a save is on its way (`Stay`).
+    /// Behind with the camera opening or open, the camera thread decides at its next frame: it closes the camera and ends Lumis, unless a continuous save or a calibration runs or a save is on its way (`Stay`).
     /// The finger is let go either way, so a touch held when the window went behind is not taken as a tap when it comes back.
     fn focus(&mut self, focused: bool) {
         BEHIND.store(!focused, Ordering::Release);
