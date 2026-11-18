@@ -1989,9 +1989,9 @@ fn layer_rows() -> &'static mut [[u64; 1344]; SURFACES] {
     unsafe { &mut *((LAYER_ROWS as *mut [[u64; 1344]; SURFACES]).add(draw::thread_slot())) }
 }
 
-/// The bars over the scene where the glass's edge and the camera hole's knockout are not (`glass_front` with no edge pixel): the bars' pixel `c` in front by `under_pm`, the scene `p` under it, or `p` as it came where the bars have nothing. A column of `[el, er)` (`edge_cols`) outside the hole's range has no edge pixel by `edge_cols`'s construction (every left edge pixel is left of `el`, every right one at `er` or past it), so this is exactly `glass_front` there, without its walk of the row's edge pixels (a pixel's walk, every pixel of the bars' blocks, in every phase: on the corner rows the walk is long).
+/// The bars in front of the scene where the glass's edge and the camera hole's knockout are not (`glass_front` with no edge pixel): the bars' pixel `c` in front by `under_pm`, the scene `p` under it, or `p` as it came where the bars have nothing. A column of `[el, er)` (`edge_cols`) outside the hole's range has no edge pixel by `edge_cols`'s construction (every left edge pixel is left of `el`, every right one at `er` or past it), so this is exactly `glass_front` there, without its walk of the row's edge pixels (a pixel's walk, every pixel of the bars' blocks, in every phase: on the corner rows the walk is long).
 #[inline(always)]
-fn bars_over(c: u64, p: u64) -> u64 {
+fn bars_front(c: u64, p: u64) -> u64 {
     if c >> 63 != 0 { p } else { under_pm(c & ((1 << 48) - 1), trans(c), p & ((1 << 48) - 1), 0).0 }
 }
 
@@ -2006,7 +2006,7 @@ fn tail_front(xt: usize, width: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, 
         let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
         // The scene's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
         let s = p(xx) & ((1 << 48) - 1);
-        front[xx - xt] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, s) } else { glass_front(xx, g, edge_px, c, s) };
+        front[xx - xt] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_front(c, s) } else { glass_front(xx, g, edge_px, c, s) };
     }
     front
 }
@@ -2199,7 +2199,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
                             let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
                             // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
                             let p = *scene_at.add(j) & ((1 << 48) - 1);
-                            front[j] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, p) } else { glass_front(xx, g, edge_px, c, p) };
+                            front[j] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_front(c, p) } else { glass_front(xx, g, edge_px, c, p) };
                         }
                         neon::present_app16(front.as_ptr(), row.as_mut_ptr().add(x), t0, t1, cm);
                     } else {
@@ -4230,8 +4230,8 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                 for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
                     for x in a..b {
                         let c = if x >= bl && x < br { bw[x] } else { CLEAR };
-                        // Between the edge's columns and off the hole, no edge pixel: the bars over the pixel without the walk (`bars_over`).
-                        px[x] = if x >= el && x < er && !(x >= hl && x < hr) { bars_over(c, px[x]) } else { glass_front(x, g, edge_px, c, px[x]) };
+                        // Between the edge's columns and off the hole, no edge pixel: the bars in front of the pixel, it under them, without the walk (`bars_front`).
+                        px[x] = if x >= el && x < er && !(x >= hl && x < hr) { bars_front(c, px[x]) } else { glass_front(x, g, edge_px, c, px[x]) };
                     }
                 }
             }
@@ -7398,7 +7398,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 deck on the right, whole (the arrow and the ring are only drawn there, nothing to aim at), but on the deck where a circle of the map lies (G#FF, the circle's; hit.rs `deck`, owner 2026-11-12); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
+            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 deck on the right, whole (the arrow and the ring are only drawn there, nothing to aim at), in front of the deck's circles as they are on the glass (hit.rs `row`, owner 2026-11-17); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
             let id = hit::at(x, y);
