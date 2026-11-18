@@ -196,7 +196,7 @@ The owner judged four dummy circles on the Pro and kept their glows (2026-11-11:
 
 | state | glow (ferros_glow) | means, as built (the owner may correct these) |
 |---|---|---|
-| running | 500 nm, thin | a live process of the kist, in front or behind (deck's tap leaves it alive behind); a widget the display draws itself (the clock) too, as it is live on the glass and never a process |
+| running | 500 nm, thin | a live process of the kist, in front or behind (deck's tap leaves it alive behind); a puck that is up (PUCKS.md) too |
 | stopped | 600 nm, thin | the kernel keeps a record for it: its last process ended by a fault, a panic or a kill from outside, or its last launch did not start (no room, not here, its checks, its capsule unreadable); dropped when it next starts |
 | not running | a ring of darkness | stowed and neither: not launched since boot, or ended by its own exit, the person's relaunch or the person's Stop on its card |
 | for you | 400 nm, heavy, reach by count | something waiting on the person for that kist; nothing sets it yet (no notifications exist): the map's `waiting` list by capsule takes a count when something does |
@@ -215,7 +215,7 @@ The owner, 2026-11-12, of four ways to see a kist's info (twist a circle to flip
 
 So the settings circle's Kists page is the **Deck** (owner, 2026-11-12, of names for the page: "Deck it is!": the home screen is the deck, what is on it is on deck; what a person keeps is in the hold, as items) (ferros_lang `Msg::PageDeck`, all sixteen languages; the map's page key `deck`), and a thing's **card** is the one place its info shows: no flip, no info circle. Wherever this document says "the Kists page", it is the Deck now.
 
-**The list.** Everything on the deck as a circle, by kind: the kists first (opened: apps), then the pucks (live circles never opened, PUCKS.md: today the clock, known by its name, `widget`), each kind a group, so contacts can come as one more. Each row is the thing's name, and under it its kind ("kist", "puck") and a kist's state as its glow says it (running, stopped, not running; nothing before the kernel has said which kists are alive). The whole row opens its card. A restore or an unstow under way shows its bar under its row. Under the list, the **pandok** (the directory, kists.fgtw.org; "available" before): each listed kist, "stowed", or "stow" or "update" with its size. A kist offered over USB stays above everything, the list or a card alike ("Stowing" below), and opens the Deck on it as it opened the Kists page.
+**The list.** Everything on the deck as a circle, by kind: the kists first (opened: apps), then the pucks (live circles never opened, known by their signed `puck` want, PUCKS.md), each kind a group, so contacts can come as one more. Each row is the thing's name, and under it its kind ("kist", "puck") and a kist's state as its glow says it (running, stopped, not running; nothing before the kernel has said which kists are alive). The whole row opens its card. A restore or an unstow under way shows its bar under its row. Under the list, the **pandok** (the directory, kists.fgtw.org; "available" before): each listed kist, "stowed", or "stow" or "update" with its size. A kist offered over USB stays above everything, the list or a card alike ("Stowing" below), and opens the Deck on it as it opened the Kists page.
 
 **A kist's card** (Back above it, which returns to the list; one unstowed meanwhile, here or on another device of theirs, closes it):
 - its name and kind;
@@ -236,7 +236,7 @@ So the settings circle's Kists page is the **Deck** (owner, 2026-11-12, of names
 - **A permission switch** is the Kists page's (`Choice::Answer`): the answer written to the person's list (`kists.list`, identity class), then init's OP_RELAUNCH, which kills a running kist and starts it with the answers as they now stand (nothing for one not running).
 - **Words**: ferros_lang `PageItems`, `KindKist`, `KindPuck`, `Pandok`, `NothingStowed`, `MadeBy`, `FactVersion`, `Size`, `Identity`, `Running`, `Stopped`, `NotRunning`, `Keeps`, `OwnDomain`, `Stop`, `Update`, `Unstow`, `AnswersKept`, `RemoveFromHome`, `TapAgainRemove`, `Shows`, `TheTime`, in all sixteen languages. The pandok's "stowed", "stow" and "update" now come from them too; its other lines ("reading the list of kists" and its neighbours) and the stower's stage words are still English outside ferros_lang.
 
-**Not yet:** run on a device; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind; the map's `widget` (a puck by its name) renamed and replaced by the signed `puck` flag (PUCKS.md).
+**Not yet:** run on a device; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind.
 
 ## The unstow sheet (2026-11-12)
 
