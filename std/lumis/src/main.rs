@@ -39,23 +39,19 @@ const CAMERA: u64 = 7;
 /// With the view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?") Lumis integrates and saves whole sensor frames, read in place.
 const BIN: u32 = 2;
 
-/// Rows unpacked per task when a frame is taken out of the view.
-const ROWS_PER_TASK: usize = 1 << 4;
-
 /// Where the camera service's frames come from.
 enum Source {
-    /// The view: whole frames read in place (`base` where this process reads it), the buffer held, the frame unpacked to 16 bits.
-    View { base: usize, view: camera::View, held: u8, frame: Vec<u16> },
+    /// The view: frames read in place (`base` where this process reads it), the buffer held until the next MAP; the integrator reads each row straight out of it (`ViewRows`), so no whole frame is ever copied.
+    View { base: usize, view: camera::View, held: u8 },
     /// Frames by copy at `BIN`, header and samples.
     Copy { buf: Vec<u8> },
 }
 
-/// A frame's time in the camera service, for the console every 64: waiting on the driver, unpacking out of the view, the integrator, the settings and saves after it, the whole turn (each summed, microseconds).
+/// A frame's time in the camera service, for the console every 64: waiting on the driver, the integrator (which reads and unpacks the view's rows itself), the settings and saves after it, the whole turn (each summed, microseconds).
 /// With the driver's own count and Eagle time of the first and last frame taken, so the line also says the sensor's period by the driver's clock and how many frames the driver wrote that Lumis never took (2026-11-17, the preview's split).
 #[derive(Default)]
 struct Turns {
     wait: u64,
-    unpack: u64,
     integrate: u64,
     after: u64,
     since: Option<std::time::Instant>,
@@ -161,39 +157,47 @@ fn copy_from_view(src: usize, dst: &mut [u8]) {
     };
 }
 
+/// A frame as the camera thread takes it: rows read in place out of the view, or a copy's samples (16 bits, little-endian, row by row).
+enum Taken<'a> {
+    View(ViewRows),
+    Bytes(&'a [u8]),
+}
+
+/// A held frame in the view, read a row at a time by the integrator (lumis_core `RowSource`): each row copied out of the non-cacheable view in 64-byte loads into a buffer on the stack, then unpacked from RAW10. The rows are read from the integrator's own bands across the cores, each once, while the buffer stays held (it is given back at the next MAP).
+struct ViewRows {
+    src: usize,
+    line: usize,
+}
+
+impl lumis_core::RowSource for ViewRows {
+    fn read_row(&self, y: usize, out: &mut [u16]) {
+        // A RAW10 line of the widest readout fits: 8160 samples are 10200 bytes.
+        let mut tmp = [0u8; 1 << 14];
+        let line = &mut tmp[..self.line];
+        copy_from_view(self.src + y * self.line, line);
+        camera::unpack_raw10(line, out);
+    }
+}
+
 impl Source {
-    /// The next frame, its header and its samples (16 bits, little-endian, row by row), with the wait and the unpacking counted.
-    fn next(&mut self, t: &mut Turns) -> Option<(camera::FrameHeader, &[u8])> {
+    /// The next frame, its header and its rows, with the wait counted (and a copy's own unpacking, none for the view).
+    fn next(&mut self, t: &mut Turns) -> Option<(camera::FrameHeader, Taken<'_>)> {
         let t0 = std::time::Instant::now();
         match self {
-            Source::View { base, view, held, frame } => {
+            Source::View { base, view, held } => {
                 let mut r = [0u8; camera::FRAME_HEADER];
                 let n = sys::call_live(CAMERA, &[camera::OP_MAP, *held], &mut r);
                 let m = (n != sys::ERR).then(|| camera::parse_map(&r[..n as usize])).flatten()?;
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                let (w, line) = (view.width, view.line);
-                let src = *base + m.offset;
-                frame.par_chunks_mut(w * ROWS_PER_TASK).enumerate().for_each_init(
-                    || vec![0u8; line],
-                    |tmp, (k, rows)| {
-                        for (j, row) in rows.chunks_exact_mut(w).enumerate() {
-                            copy_from_view(src + (k * ROWS_PER_TASK + j) * line, tmp);
-                            camera::unpack_raw10(tmp, row);
-                        }
-                    },
-                );
-                t.unpack += t1.elapsed().as_micros() as u64;
-                // SAFETY: the u16 samples' own bytes, little-endian on this target as the integrator reads them.
-                let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 2) };
-                Some((m.frame, bytes))
+                Some((m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
                 t.wait += t0.elapsed().as_micros() as u64;
                 let h = (n != sys::ERR).then(|| camera::parse_frame(&buf[..n as usize])).flatten()?;
-                Some((h, &buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()]))
+                Some((h, Taken::Bytes(&buf[camera::FRAME_HEADER..camera::FRAME_HEADER + h.samples_bytes()])))
             }
         }
     }
@@ -373,7 +377,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 return fail("the view's token was refused".into());
             }
             println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at {base:#x}", cam.name, v.buffers, v.width, v.height);
-            Source::View { base: base as usize, view: v, held: camera::NONE, frame: vec![0u16; v.width * v.height] }
+            Source::View { base: base as usize, view: v, held: camera::NONE }
         }
         Some(v) => return fail(format!("the view's format {} is not one Lumis reads", v.format)),
         None => {
@@ -492,7 +496,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             turns.images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX];
         }
         turns.last = (head.count, head.time);
-        let (iso, shutter_ns, focus) = integrator.process_frame(samples, (iso(head.gain)) as i32, head.exposure_ns as i64, 0., false, head.width * 2);
+        let (iso, shutter_ns, focus) = match samples {
+            Taken::View(rows) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
+            Taken::Bytes(bytes) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
+        };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
         if iso != sent.0 && !set(camera::SET_GAIN, gain_of(iso)) {
@@ -515,7 +522,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         turns.n += 1;
         if turns.n == 1 << 6 {
             let whole = turns.since.map_or(0, |s| s.elapsed().as_micros() as u64);
-            println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, unpacking {} us, the integrator {} us", first.width, first.height, whole / 64, turns.wait / 64, turns.unpack / 64, turns.integrate / 64);
+            println!("lumis: {frames} frames of {} x {} integrated; the last 64 every {} us: the driver's answer {} us, the integrator {} us (reading the view, unpacking and adding, lumis_core process_rows)", first.width, first.height, whole / 64, turns.wait / 64, turns.integrate / 64);
             // The driver's side of the same 64: its frames between the first and the last taken (the ones Lumis skipped are the rest), their period by its own Eagle clock, and what the integrator made of them.
             let (c0, t0) = turns.first.unwrap_or(turns.last);
             // 64 distinct frames of the driver lie between the first and the last, so the span is at least 63.

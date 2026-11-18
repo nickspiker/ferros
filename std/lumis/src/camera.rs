@@ -199,6 +199,9 @@ pub struct MapHeader {
     pub frame: FrameHeader,
     pub buffer: u8,
     pub offset: usize,
+    /// The frame's own phase-detect rows in the same buffer (the combined driver, `slit-for-real`): their offset from the image's start (+56) and how many (+60); both 0 from a driver without them.
+    pub pd_offset: usize,
+    pub pd_rows: usize,
 }
 
 /// A MAP's header; None when it is not one (no frame: the driver closed).
@@ -210,7 +213,13 @@ pub fn parse_map(r: &[u8]) -> Option<MapHeader> {
     h.copy_from_slice(&r[..FRAME_HEADER]);
     // The header's samples are not in the reply: parsed as a frame of none.
     let frame = parse_frame_header(&h);
-    Some(MapHeader { frame, buffer: r[40], offset: u64::from_le_bytes(r[48..56].try_into().unwrap()) as usize })
+    Some(MapHeader {
+        frame,
+        buffer: r[40],
+        offset: u64::from_le_bytes(r[48..56].try_into().unwrap()) as usize,
+        pd_offset: u32::from_le_bytes(r[56..60].try_into().unwrap()) as usize,
+        pd_rows: u16::from_le_bytes([r[60], r[61]]) as usize,
+    })
 }
 
 /// One MIPI RAW10 line into 16-bit samples: each five bytes four samples, `(high << 2) | low bits`.
