@@ -8,7 +8,7 @@
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
-//! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `100000080000FF06` the rack, each held about 64 s).
+//! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s).
 #![no_std]
 #![no_main]
 
@@ -566,7 +566,7 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
                 }
             }
             let copy_us = ferros_sys::us_since(t);
-            say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, 4 * sum / cnt.max(1), acc & 0xFF);
+            say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; its PD rows at +G#{:X}, A#{} of them; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, u32::from_le_bytes(h64[56..60].try_into().unwrap()), u16::from_le_bytes([h64[60], h64[61]]), 4 * sum / cnt.max(1), acc & 0xFF);
         }
     }
     say!(g, "camtest: A#{got} frames mapped, A#{} us apart on average, A#{most} us the longest\n", if got > 1 { waits / (got - 1) as u64 } else { 0 });
@@ -618,7 +618,7 @@ fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, t
         }
         let w = |k: usize| u64::from_le_bytes(s[k..k + 8].try_into().unwrap());
         // The line the host's pull reads (tools/camera-pd-pair.sh): every field it packs, in order.
-        say!(g, "camtest: PAIR A#{k} image G#{:X} pd G#{:X} count A#{} exposure_ns A#{} gain A#{} focus A#{} eagle_ns A#{} status A#{}\n", w(64), w(72), u32::from_le_bytes(s[0..4].try_into().unwrap()), w(16), u32::from_le_bytes(s[24..28].try_into().unwrap()), u32::from_le_bytes(s[28..32].try_into().unwrap()), w(32), w(92) as u32);
+        say!(g, "camtest: PAIR A#{k} image G#{:X} pd G#{:X} count A#{} exposure_ns A#{} gain A#{} focus A#{} eagle_ns A#{} status A#{}\n", w(64), w(72), u32::from_le_bytes(s[0..4].try_into().unwrap()), w(16), u32::from_le_bytes(s[24..28].try_into().unwrap()), u32::from_le_bytes(s[28..32].try_into().unwrap()), w(32), u32::from_le_bytes(s[92..96].try_into().unwrap()));
         // STATS every 2^21 us meanwhile: the holder's quiet past 2^22 us ends the open (payloads/camera `UNASKED_US`), and a held pair must outlive the host's reads.
         let start = ferros_sys::now();
         let mut st = [0u8; 208];

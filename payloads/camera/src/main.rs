@@ -319,6 +319,10 @@ static FRAME_AT: AtomicU64 = AtomicU64::new(0);
 static RUN: AtomicU64 = AtomicU64::new(0);
 /// The front end's interrupts answered, and how many came on the line rather than on the thread's own tick (`TICK_US`).
 static ANSWERED: AtomicU64 = AtomicU64::new(0);
+/// Each acknowledged word's bits since the open and in the last answer (`ack_say`), by its place in the camera's list.
+const ACK_MOST: usize = 1 << 5;
+static ACK_OR: [AtomicU64; ACK_MOST] = [const { AtomicU64::new(0) }; ACK_MOST];
+static ACK_LAST: [AtomicU64; ACK_MOST] = [const { AtomicU64::new(0) }; ACK_MOST];
 static ON_LINE: AtomicU64 = AtomicU64::new(0);
 /// The image path's status words seen, or-ed over the run, for the console.
 static IMG_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -389,9 +393,9 @@ static SLITS: AtomicU64 = AtomicU64::new(0);
 /// The sensor's frame length and line length now (the mode's, or as the last exposure moved them), for STATS.
 static FLL: AtomicU64 = AtomicU64::new(0);
 static LLP: AtomicU64 = AtomicU64::new(0);
-/// The sensor's frame period now and before the last change of it (ps), and the frames counted at that change: a frame begun under the old timing may still be on its way for two frames (the sensor takes a hold at a frame's start, and a rolling shutter's next frame integrates during this one), so every deadline that waits for a frame reckons with both until then (`period_ps`).
-static PERIOD_PS: AtomicU64 = AtomicU64::new(0);
-static PERIOD_PREV_PS: AtomicU64 = AtomicU64::new(0);
+/// The sensor's frame period now and before the last change of it (ns: a 14-year frame at shift 31 passes 64 bits of ps), and the frames counted at that change: a frame begun under the old timing may still be on its way for two frames (the sensor takes a hold at a frame's start, and a rolling shutter's next frame integrates during this one), so every deadline that waits for a frame reckons with both until then (`period_ns`).
+static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+static PERIOD_PREV_NS: AtomicU64 = AtomicU64::new(0);
 static PERIOD_AT: AtomicU64 = AtomicU64::new(0);
 /// The readout as memory sees it (owner, 2026-11-17: "measure the readout skew directly"), with `MEASURE` set: from the frame's first row landing in its buffer to its last row landing (counter ticks), the last, least and most, and how many, since the timing last changed; and frames whose rows were not both seen (missed). The front end cannot say it: its line fires once a frame at DMA_DONE, SOF and EOF already latched together (G#13), and once more for SHADOW_UPDATE (G#8) about 150 us later (the Pro, b933), so the rows are watched instead (`row_timing`).
 static READ: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -414,6 +418,8 @@ fn readout_say(g: u64, what: &str) {
 static LTE_MOST: AtomicU64 = AtomicU64::new(0);
 /// The readout test (`row_timing`), the hand spawn's third input byte 1: a device test only, as it keeps a core spinning thru the last part of each frame.
 static MEASURE: AtomicU64 = AtomicU64::new(0);
+/// A device test, the hand spawn's fifth byte: a side channel off at the sensor in any mode (bit 0 phase detect, bit 1 embedded data).
+static SIDE_TEST: AtomicU64 = AtomicU64::new(0);
 /// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
 static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 fn img_log_say(g: u64) {
@@ -490,19 +496,7 @@ fn tl_say(g: u64) {
     let _ = write!(h, "; DMA_DONE gaps A#{} to A#{} us\n", us(GAP[0].load(Ordering::Relaxed)), us(GAP[1].load(Ordering::Relaxed)));
     console(g, &h.b[..h.n]);
 }
-/// The PDMA engine's first 2^5 words, said (a stream that stopped: where the engine is and what it reports).
-fn pdma_say(g: u64, what: &str) {
-    let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: PDMA {what}:");
-    for k in 0..1usize << 5 {
-        let _ = write!(l, " {:X}", rd(g, ferros_cam::PDMA + 4 * k));
-    }
-    let _ = write!(l, "\n");
-    console(g, &l.b[..l.n]);
-}
-/// Every acknowledged word's bits, ORed over the open (ferros_cam cams `ack`, in its order): the error words among them (loch0's image and PD paths' IMG_ERR at +G#438 and +G#2038: SHORT_VB bit 1, EBUF_OVERFLOW bit 3, LATE_CONFIG bit 4, WDMA bit 5) are read and cleared every answer, so this is the only record of what they said.
-static ACK_OR: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
-/// Per answer (the timeline's index), loch0's image path's error word (low 16 bits) and its PD path's (bits 16 to 31), as the acknowledgement read them.
+/// Per answer (the timeline's index), loch0's image path's error word (low 16 bits) and its PD path's (bits 16 to 31), as the acknowledgement read them (SHORT_VB bit 1, EBUF_OVERFLOW bit 3, LATE_CONFIG bit 4, WDMA bit 5, SHORT_VB_FATAL bit 13): read and cleared every answer, so this and `ACK_OR` are their only record.
 static TL_ERR: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
 /// The first answer whose error words were not 0: its frame count + 1 (0 none) and the words.
 static ERR_FIRST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -511,38 +505,27 @@ const IMG_ERR: usize = 0x1C32_0438;
 const PD_ERR: usize = 0x1C32_2038;
 const IMG_OVF: usize = 0x1C32_0428;
 const IMG_ERR_OVF: usize = 0x1C32_043C;
-fn ack_reset() {
-    for e in ACK_OR.iter().chain(TL_ERR.iter()).chain(ERR_FIRST.iter()) {
+fn err_reset() {
+    for e in TL_ERR.iter().chain(ERR_FIRST.iter()) {
         e.store(0, Ordering::Relaxed);
     }
 }
-/// What the front end said over the open and says now: the answers' timeline (`tl_say`), every acknowledged word that ever held bits, the first error, the overflow words, the engine's words.
+/// What the front end said over the open and says now: the answers' timeline (`tl_say`), the first error, the overflow words, then every acknowledged word and the engine's words (`ack_say`).
 fn fe_say(g: u64, what: &str) {
     tl_say(g);
     let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: {what}: acknowledged words that held bits:");
-    for (j, &a) in cam().ack.iter().enumerate() {
-        let v = ACK_OR[j].load(Ordering::Relaxed);
-        if v != 0 {
-            let _ = write!(l, " {:X}={v:X}", a & 0xF_FFFF);
-        }
-        if l.n > 224 {
-            let _ = write!(l, "\n");
-            console(g, &l.b[..l.n]);
-            l.n = 0;
-        }
-    }
+    let _ = write!(l, "camera: {what}: ");
     match ERR_FIRST[0].load(Ordering::Relaxed) {
         0 => {
-            let _ = write!(l, "; no error word ever set");
+            let _ = write!(l, "no error word ever set");
         }
         f => {
-            let _ = write!(l, "; the first error at frame A#{} (G#{:X})", f - 1, ERR_FIRST[1].load(Ordering::Relaxed));
+            let _ = write!(l, "the first error at frame A#{} (G#{:X})", f - 1, ERR_FIRST[1].load(Ordering::Relaxed));
         }
     }
     let _ = write!(l, "; overflow words: image G#{:X}, errors G#{:X}\n", rd(g, IMG_OVF), rd(g, IMG_ERR_OVF));
     console(g, &l.b[..l.n]);
-    pdma_say(g, what);
+    ack_say(g);
 }
 /// Bits a sample on the link: 10, or 12 for the RAW12 attempt.
 static NOW_FORMAT: AtomicU64 = AtomicU64::new(10);
@@ -778,6 +761,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         let v = rd(g, a);
         wr(g, a, v);
         ACK_OR[j].fetch_or(v as u64, Ordering::Relaxed);
+        ACK_LAST[j].store(v as u64, Ordering::Relaxed);
         if a == IMG_ERR {
             err |= v as u64 & 0xFFFF;
         } else if a == PD_ERR {
@@ -868,7 +852,7 @@ extern "C" fn frame_thread(g: u64) -> ! {
                     fe_say(g, "the line quiet");
                 }
                 answer(g, &mut idx, &mut enabled);
-            } else if ferros_sys::us_since(last) > QUIET_US + (period_ps() << 1) / 1_000_000 && QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
+            } else if ferros_sys::us_since(last) > QUIET_US + (period_ns() << 1) / 1000 && QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
                 say!(g, "camera: the line quiet A#{} us, past two frame periods, the front end's status clear (engine G#{:X} index G#{:X}, our index G#{idx:X}): the stream stopped by itself\n", ferros_sys::us_since(last), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
             }
         }
@@ -1312,8 +1296,13 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
-    // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     let arr = &ccs::ARRAYS[c.id as usize];
+    if MEASURE.load(Ordering::Relaxed) == 2 {
+        if let Some(l) = arr.lte {
+            shift_width(g, &bus, c, l);
+        }
+    }
+    // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     if let Some(m) = mode {
         say!(g, "camera: mode A#{}: A#{} x A#{} (x G#{:X} to G#{:X}, y G#{:X} to G#{:X}, increments A#{} A#{}, binning G#{:02X}{:02X}), frame A#{} lines of A#{} clocks, integration A#{} lines, format G#{:X}; the sensor's phase detect and embedded data {}{}\n", s.kind, m.x_out, m.y_out, m.x_start, m.x_end, m.y_start, m.y_end, m.inc[0], m.inc[2], m.binning[0], m.binning[1], m.fll, m.llp, m.coarse, m.format, if m.quiet { "off" } else { "as the init left them" }, if s.flags & F_MID != 0 { "; written after the first frame" } else { "" });
         if s.flags & F_MID == 0 {
@@ -1321,6 +1310,21 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
                 bus.write(c.addr, wr_).map_err(Fail::Sensor)?;
             }
         }
+    }
+    // A device test (the hand spawn's fifth byte, `SIDE_TEST`): one side channel off at the sensor in any mode, whole frames too (bit 0 phase detect, bit 1 embedded data), so a whole frame says which of the two the front end's SHORT_VB_FATAL follows.
+    let side = SIDE_TEST.load(Ordering::Relaxed);
+    if let (true, Some(sd)) = (side != 0, arr.side) {
+        let page = [(ccs::SAMSUNG_PAGE >> 8) as u8, ccs::SAMSUNG_PAGE as u8, (ccs::CCS_PAGE >> 8) as u8, ccs::CCS_PAGE as u8];
+        bus.write(c.addr, &page).map_err(Fail::Sensor)?;
+        bus.write(c.addr, c.hold).map_err(Fail::Sensor)?;
+        if let (true, Some(p)) = (side & 1 != 0, sd.pd) {
+            bus.write(c.addr, &[(p >> 8) as u8, p as u8, 0, 0]).map_err(Fail::Sensor)?;
+        }
+        if side & 2 != 0 {
+            bus.write(c.addr, &[(sd.emb >> 8) as u8, sd.emb as u8, 0, 0]).map_err(Fail::Sensor)?;
+        }
+        bus.write(c.addr, c.release).map_err(Fail::Sensor)?;
+        say!(g, "camera: side test: phase detect {}, embedded data {}\n", if side & 1 != 0 { "off" } else { "left" }, if side & 2 != 0 { "off" } else { "left" });
     }
     // The job moved into the region, its geometry rewritten to the front end's (`fe`), then placed there: the ring and the program in the region's first frame, the outputs patterned.
     let m_ = job::relocate(&mut jb[..jn], pa, &l).map_err(Fail::Job)?;
@@ -1410,6 +1414,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     NOW_FORMAT.store(mode.map_or(10, |m| m.bits() as u64), Ordering::Relaxed);
     for x in [&LATE, &BUSY, &BUSY_MOST, &WRAPS] {
         x.store(0, Ordering::Relaxed);
+    }
+    for k in 0..ACK_MOST {
+        ACK_OR[k].store(0, Ordering::Relaxed);
+        ACK_LAST[k].store(0, Ordering::Relaxed);
     }
     // The engine's places: the copies, the descriptors' flags (the job's own: its first descriptor's).
     let first = unsafe { core::ptr::read_volatile(va as *const [u32; 4]) };
@@ -1521,8 +1529,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
     LLP.store(now.llp as u64, Ordering::Relaxed);
-    PERIOD_PS.store(timing.frame_ps(&now), Ordering::Relaxed);
-    PERIOD_PREV_PS.store(0, Ordering::Relaxed);
+    PERIOD_NS.store(timing.frame_ns(&now), Ordering::Relaxed);
+    PERIOD_PREV_NS.store(0, Ordering::Relaxed);
     PERIOD_AT.store(0, Ordering::Relaxed);
     NOW_GAIN.store(o.gain, Ordering::Relaxed);
     NOW_FOCUS.store(o.focus, Ordering::Relaxed);
@@ -1533,7 +1541,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     FRAMES.store(0, Ordering::Release);
     tl_reset();
-    ack_reset();
+    err_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
     bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start).
@@ -1543,7 +1551,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     step!(g, "camera: streaming A#{} ms after the open (open step: stream on)\n", ferros_sys::us_since(t0) / 1000);
     // Mid-stream, when asked: the mode written once the first frame has landed (October's order; the sensor took one change a session and then needed a cold boot).
     if let (Some(m), true) = (mode, s.flags & F_MID != 0) {
-        let until = ferros_sys::now() + ferros_sys::freq() * late_us() / 1_000_000;
+        let until = late_tick();
         while FRAMES.load(Ordering::Acquire) == 0 && ferros_sys::now() < until {
             ferros_sys::wait(&FRAMES, 0, until);
         }
@@ -1777,7 +1785,7 @@ fn unhold(bit: u32, b: usize) {
 
 /// Wait for a buffer whose frame is past `after` and hold it for `bit`, until `late_us` passes: the sensor sends one a frame period (67.8 ms at the main's own mode, up to the longest exposure's), so none by then is a stream that stopped (the front end stops for good when it is not answered in time), and the caller is told rather than kept waiting.
 fn wait_hold(bit: u32, after: u64) -> Option<usize> {
-    let until = ferros_sys::now() + ferros_sys::freq() * late_us() / 1_000_000;
+    let until = late_tick();
     loop {
         let n = FRAMES.load(Ordering::Acquire);
         if let Some(b) = hold_newest(bit, after) {
@@ -1842,6 +1850,28 @@ fn late(g: u64) {
 }
 
 /// The camera's CSI link as it stands, said: at a stream that stopped (`late`) and at every close, so a run says which channels the sensor sent (frame starts per channel at +G#24) and whether the link took them whole (+G#14: G#20 ERR_CRC_PH).
+/// Every acknowledged status word's bits seen since the open (or) and in the last answer (last), and the PDMA engine's first 2^4 words as they stand: a stream whose frames begin and never end (a slit's third frame, 2026-11-17 night) says which block held its bits.
+fn ack_say(g: u64) {
+    // Eight words a line, so a line stays inside the console's 256 bytes.
+    for part in cam().ack.chunks(1 << 3).enumerate() {
+        let mut l = Line { b: [0; 256], n: 0 };
+        let _ = write!(l, "camera: acks (or/last):");
+        for (i, &a) in part.1.iter().enumerate() {
+            let k = (part.0 << 3) + i;
+            let (o, last) = (ACK_OR[k].load(Ordering::Relaxed), ACK_LAST[k].load(Ordering::Relaxed));
+            let _ = write!(l, " {:X}:{o:X}/{last:X}", a & 0xFFFFF);
+        }
+        let _ = write!(l, "\n");
+        console(g, &l.b[..l.n]);
+    }
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: engine words from +0:");
+    for k in 0..1 << 4 {
+        let _ = write!(l, " {:X}", rd(g, ferros_cam::PDMA + 4 * k));
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
     let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
@@ -1863,20 +1893,24 @@ static QUIET: AtomicU64 = AtomicU64::new(0);
 /// How long a FRAME waits for its frame before the stream is taken for stopped, past the frame period itself (`late_us`): about thirty of the main's ordinary frames, past the sensor's start after stream on.
 const FRAME_LATE_US: u64 = 1 << 21;
 
-/// The longest frame period that may be on its way now (ps): the timing's own, and for two frames after a change of it also the one before (`PERIOD_AT`), summed, which bounds the longer of the two.
-fn period_ps() -> u64 {
-    let now = PERIOD_PS.load(Ordering::Relaxed);
-    if FRAMES.load(Ordering::Acquire) < PERIOD_AT.load(Ordering::Relaxed) + 2 { now + PERIOD_PREV_PS.load(Ordering::Relaxed) } else { now }
+/// The longest frame period that may be on its way now (ns): the timing's own, and for two frames after a change of it also the one before (`PERIOD_AT`), summed, which bounds the longer of the two.
+fn period_ns() -> u64 {
+    let now = PERIOD_NS.load(Ordering::Relaxed);
+    if FRAMES.load(Ordering::Acquire) < PERIOD_AT.load(Ordering::Relaxed) + 2 { now + PERIOD_PREV_NS.load(Ordering::Relaxed) } else { now }
 }
 
 /// How long a wait for the next frame may take before the stream is taken for stopped (us): `FRAME_LATE_US` past two frame periods, so a frame of 16 s is waited for (it was 2^21 us flat until 2026-11-17, which closed any frame longer than about two seconds).
 fn late_us() -> u64 {
-    FRAME_LATE_US + (period_ps() << 1) / 1_000_000
+    FRAME_LATE_US + (period_ns() << 1) / 1000
+}
+/// The counter's tick at `late_us` from now, in 128 bits: past about 8.7 days of us the product with the counter's 24.576 MHz passes 64 bits (the main's widest shift has 14-year frames); the ticks themselves fit.
+fn late_tick() -> u64 {
+    ferros_sys::now() + (ferros_sys::freq() as u128 * late_us() as u128 / 1_000_000) as u64
 }
 
-/// The sensor's frame period becomes `ps` (an open's mode, an exposure that moved the frame).
-fn period_set(ps: u64) {
-    PERIOD_PREV_PS.store(PERIOD_PS.swap(ps, Ordering::Relaxed), Ordering::Relaxed);
+/// The sensor's frame period becomes `ns` (an open's mode, an exposure that moved the frame).
+fn period_set(ns: u64) {
+    PERIOD_PREV_NS.store(PERIOD_NS.swap(ns, Ordering::Relaxed), Ordering::Relaxed);
     PERIOD_AT.store(FRAMES.load(Ordering::Acquire), Ordering::Relaxed);
 }
 
@@ -1895,6 +1929,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     // The fourth, a device test of the ring's wrap only: log2 of the count to ask (`RING_TEST`; 0 the mode's).
     if input_len > 3 {
         RING_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 3) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 4 {
+        SIDE_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 4) as *const u8) } as u64, Ordering::Relaxed);
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
@@ -2069,8 +2106,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                                 if (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift) {
                                     readout_say(g, "before");
                                     readout_reset();
-                                    period_set(o.timing.frame_ps(&p));
-                                    say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, o.timing.frame_ps(&p) / 1_000_000_000);
+                                    period_set(o.timing.frame_ns(&p));
+                                    say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, o.timing.frame_ns(&p) / 1_000_000);
                                 }
                                 o.now = p;
                                 NOW_LINES.store((p.coarse as u64) << p.shift, Ordering::Relaxed);
@@ -2206,7 +2243,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     continue;
                 }
                 let after = if got >= 5 { u32::from_le_bytes(msg[1..5].try_into().unwrap()) as u64 } else { 0 };
-                let until = ferros_sys::now() + ferros_sys::freq() * late_us() / 1_000_000;
+                let until = late_tick();
                 loop {
                     let n = FRAMES.load(Ordering::Acquire);
                     if n > after || ferros_sys::now() >= until {
@@ -2372,6 +2409,22 @@ fn caps(g: u64) -> [u8; 103] {
     out
 }
 
+/// The vendor shift field's width, a device test (`MEASURE` 2, the hand spawn's third byte): after the init and before stream on, so no frame runs at a written shift, each word is written into both shift registers inside the hold and read back; the bits the sensor keeps are the field. Both go back to 0 at the end.
+/// The coordinator, 2026-11-17: shifts 21 to 23 ran (frames 105.66 s apart at 23), so the field is wider than the 6 Android used; the main's most is the widest it keeps.
+fn shift_width(g: u64, bus: &Bus, c: &Cam, l: ccs::Lte) {
+    let page = [(ccs::SAMSUNG_PAGE >> 8) as u8, ccs::SAMSUNG_PAGE as u8, (ccs::CCS_PAGE >> 8) as u8, ccs::CCS_PAGE as u8];
+    for word in [0x1800u16, 0x1F00, 0x2000, 0x3F00, 0x4000, 0x7F00, 0xFF00, 0xFFFF, 0] {
+        let mut ok = bus.write(c.addr, &page).is_ok() && bus.write(c.addr, c.hold).is_ok();
+        for r in [l.fll_reg, l.coarse_reg] {
+            ok &= bus.write(c.addr, &[(r >> 8) as u8, r as u8, (word >> 8) as u8, word as u8]).is_ok();
+        }
+        ok &= bus.write(c.addr, c.release).is_ok();
+        let (mut a, mut b) = ([0u8; 2], [0u8; 2]);
+        ok &= bus.write_read(c.addr, &l.fll_reg.to_be_bytes(), &mut a).is_ok() && bus.write_read(c.addr, &l.coarse_reg.to_be_bytes(), &mut b).is_ok();
+        say!(g, "camera: shift width: wrote G#{word:04X} to G#{:04X} and G#{:04X}, read back G#{:04X} and G#{:04X}{}\n", l.fll_reg, l.coarse_reg, u16::from_be_bytes(a), u16::from_be_bytes(b), if ok { "" } else { " (a transfer failed)" });
+    }
+}
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
@@ -2381,7 +2434,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 /// The readout, watched in memory (`MEASURE`, a device test): after a frame's DMA_DONE and the SHADOW_UPDATE answered after it, the buffer the next frame lands in (the one its descriptor names, `LAST_R`) gets the pattern in its first row's first word (its last row's probe is patterned already, `ring_turn`); the thread sleeps thru the part of the period no readout can reach, then watches both words until the last row lands. From the first row's landing to the last's is the readout (`READ`).
 /// Where a readout can start: if the vendor shift scaled the line and not only the counters, the readout would take the rows' share of the period (3072 of 40650 lines, 7.6 %, at the shifted 16 s), so the watch starts twice that share before the period ends, and gives up a quarter period after it.
 fn row_timing() {
-    let period = PERIOD_PS.load(Ordering::Relaxed) / 1_000_000;
+    let period = PERIOD_NS.load(Ordering::Relaxed) / 1000;
     let (rows, fll) = (ROWS.load(Ordering::Relaxed), FLL.load(Ordering::Relaxed));
     // WHY the test: a frame of fewer than twice its rows in lines leaves no part of the period free of the readout, and the watch starts at once.
     let quiet_us = if fll > rows << 1 { period * (fll - (rows << 1)) / fll } else { 0 };

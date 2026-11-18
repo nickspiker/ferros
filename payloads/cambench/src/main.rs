@@ -517,7 +517,9 @@ fn run(g: u64, ep: u64, a: &Args) -> Option<u16> {
     let ok = if v.slit { slits(g, ep, a, &v) } else { frames(g, ep, a, &v, sensor16) };
     stats(g, ep);
     close(g, ep);
-    (ok && sensor16 != 0 && fe16 != 0).then_some(v.h as u16)
+    // A slit's sweep goes on while the sensor streams, whatever the front end took: its RATE is the sensor's floor at each step (2026-11-17 night: the front end takes two slit frames and stops, SHORT_VB_FATAL, at any frame length).
+    let streamed = if v.slit { sensor16 != 0 } else { ok && sensor16 != 0 && fe16 != 0 };
+    streamed.then_some(v.h as u16)
 }
 
 #[unsafe(no_mangle)]
