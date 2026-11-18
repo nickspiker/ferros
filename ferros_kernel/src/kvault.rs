@@ -159,6 +159,16 @@ pub struct Region {
     blocks: u64,
 }
 
+/// Block operations since the last feed of the watchdogs (`feed`).
+static OPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Feed the watchdogs every 2^6 block operations of the kernel vault: even at a millisecond a block that is a feed every 64 ms, far inside their one-second window (platform.rs WDT_COUNT).
+fn feed() {
+    if OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & ((1 << 6) - 1) == 0 {
+        crate::platform::pet_watchdogs();
+    }
+}
+
 impl BlockDev for Region {
     fn block_count(&self) -> u64 {
         self.blocks
@@ -167,10 +177,9 @@ impl BlockDev for Region {
         if lba >= self.blocks {
             return Err(manifestus::Error::Bounds(lba));
         }
-        // A blank pair of regions is scanned whole before manifestus genesises it (131072 reads): keep the watchdogs fed through that.
-        if lba % 1024 == 0 {
-            crate::platform::pet_watchdogs();
-        }
+        // The watchdogs fed every 2^6 block reads or writes, by count (`feed`): a loop over many values (a list's deletes, an export, manifestus's whole scan of a blank pair) never goes a second unfed, wherever its blocks lie.
+        // Until 2026-11-18 only a read whose block number was a multiple of 1024 fed them and writes never did, so a long run of scattered reads and writes went unfed (VSF-AUDIT wave 0, the converter build that did not boot on the Pro).
+        feed();
         READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let u = UfsController::new(UFS_BASE);
         if u.read_block_lun(0, (self.base + lba) as u32) != 0 || u.last_response_status() != 0 {
@@ -183,6 +192,7 @@ impl BlockDev for Region {
         if lba >= self.blocks {
             return Err(manifestus::Error::Bounds(lba));
         }
+        feed();
         WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let u = UfsController::new(UFS_BASE);
         u.data_buffer_mut().copy_from_slice(buf);
@@ -807,6 +817,7 @@ impl KVault {
         for a in list.chunks_exact(32) {
             let mut b = [0u8; 32];
             b.copy_from_slice(a);
+            crate::platform::pet_watchdogs();
             self.vault.delete(&b, now())?;
         }
         if !list.is_empty() {
@@ -852,6 +863,7 @@ impl KVault {
             if EXPORT_SKIP.iter().any(|p| name.starts_with(p)) {
                 continue;
             }
+            crate::platform::pet_watchdogs();
             if let Some(v) = self.get_by_key(&name)? {
                 out.push((name, v));
             }
@@ -1097,4 +1109,9 @@ impl KVault {
         let st = self.vault.engine_stats();
         alloc::format!("manifestus gen {:?} {:?}", self.vault.generation(), st)
     }
+}
+
+/// The kernel vault's two mirror regions in the ferros partition (first block, blocks: A then B), for the owner's fresh start (service.rs `vault fresh`), which zeroes them: manifestus genesises a blank pair at the next open.
+pub fn regions() -> (u64, u64) {
+    (MIRROR_OFFSET, 2 * REGION_BLOCKS)
 }

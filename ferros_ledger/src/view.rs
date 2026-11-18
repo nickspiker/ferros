@@ -121,6 +121,7 @@ impl Why {
             Why::SeqGap { .. } => 5,
             Why::Unreadable { .. } => 6,
             Why::Shut(_) => 7,
+            Why::NotARing => 8,
         }
     }
 }
@@ -146,6 +147,7 @@ impl core::fmt::Display for Why {
             Why::SeqGap { expected, found } => write!(f, "entries A#{expected} to A#{} are missing", found - 1),
             Why::Unreadable { copy } => write!(f, "{} copy of this block could not be read", copy_name(*copy)),
             Why::Shut(e) => write!(f, "an entry this device should open does not open: {e}"),
+            Why::NotARing => write!(f, "block 0 holds no entry in either copy: not a ring; the ring starts afresh here and writes over it"),
         }
     }
 }

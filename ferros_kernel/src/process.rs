@@ -7914,3 +7914,34 @@ pub fn spawn_capsule_no_ihi(name: &[u8], capsule: &[u8], input: &[u8], grants: &
     }
     spawn(name, &g.code, input, grants, None, false, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
 }
+
+/// Zero `count` blocks of the ferros partition from block `at` of it, a run at a time through the run bounce, the watchdogs fed at every run: the owner's fresh start (service.rs `vault fresh`).
+/// Whether every run was written; it stops at the first refusal.
+/// The caller holds the kernel lock, so no other UFS command runs between the runs.
+pub fn zero_blocks(at: u64, count: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some((first, blocks)) = crate::ufs_device::part() else { return false };
+    // WHY the bound: the regions are the kernel's own constants, but the partition is the GPT's; a region past its end would zero whatever follows the partition.
+    // PROOF of no overflow: at and count are below 2^32 (block numbers of a partition the GPT gives as u32).
+    if at + count > blocks as u64 {
+        return false;
+    }
+    let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+    let run = (&raw mut UFS_RUN) as usize;
+    if ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+        u.probe_prdt_stride(0, (first as u64 + at) as u32, run);
+    }
+    // After the probe, which uses the bounce as its scratch.
+    unsafe { core::ptr::write_bytes(run as *mut u8, 0, ferros_hal::ufs::RUN_MAX << 12) };
+    let mut k = 0u64;
+    while k < count {
+        // WHY the smaller: the last run is what is left of the region, the others BLOCK_MAX.
+        let n = if count - k < BLOCK_MAX { count - k } else { BLOCK_MAX };
+        crate::platform::pet_watchdogs();
+        if !u.write_run_lun(0, (first as u64 + at + k) as u32, n as usize, run) {
+            return false;
+        }
+        k += n;
+    }
+    true
+}
