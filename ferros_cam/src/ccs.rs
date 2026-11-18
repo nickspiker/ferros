@@ -64,17 +64,182 @@ pub struct Array {
     pub unbinned: [u8; 2],
     /// The gain the list offers (1024 one): the sensor's own range (`Gain::range`, read at each open and said on the console), written here once measured on the device so the list, built with no camera powered, can carry it; 1024 and 1024 (the captured code alone) until then.
     pub gain: (u64, u64),
+    /// The integration's margin under the frame (CCS coarse_integration_time_max_margin, G#1006) as the sensor answered it on the device, so the list, built with no camera powered, can offer the long exposures it makes (`Timing`); None where never read, and there the frame never moves for an exposure (the init's own integration is the longest offered).
+    /// The driver reads the sensor's own word at each open and drives with that (`Timing::margin`); the console says so when it differs from this.
+    pub margin: Option<u16>,
+    /// The vendor's long-exposure shift (`Lte`), once a capture of Android's own long exposure shows how it is written; None until then.
+    pub lte: Option<Lte>,
+}
+
+/// A sensor vendor's long-exposure shift: the frame and the integration each counted in units of 2^shift lines, past the 16 bits of CCS frame_length_lines and coarse_integration_time (owner, 2026-11-17: "this needs done", up to 16 s on the main as on Android).
+/// The main's per-frame block under Android writes two such words in its hold every frame, G#0702 and G#0704, both 0 at its ordinary exposures (target/hv/cam-open3, the 2026-10-19 open capture, local).
+/// What a long exposure writes there (which byte carries the shift, its most, whether the stream stops around the change) comes only from the capture of Android at 16 s (docs/CAMERA.md "Long exposures"), so no camera has one yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lte {
+    /// The frame length's shift register and the integration's.
+    pub fll_reg: u16,
+    pub coarse_reg: u16,
+    /// The 16-bit word written for a shift: the shift moved left by this many bits (8 when the shift is the register's high byte).
+    pub at: u8,
+    /// The most shift the sensor takes.
+    pub most: u8,
+}
+
+impl Lte {
+    pub fn word(&self, shift: u8) -> u16 {
+        (shift as u16) << self.at
+    }
 }
 
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
     // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03). Offered: the analogue range alone, 1024 to 163840 (owner, 2026-11-17: digital gain is after the ADC, so analogue only); the noise test (camtest 4, b915) puts the real analogue at the stated 160x: no empty codes at any step, and the dark noise grows 1.67 times from 64x to 128x and 1.10 from 128x to 160x (2 and 1.25 if the gain were after the ADC).
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY) },
+    // Its integration least and margin, CAPS on the Pro (2026-11-16, b897): 2 and 2.
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: None },
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
-    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY) },
-    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY) },
+    // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64.
+    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: None },
+    // The front has never answered ferros, the tele never streamed: neither margin read.
+    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None },
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None },
 ];
+
+// ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
+
+/// The integration's least and margin, one 4-byte read from G#1004 (CCS coarse_integration_time_min, coarse_integration_time_max_margin).
+pub const COARSE_CAPS: u16 = COARSE_INTEGRATION_MIN;
+/// The most CCS's 16-bit frame length and line length hold.
+pub const LINES_MOST: u64 = (1 << 16) - 1;
+/// A stretched line's step in pixel clocks: every line length this sensor has run on ferros is a multiple of 2^4 (6320 the init's, 5888, 5632, 5376 and 4864 the 2026-11-16 sweep), so a stretched one is kept on that step (CCS states no step, and the main's limit block does not answer).
+pub const LLP_STEP: u64 = 1 << 4;
+/// The longest line offered: the most 16 bits hold, on the step.
+pub const LLP_MOST: u64 = LINES_MOST & !(LLP_STEP - 1);
+
+/// An open camera's frame timing, what an exposure in nanoseconds turns into (`plan`).
+/// The line time is measured at the captured line length (`Cam::line_ps` at `Cam::llp`) and scales with the line length, the pixel clock being the PLL's (`frame_ps`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timing {
+    pub line_ps: u64,
+    pub captured_llp: u16,
+    /// The open mode's own line length and frame length: the init's, or a mode's (OPEN's mode block). An exposure that fits this frame leaves both alone, so the frame rate stays the mode's.
+    pub llp: u16,
+    pub fll: u16,
+    /// The sensor's integration least and margin (CCS G#1004, G#1006).
+    pub coarse_min: u16,
+    pub margin: u16,
+    /// Whether the frame may move for an exposure: the sensor's margin read at this open, and the camera offered long exposures (`Array::margin`). Otherwise an exposure must fit the mode's own frame less `MARGIN`, as before 2026-11-17.
+    pub long: bool,
+    pub lte: Option<Lte>,
+}
+
+/// The sensor's timing for one exposure: line length, frame length and integration in their registers' units, and the vendor shift (0 without one).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plan {
+    pub llp: u16,
+    pub fll: u16,
+    pub coarse: u16,
+    pub shift: u8,
+}
+
+impl Timing {
+    /// The line time at line length `llp` (ps).
+    pub fn line_ps_at(&self, llp: u16) -> u64 {
+        self.line_ps * llp as u64 / self.captured_llp as u64
+    }
+
+    /// The mode's own timing with `coarse` lines of integration.
+    pub fn own(&self, coarse: u16) -> Plan {
+        Plan { llp: self.llp, fll: self.fll, coarse, shift: 0 }
+    }
+
+    /// The frame for `coarse` lines of integration at shift 0 or more (CCS: coarse <= frame_length_lines - margin, both in the shift's units).
+    /// WHY the choice of the larger: the frame has two floors, the mode's own frame (its rows and the blanking the front end needs: 128 lines on the ultrawide, 2026-11-16) and the integration plus the sensor's margin; it is the larger of the two, never cut under either.
+    fn frame(&self, coarse: u64) -> u16 {
+        if coarse + self.margin as u64 > self.fll as u64 { (coarse + self.margin as u64) as u16 } else { self.fll }
+    }
+
+    /// The timing for an exposure of `ns`, in the order that changes the least: (0) the mode's own frame when the integration fits it; (1) the frame lengthened, to the 16 bits CCS gives it (the main: about 0.21 s); (2) with the vendor's shift, the frame and integration counted in 2^shift lines at the mode's line length (Android's way, `Lte`); (3) without one, the line lengthened on `LLP_STEP` to `LLP_MOST` (the main: about 2.19 s).
+    /// None: shorter than the sensor's least integration, or longer than the most this camera takes (refused, never capped, as a gain past the range is).
+    pub fn plan(&self, ns: u64) -> Option<Plan> {
+        // WHY checked: `ns` is the caller's eight bytes (SET); past 2^64 / 1000 the product would wrap and read as a short exposure, which this refuses instead.
+        let ps = ns.checked_mul(1000)?;
+        let lines = ps / self.line_ps_at(self.llp);
+        if lines < self.coarse_min as u64 {
+            return None;
+        }
+        let room = if self.long { self.margin as u64 } else { MARGIN as u64 };
+        if lines + room <= self.fll as u64 {
+            return Some(self.own(lines as u16));
+        }
+        if !self.long {
+            return None;
+        }
+        // The most integration 16 bits of frame hold with the margin.
+        let most = LINES_MOST - self.margin as u64;
+        if lines <= most {
+            return Some(Plan { llp: self.llp, fll: self.frame(lines), coarse: lines as u16, shift: 0 });
+        }
+        if let Some(l) = self.lte {
+            // The least shift that brings the integration under 16 bits.
+            let mut shift = 1u8;
+            while shift <= l.most {
+                let c = lines >> shift;
+                if c <= most {
+                    return Some(Plan { llp: self.llp, fll: self.frame(c), coarse: c as u16, shift });
+                }
+                shift += 1;
+            }
+            return None;
+        }
+        // The least line on the step whose `most` lines hold the exposure: llp >= ps x captured / (line_ps x most), rounded up to the step; in 128 bits, as ps x captured passes 64 for an exposure past about 48 minutes.
+        let exact = (ps as u128 * self.captured_llp as u128).div_ceil(self.line_ps as u128 * most as u128);
+        let llp = exact.div_ceil(LLP_STEP as u128) * LLP_STEP as u128;
+        if llp > LLP_MOST as u128 {
+            return None;
+        }
+        let c = ps / self.line_ps_at(llp as u16);
+        Some(Plan { llp: llp as u16, fll: self.frame(c), coarse: c as u16, shift: 0 })
+    }
+
+    /// The exposure a plan gives (ns): its integration's lines, shifted, at its line's time.
+    pub fn ns(&self, p: &Plan) -> u64 {
+        ((p.coarse as u64) << p.shift) * self.line_ps_at(p.llp) / 1000
+    }
+
+    /// A plan's frame period (ps).
+    pub fn frame_ps(&self, p: &Plan) -> u64 {
+        ((p.fll as u64) << p.shift) * self.line_ps_at(p.llp)
+    }
+
+    /// The longest exposure offered (ns): with the shift, the most integration at its most shift on the mode's line; without, at the longest line; neither, the mode's own frame less `MARGIN`.
+    pub fn most_ns(&self) -> u64 {
+        if !self.long {
+            return (self.fll as u64 - MARGIN as u64) * self.line_ps_at(self.llp) / 1000;
+        }
+        let most = LINES_MOST - self.margin as u64;
+        match self.lte {
+            Some(l) => (most << l.most) * self.line_ps_at(self.llp) / 1000,
+            None => most * self.line_ps_at(LLP_MOST as u16) / 1000,
+        }
+    }
+}
+
+impl Cam {
+    /// The camera's timing as the list offers it, with no sensor powered: the captured init's line and frame, the margin and shift as measured (`ARRAYS`); the driver builds its own at the open from the sensor's own words.
+    pub fn listed_timing(&self) -> Timing {
+        let a = &ARRAYS[self.id as usize];
+        Timing {
+            line_ps: self.line_ps,
+            captured_llp: self.llp,
+            llp: self.llp,
+            fll: (self.exposure_max_lines + MARGIN as u64) as u16,
+            coarse_min: 1,
+            margin: a.margin.unwrap_or(MARGIN),
+            long: a.margin.is_some(),
+            lte: a.lte,
+        }
+    }
+}
 
 /// A readout mode: every CCS register a mode change writes, as the sensor holds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -513,6 +678,7 @@ mod tests {
         assert_eq!((m.x_out, m.y_out, m.inc), (4080, 3072, [4; 4]));
         assert_eq!((m.binning[0], m.binning[1]), (0x32, 0x44));
         assert_eq!((m.fll, m.llp, m.coarse, m.format), (0x5372, 6320, 0x535E, RAW10));
+        assert_eq!(m.llp, cams::MAIN.llp);
         // The CCS addresses span 16320 x 12288, two to a pixel of the 8160 x 6144 array.
         assert_eq!(((m.x_end + 1 - m.x_start) / a.unit, (m.y_end + 1 - m.y_start) / a.unit), a.full);
         let p = Page::of(&init);
@@ -526,12 +692,14 @@ mod tests {
             println!("ultrawide: {m:?}");
             assert_eq!((m.x_out, m.y_out, m.binning, m.crop), (4000, 3000, [1, 0x22, 8], [312, 4, 4000, 3000]));
             assert_eq!((m.fll, m.llp, m.coarse), (5081, 9568, 4124));
+            assert_eq!(m.llp, cams::ULTRAWIDE.llp);
         }
         if let Some(init) = local("tele.init") {
             let m = Mode::captured(&init, &ARRAYS[3]).unwrap();
             println!("tele: {m:?}");
             assert_eq!((m.x_out, m.y_out, m.inc, m.binning[0], m.binning[1]), (4032, 3024, [2; 4], 0x22, 0x22));
             assert_eq!((m.x_end + 1 - m.x_start, m.fll, m.llp), (8064, 5457, 5568));
+            assert_eq!(m.llp, cams::TELE.llp);
         }
     }
 
@@ -636,6 +804,86 @@ mod tests {
         assert!(main.split(163840).is_some_and(|s| s.digital == 0x100));
         // Words that describe no model: the aliasing the main's limit block shows (every word G#4140).
         assert_eq!(Gain::of(&[0x41, 0x40].repeat(10).try_into().unwrap(), &d(0x100, 0x100, 1)), None);
+    }
+
+    /// The main's timing at its init's mode: llp 6320, fll 21362, the margin and least integration it answered (2 and 2).
+    fn main_timing() -> Timing {
+        Timing { line_ps: crate::MAIN_LINE_PS, captured_llp: 6320, llp: 6320, fll: 0x5372, coarse_min: 2, margin: 2, long: true, lte: None }
+    }
+
+    /// Long exposures, step by step: inside the init's frame nothing but the integration moves; past it the frame grows to 16 bits (about 0.21 s); past that the line grows on its step to the most (about 2.19 s); past that refused. Every plan keeps the integration inside the frame by the sensor's margin, and gives back the exposure asked to within a line.
+    #[test]
+    fn long_exposures_plan() {
+        let t = main_timing();
+        // Within the frame: the mode's own frame and line.
+        let p = t.plan(17_200_000).unwrap();
+        assert_eq!((p.llp, p.fll, p.shift), (6320, 0x5372, 0));
+        assert_eq!(p.coarse as u64, 17_200_000_000 / crate::MAIN_LINE_PS);
+        // The init's own integration (21342 lines) fits its frame with the sensor's margin.
+        assert_eq!(t.plan(0x535E * crate::MAIN_LINE_PS / 1000 + 1).unwrap().fll, 0x5372);
+        // 100 ms: the frame lengthened, the line not.
+        let p = t.plan(100_000_000).unwrap();
+        assert_eq!((p.llp, p.fll as u64), (6320, p.coarse as u64 + 2));
+        // The most 16 bits of frame give at the init's line: about 0.211 s.
+        let edge = (LINES_MOST - 2) * crate::MAIN_LINE_PS / 1000;
+        assert_eq!(t.plan(edge).unwrap().llp, 6320);
+        assert!((210_000_000..212_000_000).contains(&edge), "{edge}");
+        // 1 s and 2 s: the line lengthened on its step, the frame at most 16 bits.
+        for ns in [212_000_000u64, 1_000_000_000, 2_000_000_000] {
+            let p = t.plan(ns).unwrap();
+            assert!(p.llp > 6320 && p.llp as u64 % LLP_STEP == 0 && p.llp as u64 <= LLP_MOST, "{ns}: {p:?}");
+            assert!(p.coarse as u64 + 2 <= p.fll as u64 && p.fll as u64 <= LINES_MOST, "{ns}: {p:?}");
+            // The exposure given is the one asked, short of it by less than a line.
+            let got = t.ns(&p);
+            assert!(got <= ns && ns - got < t.line_ps_at(p.llp) / 1000 + 1, "{ns}: {got}");
+        }
+        // The most offered, about 2.19 s, is taken; one more line is not.
+        let most = t.most_ns();
+        assert!((2_180_000_000..2_200_000_000).contains(&most), "{most}");
+        assert!(t.plan(most).is_some());
+        assert_eq!(t.plan(most + t.line_ps_at(LLP_MOST as u16) / 1000 + 1), None);
+        // 16 s takes the vendor's shift, which no camera has until the capture.
+        assert_eq!(t.plan(16_000_000_000), None);
+        // Under the sensor's least integration (2 lines), and a value that would wrap: refused.
+        assert_eq!(t.plan(crate::MAIN_LINE_PS / 1000), None);
+        assert_eq!(t.plan(u64::MAX), None);
+        // The frame periods: the init's 68.9 ms; at the most, 65535 lines of 33.4 us.
+        assert_eq!(t.frame_ps(&t.own(16)), 0x5372 * crate::MAIN_LINE_PS);
+        let p = t.plan(most).unwrap();
+        assert!((2_180_000_000_000..2_200_000_000_000).contains(&t.frame_ps(&p)), "{}", t.frame_ps(&p));
+    }
+
+    /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.
+    #[test]
+    fn long_exposures_with_a_shift() {
+        let l = Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 7 };
+        let t = Timing { lte: Some(l), ..main_timing() };
+        let p = t.plan(16_000_000_000).unwrap();
+        assert_eq!((p.llp, p.shift), (6320, 7));
+        assert!(p.coarse as u64 + 2 <= p.fll as u64);
+        let got = t.ns(&p);
+        assert!(got <= 16_000_000_000 && 16_000_000_000 - got < (crate::MAIN_LINE_PS << 7) / 1000 + 1, "{got}");
+        assert_eq!(l.word(7), 0x0700);
+        // A second takes shift 3: 310200 lines over 8 is under 16 bits, over 4 is not.
+        assert_eq!(t.plan(1_000_000_000).unwrap().shift, 3);
+        // The most: 65533 lines of 2^7 at 3.22 us, about 27 s.
+        assert!((27_000_000_000..27_100_000_000).contains(&t.most_ns()), "{}", t.most_ns());
+    }
+
+    /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
+    #[test]
+    fn short_cameras_keep_their_frame() {
+        let f = cams::FRONT.listed_timing();
+        assert!(!f.long);
+        assert_eq!(f.most_ns(), cams::FRONT.exposure_max_lines * cams::FRONT.line_ps / 1000);
+        let m = cams::MAIN.listed_timing();
+        assert!(m.long && m.most_ns() > 2_000_000_000);
+        let u = cams::ULTRAWIDE.listed_timing();
+        // The ultrawide: (65535 - 64) lines at 65520 clocks of its 9568-clock 6.56 us line, about 2.94 s.
+        assert!((2_930_000_000..2_950_000_000).contains(&u.most_ns()), "{}", u.most_ns());
+        let t = Timing { long: false, ..main_timing() };
+        assert!(t.plan(t.most_ns()).is_some());
+        assert_eq!(t.plan(t.most_ns() + crate::MAIN_LINE_PS / 1000 + 1), None);
     }
 
     #[test]

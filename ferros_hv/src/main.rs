@@ -732,6 +732,8 @@ static mut ORACLE_LOGGED: u64 = 0;
 /// The last logged access (pa, value, write<<8 | bytes) and how many identical ones followed it unlogged: a driver's status poll is the same read returning the same value thousands of times, and logging each one ate the whole cap on the camera bus (2026-10-19). A run is written as one `rep N` line when it ends; the decoder replays it.
 static mut ORACLE_PREV: [u64; 3] = [u64::MAX; 3];
 static mut ORACLE_REP: u64 = 0;
+/// The I2C target the controller last selected (its ADDR word, +G#70), for `ORACLE_I2C_TARGET`. One controller is trapped per capture and Linux's I2C core runs one transfer on it at a time, so one word serves.
+static mut ORACLE_I2C_NOW: u64 = 0;
 /// Census mode: two bits per oracle target page (first read, first write), each set when that access is logged.
 static mut ORACLE_SEEN: [u64; (2 * ORACLE_TARGETS.len()).div_ceil(64)] = [0; (2 * ORACLE_TARGETS.len()).div_ceil(64)];
 
@@ -747,6 +749,17 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
                 return;
             }
             q += 1;
+        }
+        // One sensor's transfers alone (FERROS_HV_ORACLE_I2C_TARGET, build.rs): the target its last ADDR write selected, and only the accesses that carry a transfer.
+        if ORACLE_I2C_TARGET != 0 {
+            let off = pa & 0xFFF;
+            if write && off == 0x70 {
+                write_volatile(&raw mut ORACLE_I2C_NOW, (val >> 10) & 0x7F);
+            }
+            let carries = matches!((off, write), (0x70, true) | (0x44, true) | (0x34, true) | (0x38, false));
+            if !carries || read_volatile(&raw const ORACLE_I2C_NOW) != ORACLE_I2C_TARGET {
+                return;
+            }
         }
         if !read_volatile(&raw const ORACLE_ARMED) {
             // Arm on the first access when there is no gap, or on the first access after the pages have been quiet for the gap; never before ORACLE_ARM_AFTER_MS.

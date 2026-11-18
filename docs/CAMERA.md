@@ -466,6 +466,56 @@ Lumis sends ISO as gain in 1024ths of one (ISO 100 = 1024) and holds it inside t
 - The caveat the test cannot close: a sensor whose ADC has more bits than its RAW10 output, with digital gain applied before the cut to 10 bits, shows no empty codes until that gain passes the extra bits; the noise growth above still argues against it up to 160x.
 - **The ultrawide** (dark, 128 us): noise 7, 8, 11, 16 sixteenths at 1x, 2x, 4x, 8x and 77 at 64x (x4.8 from 8x to 64x, against x8 for a gain after the ADC); every code near the mean holding samples at 64x (43 of 43); lit (its init's exposure) the same, no empty codes to 64x. **Its ceiling: 1024 to 65536** (ISO 100 to 6400), now in `ARRAYS`, so Lumis's ISO works on it too. (The console ring dropped the 11x to 45x lines of its dark run; the runs are in /mnt/Harbor/tmp/camtrials/runs.)
 
+## Long exposures (2026-11-17): built, not run
+
+The owner, relayed by the Lumis session: "this needs done", Lumis on ferros exposing as long as on Android, up to 16 s on the main.
+Until now the longest exposure was the init's own frame: the driver wrote only the integration (CCS coarse_integration_time, G#0202) inside the hold, never the frame, so the main stopped at 21342 lines of 3.2237 us, 68.8 ms (the ultrawide at 33 ms, the front at 14 ms).
+
+**What changes** (ferros_cam ccs `Timing`, payloads/camera `exposure_set`), in the order that moves the least, each inside the camera's own hold so line, frame and integration land at one frame's start:
+0. Inside the mode's own frame: the integration alone, as before; the frame rate stays the mode's.
+1. Past it: the frame length (CCS frame_length_lines, G#0340) lengthened to the integration plus the sensor's margin, to 16 bits. The margin is the sensor's own word (CCS coarse_integration_time_max_margin, G#1006), read at every open: the main answers 2, the ultrawide 64 (CAPS, 2026-11-16). The main reaches 65533 lines, **0.211 s**; the ultrawide 65471 lines of 6.56 us, 0.430 s.
+2. Past that: the line length (CCS line_length_pck, G#0342) lengthened on a step of 2^4 clocks (every line this sensor has run on ferros is on it) to 65520, the frame at its 16 bits. The main reaches 65533 lines of 33.42 us, **2.190 s**; the ultrawide 65471 lines of 44.93 us, **2.942 s**.
+3. Past that, to 16 s: the vendor's long-exposure shift. Android's own hold on the main writes two words every frame, G#0702 and G#0704, both 0 at ordinary exposures (the 2026-10-19 open capture, target/hv/cam-open3, local): Samsung's frame and integration shifts. How a long exposure writes them (which byte carries the shift, its most, whether the stream stops around the change) is not guessed: the capture below shows it, and then `ARRAYS[0].lte` gets it (ferros_cam ccs `Lte`, built and host-tested with an example encoding). At shift 7 the main's 16 bits of frame reach 27 s at its own line.
+
+The list offers what the camera takes (`exposure_max`, ferros_cam list from `Cam::listed_timing`): the main 2.19 s, the ultrawide 2.94 s; the front and the tele, whose margins were never read, their init's integration as before. SET refuses past it, never caps (as gain does). Lumis reads `exposure_max` from the list, so nothing changes on its side.
+A camera without a margin in the table, or whose margin read fails or makes no sense at an open (a word not under the mode's frame), keeps to its mode's frame less 2^5 lines, as before. The console says the margin it read and the longest exposure it takes at each open, and each change of the frame (`camera: exposure A#.. us: frame A#.. lines of A#.. clocks, shift A#.., integration A#.. lines; a frame every A#.. ms`).
+
+**Mid-stream: the frame in the hold with the integration.** From the docs and the code, not yet from a run:
+- The frame length written inside the real hold never hurt the main: the 2026-11-16 sweep cut it from 21362 to 3200 lines and every open streamed; "a y window changed thru CCS alone corrupts this Samsung sensor's packets; its frame length alone does not".
+- Android does it every frame: its hold on the main is the shift words, the gains, the integration and the frame length (target/hv/cam-open3, the per-frame blocks), so a frame that moves with the exposure inside the hold is the HAL's own way, not a new one.
+- October's "stuck until a cold boot" was writes outside a hold (the harness wrote the release for the hold) on a sensor never power-cycled; since 2026-11-16 every close powers the module down, and every next open streamed, mid-stream writes included.
+- The line length moving mid-stream is in no capture. It is step 2's risk, and the first thing the device test measures. If it fails, the fallback is OPEN's mode block, whose line length is written before stream on (run at 4864 to 6320 clocks on 2026-11-16): a long exposure would then reopen the stream (about 2.3 s on the main).
+- What a wedge costs: a camera-process restart. A stream that stops closes itself ("no frame in A#.. ms"), and its close, or the process's end, turns the switch off and powers the module down; the next open is a cold sensor. No kernel reload. Only a front end that takes no frame at two opens running would want a cold boot of the Pro (the owner's), and on 2026-11-16 the Pro reset once after three stuck-front-end opens in a row: the test stops at the first open whose frames stop.
+
+**The frame wait and the holder** (payloads/camera):
+- A FRAME, MAP or SLITS waits `late_us`: 2^21 us past two frame periods, the period the sensor runs now plus, for two frames after a change, the one before (a frame begun under the old timing may still come). It was 2^21 us flat, so `no frame in A#2097 ms` closed any frame past about two seconds.
+- The holder's quiet time (2^22 us with nobody asking) counts from the driver's last answer, not from its call: a MAP answered after a 16 s frame found its holder "gone" at once before.
+- The frame thread still looks every 2^17 us (the close waits on it, and nothing may touch the front end after the switch is off), but says "the stream stopped by itself" only past two frame periods of quiet.
+- A frame's header carries its exposure in ns as set (line time at the line length it ran, the shift), no longer lines at the init's line.
+
+**Lumis's preview while a long frame integrates** (std/lumis): its camera thread waits in MAP for the frame; its UI thread draws on from the integrator's memory, and lumis_core's own elapsed and remaining labels (the exposure's start in the shared header) count the exposure down, as on Android. Not built: Lumis on ferros sends a setting after each frame it gets, so a change during a long frame lands after the frame in flight (Android's Lumis pushes from a 30 Hz poll). At 2 s that is one frame; for 16 s the next step is the driver answering SET while a MAP waits (its reply held, the server back in its loop) and Lumis pushing from its UI thread.
+
+**Device test** (the coordinator's go; no kernel reload, nothing stored: the driver and camtest hand-spawned, the module power-cycled at every close):
+```
+B=target/debug/ferros-bridge; R=target/el0/aarch64-unknown-none/release
+cargo el0 -p ferros-payload-camera && cargo el0 -p ferros-payload-camtest
+aarch64-linux-gnu-objcopy -O binary $R/camera camera.bin && aarch64-linux-gnu-objcopy -O binary $R/camtest camtest.bin
+$B spawn camera.bin --name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0 --hw hsi2c3 --hw hsi2c2 --hw hsi2c4
+$B spawn camtest.bin 0408000500 --name camtest --use camera      # the main: 64 ms doubling to 2048 ms, back to 64 ms
+$B diag console
+```
+camtest's fourth byte 5 is the ladder: each step's SET answer, the frames' spacing, the mean sample, the header's exposure and the sensor's frame, line and integration read back (CAPS). Expect: the open's `integration least A#2 and margin A#2`, `exposures to A#2190 ms`; frames 68.9 ms apart up to 64 ms; at 128 ms the frame line and frames about 128 ms apart (the frame lengthened); from 256 ms the line lengthened and frames about the exposure apart; the mean doubling a step until it saturates; back at 64 ms, 68.9 ms again. The first step that writes the line (256 ms) is the mid-stream measure: frames that stop there say the line must go before stream on.
+Then the ultrawide (`04080005010B`, to 2^11 ms), then Lumis hand-spawned (above, "For the morning") with the shutter at 2 s: a frame every 2.2 s, the UI live between.
+
+**The capture for step 3** (tools/husky-hv-longexp.sh; the owner's Android session):
+- The camera: the main (boitata, Samsung G#08EF), sensor at G#3D on hsi2c_1 (G#1088_0000). One controller, and on it the sensor's transfers alone: the hv's new knob `FERROS_HV_ORACLE_I2C_TARGET` logs a controller's ADDR, AUTO_CONF and TX writes and RX reads only while that target is selected, so the lens (G#0C), OIS (G#24) and ToF (G#29) polling on the same bus (seven of every eight transfers after stream on) and the controller's status polls stay out, and the whole session fits the console ring. Logging is not capped: the ring keeps the newest, which is the 16 s change and after.
+- The image: the oracle hv in front of Android's kernel, no ferros, the UFS firewall on, console at level 4 from boot, armed 60 s into the hv's counter (about 40 s of Android's uptime), footered with the owner's key on this morning's signed boot image (as b929's flash). `build` makes it on the host.
+- Ours: `build`; note the image boot_a holds now (the restore); `flash` (ferros goes down: the owner's identity with it); `start` once Android is up (it checks /proc/cmdline for the capture's loglevel=4, quiets the console and marks).
+- **The owner**: unlock the phone; open Lumis; choose the main camera; set the shutter to 16 s; take one shot; wait until it has landed (about 35 s); say so. Nothing else on the phone.
+- Ours: `end capture.log` (marks, panics Android so the crash reset keeps the ring, the next boot traps nothing, pulls the hv's lines and decodes them with tools/oracle-i2c: `.holds` has every hold on one line, `0702=.. 0704=.. 0202=.. 0340=..`); then `restore <image>` and the owner attests on ferros again.
+- What to read: the hold where G#0702 and G#0704 leave 0, the frame and integration beside them, any line length (G#0342) and any stream off and on (G#0100) around it; the transfers' integrity line (a length mismatch inside that hold means recapture).
+- Hazards: if Android does not boot from the capture image, ABL falls back to slot b, whose gate is older than the capsules stored on 2026-11-17 (Claude memories/stored_capsules_need_flashed_kernel.md): restore boot_a from fastboot. The flash goes thru fastboot's own words (a failed 64 MiB send is the cable).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
