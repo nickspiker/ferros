@@ -117,6 +117,9 @@ pub struct Side {
     pub emb: u16,
 }
 
+/// The Pro ultrawide's least gain offered: its code 7 (`ARRAYS` 1, measured).
+pub const ULTRAWIDE_LEAST: u64 = 1031;
+
 /// By camera id (ferros_cam cams): the main (Samsung, G#08EF), the ultrawide (Sony IMX787), the front (not a rear sensor: no 1:1 mode offered), the tele (Samsung, G#08D5).
 pub const ARRAYS: [Array; 4] = [
     // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03). Offered: the analogue range alone, 1024 to 163840 (owner, 2026-11-17: digital gain is after the ADC, so analogue only); the noise test (camtest 4, b915) puts the real analogue at the stated 160x: no empty codes at any step, and the dark noise grows 1.67 times from 64x to 128x and 1.10 from 128x to 160x (2 and 1.25 if the gain were after the ADC).
@@ -128,7 +131,8 @@ pub const ARRAYS: [Array; 4] = [
     Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 31, frame_bits: 32, byte: false }), side: Some(Side { pd: Some(0x0720), emb: 0x0118 }) },
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64. Its shift: Sony's G#3100, one byte, as Android's 16 s holds write it (6 at 16 s, the frame the integration plus 64 in 2^6 lines: docs/CAMERA.md "The I2C side without a flash"); its most the 6 Android uses, the field's width and the frame counter unmeasured (65471 lines of 2^6 is under 2^22). Measured on the Pro (2026-11-18 night, camtest's ceiling, a 3164-line frame): shift 6 gave frames 1.3287 s apart (3164 lines of 2^6 at 6.5616 us), shift 7 stopped the stream (no frame for 5.5 s, the driver closed it); a 555-line frame stopped at 6 too (the frame must hold the readout in its own units). So 6 is its ceiling, 27.5 s.
-    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 6, frame_bits: 32, byte: true }), side: None },
+    // Its least gain is not its least code (the Pro, 2026-11-19, docs/CAMERA.md "The ultrawide's least gain"): in the 64-row slit (192 lines) a SET of code 0 or 1 put the sensor in a state where its own counter still ran 798 frames a second but the front end took every other frame (396 a second, 2.50 ms a slit), every word read back as written (frame 192, integration 16, hold released, G#3100 0); codes 7 and 15 set from the init's G#3C0 kept 794 a second, and once in that state it stayed to code 15 and left at 19. Whole frames (5081 lines) kept 30 a second at code 0. So the list offers from code 7, 1031 (1024 x 1024 / 1017): 0.01 stop over one.
+    Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (ULTRAWIDE_LEAST, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 6, frame_bits: 32, byte: true }), side: None },
     // The front: its margin 5 read at its first opens on the Pro (2026-11-18, b976); its shift is the main's pair of words (G#0702, G#0704, the shift in the high byte), as Android's 1 s hold writes them (shift 1, docs/CAMERA.md "The I2C side without a flash"). Its frame counter is the main's, measured on the Pro (2026-11-18 night, camtest's ceiling, 16386 lines at shifts 14 to 19): 14 to 17 held, 18 gave frames 5.4724 s apart, (16386 << 18) mod 2^32 = 2^19 lines of 10.4378 us, and 19 one 10 s in: 32 bits of lines, wrapping; the field holds 19 at least, so its most 19, its longest 65530 lines of 2^16 (12.45 hours). Gain code / 32 over codes 32 to 512 (1x to 16x) from its own words (no noise test yet).
     Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 16 * UNITY), margin: Some(5), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 19, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
     // The tele: Android's 16 s (the i2c trace of 2026-11-18, docs/CAMERA.md "The I2C side without a flash") is the main's pair of shift words (6 at 16 s: integration G#9FE8, frame G#A000 in 2^6 lines; Android's frame the integration plus 24).
@@ -860,6 +864,15 @@ impl Gain {
         (num * UNITY as i64 / den) as u64
     }
 
+    /// The model from its least code whose gain is `least` or more (1024 one): the array's measured least (`Array::gain`), where the sensor's words start lower than it streams cleanly (the Pro's ultrawide, `ULTRAWIDE_LEAST`), so SET refuses what the list does not offer. A least at or under the words' own leaves the model as it is.
+    pub fn from_least(mut self, least: u64) -> Gain {
+        // WHY the bound: the codes stop at the most; a least past every code's gain leaves the model at its most code rather than walking past it.
+        while self.analogue(self.code_min) < least && self.code_min < self.code_max {
+            self.code_min += self.step;
+        }
+        self
+    }
+
     /// The least and the most gain offered (1024 one): the analogue range alone, the least code to the most (owner, 2026-11-17: digital gain is after the ADC, so analogue only; the digital limits are read and said, never used).
     pub fn range(&self) -> (u64, u64) {
         (self.analogue(self.code_min), self.analogue(self.code_max))
@@ -876,6 +889,11 @@ impl Gain {
         let mut code = (lo + k * self.step as i64) as u16;
         while code > self.code_min && self.analogue(code) > want {
             code -= self.step;
+        }
+        // And up while the next code still is not past it: the solution is cut down to a whole code and `analogue` cuts its gain down too, so the code solved can sit a step under the one asked (2026-11-19: 1031 on the ultrawide solved to code 6, whose gain is 1030, where code 7 gives 1031, the list's least).
+        // WHY the bound: the codes stop at the most; `split` has already refused a gain past it.
+        while code + self.step <= self.code_max && self.analogue(code + self.step) <= want {
+            code += self.step;
         }
         code
     }
@@ -1149,6 +1167,14 @@ mod tests {
         assert_eq!(main.range(), (1024, 163840));
         assert_eq!(main.split(163841), None);
         assert!(main.split(163840).is_some_and(|s| s.digital == 0x100));
+        // The Pro ultrawide's own words (b915) from its measured least (2026-11-19): code 7, 1031; 1024 refused (code 0 halves its slits), the list's range the same; the main's least is its words' own.
+        let uw = Gain::of(&caps(0, 1008, 1, [0, 1024, -1, 1024]), &d(0x100, 0xFFFF, 1)).unwrap().from_least(ARRAYS[1].gain.0);
+        assert_eq!((uw.code_min, uw.range()), (7, (ULTRAWIDE_LEAST, ARRAYS[1].gain.1)));
+        assert_eq!(uw.analogue(6) < ULTRAWIDE_LEAST, true);
+        assert_eq!(uw.split(1024), None);
+        assert_eq!(uw.split(ULTRAWIDE_LEAST).map(|s| s.code), Some(7));
+        assert_eq!(uw.split(2048).map(|s| s.code), Some(512));
+        assert_eq!(main.from_least(ARRAYS[0].gain.0).code_min, 0x20);
         // Words that describe no model: the aliasing the main's limit block shows (every word G#4140).
         assert_eq!(Gain::of(&[0x41, 0x40].repeat(10).try_into().unwrap(), &d(0x100, 0x100, 1)), None);
     }

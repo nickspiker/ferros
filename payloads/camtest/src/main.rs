@@ -599,6 +599,22 @@ fn cells(g: u64, at: usize, stride: usize, w: usize, h: usize) {
     for dy in 0..4 {
         say!(g, "camtest: cell row A#{dy}: A#{} A#{} A#{} A#{} (A#{n} cells)\n", m(dy * 4), m(dy * 4 + 1), m(dy * 4 + 2), m(dy * 4 + 3));
     }
+    // The frame's profile (2026-11-19, the tele's flip): the mean of 2^3 bands of rows, top first, and of 2^3 bands of columns, left first, from the same samples; a flip or a mirror of the readout reverses one of them against a run without it on a still scene, which a cell table (the whole frame's means by place) cannot show.
+    let (mut rows, mut cols, mut rn, mut cn) = ([0u64; 8], [0u64; 8], [0u64; 8], [0u64; 8]);
+    for y in (0..h).step_by(1 << 4) {
+        for x in (0..w).step_by(1 << 4) {
+            let v = unsafe { core::ptr::read_volatile((at + y * stride + x / 4 * 5 + x % 4) as *const u8) } as u64;
+            let (by, bx) = (y * 8 / h, x * 8 / w);
+            rows[by] += v;
+            rn[by] += 1;
+            cols[bx] += v;
+            cn[bx] += 1;
+        }
+    }
+    // WHY the max: a frame under 2^3 rows or columns leaves a band with no samples, and its mean would divide by zero and panic the process.
+    let b = |s: &[u64; 8], c: &[u64; 8], k: usize| 4 * s[k] / c[k].max(1);
+    say!(g, "camtest: bands of rows, top first: A#{} A#{} A#{} A#{} A#{} A#{} A#{} A#{}\n", b(&rows, &rn, 0), b(&rows, &rn, 1), b(&rows, &rn, 2), b(&rows, &rn, 3), b(&rows, &rn, 4), b(&rows, &rn, 5), b(&rows, &rn, 6), b(&rows, &rn, 7));
+    say!(g, "camtest: bands of columns, left first: A#{} A#{} A#{} A#{} A#{} A#{} A#{} A#{}\n", b(&cols, &cn, 0), b(&cols, &cn, 1), b(&cols, &cn, 2), b(&cols, &cn, 3), b(&cols, &cn, 4), b(&cols, &cn, 5), b(&cols, &cn, 6), b(&cols, &cn, 7));
 }
 
 /// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.

@@ -1191,6 +1191,8 @@ struct Open {
     captured: bool,
     /// The sensor's gain model from its own capability words (ferros_cam ccs `Gain`), read at the open; None when they describe none (SET then takes the captured gain alone, as before 2026-11-17).
     gain_model: Option<ccs::Gain>,
+    /// The analogue code and digital gain the sensor holds now (the init's, then each gain SET's), so a SET of the same gain writes nothing; None when unknown.
+    gain_code: Option<(u16, u16)>,
     /// The outputs' extents have been reported (after the eighth frame).
     probed: bool,
     /// The view was given to the holder (an OPEN that asked for it).
@@ -1477,7 +1479,7 @@ fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
 }
 
 /// The sensor's gain model (its CCS words G#0080 to G#0093 and G#1084 to G#1089, ferros_cam ccs `Gain`) and the gain its init left (G#0204 and G#020E as the init wrote them last), said on the console with the words themselves; (None, 1024) when the words describe no model or do not read.
-fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64) {
+fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64, Option<(u16, u16)>) {
     let (mut a, mut d) = ([0u8; ccs::GAIN_CAPS_LEN], [0u8; ccs::DGAIN_CAPS_LEN]);
     let read = bus.write_read(c.addr, &ccs::GAIN_CAPS.to_be_bytes(), &mut a).is_ok() && bus.write_read(c.addr, &ccs::DGAIN_CAPS.to_be_bytes(), &mut d).is_ok();
     let be = |b: &[u8], k: usize| u16::from_be_bytes([b[k], b[k + 1]]);
@@ -1488,28 +1490,74 @@ fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64) 
     }
     let _ = write!(l, "; G#1084: {:X} {:X} {:X}{}\n", be(&d, 0), be(&d, 2), be(&d, 4), if read { "" } else { " (a read failed)" });
     console(g, &l.b[..l.n]);
-    let model = if read { ccs::Gain::of(&a, &d) } else { None };
+    // From the array's measured least (ccs `Array::gain`): the Pro ultrawide's words start at code 0, which halves its slits (docs/CAMERA.md "The ultrawide's least gain").
+    let model = if read { ccs::Gain::of(&a, &d).map(|m| m.from_least(c.array.gain.0)) } else { None };
     let p = ccs::Page::of(init);
     let Some(m) = model else {
         say!(g, "camera: {}: no gain model in those words; gain stays at the init's code G#{:X}\n", c.name, p.get(ccs::ANALOGUE_GAIN).unwrap_or(0));
-        return (None, ccs::UNITY);
+        return (None, ccs::UNITY, None);
     };
     let code = p.get(ccs::ANALOGUE_GAIN).map_or(m.code_min, |v| v as u16);
     let dig = p.get(ccs::DIGITAL_GAIN).unwrap_or(0x100) as u64;
     let now = m.analogue(code) * dig >> 8;
     let (lo, hi) = m.range();
     say!(g, "camera: {}: gain = (A#{} code + A#{}) / (A#{} code + A#{}), codes A#{} to A#{} step A#{} (analogue A#{} to A#{}), digital G#{:X} to G#{:X} step G#{:X} (never used: analogue only): A#{lo} to A#{hi} offered (1024 one); the init left code G#{code:X}, A#{now}\n", c.name, m.m0, m.c0, m.m1, m.c1, m.code_min, m.code_max, m.step, m.analogue(m.code_min), m.analogue(m.code_max), m.d_min, m.d_max, m.d_step);
-    (Some(m), now)
+    // The init's code and digital gain as the gain SET compares them (an init that wrote neither leaves them unknown: the first SET writes).
+    let left = p.get(ccs::ANALOGUE_GAIN).zip(p.get(ccs::DIGITAL_GAIN)).map(|(a, d)| (a as u16, d as u16));
+    (Some(m), now, left)
 }
 
+/// A device test (the hand spawn's thirteenth byte): the gain write's shape (`gain_set`), and a console line after every gain SET with the sensor's words read back (`gain_say`). 0 the driver's own; 1 the analogue code alone in the hold; 2 the digital gain alone in the hold; 3 the analogue code alone with no hold; 4 Android's per-frame hold on the Sony part (every register a byte: digital, analogue, integration, frame, shift); 5 the driver's own with the frame length written again in the hold; 6 the driver's own, said. Any shape but 0 writes a gain equal to the one set too.
+static GAIN_TEST: AtomicU64 = AtomicU64::new(0);
+/// A device test (the hand spawn's fourteenth byte): the stream on written with its image orientation (CCS G#0101) 0 (3) or 2 (4, Android's for the tele: its frames stood mirrored against the main in Lumis), an A/B of the orientation.
+static ORIENT_TEST: AtomicU64 = AtomicU64::new(0);
+
 /// The gain set inside the sensor's hold (as exposure is: the hold makes the change land whole at a frame's start): the analogue code, then digital gain as `s` has it (always one: analogue only).
-fn gain_set(bus: &Bus, c: &Cam, s: &ccs::GainSet) -> Result<(), u32> {
-    bus.write(c.addr, c.hold)?;
+fn gain_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, s: &ccs::GainSet) -> Result<(), u32> {
     let a = ccs::ANALOGUE_GAIN.to_be_bytes();
     let d = ccs::DIGITAL_GAIN.to_be_bytes();
-    let r = bus.write(c.addr, &[a[0], a[1], (s.code >> 8) as u8, s.code as u8]).and_then(|_| bus.write(c.addr, &[d[0], d[1], (s.digital >> 8) as u8, s.digital as u8]));
+    let w8 = |r: u16, v: u8| bus.write(c.addr, &[(r >> 8) as u8, r as u8, v]);
+    let shape = GAIN_TEST.load(Ordering::Relaxed);
+    if shape == 3 {
+        return bus.write(c.addr, &[a[0], a[1], (s.code >> 8) as u8, s.code as u8]);
+    }
+    bus.write(c.addr, c.hold)?;
+    let r = match shape {
+        1 => bus.write(c.addr, &[a[0], a[1], (s.code >> 8) as u8, s.code as u8]),
+        2 => bus.write(c.addr, &[d[0], d[1], (s.digital >> 8) as u8, s.digital as u8]),
+        4 => (|| {
+            for (r, v) in [(ccs::DIGITAL_GAIN, s.digital), (ccs::ANALOGUE_GAIN, s.code), (ccs::COARSE_INTEGRATION, now.coarse), (ccs::FRAME_LENGTH_LINES, now.fll)] {
+                w8(r, (v >> 8) as u8)?;
+                w8(r + 1, v as u8)?;
+            }
+            match t.lte {
+                Some(l) if l.byte => w8(l.fll_reg, l.word(now.shift) as u8),
+                _ => Ok(()),
+            }
+        })(),
+        _ => bus.write(c.addr, &[a[0], a[1], (s.code >> 8) as u8, s.code as u8]).and_then(|_| bus.write(c.addr, &[d[0], d[1], (s.digital >> 8) as u8, s.digital as u8])).and_then(|_| {
+            if shape == 5 {
+                let f = ccs::FRAME_LENGTH_LINES;
+                bus.write(c.addr, &[(f >> 8) as u8, f as u8, (now.fll >> 8) as u8, now.fll as u8])
+            } else {
+                Ok(())
+            }
+        }),
+    };
     bus.write(c.addr, c.release)?;
     r
+}
+
+/// A device test (`GAIN_TEST` set): the sensor's words after a gain SET, read back at once and again 2^14 us later (a dozen slit frames, the hold's release long landed): frame length, integration, analogue and digital gain, the hold, the Sony shift byte, Sony's frame-length control and the frame counter.
+fn gain_say(g: u64, bus: &Bus, c: &Cam, s: &ccs::GainSet, when: &str) {
+    let rd = |r: u16, n: usize| -> u32 {
+        let mut b = [0u8; 2];
+        match bus.write_read(c.addr, &r.to_be_bytes(), &mut b[..n]) {
+            Ok(()) => if n == 2 { u16::from_be_bytes(b) as u32 } else { b[0] as u32 },
+            Err(_) => 0xEEEE_EEEE,
+        }
+    };
+    say!(g, "camera: gain SET code G#{:X} digital G#{:X} (shape A#{}) {when}: frame G#{:X} integration G#{:X} analogue G#{:X} digital G#{:X} hold G#{:X} G#3100 G#{:X} G#0350 G#{:X} frame count A#{}\n", s.code, s.digital, GAIN_TEST.load(Ordering::Relaxed), rd(ccs::FRAME_LENGTH_LINES, 2), rd(ccs::COARSE_INTEGRATION, 2), rd(ccs::ANALOGUE_GAIN, 2), rd(ccs::DIGITAL_GAIN, 2), rd(ccs::GROUPED_HOLD, 1), rd(0x3100, 1), rd(0x0350, 1), rd(ccs::FRAME_COUNT, 1));
 }
 
 /// The engine's area past the job's region, in bytes: the long ring's descriptors, then `full` copies of the program and `slim` slim ones (`PROG_AT`).
@@ -1941,8 +1989,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     };
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
-    let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let (gain_model, gain, gain_code) = gain_of(g, &bus, c, init);
+    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, gain_code, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1961,7 +2009,15 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     tl_reset();
     err_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
-    bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
+    // A device test (`ORIENT_TEST` 3 or 4): the stream on with its orientation byte (CCS image_orientation, G#0101) 0, or 2 as Android's HAL writes the tele's (keys/husky/captures/ftrace-2026-11-18: `01 00 01 02` at all three of its readouts).
+    let orient = ORIENT_TEST.load(Ordering::Relaxed);
+    if (orient == 3 || orient == 4) && c.stream_on.len() == 4 {
+        let o = if orient == 4 { 2 } else { 0 };
+        bus.write(c.addr, &[c.stream_on[0], c.stream_on[1], c.stream_on[2], o]).map_err(Fail::Sensor)?;
+        say!(g, "camera: orientation test: the stream on with G#0101 = A#{o}\n");
+    } else {
+        bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
+    }
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start), or the lead's first descriptors (`LEAD`).
     arm(g);
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP * LEAD.load(Ordering::Relaxed) as u32);
@@ -2728,6 +2784,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 11 {
         WORDS_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 11) as *const u8) } as u64, Ordering::Relaxed);
     }
+    // The thirteenth, a device test only: the gain write's shape, and each gain SET said with the sensor's words read back (`GAIN_TEST`).
+    if input_len > 12 {
+        GAIN_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 12) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 13 {
+        ORIENT_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 13) as *const u8) } as u64, Ordering::Relaxed);
+    }
     // The eleventh: which inputs follow the knobs (`T_INIT` ..), a device test of any readout with nothing stored.
     let items = if input_len > 10 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 10) as *const u8) } } else { 0 };
     if items != 0 && input_len > FULL_INPUT_AT {
@@ -3076,13 +3139,25 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     },
                     // Gain (1024 one): the analogue code the sensor's own model gives, digital gain written as one (owner, 2026-11-17: digital gain is after the ADC, so analogue only); past the analogue's most refused, never capped; the frame's header then carries the gain the code makes. With no model, the captured gain alone (1024).
                     1 => match o.gain_model.and_then(|m| m.split(value)) {
-                        Some(s) if gain_set(&bus, c, &s).is_ok() => {
+                        // The gain already set: nothing written (a device test's shape writes it all the same).
+                        Some(s) if o.gain_code == Some((s.code, s.digital)) && GAIN_TEST.load(Ordering::Relaxed) == 0 => 0,
+                        Some(s) if gain_set(&bus, c, &o.timing, &o.now, &s).is_ok() => {
+                            if GAIN_TEST.load(Ordering::Relaxed) != 0 {
+                                gain_say(g, &bus, c, &s, "at once");
+                                ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() * (1 << 14) / 1_000_000);
+                                gain_say(g, &bus, c, &s, "after 2^14 us");
+                            }
                             o.gain = s.gain;
+                            o.gain_code = Some((s.code, s.digital));
                             NOW_GAIN.store(s.gain, Ordering::Relaxed);
                             0
                         }
                         None if o.gain_model.is_none() && value == ccs::UNITY => 0,
-                        _ => 1,
+                        // Refused, or a write that failed partway: the sensor's gain is no longer known, so the next gain SET writes whatever it asks.
+                        _ => {
+                            o.gain_code = None;
+                            1
+                        }
                     },
                     // A device test (owner, 2026-11-17: "no artificial exposure cap anywhere"): the shift every following exposure takes (0: the least that fits), to find the shift field's reach.
                     3 => {
@@ -3304,19 +3379,20 @@ fn rate(g: u64, windows: u8) -> [u8; 40] {
     out
 }
 
-/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four); since 2026-11-18 also +103 the vendor shift words (G#0702 and G#0704, four: the main's `Lte`).
-fn caps(g: u64) -> [u8; 107] {
+/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four); since 2026-11-18 also +103 the vendor shift words (G#0702 and G#0704, four: the main's `Lte`); since 2026-11-19 also +107 the grouped hold (G#0104, one), +108 the Sony shift byte (G#3100, one), +109 Sony's frame length control (G#0350, one), +110 two bytes, a bit per failed read past the first sixteen (bit 0 the G#0104 read), +112 the image orientation (G#0101, one).
+fn caps(g: u64) -> [u8; 113] {
     let c = cam();
     let bus = Bus::of(g, c);
-    let mut out = [0u8; 107];
-    let mut failed = 0u16;
-    let reads: [(u16, usize, usize); 16] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2), (0x0702, 103, 4)];
+    let mut out = [0u8; 113];
+    let mut failed = 0u32;
+    let reads: [(u16, usize, usize); 20] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2), (0x0702, 103, 4), (0x0104, 107, 1), (0x3100, 108, 1), (0x0350, 109, 1), (0x0101, 112, 1)];
     for (k, &(a, at, n)) in reads.iter().enumerate() {
         if bus.write_read(c.addr, &[(a >> 8) as u8, a as u8], &mut out[at..at + n]).is_err() {
             failed |= 1 << k;
         }
     }
-    out[71..73].copy_from_slice(&failed.to_le_bytes());
+    out[71..73].copy_from_slice(&(failed as u16).to_le_bytes());
+    out[110..112].copy_from_slice(&((failed >> 16) as u16).to_le_bytes());
     out
 }
 
