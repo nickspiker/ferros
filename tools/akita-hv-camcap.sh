@@ -60,6 +60,8 @@ image_knobs() {
     i2c-uw) ctrl=108A;;
     isp) echo "FERROS_HV_ORACLE_PAGES=$ISP_PAGES FERROS_HV_ORACLE_LATE=1 FERROS_HV_PDMA_DUMP=1"; return;;
     isp-uw) echo "FERROS_HV_ORACLE_PAGES=$ISP_SPAN FERROS_HV_ORACLE_LATE=1 FERROS_HV_PDMA_DUMP=1"; return;;
+    # The live registers sixteen frames into a stream (FERROS_HV_SNAPSHOT, docs/oracle/CAMERA.md): only the PDMA's page trapped, for the index write that triggers it; SNAP_LIST the addresses (keys/akita/captures-2026-11-19/snap-front.list: the front end, the links, the PHY's lanes, the clocks), 2026-11-19, the 8a's D-PHY cameras whose links see no line.
+    snap) echo "FERROS_HV_ORACLE_PAGES=G#1C39_0000 FERROS_HV_ORACLE_LATE=1 FERROS_HV_SNAPSHOT=1 FERROS_HV_SNAP_LIST=${SNAP_LIST:?a register list}"; return;;
     # The GNSS (Samsung KEPLER) on spi_21: its controller page (PIO only, every payload byte a TX_DATA write or an RX_DATA read) and the PERIC0 GPIO page that holds the AP-to-GNSS handshake gpp4-3, GNSS_QUIET quiet. gnss-boot logs from the hv's start (the firmware load), gnss from ARM_MS (a session to a fix).
     gnss) echo "FERROS_HV_ORACLE_PAGES=G#111E_0000,G#1084_0000 FERROS_HV_ORACLE_QUIET=$GNSS_QUIET"; return;;
     gnss-boot) echo "FERROS_HV_ORACLE_PAGES=G#111E_0000,G#1084_0000 FERROS_HV_ORACLE_QUIET=$GNSS_QUIET FERROS_HV_ORACLE_ARM_AFTER_MS=0"; return;;
@@ -78,9 +80,10 @@ session_image() {
     i2c-front | i2c-front-1s | i2c-front-gcam) echo i2c-front;;
     isp-main | isp-front | isp-main-crop) echo isp;;
     isp-uw) echo isp-uw;;
+    snap-front | snap-uw) echo snap;;
     gnss-fix) echo gnss;;
     gnss-boot) echo gnss-boot;;
-    *) die "no session $1 (i2c-main, i2c-main-16s, i2c-main-gcam, i2c-uw, i2c-uw-16s, i2c-uw-gcam, i2c-front, i2c-front-1s, i2c-front-gcam, isp-main, isp-front, isp-main-crop, isp-uw)";;
+    *) die "no session $1 (i2c-main, i2c-main-16s, i2c-main-gcam, i2c-uw, i2c-uw-16s, i2c-uw-gcam, i2c-front, i2c-front-1s, i2c-front-gcam, isp-main, isp-front, isp-main-crop, isp-uw, snap-front, snap-uw)";;
     esac
 }
 
@@ -324,6 +327,8 @@ steps_i2c-front-gcam() {
 steps_isp-main() { step "lumis main binned" "open Lumis, the main lens's first entry" lumis_main && { hold 8; done_step "lumis main binned" lumis_exit; }; }
 steps_isp-front() { step "lumis front binned" "open Lumis, the front lens's entry" lumis_front && { hold 8; done_step "lumis front binned" lumis_exit; }; }
 steps_isp-uw() { step "lumis uw binned" "open Lumis, the ultrawide's entry" lumis_uw && { hold 8; done_step "lumis uw binned" lumis_exit; }; }
+steps_snap-front() { step "lumis front binned" "open Lumis, the front lens's entry" lumis_front && { hold 8; done_step "lumis front binned" lumis_exit; }; }
+steps_snap-uw() { step "lumis uw binned" "open Lumis, the ultrawide's entry" lumis_uw && { hold 8; done_step "lumis uw binned" lumis_exit; }; }
 # The GNSS sessions. Nothing on the 8a asks for GPS by itself (Pixel Camera and Lumis leave the gps provider OFF; Maps has no location permission there), so a hands-free session grants Maps fine and coarse location for the session and takes them back after, to the flags they had (none set by a user). The fix is told by the gps provider's last location's elapsed time alone: no position is ever read or printed.
 gps_et() { A shell "dumpsys location" 2>/dev/null | tr -d '\r' | grep -o 'Location\[gps[^]]*' | grep -o 'et=[^ ,]*' | head -1 || true; }
 maps_grant() { in_ "pm grant com.google.android.apps.maps android.permission.ACCESS_FINE_LOCATION; pm grant com.google.android.apps.maps android.permission.ACCESS_COARSE_LOCATION"; }
@@ -421,6 +426,11 @@ cmd_decode() {
         local k
         for k in 1 2 3 4; do "$CO" pdma "$C/$s.log" --list $k > "$C/$s.list$k.txt" 2>/dev/null && say "PDMA list $k: $(wc -l < "$C/$s.list$k.txt") lines" || rm -f "$C/$s.list$k.txt"; done
         say "then by hand (docs/oracle/CAMERA.md): cam-oracle cpu $C/$s.log <a> <b> <c> <prefix> --link <the link> (a, b, c from $C/$s.marks), cam-oracle pdma-image $C/$s.log <out.cpr3> --list <n> --own-image"
+        ;;
+    snap-*)
+        # The snapshot's lines, one register a line (address, value), in the list's order; a missing one is a lost line.
+        grep -a "ferros hv: SN " "$C/$s.log" | awk '{print $4, $5}' > "$C/$s.snap" || true
+        say "$(wc -l < "$C/$s.snap") registers -> $C/$s.snap"
         ;;
     gnss-*)
         # How the trapped accesses fall over spi_21's registers (CH_CFG +0, MODE_CFG +8, SLAVE_SEL +C, TX_DATA +18, RX_DATA +1C, PACKET_CNT +20, SWAP_CFG +28) and the GPIO page; the bytes themselves by hand for now (docs/GPS.md "akita's KEPLER").
