@@ -1,6 +1,6 @@
 [package]
 name = "lumis-ferros"
-version = "0.2.20"
+version = "0.2.22"
 edition = "2021"
 description = "Lumis on ferros as a kist: Lumis's own core (lumis_core: the menu, the integrator, the camera UI, the VSF saves) under fluor's ferros host, its platform layer here (the window and touch from fluor, frames and controls from the camera endpoint, its choices and saves in the kist's vault). Lumis's Android build is the rest of the Lumis repository; this crate is to it what the Kotlin app is there (docs/CAMERA.md, tools/lumis-build.sh)."
 

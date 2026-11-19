@@ -27,6 +27,8 @@ pub const VIEW_REPLY_MODE: usize = 64;
 pub const OP_SLITS: u8 = 9;
 /// The mode block's kind for a binned slit (docs/CAMERA.md "Modes, the bench and the slit"): `rows` rows across the sensor's middle at the binned mode's width, on the colour filter's period, the driver's windowed default (phase detect and embedded data off, the statistics pipeline detached, the slim program: "The slit runs", 2026-11-18).
 pub const KIND_SLIT: u8 = 3;
+/// The mode block's kind for the 1:1 full-resolution readout (ferros cam-full-res: the captured init replayed), read by MAP only (no copy).
+pub const KIND_FULL: u8 = 2;
 /// A slit's rows: 64, the fewest that keep the main's link clean (56 and fewer set ERR_CRC_PH while frames still land; 2026-11-18), at the sensor's floor of about 1218 a second.
 pub const SLIT_ROWS: u16 = 1 << 6;
 /// The mode block of a binned slit of [`SLIT_ROWS`], every other field the driver's default (its frame the rows and 2^7 lines more, its integration set by SET, a ring of 2^8 buffers).
@@ -114,6 +116,10 @@ pub struct Camera {
     pub sensor_mm: (f32, f32),
     pub focal_mm: f32,
     pub f_number: f32,
+    /// The readout (ferros cam-full-res: the list's sections are readouts, a camera's grouped by `id`): its mode block's kind (0 the binned init's; 2 the 1:1 full resolution, [`KIND_FULL`]), its colour filter's period (2 a Bayer cell, 4 a quad: 2 x 2 same-colour blocks, which Lumis reads as Android's maximum-resolution RAW) and its frame in ns; 0, 2 and 0 from a driver before.
+    pub mode: u8,
+    pub cfa_period: u8,
+    pub frame_ns: u64,
 }
 
 /// The list's document, read. A section that misses a field is not a camera Lumis can show, so it is left out and said (a driver bug, not the person's).
@@ -157,6 +163,9 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 sensor_mm: (one("sensor_width_mm"), one("sensor_height_mm")),
                 focal_mm: one("focal_mm"),
                 f_number: one("f_number"),
+                mode: u("mode").unwrap_or(0) as u8,
+                cfa_period: u("cfa_period").unwrap_or(2) as u8,
+                frame_ns: u("frame_ns").unwrap_or(0),
             })
         })();
         match cam {
@@ -183,9 +192,16 @@ pub struct FrameHeader {
     pub focus: u32,
     /// When its exposure ended, Eagle time in nanoseconds.
     pub time: i64,
+    /// The colour filter's period (+14: 2 a Bayer cell, 4 a quad); 0 from a driver before, which is Bayer.
+    pub cfa_period: u8,
 }
 
 impl FrameHeader {
+    /// A quad colour filter (2 x 2 same-colour blocks in a 4 x 4 tile): the integrator's `quad`.
+    pub fn quad(&self) -> bool {
+        self.cfa_period == 4
+    }
+
     /// The bytes of the samples that follow the header.
     pub fn samples_bytes(&self) -> usize {
         self.width * self.height * 2
@@ -212,6 +228,7 @@ pub fn parse_frame(r: &[u8]) -> Option<FrameHeader> {
         gain: u32_at(24),
         focus: u32_at(28),
         time: u64_at(32) as i64,
+        cfa_period: r[14],
     };
     (r.len() >= FRAME_HEADER + h.samples_bytes()).then_some(h)
 }
@@ -295,6 +312,7 @@ fn parse_frame_header(r: &[u8; FRAME_HEADER]) -> FrameHeader {
         gain: u32_at(24),
         focus: u32_at(28),
         time: u64::from_le_bytes(r[32..40].try_into().unwrap()) as i64,
+        cfa_period: r[14],
     }
 }
 
@@ -308,6 +326,7 @@ pub fn frame_header(f: &FrameHeader) -> [u8; FRAME_HEADER] {
     h[9] = f.cfa;
     h[10..12].copy_from_slice(&f.black.to_le_bytes());
     h[12..14].copy_from_slice(&f.white.to_le_bytes());
+    h[14] = f.cfa_period;
     h[16..24].copy_from_slice(&f.exposure_ns.to_le_bytes());
     h[24..28].copy_from_slice(&f.gain.to_le_bytes());
     h[28..32].copy_from_slice(&f.focus.to_le_bytes());
@@ -332,13 +351,27 @@ mod tests {
     use vsf::VsfType;
 
     fn main_camera_doc() -> Vec<u8> {
+        camera_doc(&[None, Some((2, 8160, 6144, 4, 41670368))])
+    }
+
+    /// A list of the main's readouts: each None the binned one as a driver before cam-full-res lists it (no mode fields), each Some((mode, width, height, cfa_period, frame_ns)) one with them.
+    fn camera_doc(readouts: &[Option<(u8, u32, u32, u8, u64)>]) -> Vec<u8> {
+        let mut b = vsf::VsfBuilder::new();
+        for r in readouts {
+            b = b.add_section_direct(main_section(*r));
+        }
+        b.build().expect("the test list builds")
+    }
+
+    fn main_section(readout: Option<(u8, u32, u32, u8, u64)>) -> vsf::file_format::VsfSection {
         let f = |v: &[f32]| v.iter().map(|x| VsfType::f5(*x)).collect::<Vec<_>>();
-        let fields = vec![
+        let (width, height) = readout.map_or((4080, 3072), |r| (r.1, r.2));
+        let mut fields = vec![
             ("id".to_string(), vec![VsfType::u3(0)]),
             ("name".to_string(), vec![VsfType::a(vsf::Ascii::lit("main"))]),
             ("facing".to_string(), vec![VsfType::u3(0)]),
-            ("width".to_string(), vec![VsfType::u4(4080)]),
-            ("height".to_string(), vec![VsfType::u4(3072)]),
+            ("width".to_string(), vec![VsfType::u4(width as u16)]),
+            ("height".to_string(), vec![VsfType::u4(height as u16)]),
             ("cfa".to_string(), vec![VsfType::u3(1 | 2 << 2 | 0 << 4 | 1 << 6)]),
             ("black".to_string(), vec![VsfType::u3(64)]),
             ("white".to_string(), vec![VsfType::u4(1023)]),
@@ -356,26 +389,34 @@ mod tests {
             ("focal_mm".to_string(), f(&[6.9])),
             ("f_number".to_string(), f(&[1.68])),
         ];
-        let mut b = vsf::VsfBuilder::new();
+        if let Some((mode, _, _, period, frame_ns)) = readout {
+            fields.push(("mode".to_string(), vec![VsfType::u3(mode)]));
+            fields.push(("cfa_period".to_string(), vec![VsfType::u3(period)]));
+            fields.push(("frame_ns".to_string(), vec![VsfType::u6(frame_ns)]));
+        }
         let mut s = vsf::file_format::VsfSection::new("camera");
         for (name, values) in fields {
             let mut field = vsf::file_format::VsfField::new(name);
             field.values = values;
             s.fields.push(field);
         }
-        b = b.add_section_direct(s);
-        b.build().expect("the test list builds")
+        s
     }
 
     #[test]
     fn a_list_reads_back() {
         let cams = parse_list(&main_camera_doc()).unwrap();
-        assert_eq!(cams.len(), 1);
+        assert_eq!(cams.len(), 2);
         let c = &cams[0];
         assert_eq!((c.id, c.name.as_str(), c.width, c.height, c.black, c.white, c.rotation), (0, "main", 4080, 3072, 64, 1023, 1));
         assert_eq!(c.cfa & 3, 1);
         assert_eq!(c.idt[4], 1.);
         assert_eq!((c.sensor_mm, c.focal_mm, c.f_number), ((9.792, 7.3728), 6.9, 1.68));
+        // A driver before cam-full-res lists no mode fields: the binned readout, Bayer.
+        assert_eq!((c.mode, c.cfa_period, c.frame_ns), (0, 2, 0));
+        // The 1:1 readout: the same camera (id, name), its own size, a quad filter.
+        let full = &cams[1];
+        assert_eq!((full.id, full.name.as_str(), full.width, full.height, full.mode, full.cfa_period, full.frame_ns), (0, "main", 8160, 6144, KIND_FULL, 4, 41670368));
     }
 
     #[test]
@@ -399,7 +440,7 @@ mod tests {
         m[53] = 1;
         assert!(parse_view(&m).unwrap().cached);
         // A MAP's header (payloads/camera `header` at bin 1).
-        let f = FrameHeader { count: 9, width: 4080, height: 3072, bin: 1, cfa: 0x49, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: 5 };
+        let f = FrameHeader { count: 9, width: 4080, height: 3072, bin: 1, cfa: 0x49, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: 5, cfa_period: 2 };
         let mut h = frame_header(&f);
         h[40] = 2;
         h[48..56].copy_from_slice(&(2u64 << 24).to_le_bytes());
@@ -446,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_frame_reads_back() {
-        let f = FrameHeader { count: 7, width: 4, height: 2, bin: 2, cfa: 0b01_00_10_01, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: -5 };
+        let f = FrameHeader { count: 7, width: 4, height: 2, bin: 2, cfa: 0b01_00_10_01, black: 64, white: 1023, exposure_ns: 1 << 26, gain: GAIN_UNITY, focus: 0x3800, time: -5, cfa_period: 4 };
         let samples: [u16; 8] = [1, 2, 3, 4, 5, 6, 7, 1023];
         let mut r = frame_header(&f).to_vec();
         for s in &samples {
@@ -454,6 +495,7 @@ mod tests {
         }
         let g = parse_frame(&r).unwrap();
         assert_eq!((g.count, g.width, g.height, g.bin, g.cfa, g.black, g.white, g.exposure_ns, g.gain, g.focus, g.time), (7, 4, 2, 2, f.cfa, 64, 1023, 1 << 26, GAIN_UNITY, 0x3800, -5));
+        assert!(g.quad());
         assert_eq!(&r[FRAME_HEADER..], &samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()[..]);
         assert!(parse_frame(&r[..r.len() - 1]).is_none());
     }

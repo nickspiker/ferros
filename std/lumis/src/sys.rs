@@ -6,6 +6,7 @@ use core::arch::asm;
 /// The kernel's refusal (ferros_sys::ERR).
 pub const ERR: u64 = u64::MAX;
 const CALL: u64 = 1;
+const FACTS: u64 = 12;
 const IRA: u64 = 23;
 /// Bit 63 of a call's reply length: fail at once when no server is receiving on the endpoint, instead of waiting for one that may never come; an on-demand endpoint (`camera`) waits for the server the kernel is starting (KERNEL.md "CALL_LIVE").
 const CALL_LIVE: u64 = 1 << 63;
@@ -79,4 +80,18 @@ pub fn pin(mask: u64) -> u64 {
 /// The spawn input's bytes from `start` into `buf` (ferros_sys `input`): how many were copied, 0 past the end or for a process spawned with none (a kist opened from the map).
 pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
+}
+
+/// The gravity vector the AoC last reported (ferros_sys `Facts::gravity`: facts 12 and 13, the x and y halves of one word, then z), m/s² in the panel's frame, x right, y up, z out of the glass, as Android's gravity sensor gives it; None until the sensors are up, or from a kernel that publishes no gravity (an unknown fact reads all ones). The facts need no grant: the kernel answers them from the sensors process's block.
+pub fn gravity() -> Option<[f32; 3]> {
+    // The facts up to gravity's, all ones (unknown) where the kernel writes none.
+    let mut b = [0xFFu8; 14 * 8];
+    // Thru a mutable pointer: the kernel writes the buffer.
+    svc(FACTS, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
+    let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let (xy, z) = (word(12), word(13));
+    if xy == u64::MAX || z == u64::MAX {
+        return None;
+    }
+    Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
 }

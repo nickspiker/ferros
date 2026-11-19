@@ -29,6 +29,12 @@ use std::sync::{Arc, Mutex};
 /// The UI sets it; the camera thread reads it at each frame and decides whether Lumis stays (owner, 2026-11-17: "lumis, if we're framing up and we go to the deck, should go bye bye, unless I'm doing a continuous save"; and of a calibration, "Basically if continuous save or cal is on").
 static BEHIND: AtomicBool = AtomicBool::new(false);
 
+/// Lumis is leaving and the camera has been (or is being) closed for it: set by whichever thread sends that CLOSE first (`close_to_leave`), so there is one, and the camera thread, back from a wait that came back empty or with a frame, reads nothing more of the view and ends.
+static LEAVING: AtomicBool = AtomicBool::new(false);
+
+/// Held by the camera thread whenever it may read the view (all of its turn but the driver's wait, `Source::next`), and by a thread that closes the camera for Lumis's leaving: the driver takes the view back at CLOSE, so a CLOSE sent from another thread must never land while a frame's rows are being read.
+static VIEW: Mutex<()> = Mutex::new(());
+
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
 const SURFACE: u64 = 3;
@@ -173,6 +179,10 @@ const DEV_UNCACHED: u8 = 1 << 0;
 const DEV_SLIT: u8 = 1 << 1;
 /// Development, with `DEV_SLIT`: the second knobs byte's bits 3 and 4 pick the shutter Lumis opens at, 2^-(11 - 2n) s (n 0 to 3: about 1/2000 s, 1/500, 1/128, 1/32), the camera's least (one line) being under the sensor's two.
 const DEV_SLIT_SHUTTER: u32 = 3;
+/// Development, with `DEV_OPEN`, the second knobs byte: open the first readout with a mode of its own (the main's 1:1, ferros cam-full-res) instead of the first listed, and say the gravity Lumis is given once, at the camera screen's first pass.
+const DEV_FULL: u8 = 1 << 5;
+/// Development, the second knobs byte: open at a 2^10 s shutter (1024 s, the longest the main has been measured to honour), so a long frame is in flight for the leave test (lumis-leave-long: sent behind, the camera closed at once).
+const DEV_LONG: u8 = 1 << 6;
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
 /// The second knobs byte, 0 when the input is shorter.
@@ -343,7 +353,7 @@ const ISO_AT_UNITY: f64 = 100.;
 /// A panel ferros does not tell its size draws those off by its own ratio to the Pro's.
 const DENSITY_DPI: f32 = 489.;
 
-/// Android's gravity vector for a device held upright in portrait (m/s², +y toward the top edge): ferros hands a kist no motion sensor yet, so Lumis's UI stays upright and its level reads that.
+/// Android's gravity vector for a device held upright in portrait (m/s², +y toward the top edge), what Lumis's UI takes while the sensors give none (`sys::gravity`: before the AoC is up, or a kernel without them).
 const UPRIGHT: [f32; 3] = [0., 9.80665, 0.];
 
 /// Lumis's console lines (the `log` crate, as Lumis logs everywhere), each on the kernel console with "lumis:" before it.
@@ -397,11 +407,15 @@ enum Opened {
 
 /// The camera list as Lumis's menu takes it: each camera at the binning Lumis integrates it at, Camera2's conventions where Lumis's code reads them.
 /// The optical facts (sensor size, focal length, aperture) come from the driver's list since 2026-11-17 (owner: "Missing lens stats on the Lumis page"), so the menu draws each sensor and its field of view.
+/// The menu's entries, one per readout (`list`'s order, which `StartCamera` indexes): a camera's readouts share its group (its `id`), the first carrying the group's size, as Android's Lumis groups a lens's capture modes; each says the widest readout's width as the pixel array's, so the page's pixel size is the sensor's, and the 1:1 readout is `max_res` (Android's maximum resolution).
 fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
     cameras
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
+            let group = cameras.iter().filter(|o| o.id == c.id);
+            let first = cameras.iter().position(|o| o.id == c.id) == Some(index);
+            let (modes, widest) = group.fold((0u32, 0u32), |(n, w), o| (n + 1, w.max(o.width)));
             let Some(bayer) = camera::bayer_pattern(c.cfa) else {
                 println!("lumis: camera {} has a colour filter Lumis does not read (G#{:02X}); left out", c.name, c.cfa);
                 return None;
@@ -430,10 +444,10 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 // Shown as "RAW": full manual control of a raw stream.
                 hardware_level: 1,
                 sensor_orientation: c.rotation as i32 * 90,
-                pixel_array_width: c.width,
-                mode_count: 1,
-                group_id: -1,
-                max_res: false,
+                pixel_array_width: widest,
+                mode_count: if first { modes } else { 1 },
+                group_id: c.id as i32,
+                max_res: c.mode != 0,
                 is_cropped: false,
                 has_cal: false,
             })
@@ -483,9 +497,15 @@ fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
         ask.extend_from_slice(&camera::slit_block());
         // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
         ask.push(0);
-    } else if knobs & DEV_COPY != 0 {
+    } else if knobs & DEV_COPY != 0 && cam.mode == 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
+    } else if cam.mode != 0 {
+        // A readout of its own (the 1:1 full resolution): its kind and the rest the driver's (its frame and integration the replayed init's), written back by the view (MAP only: the driver gives no copy at 1:1).
+        ask.push(cam.mode);
+        ask.resize(3 + camera::MODE_BLOCK, 0);
+        ask.push(if dev_knobs2() & DEV_UNCACHED != 0 { 0 } else { camera::OPEN_VIEW_CACHED });
+        println!("lumis: camera {}: the open asks for readout {} ({} x {})", cam.name, cam.mode, cam.width, cam.height);
     } else {
         if !block.is_empty() {
             println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
@@ -526,6 +546,7 @@ fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
         }
         Some(v) => Err(Refused::Why(format!("the view's format {} is not one Lumis reads", v.format))),
         None if slit => Err(Refused::NoSlit),
+        None if cam.mode != 0 => Err(Refused::Why(format!("no view for readout {}: it is read in place only", cam.mode))),
         None => {
             println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
             // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
@@ -559,7 +580,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
         let shutter_ns = (1_000_000_000u64 >> 11) << (2 * ((dev_knobs2() >> DEV_SLIT_SHUTTER) & 3));
         println!("lumis: camera {}: development: the shutter {shutter_ns} ns", cam.name);
-        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0 }
+        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0, cfa_period: cam.cfa_period }
     } else {
         let Some(Got::Frame(first, _)) = src.next(&mut turns) else {
             return fail("no first frame".into());
@@ -579,6 +600,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let (seed_iso, seed_shutter) = match calibration {
         // A dark map opens at lumis_core's dark seed (16 s, Android's longest) or the camera's longest if shorter: the combined driver offers years (the main's shift modes), and a calibration must not open on one. The shutter control keeps the whole range.
         Some(dark) => (max_iso, if dark { (cam.exposure_max as f64).min(app::DARK_CALIBRATION_SHUTTER_NS) } else { cam.exposure_min as f64 }),
+        None if dev_knobs2() & DEV_LONG != 0 => (iso(first.gain), ((1u64 << 10) * 1_000_000_000) as f64),
         None => (iso(first.gain), first.exposure_ns as f64),
     };
     let setup = CameraSetup {
@@ -634,12 +656,18 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
     let mut quiet: Option<[u64; 2]> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
-    let mut slit_ok = knobs & DEV_COPY == 0;
+    let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
+        // The view read only while this is held (`VIEW`), released for the driver's wait below.
+        let mut reading = VIEW.lock().unwrap();
+        if LEAVING.load(Ordering::Acquire) {
+            drop(reading);
+            finish_leaving(integrator, vault.as_deref());
+        }
         if slit_later.is_some_and(|t| std::time::Instant::now() >= t) && integrator.header[CURRENT_MODE_IDX] != RawMode::Slitscan as u64 {
             println!("lumis: development: Slitscan");
             integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
@@ -683,7 +711,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             reopened = Some((t_close, std::time::Instant::now()));
         }
         let slit_now = src.is_slit();
-        let got = match src.next(&mut turns) {
+        drop(reading);
+        let got = src.next(&mut turns);
+        reading = VIEW.lock().unwrap();
+        // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
+        if LEAVING.load(Ordering::Acquire) {
+            drop(reading);
+            finish_leaving(integrator, vault.as_deref());
+        }
+        let got = match got {
             Some(got) => got,
             // A slit stream that ends (the Pro, 2026-11-18: a stored driver from before the detached slit stops after one; the forge driver's at 1296 and 3236 slits on LATE_CONFIG) ends that driver, not Lumis: whole frames are opened (no CLOSE: the driver closed itself, and a call would start a stored one on demand only to close it), and Slitscan takes its band from them.
             None if slit_now => {
@@ -773,7 +809,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sweep_frames += 1;
         }
         let (iso, shutter_ns, focus) = match got {
-            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
+            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
+            // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
             Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
             Got::Slit { rows, .. } => integrator.process_slit(&rows, rows.rows, sent.0, sent.1, sent.2),
@@ -932,11 +969,43 @@ fn close_camera(name: &str) {
     }
 }
 
-/// Lumis sent behind with no continuous save or calibration running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so.
+/// The camera closed for Lumis's leaving, once whoever asks first (`LEAVING`); the caller holds `VIEW` (the camera thread in its turn, or `close_from_behind`).
+fn close_to_leave(name: &str) {
+    if !LEAVING.swap(true, Ordering::AcqRel) {
+        close_camera(name);
+    }
+}
+
+/// Lumis sent behind with no continuous save or calibration running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so. Called by the camera thread in its turn (it holds `VIEW`).
 fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> ! {
     keep_saves(vault, header);
-    close_camera(name);
+    close_to_leave(name);
     lumis_core::platform::exit_because("sent behind");
+}
+
+/// The window sent behind with nothing that keeps Lumis (no continuous save or calibration): the camera closed from a thread of its own, not at the camera thread's next frame, which on a long exposure may be years away (2026-11-18, the Pro: a shutter dragged to its last stop, about 14 years, left the driver waiting on that frame and the next Lumis unable to open). It takes `VIEW`, so it waits for a frame being read to be done; the driver answers a CLOSE while a MAP or SLITS waits (ferros cam-serve-while-waiting), and that wait comes back empty. On its own thread so the window never waits on the driver.
+fn close_from_behind(name: String) {
+    let spawned = std::thread::Builder::new().name("lumis-leave".into()).spawn(move || {
+        let _reading = VIEW.lock().unwrap();
+        close_to_leave(&name);
+    });
+    if spawned.is_err() {
+        println!("lumis: no thread to close the camera; it closes at its next frame");
+    }
+}
+
+/// The camera closed for Lumis's leaving while this thread waited on it (`LEAVING`): nothing more is read from the view; a save asked for is started, every save on its way finished and kept, and Lumis ends.
+fn finish_leaving(integrator: &mut lumis_core::CameraIntegrator, vault: Option<&kete::FlatStorage>) -> ! {
+    println!("lumis: the camera closed for leaving; finishing the saves on their way");
+    loop {
+        integrator.try_save();
+        keep_saves(vault, &mut *integrator.header);
+        if !in_flight(integrator.header[FLAGS_IDX]) {
+            lumis_core::platform::exit_because("sent behind");
+        }
+        // A save encoding on its own thread: looked at again every 2^6 ms until it is kept.
+        std::thread::sleep(std::time::Duration::from_millis(1 << 6));
+    }
 }
 
 /// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
@@ -1002,6 +1071,8 @@ struct Lumis {
     screen: Screen,
     menu: Option<Box<MainMenu>>,
     menu_dirty: bool,
+    /// The camera last opened, for the console.
+    camera_name: String,
     /// `DEV_OPEN` has opened its camera (once a launch).
     dev_opened: bool,
     surface: Option<PixelSurface>,
@@ -1029,7 +1100,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1041,6 +1112,7 @@ impl Lumis {
             None => "",
         });
         *self.opened.lock().unwrap() = None;
+        self.camera_name = cam.name.clone();
         self.screen = Screen::Opening;
         let (vault, opened) = (self.vault.clone(), self.opened.clone());
         if std::thread::Builder::new().name("lumis-camera".into()).spawn(move || camera_service(cam, calibration, vault, opened)).is_err() {
@@ -1063,8 +1135,12 @@ impl Lumis {
             self.changed = true;
             return;
         }
-        if matches!(self.screen, Screen::Menu) {
-            lumis_core::platform::exit_because("sent behind");
+        match &self.screen {
+            Screen::Menu => lumis_core::platform::exit_because("sent behind"),
+            // Nothing keeps Lumis (no continuous save or calibration): the camera closed now, not at the camera thread's next frame (`close_from_behind`); the camera thread then finishes any save on its way and ends Lumis.
+            Screen::Camera(ui) if !kept(ui.header[FLAGS_IDX]) => close_from_behind(self.camera_name.clone()),
+            // Kept, or still opening (the camera thread decides as its first frame comes).
+            _ => {}
         }
     }
 
@@ -1158,7 +1234,8 @@ impl FluorApp<G2t16> for Lumis {
         match &mut self.screen {
             Screen::Menu if self.knobs & DEV_OPEN != 0 && !self.dev_opened && !self.cameras.is_empty() => {
                 self.dev_opened = true;
-                self.open(0, None);
+                let index = if dev_knobs2() & DEV_FULL != 0 { self.cameras.iter().position(|c| c.mode != 0).unwrap_or(0) } else { 0 };
+                self.open(index, None);
                 return true;
             }
             Screen::Menu => {
@@ -1173,12 +1250,18 @@ impl FluorApp<G2t16> for Lumis {
             Screen::Camera(ui) => {
                 use lumis_core::shared_memory::CAL_SHOW_RESULT_BIT;
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
-                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid);
+                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
                 let t = std::time::Instant::now();
-                app::ui_frame(ui, surface, Buttons::default(), UPRIGHT, self.finger);
+                // The AoC's gravity, as Android's Lumis gets TYPE_GRAVITY (owner, 2026-11-18: "looks like we aren't relaying gravity data to lumis?"): the controls turn with the device, the level indicator follows, and a save's orientation tag is the way it is held.
+                let gravity = sys::gravity();
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if self.knobs & DEV_OPEN != 0 && dev_knobs2() & DEV_FULL != 0 && !SAID.swap(true, Ordering::Relaxed) {
+                    println!("lumis: development: the gravity given, {gravity:?} (None: upright)");
+                }
+                app::ui_frame(ui, surface, Buttons::default(), gravity.unwrap_or(UPRIGHT), self.finger);
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
-                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own), and a turn of the device (the gravity here is a constant).
+                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device and the level indicator are read below, from the fields lumis_core keeps for them.
                 // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
                 let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
                 let other = ui.previous_histogram_counter != before.2
@@ -1187,7 +1270,9 @@ impl FluorApp<G2t16> for Lumis {
                     || ui.header[FLAGS_IDX] & (CALIBRATING_BIT | CAL_SHOW_RESULT_BIT) != 0
                     || before.4
                     || ui.last_touch_valid
-                    || self.finger.is_some();
+                    || self.finger.is_some()
+                    // A turn of the device, or the level indicator repainted (lumis_core handle_input_and_draw: past its deadband, or any change after a second): the controls are drawn whole.
+                    || (ui.device_rotation, ui.painted_roll, ui.painted_pitch) != before.5;
                 self.parts.clear();
                 if surface.take_posted() {
                     let camera: Option<Vec<fluor::canvas::PixelRect>> = lumis_core::ui::screen::camera_damage(ui).map(|v| v.into_iter().map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1)).collect());
@@ -1306,8 +1391,10 @@ fn list() -> Vec<camera::Camera> {
         return Vec::new();
     }
     match camera::parse_list(&r[..n as usize]) {
-        Ok(c) => {
-            println!("lumis: {} cameras listed", c.len());
+        Ok(mut c) => {
+            // Each camera's readouts together, the binned one first (Android's order: the menu shows a lens by its first readout and offers the rest on its page).
+            c.sort_by_key(|c| (c.id, c.mode));
+            println!("lumis: {} readouts listed", c.len());
             c
         }
         Err(e) => {
