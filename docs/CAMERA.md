@@ -1060,6 +1060,22 @@ $B diag "console kept 64"
 4. Long exposure at 1:1: camtest `0401000500000002` (64 ms to 2 s and back), then `04010005000E0A02` (1 s to 16 s): the frames the exposure apart, the sensor reading back frame, line 11600 and integration.
 5. Regressions: the slit (cambench `00034000000000000000000002080000`) and 96 a second (cambench `00010000800C00000000000002FF0003000002`), each its own driver (input `01`, no file).
 
+### On the Pro, 2026-11-18 evening (b973, the flashed forge bc1bef30, no reload, nothing stored; every driver hand-spawned from target/agent-camfull/bin, one open each, every stream ended by its own close)
+
+| step | input | result |
+|---|---|---|
+| 0 binned | camtest `4001` | pass: 64 frames 66.5 ms apart, link clean, no error word |
+| 1 the 1:1 opens | cambench `…00040000` | pass: init 747 writes 1 read in 1.3 s, mode 2 8160 x 6144 G#2222, line 6586 ns at PLL 215, a frame every 41670 us; RATE sensor 23-24/s, front end 21-22/s over the first second; 64 mapped at 24/s; DMA_DONE gaps 41525 to 41802 us; the link at 1492 MB/s |
+| 2 frames, mosaic | camtest `4001000000000002` | pass: 64 frames, DMA_DONE gaps 41550 to 41759 us; a whole frame read thru the non-cacheable view in 205 ms |
+| 3 reading | cambench `…01040000`, `…02040000` | pass: 24/s, 0 skipped both; read 16.2 ms a frame (4 threads), u16 add 29.3 ms |
+| 4 long exposures | camtest `0401000500000002`, `04010005000E0A02` | pass: 64 ms to 16384 ms, frames the exposure apart (16384079 us at 16 s), the sensor reading back line 11600, shift 0 to 6, integration 38869; the step back to 64 ms cut the frame in flight (2030 ms and 16362 ms of it left) and the next frame landed 120 ms after stream on |
+| 5 slit | cambench `00034000000000000000000002080000` | pass: sensor 1226/s, front end 1214/s, 0 lost |
+| 5 96 a second | cambench `00010000800C00000000000002FF0003000002` | first run died, a rerun cool passed (below) |
+
+**The CFA is quad.** The cell table (4 x 4 means, a dim indoor scene, black 64) read the same in the first and the 64th frame: rows 0 and 1 `80 80 73 73`, rows 2 and 3 `83 83 80 80`. That is 2 x 2 blocks of one colour, G B / R G as blocks (G 80, B 73, R 83, G 80), the binned readout's phase. The binned table (step 0) is a period of 2: `102 86 102 86` / `109 102 109 101`.
+
+**The 96 a second death was heat, not the driver.** Photon was in front rendering every frame (76 a second, 12.5 ms a draw), which kept the A715s lifted at 2367 MHz; after the 1:1 runs the zones read BIG peak 92 C, MID and LITTLE 90 C, CPUCL0's divider stepping (G#80000801). In that state cambench read only 36 frames a second (27 ms of work a frame, 1522 MHz) and the stream died at frame 26718 (about 278 s): one DMA_DONE gap of 10939 us, then LATE_CONFIG (G#10) and image overflow G#1, the driver's own close after 2117 ms with no frame. Every DMA_DONE had been released by the kernel's armed action; `diag dev` showed ispfe0 interrupt to run at most 3061 us. Photon sent behind (the Deck tap), the Pro fell from 86 C to 54 C in about 3 minutes, and the same run passed: 17201 frames at 96 a second, 16320 mapped (775 skipped, 6.2 ms of work a frame), no error word, every release the kernel's, 72 C at the end.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
