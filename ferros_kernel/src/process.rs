@@ -199,6 +199,15 @@ pub struct Rank {
     pub kernel_waits: [core::sync::atomic::AtomicU64; 4],
 }
 
+/// For the stall record (platform.rs `stall_check`): the UFS lock's holder and where it took it, in the kernel lock note's form (bits 0-7 the core + 1, 8-31 the line, 32-63 the file's first four bytes), and the storage locks `core` holds (`RANKS`).
+/// Why (2026-11-19, the Pro, b1016): a watchdog reset with core 0 silent and IRQs masked holding the kernel lock taken at syscall entry, during a RAW clip's direct writes; whether a UFS wait was behind it was not recorded.
+pub fn stall_extra(core: usize) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let site = UFS.site.load(Relaxed);
+    let ufs = UFS.holder.load(Relaxed) as u64 & 0xFF | site << 8;
+    (ufs, RANKS[core & 15].load(Relaxed) as u64)
+}
+
 impl Rank {
     const fn new(rank: u32, name: &'static str) -> Self {
         use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -4195,6 +4204,13 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         f.x[0] = ERR;
         return 0;
     };
+    // A refusal's reason on the console, written as `push_console` writes it but without taking the kernel lock, which this syscall holds and which is not reentrant.
+    // 63916ff9 called `push_console` here: a refused call spun on its own core's lock with interrupts masked until the watchdog reset the Pro (Lumis's seals from an A510, which held no keys, 2026-11-19).
+    let say = |why: &str| {
+        let line = alloc::format!("extent: {} refused: {why}\n", core::str::from_utf8(&p.name).unwrap_or("?"));
+        k().console.extend_from_slice(line.as_bytes());
+        crate::platform::pstore(line.as_bytes());
+    };
     let (eop, raw) = ((f.x[1] & 7) as u8, f.x[1] & 32 != 0);
     let block = f.x[1] >> 32;
     let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
@@ -4211,7 +4227,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         _ => false,
     };
     if !rel_ok || !len_ok {
-        push_console(alloc::format!("extent: {} refused: {}\n", core::str::from_utf8(&p.name).unwrap_or("?"), if !rel_ok { "the name is not printable ASCII (G#21 to G#7E, no spaces) of 1 to 96 bytes" } else { "the buffer's length is not the op's" }).as_bytes());
+        say(if !rel_ok { "the name is not printable ASCII (G#21 to G#7E, no spaces) of 1 to 96 bytes" } else { "the buffer's length is not the op's" });
         f.x[0] = ERR;
         return 0;
     }
@@ -4236,7 +4252,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     rest[1..9].copy_from_slice(&block.to_le_bytes());
     rest[9..13].copy_from_slice(&(len as u32).to_le_bytes());
     let Some(mut msg) = stamp(VOP_EXTENT, &prefix, classes, &name, &rest) else {
-        push_console(alloc::format!("extent: {} refused: its domain's keys are not open (the person's class while they are away)\n", core::str::from_utf8(&p.name).unwrap_or("?")).as_bytes());
+        say("its domain's keys are not open (the person's class while they are away, or this core holds no copy of the keys yet)");
         f.x[0] = ERR;
         return 0;
     };
@@ -4248,7 +4264,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
                 msg.extend_from_slice(b);
             }
             None => {
-                push_console(alloc::format!("extent: {} refused: its buffer of A#{} bytes at G#{:X} lies in no memory of its own\n", core::str::from_utf8(&p.name).unwrap_or("?"), len, f.x[4]).as_bytes());
+                say(&alloc::format!("its buffer of A#{} bytes at G#{:X} lies in no memory of its own", len, f.x[4]));
                 crate::keys::wipe_to_dram(&mut msg);
                 f.x[0] = ERR;
                 return 0;
