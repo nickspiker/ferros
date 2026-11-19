@@ -8,6 +8,7 @@
 //! Spawn, the readers (a view in slot 1: `test-view`, or `gps-view` for the GPS driver's):
 //!   ferros-bridge spawn mbtest.bin 01<threads><count, 2 bytes LE><flags> --name mbr0 --dma test-view
 //! Flags bit 0: the GPS mailbox, claimed with the view as the proof (so the driver runs) and read as ferros_mailbox::gps's layout.
+//! Flags bit 1: another writer's mailbox (`motion-view`): its words are not checked for the test writer's pattern.
 //! Each thread waits for the next publish (SYS_WAIT on the sequence word), reads it with single looks (`try_read`, a look a publish landed in counted and looked at again), checks it, and keeps how late it woke (its read against the publish's counter stamp), until it has read `count` publishes or the mailbox died.
 //! The first thread then says the sums for all of them on one line, and the wake delays as a histogram of powers of two microseconds.
 #![no_std]
@@ -21,10 +22,10 @@ use ferros_sys::{cap, claim, console, exit, freq, now, sleep_until, thread_exit,
 /// The most reader threads a process runs.
 const THREADS: usize = 1 << 4;
 /// A reader thread's stack.
-const STACK: usize = 1 << 13;
+const STACK: usize = 1 << 14;
 static mut STACKS: [[u8; STACK]; THREADS] = [[0; STACK]; THREADS];
 /// The most payload words a test publish carries.
-const WORDS: usize = 1 << 10;
+const WORDS: usize = 1 << 8;
 /// The histogram's buckets: wake delays under 2^b us in bucket b, the last everything past.
 const BUCKETS: usize = 1 << 4;
 
@@ -79,7 +80,7 @@ pub extern "C" fn payload_main(grants: u64, at: u64, len: u64) -> ! {
     let count = input(at, len, 2) as u64 | (input(at, len, 3) as u64) << 8;
     if input(at, len, 0) == 0 {
         // WHY the min: the size is the host's input; a publish past the payload buffer would read past it.
-        writer(grants, input(at, len, 1) as u32, count, 1usize << input(at, len, 4).min(10), &mut l);
+        writer(grants, input(at, len, 1) as u32, count, 1usize << input(at, len, 4).min(8), &mut l);
     }
     // Readers: the view mapped, GPS claimed in GPS mode, the threads started; the first is this one.
     // WHY the bounds: the count is the host's input; a thread past the stacks would have none, and no thread at all reads nothing.
@@ -120,7 +121,7 @@ pub extern "C" fn payload_main(grants: u64, at: u64, len: u64) -> ! {
     if flags & 1 != 0 {
         let _ = write!(l, "; A#{} reads held a fix, A#{} tracks at most", FIXES.load(Ordering::Relaxed), TRACKS.load(Ordering::Relaxed));
     }
-    let _ = write!(l, "\nmbtest: woke under 2^b us, b = 0..:");
+    let _ = write!(l, "; woke under 2^b us, b = 0..:");
     for h in HIST.iter() {
         let _ = write!(l, " A#{}", h.load(Ordering::Relaxed));
     }
@@ -173,7 +174,7 @@ fn read_all(_t: u64) {
                         FIXES.fetch_add(gp.valid as u64, Ordering::Relaxed);
                         TRACKS.fetch_max(gp.n as u64, Ordering::Relaxed);
                     }
-                } else {
+                } else if flags & 2 == 0 {
                     // The test writer's payload: its publish number in every word, so two numbers are a torn read.
                     // WHY the min: `len` is the writer's word; the check stays in this buffer.
                     let n = len.min(WORDS);

@@ -20,7 +20,7 @@ Owner (2026-11-19), after the GPS driver ran out of WATCH slots with six watcher
 - The capability is the permission: implicit rights stay implicit ([[rights_implicit_set]]), while location and the mic are asked once ([[permissions_asked_once]]).
 - Related: [[gps_onchip_fix]], [[kernel_out_moves]].
 
-**Built 2026-11-19 (branch mailboxes; KERNEL.md "Mailboxes", SENSORS.md "The motion mailbox"), not yet run on a device:**
+**Built 2026-11-19 (branch mailboxes; KERNEL.md "Mailboxes", SENSORS.md "The motion mailbox"), run on the Pro (b1005): 64 readers woken by every publish, none torn or skipped, the writer 12.6 us a publish with one reader and 122 us with 64:**
 - A mailbox is a DMA region pair over one pool frame kept for the boot: `<name>-mailbox` read-write (the writer's), `<name>-view` read-only (EL0 and EL2).
 - SYS_DMA maps it (the writer's region makes the one writer); SYS_WAIT on the sequence word waits; the writer's SYS_WAKE on it wakes every process's waiters; SYS_MAILBOX (47) op 0 opens a view with a proof (GPS: Settings, the `gps` right, a GPS view; motion: none yet, as public as SYS_FACTS).
 - The kernel marks it dead and zeroes it once the writer's process is gone (where the arc is freed, all three paths).
