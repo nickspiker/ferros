@@ -57,6 +57,16 @@ static CAM: AtomicU64 = AtomicU64::new(0);
 fn cam() -> &'static Cam {
     cams::CAMS[CAM.load(Ordering::Relaxed) as usize]
 }
+/// The open readout: 0 the camera's own (binned, a mode of it, its 1:1), k + 1 its captured readout `alts[k]` (ferros_cam cams `Alt`).
+static ALT_OPEN: AtomicU64 = AtomicU64::new(0);
+/// The open readout's receiver start and stop: its captured readout's, or the camera's.
+fn rx_of() -> (&'static [(usize, u32)], &'static [(usize, u32)]) {
+    let c = cam();
+    match ALT_OPEN.load(Ordering::Relaxed) {
+        0 => (c.rx_start, c.rx_stop),
+        k => (c.alts[k as usize - 1].rx_start, c.alts[k as usize - 1].rx_stop),
+    }
+}
 
 /// The heap the list is built in (ferros_cam list: an IDT's document parsed, the list's sections and document made), at LIST only. A list of three cameras is about 1.3 KB and an IDT 7.7 KB; 2^20 bytes leaves room for vsf's working copies many times over.
 const HEAP_BYTES: usize = 1 << 20;
@@ -68,7 +78,7 @@ static HEAP: Region<HEAP_BYTES> = Region(core::cell::UnsafeCell::new([0; HEAP_BY
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
 /// The cameras the list can name: those that stream.
-const LISTED: [u8; 3] = [0, 1, 2];
+const LISTED: [u8; 4] = [0, 1, 2, 3];
 /// The largest IDT the driver reads (each `.idt.vsf` is 7764 bytes).
 const IDT_MOST: usize = 1 << 14;
 static mut IDT: [u8; IDT_MOST] = [0; IDT_MOST];
@@ -111,8 +121,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         if !inputs_held(g, c) {
             continue;
         }
-        let mut kb = [0u8; 32];
-        let Some(idt) = get(g, input_key(&mut kb, c, b"idt"), unsafe { &mut *(&raw mut IDT) }) else { continue };
+        let Some(idt) = input(g, c, None, b"idt", T_IDT, unsafe { &mut *(&raw mut IDT) }) else { continue };
         if !LIST_SAID.load(Ordering::Relaxed) {
             let t = ferros_cam::list::Readout::binned(c).timing;
             say!(g, "camera: LIST {}: mode A#0, exposure_max A#{} ns\n", c.name, t.most_ns());
@@ -132,6 +141,29 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
             match ferros_cam::list::Readout::full(c, full).and_then(|r| ferros_cam::list::section_of(c, idt, &r)) {
                 Ok(s) => secs.push(s),
                 Err(e) => say!(g, "camera: cam.{}.init.full gives no 1:1 readout ({e:?}); {}'s 1:1 left out of the list\n", c.key, c.name),
+            }
+        }
+        // Its captured readouts (ferros_cam cams `Alt`), a section each whose init, program and job are in the vault (`cam.<key>.init.<tag>`, `.prog.<tag>`, `.pdma.<tag>`): opened by the mode block's kind `ALT + k`.
+        for (k, a) in c.alts.iter().enumerate() {
+            let have = |what: &str| {
+                let mut w = [0u8; 16];
+                let n = what.len();
+                w[..n].copy_from_slice(what.as_bytes());
+                w[n] = b'.';
+                w[n + 1..n + 1 + a.tag.len()].copy_from_slice(a.tag.as_bytes());
+                has(g, input_key(&mut [0u8; 32], c, &w[..n + 1 + a.tag.len()]))
+            };
+            if !(have("prog") && have("pdma")) {
+                continue;
+            }
+            let Some(init) = input(g, c, Some(a), b"init", T_INIT, unsafe { &mut *(&raw mut INIT) }) else { continue };
+            let r = ferros_cam::list::Readout::alt(c, k, init);
+            if !LIST_SAID.load(Ordering::Relaxed) {
+                say!(g, "camera: LIST {}: mode A#{} ({}), exposure_max A#{} ns\n", c.name, r.kind, a.tag, r.timing.most_ns());
+            }
+            match ferros_cam::list::section_of(c, idt, &r) {
+                Ok(s) => secs.push(s),
+                Err(e) => say!(g, "camera: {}'s readout {} gives no section ({e:?})\n", c.name, a.tag),
             }
         }
     }
@@ -1021,6 +1053,41 @@ static FULL_INPUT: AtomicU64 = AtomicU64::new(0);
 /// Where the spawn's input carries the 1:1 init: after 16 knob bytes, framed as ferros-bridge's `--input-file` frames a file (u32 LE length, then the bytes): `spawn camera.bin 01000000000000000000000000000000 --input-file target/cam/main-full.init`.
 const FULL_INPUT_AT: u64 = 1 << 4;
 
+/// A device test with nothing stored, for any readout (docs/CAMERA.md "Every readout, captured"): the hand spawn's eleventh byte (`TEST_ITEMS`) names which inputs follow the 16 knob bytes, each framed as `--input-file` frames it, in this order: bit 0 the 1:1 init (as `FULL_INPUT`), bit 1 the init, bit 2 the CPU program, bit 3 the job, bit 4 the IDT; each used in place of the vault's for whatever readout the open asks. 0 with one frame after the knobs is the 1:1 init alone, as before.
+const T_INIT: usize = 1;
+const T_PROG: usize = 2;
+const T_PDMA: usize = 3;
+const T_IDT: usize = 4;
+static mut T_BUF: [[u8; VALUE]; 4] = [[0; VALUE]; 4];
+static T_LEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The spawn's input `k` (`T_INIT` ..), copied out of `T_BUF` into `buf` (the open edits the job in place), or None.
+fn test_input<'a>(k: usize, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    let n = T_LEN[k - 1].load(Ordering::Relaxed) as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf[..n].copy_from_slice(unsafe { &(&*(&raw const T_BUF))[k - 1][..n] });
+    Some(&buf[..n])
+}
+
+/// Camera `c`'s input `what` (`init`, `prog`, `pdma`, `idt`) for the readout opened (`alt`: its `.<tag>`), the spawn's first (`test_input`), else the vault's.
+fn input<'a>(g: u64, c: &Cam, alt: Option<&cams::Alt>, what: &[u8], k: usize, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    if T_LEN[k - 1].load(Ordering::Relaxed) != 0 {
+        return test_input(k, buf);
+    }
+    let mut w = [0u8; 16];
+    let mut n = what.len();
+    w[..n].copy_from_slice(what);
+    if let Some(a) = alt {
+        w[n] = b'.';
+        w[n + 1..n + 1 + a.tag.len()].copy_from_slice(a.tag.as_bytes());
+        n += 1 + a.tag.len();
+    }
+    let mut kb = [0u8; 32];
+    get(g, input_key(&mut kb, c, &w[..n]), buf)
+}
+
 /// Camera `c`'s 1:1 init: the spawn's (a device test, `FULL_INPUT`), else the vault's `cam.<key>.init.full`; None when neither.
 fn full_init(g: u64, c: &Cam) -> Option<&'static [u8]> {
     let n = FULL_INPUT.load(Ordering::Relaxed) as usize;
@@ -1378,12 +1445,14 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     CAM.store(c.id as u64, Ordering::Relaxed);
     let bus = Bus::of(g, c);
     // The inputs first (the vault's, nothing powered yet): the camera's own (`cam.<key>.init`, `.prog`, `.pdma`); the main's also as the bundle `cam.frame` or by their older names, as before. The mode is read out of the init, and the region is sized to it.
-    let mut kb = [0u8; 32];
+    // A captured readout (`Alt`, kind `cams::ALT + k`): its own init, program, job and receiver, nothing rewritten.
+    let alt = if s.kind >= cams::ALT { Some(c.alts.get((s.kind - cams::ALT) as usize).ok_or(Fail::Inputs("no such readout for this camera"))?) } else { None };
+    ALT_OPEN.store(alt.map_or(0, |_| (s.kind - cams::ALT) as u64 + 1), Ordering::Relaxed);
     let (init, prog) = unsafe {
-        let own = (get(g, input_key(&mut kb, c, b"init"), &mut *(&raw mut INIT)), get(g, input_key(&mut [0u8; 32], c, b"prog"), &mut *(&raw mut PROG)));
+        let own = (input(g, c, alt, b"init", T_INIT, &mut *(&raw mut INIT)), input(g, c, alt, b"prog", T_PROG, &mut *(&raw mut PROG)));
         match own {
             (Some(i), Some(p)) => (i, p),
-            _ if c.id != 0 => return Err(Fail::Inputs("no cam.<key>.init or cam.<key>.prog for this camera in the vault")),
+            _ if c.id != 0 || alt.is_some() => return Err(Fail::Inputs("no cam.<key>.init or cam.<key>.prog (with the readout's .<tag>) for this camera in the vault")),
             _ => match get(g, b"frame", &mut *(&raw mut BUNDLE)).and_then(inputs::split_bundle) {
                 Some(both) => both,
                 None => (
@@ -1397,10 +1466,17 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let init = if s.full() { full_init(g, c).ok_or(Fail::Inputs("no cam.<key>.init.full (the 1:1 init) for this camera in the vault"))? } else { init };
     let prog = inputs::prog(prog).ok_or(Fail::Inputs("the CPU program is not a CPR2"))?;
     let jb = unsafe { &mut *(&raw mut JOB) };
-    let jn = get(g, input_key(&mut kb, c, b"pdma"), jb).ok_or(Fail::Inputs("no cam.<key>.pdma for this camera in the vault"))?.len();
-    let mode = mode_of(c, init, s)?;
-    // The front end's geometry: the camera's captured frame, and the one the mode sends (ferros_cam geom): its line on a 256-byte boundary, or the camera's own captured stride where the width and the format are the captured ones.
-    let from = geom::Geom { w: c.width as u16, h: c.height as u16, stride: c.stride as u32, pd_h: (c.height / 4) as u16, dt: geom::DT_RAW10 };
+    let jn = input(g, c, alt, b"pdma", T_PDMA, jb).ok_or(Fail::Inputs("no cam.<key>.pdma (with the readout's .<tag>) for this camera in the vault"))?.len();
+    let mode = if alt.is_some() { None } else { mode_of(c, init, s)? };
+    // The front end's geometry: the camera's captured frame (a captured readout's own), and the one the mode sends (ferros_cam geom): its line on a 256-byte boundary, or the camera's own captured stride where the width and the format are the captured ones.
+    let from = match alt {
+        Some(a) => geom::Geom { w: a.width as u16, h: a.height as u16, stride: a.stride as u32, pd_h: (a.height / 4) as u16, dt: geom::DT_RAW10 },
+        None => geom::Geom { w: c.width as u16, h: c.height as u16, stride: c.stride as u32, pd_h: (c.height / 4) as u16, dt: geom::DT_RAW10 },
+    };
+    let (sizes, skip, rx_start) = match alt {
+        Some(a) => (&a.sizes, &job::NO_SKIP, a.rx_start),
+        None => (&c.sizes, &c.skip, c.rx_start),
+    };
     let to = match mode {
         None => from,
         Some(m) => {
@@ -1416,7 +1492,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
     // The PD path on (the init's mode, or asked): each ring buffer holds its frame's PD rows right after its image (owner, 2026-11-17: phase detect as data, one MAP giving both; docs/CAMERA.md "Phase detect as data"), the main's 768 lines at the image's stride past its 3072, so a buffer is 20 MiB, not 16. `pd_off` the rows' place in the buffer, 0 none.
-    let pd_on = s.kind == K_CAPTURED || s.flags & F_PD != 0;
+    let pd_on = match alt { Some(a) => a.pd, None => s.kind == K_CAPTURED || s.flags & F_PD != 0 };
     let pd_off = if pd_on && !slit { fe.h as u64 * fe.stride as u64 } else { 0 };
     let buf = if slit { job::slit_bytes(fe.h as u64, fe.stride as u64) } else if pd_off != 0 { job::buffer_bytes(fe.h as u64 + fe.pd_h as u64, fe.stride as u64) } else { job::buffer_bytes(fe.h as u64, fe.stride as u64) };
     // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14); measured on the Pro on 2026-11-15 to work above 4 GiB too (the front end drives the high address halves in bypass), where it is taken when nothing lower is free. A vault entry `cam.region` reading `high` asks higher first.
@@ -1448,7 +1524,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The biggest ring first, under 4 GiB and then above it for each count: a ring of one gives no view, so a smaller ring under 4 GiB is not worth more than a bigger one above it (the Pro, b898: the low ranges held a ring of one, and the bench's open came back without a view).
     'ask: for &n in rings.iter() {
         for low in [low_first, !low_first] {
-            let l = job::with_image(&c.sizes, &c.skip, n as u64 * buf);
+            let l = job::with_image(sizes, skip, n as u64 * buf);
             let (f, sl) = copies(n);
             let frames = l.bytes / job::FRAME + engine_bytes(f, sl).div_ceil(job::FRAME);
             let pa = ask(frames, low);
@@ -1509,6 +1585,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         if let Some(l) = arr.lte.filter(|l| !l.byte) {
             shift_width(g, &bus, c, l);
         }
+    }
+    if let Some(a) = alt {
+        say!(g, "camera: {}: the captured readout {} (kind A#{}): A#{} x A#{} at G#{:X} a line, its own init, program, job and receiver (A#{} words), PD rows {}, CFA period A#{}\n", c.name, a.tag, s.kind, a.width, a.height, a.stride, a.rx_start.len(), if a.pd { "kept" } else { "none" }, a.period);
     }
     // The mode, inside the sensor's hold, after its init and before stream on (unless asked for mid-stream: after the first frame, below).
     if let Some(m) = mode {
@@ -1616,7 +1695,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     // The shape the frame thread and the endpoint work to.
     BUF.store(buf, Ordering::Relaxed);
-    CFA_PERIOD.store(if s.full() { ccs::ARRAYS[c.id as usize].period as u64 } else { 2 }, Ordering::Relaxed);
+    CFA_PERIOD.store(match alt { Some(a) => a.period as u64, None if s.full() => ccs::ARRAYS[c.id as usize].period as u64, None => 2 }, Ordering::Relaxed);
     ROWS.store(fe.h as u64, Ordering::Relaxed);
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);
@@ -1715,7 +1794,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The camera's receiver last, as a camera open does it, its channels' sizes and types the front end's: enabling the link first left the front end latching its configuration and never seeing a frame start (2026-10-20).
     step!(g, "camera: open step: engine started; the receiver next\n");
     let mut rx_geom = 0;
-    for &(a, v) in c.rx_start.iter() {
+    for &(a, v) in rx_start.iter() {
         let nv = geom::value(a as u32, v, &from, &fe, scope);
         rx_geom += (nv != v) as u32;
         wr(g, a, nv);
@@ -1749,11 +1828,16 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     if sane && arr.margin.is_some_and(|m| m != margin) {
         say!(g, "camera: {}: the sensor's margin is not the list's: the list's longest exposure is off by the difference\n", c.name);
     }
-    let exposure_lines = mode.map_or(c.exposure_lines, |m| m.coarse as u64);
+    // A captured readout starts at its own init's integration (G#0202 as the init wrote it last), the camera's table at its binned one.
+    let exposure_lines = match (mode, alt) {
+        (Some(m), _) => m.coarse as u64,
+        (None, Some(_)) => page.get(ccs::COARSE_INTEGRATION).map_or(c.exposure_lines, |v| v as u64),
+        (None, None) => c.exposure_lines,
+    };
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1812,6 +1896,12 @@ fn close(g: u64) {
     say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
+    // The open readout's receiver stopped here, before the engine, in Android's order (the tele's close, 2026-11-18 night: the lanes, the link and SYSREG, then the PDMA): the kernel's switch knows only each camera's own stop, and a kernel built before a camera streamed has none for it (the tele's on the flashed bc1bef30). The switch's stop after this writes the camera's own words again; the main, the ultrawide and the front keep the switch's order alone, as they ran.
+    if c.id == 3 || ALT_OPEN.load(Ordering::Relaxed) != 0 {
+        for &(a, v) in rx_of().1.iter() {
+            wr(g, a, v);
+        }
+    }
     // The frame thread stopped before the switch stops the engine: it is in a wait of at most `QUIET_US` (or the tick), and answers no more once it sees this. Bounded at twice that, so a thread that never answers cannot keep the switch on.
     if RUN.swap(2, Ordering::AcqRel) == 1 {
         let until = ferros_sys::now() + ferros_sys::freq() * (QUIET_US << 1) / 1_000_000;
@@ -2121,7 +2211,8 @@ fn ack_say(g: u64) {
 }
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
-    let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
+    // The link's start word: its common control (+4) with bit 0 set (G#205E01 on links 1 and 2, G#5F01 on link 0, G#205D01 on the tele's link 6); the resets before it carry G#5002.
+    let Some(&(a, _)) = rx_of().0.iter().find(|w| w.0 & 0xFFFF == 4 && w.1 & 3 == 1) else { return };
     let link = a & !0xFFFF;
     say!(g, "camera: link G#{link:X}: +14 G#{:X} +1C G#{:X} +24 G#{:X} +2C G#{:X}; image path G#{:X}, aggregate G#{:X}\n", rd(g, link + 0x14), rd(g, link + 0x1C), rd(g, link + 0x24), rd(g, link + 0x2C), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::CMN_STATUS));
     let mut l = Line { b: [0; 256], n: 0 };
@@ -2350,8 +2441,35 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 9 {
         NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
     }
-    // A device test with nothing stored: the 1:1 init in the input after the 16 knob bytes (`FULL_INPUT_AT`), u32 LE length and the table, as `--input-file` frames it.
-    if input_len > FULL_INPUT_AT + 4 {
+    // The eleventh: which inputs follow the knobs (`T_INIT` ..), a device test of any readout with nothing stored.
+    let items = if input_len > 10 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 10) as *const u8) } } else { 0 };
+    if items != 0 && input_len > FULL_INPUT_AT {
+        let mut at = FULL_INPUT_AT;
+        for k in 0..5 {
+            if items >> k & 1 == 0 {
+                continue;
+            }
+            let p = ferros_sys::arc_base() + input + at;
+            // WHY the tests: the lengths are the spawn's bytes; a frame past the input's end, or past a buffer, is not the framing asked for.
+            if at + 4 > input_len {
+                say!(g, "camera: the spawn's input ends before its item A#{k}; the rest ignored\n");
+                break;
+            }
+            let n = u32::from_le_bytes(core::array::from_fn(|j| unsafe { core::ptr::read_volatile((p + j as u64) as *const u8) })) as u64;
+            if at + 4 + n > input_len || n as usize > VALUE {
+                say!(g, "camera: the spawn's item A#{k} (A#{n} bytes) runs past the input or a buffer; the rest ignored\n");
+                break;
+            }
+            let dst: &mut [u8] = if k == 0 { unsafe { &mut *(&raw mut FULL) } } else { unsafe { &mut (*(&raw mut T_BUF))[k - 1] } };
+            for j in 0..n as usize {
+                dst[j] = unsafe { core::ptr::read_volatile((p + 4 + j as u64) as *const u8) };
+            }
+            if k == 0 { FULL_INPUT.store(n, Ordering::Relaxed) } else { T_LEN[k - 1].store(n, Ordering::Relaxed) }
+            say!(g, "camera: the spawn's {} A#{n} bytes (a device test: used in place of the vault's)\n", ["1:1 init", "init", "CPU program", "job", "IDT"][k]);
+            at += 4 + n;
+        }
+    } else if input_len > FULL_INPUT_AT + 4 {
+        // A device test with nothing stored: the 1:1 init in the input after the 16 knob bytes (`FULL_INPUT_AT`), u32 LE length and the table, as `--input-file` frames it.
         let at = ferros_sys::arc_base() + input + FULL_INPUT_AT;
         let n = u32::from_le_bytes(core::array::from_fn(|k| unsafe { core::ptr::read_volatile((at + k as u64) as *const u8) })) as u64;
         // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `FULL` would write past it.

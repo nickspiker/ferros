@@ -129,9 +129,10 @@ pub const ARRAYS: [Array; 4] = [
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64. Its shift: Sony's G#3100, one byte, as Android's 16 s holds write it (6 at 16 s, the frame the integration plus 64 in 2^6 lines: docs/CAMERA.md "The I2C side without a flash"); its most the 6 Android uses, the field's width and the frame counter unmeasured (65471 lines of 2^6 is under 2^22).
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 6, frame_bits: 32, byte: true }), side: None },
-    // The front: its margin 5 read at its first opens on the Pro (2026-11-18, b976); its shift is the main's pair of words (G#0702, G#0704, the shift in the high byte), as Android's 1 s hold writes them (shift 1, docs/CAMERA.md "The I2C side without a flash"). Its most is the shift Android uses, 1 (65535 lines of 2^1, about 1.37 s); the field's width and the frame counter are unmeasured (at shift 1 every frame is under 2^17 lines). The tele never streamed: its margin unread.
+    // The front: its margin 5 read at its first opens on the Pro (2026-11-18, b976); its shift is the main's pair of words (G#0702, G#0704, the shift in the high byte), as Android's 1 s hold writes them (shift 1, docs/CAMERA.md "The I2C side without a flash"). Its most is the shift Android uses, 1 (65535 lines of 2^1, about 1.37 s); the field's width and the frame counter are unmeasured (at shift 1 every frame is under 2^17 lines).
     Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(5), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 1, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
+    // The tele: Android's 16 s (the i2c trace of 2026-11-18, docs/CAMERA.md "The I2C side without a flash") is the main's pair of shift words (6 at 16 s: integration G#9FE8, frame G#A000 in 2^6 lines, the frame the integration plus 24), so its margin 24 and the main's words; its most Android's 6 until a run measures the field and the frame counter.
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(24), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 6, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
 ];
 
 // ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
@@ -377,7 +378,7 @@ impl Cam {
         self.listed_timing_at(line_ps, m.llp, m.fll)
     }
 
-    fn listed_timing_at(&self, line_ps: u64, llp: u16, fll: u16) -> Timing {
+    pub fn listed_timing_at(&self, line_ps: u64, llp: u16, fll: u16) -> Timing {
         let a = &ARRAYS[self.id as usize];
         Timing {
             line_ps,
@@ -1323,7 +1324,7 @@ mod tests {
         assert_eq!(ts.plan(((65534u64 << 16) * ts.line_ps_at(ts.llp_most() as u16)).div_ceil(1000)), None);
     }
 
-    /// The forced shift of the reach test: 16 lines of integration at shift 12 on the main is a frame of 18 (the mode's 21362 lines are 6 at that shift), at the mode's line; under the least (one line at shift 16) refused; no shift on a camera without one (the tele).
+    /// The forced shift of the reach test: 16 lines of integration at shift 12 on the main is a frame of 18 (the mode's 21362 lines are 6 at that shift), at the mode's line; under the least (one line at shift 16) refused, and past the field.
     #[test]
     fn a_forced_shift() {
         let t = Timing { fll: 0x5372, coarse_min: 2, ..cams::MAIN.listed_timing() };
@@ -1331,7 +1332,6 @@ mod tests {
         assert_eq!(t.plan_shift(ns, 12), Some(Plan { llp: 6320, fll: 18, coarse: 16, shift: 12 }));
         assert_eq!(t.plan_shift(ns, 16), None);
         assert_eq!(t.plan_shift(ns, 200), None);
-        assert_eq!(cams::TELE.listed_timing().plan_shift(ns, 1), None);
         // At shift 9 the mode's frame is the floor: 21362 lines are 42 of 2^9.
         let p = t.plan_shift((16u64 << 9) * t.line_ps_at(6320) / 1000 + 1, 9).unwrap();
         assert_eq!((p.fll, p.coarse), (42, 16));
@@ -1339,9 +1339,10 @@ mod tests {
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
     #[test]
     fn short_cameras_keep_their_frame() {
+        // The tele, since its capture (2026-11-18 night): the main's words, margin 24, its most Android's 6: 65535 - 24 lines of 2^6 at its 6.11 us line, about 25.6 s.
         let f = cams::TELE.listed_timing();
-        assert!(!f.long);
-        assert_eq!(f.most_ns(), cams::TELE.exposure_max_lines * cams::TELE.line_ps / 1000);
+        assert!(f.long);
+        assert_eq!(f.most_ns(), (65535 - 24) * 64 * cams::TELE.line_ps / 1000);
         // The front, since its margin and shift (2026-11-18): 65535 - 5 lines of 2^1 at its 10.44 us line, about 1.37 s, past Android's 1 s.
         let f = cams::FRONT.listed_timing();
         assert!(f.long);

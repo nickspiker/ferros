@@ -59,6 +59,35 @@ pub struct Cam {
     pub black: u16,
     pub white: u16,
     pub rotation: u8,
+    /// Its other readouts, each replayed whole as Android ran it (`Alt`), opened by the mode block's kind `ALT + k`.
+    pub alts: &'static [Alt],
+}
+
+/// The mode block's kind that opens a camera's readout `alts[k]`: `ALT + k`.
+pub const ALT: u8 = 8;
+
+/// A readout other than the binned one, replayed whole as Android ran it (docs/CAMERA.md "Every readout, captured"): its own sensor init, CPU setup, job and receiver, from the hv's 42-page capture, the PDMA dump and the i2c trace of Lumis on Android opening it (2026-11-18 night), nothing rewritten: the sensor runs the init's mode, the front end the job's geometry.
+/// Its inputs in the vault: `cam.<key>.init.<tag>`, `cam.<key>.prog.<tag>`, `cam.<key>.pdma.<tag>`.
+pub struct Alt {
+    pub tag: &'static str,
+    /// The readout: width and height in samples, a line's bytes (RAW10 packed, as the job writes it).
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    /// The colour filter's period in pixels (2 Bayer, 4 the quad array as it is).
+    pub period: u16,
+    /// Whether its job writes the PD rows (loch0's PD path): the ring's buffers then hold them after the image.
+    pub pd: bool,
+    pub rx_start: &'static [(usize, u32)],
+    pub rx_stop: &'static [(usize, u32)],
+    /// Its job's slots (ferros_cam job), as `Cam::sizes`, each from the start of its granule.
+    pub sizes: [u64; SLOTS],
+}
+
+impl Alt {
+    pub const fn buffer_bytes(&self) -> u64 {
+        job::buffer_bytes(self.height as u64 + if self.pd { self.height as u64 / 4 } else { 0 }, self.stride as u64)
+    }
 }
 
 const fn cfa(a: u8, b: u8, c: u8, d: u8) -> u8 {
@@ -121,6 +150,7 @@ pub const MAIN: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    alts: &[],
 };
 
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
@@ -163,6 +193,7 @@ pub const ULTRAWIDE: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    alts: &[UW48],
 };
 
 /// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06; it answers ferros since the LV buck is raised (sub GPIO2, 2026-11-18) and streams with them (docs/CAMERA.md "The other cameras on the Pro").
@@ -206,11 +237,14 @@ pub const FRONT: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 3,
+    alts: &[FRONT842],
 };
 
-/// The folded tele (kraken, Samsung, G#08D5 at G#0000 under Linux's boot probe): only its init is captured (target/cam/tele.init, 4032 x 3024 RAW10 from its CCS writes); its receiver and job need a capture of Android streaming it, which needs a bright scene (docs/oracle/CAMERA.md: in dim light the app's 5x is a crop of the main).
-/// So it does not stream; the endpoint's PROBE powers it and reads its identity (docs/CAMERA.md "The other cameras").
-/// From its capture (cam 4, 4032 x 3024, the size its init sets): cfa B G / G R, black 64, white 1023, orientation 6 (a quarter turn); derived, its init's crop start even, its flip in no captured write (its stream-on was never captured).
+/// The folded tele (kraken, Samsung, G#08D5 at G#0000), its 12.2 MP 22-degree readout (4032 x 3024 RAW10, the 48.8 MP array binned 2 x 2): its init from the i2c trace of Lumis on Android opening it (keys/husky/captures/ftrace-2026-11-18, tele22.init, 1142 transfers), its receiver, CPU setup and job from the hv's captures of the same readout (2026-11-18 night, docs/CAMERA.md "Every readout, captured").
+/// The receiver: CSI link 6 (G#1C0A), the csis3 lanes, SYSREG G#20 and G#4 (`RX_START_TELE`, its captured stop `RX_STOP_TELE`); the acknowledgement the main's (its frame handler reads back the main's 28 words, no G#1C35_0148).
+/// Android's job writes the image as 16-bit samples (loch0's format G#1C32_0550 = 2, stride G#1F80); the job ferros stores is made RAW10 packed as every other camera's (format 4, stride G#13C0, tools/oracle-isp image `--set`).
+/// Its line, measured (the Pro, 2026-11-18 night): 5568 clocks at 24.576 MHz / 4 x 371 over vt_pix_clk_div 5 at two pixels a clock (911.7 MHz), 6.1068 us: ferros took its 5457-line frames 33.24 to 33.40 ms apart (30 a second; Lumis on Android showed 15, its own pace), and Android's 16 s hold (40960 lines of 2^6) is 16.0 s at it. Lumis's integration at its open 5332 lines; Android's 16 s is the main's shift words with the frame the integration plus 24.
+/// From its capture (cam 4, 4032 x 3024, the size its init sets): cfa B G / G R, black 64, white 1023, orientation 6 (a quarter turn); derived, its init's crop start even, its stream on writes no flip.
 pub const TELE: Cam = Cam {
     id: 3,
     name: "tele",
@@ -226,27 +260,37 @@ pub const TELE: Cam = Cam {
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0,
     focus: (0, 0),
-    streams: false,
-    rx_start: &[],
-    rx_stop: &[],
+    streams: true,
+    rx_start: &crate::rx::RX_START_TELE,
+    rx_stop: &crate::rx::RX_STOP_TELE,
     ack: &crate::FRAME_ACK,
-    tick_us: 1 << 13,
+    tick_us: 1 << 15,
     width: 4032,
     height: 3024,
-    stride: 0x13B0,
-    sizes: [0; SLOTS],
+    stride: 0x13C0,
+    sizes: job::TELE_SLOT_BYTES,
     skip: job::NO_SKIP,
-    line_ps: 0,
+    line_ps: 6_106_805,
     llp: 5568,
     pll: (4, 0x173),
     fll: 5457,
-    exposure_lines: 2232,
-    exposure_max_lines: 2232,
+    exposure_lines: 5332,
+    exposure_max_lines: 5457 - 24,
     cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,
     rotation: 1,
+    alts: &[TELE11, TELE48],
 };
+
+/// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines: 41.2 ms), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
+pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 4, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES };
+/// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines (77.1 ms at the 22-degree line).
+pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES };
+/// The ultrawide's 48 MP readout, 8000 x 6000 RAW10 at G#2720 a line, its PD rows 4000 x 1500; its link at the slower op PLL (`RX_START_UW48`).
+pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES };
+/// The front's 8.42 MP readout, 3440 x 2448, the sensor's own scaler; written 16-bit by Android's job (stride G#1AE0), packed here (G#1100).
+pub const FRONT842: Alt = Alt { tag: "f8", width: 3440, height: 2448, stride: 0x1100, period: 2, pd: true, rx_start: &crate::rx::RX_START_FRONT842, rx_stop: &crate::rx::RX_STOP_FRONT, sizes: job::FRONT842_SLOT_BYTES };
 
 /// Every camera, by id.
 pub const CAMS: [&Cam; 4] = [&MAIN, &ULTRAWIDE, &FRONT, &TELE];
@@ -316,5 +360,15 @@ mod tests {
         // The front's line: 8448 clocks at 24.576 MHz / 3 x 247 over vt_pix_clk_div 5, two pixels a clock (measured: 41.66 to 41.85 ms a 4001-line frame).
         let ps = 8448u64 * 3 * 5 * 1_000_000_000_000 / (2 * 24_576_000 * 247);
         assert!(FRONT.line_ps.abs_diff(ps) <= 1, "{ps}");
+        // The tele's line: 5568 clocks at 24.576 MHz / 4 x 371 over vt_pix_clk_div 5, two pixels a clock (measured: 33.24 to 33.40 ms a 5457-line frame).
+        let ps = 5568u64 * 4 * 5 * 1_000_000_000_000 / (2 * 24_576_000 * 371);
+        assert!(TELE.line_ps.abs_diff(ps) <= 1, "{ps}");
+        // Every captured readout: its line holds its RAW10 samples on 64 bytes, a ring of four of its buffers and its job fit the window, its slots name the image's (2).
+        for c in CAMS.iter() {
+            for a in c.alts.iter() {
+                assert!(a.width * 5 / 4 <= a.stride && a.stride % 32 == 0 && a.sizes[job::OLD_SLOT_IMAGE] != 0, "{}", a.tag);
+                assert!(job::with_image(&a.sizes, &job::NO_SKIP, 4 * a.buffer_bytes()).bytes + 3 * job::FRAME <= 512 << 20, "{}", a.tag);
+            }
+        }
     }
 }

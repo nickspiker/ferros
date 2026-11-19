@@ -48,6 +48,15 @@ impl Readout {
         let timing = c.listed_mode_timing(line, &m);
         Ok(Readout { kind: KIND_FULL, width: m.x_out, height: m.y_out, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)) })
     }
+    /// The camera's captured readout `alts[k]` (kind `cams::ALT + k`) from its own init (`cam.<key>.init.<tag>`): its size and period, the init's line and frame at the line its PLL gives (`line_ps_for`).
+    pub fn alt(c: &Cam, k: usize, init: &[u8]) -> Readout {
+        let a = &c.alts[k];
+        let p = crate::ccs::Page::of(init);
+        let llp = p.get(crate::ccs::LINE_LENGTH_PCK).map_or(c.llp, |v| v as u16);
+        let fll = p.get(crate::ccs::FRAME_LENGTH_LINES).map_or(c.fll, |v| v as u16);
+        let timing = c.listed_timing_at(crate::ccs::line_ps_for(c, &p), llp, fll);
+        Readout { kind: crate::cams::ALT + k as u8, width: a.width as u16, height: a.height as u16, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)) }
+    }
 }
 
 /// Camera `c`'s section for its binned readout, its IDT's Absolute entry (`idt` the bytes of its `.idt.vsf`) carried in it.

@@ -63,7 +63,8 @@ fn whole(line: &str) -> bool {
     t.len() == 3 && t[0].len() == 16 && is_hex(t[0]) && (t[1] == "R4" || t[1] == "W4" || t[1] == "R8" || t[1] == "W8" || t[1] == "R2" || t[1] == "W2" || t[1] == "R1" || t[1] == "W1") && t[2].trim_end().len() == 16 && is_hex(t[2].trim_end())
 }
 
-pub fn cpu(text: &str, a: usize, b: usize, c: usize, link: u64) -> Cpu {
+/// `sysreg`: the receiver table also takes every other SYSREG_ISPFE word written in the window (G#1C02_0504: the tele's G#4, its PHY's pairing; camera-cpu.py took G#1C02_0500 alone, which the ultrawide's and front's tables were made with).
+pub fn cpu(text: &str, a: usize, b: usize, c: usize, link: u64, sysreg: bool) -> Cpu {
     let (mut pre, mut post, mut rx, mut garbled, mut reps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
     for (k, line) in text.split('\n').enumerate() {
         let n = k + 1;
@@ -78,7 +79,7 @@ pub fn cpu(text: &str, a: usize, b: usize, c: usize, link: u64) -> Cpu {
         }
         let Some((reg, v)) = w4(line) else { continue };
         let phy = (0x1C10_0000..0x1C11_0000).contains(&reg);
-        if phy || reg >> 16 == link || reg == 0x1C02_0500 {
+        if phy || reg >> 16 == link || reg == 0x1C02_0500 || (sysreg && (0x1C02_0504..0x1C02_0600).contains(&reg)) {
             rx.push((reg, v));
         }
         if !(0x1C04_0000..0x1C40_0000).contains(&reg) || (0x1C39_0000..0x1C39_1000).contains(&reg) || phy || is_addr(reg) {
@@ -411,6 +412,55 @@ pub fn image(d: &Dump, height: Option<u32>) -> Job {
     Job { file, report }
 }
 
+/// Every write the job's program (its piece at `LIST_PA`) makes to one of `sets`' registers (offsets into the front end) given that value; how many words changed.
+pub fn set_regs(file: &mut [u8], sets: &[(u32, u32)]) -> usize {
+    let r32 = |f: &[u8], o: usize| u32::from_le_bytes(f[o..o + 4].try_into().unwrap());
+    let n = r32(file, 4) as usize;
+    let mut o = 8;
+    let mut list = None;
+    for _ in 0..n {
+        let (pa, len) = (r32(file, o), r32(file, o + 4) as usize);
+        if pa == LIST_PA {
+            list = Some((o + 8, len / 4));
+        }
+        o += 8 + len.div_ceil(4) * 4;
+    }
+    let (at, words) = list.expect("no program piece in the job");
+    let mut changed = 0;
+    let mut put = |f: &mut [u8], k: usize, reg: u32| {
+        if let Some(&(_, v)) = sets.iter().find(|s| s.0 == reg) {
+            let p = at + 4 * k;
+            if r32(f, p) != v {
+                f[p..p + 4].copy_from_slice(&v.to_le_bytes());
+                changed += 1;
+            }
+        }
+    };
+    let mut i = 0;
+    while i < words {
+        let h = r32(file, at + 4 * i);
+        let (cnt, op) = ((h >> 14) as usize, h & 0x3FFF);
+        if h == 0 || i + 1 + cnt > words {
+            break;
+        }
+        if op == 2 {
+            let mut k = i + 1;
+            while k + 1 <= i + cnt {
+                let reg = r32(file, at + 4 * k);
+                put(file, k + 1, reg);
+                k += 2;
+            }
+        } else if op == 1 && cnt > 0 {
+            let start = r32(file, at + 4 * (i + 1));
+            for j in 0..cnt - 1 {
+                put(file, i + 2 + j, start + 4 * j as u32);
+            }
+        }
+        i += 1 + cnt;
+    }
+    changed
+}
+
 // ---- main ----
 
 /// The dump's integrity line: the list's words against the length its `PDMA buffer` line names, offsets that skip, lines that did not parse.
@@ -455,8 +505,9 @@ fn main() {
             let link = flag(&mut args, "--link").map(|s| hex(&s).expect("--link G#<link>")).unwrap_or(0x1C06);
             let name = flag(&mut args, "--name").unwrap_or_else(|| "RX_START_UW".to_string());
             let num = |s: &String| s.parse::<usize>().unwrap_or_else(|_| panic!("{s}: a line number"));
+            let sysreg = args.iter().position(|x| x == "--sysreg").map(|i| args.remove(i)).is_some();
             let [src, a, b, c, out] = &args[..] else { panic!("{usage}") };
-            let r = cpu(&read(src), num(a), num(b), num(c), link);
+            let r = cpu(&read(src), num(a), num(b), num(c), link, sysreg);
             write(&format!("{out}.cpr2"), &cpr2(&r));
             write(&format!("{out}.rx.rs"), rx_rs(&name, &r.rx).as_bytes());
             println!("{} CPU writes before, {} after; receiver start {} writes -> {out}.cpr2, {out}.rx.rs", r.pre.len(), r.post.len(), r.rx.len());
@@ -487,10 +538,20 @@ fn main() {
         "image" => {
             let which = flag(&mut args, "--list").map(|s| s.parse().expect("--list N")).unwrap_or(1);
             let height = flag(&mut args, "--height").map(|s| s.parse().expect("--height N"));
+            // `--set G#<register>=G#<value>` (repeatable): every write the program makes to that register (pairs and bursts) given that value, after the remap and the height: the tele's image path writes 16-bit samples (format G#1C32_0550 = 2, stride G#1F80), which `--set G#1C320550=G#4 --set G#1C320554=G#13C0` makes RAW10 packed as every other camera's.
+            let mut sets = Vec::new();
+            while let Some(s) = flag(&mut args, "--set") {
+                let (r, v) = s.split_once('=').expect("--set G#<register>=G#<value>");
+                sets.push(((hex(r).expect("a register") - ISPFE) as u32, hex(v).expect("a value") as u32));
+            }
             let [src, out] = &args[..] else { panic!("{usage}") };
             let d = dump(&read(src), which);
             eprintln!("{}", dump_integrity(&d));
-            let job = image(&d, height);
+            let mut job = image(&d, height);
+            if !sets.is_empty() {
+                let n = set_regs(&mut job.file, &sets);
+                job.report.push(format!("--set: A#{n} program words given their set values"));
+            }
             write(out, &job.file);
             for l in &job.report {
                 println!("{l}");
@@ -580,7 +641,7 @@ mod tests {
             "ferros hv: S2 000000001C3200B0 W4 0000000000000001",         // 9: c, not taken
         ]
         .join("\n");
-        let c = cpu(&log, 1, 5, 9, 0x1C04);
+        let c = cpu(&log, 1, 5, 9, 0x1C04, false);
         assert_eq!(c.pre, vec![(0x1C04_0004, 0x5002)]);
         assert_eq!(c.post, vec![(0x1C32_00A0, 0x81)]);
         assert_eq!(c.rx, vec![(0x1C04_0004, 0x5002), (0x1C10_131C, 0x200), (0x1C02_0500, 1)]);
