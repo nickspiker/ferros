@@ -4092,6 +4092,25 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 // Slot marking lives only in the cold build: a ferros chainloaded under Android must not rewrite devinfo (slot.rs is cold-only).
+                // `diag devinfo kv <BLAKE3 of the block now, 64 hex> <the block wanted, 8192 hex>`: devinfo's key-value block (LBA 7) put back, only while it still hashes to what the host read (slot.rs set_kv_block). For the bootloader's EIO record (avb.managed_verity_mode) after a failed Android disk check; never the identity block.
+                #[cfg(not(shim_handoff))]
+                if let Some(rest) = cmd.params.strip_prefix(b"devinfo kv ") {
+                    let hex = |s: &[u8]| -> Option<alloc::vec::Vec<u8>> {
+                        if s.len() % 2 != 0 {
+                            return None;
+                        }
+                        s.chunks(2).map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()).collect()
+                    };
+                    let mut it = rest.split(|&c| c == b' ').filter(|w| !w.is_empty());
+                    let now = it.next().and_then(hex).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+                    let want = it.next().and_then(hex);
+                    match (now, want) {
+                        (Some(now), Some(want)) => resp.extend_from_slice(alloc::format!("devinfo kv: G#{:X}\n", crate::slot::set_kv_block(&now, &want)).as_bytes()),
+                        _ => resp.extend_from_slice(b"devinfo kv <blake3 now, 64 hex> <block wanted, 8192 hex>\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 #[cfg(not(shim_handoff))]
                 if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
                     // `diag slot`: both A/B slot words from devinfo (retries | flags << 8; flags b0 unbootable, b1 successful, b2 active, b3 de-activated). `diag slot word <a|b> <retries hex> <flags hex>` sets one (slot.rs set_word: the A/B fallback test, a spare's flags).
