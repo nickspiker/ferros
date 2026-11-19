@@ -103,8 +103,9 @@ struct Clip {
     rec: ferros_clip::Recorder,
     /// The camera's name, for the console.
     cam: String,
-    /// Its frames a second (1 to 60, ferros_clip `Pacing::of`).
+    /// Its frames a second (1 to 60, ferros_clip `Pacing::of`), and the sensor's frame period, us.
     fps: u32,
+    period_us: u64,
     /// The extent's name in Lumis's domain.
     name: String,
     began: std::time::Instant,
@@ -112,6 +113,10 @@ struct Clip {
     room: u64,
     /// When the preview last integrated a frame while this records (`PREVIEW_GAP`).
     preview: std::time::Instant,
+    /// The clip's frames dropped as last said (`stats().dropped`), so each new drop is said once, with what may have caused it.
+    dropped: u64,
+    /// The camera's count of the frame last handed over.
+    last_count: u32,
     /// The recording space used as it stood when the clip began (`VIDEO_SPACE_USED_IDX`): the bar counts this clip's written bytes on top, not its whole reservation.
     space_before: u64,
 }
@@ -146,6 +151,13 @@ fn video_fps(header: &[u64]) -> u32 {
 /// `digests`: each frame's source hash taken as it is coded (ferros_clip `Mode::source_digests`, about 2^-4 of the coding), for a development run to say (`DEV_VIDEO`) and a host to check the clip against (tools/clip-check).
 fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing, head: &camera::FrameHeader, rows: &ViewRows, digests: bool) -> Result<Clip, String> {
     let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
+    // No room for a frame uncoded (the most a frame codes to): not started, said instead (the coordinator, 2026-11-19: the clips area at 63 MB free).
+    let frame_bytes = (head.height * rows.line) as u64;
+    if let Some(sp) = ferros_clip::ferros::space(slot) {
+        if sp.largest_free_bytes < frame_bytes {
+            return Err(format!("no room to record: {} MiB free in one stretch, a frame needs up to {} MiB", sp.largest_free_bytes >> 20, frame_bytes >> 20));
+        }
+    }
     let mount = header[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX];
     let held = header[lumis_core::shared_memory::DEVICE_ROTATION_IDX];
     let orientation = match (mount + held) % 360 {
@@ -194,7 +206,7 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
                 let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
                 println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now, space_before: header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, period_us: pacing.sensor_ns / 1000, name, began: now, room, preview: now, dropped: 0, last_count: head.count, space_before: header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -909,6 +921,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
     // RAW video: the rate the camera is open at (None: opened as ever, not paced), and the clip recording.
     let mut paced: Option<u32> = None;
+    // The last frame's integration, us: said with a RAW video drop that may follow it.
+    let mut last_preview_us = 0u64;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
@@ -1131,6 +1145,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     }
                     Err(e) => {
                         println!("lumis: camera {}: RAW video: no clip ({e})", cam.name);
+                        // Under the RECORD button, why nothing records.
+                        lumis_core::platform::set_video_note(Some(e));
                         integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
                     }
                 },
@@ -1148,7 +1164,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     focus: head.focus,
                 };
                 let index = c.rec.stats().frames;
+                let t_code = std::time::Instant::now();
                 let taken = c.rec.frame(&f);
+                let code_us = t_code.elapsed().as_micros() as u64;
                 if taken == ferros_clip::Taken::Recorded && dev_knobs4() & DEV_VIDEO != 0 && index & ((1 << 3) - 1) == 0 {
                     let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
                     println!("lumis: RAW video: frame {index} source {h}");
@@ -1156,6 +1174,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 let st = c.rec.stats();
                 integrator.header[VIDEO_FRAMES_IDX] = st.frames;
                 integrator.header[VIDEO_DROPPED_IDX] = st.dropped;
+                // Each drop said as it happens, with its likely cause: the camera's count stepping past one (Lumis late to the MAP: this frame's coding, the last preview's integration), or the writer holding every slot (taken Dropped).
+                if st.dropped != c.dropped {
+                    println!("lumis: camera {}: RAW video: {} dropped at clip frame {index} ({:?}; the camera's count {} after {}; this frame's hand-over {code_us} us; the last preview's integration {last_preview_us} us)", cam.name, st.dropped - c.dropped, taken, head.count, c.last_count);
+                    c.dropped = st.dropped;
+                }
+                c.last_count = head.count;
                 integrator.header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] = c.space_before + st.written;
                 // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not said) before a frame is coded: the clip's first frames can be dropped, and no frame gives no rate.
                 integrator.header[VIDEO_LEFT_S_IDX] = match st.frames {
@@ -1164,8 +1188,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 };
                 if taken == ferros_clip::Taken::Ended {
                     end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "the clip's space is full, or a write failed");
-                } else if c.preview.elapsed() < PREVIEW_GAP {
-                    // Not this frame for the preview: the camera's next frame comes first.
+                } else if c.preview.elapsed() < PREVIEW_GAP || code_us > c.period_us >> 1 {
+                    // Not this frame for the preview: the camera's next frame comes first (too soon after the last preview, or this hand-over left less than half the frame's period).
                     keep_saves(vault.as_deref(), &mut *integrator.header);
                     frames += 1;
                     continue;
@@ -1192,6 +1216,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
+        last_preview_us = (t_after - t_integrate).as_micros() as u64;
         if dev_knobs2() & DEV_NO_SET != 0 {
             sent = (iso, shutter_ns, focus);
         }
