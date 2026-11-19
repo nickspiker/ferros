@@ -187,11 +187,40 @@ The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,0
 - `recorder.stats()`: frames, dropped (no slot, or the camera's count stepping past one between frames handed over), paced, bytes coded and raw, bytes written, the longest coding: Lumis's VIDEO_FRAMES and VIDEO_DROPPED.
 - `recorder.stop()`: the closing generation and the seal; `ClipInfo` (the counts, the clip's length, its seal, the writer's time, an error if any). The clip is the extent under its name in Lumis's domain; `Extent::info` reads its record, `ferros::ExtentSource` reads it back as a VSF byte source for `vsf::visual::clip::Reader`.
 
+- `ferros::space(slot)`: the recording space in bytes (the window, free, the longest free stretch, which is what an open can get, this domain's clips and their count); the vault's read-only EOP_SPACE.
+- Lumis's choices that matter, measured with std/rawrec: workers four A715s and four A510s, the writer on the A510s (on the A715s it took a coder's core: 47 of 64 frames dropped), and Lumis's own preview work thinned while recording (a frame's coding takes about 23 of its 33 ms).
+
+### The write path and the clocks (2026-11-19, the Pro)
+
+- **Straight to the flash.** At the open the vault process gives the recording process its extent's own SYS_BLOCK capability (`Object::Extent`: the `clips` window narrowed to the extent's blocks, so every bound of the window holds it); `Extent::write` uses it, and the clip's bytes no longer pass thru the vault process. The seal takes it back, and so does the writer's end. 736 to 792 MB/s while writing (one copy into the kernel, then the bounce, queue depth one), against 266 thru the vault.
+- **The recording's own clocks**, from a clip's open to its seal or its writer's end (`EXTENTS_OPEN`, service.rs `recording`): the A715s run up to 1572 MHz (`diag clock clips <kHz>`, 0 off) and the A510s up to their top, whatever else lifts or not; `diag clock` says it. Not a cap on camera streams in general.
+- **Measured at 30/s, a minute, lossless, four A715s and four A510s:** at the camera's 2367 MHz lift the zones reached 85 C in 37 s (stopped); capped at 1572, 1800 of 1800 frames, none dropped, 75 C at most, every frame decoded bit exact on the host against the hash of the frame the camera wrote (tools/clip-check); straight to the flash, the same, 71 C at most, 170 MB/s over the clip.
+- **The first clip within about a minute of a boot or reload** may drop frames while the system starts its processes (pcie1, the modem, the stower) on the same cores; later clips are clean.
+
+- **A clip left open** (its writer died, the power went, or its seal never came) holds its whole reservation until it is closed. The next open of any clip closes every open extent no live writer holds (the kernel says, SYS_BLOCK x1 bits 3 and 5): the vault process reads it with vsf's clip reader to its last whole frame (each frame's hash and the `prev` chain), writes the closing generation right after that frame, seals the extent at that length and gives its tail back. Nothing is dropped; an extent with no readable clip is sealed empty, its first block kept. Lumis's first clip (2026-11-19, 151 frames, its seal refused, the whole 48 GiB reserved) came back this way at the next open in 3.4 s, all 151 frames decoding, the 19 Lumis hashed matching the camera's frames.
+- **The open's shutter**: the driver refuses an open whose integration does not fit its frame less 32 lines (Lumis's 67.8 ms at 30/s); `Pacing::open_msg` opens with at most that, and `open_needs_set` says when the shutter is to be SET after the first frame.
+
+### A clip from the Pro to the host
+
+The flashed build (raw-video-rec 63916ff9, both slots, 2026-11-19; keys/husky/images/boot_raw-video-rec_63916ff9_vaultcarried.img) carries the commands; until raw-video-rec is merged use its bridge and checker:
+
+```
+B=/mnt/Harbor/Code/ferros/target/agent-rawrec/bridge/debug/ferros-bridge
+export FERROS_PORT=1-2.2
+$B store extent-info <clip name> --kist /mnt/Harbor/Code/keys/husky/images/lumis-0.2.15.capsule.vsf
+$B store extent <clip name> all <clip>.vsf --kist /mnt/Harbor/Code/keys/husky/images/lumis-0.2.15.capsule.vsf
+/mnt/Harbor/Code/ferros/target/agent-rawrec/host/release/clip-check <clip>.vsf
+```
+
+`--kist` names the domain the clip is in: a stowed Lumis's by any Lumis kist capsule (its identity is the same across versions); a hand-spawned Lumis's by the exact `lumis.bin` it was spawned from (`bridge spawn` signs a payload with the developer key and its own content hash, so each build has a domain of its own: keep the image a clip was recorded with); without `--kist` the name is a scope's (`test.rawrec.clip` for std/rawrec).
+A clip's name is a value's: printable ASCII G#21 to G#7E (no spaces), 1 to 96 bytes; the kernel refuses any other and says why on the console. The pull runs about 24 MB/s over the bridge (a minute at 30/s, 10 GB, takes about 7 minutes). clip-check decodes every frame on every host core and says the frames' timing and holes; given rawrec's `test.rawrec.hashes` it checks every frame against the camera's.
+
 ### What is not done
 
-- **The clip is not sealed (encrypted) at rest.** Every vault value is sealed with its domain's key; an extent's blocks are the clip's plain bytes, found only thru the record in the (sealed, mirrored) table, but readable by anyone holding the raw flash. Sealing at 150 to 250 MB/s (XChaCha20 on the A715s, about 0.2 to 0.4 of a core at 30/s) is the owner's call.
-- **Copies.** A write goes Lumis to kernel heap to the vault process to kernel heap to the bounce (four copies of each MiB) at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue (`run_queued` with a buffer a slot).
+- **The clip is not sealed (encrypted) at rest.** Every vault value is sealed with its domain's key; an extent's blocks are the clip's plain bytes, found only thru the record in the (sealed, mirrored) table, but readable by anyone holding the raw flash. Next (the coordinator's call, 2026-11-19): sealed by default under the domain's key, a per-clip switch off, its cost at 30/s measured first.
+- **Copies.** A write still goes thru the kernel's heap and the bounce at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue.
 - **UNMAP**: a deleted extent's blocks are not unmapped (ferros sends none), so the device's garbage collection does not know they are free.
+- **The pull** is the bridge's 3 MiB a command thru the kernel's vault channel; a faster path (bulk USB straight from the extent) is open.
 
 ## The format decision (the owner's)
 

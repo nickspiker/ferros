@@ -5,3 +5,7 @@ target = "../../targets/aarch64-unknown-ferros.json"
 [unstable]
 build-std = ["core", "alloc", "std", "panic_abort"]
 build-std-features = ["compiler-builtins-mem"]
+
+[target.aarch64-unknown-ferros]
+# The chacha20 crate's NEON backend (job 3, the seal bench), as every ferros payload build asks for it.
+rustflags = ["--cfg", "chacha20_force_neon"]
