@@ -514,6 +514,32 @@ fn main() {
             let first: Vec<String> = r.garbled.iter().take(8).map(|n| n.to_string()).collect();
             eprintln!("integrity: oracle lines not whole in the window A#{} (lines {}), rep runs A#{}", r.garbled.len(), first.join(" "), r.reps);
         }
+        // `cpr2-set <in.cpr2> <out.cpr2> G#<register>=G#<value> ...`: every write a CPU program makes to that register given that value (a device test of one word, docs/CAMERA.md "Every readout, captured").
+        "cpr2-set" => {
+            let [src, out, sets @ ..] = &args[..] else { panic!("{usage}") };
+            let mut b = std::fs::read(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let r32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            assert_eq!(&b[..4], b"CPR2", "{src}: not a CPR2");
+            let mut changed = 0;
+            for s in sets {
+                let (r, v) = s.split_once('=').expect("G#<register>=G#<value>");
+                let (r, v) = (hex(r).expect("a register") as u32, hex(v).expect("a value") as u32);
+                let mut o = 8;
+                for _ in 0..3 {
+                    let n = r32(&b, o) as usize;
+                    for k in 0..n {
+                        let p = o + 4 + 8 * k;
+                        if r32(&b, p) == r {
+                            b[p + 4..p + 8].copy_from_slice(&v.to_le_bytes());
+                            changed += 1;
+                        }
+                    }
+                    o += 4 + 8 * n;
+                }
+            }
+            write(out, &b);
+            println!("A#{changed} writes given their set values -> {out}");
+        }
         "pdma" => {
             let base = flag(&mut args, "--base").map(|s| hex(&s).expect("--base G#<block>")).unwrap_or(ISPFE);
             let which = flag(&mut args, "--list").map(|s| s.parse().expect("--list N")).unwrap_or(1);

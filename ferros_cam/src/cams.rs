@@ -82,6 +82,10 @@ pub struct Alt {
     pub rx_stop: &'static [(usize, u32)],
     /// Its job's slots (ferros_cam job), as `Cam::sizes`, each from the start of its granule.
     pub sizes: [u64; SLOTS],
+    /// Its line, measured at its own init's line length (ps; 0: the camera's line scaled by the init's PLL, `line_ps_for`): the tele's 11-degree and 48.8 MP readouts run longer lines than their CCS words say (their vendor tables).
+    pub line_ps: u64,
+    /// The processing blocks' switches its job runs with (ferros_cam geom `DETACH`; 0 none): the front's 8.42 MP stalls the engine in its second program unless FC ctx3 is off (bit 0).
+    pub detach: u8,
 }
 
 impl Alt {
@@ -156,7 +160,7 @@ pub const MAIN: Cam = Cam {
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
 /// Measured: the bus, address and identity (G#0787 at the CCS sensor register G#0016), the stream writes (G#0100 alone, 8-bit), the receiver (link 2), the acknowledgement, the tick, the geometry (stride G#13C0, its front-end program's), the outputs (`job::UW_SLOT_BYTES`).
 /// From the init, not measured: the line time, 9568 pixel clocks (`line_length_pck`) at the PLL's 1458.2 MHz (24.576 MHz / 3 x 178), 6.5616 µs, which makes its 5081-line frame 33.3 ms, the 30 a second seen; the integration, 4124 lines; the longest offered, the frame less 2^6 lines (Sony's margin is not read).
-/// From its capture (cam 3, 4000 x 3000, the binned mode ferros's init sets): cfa B G / G R, black 64, white 1023, orientation 6, so a quarter turn as the main; derived, its init's crop start even and its flip (G#0101 = 3) the HAL's. Not yet seen on a ferros frame. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
+/// Its mosaic, measured on ferros (2026-11-18 night, a 256 ms frame in the owner's red-lit room, the cell table): rows `261 195` / `195 131`, so R G / G B (its 48 MP readout's 2 x 2 blocks the same), where its calibration capture (cam 3, 4000 x 3000) says B G / G R: the half turn the init's flip (G#0101 = 3, written by both readouts' inits) makes, so that capture's RAW stream ran unflipped and ferros's frames stand a half turn from it (the rotation below, from that capture, is unchecked on a ferros frame). Black 64, white 1023, orientation 6 from that capture. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
 /// Its lens actuator (G#0F) never acknowledged ferros (docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"), so focus is not offered and the lens stays at rest.
 pub const ULTRAWIDE: Cam = Cam {
     id: 1,
@@ -189,7 +193,7 @@ pub const ULTRAWIDE: Cam = Cam {
     fll: 5081,
     exposure_lines: 4124,
     exposure_max_lines: 5081 - (1 << 6),
-    cfa: cfa(2, 1, 1, 0),
+    cfa: cfa(0, 1, 1, 2),
     black: 64,
     white: 1023,
     rotation: 1,
@@ -244,7 +248,7 @@ pub const FRONT: Cam = Cam {
 /// The receiver: CSI link 6 (G#1C0A), the csis3 lanes, SYSREG G#20 and G#4 (`RX_START_TELE`, its captured stop `RX_STOP_TELE`); the acknowledgement the main's (its frame handler reads back the main's 28 words, no G#1C35_0148).
 /// Android's job writes the image as 16-bit samples (loch0's format G#1C32_0550 = 2, stride G#1F80); the job ferros stores is made RAW10 packed as every other camera's (format 4, stride G#13C0, tools/oracle-isp image `--set`).
 /// Its line, measured (the Pro, 2026-11-18 night): 5568 clocks at 24.576 MHz / 4 x 371 over vt_pix_clk_div 5 at two pixels a clock (911.7 MHz), 6.1068 us: ferros took its 5457-line frames 33.24 to 33.40 ms apart (30 a second; Lumis on Android showed 15, its own pace), and Android's 16 s hold (40960 lines of 2^6) is 16.0 s at it. Lumis's integration at its open 5332 lines; Android's 16 s is the main's shift words with the frame the integration plus 24.
-/// From its capture (cam 4, 4032 x 3024, the size its init sets): cfa B G / G R, black 64, white 1023, orientation 6 (a quarter turn); derived, its init's crop start even, its stream on writes no flip.
+/// Its mosaic, measured on ferros (2026-11-18 night, a 2 s frame in the owner's red-lit room, the cell table): rows `104 79 104 80` / `164 104 164 104`, so G B / R G (R 164, B 79, G 104; the same room read the front's R over G over B, as its calibration said). Its calibration capture (cam 4, 4032 x 3024) says B G / G R: a column apart, so Android's RAW stream for that capture ran another window or flip than Lumis's 22-degree session the init came from; ferros reads as the init sets it. Black 64, white 1023, orientation 6 (a quarter turn) from that capture.
 pub const TELE: Cam = Cam {
     id: 3,
     name: "tele",
@@ -275,22 +279,24 @@ pub const TELE: Cam = Cam {
     pll: (4, 0x173),
     fll: 5457,
     exposure_lines: 5332,
-    exposure_max_lines: 5457 - 24,
-    cfa: cfa(2, 1, 1, 0),
+    exposure_max_lines: 5457 - 4,
+    cfa: cfa(1, 2, 0, 1),
     black: 64,
     white: 1023,
     rotation: 1,
     alts: &[TELE11, TELE48],
 };
 
-/// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines: 41.2 ms), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
-pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 4, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES };
-/// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines (77.1 ms at the 22-degree line).
-pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES };
+/// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
+/// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; the cell table of a 2 s frame G B / R G as the 22-degree's), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
+pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 2, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES, line_ps: 9_871_200, detach: 0 };
+/// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines.
+/// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G B / R G), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
+pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES, line_ps: 13_200_800, detach: 0 };
 /// The ultrawide's 48 MP readout, 8000 x 6000 RAW10 at G#2720 a line, its PD rows 4000 x 1500; its link at the slower op PLL (`RX_START_UW48`).
-pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES };
+pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES, line_ps: 5_406_700, detach: 0 };
 /// The front's 8.42 MP readout, 3440 x 2448, the sensor's own scaler; written 16-bit by Android's job (stride G#1AE0), packed here (G#1100).
-pub const FRONT842: Alt = Alt { tag: "f8", width: 3440, height: 2448, stride: 0x1100, period: 2, pd: true, rx_start: &crate::rx::RX_START_FRONT842, rx_stop: &crate::rx::RX_STOP_FRONT, sizes: job::FRONT842_SLOT_BYTES };
+pub const FRONT842: Alt = Alt { tag: "f8", width: 3440, height: 2448, stride: 0x1100, period: 2, pd: true, rx_start: &crate::rx::RX_START_FRONT842, rx_stop: &crate::rx::RX_STOP_FRONT, sizes: job::FRONT842_SLOT_BYTES, line_ps: 0, detach: 1 };
 
 /// Every camera, by id.
 pub const CAMS: [&Cam; 4] = [&MAIN, &ULTRAWIDE, &FRONT, &TELE];
@@ -348,7 +354,7 @@ mod tests {
             assert!(c.exposure_lines <= c.exposure_max_lines);
         }
         // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout.
-        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [2, 1, 1, 0], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [2, 1, 1, 0], 1, (4032, 3024))] {
+        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [0, 1, 1, 2], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [1, 2, 0, 1], 1, (4032, 3024))] {
             assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
             assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }

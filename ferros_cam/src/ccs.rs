@@ -131,8 +131,9 @@ pub const ARRAYS: [Array; 4] = [
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 6, frame_bits: 32, byte: true }), side: None },
     // The front: its margin 5 read at its first opens on the Pro (2026-11-18, b976); its shift is the main's pair of words (G#0702, G#0704, the shift in the high byte), as Android's 1 s hold writes them (shift 1, docs/CAMERA.md "The I2C side without a flash"). Its most is the shift Android uses, 1 (65535 lines of 2^1, about 1.37 s); the field's width and the frame counter are unmeasured (at shift 1 every frame is under 2^17 lines).
     Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(5), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 1, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
-    // The tele: Android's 16 s (the i2c trace of 2026-11-18, docs/CAMERA.md "The I2C side without a flash") is the main's pair of shift words (6 at 16 s: integration G#9FE8, frame G#A000 in 2^6 lines, the frame the integration plus 24), so its margin 24 and the main's words; its most Android's 6 until a run measures the field and the frame counter.
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(24), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 6, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
+    // The tele: Android's 16 s (the i2c trace of 2026-11-18, docs/CAMERA.md "The I2C side without a flash") is the main's pair of shift words (6 at 16 s: integration G#9FE8, frame G#A000 in 2^6 lines; Android's frame the integration plus 24).
+    // Measured on the Pro (2026-11-18 night, docs/CAMERA.md "Every readout, captured"): its own words say integration least 4 and margin 4 (CAPS), gain code / 32 over codes 32 to 2048 (1x to 64x analogue; no noise test yet); frames 1 s to 65.5 s the exposure apart (shifts 1 to 8, the mean doubling each step); the shift field holds 29 (frames of 8 << 29 and 32770 << 29 lines held, 2^32 lines and past: no 32-bit wrap as the main's), while 30 and 31 run every frame at the sensor's floor (19.9 ms) whatever the frame. So its most is 29; the frame is held to 2^32 lines (`frame_bits` 32, 7.3 hours at the 22-degree line) as the longest waited out by inference, none past 65.5 s watched land.
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(4), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 29, frame_bits: 32, byte: false }), side: Some(Side { pd: None, emb: 0x0118 }) },
 ];
 
 // ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
@@ -1339,10 +1340,10 @@ mod tests {
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
     #[test]
     fn short_cameras_keep_their_frame() {
-        // The tele, since its capture (2026-11-18 night): the main's words, margin 24, its most Android's 6: 65535 - 24 lines of 2^6 at its 6.11 us line, about 25.6 s.
+        // The tele, since its capture and run (2026-11-18 night): the main's words, its margin 4, its frame held to 2^32 lines: 65531 lines of 2^16 at its 6.11 us line, about 7.3 hours.
         let f = cams::TELE.listed_timing();
         assert!(f.long);
-        assert_eq!(f.most_ns(), (65535 - 24) * 64 * cams::TELE.line_ps / 1000);
+        assert_eq!(f.most_ns(), (65535 - 4) * (1 << 16) * cams::TELE.line_ps / 1000);
         // The front, since its margin and shift (2026-11-18): 65535 - 5 lines of 2^1 at its 10.44 us line, about 1.37 s, past Android's 1 s.
         let f = cams::FRONT.listed_timing();
         assert!(f.long);

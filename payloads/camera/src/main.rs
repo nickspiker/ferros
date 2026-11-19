@@ -1487,7 +1487,11 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let fe = if s.flags & F_KEEP_FE != 0 { from } else { to };
     let scope = if s.flags & F_ALL != 0 { geom::Scope::All } else { geom::Scope::Core };
     let slit = s.slit() && s.flags & F_KEEP_FE == 0;
-    let (detach, slim) = s.shape(c.id == 0);
+    // A captured readout runs with its own switches (`Alt::detach`, measured) unless the hand spawn's eighth byte overrides them (bit 7), with the slim program when the OPEN asks.
+    let (detach, slim) = match alt {
+        Some(a) if DETACH.load(Ordering::Relaxed) & 0x80 == 0 => (a.detach, s.flags & F_SLIM != 0),
+        _ => s.shape(c.id == 0),
+    };
     let slim_level = if s.flags & F_SLIM2 != 0 { 2 } else { 1 };
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
@@ -1820,7 +1824,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let (cmin, margin) = (u16::from_be_bytes([cw[0], cw[1]]), u16::from_be_bytes([cw[2], cw[3]]));
     // WHY the tests: the words are the sensor's; a margin not under the mode's own frame describes none (the main's limit block at G#1100 aliases to G#4140), and a least of 0 is taken as one line, the least SET ever took.
     let sane = read && margin < fll;
-    let timing = ccs::Timing { line_ps: ccs::line_ps_for(c, &page), captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
+    // A captured readout with its own measured line takes it at its own line length; the rest the camera's line scaled by the init's PLL.
+    let (line_ps, captured_llp) = match alt { Some(a) if a.line_ps != 0 => (a.line_ps, llp), _ => (ccs::line_ps_for(c, &page), c.llp) };
+    let timing = ccs::Timing { line_ps, captured_llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
     say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
     say!(g, "camera: {}: the vendor shift to A#{}{}, the frame counter A#{} bits (the longest exposure at shift A#{}); the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.lte.map_or(0, |l| l.frame_bits), timing.lte.map_or(0, |l| timing.shift_most(&l)), timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);

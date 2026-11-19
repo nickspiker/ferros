@@ -54,7 +54,9 @@ impl Readout {
         let p = crate::ccs::Page::of(init);
         let llp = p.get(crate::ccs::LINE_LENGTH_PCK).map_or(c.llp, |v| v as u16);
         let fll = p.get(crate::ccs::FRAME_LENGTH_LINES).map_or(c.fll, |v| v as u16);
-        let timing = c.listed_timing_at(crate::ccs::line_ps_for(c, &p), llp, fll);
+        // A readout's own measured line is at its own line length (the tele's share the 22-degree's, 5568 clocks); else the camera's, scaled by the init's PLL.
+        let line = if a.line_ps != 0 { a.line_ps * c.llp as u64 / llp as u64 } else { crate::ccs::line_ps_for(c, &p) };
+        let timing = c.listed_timing_at(line, llp, fll);
         Readout { kind: crate::cams::ALT + k as u8, width: a.width as u16, height: a.height as u16, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)) }
     }
 }
