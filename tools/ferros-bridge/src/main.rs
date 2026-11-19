@@ -1002,10 +1002,13 @@ async fn cmd_store(args: &[String]) {
             p.extend_from_slice(&value);
             (ferros_pt::Op::Write, p)
         }
-        // store extent <key> <bytes> <out>: a single-copy extent (docs/RAW-VIDEO.md, a RAW clip) pulled whole, 768 blocks (3 MiB) a command; store extent-info <key>: its record.
-        Some("extent") if args.len() >= 4 => return extent_pull(&args[1], &args[2], &args[3]).await,
+        // store extent <key> <bytes> <out> [--kist <capsule.vsf>]: a single-copy extent (docs/RAW-VIDEO.md, a RAW clip) pulled whole, 768 blocks (3 MiB) a command; store extent-info <key> [--kist <capsule.vsf>]: its record. With --kist the name is in that kist's own domain (Lumis's clips: any Lumis capsule names Lumis).
+        Some("extent") if args.len() >= 4 => return extent_pull(&args[1], &args[2], &args[3], kist_of(args)).await,
         Some("extent-info") if args.len() >= 2 => {
-            let mut p = vec![0xFEu8];
+            let mut p = match kist_of(args) {
+                Some(id) => [&[0xFCu8][..], &id[..]].concat(),
+                None => vec![0xFEu8],
+            };
             p.extend_from_slice(args[1].as_bytes());
             (ferros_pt::Op::Read, p)
         }
@@ -1070,16 +1073,54 @@ async fn cmd_store(args: &[String]) {
     }
 }
 
-/// `store extent <key> <bytes> <out>`: the extent's first `bytes` (rounded up to whole blocks, then cut to `bytes`) into `out`, 768 blocks a command (the kernel's reply is built whole: STORE_VALUE_MAX), with the rate.
-async fn extent_pull(key: &str, bytes: &str, out: &str) {
-    let want: u64 = bytes.parse().unwrap_or_else(|_| {
-        eprintln!("bytes: a decimal count");
+/// `--kist <capsule.vsf>`: that kist's identity (developer key, option), as the stower names a kist's own domain.
+fn kist_of(args: &[String]) -> Option<[u8; 64]> {
+    let path = args.iter().position(|a| a == "--kist").and_then(|i| args.get(i + 1))?;
+    let capsule = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
         std::process::exit(1);
     });
+    let (developer, option) = ferros_kist::identity(&capsule).unwrap_or_else(|e| {
+        eprintln!("{path}: not a kist capsule: {e}");
+        std::process::exit(1);
+    });
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(&developer);
+    id[32..].copy_from_slice(&option);
+    Some(id)
+}
+
+/// `store extent <key> <bytes|all> <out> [--kist <capsule.vsf>]`: the extent's first `bytes` (`all`: its sealed length, from its record; a count rounded up to whole blocks, then cut to it) into `out`, 768 blocks a command (the kernel's reply is built whole: STORE_VALUE_MAX), with the rate.
+async fn extent_pull(key: &str, bytes: &str, out: &str, kist: Option<[u8; 64]>) {
     let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    let named = |head: u8| -> Vec<u8> {
+        match kist {
+            Some(id) => [&[head - 2][..], &id[..]].concat(),
+            None => vec![head],
+        }
+    };
+    let want: u64 = match bytes {
+        "all" => {
+            let mut p = named(0xFE);
+            p.extend_from_slice(key.as_bytes());
+            let r = ferros_link::pt::call_held(&link, &build_cmd(ferros_pt::command::caps::STORE, ferros_pt::Op::Read, &p)).await.unwrap_or_else(|e| {
+                eprintln!("{key}: {e}");
+                std::process::exit(1);
+            });
+            if r.first() != Some(&0) || r.len() < 66 || r[17] == 0 {
+                eprintln!("{key}: no sealed extent (status {:?})", r.first());
+                std::process::exit(1);
+            }
+            u64::from_le_bytes(r[9..17].try_into().unwrap())
+        }
+        b => b.parse().unwrap_or_else(|_| {
+            eprintln!("bytes: a decimal count, or all");
+            std::process::exit(1);
+        }),
+    };
     const PULL: u64 = 768;
     let blocks = want.div_ceil(4096);
     let mut file = std::fs::File::create(out).unwrap_or_else(|e| {
@@ -1090,7 +1131,7 @@ async fn extent_pull(key: &str, bytes: &str, out: &str) {
     let mut at = 0u64;
     while at < blocks {
         let n = (blocks - at).min(PULL);
-        let mut p = vec![0xFFu8];
+        let mut p = named(0xFF);
         p.extend_from_slice(&at.to_le_bytes());
         p.extend_from_slice(&(n as u32).to_le_bytes());
         p.extend_from_slice(key.as_bytes());

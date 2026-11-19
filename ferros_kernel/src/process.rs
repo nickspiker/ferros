@@ -4321,6 +4321,13 @@ pub fn vault_stamp_addr(op: u8, scope: &str, addr: &[u8; 32], rest: &[u8]) -> Op
     with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(sc.prefix)], &name, rest))
 }
 
+/// A stamp for the kernel's own call on a name in a kist's own domain (the bridge's `store extent --kist`: a RAW clip Lumis recorded, pulled to the host; development builds only), the kist named by its identity as the stower names one (`kist_store_route`): the person's class always, so only while they are present. None with no system secret or a locked class.
+pub fn vault_stamp_kist(op: u8, developer: &[u8; 32], option: &[u8; 32], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let ihi = crate::oracle::ihi(developer, option)?;
+    let d = blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi);
+    with_lock_held_or(|| stamp(op, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], name, rest))
+}
+
 /// A stamp for the kernel's own listing of scope `i` of `STORES` from `offset`, at most `len` bytes (names one per line): every class the scope holds, the person's left out while locked. With its prefix, to make the names whole.
 pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'static str)> {
     let sc = STORES.get(i)?;

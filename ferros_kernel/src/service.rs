@@ -233,10 +233,10 @@ enum VaultJob {
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
     /// A single-copy extent's blocks (docs/RAW-VIDEO.md: a clip pulled to the host), a UFS command's 1 MiB a call: its full name, the next block, the blocks still to read, what has come; or with `info` its record alone.
-    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, info: bool },
+    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, info: bool, kist: Option<([u8; 32], [u8; 32])> },
 }
 
-/// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record.
+/// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record. A name in a kist's own domain (a clip Lumis recorded): [G#FD][developer 32][option 32][block u64 LE][blocks u32 LE][name] and [G#FC][developer 32][option 32][name].
 const EXTENT_PULL: u64 = (STORE_VALUE_MAX >> 12) as u64;
 
 /// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
@@ -291,9 +291,20 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             if n == 0 || n > EXTENT_PULL {
                 return Some(Err(alloc::vec![5]));
             }
-            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), info: false }
+            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), info: false, kist: None }
         }
-        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), info: true },
+        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), info: true, kist: None },
+        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFD) | Some(&0xFC)) && params.len() > 65 => {
+            let (developer, option): ([u8; 32], [u8; 32]) = (params[1..33].try_into().ok()?, params[33..65].try_into().ok()?);
+            let info = params[0] == 0xFC;
+            let (block, n, at) = if info { (0, 0, 65) } else { (u64::from_le_bytes(params.get(65..73)?.try_into().ok()?), u32::from_le_bytes(params.get(73..77)?.try_into().ok()?) as u64, 77) };
+            let rel = params.get(at..)?;
+            // WHY: the count and the name are the host's: the reply is built whole in the kernel's heap (STORE_VALUE_MAX), and a name is a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
+            if (!info && (n == 0 || n > EXTENT_PULL)) || rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
+                return Some(Err(alloc::vec![5]));
+            }
+            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), info, kist: Some((developer, option)) }
+        }
         ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },
         ferros_pt::Op::Exec => VaultJob::Remove { full: name(params)? },
     };
@@ -359,13 +370,16 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
-        VaultJob::Extent { full, block, left, info, .. } => {
+        VaultJob::Extent { full, block, left, info, kist, .. } => {
             // [extent op][block u64][length u32], as process.rs `extent_forward` stamps a process's call.
             let (op, len) = if *info { (crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32) } else { (crate::process::EOP_READ, ((*left).min((crate::process::EXTENT_MAX >> 12) as u64) << 12) as u32) };
             rest.push(op);
             rest.extend_from_slice(&block.to_le_bytes());
             rest.extend_from_slice(&len.to_le_bytes());
-            vault_stamp(crate::process::VOP_EXTENT, full, &rest)
+            match kist {
+                Some((dev, opt)) => crate::process::vault_stamp_kist(crate::process::VOP_EXTENT, dev, opt, full.as_bytes(), &rest),
+                None => vault_stamp(crate::process::VOP_EXTENT, full, &rest),
+            }
         }
     };
     rest.fill(0);
