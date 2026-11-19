@@ -1358,7 +1358,7 @@ fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
     if s.kind == K_CAPTURED {
         return Ok(None);
     }
-    let a = &ccs::ARRAYS[c.id as usize];
+    let a = c.array;
     let base = match s.kind {
         K_BINNED | K_SLIT => ccs::Mode::captured(init, a).map_err(Fail::Mode)?,
         K_FULL | K_SLIT_FULL => ccs::Mode::captured_full(init, a).map_err(Fail::Mode)?,
@@ -1570,7 +1570,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
-    let arr = &ccs::ARRAYS[c.id as usize];
+    let arr = c.array;
     if MEASURE.load(Ordering::Relaxed) == 2 {
         // Samsung's two 16-bit words only: the test writes whole words, which on a one-byte shift (Sony's G#3100) would write the register after it.
         if let Some(l) = arr.lte.filter(|l| !l.byte) {
@@ -1683,7 +1683,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     // The shape the frame thread and the endpoint work to.
     BUF.store(buf, Ordering::Relaxed);
-    CFA_PERIOD.store(if s.full() { ccs::ARRAYS[c.id as usize].period as u64 } else { 2 }, Ordering::Relaxed);
+    CFA_PERIOD.store(if s.full() { c.array.period as u64 } else { 2 }, Ordering::Relaxed);
     ROWS.store(fe.h as u64, Ordering::Relaxed);
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);

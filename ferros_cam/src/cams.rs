@@ -59,6 +59,8 @@ pub struct Cam {
     pub black: u16,
     pub white: u16,
     pub rotation: u8,
+    /// Its sensor's CCS facts (ferros_cam ccs `Array`: gain, margin, long-exposure shift), by board: the Pro's `ARRAYS`, the 8a's `AKITA_ARRAYS`.
+    pub array: &'static crate::ccs::Array,
 }
 
 const fn cfa(a: u8, b: u8, c: u8, d: u8) -> u8 {
@@ -121,6 +123,7 @@ pub const MAIN: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    array: &crate::ccs::ARRAYS[0],
 };
 
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
@@ -163,6 +166,7 @@ pub const ULTRAWIDE: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    array: &crate::ccs::ARRAYS[1],
 };
 
 /// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06; it answers ferros since the LV buck is raised (sub GPIO2, 2026-11-18) and streams with them (docs/CAMERA.md "The other cameras on the Pro").
@@ -206,6 +210,7 @@ pub const FRONT: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 3,
+    array: &crate::ccs::ARRAYS[2],
 };
 
 /// The folded tele (kraken, Samsung, G#08D5 at G#0000 under Linux's boot probe): only its init is captured (target/cam/tele.init, 4032 x 3024 RAW10 from its CCS writes); its receiver and job need a capture of Android streaming it, which needs a bright scene (docs/oracle/CAMERA.md: in dim light the app's 5x is a crop of the main).
@@ -246,6 +251,7 @@ pub const TELE: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    array: &crate::ccs::ARRAYS[3],
 };
 
 /// Every camera of the Pro (husky), by id.
@@ -255,12 +261,14 @@ pub const CAMS: [&Cam; 4] = [&MAIN, &ULTRAWIDE, &FRONT, &TELE];
 
 // akita's three cameras (docs/CAMERA.md "akita's cameras"), from its device tree (the factory image's MP overlay, dtbo 18, "ZUMA AKITA MP", the same as zuma-akita-camera.dtsi): every one on its own bus at G#1A, 16-bit register addresses, 8-bit values.
 // The buses are husky's (hsi2c_1, hsi2c_3, hsi2c_2), so the driver's grant slots by id hold on both boards.
-// From the hv captures of Android opening each (2026-11-15, docs/CAMERA.md "akita's cameras"): every sensor's init (I2C, integrity clean), the main's and the front's receivers and PDMA jobs; not yet the front end's CPU programs, nor the ultrawide's receiver and job, so none streams and none is listed, and PROBE is what runs.
+// From the hv captures of Android opening each (2026-11-15 and 2026-11-18, docs/CAMERA.md "akita's cameras"): every sensor's init (I2C, integrity clean), the receivers and PDMA jobs, the front end's CPU programs (merged from captures that lost lines, docs/CAMERA.md "The 8a's main streams"); the main streams since 2026-11-19.
 // Each readout is its init's CCS output size, each line its job's stride (the ultrawide's derived: no job of its was captured), each mosaic and orientation Android's Camera2 characteristics of the same mode (dumpsys media.camera: colorFilterArrangement, sensor.orientation), black 64 and white 1023 its blackLevelPattern and whiteLevel.
 
 /// akita's main camera (oksoko): a Sony IMX787 (the same part as husky's ultrawide, G#0787 at the CCS sensor register G#0016), on hsi2c_1 at G#1A.
 /// Its master clock is CIS_CLK3, asked at 26 MHz by the device tree, but Android's init tells the sensor 24.574 MHz (EXCK_FREQ G#1893): Linux leaves it on the 24.576 MHz oscillator, as the cold boot has it (CMU_TOP G#2604_101C = 0).
-/// Measured from Android's session: 4624 x 3472 RAW10 on three lanes (CCS G#0114 = 2), CSI link 1 and the csis1 lanes as husky's main (`rx::RX_START_AKITA_MAIN`), the line G#16C0 in its job, RGGB, orientation 90.
+/// Measured from Android's session: 4624 x 3472 RAW10 on three lanes (CCS G#0114 = 2), CSI link 1 and the csis1 lanes as husky's main (`rx::RX_START_AKITA_MAIN`), RGGB, orientation 90.
+/// Android's job writes its image in 16-bit samples (format 2 at G#1C32_0550, a line of G#2420); its stored job has them RAW10 packed as every other path (format 4, the line G#16C0: cam-oracle `job-set`), so the whole driver reads it as the Pro's.
+/// Streams on ferros since 2026-11-19 (docs/CAMERA.md "The 8a's main streams"): 29.5 frames a second, every frame released by the kernel at DMA_DONE, the 2 x 2 cell measured R G / G B (the greens equal on the anti-diagonal; red from the IMX787's mosaic on the Pro, unflipped here).
 /// From its init: a line of 9568 clocks at 24.576 MHz / 3 x 166 (7.036 µs), a frame of 4826 lines (34.0 ms, 29.5 a second), the integration 1184 lines (Android's in a dark room), the longest offered the frame less 2^6 lines as the ultrawide's.
 /// Its lens is driven by "nessie" at G#24 (the actuator, the OIS and the EEPROM share that address, 32-bit values): not the main's protocol, so no focus here.
 pub const AKITA_MAIN: Cam = Cam {
@@ -278,7 +286,7 @@ pub const AKITA_MAIN: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
-    streams: false,
+    streams: true,
     rx_start: &crate::rx::RX_START_AKITA_MAIN,
     rx_stop: &crate::rx::RX_STOP,
     ack: &crate::FRAME_ACK,
@@ -298,6 +306,7 @@ pub const AKITA_MAIN: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    array: &crate::ccs::AKITA_ARRAYS[0],
 };
 
 /// akita's ultrawide (leshen-uw): a part the device tree does not name, on hsi2c_3 at G#1A, CIS_CLK0 (the oscillator, as every akita init tells its sensor 24.574 MHz).
@@ -338,6 +347,7 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 1,
+    array: &crate::ccs::AKITA_ARRAYS[1],
 };
 
 /// akita's front camera (leshen): the ultrawide's module family, on hsi2c_2 at G#1A, CIS_CLK1 (the oscillator); it answers G#0712 at G#0016 (PROBE, 2026-11-15): a Sony IMX712 as the ultrawide.
@@ -377,6 +387,7 @@ pub const AKITA_FRONT: Cam = Cam {
     black: 64,
     white: 1023,
     rotation: 3,
+    array: &crate::ccs::AKITA_ARRAYS[2],
 };
 
 /// Every camera of the 8a (akita), by id: there is no tele.
@@ -454,16 +465,16 @@ mod tests {
             assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
             assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }
-        // akita's: ids in order, none streaming yet, and each id's bus husky's for the same id (the driver's grant slots are by id).
+        // akita's: ids in order, the main streaming (2026-11-19), and each id's bus husky's for the same id (the driver's grant slots are by id).
         for (k, c) in AKITA.iter().enumerate() {
             assert_eq!(c.id as usize, k);
-            assert!(!c.streams);
+            assert_eq!(c.streams, k == 0, "{}", c.name);
             assert_eq!(c.bus, CAMS[k].bus, "{}", c.name);
             // Each line holds its RAW10 samples on a 64-byte boundary, each frame fits its buffer, and each readout fits the driver's buffers.
             assert!(c.width * 5 / 4 <= c.stride && c.stride % 64 == 0 && (c.height * c.stride) as u64 <= c.buffer_bytes(), "{}", c.name);
             assert!(c.width <= W_MOST && c.height <= H_MOST && c.stride <= STRIDE_MOST, "{}", c.name);
         }
-        // akita's main's line: 9568 clocks at 24.576 MHz / 3 x 166, and its buffer 20 MiB (3472 rows of G#16C0, 20.2 MB, in whole 2 MiB frames of the pool).
+        // akita's main's line: 9568 clocks at 24.576 MHz / 3 x 166, and its buffer 20 MiB (3472 rows of G#16C0 RAW10 packed, 20.2 MB, in whole 2 MiB frames of the pool).
         let ps = 9568u64 * 3 * 1_000_000_000_000 / (24_576_000 * 166);
         assert!(AKITA_MAIN.line_ps.abs_diff(ps) <= 1, "{ps}");
         assert_eq!(AKITA_MAIN.buffer_bytes(), 20 << 20);

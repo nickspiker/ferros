@@ -134,6 +134,20 @@ pub const ARRAYS: [Array; 4] = [
     Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
 ];
 
+/// The 8a's cameras by id (ferros_cam cams `AKITA`: 0 the main, 1 the ultrawide, 2 the front), each its `Cam::array`.
+pub const AKITA_ARRAYS: [Array; 3] = [
+    // The main is a Sony IMX787, the Pro's ultrawide's part: its gain words read on the 8a at its first opens (2026-11-19) as the Pro's, 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), its integration least 1 and margin 64.
+    // Its shift is Sony's G#3100, one byte, as Android's 16 s hold on the 8a writes it (2, 4, then 6 at 16 s, integration and frame each counted in 2^shift lines: docs/CAMERA.md "akita: the captures of 2026-11-18").
+    // The field is 3 bits (the 8a, 2026-11-19, camtest's ceiling, 4864-line frames): shifts 6 and 7 gave frames 2.19 s and 4.38 s apart, 8, 9 and 10 frames at 34.2, 68.4 and 136.9 ms (8 read as 0, 9 as 1, 10 as 2); 65471 lines of 2^7 ran, frames 59.02 s apart.
+    // So the most is 7 and the longest exposure 65471 lines of 2^7, 58.96 s at the binned line; the frame counter never binds below 2^23 lines (unmeasured past).
+    // A forced shift (SET 3, a device test) with a frame under the mode's own in shifted lines stops the sensor (76 lines of 2^6, 2026-11-19); the plan's least shift never makes one (whenever it shifts, its integration is over 32735 lines of the shift).
+    // No 1:1 readout: Camera2 offers none on the 8a (its 46 degree crop is a mode of its own).
+    Array { unit: 1, period: 4, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 7, frame_bits: 32, byte: true }), side: None },
+    // The ultrawide and the front are Sony IMX712s: their shift is G#3004, one byte, as Android's holds write it (the ultrawide 2 then 5 at 16 s, the front 1 at its 1 s); margins and gain not yet read from the sensor.
+    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 5, frame_bits: 32, byte: true }), side: None },
+    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 1, frame_bits: 32, byte: true }), side: None },
+];
+
 // ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
 
 /// The integration's least and margin, one 4-byte read from G#1004 (CCS coarse_integration_time_min, coarse_integration_time_max_margin).
@@ -378,7 +392,7 @@ impl Cam {
     }
 
     fn listed_timing_at(&self, line_ps: u64, llp: u16, fll: u16) -> Timing {
-        let a = &ARRAYS[self.id as usize];
+        let a = self.array;
         Timing {
             line_ps,
             captured_llp: self.llp,

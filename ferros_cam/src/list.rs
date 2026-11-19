@@ -42,7 +42,7 @@ impl Readout {
     }
     /// The camera's 1:1 readout from its 1:1 init (`cam.<key>.init.full`): the mode it leaves (`Mode::captured_full`), at the line time its PLL gives (`line_ps_for`).
     pub fn full(c: &Cam, init: &[u8]) -> Result<Readout, IdtError> {
-        let a = &crate::ccs::ARRAYS[c.id as usize];
+        let a = c.array;
         let m = crate::ccs::Mode::captured_full(init, a).map_err(IdtError::Mode)?;
         let line = crate::ccs::line_ps_for(c, &crate::ccs::Page::of(init));
         let timing = c.listed_mode_timing(line, &m);
@@ -93,7 +93,7 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     // The readout at the longest exposure (ns), first row to last, the rolling shutter's skew (owner, 2026-11-17: a camera that ever stretches its line says what its readout costs; the default route never does, so this is the mode's own).
     put("readout", u(t.readout_ps(&t.own(1), r.height as u64) / 1000));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
-    let (gmin, gmax) = crate::ccs::ARRAYS[c.id as usize].gain;
+    let (gmin, gmax) = c.array.gain;
     put("gain_min", u(gmin));
     put("gain_max", u(gmax));
     // Focus: the lens actuator's targets over the span measured (the main's G#0800 to G#7800); 0 and 0 where focus is not offered.

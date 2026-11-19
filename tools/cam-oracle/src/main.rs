@@ -10,6 +10,8 @@
 //! - `cam-oracle cinp <out> <name>=<file> ...`: a device test's inputs as one 'CINP' set, for the camera driver's hand spawn (`--input-file`), so nothing is stored.
 //! - `cam-oracle cinp-split <in.cinp> <dir>`: a set back into its files.
 //! - `cam-oracle prog-text <in.cpr2> <out.txt>` and `prog-build <in.txt> <out.cpr2>`: a CPU program as text and back, for merging captures that lost lines (the 8a's ISP captures, 2026-11-19: docs/CAMERA.md "The 8a's main: the cause").
+//! - `cam-oracle raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame in numbers (each cell place's mean, the fill pattern's lines, a 16 x 12 map of the mean).
+//! - `cam-oracle job-set <in.cpr3> <out.cpr3> <register>=<value> ...`: a program's writes of a register given another value (the 8a's main image path made RAW10 packed).
 
 use std::collections::BTreeMap;
 use std::process::exit;
@@ -678,10 +680,151 @@ fn cmd_prog_build(args: Vec<String>) {
     println!("{} writes before, {} after -> {}", pre.len(), post.len(), args[1]);
 }
 
+/// `job-set <in.cpr3> <out.cpr3> <register>=<value> ...`: every write the job's program (the piece at G#8801_0000) makes to each register given, its value replaced; each register must be written at least once, and the count of each is said.
+/// For a front end setting Android chose and ferros does not take as it is (2026-11-19, the 8a's main: its image path in 16-bit samples, format 2 at G#1C32_0550 and a line of G#2420, made RAW10 packed as every other path, format 4 and G#16C0).
+fn cmd_job_set(args: Vec<String>) {
+    if args.len() < 3 {
+        die("job-set <in.cpr3> <out.cpr3> <register>=<value> ...");
+    }
+    let mut b = std::fs::read(&args[0]).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    let rd = |b: &[u8], at: usize| u32::from_le_bytes(b.get(at..at + 4).unwrap_or_else(|| die("truncated")).try_into().unwrap());
+    if b.get(..4) != Some(&b"CPR3"[..]) {
+        die("not a CPR3");
+    }
+    let sets: Vec<(u32, u32)> = args[2..]
+        .iter()
+        .map(|a| {
+            let (r, v) = a.split_once('=').unwrap_or_else(|| die(&format!("{a}: not register=value")));
+            (hexnum(r) as u32, hexnum(v) as u32)
+        })
+        .collect();
+    let mut counts = vec![0u32; sets.len()];
+    let n = rd(&b, 4) as usize;
+    let mut at = 8;
+    for _ in 0..n {
+        let (pa, len) = (rd(&b, at), rd(&b, at + 4) as usize);
+        let body = at + 8;
+        if pa == 0x8801_0000 {
+            let words = len / 4;
+            let mut i = 0;
+            while i < words {
+                let h = rd(&b, body + 4 * i);
+                if h == 0 {
+                    break;
+                }
+                let (cnt, op) = ((h >> 14) as usize, h & 0x3FFF);
+                if i + 1 + cnt > words {
+                    break;
+                }
+                let mut put = |reg: u32, word: usize, b: &mut Vec<u8>| {
+                    for (k, &(r, v)) in sets.iter().enumerate() {
+                        if r == reg {
+                            b[body + 4 * word..body + 4 * word + 4].copy_from_slice(&v.to_le_bytes());
+                            counts[k] += 1;
+                        }
+                    }
+                };
+                match op {
+                    2 => {
+                        let mut k = i + 1;
+                        while k + 1 <= i + cnt {
+                            let reg = 0x1C30_0000u32.wrapping_add(rd(&b, body + 4 * k));
+                            put(reg, k + 1, &mut b);
+                            k += 2;
+                        }
+                    }
+                    1 if cnt > 0 => {
+                        let start = 0x1C30_0000u32.wrapping_add(rd(&b, body + 4 * (i + 1)));
+                        for j in 0..cnt - 1 {
+                            put(start.wrapping_add(4 * j as u32), i + 2 + j, &mut b);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1 + cnt;
+            }
+        }
+        at = body + ((len + 3) & !3);
+    }
+    for (k, &(r, v)) in sets.iter().enumerate() {
+        println!("G#{r:X} = G#{v:X}: {} writes", counts[k]);
+        if counts[k] == 0 {
+            die(&format!("the program never writes G#{r:X}"));
+        }
+    }
+    std::fs::write(&args[1], &b).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
+}
+
+/// `raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame as the front end wrote it (MIPI RAW10 packed), said in numbers: the mean of each place of a `period` x `period` cell (2 if not given) with every sample counted, the samples at 0, at 1023 and the driver's pattern, and a 16 x 12 map of the mean over the frame (whole cells), so a frame is read as a scene, a flat field or garbage without a picture (2026-11-19, the 8a's cameras).
+fn cmd_raw10(args: Vec<String>) {
+    if args.len() < 4 {
+        die("raw10 <frame.raw10> <width> <height> <stride> [period]");
+    }
+    let b = std::fs::read(&args[0]).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    let num = |s: &str| s.parse::<usize>().unwrap_or_else(|_| die("width, height, stride and period are decimal"));
+    let (w, h, stride) = (num(&args[1]), num(&args[2]), num(&args[3]));
+    let p = args.get(4).map(|s| num(s)).unwrap_or(2);
+    if b.len() < h * stride || w * 5 / 4 > stride || p == 0 {
+        die(&format!("{} bytes do not hold {h} lines of {stride} with {w} samples each", b.len()));
+    }
+    let sample = |x: usize, y: usize| -> u16 {
+        let g = &b[y * stride + x / 4 * 5..];
+        ((g[x % 4] as u16) << 2) | ((g[4] as u16 >> (2 * (x % 4))) & 3)
+    };
+    let mut cell = vec![(0u64, 0u64); p * p];
+    let (mut zero, mut full) = (0u64, 0u64);
+    let (gw, gh) = (16, 12);
+    let mut map = vec![(0u64, 0u64); gw * gh];
+    for y in 0..h {
+        for x in 0..w {
+            let v = sample(x, y) as u64;
+            let c = &mut cell[(y % p) * p + x % p];
+            c.0 += v;
+            c.1 += 1;
+            zero += (v == 0) as u64;
+            full += (v == 1023) as u64;
+            let m = &mut map[(y * gh / h) * gw + x * gw / w];
+            m.0 += v;
+            m.1 += 1;
+        }
+    }
+    // The driver's pattern (payloads/camera PATTERN) as packed bytes: a line still holding it was never written.
+    let unwritten = (0..h).filter(|&y| b[y * stride..y * stride + 8] == [0xA5u8; 8]).count();
+    println!("{w} x {h} at stride {stride}: samples at 0 {zero}, at 1023 {full}; lines whose first 8 bytes are a fill pattern {unwritten}");
+    println!("the {p} x {p} cell's means (row by row):");
+    for r in 0..p {
+        let row: Vec<String> = (0..p).map(|c| format!("{:7.2}", cell[r * p + c].0 as f64 / cell[r * p + c].1.max(1) as f64)).collect();
+        println!("  {}", row.join(" "));
+    }
+    // The same over whole cells none of whose samples is near the top (under 960, black 64 off): saturated places of the brightest channel would pull the comparison toward the others.
+    let mut lit = vec![(0i64, 0i64); p * p];
+    for cy in 0..h / p {
+        for cx in 0..w / p {
+            let v: Vec<i64> = (0..p * p).map(|k| sample(cx * p + k % p, cy * p + k / p) as i64).collect();
+            if v.iter().all(|&s| s < 960) {
+                for k in 0..p * p {
+                    lit[k].0 += v[k] - 64;
+                    lit[k].1 += 1;
+                }
+            }
+        }
+    }
+    println!("the {p} x {p} cell's means less black 64, over the A#{} cells with no sample at 960 or more:", lit[0].1);
+    for r in 0..p {
+        let row: Vec<String> = (0..p).map(|c| format!("{:7.2}", lit[r * p + c].0 as f64 / lit[r * p + c].1.max(1) as f64)).collect();
+        println!("  {}", row.join(" "));
+    }
+    println!("the mean over the frame, {gw} x {gh} blocks:");
+    for r in 0..gh {
+        let row: Vec<String> = (0..gw).map(|c| format!("{:4}", map[r * gw + c].0 / map[r * gw + c].1.max(1))).collect();
+        println!("  {}", row.join(" "));
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build (see the source's header)");
+        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build | raw10 | job-set (see the source's header)");
     }
     let cmd = args.remove(0);
     match cmd.as_str() {
@@ -695,6 +838,8 @@ fn main() {
         "cinp-split" => cmd_cinp_split(args),
         "prog-text" => cmd_prog_text(args),
         "prog-build" => cmd_prog_build(args),
+        "raw10" => cmd_raw10(args),
+        "job-set" => cmd_job_set(args),
         _ => die(&format!("unknown command {cmd}")),
     }
 }

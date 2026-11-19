@@ -65,14 +65,15 @@ pub const FRONT_SLOT_BYTES: [u64; SLOTS] = [
     16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 16 * MIB, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
-/// akita's main camera's outputs (docs/CAMERA.md "akita's cameras"): not measured, so each slot runs from the lowest offset its job names to its granule's end, in whole frames (tools/cam-oracle pdma-image `--own-image`, from list 1 of the 2026-11-15 capture: target/cam/akita-main.pdma, local).
-/// Its job was built with the image body alone in slot 2: Android put the PD output (G#1C32_21C0) at the start of the image's granule and the 20.2 MB image 5 MiB in, so a ring in slot 2 would have had the PD path write over buffer 0; the PD output is slot 1 now.
+/// akita's main camera's outputs (docs/CAMERA.md "The 8a's main streams"): its job is list 1 of the 2026-11-18 capture (isp-main, tools/cam-oracle pdma-image `--own-image`, then `job-set` for its image as RAW10 packed: keys/akita/cam-inputs-2026-11-19/main-packed.pdma, local), slot 2 the image ring alone, the PD rows in each ring buffer past its image.
+/// Each slot runs from the lowest offset its job names to its granule's end, in whole frames, but slot 6 (G#1C35_51C8's output, from 2 MiB into its granule): measured on the 8a (2026-11-19) written to +G#206_BE00, about 32.4 MiB, past its granule; laid out 14 MiB it wrote over the engine's program copies past the region's slots (the engine then stopped 68 bytes into the next program, LATE_CONFIG), so it has 40 MiB.
+/// The extents measured at the first runs: 0 to +G#76_E000, 1 to +G#E_0F00, 3 to +G#5F_A000, 4 to +G#4400, 5 to +G#4_8000, 6 to +G#206_BE00.
 pub const AKITA_MAIN_SLOT_BYTES: [u64; SLOTS] = [
-    14 * MIB, 16 * MIB, 0, 16 * MIB, 2 * MIB, 2 * MIB, 4 * MIB, 4 * MIB, 2 * MIB, 16 * MIB, 0, 0, 0, 0, 0, 0,
+    16 * MIB, 14 * MIB, 0, 8 * MIB, 2 * MIB, 6 * MIB, 40 * MIB, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 pub const AKITA_MAIN_SLOT_SKIP: [u64; SLOTS] = [
-    0x3E_0000, 0, 0, 0x10_0000, 0xE7_0000, 0xE0_0000, 0xD7_8000, 0xD8_0000, 0xE0_0000, 0, 0, 0, 0, 0, 0, 0,
+    0x6_0000, 0x30_0000, 0, 0x80_0000, 0xF7_0000, 0xA8_0000, 0x20_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 /// akita's front camera's outputs, the same way, from list 2 of the same capture (target/cam/akita-front.pdma, local): no PD output in its program.
@@ -675,11 +676,11 @@ mod tests {
         assert!(3000 * 0x13C0 <= IMAGE_BYTES);
     }
 
-    /// akita's local jobs (target/cam/akita-main.pdma, akita-front.pdma, built with `--own-image`), when they are on this machine: every address each names lands in its region, the image body in slot 2's ring buffer 0, and the program writes the image once.
+    /// akita's local jobs (keys/akita/cam-inputs-2026-11-19/main-packed.pdma, target/cam/akita-front.pdma, built with `--own-image`), when they are on this machine: every address each names lands in its region, the image body in slot 2's ring buffer 0, and the program writes the image once.
     #[test]
     fn the_local_akita_jobs() {
         for (path, sizes, skip, image, regs, slots) in [
-            ("/mnt/Harbor/Code/ferros/target/cam/akita-main.pdma", &AKITA_MAIN_SLOT_BYTES, &AKITA_MAIN_SLOT_SKIP, buffer_bytes(3472, 0x16C0), 25, (1u32 << 10) - 1),
+            ("/mnt/Harbor/Code/keys/akita/cam-inputs-2026-11-19/main-packed.pdma", &AKITA_MAIN_SLOT_BYTES, &AKITA_MAIN_SLOT_SKIP, buffer_bytes(3472, 0x16C0), 25, (1u32 << 7) - 1),
             ("/mnt/Harbor/Code/ferros/target/cam/akita-front.pdma", &AKITA_FRONT_SLOT_BYTES, &AKITA_FRONT_SLOT_SKIP, buffer_bytes(3072, 0x14C0), 20, (1u32 << 10) - 1),
         ] {
             let Ok(orig) = std::fs::read(path) else { continue };
