@@ -116,6 +116,8 @@ struct Clip {
     dropped: u64,
     /// The camera's count of the frame last handed over.
     last_count: u32,
+    /// When the clip's first frame landed, Eagle ns by the driver's clock: the clip's rate is its frames over the time since, by that clock (VIDEO_RATE_IDX).
+    first_ns: Option<i64>,
     /// The recording space used as it stood when the clip began (`VIDEO_SPACE_USED_IDX`): the bar counts this clip's written bytes on top, not its whole reservation.
     space_before: u64,
 }
@@ -205,7 +207,7 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
                 let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
                 println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now, dropped: 0, last_count: head.count, space_before: space_used });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now, dropped: 0, last_count: head.count, first_ns: None, space_before: space_used });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -236,6 +238,7 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
         header[VIDEO_FRAMES_IDX] = s.frames;
         header[VIDEO_DROPPED_IDX] = s.dropped;
         header[VIDEO_LEFT_S_IDX] = 0;
+        header[lumis_core::shared_memory::VIDEO_RATE_IDX] = 0;
         header[FLAGS_IDX] &= !RECORDING_BIT;
         // The space as the seal left it (the reservation given back past the clip's length).
         read_space(header);
@@ -1222,6 +1225,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
                 c.last_count = head.count;
                 integrator.header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] = c.space_before + st.written;
+                // The clip's frames a second by the camera's own clock: the frames after the first over the time from it to this one (the sensor's frame is whole lines of its clock, so 30 a second is 29.999; a rate from Lumis's own clock would count the wait for the first frame and the seal).
+                let first = *c.first_ns.get_or_insert(head.time);
+                if st.frames > 1 && head.time > first {
+                    integrator.header[lumis_core::shared_memory::VIDEO_RATE_IDX] = ((st.frames - 1) as f64 * 1e9 / (head.time - first) as f64).to_bits();
+                }
                 // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not said) before a frame is coded: the clip's first frames can be dropped, and no frame gives no rate.
                 integrator.header[VIDEO_LEFT_S_IDX] = match st.frames {
                     0 => 0,
