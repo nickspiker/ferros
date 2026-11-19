@@ -4,7 +4,7 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
-//! At bin 1 a sixth byte n sets the exposure to 2^n ms after the first frame, so the last frame's cell table reads a dim scene (`0601000003090008`: the tele's 11-degree readout, 6 frames, 512 ms).
+//! At bin 1 a sixth byte n sets the exposure to 2^n ms after the first frame, and a seventh m the gain to 2^m times unity, so the last frame's cell table reads a dim scene (`0601000003090008`: the tele's 11-degree readout, 6 frames, 512 ms).
 //! An eighth byte is the OPEN's mode block kind, carried by every open (0, or none: the init's mode as before): 2 the 1:1 readout from the 1:1 init (docs/CAMERA.md "1:1 on the main"), whose frames are the view's alone (FRAME by copy bins only the captured shape): `4001000000000002` the main's 1:1 thru the view, 64 frames, with the mosaic's 4 x 4 cell said (`cells`); `0401000500000002` its long-exposure ladder thru the view (bin 1).
 //! A fourth byte of 6 sweeps the main's vendor shift, each forced (SET 3), from the seventh byte to the sixth, 16 lines of 2^shift each, the first byte frames a step (1 if 0) after two let pass (`0108000600140A`: shifts 10 to 20).
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
@@ -112,7 +112,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
     if bin == 1 {
-        view(g, ep, id, frames, arg(3) == 2, arg(5), t1);
+        view(g, ep, id, frames, arg(3) == 2, arg(5), arg(6), t1);
     }
     // A fourth byte of 3: the gain's curve (owner, 2026-11-17: "the ISO doesn't do anything in lumis").
     if arg(3) == 3 {
@@ -602,7 +602,7 @@ fn cells(g: u64, at: usize, stride: usize, w: usize, h: usize) {
 }
 
 /// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.
-fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, t1: u64) -> ! {
+fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, gain_log2: u8, t1: u64) -> ! {
     let mut r = [0u8; 64];
     let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN with the view answered G#{:X}, A#{} bytes, in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, if n == ERR { 0 } else { n }, ferros_sys::us_since(t1) / 1000);
@@ -643,6 +643,15 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, t1: u64
             let mut a = [0xEEu8; 1];
             let ok = call(ep, &m, &mut a);
             say!(g, "camtest: SET exposure A#{} ms answered A#{}\n", 1u64 << exp_log2, if ok == ERR { 0xEE } else { a[0] });
+        }
+        // The seventh byte (bin 1 only): the gain 2^n times unity with it (2026-11-19, the 8a's ultrawide face down on the bench: black at 16 ms and unity).
+        if k == 0 && gain_log2 != 0 {
+            let mut m = [3u8, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+            // WHY the min: the byte is the person's; 2^8 times unity is past any camera's reach, and a larger shift would leave the u64.
+            m[2..10].copy_from_slice(&(1024u64 << gain_log2.min(8)).to_le_bytes());
+            let mut a = [0xEEu8; 1];
+            let ok = call(ep, &m, &mut a);
+            say!(g, "camtest: SET gain A#{} times unity answered A#{}\n", 1u64 << gain_log2.min(8), if ok == ERR { 0xEE } else { a[0] });
         }
         let count = u32::from_le_bytes([h64[0], h64[1], h64[2], h64[3]]);
         let skipped = count.wrapping_sub(last_count).wrapping_sub(1);
@@ -788,6 +797,9 @@ static W_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 const MAIN_FULL_LINE_PS: u64 = 6_586_118;
 /// The 8a's main's line (ps): 9568 clocks at 24.576 MHz / 3 x 166, ferros_cam cams `AKITA_MAIN.line_ps` (2026-11-19).
 const AKITA_MAIN_LINE_PS: u64 = 7_035_956;
+/// The 8a's ultrawide's and front's lines (ps), ferros_cam cams `AKITA_ULTRAWIDE.line_ps` and `AKITA_FRONT.line_ps`: the IMX712 counts its line in two clocks, measured as the frames' spacing (2026-11-19).
+const AKITA_UW_LINE_PS: u64 = 10_389_984;
+const AKITA_FRONT_LINE_PS: u64 = 10_651_916;
 
 /// Where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): on 2026-11-18 evening a 2^28 s exposure at shift 31 gave frames at the sensor's floor while 1024 s at shift 13 held.
 /// OPEN with the view (the mode block's kind from the eighth byte: 2 the 1:1), a waiter thread MAPping, then for each shift from `bottom` (14 if 0) to `top` (31 if 0): the shift forced (SET 3) and an exposure of `coarse` lines of 2^shift (2^15 if 0: an exposure that needs exactly that shift, as the least-shift plan would take it), half a unit more so the driver's division lands on `coarse`.
@@ -813,7 +825,7 @@ fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16
     };
     let caps = |c: &mut [u8; 107]| -> bool { call(ep, &[11], c) != ERR };
     // The 8a's main (board 2, fact 84) runs its own line: ferros_cam cams `AKITA_MAIN.line_ps`.
-    let line_ps = if ferros_sys::facts().board() == Some(2) && id == 0 { AKITA_MAIN_LINE_PS } else if KIND.load(SeqCst) == 2 { MAIN_FULL_LINE_PS } else { MAIN_LINE_PS };
+    let line_ps = if ferros_sys::facts().board() == Some(2) && id == 0 { AKITA_MAIN_LINE_PS } else if ferros_sys::facts().board() == Some(2) && id == 1 { AKITA_UW_LINE_PS } else if ferros_sys::facts().board() == Some(2) && id == 2 { AKITA_FRONT_LINE_PS } else if KIND.load(SeqCst) == 2 { MAIN_FULL_LINE_PS } else { MAIN_LINE_PS };
     let window = if window == 0 { 8 } else { window as u64 };
     let top = if top == 0 { 31 } else { top };
     let bottom = if bottom == 0 { 14 } else { bottom };

@@ -44,11 +44,18 @@ fn link_word(reg: u32) -> Option<u32> {
     ((0x1C04_0000..0x1C0C_0000).contains(&reg) && matches!(o, 0x40 | 0x44 | 0x50 | 0x54 | 0x60 | 0x64)).then_some(o)
 }
 
+/// loch0's input word: bits 24 to 27 the CSI link its frames come from (every capture: link 0 G#200, link 1 G#0100_0200, link 2 G#0200_0200, link 6 G#0600_0200).
+pub const LOCH0_INPUT: u32 = 0x1C32_048C;
+
 /// The image path's and PD path's stride registers (loch0, the main's job: G#1400 at both).
 pub const STRIDE_REGS: [u32; 2] = [0x1C32_0554, 0x1C32_2154];
 
 /// One register value rewritten from `from` to `to`, or as it was. Address registers never reach here (the job's `relocate` owns them).
 pub fn value(reg: u32, v: u32, from: &Geom, to: &Geom, scope: Scope) -> u32 {
+    // loch0's input word is no size: bits 24 to 27 the CSI link it takes frames from. The 8a's front (link 6, G#0600_0200) read as half its 3072 rows in the high half and was rewritten to a slit's, loch0 then listening to link 0 (2026-11-19).
+    if reg == LOCH0_INPUT {
+        return v;
+    }
     if STRIDE_REGS.contains(&reg) && v == from.stride {
         return to.stride;
     }
@@ -261,6 +268,9 @@ mod tests {
         assert_eq!(value(0x1C05_0050, 0x130AC, &MAIN, &r12, Scope::Core), 0x130B0);
         // The embedded channel's type (G#12) is not the image's.
         assert_eq!(value(0x1C05_0060, 0xB048, &MAIN, &r12, Scope::Core), 0xB048);
+        // loch0's input word keeps its link whatever the shape: the 8a's front's G#0600 is half its 3072 rows.
+        let front = Geom::of(4208, 3072, 10);
+        assert_eq!(value(LOCH0_INPUT, 0x0600_0200, &front, &Geom::of(4208, 64, 10), Scope::All), 0x0600_0200);
     }
 
     /// The main's job (target/cam/cam.pdma, local): the slit's rewrite touches the image and PD paths' sizes and strides only where they differ, and the slim program keeps the image body's address once.

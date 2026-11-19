@@ -124,7 +124,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
     for &id in LISTED.iter() {
         // WHY `by_id`: `LISTED` names the Pro's four, and the 8a has three (no tele).
         let Some(c) = cams::by_id(id) else { continue };
-        // A camera of the board that does not stream yet (the 8a's ultrawide and front) is left out, whatever its vault holds.
+        // A camera of the board that does not stream (`Cam::streams`; the 8a's ultrawide and front until 2026-11-19) is left out, whatever its vault holds.
         if !c.streams || !inputs_held(g, c) {
             continue;
         }
@@ -856,6 +856,19 @@ static NO_OPEN: AtomicU64 = AtomicU64::new(0);
 /// The front end answered once: loch0's image status read; on a frame's DMA_DONE the ring's turn (`ring_turn`) and the engine's index advanced at once; then every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and the frame counted.
 /// The index first (2026-11-16, kernlock): the next descriptor must be released before the next frame begins, so the frame's blanking (128 lines, about 400 us, at the main's 96 a second) has to hold the interrupt's wake and everything the answer does before the index write; with the 56 acknowledgements ahead of it (about 170 us of register syscalls) the stream lost every other frame and stopped.
 /// The acknowledgements clear the front end's status words (loch0's image status among them, read again there); the descriptor engine has its own index, so the order between the two is not the front end's.
+/// loch0's paths enabled, once its first SHADOW_UPDATE says the first program applied.
+fn enable_paths(g: u64, enabled: &mut bool) {
+    // The image path alone when the PD path is off (a mode whose PD rows' slot is sized for the binned frame, or a slit): G#01 of Linux's G#81.
+    let pd = PD_ON.load(Ordering::Relaxed) != 0;
+    wr(g, ferros_cam::LOCH_ENABLE, if pd { ferros_cam::LOCH_ENABLE_IMG_PD } else { ferros_cam::LOCH_ENABLE_IMG_PD & 1 });
+    *enabled = true;
+    // An open program clears the frame's bits itself: only DMA_DONE raises loch0's image interrupt from now on, so an EOF or SHADOW_UPDATE after the release never fires a second interrupt that masks the line (mask G#1A as the init leaves it: EOF, SHADOW_UPDATE, DMA_DONE).
+    if OPEN.load(Ordering::Relaxed) != 0 {
+        wr(g, IMG_MASK, ferros_cam::IMG_DMA_DONE);
+    }
+    say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}{}\n", if pd { " with its PD path" } else { ", its PD path left off" }, if OPEN.load(Ordering::Relaxed) != 0 { "; its image interrupt DMA_DONE alone" } else { "" });
+}
+
 fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let t0 = ferros_sys::now();
     let img = rd(g, ferros_cam::IMG_STATUS);
@@ -963,15 +976,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     IMG_SEEN.fetch_or(img as u64, Ordering::Relaxed);
     ANSWERED.fetch_add(1, Ordering::Relaxed);
     if !*enabled && img & ferros_cam::IMG_SHADOW != 0 {
-        // The image path alone when the PD path is off (a mode whose PD rows' slot is sized for the binned frame, or a slit): G#01 of Linux's G#81.
-        let pd = PD_ON.load(Ordering::Relaxed) != 0;
-        wr(g, ferros_cam::LOCH_ENABLE, if pd { ferros_cam::LOCH_ENABLE_IMG_PD } else { ferros_cam::LOCH_ENABLE_IMG_PD & 1 });
-        *enabled = true;
-        // An open program clears the frame's bits itself: only DMA_DONE raises loch0's image interrupt from now on, so an EOF or SHADOW_UPDATE after the release never fires a second interrupt that masks the line (mask G#1A as the init leaves it: EOF, SHADOW_UPDATE, DMA_DONE).
-        if OPEN.load(Ordering::Relaxed) != 0 {
-            wr(g, IMG_MASK, ferros_cam::IMG_DMA_DONE);
-        }
-        say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}{}\n", if pd { " with its PD path" } else { ", its PD path left off" }, if OPEN.load(Ordering::Relaxed) != 0 { "; its image interrupt DMA_DONE alone" } else { "" });
+        enable_paths(g, enabled);
     }
     if nf != 0 {
         FRAME_AT.store(eagle_ns(), Ordering::Release);
@@ -1050,6 +1055,10 @@ extern "C" fn frame_thread(g: u64) -> ! {
                     fe_say(g, "the line quiet");
                 }
                 answer(g, &mut idx, &mut enabled);
+            } else if !enabled && idx != 0 && rd(g, ferros_cam::PDMA + 0x14) == idx && rd(g, ferros_cam::PDMA + 0x5C) != 0 {
+                // The first program ran (the engine's place at our index, its progress past the start) and no answer saw its SHADOW_UPDATE: the paths enabled on the engine's word (2026-11-19, the 8a: four opens in about twenty answered first with loch0's status 0, and two of them never again, the paths never enabled, the line quiet for good).
+                say!(g, "camera: the line quiet A#{} us before loch0's paths were on; the first program ran (engine place G#{idx:X}, progress G#{:X}), its SHADOW_UPDATE never seen\n", ferros_sys::us_since(last), rd(g, ferros_cam::PDMA + 0x5C));
+                enable_paths(g, &mut enabled);
             } else if ferros_sys::us_since(last) > QUIET_US + (period_ns() << 1) / 1000 && QUIET_SEEN.fetch_add(1, Ordering::Relaxed) == 0 {
                 say!(g, "camera: the line quiet A#{} us, past two frame periods, the front end's status clear (engine G#{:X} index G#{:X}, our index G#{idx:X}): the stream stopped by itself\n", ferros_sys::us_since(last), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
             }
@@ -1891,6 +1900,14 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             n += 1;
         }
     }
+    // Which CSI link loch0 takes its frames from: G#1C32_048C bits 24 to 27, the link's number (every capture: the 8a's main crop 1, the Pro's ultrawide 2, the tele and the 8a's front 6, the Pro's front and the 8a's ultrawide 0). Lost from the 8a's front and ultrawide captures, the merged programs carried the main's 1 and loch0 listened to a silent link (2026-11-19): said when it is not the receiver's own link.
+    if let Some(link) = link_of() {
+        let want = ((link - 0x1C04_0000) >> 16) as u32;
+        let got = rd(g, LOCH0_LINK) >> 24 & 0xF;
+        if got != want {
+            say!(g, "camera: loch0 takes link A#{got} (G#1C32_048C G#{:X}), the receiver started link A#{want}: no frame can reach it\n", rd(g, LOCH0_LINK));
+        }
+    }
     let refused = REFUSED.load(Ordering::Relaxed);
     say!(g, "camera: engine started (ring G#{ring_pa:X}, count A#{ring_n}, A#{slots} descriptors round which the index goes{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
     // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered; elsewhere it stays where it rests (the ultrawide's actuator never answered ferros, the front's range is not measured).
@@ -1904,16 +1921,16 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let mut cw = [0u8; 4];
     let read = bus.write_read(c.addr, &ccs::COARSE_CAPS.to_be_bytes(), &mut cw).is_ok();
     let (cmin, margin) = (u16::from_be_bytes([cw[0], cw[1]]), u16::from_be_bytes([cw[2], cw[3]]));
-    // WHY the tests: the words are the sensor's; a margin not under the mode's own frame describes none (the main's limit block at G#1100 aliases to G#4140), and a least of 0 is taken as one line, the least SET ever took.
+    // WHY the tests: the words are the sensor's; a margin not under the mode's own frame describes none (the main's limit block at G#1100 aliases to G#4140), a least of 0 is taken as one line, the least SET ever took, and a margin of 0 as none stated (the 8a's IMX712s read 0 and 0 there, 2026-11-19): the list's, measured from Android's holds.
     let sane = read && margin < fll;
     // A captured readout with its own measured line takes it at its own line length; the rest the camera's line scaled by the init's PLL.
     let (line_ps, captured_llp) = match alt { Some(a) if a.line_ps != 0 => (a.line_ps, llp), _ => (ccs::line_ps_for(c, &page), c.llp) };
-    let timing = ccs::Timing { line_ps, captured_llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
+    let timing = ccs::Timing { line_ps, captured_llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if !sane { ccs::MARGIN } else if margin == 0 { arr.margin.unwrap_or(0) } else { margin }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
     say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
     say!(g, "camera: {}: the vendor shift to A#{}{}, the frame counter A#{} bits (the longest exposure at shift A#{}); the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.lte.map_or(0, |l| l.frame_bits), timing.lte.map_or(0, |l| timing.shift_most(&l)), timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
     readout_reset();
-    if sane && arr.margin.is_some_and(|m| m != margin) {
+    if sane && margin != 0 && arr.margin.is_some_and(|m| m != margin) {
         say!(g, "camera: {}: the sensor's margin is not the list's: the list's longest exposure is off by the difference\n", c.name);
     }
     // A captured readout starts at its own init's integration (G#0202 as the init wrote it last), the camera's table at its binned one.
@@ -2278,7 +2295,7 @@ fn release(g: u64, o: &mut Open, b: usize) {
 /// No frame came in `late_us`: said with the words that tell why.
 /// Set when the stream was taken for stopped (`late`): the close then says the front end's words (`words_say`).
 static STOPPED: AtomicU64 = AtomicU64::new(0);
-/// A device test (the hand spawn's twelfth byte 1): `words_say` at every close.
+/// A device test (the hand spawn's twelfth byte): 1 `words_say` at every close, 2 with the frame converter's words, 3 with loch0's further words and the blocks at G#1C34 and G#1C35 (for a diff against the hv's snapshot of Android, 2026-11-19).
 static WORDS_TEST: AtomicU64 = AtomicU64::new(0);
 fn late(g: u64) {
     STOPPED.store(1, Ordering::Relaxed);
@@ -2312,6 +2329,8 @@ fn ack_say(g: u64) {
 fn link_of() -> Option<usize> {
     rx_of().0.iter().find(|w| (0x1C04_0000..0x1C10_0000).contains(&w.0) && w.0 & 0xFFFF == 4 && w.1 & 3 == 1).map(|&(a, _)| a & !0xFFFF)
 }
+/// loch0's input word (ferros_cam geom `LOCH0_INPUT`): bits 24 to 27 the CSI link it takes frames from, the low bits the program's own.
+const LOCH0_LINK: usize = geom::LOCH0_INPUT as usize;
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
     let Some(link) = link_of() else { return };
@@ -2385,7 +2404,27 @@ fn words_say(g: u64) {
             n += 1;
         }
     }
-    for &(base, len) in SPANS.iter().chain(spans[..n].iter()) {
+    // The frame converter's and the front end's core words husky's live snapshot read (2026-10-21, target/hv/snap-list.txt: registers known to exist, a read into a hole can stall the bus), for a diff against the 8a's snapshots of Android (2026-11-19).
+    const CORE: [(usize, usize); 54] = [
+        (0x1C33_0000, 0x4), (0x1C33_0100, 0x4), (0x1C33_0C00, 0x10), (0x1C33_0C38, 0x8), (0x1C33_0D00, 0x10), (0x1C33_0D38, 0x8), (0x1C33_0F00, 0x4),
+        (0x1C33_1300, 0x8), (0x1C33_130C, 0x4), (0x1C33_3300, 0x8), (0x1C33_330C, 0x4), (0x1C33_5300, 0x8), (0x1C33_530C, 0x4),
+        (0x1C33_7008, 0x8), (0x1C33_7020, 0x4), (0x1C33_7028, 0x4), (0x1C33_7050, 0x4), (0x1C33_7300, 0x10), (0x1C33_7400, 0x8), (0x1C33_7500, 0x110),
+        (0x1C33_7700, 0x4), (0x1C33_7900, 0x8), (0x1C33_7A00, 0x4), (0x1C33_7B00, 0x8), (0x1C33_7C00, 0x4), (0x1C33_7D00, 0x4), (0x1C33_7E00, 0x4), (0x1C33_7F00, 0x4),
+        (0x1C33_8000, 0x4), (0x1C33_8100, 0x4), (0x1C33_8200, 0x4), (0x1C33_8300, 0x4), (0x1C33_8400, 0x4), (0x1C33_8500, 0x4), (0x1C33_8600, 0x4), (0x1C33_8700, 0x4),
+        (0x1C33_8800, 0x4), (0x1C33_8900, 0x4), (0x1C33_8A00, 0x4), (0x1C33_9300, 0x8), (0x1C33_930C, 0x4),
+        (0x1C33_B020, 0x4), (0x1C33_B028, 0x4), (0x1C33_B050, 0x4), (0x1C33_B060, 0x4), (0x1C33_B300, 0x8), (0x1C33_B30C, 0x4), (0x1C33_B400, 0x4),
+        (0x1C33_C300, 0x8), (0x1C33_C30C, 0x4), (0x1C33_D300, 0x8), (0x1C33_D30C, 0x4), (0x1C33_E300, 0x8), (0x1C33_E30C, 0x4),
+    ];
+    // loch0's and its PD path's words past SPANS, and the blocks at G#1C34 and G#1C35, as husky's snapshot read them (its two large DMA runs, the program's own and read back held, left out).
+    const CORE2: [(usize, usize); 27] = [
+        (0x1C32_0124, 0x4), (0x1C32_013C, 0x4), (0x1C32_0508, 0x10), (0x1C32_0540, 0x8), (0x1C32_0550, 0x8), (0x1C32_05C0, 0x8),
+        (0x1C32_2108, 0x10), (0x1C32_2140, 0x4), (0x1C32_2150, 0x8), (0x1C32_21C0, 0x8), (0x1C32_9000, 0xC),
+        (0x1C34_0000, 0xD8), (0x1C35_0000, 0x6C), (0x1C35_0088, 0x14), (0x1C35_00B8, 0x14), (0x1C35_00E8, 0x14), (0x1C35_0118, 0x14), (0x1C35_0148, 0x14), (0x1C35_0160, 0x14),
+        (0x1C35_0178, 0x14), (0x1C35_0190, 0x14), (0x1C35_01A8, 0x8), (0x1C35_0294, 0x1C), (0x1C35_0D70, 0x8), (0x1C35_1818, 0x10), (0x1C35_5130, 0x8), (0x1C35_51C0, 0x10),
+    ];
+    let core: &[(usize, usize)] = if WORDS_TEST.load(Ordering::Relaxed) >= 2 { &CORE } else { &[] };
+    let core2: &[(usize, usize)] = if WORDS_TEST.load(Ordering::Relaxed) >= 3 { &CORE2 } else { &[] };
+    for &(base, len) in SPANS.iter().chain(spans[..n].iter()).chain(core.iter()).chain(core2.iter()) {
         let mut at = 0;
         while at < len {
             let mut l = Line { b: [0; 256], n: 0 };
@@ -2685,7 +2724,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 9 {
         NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
     }
-    // The twelfth, a device test only: 1 says the front end's, link's and PHY's words at every close (`words_say`), a stream that ran too, for a comparison with one that did not (the eleventh on akita-stream before the merge with forge, whose eleventh names the spawn's inputs).
+    // The twelfth, a device test only (`WORDS_TEST`: 1 to 3 read ever more): 1 says the front end's, link's and PHY's words at every close (`words_say`), a stream that ran too, for a comparison with one that did not (the eleventh on akita-stream before the merge with forge, whose eleventh names the spawn's inputs).
     if input_len > 11 {
         WORDS_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 11) as *const u8) } as u64, Ordering::Relaxed);
     }
