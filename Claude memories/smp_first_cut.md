@@ -1,6 +1,6 @@
 ---
 name: smp-first-cut
-description: ferros runs on 5 cores since 2026-10-23 (X3 kernel + render, 4× A715 workers); one kernel lock, global run queue, sev not SGIs, per-thread core masks (pin); DIAG SMP_UP/SLICES_C*/LOCK_SPINS, diag threads shows masks; FERROS_SMP=0 escape; the TLBI-is and per-core kctx lessons
+description: ferros runs on 5 cores since 2026-10-23 (X3 kernel + render, 4× A715 workers; the 4 A510s join as pinned-only workers 2026-11-18); one kernel lock, global run queue, sev not SGIs, per-thread core masks (pin); DIAG SMP_UP/SLICES_C*/LOCK_SPINS, diag threads shows masks; FERROS_SMP=0 escape; the TLBI-is and per-core kctx lessons
 metadata:
   type: project
 ---
@@ -12,3 +12,5 @@ Since 2026-10-23 the kernel brings up the four Cortex-A715s (MPIDR Aff1 4-7) as 
 **How to apply:** DIAG `SMP_UP` (bitmask of workers), `SMP_ON_k` (CPU_ON results), `SLICES_C4..C8`, `LOCK_SPINS`; `diag threads` shows each thread's core mask; `diag sched` has a core column (cN). Any pool page-table change must use `tlbi vae1is` (inner shareable) — a core-local invalidate left a worker fetching through a stale non-exec entry (map faulted at its entry). Anything saved per core in asm (`__el0_kctx`) must be indexed by MPIDR Aff1. Next: tiled rendering across workers; the A510s for the waiting servers; per-core queues only if the trace shows lock contention mattering.
 
 **Later 2026-10-23:** the 7,000 spins/s were workers spinning on a fruitless look (RUNNABLE_N counted the X3-pinned render thread); fixed (sleep after a fruitless look; `kick(mask)`). WFI idle is written behind `FERROS_IDLE_WFI=1` but SHELVED: non-deterministic reload hangs, post-mortem notes kept getting overwritten (ramoops page: gate; X3 result page: a log; G#80F0_0000: the 17 MB gate image; G#C1FF_0000: modem firmware — APP_SURFACE overlaps cp_rmem, move it before cellular). Notes at G#B000_0000 now. `bridge reboot fastboot` stopped taking late in the day (3 failures in a row) — go via `diag android` + `adb reboot bootloader`, or hands.
+
+**2026-11-18, the A510s as workers (branch a510-workers, KERNEL.md Order item 6):** all eight workers up; `smp::UP` is now a core mask (bit = Aff1, G#FF), and so are SMP_ON_c, IDLE_WAKES_Cc and SLICES_C0..C8. Only threads pinned to `CORES_LITTLE` (G#000F) run on the A510s; an idle A510 looks only when `RUNNABLE_LITTLE` != 0. CPU0 is free after the hop (its park is CPU_OFF). Their clock is a third governor cluster (domain 2) on busy-run time: 324 to 1425 MHz calm, 1704 lifted, no input boost. A510 erratum 2441009 is handled (`tlbi_done`), and CTR_EL0 is ANDed across cores. Cost: about 40-50 mW on CPUCL0 while idle (`diag smp little off|on`); starting them on demand is the follow-up.

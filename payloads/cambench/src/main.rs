@@ -7,7 +7,7 @@
 //! - +8 the driver's flags (payloads/camera `F_*`: 1 RAW12, 2 mid-stream, 4 PD path, 8 geometry everywhere, 16 slim program, 32 slim level 2, 64 front end left as captured), +9 a slit ring's buffers as a power of two (0: 2^8), +10 the line length (u16; 0 the mode's),
 //! - +12 the work per frame: 0 map only (the capture's ceiling), 1 read every line out of the view (64-byte loads), 2 read and add into u16 sums folded into u32 every 64 frames, 3 read and add into u32 sums,
 //! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each; 3 the line length from 6320 clocks down, a new open each), +15 threads for whole frames (0: the four A715s),
-//! - optionally +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain).
+//! - optionally +21 an exposure (u64 ns) SET halfway thru a slit run, the slits' rate after it said; +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain), +20 bit 0 the view asked for write-back (docs/CAMERA.md "A cacheable view"), bit 1 the frame threads on the A510s (cores 0 to 3) instead of the A715s, bit 2 each frame's sampled lines read again from DRAM after the kernel drops them from the caches and compared (`check`).
 //! The driver's flag 128 keeps the sensor's phase detect and embedded data on in a windowed mode (off by default there: docs/CAMERA.md "The slit for real").
 //! A windowed mode on the main also runs detached and slim by default (the statistics pipeline off, loch0's paths alone each frame: docs/CAMERA.md "The slit runs"); the driver's eighth hand-spawn byte overrides it for an A/B.
 //! The sweeps (+14) open again in this process: with the vault's driver each open starts a fresh one; a driver spawned by hand serves one stream and refuses the next open, so a sweep of a hand-spawned driver is tools/cambench-sweep.sh (one driver an open).
@@ -23,12 +23,12 @@ use ferros_cam::raw;
 use ferros_sys::{call, cap, console, ERR};
 
 struct Line {
-    b: [u8; 256],
+    b: [u8; 512],
     n: usize,
 }
 impl Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // WHY the min: a formatted line longer than the 256-byte buffer would index past it and panic the process; the console gets the line cut instead.
+        // WHY the min: a formatted line longer than the 512-byte buffer would index past it and panic the process; the console gets the line cut instead.
         let k = s.len().min(self.b.len() - self.n);
         self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
         self.n += k;
@@ -37,7 +37,7 @@ impl Write for Line {
 }
 macro_rules! say {
     ($g:expr, $($t:tt)*) => {{
-        let mut l = Line { b: [0; 256], n: 0 };
+        let mut l = Line { b: [0; 512], n: 0 };
         let _ = write!(l, $($t)*);
         console($g, &l.b[..l.n]);
     }};
@@ -50,6 +50,8 @@ const OP_STATS: u8 = 8;
 const OP_SLITS: u8 = 9;
 const OP_RATE: u8 = 10;
 const OP_CAPS: u8 = 11;
+/// SET (payloads/camera op 3): `[3][what][value u64]`, what 0 the exposure in ns.
+const OP_SET: u8 = 3;
 const K_SLIT_FULL: u8 = 4;
 
 /// The heap's ceiling (the image header's: the kernel sizes the arc's window for it, `ferros_sys::arc::grow` maps frames as asked): the main's 1:1 sums, 8192 x 6144 samples of u16 and u32, are 302 MB.
@@ -75,14 +77,24 @@ struct Args {
     frames: u32,
     sweep: u8,
     cols: u16,
+    /// The view asked for write-back (payloads/camera `VIEW_CACHED`, docs/CAMERA.md "A cacheable view").
+    cached: bool,
+    /// Each frame's sampled lines read again from DRAM and compared (`check`).
+    check: bool,
+    /// A slit run's exposure SET halfway (ns, u64 at +21; 0 none): the driver's SET 0 mid-stream, and the slits' rate before and after it (docs/CAMERA.md "Slits under Lumis": a slit's shutter as Lumis's).
+    set_ns: u64,
 }
+/// The cores the frame threads run on (+20 bit 1: the A510s, cores 0 to 3; else the A715s, 4 to 7), as a core number's base.
+static FIRST_CORE: AtomicU64 = AtomicU64::new(4);
 
 impl Args {
-    fn open_msg(&self) -> [u8; 16] {
-        let mut m = [0u8; 16];
+    fn open_msg(&self) -> [u8; 17] {
+        let mut m = [0u8; 17];
         m[0] = OP_OPEN;
         m[1] = self.id;
         m[2] = 1;
+        // The view flags after the whole block (payloads/camera `VIEW_FLAGS`): bit 0 write-back.
+        m[16] = self.cached as u8;
         m[3] = self.kind;
         m[4..6].copy_from_slice(&self.rows.to_le_bytes());
         m[6..8].copy_from_slice(&self.fll.to_le_bytes());
@@ -157,6 +169,7 @@ fn part(k: usize, src: usize) {
     let fold = FOLD.load(Ordering::Relaxed) == 1;
     let (a16, a32) = (ACC16.load(Ordering::Relaxed) as *mut u16, ACC32.load(Ordering::Relaxed) as *mut u32);
     let (mut rt, mut at) = (0u64, 0u64);
+    let pm0 = pmu_now();
     for y in k * rows / threads..(k + 1) * rows / threads {
         let t = ferros_sys::now();
         let l = read_line(k, src + y * line, line);
@@ -180,13 +193,40 @@ fn part(k: usize, src: usize) {
     }
     READ_T[k].fetch_add(rt, Ordering::Relaxed);
     ADD_T[k].fetch_add(at, Ordering::Relaxed);
+    let pm1 = pmu_now();
+    for (s, (a, b)) in PMU_T[k].iter().zip(pm0.iter().zip(pm1.iter())) {
+        s.fetch_add(b - a, Ordering::Relaxed);
+    }
+    BUSY_T[k].fetch_add(rt + at, Ordering::Relaxed);
+}
+
+/// The PMU counts a thread takes over its shares (docs/CAMERA.md "The slowdown"): the cycles, then the events `pmu_program` sets: instructions, backend stall cycles, L2 refills, L3 refills.
+const PMU_N: usize = 5;
+const PMU_EVENTS: [u32; PMU_N - 1] = [ferros_sys::pmu::INST_RETIRED, ferros_sys::pmu::STALL_BACKEND, 0x17, 0x2A];
+static PMU_T: [[AtomicU64; PMU_N]; THREADS_MOST] = [const { [const { AtomicU64::new(0) }; PMU_N] }; THREADS_MOST];
+/// Each thread's counter ticks in its shares (reading and adding): the time its cycles are over.
+static BUSY_T: [AtomicU64; THREADS_MOST] = [const { AtomicU64::new(0) }; THREADS_MOST];
+
+/// This core's event counters set to `PMU_EVENTS` (each thread on its own core, pinned, before its first share).
+fn pmu_program() {
+    for (n, &e) in PMU_EVENTS.iter().enumerate() {
+        ferros_sys::pmu::program(n as u32, e);
+    }
+}
+
+fn pmu_now() -> [u64; PMU_N] {
+    use ferros_sys::pmu::{cycles, read};
+    [cycles(), read(0), read(1), read(2), read(3)]
 }
 /// The frame's width (the RAW12 add's sample count).
 static COLS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn worker(k: u64) -> ! {
     // One A715 each (the cores `CORES_WORKERS` names: 4 to 7), the main thread on the first.
-    ferros_sys::pin(1 << (4 + k));
+    ferros_sys::pin(1 << (FIRST_CORE.load(Ordering::Relaxed) + k));
+    // A sleep so the next run lands on the pinned core, whose counters these are.
+    ferros_sys::sleep_until(ferros_sys::now() + (ferros_sys::freq() >> 10));
+    pmu_program();
     let mut seen = 0;
     loop {
         let job = JOB.load(Ordering::Acquire);
@@ -243,6 +283,33 @@ fn memory(bytes: usize) -> Option<usize> {
 /// The view's token, where the kernel looks for it (an arc offset).
 static mut TOKEN: [u8; 32] = [0; 32];
 
+/// The check (+20 bit 2, docs/CAMERA.md "A cacheable view"): lines sampled a frame, their copies as the frame's work read them.
+const CHECK_LINES: usize = 1 << 4;
+static mut SEEN: [[u8; LINE_MOST]; CHECK_LINES] = [[0; LINE_MOST]; CHECK_LINES];
+
+/// After a frame's work: `CHECK_LINES` of its lines (spread down the frame, moved a line each frame) as the work read them thru the view, then each dropped from every core's caches by the kernel (SYS_DMA x1 = 6 on the view's token, process.rs `cam_lines`) and read again, now from DRAM.
+/// Returns the lines that read differently, and the kernel's ticks for them: a write-back view whose buffers were not made right at MAP shows what the cores kept from the last time round the ring; a right one, none.
+fn check(v: &View, src: usize, k: u32) -> (u32, u64) {
+    let toff = ferros_sys::off(unsafe { (*(&raw const TOKEN)).as_ptr() });
+    let step = v.h / CHECK_LINES;
+    let seen = unsafe { &mut *(&raw mut SEEN) };
+    let at = |j: usize| src + (j * step + k as usize % step) * v.line;
+    for j in 0..CHECK_LINES {
+        seen[j][..v.line].copy_from_slice(&read_line(0, at(j), v.line)[..v.line]);
+    }
+    let mut ticks = 0;
+    for j in 0..CHECK_LINES {
+        ticks += ferros_sys::svc(ferros_sys::nr::DMA, toff, 6, (at(j) - v.base) as u64, v.line as u64, 0);
+    }
+    let mut differ = 0;
+    for j in 0..CHECK_LINES {
+        if read_line(0, at(j), v.line)[..v.line] != seen[j][..v.line] {
+            differ += 1;
+        }
+    }
+    (differ, ticks)
+}
+
 fn u64_at(b: &[u8], k: usize) -> u64 {
     u64::from_le_bytes(b[8 * k..8 * k + 8].try_into().unwrap())
 }
@@ -268,7 +335,7 @@ fn open(g: u64, ep: u64, a: &Args) -> Option<View> {
     let u16_ = |k: usize| u16::from_le_bytes([r[k], r[k + 1]]) as usize;
     let u32_ = |k: usize| u32::from_le_bytes(r[k..k + 4].try_into().unwrap());
     let v = View { base: base as usize, ring: u32_(48), format: r[34], w: u16_(36), h: u16_(38), line: u32_(40) as usize, buf: u32_(44) as usize, slit: r[52] == 1 };
-    say!(g, "cambench: OPEN in A#{ms} ms: the view at G#{:X}, a{} ring of A#{} buffers of A#{} KiB, A#{} x A#{}, A#{} bytes a line, format A#{}\n", v.base, if v.slit { " slit" } else { "n image" }, v.ring, v.buf >> 10, v.w, v.h, v.line, v.format);
+    say!(g, "cambench: OPEN in A#{ms} ms: the view at G#{:X}{}, a{} ring of A#{} buffers of A#{} KiB, A#{} x A#{}, A#{} bytes a line, format A#{}\n", v.base, if r[53] == 1 { " (write-back)" } else { " (non-cacheable)" }, if v.slit { " slit" } else { "n image" }, v.ring, v.buf >> 10, v.w, v.h, v.line, v.format);
     Some(v)
 }
 
@@ -282,7 +349,7 @@ fn caps(g: u64, ep: u64) {
     }
     let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
     let count = (c[1] & 0xF) as usize;
-    let mut l = Line { b: [0; 256], n: 0 };
+    let mut l = Line { b: [0; 512], n: 0 };
     let _ = write!(l, "cambench: CAPS: data format model G#{:02X} G#{:02X}, A#{count} formats:", c[0], c[1]);
     for k in 0..count {
         let _ = write!(l, " G#{:04X}", be(2 + 2 * k));
@@ -332,6 +399,32 @@ fn close(g: u64, ep: u64) {
     }
 }
 
+/// Every 64 frames (docs/CAMERA.md "The slowdown"): the work a frame over the window, the MAP's wait, the frames skipped, and per thread its real clock (its cycles over its shares' time), instructions a cycle, backend stalls a cycle, and L2 and L3 refills a frame. `pm` and `busy` hold the counts at the window's start and are moved on.
+/// `w`: the work's ticks and its most, the MAP's ticks, the frames skipped, the ticks since the open, the frames in the window.
+fn window(g: u64, got: u64, pm: &mut [[u64; PMU_N]; THREADS_MOST], busy: &mut [u64; THREADS_MOST], w: (u64, u64, u64, u64, u64, u64)) {
+    let hz = ferros_sys::freq();
+    let us = |t: u64| t * 1_000_000 / hz;
+    let (work, most, map, skip, since, n) = w;
+    let mut l = Line { b: [0; 512], n: 0 };
+    // n is 64 (a window ends every 64 frames), never none.
+    let _ = write!(l, "cambench: window to frame A#{got} (A#{} ms in): work A#{} us a frame (most A#{}), MAP A#{} us, skipped A#{skip};", us(since) / 1000, us(work / n), us(most), us(map / n));
+    for k in 0..THREADS.load(Ordering::Relaxed) as usize {
+        let now: [u64; PMU_N] = core::array::from_fn(|e| PMU_T[k][e].load(Ordering::Relaxed));
+        let b = BUSY_T[k].load(Ordering::Relaxed);
+        let d: [u64; PMU_N] = core::array::from_fn(|e| now[e] - pm[k][e]);
+        let bt = b - busy[k];
+        pm[k] = now;
+        busy[k] = b;
+        // WHY the zero: a thread given no rows (more threads than rows) has no time and no cycles.
+        if bt == 0 || d[0] == 0 {
+            continue;
+        }
+        let _ = write!(l, " t{k} A#{} MHz ipc A#{} stall A#{} L2r A#{}k L3r A#{}k;", d[0] * hz / bt / 1_000_000, d[1] * 256 / d[0], d[2] * 256 / d[0], d[3] / n / 1000, d[4] / n / 1000);
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
+
 /// Whole frames: MAP each, read and add it across the threads, and say what it cost. True when the stream ran.
 fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
     let blocks = raw::blocks(v.w);
@@ -357,8 +450,15 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
     let hz = ferros_sys::freq();
     let (mut held, mut got, mut skipped, mut last) = (0xFFu8, 0u64, 0u64, 0u32);
     let (mut work_t, mut work_most, mut first_t, mut last_t) = (0u64, 0u64, 0u64, 0u64);
+    let (mut differ, mut checked, mut check_t) = (0u64, 0u64, 0u64);
+    pmu_program();
+    let (mut win_t, mut win_most, mut win_map, mut win_skip, mut win_k0) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut win_pm = [[0u64; PMU_N]; THREADS_MOST];
+    let mut win_busy = [0u64; THREADS_MOST];
+    let t_open = ferros_sys::now();
     let mut h = [0u8; 64];
     for k in 0..a.frames {
+        let t_map = ferros_sys::now();
         let n = call(ep, &[OP_MAP, held], &mut h);
         if n == ERR || n < 64 {
             say!(g, "cambench: MAP A#{k}: no frame (G#{:X})\n", n);
@@ -366,11 +466,13 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
         }
         let now = ferros_sys::now();
         held = h[40];
+        win_map += now - t_map;
         let count = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
         if k == 0 {
             first_t = now;
         } else {
             skipped += count.wrapping_sub(last).wrapping_sub(1) as u64;
+            win_skip += count.wrapping_sub(last).wrapping_sub(1) as u64;
         }
         last = count;
         last_t = now;
@@ -393,6 +495,21 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
             let t = ferros_sys::now() - now;
             work_t += t;
             work_most = work_most.max(t);
+            win_t += t;
+            win_most = win_most.max(t);
+            if got % 64 == 0 {
+                window(g, got, &mut win_pm, &mut win_busy, (win_t, win_most, win_map, win_skip, now - t_open, got - win_k0));
+                (win_t, win_most, win_map, win_skip, win_k0) = (0, 0, 0, 0, got);
+            }
+            if a.check {
+                let (d, t) = check(v, src, k);
+                differ += d as u64;
+                checked += CHECK_LINES as u64;
+                check_t += t;
+                if d != 0 && differ == d as u64 {
+                    say!(g, "cambench: check: frame A#{count} (buffer A#{held}): A#{d} of A#{CHECK_LINES} lines read otherwise from DRAM\n");
+                }
+            }
         }
     }
     if got < 2 {
@@ -418,6 +535,9 @@ fn frames(g: u64, ep: u64, a: &Args, v: &View, sensor16: u64) -> bool {
     let link = sensor16 * (v.h * v.w) as u64 * bits / 8 / 16;
     let bus = fps16 * (v.h * v.line) as u64 / 16;
     say!(g, "cambench: the image on the link A#{} MB a second at the sensor's rate, the front end writing A#{} MB a second at the taken rate\n", link / 1_000_000, bus / 1_000_000);
+    if a.check {
+        say!(g, "cambench: check: A#{differ} of A#{checked} sampled lines read otherwise thru the view than from DRAM after the kernel dropped them; the kernel's clean and invalidate of a line A#{} ns\n", if checked == 0 { 0 } else { check_t * 1_000_000_000 / hz / checked });
+    }
     if a.work >= 2 {
         // The sums' mean, a sample per frame: the first 64 rows, so the light's level says the adds landed.
         if a.work == 2 {
@@ -454,7 +574,19 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
     let mut r = [0u8; 64];
     let t0 = ferros_sys::now();
     let mut first_n = 0u64;
+    // The SET halfway (`set_ns`): when it was answered, the newest slit then, and the driver's answer.
+    let mut set_at: Option<(u64, u64, u64)> = None;
     while got < a.frames as u64 {
+        if a.set_ns != 0 && set_at.is_none() && got >= a.frames as u64 / 2 {
+            let mut m = [0u8; 10];
+            m[0] = OP_SET;
+            m[2..10].copy_from_slice(&a.set_ns.to_le_bytes());
+            let mut sr = [0u8; 8];
+            let n = call(ep, &m, &mut sr);
+            let ok = if n == ERR || n == 0 { 0xFF } else { sr[0] as u64 };
+            set_at = Some((ferros_sys::now(), last, ok));
+            say!(g, "cambench: SET exposure A#{} ns after A#{got} slits: answered A#{ok} (0 taken)\n", a.set_ns);
+        }
         let mut m = [OP_SLITS, 0, 0, 0, 0];
         m[1..5].copy_from_slice(&(last as u32).to_le_bytes());
         let n = call(ep, &m, &mut r);
@@ -508,6 +640,12 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
     let span = ferros_sys::now() - t0;
     let us = |t: u64| t * 1_000_000 / hz;
     say!(g, "cambench: A#{got} slits in A#{} ms (A#{} a second), A#{calls} SLITS calls; lost to the ring A#{lost}, read over A#{wrong}; the engine ring round A#{wraps} times; per slit reading and unpacking A#{} ns, adding A#{} ns\n", us(span) / 1000, got * hz / span, us(read_t * 1000 / got), us(add_t * 1000 / got));
+    if let Some((t, n0, ok)) = set_at {
+        // The slits the sensor sent after the SET was answered (the driver's count, the newest seen at the end against the newest then), over the time since; the first after the SET may still be at the old frame.
+        let after = last.saturating_sub(n0);
+        let span = ferros_sys::now() - t;
+        say!(g, "cambench: after the SET (answered A#{ok}): A#{after} slits in A#{} ms, A#{} a second (a slit every A#{} us)\n", us(span) / 1000, after * hz / span.max(1), if after == 0 { 0 } else { us(span) / after });
+    }
     true
 }
 
@@ -537,8 +675,11 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     // Past the 16 bytes: +16 the window's columns (u16; 0 the mode's width), +18 the frames' count moved left this many bits (a slit run of 4080 << 6, 261120 slits, is 3.6 min at 1212 a second: the drain).
     // WHY the min: the shift is the person's byte, and past 12 the count leaves the u32.
     let frames = if b(13) == 0 { 1 << 6 } else { b(13) as u32 * 16 } << b(18).min(12);
-    let a = Args { id: b(0), kind: b(1), rows: h(2), fll: h(4), exposure: h(6), flags: b(8), ring: b(9), llp: h(10), work: b(12), frames, sweep: b(14), cols: h(16) };
-    ferros_sys::pin(1 << 4);
+    let a = Args { id: b(0), kind: b(1), rows: h(2), fll: h(4), exposure: h(6), flags: b(8), ring: b(9), llp: h(10), work: b(12), frames, sweep: b(14), cols: h(16), cached: b(20) & 1 != 0, check: b(20) & 4 != 0, set_ns: u64::from_le_bytes(core::array::from_fn(|k| b(21 + k as u64))) };
+    if b(20) & 2 != 0 {
+        FIRST_CORE.store(0, Ordering::Relaxed);
+    }
+    ferros_sys::pin(1 << FIRST_CORE.load(Ordering::Relaxed));
     THREADS.store(threads as u64, Ordering::Relaxed);
     for k in 1..threads {
         ferros_sys::thread_spawn(worker, unsafe { &mut (*(&raw mut STACKS))[k - 1] }, k as u64);

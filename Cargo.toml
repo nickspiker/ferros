@@ -53,6 +53,7 @@ members = [
     "payloads/ramps",
     "payloads/capture",
     "payloads/copybench",
+    "payloads/corebench",
     "payloads/inject",
     "payloads/switchtest",
     "payloads/tecount",

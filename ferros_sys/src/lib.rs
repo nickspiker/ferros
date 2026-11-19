@@ -316,9 +316,10 @@ pub mod zone {
         (svc(nr::ZONE, 7, off(b.as_mut_ptr()), 0, 0, 0) == 8).then(|| (i32::from_le_bytes([b[0], b[1], b[2], b[3]]), i32::from_le_bytes([b[4], b[5], b[6], b[7]])))
     }
 }
-/// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
+/// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, the X3, the kernel's core, for one real compute path, and the A510s, which run only threads pinned there (2026-11-18: work that should leave the A715s free, as Lumis's camera intake). A mask none of whose cores is up runs on any core that is.
 pub const CORES_WORKERS: u64 = 0x00F0;
 pub const CORES_BIG: u64 = 0x0100;
+pub const CORES_LITTLE: u64 = 0x000F;
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
 pub const PREFS: u64 = 0xFC0;

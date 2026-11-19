@@ -214,7 +214,19 @@ pub fn ran(i: usize, intid: usize, at: u64, woke: u64, now: u64, landed: usize, 
     NOTICED[i].fetch_or(1 << (noticed & 15), Relaxed);
     RAN[i].fetch_or(1 << (c & 15), Relaxed);
     let fz = FREEZE_INTID.load(Relaxed);
-    fz != 0 && fz == intid && total >= FREEZE_TICKS.load(Relaxed) && !FROZEN.swap(true, Relaxed)
+    let freeze = fz != 0 && fz == intid && total >= FREEZE_TICKS.load(Relaxed) && !FROZEN.swap(true, Relaxed);
+    // What every core was doing up to this late run (irqarm.rs `snapshot`, said by `diag "irqs runs"`).
+    if freeze {
+        crate::irqarm::snapshot(now);
+    }
+    freeze
+}
+
+/// Per line: its waiter woken behind the run queue for a spent front credit (process.rs `enqueue_woken`), and the most credit spent at one of those wakes (ticks).
+pub static SPENT: [[AtomicU64; 2]; 32] = [const { [const { AtomicU64::new(0) }; 2] }; 32];
+pub fn spent(i: usize, credit: u64) {
+    SPENT[i][0].fetch_add(1, Relaxed);
+    SPENT[i][1].fetch_max(credit, Relaxed);
 }
 
 /// A wait on line `i` found its interrupt already pending, `age` ticks old: the thread was not waiting when it came.
@@ -243,7 +255,7 @@ pub fn irq_lock_wait(waited: u64, site: u64, what: u64) {
 
 /// `diag "dev reset"` (and `sched reset`): the interrupt measures zeroed, the trace thawed.
 pub fn lat_reset() {
-    LAT.iter().flatten().chain(LAT_HIST.iter().flatten()).chain(LANDED.iter()).chain(NOTICED.iter()).chain(RAN.iter()).chain(IRQ_LOCK.iter()).chain(IRQ_LOCK_HIST.iter()).for_each(|a| a.store(0, Relaxed));
+    LAT.iter().flatten().chain(LAT_HIST.iter().flatten()).chain(LANDED.iter()).chain(NOTICED.iter()).chain(RAN.iter()).chain(IRQ_LOCK.iter()).chain(IRQ_LOCK_HIST.iter()).chain(SPENT.iter().flatten()).for_each(|a| a.store(0, Relaxed));
     FROZEN.store(false, Relaxed);
 }
 
@@ -272,7 +284,7 @@ pub fn lat_report(out: &mut alloc::vec::Vec<u8>, names: &[(&str, u32)]) {
             continue;
         }
         let mean = |s: u64, n: u64| if n == 0 { 0 } else { us(s) / n };
-        out.extend_from_slice(alloc::format!("{name} (INTID A#{intid}): A#{n} runs, interrupt to run mean A#{} us, longest A#{}; to the wake mean A#{}, longest A#{}; on the landing core A#{}; landed G#{:X}, noticed G#{:X}, ran G#{:X}; late waits A#{late} (waited mean A#{} us, longest A#{}); yields asked A#{}\n  by length (us from):", mean(l[1].load(Relaxed), n), us(l[2].load(Relaxed)), mean(l[3].load(Relaxed), n), us(l[4].load(Relaxed)), l[5].load(Relaxed), LANDED[i].load(Relaxed), NOTICED[i].load(Relaxed), RAN[i].load(Relaxed), mean(l[7].load(Relaxed), late), us(l[8].load(Relaxed)), l[9].load(Relaxed)).as_bytes());
+        out.extend_from_slice(alloc::format!("{name} (INTID A#{intid}): A#{n} runs, interrupt to run mean A#{} us, longest A#{}; to the wake mean A#{}, longest A#{}; on the landing core A#{}; landed G#{:X}, noticed G#{:X}, ran G#{:X}; late waits A#{late} (waited mean A#{} us, longest A#{}); yields asked A#{}; woken behind the queue for a spent credit A#{} (credit up to A#{} us)\n  by length (us from):", mean(l[1].load(Relaxed), n), us(l[2].load(Relaxed)), mean(l[3].load(Relaxed), n), us(l[4].load(Relaxed)), l[5].load(Relaxed), LANDED[i].load(Relaxed), NOTICED[i].load(Relaxed), RAN[i].load(Relaxed), mean(l[7].load(Relaxed), late), us(l[8].load(Relaxed)), l[9].load(Relaxed), SPENT[i][0].load(Relaxed), us(SPENT[i][1].load(Relaxed))).as_bytes());
         for (b, h) in LAT_HIST[i].iter().enumerate() {
             let c = h.load(Relaxed);
             if c != 0 {

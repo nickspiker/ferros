@@ -438,11 +438,52 @@ pub fn mark(step: u64) {
     }
 }
 
+/// The kernel's core's stretches between crumbs (2026-11-18, slit-robust: a camera interrupt taken on the X3 while its render thread ran waited 876 us, and once 6 ms, for the service loop's pass to reach `run_slice` and wake the frame thread, no A715 being idle to notice), for `diag crumbs`: per crumb (its low byte) the longest stretch that ended at it, the crumb that began it, the counter at its end, and how many were 2^9 us or longer.
+/// Only the X3 (MPIDR Aff1 8), whose crumbs are the service loop's; a stretch D1 to D2 holds `run_slice`'s slice of a thread at EL0 and is long by design.
+pub static CRUMB_GAP: [[core::sync::atomic::AtomicU64; 4]; 256] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 4] }; 256];
+static CRUMB_PREV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CRUMB_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per core (MPIDR Aff1): its last `CORE_CRUMB_N` crumbs and their counters, a ring (crumb at 2k, counter at 2k + 1), and its count in the last word.
+pub const CORE_CRUMB_N: usize = 1 << 3;
+pub static CORE_CRUMBS: [[core::sync::atomic::AtomicU64; 2 * CORE_CRUMB_N + 1]; 16] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2 * CORE_CRUMB_N + 1] }; 16];
+/// The last `CRUMB_RING` long stretches in time order (`crumb`): the counter at the end, and the ticks with the two crumbs (begin << 56 | end << 48).
+pub const CRUMB_RING: usize = 1 << 8;
+pub static CRUMB_RING_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CRUMB_RING_E: [[core::sync::atomic::AtomicU64; 2]; CRUMB_RING] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; CRUMB_RING];
+
 pub fn crumb(c: u64) {
     LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
     let core = ((mpidr >> 8) & 0xF) as usize;
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        // Every core's last crumbs and when (irqarm.rs's freeze snapshots them: what the core that took a late interrupt was doing while its interrupts were masked).
+        let p = &CORE_CRUMBS[core];
+        let k = p[2 * CORE_CRUMB_N].fetch_add(1, Relaxed) as usize & (CORE_CRUMB_N - 1);
+        p[2 * k].store(c, Relaxed);
+        p[2 * k + 1].store(cntpct(), Relaxed);
+    }
+    if core == 8 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let t = cntpct();
+        let gap = t.wrapping_sub(CRUMB_AT.swap(t, Relaxed));
+        let prev = CRUMB_PREV.swap(c & 0xFF, Relaxed);
+        let e = &CRUMB_GAP[(c & 0xFF) as usize];
+        if gap > e[0].load(Relaxed) {
+            e[0].store(gap, Relaxed);
+            e[1].store(prev, Relaxed);
+            e[2].store(t, Relaxed);
+        }
+        e[3].fetch_add((gap >= cntfrq() >> 11) as u64, Relaxed);
+        // The stretches of 2^7 us or more in time order, but a thread's slice (D1 to D2) and the idle waits (B3 to B4, B5 to B6), long by design; the ring stops when devsched's trace freezes (`dev freeze`: the first late run of a device's waiter), so it ends at that run.
+        let pair = prev << 8 | (c & 0xFF);
+        if gap >= cntfrq() >> 13 && pair != 0xD1D2 && pair != 0xB3B4 && pair != 0xB5B6 && !crate::devsched::FROZEN.load(Relaxed) {
+            let i = CRUMB_RING_N.fetch_add(1, Relaxed) as usize & (CRUMB_RING - 1);
+            CRUMB_RING_E[i][0].store(t, Relaxed);
+            CRUMB_RING_E[i][1].store(gap | pair << 48, Relaxed);
+        }
+    }
     if (4..=8).contains(&core) {
         note(core - 3, c | (core as u64) << 56);
     }
@@ -543,11 +584,16 @@ pub fn from_android() -> bool {
     FROM_ANDROID.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether core `aff1` (MPIDR Aff1) waits on the hv's mailbox: parked there by the jump from Android, powered, for `start_core` to send on.
+pub fn on_mailbox(aff1: usize) -> bool {
+    jumped() && unsafe { read_volatile((crate::board::hv_mailbox() + aff1 * 32 + 16) as *const u64) } == 1
+}
+
 /// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. A core that is not parked there (Android had it off) gets PSCI CPU_ON.
 pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
     // A core Android had already taken offline is not on the mailbox: PSCI CPU_ON below, Linux's own way back from its own offline.
     let slot = crate::board::hv_mailbox() + aff1 * 32;
-    if jumped() && unsafe { read_volatile((slot + 16) as *const u64) } == 1 {
+    if on_mailbox(aff1) {
         unsafe {
             write_volatile((0xFD60_0C80usize + aff1 * 8) as *mut u64, cntpct() | 1);
             write_volatile((slot + 8) as *mut u64, ctx);
@@ -591,16 +637,16 @@ pub fn mark_trail(m: u8) {
 }
 
 /// The low two bits say how far: 1 into Rust, before `cpu_inform_clear`'s firmware call; 2 past it (`note_arrival_step(2)`). The seventh jump of 2026-11-03: the X3 took its entry with an intact hand-over block and never wrote the arrival, and that call came first.
-/// The last session's hand-off words for cores 4-8, into the pstore ring before this boot starts any core over them (no heap yet): per core the arrival word (G#11-G#17: the entry step it reached; a counter: Rust, low bits 1 or 2) and the hv's two trace words. The ninth jump of 2026-11-03 froze at its first TRNG call with the X3 launched, and the cold boot after it overwrote the X3's marks.
+/// The last session's hand-off words for cores 0-8, into the pstore ring before this boot starts any core over them (no heap yet): per core the arrival word (G#11-G#17: the entry step it reached; a counter: Rust, low bits 1 or 2) and the hv's two trace words. The ninth jump of 2026-11-03 froze at its first TRNG call with the X3 launched, and the cold boot after it overwrote the X3's marks.
 pub fn pstore_prev_handoff() {
-    let mut line = [0u8; 5 * 60 + 32];
+    let mut line = [0u8; 9 * 60 + 32];
     let mut n = 0;
     let mut put = |b: &[u8], n: &mut usize| {
         line[*n..*n + b.len()].copy_from_slice(b);
         *n += b.len();
     };
     put(b"ferros: last session's hand-off:", &mut n);
-    for c in 4..9usize {
+    for c in 0..9usize {
         put(&[b' ', b'c', b'0' + c as u8], &mut n);
         for base in [0xFD60_0B80usize, 0xFD60_0C80, 0xFD60_0C00] {
             let v = unsafe { read_volatile((base + c * 8) as *const u64) };
