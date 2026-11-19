@@ -7,6 +7,7 @@
 //! - `cam-oracle cpu <capture.log> <a> <b> <c> <out prefix> [--link G#1C06] [--name RX_START]`: the CPU setup (.cpr2) and the receiver start (.rx.rs).
 //! - `cam-oracle pdma <dump.log> [--list N] [--base G#1C30_0000]`: the PDMA list decoded into register writes.
 //! - `cam-oracle pdma-image <dump.log> <out.cpr3> [--list N]`: the job, a 'CPR3', at the October fixed addresses ferros_cam job relocates from.
+//! - `cam-oracle cinp <out> <name>=<file> ...`: a device test's inputs as one 'CINP' set, for the camera driver's hand spawn (`--input-file`), so nothing is stored.
 
 use std::collections::BTreeMap;
 use std::process::exit;
@@ -423,8 +424,9 @@ fn cmd_pdma_image(mut args: Vec<String>) {
     let which = opt(&mut args, "--list").map(|v| v.parse().unwrap_or_else(|_| die("--list N"))).unwrap_or(1);
     // --own-image: the image body alone in slot 2, at its start, whatever else shares its captured granule (akita's main puts its PD output at the granule's start and the 20.2 MB image 5 MiB in, 2026-11-15: a ring of image buffers in slot 2 would have the PD output written over buffer 0); every other address keeps its granule's slot and offset as before.
     let own_image = args.iter().position(|a| a == "--own-image").map(|i| args.remove(i)).is_some();
+    let slots_out = opt(&mut args, "--slots");
     if args.len() != 2 {
-        die("pdma-image <dump.log> <out.cpr3> [--list N] [--own-image]");
+        die("pdma-image <dump.log> <out.cpr3> [--list N] [--own-image] [--slots <file>]");
     }
     let (mut words, loads) = pdma_list(&read_text(&args[0]), which);
     if words.is_empty() {
@@ -561,12 +563,43 @@ fn cmd_pdma_image(mut args: Vec<String>) {
     let mib = |v: u32| if v == 0 { "0".to_string() } else { format!("{} * MIB", v >> 20) };
     println!("sizes: [{}]", sizes.iter().map(|&v| mib(v)).collect::<Vec<_>>().join(", "));
     println!("skips: [{}]", skips.iter().map(|&v| format!("0x{v:X}")).collect::<Vec<_>>().join(", "));
+    // --slots <file>: the same sizes and skips as 32 u64 LE each, for a device test's 'CINP' set (`<key>.slots`, payloads/camera `slots_of`): a job whose layout the compiled table was not made from runs without a rebuild.
+    if let Some(f) = slots_out {
+        let mut b = Vec::new();
+        for v in sizes.iter().chain(skips.iter()) {
+            b.extend_from_slice(&(*v as u64).to_le_bytes());
+        }
+        std::fs::write(&f, &b).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+    }
+}
+
+/// A device test's inputs as one set for the camera driver's hand spawn (payloads/camera `spawn_input`): 'CINP', then each (u8 name length, the name, u32 LE length, the file's bytes).
+/// Each name as the vault spells it without `cam.` (`oksoko.init`, `oksoko.prog`, `oksoko.pdma`); the set goes in after the driver's 16 knob bytes with ferros-bridge's `--input-file`, so nothing is stored.
+fn cmd_cinp(args: Vec<String>) {
+    if args.len() < 2 {
+        die("cinp <out> <name>=<file> ...");
+    }
+    let mut out = b"CINP".to_vec();
+    for a in &args[1..] {
+        let Some((name, file)) = a.split_once('=') else { die(&format!("{a}: not name=file")) };
+        if name.is_empty() || name.len() > 255 {
+            die(&format!("{name}: a name is 1 to 255 bytes"));
+        }
+        let b = std::fs::read(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(&b);
+        println!("{name}: {} bytes from {file}", b.len());
+    }
+    std::fs::write(&args[0], &out).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    println!("{}: {} bytes", args[0], out.len());
 }
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        die("i2c | init | marks | cpu | pdma | pdma-image (see the source's header)");
+        die("i2c | init | marks | cpu | pdma | pdma-image | cinp (see the source's header)");
     }
     let cmd = args.remove(0);
     match cmd.as_str() {
@@ -576,6 +609,7 @@ fn main() {
         "cpu" => cmd_cpu(args),
         "pdma" => cmd_pdma(args),
         "pdma-image" => cmd_pdma_image(args),
+        "cinp" => cmd_cinp(args),
         _ => die(&format!("unknown command {cmd}")),
     }
 }

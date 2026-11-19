@@ -1022,6 +1022,46 @@ static FULL_INPUT: AtomicU64 = AtomicU64::new(0);
 /// Where the spawn's input carries the 1:1 init: after 16 knob bytes, framed as ferros-bridge's `--input-file` frames a file (u32 LE length, then the bytes): `spawn camera.bin 01000000000000000000000000000000 --input-file target/cam/main-full.init`.
 const FULL_INPUT_AT: u64 = 1 << 4;
 
+/// A device test with nothing stored (2026-11-18, the 8a's cameras): any of the driver's inputs, carried by the hand spawn's input after its 16 knob bytes as one 'CINP' set (framed as `--input-file` frames a file), looked up by name before the vault (`get`, `has`).
+/// The set: 'CINP', then entries of a name's length (u8), the name as the vault spells it without `cam.` (`oksoko.init`), a length (u32 LE) and the bytes; tools/cam-oracle `cinp` writes one.
+static mut SPAWN_INPUTS: [u8; 1 << 17] = [0; 1 << 17];
+/// `SPAWN_INPUTS`'s length when the spawn carried a set; 0 none.
+static SPAWN_INPUTS_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// The spawn's input named `key`, when the spawn carried a 'CINP' set holding it.
+fn spawn_input(key: &[u8]) -> Option<&'static [u8]> {
+    let n = SPAWN_INPUTS_LEN.load(Ordering::Relaxed) as usize;
+    if n == 0 {
+        return None;
+    }
+    let b = unsafe { &(&*(&raw const SPAWN_INPUTS))[..n] };
+    let mut i = 4;
+    // WHY the checked reads: the set is the host's bytes, so a length that runs past the set ends the walk instead of reading past it.
+    while i < n {
+        let kl = *b.get(i)? as usize;
+        let k = b.get(i + 1..i + 1 + kl)?;
+        let l = u32::from_le_bytes(b.get(i + 1 + kl..i + 5 + kl)?.try_into().ok()?) as usize;
+        let v = b.get(i + 5 + kl..i + 5 + kl + l)?;
+        if k == key {
+            return Some(v);
+        }
+        i += 5 + kl + l;
+    }
+    None
+}
+
+/// Camera `c`'s job slots (ferros_cam job: each slot's bytes and the skip to its first output): the spawn's `<key>.slots` for a device test whose job is not the one the table was laid out from (2026-11-18, the 8a's main: the sizes and skips cam-oracle pdma-image prints, 32 of each, u64 LE), else the table's.
+fn slots_of(c: &Cam) -> ([u64; job::SLOTS], [u64; job::SLOTS]) {
+    let mut kb = [0u8; 32];
+    match spawn_input(input_key(&mut kb, c, b"slots")) {
+        Some(v) if v.len() == 2 * job::SLOTS * 8 => {
+            let w = |k: usize| u64::from_le_bytes(core::array::from_fn(|b| v[8 * k + b]));
+            (core::array::from_fn(w), core::array::from_fn(|k| w(job::SLOTS + k)))
+        }
+        _ => (c.sizes, c.skip),
+    }
+}
+
 /// Camera `c`'s 1:1 init: the spawn's (a device test, `FULL_INPUT`), else the vault's `cam.<key>.init.full`; None when neither.
 fn full_init(g: u64, c: &Cam) -> Option<&'static [u8]> {
     let n = FULL_INPUT.load(Ordering::Relaxed) as usize;
@@ -1077,6 +1117,15 @@ struct Open {
 }
 
 fn get<'a>(g: u64, key: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    // A device test's inputs first (`spawn_input`): the vault is never asked for a name the spawn carried.
+    if let Some(v) = spawn_input(key) {
+        if v.len() > buf.len() {
+            say!(g, "camera: the spawn's {} is A#{} bytes, past the A#{} this driver reads\n", core::str::from_utf8(key).unwrap_or("?"), v.len(), buf.len());
+            return None;
+        }
+        buf[..v.len()].copy_from_slice(v);
+        return Some(&buf[..v.len()]);
+    }
     match ferros_sys::store_get(cap(g, S_STORE), key, buf) {
         Some(n) if n <= buf.len() => Some(&buf[..n]),
         Some(n) => {
@@ -1149,7 +1198,7 @@ fn input_key<'a>(buf: &'a mut [u8; 32], c: &Cam, what: &[u8]) -> &'a [u8] {
 
 /// Whether the vault holds `key` (its length asked with a buffer of none: the kernel answers a value's whole length).
 fn has(g: u64, key: &[u8]) -> bool {
-    ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
+    spawn_input(key).is_some() || ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
 }
 
 /// Whether camera `c`'s inputs are in the vault: its IDT and its job, and its init and CPU program (the main's also as the bundle `cam.frame`, or by their older names).
@@ -1444,7 +1493,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The biggest ring first, under 4 GiB and then above it for each count: a ring of one gives no view, so a smaller ring under 4 GiB is not worth more than a bigger one above it (the Pro, b898: the low ranges held a ring of one, and the bench's open came back without a view).
     'ask: for &n in rings.iter() {
         for low in [low_first, !low_first] {
-            let l = job::with_image(&c.sizes, &c.skip, n as u64 * buf);
+            let (sizes, skip) = slots_of(c);
+            let l = job::with_image(&sizes, &skip, n as u64 * buf);
             let (f, sl) = copies(n);
             let frames = l.bytes / job::FRAME + engine_bytes(f, sl).div_ceil(job::FRAME);
             let pa = ask(frames, low);
@@ -2349,8 +2399,19 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > FULL_INPUT_AT + 4 {
         let at = ferros_sys::arc_base() + input + FULL_INPUT_AT;
         let n = u32::from_le_bytes(core::array::from_fn(|k| unsafe { core::ptr::read_volatile((at + k as u64) as *const u8) })) as u64;
-        // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `FULL` would write past it.
-        if FULL_INPUT_AT + 4 + n == input_len && n as usize <= VALUE {
+        let byte = |k: u64| unsafe { core::ptr::read_volatile((at + 4 + k) as *const u8) };
+        let cinp = n >= 4 && (0..4).all(|k| byte(k) == b"CINP"[k as usize]);
+        // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `SPAWN_INPUTS` or `FULL` would write past it.
+        if cinp && FULL_INPUT_AT + 4 + n == input_len && n as usize <= 1 << 17 {
+            let set = unsafe { &mut *(&raw mut SPAWN_INPUTS) };
+            for k in 0..n as usize {
+                set[k] = byte(k as u64);
+            }
+            SPAWN_INPUTS_LEN.store(n, Ordering::Relaxed);
+            say!(g, "camera: the spawn's inputs, A#{n} bytes (a device test: each name it holds read in place of the vault's)\n");
+        } else if cinp {
+            say!(g, "camera: the spawn's 'CINP' set is not framed as asked (A#{} bytes after the knobs, A#{n} said) or past A#{} bytes; ignored\n", input_len - FULL_INPUT_AT, 1u64 << 17);
+        } else if FULL_INPUT_AT + 4 + n == input_len && n as usize <= VALUE {
             let full = unsafe { &mut *(&raw mut FULL) };
             for k in 0..n as usize {
                 full[k] = unsafe { core::ptr::read_volatile((at + 4 + k as u64) as *const u8) };
@@ -2468,7 +2529,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 reply(&token, &list(g));
             }
             1 => {
-                let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams) } else { None };
+                // A camera not yet streaming (akita's, 2026-11-18) opens only for a device test whose spawn carried its init (`spawn_input`).
+                let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams || spawn_input(input_key(&mut [0u8; 32], c, b"init")).is_some()) } else { None };
                 // Held by a holder whose process has ended, on a kernel that does not watch ends (`WATCHED` 0): its held call's caller is gone (`caller_alive`), so its stream is closed now and this open is answered 3, to be asked of a driver started fresh (the frame thread here ended with that stream).
                 if let (true, Some(p)) = (open_cam.is_some() && WATCHED.load(Ordering::Relaxed) == 0, pending.as_ref()) {
                     if ferros_sys::caller_alive(&p.token) == Some(false) {
