@@ -537,3 +537,33 @@ Also seen that boot: the kernel's own `gps` start on a claim ran the Pro's drive
 1. **gnssd's boot of the core, traced whole** (`tools/akita-gnss-trace.sh build`, then `run` from Android on slot a with root, then `decode`): gnssd stopped, the core held in reset with gnssd's own G#0203, gnssd run again under gtrace, a Maps session to a fix. It logs every command and answer on `/dev/gnss_boot` with its bytes, the image ioctl's struct, and the whole CHPP session on `/dev/gnss_ipc` (no lost lines, unlike the hv's captures). No flashing, no slot change, nothing on ferros's side. **No hands needed:** the 8a only has to be in Android with Magisk's Shell grant, as it was on 2026-11-18. Not run yet: the 8a was the camera session's.
 2. **The modem process sends them** (payloads/modem): channel 240 on its SIT link, kepler.bin (in vendor_b, 1026920 bytes on the 8a's build; stored in the vault beside the CP's images) copied into GNSS_FW, then the commands in gnssd's order with their answers checked. Then this driver runs as it is.
 3. Aiding (time and place into the chip) once the trace shows the messages: the captured session sent none.
+
+## The 8a's first fix under ferros (2026-11-19, later)
+
+**The core booted by ferros.** The modem driver carries gnss_boot (SIT channel A#240) on its RAW rings and copies into GNSS_FW for the GPS driver: rmnet op G#10 sends a command and holds the call for the CP's answer (2 s, gnssd's own wait), op G#11 writes bytes at an offset of GNSS_FW, through a fourth modem window `modem-gnss` (G#EAC0_0000, 4 MiB: cp_rmem's tail could not join the IPC window and stay a power of two). gnss_kepler boots the core in gnssd's order, from the vault (`gps.kepler` = kepler.bin, `gps.kepler.cfg` = the 912-byte chip configuration gnssd builds from it and gps.cfg, both from the trace, keys/ and the device only):
+
+| Step | Command (bytes) | Answer |
+|---|---|---|
+| boot count | `01 02` | `01 05 00` count u32 |
+| BLC | `09 0e 00 00 02 01` + 8 zeros | `09 05 …` (status G#01 on a cold CP, else 0) |
+| reset held, released | `03 02`, `04 02` | `03 01 00`, `04 01 00` |
+| boot count | `01 02` | count + 1 |
+| kepler.bin | written at GNSS_FW + 0, then `05 0e` type 0, offset 0, size | `05 01 00` |
+| configuration | written at GNSS_FW + 0, then `05 0e` type 4, offset 0, size A#912 | `05 01 00` |
+| start | `09 0e 20 00 02 00 01 00 00 60` + 4 zeros (entry G#6000_0001) | `09 05 00 …` |
+
+On the 8a: the whole boot in 90 to 700 ms (the first after the CP's own boot answers its BLC slower), then CHPP's reset, discovery, time and open at once, provided the AP's sends are some 4 ms apart (a payload right after a bare ack is dropped until its resend a second later).
+
+**What the session needs (the HAL-connected trace).** gnssd under gtrace by hand never saw the location HAL, and the chip then sent two records and stopped; gtrace now attaches (`-p`) to the gnssd init starts, which the HAL connects to (`tools/akita-gnss-trace.sh run`, ATTACH=1; keys/akita/captures-2026-11-19/attach). Android then fixed 8 s after Maps opened, from a core freshly loaded. gnssd's records, in order: G#00E4 (a zero, 51 ones), G#08AD (the chip state it keeps in /data/vendor/gps/NVM99), G#0D46, G#09D3, then for Maps G#FF84, G#10DE, G#0465, G#12DE, G#01D7 (the place aid), G#0CD3, G#02D7 (the time aid), G#0D46, G#04D4, and more aids each second (and G#3348, the sensors' stream). gnss-oracle `GNSS_REPLAY_OUT` writes them as a script (word u32, length u16, bytes) that gnss_kepler plays from the vault (`gps.kepler.session`, keys/ and the device only: it carries the place aid and the chip's state), up to gnssd's second G#0465.
+- **The time aid G#02D7** (A#23 bytes): the chip's clock in µs (u64) at the instant the aid holds, the GPS week u16, the time of week in µs as a u64 written high word first, its uncertainty in µs u32 (2.4 s, then 1.8 s), a flag. Read from four aids against the chip's own G#0446 (week u16 at +1, time of week u32 s at +3).
+- **The stamp**: G#02D7, G#0D46 and G#01D7 begin with the chip's clock in µs, which the AP knows from CHPP's timesync (0.91 s after the open for the first G#0D46, 16.4 s as Maps opened). The driver writes the chip's clock now (timesync's answer plus the counter since) and the GPS time now (the wall clock + 18 s) into the played aids.
+- Played stale (the trace's stamps and time), the chip heard one or two satellites at 18 to 22 dB-Hz for ten minutes; with the time alone made live, none; with the stamps live too, four to five at 25 to 36 dB-Hz.
+
+**Result (b278, indoors, this branch's kernel in RAM, the modem and the driver hand-spawned, the driver named `kepler` so the kernel's claim keeper leaves it alone):** first fix 422 s after power-up, ±242 m, then ±91 m a minute later; satellites GPS 4 and 9 and a third at 36 dB-Hz. Android at the same spot, same core freshly loaded: 8 s.
+
+**The line's storm:** gpa5-3's interrupt fires some 250 times a second with the line low (as on the Pro, "No fix, 2026-11-18"); reading on every interrupt (rx_work's do-while) pulsed AP to GNSS at the chip as often. The driver reads only while the line stands (input bit 1 brings the do-while back). The storm itself is still open.
+
+**Open:**
+- The aids: G#01D7 (the place) is the trace's; the driver should build it from the rough place and the last fix (its layout not decoded yet), and G#08AD should be the chip's own state kept by ferros (the chip sends it, gnssd stores it). The sensors' stream G#3348 is not sent. These are the likely gap to Android's 8 s.
+- Kernel and init: the modem's `modem-gnss` window and the gps grants' `rmnet` need init's list (its page is full) and a flashed kernel; the vault's `gps` capsule on the 8a is still the Pro's driver, so the claim keeper starts that; until then the 8a's GPS runs hand-spawned.
+- SATS (op 2) sends ferros's system numbers where gpstest expects the BCM's.

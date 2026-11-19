@@ -176,6 +176,15 @@ extern "C" fn entry(sp: *const u64) -> ! {
     }
     let mut out = Out { fd: fd as u64, buf: [0; 8192], n: 0 };
 
+    // `-p <pid>`: attach to a running program (every thread, its open files read from /proc) instead of starting one; at the end the tracer just exits, and the program runs on untraced. For a daemon started by init in its own domain, which a spawned copy cannot stand in for (gnssd's HAL connects only to init's).
+    if arg(3) == b"-p" && argc >= 5 {
+        let mut pid: i64 = 0;
+        for &c in arg(4) {
+            pid = pid * 10 + (c - b'0') as i64;
+        }
+        attach(pid, &mut out);
+        trace(pid, secs, false, &mut out);
+    }
     let child = sys(CLONE, 17, 0, 0, 0);
     if child == 0 {
         sys(PTRACE, PT_TRACEME, 0, 0, 0);
@@ -190,13 +199,111 @@ extern "C" fn entry(sp: *const u64) -> ! {
     sys(PTRACE, PT_SETOPTIONS, child as u64, 0, 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x10_0000);
     sys(PTRACE, PT_SYSCALL, child as u64, 0, 0);
     slot(child);
+    trace(child, secs, true, &mut out);
+}
+
+/// Decimal digits of `v` after `pre` into `out`, NUL-terminated; the length without the NUL.
+fn path_num(out: &mut [u8], pre: &[u8], v: i64, post: &[u8]) -> usize {
+    out[..pre.len()].copy_from_slice(pre);
+    let mut n = pre.len();
+    let mut d = [0u8; 20];
+    let (mut u, mut i) = (v as u64, 20);
+    loop {
+        i -= 1;
+        d[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    out[n..n + 20 - i].copy_from_slice(&d[i..]);
+    n += 20 - i;
+    out[n..n + post.len()].copy_from_slice(post);
+    n += post.len();
+    out[n] = 0;
+    n
+}
+
+/// Every thread of `pid` seized (PTRACE_SEIZE with the options, then PTRACE_INTERRUPT: the loop takes its stop and goes on by syscall), and its open files' paths read from /proc/<pid>/fd, so calls on files opened before the attach are told by path too.
+fn attach(pid: i64, out: &mut Out) {
+    const SEIZE: u64 = 0x4206;
+    const INTERRUPT: u64 = 0x4207;
+    const GETDENTS64: u64 = 61;
+    const READLINKAT: u64 = 78;
+    let mut p = [0u8; 64];
+    path_num(&mut p, b"/proc/", pid, b"/task");
+    let dfd = sys(OPENAT, (-100i64) as u64, p.as_ptr() as u64, 0x4000, 0);
+    let mut buf = [0u8; 4096];
+    let mut n_threads = 0;
+    // The last refused seize's answer (a negative errno), 0 when none was.
+    let mut refused: i64 = 0;
+    if dfd >= 0 {
+        loop {
+            let n = sys(GETDENTS64, dfd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
+            if n <= 0 {
+                break;
+            }
+            let mut o = 0usize;
+            while o < n as usize {
+                let reclen = u16::from_le_bytes([buf[o + 16], buf[o + 17]]) as usize;
+                let name = &buf[o + 19..o + reclen];
+                let l = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                if l > 0 && name[0] != b'.' {
+                    let mut tid: i64 = 0;
+                    for &c in &name[..l] {
+                        tid = tid * 10 + (c - b'0') as i64;
+                    }
+                    // TRACESYSGOOD | TRACEFORK | TRACEVFORK | TRACECLONE | TRACEEXEC
+                    let r = sys(PTRACE, SEIZE, tid as u64, 0, 0x1 | 0x2 | 0x4 | 0x8 | 0x10);
+                    if r != 0 {
+                        refused = r;
+                    }
+                    if r == 0 {
+                        sys(PTRACE, INTERRUPT, tid as u64, 0, 0);
+                        slot(tid);
+                        n_threads += 1;
+                    }
+                }
+                o += reclen;
+            }
+        }
+        sys(CLOSE, dfd as u64, 0, 0, 0);
+    }
+    for fd in 0..256i64 {
+        let mut q = [0u8; 64];
+        path_num(&mut q, b"/proc/", pid, b"/fd/");
+        let l = q.iter().position(|&c| c == 0).unwrap_or(0);
+        let mut r = [0u8; 64];
+        let k = path_num(&mut r, &q[..l], fd, b"");
+        let mut lp = [0u8; 96];
+        let got = sys(READLINKAT, (-100i64) as u64, r[..k + 1].as_ptr() as u64, lp.as_mut_ptr() as u64, 95);
+        if got > 0 {
+            unsafe { (*(&raw mut PATHS))[fd as usize] = (lp, got as usize) };
+        }
+    }
+    out.b(b"# attached to ");
+    out.dec(pid);
+    out.b(b", threads ");
+    out.dec(n_threads);
+    out.b(b", task dir fd ");
+    out.dec(dfd);
+    out.b(b", last refusal ");
+    out.dec(refused);
+    out.b(b"\n");
+}
+
+/// The trace itself, until `secs` pass or the program ends: every thread's calls on the chip's files logged. `kill`: the program started here is killed at the end; an attached one is left to run (the tracer's exit detaches it).
+fn trace(child: i64, secs: i64, kill: bool, out: &mut Out) -> ! {
+    let mut st: i32 = 0;
     let t_end = now_ns() + secs * 1_000_000_000;
     out.b(b"# gtrace started\n");
     loop {
         if now_ns() > t_end {
             out.b(b"# time up\n");
             out.flush();
-            sys(KILL, child as u64, 9, 0, 0);
+            if kill {
+                sys(KILL, child as u64, 9, 0, 0);
+            }
             exit(0);
         }
         let tid = sys(WAIT4, (-1i64) as u64, &mut st as *mut i32 as u64, 0x4000_0000, 0);

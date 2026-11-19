@@ -206,6 +206,8 @@ enum Phase {
     /// After a core the CP freshly started: gnssd's two first records (ferros_kepler `AP_FRESH_00E4`, `AP_FRESH_08AD`).
     Fresh0,
     Fresh1,
+    /// gnssd's own session as traced with the location HAL connected (the vault's `gps.kepler.session`: each record `word u32, length u16, bytes`, gnss-oracle GNSS_REPLAY_OUT), played a record at a time, each acked, up to its second G#0465 (where gnssd asked again).
+    Script,
     SessionOpen,
     SessionAsk,
     Running,
@@ -259,6 +261,8 @@ struct State {
     grams: u32,
     chip_errs: u32,
     chip_time_ns: u64,
+    /// The counter when the chip's time came: its clock now is `chip_time_ns` plus the counter since.
+    chip_time_at: u64,
     fixes: u32,
     fix: Fix,
     fix_at: u64,
@@ -274,6 +278,58 @@ struct State {
     fresh: bool,
     /// Input bit 7: the first packets each way said by their header.
     trace: bool,
+    /// gnssd's traced session (`Phase::Script`): the records, where the next starts, where the play ends, how many went.
+    script: alloc::vec::Vec<u8>,
+    script_at: usize,
+    script_end: usize,
+    script_sent: u32,
+}
+
+/// GPS time now from the wall clock in the preferences block (payloads/gps `gps_ms_now`): milliseconds since 1980-01-06, UTC + 18 leap seconds; None before the kernel has the time.
+fn gps_ms_now() -> Option<u64> {
+    let base = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + ferros_sys::PREFS + 16) as *const u64) };
+    if base == 0 {
+        return None;
+    }
+    let (f, t) = (freq(), base.wrapping_add(now()));
+    Some((t / f * 1000 + t % f * 1000 / f).checked_sub(315_964_800_000)? + 18_000)
+}
+
+/// The script's record at `script_at`: its word, where its bytes start, their length; None at the play's end.
+fn script_record(s: &State) -> Option<(u32, usize, usize)> {
+    let b = &s.script;
+    let at = s.script_at;
+    if at + 6 > s.script_end {
+        return None;
+    }
+    let word = u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let len = u16::from_le_bytes([b[at + 4], b[at + 5]]) as usize;
+    // WHY the check: the lengths are the vault's; a record running past the blob ends the play.
+    if at + 6 + len > s.script_end {
+        return None;
+    }
+    Some((word, at + 6, len))
+}
+
+fn script_next(s: &State) -> usize {
+    script_record(s).map_or(s.script_end, |(_, at, len)| at + len)
+}
+
+/// Where the play ends: the second G#0465 record (gnssd asked again there, with Maps' close not far after), else the blob's end.
+fn script_end(b: &[u8]) -> usize {
+    let (mut at, mut seen) = (0usize, 0u32);
+    while at + 6 <= b.len() {
+        let w = u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let len = u16::from_le_bytes([b[at + 4], b[at + 5]]) as usize;
+        if w & 0xFFFF == 0x0465 {
+            seen += 1;
+            if seen == 2 {
+                return at;
+            }
+        }
+        at += 6 + len;
+    }
+    b.len().min(at)
 }
 
 /// Every packet the scanner holds, through the link and the datagram, into the state.
@@ -343,6 +399,7 @@ fn drain(g: u64, sc: &mut Scan, dg: &mut Gram, s: &mut State) {
                     s.answered = true;
                     if b.len() >= kp::App::LEN + 8 {
                         s.chip_time_ns = u64::from_le_bytes(b[kp::App::LEN..kp::App::LEN + 8].try_into().unwrap());
+                        s.chip_time_at = now();
                     }
                 }
             }
@@ -618,6 +675,34 @@ fn step_send(g: u64, io: &mut Io, s: &mut State) {
         Phase::Start => kp::ap_datagram(&[kp::AP_START], &mut payload),
         Phase::Fresh0 => kp::ap_datagram(&[kp::ApRecord { word: kp::AP_FRESH_00E4_WORD, data: &kp::AP_FRESH_00E4 }], &mut payload),
         Phase::Fresh1 => kp::ap_datagram(&[kp::ApRecord { word: kp::AP_FRESH_08AD_WORD, data: &kp::AP_FRESH_08AD }], &mut payload),
+        Phase::Script => match script_record(s) {
+            // WHY the bound: the record's length is the vault's; one past the payload buffer is not sent.
+            Some((word, at, len)) if len + 46 <= payload.len() => {
+                let mut data: alloc::vec::Vec<u8> = s.script[at..at + len].to_vec();
+                // The aids' stamp (G#02D7, G#0D46, G#01D7: their first u64) is the chip's own clock in µs at the moment the aid holds for, as the timesync gave it (the trace: 0.91 s after the open for the first G#0D46, 16.4 s as Maps opened), so the chip's clock now, not the trace's.
+                if matches!(word & 0xFFFF, 0x02D7 | 0x0D46 | 0x01D7) && len >= 8 && s.chip_time_at != 0 {
+                    let f = freq();
+                    let d = now().wrapping_sub(s.chip_time_at);
+                    let us = s.chip_time_ns / 1000 + d / f * 1_000_000 + d % f * 1_000_000 / f;
+                    data[0..8].copy_from_slice(&us.to_le_bytes());
+                }
+                // The time aid (G#02D7: the chip's stamp u64, the GPS week u16, the time of week in µs as a u64 high word first, its uncertainty in µs u32, a flag) given the clock's now, not the trace's.
+                if word & 0xFFFF == 0x02D7 && len >= 18 {
+                    if let Some(ms) = gps_ms_now() {
+                        let week = (ms / 604_800_000) as u16;
+                        let tow_us = (ms % 604_800_000) * 1000;
+                        data[8..10].copy_from_slice(&week.to_le_bytes());
+                        data[10..14].copy_from_slice(&((tow_us >> 32) as u32).to_le_bytes());
+                        data[14..18].copy_from_slice(&(tow_us as u32).to_le_bytes());
+                    }
+                }
+                if s.tries == 0 {
+                    s.script_sent += 1;
+                }
+                kp::ap_datagram(&[kp::ApRecord { word, data: &data }], &mut payload)
+            }
+            _ => return,
+        },
         Phase::SessionOpen => kp::ap_datagram(&[kp::AP_SESSION_OPEN], &mut payload),
         Phase::SessionAsk => kp::ap_datagram(&[kp::AP_SESSION_ASK], &mut payload),
         Phase::Reset => 0,
@@ -658,6 +743,16 @@ fn advance(g: u64, s: &mut State, link_only: bool) -> bool {
         Phase::Open if link_only => {
             say!(g, "gps: kepler: the link is open (input bit 4: no session started)\n");
             Phase::Idle
+        }
+        Phase::Open if !s.script.is_empty() => Phase::Script,
+        Phase::Script => {
+            s.script_at = script_next(s);
+            if script_record(s).is_some() {
+                Phase::Script
+            } else {
+                say!(g, "gps: kepler: gnssd's session played ({} records); now the chip's\n", s.script_sent);
+                Phase::Running
+            }
         }
         Phase::Open if s.fresh => Phase::Fresh0,
         Phase::Open => Phase::Start,
@@ -833,6 +928,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         grams: 0,
         chip_errs: 0,
         chip_time_ns: 0,
+        chip_time_at: 0,
         fixes: 0,
         fix: Fix::default(),
         fix_at: 0,
@@ -846,8 +942,31 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         kinds_over: 0,
         fresh: false,
         trace: input0 & 0x80 != 0,
+        script: alloc::vec::Vec::new(),
+        script_at: 0,
+        script_end: 0,
+        script_sent: 0,
     };
 
+    // gnssd's traced session, when the vault holds one (input bit 2 leaves it out): played after the open in place of Maps' two records.
+    let mut head = [0u8; 8];
+    if input0 & 0x04 == 0 {
+        if let Some(total) = ferros_sys::store_get_at(store, b"kepler.session", 0, &mut head) {
+            let mut b = alloc::vec![0u8; total];
+            let mut at = 0;
+            while at < total {
+                // WHY the min: a transfer carries at most STORE_MAX.
+                let k = (total - at).min(ferros_sys::STORE_MAX);
+                if ferros_sys::store_get_at(store, b"kepler.session", at, &mut b[at..at + k]).is_none() {
+                    break;
+                }
+                at += k;
+            }
+            s.script_end = script_end(&b);
+            s.script = b;
+            say!(g, "gps: kepler: gnssd's session in the vault: A#{} bytes, played to A#{}\n", total, s.script_end);
+        }
+    }
     // The predicted sky from the kept orbits and the rough place, before the chip says anything (payloads/gps).
     let last = read_last(store);
     let zone = ferros_sys::zone::place().map(|(la, lo)| ((la as i64 * (1 << 23) / 3600) as i32, (lo as i64 * (1 << 23) / 3600) as i32));
@@ -887,7 +1006,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             match core_boot(g) {
                 Ok(()) => {
                     booted = true;
-                    s.fresh = true;
+                    // Input bit 3: gnssd's fresh-boot records (G#00E4, G#08AD, as under gtrace with no HAL) in place of its start record G#7304 (as at an Android boot, the 2026-11-18 boot capture).
+                    s.fresh = input0 & 0x08 != 0;
                     say!(g, "gps: kepler: the core started by the CP after A#{} ms; the link next\n", now().wrapping_sub(t_all) * 1000 / f);
                 }
                 Err(why) => {
@@ -919,7 +1039,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 }
             }
         }
-        bytes += io.service(g, &mut s, core::mem::take(&mut fired));
+        // Input bit 1: a read on every interrupt whatever the line says (gnss_link_device.c's do-while). Off by default: the line's interrupt fires some 250 times a second with the line low (the 8a, 2026-11-19, as on the Pro: GPS.md "No fix, 2026-11-18"), and a read each time pulsed AP to GNSS at the chip as often.
+        bytes += io.service(g, &mut s, core::mem::take(&mut fired) && input0 & 0x02 != 0);
         while advance(g, &mut s, link_only) {
             if !matches!(s.phase, Phase::Running | Phase::Idle | Phase::Dead) {
                 step_send(g, &mut io, &mut s);

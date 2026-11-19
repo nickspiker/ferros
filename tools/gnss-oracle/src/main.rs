@@ -240,6 +240,17 @@ fn betp_lines(stream: &[Vec<u8>; 2], owner: &[Vec<usize>; 2], show: usize, lines
                         line += &format!(" | {}", hex(&data[..show.min(data.len())]));
                     }
                     lines.push((at, 2, line));
+                    // GNSS_REPLAY_OUT=<file>: the AP's records in order, each `word u32, length u16, bytes` (little-endian), for the driver to play (gnss_kepler `gps.kepler.session`); G#3348 (the sensors' stream) left out. The file carries what gnssd told the chip, the place among it: keys/ and the device's vault only.
+                    if let Ok(p) = std::env::var("GNSS_REPLAY_OUT") {
+                        if word & 0xFFFF != 0x3348 {
+                            use std::io::Write;
+                            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).expect("open GNSS_REPLAY_OUT");
+                            let mut rec = word.to_le_bytes().to_vec();
+                            rec.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                            rec.extend_from_slice(data);
+                            f.write_all(&rec).expect("write GNSS_REPLAY_OUT");
+                        }
+                    }
                     let e = tally.entry((dir.name(), word)).or_insert((0, 0, usize::MAX, 0));
                     e.0 += 1;
                     e.1 += len as u64;

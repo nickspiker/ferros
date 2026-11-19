@@ -58,7 +58,12 @@ cmd_run() {
         sleep 1
     fi
     say "gnssd under gtrace for $SECS s"
-    A shell "su -c '$D/gtrace $D/gnssd.trace $SECS /vendor/bin/hw/gnssd'" >/dev/null 2>&1 &
+    if [ "${ATTACH:-1}" = 1 ]; then
+        # gnssd started by init as always (its own domain and user, so the location HAL connects to it), gtrace attached the moment it has a pid: what gnssd sends once the HAL is there, which a gnssd run by hand under gtrace never saw (2026-11-19).
+        A shell "su -c 'setprop ctl.start gnssd; until pidof gnssd >/dev/null; do :; done; $D/gtrace $D/gnssd.trace $SECS -p \$(pidof gnssd)'" >/dev/null 2>&1 &
+    else
+        A shell "su -c '$D/gtrace $D/gnssd.trace $SECS /vendor/bin/hw/gnssd'" >/dev/null 2>&1 &
+    fi
     local tr=$!
     sleep 16
     local e0 e k=0
