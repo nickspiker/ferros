@@ -425,6 +425,8 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
             let (modes, widest) = group.fold((0u32, 0u32), |(n, w), o| (n + 1, w.max(o.width)));
             // The camera's first readout (its binned one, `list` sorts by mode): a readout of more samples is its maximum resolution (Android's max_res); one of the same or fewer (the tele's 11 degrees, the front's 8.4 MP) is another mode of the lens, not that.
             let base = cameras.iter().find(|o| o.id == c.id).map_or(0, |o| o.width as u64 * o.height as u64);
+            // A readout imaging less of the sensor than the camera's widest field is a crop (the tele's 11 degrees, the front's 8.4 MP), as Android's Lumis marks one; a driver before the fields gives none, and nothing is.
+            let widest_field = cameras.iter().filter(|o| o.id == c.id).fold(0f32, |w, o| w.max(o.field_mm.0));
             let Some(bayer) = camera::bayer_pattern(c.cfa) else {
                 println!("lumis: camera {} has a colour filter Lumis does not read (G#{:02X}); left out", c.name, c.cfa);
                 return None;
@@ -457,7 +459,8 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 mode_count: if first { modes } else { 1 },
                 group_id: c.id as i32,
                 max_res: c.width as u64 * c.height as u64 > base,
-                is_cropped: false,
+                is_cropped: c.field_mm.0 > 0. && c.field_mm.0 < widest_field,
+                fov_diagonal: c.fov_diagonal_deg,
                 has_cal: false,
             })
         })
