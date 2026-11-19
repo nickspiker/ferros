@@ -183,9 +183,11 @@ enum Said {
 }
 
 /// The picker's state, the main loop's: the list as last taken, the network picked, the forget armed, what the page says.
+/// The list and its next copy are on the heap, never in the struct: the Map lives in payload_main's frame on the 64 KiB main stack, and a 4 KiB list there (with a 4 KiB copy of COPY in `pass`) grew that frame from 28 to 36 KiB, so the WiFi page's draw (draw_page, the link's detail parsed) ran past the stack's end: the map faulted in the guard page the first time the page opened (the 8a, 2026-11-18, b249: FAR = sp, in SectionBuilder::parse_document's stack probe).
 pub struct Picker {
-    list: [u8; LIST],
-    len: usize,
+    list: Vec<u8>,
+    /// The watch's list copied here first, then swapped in once its sequence count held.
+    next: Vec<u8>,
     seen: u32,
     pick: Option<Name>,
     armed: Option<Name>,
@@ -198,7 +200,7 @@ pub struct Picker {
 
 impl Picker {
     pub fn new() -> Picker {
-        Picker { list: [0; LIST], len: 0, seen: 0, pick: None, armed: None, said: Said::Nothing, shown: false, done_seen: 0, asked: (0, 0, Name::of(&[])) }
+        Picker { list: Vec::with_capacity(LIST), next: Vec::with_capacity(LIST), seen: 0, pick: None, armed: None, said: Said::Nothing, shown: false, done_seen: 0, asked: (0, 0, Name::of(&[])) }
     }
 }
 
@@ -282,12 +284,14 @@ pub fn pass(map: &mut Map, page_shown: bool) -> bool {
     }
     let s0 = SEQ.load(Ordering::Acquire);
     if s0 != p.seen && s0 & 1 == 0 {
-        let (b, n) = unsafe { *(&raw const COPY) };
+        // Read thru a reference into the heap copy, never copied whole onto the main stack (Picker's note).
+        let c = unsafe { &*(&raw const COPY) };
+        p.next.clear();
+        p.next.extend_from_slice(&c.0[..c.1]);
         if SEQ.load(Ordering::Acquire) == s0 {
             p.seen = s0;
-            if (n, &b[..n]) != (p.len, &p.list[..p.len]) {
-                p.list[..n].copy_from_slice(&b[..n]);
-                p.len = n;
+            if p.next != p.list {
+                core::mem::swap(&mut p.list, &mut p.next);
                 dirty = true;
             }
         }
@@ -321,7 +325,7 @@ impl Map {
     /// A tap on the picker.
     pub(super) fn wifi_tap(&mut self, act: Act) {
         let p = &self.wifi;
-        let parsed = parse(&p.list[..p.len]);
+        let parsed = parse(&p.list);
         let (nets, kept) = parsed.map(|(_, n, k)| (n, k)).unwrap_or_default();
         let away: Vec<&Kept> = kept.iter().filter(|k| !nets.iter().any(|n| n.name == k.name)).collect();
         let p = &mut self.wifi;
@@ -521,8 +525,8 @@ impl Map {
         if let Some(l) = said {
             words(b, y, white(), l.as_str());
         }
-        let Some((scanning, nets, kept)) = parse(&self.wifi.list[..self.wifi.len]) else {
-            words(b, y, white(), tr(if self.wifi.len == 0 { Msg::WifiStarting } else { Msg::NoNetworkList }));
+        let Some((scanning, nets, kept)) = parse(&self.wifi.list) else {
+            words(b, y, white(), tr(if self.wifi.list.is_empty() { Msg::WifiStarting } else { Msg::NoNetworkList }));
             return;
         };
         if nets.is_empty() {
