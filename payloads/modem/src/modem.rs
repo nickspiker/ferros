@@ -3194,6 +3194,11 @@ impl Online {
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
             self.per_ch[ch as usize] += 1;
+            // The CP's answers about the GNSS core (channel 240) to the GPS driver's waiting command.
+            if name == "raw" && ch == CH_GNSS_BOOT {
+                let body: Vec<u8> = (12..flen).map(|i| at(i)).collect();
+                gnss_answer(rep, since_us(t0) / 1000, &body);
+            }
             // The radio's setup opens on the CP's first frame (`cp_spoke`), the rest of it on the CP's answers (`ril_step`).
             if probe >= 1 && !self.probed {
                 self.cp_spoke(rep);
@@ -3585,7 +3590,15 @@ pub fn ring_wait(seen: u64) {
 
 /// When the service's next timed action is due, in counter ticks, 0 for none (nothing timed, or no service): the link down 30 ms after the CP's wakeup line fell with nothing to send (Android's cp2ap_suspend_work), the registration asked (every 5 s until the data stack is home, then the 64 s backstop), the data call set up again after a refusal, the radio back on half a second after a re-register's off, and while the screen is on the signal asked every 2 s and the tracks published every 2 s. Nothing else is timed: the CP's frames and packets ring the MSI, its wish for the link CP2AP_WAKEUP, the screen and the knobs the kernel's word wake.
 pub fn next_deadline() -> u64 {
-    crate::hw::locked(|| unsafe { (*(&raw const ONLINE)).as_ref().map_or(0, |o| o.next_deadline()) })
+    crate::hw::locked(|| {
+        let s = unsafe { (*(&raw const ONLINE)).as_ref().map_or(0, |o| o.next_deadline()) };
+        // A GNSS command's 2 s as well, the earlier of the two (0 is none).
+        match (s, gnss_due()) {
+            (0, g) => g,
+            (s, 0) => s,
+            (s, g) => s.min(g),
+        }
+    })
 }
 
 /// The CP's MSI line re-armed: block 0's vectors (the CP's four) enabled and unmasked, its status cleared (write 1 to clear), so the next MSI raises SPI 416 again (pcie-exynos-rc.c, separated MSI: block k on SPI 416 + k). Not while the link is down: the controller's PHY is off with it, and no MSI can come (CP2AP_WAKEUP says when it wants the link back). True when armed.
@@ -3652,6 +3665,7 @@ fn watch_answer_locked() {
 /// After each service pass (main.rs): the held WATCH answered if packets wait or the call changed.
 pub fn watch_poke() {
     crate::hw::locked(watch_answer_locked);
+    crate::hw::locked(gnss_expire_locked);
 }
 
 /// One service pass, from the kernel's service loop (not under the kernel lock; it takes it). Its log lines go to the flash log; a CP that gave up ends the service.
@@ -3739,6 +3753,8 @@ fn ul_shape(p: &[u8], down: bool) -> alloc::string::String {
 /// - 2 RECV: → the oldest DL packet of the call, or nothing (length 0).
 /// - 3 INFO: → flags (bit 0 the call is up, bit 1 it has IPv4, bit 2 IPv6), MTU (u16 BE), IPv4 address (4), IPv6 address (16), the first DNS server's IPv4 (4) and IPv6 (16) — 43 bytes.
 /// - 9 WATCH: held until DL packets wait or the call's state changes (`WATCH`) → [1]; [0] when a newer WATCH replaces it.
+/// - G#10 GNSS command (the 8a): the bytes after the op to the CP on gnss_boot (channel 240) → the CP's answer, held until it comes, empty after 2 s or when not up (`gnss_command`).
+/// - G#11 GNSS write: `offset u32` then bytes into GNSS_FW (the `modem-gnss` window at slot 26) → [0], [1] without the window, [3] past it (`gnss_write`).
 /// Returns the reply, or None for a held WATCH (its token kept; the caller does not reply).
 pub fn rmnet_call(req: &[u8], tok: &[u8; 32]) -> Option<Vec<u8>> {
     // STATE and DOWN take the lock themselves; RESTART only asks the main thread; the rest touch the call under it.
@@ -3756,6 +3772,9 @@ pub fn rmnet_call(req: &[u8], tok: &[u8; 32]) -> Option<Vec<u8>> {
             state(&mut r);
             Some(r)
         }
+        // GNSS (the 8a, GPS.md "The core is the CP's"): G#10 a command on gnss_boot, held for the CP's answer; G#11 bytes into GNSS_FW.
+        Some(0x10) => crate::hw::locked(|| gnss_command(req, tok)),
+        Some(0x11) => Some(crate::hw::locked(|| gnss_write(req))),
         // DOWN: one shot (owner, 2026-11-08): this process ends with no teardown of its own; the CP stays as it was (the modem has no kernel power switch yet; the `off` mode powers it down on purpose).
         Some(5) => ferros_sys::exit(0),
         Some(7) => {
@@ -3829,4 +3848,95 @@ fn rmnet_locked(req: &[u8]) -> Vec<u8> {
         }
         _ => alloc::vec![3],
     }
+}
+
+// The 8a's GNSS core (docs/GPS.md "The core is the CP's"): the KEPLER is a core of this modem, and the CP powers it, resets it and loads its firmware when the AP asks on SIT channel 240 (cpif's `gnss_boot` io device, IPC_RAW: the RAW rings), as gnssd does thru /dev/gnss_boot.
+// The driver passes the GPS driver's commands thru and copies the images into cp_rmem's GNSS_FW for it (rmnet ops G#10 and G#11); the order and the bytes are the GPS driver's (payloads/gnss_kepler, from gnssd's trace).
+
+/// `EXYNOS_CH_ID_GNSS_BOOT`.
+const CH_GNSS_BOOT: u8 = 240;
+/// The `modem-gnss` window's grant slot (GNSS_FW, G#EAC0_0000, 4 MiB): after `cell` (25), granted by hand until init's list has room.
+const S_GNSS: u64 = 26;
+const GNSS_FW: u64 = 0xEAC0_0000;
+const GNSS_FW_LEN: u64 = 1 << 22;
+type GnssFw = ferros_sys::Handle<{ S_GNSS }>;
+/// A GNSS command waiting for the CP's answer: the caller's token, and when it is given up (2 s, gnssd's own wait in `pcie_send_message`): answered empty then.
+static mut GNSS_WAIT: Option<([u8; 32], u64)> = None;
+
+/// rmnet G#10: the command after the op byte to the CP on channel 240; the reply is the CP's answer on that channel (held until it comes), empty when the service is not up, the send failed, or 2 s passed. A newer command lets an older wait go, empty. Under the lock.
+fn gnss_command(req: &[u8], tok: &[u8; 32]) -> Option<Vec<u8>> {
+    let o = unsafe { (*(&raw mut ONLINE)).as_mut() }?;
+    let cmd = &req[1..];
+    // The caller's bytes: gnssd's commands are 2 or 14 bytes; anything empty or past one frame is refused, never sent.
+    if cmd.is_empty() || cmd.len() > SIT_FRAME_MAX - 12 {
+        return Some(Vec::new());
+    }
+    if let Err(e) = ring_send(&mut o.link, true, CH_GNSS_BOOT, cmd) {
+        crate::hw::log(&alloc::format!("gnss_boot: G#{:02X}{:02X} not sent: {e}", cmd.get(1).copied().unwrap_or(0), cmd[0]));
+        return Some(Vec::new());
+    }
+    let due = crate::hw::now() + 2 * crate::hw::freq();
+    if let Some((t, _)) = unsafe { (*(&raw mut GNSS_WAIT)).replace((*tok, due)) } {
+        ferros_sys::reply(&t, &[]);
+    }
+    // The service loop woken, so its wait takes the new deadline.
+    RUNG.fetch_add(1, core::sync::atomic::Ordering::Release);
+    ferros_sys::wake(&RUNG, 1);
+    None
+}
+
+/// A frame from the CP on channel 240: its payload to the waiting command, else logged (the CP's own word about the core). Under the lock.
+fn gnss_answer(rep: &mut Vec<u8>, t_ms: u64, body: &[u8]) {
+    match unsafe { (*(&raw mut GNSS_WAIT)).take() } {
+        Some((t, _)) => {
+            ferros_sys::reply(&t, body);
+        }
+        None => line(rep, alloc::format!("t={t_ms} ms: gnss_boot from the CP, nobody waiting: {}\n", hexs(&|i| body[i as usize], body.len().min(16) as u32))),
+    }
+}
+
+/// The waiting command given up once its 2 s are past (answered empty). Under the lock.
+fn gnss_expire_locked() {
+    if let Some((t, due)) = unsafe { *(&raw const GNSS_WAIT) } {
+        if crate::hw::now() > due {
+            unsafe { *(&raw mut GNSS_WAIT) = None };
+            ferros_sys::reply(&t, &[]);
+        }
+    }
+}
+
+/// When the waiting command is given up, 0 for none.
+fn gnss_due() -> u64 {
+    unsafe { (*(&raw const GNSS_WAIT)).map_or(0, |w| w.1 + 1) }
+}
+
+/// rmnet G#11: `offset u32` then bytes, copied into GNSS_FW from that offset (cpif's `IOCTL_LOAD_GNSS_IMAGE`, done by hand). → [0], [1] without the window's grant, [3] past the window.
+fn gnss_write(req: &[u8]) -> Vec<u8> {
+    // WHY the checks: the offset and length are the caller's; past GNSS_FW is the CP's IPC memory, and an absent grant is a slot that is no window.
+    if req.len() < 5 {
+        return alloc::vec![3];
+    }
+    if ferros_sys::dma(crate::hw::cap(S_GNSS)) != GNSS_FW {
+        return alloc::vec![1];
+    }
+    let off = u32::from_le_bytes([req[1], req[2], req[3], req[4]]) as u64;
+    let b = &req[5..];
+    if off + b.len() as u64 > GNSS_FW_LEN {
+        return alloc::vec![3];
+    }
+    // Whole 8-byte words where the offset allows (Device memory, one store a word), the rest a byte at a time.
+    let mut k = 0usize;
+    while k < b.len() && (off + k as u64) % 8 != 0 {
+        GnssFw::write8(off + k as u64, b[k]);
+        k += 1;
+    }
+    let words: Vec<u64> = b[k..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    GnssFw::write_words(off + k as u64, &words);
+    k += words.len() * 8;
+    while k < b.len() {
+        GnssFw::write8(off + k as u64, b[k]);
+        k += 1;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    alloc::vec![0]
 }

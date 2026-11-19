@@ -1,6 +1,6 @@
 //! gtrace: a freestanding ptrace syscall tracer for aarch64 Linux (Android, no libc, no NDK), for capturing what Broadcom's lhd says to the GPS chip.
 //! Usage: gtrace <out file> <seconds> <program> [args...]
-//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gnss, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl (cpif's GNSS image ioctls with their struct), as text lines:
+//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gnss, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl (cpif's GNSS image ioctls with their struct, each loaded image saved raw as `<out>.img<k>`), as text lines:
 //!   <monotonic ns> <tid> <call> fd=<fd> <path> ret=<ret> [<hex bytes>]
 //! After <seconds> it kills the program and exits.
 #![no_std]
@@ -133,6 +133,9 @@ fn interesting(path: &[u8]) -> bool {
 }
 
 static mut BIG: [u8; 1 << 17] = [0; 1 << 17];
+/// The log's path (NUL-terminated) and the GNSS images saved so far beside it.
+static mut OUT_PATH: [u8; 256] = [0; 256];
+static mut IMAGES: u32 = 0;
 static mut PATHS: [([u8; 96], usize); 256] = [([0; 96], 0); 256];
 /// Per traced thread: (tid, in a syscall, nr, x0, x1, x2).
 static mut TIDS: [(i64, bool, u64, u64, u64, u64); 128] = [(0, false, 0, 0, 0, 0); 128];
@@ -166,6 +169,7 @@ extern "C" fn entry(sp: *const u64) -> ! {
     let mut path = [0u8; 256];
     let o = arg(1);
     path[..o.len()].copy_from_slice(o);
+    unsafe { OUT_PATH = path };
     let fd = sys(OPENAT, (-100i64) as u64, path.as_ptr() as u64, 0x241, 0o644);
     if fd < 0 {
         exit(3);
@@ -306,6 +310,36 @@ extern "C" fn entry(sp: *const u64) -> ! {
                                     let n = peek(tid, a2, &mut st);
                                     out.b(b" struct=");
                                     out.hex(&st[..n]);
+                                    // The image itself, as the ioctl hands it to cpif: into `<out>.img<k>` beside the log (k = 0, 1, … in order), its bytes raw.
+                                    if a1 == 0x4010_6F41 && n == 16 {
+                                        let size = u32::from_le_bytes([st[0], st[1], st[2], st[3]]) as usize;
+                                        let ptr = u64::from_le_bytes([st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]]);
+                                        let k = unsafe { IMAGES };
+                                        unsafe { IMAGES += 1 };
+                                        let mut p = [0u8; 256];
+                                        let o = unsafe { OUT_PATH };
+                                        let l = o.iter().position(|&c| c == 0).unwrap_or(0);
+                                        p[..l].copy_from_slice(&o[..l]);
+                                        p[l..l + 4].copy_from_slice(b".img");
+                                        p[l + 4] = b'0' + (k % 10) as u8;
+                                        let fd = sys(OPENAT, (-100i64) as u64, p.as_ptr() as u64, 0x241, 0o644);
+                                        let big = unsafe { &mut *(&raw mut BIG) };
+                                        let mut done = 0;
+                                        while fd >= 0 && done < size {
+                                            let c = (size - done).min(big.len());
+                                            let got = peek(tid, ptr + done as u64, &mut big[..c]);
+                                            if got == 0 {
+                                                break;
+                                            }
+                                            sys(WRITE, fd as u64, big.as_ptr() as u64, got as u64, 0);
+                                            done += got;
+                                        }
+                                        if fd >= 0 {
+                                            sys(CLOSE, fd as u64, 0, 0, 0);
+                                        }
+                                        out.b(b" saved=");
+                                        out.dec(done as i64);
+                                    }
                                 }
                             }
                             out.b(b" ret=");

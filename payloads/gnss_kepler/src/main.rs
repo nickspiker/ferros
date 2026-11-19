@@ -11,11 +11,11 @@
 //! The session, as gnssd ran it for Maps (the only AP messages either capture holds): at the service's open G#0003_7304 (four zero bytes), then G#0002_12DE (no bytes) and G#0002_04D4 (G#0F); STOP sends G#0002_12DE again, as Maps' close did. The chip then sends a fix a second (G#0143, SiRF's MID 67 SID 1) and its satellites (G#710A), among some 25 other kinds of record, counted by kind (op 4).
 //! No aiding goes to the chip: gnssd sent none in the captured session (no time, no place), and the chip fixed in 10 s indoors on what it keeps itself. The rough place feeds only the predicted birds (payloads/gps predict.rs, the same file).
 //!
-//! Not here: the core's firmware and power. The CP loads, powers and resets the core (gnssd's `pcie_load_firmware`, `pcie_power_on`, `pcie_release_reset` over the modem's `gnss_boot` channel); a core with no firmware running never raises its ready line, and the driver says so and tries the reset again every `RETRY_S`.
+//! The core first: the CP powers it, resets it and loads its firmware (GPS.md "The core is the CP's"), so before the link the driver boots it thru the modem driver's `rmnet` ops in gnssd's order (`core_boot`): the boot count, a BLC, the reset held and released, kepler.bin and its chip configuration copied into GNSS_FW from the vault (`gps.kepler`, `gps.kepler.cfg`: Samsung's, the 8a's own, never in a repo) and loaded, the start BLC. A core with no firmware running never raises its ready line; a failed boot is tried again every `RETRY_S`.
 //!
-//! Spawn (the kernel's `gps` grants, payloads/gps's order): ferros-bridge spawn gnss_kepler.bin 01 --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req --use udp
-//! Grant slots: 0 console, 1 the `gps` endpoint, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2 (not used on the 8a), 6 the vault scope `gps.`, 7 the power switch, 8 GNSS to AP's interrupt, 9 `udp` (the orbits).
-//! Input byte 0: bit 4 the link alone (reset, discovery, time, open; no session), for a first look at a chip; bit 5 one bare 16-word read first (the port alone, no handshake: does the transfer run, how does the level count); anything else (the kernel's start passes 01) the whole session.
+//! Spawn (the kernel's `gps` grants, payloads/gps's order): ferros-bridge spawn gnss_kepler.bin 01 --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req --use udp --use rmnet
+//! Grant slots: 0 console, 1 the `gps` endpoint, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2 (not used on the 8a), 6 the vault scope `gps.`, 7 the power switch, 8 GNSS to AP's interrupt, 9 `udp` (the orbits), 10 `rmnet` (the modem driver: the core's boot).
+//! Input byte 0: bit 4 the link alone (reset, discovery, time, open; no session), for a first look at a chip; bit 5 one bare 16-word read first (the port alone, no handshake: does the transfer run, how does the level count); bit 6 no boot (the core already runs); anything else (the kernel's start passes 01) the whole session.
 //!
 //! The `gps` endpoint, payloads/gps's ops and layouts: 0 FIX (38 bytes), 1 STOP, 2 SATS (25 bytes a signal), 3 WATCH, 4 FRAMES (here the kinds are BETP words: key `00 00` then the word's four bytes, high first; `[4, k]` answers with no frames kept).
 //! Measures: slot 0 the state (1 searching, 2 a fix), 1 the error estimate, 2 the satellites seen, 3 those used, 4 the best C/N0, 5 altitude, 6 speed, 7 heading.
@@ -119,6 +119,10 @@ struct Chip {
     /// Transfers that never filled, and sends whose ready answer never came.
     stuck: u32,
     no_ready: u32,
+    /// Sends that found GNSS to AP still up after their 2 ms wait.
+    busy: u32,
+    /// When the last send ended (the gap before the next).
+    sent_at: u64,
 }
 
 impl Chip {
@@ -199,6 +203,9 @@ enum Phase {
     Time,
     Open,
     Start,
+    /// After a core the CP freshly started: gnssd's two first records (ferros_kepler `AP_FRESH_00E4`, `AP_FRESH_08AD`).
+    Fresh0,
+    Fresh1,
     SessionOpen,
     SessionAsk,
     Running,
@@ -239,7 +246,7 @@ struct State {
     owe_reset_ack: bool,
     nak: bool,
     /// The step's packet: its bytes, the chip's ack when it went (its sequence), when, how many times.
-    pend: [u8; 128],
+    pend: [u8; 512],
     pend_n: usize,
     pend_seq: u8,
     pend_at: u64,
@@ -263,6 +270,10 @@ struct State {
     kinds: [Kind; KINDS],
     nkinds: usize,
     kinds_over: u32,
+    /// The core was just started by the CP thru this driver: gnssd's fresh-boot records go first.
+    fresh: bool,
+    /// Input bit 7: the first packets each way said by their header.
+    trace: bool,
 }
 
 /// Every packet the scanner holds, through the link and the datagram, into the state.
@@ -273,6 +284,10 @@ fn drain(g: u64, sc: &mut Scan, dg: &mut Gram, s: &mut State) {
             kp::Found::More => return,
         };
         s.packets += 1;
+        // The first 64 packets said by their header (input bit 7): what the link does, never a payload byte.
+        if s.trace && s.packets <= 1 << 6 {
+            say!(g, "gps: kepler: in  seq G#{:02X} ack G#{:02X} code G#{:02X} flags G#{:02X} len A#{}\n", h.seq, h.ack, h.code, h.flags, h.len);
+        }
         s.link.saw(&h);
         if h.code & 0x0F != 0 {
             s.chip_errs += 1;
@@ -346,6 +361,9 @@ fn drain(g: u64, sc: &mut Scan, dg: &mut Gram, s: &mut State) {
 /// One BETP notification's records: counted by kind, the fix and the satellites decoded.
 fn records(g: u64, body: &[u8], s: &mut State) {
     let t = now();
+    if s.phase == Phase::SessionOpen && s.acked {
+        s.answered = true;
+    }
     for r in kp::chip_records(body) {
         match s.kinds[..s.nkinds].iter().position(|k| k.word == r.word) {
             Some(i) => {
@@ -401,13 +419,30 @@ struct Io {
     chip: Chip,
     sc: Scan,
     dg: Gram,
+    /// Read chunks by what they held (`read`), and the latest that held bytes.
+    zeros: u32,
+    ones: u32,
+    other: u32,
+    seen: [u8; 16],
 }
 
 impl Io {
     /// One packet out: AP to GNSS up, the chip's ready, the words, a read of as many, AP to GNSS down. False without the ready answer.
     fn send(&mut self, g: u64, pkt: &[u8], s: &mut State) -> bool {
+        if s.trace && s.packets <= 1 << 6 && pkt.len() >= 10 {
+            say!(g, "gps: kepler: out seq G#{:02X} ack G#{:02X} code G#{:02X} len A#{}\n", pkt[5], pkt[4], pkt[3], u16::from_le_bytes([pkt[6], pkt[7]]));
+        }
+        let f = freq();
+        // A gap after the last send (2^-8 s, some 4 ms): a payload sent within a millisecond of a bare ack was dropped by the chip and taken only at its resend a second later, every step of the open (the 8a, 2026-11-19); gnssd's sends came that far apart.
+        while now().wrapping_sub(self.chip.sent_at) < f >> 8 {}
+        let t0 = now();
+        // The line from the last exchange let fall first (at most 2^-9 s, some 2 ms), so the ready below is the chip's answer to this raise and not a level left over: a payload sent right after a bare ack while the line still stood went unanswered until its resend a second later (the 8a, 2026-11-19, every step).
+        while self.chip.gnss2ap() && now().wrapping_sub(t0) < f >> 9 {}
+        if self.chip.gnss2ap() {
+            self.chip.busy += 1;
+        }
         self.chip.ap2gnss(true);
-        let (t0, f) = (now(), freq());
+        let t0 = now();
         // WHY the spin: the chip's ready answer to the raised line, inside one send's handshake; Linux waits for it as an interrupt for at most 100 ms (gnss_prj.h GNSS_RDY_TIMEOUT), the limit here.
         while !self.chip.gnss2ap() {
             if now().wrapping_sub(t0) > ms(f, 100) {
@@ -428,14 +463,19 @@ impl Io {
             drain(g, &mut self.sc, &mut self.dg, s);
         }
         self.chip.ap2gnss(false);
+        self.chip.sent_at = now();
         true
     }
 
     /// While the chip holds GNSS to AP up: the 100 µs pulse, then 1024 bytes in 16 transfers.
-    fn read(&mut self, g: u64, s: &mut State) -> usize {
+    fn read(&mut self, g: u64, s: &mut State, mut once: bool) -> usize {
         let mut got = 0;
         let f = freq();
-        while self.chip.gnss2ap() {
+        // `once`: the line fired, so one read whatever the line says now, as gnss_link_device.c's rx_work reads before it looks (a do-while): the chip may drop the line before the AP looks.
+        // At most `READS` reads a pass: a line held up with nothing coming must not hold the loop from its endpoint and its report (the level interrupt brings it straight back).
+        let mut left = READS;
+        while (core::mem::take(&mut once) || self.chip.gnss2ap()) && left > 0 {
+            left -= 1;
             self.chip.ap2gnss(true);
             let t = now();
             // The pulse's length is gnss_link_device.c's `udelay(100)`: the chip's cue that the AP is about to read.
@@ -444,6 +484,15 @@ impl Io {
             let mut rx = [0u8; WORDS * 4];
             for _ in 0..READ / (WORDS * 4) {
                 if self.chip.words(None, &mut rx) {
+                    // What a read brings, by kind: all zeros (the fill), all ones (nothing driven), else bytes (the first 16 of the latest kept).
+                    match (rx.iter().all(|&b| b == 0), rx.iter().all(|&b| b == 0xFF)) {
+                        (true, _) => self.zeros += 1,
+                        (_, true) => self.ones += 1,
+                        _ => {
+                            self.other += 1;
+                            self.seen.copy_from_slice(&rx[..16]);
+                        }
+                    }
                     self.sc.feed(&rx);
                     got += rx.len();
                     drain(g, &mut self.sc, &mut self.dg, s);
@@ -454,10 +503,11 @@ impl Io {
     }
 
     /// Reads while the chip has bytes, and the acks owed, until neither is left.
-    fn service(&mut self, g: u64, s: &mut State) -> usize {
+    fn service(&mut self, g: u64, s: &mut State, fired: bool) -> usize {
         let mut got = 0;
+        let mut once = fired;
         loop {
-            got += self.read(g, s);
+            got += self.read(g, s, core::mem::take(&mut once));
             let mut out = [0u8; kp::PACKET_MAX];
             if s.owe_reset_ack {
                 s.owe_reset_ack = false;
@@ -472,27 +522,108 @@ impl Io {
                 self.send(g, &out[..n], s);
                 continue;
             }
-            if !self.chip.gnss2ap() {
-                return got;
-            }
+            return got;
         }
     }
 }
 
+/// Reads one service pass takes at most (`Io::read`).
+const READS: u32 = 1 << 4;
+
+/// The modem driver's `rmnet` (grant slot 10): its GNSS ops, G#10 a command on gnss_boot, G#11 bytes into GNSS_FW.
+const S_RMNET: u64 = 10;
+/// The images in the vault (`gps.` scope; Samsung's, the 8a's own, never in a repo): kepler.bin whole, and the 912-byte chip configuration gnssd builds from it and gps.cfg (both captured by tools/akita-gnss-trace.sh).
+const FW_KEY: &[u8] = b"kepler";
+const CFG_KEY: &[u8] = b"kepler.cfg";
+/// Bytes a GNSS_FW write carries: the modem's request buffer (4096) less the op and the offset, whole words.
+const FW_CHUNK: usize = 4088;
+
+/// One gnss_boot command thru the modem: the CP's answer (its first byte the command's low byte, its third the status), None when it gave none in its 2 s or the modem is not up.
+fn core_cmd(g: u64, cmd: &[u8]) -> Option<([u8; 16], usize)> {
+    let mut q = [0u8; 16];
+    q[0] = 0x10;
+    q[1..1 + cmd.len()].copy_from_slice(cmd);
+    let mut r = [0u8; 16];
+    let n = ferros_sys::call(cap(g, S_RMNET), &q[..1 + cmd.len()], &mut r);
+    if n == ferros_sys::ERR || n == 0 {
+        return None;
+    }
+    // WHY the min: the CP's answer is 3 or 7 bytes; the call says the whole length and copies at most the buffer.
+    Some((r, (n as usize).min(r.len())))
+}
+
+/// An image from the vault into GNSS_FW from offset 0, then the CP told (G#0E05: its type, offset 0, its size) and its answer checked (G#05, status 0). The type: 0 the firmware, 4 the chip configuration.
+fn core_load(g: u64, key: &[u8], kind: u32) -> Result<u32, &'static str> {
+    let store = cap(g, S_STORE);
+    let mut head = [0u8; 8];
+    let total = ferros_sys::store_get_at(store, key, 0, &mut head).ok_or("not in the vault")?;
+    let mut q = [0u8; 5 + FW_CHUNK];
+    q[0] = 0x11;
+    let mut at = 0usize;
+    while at < total {
+        let k = (total - at).min(FW_CHUNK);
+        ferros_sys::store_get_at(store, key, at, &mut q[5..5 + k]).ok_or("the vault refused a piece")?;
+        q[1..5].copy_from_slice(&(at as u32).to_le_bytes());
+        let mut r = [0u8; 4];
+        let n = ferros_sys::call(cap(g, S_RMNET), &q[..5 + k], &mut r);
+        if n != 1 || r[0] != 0 {
+            return Err(if r[0] == 1 { "the modem driver holds no GNSS_FW window (modem-gnss at slot 26)" } else { "a GNSS_FW write was refused" });
+        }
+        at += k;
+    }
+    let mut c = [0u8; 14];
+    c[0..2].copy_from_slice(&0x0E05u16.to_le_bytes());
+    c[2..6].copy_from_slice(&kind.to_le_bytes());
+    c[10..14].copy_from_slice(&(total as u32).to_le_bytes());
+    match core_cmd(g, &c) {
+        Some((r, n)) if n >= 3 && r[0] == 0x05 && r[2] == 0 => Ok(total as u32),
+        Some(_) => Err("the CP refused the image"),
+        None => Err("no answer to the image's load"),
+    }
+}
+
+/// The core booted as gnssd boots it (tools/akita-gnss-trace.sh, 2026-11-19): the boot count asked, a BLC G#0102, the reset held and released, the count again, kepler.bin loaded (type 0), the chip configuration (type 4), then the BLC that starts the firmware (G#20, G#2, the entry G#6000_0001). Its answers said on the console; Err stops at the first step that fails.
+fn core_boot(g: u64) -> Result<(), &'static str> {
+    let count = |r: &[u8; 16], n: usize| if n >= 7 { u32::from_le_bytes([r[3], r[4], r[5], r[6]]) } else { 0 };
+    let (r, n) = core_cmd(g, &[0x01, 0x02]).ok_or("no answer to the boot count: the modem not up, or no gnss_boot")?;
+    say!(g, "gps: kepler: the CP's GNSS boot count A#{}\n", count(&r, n));
+    let (r, n) = core_cmd(g, &[0x09, 0x0E, 0, 0, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]).ok_or("no answer to the first BLC")?;
+    say!(g, "gps: kepler: BLC G#0102 answered ({} bytes, status G#{:02X})\n", n, r[2]);
+    let (r, n) = core_cmd(g, &[0x03, 0x02]).ok_or("no answer to the reset hold")?;
+    if n < 3 || r[0] != 3 || r[2] != 0 {
+        return Err("the CP refused the reset hold");
+    }
+    let (r, n) = core_cmd(g, &[0x04, 0x02]).ok_or("no answer to the reset release")?;
+    if n < 3 || r[0] != 4 || r[2] != 0 {
+        return Err("the CP refused the reset release");
+    }
+    let (r, n) = core_cmd(g, &[0x01, 0x02]).ok_or("no answer to the second boot count")?;
+    let fw = core_load(g, FW_KEY, 0)?;
+    let cfg = core_load(g, CFG_KEY, 4)?;
+    let (r2, n2) = core_cmd(g, &[0x09, 0x0E, 0x20, 0, 0x02, 0, 0x01, 0, 0, 0x60, 0, 0, 0, 0]).ok_or("no answer to the start BLC")?;
+    say!(g, "gps: kepler: reset held and released (boot count now A#{}), kepler.bin (A#{} B) and its configuration (A#{} B) loaded, the start BLC answered status G#{:02X} ({} bytes)\n", count(&r, n), fw, cfg, r2[2], n2);
+    if n2 < 3 || r2[0] != 9 || r2[2] != 0 {
+        return Err("the CP refused the start BLC");
+    }
+    Ok(())
+}
+
 /// The step's packet built and sent: a transport reset, or a payload with the link's sequence now.
 fn step_send(g: u64, io: &mut Io, s: &mut State) {
-    let mut payload = [0u8; 128];
+    let mut payload = [0u8; 512];
     let n = match s.phase {
         Phase::Discover => copy(&mut payload, &kp::DISCOVER),
         Phase::Time => copy(&mut payload, &kp::GET_TIME),
         Phase::Open => copy(&mut payload, &kp::OPEN),
         Phase::Start => kp::ap_datagram(&[kp::AP_START], &mut payload),
+        Phase::Fresh0 => kp::ap_datagram(&[kp::ApRecord { word: kp::AP_FRESH_00E4_WORD, data: &kp::AP_FRESH_00E4 }], &mut payload),
+        Phase::Fresh1 => kp::ap_datagram(&[kp::ApRecord { word: kp::AP_FRESH_08AD_WORD, data: &kp::AP_FRESH_08AD }], &mut payload),
         Phase::SessionOpen => kp::ap_datagram(&[kp::AP_SESSION_OPEN], &mut payload),
         Phase::SessionAsk => kp::ap_datagram(&[kp::AP_SESSION_ASK], &mut payload),
         Phase::Reset => 0,
         _ => return,
     };
-    let mut out = [0u8; 128];
+    let mut out = [0u8; 512];
     let m = if s.phase == Phase::Reset { kp::Link::reset(&mut out) } else { s.link.packet(&payload[..n], &mut out) };
     s.pend[..m].copy_from_slice(&out[..m]);
     s.pend_n = m;
@@ -512,7 +643,8 @@ fn copy(out: &mut [u8], b: &[u8]) -> usize {
 
 /// The next phase once this one's packet is acked and, where it asks, answered.
 fn advance(g: u64, s: &mut State, link_only: bool) -> bool {
-    let need_answer = matches!(s.phase, Phase::Reset | Phase::Discover | Phase::Time | Phase::Open);
+    // Maps' G#12DE is answered by the chip's records, and gnssd sent G#04D4 only after them (the fix capture): the session's second record waits for the first's answer.
+    let need_answer = matches!(s.phase, Phase::Reset | Phase::Discover | Phase::Time | Phase::Open | Phase::SessionOpen);
     if !(s.answered || (!need_answer && s.acked)) {
         return false;
     }
@@ -527,7 +659,10 @@ fn advance(g: u64, s: &mut State, link_only: bool) -> bool {
             say!(g, "gps: kepler: the link is open (input bit 4: no session started)\n");
             Phase::Idle
         }
+        Phase::Open if s.fresh => Phase::Fresh0,
         Phase::Open => Phase::Start,
+        Phase::Fresh0 => Phase::Fresh1,
+        Phase::Fresh1 => Phase::SessionOpen,
         Phase::Start => Phase::SessionOpen,
         Phase::SessionOpen => Phase::SessionAsk,
         Phase::SessionAsk => {
@@ -663,7 +798,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     if !ferros_sys::power(cap(g, S_POWER), true) {
         say!(g, "gps: kepler: the power switch refused\n");
     }
-    let mut io = Io { chip: Chip { spi: cap(g, S_SPI), far: cap(g, S_FAR), peric0: cap(g, S_PERIC0), lvl_bytes: 0, lvl_words: 0, stuck: 0, no_ready: 0 }, sc: Scan::new(), dg: Gram::new() };
+    let mut io = Io { chip: Chip { spi: cap(g, S_SPI), far: cap(g, S_FAR), peric0: cap(g, S_PERIC0), lvl_bytes: 0, lvl_words: 0, stuck: 0, no_ready: 0, busy: 0, sent_at: 0 }, sc: Scan::new(), dg: Gram::new(), zeros: 0, ones: 0, other: 0, seen: [0; 16] };
     // GNSS to AP as a level-high external interrupt: function EINT (G#F), pull-down (the DT's), control nibble 1, pending cleared, unmasked.
     let far = cap(g, S_FAR);
     mmio_write(far, 0x00, (mmio_read(far, 0x00) as u32 & !(0xF << 12)) | 0xF << 12);
@@ -686,7 +821,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         owe_ack: false,
         owe_reset_ack: false,
         nak: false,
-        pend: [0; 128],
+        pend: [0; 512],
         pend_n: 0,
         pend_seq: 0,
         pend_at: 0,
@@ -709,6 +844,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         kinds: [Kind::default(); KINDS],
         nkinds: 0,
         kinds_over: 0,
+        fresh: false,
+        trace: input0 & 0x80 != 0,
     };
 
     // The predicted sky from the kept orbits and the rough place, before the chip says anything (payloads/gps).
@@ -736,10 +873,30 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut published_fix = u32::MAX;
     let mut kept = (0i32, 0i32);
     let (mut bytes, mut irqs) = (0usize, 0u32);
+    // Whether the core is to be booted thru the modem: `rmnet` granted (the grants page's count at G#200 past slot 10) and input bit 6 clear.
+    let granted = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + g + 0x200) as *const u32) as u64 };
+    let boot_wanted = granted > S_RMNET && input0 & 0x40 == 0;
+    let mut booted = false;
+    let mut fired = false;
     loop {
         ferros_sys::pet();
         // The step's packet: sent on entering a phase, again after `RESEND_MS` unacked or unanswered, and after `TRIES` the link reset and tried again every `RETRY_S`.
         let t = now();
+        // The core booted thru the modem first (the CP holds its power and its firmware), when the modem's `rmnet` was granted and input bit 6 does not say the core already runs; a boot that fails is tried again with the link, every `RETRY_S`.
+        if s.phase == Phase::Reset && s.tries == 0 && !booted && boot_wanted {
+            match core_boot(g) {
+                Ok(()) => {
+                    booted = true;
+                    s.fresh = true;
+                    say!(g, "gps: kepler: the core started by the CP after A#{} ms; the link next\n", now().wrapping_sub(t_all) * 1000 / f);
+                }
+                Err(why) => {
+                    say!(g, "gps: kepler: the core's boot stopped: {}; again in {} s\n", why, RETRY_S);
+                    s.phase = Phase::Dead;
+                    s.retry_at = t + RETRY_S * f;
+                }
+            }
+        }
         match s.phase {
             Phase::Running | Phase::Idle => {}
             Phase::Dead => {
@@ -762,11 +919,11 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 }
             }
         }
-        bytes += io.service(g, &mut s);
+        bytes += io.service(g, &mut s, core::mem::take(&mut fired));
         while advance(g, &mut s, link_only) {
             if !matches!(s.phase, Phase::Running | Phase::Idle | Phase::Dead) {
                 step_send(g, &mut io, &mut s);
-                bytes += io.service(g, &mut s);
+                bytes += io.service(g, &mut s, false);
             }
         }
         // Fresh orbits once the link runs (payloads/gps: the fetch's second or two holds nothing up).
@@ -790,6 +947,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if now().wrapping_sub(said) > 32 * f {
             let (seen, used, cn0) = counts(&s);
             say!(g, "gps: kepler, the last 32 s: {:?}, {} interrupts, {} bytes read; {} packets ({} CRC failures, {} resends, {} skips, {} errors from the chip), {} datagrams; {} fixes; {} satellites, {} used, best {} dB-Hz; transfers: {} level in bytes, {} in words, {} stuck\n", s.phase, irqs, bytes, s.packets, io.sc.bad, io.dg.resends, io.dg.skips, s.chip_errs, s.grams, s.fixes, seen, used, cn0 >> 2, io.chip.lvl_bytes, io.chip.lvl_words, io.chip.stuck);
+            say!(g, "gps: kepler: read chunks so far: {} zeros, {} ones, {} with bytes (the latest begins {:02X?})\n", io.zeros, io.ones, io.other, &io.seen[..]);
             (bytes, irqs, said) = (0, 0, now());
         }
         if s.fixes > 0 && !s.first_fix_said {
@@ -943,8 +1101,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             at(pr.at + predict::EVERY_S * f);
         }
         if !io.chip.gnss2ap() && !s.owe_ack && !s.owe_reset_ack {
-            ferros_sys::irq_wait_world(cap(g, S_IRQ), if !polled { 1 } else { due });
-            irqs += 1;
+            // 0: the line fired (the next pass reads once, whatever the line says by then); a deadline or a call answers otherwise.
+            fired = ferros_sys::irq_wait_world(cap(g, S_IRQ), if !polled { 1 } else { due }) == 0;
+            irqs += fired as u32;
         }
         mmio_write(far, EINT_PEND, PIN);
         ferros_sys::irq_ack(cap(g, S_IRQ));

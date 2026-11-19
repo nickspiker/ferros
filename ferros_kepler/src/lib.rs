@@ -456,6 +456,22 @@ pub const AP_SESSION_OPEN: ApRecord<'static> = ApRecord { word: 0x0002_12DE, dat
 pub const AP_SESSION_ASK: ApRecord<'static> = ApRecord { word: 0x0002_04D4, data: &[0x0F] };
 pub const AP_SESSION_LATER: ApRecord<'static> = ApRecord { word: 0x0002_0398, data: &[0x8E] };
 
+/// What gnssd sent once the CP had started a freshly loaded core (tools/akita-gnss-trace.sh, 2026-11-19), its first two records after the open: G#0002_00E4, a zero then 51 ones (A#52 bytes), and G#0002_08AD, a u32 (G#0B_EB66) then zeros (A#334 bytes; the chip sends the same word with its own state, which gnssd keeps).
+pub const AP_FRESH_00E4: [u8; 52] = {
+    let mut b = [1u8; 52];
+    b[0] = 0;
+    b
+};
+pub const AP_FRESH_08AD: [u8; 334] = {
+    let mut b = [0u8; 334];
+    b[0] = 0x66;
+    b[1] = 0xEB;
+    b[2] = 0x0B;
+    b
+};
+pub const AP_FRESH_00E4_WORD: u32 = 0x0002_00E4;
+pub const AP_FRESH_08AD_WORD: u32 = 0x0002_08AD;
+
 /// The chip's fix: the low half of its word, SiRF's MID 67 SID 1 ("GNSS navigation data", gnssd's `SIRF_MSG_SSB_GNSS_NAV_DATA`), A#160 bytes.
 pub const PVT: u32 = 0x0143;
 /// The satellites the chip sees: the low half of a protocol-3 word, A#37 bytes of head then A#29 a satellite.

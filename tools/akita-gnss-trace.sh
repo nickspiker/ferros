@@ -5,7 +5,7 @@
 #
 # Steps, each its own command (FERROS_PORT/AKITA_SERIAL as in akita-hv-camcap.sh):
 #   tools/akita-gnss-trace.sh build      host only: gtrace (static aarch64, no libc) and gnss-oracle
-#   tools/akita-gnss-trace.sh run        the trace: gnssd stopped, the core held in reset (RESET=1, the default: gnssd's own `pcie_assert_reset`, G#0203 on gnss_boot, so the new gnssd must load the firmware again), gnssd under gtrace for SECS (default 180), a Maps session to a fix, gnssd given back to init
+#   tools/akita-gnss-trace.sh run        the trace (and the images gnssd loads, with kepler.bin, into $C): gnssd stopped, the core held in reset (RESET=1, the default: gnssd's own `pcie_assert_reset`, G#0203 on gnss_boot, so the new gnssd must load the firmware again), gnssd under gtrace for SECS (default 180), a Maps session to a fix, gnssd given back to init
 #   tools/akita-gnss-trace.sh decode     host only: the gnss_boot commands and the CHPP session's BETP records (gnss-oracle --gtrace --betp), no place
 set -eu
 . /mnt/Harbor/Code/ferros/tools/lib/devices.sh
@@ -78,7 +78,14 @@ cmd_run() {
     A exec-out "su -c 'cat $D/gnssd.trace'" > "$C/gnss-trace.log"
     A exec-out "su -c 'cat $D/gnssd.trace'" > "$C/gnss-trace.again"
     cmp -s "$C/gnss-trace.log" "$C/gnss-trace.again" && rm "$C/gnss-trace.again" || say "the two pulls differ: keep both"
-    su_ "rm $D/gnssd.trace"
+    # The images gnssd handed cpif (gtrace saves each IOCTL_LOAD_GNSS_IMAGE buffer: kepler.bin whole, then the chip configuration it built from kepler.bin and gps.cfg), and the firmware file itself: Samsung's, keys/ only.
+    local i
+    for i in $(su_ "ls $D" | grep '^gnssd.trace.img'); do
+        A exec-out "su -c 'cat $D/$i'" > "$C/${i#gnssd.}"
+        say "$i: $(wc -c < "$C/${i#gnssd.}") bytes"
+    done
+    A exec-out "su -c 'cat /vendor/firmware/kepler.bin'" > "$C/kepler.bin"
+    su_ "rm $D/gnssd.trace $D/gnssd.trace.img*"
     say "gnssd given back to init; the trace in $C/gnss-trace.log ($(wc -l < "$C/gnss-trace.log") lines)"
 }
 

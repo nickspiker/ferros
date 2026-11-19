@@ -2593,6 +2593,8 @@ pub static DMA: &[Dma] = &[
     Dma { name: "modem-pktproc", base: crate::cachemap::MODEM_WINDOWS[0].0, size: crate::cachemap::MODEM_WINDOWS[0].1 - crate::cachemap::MODEM_WINDOWS[0].0 },
     Dma { name: "modem-ipc", base: crate::cachemap::MODEM_WINDOWS[1].0, size: crate::cachemap::MODEM_WINDOWS[1].1 - crate::cachemap::MODEM_WINDOWS[1].0 },
     Dma { name: "modem-msi", base: crate::cachemap::MODEM_WINDOWS[2].0, size: crate::cachemap::MODEM_WINDOWS[2].1 - crate::cachemap::MODEM_WINDOWS[2].0 },
+    // The GNSS core's firmware memory (cp_rmem's GNSS_FW, cachemap.rs MODEM_WINDOWS[3]): the 8a's kepler.bin and chip configuration copied here for the CP (GPS.md "The core is the CP's"); granted by hand after `cell` until init's list has a slot for it.
+    Dma { name: "modem-gnss", base: crate::cachemap::MODEM_WINDOWS[3].0, size: crate::cachemap::MODEM_WINDOWS[3].1 - crate::cachemap::MODEM_WINDOWS[3].0 },
     Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 },
     // The USB driver process (USB.md): the controller's registers, mapped for EL0 (Device), and its non-cacheable DMA memory.
     Dma { name: "usb-regs", base: 0x1121_0000, size: 0x1_0000 },
