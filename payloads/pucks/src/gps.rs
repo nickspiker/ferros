@@ -1,6 +1,6 @@
 //! The GPS puck (docs/PUCKS.md; owner, 2026-11-17: "GPS, compass, shit that's useful!").
 //!
-//! - **The API it uses** is the one kists already have (GPS.md "On demand"): the `gps` right, a send right on the GPS driver's endpoint; SYS_CLAIM op 0 with that right as proof starts the driver, op 1 releases it; the driver's FIX (op 0: valid, fixes, age, latitude, longitude, altitude, error, speed, track), SATS (op 2: each signal's system, band, PRN, used, elevation, azimuth, C/N0) and WATCH (op 3: held until its fixes or messages move). No new API was needed. Behind attest: the kernel refuses the claim while nobody is present, and starts no GPS before a person attests (memory radios_at_attest_gps_locked).
+//! - **The API it uses** is the one kists already have (GPS.md "On demand"): the `gps` right, a send right on the GPS driver's endpoint; SYS_CLAIM op 0 with that right as proof starts the driver, op 1 releases it; the driver's FIX (op 0: valid, fixes, age, latitude, longitude, altitude, error, speed, track) and WATCH (op 3: held until its fixes, its messages or its predicted sky move); the sky from the kernel's TRACKS for GPS, what the console's GPS circle reads (since 2026-11-18: the signals heard and the birds predicted from the orbits). No new API was needed. Behind attest: the kernel refuses the claim while nobody is present, and starts no GPS before a person attests (memory radios_at_attest_gps_locked).
 //! - **When the radio is on**: only while its circle is in focus (a tap on it; the map's "the GPS screen turns it on while it is open", owner, 2026-11-10). At rest it shows what the last session found, kept in memory only; nothing of a fix is stored.
 //! - **Refresh**: in focus, each time the driver's WATCH rings (its own messages, about one a second while it tracks); at rest, never (no deadline at all).
 //! - **What it never shows**: the position. A puck shows how well the device knows where it is, never where that is.
@@ -16,9 +16,6 @@ mod common;
 use ferros_faces::gps::{face, Signal, Sky, SIGNALS};
 use ferros_sys::{call_live, cap, claim};
 
-/// The driver's SATS reply: n, msgs u32, age u32, then 25-byte records (payloads/gps sky.rs `REC`).
-const REC: usize = 25;
-const SATS_MAX: usize = 1 << 6;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
@@ -39,16 +36,18 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let err = u32::from_le_bytes(f[21..25].try_into().unwrap());
                     fix = common::now_secs().map(|t| (err, t - age_ms / 1000.));
                 }
-                let mut s = [0u8; 9 + REC * SATS_MAX];
-                let got = call_live(gps, &[2], &mut s);
-                if got != ferros_sys::ERR && got >= 9 {
-                    // WHY the bounds: the reply is the driver's (at most its 64 records) and the face draws at most SIGNALS; whatever arrived past either is left out, never read past the reply.
-                    let k = (s[0] as usize).min(SATS_MAX).min((got as usize - 9) / REC).min(SIGNALS);
-                    for (i, g) in signals.iter_mut().take(k).enumerate() {
-                        let r = &s[9 + i * REC..9 + (i + 1) * REC];
-                        *g = Signal { used: r[3] & 1 == 1, el: r[4] as i8, az: u16::from_le_bytes([r[5], r[6]]) };
+                // The sky as the driver publishes it (the kernel's TRACKS for GPS, as the console's GPS circle reads it; 2026-11-18): the signals the chip hears with their C/N0 and whether used, then the birds only predicted from the orbits (C/N0 0, not used).
+                let mut b = [0u64; ferros_sys::TRACKS_MAX];
+                // WHY the min: the count is the kernel's answer; only the words the buffer holds are read.
+                let got = ferros_sys::tracks(ferros_sys::control::GPS, &mut b).min(b.len());
+                n = 0;
+                for s in b[..got].iter().filter_map(|&w| ferros_sys::sat_of(w)) {
+                    // WHY the bound: the face draws at most SIGNALS; the rest are left out.
+                    if n == SIGNALS {
+                        break;
                     }
-                    n = k;
+                    signals[n] = Signal { used: s.used, el: s.elevation, az: s.azimuth, cn0: s.cn0, predicted: s.cn0 == 0 && !s.used };
+                    n += 1;
                 }
                 let sky = Sky { signals: &signals[..n], fix, live: true };
                 common::show(link, |w, focus| face(w, &sky, focus));

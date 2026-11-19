@@ -30,6 +30,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     if op == 2 {
         sats(grants);
     }
+    if op == 5 {
+        tracks(grants);
+    }
     if op == 4 {
         // Input byte 1, when given: the kind whose latest frames to print.
         let k = if input_len > 1 { Some(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) }) } else { None };
@@ -50,6 +53,29 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
+}
+
+/// Input 05: the GPS tracks as the display and the puck read them (the kernel's TRACKS, no capability, no call to the driver): how many heard (used among them) and how many predicted (C/N0 0, not used: GPS.md "Predicted birds"), the predicted by system, and their elevations' spread; never an azimuth or a place.
+fn tracks(grants: u64) -> ! {
+    let mut b = [0u64; ferros_sys::TRACKS_MAX];
+    // WHY the min: the count is the kernel's answer; only the words the buffer holds are read.
+    let n = ferros_sys::tracks(ferros_sys::control::GPS, &mut b).min(b.len());
+    let (mut heard, mut used, mut pred) = (0u32, 0u32, [0u32; 8]);
+    let (mut lo, mut hi) = (i8::MAX, i8::MIN);
+    for s in b[..n].iter().filter_map(|&w| ferros_sys::sat_of(w)) {
+        if s.cn0 == 0 && !s.used {
+            pred[(s.system & 7) as usize] += 1;
+            lo = lo.min(s.elevation);
+            hi = hi.max(s.elevation);
+        } else {
+            heard += 1;
+            used += s.used as u32;
+        }
+    }
+    let mut l = Line { b: [0; 128], n: 0 };
+    let _ = write!(l, "gpstest: tracks: {} heard ({} used), {} predicted: GPS {} GLONASS {} Galileo {} BeiDou {}; elevations {} to {}\n", heard, used, pred.iter().sum::<u32>(), pred[0], pred[1], pred[2], pred[3], lo, hi);
+    console(grants, &l.b[..l.n]);
+    ferros_sys::exit(0);
 }
 
 /// Op 2 SATS (payloads/gps main.rs's header): a line for the list, then one per signal; elevation and azimuth only, never a place.

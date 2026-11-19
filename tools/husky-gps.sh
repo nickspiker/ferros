@@ -11,7 +11,7 @@ cargo build -q --bin ferros-bridge
 for b in gps gpstest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin"; done
 flags=00
 [ "${1:-}" = sky ] && flags=01
-timeout 120 "$B" spawn "$R/gps.bin" "$flags" --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req >/dev/null 2>&1
+timeout 120 "$B" spawn "$R/gps.bin" "$flags" --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req --use udp >/dev/null 2>&1
 for i in $(seq 20); do
     sleep 30
     timeout 60 "$B" spawn "$R/gpstest.bin" 00 --name gpstest --use gps >/dev/null 2>&1 || true

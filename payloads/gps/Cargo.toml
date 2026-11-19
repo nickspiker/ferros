@@ -15,3 +15,9 @@ ferros_spi = { path = "../../ferros_spi" }
 ferros_kept = { path = "../../ferros_kept" }
 # The heap that document is built and read in.
 ferros_heap = { path = "../../ferros_heap" }
+# The rough place combined from its sources (the single egg rule), and the predicted sky: the orbits carried forward and seen from that place.
+ferros_gnss = { path = "../../ferros_gnss" }
+# A place on the earth for the predicted sky (the sun and moon engine's, which ferros_gnss shares).
+ferros_sky = { path = "../../ferros_sky" }
+# The orbits' plain HTTP GET decoded as it arrives (ferros_kist::fetch, the stower's and the weather puck's).
+ferros_kist = { path = "../../ferros_kist" }

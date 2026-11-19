@@ -149,6 +149,29 @@ fn main() {
         }
         n += 1;
     }
+    // The reliable frames' counter (the byte flag G#02 brings: +1 for every reliable host frame, 2026-11-18): the chip refuses a frame whose counter is not the last one it took plus one (its reply's flag G#08 instead of G#04, the counter it holds beside it), and every one after. A replay with messages cut and the sequences closed up but not this counter is refused from the cut on.
+    let (mut at3, mut n3, mut last): (usize, usize, Option<u8>) = (4, 0, None);
+    let mut jumps = 0u32;
+    while at3 + 4 <= b.len() {
+        let len = u16::from_le_bytes([b[at3], b[at3 + 1]]) as usize;
+        let rec = &b[at3 + 4..at3 + 4 + len];
+        at3 += 4 + len;
+        for f in frames(rec) {
+            if f.len() >= 5 && f[2] & 0x02 != 0 {
+                let k = 3 + (f[2] & 0x01) as usize;
+                let c = f[k];
+                if let Some(l) = last {
+                    if c != l.wrapping_add(1) {
+                        jumps += 1;
+                        println!("reliable counter: rec A#{n3} seq G#{:02X} counter G#{c:02X} after G#{l:02X} (a jump of A#{})", f[0], c.wrapping_sub(l) as i8);
+                    }
+                }
+                last = Some(c);
+            }
+        }
+        n3 += 1;
+    }
+    println!("reliable counter: A#{jumps} jumps");
     // Every inner message, wherever it starts in a frame (a long RPC carries several, and a message can begin past a frame's first bytes): `c0 c1` not itself an escaped `c0 c0 c1`, then its class.
     let mut inner: BTreeMap<String, (u32, u64, usize)> = BTreeMap::new();
     let (mut at2, mut t2, mut n2) = (4usize, 0u64, 0usize);

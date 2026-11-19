@@ -1301,10 +1301,10 @@ fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault, Blocks(b"clips")]
 }
 
-/// The GPS driver's grants in its slot order (payloads/gps): 1 serve gps, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Its own list, as the vault's: init's page is full at 108, and the kernel starts this driver itself, only once a person has attested (radios at attest, GPS locked until then).
+/// The GPS driver's grants in its slot order (payloads/gps): 1 serve gps, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. 9 use udp (since 2026-11-18: the orbits for the predicted sky, CelesTrak over plain HTTP, at most daily). Its own list, as the vault's: init's page is full at 108, and the kernel starts this driver itself, only once a person has attested (radios at attest, GPS locked until then).
 fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
+    alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req"), Use(b"udp")]
 }
 
 /// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena whole (it reads a client's kernel from the client's own block), 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu), 8 the GPU MMU's interrupt (2026-11-12: a client's job that reaches outside its own memory faults in its own address space, and the service ends that job at once), 9 the `gpu-clock` switch (2026-11-20: the GPU's clock up while a job is queued or running, down when the queues empty, `gpu_clock`). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
@@ -3181,7 +3181,8 @@ pub fn run(mut b: Boot) -> ! {
             let running = crate::process::with_lock(|| crate::process::named_alive_locked(&[b"gps"])) != 0;
             if !running {
                 let mut rep = alloc::vec::Vec::new();
-                restart(&mut store, b"gps", &mut rep);
+                // Input 01, the on-chip replay (GPS.md "No fix, 2026-11-18": the stored `gps.replay` is a host-mode session that can never give a fix); the driver takes no input the same way since that day, so either side alone is enough.
+                restart_with(&mut store, b"gps", &[1], &mut rep);
                 crate::flashlog::line(&alloc::format!("gps claimed (A#{} claims): {}", crate::process::gps_claims(), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
                 // Not started: the GPS mailbox's readers woken to a dead mailbox (`mailbox_ring_dead`), as a driver's end would wake them, so none waits on a publish that will not come.
                 if !(rep.starts_with(b"gps") && rep.ends_with(b" started\n")) {

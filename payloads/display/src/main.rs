@@ -6579,14 +6579,26 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = radio_of(what);
-        // GPS's satellites as its driver tracks them (the kernel's TRACKS for its link): each one's azimuth and elevation in degrees and its weight in the rings (`gps_rings`): its carrier to noise over 48 dB-Hz, a satellite in the fix at full and one only tracked at half.
+        // GPS's satellites as its driver tracks them (the kernel's TRACKS for its link): each one's azimuth and elevation in degrees, its weight in the rings (`gps_rings`) and whether it is only predicted (2026-11-18, GPS.md "Predicted birds": the driver publishes every bird above the horizon from the orbits, C/N0 0 and not used, before the chip hears any).
+        // - Used in the fix: full weight.
+        // - Heard, not used: by its carrier to noise, a logistic step about 28 dB-Hz (a signal the chip can hold) four dB-Hz wide, at most half: 1/(1 + e^(−(C/N0 − 28)/4)) / 2, about 0.06 at 20 dB-Hz and 0.48 at 40.
+        // - Predicted: an eighth, drawn as a layer of its own behind the heard ones (`gps_rings`).
         // Whether the GPS driver runs (fact 32 bit 4): on but unclaimed, the circle is the plain lit one, no rings and no numbers.
         let receiving = what == Corner::Gps && radios & 16 != 0;
-        let sats: alloc::vec::Vec<(f32, f32, f32)> = if receiving {
+        let sats: alloc::vec::Vec<(f32, f32, f32, bool)> = if receiving {
             let mut b = [0u64; ferros_sys::TRACKS_MAX];
             // WHY the min: the count is the kernel's answer; only the words the buffer holds are read.
             let n = ferros_sys::tracks(ferros_sys::control::GPS, &mut b).min(b.len());
-            b[..n].iter().filter_map(|&w| ferros_sys::sat_of(w)).filter(|s| s.cn0 > 0).map(|s| (s.azimuth as f32, s.elevation as f32, s.cn0 as f32 * (1.0 / 48.0) * if s.used { 1.0 } else { 0.5 })).collect()
+            let heard = |cn0: f32| 0.5 / (1.0 + libm::expf(-(cn0 - 28.0) * (1.0 / (1 << 2) as f32)));
+            b[..n]
+                .iter()
+                .filter_map(|&w| ferros_sys::sat_of(w))
+                .map(|s| {
+                    let predicted = s.cn0 == 0 && !s.used;
+                    let wt = if s.used { 1.0 } else if predicted { 1.0 / (1 << 3) as f32 } else { heard(s.cn0 as f32) };
+                    (s.azimuth as f32, s.elevation as f32, wt, predicted)
+                })
+                .collect()
         } else {
             alloc::vec::Vec::new()
         };
@@ -6630,9 +6642,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         if let Some(ri) = radio {
             facts[33 + 8 * ri..41 + 8 * ri].iter().for_each(|&f| mix(f));
         }
-        for &(az, el, wt) in &sats {
+        for &(az, el, wt, predicted) in &sats {
             mix(az.to_bits() as u64 | (el.to_bits() as u64) << 32);
-            mix(wt.to_bits() as u64);
+            mix(wt.to_bits() as u64 | (predicted as u64) << 32);
         }
         // Never 0, which is "not drawn yet".
         let key = key | 1;
@@ -10601,18 +10613,24 @@ fn frame_lines(fw: u64, name: &mut Txt, lines: &mut [Txt; 9], mut nl: usize) -> 
 }
 
 /// GPS's satellites as rings that all meet over the person (owner, 2026-11-09: "arcs like the edge of a bubble ... imagine refractive index of a smooth sphere, fresnel ... those should intersect over me and if I get more ... the point gets brighter"). Each satellite (azimuth, elevation in degrees, weight) is a circle through the disc's centre: its centre toward the satellite's azimuth (north up), its radius from a quarter of the disc's radius `ri` at the zenith to half at the horizon. Its light is a bubble's limb, dense at its edge and faint inside: w / √(s² + w²) with s = 1 − (d/ρ)² across the circle, w its width (an eighth of a 16th of the disc, in s), C∞ everywhere and 1 on the edge. The satellites' light adds as depth, its opacity 1 − e^(−depth), so where every ring meets (the centre) the light grows with each one; the disc's own edge fades it by exp(1 − 1/(1 − t²)), as the radios' fields fade.
-fn gps_rings(sats: &[(f32, f32, f32)], x: f32, y: f32, ri: f32, flav: (f32, f32, f32), at: &mut dyn FnMut(i64, i64) -> Option<usize>, console: &mut [u64], cut: impl Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
+/// Predicted birds (2026-11-18, the fourth of each tuple; GPS.md "Predicted birds") are a second layer behind the heard ones, in the flavour moved halfway toward white, their depth faded near the disc's centre by 1 − e^(−(r/r₀)²) with r₀ a quarter of the disc (C∞, 0 at the centre): faint arcs pointing where each bird is, while the point over the person brightens only with real signal.
+fn gps_rings(sats: &[(f32, f32, f32, bool)], x: f32, y: f32, ri: f32, flav: (f32, f32, f32), at: &mut dyn FnMut(i64, i64) -> Option<usize>, console: &mut [u64], cut: impl Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
     use fluor::pixel::{Blend, BlendMode};
     let colour = g2t_colour(flav);
+    // White in the working values is Q14.
+    let toward_white = |v: f32| v + (16384.0 - v) * 0.5;
+    let colour_predicted = g2t_colour((toward_white(flav.0), toward_white(flav.1), toward_white(flav.2)));
     let band = ri * (1.0 / (1 << 5) as f32);
-    let rings: alloc::vec::Vec<(f32, f32, f32, f32)> = sats
+    let rings: alloc::vec::Vec<(f32, f32, f32, f32, bool)> = sats
         .iter()
-        .map(|&(az, el, wt)| {
+        .map(|&(az, el, wt, predicted)| {
             let (a, e) = (az.to_radians(), el.to_radians());
             let rho = ri * (1.0 + libm::cosf(e)) * 0.25;
-            (libm::sinf(a) * rho, -libm::cosf(a) * rho, rho, wt)
+            (libm::sinf(a) * rho, -libm::cosf(a) * rho, rho, wt, predicted)
         })
         .collect();
+    // (r/r₀)² = t² · 16 with r₀ = ri / 4.
+    let fade_k = (1 << 4) as f32;
     let (x0, x1, y0, y1) = cut(((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1));
     for py in y0..=y1 {
         for px in x0..=x1 {
@@ -10623,14 +10641,22 @@ fn gps_rings(sats: &[(f32, f32, f32)], x: f32, y: f32, ri: f32, flav: (f32, f32,
                 continue;
             }
             let env = libm::expf(1.0 - 1.0 / (1.0 - t2));
-            let mut depth = 0.0;
-            for &(cx, cy, rho, wt) in &rings {
+            let (mut depth, mut depth_predicted) = (0.0, 0.0);
+            for &(cx, cy, rho, wt, predicted) in &rings {
                 let s = 1.0 - ((dx - cx) * (dx - cx) + (dy - cy) * (dy - cy)) / (rho * rho);
                 let w = 2.0 * band / rho;
-                depth += wt * w / libm::sqrtf(s * s + w * w);
+                let d = wt * w / libm::sqrtf(s * s + w * w);
+                if predicted {
+                    depth_predicted += d;
+                } else {
+                    depth += d;
+                }
             }
+            depth_predicted *= 1.0 - libm::expf(-t2 * fade_k);
             let a = (1.0 - libm::expf(-depth)) * env;
-            console[i] = console[i].under(colour | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+            let ap = (1.0 - libm::expf(-depth_predicted)) * env;
+            // Front to back: the heard rings first, the predicted under them.
+            console[i] = console[i].under(colour | ((a * 65535.0) as u64) << 48, BlendMode::Normal).under(colour_predicted | ((ap * 65535.0) as u64) << 48, BlendMode::Normal);
         }
     }
 }

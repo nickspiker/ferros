@@ -105,6 +105,7 @@ members = [
     "ferros_puck",
     "ferros_glyphs",
     "ferros_sky",
+    "ferros_gnss",
     "ferros_compass",
     "ferros_weather",
     "ferros_faces",

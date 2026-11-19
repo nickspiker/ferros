@@ -95,11 +95,12 @@ fn compass() {
 
 #[test]
 fn gps() {
-    let sats: Vec<gps::Signal> = (0..24).map(|k| gps::Signal { az: (k * 15) as u16, el: (k * 3) as i8, used: k % 3 != 0 }).collect();
+    let sats: Vec<gps::Signal> = (0..24).map(|k| gps::Signal { az: (k * 15) as u16, el: (k * 3) as i8, used: k % 3 == 1, cn0: if k % 3 == 2 { 0 } else { 20 + k as u8 }, predicted: k % 3 == 2 }).collect();
     let s = gps::Sky { signals: &sats, fix: Some((8, NOW)), live: true };
     let words = both("gps", 0, |w, focus| gps::face(w, &s, focus));
     assert_eq!(words[0][0], "8m");
-    assert_eq!((words[0][2].as_str(), words[0][3].as_str()), ("16", "24"));
+    assert_eq!((words[0][2].as_str(), words[0][3].as_str()), ("8", "16"));
+    // The right-hand count is the signals heard: a bird only predicted is not one.
 }
 
 #[test]

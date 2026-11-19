@@ -16,3 +16,5 @@ ferros_thing = { path = "../ferros_thing" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The last fix's degrees thru vsf's position type (a rounding without std).
 libm = "0.2"
+# The GPS driver's orbits document carries ferros_gnss's elements.
+ferros_gnss = { path = "../ferros_gnss" }

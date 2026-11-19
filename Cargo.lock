@@ -1055,8 +1055,11 @@ dependencies = [
 name = "ferros-payload-gps"
 version = "0.1.0"
 dependencies = [
+ "ferros_gnss",
  "ferros_heap",
  "ferros_kept",
+ "ferros_kist",
+ "ferros_sky",
  "ferros_spi",
  "ferros_sys",
 ]
@@ -1612,6 +1615,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_gnss"
+version = "0.1.0"
+dependencies = [
+ "ferros_sky",
+ "libm",
+]
+
+[[package]]
 name = "ferros_gpuq"
 version = "0.1.0"
 
@@ -1674,6 +1685,7 @@ name = "ferros_kept"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_gnss",
  "ferros_thing",
  "libm",
  "vsf 0.11.0",

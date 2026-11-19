@@ -2,6 +2,7 @@
 //!
 //! | Value | Section | Fields |
 //! |---|---|---|
+//! | `gps.orbits` | `gnss_orbits` | `fetched` `e`, then a column per quantity: `system`, `number` `u`, `epoch` `e`, `inclination`, `node`, `eccentricity`, `perigee`, `anomaly`, `motion` `f6` (ferros_gnss::Elements) |
 //! | `gps.last` | `last_fix` | `at` `w` (the place), `when` `e` (when the fix came, on the real clock; absent when the clock was not read) |
 //! | `map.deck` | `circle`, one per circle placed by hand | `kind` `hi`, `thing` `ht` (none for settings), `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
 //! | `map.place.<label>` (until 2026-11-20, read once to migrate) | `place` | `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
@@ -24,6 +25,7 @@
 extern crate alloc;
 
 pub mod deck;
+pub mod gnss;
 pub mod gps;
 pub mod icon;
 pub mod map;

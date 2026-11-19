@@ -290,6 +290,43 @@ Known, enough to build: the SSI framing, the packet transport and its CRC, the R
 
 The 8a (Samsung KEPLER, booted through the modem's `gnss_boot`, data on SPI 21, BOARDS.md): out of scope here. It needs an Android capture of its HAL's traffic (akita-root has Magisk), its firmware path, then a driver of its own; the predicted sky above works there unchanged, since it needs no chip.
 
+## Built 2026-11-18 night: the right replay, a place put back, the predicted birds
+
+Branch gps-rough-fix. Measured on the Pro (b981, its flashed kernel, the driver hand-spawned, indoors at night).
+
+**The right replay.** The driver takes no input as the on-chip replay (`gps.replay.sky`), as input bit 0 is; the kernel's start on a claim now passes 01 as well, so either side alone is enough. `gps.replay` (the host-mode session) is used only when asked by name (input byte with bit 0 clear).
+
+**The reliable counter (found on the device).** The byte flag G#02 brings on a host frame is not lhd's ack of the chip: it is a counter, +1 for every reliable frame (0, 1, 2 … from the second stage's sync, every reliable frame of both replays). The chip acks a frame with flags G#25 (bit 0 the sequence, bit 2 the counter it took, bit 5 a byte not known) and refuses one whose counter is not the last plus one with flags G#29 (bit 3 in place of bit 2, the last counter it took beside it), and refuses every frame after it. Cutting messages closed up the sequences and the trailer counters but not this counter: `gps.replay.sky` jumps G#3D → G#43 (record 505, the `d0 81` and others cut) and G#43 → G#56 (record 506, the LTO windows cut on 2026-10-26), so **its last four messages (`03 00`, both `09 00`, `06 00`) were refused at every start**, the 2026-10-26 runs included. `tools/gps-replay-scan` now lists the jumps. The driver gives every reliable frame the next counter as it replays (`Renumber`): 5 renumbered, 0 not acked in time, against 5 refused (five G#29 replies in `gpstest 04`) in the first run, which renumbered nothing.
+
+**The place put back.** After the replay's time message (`87 81`), when the replay carries no `d0 81`, the driver builds one (`place_record`: the table above, the capture's small integers, 32 at +32 and +44) as its own record, the time frame's sequence, counter and trailer plus one, then `patch_aiding` fills the place and the time as it does every replay's; every frame after it moves on by one (sequence, trailer, counter). The chip acked it. Which field is the uncertainty is still open: input bit 2 writes the place's radius at +44, bit 3 into the words after the latitude and the longitude (6 and 7 in the captures: plausible as metres after a session of fixes at ±6-8 m); neither was tried with a sky in view.
+
+**The place's sources** (ferros_gnss::place, the single egg rule): each a circle; the tightest stands while each looser one overlaps it, and one that does not widens it to the smallest circle holding both, so no source silently wins. Today: the last fix (`gps.last`, its circle 2^6 m + 2^5 m/s of its age, 2^21 m with no time kept) and the zone's principal place (2^21 m). On the Pro there was no `gps.last`, so the zone alone: "position from the zone in effect's principal place (1 source …), the circle A#2097 km". fgtw.org's rough place is proposed below; the cell map (above) is not built.
+
+**First fix: none in 9.5 minutes** (indoors, night, the zone's place 2000 km wide, no LTO), as on 2026-11-18 before; the chip took its time (`a0 81` ×5). The place and the counters were the two things known wrong; whether they shorten a start needs a run with the sky in view, and the uncertainty field decided (bits 2 and 3).
+
+**The predicted birds** (payloads/gps predict.rs, ferros_gnss):
+- The orbits: CelesTrak's GNSS GP elements (`http://celestrak.org/NORAD/elements/gp.php?GROUP=gnss&FORMAT=tle`) over plain HTTP thru `ip` (grant slot 9, `udp`, added to the kernel's list), read by a fixed-column parser with both lines' checksums, kept as `gps.orbits` (ferros_kept::gnss: a VSF document, `fetched` Eagle time, a column per element; device class), fetched again after 2^16 s. On the Pro: 143 satellites of the four systems, 0 refused, in some 0.4 s after the replay.
+- The maths: the elements carried by SGP4's own secular rates (its Kozai undone, WGS-72, J2, J2², J4), TEME to the earth by the mean sidereal time, the place on WGS-84. Against the same day's GPS almanac (Yuma, IS-GPS-200's equations): every GPS satellite within 40 km and 0.1 degree of sky (src/tests.rs).
+- Published as tracks after the heard signals: C/N0 0, not used (no new bit); a heard signal of the same system (or a code the chip names that is not known yet) within 4 degrees, or the same GPS or BeiDou number, stands for its bird. Worked out again every 2^6 s while they show (the wait's deadline: half a degree of a satellite's travel), from the fix once there is one. On the Pro: 51 birds the moment the orbits came (GPS 14, GLONASS 8, Galileo 12, BeiDou 17; `gpstest 05` reads the tracks as the display does).
+- The console's GPS rings: used at full weight, heard by 1/(1 + e^(−(C/N0 − 28)/4)) / 2, predicted at 2^-3 as a second layer under the heard ones, in the flavour halfway to white, faded toward the centre by 1 − e^(−16 t²). Built and run on the Pro (the display restarted from a capsule of this branch: its console draws took 2.4 ms each against 1.6 ms before, the 51 rings the likely cost), not seen by eye: the capture showed the deck, not the corners. The stored display was put back after.
+- The GPS puck's sky plot reads the same tracks: used a full dot, heard a dot sized and weighted by C/N0, predicted a hollow ring at an eighth, faded toward the zenith. Built and host-tested; not on a device.
+- The tracks are readable by anyone (SYS_TRACKS), as the heard ones were: a sky in whole degrees says where the device is to some tens of km.
+
+### Proposed for fgtw.org: a signed rough place
+
+For the Photon session that owns fgtw-bootstrap; nothing here changes fgtw.org.
+
+- **Request:** `POST http://fgtw.org/` (plain HTTP, as every seed call) with a VSF document holding one section `rough_place_ask`: `nonce` (`hb`, 32 bytes fresh from the device's entropy). No identity, no device key: the question is about the request's address, not the asker.
+- **The worker:** dispatched by the section name as the others; reads `req.cf()` (workers-rs `Cf`): `coordinates()` (latitude and longitude, city level), `asn()`, `country()`. Keeps nothing, logs nothing.
+- **Reply:** a VSF document signed with the seed's key (as its other signed replies), section `rough_place`:
+  - `at` (`w`, the coordinates as vsf's WorldCoord), rounded to 2^-7 degree (under a kilometre: Cloudflare's own figure is a city's centre already);
+  - `radius` (`u`, metres): 2^15 when Cloudflare gave a city, 2^19 when only a region, no section at all when it gave no coordinates;
+  - `asn` (`u`), so the device can tell a carrier's gateway (often far off) from a home line;
+  - `country` (`a`, the two ISO letters as Cloudflare gives them; a code, not a sentence);
+  - `nonce` (`hb`, the request's, echoed: the reply answers this question and no replayed one);
+  - the document's creation time (Eagle) is when it was answered.
+- **The device:** checks the signature against the pinned seed key and the nonce, keeps the answer as `gps.rough` (identity class, beside `gps.last`: kvault.rs `IDENTITY` needs the prefix), and the driver adds it as a source circle. A carrier ASN widens it (2^19 m) unless the zone and the last fix agree with it. Over a VPN it lands in the wrong country, which the zone then contradicts and the combination widens to cover both.
+
 ## Next
 
 1. ~~Navigation~~ — done above.
