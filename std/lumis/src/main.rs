@@ -181,6 +181,8 @@ const DEV_SLIT: u8 = 1 << 1;
 const DEV_SLIT_SHUTTER: u32 = 3;
 /// Development, with `DEV_OPEN`, the second knobs byte: open the first readout with a mode of its own (the main's 1:1, ferros cam-full-res) instead of the first listed, and say the gravity Lumis is given once, at the camera screen's first pass.
 const DEV_FULL: u8 = 1 << 5;
+/// Development, the second knobs byte: open at a 2^10 s shutter (1024 s, the longest the main has been measured to honour), so a long frame is in flight for the leave test (lumis-leave-long: sent behind, the camera closed at once).
+const DEV_LONG: u8 = 1 << 6;
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
 /// The second knobs byte, 0 when the input is shorter.
@@ -598,6 +600,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let (seed_iso, seed_shutter) = match calibration {
         // A dark map opens at lumis_core's dark seed (16 s, Android's longest) or the camera's longest if shorter: the combined driver offers years (the main's shift modes), and a calibration must not open on one. The shutter control keeps the whole range.
         Some(dark) => (max_iso, if dark { (cam.exposure_max as f64).min(app::DARK_CALIBRATION_SHUTTER_NS) } else { cam.exposure_min as f64 }),
+        None if dev_knobs2() & DEV_LONG != 0 => (iso(first.gain), ((1u64 << 10) * 1_000_000_000) as f64),
         None => (iso(first.gain), first.exposure_ns as f64),
     };
     let setup = CameraSetup {
