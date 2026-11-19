@@ -512,46 +512,6 @@ pub fn covered(now: bool) {
     unlock();
 }
 
-/// The gravity turn the pucks' faces were last drawn at.
-static mut GRAV_DRAWN: Option<(i64, i64)> = None;
-
-/// Gravity turned the faces by half a pixel at the largest puck's rim since they were last drawn: each puck on the glass hears its new turn, and its box is owed to every phase (its sprite turns with it), drawn at the flips as a new square is, never the whole deck (the 8a, 2026-11-18: gravity moved by that much on nearly every pass and each was a whole redraw). Only the pucks turn by gravity.
-pub fn regravity(turn: Option<(i64, i64)>) {
-    let was = unsafe { GRAV_DRAWN };
-    let Some((c, s)) = turn else { return };
-    if let Some((pc, ps)) = was {
-        // sin of the angle between them, Q28, times the radius (Q8): under half a pixel (2^27 · 2^8) the faces draw the same.
-        if (c * ps - s * pc).abs() * largest_r() < 1 << 35 {
-            return;
-        }
-    }
-    unsafe { GRAV_DRAWN = turn };
-    let bound = unsafe { &*(&raw const BOUND) };
-    let es = lock();
-    for j in 0..N {
-        let shown = unsafe { SEEN[j].shown };
-        if bound[j] == [0; 64] || !shown {
-            continue;
-        }
-        unsafe {
-            SEEN[j].c = c as i16;
-            SEEN[j].s = s as i16;
-            GEOM[j].3 = c;
-            GEOM[j].4 = s;
-            for p in 0..4 {
-                PHASE_SEQ[p][j] = 0;
-            }
-        }
-        if let Some(e) = es.iter_mut().find(|e| e.id == bound[j]) {
-            e.view.c = c as i16;
-            e.view.s = s as i16;
-            tell(e);
-            count(2);
-        }
-    }
-    unlock();
-}
-
 /// What the pucks did since the last read (`counts`): squares taken, frames told, views told, whole redraws they caused, boxes drawn into a phase at its flip. For the display's ten-second line.
 static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
