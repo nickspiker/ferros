@@ -2,8 +2,8 @@
 //!
 //! ferros-bridge spawn cambench.bin <hex input> --name cambench --use camera
 //! Its input, bytes given in hex (u16 little-endian):
-//! - +0 the camera (ferros_cam cams: 0 main, 1 ultrawide, 3 tele), +1 the mode kind (0 the init's, 1 binned with its frame cut, 2 1:1, 3 binned slit, 4 1:1 slit),
-//! - +2 a slit's rows (u16), +4 the frame in lines (u16; 0 the driver's default, FFFF the mode's own), +6 the integration in lines (u16; 0 the driver's 16),
+//! - +0 the camera (ferros_cam cams: 0 main, 1 ultrawide, 3 tele), +1 the mode kind (0 the init's, 1 binned with its frame cut, 2 1:1 (the 1:1 init `cam.<key>.init.full` replayed: docs/CAMERA.md "1:1 on the main"), 3 binned slit, 4 1:1 slit from the same init),
+//! - +2 a slit's rows (u16), +4 the frame in lines (u16; 0 the driver's default, FFFF the mode's own; kind 2: 0 the 1:1 init's own), +6 the integration in lines (u16; 0 the driver's 16; kind 2: 0 the 1:1 init's own),
 //! - +8 the driver's flags (payloads/camera `F_*`: 1 RAW12, 2 mid-stream, 4 PD path, 8 geometry everywhere, 16 slim program, 32 slim level 2, 64 front end left as captured), +9 a slit ring's buffers as a power of two (0: 2^8), +10 the line length (u16; 0 the mode's),
 //! - +12 the work per frame: 0 map only (the capture's ceiling), 1 read every line out of the view (64-byte loads), 2 read and add into u16 sums folded into u32 every 64 frames, 3 read and add into u32 sums,
 //! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each; 3 the line length from 6320 clocks down, a new open each), +15 threads for whole frames (0: the four A715s),

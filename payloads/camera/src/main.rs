@@ -3,7 +3,7 @@
 //!
 //! The kernel keeps what a process may not do behind the `camera` power switch (kernel camera_power.rs): the camera buses' pins and clocks, the module's rails behind the overvoltage guard (which module: the switch's argument, ferros_sys `power_arg`), the front end's power domain and clocks, the D-PHY's isolation, the SYSMMUs in bypass and the S2MPUs fenced to this driver's frames. Here, thru its grants: the open camera's sensor and lens actuator on its bus, the front end and its PDMA engine, the CSI links and PHY, and the front end's line 0.
 //!
-//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on for that camera's module, the sensor's identity read, its init replayed from the vault (`cam.<key>.init`; the main's also `cam.frame`), the PDMA job from the vault (`cam.<key>.pdma`; its IDT `cam.<key>.idt` beside them, for the list) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.<key>.prog`; the main's `cam.ispfe.prog`), the engine started, the camera's receiver last, the CPU's writes after it, the lens set, the stream on. The keys: boitata (main), oksoko (ultrawide), dokkaebi (front), kraken (tele).
+//! An open, in the order a camera open does it (the kernel's `diag cam pdma`, which this replaces): the region taken (a run of frames from the pool, zeroed, fenced), the switch on for that camera's module, the sensor's identity read, its init replayed from the vault (`cam.<key>.init`; the main's also `cam.frame`; a 1:1 mode's `cam.<key>.init.full`), the PDMA job from the vault (`cam.<key>.pdma`; its IDT `cam.<key>.idt` beside them, for the list) moved into the region (ferros_cam job) and placed there, the CPU's setup writes before the engine (`cam.<key>.prog`; the main's `cam.ispfe.prog`), the engine started, the camera's receiver last, the CPU's writes after it, the lens set, the stream on. The keys: boitata (main), oksoko (ultrawide), dokkaebi (front), kraken (tele).
 //! Then the front end is answered on its interrupt: every acknowledgement in the order Linux makes them (the camera's, ferros_cam cams `ack`), loch0's paths enabled after the first SHADOW_UPDATE (G#81 to G#1C32_00A0), the engine's descriptor index advanced once a frame. Left unanswered past about a frame period the front end stops for good (docs/oracle/CAMERA.md "Focus, exposure"), which is why this is its own thread on an interrupt and not the kernel's spin.
 //!
 //! Spawn by hand (the kernel also starts it itself on a call to `camera`):
@@ -11,7 +11,7 @@
 //! Grant slots, in that order: 0 console, 1 serve camera, 2 hsi2c_1, 3 the front end, 4 the CSI links and PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.`, 7 the switch, 8 the region, 9 the line, 10 hsi2c_3 (the ultrawide), 11 hsi2c_2 (the front), 12 hsi2c_4 (the tele).
 //!
 //! The `camera` endpoint (docs/CAMERA.md "The endpoint"), first byte the op:
-//! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`.
+//! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`; a camera whose 1:1 init is in the vault (`cam.<key>.init.full`) has a second section, the same `id` and `name`, its `mode` 2 and its own size, `cfa_period`, `frame_ns` and exposure range (ferros_cam list `Readout`).
 //! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
 //! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 3 (a device test) the vendor shift every later exposure takes (0 the least that fits). `[0]` taken, `[1]` outside the range.
@@ -115,7 +115,17 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         let Some(idt) = get(g, input_key(&mut kb, c, b"idt"), unsafe { &mut *(&raw mut IDT) }) else { continue };
         match ferros_cam::list::section(c, idt) {
             Ok(s) => secs.push(s),
-            Err(e) => say!(g, "camera: cam.{}.idt does not read ({e:?}); {} left out of the list\n", c.key, c.name),
+            Err(e) => {
+                say!(g, "camera: cam.{}.idt does not read ({e:?}); {} left out of the list\n", c.key, c.name);
+                continue;
+            }
+        }
+        // Its 1:1 readout, a second section with the same `id` and `name`, when its 1:1 init is in the vault (`cam.<key>.init.full`; docs/CAMERA.md "1:1 on the main"): its own size, mosaic period, frame period and exposure range, read off that init; opened by the mode block's kind 2.
+        if let Some(full) = full_init(g, c) {
+            match ferros_cam::list::Readout::full(c, full).and_then(|r| ferros_cam::list::section_of(c, idt, &r)) {
+                Ok(s) => secs.push(s),
+                Err(e) => say!(g, "camera: cam.{}.init.full gives no 1:1 readout ({e:?}); {}'s 1:1 left out of the list\n", c.key, c.name),
+            }
         }
     }
     ferros_cam::list::document(secs).unwrap_or_default()
@@ -383,6 +393,8 @@ const SLIM_STRIDE: usize = 1 << 10;
 
 /// The open's shape (`open`): a buffer's bytes in the ring (the mode's rows and line in whole frames of the pool, ferros_cam job `buffer_bytes`: the Pro's binned main 16 MiB, its 1:1 frame 60 MiB, a slit a few KiB, `slit_bytes`), the frame's rows, width and line bytes, whether the descriptors after the first run the slim program, whether loch0's PD path is enabled, and the slit ring's buffer count (0: a ring of whole frames with holds, `ring_turn`; else `slit_turn`).
 static BUF: AtomicU64 = AtomicU64::new(job::IMAGE_BYTES);
+/// The open mode's mosaic period in pixels (2 Bayer; a 1:1 mode's quad array, ferros_cam ccs `Array::period`), for the frame header's +14.
+static CFA_PERIOD: AtomicU64 = AtomicU64::new(2);
 static ROWS: AtomicU64 = AtomicU64::new(cams::H_MOST as u64);
 static COLS: AtomicU64 = AtomicU64::new(cams::W_MOST as u64);
 static LINE: AtomicU64 = AtomicU64::new(cams::STRIDE_MOST as u64);
@@ -991,6 +1003,22 @@ static mut INIT: [u8; VALUE] = [0; VALUE];
 static mut PROG: [u8; VALUE] = [0; VALUE];
 static mut BUNDLE: [u8; 2 * VALUE] = [0; 2 * VALUE];
 static mut JOB: [u8; VALUE] = [0; VALUE];
+/// The 1:1 init (`cam.<key>.init.full`, the main's 15499 bytes), for an OPEN of a 1:1 kind and for LIST's 1:1 section.
+static mut FULL: [u8; VALUE] = [0; VALUE];
+/// A device test with nothing stored: the 1:1 init's length when the hand spawn's input carried it (`FULL_INPUT_AT`), held in `FULL` from the start and used in place of the vault's; 0 none.
+static FULL_INPUT: AtomicU64 = AtomicU64::new(0);
+/// Where the spawn's input carries the 1:1 init: after 16 knob bytes, framed as ferros-bridge's `--input-file` frames a file (u32 LE length, then the bytes): `spawn camera.bin 01000000000000000000000000000000 --input-file target/cam/main-full.init`.
+const FULL_INPUT_AT: u64 = 1 << 4;
+
+/// Camera `c`'s 1:1 init: the spawn's (a device test, `FULL_INPUT`), else the vault's `cam.<key>.init.full`; None when neither.
+fn full_init(g: u64, c: &Cam) -> Option<&'static [u8]> {
+    let n = FULL_INPUT.load(Ordering::Relaxed) as usize;
+    if n != 0 {
+        return Some(unsafe { &(&*(&raw const FULL))[..n] });
+    }
+    let mut kf = [0u8; 32];
+    get(g, input_key(&mut kf, c, b"init.full"), unsafe { &mut *(&raw mut FULL) })
+}
 
 /// A fill no frame holds, so a write anywhere in an output shows (docs/oracle/CAMERA.md "the write test was blind to dark frames": a point reading anything else, zero included, was written).
 const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
@@ -1176,9 +1204,9 @@ enum Fail {
 }
 
 /// What an OPEN asks of the sensor (docs/CAMERA.md "Modes, the bench and the slit"): its mode block after `[1][id][view]`, every field optional, a shorter OPEN taking the defaults (the init's mode untouched, as every open before the bench).
-/// `kind`: 0 the init's mode (Android's binned), 1 the binned mode with its frame and integration cut, 2 the 1:1 readout (a guess until a capture), 3 a binned slit, 4 a 1:1 slit.
-/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells), `fll` the frame in lines (0: the rows and `BLANK` more; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's), `cols` the window's output columns across the middle (0: the mode's whole width; on 2^4, ferros_cam ccs `Mode::cols`).
-/// A windowed mode (a slit, or `cols` set) turns the sensor's phase detect and embedded data off in its hold (ferros_cam ccs `Side`), unless `F_LOUD`: both are laid out for the whole binned frame.
+/// `kind`: 0 the init's mode (Android's binned), 1 the binned mode with its frame and integration cut, 2 the 1:1 readout (the 1:1 init `cam.<key>.init.full` replayed in place of the binned one: Android's own maximum-resolution mode, the main's 8160 x 6144 from the 16 s capture; docs/CAMERA.md "1:1 on the main"), 3 a binned slit, 4 a 1:1 slit (from the same 1:1 init).
+/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells), `fll` the frame in lines (0: the rows and `BLANK` more, or for kind 2 the 1:1 init's own; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`, or for kind 2 the 1:1 init's own: an all-zero block of kind 2 is Android's 1:1 mode as its init leaves it, as an all-zero block is the binned init's), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's), `cols` the window's output columns across the middle (0: the mode's whole width; on 2^4, ferros_cam ccs `Mode::cols`).
+/// A windowed mode (a slit, or `cols` set) and a 1:1 mode turn the sensor's phase detect and embedded data off in its hold (ferros_cam ccs `Side`), unless `F_LOUD`: both are laid out for the whole binned frame (the 1:1 init writes the same 2040 x 768 PD block as the binned one, and the PD channel's size at 1:1 was never captured).
 #[derive(Clone, Copy)]
 struct Spec {
     kind: u8,
@@ -1236,28 +1264,37 @@ impl Spec {
     fn windowed(&self) -> bool {
         self.slit() || self.cols != 0
     }
-    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults are the main's alone: the switches are read off its program, and the ultrawide's slim program took one frame (2026-11-16).
+    /// A mode from the 1:1 init (`cam.<key>.init.full`): its whole frame or a slit of it.
+    fn full(&self) -> bool {
+        matches!(self.kind, K_FULL | K_SLIT_FULL)
+    }
+    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults are the main's alone: the switches are read off its program, and the ultrawide's slim program took one frame (2026-11-16). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
     fn shape(&self, main: bool) -> (u8, bool) {
-        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed(), main, self.flags & F_SLIM != 0)
+        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), main, self.flags & F_SLIM != 0)
     }
 }
 
-/// The sensor's mode for `s` (None: the init's, untouched), built from the init's own (`ccs::Mode::captured`).
+/// The sensor's mode for `s` (None: the init's, untouched), built from the init's own (`ccs::Mode::captured`; for the 1:1 kinds the 1:1 init's, `ccs::Mode::captured_full`, which `init` then is).
+/// The 1:1 frame (kind 2) defaults to the 1:1 init's own frame and integration, and is always written in the hold (its own registers again, with phase detect and embedded data off unless `F_LOUD`).
 fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
     if s.kind == K_CAPTURED {
         return Ok(None);
     }
     let a = &ccs::ARRAYS[c.id as usize];
-    let own = ccs::Mode::captured(init, a).map_err(Fail::Mode)?;
     let base = match s.kind {
-        K_BINNED | K_SLIT => own,
-        K_FULL | K_SLIT_FULL => own.unbinned(a).map_err(Fail::Mode)?,
+        K_BINNED | K_SLIT => ccs::Mode::captured(init, a).map_err(Fail::Mode)?,
+        K_FULL | K_SLIT_FULL => ccs::Mode::captured_full(init, a).map_err(Fail::Mode)?,
         _ => return Err(Fail::Inputs("no such mode kind")),
     };
-    let exp = if s.exposure == 0 { EXPOSURE } else { s.exposure };
+    let exp = match s.exposure {
+        0 if s.kind == K_FULL => base.coarse,
+        0 => EXPOSURE,
+        e => e,
+    };
     let rows = if s.slit() { s.rows } else { base.y_out };
     let fll = match s.fll {
         0 if s.slit() => rows + BLANK,
+        0 if s.kind == K_FULL => base.fll,
         0 => rows + (BLANK << 1),
         FLL_OWN => base.fll,
         f => f,
@@ -1269,7 +1306,7 @@ fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
     if s.cols != 0 {
         m = m.cols(a, s.cols).map_err(Fail::Mode)?;
     }
-    if (s.slit() || s.cols != 0) && s.flags & F_LOUD == 0 {
+    if (s.windowed() || s.full()) && s.flags & F_LOUD == 0 {
         m = m.quiet();
     }
     if s.flags & F_RAW12 != 0 {
@@ -1340,6 +1377,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             },
         }
     };
+    // A 1:1 mode replays the 1:1 init in place of the binned one (`cam.<key>.init.full`, docs/CAMERA.md "1:1 on the main"); the CPU's writes and the job stay the binned session's, their geometry rewritten to the 1:1 frame as any mode's is.
+    let init = if s.full() { full_init(g, c).ok_or(Fail::Inputs("no cam.<key>.init.full (the 1:1 init) for this camera in the vault"))? } else { init };
     let prog = inputs::prog(prog).ok_or(Fail::Inputs("the CPU program is not a CPR2"))?;
     let jb = unsafe { &mut *(&raw mut JOB) };
     let jn = get(g, input_key(&mut kb, c, b"pdma"), jb).ok_or(Fail::Inputs("no cam.<key>.pdma for this camera in the vault"))?.len();
@@ -1560,6 +1599,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     // The shape the frame thread and the endpoint work to.
     BUF.store(buf, Ordering::Relaxed);
+    CFA_PERIOD.store(if s.full() { ccs::ARRAYS[c.id as usize].period as u64 } else { 2 }, Ordering::Relaxed);
     ROWS.store(fe.h as u64, Ordering::Relaxed);
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);
@@ -1684,9 +1724,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let (cmin, margin) = (u16::from_be_bytes([cw[0], cw[1]]), u16::from_be_bytes([cw[2], cw[3]]));
     // WHY the tests: the words are the sensor's; a margin not under the mode's own frame describes none (the main's limit block at G#1100 aliases to G#4140), and a least of 0 is taken as one line, the least SET ever took.
     let sane = read && margin < fll;
-    let timing = ccs::Timing { line_ps: c.line_ps, captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
+    let timing = ccs::Timing { line_ps: ccs::line_ps_for(c, &page), captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
-    say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
+    say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
     say!(g, "camera: {}: the vendor shift to A#{}{}; the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
     readout_reset();
     if sane && arr.margin.is_some_and(|m| m != margin) {
@@ -1904,6 +1944,8 @@ fn header(h: &mut [u8], b: usize, bin: usize) {
     h[6..8].copy_from_slice(&(bh as u16).to_le_bytes());
     h[8] = bin as u8;
     h[9] = c.cfa;
+    // The mosaic's period (2 Bayer, 4 the quad array of a 1:1 frame: `cfa` then names its 2 x 2 blocks), at +14; a driver from before leaves it 0, which reads as 2.
+    h[14] = CFA_PERIOD.load(Ordering::Relaxed) as u8;
     h[10..12].copy_from_slice(&c.black.to_le_bytes());
     h[12..14].copy_from_slice(&c.white.to_le_bytes());
     h[16..24].copy_from_slice(&B_NS[b].load(Ordering::Relaxed).to_le_bytes());
@@ -2290,6 +2332,22 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     if input_len > 9 {
         NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    // A device test with nothing stored: the 1:1 init in the input after the 16 knob bytes (`FULL_INPUT_AT`), u32 LE length and the table, as `--input-file` frames it.
+    if input_len > FULL_INPUT_AT + 4 {
+        let at = ferros_sys::arc_base() + input + FULL_INPUT_AT;
+        let n = u32::from_le_bytes(core::array::from_fn(|k| unsafe { core::ptr::read_volatile((at + k as u64) as *const u8) })) as u64;
+        // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `FULL` would write past it.
+        if FULL_INPUT_AT + 4 + n == input_len && n as usize <= VALUE {
+            let full = unsafe { &mut *(&raw mut FULL) };
+            for k in 0..n as usize {
+                full[k] = unsafe { core::ptr::read_volatile((at + 4 + k as u64) as *const u8) };
+            }
+            FULL_INPUT.store(n, Ordering::Relaxed);
+            say!(g, "camera: the 1:1 init from the spawn's input, A#{n} bytes (a device test: used in place of the vault's cam.<key>.init.full)\n");
+        } else {
+            say!(g, "camera: the spawn's input past its knobs is not a framed 1:1 init (A#{} bytes); ignored\n", input_len - FULL_INPUT_AT);
+        }
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);

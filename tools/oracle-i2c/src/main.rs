@@ -3,11 +3,12 @@
 //! Input: the flushed console (console-ramoops-0), or its `ferros hv: S2 <pa> <R|W><bytes> <value>` lines (HV.md, the register oracle); `ferros hv: S2 rep <N>` repeats the access before it N more times; `ferros-mark: ...` lines written from Android pass thru as `# MARK ...`.
 //! Register map as ferros_kernel hsi2c.rs has it: TX_DATA G#34, RX_DATA G#38, AUTO_CONF G#44 (length bits 0-15, READ bit 16, RUN bit 31), ADDR G#70 (the 7-bit target at bits 10-16).
 //!
-//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table]
+//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--init <out>]
 //! - Transfers (the default): `G#3D W 02 02 53 5E`, one a line; a transfer longer than `--max-bytes` as its first four bytes, its length and its blake3 (a sensor's settings upload is vendor firmware: its size and identity stay checkable, its bytes stay out of any file meant for the repository).
 //! - `--holds T`: target T's writes as 16-bit CCS register and data: every hold (G#0104 = 1 ... G#0104 = 0) on one line, `hold: 0702=0000 0704=0000 0202=535E 0340=5372`; every write outside a hold on its own line (stream on and off, mode changes); Samsung's indirect window (G#6028, G#602A, G#6F12) said as the page address it writes; reads as `R`. What a long exposure writes is then read straight off it (docs/CAMERA.md "Long exposures").
 //! - `--flat` (with `--holds T`): every write to T one 16-bit word a line at its resolved address, `2001_8D3E=000C` (the page G#FCFC selects, or the indirect window), so two inits diff with sort and join: docs/CAMERA.md "The slit for real" found the side channels this way.
 //! - `--table`: the input is an init table (`cam.<key>.init`, or the init inside a `cam.frame` bundle), not a capture, read as transfers to `--holds T`.
+//! - `--init <out>` (with `--holds T`): T's transfers up to its first stream on written as an init table the camera driver replays (W, R and D records, ferros_cam inputs), as tools/camera-init.py made them; refused when the capture has no stream on or a transfer before it lost bytes. The main's 1:1 init (`cam.boitata.init.full`) came from the 16 s capture this way (docs/CAMERA.md "1:1 on the main").
 //! Integrity on stderr: transfers whose byte count is not the length their AUTO_CONF run was programmed with (lines lost from the console ring: never replay such a transfer; memory feedback_oracle_capture_integrity).
 
 use std::fmt::Write as _;
@@ -212,6 +213,54 @@ fn flat(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
     out
 }
 
+/// Target `target`'s transfers up to its first stream on (a write of G#0100 on the CCS page with a nonzero mode byte, CCS mode_select), not including it, as an init table the camera driver replays (ferros_cam inputs `records`): what tools/camera-init.py made, in Rust.
+/// A two-byte write followed by a read is one `R` record (the register and the count read); a read alone is an `R` of register 0.
+/// The capture has no times, so the delays are the main's binned table's, which has run since 2026-10-19: 10 ms after each of the first three transfers, 5 ms after a write past 256 bytes (the settings upload), 1 ms after every other write.
+/// Refused (None) when the capture holds no stream on, or a transfer whose byte count is not its programmed length (feedback_oracle_capture_integrity: never replay one).
+fn init_table(items: &[Item], target: u8) -> Option<(Vec<u8>, usize)> {
+    let xs: Vec<&Xfer> = items.iter().filter_map(|it| if let Item::Xfer(x) = it { (x.target == target).then_some(x) } else { None }).collect();
+    // The stream on is G#0100 on the CCS page: a Samsung part's G#0100 on another page (G#FCFC = G#4001 selects one, the main's init writes G#0100 = G#FFFF there) is not mode_select.
+    let mut page = 0x4000u16;
+    let end = xs.iter().position(|x| {
+        if x.read || x.data.len() < 3 {
+            return false;
+        }
+        if x.data[..2] == [0xFC, 0xFC] && x.data.len() >= 4 {
+            page = u16::from_be_bytes([x.data[2], x.data[3]]);
+        }
+        page == 0x4000 && x.data[..2] == [0x01, 0x00] && x.data[2] != 0
+    })?;
+    if xs[..end].iter().any(|x| x.expect.is_some_and(|e| e != x.data.len())) {
+        return None;
+    }
+    let mut t = Vec::new();
+    let (mut i, mut n) = (0, 0);
+    while i < end {
+        let x = xs[i];
+        if !x.read && x.data.len() == 2 && i + 1 < end && xs[i + 1].read {
+            t.push(b'R');
+            t.extend_from_slice(&(xs[i + 1].data.len() as u16).to_be_bytes());
+            t.extend_from_slice(&x.data);
+            i += 2;
+        } else if !x.read {
+            t.push(b'W');
+            t.extend_from_slice(&(x.data.len() as u16).to_be_bytes());
+            t.extend_from_slice(&x.data);
+            let us: u32 = if n < 3 { 10_000 } else if x.data.len() > 256 { 5_000 } else { 1_000 };
+            t.push(b'D');
+            t.extend_from_slice(&us.to_be_bytes());
+            i += 1;
+        } else {
+            t.push(b'R');
+            t.extend_from_slice(&(x.data.len() as u16).to_be_bytes());
+            t.extend_from_slice(&[0, 0]);
+            i += 1;
+        }
+        n += 1;
+    }
+    Some((t, n))
+}
+
 /// One sensor's writes as CCS registers: holds on one line each, the rest a line each.
 fn holds(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
     let mut out = Vec::new();
@@ -284,9 +333,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut path, mut base, mut max, mut focus) = (None, 0x1088_0000u64, None, None);
     let (mut flat_out, mut is_table) = (false, false);
+    let mut init_out: Option<String> = None;
     let mut k = 0;
     while k < args.len() {
         match args[k].as_str() {
+            "--init" => {
+                init_out = Some(args.get(k + 1).expect("--init <out>").clone());
+                k += 2;
+            }
             "--flat" => {
                 flat_out = true;
                 k += 1;
@@ -314,11 +368,21 @@ fn main() {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: oracle-i2c <capture.log or init table> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table]");
+        eprintln!("usage: oracle-i2c <capture.log or init table> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--init <out>]");
         std::process::exit(2);
     };
     let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let items = if is_table { table(&raw, focus.expect("--table needs --holds G#<target> or --flat with --holds")) } else { transfers(&accesses(&String::from_utf8_lossy(&raw)), base) };
+    if let Some(out) = init_out {
+        let t = focus.expect("--init needs --holds G#<target>");
+        let Some((table, n)) = init_table(&items, t) else {
+            eprintln!("# no init: no stream on to G#{t:02X} in the capture, or a transfer before it whose byte count is not its programmed length -- DO NOT REPLAY");
+            std::process::exit(1);
+        };
+        std::fs::write(&out, &table).unwrap_or_else(|e| panic!("{out}: {e}"));
+        eprintln!("# {n} transfers before the stream on -> {} bytes in {out}, blake3 {}", table.len(), blake3::hash(&table).to_hex());
+        return;
+    }
     let mut bad = 0usize;
     let mut targets: Vec<u8> = Vec::new();
     let mut n = 0usize;
@@ -393,6 +457,33 @@ mod tests {
         let h = holds(&items, 0x3D, None);
         assert_eq!(h, vec!["# MARK sixteen seconds", "hold: 0702=0700 0202=0000", "W 0100=0103"]);
         assert!(items.iter().all(|i| !matches!(i, Item::Xfer(x) if x.expect != Some(x.data.len()))));
+    }
+
+    /// An init table from transfers: the identity read as one R record, writes each with its delay (10 ms for the first three), stopped at the stream on; a transfer that lost bytes, or no stream on, refuses.
+    #[test]
+    fn an_init_table() {
+        let w = |d: &[u8]| Item::Xfer(Xfer { target: 0x3D, read: false, data: d.to_vec(), expect: Some(d.len()) });
+        let r = |d: &[u8]| Item::Xfer(Xfer { target: 0x3D, read: true, data: d.to_vec(), expect: Some(d.len()) });
+        let mut items = vec![w(&[0, 0]), r(&[8, 0xEF]), w(&[0xFC, 0xFC, 0x40, 0x00]), w(&[1, 4, 1, 1]), w(&[2, 2, 0x11, 0xDA]), w(&[1, 0, 1, 3]), w(&[1, 4, 0, 1])];
+        let (t, n) = init_table(&items, 0x3D).unwrap();
+        assert_eq!(n, 4);
+        let mut want = vec![b'R', 0, 2, 0, 0];
+        for (d, us) in [(&[0xFCu8, 0xFC, 0x40, 0x00][..], 10_000u32), (&[1, 4, 1, 1], 10_000), (&[2, 2, 0x11, 0xDA], 1_000)] {
+            want.push(b'W');
+            want.extend_from_slice(&(d.len() as u16).to_be_bytes());
+            want.extend_from_slice(d);
+            want.push(b'D');
+            want.extend_from_slice(&us.to_be_bytes());
+        }
+        assert_eq!(t, want);
+        // The table reads back as the transfers it came from.
+        let back = flat(&table(&t, 0x3D), 0x3D, None);
+        assert_eq!(back, vec!["4000_0104=0101", "4000_0202=11DA"]);
+        items[4] = Item::Xfer(Xfer { target: 0x3D, read: false, data: vec![2, 2, 0x11], expect: Some(4) });
+        assert!(init_table(&items, 0x3D).is_none());
+        items.truncate(5);
+        items[4] = w(&[2, 2, 0x11, 0xDA]);
+        assert!(init_table(&items, 0x3D).is_none());
     }
 
     /// An init table read flat: a direct write on the CCS page until G#FCFC moves it, the page after, the indirect window's words at its address in two-byte steps, a byte write alone.

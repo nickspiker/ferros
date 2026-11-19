@@ -4,6 +4,7 @@
 //! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024), and optionally 1 to drive the controls mid-stream (`60080001`: 96 frames at bin 8, exposure, gain and focus changed).
 //! Bin 1 is the view (docs/CAMERA.md "The view"): whole frames read in place, held one at a time (`4001`: 64 frames); a fourth byte of 2 also stores into the view at the end, which must fault (`40010002`).
 //! A fifth byte names the camera (ferros_cam cams: 0 the main, the default; 1 the ultrawide; 2 the front; 3 the tele): `4001000001` the ultrawide's view, `4008000001` its frames at bin 8. A fourth byte of 7 PROBEs that camera instead and ends (`0000000702`: the front's identity and which addresses answer on its bus; docs/CAMERA.md "Device test plan").
+//! An eighth byte is the OPEN's mode block kind, carried by every open (0, or none: the init's mode as before): 2 the 1:1 readout from the 1:1 init (docs/CAMERA.md "1:1 on the main"), whose frames are the view's alone (FRAME by copy bins only the captured shape): `4001000000000002` the main's 1:1 thru the view, 64 frames, with the mosaic's 4 x 4 cell said (`cells`); `0401000500000002` its long-exposure ladder thru the view (bin 1).
 //! A fourth byte of 6 sweeps the main's vendor shift, each forced (SET 3), from the seventh byte to the sixth, 16 lines of 2^shift each, the first byte frames a step (1 if 0) after two let pass (`0108000600140A`: shifts 10 to 20).
 //! A fourth byte of 4 measures where the analogue gain ends (2026-11-17): raw frames thru the view at each step 1x to 160x, the temporal noise and its input-referred value, the codes' histogram near the mean (`0400000400` the main at the init's exposure; `040000040007` at 128 us, dark).
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
@@ -40,6 +41,17 @@ macro_rules! say {
 /// The reply buffer: a frame at bin 2 is 6 MiB and its header.
 static mut BUF: [u8; (1 << 23) + 64] = [0; (1 << 23) + 64];
 
+/// The OPEN's mode block kind every open carries (the eighth input byte; 0 none: the init's mode, as before): 2 opens the 1:1 readout (payloads/camera `K_FULL`, the 1:1 init `cam.<key>.init.full` with its own frame and integration).
+static KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// An OPEN of camera `id`, with the view or not, and the mode block's kind when one is asked (`KIND`; every other field of the block zero, the driver's defaults): the message and its length.
+fn open_msg(id: u8, view: bool) -> ([u8; 4], usize) {
+    match KIND.load(core::sync::atomic::Ordering::Relaxed) as u8 {
+        0 => ([1, id, view as u8, 0], if view { 3 } else { 2 }),
+        k => ([1, id, view as u8, k], 4),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -48,6 +60,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         0 => 16,
         n => n as u32 * if arg(2) == 0 { 1 } else { arg(2) as u32 },
     };
+    KIND.store(arg(7) as u64, core::sync::atomic::Ordering::Relaxed);
     let bin = match arg(1) {
         1 => 1u8,
         2 => 2,
@@ -88,6 +101,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 9 {
         serve_wait(g, ep, id, arg(5), arg(6), t1);
     }
+    // The ladder at bin 1 takes its frames thru the view (a 1:1 frame has no FRAME by copy), so it goes before the plain view run.
+    if arg(3) == 5 && bin == 1 {
+        long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
+    }
     if bin == 1 {
         view(g, ep, id, frames, arg(3) == 2, t1);
     }
@@ -108,7 +125,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         snap_pair(g, ep, id, arg(0), arg(5), arg(6), t1);
     }
     let mut r = [0u8; 4];
-    let n = call(ep, &[1, id], &mut r);
+    let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
@@ -167,12 +184,31 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
 /// A step whose frames stop ends the run with the driver's own "no frame" line on the console; the close powers the module down, so the next open is a cold sensor (docs/CAMERA.md "Long exposures").
 fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_log2: u8, t1: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
-    let mut r = [0u8; 4];
-    let n = call(ep, &[1, id], &mut r);
-    say!(g, "camtest: long exposures: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
-    if n == ERR || r[0] != 0 {
+    // At bin 1 the frames come thru the view, MAPped one at a time (the 1:1 readout's only way: FRAME by copy bins the captured shape alone).
+    let view = bin == 1;
+    let mut r = [0u8; 64];
+    let n = { let (m, l) = open_msg(id, view); call(ep, &m[..l], &mut r) };
+    say!(g, "camtest: long exposures: OPEN{} answered G#{:X} in A#{} ms\n", if view { " with the view" } else { "" }, if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 || view && n < 48 {
         ferros_sys::exit(1);
     }
+    // The view's base, its frames' width and height and a line's bytes (none without the view).
+    let (base, vw, vh, stride) = if view {
+        let tok = unsafe { &mut *(&raw mut VIEW_TOKEN) };
+        tok.copy_from_slice(&r[1..33]);
+        let base = ferros_sys::dma(ferros_sys::off(tok.as_ptr()));
+        if base == ERR {
+            say!(g, "camtest: long exposures: the view's token gave no base\n");
+            ferros_sys::exit(1);
+        }
+        (base as usize, u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize, u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize)
+    } else {
+        (0, 0, 0, 0)
+    };
+    if view {
+        say!(g, "camtest: long exposures thru the view: A#{vw} x A#{vh}, A#{stride} bytes a line\n");
+    }
+    let mut held = 0xFFu8;
     let set = |value: u64| -> u8 {
         let mut m = [3u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         m[2..10].copy_from_slice(&value.to_le_bytes());
@@ -183,6 +219,24 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_l
     let top = if top_log2 == 0 { 11 } else { top_log2 };
     // A frame's mean sample (every 16th binned sample, in 16ths) and the header's exposure (ns); None when no frame came.
     let mut frame = || -> Option<(u64, u64)> {
+        if view {
+            // MAP, giving back the buffer held; the mean of a sample's high eight bits (every 65th byte of every 16th line: always a sample's high byte), times 4 for ten bits and 16 for sixteenths, as the binned means.
+            let n = call(ep, &[5, held], &mut buf[..64]);
+            if n == ERR || n < 64 {
+                return None;
+            }
+            held = buf[40];
+            let at = base + u64::from_le_bytes(buf[48..56].try_into().unwrap()) as usize;
+            let (mut sum, mut cnt) = (0u64, 0u64);
+            for y in (0..vh).step_by(1 << 4) {
+                for x in (0..vw * 5 / 4).step_by(65) {
+                    sum += unsafe { core::ptr::read_volatile((at + y * stride + x) as *const u8) } as u64;
+                    cnt += 1;
+                }
+            }
+            // WHY the max: a view of no rows would divide by zero and panic the process.
+            return Some((sum * 4 * 16 / cnt.max(1), u64::from_le_bytes(buf[16..24].try_into().unwrap())));
+        }
         let n = call(ep, &[2, bin], buf);
         if n == ERR || n < 64 {
             return None;
@@ -250,7 +304,7 @@ const MAIN_LINE_PS: u64 = 3_148_916;
 fn shift_sweep(g: u64, ep: u64, per: u8, top: u8, bottom: u8, t1: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
     let mut r = [0u8; 4];
-    let n = call(ep, &[1, 0], &mut r);
+    let n = { let (m, l) = open_msg(0, false); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: shift sweep: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
@@ -348,7 +402,7 @@ fn isqrt(v: u64) -> u64 {
 /// - the codes' histogram near the mean (within 4 sigma): how many of those codes hold samples, and the samples' residues mod 2 and mod 4 (in 256ths): a gain after the ADC leaves only every 2nd or 4th code filled.
 fn gain_noise(g: u64, ep: u64, id: u8, pairs: u8, exp_log2: u8, t1: u64) -> ! {
     let mut r = [0u8; 64];
-    let n = call(ep, &[1, id, 1], &mut r);
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: gain noise: OPEN with the view answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 || n < 48 {
         ferros_sys::exit(1);
@@ -448,7 +502,7 @@ fn gain_noise(g: u64, ep: u64, id: u8, pairs: u8, exp_log2: u8, t1: u64) -> ! {
 fn gain_curve(g: u64, ep: u64, id: u8, bin: u8, per: u8, exp_log2: u8, t1: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
     let mut r = [0u8; 4];
-    let n = call(ep, &[1, id], &mut r);
+    let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: gain curve: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
@@ -512,10 +566,34 @@ fn gain_curve(g: u64, ep: u64, id: u8, bin: u8, per: u8, exp_log2: u8, t1: u64) 
 /// The view's token, where the kernel looks for it (an arc offset).
 static mut VIEW_TOKEN: [u8; 32] = [0; 32];
 
+/// The mosaic's 4 x 4 cell read off a frame in the view (at `at`, RAW10 lines of `stride` bytes, `w` x `h` samples): the mean of each of its 16 places (a sample's high eight bits, times 4 for ten bits) over every 16th cell across and down, a line of four a row of the cell.
+/// What it tells under a lit scene of any colour: a Bayer frame (the binned modes) repeats every 2 samples, place (x, y) like (x + 2, y) and (x, y + 2); a quad frame (the 1:1 array) holds 2 x 2 blocks of one colour, places (0, 0), (1, 0), (0, 1), (1, 1) alike and (2, 0) another (docs/CAMERA.md "1:1 on the main": the list's `cfa_period` 4 rests on it).
+fn cells(g: u64, at: usize, stride: usize, w: usize, h: usize) {
+    let mut sum = [0u64; 16];
+    let mut n = 0u64;
+    for cy in (0..h / 4).step_by(1 << 4) {
+        for cx in (0..w / 4).step_by(1 << 4) {
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    let (x, y) = (cx * 4 + dx, cy * 4 + dy);
+                    // RAW10: four samples' high bytes, then their low bits; sample x's high byte at x / 4 * 5 + x % 4.
+                    sum[dy * 4 + dx] += unsafe { core::ptr::read_volatile((at + y * stride + x / 4 * 5 + x % 4) as *const u8) } as u64;
+                }
+            }
+            n += 1;
+        }
+    }
+    // WHY the max: a frame under 4 rows or columns has no whole cell, and the means would divide by zero and panic the process.
+    let m = |k: usize| 4 * sum[k] / n.max(1);
+    for dy in 0..4 {
+        say!(g, "camtest: cell row A#{dy}: A#{} A#{} A#{} A#{} (A#{n} cells)\n", m(dy * 4), m(dy * 4 + 1), m(dy * 4 + 2), m(dy * 4 + 3));
+    }
+}
+
 /// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.
 fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
     let mut r = [0u8; 64];
-    let n = call(ep, &[1, id, 1], &mut r);
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN with the view answered G#{:X}, A#{} bytes, in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, if n == ERR { 0 } else { n }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 || n < 48 {
         ferros_sys::exit(1);
@@ -571,6 +649,7 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
                 }
             }
             let copy_us = ferros_sys::us_since(t);
+            cells(g, at, stride, w, h);
             say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; its PD rows at +G#{:X}, A#{} of them; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, u32::from_le_bytes(h64[56..60].try_into().unwrap()), u16::from_le_bytes([h64[60], h64[61]]), 4 * sum / cnt.max(1), acc & 0xFF);
         }
     }
@@ -591,7 +670,7 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, t1: u64) -> ! {
 /// `focus_hi` the lens's target's high byte (G#38, about a metre, if 0); G#FF a rack: G#1000 to G#7000 in steps of G#1000, seven pairs.
 fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, t1: u64) -> ! {
     let mut r = [0u8; 4];
-    let n = call(ep, &[1, id], &mut r);
+    let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
@@ -675,7 +754,7 @@ fn serve_wait(g: u64, ep: u64, id: u8, long_log2: u8, how: u8, t1: u64) -> ! {
     use core::sync::atomic::Ordering::SeqCst;
     let us = |t: u64| ferros_sys::us_since(t);
     let mut r = [0u8; 64];
-    let n = call(ep, &[1, id, 1], &mut r);
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN with the view answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, us(t1) / 1000);
     if n == ERR || r[0] != 0 || n < 48 {
         ferros_sys::exit(1);
