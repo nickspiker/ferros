@@ -12,7 +12,7 @@
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 //! A fourth byte of 9 drives the driver while a long frame's MAP waits (2026-11-18, docs/CAMERA.md "Serving while a frame waits"): OPEN with the view, the exposure to 2^n s (the sixth byte; 10 if 0), a second thread MAPping, then LIST, STATS and a SET back to 67 ms timed (the frame in flight cut), the exposure long again, and the end by the seventh byte: 0 CLOSE, 1 this process ends with the MAP held, 2 it holds until killed from the host (`00000009` the main, 2^10 s, CLOSE; `00000009001C01` the main, 2^28 s, about 8.5 years, its end; `00000009001C02` the same, killed from the host).
 //! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut), the third byte 1 the driver's plain plan instead of a forced shift (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
-//! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s).
+//! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s); the ninth byte the exposure as 2^n ms and the tenth the gain as 2^n times unity, set first (`02000008000006000E06`: 16 s at 64x, two frames to settle).
 #![no_std]
 #![no_main]
 
@@ -128,7 +128,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     // A fourth byte of 8: an image and its phase-detect rows kept as a pair (owner, 2026-11-17: phase detect as data).
     if arg(3) == 8 {
-        snap_pair(g, ep, id, arg(0), arg(5), arg(6), t1);
+        snap_pair(g, ep, id, arg(0), arg(5), arg(6), arg(8), arg(9), t1);
     }
     let mut r = [0u8; 4];
     let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
@@ -687,12 +687,23 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, t1: u64
 
 /// The pairs (docs/CAMERA.md "Phase detect as data"): OPEN the camera in its init's mode (its PD rows in every ring buffer), then per focus target: SET the lens, `settle` frames by copy at bin 8 to let it land (16 if 0), SNAP (the driver holds the next frame's buffer, image and PD rows, and says both addresses), and hold it 2^`hold_log2` s (about; 2^7 if 0) for the host to read (tools/camera-pd-pair.sh); the next SNAP gives the last back.
 /// `focus_hi` the lens's target's high byte (G#38, about a metre, if 0); G#FF a rack: G#1000 to G#7000 in steps of G#1000, seven pairs.
-fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, t1: u64) -> ! {
+fn snap_pair(g: u64, ep: u64, id: u8, settle: u8, focus_hi: u8, hold_log2: u8, exp_log2: u8, gain_log2: u8, t1: u64) -> ! {
     let mut r = [0u8; 4];
     let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
     say!(g, "camtest: OPEN answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
     if n == ERR || r[0] != 0 {
         ferros_sys::exit(1);
+    }
+    // The ninth and tenth bytes, when not 0: the exposure 2^n ms and the gain 2^n times unity, set before the settling frames (2026-11-19, the 8a in a dark room: a mosaic is read from signal).
+    // WHY the mins: the bytes are the person's; 2^20 ms (17 minutes) and 2^8 times unity are past any camera's reach, and a larger shift would leave the u64.
+    for (what, v) in [(0u8, if exp_log2 == 0 { 0 } else { 1_000_000u64 << exp_log2.min(20) }), (1, if gain_log2 == 0 { 0 } else { 1024u64 << gain_log2.min(8) })] {
+        if v != 0 {
+            let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+            m[2..10].copy_from_slice(&v.to_le_bytes());
+            let mut a = [0xEEu8; 1];
+            let n = call(ep, &m, &mut a);
+            say!(g, "camtest: SET A#{what} to A#{v}: answered A#{}\n", if n == ERR { 0xEE } else { a[0] });
+        }
     }
     let one = [(if focus_hi == 0 { 0x38 } else { focus_hi } as u64) << 8];
     let rack = [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000];
@@ -775,6 +786,8 @@ static W_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 
 /// The main's line time at its 1:1 mode's 11600 clocks (ps): `MAIN_LINE_PS` under the 1:1 init's PLL (215 for 245, ferros_cam ccs `line_ps_for`), as the driver derives it.
 const MAIN_FULL_LINE_PS: u64 = 6_586_118;
+/// The 8a's main's line (ps): 9568 clocks at 24.576 MHz / 3 x 166, ferros_cam cams `AKITA_MAIN.line_ps` (2026-11-19).
+const AKITA_MAIN_LINE_PS: u64 = 7_035_956;
 
 /// Where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): on 2026-11-18 evening a 2^28 s exposure at shift 31 gave frames at the sensor's floor while 1024 s at shift 13 held.
 /// OPEN with the view (the mode block's kind from the eighth byte: 2 the 1:1), a waiter thread MAPping, then for each shift from `bottom` (14 if 0) to `top` (31 if 0): the shift forced (SET 3) and an exposure of `coarse` lines of 2^shift (2^15 if 0: an exposure that needs exactly that shift, as the least-shift plan would take it), half a unit more so the driver's division lands on `coarse`.
@@ -799,7 +812,8 @@ fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16
         if call(ep, &m, &mut a) == ERR { 0xEE } else { a[0] }
     };
     let caps = |c: &mut [u8; 107]| -> bool { call(ep, &[11], c) != ERR };
-    let line_ps = if KIND.load(SeqCst) == 2 { MAIN_FULL_LINE_PS } else { MAIN_LINE_PS };
+    // The 8a's main (board 2, fact 84) runs its own line: ferros_cam cams `AKITA_MAIN.line_ps`.
+    let line_ps = if ferros_sys::facts().board() == Some(2) && id == 0 { AKITA_MAIN_LINE_PS } else if KIND.load(SeqCst) == 2 { MAIN_FULL_LINE_PS } else { MAIN_LINE_PS };
     let window = if window == 0 { 8 } else { window as u64 };
     let top = if top == 0 { 31 } else { top };
     let bottom = if bottom == 0 { 14 } else { bottom };

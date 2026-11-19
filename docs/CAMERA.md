@@ -72,12 +72,137 @@ The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what 
 - It adopts the panel itself (`display::adopt`), which the display server owns now.
 - Whether the Pro's running kernel even carries the PDMA job is unchecked tonight (a build without FERROS_CAM_PDMA refuses with "no PDMA job built in"): no camera command was run on the Pro.
 
-**akita: no camera has been touched from ferros.** From its device tree (/mnt/Harbor/ferros-ref/kdev-akita/dts/zuma-akita-camera.dtsi, -camera-pmic.dtsi):
-- The main camera, "oksoko", is on hsi2c_1 at G#1A: the same sensor model as husky's ultrawide (Sony IMX787, G#0787 at G#0016), which ferros streams. Its init exists locally (target/cam/uw.init), but husky's ultrawide runs a 24 MHz master clock and akita's main 26 MHz (CIS_CLK3, mclk4): the captured PLL settings would run it about 8 % fast. Recapture on akita, or rescale the PLL.
-- Its power: sub-PMIC LDO12, camera-PMIC LDO5, 4, 1, 3, then the sub-PMIC's GPIO2 (CAMS_LVBUCK_EN), reset gpp2-2, 1 ms after the enable, the clock 2 ms after.
-- The camera PMIC is an SLG51002 at G#75 on hsi2c_14 (as husky's), with an RT6160 buck-boost at G#77 on hsi2c_9 that husky does not have.
-- The front ("leshen") and the ultrawide ("leshen-uw") are on hsi2c_2 and hsi2c_3, both at G#1A; their part is not named in the tree.
-- Its CSI link, PHY lanes and the front end's program are unknown: they come from an hv oracle capture of Android's camera on akita, as husky's did (`tools/akita-hv.sh` runs Android under the hv).
+**akita: the three cameras answer from ferros; none streams yet** (2026-11-15, "akita's cameras" below).
+
+## akita's cameras (2026-11-15)
+
+The owner, 2026-11-15: "Might not be a bad idea to work on the 8a cams whilst it's plugged in." Branch akita-cams.
+
+**From its device tree** (the factory image's MP overlay, dtbo 18, the same as /mnt/Harbor/ferros-ref/kdev-akita/dts/zuma-akita-camera.dtsi and -camera-pmic.dtsi), in ferros_cam cams (`AKITA`, chosen by fact 84 in the driver and by the board in the kernel) and camera.rs (`AKITA_MAIN`, `AKITA_ULTRAWIDE`, `AKITA_FRONT`):
+
+| id | name | module | sensor bus | power-up (device tree order and delays) | reset | master clock |
+|---|---|---|---|---|---|---|
+| 0 | main | oksoko | hsi2c_1 G#1A | sub LDO12, LDO5, LDO4, LDO1, LDO3, sub GPIO2 (1 ms), reset, clock (2 ms) | gpp2-2 | gpp9-0, CIS_CLK3 |
+| 1 | ultrawide | leshen-uw | hsi2c_3 G#1A | sub LDO12, LDO2, LDO6 (1 ms), reset, clock (1 ms) | gpp6-3 | gpp3-0, CIS_CLK0 |
+| 2 | front | leshen | hsi2c_2 G#1A | sub LDO12, LDO2, LDO7 (1 ms), reset, clock (+1 ms of ours) | gpp4-2 | gpp5-0, CIS_CLK1 |
+
+- **akita's rails are not husky's**: LDO1 2.9 V, LDO2, 4 and 5 2.8 V, LDO3 1.8 V, LDO6 and 7 1.2 V, LDO8 1.1 V (`RAILS_AKITA`). husky's table would have put 2.25 V on akita main's 1.8 V LDO3. Android's /sys/class/regulator reads exactly akita's table.
+- Sub LDO12 (L12S_CAMIO, the modules' I/O and nothing else) is read before its enable and held to a tenth over 1.8 V: cold it reads G#AE, 1.85 V (Linux sets 1.8). The camera PMIC goes on only as REVISION_AB (pattern 03 31 B1, as husky's); akita names no sub GPIO3, so it is never driven there; the RT6160 buck-boost (G#77, hsi2c_9) is not registered under Linux at all and is left as the boot has it.
+- Every master clock pin at drive X2 (1). The clocks stay on the 24.576 MHz oscillator (CMU_TOP's CIS muxes and dividers read 0 cold): the device tree asks 26 MHz of CIS_CLK3 and 24 MHz of the others, but every init Android sends tells its sensor 24.574 MHz (EXCK_FREQ G#1893), so Linux runs them on the oscillator too.
+
+**PROBE on the 8a** (b232, the akita-cams kernel RAM-reloaded, the driver stored as `camera`, camtest `00000007<id>`):
+- main: G#0787 at G#0016 (Sony IMX787), only G#1A acknowledged (its "nessie" lens/OIS/EEPROM at G#24 did not);
+- ultrawide: G#0712 (Sony IMX712), its EEPROM at G#50;
+- front: G#0712 (Sony IMX712), its EEPROM at G#50.
+
+**Android's Camera2 characteristics** (`dumpsys media.camera`, local: /mnt/Harbor/tmp/akitacams/android-dumpsys-camera.txt, the colour matrices in android-matrices.txt; model-tier seeds for each IDT until a spectral calibration):
+
+| camera | pixel array | CFA | black / white | orientation | exposure | focal, aperture |
+|---|---|---|---|---|---|---|
+| main (physical 2) | 4624 x 3472 | RGGB | 64 / 1023 | 90 | 59.9 µs to 16 s, ISO 50 to 9846 (analogue to 615) | 5.43 mm f/1.89 |
+| main 2x (physical 4) | 4624 x 3472, half the main's sensor size | RGGB | 64 / 1023 | 90 | from 84.7 µs | the same lens: the unbinned centre crop |
+| ultrawide (physical 3) | 4208 x 3120 | RGGB | 64 / 1023 | 90 | 12.4 µs to 16 s, ISO 49 to 4729 | 1.835 mm f/2.2 |
+| front | 4208 x 3072 | BGGR | 64 / 1023 | 270 | 12.4 µs to 1 s, ISO 48 to 6095 | 2.74 mm f/2.2 |
+
+**The captures** (Android under oracle hv builds on slot b, tools/akita-hv-camall.sh, decoded with tools/cam-oracle; all local in /mnt/Harbor/tmp/akitacams, the vendor's settings):
+- The sensor inits, one bus a capture, each clean inside its init (the only length mismatches were the main bus's G#24 controller and each session's last stream off): main 277 transfers to stream on (4624 x 3472, three lanes, a 9568-clock line, a 4826-line frame: 7.036 µs a line, 29.5 frames a second), ultrawide 140 (4208 x 3120, four lanes), front 119 (4208 x 3072, four lanes, flipped both ways, G#0101 = 3). `inputs/oksoko.init`, `leshen-uw.init`, `leshen.init`.
+- The receivers and jobs (the light build: the PHY, the CSI links, SYSREG_ISPFE and the PDMA trapped, the PDMA dumped): the main runs CSI link 1 and the csis1 lanes, its receiver husky's main's but for link 1's sizes (`rx::RX_START_AKITA_MAIN`), SYSREG select 2, the line G#16C0; the front runs link 6 and the csis3 lanes (`RX_START_AKITA_FRONT`, its captured stop `RX_STOP_AKITA_FRONT`), SYSREG G#60, the line G#14C0. PDMA jobs: the main's twice (lists of 6656 and 6672 bytes), the front's (6220).
+- The main's job puts the PD output at the start of a 16 MiB IOVA granule and the image 5 MiB into it, and the image is 20.2 MB: October's one-granule-a-slot mapping (cam-oracle pdma-image, as camera-pdma-image.py) does not fit it as it stands.
+- **The jobs, laid out** (desk work after the captures): `cam-oracle pdma-image --own-image` gives the image body slot 2 alone, at its start, so the main's PD output (G#1C32_21C0) moves to slot 1, and drops a last record that runs past the buffer (the main's list 1 ends in four stale words under a header G#0004_0000, which ferros_cam job's walker refused as truncated; the engine stops at the buffer's length, so it never ran them).
+  Each slot then runs from the lowest offset the job names to its granule's end in whole frames, until a first run measures the outputs (ferros_cam job `AKITA_MAIN_SLOT_BYTES` / `_SKIP`, `AKITA_FRONT_SLOT_BYTES` / `_SKIP`); the local jobs (target/cam/akita-main.pdma from the main's list 1, akita-front.pdma from list 2) move into their regions in the host test, 98 MiB with a ring of one for the main (158 with four), 94 for the front (142).
+  Unsettled: which of the main's two lists to run (list 1 at the first open, 6640 bytes after the cut; list 3 at the reopen, 6672; on husky one list reset the phone and the other ran), and the front's tail (its last nine words read as a burst header with no body and a record past the buffer: cut, but they may be a half-written list the dump caught, frame 16 being mid-update).
+- The ultrawide's session ran link 0 with the csis0 lanes, SYSREG select 3 then 1, and its first writes stopped the PDMA engine (control 0) and reset the main's link; the engine did not start again until the front camera opened. So its frames reach memory some other way than the PDMA program (the front end's core pages, not trapped in the light build, or another block): its path needs the late-arm capture of an ultrawide session.
+- **IDTs**: the Camera2 matrices (ColorMatrix1/2 as colorTransform1/2 under StandardA and D65, ForwardMatrix1/2, and the unit's own calibrationTransform) give a model-tier Absolute matrix (camera to XYZ by inverting ColorMatrix2, then vsf's XYZ2VSF_RGB), but no sensitivity, and the endpoint's list wants the Absolute entry's scale (ferros_cam list): none was written, so as not to invent a sensitivity. The owner's calibration (as the Pro's 2026-10-21 captures) gives both.
+- The full trap of the front end's 42 pages (husky's recipe) hard-locked a core 24 s into Android's boot ("Watchdog detected hard LOCKUP on cpu 4"): the camera stack's boot probe, trapped access by access. FERROS_HV_ORACLE_LATE (ferros_hv) now traps the pages only from the arm time on; its first capture was flashed when the host's USB controller died (below).
+
+**Left, in order**: the front end's CPU programs with the late-arm build (main, then front, then the ultrawide's path); the main's job laid out for its 20.2 MB image (the image granule shared with the PD output); per camera slot sizes, acknowledgement and tick (the first run's report measures the outputs); `streams: true`; the vault inputs (`cam.oksoko.*`, `cam.leshen.*`); camtest, the view; IDTs (model tier from the matrices above, then the owner's calibration).
+
+**The 8a as left (2026-11-15 afternoon)**: the host's USB card (xhci 0000:04:00.0, the ASM107x card both devices sat on) died at 11:48:24 right after the late-arm build was flashed, so that capture never ran; the owner reset the card, and slot b was flashed back from `/mnt/Harbor/tmp/akitacams/back/boot_b.img` and read back from Android (sha256 fc572ff3, the same), ferros through the gate, attested. Slot a is the bare ferros (BOARDS.md "akita's slots"); nothing camera is in the vault; Android's settings changed for the captures (stay on while plugged in, Pixel Camera's location answer) are put back. The next capture session waits for the 8a on a motherboard port, so a card crash cannot take the Pro with it.
+
+### akita: the captures of 2026-11-18 (Android 17 on slot a, rooted, under the hv)
+
+Android updated itself into slot a that day (CP3A.261005.005, kernel 6.1.162), so the captures moved there: slot a's boot carries the oracle hv in front of its own kernel, and ferros's gate on slot b is never written (BOARDS.md "akita's slots").
+`tools/akita-hv-camcap.sh` (SLOT=a, AUTO=1) ran every session hands-free over adb (the 8a has no lock screen): the image flashed to boot_a, a capture boot, the session's marks, a sysrq crash, the next boot's ring pulled twice and compared.
+All local: /mnt/Harbor/Code/keys/akita/captures-2026-11-18/ (B3SUMS over every file; the vendor's settings, never the repository).
+
+What Lumis 0.2.8 lists on the 8a: the ultrawide (4208 x 3120, to 16 s), "multiple Back" opening the main at 80 degrees (4624 x 3472, to 16 s) and the main's in-sensor 2x crop at 46 degrees (4624 x 3472 of 0.8 µm pixels, to 16 s), and the front (4208 x 3072, to 1 s).
+Camera2 offers no maximum-resolution mode on any 8a camera (`dumpsys media.camera`: the main's whole array is 4624 x 3472), so the 46 degree crop is the only other main mode.
+
+**The I2C sessions** (one bus a capture, the sensor at G#1A alone, nine set-up words quiet; one capture boot per session, since the main's binned and crop opens alone filled the 2^15-line cap with their frames' holds):
+
+| session | transfers | integrity | inits (transfers before stream on) |
+|---|---|---|---|
+| i2c-main (Lumis binned, crop) | 4257 | 0 | binned 278, crop 289 |
+| i2c-main-16s (Lumis, 16 s) | 1398 | 0 | 278 (the binned one, byte for byte) |
+| i2c-main-gcam (Pixel Camera 1x, 2x) | 2231 | 1 | 1x 278, 2x 206 (a mode switch, no power cycle) |
+| i2c-uw (Lumis binned) | 2234 | 1 | 140 |
+| i2c-uw-16s | 1305 | 1 | 140 (the same) |
+| i2c-uw-gcam (Pixel Camera .5, video) | 2385 | 1 | .5 140, video 143 |
+| i2c-front (Lumis binned) | 3416 | 1 | 119 |
+| i2c-front-1s | 1921 | 1 | 119 (the same) |
+| i2c-front-gcam (photo, video) | 2782 | 1 | photo 119, video 155 |
+
+Every length mismatch is outside every init: each session's last stream off (G#0100 written with two of its three bytes), and once a per-frame hold word in the main's Pixel Camera 2x stream.
+The geometry and timing words, from the inits (CCS):
+- main binned: the whole 9248 x 6944 array read to 4624 x 3472, a line of 9568 clocks, a frame of 4826 lines, PLL multiplier 166 (as 2026-11-15's);
+- main crop (Lumis 46 degrees and Pixel Camera's 2x alike): x the whole width, y G#6C0 to G#145F (3488 rows), out 4624 x 3472, a line of 10320 clocks, frame 6011 lines, PLL 223;
+- ultrawide: 4208 x 3120 of the whole array, a line of 5192 clocks, PLL 122; its video y G#178 to G#AB7, 4208 x 2368, PLL 102;
+- front: 4208 x 3072 (y G#18 to G#C17), a line of 5192, PLL 119; its video 4208 x 2368 as the ultrawide's.
+
+**Long exposures, the holds** (`<session>.holds`): the main (Sony IMX787) shifts its integration and frame by G#3100 (2, 4, then 6 at 16 s: integration G#8ACA and frame G#8B0A lines, each times 2^6, at its 7.036 µs line is 16.0 s), mid-stream, frame by frame as the Pro's Samsung main does with G#0702 and G#0704; the ultrawide and the front (Sony IMX712) shift by G#3004 (the ultrawide 2 then 5 at 16 s; the front 1 at its 1 s).
+Gain G#0204 (analogue) and G#020E (digital, 1) ride in the same holds.
+
+**The ISP sessions** (the late-arm build, FERROS_HV_ORACLE_LATE: no lock at boot this time):
+
+| session | oracle lines | PDMA lists dumped | link, CSIS select |
+|---|---|---|---|
+| isp-main | 28696 | 2 | link 1 (G#1C05), 2 |
+| isp-front | 24147 | 3 | link 6 (G#1C0A), G#60 |
+| isp-main-crop | 20797 | 2 | link 1, 2 |
+| isp-uw (the whole front-end span trapped) | 3029 | 1 | link 0 (G#1C04), 1 |
+
+The main's engine is started (control +0 = 1) in isp-main; in isp-main-crop and isp-uw Android starts it another way (+G#28 = 1, +G#C = 1000), not yet read.
+The ultrawide's frames do go thru a PDMA program this time (list 1 dumped), unlike 2026-11-15's session.
+`cam-oracle cpu` (inputs/akita-main.cpr2: 134 CPU writes before the engine, 54 after; inputs/akita-front.cpr2: 132 and 36) gives the receiver starts too: the main's matches `rx::RX_START_AKITA_MAIN` word for word (2026-11-15's), the front's differs from `RX_START_AKITA_FRONT` in its lane resets and five csis1 base words.
+
+**Streaming from a hand-spawned driver (2026-11-18, nothing stored):** the akita-cams kernel RAM-reloaded (b262; the flashed kernel has no akita camera switch and would run husky's rails), the driver spawned by hand with its inputs in its spawn (`cam-oracle cinp`, payloads/camera `spawn_input`: a 'CINP' set after the 16 knob bytes, read in place of the vault's, with `<key>.slots` in place of the compiled job layout), camtest `1008` (16 frames at bin 8).
+- **main**: PROBE answers G#0787; the open runs to stream on in 610 ms (switch 41 ms, init 276 writes and 2 reads in 544 ms, job placed, engine started, receiver on, 188 CPU writes, none refused); CSI link 1 latches frame start and frame end on channels 0 to 2 (+G#24 = +G#2C = G#7), but the front end never answers: no interrupt on SPI 479, loch0's image status 0, not even SHADOW_UPDATE, in 2.1 s; the same with 2026-11-15's job, today's list 1 and today's list 2. So the link takes frames and nothing reaches loch0: where husky's main stood on 2026-10-20, but one step before (husky's raised SHADOW_UPDATE).
+- **front**: the init runs (117 writes, 2 reads, 153 ms), then the job does not move into its region (`ImageWrites(0, 0)`: none of the lists, 2026-11-15's included, writes the image address register the relocation looks for), so the open is refused (3) before the engine.
+- **ultrawide**: not tried (no CPU program cut from isp-uw yet, no receiver table).
+Next: read Android's engine start of isp-main-crop and isp-uw; the hv snapshot (FERROS_HV_SNAPSHOT, docs/oracle/CAMERA.md) of the front end mid-stream under Android against `diag cam pdma`-style cold reads, as husky's ISPFE_NOC clock was found; which register the front's jobs name its image by.
+(Answered on 2026-11-19, below: "Android starts it another way" and "the front's jobs name no image address" were both misreadings.)
+
+### The 8a's main streams (2026-11-19, branch akita-stream)
+
+akita-stream's kernel RAM-reloaded (b264 to b266), then flashed (b267); the driver hand-spawned with its inputs (`cam-oracle cinp`) until stored; camtest and cambench.
+The driver now says why a stream stopped (`readback_say`, `words_say`, `copies_say`, the engine's log at the first answers): every register the program's first copy and the CPU wrote, read back; the PDMA's five contexts, loch0's words, the link's and its PHY lanes' words; the program's copies against the first; the engine's place and progress (+G#58, +G#5C) at each of the first answers.
+A stream that stopped says them at its close; a device test asks for `words_say` at every close with the spawn's twelfth byte 1 (the eleventh on akita-stream; forge's eleventh names the spawn's inputs, so it moved at the merge, 2026-11-19).
+Since the merge with forge the link and PHY pages it reads are the open readout's receiver's (`rx_of`, a captured readout's own on the Pro).
+
+**The cause, two of them, both measured:**
+- **Every 8a ISP capture lost oracle lines.** Read and write pairs with one half missing, each session different ones (the main lost G#1C32_0444, 0458, 0418, 00B0 = 1, 0478, 0470, 048C, 0488, 2018 and 8800; its crop session kept most of those and lost others; the PDMA's own `+0 = 1` start is missing from isp-uw and isp-main-crop, which is all "Android starts it another way" was). The PDMA dumps are whole (their lines carry offsets: no gap in any). The main's CPU program cut from isp-main therefore left loch0's image path unconfigured: the engine ran its first program (the program read back 1446 of 1447), and loch0 raised nothing. Merged by hand (keys/akita/cam-inputs-2026-11-19/main-after.txt: the crop session's order, the binned main's values, the pairs the 8a lost both times from husky's list; `cam-oracle prog-text` and `prog-build`), the first frame landed at once: SHADOW_UPDATE at stream on, SOF 10.9 ms later, EOF and DMA_DONE at 35.4 ms, a whole frame.
+- **Slot 6 was laid out 14 MiB; its output is about 32.4 MiB.** G#1C35_51C8's output starts 2 MiB into its granule and ran on past the region's slots into the engine's area, over the program's copies (`copies_say`: copies 1 to 3 differed from copy 0 in 1100 to 1482 words from word 0). The engine then stopped 68 bytes into the next program it was given (+G#5C stuck at G#44 while the index ran on) and every later frame began and never ended (LATE_CONFIG on both paths). With slot 6 at 40 MiB the stream runs; measured, it is written to +G#206_BE00. The front's and the ultrawide's jobs name the same register (their slot 3 and slot 4): 40 MiB each there too.
+- Not the cause, for the record: Android on the 8a enables SOF in loch0's mask (G#1B) and writes the next index after each SOF, where the Pro's release is at DMA_DONE. Both were run on the 8a once the copies were safe: both clean (69 of 69 frames each), so the driver keeps one path, the Pro's.
+
+**Android's image format is not ferros's.** The 8a's jobs write loch0's image in 16-bit samples (G#1C32_0550 = 2, a line of G#2420 for the main), the PD path RAW10 packed (4, G#16A0). Every path of the driver (binning, the view, Lumis) reads RAW10 packed, so the stored jobs have the image's format word 4 and the line G#16C0 (`cam-oracle job-set`, `keys/akita/cam-inputs-2026-11-19/main-packed.pdma`), as the Pro's jobs do.
+
+**Measured on the main** (IMX787, 4624 x 3472 binned, C-PHY on link 1):
+- 29.5 frames a second (the sensor's counter 68 frames in 2.30 s; frames 33.96 ms apart), every descriptor released by the kernel at DMA_DONE, no error word, 64 of 64 asked frames clean, the image's mean 64.05 in the dark (black 64) and a scene at 16 s, 64x;
+- the 2 x 2 cell R G / G B: the greens equal on the anti-diagonal (268 against 325 and 396 per sample over black, unsaturated cells, 16 s at 64x under the room's coloured light); red at (0, 0) from the IMX787's mosaic as the Pro's ultrawide measured it (B G / G R flipped both ways there, unflipped here: the 8a's init writes no G#0101), and Camera2's RGGB;
+- long exposures thru Sony's shift G#3100 (ccs `AKITA_ARRAYS`): the ladder 64 ms to 2 s ran (frames 64.5, 128.4, 256.5, 511.8, 1026.3, 2052.9 ms apart). **The shift's ceiling** (camtest's fourth byte 10): the field is 3 bits wide: shifts 6 and 7 at 4800 lines gave frames 2.19 s and 4.38 s apart, 8, 9 and 10 frames at 34.2, 68.4 and 136.9 ms (read as 0, 1 and 2); 65471 lines of 2^7 ran, frames 59.02 s apart. The longest exposure is 65471 lines of 2^7, 58.96 s, now LIST's `exposure_max`. A forced shift whose frame is under the mode's own in shifted lines (76 lines of 2^6) stops the sensor; the plan never makes one;
+- slits: the default 64-row binned slit (detached, slim) at 745 a second at the sensor, 740 at the front end; 65280 slits in 88.2 s with none lost (cambench); one earlier run died after 783 slits on an 11.2 ms gap in the interrupts (LATE_CONFIG), the Pro's slit death, not seen again in 69368 slits since.
+
+**Stored and flashed** (the 8a's kernel vault, each read back alike): `camera` (this branch's driver), `cam.oksoko.init` (the binned init, i2c-main), `cam.oksoko.prog` (the merged program), `cam.oksoko.pdma` (list 1, RAW10 packed), and `cam.oksoko.idt`: the Pro's ultrawide's IDT (`cam3-ultrawide.idt.vsf`, the same IMX787 module family), a stand-in so the main is listed, until the owner's calibration of this unit (its lens is f/1.89 to the Pro ultrawide's f/2.2, so its absolute scale is off).
+boot_b was saved first (keys/akita/images/boot_b-before-2026-11-19, blake3 8b9de8e1, read twice), then flashed with the same hv and Linux Image and this branch's kernel (`ferros-mkimg gate` over the old gate's own hv and Image, `avb-footer` with the old gate as template; blake3 808edcea, kept beside it). The 8a booted it cold (b267), the identity unlocked at boot, and camtest against the vault's driver (started on demand) took 64 frames clean.
+
+### The 8a's front and ultrawide (2026-11-19): wired, no line arrives
+
+Both are Sony IMX712s on D-PHY (four lanes): the front on link 6 and the csis5 and csis6 PHYs, the ultrawide on link 0 and csis0.
+Wired the main's way: their programs merged from their lossy sessions (keys/akita/cam-inputs-2026-11-19/front and uw), the front's receiver merged from both captures and the ultrawide's from isp-uw (`rx::RX_START_AKITA_FRONT`, `RX_START_AKITA_UW`), their jobs RAW10 packed, the 40 MiB slot, their timing from their inits (lines of 5192 clocks at PLLs 119 and 122). The front's open had been refused because the driver asked a PD path of every captured-mode job and the front's has none (fixed: a PD path only where the program writes one).
+Both now run to stream on, SHADOW_UPDATE applies their programs (the go bit G#1C32_041C read back consumed), and their links latch frame start and end on two channels (+G#24 = +G#2C = 3), with no error word. But no line reaches the link: its per-channel packet words (+G#6A0 on) stay 0 where the main's read G#1694_2B00 (5780 bytes of data type G#2B), and loch0 never sees a frame start.
+Not it: the 8800 block (G#1C32_8800 = 1, lost by the front's session, written by the others), G#1C32_048C (the Pro's front writes G#200: no change), the lanes' G#x30 word (Android's G#137 on both; G#8, the Pro front's, gives the same; G#37 gives a storm of errors and frame starts on every channel, so that word does govern the HS reception).
+Next: the hv snapshot of Android's front stream against ferros's reads of the same list (`tools/akita-hv-camcap.sh` image `snap`, sessions `snap-front` and `snap-uw`, SNAP_LIST keys/akita/captures-2026-11-19/snap-front.list: CMU_TOP's ISPFE_NOC mux and divider, CMU_ISPFE, the links, the csis0, 5 and 6 lanes, loch0). Built (target/agent-akitastream/camcap/snap.img); not flashed: the host's USB card died (xhci 0000:04:00.0, 00:54:25) while the script waited for the 8a's fastboot, with Android up on slot a and boot_a untouched.
+The suspects it would settle: the ISPFE_NOC clock Android's DVFS runs these faster D-PHY sensors at (ferros sets 465 MHz, the Pro main's level), and any PHY or link word set before the late arm.
 
 ## The gap to "Lumis opens and shows a live preview"
 
@@ -90,7 +215,7 @@ The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what 
 | the driver | payloads/camera behind the `camera` switch (built 2026-11-14) | streams on the Pro (2026-11-14); the harness out the same day |
 | the front end's answer | its interrupt, SPI 479, in the driver's frame thread (built 2026-11-14) | whether the line fires (else the thread's own tick, said on the console) |
 | the PDMA job | from the vault (`cam.boitata.pdma`), moved into the region in Rust (ferros_cam job, built 2026-11-14) | the vault entry on the Pro |
-| akita's cameras | nothing | power, ID, init at 26 MHz, the receiver and front end from a capture |
+| akita's cameras | the main streams and is stored, its kernel flashed (2026-11-19, "The 8a's main streams"); the front and the ultrawide wired | the front's and the ultrawide's D-PHY lines ("The 8a's front and ultrawide"); the main's own IDT |
 
 ## The endpoint
 
@@ -1222,6 +1347,7 @@ Every pulled zone's sha256 equalled the device's. Traps: the script took the fir
 **Built** (ferros_cam, payloads/camera, camtest):
 - ferros_cam rx: `RX_START_TELE`, `RX_START_TELE11`, `RX_START_TELE48`, `RX_STOP_TELE`, `RX_START_UW48`, `RX_START_FRONT842`. cams: the tele streams; `Alt`, a captured readout replayed whole (its own init, CPU program, job and receiver, nothing rewritten, its measured line and switches), opened by the mode block's kind 8 + k: the ultrawide's `w48` (kind 8), the front's `f8` (kind 8), the tele's `t11` (kind 8) and `t48` (kind 9). Their vault inputs `cam.<key>.<what>.<tag>`.
 - payloads/camera: kind 8 + k; LIST a section per captured readout whose inputs are stored; the spawn's eleventh byte frames any of the 1:1 init, init, CPU program, job and IDT (bits 0 to 4, `--input-file` in that order) for a device test with nothing stored.
+  With the eleventh byte 0, one frame after the knobs is a 'CINP' set (akita-stream's `spawn_input`, by name) or the 1:1 init alone; akita-stream's `words_say` at every close moved from the eleventh byte to the twelfth at the merge (2026-11-19).
 - camtest: at bin 1 a sixth byte sets the exposure to 2^n ms after the first frame (a dim scene's cell table).
 
 **On the Pro** (b983, the flashed gate's kernel, no reload; every driver hand-spawned from target/agent-oracle/bin, one open each, every stream ended by its own close; logs target/agent-oracle/runs):
@@ -1284,6 +1410,17 @@ The captured readouts' gather is a field of each (`Alt::gather`, 1 for all four)
 | tele, mode 0 and 9 (t48) | 4032 x 3024, 8064 x 6048 | 5.645 x 4.234 | 17.82 x 13.41, 22.18 | 110.37 |
 | tele, mode 8 (t11) | 4032 x 3024 | 2.822 x 2.117 | 8.97 x 6.73, 11.19 | 220.75 |
 The diagonals equal Android's computed ones (83.2, 121.7, 22.2, 11.2), the 35 mm equivalents the captures' recorded ones; host tests optics `the_diagonal_angles_are_androids`, list `every_readouts_field`. On the Pro the driver's first LIST says each readout's size and diagonal (6541 bytes, nine readouts with the 1:1 stored). What Lumis does with them is Lumis's.
+
+**Each board's own optics (the merge of akita-stream into forge, 2026-11-19).**
+The optics are the camera's (`Cam::optics`, as its CCS facts are `Cam::array`): the Pro's `OPTICS`, the 8a's `AKITA_OPTICS`; until then the list took the Pro's by camera id, so the 8a's main would have listed the Pro main's sensor and lens.
+The 8a's are its Camera2 report (`dumpsys media.camera`, keys/akita/captures-2026-11-18/dumpsys-media-camera.txt): SENSOR_INFO_PHYSICAL_SIZE over SENSOR_INFO_PIXEL_ARRAY_SIZE, the focal length and aperture.
+The 8a lists no maximum resolution, so each array is the readout ferros streams and gathers one array pixel a pixel (the main's 1.6 um pixels, the IMX712s' 1.12 um); the main's 2x (physical camera 4, 3.6992 x 2.7776 mm) is its middle quarter, not a readout of ferros's.
+| 8a readout | size | sensor (mm) | focal, aperture | angles across width x height, diagonal (degrees) | 35 mm equivalent |
+|---|---|---|---|---|---|
+| main (streams) | 4624 x 3472 | 7.3984 x 5.5552 | 5.43 mm f/1.89 | 68.53 x 54.18, 80.86 | 25.39 |
+| ultrawide | 4208 x 3120 | 4.7130 x 3.4944 | 1.835 mm f/2.2 | 104.18 x 87.19, 115.95 | 13.53 |
+| front | 4208 x 3072 | 4.7130 x 3.4406 | 2.74 mm f/2.2 | 81.39 x 64.25, 93.60 | 20.32 |
+Host tests optics `the_8a_sizes_agree` (the 2x's size, the pixel pitches), list `the_8as_main_lists_its_own_optics`.
 
 ### The main's 1:1 init stored
 

@@ -44,7 +44,7 @@ impl Readout {
     }
     /// The camera's 1:1 readout from its 1:1 init (`cam.<key>.init.full`): the mode it leaves (`Mode::captured_full`), at the line time its PLL gives (`line_ps_for`).
     pub fn full(c: &Cam, init: &[u8]) -> Result<Readout, IdtError> {
-        let a = &crate::ccs::ARRAYS[c.id as usize];
+        let a = c.array;
         let m = crate::ccs::Mode::captured_full(init, a).map_err(IdtError::Mode)?;
         let line = crate::ccs::line_ps_for(c, &crate::ccs::Page::of(init));
         let timing = c.listed_mode_timing(line, &m);
@@ -106,14 +106,14 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     // The readout at the longest exposure (ns), first row to last, the rolling shutter's skew (owner, 2026-11-17: a camera that ever stretches its line says what its readout costs; the default route never does, so this is the mode's own).
     put("readout", u(t.readout_ps(&t.own(1), r.height as u64) / 1000));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
-    let (gmin, gmax) = crate::ccs::ARRAYS[c.id as usize].gain;
+    let (gmin, gmax) = c.array.gain;
     put("gain_min", u(gmin));
     put("gain_max", u(gmax));
     // Focus: the lens actuator's targets over the span measured (the main's G#0800 to G#7800); 0 and 0 where focus is not offered.
     put("focus_min", u(c.focus.0));
     put("focus_max", u(c.focus.1));
-    // The optics (ferros_cam optics: Android's Camera2 values Lumis recorded on the Pro): the sensor's size in mm, the focal length in mm, the f-number.
-    let o = crate::optics::OPTICS[c.id as usize];
+    // The optics (ferros_cam optics, the camera's `Cam::optics`: Android's Camera2 values, on the Pro as Lumis recorded them, on the 8a its dumpsys): the sensor's size in mm, the focal length in mm, the f-number.
+    let o = c.optics;
     put("sensor_width_mm", alloc::vec![VsfType::f5(o.sensor_mm.0)]);
     put("sensor_height_mm", alloc::vec![VsfType::f5(o.sensor_mm.1)]);
     put("focal_mm", alloc::vec![VsfType::f5(o.focal_mm)]);
@@ -166,7 +166,7 @@ mod tests {
             for f in ["facing", "mode", "width", "height", "cfa", "cfa_period", "frame_ns", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
-            let o = crate::optics::OPTICS[k];
+            let o = c.optics;
             assert_eq!((floats("sensor_width_mm"), floats("sensor_height_mm"), floats("focal_mm"), floats("f_number")), (vec![o.sensor_mm.0], vec![o.sensor_mm.1], vec![o.focal_mm], vec![o.f_number]), "{}", c.name);
             let (m, sens) = (floats("idt"), floats("sensitivity"));
             assert_eq!((m.len(), sens.len()), (9, 3));
@@ -220,6 +220,25 @@ mod tests {
         let tele: Vec<_> = d.entries_named("camera").into_iter().map(|e| d.section(e).unwrap()).filter(|s| s.uint("id") == Some(3)).collect();
         assert_eq!((tele[0].uint("width"), tele[1].uint("width")), (Some(4032), Some(4032)));
         assert!((f(&tele[0], "field_width_mm") - 2. * f(&tele[1], "field_width_mm")).abs() < 1e-5);
+    }
+
+    /// The 8a's main lists its own sensor and lens (ferros_cam optics `AKITA_OPTICS`, its Camera2 report), not the Pro's main's of the same id, and its binned readout reads its whole array; its IDT the Pro ultrawide's stand-in, as the 8a's vault holds it (docs/CAMERA.md "The 8a's main streams").
+    #[test]
+    fn the_8as_main_lists_its_own_optics() {
+        let c = &cams::AKITA_MAIN;
+        let doc = document(vec![section(c, &idt(&cams::ULTRAWIDE)).unwrap()]).unwrap();
+        let d = vsf::container::Document::open(&doc[..]).unwrap();
+        let s = d.section(d.entries_named("camera").next().unwrap()).unwrap();
+        let f = |name: &str| -> f32 { if let [VsfType::f5(x)] = s.get_field(name).unwrap().values[..] { x } else { panic!("{name}") } };
+        let o = crate::optics::AKITA_OPTICS[0];
+        assert_eq!((f("sensor_width_mm"), f("sensor_height_mm"), f("focal_mm"), f("f_number")), (o.sensor_mm.0, o.sensor_mm.1, o.focal_mm, o.f_number));
+        assert_eq!(c.binned_field(), o.array_px);
+        assert_eq!(f("fov_diagonal_deg"), o.field(o.array_px).fov_deg.2);
+        assert!((f("fov_diagonal_deg") - crate::optics::OPTICS[0].field(crate::optics::OPTICS[0].array_px).fov_deg.2).abs() > 1.);
+        for c in cams::AKITA.iter() {
+            let fd = c.optics.field(c.binned_field());
+            println!("the 8a's {}: {} x {}, field {:.4} x {:.4} mm, {:.2} x {:.2} degrees, {:.2} diagonal, {:.2} mm equivalent", c.name, c.width, c.height, fd.mm.0, fd.mm.1, fd.fov_deg.0, fd.fov_deg.1, fd.fov_deg.2, fd.focal_equiv_mm);
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Each camera's optics as the list carries them (owner, 2026-11-17: "Missing lens stats on the Lumis page"; docs/CAMERA.md "The endpoint"): the sensor's physical size, the lens's focal length and f-number, by camera id (ferros_cam cams).
-//! Every value is Android's Camera2 report, recorded by Lumis on the Pro, said per field below; none is a ferros measurement.
+//! Each camera's optics as the list carries them (owner, 2026-11-17: "Missing lens stats on the Lumis page"; docs/CAMERA.md "The endpoint"): the sensor's physical size, the lens's focal length and f-number, by board and camera id (ferros_cam cams `Cam::optics`: the Pro's `OPTICS`, the 8a's `AKITA_OPTICS`).
+//! Every value is Android's Camera2 report, recorded by Lumis on the Pro, said per field below (the 8a's at `AKITA_OPTICS`); none is a ferros measurement.
 //! - Sensor size: SENSOR_INFO_PHYSICAL_SIZE, enumerated by Lumis on the Pro (Lumis docs/google-bug-tele-maxres-fov.md, its table of physical cameras 2, 3, 4); the front camera's is not in that table and is derived from its recorded 35 mm equivalent (below).
 //! - Focal length and f-number: LENS_FOCAL_LENGTH and LENS_APERTURE as Lumis wrote them into each camera's calibration capture (`pixel 8 pro calibration data/*average.vsf`, fields `focal_mm`, `f_number`, 2026-10-21; local, only these numbers read).
 //! - The 35 mm equivalents in the same captures agree with the sizes: 43.27 mm x focal / diagonal gives the main 24.36 (recorded 24.358), the ultrawide 12.06 (12.062), the tele 110.4 (110.38).
@@ -25,6 +25,16 @@ pub const OPTICS: [Optics; 4] = [
     // The front's size from its 35 mm equivalent (20.6108 at 2.74 mm): a diagonal of 43.2666 x 2.74 / 20.6108 = 5.7519 mm, split at its readout's 3840 : 2736.
     Optics { sensor_mm: (4.6846, 3.3378), array_px: (3840, 2736), focal_mm: 2.74, f_number: 2.2 },
     Optics { sensor_mm: (5.6448, 4.2336), array_px: (8064, 6048), focal_mm: 18.0, f_number: 2.8 },
+];
+
+/// The 8a's (akita) by camera id (ferros_cam cams `AKITA`): the main (Camera2 physical camera 2), the ultrawide (3), the front (logical camera 1).
+/// Each is Android's Camera2 report on the 8a (`dumpsys media.camera`, 2026-11-18, keys/akita/captures-2026-11-18/dumpsys-media-camera.txt): SENSOR_INFO_PHYSICAL_SIZE over SENSOR_INFO_PIXEL_ARRAY_SIZE, LENS_INFO_AVAILABLE_FOCAL_LENGTHS, LENS_INFO_AVAILABLE_APERTURES.
+/// The 8a lists no maximum resolution, so each array is the readout ferros streams (the main's 1.6 um pixels, the IMX712s' 1.12 um), and every readout gathers one array pixel a pixel.
+/// The main's 2x (physical camera 4) is the same lens with half the main's size, 3.6992 x 2.7776 mm: its middle quarter, not a readout of ferros's.
+pub const AKITA_OPTICS: [Optics; 3] = [
+    Optics { sensor_mm: (7.3984, 5.5552), array_px: (4624, 3472), focal_mm: 5.43, f_number: 1.89 },
+    Optics { sensor_mm: (4.71296, 3.4944), array_px: (4208, 3120), focal_mm: 1.835, f_number: 2.2 },
+    Optics { sensor_mm: (4.71296, 3.44064), array_px: (4208, 3072), focal_mm: 2.74, f_number: 2.2 },
 ];
 
 /// The full frame's diagonal (36 x 24 mm), what a 35 mm equivalent focal length is measured against.
@@ -112,5 +122,16 @@ mod tests {
         }
         let t = OPTICS[3];
         assert!((t.field((t.array_px.0 / 2, t.array_px.1 / 2)).fov_deg.2 - 11.2).abs() < 0.05);
+    }
+
+    /// The 8a's sizes hold together: the main's middle quarter is its 2x's reported size (physical camera 4, 3.6992 x 2.7776 mm), and the pixels are the parts' own (the main 1.6 um, the IMX712s 1.12 um).
+    #[test]
+    fn the_8a_sizes_agree() {
+        let m = AKITA_OPTICS[0];
+        let q = m.field((m.array_px.0 / 2, m.array_px.1 / 2));
+        assert!((q.mm.0 - 3.6992).abs() < 1e-4 && (q.mm.1 - 2.7776).abs() < 1e-4, "{q:?}");
+        for (o, um) in AKITA_OPTICS.iter().zip([1.6f32, 1.12, 1.12]) {
+            assert!((o.sensor_mm.0 * 1000. / o.array_px.0 as f32 - um).abs() < 1e-4 && (o.sensor_mm.1 * 1000. / o.array_px.1 as f32 - um).abs() < 1e-4, "{o:?}");
+        }
     }
 }

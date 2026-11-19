@@ -55,7 +55,7 @@ const S_BUS: [u64; 4] = [2, 10, 11, 12];
 /// The open camera's id (ferros_cam cams), set by the open before anything reads it.
 static CAM: AtomicU64 = AtomicU64::new(0);
 fn cam() -> &'static Cam {
-    cams::CAMS[CAM.load(Ordering::Relaxed) as usize]
+    cams::all()[CAM.load(Ordering::Relaxed) as usize]
 }
 /// The open readout: 0 the camera's own (binned, a mode of it, its 1:1), k + 1 its captured readout `alts[k]` (ferros_cam cams `Alt`).
 static ALT_OPEN: AtomicU64 = AtomicU64::new(0);
@@ -113,17 +113,19 @@ macro_rules! step {
     }};
 }
 
-/// A readout's diagonal field in degrees, as its list section carries it (ferros_cam optics `Optics::field`).
+/// A readout's diagonal field in degrees, as its list section carries it (ferros_cam optics `Optics::field`, by the camera's own board's optics, `Cam::optics`).
 fn field_deg(c: &Cam, r: &ferros_cam::list::Readout) -> f32 {
-    ferros_cam::optics::OPTICS[c.id as usize].field(r.covered).fov_deg.2
+    c.optics.field(r.covered).fov_deg.2
 }
 
 /// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
     for &id in LISTED.iter() {
-        let c = cams::CAMS[id as usize];
-        if !inputs_held(g, c) {
+        // WHY `by_id`: `LISTED` names the Pro's four, and the 8a has three (no tele).
+        let Some(c) = cams::by_id(id) else { continue };
+        // A camera of the board that does not stream yet (the 8a's ultrawide and front) is left out, whatever its vault holds.
+        if !c.streams || !inputs_held(g, c) {
             continue;
         }
         let Some(idt) = input(g, c, None, b"idt", T_IDT, unsafe { &mut *(&raw mut IDT) }) else { continue };
@@ -522,7 +524,17 @@ fn img_log_say(g: u64) {
     }
     let _ = write!(p, "\n");
     console(g, &p.b[..p.n]);
+    let mut q = Line { b: [0; 256], n: 0 };
+    let _ = write!(q, "camera: the engine at the first answers (+14 place, +58, +5C, +54):");
+    for e in ENGINE_LOG.iter().take(1 << 4) {
+        let v = e.load(Ordering::Relaxed);
+        let _ = write!(q, " {:X}/{:X}/{:X}/{:X}", v >> 48, v >> 32 & 0xFFFF, v >> 16 & 0xFFFF, v & 0xFFFF);
+    }
+    let _ = write!(q, "\n");
+    console(g, &q.b[..q.n]);
 }
+/// The PDMA engine's place and its words +G#58, +G#5C and +G#54 (16 bits each) as each of the first answers found them (2026-11-19, the 8a: the engine stuck past a frame).
+static ENGINE_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 /// The last 2^8 answers, for the console when a stream stops (camera-full-rate, 2026-11-17: which interrupt came last and how late): per answer the counter at its start (above bit 8) and the image status (low byte); and the index it wrote (low 16 bits, G#FFFF none) with the answer's ticks above.
 static TL: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
 static TL_IDX: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
@@ -851,6 +863,8 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let k = ANSWERED.load(Ordering::Relaxed) as usize;
     if k < IMG_LOG.len() {
         IMG_LOG[k].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
+        let e = |o: usize| rd(g, ferros_cam::PDMA + o) as u64 & 0xFFFF;
+        ENGINE_LOG[k].store(e(0x14) << 48 | e(0x58) << 32 | e(0x5C) << 16 | e(0x54), Ordering::Relaxed);
     }
     TL[k & 0xFF].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
     let mut wrote = 0xFFFFu64;
@@ -1058,7 +1072,7 @@ static FULL_INPUT: AtomicU64 = AtomicU64::new(0);
 /// Where the spawn's input carries the 1:1 init: after 16 knob bytes, framed as ferros-bridge's `--input-file` frames a file (u32 LE length, then the bytes): `spawn camera.bin 01000000000000000000000000000000 --input-file target/cam/main-full.init`.
 const FULL_INPUT_AT: u64 = 1 << 4;
 
-/// A device test with nothing stored, for any readout (docs/CAMERA.md "Every readout, captured"): the hand spawn's eleventh byte (`TEST_ITEMS`) names which inputs follow the 16 knob bytes, each framed as `--input-file` frames it, in this order: bit 0 the 1:1 init (as `FULL_INPUT`), bit 1 the init, bit 2 the CPU program, bit 3 the job, bit 4 the IDT; each used in place of the vault's for whatever readout the open asks. 0 with one frame after the knobs is the 1:1 init alone, as before.
+/// A device test with nothing stored, for any readout (docs/CAMERA.md "Every readout, captured"): the hand spawn's eleventh byte (`TEST_ITEMS`) names which inputs follow the 16 knob bytes, each framed as `--input-file` frames it, in this order: bit 0 the 1:1 init (as `FULL_INPUT`), bit 1 the init, bit 2 the CPU program, bit 3 the job, bit 4 the IDT; each used in place of the vault's for whatever readout the open asks. 0 with one frame after the knobs is a 'CINP' set (`spawn_input`, by name) or the 1:1 init alone, as before.
 const T_INIT: usize = 1;
 const T_PROG: usize = 2;
 const T_PDMA: usize = 3;
@@ -1091,6 +1105,46 @@ fn input<'a>(g: u64, c: &Cam, alt: Option<&cams::Alt>, what: &[u8], k: usize, bu
     }
     let mut kb = [0u8; 32];
     get(g, input_key(&mut kb, c, &w[..n]), buf)
+}
+
+/// A device test with nothing stored (2026-11-18, the 8a's cameras): any of the driver's inputs, carried by the hand spawn's input after its 16 knob bytes as one 'CINP' set (framed as `--input-file` frames a file), looked up by name before the vault (`get`, `has`).
+/// The set: 'CINP', then entries of a name's length (u8), the name as the vault spells it without `cam.` (`oksoko.init`), a length (u32 LE) and the bytes; tools/cam-oracle `cinp` writes one.
+static mut SPAWN_INPUTS: [u8; 1 << 17] = [0; 1 << 17];
+/// `SPAWN_INPUTS`'s length when the spawn carried a set; 0 none.
+static SPAWN_INPUTS_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// The spawn's input named `key`, when the spawn carried a 'CINP' set holding it.
+fn spawn_input(key: &[u8]) -> Option<&'static [u8]> {
+    let n = SPAWN_INPUTS_LEN.load(Ordering::Relaxed) as usize;
+    if n == 0 {
+        return None;
+    }
+    let b = unsafe { &(&*(&raw const SPAWN_INPUTS))[..n] };
+    let mut i = 4;
+    // WHY the checked reads: the set is the host's bytes, so a length that runs past the set ends the walk instead of reading past it.
+    while i < n {
+        let kl = *b.get(i)? as usize;
+        let k = b.get(i + 1..i + 1 + kl)?;
+        let l = u32::from_le_bytes(b.get(i + 1 + kl..i + 5 + kl)?.try_into().ok()?) as usize;
+        let v = b.get(i + 5 + kl..i + 5 + kl + l)?;
+        if k == key {
+            return Some(v);
+        }
+        i += 5 + kl + l;
+    }
+    None
+}
+
+/// Camera `c`'s job slots (ferros_cam job: each slot's bytes and the skip to its first output): the spawn's `<key>.slots` for a device test whose job is not the one the table was laid out from (2026-11-18, the 8a's main: the sizes and skips cam-oracle pdma-image prints, 32 of each, u64 LE), else the table's.
+fn slots_of(c: &Cam) -> ([u64; job::SLOTS], [u64; job::SLOTS]) {
+    let mut kb = [0u8; 32];
+    match spawn_input(input_key(&mut kb, c, b"slots")) {
+        Some(v) if v.len() == 2 * job::SLOTS * 8 => {
+            let w = |k: usize| u64::from_le_bytes(core::array::from_fn(|b| v[8 * k + b]));
+            (core::array::from_fn(w), core::array::from_fn(|k| w(job::SLOTS + k)))
+        }
+        _ => (c.sizes, c.skip),
+    }
 }
 
 /// Camera `c`'s 1:1 init: the spawn's (a device test, `FULL_INPUT`), else the vault's `cam.<key>.init.full`; None when neither.
@@ -1148,6 +1202,15 @@ struct Open {
 }
 
 fn get<'a>(g: u64, key: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    // A device test's inputs first (`spawn_input`): the vault is never asked for a name the spawn carried.
+    if let Some(v) = spawn_input(key) {
+        if v.len() > buf.len() {
+            say!(g, "camera: the spawn's {} is A#{} bytes, past the A#{} this driver reads\n", core::str::from_utf8(key).unwrap_or("?"), v.len(), buf.len());
+            return None;
+        }
+        buf[..v.len()].copy_from_slice(v);
+        return Some(&buf[..v.len()]);
+    }
     match ferros_sys::store_get(cap(g, S_STORE), key, buf) {
         Some(n) if n <= buf.len() => Some(&buf[..n]),
         Some(n) => {
@@ -1225,7 +1288,7 @@ fn input_key<'a>(buf: &'a mut [u8; 32], c: &Cam, what: &[u8]) -> &'a [u8] {
 
 /// Whether the vault holds `key` (its length asked with a buffer of none: the kernel answers a value's whole length).
 fn has(g: u64, key: &[u8]) -> bool {
-    ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
+    spawn_input(key).is_some() || ferros_sys::store_get(cap(g, S_STORE), key, &mut [0u8; 8]).is_some()
 }
 
 /// Whether camera `c`'s inputs are in the vault: its IDT and its job, and its init and CPU program (the main's also as the bundle `cam.frame`, or by their older names).
@@ -1369,7 +1432,7 @@ fn mode_of(c: &Cam, init: &[u8], s: &Spec) -> Result<Option<ccs::Mode>, Fail> {
     if s.kind == K_CAPTURED {
         return Ok(None);
     }
-    let a = &ccs::ARRAYS[c.id as usize];
+    let a = c.array;
     let base = match s.kind {
         K_BINNED | K_SLIT => ccs::Mode::captured(init, a).map_err(Fail::Mode)?,
         K_FULL | K_SLIT_FULL => ccs::Mode::captured_full(init, a).map_err(Fail::Mode)?,
@@ -1449,6 +1512,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // A sensor that drops a mode written before stream on (`Cam::mode_live`, the tele) has it written after the first frame.
     let s = &Spec { flags: s.flags | if c.mode_live { F_MID } else { 0 }, ..*s };
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
+    STOPPED.store(0, Ordering::Relaxed);
     let t0 = ferros_sys::now();
     CAM.store(c.id as u64, Ordering::Relaxed);
     let bus = Bus::of(g, c);
@@ -1472,7 +1536,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     };
     // A 1:1 mode replays the 1:1 init in place of the binned one (`cam.<key>.init.full`, docs/CAMERA.md "1:1 on the main"); the CPU's writes and the job stay the binned session's, their geometry rewritten to the 1:1 frame as any mode's is.
     let init = if s.full() { full_init(g, c).ok_or(Fail::Inputs("no cam.<key>.init.full (the 1:1 init) for this camera in the vault"))? } else { init };
+    let prog_bytes = prog;
     let prog = inputs::prog(prog).ok_or(Fail::Inputs("the CPU program is not a CPR2"))?;
+    PROG_IN.store(prog_bytes.as_ptr() as u64, Ordering::Relaxed);
+    PROG_IN_LEN.store(prog_bytes.len() as u64, Ordering::Relaxed);
     let jb = unsafe { &mut *(&raw mut JOB) };
     let jn = input(g, c, alt, b"pdma", T_PDMA, jb).ok_or(Fail::Inputs("no cam.<key>.pdma (with the readout's .<tag>) for this camera in the vault"))?.len();
     let mode = if alt.is_some() { None } else { mode_of(c, init, s)? };
@@ -1481,9 +1548,13 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         Some(a) => geom::Geom { w: a.width as u16, h: a.height as u16, stride: a.stride as u32, pd_h: (a.height / 4) as u16, dt: geom::DT_RAW10 },
         None => geom::Geom { w: c.width as u16, h: c.height as u16, stride: c.stride as u32, pd_h: (c.height / 4) as u16, dt: geom::DT_RAW10 },
     };
+    // The job's slots: a captured readout's own; the camera's from `slots_of` (a device test's `<key>.slots`, else the table's).
     let (sizes, skip, rx_start) = match alt {
-        Some(a) => (&a.sizes, &job::NO_SKIP, a.rx_start),
-        None => (&c.sizes, &c.skip, c.rx_start),
+        Some(a) => (a.sizes, job::NO_SKIP, a.rx_start),
+        None => {
+            let (sizes, skip) = slots_of(c);
+            (sizes, skip, c.rx_start)
+        }
     };
     let to = match mode {
         None => from,
@@ -1504,7 +1575,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
     // The PD path on (the init's mode, or asked): each ring buffer holds its frame's PD rows right after its image (owner, 2026-11-17: phase detect as data, one MAP giving both; docs/CAMERA.md "Phase detect as data"), the main's 768 lines at the image's stride past its 3072, so a buffer is 20 MiB, not 16. `pd_off` the rows' place in the buffer, 0 none.
-    let pd_on = match alt { Some(a) => a.pd, None => s.kind == K_CAPTURED || s.flags & F_PD != 0 };
+    // A captured readout's PD rows as measured (`Alt::pd`); the camera's own only where the job has a PD path at all (its program writes loch0's PD address): the 8a's front has none (2026-11-19: its open was refused for want of one).
+    let has_pd = job::list_piece(&jb[..jn]).is_ok_and(|(at, len)| job::pd_words(&jb[at..at + len]).is_ok());
+    let pd_on = match alt { Some(a) => a.pd, None => has_pd && (s.kind == K_CAPTURED || s.flags & F_PD != 0) };
     let pd_off = if pd_on && !slit { fe.h as u64 * fe.stride as u64 } else { 0 };
     let buf = if slit { job::slit_bytes(fe.h as u64, fe.stride as u64) } else if pd_off != 0 { job::buffer_bytes(fe.h as u64 + fe.pd_h as u64, fe.stride as u64) } else { job::buffer_bytes(fe.h as u64, fe.stride as u64) };
     // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14); measured on the Pro on 2026-11-15 to work above 4 GiB too (the front end drives the high address halves in bypass), where it is taken when nothing lower is free. A vault entry `cam.region` reading `high` asks higher first.
@@ -1536,7 +1609,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The biggest ring first, under 4 GiB and then above it for each count: a ring of one gives no view, so a smaller ring under 4 GiB is not worth more than a bigger one above it (the Pro, b898: the low ranges held a ring of one, and the bench's open came back without a view).
     'ask: for &n in rings.iter() {
         for low in [low_first, !low_first] {
-            let l = job::with_image(sizes, skip, n as u64 * buf);
+            let l = job::with_image(&sizes, &skip, n as u64 * buf);
             let (f, sl) = copies(n);
             let frames = l.bytes / job::FRAME + engine_bytes(f, sl).div_ceil(job::FRAME);
             let pa = ask(frames, low);
@@ -1591,7 +1664,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
         }
     }
     step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
-    let arr = &ccs::ARRAYS[c.id as usize];
+    let arr = c.array;
     if MEASURE.load(Ordering::Relaxed) == 2 {
         // Samsung's two 16-bit words only: the test writes whole words, which on a one-byte shift (Sony's G#3100) would write the register after it.
         if let Some(l) = arr.lte.filter(|l| !l.byte) {
@@ -1707,7 +1780,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     // The shape the frame thread and the endpoint work to.
     BUF.store(buf, Ordering::Relaxed);
-    CFA_PERIOD.store(match alt { Some(a) => a.period as u64, None if s.full() => ccs::ARRAYS[c.id as usize].period as u64, None => 2 }, Ordering::Relaxed);
+    CFA_PERIOD.store(match alt { Some(a) => a.period as u64, None if s.full() => c.array.period as u64, None => 2 }, Ordering::Relaxed);
     ROWS.store(fe.h as u64, Ordering::Relaxed);
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);
@@ -1729,6 +1802,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     DESC_FLAGS.store(first[0] as u64, Ordering::Relaxed);
     PROG_PA.store(pa + (long + PROG_AT) as u64, Ordering::Relaxed);
     PROG_LEN.store(list_len as u64, Ordering::Relaxed);
+    PROG_VA.store((va + long + PROG_AT) as u64, Ordering::Relaxed);
     SLIM_PA.store(pa + (long + slim_at) as u64, Ordering::Relaxed);
     SLIM_LEN.store(slim_len as u64, Ordering::Relaxed);
     RING_VA.store((va + ring_off) as u64, Ordering::Relaxed);
@@ -1907,6 +1981,12 @@ fn close(g: u64) {
     let c = cam();
     link_say(g);
     fe_say(g, "at the close");
+    if FRAMES.load(Ordering::Relaxed) == 0 {
+        readback_say(g);
+    } else if STOPPED.load(Ordering::Relaxed) != 0 || WORDS_TEST.load(Ordering::Relaxed) != 0 {
+        words_say(g);
+        copies_say(g);
+    }
     say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
@@ -2196,7 +2276,12 @@ fn release(g: u64, o: &mut Open, b: usize) {
 }
 
 /// No frame came in `late_us`: said with the words that tell why.
+/// Set when the stream was taken for stopped (`late`): the close then says the front end's words (`words_say`).
+static STOPPED: AtomicU64 = AtomicU64::new(0);
+/// A device test (the hand spawn's twelfth byte 1): `words_say` at every close.
+static WORDS_TEST: AtomicU64 = AtomicU64::new(0);
 fn late(g: u64) {
+    STOPPED.store(1, Ordering::Relaxed);
     say!(g, "camera: no frame in A#{} ms (A#{} so far; A#{} answers, A#{} on the line; image status bits seen G#{:X}; ring frames unseen A#{}); closing\n", late_us() / 1000, FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), IMG_SEEN.load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed));
 }
 
@@ -2223,11 +2308,13 @@ fn ack_say(g: u64) {
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
 }
+/// The open readout's CSI link (its base): where its receiver start (`rx_of`) wrote a link's common control (+4) with the start bits (G#205E01 on links 1 and 2, G#5F01 on link 0 and the 8a's front's link 6, G#205D01 on the tele's link 6); the resets before it carry G#5002, a stop G#5F03.
+fn link_of() -> Option<usize> {
+    rx_of().0.iter().find(|w| (0x1C04_0000..0x1C10_0000).contains(&w.0) && w.0 & 0xFFFF == 4 && w.1 & 3 == 1).map(|&(a, _)| a & !0xFFFF)
+}
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
-    // The link's start word: its common control (+4) with bit 0 set (G#205E01 on links 1 and 2, G#5F01 on link 0, G#205D01 on the tele's link 6); the resets before it carry G#5002.
-    let Some(&(a, _)) = rx_of().0.iter().find(|w| w.0 & 0xFFFF == 4 && w.1 & 3 == 1) else { return };
-    let link = a & !0xFFFF;
+    let Some(link) = link_of() else { return };
     say!(g, "camera: link G#{link:X}: +14 G#{:X} +1C G#{:X} +24 G#{:X} +2C G#{:X}; image path G#{:X}, aggregate G#{:X}\n", rd(g, link + 0x14), rd(g, link + 0x1C), rd(g, link + 0x24), rd(g, link + 0x2C), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::CMN_STATUS));
     let mut l = Line { b: [0; 256], n: 0 };
     let _ = write!(l, "camera: link counters from +634:");
@@ -2236,6 +2323,149 @@ fn link_say(g: u64) {
     }
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
+}
+
+/// The open's CPU program (its 'CPR2' bytes, wherever they were read from) and the program's first full copy in the region, for `readback_say`.
+static PROG_IN: AtomicU64 = AtomicU64::new(0);
+static PROG_IN_LEN: AtomicU64 = AtomicU64::new(0);
+static PROG_VA: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the program's copies are still the program (2026-11-19, the 8a: the engine stopped 68 bytes into the third copy it ran): each full copy against the first, every word but the buffer's own address words; and the first descriptors as they stand.
+fn copies_say(g: u64) {
+    let (va, len) = (PROG_VA.load(Ordering::Relaxed) as usize, PROG_LEN.load(Ordering::Relaxed) as usize);
+    let n = RING_BUFS.load(Ordering::Relaxed) as usize;
+    if va == 0 || n == 0 {
+        return;
+    }
+    let w = |b: usize, i: usize| unsafe { core::ptr::read_volatile((va + b * PROG_STRIDE + 4 * i) as *const u32) };
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the program's copies against the first (words differing, the first at):");
+    for b in 1..n {
+        let (mut d, mut first) = (0u32, usize::MAX);
+        for i in 0..len / 4 {
+            if w(b, i) != w(0, i) {
+                d += 1;
+                first = first.min(i);
+            }
+        }
+        let _ = write!(l, " A#{b}: A#{d} at A#{}", if first == usize::MAX { 0 } else { first });
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+    let dv = DESC_VA.load(Ordering::Relaxed) as usize;
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: descriptors 0 to 4:");
+    for e in 0..5 {
+        let d = unsafe { core::ptr::read_volatile((dv + e * 16) as *const [u32; 4]) };
+        let _ = write!(l, " {:X}/{:X}{:08X}/{:X}", d[0], d[2], d[1], d[3]);
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
+
+/// The words a stream that stopped is read by (2026-11-19, the 8a): the PDMA engine's five contexts, loch0's common words, its image path's and its PD path's, as they stand.
+fn words_say(g: u64) {
+    const SPANS: [(usize, usize); 8] = [
+        (0x1C39_0000, 0x80), (0x1C39_1000, 0x40), (0x1C39_2000, 0x40), (0x1C39_3000, 0x40), (0x1C39_4000, 0x40),
+        (0x1C32_0000, 0x120), (0x1C32_0400, 0xA0), (0x1C32_2000, 0xA0),
+    ];
+    // The camera's link (+0 to +G#100, +G#600 to +G#700) and its PHY lanes (G#1C10_xx00 pages its receiver start writes, each page's first G#100), as they stand: a link that latches frame starts and ends but counts no line says where the lines stop (2026-11-19, the 8a's front).
+    let mut spans: [(usize, usize); 1 << 5] = [(0, 0); 1 << 5];
+    let mut n = 0;
+    if let Some(link) = link_of() {
+        spans[0] = (link, 0x100);
+        spans[1] = (link + 0x600, 0x100);
+        n = 2;
+    }
+    for &(a, _) in rx_of().0.iter() {
+        let page = a & !0xFF;
+        // WHY the bound: the table holds 2^5 spans; a receiver start naming more lanes than that has the rest unread.
+        if (0x1C10_1000..0x1C10_4000).contains(&a) && a & 0xFF != 0x1C && n < spans.len() && !spans[..n].iter().any(|s| s.0 == page) {
+            spans[n] = (page, 0x100);
+            n += 1;
+        }
+    }
+    for &(base, len) in SPANS.iter().chain(spans[..n].iter()) {
+        let mut at = 0;
+        while at < len {
+            let mut l = Line { b: [0; 256], n: 0 };
+            let _ = write!(l, "camera: words G#{:X}:", base + at);
+            for k in 0..(1 << 4).min((len - at) / 4) {
+                let _ = write!(l, " {:X}", rd(g, base + at + 4 * k));
+            }
+            let _ = write!(l, "\n");
+            console(g, &l.b[..l.n]);
+            at += 1 << 6;
+        }
+    }
+}
+
+/// A stream that never framed (2026-11-19, the 8a's main: the engine ran its first descriptor, loch0 said nothing): every register the program's first copy and the CPU's setup wrote, read back where the driver may read it, and the ones that do not hold what was written said (a block whose writes were dropped reads back its reset value).
+/// Not the PDMA's own page (the engine's) nor G#1C36 (written by the engine's block loads only); a status word that clears itself reads differently by nature, so this is evidence to read, not a verdict.
+fn readback_say(g: u64) {
+    words_say(g);
+    let fe_ok = |a: usize| grant_of(a).is_some() && !(0x1C39_0000..0x1C39_1000).contains(&a) && !(0x1C36_0000..0x1C37_0000).contains(&a);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let (mut n, mut same, mut shown) = (0u32, 0u32, 0u32);
+    let (va, len) = (PROG_VA.load(Ordering::Relaxed) as usize, PROG_LEN.load(Ordering::Relaxed) as usize);
+    if va != 0 {
+        let list = unsafe { core::slice::from_raw_parts(va as *const u8, len) };
+        let _ = write!(l, "camera: the program read back (reg:written/read):");
+        geom::writes(list, &mut |i, reg| {
+            let a = reg as usize;
+            if !fe_ok(a) {
+                return;
+            }
+            let want = u32::from_le_bytes([list[i * 4], list[i * 4 + 1], list[i * 4 + 2], list[i * 4 + 3]]);
+            let got = rd(g, a);
+            n += 1;
+            if got == want {
+                same += 1;
+            } else if shown < 1 << 4 {
+                shown += 1;
+                if l.n > 200 {
+                    let _ = write!(l, "\n");
+                    console(g, &l.b[..l.n]);
+                    l = Line { b: [0; 256], n: 0 };
+                    let _ = write!(l, "camera:  ");
+                }
+                let _ = write!(l, " {:X}:{want:X}/{got:X}", a & 0xFFFFF);
+            }
+        });
+        let _ = write!(l, "\n");
+        console(g, &l.b[..l.n]);
+        say!(g, "camera: the program's writes read back: A#{n} readable, A#{same} holding what was written\n");
+    }
+    let (p, pl) = (PROG_IN.load(Ordering::Relaxed) as usize, PROG_IN_LEN.load(Ordering::Relaxed) as usize);
+    if p == 0 {
+        return;
+    }
+    let Some(prog) = inputs::prog(unsafe { core::slice::from_raw_parts(p as *const u8, pl) }) else { return };
+    let (mut n, mut same, mut shown) = (0u32, 0u32, 0u32);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the CPU's writes read back (reg:written/read):");
+    for (a, want) in prog.before.iter().chain(prog.after.iter()) {
+        if !fe_ok(a) || !inputs::cpu_write_allowed(a) {
+            continue;
+        }
+        let got = rd(g, a);
+        n += 1;
+        if got == want {
+            same += 1;
+        } else if shown < 1 << 5 {
+            shown += 1;
+            if l.n > 200 {
+                let _ = write!(l, "\n");
+                console(g, &l.b[..l.n]);
+                l = Line { b: [0; 256], n: 0 };
+                let _ = write!(l, "camera:  ");
+            }
+            let _ = write!(l, " {:X}:{want:X}/{got:X}", a & 0xFFFFF);
+        }
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+    say!(g, "camera: the CPU's writes read back: A#{n} readable, A#{same} holding what was written (a later write of the same register counts against the earlier)\n");
 }
 
 /// How long the stream may run with nobody asking before the holder is taken for gone: 2^22 us (it was 64 frames, 4.4 s at 14.5 a second; a slit runs 64 frames in 53 ms). Never while a call of its waits for a frame (`Pending`): that holder is asking.
@@ -2455,6 +2685,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 9 {
         NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
     }
+    // The twelfth, a device test only: 1 says the front end's, link's and PHY's words at every close (`words_say`), a stream that ran too, for a comparison with one that did not (the eleventh on akita-stream before the merge with forge, whose eleventh names the spawn's inputs).
+    if input_len > 11 {
+        WORDS_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 11) as *const u8) } as u64, Ordering::Relaxed);
+    }
     // The eleventh: which inputs follow the knobs (`T_INIT` ..), a device test of any readout with nothing stored.
     let items = if input_len > 10 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 10) as *const u8) } } else { 0 };
     if items != 0 && input_len > FULL_INPUT_AT {
@@ -2483,11 +2717,22 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
             at += 4 + n;
         }
     } else if input_len > FULL_INPUT_AT + 4 {
-        // A device test with nothing stored: the 1:1 init in the input after the 16 knob bytes (`FULL_INPUT_AT`), u32 LE length and the table, as `--input-file` frames it.
+        // A device test with nothing stored, the eleventh byte 0: the input after the 16 knob bytes (`FULL_INPUT_AT`) is one frame, u32 LE length and the bytes, as `--input-file` frames it: a 'CINP' set (`spawn_input`), else the 1:1 init alone.
         let at = ferros_sys::arc_base() + input + FULL_INPUT_AT;
         let n = u32::from_le_bytes(core::array::from_fn(|k| unsafe { core::ptr::read_volatile((at + k as u64) as *const u8) })) as u64;
-        // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `FULL` would write past it.
-        if FULL_INPUT_AT + 4 + n == input_len && n as usize <= VALUE {
+        let byte = |k: u64| unsafe { core::ptr::read_volatile((at + 4 + k) as *const u8) };
+        let cinp = n >= 4 && (0..4).all(|k| byte(k) == b"CINP"[k as usize]);
+        // WHY the tests: the length is the spawn's bytes; one that does not end exactly at the input's end is not the framing asked for, and one past `SPAWN_INPUTS` or `FULL` would write past it.
+        if cinp && FULL_INPUT_AT + 4 + n == input_len && n as usize <= 1 << 17 {
+            let set = unsafe { &mut *(&raw mut SPAWN_INPUTS) };
+            for k in 0..n as usize {
+                set[k] = byte(k as u64);
+            }
+            SPAWN_INPUTS_LEN.store(n, Ordering::Relaxed);
+            say!(g, "camera: the spawn's inputs, A#{n} bytes (a device test: each name it holds read in place of the vault's)\n");
+        } else if cinp {
+            say!(g, "camera: the spawn's 'CINP' set is not framed as asked (A#{} bytes after the knobs, A#{n} said) or past A#{} bytes; ignored\n", input_len - FULL_INPUT_AT, 1u64 << 17);
+        } else if FULL_INPUT_AT + 4 + n == input_len && n as usize <= VALUE {
             let full = unsafe { &mut *(&raw mut FULL) };
             for k in 0..n as usize {
                 full[k] = unsafe { core::ptr::read_volatile((at + 4 + k as u64) as *const u8) };
@@ -2499,6 +2744,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         }
     }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    // The board's cameras (fact 84: 1 husky, 2 akita), once, before anything reads the table; a kernel that does not say is husky's.
+    cams::set_board(ferros_sys::facts().board().unwrap_or(cams::BOARD_HUSKY as u64) as u8);
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
         ferros_sys::thread_spawn(binner, unsafe { &mut (*(&raw mut BIN_STACKS))[k - 1] }, k as u64);
@@ -2603,7 +2850,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 reply(&token, &list(g));
             }
             1 => {
-                let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams) } else { None };
+                // A camera not yet streaming (akita's, 2026-11-18) opens only for a device test whose spawn carried its init (`spawn_input` by name, or the eleventh byte's `T_INIT`).
+                let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams || spawn_input(input_key(&mut [0u8; 32], c, b"init")).is_some() || T_LEN[T_INIT - 1].load(Ordering::Relaxed) != 0) } else { None };
                 // Held by a holder whose process has ended, on a kernel that does not watch ends (`WATCHED` 0): its held call's caller is gone (`caller_alive`), so its stream is closed now and this open is answered 3, to be asked of a driver started fresh (the frame thread here ended with that stream).
                 if let (true, Some(p)) = (open_cam.is_some() && WATCHED.load(Ordering::Relaxed) == 0, pending.as_ref()) {
                     if ferros_sys::caller_alive(&p.token) == Some(false) {

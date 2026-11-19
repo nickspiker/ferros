@@ -1,0 +1,10 @@
+[package]
+name = "cam-oracle"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: a camera's hv oracle captures turned into what the camera driver replays (the Rust port of tools/oracle-decode-hsi2c.py, camera-init.py, camera-cpu.py, oracle-decode-pdma.py and camera-pdma-image.py)"
+
+[workspace]
+
+[dependencies]
+blake3 = "1"

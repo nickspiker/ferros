@@ -104,8 +104,10 @@ fn spin_us(us: u64) {
 }
 
 /// Power the camera PMIC. Its I2C interface needs chip select (sub GPIO0) high: Android keeps it high whenever the camera is closed and the chip does not acknowledge without it (measured 2026-10-19: debugfs gpio shows cs hi / bb lo / buck lo closed, all hi open; ferros cold had cs low and every address NACKed). Then the driver's `slg51002_power_on`: buck-boost enable (sub GPIO1) high, 2 ms, buck enable (sub GPIO3) high, 2 ms. Then read its pattern ID.
+/// akita's device tree names only the chip select (sub GPIO0) and the buck-boost (sub GPIO1, its RT6160 at G#77 on hsi2c_9, 3.2 V under Linux) for its camera PMIC, no buck enable: its sub GPIO3 is nobody's, so it is never driven there.
 pub fn pmic_power_on(rep: &mut Vec<u8>) {
-    for (n, label) in [(0, "GPIO0 chip select"), (1, "GPIO1 buck-boost"), (3, "GPIO3 buck")] {
+    let supplies: &[(u32, &str)] = if crate::board::akita() { &[(0, "GPIO0 chip select"), (1, "GPIO1 buck-boost")] } else { &[(0, "GPIO0 chip select"), (1, "GPIO1 buck-boost"), (3, "GPIO3 buck")] };
+    for &(n, label) in supplies {
         let r = sub_gpio_high(n);
         let v = acpm::read(acpm::SUB, acpm::T_GPIO, 0x08 + n);
         line(rep, alloc::format!("{label}: set {:?}, reads {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), v.map(|x| alloc::format!("G#{x:X}")).map_err(|e| alloc::format!("G#{e:X}"))));
@@ -166,6 +168,25 @@ const RAILS: [Rail; 8] = [
     Rail { name: "LDO8 0.97 V", vsel: 0x3200, code: 0x72, range: 0x3260, base_mv: 400, step_mv: 5, target_mv: 970 },
 ];
 
+/// akita's rails, from its device tree (the factory MP overlay, dtbo 18, the same as zuma-akita-camera.dtsi): every one with its minimum equal to its maximum, so Linux sets exactly this at boot.
+/// Not one is husky's: LDO3 is akita main's 1.8 V I/O where husky's is 2.25 V (25 % over, which the guard against husky's table would not have seen), LDO1 2.9 V, LDO2, 4 and 5 2.8 V, LDO6 and 7 1.2 V, LDO8 1.1 V (its cold code, G#8C).
+/// The same chip, so the same registers and steps; whether Android's readout (/sys/class/regulator) agrees is unmeasured.
+const RAILS_AKITA: [Rail; 8] = [
+    Rail { name: "LDO1 2.90 V", vsel: 0x2000, code: 0xAA, range: 0x2060, base_mv: 1200, step_mv: 10, target_mv: 2900 },
+    Rail { name: "LDO2 2.80 V", vsel: 0x2200, code: 0xA0, range: 0x2260, base_mv: 1200, step_mv: 10, target_mv: 2800 },
+    Rail { name: "LDO3 1.80 V", vsel: 0x2300, code: 0x3C, range: 0x2360, base_mv: 1200, step_mv: 10, target_mv: 1800 },
+    Rail { name: "LDO4 2.80 V", vsel: 0x2500, code: 0xA0, range: 0x2560, base_mv: 1200, step_mv: 10, target_mv: 2800 },
+    Rail { name: "LDO5 2.80 V", vsel: 0x2700, code: 0xA0, range: 0x2760, base_mv: 1200, step_mv: 10, target_mv: 2800 },
+    Rail { name: "LDO6 1.20 V", vsel: 0x2900, code: 0xA0, range: 0x2960, base_mv: 400, step_mv: 5, target_mv: 1200 },
+    Rail { name: "LDO7 1.20 V", vsel: 0x3100, code: 0xA0, range: 0x3160, base_mv: 400, step_mv: 5, target_mv: 1200 },
+    Rail { name: "LDO8 1.10 V", vsel: 0x3200, code: 0x8C, range: 0x3260, base_mv: 400, step_mv: 5, target_mv: 1100 },
+];
+
+/// This board's rails.
+fn rails() -> &'static [Rail; 8] {
+    if crate::board::akita() { &RAILS_AKITA } else { &RAILS }
+}
+
 
 /// Refuse a voltage code that would put more than a tenth over target on a rail.
 ///
@@ -216,7 +237,7 @@ fn program_rails(rep: &mut Vec<u8>) -> bool {
             return false;
         }
     }
-    for rail in RAILS.iter() {
+    for rail in rails().iter() {
         let (name, vsel, code, range) = (rail.name, rail.vsel, rail.code, rail.range);
         let r = (|| -> Result<alloc::string::String, alloc::string::String> {
             // The overvoltage guard before anything else, so a bad code never reaches the chip.
@@ -445,8 +466,68 @@ pub const TELE: Module = Module {
     down: &[(Step::Reset, 0), (Step::Mclk, 0), (Step::Switch(0x1710), 1000), (Step::Ldo(4), 0), (Step::Ldo(6), 0), (Step::SubLdo(0x3A), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0), (Step::Ldo(2), 0), (Step::SubGpio(LV_BUCK_EN), 0)],
 };
 
-/// The module the `camera` switch powers for camera `id` (ferros_cam cams: 0 the main, whose own `power_up` runs; 1 the ultrawide, 2 the front, 3 the tele).
+// akita (Pixel 8a), from its device tree (the factory MP overlay, dtbo 18, as zuma-akita-camera.dtsi): every module's sequence as written there, every sensor at G#1A, every master clock pin at drive X2 (1), the clocks' own rates left as the cold boot runs them (the 24.576 MHz oscillator: CMU_TOP's CIS_CLK muxes and dividers read 0, 2026-11-15; the main's device tree asks 26 MHz, which only an open's init needs).
+// akita's camera PMIC has no load switches in use and no buck enable (`pmic_power_on`), and its sub LDO12 (L12S_CAMIO, the modules' 1.8 V I/O and nothing else on the board) is checked against its 1.8 V before it is enabled (`SubLdo`).
+
+/// GPP2 inside GPIO_PERIC0 (akita's main sensor's bus and reset) and GPP9 (its master clock, CIS_CLK3's pin, as husky's main).
+const GPP2: usize = 0x40;
+const GPP9: usize = 0x120;
+
+/// akita's main camera (oksoko, Sony IMX787): hsi2c_1 (G#1088_0000, gpp2-0/1, USI offset 0), reset gpp2-2 (RCAM_RST_L), master clock gpp9-0 (CIS_CLK3, `sensor_mclk4`), the sensor enable the sub-PMIC's GPIO2 (its device tree's `enable-gpios`, "CAMS_LVBUCK_EN for ldo8" as husky's comment reads, though no akita module lists LDO8).
+/// `sensor@0`: sub LDO12, LDO5, LDO4, LDO1, LDO3, then the enable and 1 ms, the reset released, the clock and 2 ms.
+pub const AKITA_MAIN: Module = Module {
+    name: "main",
+    bus: 0x1088_0000,
+    bus_bank: GPP2,
+    usi_mode: SYSREG_PERIC0,
+    usi_mux: CMU_PERIC0 + 0x650,
+    reset: (GPP2, 2),
+    mclk: (GPP9, 1),
+    up: &[(Step::SubLdo(0x3A), 0), (Step::Ldo(4), 0), (Step::Ldo(3), 0), (Step::Ldo(0), 0), (Step::Ldo(2), 0), (Step::SubGpio(2), 1000), (Step::Reset, 0), (Step::Mclk, 2000)],
+    down: &[(Step::Mclk, 0), (Step::Reset, 0), (Step::SubGpio(2), 0), (Step::Ldo(2), 0), (Step::Ldo(0), 0), (Step::Ldo(3), 0), (Step::Ldo(4), 0), (Step::SubLdo(0x3A), 0)],
+};
+
+/// akita's ultrawide (leshen-uw): hsi2c_3 (G#108A_0000, gpp6-0/1, USI offset 8), reset gpp6-3, master clock gpp3-0 (CIS_CLK0, `sensor_mclk1`).
+/// `sensor@2`: sub LDO12, LDO2, LDO6 and 1 ms, the reset released, the clock and 1 ms.
+pub const AKITA_ULTRAWIDE: Module = Module {
+    name: "ultrawide",
+    bus: 0x108A_0000,
+    bus_bank: GPP6,
+    usi_mode: SYSREG_PERIC0 + 0x8,
+    usi_mux: CMU_PERIC0 + 0x670,
+    reset: (GPP6, 3),
+    mclk: (GPP3, 1),
+    up: &[(Step::SubLdo(0x3A), 0), (Step::Ldo(1), 0), (Step::Ldo(5), 1000), (Step::Reset, 0), (Step::Mclk, 1000)],
+    down: &[(Step::Mclk, 0), (Step::Reset, 0), (Step::Ldo(5), 0), (Step::Ldo(1), 0), (Step::SubLdo(0x3A), 1000)],
+};
+
+/// akita's front camera (leshen): hsi2c_2 (G#1089_0000, gpp4-0/1, USI offset 4), reset gpp4-2, master clock gpp5-0 (CIS_CLK1, `sensor_mclk2`).
+/// `sensor@1`: sub LDO12, LDO2, LDO7 and 1 ms, the reset released, the clock; its device tree gives no time after the clock, and 1 ms is added before the first I2C (Linux's first transfer comes later still, from the HAL).
+pub const AKITA_FRONT: Module = Module {
+    name: "front",
+    bus: 0x1089_0000,
+    bus_bank: GPP4,
+    usi_mode: SYSREG_PERIC0 + 0x4,
+    usi_mux: CMU_PERIC0 + 0x660,
+    reset: (GPP4, 2),
+    mclk: (GPP5, 1),
+    up: &[(Step::SubLdo(0x3A), 0), (Step::Ldo(1), 0), (Step::Ldo(6), 1000), (Step::Reset, 0), (Step::Mclk, 1000)],
+    down: &[(Step::Mclk, 0), (Step::Reset, 0), (Step::Ldo(6), 0), (Step::Ldo(1), 0), (Step::SubLdo(0x3A), 0)],
+};
+
+/// akita's sub LDO12 (L12S_CAMIO): 1.8 V in its device tree; LDO12S's code is bits 0-5 of its control register, 0.7 V + 25 mV a step (s2mpg15-regulator.c group 6).
+const AKITA_LDO12_MV: u32 = 1800;
+
+/// The module the `camera` switch powers for camera `id` (ferros_cam cams). husky: 0 the main, whose own `power_up` runs (none here); 1 the ultrawide, 2 the front, 3 the tele. akita: 0 the main, 1 the ultrawide, 2 the front, every one a `Module`.
 pub fn module(id: u8) -> Option<&'static Module> {
+    if crate::board::akita() {
+        return match id {
+            0 => Some(&AKITA_MAIN),
+            1 => Some(&AKITA_ULTRAWIDE),
+            2 => Some(&AKITA_FRONT),
+            _ => None,
+        };
+    }
     match id {
         1 => Some(&ULTRAWIDE),
         2 => Some(&FRONT),
@@ -477,6 +558,15 @@ fn module_step(m: &Module, s: Step, on: bool) -> Result<alloc::string::String, a
             Ok(alloc::format!("LDO{} {}: matrix G#{:02X}", bit + 1, if on { "on" } else { "off" }, pmic_read(MATRIX_A).map_err(hex)?))
         }
         Step::SubLdo(reg) => {
+            // akita: the rail's own voltage read and held to the guard's tenth over its device tree's 1.8 V before its enable (the code is the boot's, never written here: nothing on ferros has set it, and it is the modules' I/O alone).
+            if on && reg == 0x3A && crate::board::akita() {
+                let c = acpm::read(acpm::SUB, acpm::T_PMIC, reg).map_err(hex)?;
+                let mv = 700 + (c & 0x3F) as u32 * 25;
+                let ceiling = AKITA_LDO12_MV + AKITA_LDO12_MV / 10;
+                if mv > ceiling {
+                    return Err(alloc::format!("REFUSED: sub LDO12 reads G#{c:02X}, A#{mv} mV, over the A#{ceiling} mV ceiling for its A#{AKITA_LDO12_MV} mV"));
+                }
+            }
             acpm::update(acpm::SUB, acpm::T_PMIC, reg, if on { 0x80 } else { 0 }, 0x80).map_err(hex)?;
             Ok(alloc::format!("sub LDO G#{reg:X} {}: ctrl G#{:02X}", if on { "on" } else { "off" }, acpm::read(acpm::SUB, acpm::T_PMIC, reg).map_err(hex)?))
         }
@@ -517,6 +607,15 @@ fn module_step(m: &Module, s: Step, on: bool) -> Result<alloc::string::String, a
 /// Power a module other than the main: the camera PMIC's supplies (`pmic_power_on`), every rail's voltage programmed and verified while all are off (`program_rails`: refused if any rail is on), then its device-tree sequence with its delays. On any failure it powers back down.
 pub fn power_module(m: &Module, rep: &mut Vec<u8>) -> bool {
     pmic_power_on(rep);
+    // akita's camera PMIC has never been driven from ferros: only the revision husky's is (REVISION_AB, pattern ID 03 31 B1) goes on. REVISION_AA wants Linux's startup and current-limit writes in the chip's test mode first (slg51002-core.c `slg51002_set_revision_specific_regs`), which ferros does not make.
+    if crate::board::akita() {
+        let id: Result<alloc::vec::Vec<u8>, u32> = (0x1105u16..=0x1107).map(pmic_read).collect();
+        if id.as_deref() != Ok(&[0x03, 0x31, 0xB1][..]) {
+            line(rep, alloc::format!("  {}: FAILED the camera PMIC's pattern ID {:?} is not REVISION_AB (03 31 B1); nothing enabled\n", m.name, id.map_err(|e| alloc::format!("G#{e:X}"))));
+            power_down_module(m, rep);
+            return false;
+        }
+    }
     if !program_rails(rep) {
         power_down_module(m, rep);
         return false;
@@ -544,7 +643,10 @@ pub fn power_down_module(m: &Module, rep: &mut Vec<u8>) {
         spin_us(us);
     }
     let left = pmic_read(MATRIX_A);
-    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x0B, 0x40, 0x60);
+    // akita's sub GPIO3 is nobody's (`pmic_power_on`): left as the boot has it.
+    if !crate::board::akita() {
+        let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x0B, 0x40, 0x60);
+    }
     let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x09, 0x40, 0x60);
     line(rep, alloc::format!("{} powered down: MATRIX_CONF_A before supplies off {:?}\n", m.name, left.map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))));
 }
