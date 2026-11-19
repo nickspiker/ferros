@@ -1130,6 +1130,26 @@ The driver hand-spawned (`01`; at 1:1 `01000000000000000000000000000000` with `-
 - The driver's open says `the frame counter A#32 bits (the longest exposure at shift A#16)` and `exposures to A#13523872 ms`; the first LIST of a run says each readout's `exposure_max`; CAPS is 107 bytes (+103 the shift words G#0702 and G#0704).
 - Host tests: ccs `the_frame_counter` (every measured held and wrapped frame, the plan at 3 hours taken and 4 refused, 65534 lines of 2^16 refused, the 1:1 readout, the stretch), `the_mains_shift`, `the_cut`, `the_main_full_mode`; list `the_mains_two_readouts` prints both ranges.
 
+## The other cameras on the Pro (2026-11-18 night, branch pro-cam-captures)
+
+The owner: "all four cams up with all modes on the pro ... slitscan and all".
+The Pro on the flashed forge bc1bef30 (b976, both slots the signed gate blake3 d4494f92, the identity unlocked at boot); every driver hand-spawned from target/agent-procaps/bin (forge 7451dd26), input `01`, one open each, every stream ended by its own close; logs in target/agent-procaps/runs.
+
+**The front answers: the LV buck was it.** camtest `0000000702` ("Device test plan" step 7): the switch raised sub GPIO2 (G#40 to G#60) after LDO1, then LDO8, and the sensor answered G#30A1 at G#0000, with G#0C (its actuator) and G#51 (its EEPROM) acknowledging beside G#10. The NACK of 2026-11-06 was CAMS_LVBUCK_EN low, as the device tree said.
+- Its inputs stored as step 7 says (absent before): `cam.dokkaebi.init` (front.init), `.prog` (front.cpr2), `.pdma` (front.pdma), `.idt` (cam7-front.idt.vsf), each read back and compared exact. So LIST now carries the front (1761 bytes with main and ultrawide).
+- **Its first frames** (camtest `4008000002`): init 503 writes and 1 read in 663 ms, stream on 742 ms after the open, the first frame at 801 ms; 64 frames at bin 8 (480 x 342), mean sample 78; no error word, the overflow words 0, every DMA_DONE released by the kernel's armed action; closed cleanly.
+- **Its view** (camtest `4001000002`): a ring of four 16 MiB buffers, 3840 x 2736 at 4800 bytes a line; 64 whole frames 41.1 ms apart on average (41.9 the longest); a frame read thru the non-cacheable view in 33 ms. The PD rows land in the buffer too (+G#C86400, 684 rows).
+- **Its mosaic, measured**: the cell table (4 x 4 means of the whole frame, the first and the 64th the same) reads rows `79 97 79 97` / `75 78 75 79`: a period-2 Bayer cell with G at (0,0) and (1,1) (79, 78), R 97, B 75, so **G R / B G**, as its calibration capture said.
+- **Its rate is 24 a second, not the 30 guessed**: DMA_DONE gaps 41657 to 41849 us. The driver's timing still takes the guessed line (8.35 us, 4001 lines, "a frame every A#33409 us"), so every front exposure it reports (the header's 14295 us, `exposure_max` 33 ms) is off by the same factor. If the sensor runs the init's 4001 lines the line is about 10.43 us; not fixed here: the sensor's frame and line read back (CAPS) and a frame-length step are the measure, then `FRONT.line_ps`.
+- The driver's open reads its words: integration least 2, margin 5 (the table has none, so exposures stay inside the mode's frame), gain = code / 32 with codes 32 to 512 (analogue 1x to 16x, Samsung's CCS model as the main's), the init leaving code G#20 (1x).
+
+**The tele answers too** (camtest `0000000703`): G#08D5 at G#0000, with G#2D (itself) and G#35 acknowledging; its power sequence and the LV buck are right. Only its capture is missing (receiver, CPU setup, job: "The tele's capture").
+
+**The ultrawide's slit streams, detached and slim** (the driver's eighth byte `81`: FC ctx3 off, the program as the open asks; cambench `01034000000000001000000002080000`: 64 rows, the slim flag G#10). The open: mode 3, 4000 x 64 (y G#D50 to G#DCF, binning G#0122), frame 192 lines of 9568 clocks (1259 us), phase detect and embedded data off; detach switched off 1 program word; the slit ring of 256 buffers of 320 KiB; the release armed open.
+- RATE: the sensor's counter 798 a second, the front end 793; the link clean (+14 G#0, two channels starting and ending, +24 = +2C = G#3).
+- The first run died at slit 838 on LATE_CONFIG (G#10): one DMA_DONE's interrupt ran 8997 us after the one before (`diag "irqs runs"`, on core 4), so its release came seven slits late. The late-interrupt class of "Slits under Lumis" ("Open"), not the ultrawide's shape: the rerun took 969 slits clean, and a drain (`…02FF0000000004`) took **65280 slits in 82.2 s (793 a second), lost to the ring 0, read over 0, the engine ring round 16 times**, no error word, every release the kernel's, 54 C.
+- On 2026-11-16 the same slit took two frames and stopped; the switch is the detach (with the slim program), as on the main. So the ultrawide's windowed modes want the same defaults as the main's (ferros_cam geom `shape` keeps them to the main: not changed here, an override per open for now).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
