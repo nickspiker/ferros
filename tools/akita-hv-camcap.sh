@@ -1,34 +1,40 @@
 #!/usr/bin/env bash
-# The 8a's camera captures (docs/CAMERA.md "akita: the capture session"): Android on the 8a (akita) runs each camera in each of its modes under an oracle hv on slot b, the hv logs the registers it touches into the console ring, a deliberate crash keeps the ring, and the next boot's pstore is pulled into keys/akita/.
-# Lumis on Android first wherever it opens the mode (the owner, 2026-11-18): its binned entry, its maximum-resolution entry and its shutter to 16 s; the Pixel Camera app for what Lumis cannot open (the 2x crop if Lumis does not list it, the video modes).
-# The owner's hands: his wife's Android is unlocked by him alone (no PIN, password or handle is ever asked for, typed or kept by this script), and he opens each Lumis entry when the script says.
+# The 8a's camera captures (docs/CAMERA.md "akita: the capture session"): Android on the 8a (akita) runs each camera in each of its modes under an oracle hv on Android's slot, the hv logs the registers it touches into the console ring, a deliberate crash keeps the ring, and the next boot's pstore is pulled into keys/akita/.
+# Since 2026-11-18 Android lives on slot a (Android 17, CP3A.261005.005, kernel 6.1.162, Magisk on init_boot_a) and slot b holds ferros's gate, so SLOT defaults to a: the capture images go to boot_a, around slot a's own kernel (unpacked from the stock boot_a saved in keys/akita/images), and ferros's boot_b is never written.
+# Lumis on Android first wherever it opens the mode (the owner, 2026-11-18); the Pixel Camera app for what Lumis cannot open (the video modes).
+# What Lumis 0.2.8 lists on the 8a (2026-11-18): the ultrawide (4208 x 3120, to 16 s), "multiple Back" = the main at 80 degrees (4624 x 3472, to 16 s) and the main's in-sensor 2x crop at 46 degrees (4624 x 3472 of 0.8 um pixels, to 16 s), the front (4208 x 3072, to 1 s); Camera2 has no maximum-resolution mode on any 8a camera (dumpsys: 4624 x 3472 is the main's whole array).
+# AUTO=1 drives Android by adb taps (positions measured at 1080 x 2400, Lumis 0.2.8, Pixel Camera 10.4): no hands, when the 8a has no lock screen (`locksettings get-disabled` true). Without AUTO the owner acts at each step, as before; his wife's Android is unlocked by him alone (no PIN, password or handle is ever asked for, typed or kept by this script).
 #
-# Steps, each its own command, run from the main checkout (a worktree's cargo trips on the sibling crates), the 8a on a motherboard USB port (FERROS_PORT its ferros socket):
-#   tools/akita-hv-camcap.sh build              host only: the five capture images (i2c-main, i2c-uw, i2c-front, isp, isp-uw) into $W
-#   tools/akita-hv-camcap.sh save               from ferros on the 8a: boot_b (the gate) and boot_a dumped twice each into $C/back, the gate's Android kernel checked against $LINUX; boot_b's dump is what `restore` puts back
-#   tools/akita-hv-camcap.sh rehearse           from ferros: Android under the gate as it is (`diag "android here"`), nothing flashed; the owner unlocks; root, Lumis, the camera list and the clocks read
-#   tools/akita-hv-camcap.sh flash <image>      to fastboot, slot b checked current, boot_b written whole (no set-active), Android boots under the capture image
-#   tools/akita-hv-camcap.sh capture <session>  the marked session (the owner opens what it says), the crash, the next boot's ring pulled twice and compared
+# Steps, each its own command (a worktree's cargo trips on the sibling crates: run from the main checkout or a copy of it), FERROS_PORT the 8a's ferros socket:
+#   tools/akita-hv-camcap.sh build              host only: the capture images (i2c-main, i2c-uw, i2c-front, isp, isp-uw) into $W, around $STOCK's kernel
+#   tools/akita-hv-camcap.sh save               boot_$SLOT dumped twice into $C/back (from ferros, or from Android with root); that is what `restore` puts back
+#   tools/akita-hv-camcap.sh rehearse           from Android: root, Lumis, the camera list and the clocks read
+#   tools/akita-hv-camcap.sh flash <image>      to fastboot, slot $SLOT checked current, boot_$SLOT written whole (no set-active), Android boots under the capture image
+#   tools/akita-hv-camcap.sh capture <session>  the marked session, the crash, the next boot's ring pulled twice and compared
 #   tools/akita-hv-camcap.sh again              a fresh capture boot on the image already flashed (the read boot cleared the hv's one-shot marker)
 #   tools/akita-hv-camcap.sh decode <session>   host only: the transfers and their integrity, the inits per mark, the holds; the marks and PDMA lists of an ISP session
-#   tools/akita-hv-camcap.sh restore            boot_b back from $C/back/boot_b.img; ferros boots through the gate (the identity unlocks at boot)
-# Sessions and their images: i2c-main, i2c-uw, i2c-front (each its own image); isp-main, isp-front, isp-main-max (the image `isp`); isp-uw (the image `isp-uw`).
-# Nothing here writes any partition but boot_b, and only in `flash` and `restore`; never a set-active, never a wipe, never a vbmeta.
+#   tools/akita-hv-camcap.sh restore            boot_$SLOT back from $C/back/boot_$SLOT.img
+# Sessions and their images: i2c-main (binned, crop), i2c-main-16s, i2c-main-gcam on the image `i2c-main`, and the same three for i2c-uw and i2c-front (the front's long one i2c-front-1s), one boot each (`again` between); isp-main, isp-front, isp-main-crop on `isp`; isp-uw on `isp-uw`.
+# Nothing here writes any partition but boot_$SLOT, and only in `flash` and `restore`; never a set-active, never a wipe, never a vbmeta.
 set -eu
 . /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+# AKITA_SERIAL pins the 8a by its serial alone: device_pin otherwise asks every phone in fastboot for its product, and on 2026-11-18 a `getvar` to the Pro, wedged in another session's fastboot, hung a capture for nine minutes.
+if [ -n "${AKITA_SERIAL:-}" ]; then device_pin() { device_pinned akita "$AKITA_SERIAL"; }; fi
 cd "$(dirname "$0")/.."
 REPO=$PWD
 # No FERROS_HV_* from the caller's shell reaches a build: each image sets exactly its own.
 for v in $(env | grep -o '^FERROS_HV_[A-Z0-9_]*' || true); do unset "$v"; done
+SLOT=${SLOT:-a}
 W=${W:-$REPO/target/akita-camcap}
 C=${C:-/mnt/Harbor/Code/keys/akita/captures-$(date +%F)}
 B=${B:-$REPO/target/debug/ferros-bridge}
-# Android's kernel as slot b's gate carries it (Google's 6.1.157 ab14791245, zero-padded to 17 x 2 MiB): `save` checks it against the dump.
-LINUX=${LINUX:-/mnt/Harbor/Code/keys/akita/images/linux_Image_akita_2026-11-13}
+# Android's own boot image on that slot, as Google shipped it (dumped twice from ferros, 2026-11-18): its kernel goes into every capture image, its AVB footer is the template.
+STOCK=${STOCK:-/mnt/Harbor/Code/keys/akita/images/slot-a-CP3A.261005.005/boot_$SLOT.img}
+LINUX=${LINUX:-$W/Image}
 AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
-# The footer's template: the gate dumped by `save`, else the 2026-11-13 one in keys/akita.
-AVB_TEMPLATE=${AVB_TEMPLATE:-}
-# Armed 60 s after the reset (the hv's counter runs about 20 s ahead of Android's uptime): past the camera service's boot probe, before the owner can have unlocked and opened anything.
+AVB_TEMPLATE=${AVB_TEMPLATE:-$STOCK}
+AUTO=${AUTO:-0}
+# Armed 60 s after the reset (the hv's counter runs about 20 s ahead of Android's uptime): past the camera service's boot probe, before anything is opened.
 ARM_MS=60000
 CAP=$((1 << 15))
 MKIMG=$W/cargo/debug/ferros-mkimg
@@ -62,18 +68,20 @@ image_knobs() {
 
 session_image() {
     case $1 in
-    i2c-main | i2c-uw | i2c-front) echo "$1";;
-    isp-main | isp-front | isp-main-max) echo isp;;
+    i2c-main | i2c-main-16s | i2c-main-gcam) echo i2c-main;;
+    i2c-uw | i2c-uw-16s | i2c-uw-gcam) echo i2c-uw;;
+    i2c-front | i2c-front-1s | i2c-front-gcam) echo i2c-front;;
+    isp-main | isp-front | isp-main-crop) echo isp;;
     isp-uw) echo isp-uw;;
-    *) die "no session $1 (i2c-main, i2c-uw, i2c-front, isp-main, isp-front, isp-main-max, isp-uw)";;
+    *) die "no session $1 (i2c-main, i2c-main-16s, i2c-main-gcam, i2c-uw, i2c-uw-16s, i2c-uw-gcam, i2c-front, i2c-front-1s, i2c-front-gcam, isp-main, isp-front, isp-main-crop, isp-uw)";;
     esac
 }
 
 session_ctrl() {
     case $1 in
-    i2c-main) echo G#1088_0000;;
-    i2c-front) echo G#1089_0000;;
-    i2c-uw) echo G#108A_0000;;
+    i2c-main*) echo G#1088_0000;;
+    i2c-front*) echo G#1089_0000;;
+    i2c-uw*) echo G#108A_0000;;
     esac
 }
 
@@ -109,27 +117,62 @@ owner_unlock() {
 su_ok() { [ "$(A shell "su -c 'id -u'" 2>/dev/null | tr -d '\r')" = 0 ]; }
 need_su() {
     until su_ok; do
+        [ "$AUTO" = 1 ] && die "root refused: the owner opens the Magisk app and grants Shell (Superuser)"
         say "root refused: the owner opens the Magisk app and grants Shell (Superuser), or unlocks the phone if it is locked; Enter when done"
         read -r _ </dev/tty
     done
 }
 mark() { A shell "su -c 'echo \"<3>ferros-mark: $1\" > /dev/kmsg'" >/dev/null 2>&1; }
-# One step: the owner's instruction, Enter, the mark, then the owner acts; `s` skips it (marked as skipped).
+# Hands-free: the screen on and past the (disabled) lock screen, then taps.
+in_() { A shell "$*" >/dev/null 2>&1 || true; }
+wake() { in_ "input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"; }
+# One step: the owner's instruction, Enter, the mark, then the owner acts; `s` skips it (marked as skipped). With AUTO=1 the mark, then the step's own taps (its third argument, a function).
 step() {
-    local m=$1; shift
+    local m=$1 what=$2 act=${3:-}
     echo
-    say "$*"
+    if [ "$AUTO" = 1 ]; then
+        say "$m (hands-free)"
+        wake
+        mark "$m"
+        [ -z "$act" ] || "$act"
+        return 0
+    fi
+    say "$what"
     local r
     read -r -p "   Enter, then do it (s + Enter: skip) " r </dev/tty
     if [ "$r" = s ]; then mark "$m: skipped"; return 1; fi
     mark "$m"
 }
 done_step() {
+    local m=$1 act=${2:-}
+    if [ "$AUTO" = 1 ]; then
+        [ -z "$act" ] || "$act"
+        mark "$m: end"
+        return 0
+    fi
     local r
     read -r -p "   Enter when it is done " r </dev/tty
-    mark "$1: end"
+    mark "$m: end"
 }
 hold() { say "keep it running: $1 s"; sleep "$1"; }
+
+# Lumis 0.2.8 at 1080 x 2400 (screenshots 2026-11-18): the menu's entries at y 1480 (ultrawide), 1690 (the main's "multiple Back"), 1880 (front), each opening a menu of its own: the ultrawide's and the front's single entry at 1690 (BACK above it), the main's 1480 (80 degrees) and 1690 (the 46 degree crop); in a camera, EXIT at (831, 1254) leaves Lumis whole, and SHUTTER's knob rides y 1935 (dragged right to the end: 16 s on the rear cameras, 1 s on the front). Each open starts at 1/15 s.
+lumis_menu() { in_ "input keyevent KEYCODE_HOME"; sleep 1; in_ "am start -n com.lumis.camera/.PermissionsRequest"; sleep 4; }
+lumis_uw() { lumis_menu; in_ "input tap 540 1480"; sleep 2; in_ "input tap 540 1690"; sleep 6; }
+lumis_main() { lumis_menu; in_ "input tap 540 1690"; sleep 2; in_ "input tap 540 1480"; sleep 6; }
+lumis_crop() { lumis_menu; in_ "input tap 540 1690"; sleep 2; in_ "input tap 540 1690"; sleep 6; }
+lumis_front() { lumis_menu; in_ "input tap 540 1880"; sleep 2; in_ "input tap 540 1690"; sleep 6; }
+lumis_longest() { in_ "input swipe 567 1935 1040 1935 600"; }
+lumis_exit() { in_ "input tap 831 1254"; sleep 2; in_ "input keyevent KEYCODE_HOME"; sleep 1; }
+lumis_uw_16() { lumis_uw; lumis_longest; hold 36; }
+lumis_main_16() { lumis_main; lumis_longest; hold 36; }
+lumis_front_1() { lumis_front; lumis_longest; hold 6; }
+# Pixel Camera 10.4 at 1080 x 2400 (2026-11-18): zoom .5 (411, 1521), 1x (534, 1521), 2 (657, 1521); flip (855, 1776); Photo (468, 2172), Video (588, 2172). The app reopens the camera and mode used last, so every session leaves it on the rear 1x Photo.
+gcam() { in_ "input keyevent KEYCODE_HOME"; sleep 1; in_ "am start -a android.media.action.STILL_IMAGE_CAMERA"; sleep 4; }
+gcam_main() { gcam; in_ "input tap 534 1521"; hold 5; mark "pixel camera main 2x"; in_ "input tap 657 1521"; hold 5; in_ "input tap 534 1521"; sleep 1; }
+gcam_uw() { gcam; in_ "input tap 411 1521"; hold 5; mark "pixel camera uw video"; in_ "input tap 588 2172"; hold 5; in_ "input tap 468 2172"; sleep 2; in_ "input tap 534 1521"; sleep 1; }
+gcam_front() { gcam; in_ "input tap 855 1776"; hold 5; mark "pixel camera front video"; in_ "input tap 588 2172"; hold 5; in_ "input tap 468 2172"; sleep 2; in_ "input tap 855 1776"; sleep 3; }
+gcam_home() { in_ "input keyevent KEYCODE_HOME"; sleep 1; }
 
 to_fastboot() {
     need_port
@@ -140,20 +183,24 @@ to_fastboot() {
     device_pin akita && fastboot devices | grep -q . || die "no fastboot: if the 8a shows fastboot but answers nothing, power + volume down by hand"
 }
 # fastboot's own words, and a stop on FAILED (a whole night once ran on a stale build behind a hidden failed flash).
-flash_boot_b() {
+flash_boot() {
     local out
-    out=$(fastboot flash boot_b "$1" 2>&1)
+    out=$(fastboot flash boot_$SLOT "$1" 2>&1)
     echo "$out"
-    if echo "$out" | grep -q FAILED || ! echo "$out" | grep -q OKAY; then die "boot_b NOT written"; fi
+    if echo "$out" | grep -q FAILED || ! echo "$out" | grep -q OKAY; then die "boot_$SLOT NOT written"; fi
+}
+slot_is_ours() {
+    local slot
+    slot=$(fastboot getvar current-slot 2>&1 | awk '/^current-slot:/ {print $2}')
+    [ "$slot" = "$SLOT" ] || die "the current slot is '${slot:-?}', not $SLOT: stop; the owner decides (this script never sets a slot active)"
 }
 
 cmd_build() {
-    [ -f "$LINUX" ] || die "no Android kernel at $LINUX"
-    local tmpl=$AVB_TEMPLATE
-    [ -n "$tmpl" ] || { [ -f "$C/back/boot_b.img" ] && tmpl=$C/back/boot_b.img || tmpl=/mnt/Harbor/Code/keys/akita/images/avb_template_boot_b_2026-11-13.img; }
-    [ -f "$tmpl" ] || die "no AVB template at $tmpl"
+    [ -f "$STOCK" ] || die "no stock boot image at $STOCK"
+    [ -f "$AVB_TEMPLATE" ] || die "no AVB template at $AVB_TEMPLATE"
     mkdir -p "$W"
     CARGO_TARGET_DIR=$W/cargo cargo build -q -p ferros-mkimg
+    [ -f "$LINUX" ] || "$MKIMG" unpack-kernel --boot "$STOCK" -o "$LINUX"
     local img k
     for img in i2c-main i2c-uw i2c-front isp isp-uw; do
         k=$(image_knobs $img)
@@ -166,43 +213,35 @@ cmd_build() {
         # The hv alone in front of Android (no ferros packed, no gate); the console quiet from boot (pstore integrity) and the image's name on the command line, which `capture` checks.
         "$MKIMG" gate --hv "$W/hv-$img.bin" --image "$LINUX" --cmdline "loglevel=4 ferros_cap.image=$img" -o "$W/$img.bare.img"
         # Whole partition with its own footer (a bare 20 MB image buries Google's vbmeta and ABL refuses the slot, 2026-11-06).
-        "$MKIMG" avb-footer --key "$AVB_KEY" --google-boot "$tmpl" --image "$W/$img.bare.img" -o "$W/$img.img"
+        "$MKIMG" avb-footer --key "$AVB_KEY" --google-boot "$AVB_TEMPLATE" --image "$W/$img.bare.img" -o "$W/$img.img"
         say "$img: $W/$img.img ($(stat -c %s "$W/$img.img") bytes, blake3 $(b3sum --no-names "$W/$img.img" | cut -c1-16)); hv knobs: $k"
     done
     CARGO_TARGET_DIR=$W/oracle-i2c cargo build -q --release --manifest-path tools/oracle-i2c/Cargo.toml
     CARGO_TARGET_DIR=$W/cam-oracle cargo build -q --release --manifest-path tools/cam-oracle/Cargo.toml
-    say "built; the template was $tmpl"
+    say "built around $LINUX; the template was $AVB_TEMPLATE"
 }
 
 cmd_save() {
-    need_port
-    ferros_here || die "the 8a is not on ferros (FERROS_PORT=${FERROS_PORT:-unset})"
-    [ -x "$B" ] || cargo build -q -p ferros-bridge
     mkdir -p "$C/back"
-    local p
-    for p in boot_b boot_a; do
-        "$B" part dump $p "$C/back/$p.img"
-        "$B" part dump $p "$C/back/$p.again"
-        cmp "$C/back/$p.img" "$C/back/$p.again" || die "$p read twice differs"
-        rm "$C/back/$p.again"
-    done
-    "$B" part list > "$C/back/partitions.txt"
-    ( cd "$C/back" && b3sum boot_b.img boot_a.img > B3SUMS )
-    # The gate's Android kernel: the hv is padded to G#18_0000 in the boot image's kernel, the Linux Image right after it.
-    CARGO_TARGET_DIR=$W/cargo cargo build -q -p ferros-mkimg
-    "$MKIMG" unpack-kernel --boot "$C/back/boot_b.img" -o "$W/boot_b.blob"
-    tail -c +$((0x180000 + 1)) "$W/boot_b.blob" | cmp -n "$(stat -c %s "$LINUX")" - "$LINUX" >/dev/null \
-        || die "slot b's gate carries another Android kernel than $LINUX: extract it from $W/boot_b.blob before building"
-    say "slot b's gate carries $LINUX; its hv: $(head -c $((0x180000)) "$W/boot_b.blob" | strings -n 3 | grep -A1 -m1 'Linux at EL1; build' | tr '\n' ' ')"
-    say "saved: $C/back (boot_b.img is what restore flashes)"
-}
-
-cmd_rehearse() {
+    local p=boot_$SLOT
     need_port
     if ferros_here; then
         [ -x "$B" ] || cargo build -q -p ferros-bridge
-        "$B" diag "android here" || die "the gate did not take 'android here'"
+        "$B" part dump $p "$C/back/$p.img"
+        "$B" part dump $p "$C/back/$p.again"
+    else
+        wait_android
+        need_su
+        A exec-out "su -c 'cat /dev/block/by-name/$p'" > "$C/back/$p.img"
+        A exec-out "su -c 'cat /dev/block/by-name/$p'" > "$C/back/$p.again"
     fi
+    cmp "$C/back/$p.img" "$C/back/$p.again" || die "$p read twice differs"
+    rm "$C/back/$p.again"
+    ( cd "$C/back" && b3sum $p.img >> B3SUMS )
+    say "saved: $C/back/$p.img, blake3 $(b3sum --no-names "$C/back/$p.img" | cut -c1-16) (what restore flashes)"
+}
+
+cmd_rehearse() {
     wait_android
     owner_unlock
     need_su
@@ -217,8 +256,8 @@ cmd_rehearse() {
     } | tee "$C/rehearsal.txt"
     # The cameras' characteristics only: the service's client and event lines (which apps used the camera, when) are left on the phone.
     A shell "su -c 'dumpsys media.camera'" | tr -d '\r' | grep -v -i -E 'package|client|event|pid' > "$C/dumpsys-media-camera.txt" || true
-    say "dumpsys: $(grep -c -i 'MaximumResolution' "$C/dumpsys-media-camera.txt") maximum-resolution lines, $(grep -c -i 'physicalIds\|physical camera' "$C/dumpsys-media-camera.txt") physical-camera lines -> $C/dumpsys-media-camera.txt"
-    step "rehearsal lumis" "the owner: open Lumis (allow the camera if it asks); on its menu, count each lens's entries (green = maximum resolution, red = cropped) and tell the agent the numbers; then open the main's first entry and leave it open" || true
+    say "dumpsys: $(grep -c -i 'MaximumResolution' "$C/dumpsys-media-camera.txt" || true) maximum-resolution lines -> $C/dumpsys-media-camera.txt"
+    step "rehearsal lumis" "the owner: open Lumis (allow the camera if it asks), then the main's first entry, and leave it open" lumis_main || true
     if [ "${AKITA_CLOCKS:-1}" = 1 ]; then
         # The master clocks while a camera streams, one clock at a time (debugfs's clk_summary resets this phone, 2026-11-15).
         A shell "su -c 'mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug'" >/dev/null 2>&1 || true
@@ -227,66 +266,59 @@ cmd_rehearse() {
             echo "$c $(A shell "su -c 'cat /sys/kernel/debug/clk/$c/clk_rate'" 2>/dev/null | tr -d '\r')"
         done | tee "$C/cis-clocks.txt"
     fi
-    done_step "rehearsal lumis"
-    step "rehearsal pixel camera" "the owner: close Lumis (EXIT, then home); the script opens the Pixel Camera app; answer any first-run question yourself" || true
-    A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true
-    done_step "rehearsal pixel camera"
-    A shell input keyevent KEYCODE_HOME >/dev/null 2>&1 || true
-    say "rehearsal done: $C/rehearsal.txt. Next: $0 flash i2c-main (from here: Android goes to fastboot)"
+    done_step "rehearsal lumis" lumis_exit
+    say "rehearsal done: $C/rehearsal.txt. Next: $0 flash i2c-main"
 }
 
 cmd_flash() {
     local img=${1:?usage: $0 flash <i2c-main|i2c-uw|i2c-front|isp|isp-uw>}
     image_knobs "$img" >/dev/null
     [ -f "$W/$img.img" ] || die "no $W/$img.img: run build first"
-    [ -f "$C/back/boot_b.img" ] || die "no $C/back/boot_b.img: run save first (restore needs it)"
+    [ -f "$C/back/boot_$SLOT.img" ] || die "no $C/back/boot_$SLOT.img: run save first (restore needs it)"
     to_fastboot
-    local slot
-    slot=$(fastboot getvar current-slot 2>&1 | awk '/^current-slot:/ {print $2}')
-    [ "$slot" = b ] || die "the current slot is '${slot:-?}', not b: stop; the owner decides (this script never sets a slot active)"
+    slot_is_ours
     if [ ! -f "$C/pkvm.txt" ]; then fastboot oem pkvm status > "$C/pkvm.txt" 2>&1 || true; say "pKVM: $(grep -i pkvm "$C/pkvm.txt" | head -1) (recorded, not changed)"; fi
-    flash_boot_b "$W/$img.img"
+    flash_boot "$W/$img.img"
     fastboot reboot >/dev/null 2>&1
     echo "$img" > "$C/flashed"
-    say "boot_b holds $img; Android boots under it (no gate). Next: $0 capture <session>"
+    say "boot_$SLOT holds $img; Android boots under it (no gate). Next: $0 capture <session>"
 }
 
-# The sessions. Lumis first; the Pixel Camera app last in a session (its preview's per-frame exposure writes fill the ring fastest).
+# The sessions, one capture boot each: on 2026-11-18 the main's binned and crop opens alone (each about 16000 lines with its frames' holds) filled the 2^15-line cap, so the long exposure and the Pixel Camera app get boots of their own (`again` between them). Lumis first.
 steps_i2c-main() {
-    step "lumis main binned" "open Lumis, the main lens's first entry (binned, the whole field)" && { hold 6; done_step "lumis main binned"; }
-    step "lumis main maxres" "EXIT to the menu; open the main's maximum-resolution entry (green), if Lumis lists one" && { hold 6; done_step "lumis main maxres"; }
-    step "lumis main crop" "EXIT; open the main's cropped entry (red: the 2x), if Lumis lists one" && { hold 6; done_step "lumis main crop"; }
-    step "lumis main 16s" "EXIT; open the main's first entry again, drag SHUTTER to 16 s, wait until a whole 16 s frame has landed (about 35 s), then EXIT; never a volume key (Lumis saves; the hv kills on both)" && done_step "lumis main 16s"
-    if step "pixel camera main" "leave Lumis (home); the script opens the Pixel Camera app on 1x for 5 s; then tap 2x yourself and hold 5 s"; then
-        A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true
-        hold 5; mark "pixel camera main 2x"; done_step "pixel camera main"
+    step "lumis main binned" "open Lumis, the main lens's first entry (80 degrees, the whole field)" lumis_main && { hold 6; done_step "lumis main binned" lumis_exit; }
+    step "lumis main crop" "EXIT; open the main's 46 degree entry (the in-sensor 2x crop)" lumis_crop && { hold 6; done_step "lumis main crop" lumis_exit; }
+}
+steps_i2c-main-16s() {
+    step "lumis main 16s" "open the main's first entry, drag SHUTTER to 16 s, wait until a whole 16 s frame has landed (about 35 s), then EXIT; never a volume key (Lumis saves; the hv kills on both)" lumis_main_16 && done_step "lumis main 16s" lumis_exit
+}
+steps_i2c-main-gcam() {
+    if step "pixel camera main" "open the Pixel Camera app on 1x for 5 s; then tap 2x yourself and hold 5 s" gcam_main; then
+        [ "$AUTO" = 1 ] || { A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true; hold 5; mark "pixel camera main 2x"; }
+        done_step "pixel camera main" gcam_home
     fi
 }
-steps_i2c-uw() {
-    step "lumis uw binned" "open Lumis, the ultrawide's first entry" && { hold 6; done_step "lumis uw binned"; }
-    step "lumis uw maxres" "EXIT; the ultrawide's maximum-resolution entry, if listed" && { hold 6; done_step "lumis uw maxres"; }
-    step "lumis uw 16s" "EXIT; the ultrawide's first entry, SHUTTER to 16 s, wait for one whole frame (about 35 s), EXIT" && done_step "lumis uw 16s"
-    if step "pixel camera uw" "home; the script opens the Pixel Camera app and taps .5; after 5 s switch to Video yourself and hold 5 s"; then
-        A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true
-        sleep 3; A shell input tap 414 1513 >/dev/null 2>&1 || true
-        hold 5; mark "pixel camera uw video"; done_step "pixel camera uw"
+steps_i2c-uw() { step "lumis uw binned" "open Lumis, the ultrawide's entry" lumis_uw && { hold 6; done_step "lumis uw binned" lumis_exit; }; }
+steps_i2c-uw-16s() { step "lumis uw 16s" "the ultrawide's entry, SHUTTER to 16 s, wait for one whole frame (about 35 s), EXIT" lumis_uw_16 && done_step "lumis uw 16s" lumis_exit; }
+steps_i2c-uw-gcam() {
+    if step "pixel camera uw" "open the Pixel Camera app and tap .5; after 5 s switch to Video and hold 5 s" gcam_uw; then
+        [ "$AUTO" = 1 ] || { A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true; sleep 3; A shell input tap 411 1521 >/dev/null 2>&1 || true; hold 5; mark "pixel camera uw video"; }
+        done_step "pixel camera uw" gcam_home
     fi
 }
-steps_i2c-front() {
-    step "lumis front binned" "open Lumis, the front lens's first entry" && { hold 6; done_step "lumis front binned"; }
-    step "lumis front maxres" "EXIT; the front's maximum-resolution entry, if listed" && { hold 6; done_step "lumis front maxres"; }
-    step "lumis front 1s" "EXIT; the front's first entry, SHUTTER to its longest (1 s), wait 5 s, EXIT" && done_step "lumis front 1s"
-    if step "pixel camera front" "home; the script opens the Pixel Camera app and flips to the front; after 5 s switch to Video yourself and hold 5 s, then flip back to the rear (the app reopens the camera used last)"; then
-        A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true
-        sleep 3; A shell input tap 859 1796 >/dev/null 2>&1 || true
-        hold 5; mark "pixel camera front video"; done_step "pixel camera front"
+steps_i2c-front() { step "lumis front binned" "open Lumis, the front lens's entry" lumis_front && { hold 6; done_step "lumis front binned" lumis_exit; }; }
+steps_i2c-front-1s() { step "lumis front 1s" "the front's entry, SHUTTER to its longest (1 s), wait 5 s, EXIT" lumis_front_1 && done_step "lumis front 1s" lumis_exit; }
+steps_i2c-front-gcam() {
+    if step "pixel camera front" "open the Pixel Camera app and flip to the front; after 5 s switch to Video and hold 5 s, then flip back to the rear (the app reopens the camera used last)" gcam_front; then
+        [ "$AUTO" = 1 ] || { A shell am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1 || true; sleep 3; A shell input tap 855 1776 >/dev/null 2>&1 || true; hold 5; mark "pixel camera front video"; }
+        done_step "pixel camera front" gcam_home
     fi
 }
 # An ISP session holds one camera's open: the PDMA dump is taken once a boot (its 16th frame), and the front end's per-frame answers fill the cap in seconds.
-steps_isp-main() { step "lumis main binned" "open Lumis, the main lens's first entry" && { hold 8; done_step "lumis main binned"; }; }
-steps_isp-front() { step "lumis front binned" "open Lumis, the front lens's first entry" && { hold 8; done_step "lumis front binned"; }; }
-steps_isp-uw() { step "lumis uw binned" "open Lumis, the ultrawide's first entry" && { hold 8; done_step "lumis uw binned"; }; }
-steps_isp-main-max() { step "lumis main maxres" "open Lumis, the main's maximum-resolution entry" && { hold 8; done_step "lumis main maxres"; }; }
+steps_isp-main() { step "lumis main binned" "open Lumis, the main lens's first entry" lumis_main && { hold 8; done_step "lumis main binned" lumis_exit; }; }
+steps_isp-front() { step "lumis front binned" "open Lumis, the front lens's entry" lumis_front && { hold 8; done_step "lumis front binned" lumis_exit; }; }
+steps_isp-uw() { step "lumis uw binned" "open Lumis, the ultrawide's entry" lumis_uw && { hold 8; done_step "lumis uw binned" lumis_exit; }; }
+steps_isp-main-crop() { step "lumis main crop" "open Lumis, the main's 46 degree entry" lumis_crop && { hold 8; done_step "lumis main crop" lumis_exit; }; }
 
 cmd_capture() {
     local s=${1:?usage: $0 capture <session>}
@@ -299,6 +331,7 @@ cmd_capture() {
     owner_unlock
     need_su
     A shell "su -c 'echo 4 > /proc/sys/kernel/printk'" >/dev/null 2>&1
+    [ "$AUTO" = 1 ] && in_ "settings put global stay_on_while_plugged_in 7"
     say "session $s on $img: the phone on its stand, the scene lit; hands only where the script asks"
     mark "session $s"
     "steps_$s" || true
@@ -364,17 +397,19 @@ cmd_decode() {
 }
 
 cmd_restore() {
-    [ -f "$C/back/boot_b.img" ] || die "no $C/back/boot_b.img"
+    [ -f "$C/back/boot_$SLOT.img" ] || die "no $C/back/boot_$SLOT.img"
     to_fastboot
-    local slot
-    slot=$(fastboot getvar current-slot 2>&1 | awk '/^current-slot:/ {print $2}')
-    [ "$slot" = b ] || die "the current slot is '${slot:-?}', not b: stop; the owner decides"
-    flash_boot_b "$C/back/boot_b.img"
+    slot_is_ours
+    flash_boot "$C/back/boot_$SLOT.img"
     fastboot reboot >/dev/null 2>&1
     rm -f "$C/flashed"
     local i
-    for i in $(seq 60); do ferros_here && { say "ferros on USB after $((i * 2)) s (through the gate); the identity unlocks at boot"; return 0; }; sleep 2; done
-    die "no ferros on USB after 120 s: the gate shows on the panel? volume down there would boot Android; else fastboot by hand"
+    for i in $(seq 90); do
+        ferros_here && { say "ferros on USB after $((i * 2)) s"; return 0; }
+        adb devices 2>/dev/null | grep -q 'device$' && { say "Android on adb after $((i * 2)) s"; return 0; }
+        sleep 2
+    done
+    die "nothing on USB after 180 s: read ABL's log from fastboot (fastboot oem dmesg) before anything else"
 }
 
 case "${1:-}" in
@@ -386,5 +421,5 @@ capture) cmd_capture "${2:-}";;
 again) cmd_again;;
 decode) cmd_decode "${2:-}";;
 restore) cmd_restore;;
-*) sed -n '2,21p' "$0"; exit 2;;
+*) sed -n '2,22p' "$0"; exit 2;;
 esac
