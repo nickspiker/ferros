@@ -171,6 +171,8 @@ mod tests {
         let d = vsf::container::Document::open(&doc[..]).unwrap();
         let s: Vec<_> = d.entries_named("camera").into_iter().map(|e| d.section(e).unwrap()).collect();
         assert_eq!(s.len(), 2);
+        let one = document(vec![section(c, &idt(c)).unwrap()]).unwrap();
+        println!("the list of the main's two readouts: {} bytes, its binned one alone {}", doc.len(), one.len());
         let get = |k: usize, f: &str| s[k].uint(f).unwrap();
         assert_eq!((get(0, "id"), get(1, "id"), s[0].text("name"), s[1].text("name")), (0, 0, Some("main"), Some("main")));
         assert_eq!((get(0, "mode"), get(0, "width"), get(0, "height"), get(0, "cfa_period")), (0, 4080, 3072, 2));
