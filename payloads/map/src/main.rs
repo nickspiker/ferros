@@ -6251,6 +6251,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut corner_done = false;
     // Whether the helm's finger went further than a roll from where it landed (`HELM_ROLL`): then its lift is no tap.
     let mut corner_far = false;
+    // Measuring (owner, 2026-11-18, on the 8a: "the swipe in from corner gestures don't like to register"): a helm session's furthest travel inward and its travel across then, said as it ends with what the tests made of it.
+    let mut corner_best = (0f64, 0f64);
     // Two fingers on back and deck together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
     let mut pair = 0u8;
     let mut pair_done = false;
@@ -6808,6 +6810,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             corner_from = (f.1, f.2);
             corner_done = false;
             corner_far = false;
+            corner_best = (0., 0.);
             pair = 0;
             pair_done = false;
             // Measuring (the first cut did not fire for the owner): a touch in the bottom sixth, what the display said is under it.
@@ -6905,6 +6908,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The helm button's light follows the swipe: half at the landing, toward full as the finger comes in (½(1 + tanh(inward / threshold)), C∞, lower again if it pulls away), full once it acted.
                 let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / reach)) };
                 map.helm_light(corner, lvl as f32);
+                if inward > corner_best.0 {
+                    corner_best = (inward, across);
+                }
                 if !corner_done && inward > reach && inward > across.abs() {
                     corner_done = true;
                     // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Deck's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
@@ -6989,6 +6995,23 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The helm tapped still: deck or back (`helm_tap`), with an app in front as on the map. Two fingers on back and deck together are the hit map's pair (development builds), never a tap.
                 8 | 9 => {
                     tap_thru = false;
+                    {
+                        let span = (2 * w * h) as f64 / (w + h) as f64;
+                        let (reach, roll) = (span / HELM_SWIPE, span / HELM_ROLL);
+                        let (inw, acr) = corner_best;
+                        let what = if corner_done {
+                            "acted"
+                        } else if !corner_far && pair != 1 {
+                            "a tap"
+                        } else if inw <= reach {
+                            "refused: not far enough inward"
+                        } else {
+                            "refused: more across than inward"
+                        };
+                        let mut l = Line::new();
+                        let _ = write!(l, "map: helm {} from {},{}: inward {} across {} (reach {}, roll {}): {}\n", if corner == 8 { "deck" } else { "back" }, corner_from.0, corner_from.1, inw as i64, acr as i64, reach as i64, roll as i64, what);
+                        console(grants, l.as_str().as_bytes());
+                    }
                     // Still, or rolled less than a twelfth of the span and never swiped (owner, 2026-11-12: a tap with a roll is a tap): the general slop is a few pixels, a fingertip's roll on the glass more.
                     if !corner_done && !corner_far && pair != 1 {
                         let said = map.helm_tap(corner);
