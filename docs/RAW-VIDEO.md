@@ -160,6 +160,39 @@ For an SSD it would need:
 - Size: weeks, not days (PHY and Type-C bring-up the riskiest part, as the eUSB2 PHY was), and **the phone has one port**: while an SSD hangs on it, the bridge and charging need a powered hub with the phone as host, or WiFi for the bridge.
 - Against it: the internal flash already sustains 555 MB/s, which every lossless mode but 1:1 fits; the SSD buys uncompressed 60/s and headroom, not lossless.
 
+## Part 4: the recorder (branch raw-video-rec, 2026-11-19)
+
+The owner's decisions, 2026-11-19: VSF video; lossless only ("I'd just stick with the lossless compressed"); 1-minute clips; a simple FPS control (any whole rate 1 to 60) and start/stop in Lumis; the frame interval the longer of 1/fps and the shutter; clips single-copy in the vault ("single, no dual write"); 60/s a nice-to-have, cool.
+
+### The pieces
+
+| piece | where | what |
+|---|---|---|
+| the codec | `ferros_rawcodec/` | no_std, no alloc, format Zil: tools/raw-codec's default path, its bytes less the 4-byte stream length (the container keeps both); the bitstream specified in lib.rs; a `neon` feature (residuals, block sums, codes) |
+| the format | vsf branch `raw-video`: `visual::clip`, `visual::cfa_band`, `v('c')` | one VSF document a clip: generation 0, far-form `frame` sections as recorded (each naming the one before by BLAKE3), a closing generation with `index.b0`; a clip cut short reads to its last whole frame; vsf's `idt/image.md` "A RAW clip" has the tables |
+| the store | manifestus branch `single-copy` (`extent`), payloads/vault | single-copy extents: the table one mirrored vault value, the data written once into the `clips` window, no mirror, no read-back, its BLAKE3 at the seal |
+| the kernel | process.rs, service.rs | the `clips` window (48 GiB from 24 GiB, held inside the proven-free stretch at build time) granted to the vault process; `SYS_STORE` x1 bit 6 forwards extent ops (`VOP_EXTENT`, 1 MiB a write); WriteBooster on at the window's first write; bridge `store extent` pulls one |
+| the recorder | `ferros_clip/` (std) | bands coded on pinned workers, a writer staging whole blocks a UFS command at a time, the camera's pacing |
+| the harness | `std/rawrec`, `tools/clip-check` | records the binned main, hashes frames as captured, decodes the clip from the flash on the device; the host decodes a pulled clip against the hashes |
+
+### Pacing: every whole rate from 1 to 60
+
+The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,000 Hz (3.1489 us); the clock is 2^16 5^4 7^2, so a rate with a factor 3 (24, 30, 60) is never exact, and none is exact at llp 6320. `Pacing::of(fps)` picks the nearest frame length (the open's `fll`): every rate 1 to 60 lands within 87 ppm (24/s: fll 13232, 41.666454 ms, -5 ppm; 30/s: fll 10586, 33.334422 ms, +33 ppm; 60/s: fll 5293, 16.667211 ms, +33 ppm). The sensor's 16-bit frame length ends at 65535 lines (206 ms, 4.85/s): below 5/s the sensor runs at a multiple (1/s: 5/s, keep every 5th; 2/s: 6/s every 3rd; 3/s: 6/s every 2nd; 4/s: 8/s every 2nd), and the recorder keeps a frame when it is due by its time, so a long shutter still gives every frame. A shutter longer than 1/fps lengthens the sensor's frame itself (the driver's `Timing::plan`: lines + margin past `fll` stretch the frame, then the shift), which is the owner's max(1/fps, shutter).
+
+### The recorder's API (ferros_clip), for Lumis
+
+- `Pacing::of(fps)`, then `pacing.open_msg(camera, shutter_ns)`: the camera's OPEN (kind 1, the binned readout, `fll` for the rate, the write-back view). The rate is fixed at the open (the driver has no SET for it): a new rate is CLOSE and OPEN. Exposure, gain and focus are SETs as now; the frame lengthens by itself for a long shutter.
+- `Recorder::start(&Camera, &Mode, Box<dyn Sink>)`: `Camera` the geometry (width, height, stride, the mosaic from the MAP header's `cfa` byte by `cfa_of_byte`, black, white) and the still's facts (make, model, sensor, lens, characterization); `Mode` the pacing, the title, the workers' core masks (one a thread), the writer's mask, the slots (coded frames waiting for the flash), the extent's blocks, the start's Eagle time; the sink `ferros::ExtentSink(Extent::new(store_slot, name))`.
+- `recorder.frame(&FrameIn)` for every MAPped frame: the held buffer's rows in place and the MAP header's count, Eagle ns, exposure, gain and focus. It returns once every band is coded (the buffer may go back at the next MAP); `Taken::Recorded`, `Paced` (not due, below 5/s), `Dropped` (no slot: the flash fell behind) or `Ended` (the extent full, or a write failed).
+- `recorder.stats()`: frames, dropped (no slot, or the camera's count stepping past one between frames handed over), paced, bytes coded and raw, bytes written, the longest coding: Lumis's VIDEO_FRAMES and VIDEO_DROPPED.
+- `recorder.stop()`: the closing generation and the seal; `ClipInfo` (the counts, the clip's length, its seal, the writer's time, an error if any). The clip is the extent under its name in Lumis's domain; `Extent::info` reads its record, `ferros::ExtentSource` reads it back as a VSF byte source for `vsf::visual::clip::Reader`.
+
+### What is not done
+
+- **The clip is not sealed (encrypted) at rest.** Every vault value is sealed with its domain's key; an extent's blocks are the clip's plain bytes, found only thru the record in the (sealed, mirrored) table, but readable by anyone holding the raw flash. Sealing at 150 to 250 MB/s (XChaCha20 on the A715s, about 0.2 to 0.4 of a core at 30/s) is the owner's call.
+- **Copies.** A write goes Lumis to kernel heap to the vault process to kernel heap to the bounce (four copies of each MiB) at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue (`run_queued` with a buffer a slot).
+- **UNMAP**: a deleted extent's blocks are not unmapped (ferros sends none), so the device's garbage collection does not know they are free.
+
 ## The format decision (the owner's)
 
 Nothing below is decided; each is a new format or a new place under Rule -1.
