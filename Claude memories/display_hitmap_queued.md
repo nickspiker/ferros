@@ -14,4 +14,6 @@ Owner, 2026-11-11, on touch routing (today op 27 walks windows front to back rea
 - Dev only: every 4th presented frame shows the map (flat colour per owner) instead of the image; a developer-page checkbox and a two-finger swipe up from back and home together toggle it.
 - On that view, any redraw of the map picks a new colour palette (owner, 2026-11-11: "on that fourth frame, any redraw to the map should trigger a new colour palette"), so every change of ownership shows as a colour change.
 
+**2026-11-18:** the two-finger slide on back and deck is the screenshot now (owner); the hit map's view is the Developer page's switch alone, on every build (the page is there after the twelve taps in a release build), op 58 the system's alone on a release build.
+
 Related: [[display-global-mask-then-layers]], [[feedback-darkness-space]].

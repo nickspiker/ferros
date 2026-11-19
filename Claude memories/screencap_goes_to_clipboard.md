@@ -18,3 +18,5 @@ Today the dev tool (tools/screencap) reads a free window surface over the bridge
 - Don't build save-to-file or a reserved capture region.
 - When the clipboard exists, op 30's composed frame goes there.
 - Until then, the "every surface held" case stays a known gap.
+
+**2026-11-18 (branch chords-screenshot; on forge since 2026-11-20):** the owner made the helm's two-finger slide the screenshot ("screenshot is the two finger slide"). Built: the display keeps the frame op 30 makes as the offer (`offer_keep`, display ops 84 `shot` and 85 `offer`), RAM only, its room grown in the display's arc at the first screenshot; the quick row's screencap lands there too. No paste gesture yet: only `tools/screencap --offer` reads it, on development builds. WINDOWS.md "Screenshot".

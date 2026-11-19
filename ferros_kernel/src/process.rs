@@ -8115,7 +8115,7 @@ fn identity_bell() {
 }
 
 /// Power + volume down (service.rs, chord.rs; owner, 2026-11-18: "power plus vol down kills", then: Stop ends the app in front immediately, no close message, no grace period): the app in front ended now, one shot dead, as init's OP_STOP ends a kist from the deck's Stop, and no record kept (the person's own act). ferros apps keep every change as it happens, so there is nothing to shut down; the camera driver closes its stream the moment its holder ends.
-/// The app in front is the display's, read from the word it registered (`BELL_FRONT`) and keeps current as it composes: nothing of the display is asked now, so a display or touch the app wedged still lets the chord through.
+/// The app in front is the display's, read from the word it registered (`BELL_FRONT`) and keeps current as it composes: nothing of the display is asked now, so a display or touch the app wedged still lets the chord thru.
 /// Nothing on the deck with no app in front, and never a system process (one holding Settings that is not a kist: the map, the attest screen). Returns what happened, for the flash log.
 pub fn stop_front() -> alloc::string::String {
     with_lock(|| {

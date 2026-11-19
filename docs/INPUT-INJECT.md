@@ -109,8 +109,13 @@ A wait for idle ends after 8 refresh periods in a row with no frame started. At 
 
 `diag key power`, development kernels only (inside the DIAG development block of service.rs):
 - It sets `__power_pressed`, which is where the power key's interrupt records a press (main.rs `.Lirq_power`). The service loop's screen toggle and the proximity wake rule then take it as they take a finger's press.
-- It is refused while a volume key is physically held. The press would make a chord with it: power + volume up is the hv's jump under Android, and both volume keys are the kill. No chord is ever injected.
-- The volume keys have nothing to inject into. The killswitch and the "Ready?" gate read their pins' levels, and nothing queues their presses. `diag key volup` answers so.
+- It is refused while a volume key is physically held. The press would make a chord with it: power + volume up is the hv's jump under Android and ferros's restart, power + volume down ends the app in front, and both volume keys are the kill. No chord is ever injected.
+- The volume keys have nothing to inject into. The killswitch, the "Ready?" gate and the chords read their pins' levels, and nothing queues their presses. `diag key volup` answers so.
+
+`diag key stop` (2026-11-18, development kernels, `ferros-bridge diag "key stop"`): the stop chord's action, not its keys (WINDOWS.md "Stop").
+- The chord is two pins held together, read as levels each pass of the service loop, so there is no press to put anywhere; this runs what the chord runs, process.rs `stop_front`, from the same place, and answers its line (`stop: <name> (surface <k>) ended`, or why nothing was).
+- So a script can end the app in front between its touch parts, as `ferros-bridge diag "key stop"` from the host; a script's own `key` event stays power, volume up or volume down (ferros_inject), and the bridge's `input key` has no `stop`.
+- What it cannot test: the pins, the arming (a hold at the loop's start fires nothing) and the power press that joins it. Those are chord.rs's, host-tested (tools/chords), and need hands on the device.
 
 A key event in a script is a press. The bridge cuts the script at its keys:
 - The touch parts go to the inject process.

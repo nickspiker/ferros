@@ -23,4 +23,6 @@ Chords while Android runs under the hv:
 
 **Why:** the owner wants a button that gets back from Android, keeps Android's RAM ("steal whatever Android had going on"), and works even when Linux is wedged.
 
+**Under ferros (2026-11-18, branch chords-screenshot; on forge since 2026-11-20):** power + volume down ends the app in front at once (owner: "power plus vol down kills"; then Stop is immediate, no close message, no deadline). Kernel chord.rs + process.rs `stop_front`, reading the display's front word (`BELL_FRONT`), so a wedged display or touch still lets it thru. Under Android it stays Android's screenshot; the hv is untouched. WINDOWS.md "Stop".
+
 Related: [[android-behind-attestation]], [[ufs-firewall-decided]], [[feedback-killswitch-irq-mask]].

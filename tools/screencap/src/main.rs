@@ -3,6 +3,7 @@
 //! The kernel's memory read hands back up to 4 MiB of DRAM a call (service.rs), so a WQHD canvas is 8 reads; the tool advances by what each read returns, so an older kernel (64 KiB) still works, slowly.
 //! Usage: screencap [out.vsf] [width height]   (default target/screen/<time>.vsf, 1344 2992; a jump from Android's scaled mode runs 1008 2244)
 //!        screencap --enter [width height]      (a capture each time Enter is pressed, into the folder it was started from as <Eagle time in hex>.vsf; `q` then Enter ends it; tools/snap.sh runs it from anywhere)
+//!        screencap --offer [out.vsf]   (the screenshot the display holds as the offer, display op 85: the helm's two-finger slide or the quick row's screencap; default offer.vsf here; development builds)
 //!        screencap --mask [out.vsf] [width height]   (the glass's mask alone, white where the glass shows and black where the mask covers, its edges antialiased as the panel gets them; default mask.vsf here: tools/vsf2web's --mask)
 
 use std::process::Command;
@@ -66,6 +67,16 @@ fn main() {
         capture(&bridge, &bin, &out, w, h, true);
         return;
     }
+    // The screenshot the display holds as the offer (development builds: the address is said only there), read where it is; nothing is composed now.
+    if a.get(1).map(String::as_str) == Some("--offer") {
+        let out = a.get(2).cloned().unwrap_or_else(|| "offer.vsf".into());
+        let bin = build_capture();
+        match offer_source(&bridge, &bin) {
+            Some((at, w, h, _)) => read_visual(&bridge, at, &out, w, h),
+            None => eprintln!("no screenshot held (or a release build, which says no address)"),
+        }
+        return;
+    }
     if a.get(1).map(String::as_str) == Some("--enter") {
         let w: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1344);
         let h: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(2992);
@@ -97,13 +108,42 @@ fn main() {
     capture(&bridge, &bin, &out, w, h, false);
 }
 
+/// The offer the display holds (display op 85, docs/WINDOWS.md "Screenshot": the helm's two-finger slide, or the quick row's screencap): asked thru the capture process with the op as its input, its reply printed in hex. Its frame's address, width and height and its number; None when nothing is held, or on a release build (no address).
+fn offer_source(bridge: &std::path::Path, bin: &std::path::Path) -> Option<(usize, usize, usize, u32)> {
+    let out = Command::new(bridge).arg("spawn").arg(bin).arg("55").args(["--use", "display"]).output().expect("ferros-bridge");
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    // The reply's 18 bytes as 36 hex digits on the console (the capture's own line), asked again of the console if the spawn came back first, as `source` does.
+    let line = |t: &str| t.split(|c: char| !c.is_ascii_hexdigit()).find(|w| w.len() == 36 && w.starts_with("00")).map(str::to_string);
+    for _ in 0..4 {
+        if line(&text).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
+            text = String::from_utf8_lossy(&o.stdout).into_owned();
+        }
+    }
+    let hex = line(&text)?;
+    let b: Vec<u8> = (0..18).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+    let number = u32::from_le_bytes(b[2..6].try_into().unwrap());
+    let (w, h) = (u16::from_le_bytes([b[6], b[7]]) as usize, u16::from_le_bytes([b[8], b[9]]) as usize);
+    let at = u64::from_le_bytes(b[10..18].try_into().unwrap()) as usize;
+    eprintln!("offer: kind {}, number {number}, {w} x {h}, at G#{at:X}", b[1]);
+    (b[1] == 1 && at != 0).then_some((at, w, h, number))
+}
+
 /// One capture: the finished frame's address from the capture process, the frame read over the bridge, written to `out` as a VSF visual.
 fn capture(bridge: &std::path::Path, bin: &std::path::Path, out: &str, w: usize, h: usize, mask: bool) {
+    let base = source(bridge, bin, mask);
+    eprintln!("reading G#{base:X}{}", if base == CANVAS { " (the canvas: the capture named no surface)" } else { "" });
+    read_visual(bridge, base, out, w, h);
+}
+
+/// The frame of working values at `base` (w × h, a u64 a pixel) read over the bridge and written to `out` as a VSF visual.
+fn read_visual(bridge: &std::path::Path, base: usize, out: &str, w: usize, h: usize) {
     let bytes = w * h * 8;
     let tmp = std::env::temp_dir().join("screencap.part");
     let t0 = std::time::Instant::now();
-    let base = source(bridge, bin, mask);
-    eprintln!("reading G#{base:X}{}", if base == CANVAS { " (the canvas: the capture named no surface)" } else { "" });
     let mut raw = Vec::with_capacity(bytes);
     let mut reads = 0;
     while raw.len() < bytes {

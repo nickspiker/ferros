@@ -140,6 +140,7 @@ So the firewall's rules cost normal use nothing: refuse LU0 writes and UNMAPs th
   - **Measured on slot b (2026-11-01).** Android booted with CPU 3 offline. The keys worked in Android (33 edges forwarded of 34 taken). Power + volume up blanked the screen at once, and the next boot went straight to ferros: GATE_ANSWER 5, with counters 1 / 0 / 1 / 34 / 33 / 35 / 1 / 0 / – / 1 / 0 / INTID 60 / frame 3 / 0 / 3.
   - **Costs:** the reset goes through ABL, so its unlocked-device warning shows each time, and Android's RAM is lost. Keeping Android's RAM and skipping ABL is the swap without a reset (the reverse swap). Suspend with core 3 is not measured yet (no stop counted that session).
   - **Still polled:** the kill chord's old trap-time check stays alongside, as a fallback.
+- **Under ferros the same keys mean** (no hv in the path; the kernel's service loop reads the pins, ferros_kernel chord.rs): power + volume up restarts ferros (restart.rs, 2026-11-10); power + volume down ends the app in front at once (2026-11-18, owner: "power plus vol down kills"; WINDOWS.md "Stop"), where under Android it stays Android's screenshot; volume up + volume down is the kill switch, as everywhere. The hv's handling of power + volume down is untouched: it forwards those edges to Android as before.
 
 ## The jump to ferros (built 2026-11-01, slot b)
 
