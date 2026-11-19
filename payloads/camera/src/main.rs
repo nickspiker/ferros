@@ -113,6 +113,11 @@ macro_rules! step {
     }};
 }
 
+/// A readout's diagonal field in degrees, as its list section carries it (ferros_cam optics `Optics::field`).
+fn field_deg(c: &Cam, r: &ferros_cam::list::Readout) -> f32 {
+    ferros_cam::optics::OPTICS[c.id as usize].field(r.covered).fov_deg.2
+}
+
 /// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
@@ -123,8 +128,8 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         }
         let Some(idt) = input(g, c, None, b"idt", T_IDT, unsafe { &mut *(&raw mut IDT) }) else { continue };
         if !LIST_SAID.load(Ordering::Relaxed) {
-            let t = ferros_cam::list::Readout::binned(c).timing;
-            say!(g, "camera: LIST {}: mode A#0, exposure_max A#{} ns\n", c.name, t.most_ns());
+            let r = ferros_cam::list::Readout::binned(c);
+            say!(g, "camera: LIST {}: mode A#0, A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
         }
         match ferros_cam::list::section(c, idt) {
             Ok(s) => secs.push(s),
@@ -136,7 +141,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         // Its 1:1 readout, a second section with the same `id` and `name`, when its 1:1 init is in the vault (`cam.<key>.init.full`; docs/CAMERA.md "1:1 on the main"): its own size, mosaic period, frame period and exposure range, read off that init; opened by the mode block's kind 2.
         if let Some(full) = full_init(g, c) {
             if let (false, Ok(r)) = (LIST_SAID.load(Ordering::Relaxed), ferros_cam::list::Readout::full(c, full)) {
-                say!(g, "camera: LIST {}: mode A#{}, exposure_max A#{} ns\n", c.name, r.kind, r.timing.most_ns());
+                say!(g, "camera: LIST {}: mode A#{}, A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.kind, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
             }
             match ferros_cam::list::Readout::full(c, full).and_then(|r| ferros_cam::list::section_of(c, idt, &r)) {
                 Ok(s) => secs.push(s),
@@ -159,7 +164,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
             let Some(init) = input(g, c, Some(a), b"init", T_INIT, unsafe { &mut *(&raw mut INIT) }) else { continue };
             let r = ferros_cam::list::Readout::alt(c, k, init);
             if !LIST_SAID.load(Ordering::Relaxed) {
-                say!(g, "camera: LIST {}: mode A#{} ({}), exposure_max A#{} ns\n", c.name, r.kind, a.tag, r.timing.most_ns());
+                say!(g, "camera: LIST {}: mode A#{} ({}), A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.kind, a.tag, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
             }
             match ferros_cam::list::section_of(c, idt, &r) {
                 Ok(s) => secs.push(s),

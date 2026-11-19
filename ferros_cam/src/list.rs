@@ -30,6 +30,8 @@ pub struct Readout {
     pub timing: crate::ccs::Timing,
     /// Its own frame period (ns): the init's frame of lines at its line, the frame rate while an exposure fits it.
     pub frame_ns: u64,
+    /// The array pixels it reads, width and height (its size times the pixels each output pixel gathers): its field of view (ferros_cam optics `Optics::field`).
+    pub covered: (u32, u32),
 }
 
 /// The kind of the mode block that opens a 1:1 readout (payloads/camera `K_FULL`).
@@ -38,7 +40,7 @@ pub const KIND_FULL: u8 = 2;
 impl Readout {
     /// The camera's binned readout, its captured init's (as the list has offered since 2026-11-14).
     pub fn binned(c: &Cam) -> Readout {
-        Readout { kind: 0, width: c.width as u16, height: c.height as u16, period: 2, timing: c.listed_timing(), frame_ns: c.fll as u64 * c.line_ps / 1000 }
+        Readout { kind: 0, width: c.width as u16, height: c.height as u16, period: 2, timing: c.listed_timing(), frame_ns: c.fll as u64 * c.line_ps / 1000, covered: c.binned_field() }
     }
     /// The camera's 1:1 readout from its 1:1 init (`cam.<key>.init.full`): the mode it leaves (`Mode::captured_full`), at the line time its PLL gives (`line_ps_for`).
     pub fn full(c: &Cam, init: &[u8]) -> Result<Readout, IdtError> {
@@ -46,7 +48,7 @@ impl Readout {
         let m = crate::ccs::Mode::captured_full(init, a).map_err(IdtError::Mode)?;
         let line = crate::ccs::line_ps_for(c, &crate::ccs::Page::of(init));
         let timing = c.listed_mode_timing(line, &m);
-        Ok(Readout { kind: KIND_FULL, width: m.x_out, height: m.y_out, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)) })
+        Ok(Readout { kind: KIND_FULL, width: m.x_out, height: m.y_out, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)), covered: (m.x_out as u32, m.y_out as u32) })
     }
     /// The camera's captured readout `alts[k]` (kind `cams::ALT + k`) from its own init (`cam.<key>.init.<tag>`): its size and period, the init's line and frame at the line its PLL gives (`line_ps_for`).
     pub fn alt(c: &Cam, k: usize, init: &[u8]) -> Readout {
@@ -57,7 +59,7 @@ impl Readout {
         // A readout's own measured line is at its own line length (the tele's share the 22-degree's, 5568 clocks); else the camera's, scaled by the init's PLL.
         let line = if a.line_ps != 0 { a.line_ps * c.llp as u64 / llp as u64 } else { crate::ccs::line_ps_for(c, &p) };
         let timing = c.listed_timing_at(line, llp, fll);
-        Readout { kind: crate::cams::ALT + k as u8, width: a.width as u16, height: a.height as u16, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)) }
+        Readout { kind: crate::cams::ALT + k as u8, width: a.width as u16, height: a.height as u16, period: a.period, timing, frame_ns: timing.frame_ns(&timing.own(1)), covered: (a.width as u32 * a.gather as u32, a.height as u32 * a.gather as u32) }
     }
 }
 
@@ -116,6 +118,14 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     put("sensor_height_mm", alloc::vec![VsfType::f5(o.sensor_mm.1)]);
     put("focal_mm", alloc::vec![VsfType::f5(o.focal_mm)]);
     put("f_number", alloc::vec![VsfType::f5(o.f_number)]);
+    // The readout's own field (ferros_cam optics `Optics::field`, owner via the Lumis session, 2026-11-19: what tells two readouts of one lens apart in a menu, the tele's two 4032 x 3024 at 22 and 11 degrees): the sensor's part it reads in mm (its pixels over the array's, `Readout::covered`), the angles across its width, height and diagonal in degrees, and its 35 mm equivalent focal length.
+    let fd = o.field(r.covered);
+    put("field_width_mm", alloc::vec![VsfType::f5(fd.mm.0)]);
+    put("field_height_mm", alloc::vec![VsfType::f5(fd.mm.1)]);
+    put("fov_width_deg", alloc::vec![VsfType::f5(fd.fov_deg.0)]);
+    put("fov_height_deg", alloc::vec![VsfType::f5(fd.fov_deg.1)]);
+    put("fov_diagonal_deg", alloc::vec![VsfType::f5(fd.fov_deg.2)]);
+    put("focal_equiv_mm", alloc::vec![VsfType::f5(fd.focal_equiv_mm)]);
     Ok(s)
 }
 
@@ -165,6 +175,51 @@ mod tests {
             seen.push(m);
         }
         assert_eq!(seen.len(), 4);
+    }
+
+    /// Every readout's field as the list carries it, read back from the document: the binned readouts and the 1:1 ones read the whole array (Android's diagonal angles: the main 83.2, the ultrawide 121.7, the tele 22.2), the tele's 11 degrees its middle quarter (Android's virtual camera 6, 11.2), the front's 8.42 MP its middle 3440 x 2448; no two readouts of one lens with the same size and the same field.
+    /// The captured readouts' sections need no init for the field (an empty one gives the camera's own line and frame).
+    #[test]
+    fn every_readouts_field() {
+        let mut secs = Vec::new();
+        let mut want = Vec::new();
+        for c in cams::CAMS.iter() {
+            secs.push(section(c, &idt(c)).unwrap());
+            want.push((c.id, 0u8, [83.2f32, 121.7, 0., 22.2][c.id as usize]));
+            if let (0, Ok(full)) = (c.id, std::fs::read("/mnt/Harbor/Code/ferros/target/cam/main-full.init")) {
+                secs.push(section_of(c, &idt(c), &Readout::full(c, &full).unwrap()).unwrap());
+                want.push((0, KIND_FULL, 83.2));
+            }
+            for k in 0..c.alts.len() {
+                secs.push(section_of(c, &idt(c), &Readout::alt(c, k, &[])).unwrap());
+                want.push((c.id, cams::ALT + k as u8, match (c.id, k) { (3, 0) => 11.2, (2, 0) => 0., _ => [83.2f32, 121.7, 0., 22.2][c.id as usize] }));
+            }
+        }
+        let doc = document(secs).unwrap();
+        let d = vsf::container::Document::open(&doc[..]).unwrap();
+        let f = |s: &vsf::file_format::VsfSection, name: &str| -> f32 { if let [VsfType::f5(x)] = s.get_field(name).unwrap().values[..] { x } else { panic!("{name}") } };
+        let mut seen: Vec<(u64, u64, u64, i64)> = Vec::new();
+        for (e, &(id, kind, diag)) in d.entries_named("camera").into_iter().zip(want.iter()) {
+            let s = d.section(e).unwrap();
+            assert_eq!((s.uint("id"), s.uint("mode")), (Some(id as u64), Some(kind as u64)));
+            let (fw, fh, aw, ah, ad, eq) = (f(&s, "field_width_mm"), f(&s, "field_height_mm"), f(&s, "fov_width_deg"), f(&s, "fov_height_deg"), f(&s, "fov_diagonal_deg"), f(&s, "focal_equiv_mm"));
+            println!("{} mode {}: {} x {}, field {fw:.4} x {fh:.4} mm, {aw:.2} x {ah:.2} degrees, {ad:.2} diagonal, {eq:.2} mm equivalent", s.text("name").unwrap(), kind, s.uint("width").unwrap(), s.uint("height").unwrap());
+            if diag != 0. {
+                assert!((ad - diag).abs() < 0.05, "camera {id} mode {kind}: {ad} against {diag}");
+            }
+            assert!(aw < ad && ah < aw && fh < fw);
+            let key = (id as u64, s.uint("width").unwrap(), s.uint("height").unwrap(), (ad * 16.) as i64);
+            assert!(!seen.contains(&key), "two readouts alike: {key:?}");
+            seen.push(key);
+        }
+        // The front's two: 10.5 MP its whole array (the 35 mm equivalent its captures recorded, 20.61), 8.42 MP its middle 3440 x 2448, narrower by 3440 / 3840 on the width.
+        let front: Vec<_> = d.entries_named("camera").into_iter().map(|e| d.section(e).unwrap()).filter(|s| s.uint("id") == Some(2)).collect();
+        assert!((f(&front[0], "focal_equiv_mm") - 20.6108).abs() < 0.01);
+        assert!((f(&front[1], "field_width_mm") / f(&front[0], "field_width_mm") - 3440. / 3840.).abs() < 1e-5);
+        // The tele's two 4032 x 3024: 22 and 11 degrees, a quarter of the array's area apart.
+        let tele: Vec<_> = d.entries_named("camera").into_iter().map(|e| d.section(e).unwrap()).filter(|s| s.uint("id") == Some(3)).collect();
+        assert_eq!((tele[0].uint("width"), tele[1].uint("width")), (Some(4032), Some(4032)));
+        assert!((f(&tele[0], "field_width_mm") - 2. * f(&tele[1], "field_width_mm")).abs() < 1e-5);
     }
 
     #[test]

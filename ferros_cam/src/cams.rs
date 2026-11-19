@@ -89,6 +89,9 @@ pub struct Alt {
     pub line_ps: u64,
     /// The processing blocks' switches its job runs with (ferros_cam geom `DETACH`; 0 none): the front's 8.42 MP stalls the engine in its second program unless FC ctx3 is off (bit 0).
     pub detach: u8,
+    /// Array pixels each output pixel gathers on each axis (2 binned, 1 at 1:1), so its field is its size times this (ferros_cam optics `Optics::field`, the list's `field_*` and `fov_*`).
+    /// Every captured readout is 1: the tele's 11 degrees is the array's middle 4032 x 3024 at 1:1 (its CCS words say the whole array binned as the 22 degrees' do; the crop is the vendor's G#0B30 = G#0101, and Android's virtual camera 6 reports half the tele's sensor, 2.8224 x 2.1168 mm), its 48.8 MP and the ultrawide's 48 MP the whole array at 1:1, the front's 8.42 MP the middle 3440 x 2448 of its 3840 x 2736 (its init's output crop, G#0350/G#0352 = 268 and 144).
+    pub gather: u16,
 }
 
 impl Alt {
@@ -296,14 +299,14 @@ pub const TELE: Cam = Cam {
 
 /// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
 /// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; the cell table of a 2 s frame G B / R G as the 22-degree's), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
-pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 2, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES, line_ps: 9_871_200, detach: 0 };
+pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 2, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES, line_ps: 9_871_200, detach: 0, gather: 1 };
 /// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines.
 /// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G B / R G), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
-pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES, line_ps: 13_200_800, detach: 0 };
+pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES, line_ps: 13_200_800, detach: 0, gather: 1 };
 /// The ultrawide's 48 MP readout, 8000 x 6000 RAW10 at G#2720 a line, its PD rows 4000 x 1500; its link at the slower op PLL (`RX_START_UW48`).
-pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES, line_ps: 5_406_700, detach: 0 };
+pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES, line_ps: 5_406_700, detach: 0, gather: 1 };
 /// The front's 8.42 MP readout, 3440 x 2448, the sensor's own scaler; written 16-bit by Android's job (stride G#1AE0), packed here (G#1100).
-pub const FRONT842: Alt = Alt { tag: "f8", width: 3440, height: 2448, stride: 0x1100, period: 2, pd: true, rx_start: &crate::rx::RX_START_FRONT842, rx_stop: &crate::rx::RX_STOP_FRONT, sizes: job::FRONT842_SLOT_BYTES, line_ps: 0, detach: 1 };
+pub const FRONT842: Alt = Alt { tag: "f8", width: 3440, height: 2448, stride: 0x1100, period: 2, pd: true, rx_start: &crate::rx::RX_START_FRONT842, rx_stop: &crate::rx::RX_STOP_FRONT, sizes: job::FRONT842_SLOT_BYTES, line_ps: 0, detach: 1, gather: 1 };
 
 /// Every camera, by id.
 pub const CAMS: [&Cam; 4] = [&MAIN, &ULTRAWIDE, &FRONT, &TELE];
@@ -327,6 +330,13 @@ impl Cam {
     /// Its region with an image ring of `n` buffers of its captured readout.
     pub const fn layout(&self, n: usize) -> job::Layout {
         job::with_image(&self.sizes, &self.skip, n as u64 * self.buffer_bytes())
+    }
+    /// The array pixels its captured (binned) readout reads, width and height: each output pixel gathers the array's pixels over its own (ferros_cam optics `array_px`: the rear sensors' 2 x 2, Android's PIXEL_ARRAY 4080 x 3072 against PIXEL_ARRAY_MAXIMUM_RESOLUTION 8160 x 6144 and the like; the front's one), so every binned readout reads the whole array.
+    /// Its init's window says the same: the main's x G#10 to G#3FCF, 16320 addresses at 2 a pixel, 8160; the tele's x G#8 to G#1F87, 8064, its rows 6080 binned to 3040 and 3024 kept (G#0352 = 8 at each end); the ultrawide's 4000 x 3000 binned out of 8000 x 6000 by its digital crop.
+    pub const fn binned_field(&self) -> (u32, u32) {
+        let o = crate::optics::OPTICS[self.id as usize];
+        let g = o.array_px.0 / self.width as u32;
+        (self.width as u32 * g, self.height as u32 * g)
     }
     /// The binned readout at `bin`: whole 2 x 2 cells of `bin` x `bin` blocks, so the mosaic keeps its phase (the ultrawide's 3000 rows at bin 8 are 374, not 375).
     pub const fn binned(&self, bin: usize) -> (usize, usize) {
