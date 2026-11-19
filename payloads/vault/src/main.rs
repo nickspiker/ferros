@@ -858,7 +858,7 @@ extern "C" fn work(_: u64) -> ! {
         if m[1] & 1 != 0 {
             migrate(&mut store);
         }
-        let len = serve(&mut store, &mut writers, &mut export, m, &mut out);
+        let len = serve(&mut store, &mut writers, &mut export, m, &mut out, &token);
         live_note(store.engine());
         // The stamp's keys and the name wiped; an extent's bytes past them are the clip's own, not a secret of the vault's, and zeroing a MiB a write cost the clip's write path (2026-11-19).
         let wipe_to = if m[0] == OP_EXTENT { m.len().min(1 << 9) } else { m.len() };
@@ -882,7 +882,7 @@ fn wipe(d: &mut Domain) {
 }
 
 /// One stamped request into `out` (the reply: the syscall's value, then the caller's bytes); returns the reply's length.
-fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>>, m: &[u8], out: &mut [u8]) -> usize {
+fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>>, m: &[u8], out: &mut [u8], token: &[u8; 32]) -> usize {
     const NOTHING: u64 = ferros_sys::NOTHING;
     let (op, count) = (m[0], m[6] as usize);
     let at_name = 7 + count * 65;
@@ -933,7 +933,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         }
     } else if op == OP_EXTENT {
         let (_, mut d) = domain_at(m, 7);
-        let r = extent(store, &d, name, rest, out, &mut data);
+        let r = extent(store, &d, name, rest, out, &mut data, token);
         wipe(&mut d);
         r
     } else if op == OP_DROP {
@@ -1152,8 +1152,17 @@ fn extent_name(d: &Domain, name: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The kernel's SYS_BLOCK x1 bit 3 on the clips window (process.rs `extent_give`): the extent `first`, `blocks` given to the caller the reply token names, its capability back (None: refused, or a kernel from before); with `take_back` that caller's extents taken back.
+fn extent_give(token: &[u8; 32], first: u64, blocks: u64, take_back: bool) -> Option<[u8; 32]> {
+    let mut io = [0u8; 64];
+    io[..32].copy_from_slice(token);
+    let r = ferros_sys::svc(ferros_sys::nr::BLOCK, cap(grants(), S_CLIPS), 8 | (take_back as u64) << 4, first, blocks, ferros_sys::off(io.as_ptr()));
+    io[..32].fill(0);
+    (r == 0 && !take_back).then(|| io[32..].try_into().unwrap())
+}
+
 /// One extent request (`OP_EXTENT`): its value, with the reply's bytes in `out[8..]` (their count in `data`).
-fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], data: &mut usize) -> u64 {
+fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], data: &mut usize, token: &[u8; 32]) -> u64 {
     const NOTHING: u64 = ferros_sys::NOTHING;
     let (eop, block, len) = (rest[0], u64::from_le_bytes(rest[1..9].try_into().unwrap()), u32::from_le_bytes(rest[9..13].try_into().unwrap()) as usize);
     let bytes = &rest[13..];
@@ -1170,7 +1179,13 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
             match next.reserve(key, owner, blocks, now).and_then(|e| next.store(store.engine(), now).map(|()| e)) {
                 Ok(e) => {
                     *t = next;
-                    say!("vault: extent opened: {} blocks at {} of the clips area{}; {} free at most", e.blocks, e.first, if had { ", over the name's last" } else { "" }, t.largest_free());
+                    // The extent's blocks given to the caller for its own writes (a kernel from 2026-11-19 on): the clip's bytes then go straight to the flash, not thru this process. Refused, the caller writes thru the vault (EOP_WRITE) as before.
+                    let given = extent_give(token, e.first, e.blocks, false);
+                    if let Some(tok) = given {
+                        out[8..40].copy_from_slice(&tok);
+                        *data = 32;
+                    }
+                    say!("vault: extent opened: {} blocks at {} of the clips area{}{}; {} free at most", e.blocks, e.first, if had { ", over the name's last" } else { "" }, if given.is_some() { ", given to the caller" } else { "" }, t.largest_free());
                     e.blocks
                 }
                 Err(err) => {
@@ -1215,6 +1230,8 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
             match next.seal(&key, length, hash, now).and_then(|_| next.store(store.engine(), now)) {
                 Ok(()) => {
                     *t = next;
+                    // Sealed: the caller's own writes end (it holds no extent any more).
+                    let _ = extent_give(token, 0, 0, true);
                     let m = unsafe { core::mem::take(&mut *(&raw mut EXT_METER)) };
                     let f = freq();
                     say!("vault: extent sealed, {} bytes: {} writes of {} MiB in all, {} ms in the block calls ({} MB/s), {} ms from the first write", length, m.0, m.1 >> 20, m.2 * 1000 / f, m.1 * f / m.2.max(1) / 1_000_000, (ferros_sys::now() - m.3) * 1000 / f);

@@ -75,27 +75,44 @@ pub struct Info {
 pub struct Extent {
     slot: u64,
     name: Vec<u8>,
+    /// The extent's own SYS_BLOCK capability, when the vault gave one at the open (a kernel and vault from 2026-11-19 on): writes go straight to the flash, not thru the vault process.
+    own: Option<Box<[u8; 32]>>,
 }
+
+const BLOCK: u64 = 29;
 
 impl Extent {
     /// The extent named `name` (printable ASCII, at most 96 bytes, as a value's name).
     pub fn new(slot: u64, name: &str) -> Extent {
-        Extent { slot, name: name.as_bytes().to_vec() }
+        Extent { slot, name: name.as_bytes().to_vec(), own: None }
     }
     fn call(&self, op: u64, block: u64, buf: *const u8, len: usize) -> u64 {
         svc(STORE, cap(self.slot), EXTENT | op | (len as u64) << 8 | block << 32, off(self.name.as_ptr()), self.name.len() as u64, off(buf))
     }
     /// Reserve `blocks` (a fresh extent under the name; the old one, if any, goes): the blocks reserved.
-    pub fn open(&self, blocks: u64) -> Result<u64, String> {
-        let b = blocks.to_le_bytes();
-        match self.call(EOP_OPEN, 0, b.as_ptr(), 8) {
+    pub fn open(&mut self, blocks: u64) -> Result<u64, String> {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&blocks.to_le_bytes());
+        match self.call(EOP_OPEN, 0, b.as_ptr(), 32) {
             ERR => Err(format!("extent open of A#{blocks} blocks refused (no stretch that long free, or no vault process with a clips window)")),
-            n => Ok(n),
+            n => {
+                // The reply's 32 bytes: the extent's own capability; a vault that gives none answers no bytes, and past the count they stay zeros.
+                self.own = b[8..].iter().any(|&x| x != 0).then(|| Box::new(b));
+                Ok(n)
+            }
         }
+    }
+    /// Whether writes go straight to the flash (the extent's own capability) or thru the vault process.
+    pub fn direct(&self) -> bool {
+        self.own.is_some()
     }
     /// Whole blocks at `block`, at most 1 MiB.
     pub fn write(&self, block: u64, bytes: &[u8]) -> Result<(), String> {
-        match self.call(EOP_WRITE, block, bytes.as_ptr(), bytes.len()) {
+        let r = match &self.own {
+            Some(t) => svc(BLOCK, off(t.as_ptr()), 1 | ((bytes.len() as u64 >> 12) & 0xFFFF) << 8, block, off(bytes.as_ptr()), 0),
+            None => self.call(EOP_WRITE, block, bytes.as_ptr(), bytes.len()),
+        };
+        match r {
             0 => Ok(()),
             r => Err(format!("extent write of A#{} bytes at block A#{block} refused (G#{r:X})", bytes.len())),
         }

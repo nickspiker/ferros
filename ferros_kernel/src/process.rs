@@ -1046,6 +1046,8 @@ pub enum Object {
     SpareSurface,
     /// A puck's square to be (docs/PUCKS.md, 2026-11-18): a spawn turns it into a free slot of the pucks' window with no frames yet, the child's own (`Dma` of a `puck`, `puck_take`); it asks for its frames by SYS_DMA x1 = 6. Handed to a kist that declares `puck` in its surface's place.
     NewPuck,
+    /// Served by the kernel: a RAW clip's extent of the `clips` window (index into `EXTENT_GRANTS`), given by the vault process to the process whose extent it opened (SYS_BLOCK x1 bit 3), written and read by that process alone by block number within it (docs/RAW-VIDEO.md "The recorder": the clip's bytes go straight to the flash, not thru the vault process).
+    Extent(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -1096,6 +1098,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::NewRegion(n) => (23, n as u64),
         Object::SpareSurface => (24, 0),
         Object::NewPuck => (25, 0),
+        Object::Extent(i) => (26, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -2008,6 +2011,52 @@ pub static CLIPS_WB: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 pub static CLIPS_WB_SET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The counter at the `clips` window's last write: a RAW clip being recorded (service.rs `recording`, the A715s held at `CLIPS_KHZ`).
 pub static CLIPS_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A clip's extent given to the process recording it (`Object::Extent`): its holder (the process's epoch, 0 a free slot), its first block within the `clips` window and its blocks. Under the kernel lock.
+#[derive(Clone, Copy)]
+pub struct ExtentGrant {
+    pub holder: u64,
+    pub first: u64,
+    pub blocks: u64,
+}
+/// Extents given at once at most: one a recording process, a few recording together.
+pub const EXTENT_GRANTS_MOST: usize = 1 << 3;
+pub static mut EXTENT_GRANTS: [ExtentGrant; EXTENT_GRANTS_MOST] = [ExtentGrant { holder: 0, first: 0, blocks: 0 }; EXTENT_GRANTS_MOST];
+
+/// SYS_BLOCK x1 bit 3 on the `clips` window (the vault process's, while it serves a call): give the caller its reply token names the extent of `blocks` blocks from window block `first`; x4 the offset of [the reply token 32][the given token 32, written]. Bit 4 with bit 3: take every extent of that caller back instead (its seal). 0 or ERR. Under the kernel lock.
+/// WHY the bounds: `first` and `blocks` are the vault process's words; an extent outside its window would reach blocks the vault keeps or no window holds.
+fn extent_give(p: &Process, w: &BlockWindow, first: u64, blocks: u64, io_off: u64, take_back: bool) -> u64 {
+    if w.name != "clips" {
+        return ERR;
+    }
+    let token = p.read(io_off, 32);
+    let holder = match p.lookup(&token).map(|i| p.cspace[i].object) {
+        Some(Object::Reply(t)) if t != KERNEL_CALLER => proc_of(t).filter(|q| q.epoch != p.epoch && !q.dying),
+        _ => None,
+    };
+    let Some(q) = holder else { return ERR };
+    let grants = unsafe { &mut *(&raw mut EXTENT_GRANTS) };
+    // The holder's earlier extents go: one clip at a time a process (and all of them at a take back).
+    for (i, g) in grants.iter_mut().enumerate() {
+        if g.holder == q.epoch {
+            g.holder = 0;
+            q.cspace.retain(|c| !matches!(c.object, Object::Extent(j) if j == i));
+        }
+    }
+    if take_back {
+        return 0;
+    }
+    if blocks == 0 || first >= w.blocks || blocks > w.blocks - first {
+        return ERR;
+    }
+    // A slot free, or one whose holder has ended.
+    let Some(i) = grants.iter().position(|g| g.holder == 0 || !k().procs.iter().flatten().any(|r| r.epoch == g.holder && !r.dying)) else { return ERR };
+    grants[i] = ExtentGrant { holder: q.epoch, first, blocks };
+    let t = mint(Object::Extent(i), RIGHT_SEND, q.epoch);
+    q.cspace.push(CapEntry { token: t, object: Object::Extent(i), rights: RIGHT_SEND });
+    p.write(io_off + 32, &t);
+    0
+}
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -3932,7 +3981,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     // WHY: the op, the name and the length are the caller's: a name as a value's (printable ASCII up to 96 bytes, or a 32-byte address); a write or read whole blocks of at most one UFS command; an open its block count, a seal its length and hash, an info its record's buffer.
     let rel_ok = if raw { rel.len() == 32 } else { !rel.is_empty() && rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) };
     let len_ok = match eop {
-        EOP_OPEN => len == 8,
+        EOP_OPEN => len == 32,
         EOP_WRITE | EOP_READ => len != 0 && len & 4095 == 0 && len <= EXTENT_MAX && (eop == EOP_WRITE || len <= vault_get_max(ep)),
         EOP_SEAL => len == 40,
         EOP_INFO => len == EXTENT_INFO,
@@ -3981,7 +4030,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
             }
         }
     }
-    let rcap = if matches!(eop, EOP_READ | EOP_INFO) { len as u64 } else { 0 };
+    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN) { len as u64 } else { 0 };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
         t.what = VOP_EXTENT as u64 | (len as u64) << 8 | block << 32;
@@ -3990,7 +4039,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
 }
 
 /// The extent ops (x1 bits 0-2 with `STORE_EXTENT`; payloads/vault `extent`).
-/// Open: reserve x4's u64 of blocks under the name (a fresh extent; an open one of the same name is dropped first) → the blocks reserved, ERR when no stretch that long is free.
+/// Open: reserve the u64 of blocks at the start of x4's 32 bytes under the name (a fresh extent; an open one of the same name is dropped first) → the blocks reserved, ERR when no stretch that long is free; the 32 bytes then hold the extent's own SYS_BLOCK capability (`Object::Extent`), or zeros from a vault process that gives none.
 pub const EOP_OPEN: u8 = 0;
 /// Write the buffer's whole blocks at the block in x1's top half, inside the extent, once, not read back → 0.
 pub const EOP_WRITE: u8 = 1;
@@ -5052,12 +5101,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_ARC => arc_call(f, cur, pi),
         SYS_BLOCK => {
             let token = p.read(f.x[0], 32);
+            // A window by name, or a clip's extent given to this process: an extent is the `clips` window narrowed to its own blocks (so every bound below holds it there).
             let window = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
-                Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i),
+                Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i).map(|w| BlockWindow { name: w.name, offset: w.offset, blocks: w.blocks }),
+                Some((Object::Extent(i), r)) if r & RIGHT_SEND != 0 => {
+                    let g = unsafe { (*(&raw const EXTENT_GRANTS))[i] };
+                    (g.holder == p.epoch).then_some(BlockWindow { name: "clips", offset: CLIPS_OFFSET + g.first, blocks: g.blocks })
+                }
                 _ => None,
             };
+            // Bit 3: the vault process gives (or, with bit 4, takes back) a clip's extent of its `clips` window (`extent_give`).
+            let give = (f.x[1] & 8 != 0).then(|| {
+                let named = matches!(p.lookup(&token).map(|i| p.cspace[i].object), Some(Object::Blocks(_)));
+                match &window {
+                    Some(w) if named => extent_give(p, w, f.x[2], f.x[3], f.x[4], f.x[1] & 16 != 0),
+                    _ => ERR,
+                }
+            });
+            let window = window.as_ref();
             let (write, timed, count, at, buf) = (f.x[1] & 1 != 0, f.x[1] & 2 != 0, (f.x[1] >> 8) & 0xFFFF, f.x[2], f.x[3]);
             f.x[0] = match (window, crate::ufs_device::part()) {
+                _ if give.is_some() => give.unwrap_or(ERR),
                 // The owner's fresh start is zeroing the flash (service.rs `vault fresh`): nothing more is read or written before its reset.
                 _ if BLOCKS_SHUT.load(core::sync::atomic::Ordering::SeqCst) => ERR,
                 // Op bit 2 (development, docs/RAW-VIDEO.md): the flash at a queue deeper than one, on the `rawbench` window only (it writes the same bytes everywhere, so never where anything is kept): x4's low 32 bits commands of `count` blocks at consecutive places from `at`, its bits 32-39 the depth (1 to QUEUE_MOST); every command's data the caller's `count` blocks (a write) or the bounce (a read, nothing copied back).
