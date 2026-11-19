@@ -199,6 +199,15 @@ pub struct Rank {
     pub kernel_waits: [core::sync::atomic::AtomicU64; 4],
 }
 
+/// For the stall record (platform.rs `stall_check`): the UFS lock's holder and where it took it, in the kernel lock note's form (bits 0-7 the core + 1, 8-31 the line, 32-63 the file's first four bytes), and the storage locks `core` holds (`RANKS`).
+/// Why (2026-11-19, the Pro, b1016): a watchdog reset with core 0 silent and IRQs masked holding the kernel lock taken at syscall entry, during a RAW clip's direct writes; whether a UFS wait was behind it was not recorded.
+pub fn stall_extra(core: usize) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let site = UFS.site.load(Relaxed);
+    let ufs = UFS.holder.load(Relaxed) as u64 & 0xFF | site << 8;
+    (ufs, RANKS[core & 15].load(Relaxed) as u64)
+}
+
 impl Rank {
     const fn new(rank: u32, name: &'static str) -> Self {
         use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};

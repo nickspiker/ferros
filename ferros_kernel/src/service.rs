@@ -1086,7 +1086,10 @@ fn stall_lines(freq: u64) -> alloc::string::String {
         }
         let holder = (w[0] >> 40) & 0xFF;
         let lock = if holder == 0 { alloc::string::String::from("the lock free") } else { alloc::format!("the lock held by core A#{} from {}", holder - 1, site_text(w[4] >> 8)) };
-        let at = if w[1] == 0 { alloc::string::String::from("it did not answer (interrupts masked)") } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
+        let at = if w[1] == 0 {
+            let ufs = if w[2] & 0xFF == 0 { alloc::string::String::from("the UFS lock free") } else { alloc::format!("the UFS lock held by core A#{} from {}", (w[2] & 0xFF) - 1, site_text(w[2] >> 8)) };
+            alloc::format!("it did not answer (interrupts masked); {ufs}; the stalled core holds the storage locks G#{:X}", w[3])
+        } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
         s.push_str(&alloc::format!("stall ({what}, A#{} caught): core A#{} silent A#{} ms after the last pet, caught by core A#{}, {lock}; {at}\n", w[0] >> 48, (w[0] & 0xFF) - 1, (w[0] >> 16) & 0xFF_FFFF, (w[0] >> 8) & 0xFF));
     }
     s

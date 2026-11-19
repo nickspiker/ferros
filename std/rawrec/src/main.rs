@@ -284,7 +284,8 @@ fn main() {
     let stop_c = if arg(15) == 0 { 85 } else { arg(15) } as u64;
     let verify = arg(16) != 2;
     // The recorder's own loop (MAP, the hand-over, the hashes) on the A715s beside its workers; the writer on the A510s.
-    ferros_clip::ferros::pin(0x00F0);
+    // +18: the recorder's own loop (MAP, the hand-over, its start's allocations) on the A715s (0) or the A510s (1), as Lumis's camera thread may run.
+    ferros_clip::ferros::pin(if arg(18) == 1 { 0x000F } else { 0x00F0 });
     println!("rawrec: A#{fps} a second (fll A#{}, the sensor's frame A#{} ns, every A#{}-th kept: the clip's frame A#{} ns), A#{} frames or A#{secs} s, workers A#{a715} A715 + A#{a510} A510, shutter A#{shutter_us} us, gain byte A#{}, every A#{}-th frame hashed, A#{slots} slots, stop at A#{stop_c} C", pacing.fll, pacing.sensor_ns, pacing.keep, pacing.period_ns, frames_want, arg(12), 1u64 << hash_log2);
 
     // The camera: the binned main at this pacing, with its view.

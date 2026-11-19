@@ -407,7 +407,9 @@ pub fn stall_check() {
     let n = STALLS.fetch_add(1, Relaxed) + 1;
     let ms = now.wrapping_sub(last) * 1000 / f;
     let head = (target as u64 + 1) | (me as u64) << 8 | ms << 16 | (holder as u64) << 40 | n << 48;
-    let words = [head, d[0], d[9], d[1], note_read(0), now];
+    // Not answered (its interrupts masked): the UFS lock's holder and site in the ELR's place, the storage locks the stalled core holds in the LR's.
+    let (ufs, ranks) = crate::process::stall_extra(target);
+    let words = if d[0] == 0 { [head, 0, ufs, ranks, note_read(0), now] } else { [head, d[0], d[9], d[1], note_read(0), now] };
     unsafe {
         for (i, &w) in words.iter().enumerate() {
             write_volatile((STALL + i * 8) as *mut u64, w);
