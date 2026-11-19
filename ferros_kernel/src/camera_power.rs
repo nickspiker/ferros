@@ -189,6 +189,10 @@ fn up() -> bool {
     crate::camera::fe_clocks(&mut rep);
     phy_isolation_bypass();
     crate::camera::sysmmu_bypass(&mut rep);
+    // The front end's clocks, rail and SYSMMUs as this on left them, into the flash log (2026-11-19, the 8a: the engine ran its first descriptor and loch0 never answered, so what the switch set is evidence).
+    for l in core::str::from_utf8(&rep).unwrap_or("").lines().filter(|l| l.starts_with("SYSMMU") || l.starts_with("ISPFE core") || l.starts_with("CMU_") || l.starts_with("VDD_CAM")) {
+        crate::flashlog::line(&alloc::format!("camera: {l}"));
+    }
     // The engine's ring base cleared while it is idle: `down` reads it to know whether a job was ever given.
     wr(PDMA + ferros_cam::PDMA_BASE_LO, 0);
     let fenced = fence_now();

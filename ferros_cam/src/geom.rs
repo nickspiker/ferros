@@ -89,7 +89,7 @@ fn w32(b: &[u8], i: usize) -> u32 {
 }
 
 /// Every write a program (a job's `list_piece`) makes: (the value's word index, its register), in order; op 2 (register, value) pairs and op 1 bursts, as `job::each_write` reads them.
-fn writes(list: &[u8], f: &mut dyn FnMut(usize, u32)) {
+pub fn writes(list: &[u8], f: &mut dyn FnMut(usize, u32)) {
     let words = list.len() / 4;
     let mut i = 0;
     while i < words {

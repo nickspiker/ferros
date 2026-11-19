@@ -486,7 +486,17 @@ fn img_log_say(g: u64) {
     }
     let _ = write!(p, "\n");
     console(g, &p.b[..p.n]);
+    let mut q = Line { b: [0; 256], n: 0 };
+    let _ = write!(q, "camera: the engine at the first answers (+14 place, +58, +5C, +54):");
+    for e in ENGINE_LOG.iter().take(1 << 4) {
+        let v = e.load(Ordering::Relaxed);
+        let _ = write!(q, " {:X}/{:X}/{:X}/{:X}", v >> 48, v >> 32 & 0xFFFF, v >> 16 & 0xFFFF, v & 0xFFFF);
+    }
+    let _ = write!(q, "\n");
+    console(g, &q.b[..q.n]);
 }
+/// The PDMA engine's place and its words +G#58, +G#5C and +G#54 (16 bits each) as each of the first answers found them (2026-11-19, the 8a: the engine stuck past a frame).
+static ENGINE_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 /// The last 2^8 answers, for the console when a stream stops (camera-full-rate, 2026-11-17: which interrupt came last and how late): per answer the counter at its start (above bit 8) and the image status (low byte); and the index it wrote (low 16 bits, G#FFFF none) with the answer's ticks above.
 static TL: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
 static TL_IDX: [AtomicU64; 1 << 8] = [const { AtomicU64::new(0) }; 1 << 8];
@@ -815,6 +825,8 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let k = ANSWERED.load(Ordering::Relaxed) as usize;
     if k < IMG_LOG.len() {
         IMG_LOG[k].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
+        let e = |o: usize| rd(g, ferros_cam::PDMA + o) as u64 & 0xFFFF;
+        ENGINE_LOG[k].store(e(0x14) << 48 | e(0x58) << 32 | e(0x5C) << 16 | e(0x54), Ordering::Relaxed);
     }
     TL[k & 0xFF].store((t0 << 8) | img as u64 & 0xFF, Ordering::Relaxed);
     let mut wrote = 0xFFFFu64;
@@ -1424,6 +1436,7 @@ fn engine_bytes(full: usize, slim: usize) -> u64 {
 
 fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
+    STOPPED.store(0, Ordering::Relaxed);
     let t0 = ferros_sys::now();
     CAM.store(c.id as u64, Ordering::Relaxed);
     let bus = Bus::of(g, c);
@@ -1445,7 +1458,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     };
     // A 1:1 mode replays the 1:1 init in place of the binned one (`cam.<key>.init.full`, docs/CAMERA.md "1:1 on the main"); the CPU's writes and the job stay the binned session's, their geometry rewritten to the 1:1 frame as any mode's is.
     let init = if s.full() { full_init(g, c).ok_or(Fail::Inputs("no cam.<key>.init.full (the 1:1 init) for this camera in the vault"))? } else { init };
+    let prog_bytes = prog;
     let prog = inputs::prog(prog).ok_or(Fail::Inputs("the CPU program is not a CPR2"))?;
+    PROG_IN.store(prog_bytes.as_ptr() as u64, Ordering::Relaxed);
+    PROG_IN_LEN.store(prog_bytes.len() as u64, Ordering::Relaxed);
     let jb = unsafe { &mut *(&raw mut JOB) };
     let jn = get(g, input_key(&mut kb, c, b"pdma"), jb).ok_or(Fail::Inputs("no cam.<key>.pdma for this camera in the vault"))?.len();
     let mode = mode_of(c, init, s)?;
@@ -1689,6 +1705,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     DESC_FLAGS.store(first[0] as u64, Ordering::Relaxed);
     PROG_PA.store(pa + (long + PROG_AT) as u64, Ordering::Relaxed);
     PROG_LEN.store(list_len as u64, Ordering::Relaxed);
+    PROG_VA.store((va + long + PROG_AT) as u64, Ordering::Relaxed);
     SLIM_PA.store(pa + (long + slim_at) as u64, Ordering::Relaxed);
     SLIM_LEN.store(slim_len as u64, Ordering::Relaxed);
     RING_VA.store((va + ring_off) as u64, Ordering::Relaxed);
@@ -1860,6 +1877,12 @@ fn close(g: u64) {
     let c = cam();
     link_say(g);
     fe_say(g, "at the close");
+    if FRAMES.load(Ordering::Relaxed) == 0 {
+        readback_say(g);
+    } else if STOPPED.load(Ordering::Relaxed) != 0 {
+        words_say(g);
+        copies_say(g);
+    }
     say!(g, "camera: closing after A#{} frames, the ring's index round A#{} times\n", FRAMES.load(Ordering::Relaxed), WRAPS.load(Ordering::Relaxed));
     let _ = Bus::of(g, c).write(c.addr, c.stream_off);
     ferros_sys::delay_us(1 << 16);
@@ -2143,7 +2166,10 @@ fn release(g: u64, o: &mut Open, b: usize) {
 }
 
 /// No frame came in `late_us`: said with the words that tell why.
+/// Set when the stream was taken for stopped (`late`): the close then says the front end's words (`words_say`).
+static STOPPED: AtomicU64 = AtomicU64::new(0);
 fn late(g: u64) {
+    STOPPED.store(1, Ordering::Relaxed);
     say!(g, "camera: no frame in A#{} ms (A#{} so far; A#{} answers, A#{} on the line; image status bits seen G#{:X}; ring frames unseen A#{}); closing\n", late_us() / 1000, FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), IMG_SEEN.load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed));
 }
 
@@ -2182,6 +2208,133 @@ fn link_say(g: u64) {
     }
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
+}
+
+/// The open's CPU program (its 'CPR2' bytes, wherever they were read from) and the program's first full copy in the region, for `readback_say`.
+static PROG_IN: AtomicU64 = AtomicU64::new(0);
+static PROG_IN_LEN: AtomicU64 = AtomicU64::new(0);
+static PROG_VA: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the program's copies are still the program (2026-11-19, the 8a: the engine stopped 68 bytes into the third copy it ran): each full copy against the first, every word but the buffer's own address words; and the first descriptors as they stand.
+fn copies_say(g: u64) {
+    let (va, len) = (PROG_VA.load(Ordering::Relaxed) as usize, PROG_LEN.load(Ordering::Relaxed) as usize);
+    let n = RING_BUFS.load(Ordering::Relaxed) as usize;
+    if va == 0 || n == 0 {
+        return;
+    }
+    let w = |b: usize, i: usize| unsafe { core::ptr::read_volatile((va + b * PROG_STRIDE + 4 * i) as *const u32) };
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the program's copies against the first (words differing, the first at):");
+    for b in 1..n {
+        let (mut d, mut first) = (0u32, usize::MAX);
+        for i in 0..len / 4 {
+            if w(b, i) != w(0, i) {
+                d += 1;
+                first = first.min(i);
+            }
+        }
+        let _ = write!(l, " A#{b}: A#{d} at A#{}", if first == usize::MAX { 0 } else { first });
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+    let dv = DESC_VA.load(Ordering::Relaxed) as usize;
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: descriptors 0 to 4:");
+    for e in 0..5 {
+        let d = unsafe { core::ptr::read_volatile((dv + e * 16) as *const [u32; 4]) };
+        let _ = write!(l, " {:X}/{:X}{:08X}/{:X}", d[0], d[2], d[1], d[3]);
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+}
+
+/// The words a stream that stopped is read by (2026-11-19, the 8a): the PDMA engine's five contexts, loch0's common words, its image path's and its PD path's, as they stand.
+fn words_say(g: u64) {
+    const SPANS: [(usize, usize); 8] = [
+        (0x1C39_0000, 0x80), (0x1C39_1000, 0x40), (0x1C39_2000, 0x40), (0x1C39_3000, 0x40), (0x1C39_4000, 0x40),
+        (0x1C32_0000, 0x120), (0x1C32_0400, 0xA0), (0x1C32_2000, 0xA0),
+    ];
+    for &(base, len) in SPANS.iter() {
+        let mut at = 0;
+        while at < len {
+            let mut l = Line { b: [0; 256], n: 0 };
+            let _ = write!(l, "camera: words G#{:X}:", base + at);
+            for k in 0..(1 << 4).min((len - at) / 4) {
+                let _ = write!(l, " {:X}", rd(g, base + at + 4 * k));
+            }
+            let _ = write!(l, "\n");
+            console(g, &l.b[..l.n]);
+            at += 1 << 6;
+        }
+    }
+}
+
+/// A stream that never framed (2026-11-19, the 8a's main: the engine ran its first descriptor, loch0 said nothing): every register the program's first copy and the CPU's setup wrote, read back where the driver may read it, and the ones that do not hold what was written said (a block whose writes were dropped reads back its reset value).
+/// Not the PDMA's own page (the engine's) nor G#1C36 (written by the engine's block loads only); a status word that clears itself reads differently by nature, so this is evidence to read, not a verdict.
+fn readback_say(g: u64) {
+    words_say(g);
+    let fe_ok = |a: usize| grant_of(a).is_some() && !(0x1C39_0000..0x1C39_1000).contains(&a) && !(0x1C36_0000..0x1C37_0000).contains(&a);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let (mut n, mut same, mut shown) = (0u32, 0u32, 0u32);
+    let (va, len) = (PROG_VA.load(Ordering::Relaxed) as usize, PROG_LEN.load(Ordering::Relaxed) as usize);
+    if va != 0 {
+        let list = unsafe { core::slice::from_raw_parts(va as *const u8, len) };
+        let _ = write!(l, "camera: the program read back (reg:written/read):");
+        geom::writes(list, &mut |i, reg| {
+            let a = reg as usize;
+            if !fe_ok(a) {
+                return;
+            }
+            let want = u32::from_le_bytes([list[i * 4], list[i * 4 + 1], list[i * 4 + 2], list[i * 4 + 3]]);
+            let got = rd(g, a);
+            n += 1;
+            if got == want {
+                same += 1;
+            } else if shown < 1 << 4 {
+                shown += 1;
+                if l.n > 200 {
+                    let _ = write!(l, "\n");
+                    console(g, &l.b[..l.n]);
+                    l = Line { b: [0; 256], n: 0 };
+                    let _ = write!(l, "camera:  ");
+                }
+                let _ = write!(l, " {:X}:{want:X}/{got:X}", a & 0xFFFFF);
+            }
+        });
+        let _ = write!(l, "\n");
+        console(g, &l.b[..l.n]);
+        say!(g, "camera: the program's writes read back: A#{n} readable, A#{same} holding what was written\n");
+    }
+    let (p, pl) = (PROG_IN.load(Ordering::Relaxed) as usize, PROG_IN_LEN.load(Ordering::Relaxed) as usize);
+    if p == 0 {
+        return;
+    }
+    let Some(prog) = inputs::prog(unsafe { core::slice::from_raw_parts(p as *const u8, pl) }) else { return };
+    let (mut n, mut same, mut shown) = (0u32, 0u32, 0u32);
+    let mut l = Line { b: [0; 256], n: 0 };
+    let _ = write!(l, "camera: the CPU's writes read back (reg:written/read):");
+    for (a, want) in prog.before.iter().chain(prog.after.iter()) {
+        if !fe_ok(a) || !inputs::cpu_write_allowed(a) {
+            continue;
+        }
+        let got = rd(g, a);
+        n += 1;
+        if got == want {
+            same += 1;
+        } else if shown < 1 << 5 {
+            shown += 1;
+            if l.n > 200 {
+                let _ = write!(l, "\n");
+                console(g, &l.b[..l.n]);
+                l = Line { b: [0; 256], n: 0 };
+                let _ = write!(l, "camera:  ");
+            }
+            let _ = write!(l, " {:X}:{want:X}/{got:X}", a & 0xFFFFF);
+        }
+    }
+    let _ = write!(l, "\n");
+    console(g, &l.b[..l.n]);
+    say!(g, "camera: the CPU's writes read back: A#{n} readable, A#{same} holding what was written (a later write of the same register counts against the earlier)\n");
 }
 
 /// How long the stream may run with nobody asking before the holder is taken for gone: 2^22 us (it was 64 frames, 4.4 s at 14.5 a second; a slit runs 64 frames in 53 ms). Never while a call of its waits for a frame (`Pending`): that holder is asking.

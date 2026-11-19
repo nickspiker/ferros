@@ -8,6 +8,8 @@
 //! - `cam-oracle pdma <dump.log> [--list N] [--base G#1C30_0000]`: the PDMA list decoded into register writes.
 //! - `cam-oracle pdma-image <dump.log> <out.cpr3> [--list N]`: the job, a 'CPR3', at the October fixed addresses ferros_cam job relocates from.
 //! - `cam-oracle cinp <out> <name>=<file> ...`: a device test's inputs as one 'CINP' set, for the camera driver's hand spawn (`--input-file`), so nothing is stored.
+//! - `cam-oracle cinp-split <in.cinp> <dir>`: a set back into its files.
+//! - `cam-oracle prog-text <in.cpr2> <out.txt>` and `prog-build <in.txt> <out.cpr2>`: a CPU program as text and back, for merging captures that lost lines (the 8a's ISP captures, 2026-11-19: docs/CAMERA.md "The 8a's main: the cause").
 
 use std::collections::BTreeMap;
 use std::process::exit;
@@ -596,10 +598,90 @@ fn cmd_cinp(args: Vec<String>) {
     println!("{}: {} bytes", args[0], out.len());
 }
 
+/// `cinp-split <in.cinp> <dir>`: a 'CINP' set's inputs back into one file each, named as in the set.
+fn cmd_cinp_split(args: Vec<String>) {
+    if args.len() != 2 {
+        die("cinp-split <in.cinp> <dir>");
+    }
+    let b = std::fs::read(&args[0]).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    if b.get(..4) != Some(&b"CINP"[..]) {
+        die("not a CINP set");
+    }
+    let mut i = 4;
+    while i < b.len() {
+        let kl = b[i] as usize;
+        let name = String::from_utf8_lossy(&b[i + 1..i + 1 + kl]).into_owned();
+        let l = u32::from_le_bytes(b[i + 1 + kl..i + 5 + kl].try_into().unwrap()) as usize;
+        let v = b.get(i + 5 + kl..i + 5 + kl + l).unwrap_or_else(|| die(&format!("{name}: runs past the set")));
+        let path = format!("{}/{name}", args[1]);
+        std::fs::write(&path, v).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+        println!("{name}: {l} bytes -> {path}");
+        i += 5 + kl + l;
+    }
+}
+
+/// `prog-text <in.cpr2> <out.txt>`: a 'CPR2' as text, one write a line (`B` before the engine, `A` after it), `<B|A> G#<register> G#<value>`, for hand merging captures that lost lines (2026-11-19: the 8a's ISP captures).
+fn cmd_prog_text(args: Vec<String>) {
+    if args.len() != 2 {
+        die("prog-text <in.cpr2> <out.txt>");
+    }
+    let b = std::fs::read(&args[0]).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    let w = |i: usize| -> u32 { u32::from_le_bytes(b.get(i * 4..i * 4 + 4).unwrap_or_else(|| die("truncated")).try_into().unwrap()) };
+    if b.get(..4) != Some(&b"CPR2"[..]) {
+        die("not a CPR2");
+    }
+    let mut at = 2 + w(1) as usize;
+    let mut out = String::new();
+    for tag in ["B", "P", "A"] {
+        let n = w(at) as usize;
+        for k in 0..n {
+            out.push_str(&format!("{tag} G#{:X} G#{:X}\n", w(at + 1 + 2 * k), w(at + 2 + 2 * k)));
+        }
+        at += 1 + 2 * n;
+    }
+    std::fs::write(&args[1], out).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
+}
+
+/// `prog-build <in.txt> <out.cpr2>`: `prog-text`'s text (lines starting `#` and blank lines skipped) back into a 'CPR2'.
+fn cmd_prog_build(args: Vec<String>) {
+    if args.len() != 2 {
+        die("prog-build <in.txt> <out.cpr2>");
+    }
+    let (mut pre, mut prog, mut post) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, line) in read_text(&args[0]).lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = t.split_whitespace().collect();
+        if f.len() < 3 {
+            die(&format!("line {}: <B|P|A> <register> <value>", k + 1));
+        }
+        let pair = (hexnum(f[1]) as u32, hexnum(f[2]) as u32);
+        match f[0] {
+            "B" => pre.push(pair),
+            "P" => prog.push(pair),
+            "A" => post.push(pair),
+            x => die(&format!("line {}: {x} is not B, P or A", k + 1)),
+        }
+    }
+    let mut cpr = b"CPR2".to_vec();
+    cpr.extend_from_slice(&0u32.to_le_bytes());
+    for s in [&pre, &prog, &post] {
+        cpr.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        for &(r, v) in s.iter() {
+            cpr.extend_from_slice(&r.to_le_bytes());
+            cpr.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    std::fs::write(&args[1], &cpr).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
+    println!("{} writes before, {} after -> {}", pre.len(), post.len(), args[1]);
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        die("i2c | init | marks | cpu | pdma | pdma-image | cinp (see the source's header)");
+        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build (see the source's header)");
     }
     let cmd = args.remove(0);
     match cmd.as_str() {
@@ -610,6 +692,9 @@ fn main() {
         "pdma" => cmd_pdma(args),
         "pdma-image" => cmd_pdma_image(args),
         "cinp" => cmd_cinp(args),
+        "cinp-split" => cmd_cinp_split(args),
+        "prog-text" => cmd_prog_text(args),
+        "prog-build" => cmd_prog_build(args),
         _ => die(&format!("unknown command {cmd}")),
     }
 }
