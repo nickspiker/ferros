@@ -1,0 +1,21 @@
+[package]
+name = "ferros-payload-gnss-kepler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gnss_kepler"
+path = "src/main.rs"
+
+[dependencies]
+ferros_sys = { path = "../../ferros_sys" }
+# The link: CHPP's transport and app layer, BETP's records, the fix and the satellites.
+ferros_kepler = { path = "../../ferros_kepler" }
+# The last fix kept as a VSF document, as payloads/gps keeps it.
+ferros_kept = { path = "../../ferros_kept" }
+ferros_heap = { path = "../../ferros_heap" }
+# The rough place and the predicted sky (payloads/gps predict.rs and net.rs, the same files).
+ferros_gnss = { path = "../../ferros_gnss" }
+ferros_sky = { path = "../../ferros_sky" }
+ferros_kist = { path = "../../ferros_kist" }

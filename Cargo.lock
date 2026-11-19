@@ -1052,6 +1052,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-gnss-kepler"
+version = "0.1.0"
+dependencies = [
+ "ferros_gnss",
+ "ferros_heap",
+ "ferros_kepler",
+ "ferros_kept",
+ "ferros_kist",
+ "ferros_sky",
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-gps"
 version = "0.1.0"
 dependencies = [

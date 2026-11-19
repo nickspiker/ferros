@@ -36,6 +36,7 @@ members = [
     "payloads/echo_server",
     "payloads/touch",
     "payloads/gps",
+    "payloads/gnss_kepler",
     "payloads/nfc",
     "payloads/amp",
     "payloads/torch",

@@ -37,7 +37,11 @@ fn set_dat(p: (usize, u32), high: bool) {
     wr(bank + 4, if high { rd(bank + 4) | 1 << n } else { rd(bank + 4) & !(1 << n) });
 }
 /// The GPS driver's power switch (process.rs `POWERS`, `SYS_POWER`): on = the lines' modes (MCU_REQ and nSTANDBY outputs, low; MCU_RESP and HOST_REQ inputs), the three rails on at their programmed voltages, the SPI port's clocks and USI mode; the driver then raises nSTANDBY itself. Off = MCU_REQ and nSTANDBY low, the rails off.
+/// On the 8a the same switch is the KEPLER's (`kepler_power`), whose driver (payloads/gnss_kepler) takes the same grants.
 pub fn power(on: bool) -> bool {
+    if crate::board::akita() {
+        return kepler_power(on);
+    }
     set_dat(MCU_REQ, false);
     set_dat(NSTANDBY, false);
     if on {
@@ -55,4 +59,28 @@ pub fn power(on: bool) -> bool {
         crate::spi::GPS.up();
     }
     ok
+}
+
+/// The 8a's GNSS: the KEPLER core of its S5300 modem (docs/GPS.md "akita's KEPLER"), on the same spi_21 and the same two pins as husky's HOST_REQ and MCU_REQ (zuma-cp-s5300-gnss.dtsi): gpp4-3 AP to GNSS (an output, no pull), gpa5-3 GNSS to AP (its interrupt, pull-down; the driver makes it an EINT).
+/// No rails and no reset here: the core is powered, reset and given its firmware by the CP (gnssd's `pcie_power_on`, `pcie_release_reset`, `pcie_load_firmware` over the modem's `gnss_boot` channel); the 8a's device tree gives it neither husky's gph3 lines nor the sub-PMIC's GNSS LDOs, so neither is touched.
+/// On = the lines' modes and the port's clocks, USI mode and setup, then its clock halved: 3.07 MHz on the wire, under the DT's `spi-max-frequency` of 3.125 MHz. Off = AP to GNSS low.
+fn kepler_power(on: bool) -> bool {
+    const AP2GNSS: (usize, u32) = MCU_REQ;
+    const GNSS2AP: (usize, u32) = HOST_REQ;
+    set_dat(AP2GNSS, false);
+    if on {
+        set_con(AP2GNSS, 1);
+        set_pud(AP2GNSS, 0);
+        set_con(GNSS2AP, 0);
+        set_pud(GNSS2AP, 1);
+        crate::spi::GPS.up();
+        crate::spi::GPS.halved();
+    }
+    true
+}
+
+/// A pin's pull, 4 bits a pin at +8: 0 none, 1 down.
+fn set_pud(p: (usize, u32), v: u32) {
+    let (bank, n) = p;
+    wr(bank + 8, (rd(bank + 8) & !(0xF << (n * 4))) | v << (n * 4));
 }

@@ -1,6 +1,6 @@
 //! gtrace: a freestanding ptrace syscall tracer for aarch64 Linux (Android, no libc, no NDK), for capturing what Broadcom's lhd says to the GPS chip.
 //! Usage: gtrace <out file> <seconds> <program> [args...]
-//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gps, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl, as text lines:
+//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gnss, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl (cpif's GNSS image ioctls with their struct), as text lines:
 //!   <monotonic ns> <tid> <call> fd=<fd> <path> ret=<ret> [<hex bytes>]
 //! After <seconds> it kills the program and exits.
 #![no_std]
@@ -300,6 +300,13 @@ extern "C" fn entry(sp: *const u64) -> ! {
                                 out.dec(a1 as i64);
                                 out.b(b" arg=");
                                 out.dec(a2 as i64);
+                                // cpif's IOCTL_LOAD_GNSS_IMAGE and IOCTL_READ_GNSS_IMAGE (_IOW/_IOR 'o' G#41/G#42, a 16-byte `struct gnss_image`: size u32, offset u32, the buffer's address u64): the struct, so the 8a's firmware load is told by its size and offset (the bytes are /vendor/firmware/kepler.bin's).
+                                if a1 == 0x4010_6F41 || a1 == 0x8010_6F42 {
+                                    let mut st = [0u8; 16];
+                                    let n = peek(tid, a2, &mut st);
+                                    out.b(b" struct=");
+                                    out.hex(&st[..n]);
+                                }
                             }
                             out.b(b" ret=");
                             out.dec(ret);

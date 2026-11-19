@@ -329,6 +329,8 @@ pub struct Datagram<const N: usize> {
     pub cut: u32,
     pub skips: u32,
     open: bool,
+    /// The rest of a datagram that lost a packet, dropped until its last.
+    dropping: bool,
 }
 
 /// What a payload packet did to the datagram being put together.
@@ -350,7 +352,15 @@ impl<const N: usize> Default for Datagram<N> {
 
 impl<const N: usize> Datagram<N> {
     pub const fn new() -> Self {
-        Datagram { buf: [0; N], n: 0, last: None, resends: 0, cut: 0, skips: 0, open: false }
+        Datagram { buf: [0; N], n: 0, last: None, resends: 0, cut: 0, skips: 0, open: false, dropping: false }
+    }
+
+    /// The link was reset: the chip's sequences start again.
+    pub fn restart(&mut self) {
+        self.last = None;
+        self.open = false;
+        self.dropping = false;
+        self.n = 0;
     }
 
     /// A payload packet from the chip.
@@ -359,19 +369,24 @@ impl<const N: usize> Datagram<N> {
             self.resends += 1;
             return Took::Resend;
         }
-        // A sequence that is not the last plus one: a packet was lost between, so the datagram it was part of is not whole; this packet starts afresh unless it is a continuation, which is dropped with it.
+        // A sequence that is not the last plus one: a packet was lost between, so the datagram it fell in is not whole. A first packet starts afresh; a continuation is dropped, with the rest of its datagram up to the packet that ends it.
         let skipped = self.last.is_some_and(|l| l.wrapping_add(1) != h.seq);
         self.last = Some(h.seq);
-        if !self.open {
-            self.n = 0;
-        }
+        let more = h.flags & MORE != 0;
         if skipped {
             self.skips += 1;
             if self.open {
-                self.n = 0;
-                self.open = h.flags & MORE != 0;
-                return Took::Part;
+                self.dropping = true;
             }
+        }
+        if self.dropping {
+            self.open = more;
+            self.dropping = more;
+            self.n = 0;
+            return Took::Part;
+        }
+        if !self.open {
+            self.n = 0;
         }
         let room = N - self.n;
         let k = payload.len().min(room);
@@ -381,8 +396,8 @@ impl<const N: usize> Datagram<N> {
         }
         self.buf[self.n..self.n + k].copy_from_slice(&payload[..k]);
         self.n += k;
-        self.open = h.flags & MORE != 0;
-        if self.open { Took::Part } else { Took::Whole }
+        self.open = more;
+        if more { Took::Part } else { Took::Whole }
     }
 
     /// The datagram just completed.

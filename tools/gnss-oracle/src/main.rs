@@ -7,7 +7,8 @@
 //! A payload that starts a message (not a continuation) begins with CHPP's app header: handle, type, transaction, error, command u16.
 //! Positions: payload bytes are shown only with --hex, and only that many: the session's location reports carry the place.
 //! --betp: instead of packets, the datagrams put back together (ferros_kepler) and the BETP records in them, then a tally by word.
-//! Usage: gnss-oracle <capture.log> [--hex <n>] [--transfers] [--betp]
+//! --gtrace: the input is a gtrace log of gnssd (tools/akita-gnss-trace.sh) instead of an hv capture: whole, nothing lost, the CP's gnss_boot commands as marks.
+//! Usage: gnss-oracle <capture.log> [--hex <n>] [--transfers] [--betp] [--gtrace]
 
 use std::collections::BTreeMap;
 
@@ -117,6 +118,34 @@ fn events(text: &str) -> Vec<Event> {
         let s = f[1][1..].parse::<u8>().unwrap_or(4);
         prev = Some((a, w, s, v));
         apply(a, w, s, v, &mut out, &mut open);
+    }
+    out
+}
+
+/// A gtrace log of gnssd (tools/akita-gnss-trace.sh) as the same events: its writes to `/dev/gnss_ipc` the AP's bytes, its reads the chip's (each read the kernel's whole 1024-byte buffer), every `/dev/gnss_boot` write and read and every GNSS image ioctl as a mark with its bytes (the CP's commands for the core: power, reset, firmware; no place travels there), and gtrace's own `#` lines as marks.
+fn gtrace_events(text: &str) -> Vec<Event> {
+    let unhex = |h: &str| (0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()).collect::<Vec<u8>>();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') {
+            out.push(Event::Mark(line[1..].trim().to_string()));
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let (call, path) = (f[2], f[4]);
+        let bytes = f.last().map(|h| if h.contains('=') { Vec::new() } else { unhex(h) }).unwrap_or_default();
+        if path.contains("gnss_boot") || f.iter().any(|x| x.starts_with("struct=")) {
+            out.push(Event::Mark(format!("{} {} {}", f[0], call, f[4..].join(" "))));
+        } else if path.contains("gnss_ipc") && !bytes.is_empty() {
+            match call {
+                "write" => out.push(Event::Transfer { dir: Dir::Tx, words: (bytes.len() / 4) as u64, bytes }),
+                "read" => out.push(Event::Transfer { dir: Dir::Rx, words: (bytes.len() / 4) as u64, bytes }),
+                _ => {}
+            }
+        }
     }
     out
 }
@@ -280,7 +309,7 @@ fn main() {
     let transfers = args.iter().any(|a| a == "--transfers");
     let betp = args.iter().any(|a| a == "--betp");
     let text = String::from_utf8_lossy(&std::fs::read(&args[1]).expect("read the capture")).into_owned();
-    let ev = events(&text);
+    let ev = if args.iter().any(|a| a == "--gtrace") { gtrace_events(&text) } else { events(&text) };
     // Each direction's stream, and for each byte the event it came in, which orders packets against marks and the other direction.
     let mut stream: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
     let mut owner: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
