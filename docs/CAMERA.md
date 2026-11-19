@@ -203,6 +203,52 @@ Both now run to stream on, SHADOW_UPDATE applies their programs (the go bit G#1C
 Not it: the 8800 block (G#1C32_8800 = 1, lost by the front's session, written by the others), G#1C32_048C (the Pro's front writes G#200: no change), the lanes' G#x30 word (Android's G#137 on both; G#8, the Pro front's, gives the same; G#37 gives a storm of errors and frame starts on every channel, so that word does govern the HS reception).
 Next: the hv snapshot of Android's front stream against ferros's reads of the same list (`tools/akita-hv-camcap.sh` image `snap`, sessions `snap-front` and `snap-uw`, SNAP_LIST keys/akita/captures-2026-11-19/snap-front.list: CMU_TOP's ISPFE_NOC mux and divider, CMU_ISPFE, the links, the csis0, 5 and 6 lanes, loch0). Built (target/agent-akitastream/camcap/snap.img); not flashed: the host's USB card died (xhci 0000:04:00.0, 00:54:25) while the script waited for the 8a's fastboot, with Android up on slot a and boot_a untouched.
 The suspects it would settle: the ISPFE_NOC clock Android's DVFS runs these faster D-PHY sensors at (ferros sets 465 MHz, the Pro main's level), and any PHY or link word set before the late arm.
+(Answered the same day, below: neither. Lines did arrive; loch0 listened to the main's link.)
+
+### The 8a's front and ultrawide stream (2026-11-19, branch akita-dphy)
+
+**The cause: loch0 listened to link 1.** G#1C32_048C is loch0's input word, and its bits 24 to 27 are the CSI link its frames come from. Every capture that kept the write says so: the 8a's main crop G#0100_0200 (link 1), the Pro's ultrawide G#0200_0200 (link 2), the Pro's tele and the 8a's front G#0600_0200 (link 6), the Pro's front and the 8a's ultrawide G#200 (link 0).
+The 8a's front and ultrawide sessions both lost that write (as they lost others, "The 8a's main streams"), and the merged programs carried the main's G#0100_0200. So loch0 waited on link 1 while the front sent on link 6 and the ultrawide on link 0.
+The links were never the problem. The PHY lanes' last-header words read RAW10 long packets on ferros (lane 0 G#2B, the data type; lanes 1 and 2 G#8C and G#14, the word count G#148C = 5260 bytes = 4208 pixels; lane 3 the ECC). Android's link words read the same as ferros's, and +G#6A0 is 0 under Android too, so the "no line" reading was wrong.
+The fix is G#0600_0200 for the front and G#200 for the ultrawide, Android's own live values. The front then took 16 of 16 frames at once.
+- **The ultrawide had a second fault: its job ran one word past Android's.** isp-uw's list 1 ends in a stray word G#1 after the last record. With it, the program is G#182C bytes where Android gives the engine G#1828 (its live PDMA +G#50). The ultrawide took one frame, then LATE_CONFIG (G#10 at G#1C32_0438): every later frame began and never ended. `cam-oracle job-len <in> <out> G#1828` cuts the program and every descriptor's length, and then it streamed.
+- **Not it, measured:**
+  - the ISPFE_NOC clock: Android streams both D-PHY cameras at the cold PLL_SHARED3_D1 over six (CMU_TOP G#2604_10BC = 1, G#2604_18B4 = 5), a quarter of ferros's 465 MHz. A kernel that set Android's clock from the switch on (RAM-reloaded, b271) changed nothing, so it was reverted; the front streams at 465 MHz.
+  - every link, PHY, SYSREG and CMU_ISPFE word in the snapshots: equal to ferros's, but for status.
+  - loch0's G#478 and G#47C (also lost, the main's values carried): Android's front G#7CA00 and G#15F0, ultrawide G#C44A0 and G#14F8. The front streams with the main's 478 and its own 48C. The stored programs carry Android's values all the same.
+- **How it was found** (the hv snapshot, `tools/akita-hv-camcap.sh` image `snap`, sessions `snap-front` and `snap-uw`, all local in keys/akita/captures-2026-11-19):
+  - The first list (whole spans, link 0 and the csis0 lanes read during the front's stream) hung the 8a mid-snapshot ("No kernel logs", nothing usable; snap-front-hang).
+  - Lists cut to registers read safely before then ran whole: husky's 2026-10-21 snapshot list, plus the spans the driver's `words_say` reads while streaming. The second cut had 1288 and 1224 registers, the third 1450 and 1386 with loch0's further words and the blocks at G#1C34 and G#1C35. Every address came back in the list's order.
+  - Ferros's side: the driver's `words_say` at the close, widened by its twelfth spawn byte (2: the frame converter's words at G#1C33, 3: loch0's, G#1C34's and G#1C35's), joined against the snapshot by address.
+  - The diff left loch0's and the frame converter's status (FC ctx3 G#1C33_700C G#8F against G#10: requests pending, as on husky in October) and the LMP's counters (G#1C35_0014, G#1C35_001C zero on ferros). So frames reached neither block. The programs' writes against Android's live values then left exactly G#478, G#47C and G#48C.
+- **The driver now says it**: an open whose loch0 input is not the receiver's link prints "loch0 takes link A#x ..., the receiver started link A#y: no frame can reach it".
+  geom `value` no longer rewrites G#1C32_048C: a front slit turned G#0600 (half of 3072 rows) into a slit's 32 and sent loch0 to link 0 (`LOCH0_INPUT`, host-tested).
+- **Facts found on the way, don't re-derive:**
+  - Both IMX712s count their line in two clocks. The real line is 10.652 us on the front and 10.390 us on the ultrawide (frames 33.88 to 34.04 ms apart at 3187 and 3269 lines), twice what cams had. Every exposure before read half its time; `line_ps` is corrected in cams and camtest.
+  - Both stream their whole 4208-wide array unbinned (G#0900 = 0) and write no digital crop. So ccs `crop` is false for them, and a captured mode's `bin` is 1 where a Sony init's binning mode is 0 (a slit refused "Missing(1032)" before).
+  - Their margin is 10 lines: every Android hold sets the frame 10 past the integration. Their CCS G#1004 words read 0 and 0, so the driver takes the list's margin when the sensor states none.
+  - The stored front's job is front-packed.pdma, so job `AKITA_FRONT_SLOT_*` is its layout: 12, 16 and 40 MiB, from offsets G#40_0000, G#8_0000 and G#E0_0000. The table was another list's, and the stored front would not move into its region (`Unplaced`).
+  - About one open in four answers first with loch0's status 0. Twice that was the stream's only answer: the paths never came on and the line went quiet. Now, when the line is quiet with the paths off but the engine's place is at the index and its progress past the start, the driver enables them anyway. Six of six front view opens ran, one of them saved this way.
+  - Lanes: csis5 (G#1C10_3100, clock lane, data lanes 3200 to 3500) and csis6 (G#1C10_3600) are released by SYSREG G#1C02_0500 bits 5 and 6 (the device tree's `sysreg_csis_reset`, one bit a PHY: the "select" word is the PHYs' reset). The ultrawide's csis0 is bit 0.
+
+**Measured** (the flashed kernel b267's build, no reload; the driver hand-spawned, then stored; camtest and cambench; every stream ended by its close):
+
+| | front (leshen, link 6) | ultrawide (leshen-uw, link 0) |
+|---|---|---|
+| frames | 255 of 255 at bin 8, no error word | 255 of 255 at bin 8, no error word |
+| rate | 29.5 a second (DMA_DONEs 33.88 to 34.02 ms apart) | 29.4 a second (33.89 to 34.04 ms) |
+| cell (2 x 2, thru the view) | 151 232 / 234 211: greens on the anti-diagonal, the dimmer corner (0, 0) blue under the room's warm light: B G / G R (Camera2 BGGR) | 796 729 / 725 630 at 4 s and 16x: R G / G B (Camera2 RGGB) |
+| the shift G#3004 | 3 bits: shifts 5, 6, 7 at 4800 lines gave frames 1.640, 3.279, 6.558 s apart; 8 read as 0 (51.2 ms); a forced 9 stopped the front end | the same: 1.599, 3.198, 6.397 s; 8 read as 0 (49.98 ms) |
+| longest | 65525 lines of 2^7: frames 89.353 s apart; LIST's exposure_max 89.34 s | 65525 lines of 2^7: 87.156 s apart; exposure_max 87.14 s |
+| the plan's ladder | 64 ms to 16.384 s, each frame as asked (16.388 s) | 64 ms to 16.384 s (16.392 s) |
+| slits (64 rows, detached, slim, 192-line frames) | 4099 in 8.38 s, 489 a second (sensor 492), none lost, no error word | 4096 in 8.17 s, 501 a second (sensor 505), none lost |
+
+A forced shift with a frame under the mode's own in shifted lines (1429 of 2^6) stopped the front, as the main's 76 of 2^6 did; the plan never makes one.
+
+**Stored** (the 8a's vault, each read back alike): `camera` (this branch's driver, unmasked capsule, blake3 20ef0f61; the one before saved in keys/akita/cam-inputs-2026-11-19/final/camera-before.capsule.vsf). Also `cam.leshen.{init,prog,pdma,idt}` and `cam.leshen-uw.{init,prog,pdma,idt}`: the inits as before, the programs with Android's G#478, G#47C and G#48C, the ultrawide's job cut to G#1828. The IDTs are stand-ins so both are listed: the Pro's front's for the front, the Pro's ultrawide's for the ultrawide, until the owner's calibration.
+The files are local in keys/akita/cam-inputs-2026-11-19/final (B3SUMS).
+LIST from the vault's driver lists the main, the ultrawide (4208 x 3120, 115.95 degrees) and the front (4208 x 3072, 93.60 degrees). camtest from the vault took 16 frames clean on each of the three.
+Nothing was flashed: no kernel change was needed, and boot_b is untouched. boot_a holds the hv-alone image again (blake3 e6ee3eea, restored after the snapshot images).
 
 ## The gap to "Lumis opens and shows a live preview"
 

@@ -145,9 +145,11 @@ pub const AKITA_ARRAYS: [Array; 3] = [
     // A forced shift (SET 3, a device test) with a frame under the mode's own in shifted lines stops the sensor (76 lines of 2^6, 2026-11-19); the plan's least shift never makes one (whenever it shifts, its integration is over 32735 lines of the shift).
     // No 1:1 readout: Camera2 offers none on the 8a (its 46 degree crop is a mode of its own).
     Array { unit: 1, period: 4, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: Some(Lte { fll_reg: 0x3100, coarse_reg: 0x3100, at: 0, most: 7, frame_bits: 32, byte: true }), side: None },
-    // The ultrawide and the front are Sony IMX712s: their shift is G#3004, one byte, as Android's holds write it (the ultrawide 2 then 5 at 16 s, the front 1 at its 1 s); margins and gain not yet read from the sensor.
-    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 5, frame_bits: 32, byte: true }), side: None },
-    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 1, frame_bits: 32, byte: true }), side: None },
+    // The ultrawide and the front are Sony IMX712s: their shift is G#3004, one byte, as Android's holds write it (the ultrawide 2 then 5 at 16 s, the front 1 at its 1 s).
+    // Their inits read the whole 4208-wide array unbinned (G#0900 = 0) and write no digital crop (G#0408 on): `crop` false, the captured mode's `bin` 1.
+    // Their margin is 10 lines: every one of Android's holds on both sets the frame 10 lines past the integration (i2c-uw-16s and i2c-front-1s, 2026-11-18), and their CCS words at G#1004 read 0 and 0 on ferros (2026-11-19). Gain not yet measured.
+    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: false, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(10), lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 7, frame_bits: 32, byte: true }), side: None },
+    Array { unit: 1, period: 2, full: (0, 0), samsung: false, incs: false, crop: false, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(10), lte: Some(Lte { fll_reg: 0x3004, coarse_reg: 0x3004, at: 0, most: 7, frame_bits: 32, byte: true }), side: None },
 ];
 
 // ---------------------------------------------------------------- long exposures (owner, 2026-11-17: "this needs done": up to 16 s on the main, as Lumis exposes on Android)
@@ -526,7 +528,7 @@ pub enum Error {
 pub const MARGIN: u16 = 1 << 5;
 
 impl Mode {
-    /// The mode an init leaves the sensor in (Android's binned mode); `bin` 2 (every rear camera's init is its binned mode).
+    /// The mode an init leaves the sensor in (Android's binned mode); `bin` 2 where it bins, 1 where its binning mode is off (the 8a's IMX712s).
     pub fn captured(init: &[u8], a: &Array) -> Result<Mode, Error> {
         let p = Page::of(init);
         let g = |r: u16| p.get(r).map(|v| v as u16).ok_or(Error::Missing(r));
@@ -548,7 +550,8 @@ impl Mode {
             llp: g(LINE_LENGTH_PCK)?,
             coarse: g(COARSE_INTEGRATION)?,
             format: opt(CSI_DATA_FORMAT),
-            bin: 2,
+            // WHY the test: CCS binning_mode 0 is no binning; the 8a's IMX712s (front and ultrawide) stream their whole 4208-wide array unbinned (G#0900 = 0, 2026-11-19), every other Sony init here bins (Samsung's G#0900 carries its own codes: left at 2).
+            bin: if binning[0] == 0 && !a.samsung { 1 } else { 2 },
             quiet: false,
         })
     }

@@ -12,6 +12,7 @@
 //! - `cam-oracle prog-text <in.cpr2> <out.txt>` and `prog-build <in.txt> <out.cpr2>`: a CPU program as text and back, for merging captures that lost lines (the 8a's ISP captures, 2026-11-19: docs/CAMERA.md "The 8a's main: the cause").
 //! - `cam-oracle raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame in numbers (each cell place's mean, the fill pattern's lines, a 16 x 12 map of the mean).
 //! - `cam-oracle job-set <in.cpr3> <out.cpr3> <register>=<value> ...`: a program's writes of a register given another value (the 8a's main image path made RAW10 packed).
+//! - `cam-oracle job-len <in.cpr3> <out.cpr3> <bytes>`: the program cut to a length, every descriptor given it (the 8a's ultrawide: a dump that ran one word past the program).
 
 use std::collections::BTreeMap;
 use std::process::exit;
@@ -755,6 +756,62 @@ fn cmd_job_set(args: Vec<String>) {
     std::fs::write(&args[1], &b).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
 }
 
+/// `job-len <in.cpr3> <out.cpr3> <bytes>`: the program (the piece at G#8801_0000) cut to `bytes`, and every descriptor of the ring (the piece at G#8800_0000: its fourth word the length the engine is given) given that length.
+/// For a dump that caught words past the program the engine is given (2026-11-19, the 8a's ultrawide: isp-uw's list 1 ends in one more word, G#1, than Android's live length G#1828 at the PDMA's +G#50, and with it the engine stopped at the second frame).
+fn cmd_job_len(args: Vec<String>) {
+    if args.len() != 3 {
+        die("job-len <in.cpr3> <out.cpr3> <bytes>");
+    }
+    let b = std::fs::read(&args[0]).unwrap_or_else(|e| die(&format!("{}: {e}", args[0])));
+    let want = hexnum(&args[2]) as usize;
+    let rd = |at: usize| u32::from_le_bytes(b.get(at..at + 4).unwrap_or_else(|| die("truncated")).try_into().unwrap());
+    if b.get(..4) != Some(&b"CPR3"[..]) {
+        die("not a CPR3");
+    }
+    // WHY the checks: the length is the caller's; a program can only be cut, never grown past its own bytes, and a length the engine reads in words stays whole words.
+    if want % 4 != 0 {
+        die("the length must be whole words");
+    }
+    let n = rd(4) as usize;
+    let mut out = b[..8].to_vec();
+    let (mut at, mut was, mut ring, mut cut) = (8, 0usize, 0u32, Vec::new());
+    for _ in 0..n {
+        let (pa, len) = (rd(at), rd(at + 4) as usize);
+        let body = &b[at + 8..at + 8 + len];
+        if pa == 0x8801_0000 {
+            if want > len {
+                die(&format!("the program is G#{len:X} bytes, shorter than G#{want:X}"));
+            }
+            was = len;
+            cut = body[want..].to_vec();
+            out.extend_from_slice(&pa.to_le_bytes());
+            out.extend_from_slice(&(want as u32).to_le_bytes());
+            out.extend_from_slice(&body[..want]);
+        } else if pa == 0x8800_0000 {
+            let mut d = body.to_vec();
+            for e in d.chunks_exact_mut(16) {
+                if u32::from_le_bytes(e[12..16].try_into().unwrap()) != 0 {
+                    e[12..16].copy_from_slice(&(want as u32).to_le_bytes());
+                    ring += 1;
+                }
+            }
+            out.extend_from_slice(&pa.to_le_bytes());
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+            out.extend_from_slice(&d);
+        } else {
+            out.extend_from_slice(&b[at..at + 8 + len]);
+        }
+        let padded = (len + 3) & !3;
+        out.resize(out.len() + ((4 - out.len() % 4) % 4), 0);
+        at += 8 + padded;
+    }
+    if was == 0 {
+        die("no program piece at G#8801_0000");
+    }
+    println!("the program G#{was:X} -> G#{want:X} bytes, the cut bytes {cut:02X?}; A#{ring} descriptors given the length");
+    std::fs::write(&args[1], &out).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
+}
+
 /// `raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame as the front end wrote it (MIPI RAW10 packed), said in numbers: the mean of each place of a `period` x `period` cell (2 if not given) with every sample counted, the samples at 0, at 1023 and the driver's pattern, and a 16 x 12 map of the mean over the frame (whole cells), so a frame is read as a scene, a flat field or garbage without a picture (2026-11-19, the 8a's cameras).
 fn cmd_raw10(args: Vec<String>) {
     if args.len() < 4 {
@@ -824,7 +881,7 @@ fn cmd_raw10(args: Vec<String>) {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build | raw10 | job-set (see the source's header)");
+        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build | raw10 | job-set | job-len (see the source's header)");
     }
     let cmd = args.remove(0);
     match cmd.as_str() {
@@ -840,6 +897,7 @@ fn main() {
         "prog-build" => cmd_prog_build(args),
         "raw10" => cmd_raw10(args),
         "job-set" => cmd_job_set(args),
+        "job-len" => cmd_job_len(args),
         _ => die(&format!("unknown command {cmd}")),
     }
 }

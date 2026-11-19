@@ -381,7 +381,8 @@ pub const AKITA_MAIN: Cam = Cam {
 /// akita's ultrawide (leshen-uw): a part the device tree does not name, on hsi2c_3 at G#1A, CIS_CLK0 (the oscillator, as every akita init tells its sensor 24.574 MHz).
 /// It answers G#0712 at the CCS sensor register G#0016 (PROBE, 2026-11-15): a Sony IMX712.
 /// From its init: 4208 x 3120 RAW10 on four lanes, orientation 90 and RGGB in Camera2; CSI link 0 and the csis0 lanes (`rx::RX_START_AKITA_UW`, SYSREG select 1), its job (2026-11-18, isp-uw list 1) writing 16-bit samples, stored RAW10 packed at G#14C0 a line as the main's.
-/// Its timing from its init: a line of 5192 clocks at 24.576 MHz / 3 x 122 (5.195 us), a frame of 3269 lines (16.98 ms), the integration 801 lines; the margin taken as the main's 2^6 until read.
+/// Its timing: a line of 5192 clocks at 24.576 MHz / 3 x 122 counted in two (10.390 us: its frames 33.89 to 34.04 ms apart at 3269 lines, 2026-11-19), the integration 801 lines, the margin 10 (Android's holds).
+/// Streams on ferros since 2026-11-19 (docs/CAMERA.md "The 8a's front and ultrawide stream"): its program's loch0 input on link 0 (G#1C32_048C G#200) and its job cut to Android's G#1828 bytes; 29.4 a second, R G / G B, the shift's ceiling 7 (87.16 s).
 pub const AKITA_ULTRAWIDE: Cam = Cam {
     id: 1,
     name: "ultrawide",
@@ -397,7 +398,7 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
-    streams: false,
+    streams: true,
     rx_start: &crate::rx::RX_START_AKITA_UW,
     rx_stop: &crate::rx::RX_STOP_FRONT,
     ack: &crate::FRAME_ACK,
@@ -407,12 +408,12 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     stride: 0x14C0,
     sizes: job::AKITA_UW_SLOT_BYTES,
     skip: job::AKITA_UW_SLOT_SKIP,
-    line_ps: 5_194_992,
+    line_ps: 10_389_984,
     llp: 5192,
     pll: (3, 122),
     fll: 3269,
     exposure_lines: 801,
-    exposure_max_lines: 3269 - (1 << 6),
+    exposure_max_lines: 3269 - 10,
     cfa: cfa(0, 1, 1, 2),
     black: 64,
     white: 1023,
@@ -425,7 +426,8 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
 
 /// akita's front camera (leshen): the ultrawide's module family, on hsi2c_2 at G#1A, CIS_CLK1 (the oscillator); it answers G#0712 at G#0016 (PROBE, 2026-11-15): a Sony IMX712 as the ultrawide.
 /// Measured from Android's session: 4208 x 3072 RAW10 on four lanes, its image flipped both ways by its init (G#0101 = 3), CSI link 6 and the csis3 lanes (`rx::RX_START_AKITA_FRONT`, SYSREG select G#60), BGGR, orientation 270; its job writes 16-bit samples (format 2, a G#20E0 line), stored RAW10 packed (format 4, the line G#14C0) as the main's.
-/// From its init: a line of 5192 clocks at 24.576 MHz / 3 x 119 (5.326 us), a frame of 3128 lines (16.66 ms), the integration 3118 lines; the margin under the frame taken as the main's 2^6 until the sensor's own is read.
+/// Its timing: a line of 5192 clocks at 24.576 MHz / 3 x 119 counted in two (10.652 us: its frames 33.88 to 34.02 ms apart at 3187 lines, 2026-11-19), the integration 3118 lines, the margin 10 (Android's holds).
+/// Streams on ferros since 2026-11-19 (docs/CAMERA.md "The 8a's front and ultrawide stream"): its program's loch0 input on link 6 (G#1C32_048C G#0600_0200); 29.5 a second, B G / G R, the shift's ceiling 7 (89.35 s).
 pub const AKITA_FRONT: Cam = Cam {
     id: 2,
     name: "front",
@@ -441,7 +443,7 @@ pub const AKITA_FRONT: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
-    streams: false,
+    streams: true,
     rx_start: &crate::rx::RX_START_AKITA_FRONT,
     rx_stop: &crate::rx::RX_STOP_AKITA_FRONT,
     ack: &crate::FRAME_ACK,
@@ -451,12 +453,12 @@ pub const AKITA_FRONT: Cam = Cam {
     stride: 0x14C0,
     sizes: job::AKITA_FRONT_SLOT_BYTES,
     skip: job::AKITA_FRONT_SLOT_SKIP,
-    line_ps: 5_325_958,
+    line_ps: 10_651_916,
     llp: 5192,
     pll: (3, 119),
     fll: 3128,
     exposure_lines: 3118,
-    exposure_max_lines: 3128 - (1 << 6),
+    exposure_max_lines: 3128 - 10,
     cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,

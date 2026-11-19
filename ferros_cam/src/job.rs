@@ -76,9 +76,10 @@ pub const AKITA_MAIN_SLOT_SKIP: [u64; SLOTS] = [
     0x6_0000, 0x30_0000, 0, 0x80_0000, 0xF7_0000, 0xA8_0000, 0x20_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
-/// akita's front camera's outputs, the same way, from list 2 of the same capture (target/cam/akita-front.pdma, local): no PD output in its program.
+/// akita's front camera's outputs, the same way, from the job it streams with and the vault holds (keys/akita/cam-inputs-2026-11-19/front/front-packed.pdma, local: `cam-oracle pdma-image --own-image`, RAW10 packed), its slots as that build printed them: no PD output in its program, slot 3 (G#1C35_51C8's output) 40 MiB as the main's slot 6.
+/// The table before (list 2 of 2026-11-18, ten slots) was another job's: with it the stored front would not move into its region (`Unplaced`, 2026-11-19).
 pub const AKITA_FRONT_SLOT_BYTES: [u64; SLOTS] = [
-    16 * MIB, 12 * MIB, 0, 4 * MIB, 2 * MIB, 8 * MIB, 2 * MIB, 8 * MIB, 12 * MIB, 12 * MIB, 0, 0, 0, 0, 0, 0,
+    12 * MIB, 16 * MIB, 0, 40 * MIB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 /// akita's ultrawide's outputs: list 1 of the 2026-11-18 capture (isp-uw, cam-oracle pdma-image `--own-image`, `job-set` for RAW10 packed: keys/akita/cam-inputs-2026-11-19/uw, local), each slot from the lowest offset its job names to its granule's end, but slot 4 (G#1C35_51C8's output, the one the main's slot 6 measured at about 32.4 MiB): 40 MiB.
@@ -91,7 +92,7 @@ pub const AKITA_UW_SLOT_SKIP: [u64; SLOTS] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 pub const AKITA_FRONT_SLOT_SKIP: [u64; SLOTS] = [
-    0x10_0000, 0x47_8000, 0, 0xD6_0000, 0xE6_D000, 0x88_0000, 0xFF_4000, 0x98_0000, 0x50_0000, 0x48_0000, 0, 0, 0, 0, 0, 0,
+    0x40_0000, 0x8_0000, 0, 0xE0_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
@@ -704,12 +705,12 @@ mod tests {
         assert!(3000 * 0x13C0 <= IMAGE_BYTES);
     }
 
-    /// akita's local jobs (keys/akita/cam-inputs-2026-11-19/main-packed.pdma, target/cam/akita-front.pdma, built with `--own-image`), when they are on this machine: every address each names lands in its region, the image body in slot 2's ring buffer 0, and the program writes the image once.
+    /// akita's local jobs (keys/akita/cam-inputs-2026-11-19/main-packed.pdma and front/front-packed.pdma, built with `--own-image`), when they are on this machine: every address each names lands in its region, the image body in slot 2's ring buffer 0, and the program writes the image once.
     #[test]
     fn the_local_akita_jobs() {
         for (path, sizes, skip, image, regs, slots) in [
             ("/mnt/Harbor/Code/keys/akita/cam-inputs-2026-11-19/main-packed.pdma", &AKITA_MAIN_SLOT_BYTES, &AKITA_MAIN_SLOT_SKIP, buffer_bytes(3472, 0x16C0), 25, (1u32 << 7) - 1),
-            ("/mnt/Harbor/Code/ferros/target/cam/akita-front.pdma", &AKITA_FRONT_SLOT_BYTES, &AKITA_FRONT_SLOT_SKIP, buffer_bytes(3072, 0x14C0), 20, (1u32 << 10) - 1),
+            ("/mnt/Harbor/Code/keys/akita/cam-inputs-2026-11-19/front/front-packed.pdma", &AKITA_FRONT_SLOT_BYTES, &AKITA_FRONT_SLOT_SKIP, buffer_bytes(3072, 0x14C0), 20, (1u32 << 4) - 1),
         ] {
             let Ok(orig) = std::fs::read(path) else { continue };
             for n in [1u64, 4] {
