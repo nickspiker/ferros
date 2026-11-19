@@ -183,6 +183,46 @@ const DEV_SLIT_SHUTTER: u32 = 3;
 const DEV_FULL: u8 = 1 << 5;
 /// Development, the second knobs byte: open at a 2^10 s shutter (1024 s, the longest the main has been measured to honour), so a long frame is in flight for the leave test (lumis-leave-long: sent behind, the camera closed at once).
 const DEV_LONG: u8 = 1 << 6;
+/// Development, the second knobs byte: never send the integrator's settings to the driver (gain, shutter, focus stay the open's), to tell a camera's own rate from what a setting does to it.
+const DEV_NO_SET: u8 = 1 << 7;
+/// Development, the fourth knobs byte (the input's seventeenth): the 16th frame's mean of each place in a 4 x 4 cell over the middle of the frame (the colour filter's table: a Bayer cell's two greens alike, a quad's 2 x 2 blocks alike); and a VSF 8B save at the 32nd (Lumis's developed frame, kept in the vault as any save).
+const DEV_CELLS: u8 = 1 << 0;
+const DEV_SAVE: u8 = 1 << 1;
+/// Development, the input's 18th to 21st bytes: the shutter Lumis opens at, in us (u32 LE; 0 the open's own), for whole frames and slits alike (DEV_SLIT's own seed then gives way); and the 22nd: which settings Lumis sends the driver, bit 0 the gain, 1 the shutter, 2 the focus (0 all, as ever), to find which of them a camera answers by changing its frame.
+fn dev_shutter_us() -> u32 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b) as usize;
+    let at = 4 + camera::MODE_BLOCK;
+    if n >= at + 4 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) } else { 0 }
+}
+fn dev_sets() -> u8 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b) as usize;
+    let at = 8 + camera::MODE_BLOCK;
+    if n > at { b[at] } else { 0 }
+}
+fn dev_knobs4() -> u8 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b);
+    if n > 3 + camera::MODE_BLOCK { b[3 + camera::MODE_BLOCK] } else { 0 }
+}
+
+/// The mean of each place of a 4 x 4 cell over the middle half of the frame's columns and 2^8 of its rows (`DEV_CELLS`), said on the console as four rows of four.
+fn say_cells(name: &str, rows: &dyn lumis_core::RowSource, width: usize, height: usize) {
+    let mut sums = [[0u64; 4]; 4];
+    let mut counts = [[0u64; 4]; 4];
+    let mut row = vec![0u16; width];
+    let y0 = (height / 2 - (1 << 7)) & !3;
+    for y in y0..y0 + (1 << 8) {
+        rows.read_row(y, &mut row);
+        for x in (width / 4) & !3..(3 * width / 4) & !3 {
+            sums[y & 3][x & 3] += row[x] as u64;
+            counts[y & 3][x & 3] += 1;
+        }
+    }
+    let table: Vec<String> = (0..4).map(|r| (0..4).map(|c| format!("{:5}", sums[r][c] / counts[r][c])).collect::<Vec<_>>().join(" ")).collect();
+    println!("lumis: development: camera {name}'s 4 x 4 cell means (rows 0 to 3, from row {y0}): {}", table.join(" / "));
+}
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
 /// Development, the third knobs byte (the input's sixteenth, after the second): with `DEV_OPEN`, open readout k - 1 of the list as `list` prints it, 0 the first (or `DEV_FULL`'s); for a run over every camera and mode with no tap.
@@ -590,7 +630,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut turns = Turns::default();
     let first = if dev_slit {
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
-        let shutter_ns = (1_000_000_000u64 >> 11) << (2 * ((dev_knobs2() >> DEV_SLIT_SHUTTER) & 3));
+        let shutter_ns = match dev_shutter_us() {
+            0 => (1_000_000_000u64 >> 11) << (2 * ((dev_knobs2() >> DEV_SLIT_SHUTTER) & 3)),
+            us => us as u64 * 1000,
+        };
         println!("lumis: camera {}: development: the shutter {shutter_ns} ns", cam.name);
         camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0, cfa_period: cam.cfa_period }
     } else {
@@ -613,6 +656,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         // A dark map opens at lumis_core's dark seed (16 s, Android's longest) or the camera's longest if shorter: the combined driver offers years (the main's shift modes), and a calibration must not open on one. The shutter control keeps the whole range.
         Some(dark) => (max_iso, if dark { (cam.exposure_max as f64).min(app::DARK_CALIBRATION_SHUTTER_NS) } else { cam.exposure_min as f64 }),
         None if dev_knobs2() & DEV_LONG != 0 => (iso(first.gain), ((1u64 << 10) * 1_000_000_000) as f64),
+        None if dev_shutter_us() != 0 => (iso(first.gain), dev_shutter_us() as f64 * 1000.),
         None => (iso(first.gain), first.exposure_ns as f64),
     };
     let setup = CameraSetup {
@@ -820,6 +864,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sweep_last = now;
             sweep_frames += 1;
         }
+        let k4 = dev_knobs4();
+        if let (true, Got::Frame(head, Taken::View(rows))) = (k4 & DEV_CELLS != 0 && frames == 16, &got) {
+            say_cells(&cam.name, rows, head.width, head.height);
+        }
+        if k4 & DEV_SAVE != 0 && frames == 32 {
+            println!("lumis: development: a VSF 8B save asked");
+            integrator.header[lumis_core::shared_memory::SAVE_FORMAT_IDX] = lumis_core::shared_memory::SAVE_FORMAT_VSF8;
+            integrator.header[FLAGS_IDX] |= MANUAL_SAVE_BIT;
+        }
         let (iso, shutter_ns, focus) = match got {
             Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
             // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
@@ -829,6 +882,22 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
+        if dev_knobs2() & DEV_NO_SET != 0 {
+            sent = (iso, shutter_ns, focus);
+        }
+        // Only the settings asked for go (`dev_sets`); the rest are taken as sent.
+        let only = dev_sets();
+        if only != 0 {
+            if only & 1 == 0 {
+                sent.0 = iso;
+            }
+            if only & 2 == 0 {
+                sent.1 = shutter_ns;
+            }
+            if only & 4 == 0 {
+                sent.2 = focus;
+            }
+        }
         if iso != sent.0 && !set(camera::SET_GAIN, gain_of(iso)) {
             println!("lumis: the camera did not take gain {} (ISO {iso})", gain_of(iso));
         }
@@ -1438,6 +1507,8 @@ fn main() {
         lumis_core::set_save_cores(|| {
             sys::pin(CORES_WORKERS);
         });
+        // A save on all four A715s, a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
+        lumis_core::platform::set_save_threads(4);
         println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     let vault = open_vault();
