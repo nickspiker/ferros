@@ -35,3 +35,4 @@ Related: [[sensor_mailboxes]], [[gpu_role_layers]], [[feedback_keep_devices_busy
   - Chosen: a HOST-ONLY tool, `tools/clip-export`, writing a CinemaDNG sequence that keeps the mosaic lossless.
   - It's the one approved foreign encoder, for grading only; nothing on a device writes DNG.
   - A Resolve decode plugin is being researched as the ideal.
+- **Grading belongs in Opsin** (owner: "it should be building that into Opsin"). Opsin (/mnt/Harbor/Code/opsin) opens, plays and grades VSF RAW clips with its view ops as appended generations, and exports a CinemaDNG sequence for other tools. The codec's decoder is proposed for vsf's raw-video branch, so every VSF reader has it.
