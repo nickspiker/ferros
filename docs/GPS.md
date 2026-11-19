@@ -405,9 +405,25 @@ The driver (payloads/gps `time_record`) builds the time message from the record 
 The fix is written to `gps.last` (identity class) as it comes, so the next start has the place.
 The replay's windows carry Broadcom's LTO predictions made on 2026-11-19, good for some days: the broadcast ephemerides below replace them.
 
+## Broadcast ephemerides in the windows: measured (2026-11-19, 09:42-09:55)
+
+`gps-trace brdc` on o2's replay with BKG's BRDC fetched at 17:23 UTC: the 30 GPS records' ephemeris and clock words from the latest broadcast set of each satellite, the GLONASS group dropped, Broadcom's LTO in none of it; the driver putting in the time and the place as above. On the Pro (b1006, indoors), hand-spawned with input 00 (stored as `gps.replay` for the test, put back after):
+
+| Run | Windows | First fix |
+|---|---|---|
+| 0 | BRDC, GPS only | none in 192 s (one frame not acked in time; the place's circle 23 km) |
+| control | the rebuild with the LTO values, frames rebuilt | none in 128 s |
+| control | the stored o2 replay as it is | 55.1 s |
+| 1 | BRDC, GPS only | **37.0 s**, 6 satellites, ±48 m |
+| 2 | BRDC, GPS only | none in 128 s |
+
+The chip took and used ephemerides built from the IGS's broadcast sets alone: run 1's fix had no other orbit source (the chip's rails go off between runs).
+Not yet reliable: the same half hour the LTO replay slowed from 14-33 s to 55 s and its frame-identical rebuild found nothing in 128 s, so the sky indoors had worsened; and the GLONASS windows (24 satellites more in gpsd's session) are left out. Next: GLONASS (RINEX `R` records, PZ-90 state vectors, turned into the same Kepler form as gpsd does) and Galileo windows, then the fetch below.
+The test replay: keys/husky/captures/gps-2026-11-19/brdc-gps.gnr (local).
+
 ## Proposed: broadcast ephemerides for the chip (2026-11-19, for the owner)
 
-If the chip fixes from BRDC-built windows (the test is `gps-trace brdc` on the stored replay, GLONASS dropped):
+Now that the chip fixes from BRDC-built windows (above), the path to keep them fresh:
 - **Where from:** the IGS's broadcast navigation files, every constellation, merged from receivers worldwide and updated every 15 minutes: BKG (`https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<year>/<day>/BRDC00WRD_S_<year><day>0000_01D_MN.rnx.gz`, 0.7 MB gzip for the day so far) and ESA (`ftp://gssc.esa.int/gnss/data/daily/<year>/<day>/`). Neither answers plain HTTP, ferros has no TLS, so the fetch is fgtw.org's: the worker fetches BKG (ESA the second source, the single egg rule: the two must agree on every satellite's √A, e and i0 or the satellite is left out), keeps the GPS (and later Galileo, BeiDou) LNAV sets whose toe is within 2 hours of now, and answers a plain HTTP `POST` with a signed VSF document (the seed's key, as its other replies): a section `gps_eph` with `fetched` (Eagle time) and one field per quantity, a column each (`prn`, `week`, `toe`, `toc`, then `af0` … `idot` as `f6` in SI units), the way `gps.orbits` keeps CelesTrak's elements. About 32 × 22 numbers, under 8 KB. The host can do the same over USB (`ferros-bridge`) until the worker has it.
 - **How often:** a set is good for its 4-hour fit interval; the driver asks when its kept set's newest toe is more than 2^12 s behind the clock (about hourly while GPS is in use), never on a timer of its own: at a start, and when a fix's chip time shows the kept set has gone stale.
 - **Kept as:** `gps.eph` in the vault, device class (orbits are public), written whole when fetched (every change hits disk), its signature checked before it is kept.
