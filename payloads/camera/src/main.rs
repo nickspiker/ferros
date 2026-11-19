@@ -1109,8 +1109,13 @@ fn exposure_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, p: &ccs::P
             w16(ccs::LINE_LENGTH_PCK, p.llp)?;
         }
         if let Some(l) = t.lte {
-            w16(l.fll_reg, l.word(p.shift))?;
-            w16(l.coarse_reg, l.word(p.shift))?;
+            if l.byte {
+                // Sony's shift, one byte at its register alone (ccs `Lte::byte`): a 16-bit write would also write the register after it.
+                bus.write(c.addr, &[(l.fll_reg >> 8) as u8, l.fll_reg as u8, l.word(p.shift) as u8])?;
+            } else {
+                w16(l.fll_reg, l.word(p.shift))?;
+                w16(l.coarse_reg, l.word(p.shift))?;
+            }
         }
         w16(ccs::COARSE_INTEGRATION, p.coarse)?;
         if p.fll != now.fll {
@@ -1500,7 +1505,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     step!(g, "camera: {}: switch on in A#{} ms; sensor G#{:02X}{:02X}; init A#{w} writes, A#{r} reads in A#{} ms (open step: init done)\n", c.name, powered / 1000, id[0], id[1], ferros_sys::us_since(t_init) / 1000);
     let arr = &ccs::ARRAYS[c.id as usize];
     if MEASURE.load(Ordering::Relaxed) == 2 {
-        if let Some(l) = arr.lte {
+        // Samsung's two 16-bit words only: the test writes whole words, which on a one-byte shift (Sony's G#3100) would write the register after it.
+        if let Some(l) = arr.lte.filter(|l| !l.byte) {
             shift_width(g, &bus, c, l);
         }
     }
