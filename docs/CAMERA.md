@@ -1467,6 +1467,7 @@ A gain SET equal to the gain already set writes nothing (`Open::gain_code`, the 
 | 4096 | `[0]` | 799 / 794, every 1259 us |
 | 8192 | `[0]` | 799 / 794, every 1259 us |
 Regressions with this driver: the main's 64-row slit 1231 a second, clean; the tele's 557 a second, G#404 at frame 0 alone, as "Slits on every camera" measured.
+**Stored** on the Pro: `camera` (capsule 555697 bytes, object 913e2b19b31cd716; the vault's one before, 530633 bytes, the cam-slits-all build, kept in target/agent-uwgain/camera-before.capsule.vsf), read back and compared equal; started on demand it said codes 7 to 1008, refused 1024, and ran the slit at 794 a second.
 
 **The 8a.** Its main is the same IMX787 (`AKITA_ARRAYS[0]`, its gain words read alike), so its slits (740 a second) likely do the same at codes 0 and 1: unmeasured, its least left at 1024. Its ultrawide and front (IMX712) have no gain model in the list yet; when they stream, a cambench gain ladder from code 0 in a slit (`...010400...` with +31 `80`-steps) says whether they need a least of their own.
 
