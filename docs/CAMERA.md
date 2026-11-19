@@ -1522,7 +1522,7 @@ Regressions with this driver: the main's 64-row slit 1231 a second, clean; the t
 - A hand-spawned driver without the stay byte (input `00`) ends at camtest's LIST, and camtest's OPEN then runs the vault's driver: every camtest run needs `01` and the driver killed after its own CLOSE.
 - A slit opened within 3 minutes of a boot, or while rawbench writes, stopped at its first or 840th frame (LATE_CONFIG); cambench's 512 MiB slit ring, grown for the first SLITS, is the suspect, so a map-only run now keeps one slit.
 
-### The tele's orientation (2026-11-19, open)
+### The tele's orientation (2026-11-19; settled below, "The tele flipped, stored")
 
 The Lumis session: every tele readout stands mirrored left to right against the main (NCC 0.935 mirrored, 0.40 straight).
 Android's HAL writes the tele's stream on as `01 00 01 02`, CCS image_orientation G#0101 = 2 (the vertical flip), at all three readouts (keys/husky/captures/ftrace-2026-11-18); ferros's is `01 00 01 00`, and no tele init writes G#0101.
@@ -1535,6 +1535,45 @@ Measured back to back on the 22-degree readout (one scene, minutes apart):
 - The sensor takes the bit (CAPS reads G#0101 = 2) and the rows turn over: the bright bands move to the bottom and the cell's rows swap, so the mosaic as ferros reads it goes from G B / R G to R G / G B, not the calibration's B G / G R.
 - But the frame is not the same scene turned over: the column bands change shape and the bright part reads 2.5 times as bright at the same header exposure and gain. A vertical flip alone explains neither.
 - So nothing is changed in the stored driver: Lumis's NCC on a frame with byte 14 = 4 (the driver hand-spawned) says whether that readout matches the main, and the 11-degree and 48.8 MP readouts are untried. Writing G#0101 = 2 before the init, or mid-stream in the hold, is untried (those runs went to the vault's driver, the trap above).
+- (Later the same day, below: both "A vertical flip alone explains neither" points were camtest's, not the sensor's. Its bands and its mean read one place of the 2 x 2 cell, the place the flip turns from green to red.)
+
+### The tele flipped, stored (2026-11-19, branch tele-orientation)
+
+The Lumis session measured on the Pro with byte 14 = 4 (logs in the lumis-slit worktree's target/runs/tele): with G#0101 = 2 all three tele readouts match the main straight (22 degrees NCC 0.947, 48.8 MP 0.947, 11 degrees against 22 degrees 0.997); with 0 they read mirrored.
+The tele's quarter turn puts the sensor's rows across the screen, so the sensor's vertical flip is the screen's left-right mirror.
+The Pro b1003 (the flashed forge kernel), every driver hand-spawned from target/agent-teleorient/bin with the stay byte, one open each, every stream ended by its own close; logs in target/agent-teleorient/runs.
+
+**The 2.5 times was camtest's sampling, not the sensor.**
+camtest's bands of rows and columns read every 16th sample of every 16th line, and its "mean sample" every 65th byte of every 16th line: x and y always even, so always the cell's top left place, one colour.
+Unflipped (G B / R G) that place is green; flipped (R G / G B) it is red.
+The run of the table above read R 400, G 155, B 114 in its cell table: red over green is 2.5, the "2.5 times as bright".
+The column profile changed because it was the red channel's profile against the green channel's.
+camtest now reads whole 2 x 2 cells at all ten bits: its bands, an 8 x 8 grid of them and the frame's mean (also the view's MAP mean and the long-exposure ladder's view mean).
+
+Measured with it, back to back, the 22-degree readout, the same scene (whatever was in view), the init's 32.56 ms and 16x on the first frame, then SET to 16 ms and 8x (camtest `08010000030403`, the driver `01` and 12 zero bytes then `0B` (0) or `0C` (2)):
+| run | G#0101 | cell rows 0 and 1, first frame | whole cells: frame mean, first / at 16 ms 8x | bands of columns, first frame |
+|---|---|---|---|---|
+| a0 | 0 | `199 141` / `498 197` | 260 / 135 | 265 280 285 284 273 257 234 205 |
+| a1 | 2 | `494 198` / `197 139` | 259 / 134 | 264 279 284 282 272 255 232 204 |
+| a2 | 0 | `196 138` / `498 195` | 259 / 134 | |
+| a3 | 2 | `494 195` / `194 137` | 257 / 134 | |
+- The grid's rows turn over and nothing else: a0's top grid row `336 402 436 450 454 449 427 380` is a1's bottom `337 403 436 450 454 449 428 381`, and so on down; the columns keep their order and their values.
+- Each colour, flipped against not: red 494 against 498, green 197 against 198, blue 139 against 140 (a0 to a3, the first frames): within 1 % of black-subtracted signal, as one or two rows of the window at a steep vertical gradient would make. No brightness difference to explain.
+- **The sensor's words differ in two places only.** The driver's fourteenth byte with bit 3 reads G#0000 to G#10FF back after the first frame (`regs_say`); of its 32-byte rows, those that differ between two runs of the same flip (G#0440, 0580, 0680, 0760 to 07A0, 08C0, 09A0 to 09E0, 0BE0, 0D40, 0F80) are read noise of unimplemented space; between the flips only G#0101 (0 to 2) and G#0006 (0 to 2) differ. G#0006 is CCS pixel_order: the sensor names its order GRBG unflipped and BGGR flipped, the transpose of what ferros's cell tables read (G B / R G and R G / G B: red is the place a red-lit scene lights most), so the flip moves its own report the same way and no other register.
+
+**Built:** ferros_cam cams `TELE.stream_on` = `01 00 01 02` (every tele readout: the 22 degrees, the 11 degrees and the 48.8 MP replay the camera's stream on, as does a slit and the exposure cut's stream on), `TELE.cfa` R G / G B; the driver's fourteenth byte keeps 3 (G#0101 = 0) and 4 (2) as an A/B, and bit 3 adds `regs_say`.
+The cell tables with the stream on as built (the driver `01`, camtest `08010000030403` with kind 0, 8, 9 in the eighth byte; at 16 ms 8x):
+| readout | cell table, rows 0 to 3 | mosaic |
+|---|---|---|
+| 22 degrees (the stored driver, on demand) | `257 94 257 93` / `93 79 93 79` / `257 93 257 93` / `93 79 93 79` | R G / G B |
+| 11 degrees (kind 8) | `309 103 308 102` / `102 83 102 85` / `306 102 309 102` / `102 84 103 82` | R G / G B (remosaiced Bayer) |
+| 48.8 MP (kind 9) | `258 255 95 93` / `254 253 93 94` / `92 93 80 78` / `93 94 79 78` | the quad, blocks R G / G B |
+Each link clean (+14 G#0, +1C G#0), no error word.
+- An aside, not chased: at the same header exposure and gain the 48.8 MP reads about 2.8 times the 22 degrees' signal over black (whole-cell means 257 and 133 at 16 ms 8x). Two readouts with their own inits, so their own analogue settings; Lumis's NCC does not see it.
+
+**The slit** (cambench `03034000000000000000000002800000`, the 64-row binned slit, 2048 slits added into u16): 557 a second (the sensor 559, the front end 555), none lost to the ring, none read over; G#404 at frame 0 alone and the link's +1C G#40, as "Slits on every camera" measured. CAPS: y G#BA0 to G#C1F, the window symmetric about the array's middle, so the flip reads the same rows.
+
+**Stored** on the Pro: `camera` (capsule 560345 bytes, blake3 32829448fc96da9c; the vault's one before, 555697 bytes, the uw-gain-slit build, kept in target/agent-teleorient/camera-before.capsule.vsf), read back and compared equal; started on demand (camtest alone) it read the 22 degrees R G / G B, the link clean.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 

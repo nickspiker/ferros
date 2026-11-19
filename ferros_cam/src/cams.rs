@@ -267,7 +267,8 @@ pub const FRONT: Cam = Cam {
 /// The receiver: CSI link 6 (G#1C0A), the csis3 lanes, SYSREG G#20 and G#4 (`RX_START_TELE`, its captured stop `RX_STOP_TELE`); the acknowledgement the main's (its frame handler reads back the main's 28 words, no G#1C35_0148).
 /// Android's job writes the image as 16-bit samples (loch0's format G#1C32_0550 = 2, stride G#1F80); the job ferros stores is made RAW10 packed as every other camera's (format 4, stride G#13C0, tools/oracle-isp image `--set`).
 /// Its line, measured (the Pro, 2026-11-18 night): 5568 clocks at 24.576 MHz / 4 x 371 over vt_pix_clk_div 5 at two pixels a clock (911.7 MHz), 6.1068 us: ferros took its 5457-line frames 33.24 to 33.40 ms apart (30 a second; Lumis on Android showed 15, its own pace), and Android's 16 s hold (40960 lines of 2^6) is 16.0 s at it. Lumis's integration at its open 5332 lines; Android's 16 s is the main's shift words with the frame the integration plus 24.
-/// Its mosaic, measured on ferros (2026-11-18 night, a 2 s frame in the owner's red-lit room, the cell table): rows `104 79 104 80` / `164 104 164 104`, so G B / R G (R 164, B 79, G 104; the same room read the front's R over G over B, as its calibration said). Its calibration capture (cam 4, 4032 x 3024) says B G / G R: a column apart, so Android's RAW stream for that capture ran another window or flip than Lumis's 22-degree session the init came from; ferros reads as the init sets it. Black 64, white 1023, orientation 6 (a quarter turn) from that capture.
+/// Its stream on writes the image orientation G#0101 = 2 (the vertical flip), as Android's HAL writes it at all three of its readouts (`01 00 01 02`, keys/husky/captures/ftrace-2026-11-18; no tele init writes G#0101): with 0 every tele readout stood mirrored left to right against the main in Lumis (NCC 0.935 mirrored, 0.40 straight), with 2 all three match the main straight (22 degrees NCC 0.947, 48.8 MP 0.947, 11 degrees against 22 degrees 0.997; the Lumis session, 2026-11-19, docs/CAMERA.md "The tele's orientation"). The tele's quarter turn puts the sensor's rows across the screen, so its vertical flip is the screen's mirror.
+/// Its mosaic with that flip, measured on ferros (2026-11-19, the cell table): R G / G B, the rows of the G B / R G it read unflipped (2026-11-18 night, a 2 s frame in the owner's red-lit room: rows `104 79 104 80` / `164 104 164 104`) turned over; the 48.8 MP quad's 2 x 2 blocks the same. Its calibration capture (cam 4, 4032 x 3024) says B G / G R: a column from the unflipped G B / R G, so Android's RAW stream for that capture ran another window or flip than Lumis's 22-degree session the init came from; ferros reads as the init and the stream on set it. Black 64, white 1023, orientation 6 (a quarter turn) from that capture.
 pub const TELE: Cam = Cam {
     id: 3,
     name: "tele",
@@ -277,7 +278,7 @@ pub const TELE: Cam = Cam {
     addr: 0x2D,
     id_reg: [0x00, 0x00],
     id_val: [0x08, 0xD5],
-    stream_on: &[0x01, 0x00, 0x01, 0x00],
+    stream_on: &[0x01, 0x00, 0x01, 0x02],
     stream_off: &[0x01, 0x00, 0x00, 0x00],
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
@@ -299,7 +300,7 @@ pub const TELE: Cam = Cam {
     fll: 5457,
     exposure_lines: 5332,
     exposure_max_lines: 5457 - 4,
-    cfa: cfa(1, 2, 0, 1),
+    cfa: cfa(0, 1, 1, 2),
     black: 64,
     white: 1023,
     rotation: 1,
@@ -310,10 +311,10 @@ pub const TELE: Cam = Cam {
 };
 
 /// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
-/// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; the cell table of a 2 s frame G B / R G as the 22-degree's), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
+/// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; the cell table of a 2 s frame G B / R G as the 22-degree's unflipped, R G / G B with the stream on's G#0101 = 2, 2026-11-19), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
 pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 2, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES, line_ps: 9_871_200, detach: 0, gather: 1 };
 /// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines.
-/// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G B / R G), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
+/// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G B / R G unflipped, R G / G B with the stream on's G#0101 = 2, 2026-11-19: the 4 x 4 cell R R G G / R R G G / G G B B / G G B B), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
 pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES, line_ps: 13_200_800, detach: 0, gather: 1 };
 /// The ultrawide's 48 MP readout, 8000 x 6000 RAW10 at G#2720 a line, its PD rows 4000 x 1500; its link at the slower op PLL (`RX_START_UW48`).
 pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES, line_ps: 5_406_700, detach: 0, gather: 1 };
@@ -546,15 +547,17 @@ mod tests {
             }
             assert!(c.exposure_lines <= c.exposure_max_lines);
         }
-        // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout.
-        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [0, 1, 1, 2], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [1, 2, 0, 1], 1, (4032, 3024))] {
+        // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout; the ultrawide's and the tele's mosaics as ferros reads them (cell tables: the ultrawide's init flips, the tele's stream on flips its rows).
+        // The tele's stream on carries Android's G#0101 = 2 (its frames mirrored against the main without it).
+        assert_eq!(TELE.stream_on, &[0x01, 0x00, 0x01, 0x02]);
+        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [0, 1, 1, 2], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [0, 1, 1, 2], 1, (4032, 3024))] {
             assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
             assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }
-        // akita's: ids in order, the main streaming (2026-11-19), and each id's bus husky's for the same id (the driver's grant slots are by id).
+        // akita's: ids in order, all three streaming (the main, then the front and ultrawide, 2026-11-19), and each id's bus husky's for the same id (the driver's grant slots are by id).
         for (k, c) in AKITA.iter().enumerate() {
             assert_eq!(c.id as usize, k);
-            assert_eq!(c.streams, k == 0, "{}", c.name);
+            assert!(c.streams, "{}", c.name);
             assert_eq!(c.bus, CAMS[k].bus, "{}", c.name);
             // Each line holds its RAW10 samples on a 64-byte boundary, each frame fits its buffer, and each readout fits the driver's buffers.
             assert!(c.width * 5 / 4 <= c.stride && c.stride % 64 == 0 && (c.height * c.stride) as u64 <= c.buffer_bytes(), "{}", c.name);
