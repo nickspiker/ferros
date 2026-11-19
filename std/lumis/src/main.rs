@@ -349,7 +349,7 @@ const ISO_AT_UNITY: f64 = 100.;
 /// A panel ferros does not tell its size draws those off by its own ratio to the Pro's.
 const DENSITY_DPI: f32 = 489.;
 
-/// Android's gravity vector for a device held upright in portrait (m/s², +y toward the top edge): ferros hands a kist no motion sensor yet, so Lumis's UI stays upright and its level reads that.
+/// Android's gravity vector for a device held upright in portrait (m/s², +y toward the top edge), what Lumis's UI takes while the sensors give none (`sys::gravity`: before the AoC is up, or a kernel without them).
 const UPRIGHT: [f32; 3] = [0., 9.80665, 0.];
 
 /// Lumis's console lines (the `log` crate, as Lumis logs everywhere), each on the kernel console with "lumis:" before it.
@@ -1232,12 +1232,13 @@ impl FluorApp<G2t16> for Lumis {
             Screen::Camera(ui) => {
                 use lumis_core::shared_memory::CAL_SHOW_RESULT_BIT;
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
-                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid);
+                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
                 let t = std::time::Instant::now();
-                app::ui_frame(ui, surface, Buttons::default(), UPRIGHT, self.finger);
+                // The AoC's gravity, as Android's Lumis gets TYPE_GRAVITY (owner, 2026-11-18: "looks like we aren't relaying gravity data to lumis?"): the controls turn with the device, the level indicator follows, and a save's orientation tag is the way it is held.
+                app::ui_frame(ui, surface, Buttons::default(), sys::gravity().unwrap_or(UPRIGHT), self.finger);
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
-                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own), and a turn of the device (the gravity here is a constant).
+                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own) (a turn of the device and the level are read below, from the fields lumis_core keeps for them).
                 // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
                 let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
                 let other = ui.previous_histogram_counter != before.2
@@ -1246,7 +1247,9 @@ impl FluorApp<G2t16> for Lumis {
                     || ui.header[FLAGS_IDX] & (CALIBRATING_BIT | CAL_SHOW_RESULT_BIT) != 0
                     || before.4
                     || ui.last_touch_valid
-                    || self.finger.is_some();
+                    || self.finger.is_some()
+                    // A turn of the device, or the level indicator repainted (lumis_core handle_input_and_draw: past its deadband, or any change after a second): the controls are drawn whole.
+                    || (ui.device_rotation, ui.painted_roll, ui.painted_pitch) != before.5;
                 self.parts.clear();
                 if surface.take_posted() {
                     let camera: Option<Vec<fluor::canvas::PixelRect>> = lumis_core::ui::screen::camera_damage(ui).map(|v| v.into_iter().map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1)).collect());
