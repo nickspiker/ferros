@@ -421,6 +421,12 @@ The chip took and used ephemerides built from the IGS's broadcast sets alone: ru
 Not yet reliable: the same half hour the LTO replay slowed from 14-33 s to 55 s and its frame-identical rebuild found nothing in 128 s, so the sky indoors had worsened; and the GLONASS windows (24 satellites more in gpsd's session) are left out. Next: GLONASS (RINEX `R` records, PZ-90 state vectors, turned into the same Kepler form as gpsd does) and Galileo windows, then the fetch below.
 The test replay: keys/husky/captures/gps-2026-11-19/brdc-gps.gnr (local).
 
+**GLONASS windows from the broadcast vectors** (ferros_gnss `glo`, `gps-trace brdc --glonass`): each slot's broadcast state vectors (RINEX `R` records: PZ-90 position, velocity and lunisolar acceleration every 30 minutes, epoch UTC + 18 s) carried by the ICD's 4th-order Runge-Kutta (J2, the earth's rotation; steps of at most 32 s), from the vector nearest each instant, and IS-GPS-200's 15 orbit parameters fitted to that over toe ± 1 hour (Levenberg-Marquardt, numerical Jacobian, from the osculating elements at toe); the clock af0 = -τn + γn (toe − tb) (RINEX gives -τn: gpsd's windows carry the same number, 1.942e-4 s for R01), af1 = γn; the record's other words (the slot, the channel code, word 6) kept.
+- Host-tested (src/tests.rs, BKG's records of 15:00-18:00 UTC): a vector carried 30 minutes lands within 12.1 m of the next one broadcast; the fits' RMS 0.1 to 1.4 m.
+- **Against gpsd's own windows** (o2, made from Broadcom's LTO): at each window's toe the GPS windows sit 1 to 3 m from BRDC's sets and the GLONASS windows 1 to 8 m from the carried broadcast vectors. Two independent sources, the same orbits to metres: the layout above is right for both systems, and the chip's frame is the earth-fixed WGS-84 one with IS-GPS-200's rotation term.
+- The GLONASS record's word 1 is the frequency channel: bits 5-9 hold k as 4-bit two's complement plus 16 (R01 k = +1 → G#221, R02 k = -4 → G#381), bit 0 set.
+- **Galileo, BeiDou:** gpsd sent none (its LTO file covers GPS and GLONASS), so no window of theirs has been seen and their record (a system code, the clock's reference) is not known. They are left out until a capture shows one (gpsd's `EnableB1C`, an LTO variant with more systems) or a guessed record is tested on the chip.
+
 ## Proposed: broadcast ephemerides for the chip (2026-11-19, for the owner)
 
 Now that the chip fixes from BRDC-built windows (above), the path to keep them fresh:

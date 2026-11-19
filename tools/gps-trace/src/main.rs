@@ -452,6 +452,8 @@ fn inner_ck(m: &[u8]) -> u16 {
 pub fn brdc(args: &[String]) {
     let (inp, rinex, out) = (&args[2], &args[3], &args[4]);
     let keep_glonass = args.iter().any(|a| a == "--keep-glonass");
+    let glonass = args.iter().any(|a| a == "--glonass");
+    let (mut glo_written, mut glo_kept) = (0, 0);
     let b = std::fs::read(inp).unwrap_or_else(|e| panic!("{inp}: {e}"));
     assert!(b.starts_with(b"GNR1"));
     let mut recs: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -484,6 +486,8 @@ pub fn brdc(args: &[String]) {
     }
     let mut eph: Vec<ferros_gnss::eph::GpsEph> = Vec::new();
     let text = std::fs::read(rinex).unwrap_or_else(|e| panic!("{rinex}: {e}"));
+    let mut glo = Vec::new();
+    ferros_gnss::glo::each_glo(&text, |e| glo.push(e));
     ferros_gnss::eph::each_gps(&text, |e| {
         if let Some(i) = eph.iter().position(|x| x.prn == e.prn) {
             if e.week as f64 * 604_800. + e.toe > eph[i].week as f64 * 604_800. + eph[i].toe {
@@ -501,11 +505,56 @@ pub fn brdc(args: &[String]) {
     for m in &msgs {
         let w = |k: usize| u32::from_le_bytes([m[k * 4], m[k * 4 + 1], m[k * 4 + 2], m[k * 4 + 3]]);
         // The GPS group's header carries a word at +G#4C (G#1207 with a first-of-group bit); the GLONASS group's is 0.
-        if w(0x4C / 4) == 0 && !keep_glonass {
+        if w(0x4C / 4) == 0 && !keep_glonass && !glonass {
             dropped += 1;
             continue;
         }
         let mut m = m.clone();
+        if w(0x4C / 4) == 0 && glonass {
+            // GLONASS: each slot's broadcast vectors carried by the ICD's Runge-Kutta and fitted with IS-GPS-200's ephemeris over toe ± 1 hour (ferros_gnss::glo), toe the slot's latest vector's time; the clock -τn + γn (t - tb), drift γn.
+            let n = w(0x68 / 4) as usize;
+            for r in 0..n {
+                let base = 0xBC + 0xA8 * r;
+                let slot = u32::from_le_bytes([m[base], m[base + 1], m[base + 2], m[base + 3]]) as u8;
+                let recs: Vec<_> = glo.iter().copied().filter(|e| e.slot == slot && e.health == 0).collect();
+                let Some(last) = recs.iter().copied().max_by(|a, b| a.tb.partial_cmp(&b.tb).unwrap()) else {
+                    glo_kept += 1;
+                    continue;
+                };
+                let rw = |m: &Vec<u8>, k: usize| u32::from_le_bytes([m[base + 4 * k], m[base + 4 * k + 1], m[base + 4 * k + 2], m[base + 4 * k + 3]]);
+                // The window as gpsd sent it, read back the same way, for the comparison below (printed only as distances).
+                let old = ferros_gnss::eph::GpsEph { toe: rw(&m, 24) as f64 * 16., sqrt_a: rw(&m, 23) as f64 * 2f64.powi(-19), e: rw(&m, 21) as f64 * 2f64.powi(-33), m0: rw(&m, 19) as i32 as f64 * 2f64.powi(-31) * pi, dn: rw(&m, 18) as i32 as f64 * 2f64.powi(-43) * pi, crs: rw(&m, 17) as i32 as f64 / 32., cuc: rw(&m, 20) as i32 as f64 * 2f64.powi(-29), cus: rw(&m, 22) as i32 as f64 * 2f64.powi(-29), cic: rw(&m, 27) as i32 as f64 * 2f64.powi(-29), omega0: rw(&m, 28) as i32 as f64 * 2f64.powi(-31) * pi, cis: rw(&m, 29) as i32 as f64 * 2f64.powi(-29), i0: rw(&m, 30) as i32 as f64 * 2f64.powi(-31) * pi, crc: rw(&m, 31) as i32 as f64 / 32., omega: rw(&m, 32) as i32 as f64 * 2f64.powi(-31) * pi, omega_dot: rw(&m, 33) as i32 as f64 * 2f64.powi(-43) * pi, idot: rw(&m, 34) as i32 as f64 * 2f64.powi(-43) * pi, ..Default::default() };
+                let toe = (last.tb / 16.).round() * 16.;
+                let pos = |t: f64| ferros_gnss::glo::orbit_at(&recs, t).unwrap();
+                let (e, rms) = ferros_gnss::glo::fit(&pos, last.week, toe, 3600.);
+                let d = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+                let at = old.toe;
+                println!("R{slot:02}: fit RMS {rms:.1} m; gpsd's window against the broadcast orbit at its toe: {:.0} m", d(ferros_gnss::eph::gps_ecef(&old, at), pos(at)));
+                let put = |m: &mut Vec<u8>, k: usize, v: u32| m[base + 4 * k..base + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                put(&mut m, 13, (toe / 16.) as u32);
+                put(&mut m, 14, 0);
+                put(&mut m, 15, sc(last.gamma, -43));
+                put(&mut m, 16, sc(last.tau + last.gamma * (toe - last.tb), -31));
+                put(&mut m, 17, sc(e.crs, -5));
+                put(&mut m, 18, sc(e.dn / pi, -43));
+                put(&mut m, 19, sc(e.m0 / pi, -31));
+                put(&mut m, 20, sc(e.cuc, -29));
+                put(&mut m, 21, (e.e * 2f64.powi(33)).round() as u32);
+                put(&mut m, 22, sc(e.cus, -29));
+                put(&mut m, 23, (e.sqrt_a * 2f64.powi(19)).round() as u32);
+                put(&mut m, 24, (toe / 16.) as u32);
+                put(&mut m, 27, sc(e.cic, -29));
+                put(&mut m, 28, sc(e.omega0 / pi, -31));
+                put(&mut m, 29, sc(e.cis, -29));
+                put(&mut m, 30, sc(e.i0 / pi, -31));
+                put(&mut m, 31, sc(e.crc, -5));
+                put(&mut m, 32, sc(e.omega / pi, -31));
+                put(&mut m, 33, sc(e.omega_dot / pi, -43));
+                put(&mut m, 34, sc(e.idot / pi, -43));
+                put(&mut m, 35, (last.week % 1024) as u32);
+                glo_written += 1;
+            }
+        }
         if w(0x4C / 4) != 0 {
             let n = w(0x68 / 4) as usize;
             for r in 0..n {
@@ -515,6 +564,11 @@ pub fn brdc(args: &[String]) {
                     kept += 1;
                     continue;
                 };
+                // gpsd's window against the broadcast set at the window's toe (printed as a distance only).
+                let rw = |m: &Vec<u8>, k: usize| u32::from_le_bytes([m[base + 4 * k], m[base + 4 * k + 1], m[base + 4 * k + 2], m[base + 4 * k + 3]]);
+                let old = ferros_gnss::eph::GpsEph { toe: rw(&m, 24) as f64 * 16., sqrt_a: rw(&m, 23) as f64 * 2f64.powi(-19), e: rw(&m, 21) as f64 * 2f64.powi(-33), m0: rw(&m, 19) as i32 as f64 * 2f64.powi(-31) * pi, dn: rw(&m, 18) as i32 as f64 * 2f64.powi(-43) * pi, crs: rw(&m, 17) as i32 as f64 / 32., cuc: rw(&m, 20) as i32 as f64 * 2f64.powi(-29), cus: rw(&m, 22) as i32 as f64 * 2f64.powi(-29), cic: rw(&m, 27) as i32 as f64 * 2f64.powi(-29), omega0: rw(&m, 28) as i32 as f64 * 2f64.powi(-31) * pi, cis: rw(&m, 29) as i32 as f64 * 2f64.powi(-29), i0: rw(&m, 30) as i32 as f64 * 2f64.powi(-31) * pi, crc: rw(&m, 31) as i32 as f64 / 32., omega: rw(&m, 32) as i32 as f64 * 2f64.powi(-31) * pi, omega_dot: rw(&m, 33) as i32 as f64 * 2f64.powi(-43) * pi, idot: rw(&m, 34) as i32 as f64 * 2f64.powi(-43) * pi, ..Default::default() };
+                let (a, b) = (ferros_gnss::eph::gps_ecef(&old, old.toe), ferros_gnss::eph::gps_ecef(e, old.toe));
+                println!("G{prn:02}: gpsd's window against the broadcast set at its toe: {:.0} m", ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt());
                 let put = |m: &mut Vec<u8>, k: usize, v: u32| m[base + 4 * k..base + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
                 put(&mut m, 12, sc(e.tgd, -31));
                 put(&mut m, 13, (e.toc / 16.).round() as u32);
@@ -591,5 +645,5 @@ pub fn brdc(args: &[String]) {
         o.extend_from_slice(r);
     }
     std::fs::write(out, &o).unwrap_or_else(|e| panic!("{out}: {e}"));
-    println!("{out}: A#{} 82 81 messages ({dropped} GLONASS dropped), A#{written} GPS records from the broadcast ephemerides, A#{kept} kept as they were (no broadcast set); A#{} records, A#{} bytes", new_msgs.len(), new_recs.len(), o.len());
+    println!("{out}: A#{} 82 81 messages ({dropped} GLONASS dropped), A#{written} GPS records from the broadcast ephemerides, A#{kept} kept as they were (no broadcast set), A#{glo_written} GLONASS records fitted to the broadcast vectors (A#{glo_kept} with no healthy vector kept as they were); A#{} records, A#{} bytes", new_msgs.len(), new_recs.len(), o.len());
 }

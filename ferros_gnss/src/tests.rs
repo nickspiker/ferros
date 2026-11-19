@@ -258,3 +258,34 @@ fn broadcast_ephemerides_agree_with_the_almanac() {
     }
     assert!(worst < 8., "the worst A#{worst} km");
 }
+
+const BRDC_GLO: &str = include_str!("testdata/brdc-glo-2026-11-19.rnx");
+
+#[test]
+fn glonass_vectors_carried_meet_the_next_and_the_kepler_fit_holds() {
+    // BKG's BRDC GLONASS records of 2026-11-19 15:00 to 17:59 UTC: each vector carried 30 minutes by the ICD's Runge-Kutta must land on the next one broadcast (independent uploads), and the IS-GPS-200 ephemeris fitted to the carried orbit over 2 hours must reproduce it.
+    let mut v = Vec::new();
+    let (taken, refused) = glo::each_glo(BRDC_GLO.as_bytes(), |e| v.push(e));
+    assert_eq!(refused, 0);
+    assert!(taken >= 64, "A#{taken}");
+    let mut worst: f64 = 0.;
+    for e in &v {
+        if let Some(n) = v.iter().find(|n| n.slot == e.slot && n.tb == e.tb + 1800.) {
+            let p = glo::carry(e, n.tb);
+            let d = sqrt((p[0] - n.r[0]).powi(2) + (p[1] - n.r[1]).powi(2) + (p[2] - n.r[2]).powi(2));
+            worst = worst.max(d);
+        }
+    }
+    println!("carried 30 minutes onto the next vector: the worst A#{worst:.1} m");
+    assert!(worst < 64., "A#{worst} m");
+    let mut worst_fit: f64 = 0.;
+    for slot in 1..=24u8 {
+        let recs: Vec<_> = v.iter().copied().filter(|e| e.slot == slot).collect();
+        let Some(last) = recs.iter().max_by(|a, b| a.tb.partial_cmp(&b.tb).unwrap()) else { continue };
+        let toe = ((last.tb - 1800.) / 16.).round() * 16.;
+        let (eph, rms) = glo::fit(&|t| glo::orbit_at(&recs, t).unwrap(), last.week, toe, 3600.);
+        println!("R{slot:02} toe A#{toe} sqrtA {:.3} e {:.5} i {:.4} fit RMS A#{rms:.2} m", eph.sqrt_a, eph.e, eph.i0);
+        worst_fit = worst_fit.max(rms);
+    }
+    assert!(worst_fit < 16., "A#{worst_fit} m");
+}
