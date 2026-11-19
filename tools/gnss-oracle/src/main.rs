@@ -6,7 +6,8 @@
 //! CHPP (the context hub peripheral protocol) frames each packet: the preamble 68 43, an 8-byte transport header (flags, packet code, ack seq, seq, length u16, reserved u16), the payload, a CRC-32 over header and payload.
 //! A payload that starts a message (not a continuation) begins with CHPP's app header: handle, type, transaction, error, command u16.
 //! Positions: payload bytes are shown only with --hex, and only that many: the session's location reports carry the place.
-//! Usage: gnss-oracle <capture.log> [--hex <n>] [--transfers]
+//! --betp: instead of packets, the datagrams put back together (ferros_kepler) and the BETP records in them, then a tally by word.
+//! Usage: gnss-oracle <capture.log> [--hex <n>] [--transfers] [--betp]
 
 use std::collections::BTreeMap;
 
@@ -173,14 +174,111 @@ fn app_type(t: u8) -> &'static str {
     }
 }
 
+/// The datagrams of both directions put back together as the driver does (ferros_kepler `Datagram`: resends dropped, fragments joined), and each BETP record in them: its word, its head's other fields, its length, and with --hex that many of its bytes.
+/// Then a tally by direction and word.
+fn betp_lines(stream: &[Vec<u8>; 2], owner: &[Vec<usize>; 2], show: usize, lines: &mut Vec<(usize, usize, String)>) {
+    use ferros_kepler::{chip_records, App, Datagram, Header, Took};
+    let mut tally: BTreeMap<(&'static str, u32), (u64, u64, usize, usize)> = BTreeMap::new();
+    for (d, dir) in [Dir::Tx, Dir::Rx].into_iter().enumerate() {
+        let (ps, _) = packets(&stream[d]);
+        let mut dg: Box<Datagram<{ 1 << 16 }>> = Box::new(Datagram::new());
+        for p in ps.iter().filter(|p| !p.payload.is_empty() && p.code & 0xF0 == 0) {
+            let h = Header { flags: p.flags, code: p.code, ack: p.ack, seq: p.seq, len: p.payload.len() as u16 };
+            if dg.take(&h, &p.payload) != Took::Whole {
+                continue;
+            }
+            let b = dg.bytes();
+            let Some(app) = App::read(b) else { continue };
+            if app.handle != ferros_kepler::BETP || (app.cmd != ferros_kepler::CMD_AP_BETP && app.cmd != ferros_kepler::CMD_CHIP_BETP) {
+                continue;
+            }
+            let body = &b[App::LEN..];
+            let at = owner[d][p.start];
+            if dir == Dir::Tx {
+                // The AP's 20-byte heads: word, length, a u32, next offset, next size, head size, length.
+                let mut o = 0;
+                loop {
+                    if o + 20 > body.len() {
+                        break;
+                    }
+                    let r = &body[o..];
+                    let word = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+                    let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as usize;
+                    let next = u16::from_le_bytes([r[12], r[13]]) as usize;
+                    let data = &r[20..(20 + len).min(r.len())];
+                    let mut line = format!("{} BETP G#{:04X}_{:04X} len A#{}", dir.name(), word >> 16, word & 0xFFFF, len);
+                    if show > 0 {
+                        line += &format!(" | {}", hex(&data[..show.min(data.len())]));
+                    }
+                    lines.push((at, 2, line));
+                    let e = tally.entry((dir.name(), word)).or_insert((0, 0, usize::MAX, 0));
+                    e.0 += 1;
+                    e.1 += len as u64;
+                    e.2 = e.2.min(len);
+                    e.3 = e.3.max(len);
+                    if next == 0 {
+                        break;
+                    }
+                    o += next;
+                }
+            } else {
+                let mut recs = chip_records(body);
+                for r in recs.by_ref() {
+                    let mut line = format!("{} BETP G#{:04X}_{:04X} tag G#{:08X} aux G#{:04X} len A#{}", dir.name(), r.word >> 16, r.word & 0xFFFF, r.tag, r.aux, r.data.len());
+                    if show > 0 {
+                        // The fix's place (ferros_kepler `Pvt`: latitude and longitude at +48 and +52) never shown, even with --hex.
+                        let mut shown = r.data[..show.min(r.data.len())].to_vec();
+                        if r.word & 0xFFFF == ferros_kepler::PVT {
+                            for b in shown.iter_mut().skip(48).take(8) {
+                                *b = 0xEE;
+                            }
+                        }
+                        line += &format!(" | {}", hex(&shown));
+                    }
+                    // The decoded fix (no place: its validity, type, time, error estimates, HDOP) and the satellite list, as the driver reads them.
+                    if r.word & 0xFFFF == ferros_kepler::PVT {
+                        if let Some(p) = ferros_kepler::Pvt::read(r.data) {
+                            line += &format!(" | fix: valid G#{:X} type G#{:X} week A#{} tow A#{} ms, ±A#{} m horizontal, ±A#{} m vertical, HDOP A#{}/5, speed A#{} cm/s", p.valid, p.kind, p.week, p.tow_ms, p.ehpe_cm / 100, p.evpe_cm / 100, p.hdop_fifths, p.speed_cms);
+                        }
+                    }
+                    if r.word & 0xFFFF == ferros_kepler::SVS {
+                        let n = ferros_kepler::Sv::count(r.data);
+                        line += &format!(" | A#{n} satellites:");
+                        for k in 0..n {
+                            match ferros_kepler::Sv::read(r.data, k) {
+                                Some(s) => line += &format!(" {}{}{} {:.0}dB {:.0}/{:.0} {:.0}MHz;", s.system, if s.flags & ferros_kepler::SV_USED != 0 { "*" } else { ":" }, s.number, s.cn0, s.elevation, s.azimuth, s.carrier_hz / 1e6),
+                                None => line += " (short)",
+                            }
+                        }
+                    }
+                    lines.push((at, 2, line));
+                    let e = tally.entry((dir.name(), r.word)).or_insert((0, 0, usize::MAX, 0));
+                    e.0 += 1;
+                    e.1 += r.data.len() as u64;
+                    e.2 = e.2.min(r.data.len());
+                    e.3 = e.3.max(r.data.len());
+                }
+                if recs.short {
+                    lines.push((at, 2, format!("{} BETP: a record ran past its datagram (A#{} bytes)", dir.name(), body.len())));
+                }
+            }
+        }
+        lines.push((usize::MAX, 0, format!("# {}: A#{} resends dropped, A#{} sequence skips, A#{} datagrams cut", dir.name(), dg.resends, dg.skips, dg.cut)));
+    }
+    for ((d, w), (n, b, lo, hi)) in tally {
+        lines.push((usize::MAX, 1, format!("#   {d} BETP G#{:04X}_{:04X}: A#{n} records, A#{b} bytes, A#{lo} to A#{hi} each", w >> 16, w & 0xFFFF)));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: gnss-oracle <capture.log> [--hex <n>] [--transfers]");
+        eprintln!("usage: gnss-oracle <capture.log> [--hex <n>] [--transfers] [--betp]");
         std::process::exit(2);
     }
     let show = args.iter().position(|a| a == "--hex").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let transfers = args.iter().any(|a| a == "--transfers");
+    let betp = args.iter().any(|a| a == "--betp");
     let text = String::from_utf8_lossy(&std::fs::read(&args[1]).expect("read the capture")).into_owned();
     let ev = events(&text);
     // Each direction's stream, and for each byte the event it came in, which orders packets against marks and the other direction.
@@ -233,6 +331,10 @@ fn main() {
             }
             lines.push((owner[d][p.start], 1, line));
         }
+    }
+    if betp {
+        lines.retain(|l| l.2.starts_with("# MARK"));
+        betp_lines(&stream, &owner, show, &mut lines);
     }
     lines.sort_by_key(|l| (l.0, l.1));
     for l in &lines {
