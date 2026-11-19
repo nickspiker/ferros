@@ -1227,8 +1227,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
-        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page) (payloads/map).
-        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108],
+        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page), 9 use nfc (the NFC page's add), 10 use wlan (the WiFi page's picker) (payloads/map; as init gives them: with eight a restarted map had no NFC add, its torch was slot 9 not 11, and the WiFi page said the driver gives no list, 2026-11-18 on the 8a).
+        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108, 80, 44],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
