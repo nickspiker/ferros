@@ -67,6 +67,7 @@ pub mod nr {
     pub const THREAD_NAME: u64 = 44;
     pub const IRQ_ARM: u64 = 45;
     pub const PANIC: u64 = 46;
+    pub const MAILBOX: u64 = 47;
 }
 
 /// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
@@ -1070,7 +1071,7 @@ pub mod claim {
     /// GPS's claims in the facts (fact 85): bits 0-15 how many, bits 16 and up a count of every change.
     pub const FACT: usize = 85;
 
-    /// Claim right `right`, proved by the token at `proof` (for GPS: Settings, or the `gps` endpoint's send right). False when refused: no such proof, nobody present, GPS switched off. Claiming again is no second claim.
+    /// Claim right `right`, proved by the token at `proof` (for GPS: Settings, the `gps` endpoint's send right, or a GPS mailbox view). False when refused: no such proof, nobody present, GPS switched off. Claiming again is no second claim.
     pub fn claim(right: u64, proof: u64) -> bool {
         svc(nr::CLAIM, 0, right, proof, 0, 0) == 0
     }
@@ -1096,6 +1097,107 @@ pub mod claim {
     /// The claims' doorbell (kernel op 4), given Settings: the kernel writes GPS's claims (`FACT`'s word: the count, and a change count above bit 16) into `word` now and whenever they change, waking whatever waits on it (`wait_world`). False without the capability.
     pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
         svc(nr::CLAIM, 4, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
+}
+
+/// Mailboxes (ferros_mailbox, docs/KERNEL.md "Mailboxes"; owner, 2026-11-19: "a capability based public read only mailbox so you could have an unlimited number of items accessing it"): a driver publishes into a frame of words, and any number of readers map it read-only and read it without calling the driver.
+/// - The writer holds the `<name>-mailbox` region (granted at its spawn) and takes it with `Writer::take`; it publishes with `publish` (or `begin` and `finish` for a payload built in place), which wakes every reader waiting, in one call, however many there are.
+/// - A reader holds the `<name>-view` region, granted at its spawn (`Reader::map`) or opened with a proof (`Reader::open`: the GPS right, Settings); it waits for the next publish (`wait`) and reads a whole one (`read`), never calling the writer.
+/// - The kernel marks the mailbox dead when the writer's process ends and zeroes its payload (`Got::Dead`); a new writer's first publish brings it back.
+pub mod mailbox {
+    pub use ferros_mailbox::{gps, motion, Got, Publish, AT, BOX_NAMES, DEAD, GPS, HEADER, KIND, LEN, MIC, MOTION, NAMES, PAYLOAD_MAX, SEQ, TEST, VIEW_NAMES, WORDS};
+    use super::{dma, now, nr, off, svc, wait, wait_world, wake, ERR};
+    use core::sync::atomic::AtomicU64;
+
+    /// SYS_MAILBOX's op: open a view with a proof.
+    const OPEN: u64 = 0;
+
+    /// The mailbox's words at `base` (its region's address, from SYS_DMA or the open).
+    fn words(base: u64) -> &'static [AtomicU64] {
+        // SAFETY: `base` is the kernel's answer for a region this process holds: a frame of the pool mapped for the boot at that address (the writer's window read-write, the readers' read-only), 8-aligned, `WORDS` words long; atomics read it whatever another process writes there.
+        unsafe { core::slice::from_raw_parts(base as *const AtomicU64, WORDS) }
+    }
+
+    /// The writer's side of a mailbox.
+    pub struct Writer {
+        words: &'static [AtomicU64],
+    }
+
+    impl Writer {
+        /// The mailbox whose writer's region is granted at `token` (`<name>-mailbox`), mapped, this process its one writer. None: no such grant, a kernel without mailboxes, or another live process writes it (a writer still ending: take it again at the next publish).
+        pub fn take(token: u64) -> Option<Writer> {
+            let base = dma(token);
+            (base != ERR && base != 0).then(|| Writer { words: words(base) })
+        }
+        /// Publish `payload` whole, tagged `kind`, and wake every reader waiting: the new sequence and how many threads woke.
+        pub fn publish(&self, kind: u64, payload: &[u64]) -> (u64, u64) {
+            let s = ferros_mailbox::publish(self.words, kind, now(), payload);
+            (s, self.ring())
+        }
+        /// Begin a publish built in place (`Publish::put` each word), then `finish`.
+        pub fn begin(&self) -> Publish<'static> {
+            Publish::begin(self.words)
+        }
+        /// The publish begun whole (`kind`, `len` words), and every reader waiting woken: the new sequence and how many threads woke.
+        pub fn finish(&self, p: Publish<'static>, kind: u64, len: usize) -> (u64, u64) {
+            let s = p.finish(kind, len, now());
+            (s, self.ring())
+        }
+        /// The sequence word's waiters woken, in every process: the kernel's one scan of its threads (SYS_WAKE on a mailbox's sequence word by its writer), never a call per reader.
+        fn ring(&self) -> u64 {
+            wake(&self.words[SEQ], u64::MAX)
+        }
+    }
+
+    /// A reader's side of a mailbox.
+    pub struct Reader {
+        words: &'static [AtomicU64],
+    }
+
+    impl Reader {
+        /// The mailbox whose view is granted at `token` (`<name>-view`, a spawn's grant, or the token `open` wrote).
+        pub fn map(token: u64) -> Option<Reader> {
+            let base = dma(token);
+            (base != ERR && base != 0).then(|| Reader { words: words(base) })
+        }
+        /// Mailbox `id` (`GPS`, `MOTION`, ...) opened with the token at `proof` (0: none), the view's own token written into `token`, which the caller keeps (a proof for a claim, `map` again).
+        /// The proof the kernel takes: for GPS the Settings capability, the `gps` right (its endpoint's send right) or a GPS view; the motion mailbox none yet (gravity and the field are in the facts, which anyone reads). None: refused, or a kernel without mailboxes.
+        pub fn open(id: usize, proof: u64, token: &mut [u8; 32]) -> Option<Reader> {
+            let base = svc(nr::MAILBOX, OPEN, id as u64, proof, off(token.as_mut_ptr()), 0);
+            (base != ERR && base != 0).then(|| Reader { words: words(base) })
+        }
+        /// The sequence now (even: whole; odd: a publish under way; `DEAD`: no writer).
+        pub fn seq(&self) -> u64 {
+            self.words[SEQ].load(core::sync::atomic::Ordering::Acquire)
+        }
+        /// Asleep until the sequence is other than `seen` (a publish, or the writer's end), or the counter reaches `deadline` (0: none): the sequence then. A wait on the world (`wait_world`): what the writer publishes comes when it comes, so the process watchdog's clock is paused.
+        /// Every wait in the system is a loop that looks again (the kernel wakes all word waiters when a preference changes), so a wake that finds the sequence unmoved waits again.
+        pub fn wait(&self, seen: u64, deadline: u64) -> u64 {
+            loop {
+                let r = wait_world(&self.words[SEQ], seen, deadline);
+                let s = self.seq();
+                // 2: the deadline; ERR: a kernel that refuses the word (none from before 2026-11-19 takes it).
+                if s != seen || r == 2 || r == ERR {
+                    return s;
+                }
+            }
+        }
+        /// One look (ferros_mailbox `try_read`): `Busy` when a publish was under way or landed in it. For a reader that counts its retries (payloads/mbtest); `read` is the rest's.
+        pub fn try_read(&self, out: &mut [u64]) -> Got {
+            ferros_mailbox::try_read(self.words, out)
+        }
+        /// One whole publish into `out` (as many words as fit): a read that a publish landed in is read again at once, one under way is waited out on the sequence word (the writer's wake ends it). Never `Busy`.
+        pub fn read(&self, out: &mut [u64]) -> Got {
+            loop {
+                match ferros_mailbox::try_read(self.words, out) {
+                    Got::Busy { seq } if seq & 1 != 0 => {
+                        wait(&self.words[SEQ], seq, 0);
+                    }
+                    Got::Busy { .. } => {}
+                    g => return g,
+                }
+            }
+        }
     }
 }
 

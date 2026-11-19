@@ -106,9 +106,9 @@ pub fn lock_reset() {
 
 /// The syscall names `lock_report` prints (process.rs's numbers).
 fn nr_name(nr: u64) -> &'static str {
-    const N: [&str; 46] = [
+    const N: [&str; 48] = [
         "exit", "call", "recv", "reply", "mmio_read", "mmio_write", "entropy", "dma", "input", "sleep", "spawn", "set_pref", "facts", "store", "thread_spawn", "thread_exit", "wait", "wake", "irq_wait", "irq_ack", "pin", "light", "power", "ira", "unlock", "pt", "sensors", "status", "pet", "block", "vault", "tracks", "control", "controls", "detail", "zone", "lang",
-        "claim", "bell", "not_started", "arc", "offer", "caller", "notify", "thread_name", "irq_arm",
+        "claim", "bell", "not_started", "arc", "offer", "caller", "notify", "thread_name", "irq_arm", "panic", "mailbox",
     ];
     N.get(nr as usize).copied().unwrap_or("?")
 }
