@@ -546,7 +546,14 @@ impl Mode {
         let mut m = Mode::captured(init, a)?;
         // In u32 and added, never subtracted: the window's ends are the init's (vault data), and an end before its start would wrap a u16 difference.
         let whole = |out: u16, start: u16, end: u16| out as u32 * a.unit as u32 + start as u32 == end as u32 + 1;
-        if !whole(m.x_out, m.x_start, m.x_end) || !whole(m.y_out, m.y_start, m.y_end) || (m.x_out, m.y_out) != a.full {
+        // A part that crops digitally (the Sony ultrawide: its 48 MP init reads the 9248 x 6016 window and crops 8000 x 6000 at 624, 8, Android's own, docs/CAMERA.md "The I2C side without a flash") is 1:1 when its binning is off and its crop, inside the window, is the output and the array's maximum resolution.
+        let cropped = |out: u16, off: u16, size: u16, start: u16, end: u16| size == out && (off as u32 + size as u32) * a.unit as u32 + start as u32 <= end as u32 + 1;
+        let full = if a.crop {
+            m.binning[0] == 0 && cropped(m.x_out, m.crop[0], m.crop[2], m.x_start, m.x_end) && cropped(m.y_out, m.crop[1], m.crop[3], m.y_start, m.y_end)
+        } else {
+            whole(m.x_out, m.x_start, m.x_end) && whole(m.y_out, m.y_start, m.y_end)
+        };
+        if !full || (m.x_out, m.y_out) != a.full {
             return Err(Error::NotFull(m.x_out, m.y_out));
         }
         m.bin = 1;
@@ -954,6 +961,15 @@ mod tests {
             assert_eq!((m.x_out, m.y_out, m.binning, m.crop), (4000, 3000, [1, 0x22, 8], [312, 4, 4000, 3000]));
             assert_eq!((m.fll, m.llp, m.coarse), (5081, 9568, 4124));
             assert_eq!(m.llp, cams::ULTRAWIDE.llp);
+            // The binned init is no 1:1 mode.
+            assert_eq!(Mode::captured_full(&init, &ARRAYS[1]), Err(Error::NotFull(4000, 3000)));
+        }
+        // Android's 48 MP init (the 2026-11-18 i2c trace, oracle-i2c --ftrace, local): the whole window, binning off, the crop the output.
+        if let Some(init) = local("uw-full.init") {
+            let m = Mode::captured_full(&init, &ARRAYS[1]).unwrap();
+            println!("ultrawide 48 MP: {m:?}");
+            assert_eq!((m.x_out, m.y_out, m.binning, m.crop, m.bin), (8000, 6000, [0, 0x11, 0x0A], [624, 8, 8000, 6000], 1));
+            assert_eq!(m.llp, 10320);
         }
         if let Some(init) = local("tele.init") {
             let m = Mode::captured(&init, &ARRAYS[3]).unwrap();
