@@ -74,6 +74,7 @@ const EOP_SEAL: u8 = 2;
 const EOP_READ: u8 = 3;
 const EOP_INFO: u8 = 4;
 const EOP_DELETE: u8 = 5;
+const EOP_SPACE: u8 = 6;
 /// Grant slot 5: the `clips` block window, the extents' area (process.rs WINDOWS; a kernel from before grants none, and every extent op is refused).
 const S_CLIPS: u64 = 5;
 /// The area's blocks: process.rs CLIPS_BLOCKS (48 GiB); the kernel bounds every call to the window whatever this says.
@@ -1257,6 +1258,16 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
             }
             None => NOTHING,
         },
+        EOP_SPACE => {
+            // Read only: the area, what every extent takes, the longest free stretch, this domain's own extents' blocks and count (Lumis's recording space).
+            let (mine, n) = t.list().iter().filter(|e| e.owner == owner).fold((0u64, 0u64), |(b, c), e| (b + e.blocks, c + 1));
+            let free = t.area - t.taken();
+            for (k, v) in [t.area, t.taken(), t.largest_free(), mine, n].iter().enumerate() {
+                out[8 + k * 8..16 + k * 8].copy_from_slice(&v.to_le_bytes());
+            }
+            *data = 40;
+            free
+        }
         EOP_DELETE => {
             let mut next = t.clone();
             match next.remove(&key) {

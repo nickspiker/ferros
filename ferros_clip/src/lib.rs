@@ -140,6 +140,29 @@ pub fn cfa_of_byte(b: u8) -> Vec<u8> {
     (0..4).map(|i| (b >> (2 * i)) & 3).collect()
 }
 
+/// The recording space (`ferros::space`, the vault's EOP_SPACE, read only), in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    /// The clips window: 48 GiB.
+    pub window_bytes: u64,
+    /// Free in all (the window less every app's clips, an open one at its reservation).
+    pub free_bytes: u64,
+    /// The longest free stretch: what an OPEN can get now (a clip is one stretch, first fit), so the longest clip that fits.
+    pub largest_free_bytes: u64,
+    /// What this app's own clips hold: a sealed one its length rounded up to 4 KiB, an open one its whole reservation.
+    pub mine_bytes: u64,
+    /// How many clips this app has.
+    pub clips: u64,
+}
+
+impl Space {
+    /// From the vault's reply: five u64 LE, in 4 KiB blocks (the window, every clip's, the longest free stretch, this domain's) and this domain's count.
+    pub fn from_reply(b: &[u8; 40]) -> Space {
+        let u = |k: usize| u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap());
+        Space { window_bytes: u(0) << 12, free_bytes: (u(0) - u(1)) << 12, largest_free_bytes: u(2) << 12, mine_bytes: u(3) << 12, clips: u(4) }
+    }
+}
+
 /// One frame handed over: its packed rows in place (the camera's held buffer), and its facts from the MAP header.
 pub struct FrameIn<'a> {
     pub rows: &'a [u8],

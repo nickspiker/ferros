@@ -2080,7 +2080,12 @@ fn gov_top(g: &Gov, lifted: bool) -> usize {
         (_, false) => A715_CALM_KHZ,
     };
     // A RAW clip being recorded (the `clips` window written within the last second, process.rs `CLIPS_AT`) holds the A715s at `CLIPS_KHZ` at most, whatever lifts them (docs/RAW-VIDEO.md: at the camera's 2367 MHz lift a minute at 30/s reached 85 C in 37 s; at 1572 it ended at 75 C).
-    let cap = if g.domain == 3 && recording() { cap.min(CLIPS_KHZ.load(Relaxed)) } else { cap };
+    // It is also the recording's own lift, so every clip codes at the clocks its minutes were measured at whatever else lifts or not: the A715s up to `CLIPS_KHZ` and the A510s their whole table, from the clip's open to its seal only (2026-11-19: the first clip after a RAM reload, with no camera lift yet, coded its A510 bands at their calm 324 MHz, 54 ms a frame, and dropped 47 of 64).
+    let cap = match (g.domain, recording()) {
+        (3, true) => CLIPS_KHZ.load(Relaxed),
+        (2, true) => u32::MAX,
+        _ => cap,
+    };
     // The highest point at or under the ceiling (the table starts at the floor, which every ceiling is above).
     g.opps.iter().rposition(|&o| o <= cap).unwrap_or(0)
 }
@@ -2589,7 +2594,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
-    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): the A715s up to A#{} MHz (0: none) while a RAW clip is recorded; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if recording() { "recording" } else { "not recording" }).as_bytes());
+    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them) and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if recording() { "recording" } else { "not recording" }).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;

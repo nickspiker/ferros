@@ -113,6 +113,7 @@ fn main() {
         return;
     };
     let ext = Extent::new(slot, NAME);
+    println!("rawrec: the recording space: {:?}", ferros_clip::ferros::space(slot));
     match arg(0) {
         1 => {
             println!("rawrec: {NAME}: {:?}", ext.info());
@@ -308,6 +309,7 @@ fn main() {
     println!("rawrec: seal {}", hex(&info.hash));
     if let Some(i) = ext.info() {
         println!("rawrec: the extent: A#{} blocks from block A#{} of the clips area (partition block A#{}), A#{} bytes, sealed {}", i.blocks, i.first, (6u64 << 20) + i.first, i.bytes, i.sealed);
+        println!("rawrec: the recording space: {:?}", ferros_clip::ferros::space(slot));
     }
     let doc = hashes_doc(&hashes);
     println!("rawrec: A#{} frames' source hashes stored as test.rawrec.hashes ({} bytes): {}", hashes.len(), doc.len(), store_put(slot, "rawrec.hashes", &doc));

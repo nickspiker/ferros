@@ -3,6 +3,17 @@
 use ferros_clip::{cfa_of_byte, Camera, FrameIn, MemSink, Mode, Pacing, Recorder, Taken};
 use vsf::visual::clip::Reader;
 
+#[test]
+fn space_from_the_vaults_reply() {
+    // The vault's EOP_SPACE reply in blocks: a 48 GiB window, 2^20 blocks taken, 2^21 the longest free stretch, 2^18 this app's in 3 clips.
+    let mut b = [0u8; 40];
+    for (k, v) in [12u64 << 20, 1 << 20, 1 << 21, 1 << 18, 3].iter().enumerate() {
+        b[k * 8..k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let s = ferros_clip::Space::from_reply(&b);
+    assert_eq!(s, ferros_clip::Space { window_bytes: 48 << 30, free_bytes: 44 << 30, largest_free_bytes: 8 << 30, mine_bytes: 1 << 30, clips: 3 });
+}
+
 fn lcg(s: &mut u64) -> u64 {
     *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); // the algorithm: an LCG wraps by definition
     *s >> 33

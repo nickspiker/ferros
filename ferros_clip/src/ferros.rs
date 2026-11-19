@@ -71,6 +71,18 @@ pub struct Info {
     pub first: u64,
 }
 
+
+/// The recording space, read only, thru the store grant in `slot` (a vault and kernel from 2026-11-19 on; None from an older one).
+pub fn space(slot: u64) -> Option<crate::Space> {
+    const EOP_SPACE: u64 = 6;
+    let name = b"space";
+    let mut b = [0u8; 40];
+    match svc(STORE, cap(slot), EXTENT | EOP_SPACE | 40 << 8, off(name.as_ptr()), name.len() as u64, off(b.as_mut_ptr())) {
+        ERR | NOTHING => None,
+        _ => Some(crate::Space::from_reply(&b)),
+    }
+}
+
 /// A named extent of the vault, on the store grant in `slot`.
 pub struct Extent {
     slot: u64,

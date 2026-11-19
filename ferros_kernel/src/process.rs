@@ -4000,6 +4000,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         EOP_SEAL => len == 40,
         EOP_INFO => len == EXTENT_INFO,
         EOP_DELETE => len == 0,
+        EOP_SPACE => len == EXTENT_SPACE,
         _ => false,
     };
     if !rel_ok || !len_ok {
@@ -4044,7 +4045,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
             }
         }
     }
-    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN) { len as u64 } else { 0 };
+    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN | EOP_SPACE) { len as u64 } else { 0 };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
         t.what = VOP_EXTENT as u64 | (len as u64) << 8 | block << 32;
@@ -4066,6 +4067,9 @@ pub const EOP_INFO: u8 = 4;
 /// Drop it → 0, NOTHING when the name has none.
 pub const EOP_DELETE: u8 = 5;
 pub const EXTENT_INFO: usize = 8 + 8 + 1 + 32 + 8 + 8;
+/// The recording space, read only (the name any of the caller's, it is not looked up) → the clips area's free blocks; the buffer (`EXTENT_SPACE` bytes, u64 LE each): the area's blocks, the blocks every extent takes, the longest free stretch, the blocks the caller's own domain's extents take, how many they are.
+pub const EOP_SPACE: u8 = 6;
+pub const EXTENT_SPACE: usize = 5 * 8;
 
 /// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.
 fn kist_domain_forward(f: &mut Frame, cur: usize, ep: usize, d: &[u8; 32]) -> u64 {
