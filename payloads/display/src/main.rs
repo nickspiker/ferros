@@ -2315,21 +2315,42 @@ static mut WALL_BUF: usize = 0;
 static mut WALL_ON: bool = false;
 const SPRITE_MAX: usize = 1100;
 
-/// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
+/// The arena ran out during a scene (`sprite_room`): it starts over at the next scene's start (`arena_turn`), never in the middle of one.
+static mut ARENA_FULL: bool = false;
+
+/// Whether circle i's sprite of side d can be drawn this scene without moving any other: its own space is big enough, or the arena has room past what is taken. When it has not, the arena is marked full and the circle is drawn straight this scene. Starting the arena over here, as `sprite` once did, drew new sprites over ones this scene's list still blits from (the 8a, 2026-11-18: "range end index 410119 out of range for slice of length 409600", a 640-pixel puck's sprite blitted with another's pixels for its row extents).
+fn sprite_room(i: usize, d: usize) -> bool {
+    unsafe {
+        let words = d * d + d;
+        if SPRITES[i].cap >= words || ARENA_NEXT + words <= ARENA_WORDS {
+            return true;
+        }
+        ARENA_FULL = true;
+        false
+    }
+}
+
+/// At a scene's start, with nothing in its list yet: an arena that ran out in an earlier scene starts over, every sprite drawn again as it is next wanted.
+fn arena_turn() {
+    unsafe {
+        if ARENA_FULL {
+            for k in 0..256 {
+                SPRITES[k].valid = false;
+                SPRITES[k].cap = 0;
+            }
+            ARENA_NEXT = 0;
+            ARENA_FULL = false;
+        }
+    }
+}
+
+/// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space; `sprite_room` first says there is room). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
 fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [Px], usize)) -> (&'static [Px], &'static [Px]) {
     unsafe {
         let words = d * d + d;
         let sp = &mut *(&raw mut SPRITES[i]);
         if !(sp.valid && sp.key == key && sp.d == d) {
             if sp.cap < words {
-                if ARENA_NEXT + words > ARENA_WORDS {
-                    // Full: every sprite is drawn again from the start of the arena.
-                    for k in 0..256 {
-                        SPRITES[k].valid = false;
-                        SPRITES[k].cap = 0;
-                    }
-                    ARENA_NEXT = 0;
-                }
                 sp.off = ARENA_NEXT;
                 sp.cap = words;
                 ARENA_NEXT += words;
@@ -8466,6 +8487,7 @@ fn server(grants: u64) -> ! {
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
+                    arena_turn();
                     // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
                     // What each puck's circle shows of itself this frame (puck.rs `scene_end`: a held WATCH answered when it changes), gathered in the same pass.
                     if clip_k.is_none() {
@@ -8554,7 +8576,7 @@ fn server(grants: u64) -> ! {
                                 let d = (2 * ((sr >> 8) + 3)) as usize;
                                 let still = unsafe { LAST_KEY[i] == key };
                                 unsafe { LAST_KEY[i] = key };
-                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
+                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
                                     let (spr, ext) = sprite(i, key, d, |px, d| {
                                         let c = ((d as i64 / 2) << 8) | 128;
                                         if !puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts) {
@@ -8670,7 +8692,7 @@ fn server(grants: u64) -> ! {
                             let mut r = draw::Rect::EMPTY;
                             let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
                             unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
-                            if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
+                            if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
                                 // Cached: drawn at the sprite's centre pixel, then blitted.
                                 let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
                                 let (spr, ext) = sprite(i, key, d, |px, d| {

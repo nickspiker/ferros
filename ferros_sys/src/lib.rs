@@ -2164,10 +2164,19 @@ pub fn panic_exit() -> ! {
     exit(0xDEAD)
 }
 
-/// What a payload's panic handler calls: the panic's message, file, line and column to the kernel (`panic_tell`), then exit with G#DEAD.
-/// The kernel keeps them with the call chain it walks from here, and the process's end goes to the flash log, the console and (with no display) the glass whole: the message, `file:line:column`, the thread, and the frames as offsets into the arc for the host to name (`ferros-bridge deaths`, KERNEL.md "A process that dies").
-/// No allocation: the message is formatted into a buffer on the stack.
-pub fn panic_report(info: &core::panic::PanicInfo) -> ! {
+/// The grants a payload's panic is said thru (`panic_report`: slot 0, the console), set by the payload at its start; before that (`u64::MAX`, never a grants address) nothing is said on the console (the kernel still says it, from `panic_tell`). Not 0: a masked process's grants are at its arc's offset 0 (2026-11-18: the pucks' first panic report said nothing for that).
+static PANIC_GRANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Where `panic_report` says a panic: the payload's grants, as its entry got them.
+pub fn panic_grants(grants: u64) {
+    PANIC_GRANTS.store(grants, Ordering::Relaxed);
+}
+
+/// What a payload's panic handler calls (`ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)`): the panic's message, file, line and column to the kernel (`panic_tell`), then, when the payload gave its grants (`panic_grants`), `name: panicked at file:line:col: message` on the console, then exit G#DEAD.
+/// The kernel keeps the report with the call chain it walks from here, and the process's end goes to the flash log, the console and (with no display) the glass whole: the message, `file:line:column`, the thread, and the frames as offsets into the arc for the host to name (`ferros-bridge deaths`, KERNEL.md "A process that dies").
+/// The console line is for a kernel from before SYS_PANIC, whose death line takes the last console line (2026-11-18: GPS and Compass panicked on the 8a with an empty last line, their handler having said nothing).
+/// No allocation: the message is formatted once, into a buffer on the stack.
+pub fn panic_report(name: &str, info: &core::panic::PanicInfo) -> ! {
     // WHY the flag: formatting the message runs the panicking code's own Display impls, which can panic again, and a second panic comes back here; formatting again would recurse until the stack ran out. The second (and any other thread's at the same time) goes straight to the exit with what the first already told the kernel.
     static TELLING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !TELLING.swap(true, Ordering::AcqRel) {
@@ -2182,8 +2191,36 @@ pub fn panic_report(info: &core::panic::PanicInfo) -> ! {
         };
         let (file, line, column) = info.location().map_or(("", 0, 0), |l| (l.file(), l.line(), l.column()));
         panic_tell(text, file.as_bytes(), line, column);
+        let grants = PANIC_GRANTS.load(Ordering::Relaxed);
+        if grants != u64::MAX {
+            let mut l = PanicLine { b: [0; PANIC_TEXT << 1], n: 0 };
+            // The message as already formatted (cut at a character boundary by `PanicText`, so still UTF-8), never formatted a second time.
+            let m = core::str::from_utf8(text).unwrap_or("");
+            let _ = core::fmt::write(&mut l, format_args!("{name}: panicked at {file}:{line}:{column}: {m}"));
+            l.b[l.n] = b'\n';
+            console(grants, &l.b[..l.n + 1]);
+        }
     }
     exit(0xDEAD)
+}
+
+/// The console's line: the name, the place and the message, the last byte kept for the newline.
+struct PanicLine {
+    b: [u8; PANIC_TEXT << 1],
+    n: usize,
+}
+
+impl core::fmt::Write for PanicLine {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            // WHY the bound: a file name and a message are whatever the panic gave; past the line's room they are cut, never written past it, and the last byte stays for the newline.
+            if self.n < self.b.len() - 1 {
+                self.b[self.n] = c;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The most of a panic's message `panic_report` formats: the kernel keeps 2^9 bytes of it (ferros_ledger death MESSAGE_MAX).
