@@ -83,13 +83,22 @@ pub struct Lte {
     pub coarse_reg: u16,
     /// The 16-bit word written for a shift: the shift moved left by this many bits (8 when the shift is the register's high byte).
     pub at: u8,
-    /// The most shift the sensor takes.
+    /// The most shift the sensor takes (the field's width).
     pub most: u8,
+    /// The sensor's frame counter in bits: the frame in lines, the frame length shifted (frame_length_lines << shift), kept in this many bits and wrapping past them.
+    /// A frame of 2^bits lines or more is not a long frame on the sensor: it runs the frame modulo 2^bits lines (at the sensor's floor where that is 0), so the longest exposure is the longest integration whose frame stays under 2^bits lines (`Timing::shift_most`).
+    pub frame_bits: u8,
 }
 
 impl Lte {
     pub fn word(&self, shift: u8) -> u16 {
         (shift as u16) << self.at
+    }
+
+    /// Whether a frame of `fll` lines of 2^`shift` stays inside the frame counter (`frame_bits`).
+    /// In 128 bits: `shift` is at most `most` (the table's 31, or a device test's override byte), and 16 bits of frame shifted that far pass 64 bits past a shift of 48.
+    pub fn holds(&self, fll: u16, shift: u8) -> bool {
+        (fll as u128) << shift >> self.frame_bits == 0
     }
 }
 
@@ -111,8 +120,10 @@ pub const ARRAYS: [Array; 4] = [
     // The main's gain, its own words read on the Pro (2026-11-17): analogue code / 32 over codes 32 to 5120 (1x to 160x), digital 1x to 128x in whole steps, measured linear from 8x to 128x (twice the signal a doubling, 2.35 to 2.03). Offered: the analogue range alone, 1024 to 163840 (owner, 2026-11-17: digital gain is after the ADC, so analogue only); the noise test (camtest 4, b915) puts the real analogue at the stated 160x: no empty codes at any step, and the dark noise grows 1.67 times from 64x to 128x and 1.10 from 128x to 160x (2 and 1.25 if the gain were after the ADC).
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b897): 2 and 2.
     // Its long-exposure shift, Android's own at 16 s (the capture of 2026-11-17, Lumis on Android in its 8160 x 6144 mode, integrity 0): G#0702 and G#0704 both carry the shift in their high byte, written in every hold beside the integration and frame, which count in 2^shift lines (frame = integration + 36 in those units); 0, then 3, then 6 at 16 s, mid-stream, no stream off or on around it, the line length untouched. 6 is the most Android showed; 7 (16 s) and 8 (32 s) ran on ferros at the mode's line (b933: frames 16.4 s and 32.8 s apart, the sensor reading back its shifted counters and the line 6320), so 8 was offered (52.8 s) until the field's width was found.
-    // The field is 5 bits (the Pro, 2026-11-17 night): shifts 21, 22 and 23 ran (frames 26.4 s, 52.8 s, 105.66 s apart, the long-exposure sweep), so bit 4 counts; shift 32 forced (SET 3, 16 lines of 2^32) gave frames 10.3 ms apart, the sensor's own floor, so bit 5 is ignored (32 reads as 0), while the registers keep all 16 bits written (read back G#FFFF). So the most is 31, no other cap (the owner: none anywhere): 65533 lines of 2^31 at 3.15 us, about 14 years.
-    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 31 }), side: Some(Side { pd: Some(0x0720), emb: 0x0118 }) },
+    // The field is 5 bits (the Pro, 2026-11-17 night): shifts 21, 22 and 23 ran (frames 26.4 s, 52.8 s, 105.66 s apart, the long-exposure sweep), so bit 4 counts, while the registers keep all 16 bits written (read back G#FFFF). So the most is 31.
+    // But the frame is counted in 32 bits of lines (the Pro, 2026-11-18, camtest's ceiling sweep, docs/CAMERA.md "The shift's ceiling"): frame_length_lines << shift wraps modulo 2^32. At 32768 lines of integration (a 32770-line frame) shifts 14 to 16 held, and 17 to 20 gave frames 2^18, 2^19, 2^20 and 2^21 lines apart (825.46 ms, 1650.9 ms, 3301.8 ms at the binned line; 1726.50 ms at 1:1 for 17): (32770 << s) mod 2^32 = 2^(s+1) lines. Shift 31 with an even frame wraps to 0 and the sensor runs at its floor (10.31 ms binned, 41.6 ms at 1:1), as on 2026-11-18 evening; with an odd frame (5 lines at shifts 29 to 31) it held. A frame of exactly 2^32 lines (4 at shift 30, 32768 at 17) ran at the floor, 2^32 - 2^17 and 2^32 - 2^16 lines held. The same in lines at 1:1, so the counter is lines, not time.
+    // So the longest exposure is 65533 lines of 2^16 (its frame 65535 << 16, under 2^32): 13524 s, about 3.76 hours, binned (3.15 us a line); 28286 s, about 7.86 hours, at 1:1 (6.59 us). The shift 32 of 2026-11-17 (16 lines of 2^32) was this wrap too, not bit 5 ignored.
+    Array { unit: 2, period: 4, full: (8160, 6144), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 160 * UNITY), margin: Some(2), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 31, frame_bits: 32 }), side: Some(Side { pd: Some(0x0720), emb: 0x0118 }) },
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64.
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: None, side: None },
@@ -188,6 +199,7 @@ impl Timing {
     }
 
     /// A device test of the shift field's reach (owner, 2026-11-17: "no artificial exposure cap anywhere"): `ns` at exactly `shift`, the mode's line, whatever the least shift would be; None when the integration does not fit 16 bits at that shift or falls under the sensor's least, or the camera has no shift.
+    /// Not held to the sensor's frame counter (`Lte::holds`): a frame past it runs wrapped, which is how the counter was measured (the Pro, 2026-11-18); `plan` is.
     pub fn plan_shift(&self, ns: u64, shift: u8) -> Option<Plan> {
         self.lte?;
         // WHY checked: `shift` is the caller's byte: past 63 a shift of 64 bits has no meaning, and is refused.
@@ -221,17 +233,24 @@ impl Timing {
             return Some(Plan { llp: self.llp, fll: self.frame(lines, 0), coarse: lines as u16, shift: 0 });
         }
         // With the vendor's shift: the least shift that brings the integration under 16 bits at the mode's line (Android's choice on 2026-11-17: shift 3 for an exposure 3 needs, 6 at 16 s, the line untouched). The shift scales the sensor's counters only: the line, and with it the readout, stay the mode's (owner, 2026-11-17: "keep the readout clean").
+        // No further than `shift_most`: past it the frame no longer fits the sensor's frame counter for any exposure the shifts before it could not hold (the frame in lines is the exposure plus the margin either way), and the sensor would run the frame wrapped (`Lte::frame_bits`).
         let mut shift = 0u8;
         if let Some(l) = self.lte {
+            let top = self.shift_most(&l);
             shift = 1;
-            while shift <= l.most {
+            while shift <= top {
                 let c = lines >> shift;
                 if c <= most {
-                    return Some(Plan { llp: self.llp, fll: self.frame(c, shift), coarse: c as u16, shift });
+                    let fll = self.frame(c, shift);
+                    // WHY the test: at the least shift a frame past the counter is an exposure past the longest it holds (`most_ns`); refused, never capped, as past the range.
+                    if !l.holds(fll, shift) {
+                        break;
+                    }
+                    return Some(Plan { llp: self.llp, fll, coarse: c as u16, shift });
                 }
                 shift += 1;
             }
-            shift = l.most;
+            shift = top;
         }
         // The line lengthened: the last resort, and only where asked for (`stretch`), as it lengthens the readout and the rolling shutter's skew with it (`readout_ps`).
         if !self.stretch {
@@ -244,7 +263,40 @@ impl Timing {
             return None;
         }
         let c = (ps / self.line_ps_at(llp as u16) as u128) as u64 >> shift;
-        Some(Plan { llp: llp as u16, fll: self.frame(c, shift), coarse: c as u16, shift })
+        let fll = self.frame(c, shift);
+        // WHY the test: the stretched line keeps the frame's lines under the counter at `shift_most` by construction (`most` lines of 2^shift), but the mode's own frame as the floor (`frame`) is checked as well rather than assumed.
+        if self.lte.is_some_and(|l| !l.holds(fll, shift)) {
+            return None;
+        }
+        Some(Plan { llp: llp as u16, fll, coarse: c as u16, shift })
+    }
+
+    /// The most integration (in units of 2^`shift` lines) whose frame, the integration plus the margin, fits both the 16 bits of CCS's frame length and the sensor's frame counter (`Lte::frame_bits`) at `shift`; None when no integration does.
+    fn coarse_most(&self, l: &Lte, shift: u8) -> Option<u64> {
+        let regs = LINES_MOST;
+        let counter = ((1u128 << l.frame_bits) - 1) >> shift;
+        // WHY the shorter: two ceilings on the frame, the register's 16 bits and the frame counter's lines in units of the shift; a frame past either is one the sensor does not hold (the counter's: it runs the frame wrapped, the Pro, 2026-11-18).
+        let frame = if counter < regs as u128 { counter as u64 } else { regs };
+        let floor = (self.fll as u64).div_ceil(1 << shift);
+        // WHY the test: a frame ceiling under the margin plus the least integration, or under the mode's own frame in these units, leaves no integration this shift can hold.
+        if frame < self.margin as u64 + self.coarse_min as u64 || frame < floor {
+            return None;
+        }
+        Some(frame - self.margin as u64)
+    }
+
+    /// The shift that holds the longest integration (`coarse_most` lines of 2^shift), up to the field's `most`: the least of the longest, so the planner's least shift never passes it.
+    /// The main: 16 (65533 lines of 2^16, its frame 65535 << 16 under 2^32); a shift past it holds less, the counter halving the frame faster than the shift doubles it.
+    pub fn shift_most(&self, l: &Lte) -> u8 {
+        let mut best = (0u128, 0u8);
+        for s in 0..=l.most {
+            if let Some(c) = self.coarse_most(l, s) {
+                if (c as u128) << s > best.0 {
+                    best = ((c as u128) << s, s);
+                }
+            }
+        }
+        best.1
     }
 
     /// The exposure a plan gives (ns): its integration's lines, shifted, at its line's time.
@@ -276,7 +328,15 @@ impl Timing {
         if !self.long {
             return (self.fll as u64 - MARGIN as u64) * self.line_ps_at(self.llp) / 1000;
         }
-        let most = ((LINES_MOST - self.margin as u64) as u128) << self.lte.map_or(0, |l| l.most);
+        // With a shift, the longest integration the frame counter holds (`shift_most`), not the field's widest shift: past the counter the sensor runs the frame wrapped (the Pro, 2026-11-18).
+        let most = match self.lte {
+            Some(l) => {
+                let s = self.shift_most(&l);
+                // None only where no shift holds even the least integration (a counter narrower than the margin): then the longest offered is 0.
+                (self.coarse_most(&l, s).unwrap_or(0) as u128) << s
+            }
+            None => (LINES_MOST - self.margin as u64) as u128,
+        };
         let llp = if self.stretch { self.llp_most() as u16 } else { self.llp };
         (most * self.line_ps_at(llp) as u128 / 1000) as u64
     }
@@ -872,7 +932,8 @@ mod tests {
         // Android at 16 s in this mode wrote integration G#9446 at shift 6 (the capture's third hold): the plan agrees to a line.
         assert_eq!((p16.llp, p16.shift), (11600, 6));
         assert!((p16.coarse as i32 - 0x9446).abs() <= 1, "{:X}", p16.coarse);
-        assert!(t.most_ns() > 13 * 365 * 86400 * 1_000_000_000);
+        // The longest, the frame counter's (65533 lines of 2^16 at the 1:1 line): about 7.86 hours, twice the binned mode's 3.76 for its longer line.
+        assert!((28_285_000_000_000..28_287_000_000_000).contains(&t.most_ns()), "{}", t.most_ns());
         // A 1:1 slit: whole quad cells.
         assert_eq!(m.slit(a, 2, 128, 16), Err(Error::Rows(2)));
         let s = m.slit(a, 64, 64 + (1 << 7), 16).unwrap();
@@ -1111,7 +1172,7 @@ mod tests {
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.
     #[test]
     fn long_exposures_with_a_shift() {
-        let l = Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 7 };
+        let l = Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 7, frame_bits: 32 };
         let t = Timing { lte: Some(l), ..main_timing() };
         let p = t.plan(16_000_000_000).unwrap();
         assert_eq!((p.llp, p.shift), (6320, 7));
@@ -1141,16 +1202,18 @@ mod tests {
             // The readout is the mode's at every exposure: 3072 rows of the 6320-clock line.
             assert!((9_600_000_000..9_700_000_000).contains(&t.readout_ps(&p, 3072)), "{}", t.readout_ps(&p, 3072));
         }
-        // 16 s at shift 7 and 32 s at shift 8, both at the mode's line (b933), 105 s at 9; the most, 65533 lines of 2^31 (the field's 5 bits), 443150242 s, about 14 years; its frame period in ns; past it refused.
+        // 16 s at shift 7 and 32 s at shift 8, both at the mode's line (b933), 105 s at 9; the most, 65533 lines of 2^16 (the frame counter's 32 bits, the Pro 2026-11-18), 13524 s, about 3.76 hours; its frame period in ns; past it refused.
         for (ns, shift) in [(16_000_000_000u64, 7u8), (32_000_000_000, 8), (105_000_000_000, 9)] {
             assert_eq!(t.plan(ns).map(|p| (p.llp, p.shift)), Some((6320, shift)), "{ns}");
         }
-        assert_eq!(t.most_ns(), 443_150_242_145_049_247);
-        // The most in whole ns lies a fraction of a line under 65533 x 2^31 lines, so it plans 65532 of 2^31.
+        assert_eq!(t.most_ns(), (65533u64 << 16) * crate::MAIN_LINE_PS / 1000);
+        assert!((13_523_000_000_000..13_525_000_000_000).contains(&t.most_ns()), "{}", t.most_ns());
+        // The most in whole ns lies a fraction of a line under 65533 x 2^16 lines, so it plans 65532 of 2^16.
         let p = t.plan(t.most_ns()).unwrap();
-        assert_eq!((p.shift, p.coarse, p.fll), (31, 65532, 65534));
-        assert_eq!(t.frame_ns(&p), 443_157_004_390_668_173);
-        assert_eq!(t.plan(t.most_ns() + (crate::MAIN_LINE_PS << 32) / 1000), None);
+        assert_eq!((p.shift, p.coarse, p.fll), (16, 65532, 65534));
+        assert_eq!(t.frame_ns(&p), (65534u64 << 16) * crate::MAIN_LINE_PS / 1000);
+        // 65534 lines of 2^16 (the least past the most, whose frame at the least shift that holds it, 32769 << 17, passes 2^32) is refused.
+        assert_eq!(t.plan(((65534u64 << 16) * crate::MAIN_LINE_PS).div_ceil(1000)), None);
         // Held to 6 (Android's most): 16 s refused at the mode's line, and 13.2 s the most.
         let l6 = Lte { most: 6, ..ARRAYS[0].lte.unwrap() };
         let t6 = Timing { lte: Some(l6), ..t };
@@ -1164,7 +1227,7 @@ mod tests {
         assert!(ts.readout_ps(&p, 3072) > 11_000_000_000, "{}", ts.readout_ps(&p, 3072));
     }
 
-    /// The cut (docs/CAMERA.md "Serving while a frame waits"): the owner's shutter dragged to the end (a 14-year frame) and back to 1 s cuts the frame in flight, at any point of it, with the counter's 24.576 MHz (no 64-bit wrap reads it as short); "a 64 s exposure, 5 s in I want 12 s" cuts (the new frame would end 47 s sooner); a new frame ending under the margin (2^20 us) sooner, or later, does not; a frame begun just now at 64 s and asked for 63.5 s does not.
+    /// The cut (docs/CAMERA.md "Serving while a frame waits"): the owner's shutter dragged to the end (a 3.76-hour frame since the counter's ceiling; a 14-year one was planned before) and back to 1 s cuts the frame in flight, at any point of it, with the counter's 24.576 MHz (no 64-bit wrap reads it as short, tested at the 14-year frame the arithmetic must still take); "a 64 s exposure, 5 s in I want 12 s" cuts (the new frame would end 47 s sooner); a new frame ending under the margin (2^20 us) sooner, or later, does not; a frame begun just now at 64 s and asked for 63.5 s does not.
     #[test]
     fn the_cut() {
         let t = cams::MAIN.listed_timing();
@@ -1172,10 +1235,14 @@ mod tests {
         let hz = 24_576_000u64;
         let margin = 1u64 << 20;
         let s = |x: u64| x * hz;
-        let years = t.frame_ns(&t.plan(t.most_ns()).unwrap());
+        let hours = t.frame_ns(&t.plan(t.most_ns()).unwrap());
+        // The 14-year frame of shift 31 (the field's width, before the counter was measured): forced, the device test's way.
+        let years = t.frame_ns(&t.plan_shift(443_150_242_145_049_247, 31).unwrap());
         let one = t.frame_ns(&t.plan(1_000_000_000).unwrap());
         let at = 1u64 << 40;
-        // A second into the 14-year frame, and 13 years into it.
+        // A second into the 3.76-hour frame, and 3 hours into it; a second and 13 years into the 14-year one.
+        assert!(Timing::cut_due(at, hours, at + s(1), one, hz, margin));
+        assert!(Timing::cut_due(at, hours, at + s(3 * 3600), one, hz, margin));
         assert!(Timing::cut_due(at, years, at + s(1), one, hz, margin));
         assert!(Timing::cut_due(at, years, at + s(13 * 365 * 86400), one, hz, margin));
         // 64 s, 5 s in, now 12 s: about 47 s sooner.
@@ -1191,6 +1258,52 @@ mod tests {
         assert!(!Timing::cut_due(at, one, at, years, hz, margin));
     }
 
+
+    /// The sensor's frame counter (the Pro, 2026-11-18, docs/CAMERA.md "The shift's ceiling"): frames of 32770 lines at shifts 14 to 16 held, at 17 to 20 ran wrapped modulo 2^32 lines; exactly 2^32 ran at the floor, 2^32 - 2^16 and 2^32 - 2^17 held; the same in lines at 1:1.
+    /// So the plan stops at shift 16 (65533 lines of 2^16): 3.76 hours binned, 7.86 hours at 1:1; every held exposure plans, every wrapped one is refused; a forced shift (the device test's) still reaches past the counter, as the measurement needs.
+    #[test]
+    fn the_frame_counter() {
+        let l = ARRAYS[0].lte.unwrap();
+        assert_eq!((l.most, l.frame_bits), (31, 32));
+        // What ran: held, and wrapped.
+        for s in 14..=16 {
+            assert!(l.holds(32770, s), "{s}");
+        }
+        for s in 17..=31 {
+            assert!(!l.holds(32770, s), "{s}");
+        }
+        assert!(l.holds(65535, 16) && l.holds(32767, 17) && l.holds(5, 29));
+        assert!(!l.holds(32768, 17) && !l.holds(4, 30) && !l.holds(4, 31) && !l.holds(5, 30));
+        let t = Timing { fll: 0x5372, coarse_min: 2, ..cams::MAIN.listed_timing() };
+        assert_eq!(t.shift_most(&l), 16);
+        // The run's exposures, 32768 lines of 2^s and half a unit more as camtest asks them: shifts 14 to 16 plan at that shift, 17 and past are refused.
+        let at = |s: u8| (((32768u128 << s) + (1u128 << s >> 1)) * crate::MAIN_LINE_PS as u128 / 1000) as u64;
+        for s in 14..=16 {
+            let p = t.plan(at(s)).unwrap();
+            assert_eq!((p.shift, p.coarse, p.fll, p.llp), (s, 32768, 32770, 6320), "{s}");
+        }
+        for s in 17..=31 {
+            assert_eq!(t.plan(at(s)), None, "{s}");
+        }
+        // Three hours plans at shift 16; four do not.
+        assert_eq!(t.plan(3 * 3600 * 1_000_000_000).map(|p| p.shift), Some(16));
+        assert_eq!(t.plan(4 * 3600 * 1_000_000_000), None);
+        // The 1:1 readout: the same lines at its 6.586 us line (the 1:1 init's PLL, 215 for 245), its own frame of 6327 lines at 11600 clocks: 28286 s.
+        let full = Timing { line_ps: crate::MAIN_LINE_PS * 245 / 215, llp: 11600, fll: 6327, ..t };
+        assert_eq!(full.line_ps_at(11600), 6_586_118);
+        assert_eq!(full.shift_most(&l), 16);
+        assert!((28_285_000_000_000..28_287_000_000_000).contains(&full.most_ns()), "{}", full.most_ns());
+        let p = full.plan(full.most_ns()).unwrap();
+        assert!(p.shift == 16 && l.holds(p.fll, p.shift), "{p:?}");
+        assert_eq!(full.plan(((65534u64 << 16) * 6_586_118).div_ceil(1000)), None);
+        // The device test's forced shift is not held to the counter: it is how the wrap was found.
+        assert_eq!(t.plan_shift(at(17), 17).map(|p| (p.coarse, p.fll)), Some((32768, 32770)));
+        // A stretched line with the shift stays inside the counter too.
+        let ts = Timing { stretch: true, ..t };
+        let p = ts.plan(ts.most_ns()).unwrap();
+        assert!(p.llp > 6320 && l.holds(p.fll, p.shift), "{p:?}");
+        assert_eq!(ts.plan(((65534u64 << 16) * ts.line_ps_at(ts.llp_most() as u16)).div_ceil(1000)), None);
+    }
 
     /// The forced shift of the reach test: 16 lines of integration at shift 12 on the main is a frame of 18 (the mode's 21362 lines are 6 at that shift), at the mode's line; under the least (one line at shift 16) refused; no shift on a camera without one.
     #[test]

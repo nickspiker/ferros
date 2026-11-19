@@ -592,6 +592,7 @@ Then the ultrawide (`04080005010B`, to 2^11 ms), then Lumis hand-spawned (above,
   - Bit 4 counts (16 to 23 ran), bit 5 does not: **the field is 5 bits, shifts 0 to 31.** `ARRAYS[0].lte.most` is 31 and nothing else caps it (the owner: no artificial cap anywhere): the main offers 65533 lines of 2^31 at 3.1489 us, **443150242 s, about 14.0 years** (`exposure_max` A#443150242145049247 ns); the open says "exposures to A#443150242145 ms".
   - The arithmetic moved to 128 bits where it passed 64 (65535 lines of 2^31 is 4.4 x 10^20 ps): ccs `Timing::ns`, `most_ns`, `plan`, `plan_shift`, and the frame period is now ns (`frame_ns`; the driver's `PERIOD_NS`, its waits' deadline `late_tick`, past about 8.7 days of us the product with the counter's 24.576 MHz). Host tests: 105 s at shift 9, the most at 31, its frame 443157004 s.
   - Lumis's calibration's dark seed takes `exposure_max` as its shutter (std/lumis main.rs, `calibration` Some(true)): with the whole reach that asks a 14-year frame. Lumis's to decide; not changed here.
+  - **Corrected 2026-11-18** ("The shift's ceiling" below): the field is 5 bits, but the sensor counts the frame in 32 bits of lines (frame_length_lines << shift, modulo 2^32). Shift 32's floor here was that wrap (18 << 32), and the 14-year offer was a frame the sensor runs wrapped; the main now offers 65533 lines of 2^16, 13524 s binned and 28286 s at 1:1.
 To test with Lumis, the driver is spawned by hand with the input `01`: it then stays between calls (a hand-spawned driver ended after a LIST, and the OPEN behind it started the vault's).
 
 ## The slit for real (2026-11-17): built, device runs pending
@@ -1015,6 +1016,7 @@ Measured on the Pro, not attested, the identity unlocked at boot, RAM reloads b9
 - **Step 1 passes, the cut lands.** camtest `00000009`: LIST 1105 bytes in 14 ms and STATS in 44 us while the 1024 s frame's MAP waits; the SET to 67 ms answered in 2.5 ms, "the frame in flight cut with about A#1022094 ms of it left", the first frame after the cut 92 ms after stream on, the waiter's MAP answered 95 ms after the SET; CLOSE answered in 168 ms, the waiter's MAP empty; link clean, no error word. So this Samsung sensor truncates on G#0106 and the front end takes a stream off and on with no close.
 - **Steps 2 and 3 pass**: "its holder's process has ended (the kernel's watch); closing" in the same millisecond as camtest's exit (`00000009001C01`), and at once after `diag "kill camtest"` (`00000009001C02`), each closing thru its own close.
 - **But 2^28 s is not a long frame on the sensor.** At `…1C…` the driver plans shift 31 ("a frame every A#268447626580 ms") and the sensor ignores it: frames kept coming 10.2 ms apart (about 96 a second, the sensor's floor), 188 MAPs answered in the 2 s before the hold, so in steps 2 and 3 the MAP was held only between frames. The same two ends with a really held MAP (`00000009000A01`, `00000009000A02`, 1024 s at shift 13, no frame for 2 s until the cut) closed at once too. Shift 13 holds; somewhere between 13 and 31 the sensor stops honouring the shift, unmeasured (b933 ran 1 to 8).
+  - Measured since ("The shift's ceiling" below): not a shift ceiling but the frame counter's 32 bits of lines; 39700 << 31 wraps to 0, the sensor's floor.
 - **Regressions pass**: camtest `4001` 64 frames 66.7 ms apart; the slit sensor 1218/s, front end 1209/s, 1238 slits a second read, 0 lost; 96 a second 18184 frames, 16320 mapped (1757 skipped, 7.2 ms of work a frame), no error word, every release the kernel's, 55 C to 75 C.
 - Rebooted after (b975, cold, the flashed kernel): "identity unlocked at boot", fgtw "a fleet member with the fleet key".
 
@@ -1037,6 +1039,7 @@ On Android Lumis lists a second readout per lens ("50 MP" on the main, 8160 x 61
 - ferros_cam ccs `Mode::captured_full` (the 1:1 mode out of that init, bin 1; refused unless its output is one pixel an array pixel over its window and `Array::full`: the binned init under the name is refused), `line_ps_for` (the camera's measured line time scaled by the init's PLL, `Cam::pll`), `Cam::listed_mode_timing`; cams `pll` and `fll`; list `Readout` (a section per readout) with `mode`, `cfa_period` and `frame_ns`.
 - payloads/camera: kinds 2 and 4 replay `cam.<key>.init.full` in place of the binned init (the CPU's writes and the job stay the binned session's, their geometry rewritten to 8160 x 6144 at G#2800 a line, `Scope::Core`); kind 2 with zeros is the 1:1 init's own frame and integration, written again in the hold with phase detect and embedded data off (`F_LOUD` keeps them); the statistics pipeline detached and the slim program by default (ferros_cam geom `shape`: what a window needed, and what whole binned frames ran clean in); the timing at the 1:1 line (the open's console says the line, the PLL and the frame); LIST's second section; the header's +14. Buffers of 60 MiB (6144 lines of G#2800), a ring of four 302 MiB with the region, rings of three, two, one as the pool allows; FRAME by copy refused at 1:1 (it bins the captured shape only), so frames go thru the view.
 - A device test with nothing stored: a hand-spawned driver takes the 1:1 init in its input, after 16 knob bytes, as `--input-file` frames it, in place of the vault's.
+- **A hand-spawned driver takes the 1:1 init in its input only after the 16 knob bytes; without them it ignores the init** (input `01` + 15 zero bytes, `01000000000000000000000000000000`, then `--input-file target/cam/main-full.init`).
 - camtest's eighth byte, the OPEN's kind (`4001000000000002`: the 1:1 thru the view); its view run says the mosaic's 4 x 4 cell (`cells`: each place's mean, so a quad array shows 2 x 2 blocks alike and a Bayer one a period of 2); its long-exposure ladder runs thru the view at bin 1 (`0401000500000002`).
 - Host tests: the 1:1 mode, its clock, its timing and the shift (ccs `the_main_full_mode`), the two sections as Lumis's parser reads them (list `the_mains_two_readouts`), the table's writer (oracle-i2c `an_init_table`).
 
@@ -1083,6 +1086,49 @@ $B diag "console kept 64"
 **The CFA is quad.** The cell table (4 x 4 means, a dim indoor scene, black 64) read the same in the first and the 64th frame: rows 0 and 1 `80 80 73 73`, rows 2 and 3 `83 83 80 80`. That is 2 x 2 blocks of one colour, G B / R G as blocks (G 80, B 73, R 83, G 80), the binned readout's phase. The binned table (step 0) is a period of 2: `102 86 102 86` / `109 102 109 101`.
 
 **The 96 a second death was heat, not the driver.** Photon was in front rendering every frame (76 a second, 12.5 ms a draw), which kept the A715s lifted at 2367 MHz; after the 1:1 runs the zones read BIG peak 92 C, MID and LITTLE 90 C, CPUCL0's divider stepping (G#80000801). In that state cambench read only 36 frames a second (27 ms of work a frame, 1522 MHz) and the stream died at frame 26718 (about 278 s): one DMA_DONE gap of 10939 us, then LATE_CONFIG (G#10) and image overflow G#1, the driver's own close after 2117 ms with no frame. Every DMA_DONE had been released by the kernel's armed action; `diag dev` showed ispfe0 interrupt to run at most 3061 us. Photon sent behind (the Deck tap), the Pro fell from 86 C to 54 C in about 3 minutes, and the same run passed: 17201 frames at 96 a second, 16320 mapped (775 skipped, 6.2 ms of work a frame), no error word, every release the kernel's, 72 C at the end.
+
+## The shift's ceiling (2026-11-18, branch cam-exposure-ceiling)
+
+The question ("Serving while a frame waits", its Pro run): 2^28 s at shift 31 gave frames at the sensor's floor while 1024 s at shift 13 held. Where does the main stop honouring a long exposure, binned and 1:1?
+**Answer: not at a shift.** The sensor counts the frame in lines, frame_length_lines << shift, in 32 bits, and wraps past them: a frame of 2^32 lines or more runs as its remainder modulo 2^32 (at the sensor's floor when that is 0). So the longest exposure is the longest integration whose frame stays under 2^32 lines: 65533 lines of 2^16 (the frame 65535 << 16). **Binned 13523.9 s (3 h 45 min); 1:1 28285.9 s (7 h 51 min).**
+
+**The tool**: camtest's fourth byte 10 (`ceiling`): OPEN with the view, a second thread MAPping, then for each shift (seventh byte to sixth, 14 to 31 by default) the shift forced (SET 3) with an integration of the ninth and tenth bytes' lines (u16 LE, 2^15 by default) of 2^shift; 2^20 us for the old timing's frames, then a window (first byte, 8 s) counting the frames that land and their spacing, with CAPS before and after (now with the shift words, +103); then 67 ms again, which cuts the long frame, and the next frame within 4 s or the run closes. Third byte 1: no shift forced, the driver's own plan. Nothing waits out a long frame: a held frame is no frame in the window.
+The driver hand-spawned (`01`; at 1:1 `01000000000000000000000000000000` with `--input-file target/cam/main-full.init`), nothing stored, nothing flashed, every stream ended by its own close.
+
+**Binned** (b975, the flashed forge bc1bef30; camtest `0800000A`, one open, 32768 lines of integration, so a 32770-line frame, at each shift):
+
+| shift | asked | frames in 8 s | spacing | (32770 << shift) mod 2^32 |
+|---|---|---|---|---|
+| 14 | 1690 s | 0 | held | 2^29 + 2^15, held |
+| 15 | 3381 s | 0 | held | 2^30 + 2^16 |
+| 16 | 6762 s | 0 | held | 2^31 + 2^17 |
+| 17 | 13524 s | 9 | 825.461 ms | 2^18 lines: 825.47 ms |
+| 18 | 27049 s | 5 | 1650.924 ms | 2^19: 1650.94 ms |
+| 19 | 54098 s | 2 | 3301.827 ms | 2^20: 3301.9 ms |
+| 20 | 108197 s | 1, 6.6 s after the SET | | 2^21: 6.60 s |
+| 21 to 30 | 216395 s to 1.1 x 10^8 s | 0 | | 2^22 to 2^31: 13 s to 1.9 h |
+| 31 | 2.2 x 10^8 s | 776 | 10.310 ms, the floor | 0 |
+
+- Every step read back as written (frame 32770, line 6320, integration 32768, both shift words G#0E00 to G#1F00), and the sensor's own frame count (G#0005) stood still in the held steps and moved in the others: the words are taken, the frame is what wraps.
+- Every spacing is 2^(shift + 1) lines of the measured 3.148916 us line to 0.01 %.
+
+**The model's checks** (one open each, binned):
+- A 4-line frame (integration 2) at 29, 30, 31: 29 held (2^31 lines), 30 and 31 at the floor (4 << 30 is 2^32: 0), 10.31 ms.
+- A 5-line frame (integration 3) at 29, 30, 31: all held (5 << 30 wraps to 2^30, 5 << 31 to 2^31). So shifts 30 and 31 are taken as written; on 2026-11-17 and on the evening run they only looked ignored because their frames wrapped to 0 (shift 32's 18-line frame, the 39700-line frame at 31: both even).
+- The edge: 65535 << 16 (2^32 - 2^16) held; 32767 << 17 (2^32 - 2^17) held; 32768 << 17 (2^32) at the floor.
+
+**1:1** (b976, the 1:1 init in the spawn's input; one open each): 32768 lines at 17 gave frames 1726.501 ms apart, 2^18 lines of 6.586118 us (1726.51 ms); 32768 << 17 (2^32) ran at the 1:1 floor, 41.6 ms; 65535 << 16 held, and 32770 at 14, 15 and 16 held. The same 32 bits of lines: the counter is lines, not time, so the 1:1's longer line doubles its ceiling in seconds.
+
+**What is inferred, not seen**: no frame past b933's 105.66 s (2^25 lines) was waited out. That 2^32 - 2^16 lines really ends after 3.76 hours rests on the wrap, which every spacing above matches exactly; a frame at the ceiling has not been watched land.
+
+**A reset, not reproduced**: the first 1:1 sweep (one open, shifts from 14, b975) ended with the Pro resetting about 10 s into shift 15's window, a held frame with nothing moving, after shift 14 had held 8 s and been cut cleanly. Cold boot b976, no panic record (the record's words all ones), nothing in the flash log after the open's first frame. The same sequence again in one open (14, 15, 16, each cut) and each step on its own ran clean. Cause unknown; noted in case it returns.
+
+**Built** (ferros_cam ccs, payloads/camera, payloads/camtest):
+- `Lte::frame_bits` (32 on the main) and `Lte::holds`; `Timing::shift_most` (16 on the main), the least shift that holds the longest integration; `plan` stops its least-shift search there and refuses an exposure whose frame passes the counter (never caps, as past any range); the stretched-line path is checked too.
+- `Timing::most_ns`: the longest integration the counter holds at the readout's line, so the list's `exposure_max` per readout is the longest honoured exposure: binned A#13523872135774 ns, 1:1 A#28285866534109 ns (they were 443150242 s and about 926871274 s, 14 and 29 years, at shift 31). Lumis's slider and its LONG EXPOSURES go by the list; nothing changes on its side.
+- `plan_shift` (SET 3, a device test) is not held to the counter: forcing a wrap is how it was measured.
+- The driver's open says `the frame counter A#32 bits (the longest exposure at shift A#16)` and `exposures to A#13523872 ms`; the first LIST of a run says each readout's `exposure_max`; CAPS is 107 bytes (+103 the shift words G#0702 and G#0704).
+- Host tests: ccs `the_frame_counter` (every measured held and wrapped frame, the plan at 3 hours taken and 4 refused, 65534 lines of 2^16 refused, the 1:1 readout, the stretch), `the_mains_shift`, `the_cut`, `the_main_full_mode`; list `the_mains_two_readouts` prints both ranges.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
