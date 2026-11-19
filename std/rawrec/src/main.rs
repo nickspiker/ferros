@@ -2,7 +2,7 @@
 //! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`.
 //!
 //! The input (hex bytes):
-//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it.
+//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost).
 //! - record (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
@@ -104,6 +104,31 @@ fn hex(h: &[u8; 32]) -> String {
     h.iter().map(|b| format!("{b:02X}")).collect()
 }
 
+/// Job 3: what sealing a clip would cost (docs/RAW-VIDEO.md, the next step): XChaCha20-Poly1305 over 2^6 MiB in place, a MiB a seal, on one core and on four of each cluster, at the clocks the recording holds (the A715s at 1572 MHz while a clip is open: hold them with `diag dvfs` around this job to match).
+fn seal_bench() {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    let key = chacha20poly1305::Key::from_slice(&[7u8; 32]).to_owned();
+    for (what, mask, threads) in [("one A715", 0x00F0u64, 1usize), ("four A715s", 0x00F0, 4), ("one A510", 0x000F, 1), ("four A510s", 0x000F, 4)] {
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| {
+                    ferros_clip::ferros::pin(mask);
+                    let c = chacha20poly1305::XChaCha20Poly1305::new(&key);
+                    let mut buf = vec![0x5Au8; 1 << 20];
+                    for k in 0..(1u64 << 6) {
+                        let mut nonce = [0u8; 24];
+                        nonce[..8].copy_from_slice(&k.to_le_bytes());
+                        let _ = c.encrypt_in_place_detached(chacha20poly1305::XNonce::from_slice(&nonce), b"", &mut buf);
+                    }
+                });
+            }
+        });
+        let us = t.elapsed().as_micros() as u64;
+        println!("rawrec: seal bench, {what}: A#{} MiB in A#{} ms, A#{} MB/s", threads << 6, us / 1000, ((threads as u64) << 26) / us.max(1));
+    }
+}
+
 fn main() {
     let inp = input();
     let arg = |k: usize| inp.get(k).copied().unwrap_or(0);
@@ -121,6 +146,10 @@ fn main() {
         }
         2 => {
             println!("rawrec: {NAME} deleted: {}", ext.delete());
+            return;
+        }
+        3 => {
+            seal_bench();
             return;
         }
         _ => {}

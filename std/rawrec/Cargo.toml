@@ -12,6 +12,8 @@ path = "src/main.rs"
 ferros_clip = { path = "../../ferros_clip" }
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
 blake3 = "1.5"
+# Job 3: what sealing a clip would cost (XChaCha20-Poly1305, as the vault seals its values).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = 3
