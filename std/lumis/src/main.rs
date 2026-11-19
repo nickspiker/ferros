@@ -132,8 +132,8 @@ fn seal_at_exit() {
     }
 }
 
-/// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost.
-const PREVIEW_GAP_LOG2: u32 = 8;
+/// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost; at 2^7 (about 7.5 previews a second) a warm 32 s clip lost none of its 871 frames (the coding 30.2 ms on average).
+const PREVIEW_GAP_LOG2: u32 = 7;
 
 /// The preview's gap while recording: 2^`PREVIEW_GAP_LOG2` ms, or the input's 24th byte's power of two (development: `DEV_VIDEO` runs measure where drops begin).
 fn preview_gap() -> std::time::Duration {
