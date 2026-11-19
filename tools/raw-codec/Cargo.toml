@@ -1,0 +1,23 @@
+[package]
+name = "raw-codec"
+version = "0.1.0"
+edition = "2024"
+description = "Prototype lossless (and optional shot-noise quantised) codec for 10-bit camera RAW mosaics: a no_std band coder plus a host measuring binary"
+
+[workspace]
+
+[lib]
+name = "raw_codec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "raw-codec"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+panic = "abort"

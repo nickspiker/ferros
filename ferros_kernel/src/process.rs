@@ -3456,6 +3456,12 @@ pub struct BlockWindow {
 }
 
 /// The windows (VAULT-OUT.md, block window first cut): the kernel keeps the UFS driver and moves blocks; it does not hold values, parse them or seal them. `vault`: the vault process's two mirrors, 8 GiB each, from 4 GiB into the partition (past the flash log at 1 GiB and the kernel's own vault at 2 GiB to 2.5 GiB; every ferros partition is at least 77 GiB).
+/// `rawbench` (development, docs/RAW-VIDEO.md, 2026-11-19): the flash's sustained rate measured by std/rawbench, 32 GiB from 32 GiB into the partition, where nothing is kept.
+/// What the partition holds, by the code that places it: the old ferros_vault file at its start (shim, 256 blocks), the old text log at 1 GiB and the flash log's ring after it to 1 GiB + 192 MiB (flashlog.rs), the kernel's vault at 2 GiB to 2.5 GiB (kvault.rs), the vault process at 4 GiB to 20 GiB (`vault` above); from 20 GiB to the partition's end (128 GiB on husky, 77.7 GiB on akita) nothing is written by any code.
+/// Its blocks hold the bench's patterns and nothing reads them; a recording region would be the owner's own carve (RAW-VIDEO.md).
+#[cfg(not(ferros_production))]
+pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }, BlockWindow { name: "rawbench", offset: 1 << 23, blocks: 1 << 23 }];
+#[cfg(ferros_production)]
 pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }];
 
 pub static STORES: &[StoreScope] = &[
@@ -4925,6 +4931,34 @@ fn el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = match (window, crate::ufs_device::part()) {
                 // The owner's fresh start is zeroing the flash (service.rs `vault fresh`): nothing more is read or written before its reset.
                 _ if BLOCKS_SHUT.load(core::sync::atomic::Ordering::SeqCst) => ERR,
+                // Op bit 2 (development, docs/RAW-VIDEO.md): the flash at a queue deeper than one, on the `rawbench` window only (it writes the same bytes everywhere, so never where anything is kept): x4's low 32 bits commands of `count` blocks at consecutive places from `at`, its bits 32-39 the depth (1 to QUEUE_MOST); every command's data the caller's `count` blocks (a write) or the bounce (a read, nothing copied back).
+                // The answer: x1 the ticks from the first doorbell to the last completion, x2 the commands that completed well.
+                // WHY the bounds: the commands, depth and place are the process's; all of them inside the window, the depth inside the slots the HAL keeps.
+                #[cfg(not(ferros_production))]
+                (Some(w), Some((first, blocks))) if f.x[1] & 4 != 0 && w.name == "rawbench" && (1..=BLOCK_MAX).contains(&count) && (1..=ferros_hal::ufs::QUEUE_MOST as u64).contains(&(f.x[4] >> 32 & 0xFF)) && (f.x[4] & 0xFFFF_FFFF) != 0 && at < w.blocks && (f.x[4] & 0xFFFF_FFFF) * count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let base = (first as u64 + w.offset + at) as u32;
+                    let (n, cmds, depth) = (count as usize, (f.x[4] & 0xFFFF_FFFF) as usize, (f.x[4] >> 32 & 0xFF) as usize);
+                    let mut data = alloc::vec![0u8; n << 12];
+                    if write {
+                        p.read_into(buf, &mut data);
+                    }
+                    let (ok, ticks) = unlocked(|| {
+                        UFS.with(|| {
+                            let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                            let run = (&raw mut UFS_RUN) as usize;
+                            if ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+                                u.probe_prdt_stride(0, base, run);
+                            }
+                            // SAFETY: the bounce holds RUN_MAX blocks and n is at most BLOCK_MAX (RUN_MAX), checked above; it is touched only under the UFS lock, held here.
+                            unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) }.copy_from_slice(&data);
+                            u.run_queued(0, base, n, cmds, depth, run, write)
+                        })
+                    });
+                    f.x[1] = ticks;
+                    f.x[2] = ok as u64;
+                    if ok == cmds { 0 } else { ERR }
+                }
                 // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
                 (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
                     use core::sync::atomic::Ordering::Relaxed;

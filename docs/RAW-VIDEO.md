@@ -1,0 +1,177 @@
+# RAW video on ferros
+
+Status: measured and prototyped, 2026-11-19 (branch raw-video).
+Nothing is built into a shooter yet, and nothing was stored on a device in a new format.
+The format decision at the end is the owner's (AGENT.md Rule -1).
+
+The owner (2026-11-19): a RAW video shooter on ferros, graded later, lossless if at all possible; the main camera at 24, 30 and 60 a second binned and at 24 a second 1:1; clips of about a minute.
+
+## The answer first
+
+| mode | raw | fits the flash for a minute? | lossless (measured 2 to 3.5x) | CPU today |
+|---|---|---|---|---|
+| binned 24/s | 376 MB/s | yes, uncompressed, sustained (the flash's floor is 555 MB/s) | 110 to 190 MB/s | the codec at 24/s on four A715s at 1065 MHz has room (26.6 ms of 41.7) |
+| binned 30/s | 470 MB/s | yes, uncompressed (85 % of the floor; with WriteBooster on, all of a minute lands in its SLC cache) | 135 to 240 MB/s | **measured: 30/s for 60 s on four A715s at 1065 MHz, 61 C at most** |
+| binned 60/s | 940 MB/s | no uncompressed (the cache holds about 33 GB, 35 s of it) | 270 to 480 MB/s: fits | 12.4 ms of 16.7 at 2367 MHz, but **not sustained: 60/s for 10 s, then 88 C and the clock divider, 38 to 40/s** |
+| 1:1 24/s | 1504 MB/s | no | 650 MB/s at 2.3x: the cache covers about 50 s, then a 1 GB backlog | 61 ms a frame on four A715s at 2367 MHz: 16/s, short of 24 |
+
+- **Lossless fits the internal flash in every mode but 1:1**, and binned 24 and 30 even fit uncompressed.
+- **The wall is the CPU, not the flash**: 60/s binned is heat-limited and 1:1 at 24/s is compute-limited with this codec on the CPU. Both want a faster encoder (hand-written NEON, the A510s alongside, or the Mali GPU) before anything else.
+- The visually lossless mode (below) adds ratio (about 3.5 to 3.9x at s = 1) but not speed: it runs the same coder.
+- Lossless stays the default.
+
+## What the camera gives
+
+| mode | frame | a frame (RAW10 packed) | a second | a minute |
+|---|---|---|---|---|
+| binned 24/s | 4080 x 3072, Bayer G B / R G | 15.67 MB | 376 MB/s | 22.6 GB |
+| binned 30/s | | | 470 MB/s | 28.2 GB |
+| binned 60/s | | | 940 MB/s | 56.4 GB |
+| 1:1 24/s | 8160 x 6144, quad (2 x 2 blocks of one colour) | 62.67 MB | 1504 MB/s | 90.2 GB |
+
+The front end writes each line on a 256-byte stride (5120 bytes binned, 10240 at 1:1); the table counts the pixels' 10 bits only.
+
+## Part 1: the flash
+
+### Where a clip could live: the ferros partition, proven
+
+The Pro's ferros partition: LU 0, first LBA G#1B8_B400 (A#28881920), A#33554427 blocks of 4 KiB (128 GiB less 20 KiB), checked against the GPT by `ufs_device::locate` and said by every `diag` (FERROS_PART_FIRST, FERROS_PART_BLOCKS).
+Everything the code writes there, by the code that places it (partition-relative blocks):
+
+| blocks | what | placed by |
+|---|---|---|
+| 0 to 255 | the old ferros_vault file | shim.rs `ferros_windowed(.., 256)` (shim builds only) |
+| 2^18 to 2^18 + 2^14 | the old text log (1 GiB in) | flashlog.rs `OLD_OFFSET`, `OLD_BLOCKS` |
+| 2^18 + 2^14 to 2^18 + 3 x 2^14 | the ledger's flash ring, two copies | flashlog.rs `OFFSET`, `HALF` |
+| 2^19 to 2^19 + 2^17 | the kernel's vault, mirrors A and B (2 GiB to 2.5 GiB) | kvault.rs `MIRROR_OFFSET`, `REGION_BLOCKS` |
+| 2^20 to 2^20 + 2^22 | the vault process's window (4 GiB to 20 GiB), its two mirrors 2^21 apart | process.rs `WINDOWS` `vault`, payloads/vault `HALF` |
+| 2^20 + 2^22 to the end | **nothing**: about 108 GiB | |
+
+The kernel bounds every SYS_BLOCK call to its window and every window to the partition; no other branch adds a window (searched every remote branch); the hv never writes UFS (its firewall only reads Android's commands); ferros_hal ring.rs's absolute LBAs (an old M1-era layout) have no caller on husky.
+One stray found: shim.rs writes and restores absolute LBA A#30000000 (partition block A#1118080, inside the vault process's window) in `FERROS_SHIM_HANDOFF` builds only; harmless while nobody builds that, but it should move.
+
+The measurements below wrote only to a development window, `rawbench` (process.rs `WINDOWS`, development builds only): 2^23 blocks from 2^23 in, 32 GiB to 64 GiB, inside the free stretch on both boards (akita's partition is 77.7 GiB).
+Its blocks now hold the bench's patterns; nothing reads them.
+
+### The link and the device
+
+`diag "ufs link"` (new, service.rs) reads the host's own UniPro attributes and the device's descriptors:
+- **HS-G4, series B, two lanes each way, fast mode**: the fastest the link offers (the device's advertised receive gear is 4). ferros runs it at its top.
+- The device reports spec G#0400 (UFS 4.0), a queue depth of A#64; the controller has 32 transfer slots. **ferros's driver uses one** (queue depth 1, one command at a time, polled), up to 1 MiB a command (256 PRDT entries of 4 KiB).
+- **WriteBooster**: a shared SLC buffer of A#8192 units of 4 MiB (32 GiB nominal), user space preserved, life used under a tenth. **ferros never turned it on**: its enable and flush flags are volatile (every power-on clears them) and Linux sets them at each probe. `diag "ufs link wb on|off"` sets them now.
+
+### Measured on the Pro (2026-11-19, b1001 and b1003, this branch's kernel RAM-reloaded; std/rawbench, 1 MiB commands of incompressible bytes, sequential)
+
+| what | rate | over time |
+|---|---|---|
+| write, queue 1, WriteBooster off | **556 MB/s** | flat for 64 s, no cliff (33960 MiB): the device's direct rate |
+| write, queue 4 and 8, WriteBooster off | 558 and 559 MB/s | the same: the queue does not matter without the cache |
+| write, queue 1, WriteBooster on | 960 to 1234 MB/s | for about 20 s, then 550 to 565 MB/s |
+| write, queue 8, WriteBooster on (8 commands a call) | **1730 MB/s** (1.92 GB/s at the device) | for 19.5 s (about 33 GB), then 548 to 570 MB/s |
+| read, queue 1 | 1242 MB/s | flat for 32 s |
+| read, queue 8 | **2216 MB/s** (2244 at the device) | flat: the link's ceiling (2 lanes x 11.66 Gb/s x 8/10 = 2.33 GB/s) |
+
+- **The cliff is the SLC cache, not heat**: with WriteBooster off there is none. The cache said 6 tenths free before the queue-8 run and 0 after, and 8 tenths again about 8 minutes later, idle.
+- **For a minute's clip**: about 33 GB at up to 1.7 GB/s, then 555 MB/s for as long as the free space lasts, with WriteBooster on and a queue of 8; 555 MB/s flat without it.
+- **The vault's large-object path would halve this**: the vault writes, reads back and checks every block, then the mirror the same way; a clip wants its own region (below).
+- **What the write path costs a core now**: for each MiB the kernel copies the caller's bytes into its heap and into the bounce (about 50 us each, process.rs), cleans the bounce from the caches (92 us a MiB measured: 390 ms over 4246 MiB, `diag "ufs runs"`), and then the caller's core spins on the doorbell until the command ends (1.86 ms a MiB at 556 MB/s). A writer at queue 1 keeps one core busy the whole time. Completion by interrupt, and the UFS DMA reading the camera's buffer or the encoder's output directly (UFS is the one coherent DMA master on zuma), would leave the copies and the spin out.
+- **A reset during the first queue-8 run (b1001)**: the kernel's core went silent 500 ms with interrupts masked and the watchdog reset the Pro. That run held the UFS lock for 64 commands a call (up to about 120 ms, more if the device stalled), and the kernel's own loop takes that lock with interrupts masked; most likely mine. The rerun held it 8 commands a call and ran clean. A recorder must keep each lock hold short, or give the recording its own path.
+
+### What the camera costs the CPU now (cambench, the write-back view, four A715 threads at 2367 MHz, read every line)
+
+| rate | per frame, wall on 4 threads | threads' reading time | cores used of the four | the link |
+|---|---|---|---|---|
+| 60/s (fll 5170) | 1.03 ms | 2.73 ms | 0.17 | 955 MB/s |
+| 30/s (fll 10340) | 0.99 ms | 2.78 ms | 0.09 | 492 MB/s |
+
+Plus the driver's cache maintenance at each MAP: 0.4 to 0.7 ms a binned buffer (20 MiB with the PD rows), 1.9 ms a 1:1 buffer (60 MiB), up to 16 ms seen with Lumis loading every core.
+Reading the frame is cheap since the view is write-back (CAMERA.md "A cacheable view"); the encode is what costs.
+
+## Part 2: the lossless codec (tools/raw-codec, a prototype)
+
+- **Shape**: no_std, no alloc, the unpack of MIPI RAW10 fused in. Each sample predicted from its own colour plane (Bayer: neighbours 2 apart; quad: the nearest same-colour sample, 1 inside a 2 x 2 block, 3 across). Per block of 2^5 samples the cheaper of (a+b+c+d)/4 and MED (one bit), the residual wrapped to 10 bits and zigzagged, then Rice coded with k per block from the block's sum by clz, unary capped at 2^4 then the raw 10 bits. Bands of 2^6 rows are independent, so cores split a frame by bands.
+- A JPEG-LS (LOCO-I) coder beside it is the ratio reference: on these noisy frames the averaging predictor ties or beats it, at a tenth of its time.
+- Every frame round-tripped bit exact on the host, and on the device (the device build decodes every band and compares every sample before it times anything).
+
+### Ratio (against packed RAW10)
+
+On the Pro, the main camera aimed at the bench's indoor scene (std/rawbench job 3: the frame held, copied out, coded on the device):
+
+| frame | exposure, gain | mean | bits a pixel | ratio |
+|---|---|---|---|---|
+| binned | 32 ms, 1x | 68 DN (black 64) | 2.86 | 3.50 |
+| binned | 128 ms, 1x | 84 DN | 3.34 | 2.99 |
+| binned | 32 ms, 8x | 106 DN | 4.15 | 2.41 |
+| binned | 32 ms, 32x | 220 DN | 5.11 | 1.96 |
+| **1:1 quad** | 32 ms, 8x | 106 DN | 4.32 | **2.31** |
+
+On the host's frames (target/agent-rawvideo/codec-results.txt has every variant): the Pro main's October and November frames at 32x 2.7 to 3.15 (dark), 2.21 on the brightest (52 DN over black); the ultrawide 2.4 to 2.7; the 8a's main 2.2.
+- **Noise sets the ratio**: these frames are noise-limited, and each step up in gain costs about half a bit. A brightly lit scene at unity gain should sit between 2 and 3.
+- Bands of 16 rows cost 0.02 to 0.03 bits a pixel over 64; a whole frame saves 0.01.
+- Predicting from the previous frame gains at most 0.1 bit on a still scene and loses when anything moves (the difference carries both frames' noise): not worth a frame buffer.
+
+### Speed (measured on the Pro, clocks held by `diag dvfs`)
+
+| frame | one A715 at 2367 MHz | four A715s at 2367 | four A715s at 1065 | one A510 at 1704 | four A510s |
+|---|---|---|---|---|---|
+| binned 12.5 Mpix | 46.2 ms (271 Mpix/s, about 8.7 cycles a pixel) | **12.4 ms** (1.01 Gpix/s) | **26.6 ms** | 165 ms | 32 to 42 ms |
+| 1:1 50.1 Mpix | 236 ms | **61 ms** | | 984 ms | 268 ms |
+
+At 1065 MHz one A715 takes 103 ms a binned frame: the same 8.8 cycles a pixel, so the codec scales with the clock.
+The host (Ryzen 5950X, 4.5 GHz) takes 24.9 ms a binned frame on one core; the decoder is serial, 60 to 69 ms a binned frame on the host, fine for grading offline.
+
+**Sustained, four A715s, the frame held and coded at the clip's rate for 60 s:**
+- 60/s at 2367 MHz: every frame in time for the first 10 s, then the zones at 85 to 90 C (past the 85 C this work meant to stop at: a guard that kills the run at 85 C was added after) and the clusters' dividers stepping: 57, then 48, then 38 to 40 frames a second to the end. Back to 62 C a minute after.
+- 30/s at 1065 MHz: 30 frames every second for 60 s, the zones 51 to 61 C, a third of the frames past their 33 ms period (the longest 47 ms), each caught up by the next: a recorder needs two frames of slack.
+
+### The visually lossless mode (optional; lossless stays the default)
+
+Each sample mapped to a code whose step is s times its own photon noise, sigma(x)^2 = g (x - black) + r^2, where that exceeds a DN (a generalised Anscombe transform in closed form, integer only); the codes go thru the same coder; the decoder maps each code back to its bin's centroid. g and r are measured from each frame (photon transfer over same-colour second differences); the Pro's main at 32x reads g 0.41 to 0.60 DN an electron, r about 1.5 DN.
+
+| s | ratio (dark Pro frames; the bright one) | RMS error / sigma | largest error / sigma |
+|---|---|---|---|
+| 1 | 3.47 to 3.91; 3.73 | 0.39 to 0.54 (0.29 to 0.32 in the mid and high levels, the theory's s / sqrt 12) | 0.42 to 0.90, always under one sigma |
+| 1/2 | 2.95 to 3.47 | 0.15 to 0.32 | at most 0.69 |
+| 1/4 | 2.52 to 3.15 | 0.07 to 0.23 | |
+
+Its bias is largest next to black (up to 0.46 sigma at s = 1: samples at 63 coming back 64); a fractional bit in the reconstruction, or the frame's own centroids (about 1.3 KB a frame), take most of it.
+The prototype's forward map is a 1024-entry table; on the hot path it would be about 6 NEON instructions per 4 samples (ucvtf, fmla, frsqrte with one step, fmla, fcvtns), or a piecewise line per octave picked by clz.
+
+## Part 3: what the recorder needs
+
+### On the internal flash
+
+1. **A recording region of its own**, outside the vault: the vault's write, read back, check and mirror halves the rate and holds every block in its tract. Proposal for the owner: a `clips` window in the free stretch (20 GiB to the end, about 108 GiB: a minute of every lossless mode, or two of binned 30/s uncompressed), written as a ring a frame at a time with a BLAKE3 per frame, one copy; each finished clip's index (frames, offsets, hashes) committed to the vault; and its blocks UNMAPped when deleted so the device's SLC cache and garbage collection stay healthy (ferros sends no UNMAP yet).
+2. **WriteBooster on**, with its flush flags (one query each at boot; the cache refills within minutes when idle).
+3. **A queue deeper than one**: built here as a measure (ferros_hal `run_queued`, SYS_BLOCK op bit 2 on `rawbench` only); a recorder wants it for real, completion by interrupt, and short UFS lock holds.
+4. **No copies**: the UFS DMA reading the encoder's output in place (its S2MPU opened to that buffer), so the CPU's only work is the encode.
+5. **An encoder fast enough cool**: 30/s binned is there today at 1065 MHz; 60/s binned and 1:1 at 24/s want about 1.5 to 2x (hand-written NEON for the residual and k steps, the A510s taking bands too, or a Mali compute kernel: GPU-KISTS.md), measured against the 85 C line before anything is promised.
+
+### An external SSD over USB 3.2 Gen 2 (estimated, not built)
+
+The SoC's USB is a dual-role DWC3 (USB32DRD at G#1121_0000, `maximum-speed = "super-speed-plus"`, zuma-usb.dtsi) behind a Synopsys USB3/DisplayPort combo PHY; ferros runs it today as a High Speed device on the eUSB2 PHY only (USB.md: 35 to 40 MB/s).
+For an SSD it would need:
+- **the combo PHY at Gen 2** (soc-gs drivers/phy/samsung phy-exynos-usbdp-gen2, about 33000 lines of register tables to port the needed subset of) and the controller in host mode;
+- **Type-C as host**: the TCPC (role, orientation) and VBUS out from the charger's boost (an SSD draws 1 to 3 W from the phone);
+- **an xHCI driver**: command, event and transfer rings, slot and endpoint contexts, enumeration (and a hub, if the SSD hangs off one), the HSI0 SysMMU or S2MPU opened to its rings;
+- **USB mass storage**: BOT (one command at a time: CBW, data, CSW) is the smaller job; UAS (four pipes, streams, a real queue) is what reaches the drive's speed;
+- the write path: SCSI WRITE(10/16) of 1 MiB or more, the same region idea on the SSD.
+- What it would give: Gen 2 is 10 Gb/s with 128b/132b coding, about 1.2 GB/s on the wire; drives like the Samsung T7 are rated 1.05 GB/s; BOT typically 0.8 to 0.9 GB/s, UAS about 1 GB/s. That carries binned 60/s uncompressed (940 MB/s) for as long as the SSD keeps its own cache, but not 1:1 uncompressed (1.5 GB/s); 1:1 lossless (650 MB/s) fits.
+- Size: weeks, not days (PHY and Type-C bring-up the riskiest part, as the eUSB2 PHY was), and **the phone has one port**: while an SSD hangs on it, the bridge and charging need a powered hub with the phone as host, or WiFi for the bridge.
+- Against it: the internal flash already sustains 555 MB/s, which every lossless mode but 1:1 fits; the SSD buys uncompressed 60/s and headroom, not lossless.
+
+## The format decision (the owner's)
+
+Nothing below is decided; each is a new format or a new place under Rule -1.
+1. **The codec's bitstream is a new encoding.** It needs a name and a VSF type for its payload (a frame, or a band of 2^6 rows, as a VSF binary value), and the parameters it was coded with (predictor set, block 2^5, escape 2^4, band rows, two streams) recorded beside it, so a decoder written years later reads it from the file alone.
+2. **The clip as one complete VSF file**: a header (camera, readout, CFA and its phase, black 64, white 1023, the noise model g and r when the visually lossless mode is used, the frame rate), then a section a frame (its Eagle time, exposure, gain, focus, the bands' offsets, its BLAKE3), the provenance hash over the whole. Written while recording, its hash and field count known only at the end: the header gets a fixed reservation filled last, or the clip is a run of complete frame-files plus a closing index file. Which one is the owner's call.
+3. **Where it lives**: one copy in a recording region (the vault keeps the index and the hashes), or mirrored after the take (a background copy once the clip ends, the device idle): the owner's single-copy versus write-verify-then-mirror trade.
+4. **Lossless only, or the visually lossless mode as a per-clip option** with its g, r and s in the header.
+5. **RAW10 kept as is** (the coder takes it packed and gives back 10-bit samples); a grade-time decoder on the host (tools/raw-codec `decode_band`) unpacks to whatever the grading tool takes.
+
+## To repeat
+
+- Build (from a copy, never the worktree: target/agent-rawvideo/build.sh `kernel`, `std rawbench`, a payload's package name), RAM-reload the kernel, then `ferros-bridge spawn rawbench.bin <hex> --name rawbench --blocks rawbench`:
+  - `0000400000` a minute of queue-1 writes; `0100200000` 32 s of reads; `04002000000803` queued writes, depth 8, 8 commands a call (keep the calls short: the lock); `05..` queued reads; `diag "ufs link wb on"` first for the cache.
+- The camera and the codec on the device (`--use camera`, any kernel): `0300000000001000050404` binned, 32 ms, 8x, the codec four runs on each core set; `0300000000021000050404` the 1:1; `03000000000010000504003C1E` the sustained 30/s run (+11 seconds, +12 the rate). Hold the clocks with `diag "dvfs policy off"` and `diag "dvfs set 3 <kHz>"`, put the policy back after, and watch `diag thermal` (target/agent-rawvideo/guard.sh kills the run past 85 C).
+- The codec on the host: tools/raw-codec, `raw-codec report <frames list> <out>`, `raw-codec bench <file> <w> <h> <stride> <period> <runs>`.
