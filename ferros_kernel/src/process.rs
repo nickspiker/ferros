@@ -43,7 +43,10 @@ unsafe impl<T> Sync for Global<T> {}
 // ---------------------------------------------------------------- the kernel lock and the cores
 //
 // One lock over the kernel's shared state (KERNEL.md "Cores"): taken for the microseconds a trap, a slice hand-out or a service-loop call holds it, never across a wait or a run at EL0. Every `pub fn` here takes it; everything private assumes it is held. `LOCK_SPINS` counts contended acquisitions for DIAG.
-static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The lock is a ticket lock (2026-11-18, slit-robust): a core takes the next ticket and waits until the serving word reaches it; unlock moves the serving word on. Free when the two are equal.
+/// Why not test-and-set (the lock until then, the waiters spinning on a load and racing for the store once it read free): it has no order, and under Lumis's thread pool (its threads yielding every 10 us on two A715s, each yield thru the lock, 56k holds a second) the camera's frame thread's longest wait in three runs of four was 852 to 1029 us (once for a SYS_WAKE between its acknowledgements and its ack of the line) while no hold in those runs but the spawn's and one other was 666 us or longer: the others kept winning the race. Its interrupt line stayed masked meanwhile, the next frame's descriptor went unreleased, and the slit stream died on LATE_CONFIG (the Pro, b965). In ticket order a wait is at most the holds of the cores ahead, eight at most.
+static TICKET_NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TICKET_SERVING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static LOCK_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The core holding the kernel lock, plus one (0: free): lets code that runs both inside syscalls and from the service loop take the lock only when it does not already hold it (`with_lock_held_or`).
 static HOLDER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -85,15 +88,17 @@ fn lock() {
     if ranks != 0 {
         panic!("lock order: the kernel lock taken at {} while this core holds storage locks G#{ranks:X}", site_text_of(site_word(core::panic::Location::caller())));
     }
-    if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    // A ticket: the lock is taken in the order it was asked for (`TICKET_NEXT`, `TICKET_SERVING`).
+    let my = TICKET_NEXT.fetch_add(1, Ordering::Relaxed);
+    if TICKET_SERVING.load(Ordering::Acquire) != my {
         LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
         // The wait is timed only when there is one: the uncontended take reads no counter.
         let t0 = crate::platform::cntpct();
         let mut spins = 0u32;
         // The holder this wait was behind, as last seen (devsched `irq_lock_wait`).
         let mut by = (0u64, 0u64);
-        // Test, then test-and-set: the waiters spin on a plain load of their shared copy of the line and try the exclusive store only once it reads free. Every core hammering the store (2026-11-17, a Photon scroll: four A715s and the X3 waiting on it at once) kept taking the line from the holder, which then waited for it again to let go.
-        while (LOCK.load(Ordering::Relaxed) && !OLD.load(Ordering::Relaxed)) || LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        // The waiters spin on a plain load of their shared copy of the serving word; only the holder writes it, once, at its unlock.
+        while TICKET_SERVING.load(Ordering::Acquire) != my {
             by = (LOCK_SITE.load(Ordering::Relaxed), crate::devsched::WHAT.load(Ordering::Relaxed));
             core::hint::spin_loop();
             // Every 4096th turn: is the holder stalled past half the watchdog's window? (platform::stall_check: one SGI to it, its place kept for the post-mortem.) WHY wrapping: a spin past 2^32 turns (minutes, a hang the watchdog ended long before) only feeds this every-4096th test, where a wrap changes nothing.
@@ -142,7 +147,8 @@ fn unlock() {
     }
     HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
-    LOCK.store(false, core::sync::atomic::Ordering::Release);
+    // Only the holder writes the serving word, so the add is the next ticket's turn. WHY wrapping (the atomic's own add): the tickets count round 2^32 together, and only equality is ever asked.
+    TICKET_SERVING.fetch_add(1, core::sync::atomic::Ordering::Release);
     // The flash log lines this core said while it held the lock, written now that every other core may go on (flashlog.rs `deferred`).
     crate::flashlog::deferred();
 }
@@ -388,6 +394,7 @@ fn cur_set(t: Option<usize>) {
         x.urgent = false;
         // A device line's waiter runs: from its interrupt to here, per line (devsched.rs, `diag dev`); the trace's event first, as this run may freeze it.
         if x.irq_line != 0 {
+            x.run_line = x.irq_line;
             let i = x.irq_line as usize - 1;
             let (at, landed, noticed) = (x.irq_at, x.irq_core as usize, x.irq_noticed as usize);
             x.irq_line = 0;
@@ -613,7 +620,7 @@ fn make_room(t: usize, line: usize, landed: usize) {
     }
 }
 
-/// `diag "sched old on|off"`: the scheduler as before 2026-11-17 (KERNEL.md Order item 8), for measuring the two in adjacent runs on one boot: the lock's spin a bare test-and-set, every yield under the lock and kicking every core, futex and deadline wakes to the back, no `make_way`, deadlines noticed only between slices and idle workers on their event stream, a thread asked to yield kept at the very front and only under devsched `first`. Off by default.
+/// `diag "sched old on|off"`: the scheduler as before 2026-11-17 (KERNEL.md Order item 8), for measuring the two in adjacent runs on one boot: every yield under the lock and kicking every core, futex and deadline wakes to the back, no `make_way`, deadlines noticed only between slices and idle workers on their event stream, a thread asked to yield kept at the very front and only under devsched `first`. Off by default.
 pub static OLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// `diag "sched x3 on|off"`: a thread on the workers' default mask (not pinned, not a device thread) may run on the kernel's core too, when it is free; a thread pinned there (the render thread) woken while one runs there has it yield (`make_way`), as an interrupt's waiter has under devsched `first` (`make_room`). Off by default: measured 2026-11-17, the X3 sat ~60 % idle thru a Photon pinch while the four A715s were saturated.
 pub static X3_SHARE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -688,16 +695,18 @@ fn make_way(t: usize) {
 
 /// The core a line its thread `x` now waits on is routed to (SYS_IRQ_WAIT, the thread on this core): the kernel's core, as since 2026-11-13, unless devsched `follow` or `core` is on; then the one core `x` may run on when it has one (its pin, or the dedicated core), else this core when `x` may run here (where it waits from, so it likely runs here next), else the kernel's.
 /// A worker switched off (the dark profile, a reload) takes its lines home first (`irq_routes_home`), so no line is left routed to a core that is off.
-fn irq_route(x: &Thread) -> usize {
+/// An armed line (irqarm.rs) follows its waiter whatever `follow` says (2026-11-18, slit-robust, the Pro): its deadline is a frame's blanking, and on the kernel's core its waiter was noticed only when the service loop's pass came round to `run_slice` (876 us behind the battery gauge's poll, 6 ms once) whenever every A715 ran Lumis; landing on the waiter's core, the interrupt parks what runs there and that core runs the waiter at once.
+fn irq_route(x: &Thread, intid: u32) -> usize {
     use core::sync::atomic::Ordering::Relaxed;
     let home = kernel_mask().trailing_zeros() as usize;
-    if !crate::devsched::FOLLOW.load(Relaxed) && crate::devsched::CORE.load(Relaxed) == 0 {
+    let follow = crate::devsched::FOLLOW.load(Relaxed) || crate::irqarm::armed(intid);
+    if !follow && crate::devsched::CORE.load(Relaxed) == 0 {
         return home;
     }
     let m = may_run(x);
     if m.count_ones() == 1 {
         m.trailing_zeros() as usize
-    } else if crate::devsched::FOLLOW.load(Relaxed) && m >> core() & 1 != 0 {
+    } else if follow && m >> core() & 1 != 0 {
         core()
     } else {
         home
@@ -739,8 +748,10 @@ fn irq_stamp(x: &mut Thread, intid: usize) {
 const CREDIT_LEAK_LOG2: u32 = 3;
 /// Thread `x`'s spent credit as of `now`: `ran` less the leak since `ran_at`. WHY saturating: a leaky bucket empties to nothing, never below (a long sleep is not credit in advance); and the leak's time is taken saturating too, as `ran_at` may come from another core's counter read, which the lock does not order (`cur_set`).
 fn credit(x: &Thread, now: u64) -> u64 {
-    x.ran.saturating_sub(now.saturating_sub(x.ran_at) >> CREDIT_LEAK_LOG2)
+    x.ran.saturating_sub(now.saturating_sub(x.ran_at) >> (CREDIT_LEAK_LOG2 - x.device as u32 * DEVICE_LEAK_MORE))
 }
+/// A device thread's credit leaks a quarter of the time passing, not an eighth (2026-11-18, slit-robust, the Pro): the camera's frame thread answers a slit every 812 us, 60 to 100 us of a core with its syscalls and up to 323 us now and then, about an eighth; its credit ran out after seconds of Lumis drawing on every A715, its next interrupt's wake went to the back of the queue (not urgent, no core made for it), it ran 2.8 to 8 ms late with its line masked, and the next frame's descriptor went unreleased (LATE_CONFIG). Under a quarter of a core a driver keeps the front for good; the bound above holds with 4 in place of 8 (N under 4·C device threads, sixteen on the four workers).
+const DEVICE_LEAK_MORE: u32 = 1;
 
 /// The wake's stamp, for its wake-to-run time (`cur_set`).
 fn woken(t: usize, kind: usize) {
@@ -765,6 +776,8 @@ pub static WAKE_LAT: [[core::sync::atomic::AtomicU64; 3]; WAKE_KINDS] = [const {
 pub static WAKE_HIST: [[core::sync::atomic::AtomicU64; 64]; WAKE_KINDS] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 64] }; WAKE_KINDS];
 /// Hand-offs (a woken thread run next on the waker's core), and woken threads sent to the back for a spent credit (`enqueue_woken`).
 pub static HANDOFFS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Device threads parked mid-run for their interrupt by another line's interrupt and kept at the front (`ferros_el0_preempt`).
+pub static PREEMPT_KEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Yields (`sleep(0)` and past deadlines, SYS_SLEEP): [0] answered without the lock (nothing queued, `ferros_el0_trap`), [1] under it with nothing queued this core may run, [2] that gave the core to another thread, [3] that queued and took the core back.
 pub static YIELDS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 pub static SPENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1151,6 +1164,8 @@ struct Thread {
     urgent: bool,
     /// Its run now began as an urgent one (its device's interrupt): never asked to yield for another device thread meanwhile; any other run may be (devsched `first`, `make_room`).
     on_irq: bool,
+    /// The line of its run for its interrupt (`IRQS` index plus one, 0 none), kept for the run as `irq_line` is not: `ferros_el0_preempt` asks a core for it with it (`make_room`).
+    run_line: u8,
     /// When its current run began (`cur_set`): an `on_irq` run's budget counts from here (`over_budget`).
     irq_run_at: u64,
     /// The core it last ran on: where a yield is asked first.
@@ -1384,7 +1399,7 @@ fn sched_counters(out: &mut Vec<u8>) {
         }
         out.push(b'\n');
     }
-    out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed)).as_bytes());
+    out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}, device threads parked mid-run by another line kept at the front A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed), PREEMPT_KEPT.load(Relaxed)).as_bytes());
     let y: [u64; 4] = core::array::from_fn(|i| YIELDS[i].load(Relaxed));
     out.extend_from_slice(alloc::format!("yields: A#{} without the lock, A#{} with nothing queued here, A#{} to another thread, A#{} back to itself\n", y[0], y[1], y[2], y[3]).as_bytes());
     let w: [u64; 3] = core::array::from_fn(|i| WAY_LOOKS[i].load(Relaxed));
@@ -1996,6 +2011,7 @@ fn irq_pending_take(intid: u32) -> bool {
         let v = core::ptr::read_volatile(p);
         if v != 0 {
             core::ptr::write_volatile(p, 0);
+            crate::irqarm::untake(intid);
             // A finger on the glass: the clock policy's sign of someone using the device (service.rs clock_policy).
             if intid == IRQ_TOUCH_INT {
                 note_input();
@@ -2255,7 +2271,10 @@ fn wake_word_waiters() {
 /// A lock held already (by the panicking core, or another) is left as it is.
 pub fn seize_for_panic() -> bool {
     use core::sync::atomic::Ordering;
-    let took = LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
+    // Free when no ticket is out past the serving one: the next ticket taken only then.
+    let s = TICKET_SERVING.load(Ordering::Acquire);
+    // WHY wrapping: the tickets count round 2^32 as the atomic add does.
+    let took = TICKET_NEXT.compare_exchange(s, s.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed).is_ok();
     if took {
         HOLDER.store(core() + 1, Ordering::Relaxed);
     }
@@ -4424,7 +4443,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -4526,7 +4545,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         f.x[0] = ERR;
                         0
                     } else {
-                        crate::killswitch::enable_spi_to(intid, irq_route(t));
+                        // Not for an armed line whose interrupt is taken and not yet marked pending (irqarm.rs `TAKEN`): `.Lirq` masks it a few instructions on, and an unmask landing after that fires it again, running its program twice on one event.
+                        if !crate::irqarm::taken(intid) {
+                            crate::killswitch::enable_spi_to(intid, irq_route(t, intid));
+                        }
                         let deadline = f.x[1];
                         let t_now: u64;
                         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
@@ -6843,6 +6865,9 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     // Asked by `make_room` (devsched `first` on) or by `make_way` (a light thread woken with every worker busy, 2026-11-17).
     let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
     let keep = asked && ctl & 1 != 0 && (!old || crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed));
+    // A device thread in its run for its own interrupt (`on_irq`, inside its 2^10 us budget), parked unasked, by an interrupt taken at EL0 for another line or by the slice's end: it keeps its place just behind the thread that interrupt woke, and is urgent again, so the core takes it back next.
+    // Measured 2026-11-18 (slit-robust, the Pro, Lumis in Slitscan): the camera's frame thread, preempted mid-answer on c6 by the sensors' line, went behind Lumis's threads for 4.4 ms with its line masked; once its line followed it, the same thread parked 2 ms between its last two syscalls of an answer (the slice it was handed on a busy core ending: a slice is armed once a `run_slice`, so a thread woken onto a core can inherit one nearly spent). Either way the next frame's descriptor went unreleased and the slit stream died on LATE_CONFIG.
+    let irq_run = !asked && !old && cur_get().and_then(|c| th(c).map(|y| (c, y.on_irq))).is_some_and(|(c, on)| on && th(c).is_some_and(|y| !over_budget(c, y)));
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
@@ -6853,6 +6878,15 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
                     enqueue_front(cur);
                 } else if keep {
                     enqueue_second(cur);
+                } else if irq_run {
+                    p.urgent = true;
+                    let line = p.run_line;
+                    PREEMPT_KEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    enqueue_second(cur);
+                    // And a core for it now if none is idle (`make_room`): behind the thread its core was taken for (another device's, which may run a while), it would otherwise wait for that thread (2026-11-18: the camera's frame thread parked 1.36 ms between two syscalls of one answer with every A715 busy, its line masked meanwhile).
+                    if line != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed) {
+                        make_room(cur, line as usize - 1, core());
+                    }
                 } else {
                     enqueue_back(cur);
                 }
@@ -6927,7 +6961,12 @@ fn wake_sleepers() {
                     irq_stamp(p, a);
                     let (line, landed) = (p.irq_line as usize, p.irq_core as usize);
                     tr(TR_IRQ, i, (landed as u64) << 8 | (a as u64 & 0xFF));
+                    let spent = credit(p, now);
                     let front = enqueue_woken(i, WAKE_IRQ);
+                    // Woken behind the queue, its front credit spent: counted per line with the credit it had (devsched `spent`, `diag dev`).
+                    if !front && line != 0 {
+                        crate::devsched::spent(line - 1, spent);
+                    }
                     tr(TR_WAKE, i, a as u64);
                     // With front credit left it is urgent (devsched `first`): picked first, and a core made free for it when none is.
                     if front && line != 0 {
@@ -8235,7 +8274,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
     Ok((me, arc, in_off))
 }
 

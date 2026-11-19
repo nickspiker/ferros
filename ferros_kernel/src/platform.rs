@@ -438,11 +438,52 @@ pub fn mark(step: u64) {
     }
 }
 
+/// The kernel's core's stretches between crumbs (2026-11-18, slit-robust: a camera interrupt taken on the X3 while its render thread ran waited 876 us, and once 6 ms, for the service loop's pass to reach `run_slice` and wake the frame thread, no A715 being idle to notice), for `diag crumbs`: per crumb (its low byte) the longest stretch that ended at it, the crumb that began it, the counter at its end, and how many were 2^9 us or longer.
+/// Only the X3 (MPIDR Aff1 8), whose crumbs are the service loop's; a stretch D1 to D2 holds `run_slice`'s slice of a thread at EL0 and is long by design.
+pub static CRUMB_GAP: [[core::sync::atomic::AtomicU64; 4]; 256] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 4] }; 256];
+static CRUMB_PREV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CRUMB_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per core (MPIDR Aff1): its last `CORE_CRUMB_N` crumbs and their counters, a ring (crumb at 2k, counter at 2k + 1), and its count in the last word.
+pub const CORE_CRUMB_N: usize = 1 << 3;
+pub static CORE_CRUMBS: [[core::sync::atomic::AtomicU64; 2 * CORE_CRUMB_N + 1]; 16] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2 * CORE_CRUMB_N + 1] }; 16];
+/// The last `CRUMB_RING` long stretches in time order (`crumb`): the counter at the end, and the ticks with the two crumbs (begin << 56 | end << 48).
+pub const CRUMB_RING: usize = 1 << 8;
+pub static CRUMB_RING_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CRUMB_RING_E: [[core::sync::atomic::AtomicU64; 2]; CRUMB_RING] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; CRUMB_RING];
+
 pub fn crumb(c: u64) {
     LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
     let core = ((mpidr >> 8) & 0xF) as usize;
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        // Every core's last crumbs and when (irqarm.rs's freeze snapshots them: what the core that took a late interrupt was doing while its interrupts were masked).
+        let p = &CORE_CRUMBS[core];
+        let k = p[2 * CORE_CRUMB_N].fetch_add(1, Relaxed) as usize & (CORE_CRUMB_N - 1);
+        p[2 * k].store(c, Relaxed);
+        p[2 * k + 1].store(cntpct(), Relaxed);
+    }
+    if core == 8 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let t = cntpct();
+        let gap = t.wrapping_sub(CRUMB_AT.swap(t, Relaxed));
+        let prev = CRUMB_PREV.swap(c & 0xFF, Relaxed);
+        let e = &CRUMB_GAP[(c & 0xFF) as usize];
+        if gap > e[0].load(Relaxed) {
+            e[0].store(gap, Relaxed);
+            e[1].store(prev, Relaxed);
+            e[2].store(t, Relaxed);
+        }
+        e[3].fetch_add((gap >= cntfrq() >> 11) as u64, Relaxed);
+        // The stretches of 2^7 us or more in time order, but a thread's slice (D1 to D2) and the idle waits (B3 to B4, B5 to B6), long by design; the ring stops when devsched's trace freezes (`dev freeze`: the first late run of a device's waiter), so it ends at that run.
+        let pair = prev << 8 | (c & 0xFF);
+        if gap >= cntfrq() >> 13 && pair != 0xD1D2 && pair != 0xB3B4 && pair != 0xB5B6 && !crate::devsched::FROZEN.load(Relaxed) {
+            let i = CRUMB_RING_N.fetch_add(1, Relaxed) as usize & (CRUMB_RING - 1);
+            CRUMB_RING_E[i][0].store(t, Relaxed);
+            CRUMB_RING_E[i][1].store(gap | pair << 48, Relaxed);
+        }
+    }
     if (4..=8).contains(&core) {
         note(core - 3, c | (core as u64) << 56);
     }

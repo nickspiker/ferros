@@ -433,17 +433,20 @@ static PLACE_LOG: [AtomicU64; 1 << 3] = [const { AtomicU64::new(0) }; 1 << 3];
 static BY_KERNEL: AtomicU64 = AtomicU64::new(0);
 /// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
 static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
+/// The same answers' length (counter ticks, from the status read to the end of `answer`, before the line's ack).
+static IMG_DUR: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 fn img_log_say(g: u64) {
     let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
     let first = IMG_LOG[0].load(Ordering::Relaxed) >> 8;
     let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: the first answers' image status, us from the first:");
-    for e in IMG_LOG.iter() {
+    // The first one's time on the counter (us), to set them beside the kernel's armed runs (`diag "irqs runs"`); each as status@start+its length, the first 2^4 (a line holds no more).
+    let _ = write!(l, "camera: the first answers' image status, from A#{} us on the counter (status@us from the first+us it took):", us(first));
+    for (e, d) in IMG_LOG.iter().zip(IMG_DUR.iter()).take(1 << 4) {
         let v = e.load(Ordering::Relaxed);
         if v == 0 {
             break;
         }
-        let _ = write!(l, " {:X}@{}", v & 0xFF, us((v >> 8) - first));
+        let _ = write!(l, " {:X}@{}+{}", v & 0xFF, us((v >> 8) - first), us(d.load(Ordering::Relaxed)));
     }
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
@@ -481,8 +484,9 @@ fn tl_say(g: u64) {
     // WHY saturating: an open with fewer than 2^5 answers starts at its first.
     let k0 = n.saturating_sub(1 << 5);
     let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: the last answers (us after the one before, status, index written, !error words):");
     let mut prev = TL[k0 & 0xFF].load(Ordering::Relaxed) >> 8;
+    // The first one's time on the counter (us), to set the answers beside the kernel's armed runs (`diag "irqs runs"`, the same counter).
+    let _ = write!(l, "camera: the last answers (from A#{} us on the counter; us after the one before, status, index written, !error words):", us(prev));
     for k in k0..n {
         let (v, x) = (TL[k & 0xFF].load(Ordering::Relaxed), TL_IDX[k & 0xFF].load(Ordering::Relaxed));
         let _ = write!(l, " {}:{:X}", us((v >> 8) - prev), v & 0xFF);
@@ -821,7 +825,12 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let mut err = 0u64;
     for (j, &a) in cam().ack.iter().enumerate() {
         let v = rd(g, a);
-        wr(g, a, v);
+        // loch0's image status: a DMA_DONE this answer did not see (latched since its first read) is left latched, so the line fires again at the ack and the kernel's armed action (or the next answer) releases its descriptor (2026-11-18, slit-robust: an answer 786 us late read one DMA_DONE, the next landed during its acknowledgements and was cleared unanswered, its descriptor never released, and the frame after died on LATE_CONFIG).
+        let w = if a == ferros_cam::IMG_STATUS { v & (img | !ferros_cam::IMG_DMA_DONE) } else { v };
+        // A word that read 0 is not written back: writing a write-one-to-clear word 0 clears nothing, and each write is a register syscall (2026-11-18, slit-robust: 56 a answer, about 91 us of the frame thread's every 812 us in a slit stream, past the eighth of a core under which the scheduler keeps a woken device thread at the front; with its credit spent the thread queued behind Lumis's and the slit stream died).
+        if w != 0 {
+            wr(g, a, w);
+        }
         ACK_OR[j].fetch_or(v as u64, Ordering::Relaxed);
         ACK_LAST[j].store(v as u64, Ordering::Relaxed);
         if a == IMG_ERR {
@@ -854,6 +863,9 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         ferros_sys::wake(&FRAMES, 4);
     }
     let t = ferros_sys::now() - t0;
+    if k < IMG_DUR.len() {
+        IMG_DUR[k].store(t, Ordering::Relaxed);
+    }
     BUSY.fetch_add(t, Ordering::Relaxed);
     TL_IDX[k & 0xFF].store(wrote | t << 16, Ordering::Relaxed);
     BUSY_MOST.fetch_max(t, Ordering::Relaxed);

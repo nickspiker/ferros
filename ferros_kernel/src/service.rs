@@ -2798,6 +2798,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::pcie_guard::release_stuck();
         // The power switches a process left on when it ended (one shot dead, no cleanup of its own): turned off here, on the kernel's core.
         crate::process::power_offs_apply();
+        platform::crumb(0xF0);
         // Frames given back, wiped and freed with the kernel lock let go (frames.rs `reclaim_step`): up to 2^3 a pass (about a millisecond of this core), the idle workers taking the rest; with none up (the dark, alone) this is the only taker.
         for _ in 0..1 << 3 {
             if !crate::frames::reclaim_step() {
@@ -2913,6 +2914,7 @@ pub fn run(mut b: Boot) -> ! {
             crate::flashlog::line(&alloc::format!("gps unclaimed: driver {}, power {}", if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
         }
         // Servers started on demand (process.rs ON_DEMAND: the torch): a call found none receiving, so one is started from its capsule; the call waits for it (a live call has had its ERR already, and the next one finds it). Already alive (spawned, not yet at its first receive) is left alone. One that cannot start answers its waiting calls ERR, so none waits on a server that is not coming, and is tried again at the next call.
+        platform::crumb(0xF1);
         let wanted = crate::process::on_demand_take();
         for (i, name) in crate::process::ON_DEMAND.iter().enumerate() {
             if wanted >> i & 1 == 0 || crate::process::with_lock(|| crate::process::named_alive_locked(&[name])) != 0 {
@@ -3105,6 +3107,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        platform::crumb(0xF2);
         move_seals(&mut store);
         if let Some(job) = kist_job.as_mut() {
             if let Some(r) = kist_step(job) {
@@ -3177,6 +3180,7 @@ pub fn run(mut b: Boot) -> ! {
             let replied = platform::RAW_REPLIED.load(core::sync::atomic::Ordering::Relaxed);
             crate::process::with_lock(|| crate::ptlink::reply(reply, replied, act));
         }
+        platform::crumb(0xF3);
         crate::keys::serve();
         if !keys_settled && cntpct() > keys_settle {
             crate::keys::forget_missing();
@@ -3223,16 +3227,19 @@ pub fn run(mut b: Boot) -> ! {
         if now.wrapping_sub(t_boot) > 2 * cntfrq() {
             crate::heap2_join();
         }
+        platform::crumb(0xF4);
         crate::odpm::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs). After a jump at once, on the first pass: the jump is a killswitch, and a domain Android left on may hold a bus master still running Android's work (the GPU, a codec, the camera's chain, the TPU); its power cut stops it dead, through EL3 as every domain switch goes, where its S2MPU could not be touched safely (owner, 2026-11-04: "kill the rails").
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), if platform::jumped() { 0 } else { 16 * cntfrq() });
         platform::crumb(0xD7);
         clock_policy(false, now.wrapping_sub(t_boot));
+        platform::crumb(0xF5);
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the UFS lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
             crate::process::UFS.with(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
         }
         // The SoC's heat and the thermal policy, once a second (thermal.rs); the facts' bell after each read.
+        platform::crumb(0xF6);
         if crate::thermal::poll() {
             bell_facts();
         }
@@ -4124,6 +4131,58 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
                     // `diag keyreg [dbg|check|ao]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
                     crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"crumbs ring" {
+                    // `diag "crumbs ring"`: the kernel's core's last long stretches in time order (platform.rs `CRUMB_RING`): when each ended (us on the counter), us, from which crumb to which.
+                    let f = cntfrq();
+                    let n = platform::CRUMB_RING_N.load(core::sync::atomic::Ordering::Relaxed) as usize;
+                    resp.extend_from_slice(alloc::format!("crumb stretches of 2^7 us or more (not D1-D2, B3-B4, B5-B6): A#{n}, the last A#{} (end us on the counter:us:from-to):", n.min(platform::CRUMB_RING)).as_bytes());
+                    for k in n.saturating_sub(platform::CRUMB_RING)..n {
+                        let e = &platform::CRUMB_RING_E[k & (platform::CRUMB_RING - 1)];
+                        let (t, w) = (e[0].load(core::sync::atomic::Ordering::Relaxed), e[1].load(core::sync::atomic::Ordering::Relaxed));
+                        if (k & 7) == 0 {
+                            resp.push(b'\n');
+                        }
+                        resp.extend_from_slice(alloc::format!(" {}:{}:{:02X}-{:02X}", t * 1_000_000 / f, (w & ((1 << 48) - 1)) * 1_000_000 / f, w >> 56, w >> 48 & 0xFF).as_bytes());
+                    }
+                    resp.push(b'\n');
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"crumbs" || cmd.params == b"crumbs reset" {
+                    // `diag crumbs`: the kernel's core's longest stretch ending at each service-loop crumb (platform.rs `CRUMB_GAP`): us, the crumb it began at, when it ended (us on the counter), and how many were 2^9 us or longer. `diag "crumbs reset"` zeroes them first.
+                    let f = cntfrq();
+                    if cmd.params == b"crumbs reset" {
+                        platform::CRUMB_RING_N.store(0, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    for (k, e) in platform::CRUMB_GAP.iter().enumerate() {
+                        if cmd.params == b"crumbs reset" {
+                            for w in e.iter() {
+                                w.store(0, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                        let w: [u64; 4] = core::array::from_fn(|j| e[j].load(core::sync::atomic::Ordering::Relaxed));
+                        if w[0] != 0 {
+                            resp.extend_from_slice(alloc::format!("crumb G#{k:02X}: longest A#{} us from G#{:02X}, ended at A#{} us; A#{} of 2^9 us or more\n", w[0] * 1_000_000 / f, w[1], w[2] * 1_000_000 / f, w[3]).as_bytes());
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"irqs runs") || cmd.params.starts_with(b"irqs freeze ") {
+                    // `diag "irqs runs"`: the armed actions' last runs, each with what its operations read (irqarm.rs `runs_report`); `diag "irqs runs reset"` clears them; `diag "irqs freeze <us>"` keeps the runs around the first gap between acted runs longer than that (0 off).
+                    if cmd.params == b"irqs runs reset" {
+                        crate::irqarm::runs_reset_all();
+                    }
+                    if let Some(n) = cmd.params.strip_prefix(b"irqs freeze short ").and_then(|d| core::str::from_utf8(d).ok()).and_then(|d| d.trim().parse::<u64>().ok()) {
+                        crate::irqarm::FREEZE_SHORT_US.store(n, core::sync::atomic::Ordering::Relaxed);
+                    } else if let Some(n) = cmd.params.strip_prefix(b"irqs freeze ").and_then(|d| core::str::from_utf8(d).ok()).and_then(|d| d.trim().parse::<u64>().ok()) {
+                        crate::irqarm::FREEZE_US.store(n, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    crate::irqarm::runs_report(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
