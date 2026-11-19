@@ -45,6 +45,8 @@ CO=$W/cam-oracle/release/cam-oracle
 ISP_PAGES="G#1C00_0000,G#1C00_1000,G#1C00_3000,G#1C00_7000,G#1C02_0000,G#1C04_0000,G#1C05_0000,G#1C06_0000,G#1C07_0000,G#1C08_0000,G#1C09_0000,G#1C0A_0000,G#1C0B_0000,G#1C0C_0000,G#1C0D_0000,G#1C0E_0000,G#1C0F_0000,G#1C10_0000,G#1C10_1000,G#1C10_2000,G#1C10_3000,G#1C32_0000,G#1C32_2000,G#1C32_8000,G#1C32_9000,G#1C33_0000,G#1C33_1000,G#1C33_3000,G#1C33_5000,G#1C33_7000,G#1C33_8000,G#1C33_9000,G#1C33_B000,G#1C33_C000,G#1C33_D000,G#1C33_E000,G#1C35_0000,G#1C39_0000,G#1C39_1000,G#1C39_2000,G#1C39_3000,G#1C39_4000,G#1C39_5000"
 # The ultrawide's frames did not go thru the PDMA program on 2026-11-15: every page of the front end's span, so whatever carries them is in the log.
 ISP_SPAN="G#1C00_0000-G#1C3F_F000"
+# The GNSS captures keep spi_21's data (TX_DATA +18, RX_DATA +1C), its packet count (+20, an RX's length) and the GPIO data word holding gpp4-3 (G#1084_0084, the AP-to-GNSS handshake); quiet are the controller's set-up and status words (CH_CFG, MODE_CFG, SLAVE_SEL, STATUS, SWAP_CFG, PENDING_CLR: the first session's 2^15 lines were two thirds of them, 2026-11-18) and an EINT another driver works in the same GPIO page (+900, +A00, +B08).
+GNSS_QUIET="G#111E_0000,G#111E_0008,G#111E_000C,G#111E_0014,G#111E_0028,G#111E_002C,G#1084_0900,G#1084_0A00,G#1084_0B08"
 
 die() { echo "== $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -58,7 +60,10 @@ image_knobs() {
     i2c-uw) ctrl=108A;;
     isp) echo "FERROS_HV_ORACLE_PAGES=$ISP_PAGES FERROS_HV_ORACLE_LATE=1 FERROS_HV_PDMA_DUMP=1"; return;;
     isp-uw) echo "FERROS_HV_ORACLE_PAGES=$ISP_SPAN FERROS_HV_ORACLE_LATE=1 FERROS_HV_PDMA_DUMP=1"; return;;
-    *) die "no image $1 (i2c-main, i2c-uw, i2c-front, isp, isp-uw)";;
+    # The GNSS (Samsung KEPLER) on spi_21: its controller page (PIO only, every payload byte a TX_DATA write or an RX_DATA read) and the PERIC0 GPIO page that holds the AP-to-GNSS handshake gpp4-3, GNSS_QUIET quiet. gnss-boot logs from the hv's start (the firmware load), gnss from ARM_MS (a session to a fix).
+    gnss) echo "FERROS_HV_ORACLE_PAGES=G#111E_0000,G#1084_0000 FERROS_HV_ORACLE_QUIET=$GNSS_QUIET"; return;;
+    gnss-boot) echo "FERROS_HV_ORACLE_PAGES=G#111E_0000,G#1084_0000 FERROS_HV_ORACLE_QUIET=$GNSS_QUIET FERROS_HV_ORACLE_ARM_AFTER_MS=0"; return;;
+    *) die "no image $1 (i2c-main, i2c-uw, i2c-front, isp, isp-uw, gnss, gnss-boot)";;
     esac
     # One controller, its sensor alone (every akita sensor answers at G#1A; the main's lens, OIS and EEPROM at G#24 and the others' EEPROMs at G#50 stay out), the controller's nine setup and status words quiet.
     local q="" o
@@ -73,6 +78,8 @@ session_image() {
     i2c-front | i2c-front-1s | i2c-front-gcam) echo i2c-front;;
     isp-main | isp-front | isp-main-crop) echo isp;;
     isp-uw) echo isp-uw;;
+    gnss-fix) echo gnss;;
+    gnss-boot) echo gnss-boot;;
     *) die "no session $1 (i2c-main, i2c-main-16s, i2c-main-gcam, i2c-uw, i2c-uw-16s, i2c-uw-gcam, i2c-front, i2c-front-1s, i2c-front-gcam, isp-main, isp-front, isp-main-crop, isp-uw)";;
     esac
 }
@@ -202,11 +209,10 @@ cmd_build() {
     CARGO_TARGET_DIR=$W/cargo cargo build -q -p ferros-mkimg
     [ -f "$LINUX" ] || "$MKIMG" unpack-kernel --boot "$STOCK" -o "$LINUX"
     local img k
-    for img in i2c-main i2c-uw i2c-front isp isp-uw; do
+    for img in ${IMAGES:-i2c-main i2c-uw i2c-front isp isp-uw gnss gnss-boot}; do
         k=$(image_knobs $img)
         # As the gate's hv (akita's board, the hv core) plus stage 2, the oracle, no PMU reads, the oracle's knobs, armed at ARM_MS, CAP lines at most; built in a target of its own so no other session's hv build is taken for it.
-        env $k FERROS_HV_BOARD=akita FERROS_HV_CORE=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 \
-            FERROS_HV_ORACLE_CAP=$CAP FERROS_HV_ORACLE_ARM_AFTER_MS=$ARM_MS \
+        env FERROS_HV_ORACLE_CAP=$CAP FERROS_HV_ORACLE_ARM_AFTER_MS=$ARM_MS $k FERROS_HV_BOARD=akita FERROS_HV_CORE=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 \
             CARGO_TARGET_DIR=$W/cargo cargo build -q -p ferros_hv --target aarch64-unknown-none-softfloat --release
         aarch64-linux-gnu-objcopy -O binary "$W/cargo/aarch64-unknown-none-softfloat/release/ferros_hv" "$W/hv-$img.bin"
         [ "$(stat -c %s "$W/hv-$img.bin")" -le $((0x180000)) ] || die "hv-$img is over its G#18_0000 pad"
@@ -318,6 +324,31 @@ steps_i2c-front-gcam() {
 steps_isp-main() { step "lumis main binned" "open Lumis, the main lens's first entry" lumis_main && { hold 8; done_step "lumis main binned" lumis_exit; }; }
 steps_isp-front() { step "lumis front binned" "open Lumis, the front lens's entry" lumis_front && { hold 8; done_step "lumis front binned" lumis_exit; }; }
 steps_isp-uw() { step "lumis uw binned" "open Lumis, the ultrawide's entry" lumis_uw && { hold 8; done_step "lumis uw binned" lumis_exit; }; }
+# The GNSS sessions. Nothing on the 8a asks for GPS by itself (Pixel Camera and Lumis leave the gps provider OFF; Maps has no location permission there), so a hands-free session grants Maps fine and coarse location for the session and takes them back after, to the flags they had (none set by a user). The fix is told by the gps provider's last location's elapsed time alone: no position is ever read or printed.
+gps_et() { A shell "dumpsys location" 2>/dev/null | tr -d '\r' | grep -o 'Location\[gps[^]]*' | grep -o 'et=[^ ,]*' | head -1 || true; }
+maps_grant() { in_ "pm grant com.google.android.apps.maps android.permission.ACCESS_FINE_LOCATION; pm grant com.google.android.apps.maps android.permission.ACCESS_COARSE_LOCATION"; }
+maps_ungrant() {
+    in_ "pm revoke com.google.android.apps.maps android.permission.ACCESS_FINE_LOCATION; pm revoke com.google.android.apps.maps android.permission.ACCESS_COARSE_LOCATION"
+    in_ "pm clear-permission-flags com.google.android.apps.maps android.permission.ACCESS_FINE_LOCATION user-set user-fixed; pm clear-permission-flags com.google.android.apps.maps android.permission.ACCESS_COARSE_LOCATION user-set user-fixed"
+    say "Maps's location: $(A shell dumpsys package com.google.android.apps.maps | tr -d '\r' | grep -E 'ACCESS_(FINE|COARSE)_LOCATION: granted' | sed 's/^ *//' | tr '\n' ' ')"
+}
+maps_open() { [ "$AUTO" = 1 ] && maps_grant; in_ "am start -n com.google.android.apps.maps/com.google.android.maps.MapsActivity"; }
+steps_gnss-fix() {
+    local e0 e k=0
+    e0=$(gps_et)
+    step "maps open" "open Google Maps (its location request starts the GNSS session)" maps_open || return 0
+    until e=$(gps_et); [ -n "$e" ] && [ "$e" != "$e0" ]; do
+        sleep 2; k=$((k + 1))
+        [ $k -lt 128 ] || break
+    done
+    if [ $k -lt 128 ]; then mark "first fix"; say "a GPS fix about $((k * 2)) s after Maps opened"; hold 32; else mark "no fix in 256 s"; say "no GPS fix in 256 s"; fi
+    mark "maps close"
+    in_ "input keyevent KEYCODE_HOME"
+    hold 16
+    [ "$AUTO" = 1 ] && maps_ungrant
+    return 0
+}
+steps_gnss-boot() { step "boot load" "nothing to do: the firmware load at boot is in the ring already" && hold 2; }
 steps_isp-main-crop() { step "lumis main crop" "open Lumis, the main's 46 degree entry" lumis_crop && { hold 8; done_step "lumis main crop" lumis_exit; }; }
 
 cmd_capture() {
@@ -390,6 +421,11 @@ cmd_decode() {
         local k
         for k in 1 2 3 4; do "$CO" pdma "$C/$s.log" --list $k > "$C/$s.list$k.txt" 2>/dev/null && say "PDMA list $k: $(wc -l < "$C/$s.list$k.txt") lines" || rm -f "$C/$s.list$k.txt"; done
         say "then by hand (docs/oracle/CAMERA.md): cam-oracle cpu $C/$s.log <a> <b> <c> <prefix> --link <the link> (a, b, c from $C/$s.marks), cam-oracle pdma-image $C/$s.log <out.cpr3> --list <n> --own-image"
+        ;;
+    gnss-*)
+        # How the trapped accesses fall over spi_21's registers (CH_CFG +0, MODE_CFG +8, SLAVE_SEL +C, TX_DATA +18, RX_DATA +1C, PACKET_CNT +20, SWAP_CFG +28) and the GPIO page; the bytes themselves by hand for now (docs/GPS.md "akita's KEPLER").
+        grep -a 'ferros hv: S2 [0-9A-F]' "$C/$s.log" | awk '{print $4, $5}' | sort | uniq -c | sort -rn | head -32 > "$C/$s.summary" || true
+        cat "$C/$s.summary"
         ;;
     *) die "no session $s";;
     esac
