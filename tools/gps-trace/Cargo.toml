@@ -1,0 +1,7 @@
+[package]
+name = "gps-trace"
+version = "0.0.0"
+edition = "2024"
+description = "Reads a gtrace capture of lhd's /dev/ttyBCM traffic (both directions), lists every packet and inner message with its time, and cuts a GNR1 replay of the host's writes for the ferros GPS driver"
+
+[workspace]

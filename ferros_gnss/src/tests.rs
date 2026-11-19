@@ -230,3 +230,31 @@ fn a_last_fix_widens_with_its_age() {
     assert_eq!(last_fix(0., 0., None, None).radius, UNDATED_M);
     assert_eq!(combine(&[]), None);
 }
+
+const BRDC: &str = include_str!("testdata/brdc-gps-2026-11-19.rnx");
+
+#[test]
+fn broadcast_ephemerides_agree_with_the_almanac() {
+    // BKG's BRDC for 2026-11-19 (day 323, the first ephemeris of each GPS satellite) by IS-GPS-200's ephemeris equations, against the almanac of 2026-11-18 by its own: two sources, the same satellites to an almanac's few km (1.1 to 3.6 km measured).
+    let mut v = Vec::new();
+    let (taken, refused) = eph::each_gps(BRDC.as_bytes(), |e| v.push(e));
+    assert_eq!(refused, 0);
+    assert!(taken >= 30, "A#{taken}");
+    let alm = yuma();
+    // 2026-11-19 03:00 UTC as Eagle seconds, and as GPS seconds of the ephemeris's week.
+    let t = eagle(2026, 11, 19, 3, 0, 0.);
+    let gps = t + EAGLE_EPOCH_UNIX_SECS as f64 - 315_964_800. + 18.;
+    let mut worst: f64 = 0.;
+    for e in &v {
+        let Some(a) = alm.iter().find(|a| a.prn == e.prn) else { continue };
+        let sow = gps - e.week as f64 * 604_800.;
+        let p = eph::gps_ecef(e, sow);
+        let q = alm_ecef(a, t);
+        let d = sqrt((p[0] / 1000. - q[0]).powi(2) + (p[1] / 1000. - q[1]).powi(2) + (p[2] / 1000. - q[2]).powi(2));
+        let r = sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) / 1000.;
+        println!("G{:02} week A#{} toe A#{} radius {r:.0} km, from the almanac {d:.2} km", e.prn, e.week, e.toe);
+        assert!((26_000. ..27_000.).contains(&r));
+        worst = worst.max(d);
+    }
+    assert!(worst < 8., "the worst A#{worst} km");
+}
