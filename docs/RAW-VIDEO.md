@@ -288,6 +288,13 @@ Opsin builds against vsf `raw-video` with `clip::edit_generation` and `Reader::v
    opsin --characterize clip.vsf "pixel 8 pro calibration data/derived/cam2-main.idt.vsf"
    ```
    The device's own copy is the vault's `cam.<key>.idt` (the main is `boitata`).
+   Or measured on the shoot: with the colour target in frame for a moment, `Cal` in Opsin (built with `--features calibrate`) on that frame scans it and pastes the solved DSR IDT into the clip at `unit`/`relative`; or copy a profile from a still of the same camera and paste it, as for stills:
+   ```bash
+   opsin --copy-idt <still.vsf | still.dng | camera.idt.vsf | other clip.vsf>
+   opsin --paste-idt clip.vsf
+   opsin --unpaste-idt clip.vsf
+   ```
+   (`Ctrl+C`, `Ctrl+V`, `Ctrl+Shift+V` in the viewer.) The paste is refused when make or model differ (`--force` past it): rawrec names its clips `Google` `Pixel 8 Pro`, Lumis on Android names the main's stills `Google` `Pixel 8 Pro cam 2` and Lumis on ferros names stills and clips alike `ferros` `camera`, so today only Lumis-on-ferros stills paste onto Lumis-on-ferros clips without `--force`.
 4. **Look and grade in Opsin.** `opsin clip.vsf`: `,` `.` a frame, `<` `>` a second, Home and End, Space plays by the frames' own times; exposure, HDR, crop and rotation as for a still; `V` appends the grade to the clip as a generation (no frame's bytes move); `E` a frame as JPEG.
 5. **Export for Resolve.** `D` in the viewer, or:
    ```bash
