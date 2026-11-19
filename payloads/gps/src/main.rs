@@ -41,6 +41,8 @@ const S_STORE: u64 = 6;
 const S_POWER: u64 = 7;
 /// FIX's reply: the fix (33 bytes), then the chip's frames so far and their kinds (5).
 const FIX_LEN: usize = 33 + 5;
+/// The WATCH calls held at once (op 3): more than the watchers there are (the map's GPS page and each puck's placer, six on the Pro), so none is turned away; one past it is answered empty and waits its breath.
+const WATCHES: usize = 1 << 4;
 /// FRAMES' record for a kind: key 6, count, bytes, age.
 const KIND_REC: usize = 6 + 4 + 4 + 4;
 /// HOST_REQ's interrupt (kernel `gps-host-req`): the loop sleeps on it instead of polling the line, which missed the chip's requests (2026-10-26: a fix, then nothing).
@@ -1107,8 +1109,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut published_sky = (u32::MAX, u32::MAX);
     // The fix count the altitude, speed and heading were last published for (u32::MAX: never, so the first pass empties their slots).
     let mut published_fix = u32::MAX;
-    // The WATCH calls held (op 3): each its reply token and the change count its caller last saw, answered when the count moves. Four at most; only the map's GPS page watches today.
-    let mut watches: [Option<([u8; 32], u32)>; 1 << 2] = [None; 1 << 2];
+    // The WATCH calls held (op 3): each its reply token and the change count its caller last saw, answered when the count moves. `WATCHES` at most: the map's GPS page and every puck's placer watch (six on the Pro, 2026-11-19).
+    let mut watches: [Option<([u8; 32], u32)>; WATCHES] = [None; WATCHES];
     // Whether the endpoint has been polled once: from then the kernel knows this thread as its poller and wakes it out of the interrupt wait for a call (process.rs wake_server).
     let mut polled = false;
     loop {
@@ -1222,22 +1224,18 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                     reply(&token, &r[..9 + REC * n]);
                 }
-                // WATCH (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure"): `count u32`, the change count the caller last saw → `count u32` now, answered at once when it differs, else held until it moves (below). A fifth watch while four are held answers the oldest with the count as it is, which asks again.
+                // WATCH (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure"): `count u32`, the change count the caller last saw → `count u32` now, answered at once when it differs, else held until it moves (below).
+                // A watch past the table's `WATCHES` is answered empty, never held: the caller takes that as a driver not ready and waits its breath (ferros_puck `gps_fix`: 1/8 s) before asking again.
+                // Until 2026-11-19 a fifth watch answered the oldest held one with the count unchanged, and that caller watched again at once, answering the next oldest: with the five pucks' placers and the map watching, the six went round the four slots some 40,000 times a second for the two minutes the pucks wait on a fix (measured on the Pro, cold boot b1002: 571 round trips in 14 ms, 3.3 million unmasks of `gps-host-req` from the driver's waits and acks, the driver at most of an A715).
                 3 if n >= 5 => {
                     let seen = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
                     let c = changes(&d, &pr);
                     if c != seen {
                         reply(&token, &c.to_le_bytes());
+                    } else if let Some(w) = watches.iter_mut().find(|w| w.is_none()) {
+                        *w = Some((token, seen));
                     } else {
-                        if watches.iter().all(|w| w.is_some()) {
-                            if let Some((t, _)) = watches[0].take() {
-                                reply(&t, &c.to_le_bytes());
-                            }
-                            watches.rotate_left(1);
-                        }
-                        if let Some(w) = watches.iter_mut().find(|w| w.is_none()) {
-                            *w = Some((token, seen));
-                        }
+                        reply(&token, &[]);
                     }
                 }
                 // FRAMES (2026-11-11, GPS.md "What the chip sends before a fix"): `[4]` the kinds, `[4, k]` kind k's latest frames (main.rs's header has both layouts).
