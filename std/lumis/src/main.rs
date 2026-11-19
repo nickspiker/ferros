@@ -179,6 +179,8 @@ const DEV_UNCACHED: u8 = 1 << 0;
 const DEV_SLIT: u8 = 1 << 1;
 /// Development, with `DEV_SLIT`: the second knobs byte's bits 3 and 4 pick the shutter Lumis opens at, 2^-(11 - 2n) s (n 0 to 3: about 1/2000 s, 1/500, 1/128, 1/32), the camera's least (one line) being under the sensor's two.
 const DEV_SLIT_SHUTTER: u32 = 3;
+/// Development, with `DEV_OPEN`, the second knobs byte: open the first readout with a mode of its own (the main's 1:1, ferros cam-full-res) instead of the first listed, and say the gravity Lumis is given once, at the camera screen's first pass.
+const DEV_FULL: u8 = 1 << 5;
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
 /// The second knobs byte, 0 when the input is shorter.
@@ -1229,7 +1231,8 @@ impl FluorApp<G2t16> for Lumis {
         match &mut self.screen {
             Screen::Menu if self.knobs & DEV_OPEN != 0 && !self.dev_opened && !self.cameras.is_empty() => {
                 self.dev_opened = true;
-                self.open(0, None);
+                let index = if dev_knobs2() & DEV_FULL != 0 { self.cameras.iter().position(|c| c.mode != 0).unwrap_or(0) } else { 0 };
+                self.open(index, None);
                 return true;
             }
             Screen::Menu => {
@@ -1247,7 +1250,12 @@ impl FluorApp<G2t16> for Lumis {
                 let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
                 let t = std::time::Instant::now();
                 // The AoC's gravity, as Android's Lumis gets TYPE_GRAVITY (owner, 2026-11-18: "looks like we aren't relaying gravity data to lumis?"): the controls turn with the device, the level indicator follows, and a save's orientation tag is the way it is held.
-                app::ui_frame(ui, surface, Buttons::default(), sys::gravity().unwrap_or(UPRIGHT), self.finger);
+                let gravity = sys::gravity();
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if self.knobs & DEV_OPEN != 0 && dev_knobs2() & DEV_FULL != 0 && !SAID.swap(true, Ordering::Relaxed) {
+                    println!("lumis: development: the gravity given, {gravity:?} (None: upright)");
+                }
+                app::ui_frame(ui, surface, Buttons::default(), gravity.unwrap_or(UPRIGHT), self.finger);
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
                 // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device and the level indicator are read below, from the fields lumis_core keeps for them.
