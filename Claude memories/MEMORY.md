@@ -64,6 +64,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Identity restores the device](identity_restores_the_device.md) - attest syncs roster, answers, layout; capsules refetched
 - [Settings flow identity to device only](settings_identity_to_device_only.md) - never device to identity; settings are spec VSF
 - [Permissions asked once, ever](permissions_asked_once.md) - per person, per kist, per permission; travels to all devices
+- [Sensor mailboxes](sensor_mailboxes.md) - drivers publish to a cap-gated read-only mailbox; unlimited readers wait on its sequence, never call the driver
 - [Implicit rights](rights_implicit_set.md) - display, touch, surface, domain, entropy, ira, audio out, GPU: never asked
 - [GPU is implicit](gpu_implicit.md) - no GPU permission ever; isolation between clients is the protection
 - [Notifications: in view](notifications_in_view.md) - in the deck's resting view can notify, out of view silent; three kinds
