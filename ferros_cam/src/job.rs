@@ -81,6 +81,15 @@ pub const AKITA_FRONT_SLOT_BYTES: [u64; SLOTS] = [
     16 * MIB, 12 * MIB, 0, 4 * MIB, 2 * MIB, 8 * MIB, 2 * MIB, 8 * MIB, 12 * MIB, 12 * MIB, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
+/// akita's ultrawide's outputs: list 1 of the 2026-11-18 capture (isp-uw, cam-oracle pdma-image `--own-image`, `job-set` for RAW10 packed: keys/akita/cam-inputs-2026-11-19/uw, local), each slot from the lowest offset its job names to its granule's end, but slot 4 (G#1C35_51C8's output, the one the main's slot 6 measured at about 32.4 MiB): 40 MiB.
+pub const AKITA_UW_SLOT_BYTES: [u64; SLOTS] = [
+    12 * MIB, 8 * MIB, 0, 6 * MIB, 40 * MIB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+pub const AKITA_UW_SLOT_SKIP: [u64; SLOTS] = [
+    0x45_0000, 0x80_0000, 0, 0xA8_0000, 0xA0_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
 pub const AKITA_FRONT_SLOT_SKIP: [u64; SLOTS] = [
     0x10_0000, 0x47_8000, 0, 0xD6_0000, 0xE6_D000, 0x88_0000, 0xFF_4000, 0x98_0000, 0x50_0000, 0x48_0000, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

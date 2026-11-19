@@ -1482,7 +1482,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.
     let slit_n = if s.ring == 0 { 1usize << SLIT_RING } else if s.ring <= SLIT_RING_MOST { 1usize << s.ring } else { return Err(Fail::Inputs("a slit ring past 2^12 buffers")) };
     // The PD path on (the init's mode, or asked): each ring buffer holds its frame's PD rows right after its image (owner, 2026-11-17: phase detect as data, one MAP giving both; docs/CAMERA.md "Phase detect as data"), the main's 768 lines at the image's stride past its 3072, so a buffer is 20 MiB, not 16. `pd_off` the rows' place in the buffer, 0 none.
-    let pd_on = s.kind == K_CAPTURED || s.flags & F_PD != 0;
+    // Only where the job has a PD path at all (its program writes loch0's PD address): the 8a's front has none (2026-11-19: its open was refused for want of one).
+    let has_pd = job::list_piece(&jb[..jn]).is_ok_and(|(at, len)| job::pd_words(&jb[at..at + len]).is_ok());
+    let pd_on = has_pd && (s.kind == K_CAPTURED || s.flags & F_PD != 0);
     let pd_off = if pd_on && !slit { fe.h as u64 * fe.stride as u64 } else { 0 };
     let buf = if slit { job::slit_bytes(fe.h as u64, fe.stride as u64) } else if pd_off != 0 { job::buffer_bytes(fe.h as u64 + fe.pd_h as u64, fe.stride as u64) } else { job::buffer_bytes(fe.h as u64, fe.stride as u64) };
     // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14); measured on the Pro on 2026-11-15 to work above 4 GiB too (the front end drives the high address halves in bypass), where it is taken when nothing lower is free. A vault entry `cam.region` reading `high` asks higher first.
@@ -1879,7 +1881,7 @@ fn close(g: u64) {
     fe_say(g, "at the close");
     if FRAMES.load(Ordering::Relaxed) == 0 {
         readback_say(g);
-    } else if STOPPED.load(Ordering::Relaxed) != 0 {
+    } else if STOPPED.load(Ordering::Relaxed) != 0 || WORDS_TEST.load(Ordering::Relaxed) != 0 {
         words_say(g);
         copies_say(g);
     }
@@ -2168,6 +2170,8 @@ fn release(g: u64, o: &mut Open, b: usize) {
 /// No frame came in `late_us`: said with the words that tell why.
 /// Set when the stream was taken for stopped (`late`): the close then says the front end's words (`words_say`).
 static STOPPED: AtomicU64 = AtomicU64::new(0);
+/// A device test (the hand spawn's eleventh byte 1): `words_say` at every close.
+static WORDS_TEST: AtomicU64 = AtomicU64::new(0);
 fn late(g: u64) {
     STOPPED.store(1, Ordering::Relaxed);
     say!(g, "camera: no frame in A#{} ms (A#{} so far; A#{} answers, A#{} on the line; image status bits seen G#{:X}; ring frames unseen A#{}); closing\n", late_us() / 1000, FRAMES.load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed), ON_LINE.load(Ordering::Relaxed), IMG_SEEN.load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed));
@@ -2198,7 +2202,8 @@ fn ack_say(g: u64) {
 }
 fn link_say(g: u64) {
     // The camera's CSI link as it stands (its base: the link the receiver's start word G#205E01 went to): its interrupt words (+G#14 errors, +G#1C line end, lost frame and size mismatch, +G#24 frame starts, +G#2C frame ends per channel) and its per-channel counters (+G#634 to +G#6C4, October's 21 words), so a stream that stopped says whether frames still reached the link and what it made of them (docs/oracle/CAMERA.md: a mismatched slit added size errors there).
-    let Some(&(a, _)) = cam().rx_start.iter().find(|w| w.1 == 0x205E01) else { return };
+    // The link the start went to: its control word (+4) written with bit 0 set (G#205E01 on the mains, G#5F01 on the 8a's front).
+    let Some(&(a, _)) = cam().rx_start.iter().find(|w| (0x1C04_0000..0x1C10_0000).contains(&w.0) && w.0 & 0xFFFF == 4 && w.1 & 1 == 1) else { return };
     let link = a & !0xFFFF;
     say!(g, "camera: link G#{link:X}: +14 G#{:X} +1C G#{:X} +24 G#{:X} +2C G#{:X}; image path G#{:X}, aggregate G#{:X}\n", rd(g, link + 0x14), rd(g, link + 0x1C), rd(g, link + 0x24), rd(g, link + 0x2C), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::CMN_STATUS));
     let mut l = Line { b: [0; 256], n: 0 };
@@ -2254,7 +2259,24 @@ fn words_say(g: u64) {
         (0x1C39_0000, 0x80), (0x1C39_1000, 0x40), (0x1C39_2000, 0x40), (0x1C39_3000, 0x40), (0x1C39_4000, 0x40),
         (0x1C32_0000, 0x120), (0x1C32_0400, 0xA0), (0x1C32_2000, 0xA0),
     ];
-    for &(base, len) in SPANS.iter() {
+    // The camera's link (+0 to +G#100, +G#600 to +G#700) and its PHY lanes (G#1C10_xx00 pages its receiver start writes, each page's first G#100), as they stand: a link that latches frame starts and ends but counts no line says where the lines stop (2026-11-19, the 8a's front).
+    let mut spans: [(usize, usize); 1 << 5] = [(0, 0); 1 << 5];
+    let mut n = 0;
+    if let Some(&(a, _)) = cam().rx_start.iter().find(|w| (0x1C04_0000..0x1C10_0000).contains(&w.0) && w.0 & 0xFFFF == 4 && w.1 & 1 == 1) {
+        let link = a & !0xFFFF;
+        spans[0] = (link, 0x100);
+        spans[1] = (link + 0x600, 0x100);
+        n = 2;
+    }
+    for &(a, _) in cam().rx_start.iter() {
+        let page = a & !0xFF;
+        // WHY the bound: the table holds 2^5 spans; a receiver start naming more lanes than that has the rest unread.
+        if (0x1C10_1000..0x1C10_4000).contains(&a) && a & 0xFF != 0x1C && n < spans.len() && !spans[..n].iter().any(|s| s.0 == page) {
+            spans[n] = (page, 0x100);
+            n += 1;
+        }
+    }
+    for &(base, len) in SPANS.iter().chain(spans[..n].iter()) {
         let mut at = 0;
         while at < len {
             let mut l = Line { b: [0; 256], n: 0 };
@@ -2553,6 +2575,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     if input_len > 9 {
         NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    // The eleventh, a device test only: 1 says the front end's, link's and PHY's words at every close (`words_say`), a stream that ran too, for a comparison with one that did not.
+    if input_len > 10 {
+        WORDS_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 10) as *const u8) } as u64, Ordering::Relaxed);
     }
     // A device test with nothing stored: the 1:1 init in the input after the 16 knob bytes (`FULL_INPUT_AT`), u32 LE length and the table, as `--input-file` frames it.
     if input_len > FULL_INPUT_AT + 4 {

@@ -311,7 +311,8 @@ pub const AKITA_MAIN: Cam = Cam {
 
 /// akita's ultrawide (leshen-uw): a part the device tree does not name, on hsi2c_3 at G#1A, CIS_CLK0 (the oscillator, as every akita init tells its sensor 24.574 MHz).
 /// It answers G#0712 at the CCS sensor register G#0016 (PROBE, 2026-11-15): a Sony IMX712.
-/// From its init: 4208 x 3120 RAW10 on four lanes, orientation 90 and RGGB in Camera2; its session ran on CSI link 0 with the csis0 lanes (SYSREG select 1) and no PDMA program was seen, so its path is not known; the line G#14C0 is derived (the front's 4208 in its job).
+/// From its init: 4208 x 3120 RAW10 on four lanes, orientation 90 and RGGB in Camera2; CSI link 0 and the csis0 lanes (`rx::RX_START_AKITA_UW`, SYSREG select 1), its job (2026-11-18, isp-uw list 1) writing 16-bit samples, stored RAW10 packed at G#14C0 a line as the main's.
+/// Its timing from its init: a line of 5192 clocks at 24.576 MHz / 3 x 122 (5.195 us), a frame of 3269 lines (16.98 ms), the integration 801 lines; the margin taken as the main's 2^6 until read.
 pub const AKITA_ULTRAWIDE: Cam = Cam {
     id: 1,
     name: "ultrawide",
@@ -328,21 +329,21 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     actuator: 0,
     focus: (0, 0),
     streams: false,
-    rx_start: &[],
-    rx_stop: &[],
+    rx_start: &crate::rx::RX_START_AKITA_UW,
+    rx_stop: &crate::rx::RX_STOP_FRONT,
     ack: &crate::FRAME_ACK,
     tick_us: 1 << 13,
     width: 4208,
     height: 3120,
     stride: 0x14C0,
-    sizes: [0; SLOTS],
-    skip: job::NO_SKIP,
-    line_ps: 0,
-    llp: 0,
-    pll: (0, 0),
-    fll: 0,
-    exposure_lines: 0,
-    exposure_max_lines: 0,
+    sizes: job::AKITA_UW_SLOT_BYTES,
+    skip: job::AKITA_UW_SLOT_SKIP,
+    line_ps: 5_194_992,
+    llp: 5192,
+    pll: (3, 122),
+    fll: 3269,
+    exposure_lines: 801,
+    exposure_max_lines: 3269 - (1 << 6),
     cfa: cfa(0, 1, 1, 2),
     black: 64,
     white: 1023,
@@ -351,7 +352,8 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
 };
 
 /// akita's front camera (leshen): the ultrawide's module family, on hsi2c_2 at G#1A, CIS_CLK1 (the oscillator); it answers G#0712 at G#0016 (PROBE, 2026-11-15): a Sony IMX712 as the ultrawide.
-/// Measured from Android's session: 4208 x 3072 RAW10 on four lanes, its image flipped both ways by its init (G#0101 = 3), CSI link 6 and the csis3 lanes (`rx::RX_START_AKITA_FRONT`, SYSREG select G#60), the line G#14C0 in its job, BGGR, orientation 270.
+/// Measured from Android's session: 4208 x 3072 RAW10 on four lanes, its image flipped both ways by its init (G#0101 = 3), CSI link 6 and the csis3 lanes (`rx::RX_START_AKITA_FRONT`, SYSREG select G#60), BGGR, orientation 270; its job writes 16-bit samples (format 2, a G#20E0 line), stored RAW10 packed (format 4, the line G#14C0) as the main's.
+/// From its init: a line of 5192 clocks at 24.576 MHz / 3 x 119 (5.326 us), a frame of 3128 lines (16.66 ms), the integration 3118 lines; the margin under the frame taken as the main's 2^6 until the sensor's own is read.
 pub const AKITA_FRONT: Cam = Cam {
     id: 2,
     name: "front",
@@ -377,12 +379,12 @@ pub const AKITA_FRONT: Cam = Cam {
     stride: 0x14C0,
     sizes: job::AKITA_FRONT_SLOT_BYTES,
     skip: job::AKITA_FRONT_SLOT_SKIP,
-    line_ps: 0,
-    llp: 0,
-    pll: (0, 0),
-    fll: 0,
-    exposure_lines: 0,
-    exposure_max_lines: 0,
+    line_ps: 5_325_958,
+    llp: 5192,
+    pll: (3, 119),
+    fll: 3128,
+    exposure_lines: 3118,
+    exposure_max_lines: 3128 - (1 << 6),
     cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,
