@@ -113,6 +113,11 @@ macro_rules! step {
     }};
 }
 
+/// A readout's diagonal field in degrees, as its list section carries it (ferros_cam optics `Optics::field`).
+fn field_deg(c: &Cam, r: &ferros_cam::list::Readout) -> f32 {
+    ferros_cam::optics::OPTICS[c.id as usize].field(r.covered).fov_deg.2
+}
+
 /// The list (docs/CAMERA.md "The endpoint"): a section per camera that streams and whose inputs and IDT are in the vault (`inputs_held`, `cam.<key>.idt`), each carrying its own Absolute IDT and sensitivity read from that entry (ferros_cam list). A camera whose IDT does not read is left out and said.
 fn list(g: u64) -> alloc::vec::Vec<u8> {
     let mut secs = alloc::vec::Vec::new();
@@ -123,8 +128,8 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         }
         let Some(idt) = input(g, c, None, b"idt", T_IDT, unsafe { &mut *(&raw mut IDT) }) else { continue };
         if !LIST_SAID.load(Ordering::Relaxed) {
-            let t = ferros_cam::list::Readout::binned(c).timing;
-            say!(g, "camera: LIST {}: mode A#0, exposure_max A#{} ns\n", c.name, t.most_ns());
+            let r = ferros_cam::list::Readout::binned(c);
+            say!(g, "camera: LIST {}: mode A#0, A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
         }
         match ferros_cam::list::section(c, idt) {
             Ok(s) => secs.push(s),
@@ -136,7 +141,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         // Its 1:1 readout, a second section with the same `id` and `name`, when its 1:1 init is in the vault (`cam.<key>.init.full`; docs/CAMERA.md "1:1 on the main"): its own size, mosaic period, frame period and exposure range, read off that init; opened by the mode block's kind 2.
         if let Some(full) = full_init(g, c) {
             if let (false, Ok(r)) = (LIST_SAID.load(Ordering::Relaxed), ferros_cam::list::Readout::full(c, full)) {
-                say!(g, "camera: LIST {}: mode A#{}, exposure_max A#{} ns\n", c.name, r.kind, r.timing.most_ns());
+                say!(g, "camera: LIST {}: mode A#{}, A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.kind, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
             }
             match ferros_cam::list::Readout::full(c, full).and_then(|r| ferros_cam::list::section_of(c, idt, &r)) {
                 Ok(s) => secs.push(s),
@@ -159,7 +164,7 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
             let Some(init) = input(g, c, Some(a), b"init", T_INIT, unsafe { &mut *(&raw mut INIT) }) else { continue };
             let r = ferros_cam::list::Readout::alt(c, k, init);
             if !LIST_SAID.load(Ordering::Relaxed) {
-                say!(g, "camera: LIST {}: mode A#{} ({}), exposure_max A#{} ns\n", c.name, r.kind, a.tag, r.timing.most_ns());
+                say!(g, "camera: LIST {}: mode A#{} ({}), A#{} x A#{}, exposure_max A#{} ns, a field of A#{:.2} degrees on the diagonal\n", c.name, r.kind, a.tag, r.width, r.height, r.timing.most_ns(), field_deg(c, &r));
             }
             match ferros_cam::list::section_of(c, idt, &r) {
                 Ok(s) => secs.push(s),
@@ -1308,7 +1313,8 @@ const K_SLIT: u8 = 3;
 const K_SLIT_FULL: u8 = 4;
 /// RAW12 (the sensor's data format, the link's data type, the front end's stride; the core's own format word is not known, docs/CAMERA.md "RAW12").
 const F_RAW12: u8 = 1 << 0;
-/// The mode written after the first frame instead of before stream on: the one order that streamed a slit in October (2026-10-21, one change a session), and the one that left the sensor stuck until a cold boot.
+/// The mode written after the first frame instead of before stream on: the one order that streamed a slit in October (2026-10-21, one change a session), and the one that left the sensor stuck until a cold boot (with no real hold; the close's power cycle unsticks it since).
+/// Always on a camera whose sensor drops a mode written before stream on (`Cam::mode_live`, the tele): its first frame or two then arrive at the init's shape, which loch0 counts as one resolution mismatch before the mode lands.
 const F_MID: u8 = 1 << 1;
 /// loch0's PD path enabled (Linux's G#81); off by default in every mode but the init's, whose PD rows' slot is sized for the binned frame.
 const F_PD: u8 = 1 << 2;
@@ -1351,9 +1357,9 @@ impl Spec {
     fn full(&self) -> bool {
         matches!(self.kind, K_FULL | K_SLIT_FULL)
     }
-    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults are the main's alone: the switches are read off its program, and the ultrawide's slim program took one frame (2026-11-16). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
-    fn shape(&self, main: bool) -> (u8, bool) {
-        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), main, self.flags & F_SLIM != 0)
+    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults hold on every camera (2026-11-18: the ultrawide's, the front's and the tele's slits stream detached and slim, and took two frames without). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
+    fn shape(&self) -> (u8, bool) {
+        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), self.flags & F_SLIM != 0)
     }
 }
 
@@ -1440,6 +1446,8 @@ fn engine_bytes(full: usize, slim: usize) -> u64 {
 }
 
 fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
+    // A sensor that drops a mode written before stream on (`Cam::mode_live`, the tele) has it written after the first frame.
+    let s = &Spec { flags: s.flags | if c.mode_live { F_MID } else { 0 }, ..*s };
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
     let t0 = ferros_sys::now();
     CAM.store(c.id as u64, Ordering::Relaxed);
@@ -1490,7 +1498,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // A captured readout runs with its own switches (`Alt::detach`, measured) unless the hand spawn's eighth byte overrides them (bit 7), with the slim program when the OPEN asks.
     let (detach, slim) = match alt {
         Some(a) if DETACH.load(Ordering::Relaxed) & 0x80 == 0 => (a.detach, s.flags & F_SLIM != 0),
-        _ => s.shape(c.id == 0),
+        _ => s.shape(),
     };
     let slim_level = if s.flags & F_SLIM2 != 0 { 2 } else { 1 };
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.

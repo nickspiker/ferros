@@ -1247,6 +1247,54 @@ Every pulled zone's sha256 equalled the device's. Traps: the script took the fir
 
 **Left**: this driver into the vault (and Lumis's mode numbers 8 and 9 tried from its menu); the tele's frame floor and slit window; the rotations of the ultrawide and the tele on a ferros frame; noise tests of the tele's and the front's gain ranges; the main's own front-end captures were lost with Harbor tmp (its 1:1 still runs on the binned job rewritten).
 
+## Slits on every camera (2026-11-18 night, branch cam-slits-all)
+
+The Lumis session ran every Pro readout in Lumis: the slits on the ultrawide, the front and the tele each took 2 frames, then "no frame in 2099 ms" (the link +14 G#0 on the ultrawide, +1C G#40 on the front and the tele).
+The Pro b983 (the flashed gate's kernel, no reload, the identity unlocked at boot); every driver hand-spawned from target/agent-slitsall/bin, one open each, every stream ended by its own close; logs target/agent-slitsall/runs.
+Every slit below is a 64-row binned slit as Lumis opens it (kind 3, rows 64, every other byte 0: no slim flag, no override), cambench `0X034000000000000000000002080000000005`: 4096 slits added into u16 on the A715s.
+
+**The cause, the same on three cameras: the statistics pipeline.** The defaults that let the main's slit run (FC ctx3 detached, the slim program: "The slit runs") applied to the main alone (geom `shape`, `main`), so the others opened their slits with FC ctx3 on and the full program, as the main's slits died in 2026-11-17's runs. The front, with the override (driver byte 8 `81`, cambench's slim flag), took 128 slits at 503 a second at once; the ultrawide had run so earlier in the day. `shape` now gives every camera's windowed (and 1:1) mode the defaults; whole frames are as before.
+
+**The tele's two faults, measured:**
+- **Its 30 a second: the sensor drops a mode written before stream on.** Frames of 8000, 6000, 5000 and 4000 lines written in the hold before stream on (kind 1, whole frames) all ran 30 a second, and a 64-row slit's window and size were dropped too: opened with the front end left at the whole frame (`F_KEEP_FE`), the slit's sensor sent clean whole 4032 x 3024 frames at 30 a second (link +1C G#0, no error word). That is the size mismatch of every tele slit (image path G#404, SENSOR_RESOL_MISMATCH and STREAM_ERROR; link +1C G#40, VRESOL_MISMATCH: the front end set for 64 rows, the sensor sending 3024) and its 30 a second (the init's 5457-line frame, 33.3 ms, whatever was asked). Written after the first frame (`F_MID`), the same words take: 8000 lines 20 a second, 4000 lines 40, the slit 559. The CCS words read back as written either way (CAPS), so the sensor holds them and its stream on runs its own mode over them; long exposures always worked because they are SETs mid-stream. Built: ferros_cam cams `Cam::mode_live` (the tele's true), the driver writes such a camera's mode after its first frame; that first frame arrives at the init's shape and loch0 counts it once (G#404 at frame 0, none after).
+- **Its slit floor**: the frame asked against the sensor's counter, 64 rows: 192 and 256 lines gave 558 a second (1.79 ms, about 293 lines of 6.1068 us), 320 lines 513, 384 lines 427, 512 lines 322 (each the frame asked). So the tele's least frame is about 293 lines, as the main's is about 262.
+- After a cut (a SET shortening the exposure by over 2^20 us: stream off and on) the tele's frame word reads its init's 5456 again (its stream on), while the integration written in standby holds and lengthens the frame: camtest's ladder 64 ms to 2 s and back cut the 2 s frame, and the 64 ms frames after it ran 64.04 ms apart, the mean as before. So exposures survive a cut; a slit ring never cuts.
+
+**Measured, 4096 slits each, none lost to the ring, none read over:**
+| camera | slits a second (sensor / front end / drained) | frame | link at the close | error words |
+|---|---|---|---|---|
+| main | 1219 / 1209 / 1231 | 192 lines, its floor about 262 | +14 G#0, +1C G#0 | none |
+| ultrawide | 798 / 793 / 794 | 192 lines of 6.5616 us, 1.26 ms | +14 G#0, +1C G#0 | none |
+| front | 503 / 497 / 499 | 192 lines of 10.4378 us, 2.00 ms (as asked) | +14 G#0, +1C G#40 | image 0; PD path G#414 |
+| tele | 559 / 554 / 557 | its floor, about 293 lines of 6.1068 us | +14 G#0, +1C G#40 (frame 0) | image G#404 at frame 0 alone |
+- The front's +1C G#40 and its PD path's G#414 (SENSOR_RESOL_MISMATCH, LATE_CONFIG, STREAM_ERROR) read as its phase detect (the image path is clean; inferred, not isolated): no PD switch is known for it (ccs `Side::pd` None), so its sensor keeps sending PD rows the link's channel 1 was resized for (`geom::value`: a quarter of the slit's rows); the image path is clean and every slit lands. Its PD control word, or the channel 1 size its sensor sends in a slit, would quiet it; neither is known.
+- Regressions with this driver: the tele's whole frames (kind 0) 64 at 30 a second, clean; the main's 1:1 (kind 2) from the vault's stored init, 64 at 23 a second, clean.
+
+### A readout's field of view
+
+The Lumis session: a field per LIST readout that tells modes apart in a menu (the tele's two 4032 x 3024: 22 degrees and the 11-degree 2x crop).
+Each section now carries `field_width_mm`, `field_height_mm` (the sensor's part it reads), `fov_width_deg`, `fov_height_deg`, `fov_diagonal_deg` and `focal_equiv_mm` (its 35 mm equivalent), all f5, from ferros_cam optics `Optics::field`: the readout's array pixels (`Readout::covered`, its size times the array pixels each output pixel gathers: 2 binned, 1 at 1:1) over the array the sensor size measures (`Optics::array_px`: the rear sensors' maximum resolution, the front's 10.5 MP), times the sensor's size (Camera2 SENSOR_INFO_PHYSICAL_SIZE), and the lens's focal length (the calibration captures' `focal_mm`). The angles need an arctangent and a square root core has none of: `optics::atan`, `optics::sqrt`, host-tested against std's to 1e-14.
+The captured readouts' gather is a field of each (`Alt::gather`, 1 for all four): the tele's 11 degrees cannot be read off its init, whose CCS words say the whole array binned as the 22 degrees' do; its crop is the vendor's G#0B30 = G#0101, and Android's virtual camera 6 reports half the tele's sensor (Lumis docs/google-bug-tele-maxres-fov.md).
+| readout | size | field (mm) | angles across width x height, diagonal (degrees) | 35 mm equivalent |
+|---|---|---|---|---|
+| main, mode 0 and 2 | 4080 x 3072, 8160 x 6144 | 9.792 x 7.373 | 70.72 x 56.23, 83.22 | 24.36 |
+| ultrawide, mode 0 and 8 (w48) | 4000 x 3000, 8000 x 6000 | 6.400 x 4.800 | 110.26 x 94.21, 121.72 | 12.06 |
+| front, mode 0 | 3840 x 2736 | 4.685 x 3.338 | 81.05 x 62.69, 92.78 | 20.61 |
+| front, mode 8 (f8) | 3440 x 2448 | 4.197 x 2.987 | 74.89 x 57.18, 86.45 | 23.02 |
+| tele, mode 0 and 9 (t48) | 4032 x 3024, 8064 x 6048 | 5.645 x 4.234 | 17.82 x 13.41, 22.18 | 110.37 |
+| tele, mode 8 (t11) | 4032 x 3024 | 2.822 x 2.117 | 8.97 x 6.73, 11.19 | 220.75 |
+The diagonals equal Android's computed ones (83.2, 121.7, 22.2, 11.2), the 35 mm equivalents the captures' recorded ones; host tests optics `the_diagonal_angles_are_androids`, list `every_readouts_field`. On the Pro the driver's first LIST says each readout's size and diagonal (6541 bytes, nine readouts with the 1:1 stored). What Lumis does with them is Lumis's.
+
+### The main's 1:1 init stored
+
+`cam.boitata.init.full` stored in the Pro's vault from target/cam/main-full.init (15499 bytes, blake3 81359be0b2d8a75e; local only, the vendor's settings) and read back equal (`cmp`). A driver with nothing in its input lists the main's 8160 x 6144 readout (mode 2) and opens it from the vault: init 747 writes and 1 read in 1.3 s, 64 frames at 23 a second, the link clean.
+
+**Open:**
+- This driver is not stored: Lumis's on-demand `camera` is still the vault's older one until it is (`$B capsule` then `store put camera`), so Lumis's slits on the other cameras stay as they were until then.
+- The front's phase-detect switch (its +1C G#40, harmless to the slits).
+- Why the tele's sensor runs its own mode over the CCS words at stream on: a vendor word in its init (the G#0B30 writes, G#00FF then G#01FF then G#0100, look like a mode select and apply) may say; written mid-stream is enough for now.
+- The front's slit floor (192 lines ran as asked; shorter not tried).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
