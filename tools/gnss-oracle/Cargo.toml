@@ -1,0 +1,9 @@
+[package]
+name = "gnss-oracle"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: an hv oracle capture of akita's spi_21 (the Samsung KEPLER GNSS) turned back into SPI transfers and the CHPP packets they carry (docs/GPS.md \"akita's KEPLER\")"
+
+[workspace]
+
+[dependencies]
