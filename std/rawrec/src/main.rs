@@ -2,7 +2,7 @@
 //! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`.
 //!
 //! The input (hex bytes):
-//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost).
+//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
 //! - record (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
@@ -129,6 +129,116 @@ fn seal_bench() {
     }
 }
 
+/// One frame's bands coded by `encode_band` (NEON in a `--features neon` build) and by `encode_band_scalar`, compared byte for byte, and both timed on four A715 threads: (bands that differ, scalar us, this build's us, coded bytes).
+fn neon_frame(rows: &[u8], w: usize, h: usize, stride: usize) -> (usize, u64, u64, usize) {
+    use ferros_rawcodec as rc;
+    let nb = rc::bands(h);
+    let mut work = Box::new(rc::Work::new());
+    let mut a = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+    let mut b = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+    let (mut differ, mut coded) = (0, 0);
+    for k in 0..nb {
+        let n = rc::band_rows(h, k);
+        let src = &rows[rc::band_src(k, h, w, stride)];
+        let (la, lb) = rc::encode_band(src, stride, w, n, rc::Cfa::Bayer, &mut work, &mut a);
+        let (sa, sb) = rc::encode_band_scalar(src, stride, w, n, rc::Cfa::Bayer, &mut work, &mut b);
+        coded += la + lb;
+        if (la, lb) != (sa, sb) || a[..la + lb] != b[..sa + sb] {
+            differ += 1;
+            if differ == 1 {
+                let at = a[..la + lb].iter().zip(b[..sa + sb].iter()).position(|(x, y)| x != y).unwrap_or(la.min(sa));
+                println!("rawrec: neon check: band A#{k} differs: lengths A#{la}+A#{lb} against the scalar's A#{sa}+A#{sb}, first at byte A#{at}");
+            }
+        }
+    }
+    let time = |neon: bool| -> u64 {
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for q in 0..4usize {
+                sc.spawn(move || {
+                    ferros_clip::ferros::pin(0x00F0);
+                    let mut work = Box::new(rc::Work::new());
+                    let mut o = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+                    for k in (q..nb).step_by(4) {
+                        let n = rc::band_rows(h, k);
+                        let src = &rows[rc::band_src(k, h, w, stride)];
+                        if neon {
+                            rc::encode_band(src, stride, w, n, rc::Cfa::Bayer, &mut work, &mut o);
+                        } else {
+                            rc::encode_band_scalar(src, stride, w, n, rc::Cfa::Bayer, &mut work, &mut o);
+                        }
+                    }
+                });
+            }
+        });
+        t.elapsed().as_micros() as u64
+    };
+    let (ts, tn) = (time(false), time(true));
+    (differ, ts, tn, coded)
+}
+
+/// Job 4: this build's band coder (NEON with `--features neon`) against the scalar one, byte for byte, on frames of the binned main at four gains (+1 the frames at each, 0: 4), then each band decoded and compared with the frame; the times on four A715s.
+fn neon_check(inp: &[u8]) {
+    let per = if inp.get(1).copied().unwrap_or(0) == 0 { 4 } else { inp[1] as usize };
+    println!("rawrec: neon check: this build codes with NEON {}", ferros_rawcodec::NEON);
+    let mut r = [0u8; 64];
+    let n = call(S_CAMERA, &Pacing::of(30).open_msg(0, 16_000_000), &mut r);
+    if n == ERR || r[0] != 0 || n < 48 {
+        println!("rawrec: neon check: OPEN refused");
+        return;
+    }
+    let mut tok = [0u8; 32];
+    tok.copy_from_slice(&r[1..33]);
+    let base = svc(SYS_DMA, off(tok.as_ptr()), 0, 0, 0, 0);
+    let (w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    let mut hd = [0u8; 64];
+    let mut held = 0xFFu8;
+    let (mut frames, mut bad, mut ts, mut tn) = (0, 0, 0u64, 0u64);
+    let mut work = Box::new(ferros_rawcodec::Work::new());
+    let mut px = vec![0u16; w * ferros_rawcodec::BAND_ROWS];
+    let mut o = vec![0u8; ferros_rawcodec::max_band_len(w, ferros_rawcodec::BAND_ROWS)];
+    for g in 0..4u64 {
+        set(1, 1024 << (2 * g));
+        for _ in 0..per + 4 {
+            if call(S_CAMERA, &[5, held], &mut hd) == ERR {
+                println!("rawrec: neon check: MAP failed");
+                let _ = call(S_CAMERA, &[4], &mut r);
+                return;
+            }
+            held = hd[40];
+        }
+        for _ in 0..per {
+            if call(S_CAMERA, &[5, held], &mut hd) == ERR {
+                break;
+            }
+            held = hd[40];
+            // SAFETY: the view's buffer this MAP names, held until the next MAP.
+            let rows = unsafe { core::slice::from_raw_parts((base + u64::from_le_bytes(hd[48..56].try_into().unwrap())) as *const u8, h * stride) };
+            let (d, s, t, coded) = neon_frame(rows, w, h, stride);
+            // Every band of this build's code decoded and compared with the frame's samples.
+            let mut lossy = 0;
+            for k in 0..ferros_rawcodec::bands(h) {
+                let n = ferros_rawcodec::band_rows(h, k);
+                let src = &rows[ferros_rawcodec::band_src(k, h, w, stride)];
+                let (la, lb) = ferros_rawcodec::encode_band(src, stride, w, n, ferros_rawcodec::Cfa::Bayer, &mut work, &mut o);
+                let (oa, ob) = o.split_at(la);
+                ferros_rawcodec::decode_band(oa, &ob[..lb], w, n, ferros_rawcodec::Cfa::Bayer, &mut work, &mut px, w);
+                let same = (0..n).all(|y| (0..w / 4).all(|gq| (0..4).all(|i| px[y * w + gq * 4 + i] == ((src[y * stride + gq * 5 + i] as u16) << 2 | ((src[y * stride + gq * 5 + 4] >> (2 * i)) & 3) as u16))));
+                lossy += !same as usize;
+            }
+            frames += 1;
+            bad += d + lossy;
+            ts += s;
+            tn += t;
+            println!("rawrec: neon check: gain A#{}x frame: A#{d} bands differ from the scalar, A#{lossy} do not decode to the frame; ratio A#{}.{:02}; scalar A#{} us, this build A#{} us on four A715s", 1u64 << (2 * g), (h * w * 5 / 4) / coded, (h * w * 5 / 4) * 100 / coded % 100, s, t);
+        }
+    }
+    let _ = call(S_CAMERA, &[6, held], &mut r);
+    let _ = call(S_CAMERA, &[4], &mut r);
+    println!("rawrec: neon check: A#{frames} frames, A#{bad} bands wrong; scalar A#{} us a frame, this build A#{} us a frame on average (four A715s)", ts / frames.max(1) as u64, tn / frames.max(1) as u64);
+}
+
 fn main() {
     let inp = input();
     let arg = |k: usize| inp.get(k).copied().unwrap_or(0);
@@ -150,6 +260,10 @@ fn main() {
         }
         3 => {
             seal_bench();
+            return;
+        }
+        4 => {
+            neon_check(&inp);
             return;
         }
         _ => {}

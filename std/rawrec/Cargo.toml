@@ -12,6 +12,8 @@ path = "src/main.rs"
 ferros_clip = { path = "../../ferros_clip" }
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
 blake3 = "1.5"
+# Job 4: this build's band coder against the scalar one.
+ferros_rawcodec = { path = "../../ferros_rawcodec" }
 # Job 3: what sealing a clip would cost (XChaCha20-Poly1305, as the vault seals its values).
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
@@ -32,4 +34,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"
 
 [features]
 # The band coder's hand-written NEON (ferros_rawcodec `neon`), checked here against the scalar coder before it is trusted.
-neon = ["ferros_clip/neon"]
+neon = ["ferros_clip/neon", "ferros_rawcodec/neon"]

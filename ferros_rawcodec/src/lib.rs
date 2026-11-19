@@ -443,20 +443,20 @@ fn residuals_scalar<const P: u8, const DXE: usize, const DXO: usize, const DRE: 
 }
 
 #[inline(always)]
-fn residuals_t<const P: u8, const DXE: usize, const DXO: usize, const DRE: usize, const DRO: usize>(cur: &[u16; ROW], up: &[u16; ROW], w: usize, m: &mut [u16]) {
+fn residuals_t<const N: bool, const P: u8, const DXE: usize, const DXO: usize, const DRE: usize, const DRO: usize>(cur: &[u16; ROW], up: &[u16; ROW], w: usize, m: &mut [u16]) {
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    {
+    if N {
         let x0 = neon::residuals::<P, DXE, DXO, DRE, DRO>(cur, up, w, m);
         residuals_scalar::<P, DXE, DXO, DRE, DRO>(cur, up, x0, w, m);
+        return;
     }
-    #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
     residuals_scalar::<P, DXE, DXO, DRE, DRO>(cur, up, 0, w, m);
 }
 
-fn residuals<const P: u8>(cfa: Cfa, cur: &[u16; ROW], up: &[u16; ROW], w: usize, m: &mut [u16]) {
+fn residuals<const N: bool, const P: u8>(cfa: Cfa, cur: &[u16; ROW], up: &[u16; ROW], w: usize, m: &mut [u16]) {
     match cfa {
-        Cfa::Bayer => residuals_t::<P, 2, 2, 2, 2>(cur, up, w, m),
-        Cfa::Quad => residuals_t::<P, 3, 1, 1, 3>(cur, up, w, m),
+        Cfa::Bayer => residuals_t::<N, P, 2, 2, 2, 2>(cur, up, w, m),
+        Cfa::Quad => residuals_t::<N, P, 3, 1, 1, 3>(cur, up, w, m),
     }
 }
 
@@ -493,10 +493,11 @@ fn get_k(br: &mut BitReader, kprev: u32) -> u32 {
 
 /// Sum of a block's residuals: at most 2^5 x 1023, inside a u32.
 #[inline(always)]
-fn block_sum(v: &[u16]) -> u32 {
+fn block_sum<const N: bool>(v: &[u16]) -> u32 {
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    return neon::block_sum(v);
-    #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
+    if N {
+        return neon::block_sum(v);
+    }
     v.iter().map(|&v| v as u32).sum()
 }
 
@@ -519,27 +520,27 @@ fn codes_scalar(v: &[u16], k: u32, lens: &mut [u16], codes: &mut [u16]) {
 }
 
 #[inline(always)]
-fn codes(v: &[u16], k: u32, lens: &mut [u16], codes: &mut [u16]) {
+fn codes<const N: bool>(v: &[u16], k: u32, lens: &mut [u16], codes: &mut [u16]) {
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    {
+    if N {
         let i0 = neon::codes(v, k, lens, codes);
         codes_scalar(&v[i0..], k, &mut lens[i0..], &mut codes[i0..]);
+        return;
     }
-    #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
     codes_scalar(v, k, lens, codes);
 }
 
 /// One row's block headers, codes and lengths.
 /// SEL: the row has a row above, so each block takes the cheaper of m0 (Avg4) and m1 (MED) and sends one selection bit; without it m0 is Left and m1 is not read.
-fn block_codes<const SEL: bool>(m0: &[u16], m1: &[u16], w: usize, kprev: &mut u32, rc: &mut RowCodes) {
+fn block_codes<const N: bool, const SEL: bool>(m0: &[u16], m1: &[u16], w: usize, kprev: &mut u32, rc: &mut RowCodes) {
     let mut x = 0;
     let mut j = 0;
     while x < w {
         // The block's length, not a guard: whole blocks, then the row's remainder (4080 = 127 x 32 + 16).
         let n = if w - x < BLOCK { w - x } else { BLOCK };
-        let s0 = block_sum(&m0[x..x + n]);
+        let s0 = block_sum::<N>(&m0[x..x + n]);
         let (best, s) = if SEL {
-            let s1 = block_sum(&m1[x..x + n]);
+            let s1 = block_sum::<N>(&m1[x..x + n]);
             // Strictly less: a tie keeps Avg4.
             let b = s1 < s0;
             (b as u32, if b { s1 } else { s0 })
@@ -554,7 +555,7 @@ fn block_codes<const SEL: bool>(m0: &[u16], m1: &[u16], w: usize, kprev: &mut u3
         *kprev = k;
         rc.hcode[j] = ((best << kl) | kc) as u8;
         rc.hlen[j] = (SEL as u32 + kl) as u8;
-        codes(chunk, k, &mut rc.lens[x..x + n], &mut rc.codes[x..x + n]);
+        codes::<N>(chunk, k, &mut rc.lens[x..x + n], &mut rc.codes[x..x + n]);
         // Join neighbours into pairs (u64 lanes, a per-lane variable shift: NEON ushl); n is a multiple of 4.
         let (l2, c2) = (&rc.lens[x..x + n], &rc.codes[x..x + n]);
         for (((pc, pl), l), c) in rc.pcode[x >> 1..(x + n) >> 1].iter_mut().zip(rc.plen[x >> 1..(x + n) >> 1].iter_mut()).zip(l2.chunks_exact(2)).zip(c2.chunks_exact(2)) {
@@ -633,6 +634,18 @@ fn block_row_decode<const SEL: bool>(seq: &mut [u16], sel: &mut [u8], kprev: &mu
 /// `out` must hold `max_band_len(width, rows)` bytes; the bytes past la + lb are scratch.
 /// Panics if width is not a multiple of 4 or outside MIN_W..=MAX_W, if rows is 0, if src is short, or if out is shorter than max_band_len: a caller's bug, loud.
 pub fn encode_band(src: &[u8], stride: usize, width: usize, rows: usize, cfa: Cfa, work: &mut Work, out: &mut [u8]) -> (usize, usize) {
+    encode_band_with::<NEON>(src, stride, width, rows, cfa, work, out)
+}
+
+/// Whether this build's `encode_band` takes the NEON lane steps (the `neon` feature on aarch64).
+pub const NEON: bool = cfg!(all(feature = "neon", target_arch = "aarch64"));
+
+/// `encode_band` with the scalar lane steps whatever the build: the reference a NEON build is checked against byte for byte where it runs (std/rawrec job 4).
+pub fn encode_band_scalar(src: &[u8], stride: usize, width: usize, rows: usize, cfa: Cfa, work: &mut Work, out: &mut [u8]) -> (usize, usize) {
+    encode_band_with::<false>(src, stride, width, rows, cfa, work, out)
+}
+
+fn encode_band_with<const N: bool>(src: &[u8], stride: usize, width: usize, rows: usize, cfa: Cfa, work: &mut Work, out: &mut [u8]) -> (usize, usize) {
     let rb = row_bytes(width);
     assert!(width & 3 == 0 && width >= MIN_W && width <= MAX_W, "width {width}");
     assert!(rows >= 1 && src.len() >= (rows - 1) * stride + rb, "short band source");
@@ -651,13 +664,13 @@ pub fn encode_band(src: &[u8], stride: usize, width: usize, rows: usize, cfa: Cf
         left_pad(&mut work.rows, ci, has_up.then_some(ui));
         let [m0, m1] = &mut work.m;
         if has_up {
-            residuals::<AVG4>(cfa, &work.rows[ci], &work.rows[ui], width, m0);
-            residuals::<MED>(cfa, &work.rows[ci], &work.rows[ui], width, m1);
-            block_codes::<true>(&m0[..width], &m1[..width], width, &mut kprev, &mut work.rc);
+            residuals::<N, AVG4>(cfa, &work.rows[ci], &work.rows[ui], width, m0);
+            residuals::<N, MED>(cfa, &work.rows[ci], &work.rows[ui], width, m1);
+            block_codes::<N, true>(&m0[..width], &m1[..width], width, &mut kprev, &mut work.rc);
         } else {
             // A band's first rows of each phase have no row above: Left only, no selection sent.
-            residuals::<LEFT>(cfa, &work.rows[ci], &work.rows[ci], width, m0);
-            block_codes::<false>(&m0[..width], &m0[..width], width, &mut kprev, &mut work.rc);
+            residuals::<N, LEFT>(cfa, &work.rows[ci], &work.rows[ci], width, m0);
+            block_codes::<N, false>(&m0[..width], &m0[..width], width, &mut kprev, &mut work.rc);
         }
         pack_row(&work.rc, width, &mut bws);
         right_pad(&mut work.rows[ci], width);
