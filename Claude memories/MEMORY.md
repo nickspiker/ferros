@@ -130,7 +130,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [eret race: IRQs masked around eret](eret_race_irqs_masked.md) - every eret sequence with IRQs masked; `diag core <k>`
 - [sched trace + past-deadline spin](sched_trace_and_past_deadline_spin.md) - diag sched; stack overflow checks (canary)
 - [PMU timing: pin to the X3](pmu_timing_pin_x3.md) - pin, sleep 1 ms, report cycles/us and the clock
-- [Power profile traps](power_profile_traps.md) - `diag power start`; DVFS inside zuma-cpu.dtsi floors; ODPM quirks
+- [Power profile traps](power_profile_traps.md) - `diag power start`; DVFS inside zuma-cpu.dtsi floors; ODPM quirks; the X3's sev storm (doze), the busy lift
 - [std target](std_target_status.md) - Rust std on ferros: target JSON + ferros_rt + forked std; Photon runs
 - [std apps miss ferros_rt changes](std_rebuild_ferros_rt.md) - delete the app's ferros-rt fingerprints before rebuilding
 - [Masked capsule needs a seal](masked_capsule_needs_seal.md) - after store put of a masked payload run `bridge seal` per device

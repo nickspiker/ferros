@@ -1926,6 +1926,9 @@ struct Gov {
     over: u64,
     under: u64,
     busy: bool,
+    /// The least busy core's share over the last window, and its average as `avg` is kept, in 256ths: the whole cluster busy, which the busy lift begins on.
+    least: u32,
+    whole: u32,
 }
 const X3_OPPS: [u32; 15] = [500_000, 880_000, 1_164_000, 1_298_000, 1_557_000, 1_745_000, 1_885_000, 2_049_000, 2_147_000, 2_294_000, 2_363_000, 2_556_000, 2_687_000, 2_850_000, 2_914_000];
 const A715_OPPS: [u32; 15] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000, 1_221_000, 1_328_000, 1_418_000, 1_572_000, 1_836_000, 1_945_000, 2_130_000, 2_245_000, 2_367_000];
@@ -1987,9 +1990,10 @@ fn interactive(now: u64, f: u64) -> bool {
 }
 
 /// The A715s' ceiling while their own load holds the busy lift and nobody interacts (`diag clock busy <kHz>`; 0: no busy lift, the calm ceiling as before 2026-11-19).
-/// The busy lift: a load that keeps the cluster's averaged busy share over the governor's 4/5 at the calm ceiling for 2^`GOV_BUSY_HOLD` windows asks more than the calm ceiling gives, so the ceiling rises to this; it falls back once the load has asked at or under the calm ceiling for as long.
+/// The busy lift: a load that keeps every core of the cluster at the governor's saturated mark (7/8 averaged) at the calm ceiling for 2^`GOV_BUSY_HOLD` windows asks more than the calm ceiling gives, so the ceiling rises to this; it falls back once the load has asked at or under the calm ceiling for as long.
 /// The test is on what the load asks (the running rate × the averaged share × 5/4, the governor's own `want`), which stays the same as the clock moves for a paced load and grows with it for one bound by the cores, so a lift begun is not ended by the clock it bought.
-/// Why 1572 MHz (THERMAL.md "The busy lift"): `pixel_em` gives an A715 449 mW there against 208 at 1065 and 1514 at 2367, so a save's whole energy with the device's other 2 W or so is least between 1328 and 1836 MHz, 1572 in the middle; and a 1572 MHz ceiling held the zones at 79-80 C under Lumis's stream where 2367 reached the 88 C divider within 6 s (CAMERA.md "The slowdown, measured").
+/// Why 1572 MHz (THERMAL.md "The busy lift", the Pro, 2026-11-19): a 12.5 MP Lumis save encoded in 8.58 s at 1065, 5.76 s at 1572 and 5.63 s at 2367, the zones ending at 66, 75 and 90 C, every cluster's divider stepping only at 2367.
+/// A 50 MP save took 31.3 s at 1572 and 48.0 s at 2367 (the dividers stepping), and `pixel_em` gives an A715 449 mW at 1572 against 208 at 1065 and 1514 at 2367: with the device's other 2 W or so the save's energy is least at 1572.
 static GOV_BUSY_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
 /// The busy lift's hold, as windows in a row (a power of two, `diag clock busyhold <n>`; 4: 16 windows, a quarter second at the 2^-6 s window), both to begin and to end.
 static GOV_BUSY_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(4);
@@ -2017,9 +2021,9 @@ const A715_REST_KHZ: u32 = 712_000;
 /// The A510s' middle, likewise: over it they ask the active tier too (their cluster shares the DSU and MIF with the others).
 const A510_REST_KHZ: u32 = 955_000;
 static mut GOV: [Gov; 3] = [
-    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
-    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF0, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
-    Gov { domain: 2, opps: &A510_OPPS, cores: 0xF, level: 324_000, at: 0, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
+    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false, least: 0, whole: 0 },
+    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF0, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false, least: 0, whole: 0 },
+    Gov { domain: 2, opps: &A510_OPPS, cores: 0xF, level: 324_000, at: 0, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false, least: 0, whole: 0 },
 ];
 /// Whether the governor runs (`diag clock gov on|off`; off, the X3 and the A715s follow the tier tables as before 2026-11-13).
 static GOV_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
@@ -2083,6 +2087,7 @@ fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
     use core::sync::atomic::Ordering::Relaxed;
     let up = crate::smp::UP.load(Relaxed);
     let mut share = None;
+    let mut least = 256u32;
     // The kernel's core alone (its idle ticks in slot 0), or each of the cluster's cores by Aff1.
     for c in 0..8 {
         if g.cores == 0 && c != 0 {
@@ -2104,7 +2109,9 @@ fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
         let busy = if little { d.min(el) } else { el - d.min(el) };
         let s = (busy * 256 / el) as u32;
         share = Some(share.map_or(s, |m: u32| m.max(s)));
+        least = least.min(s);
     }
+    g.least = if share.is_some() { least } else { 0 };
     share
 }
 
@@ -2175,15 +2182,20 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         g.res[g.at] += el;
         g.last = share;
         g.avg = g.avg - (g.avg >> avg_s) + (share >> avg_s);
+        g.whole = g.whole - (g.whole >> avg_s) + (g.least >> avg_s);
         g.sat = if share >= 224 { g.sat + 1 } else { 0 };
         let rate = g.opps[g.at];
         // The rate that would leave the averaged share at 4/5: the running rate × the average × 5/4, in 256ths of the share.
         let want = (rate as u64 * g.avg as u64 * 5 >> 10) as u32;
-        // The busy lift (`GOV_BUSY_KHZ`, the A715s only): what the load asks against the calm ceiling, window by window; 2^`GOV_BUSY_HOLD` in a row over it begin the lift, as many at or under it end it.
+        // The busy lift (`GOV_BUSY_KHZ`, the A715s only), window by window: 2^`GOV_BUSY_HOLD` windows in a row with every core of the cluster at the governor's saturated mark (7/8, the least busy core's averaged share `whole`) begin it; as many in a row with the load asking no more than the calm ceiling end it.
+        // The whole cluster saturated to begin, not its busiest core over the 4/5 target (2026-11-19, the Pro at rest): a driver polling on one A715 (gps, after a reload) held the busiest core at 190 to 205 of 256, and a thread left running (kists.1) one core at 256, and either lifted the cluster with nobody using the device; a save's four encoding threads hold all four at 256.
         if g.domain == 3 {
             let hold = 1u64 << GOV_BUSY_HOLD.load(Relaxed);
-            let over = want > A715_CALM_KHZ && GOV_BUSY_KHZ.load(Relaxed) > A715_CALM_KHZ && !crate::thermal::throttled();
-            (g.over, g.under) = if over { (g.over + 1, 0) } else { (0, g.under + 1) };
+            let allowed = GOV_BUSY_KHZ.load(Relaxed) > A715_CALM_KHZ && !crate::thermal::throttled();
+            let begin = allowed && g.whole >= 224;
+            let end = !allowed || want <= A715_CALM_KHZ;
+            g.over = if begin { g.over + 1 } else { 0 };
+            g.under = if end { g.under + 1 } else { 0 };
             let was = g.busy;
             g.busy = if g.busy { g.under < hold } else { g.over >= hold };
             unsafe {
@@ -2507,7 +2519,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
-    out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while their load asks over A#{} MHz for 2^A#{} windows in a row, until it asks at or under it as long; {} now (A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
+    out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());

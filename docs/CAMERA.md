@@ -1047,6 +1047,7 @@ Measured on the Pro, not attested, the driver hand-spawned with input 01, every 
   - Lumis's draw held at 19.8 ms (13.8 rising to 30). The integrator held 13.0-13.3 ms, with 1920 of 1968 frames integrated (1856 and 1728 at 2367).
   - The MAP's maintenance held at 427-433 us. The A510s stayed at 1097 MHz.
   - The ceiling buys a steady preview at about 70 % of the cold start's rate, for about 4 W less on the A715s. The lift went back to 2367000 after the run; the ceiling during a stream is the owner's choice to build.
+- **Saves under the stream, measured 2026-11-19** (THERMAL.md "The busy lift"): a 12.5 MP save at 1572 MHz took 5.76 s against 5.63 s at 2367, the zones ending at 75 C against 90; a 50 MP save took 31.3 s at 1572 (the A510s calm) against 48.0 s at 2367 (the A510s at 1704, every cluster's divider stepping). The cap would make a stream's saves faster as well as cooler.
 
 A reload with this kernel's first trace build (every divider word read every pass, six ACPM rate reads a second) found ACPM answering nothing and the device reset 35 s later (b950, the kernel's core between the clock policy and the heat step, crumb G#D7). The build committed reads only CPUCL0's word every pass and asks ACPM nothing extra.
 
