@@ -171,7 +171,8 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
         observer: String::new(),
         orientation,
     };
-    let name = format!("video/{} video.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()));
+    // The stills' stamp with its spaces as underscores: an extent's name is printed ASCII without the space (the kernel's extent_forward takes 0x21 to 0x7E; 2026-11-19, the Pro: every open of "video/<stamp> video.vsf" refused before the vault saw it).
+    let name = format!("video/{}.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()).replace(' ', "_"));
     // The longest free stretch of the clips window, whole (what an OPEN can get: a clip is one stretch), where the vault says it; else from CLIP_BLOCKS_MOST, halving on refusal.
     let mut blocks = ferros_clip::ferros::space(slot).map_or(CLIP_BLOCKS_MOST, |sp| sp.largest_free_bytes / ferros_clip::BLOCK as u64);
     loop {
@@ -956,9 +957,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             report(&src, &mut turns, &cam.name);
             keep_saves(vault.as_deref(), &mut *integrator.header);
             close_camera(&cam.name);
-            let shutter_ns = f64::from_bits(integrator.header[SHUTTER_NS_IDX]) as u64;
             src = match want {
-                Some(fps) => match open(&cam, false, Some((ferros_clip::Pacing::of(fps), shutter_ns))) {
+                // Opened with no shutter of its own (the open's least, a line), as std/rawrec opens: the driver takes no integration past the paced frame at the open ("no such mode (Integration(21342, 10586))", 2026-11-19, the Pro: Lumis's 67 ms in a 30 a second frame), while a SET is planned, the frame lengthened when the shutter is longer; the settings are all sent again after a reopen.
+                Some(fps) => match open(&cam, false, Some((ferros_clip::Pacing::of(fps), 0))) {
                     Ok(s) => {
                         paced = want;
                         read_space(&mut *integrator.header);
