@@ -1481,7 +1481,8 @@ fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64, 
     }
     let _ = write!(l, "; G#1084: {:X} {:X} {:X}{}\n", be(&d, 0), be(&d, 2), be(&d, 4), if read { "" } else { " (a read failed)" });
     console(g, &l.b[..l.n]);
-    let model = if read { ccs::Gain::of(&a, &d) } else { None };
+    // From the array's measured least (ccs `Array::gain`): the Pro ultrawide's words start at code 0, which halves its slits (docs/CAMERA.md "The ultrawide's least gain").
+    let model = if read { ccs::Gain::of(&a, &d).map(|m| m.from_least(c.array.gain.0)) } else { None };
     let p = ccs::Page::of(init);
     let Some(m) = model else {
         say!(g, "camera: {}: no gain model in those words; gain stays at the init's code G#{:X}\n", c.name, p.get(ccs::ANALOGUE_GAIN).unwrap_or(0));
@@ -1499,6 +1500,8 @@ fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64, 
 
 /// A device test (the hand spawn's thirteenth byte): the gain write's shape (`gain_set`), and a console line after every gain SET with the sensor's words read back (`gain_say`). 0 the driver's own; 1 the analogue code alone in the hold; 2 the digital gain alone in the hold; 3 the analogue code alone with no hold; 4 Android's per-frame hold on the Sony part (every register a byte: digital, analogue, integration, frame, shift); 5 the driver's own with the frame length written again in the hold; 6 the driver's own, said. Any shape but 0 writes a gain equal to the one set too.
 static GAIN_TEST: AtomicU64 = AtomicU64::new(0);
+/// A device test (the hand spawn's fourteenth byte): the stream on written with its image orientation (CCS G#0101) 0 (3) or 2 (4, Android's for the tele: its frames stood mirrored against the main in Lumis), an A/B of the orientation.
+static ORIENT_TEST: AtomicU64 = AtomicU64::new(0);
 
 /// The gain set inside the sensor's hold (as exposure is: the hold makes the change land whole at a frame's start): the analogue code, then digital gain as `s` has it (always one: analogue only).
 fn gain_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, s: &ccs::GainSet) -> Result<(), u32> {
@@ -1989,7 +1992,15 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     tl_reset();
     err_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
-    bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
+    // A device test (`ORIENT_TEST` 3 or 4): the stream on with its orientation byte (CCS image_orientation, G#0101) 0, or 2 as Android's HAL writes the tele's (keys/husky/captures/ftrace-2026-11-18: `01 00 01 02` at all three of its readouts).
+    let orient = ORIENT_TEST.load(Ordering::Relaxed);
+    if (orient == 3 || orient == 4) && c.stream_on.len() == 4 {
+        let o = if orient == 4 { 2 } else { 0 };
+        bus.write(c.addr, &[c.stream_on[0], c.stream_on[1], c.stream_on[2], o]).map_err(Fail::Sensor)?;
+        say!(g, "camera: orientation test: the stream on with G#0101 = A#{o}\n");
+    } else {
+        bus.write(c.addr, c.stream_on).map_err(Fail::Sensor)?;
+    }
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start), or the lead's first descriptors (`LEAD`).
     arm(g);
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP * LEAD.load(Ordering::Relaxed) as u32);
@@ -2738,6 +2749,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 12 {
         GAIN_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 12) as *const u8) } as u64, Ordering::Relaxed);
     }
+    if input_len > 13 {
+        ORIENT_TEST.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 13) as *const u8) } as u64, Ordering::Relaxed);
+    }
     // The eleventh: which inputs follow the knobs (`T_INIT` ..), a device test of any readout with nothing stored.
     let items = if input_len > 10 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 10) as *const u8) } } else { 0 };
     if items != 0 && input_len > FULL_INPUT_AT {
@@ -3326,13 +3340,13 @@ fn rate(g: u64, windows: u8) -> [u8; 40] {
     out
 }
 
-/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four); since 2026-11-18 also +103 the vendor shift words (G#0702 and G#0704, four: the main's `Lte`); since 2026-11-19 also +107 the grouped hold (G#0104, one), +108 the Sony shift byte (G#3100, one), +109 Sony's frame length control (G#0350, one), +110 two bytes, a bit per failed read past the first sixteen (bit 0 the G#0104 read).
-fn caps(g: u64) -> [u8; 112] {
+/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four); since 2026-11-18 also +103 the vendor shift words (G#0702 and G#0704, four: the main's `Lte`); since 2026-11-19 also +107 the grouped hold (G#0104, one), +108 the Sony shift byte (G#3100, one), +109 Sony's frame length control (G#0350, one), +110 two bytes, a bit per failed read past the first sixteen (bit 0 the G#0104 read), +112 the image orientation (G#0101, one).
+fn caps(g: u64) -> [u8; 113] {
     let c = cam();
     let bus = Bus::of(g, c);
-    let mut out = [0u8; 112];
+    let mut out = [0u8; 113];
     let mut failed = 0u32;
-    let reads: [(u16, usize, usize); 19] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2), (0x0702, 103, 4), (0x0104, 107, 1), (0x3100, 108, 1), (0x0350, 109, 1)];
+    let reads: [(u16, usize, usize); 20] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2), (0x0702, 103, 4), (0x0104, 107, 1), (0x3100, 108, 1), (0x0350, 109, 1), (0x0101, 112, 1)];
     for (k, &(a, at, n)) in reads.iter().enumerate() {
         if bus.write_read(c.addr, &[(a >> 8) as u8, a as u8], &mut out[at..at + n]).is_err() {
             failed |= 1 << k;

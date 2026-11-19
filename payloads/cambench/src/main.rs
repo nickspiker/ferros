@@ -7,7 +7,7 @@
 //! - +8 the driver's flags (payloads/camera `F_*`: 1 RAW12, 2 mid-stream, 4 PD path, 8 geometry everywhere, 16 slim program, 32 slim level 2, 64 front end left as captured), +9 a slit ring's buffers as a power of two (0: 2^8), +10 the line length (u16; 0 the mode's),
 //! - +12 the work per frame: 0 map only (the capture's ceiling), 1 read every line out of the view (64-byte loads), 2 read and add into u16 sums folded into u32 every 64 frames, 3 read and add into u32 sums,
 //! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each; 3 the line length from 6320 clocks down, a new open each), +15 threads for whole frames (0: the four A715s),
-//! - optionally +21 an exposure (u64 ns) SET halfway thru a slit run, the slits' rate after it said (+29 what it sets: 0 the exposure, 1 the gain in 1024ths; +30 how many SETs, at k / (n + 1) of the run; +31 each value the one before moved left this many bits; each SET followed by CAPS said: `0103400000000000000000000280000000000200000004000000000000010401` the ultrawide's 64-row slit, 8192 slits added, gains 1x, 2x, 4x and 8x at each fifth); +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain), +20 bit 0 the view asked for write-back (docs/CAMERA.md "A cacheable view"), bit 1 the frame threads on the A510s (cores 0 to 3) instead of the A715s, bit 2 each frame's sampled lines read again from DRAM after the kernel drops them from the caches and compared (`check`).
+//! - optionally +21 an exposure (u64 ns) SET halfway thru a slit run, the slits' rate after it said (+29 what it sets: 0 the exposure, 1 the gain in 1024ths; +30 how many SETs, at k / (n + 1) of the run; +31 each value the one before moved left this many bits, or with bit 7 set the one before plus 2 to the low bits; each SET followed by CAPS said: `0103400000000000000000000280000000000200000004000000000000010401` the ultrawide's 64-row slit, 8192 slits added, gains 1x, 2x, 4x and 8x at each fifth); +16 the window's output columns across the middle (u16; 0 the mode's width; on 2^4), +18 the frames' count moved left this many bits (to 12: long slit runs, the ring's drain), +20 bit 0 the view asked for write-back (docs/CAMERA.md "A cacheable view"), bit 1 the frame threads on the A510s (cores 0 to 3) instead of the A715s, bit 2 each frame's sampled lines read again from DRAM after the kernel drops them from the caches and compared (`check`).
 //! The driver's flag 128 keeps the sensor's phase detect and embedded data on in a windowed mode (off by default there: docs/CAMERA.md "The slit for real").
 //! A windowed mode runs detached and slim by default on every camera (the statistics pipeline off, loch0's paths alone each frame: docs/CAMERA.md "The slit runs", "Slits on every camera"); the driver's eighth hand-spawn byte overrides it for an A/B.
 //! The sweeps (+14) open again in this process: with the vault's driver each open starts a fresh one; a driver spawned by hand serves one stream and refuses the next open, so a sweep of a hand-spawned driver is tools/cambench-sweep.sh (one driver an open).
@@ -345,7 +345,7 @@ fn open(g: u64, ep: u64, a: &Args) -> Option<View> {
 
 /// CAPS, said: the sensor's data formats (CCS descriptors: (uncompressed << 8) | compressed), its integration limits, the mode as the sensor holds it.
 fn caps(g: u64, ep: u64) {
-    let mut c = [0u8; 80];
+    let mut c = [0u8; 113];
     let n = call(ep, &[OP_CAPS], &mut c);
     if n == ERR || n < 73 {
         say!(g, "cambench: CAPS gave nothing\n");
@@ -361,7 +361,7 @@ fn caps(g: u64, ep: u64) {
     let raw12 = (0..count).any(|k| be(2 + 2 * k) == 0x0C0C);
     let _ = write!(l, "{}\n", if raw12 { " (RAW12 G#0C0C offered)" } else { " (no G#0C0C)" });
     console(g, &l.b[..l.n]);
-    say!(g, "cambench: CAPS: integration least A#{} lines, margin A#{}; frame A#{} lines of A#{}; x G#{:X} to G#{:X}, y G#{:X} to G#{:X}, out A#{} x A#{}; increments A#{} A#{} A#{} A#{}; binning G#{:02X} G#{:02X} G#{:02X}; format G#{:04X}; integration A#{}; mode select G#{:X}; frame count A#{}; reads failed G#{:X}\n", be(34), be(36), be(38), be(40), be(42), be(46), be(44), be(48), be(50), be(52), be(54), be(56), be(58), be(60), c[62], c[63], c[64], be(65), be(67), c[69], c[70], u16::from_le_bytes([c[71], c[72]]));
+    say!(g, "cambench: CAPS: integration least A#{} lines, margin A#{}; frame A#{} lines of A#{}; x G#{:X} to G#{:X}, y G#{:X} to G#{:X}, out A#{} x A#{}; increments A#{} A#{} A#{} A#{}; binning G#{:02X} G#{:02X} G#{:02X}; format G#{:04X}; integration A#{}; mode select G#{:X}; frame count A#{}; reads failed G#{:X}; orientation G#{:X} (G#0101, from a driver of 2026-11-19 on)\n", be(34), be(36), be(38), be(40), be(42), be(46), be(44), be(48), be(50), be(52), be(54), be(56), be(58), be(60), c[62], c[63], c[64], be(65), be(67), c[69], c[70], u16::from_le_bytes([c[71], c[72]]), c[112]);
 }
 
 /// CAPS after a SET, said short: the sensor's frame, line and integration, its gain words, the hold, the Sony shift byte and frame-length control as it holds them now (payloads/camera `caps`, +107 on since 2026-11-19); then RATE.
@@ -581,7 +581,9 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
     let blocks = raw::blocks(v.w);
     let pitch = blocks * raw::BLOCK_SAMPLES;
     let slit = v.h * pitch;
-    let (n_ring, n_sum) = (SLIT_KEEP * slit * 2, slit * 4);
+    // Map only (work 0) keeps one slit: the ultrawide's slit stream stopped (LATE_CONFIG) right after RATE in six runs of 2026-11-19, each as the arc grew by the whole ring (512 MiB) for the first SLITS: the grow is the suspect (a kernel hold past a 1.26 ms slit), not proven.
+    let keep_n = if a.work == 0 { 1 } else { SLIT_KEEP };
+    let (n_ring, n_sum) = (keep_n * slit * 2, slit * 4);
     let Some(mem) = memory(n_ring + n_sum) else {
         say!(g, "cambench: no memory for the slit ring (A#{} MiB)\n", (n_ring + n_sum) >> 20);
         return false;
@@ -603,8 +605,9 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
                 let (after, span) = (last.saturating_sub(n0), ferros_sys::now() - t);
                 say!(g, "cambench: SET A#{} held: A#{after} slits in A#{} us, a slit every A#{} ns\n", set_k - 1, span * 1_000_000 / hz, if after == 0 { 0 } else { span * 1_000_000_000 / hz / after });
             }
-            // WHY the shift's bound: the step and the count are the person's bytes; past 63 bits the value leaves the u64.
-            let value = a.set_ns << (set_k * a.set_step as u64).min(63);
+            // WHY the shifts' bound: the step and the count are the person's bytes; past 63 bits the value leaves the u64.
+            // The step's bit 7: each value the one before plus 2^(step's low bits), a ladder of even steps (the gain's codes near unity).
+            let value = if a.set_step & 0x80 != 0 { a.set_ns + (set_k << (a.set_step & 0x3F)) } else { a.set_ns << (set_k * a.set_step as u64).min(63) };
             let mut m = [0u8; 10];
             m[0] = OP_SET;
             m[1] = a.set_what;
@@ -636,7 +639,7 @@ fn slits(g: u64, ep: u64, a: &Args, v: &View) -> bool {
         lost += from - (last + 1);
         for f in from..=newest {
             let at = v.base + ((f - 1) % ring) as usize * buf;
-            let keep = unsafe { (mem as *mut u16).add((got as usize % SLIT_KEEP) * slit) };
+            let keep = unsafe { (mem as *mut u16).add((got as usize % keep_n) * slit) };
             let t = ferros_sys::now();
             for y in 0..rows {
                 let l = read_line(0, at + y * line, line);

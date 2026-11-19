@@ -1432,6 +1432,62 @@ Host tests optics `the_8a_sizes_agree` (the 2x's size, the pixel pitches), list 
 - Why the tele's sensor runs its own mode over the CCS words at stream on: a vendor word in its init (the G#0B30 writes, G#00FF then G#01FF then G#0100, look like a mode select and apply) may say; written mid-stream is enough for now.
 - The front's slit floor (192 lines ran as asked; shorter not tried).
 
+## The ultrawide's least gain (2026-11-19, branch uw-gain-slit)
+
+The Lumis session on the Pro: the ultrawide's 64-row slit ran 794 a second until the first gain SET, even at unity (1024), then 397 a second (2517.5 us, 384 lines' worth); exposure and focus SETs left it alone.
+The Pro on its flashed forge kernel; every driver hand-spawned from target/agent-uwgain/bin, cambench's SETs in a slit run (its +29 what, +30 how many, +31 the step), each followed by CAPS and RATE; the driver's thirteenth spawn byte 6 says every gain SET with the sensor's words read back at once and 2^14 us later; logs target/agent-uwgain/runs.
+
+**Not the hold, not the frame.** After the gain SET that halved the slits, the sensor read back frame G#C0 (192 lines), integration G#10, the code written, digital G#100, the hold G#0 (released), G#3100 G#0 and G#0350 G#1, at once and 2^14 us later, the same as before the SET.
+**The sensor sends every frame; the front end takes every other one.** RATE over a second after the SET: the sensor's own counter (G#0005) 799 to 801 frames a second, the front end 396 a second.
+Every link and error word stayed clear (+14 G#0, +1C G#0, no error word, no overflow).
+
+**The analogue code, not the write.** In the same run, set one after another from the init's G#3C0:
+| codes asked, in order | slits a second after each |
+|---|---|
+| 0, G#200, G#300, G#380 | 397, 794, 794, 794 |
+| 0, G#72, G#CD, ... G#1DE (a ladder of 128ths) | 397, then 794 at every step |
+| 0, 3, 7, B, F, G#13, G#17, G#1B | 397 to F, 794 from G#13 |
+| F, G#10, G#11, G#12, G#13 | 794 at every step |
+| 1, 9 | 397, 397 |
+| 7 | 794 |
+- So codes 0 and 1 set from the init's code put the sensor in a state where the front end drops every other slit; once in it, codes to F keep it there and G#13 (19) or more leave it. Codes 2 to 6 were not tried.
+- Whole frames are not touched: camtest's gain curve (1x first) on the ultrawide ran every step's frames 33.25 to 33.43 ms apart, the mean rising with the gain from 1x.
+- What the state is inside the sensor is not known (a readout that runs longer at the lowest gains, leaving the 192-line frame too little blank for the front end, would fit, unmeasured; a 256-line slit did not stream at all on this kernel, from its first frame, before any SET).
+
+**The fix: the list offers the ultrawide from code 7.** ccs `ULTRAWIDE_LEAST` = 1031 (1024 x 1024 / 1017, 0.01 stop over one) is the least of `ARRAYS[1].gain`, and the driver's model starts at the least code that gives it (ccs `Gain::from_least`), so SET refuses 1024 (`[1]`, outside the range) as the list no longer offers it: Lumis's least ISO there becomes 100.7. Refused, never capped. Asked of the owner, as any floor is.
+`Gain::split` also found a code a step low: the solution cut to a whole code and `analogue` cutting its gain made 1031 solve to code 6 (1030); it walks up now (host test `gain_models`).
+A gain SET equal to the gain already set writes nothing (`Open::gain_code`, the init's code and digital gain first).
+
+**Measured with the fix** (the slit, map only):
+| gain asked | answer | slits a second, the sensor / the front end |
+|---|---|---|
+| 1024 | `[1]` refused | 801 / 794 (the init's G#3C0 kept) |
+| 1031 (code 7) | `[0]` | 798 / 793, a slit every 1232 us |
+| 2048, 2062 | `[0]` | 799 / 794, every 1258 us |
+| 4096 | `[0]` | 799 / 794, every 1259 us |
+| 8192 | `[0]` | 799 / 794, every 1259 us |
+Regressions with this driver: the main's 64-row slit 1231 a second, clean; the tele's 557 a second, G#404 at frame 0 alone, as "Slits on every camera" measured.
+
+**The 8a.** Its main is the same IMX787 (`AKITA_ARRAYS[0]`, its gain words read alike), so its slits (740 a second) likely do the same at codes 0 and 1: unmeasured, its least left at 1024. Its ultrawide and front (IMX712) have no gain model in the list yet; when they stream, a cambench gain ladder from code 0 in a slit (`...010400...` with +31 `80`-steps) says whether they need a least of their own.
+
+**Traps met on the way:**
+- A hand-spawned driver without the stay byte (input `00`) ends at camtest's LIST, and camtest's OPEN then runs the vault's driver: every camtest run needs `01` and the driver killed after its own CLOSE.
+- A slit opened within 3 minutes of a boot, or while rawbench writes, stopped at its first or 840th frame (LATE_CONFIG); cambench's 512 MiB slit ring, grown for the first SLITS, is the suspect, so a map-only run now keeps one slit.
+
+### The tele's orientation (2026-11-19, open)
+
+The Lumis session: every tele readout stands mirrored left to right against the main (NCC 0.935 mirrored, 0.40 straight).
+Android's HAL writes the tele's stream on as `01 00 01 02`, CCS image_orientation G#0101 = 2 (the vertical flip), at all three readouts (keys/husky/captures/ftrace-2026-11-18); ferros's is `01 00 01 00`, and no tele init writes G#0101.
+The driver's fourteenth spawn byte writes the stream on with G#0101 0 (3) or 2 (4); camtest's cell table now also says the frame's mean in eight bands of rows and of columns.
+Measured back to back on the 22-degree readout (one scene, minutes apart):
+| G#0101 | cell rows 0 and 1 | bands of rows, top first | bands of columns, left first | mean |
+|---|---|---|---|---|
+| 0 | `156 114` / `400 155` | 266 370 270 75 67 66 65 65 | 150 166 174 176 170 157 138 116 | 156 |
+| 2 | `395 156` / `156 114` | 75 78 82 85 131 692 1019 1004 | 445 441 426 409 388 367 345 319 | 387 |
+- The sensor takes the bit (CAPS reads G#0101 = 2) and the rows turn over: the bright bands move to the bottom and the cell's rows swap, so the mosaic as ferros reads it goes from G B / R G to R G / G B, not the calibration's B G / G R.
+- But the frame is not the same scene turned over: the column bands change shape and the bright part reads 2.5 times as bright at the same header exposure and gain. A vertical flip alone explains neither.
+- So nothing is changed in the stored driver: Lumis's NCC on a frame with byte 14 = 4 (the driver hand-spawned) says whether that readout matches the main, and the 11-degree and 48.8 MP readouts are untried. Writing G#0101 = 2 before the init, or mid-stream in the hold, is untried (those runs went to the vault's driver, the trap above).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
