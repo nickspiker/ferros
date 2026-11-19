@@ -95,3 +95,12 @@ pub fn gravity() -> Option<[f32; 3]> {
     }
     Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
 }
+
+/// Which board this is (fact 84, as ferros_sys `Facts::board`): 1 husky (the Pixel 8 Pro), 2 akita (the Pixel 8a); None from a kernel that does not say.
+pub fn board() -> Option<u64> {
+    let mut b = [0xFFu8; 85 * 8];
+    // Thru a mutable pointer: the kernel writes the buffer.
+    svc(FACTS, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
+    let v = u64::from_le_bytes(b[84 * 8..85 * 8].try_into().unwrap());
+    (v != u64::MAX).then_some(v)
+}

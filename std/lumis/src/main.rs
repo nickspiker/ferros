@@ -161,8 +161,9 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
         cfa: ferros_clip::cfa_of_byte(head.cfa),
         black: head.black,
         white: head.white,
-        make: "ferros".into(),
-        model: "camera".into(),
+        // The still's Make and Model (`identity`: "Google", "Pixel 8 Pro cam 2"), so one IDT check fits both.
+        make: identity(cam).make_tag(),
+        model: identity(cam).model_tag(),
         sensor_module: cam.name.clone(),
         lens: String::new(),
         f_number: (cam.f_number > 0.).then_some(cam.f_number),
@@ -669,6 +670,20 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
         .collect()
 }
 
+/// The camera's make, model and id as Lumis on Android writes them (Build.MANUFACTURER, Build.MODEL and the module's Camera2 physical id: Make "Google", Model "Pixel 8 Pro cam 2" for the main), so an IDT from an Android still or the derived files (derived/cam2-main.idt.vsf, cam3-ultrawide, cam4-tele, cam7-front) pastes onto a ferros still or clip without --force, and the main is told from the ultrawide (Opsin's check). The Pro's ids from those files; the 8a's are not known here yet, so its modules say their ferros name; a board ferros does not say keeps the old "ferros" / "camera".
+fn identity(cam: &camera::Camera) -> CameraIdentity {
+    let (make, model, id) = match (sys::board(), cam.name.as_str()) {
+        (Some(1), "main") => ("Google", "Pixel 8 Pro", "2"),
+        (Some(1), "ultrawide") => ("Google", "Pixel 8 Pro", "3"),
+        (Some(1), "tele") => ("Google", "Pixel 8 Pro", "4"),
+        (Some(1), "front") => ("Google", "Pixel 8 Pro", "7"),
+        (Some(1), name) => ("Google", "Pixel 8 Pro", name),
+        (Some(2), name) => ("Google", "Pixel 8a", name),
+        (_, name) => ("ferros", "camera", name),
+    };
+    CameraIdentity { make: make.into(), model: model.into(), camera_id: id.into() }
+}
+
 /// The display matrix for a camera: its Absolute IDT (camera to linear VSF RGB) with its sensitivity folded in, scaled so the sensor's white in all three channels lands at green 1 (Lumis's display then puts it at its white at display gain 1).
 /// A camera whose IDT takes white to no green is the driver's bug, and the division fails loud as infinities on the screen.
 fn display_matrix(c: &camera::Camera) -> [f32; 9] {
@@ -846,7 +861,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         sensor_diag_mm: 0.,
         colour: SensorColour::CameraToDisplay(display_matrix(&cam)),
     };
-    lumis_core::set_camera_identity(CameraIdentity { make: "ferros".into(), model: "camera".into(), camera_id: cam.name.clone() });
+    lumis_core::set_camera_identity(identity(&cam));
     // The integrator's memory is the UI's too, for the life of the process (the UI reads it every frame), so the integrator is never dropped.
     let integrator = Box::leak(app::camera_new(&setup));
     if let Some(dark) = calibration {
