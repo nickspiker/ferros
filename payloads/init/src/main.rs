@@ -296,6 +296,7 @@ fn wait_person(grants: u64, bound: bool) {
 /// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.
 fn wait_front(grants: u64) {
     // Unlocked and bound already (unlock at boot, or ahau started again after attest): ahau shows no attest screen (ahau main.rs `at_boot`, the same test), so there is no window to wait for (2026-11-18, the 8a: every unlock-at-boot boot waited the whole 4 s before the map).
+    // The one exception is not waited for either: the identity service holding no roots, which ahau learns from fgtw once init has started it, and its attest screen then comes up over whatever has started (AUTH.md "Never stuck").
     if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
         return;
     }
