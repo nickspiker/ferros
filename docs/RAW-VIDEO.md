@@ -211,7 +211,11 @@ export FERROS_PORT=1-2.2
 $B store extent-info <clip name> --kist /mnt/Harbor/Code/keys/husky/images/lumis-0.2.15.capsule.vsf
 $B store extent <clip name> all <clip>.vsf --kist /mnt/Harbor/Code/keys/husky/images/lumis-0.2.15.capsule.vsf
 /mnt/Harbor/Code/ferros/target/agent-rawrec/host/release/clip-check <clip>.vsf
+$B store extent-list x --kist <capsule or lumis.bin>
+$B store extent-drop <first block> x --kist <capsule or lumis.bin>
 ```
+
+`extent-list` gives every extent of the clips area (first block, blocks, bytes, sealed, at, owner) with that domain's marked; `extent-drop` drops that domain's extent at a first block (a clip whose name is lost), its blocks free at once. An extent's name is a derived key the vault never stores, so these are the way to find a clip by its domain alone.
 
 `--kist` names the domain the clip is in: a stowed Lumis's by any Lumis kist capsule (its identity is the same across versions); a hand-spawned Lumis's by the exact `lumis.bin` it was spawned from (`bridge spawn` signs a payload with the developer key and its own content hash, so each build has a domain of its own: keep the image a clip was recorded with); without `--kist` the name is a scope's (`test.rawrec.clip` for std/rawrec).
 A clip's name is a value's: printable ASCII G#21 to G#7E (no spaces), 1 to 96 bytes; the kernel refuses any other and says why on the console. The pull runs about 24 MB/s over the bridge (a minute at 30/s, 10 GB, takes about 7 minutes). clip-check decodes every frame on every host core and says the frames' timing and holes; given rawrec's `test.rawrec.hashes` it checks every frame against the camera's.
@@ -222,7 +226,7 @@ To check a pulled clip, run clip-check on it: it opens the clip by its index (re
 
 - **The clip is not sealed (encrypted) at rest.** Every vault value is sealed with its domain's key; an extent's blocks are the clip's plain bytes, found only thru the record in the (sealed, mirrored) table, but readable by anyone holding the raw flash. Next (the coordinator's call, 2026-11-19): sealed by default under the domain's key, a per-clip switch off, its cost at 30/s measured first.
 - **Copies.** A write still goes thru the kernel's heap and the bounce at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue.
-- **UNMAP**: a deleted extent's blocks are not unmapped (ferros sends none), so the device's garbage collection does not know they are free.
+- **UNMAP**: a deleted or dropped extent's blocks go back to the clips area's free list at once, but they are not unmapped on the flash (ferros sends no UNMAP), so the device's garbage collection and WriteBooster do not know they are free (2026-11-19: 23 agents' test clips, about 44 GB, dropped without one).
 - **The pull** is the bridge's 3 MiB a command thru the kernel's vault channel; a faster path (bulk USB straight from the extent) is open.
 
 ## The format decision (the owner's)
