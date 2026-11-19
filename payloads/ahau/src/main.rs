@@ -2595,6 +2595,8 @@ impl Ahau {
                 );
             }
             let mut polls = 0u32;
+            // Whether the lone finger down now has been offered to the Cancel button (`net_press`), as the attest screen's loop offers its buttons once a landing.
+            let mut press_asked = false;
             while matches!(self.mode, Mode::Words(_) | Mode::Keys) {
                 ferros_sys::pet();
                 // The app in front let the keyboard go (its field lost focus, it went behind, back's tap, the keyboard's own key): down.
@@ -2613,6 +2615,39 @@ impl Ahau {
                     let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                     held[k] = (rec[0], u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
                     k += 1;
+                }
+                // The words' Cancel button (`button_label`), taken as the attest screen's loop takes its buttons: lit at a lone finger's landing above the keys, back at rest if the finger leaves it, a second finger lets it go, and at the lift while still on it the words are let go (fgtw op 15 [0], `end_words`). Until 2026-11-18 this loop never asked, so the button drawn here did nothing (the 8a, the WiFi page's passphrase: Cancel tapped, the keyboard stayed).
+                if matches!(self.mode, Mode::Words(_)) {
+                    if k == 1 {
+                        let (x, y) = (held[0].1, held[0].2);
+                        if !press_asked {
+                            press_asked = true;
+                            if y < self.kb.top as i64 && self.net_press(x, y) {
+                                self.show();
+                            }
+                        } else if self.pressed.get().is_some() {
+                            self.net_follow(x, y);
+                            if self.pressed.get().is_none() {
+                                self.show();
+                            }
+                        }
+                    } else if k >= 2 {
+                        if let Some(e) = self.pressed.take() {
+                            self.net_redraw(e);
+                            self.show();
+                        }
+                    } else {
+                        press_asked = false;
+                        if let Some(e) = self.pressed.take() {
+                            if e == 0 {
+                                console(self.grants, b"ahau: the words cancelled (the Cancel button)\n");
+                                self.end_words(true);
+                                break;
+                            }
+                            self.net_redraw(e);
+                            self.show();
+                        }
+                    }
                 }
                 let mut outs = [Touch::Scrolled; 48];
                 let mut no = 0;
