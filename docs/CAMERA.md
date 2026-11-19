@@ -72,12 +72,52 @@ The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what 
 - It adopts the panel itself (`display::adopt`), which the display server owns now.
 - Whether the Pro's running kernel even carries the PDMA job is unchecked tonight (a build without FERROS_CAM_PDMA refuses with "no PDMA job built in"): no camera command was run on the Pro.
 
-**akita: no camera has been touched from ferros.** From its device tree (/mnt/Harbor/ferros-ref/kdev-akita/dts/zuma-akita-camera.dtsi, -camera-pmic.dtsi):
-- The main camera, "oksoko", is on hsi2c_1 at G#1A: the same sensor model as husky's ultrawide (Sony IMX787, G#0787 at G#0016), which ferros streams. Its init exists locally (target/cam/uw.init), but husky's ultrawide runs a 24 MHz master clock and akita's main 26 MHz (CIS_CLK3, mclk4): the captured PLL settings would run it about 8 % fast. Recapture on akita, or rescale the PLL.
-- Its power: sub-PMIC LDO12, camera-PMIC LDO5, 4, 1, 3, then the sub-PMIC's GPIO2 (CAMS_LVBUCK_EN), reset gpp2-2, 1 ms after the enable, the clock 2 ms after.
-- The camera PMIC is an SLG51002 at G#75 on hsi2c_14 (as husky's), with an RT6160 buck-boost at G#77 on hsi2c_9 that husky does not have.
-- The front ("leshen") and the ultrawide ("leshen-uw") are on hsi2c_2 and hsi2c_3, both at G#1A; their part is not named in the tree.
-- Its CSI link, PHY lanes and the front end's program are unknown: they come from an hv oracle capture of Android's camera on akita, as husky's did (`tools/akita-hv.sh` runs Android under the hv).
+**akita: the three cameras answer from ferros; none streams yet** (2026-11-15, "akita's cameras" below).
+
+## akita's cameras (2026-11-15)
+
+The owner, 2026-11-15: "Might not be a bad idea to work on the 8a cams whilst it's plugged in." Branch akita-cams.
+
+**From its device tree** (the factory image's MP overlay, dtbo 18, the same as /mnt/Harbor/ferros-ref/kdev-akita/dts/zuma-akita-camera.dtsi and -camera-pmic.dtsi), in ferros_cam cams (`AKITA`, chosen by fact 84 in the driver and by the board in the kernel) and camera.rs (`AKITA_MAIN`, `AKITA_ULTRAWIDE`, `AKITA_FRONT`):
+
+| id | name | module | sensor bus | power-up (device tree order and delays) | reset | master clock |
+|---|---|---|---|---|---|---|
+| 0 | main | oksoko | hsi2c_1 G#1A | sub LDO12, LDO5, LDO4, LDO1, LDO3, sub GPIO2 (1 ms), reset, clock (2 ms) | gpp2-2 | gpp9-0, CIS_CLK3 |
+| 1 | ultrawide | leshen-uw | hsi2c_3 G#1A | sub LDO12, LDO2, LDO6 (1 ms), reset, clock (1 ms) | gpp6-3 | gpp3-0, CIS_CLK0 |
+| 2 | front | leshen | hsi2c_2 G#1A | sub LDO12, LDO2, LDO7 (1 ms), reset, clock (+1 ms of ours) | gpp4-2 | gpp5-0, CIS_CLK1 |
+
+- **akita's rails are not husky's**: LDO1 2.9 V, LDO2, 4 and 5 2.8 V, LDO3 1.8 V, LDO6 and 7 1.2 V, LDO8 1.1 V (`RAILS_AKITA`). husky's table would have put 2.25 V on akita main's 1.8 V LDO3. Android's /sys/class/regulator reads exactly akita's table.
+- Sub LDO12 (L12S_CAMIO, the modules' I/O and nothing else) is read before its enable and held to a tenth over 1.8 V: cold it reads G#AE, 1.85 V (Linux sets 1.8). The camera PMIC goes on only as REVISION_AB (pattern 03 31 B1, as husky's); akita names no sub GPIO3, so it is never driven there; the RT6160 buck-boost (G#77, hsi2c_9) is not registered under Linux at all and is left as the boot has it.
+- Every master clock pin at drive X2 (1). The clocks stay on the 24.576 MHz oscillator (CMU_TOP's CIS muxes and dividers read 0 cold): the device tree asks 26 MHz of CIS_CLK3 and 24 MHz of the others, but every init Android sends tells its sensor 24.574 MHz (EXCK_FREQ G#1893), so Linux runs them on the oscillator too.
+
+**PROBE on the 8a** (b232, the akita-cams kernel RAM-reloaded, the driver stored as `camera`, camtest `00000007<id>`):
+- main: G#0787 at G#0016 (Sony IMX787), only G#1A acknowledged (its "nessie" lens/OIS/EEPROM at G#24 did not);
+- ultrawide: G#0712 (Sony IMX712), its EEPROM at G#50;
+- front: G#0712 (Sony IMX712), its EEPROM at G#50.
+
+**Android's Camera2 characteristics** (`dumpsys media.camera`, local: /mnt/Harbor/tmp/akitacams/android-dumpsys-camera.txt, the colour matrices in android-matrices.txt; model-tier seeds for each IDT until a spectral calibration):
+
+| camera | pixel array | CFA | black / white | orientation | exposure | focal, aperture |
+|---|---|---|---|---|---|---|
+| main (physical 2) | 4624 x 3472 | RGGB | 64 / 1023 | 90 | 59.9 µs to 16 s, ISO 50 to 9846 (analogue to 615) | 5.43 mm f/1.89 |
+| main 2x (physical 4) | 4624 x 3472, half the main's sensor size | RGGB | 64 / 1023 | 90 | from 84.7 µs | the same lens: the unbinned centre crop |
+| ultrawide (physical 3) | 4208 x 3120 | RGGB | 64 / 1023 | 90 | 12.4 µs to 16 s, ISO 49 to 4729 | 1.835 mm f/2.2 |
+| front | 4208 x 3072 | BGGR | 64 / 1023 | 270 | 12.4 µs to 1 s, ISO 48 to 6095 | 2.74 mm f/2.2 |
+
+**The captures** (Android under oracle hv builds on slot b, tools/akita-hv-camall.sh, decoded with tools/cam-oracle; all local in /mnt/Harbor/tmp/akitacams, the vendor's settings):
+- The sensor inits, one bus a capture, each clean inside its init (the only length mismatches were the main bus's G#24 controller and each session's last stream off): main 277 transfers to stream on (4624 x 3472, three lanes, a 9568-clock line, a 4826-line frame: 7.036 µs a line, 29.5 frames a second), ultrawide 140 (4208 x 3120, four lanes), front 119 (4208 x 3072, four lanes, flipped both ways, G#0101 = 3). `inputs/oksoko.init`, `leshen-uw.init`, `leshen.init`.
+- The receivers and jobs (the light build: the PHY, the CSI links, SYSREG_ISPFE and the PDMA trapped, the PDMA dumped): the main runs CSI link 1 and the csis1 lanes, its receiver husky's main's but for link 1's sizes (`rx::RX_START_AKITA_MAIN`), SYSREG select 2, the line G#16C0; the front runs link 6 and the csis3 lanes (`RX_START_AKITA_FRONT`, its captured stop `RX_STOP_AKITA_FRONT`), SYSREG G#60, the line G#14C0. PDMA jobs: the main's twice (lists of 6656 and 6672 bytes), the front's (6220).
+- The main's job puts the PD output at the start of a 16 MiB IOVA granule and the image 5 MiB into it, and the image is 20.2 MB: October's one-granule-a-slot mapping (cam-oracle pdma-image, as camera-pdma-image.py) does not fit it as it stands.
+- **The jobs, laid out** (desk work after the captures): `cam-oracle pdma-image --own-image` gives the image body slot 2 alone, at its start, so the main's PD output (G#1C32_21C0) moves to slot 1, and drops a last record that runs past the buffer (the main's list 1 ends in four stale words under a header G#0004_0000, which ferros_cam job's walker refused as truncated; the engine stops at the buffer's length, so it never ran them).
+  Each slot then runs from the lowest offset the job names to its granule's end in whole frames, until a first run measures the outputs (ferros_cam job `AKITA_MAIN_SLOT_BYTES` / `_SKIP`, `AKITA_FRONT_SLOT_BYTES` / `_SKIP`); the local jobs (target/cam/akita-main.pdma from the main's list 1, akita-front.pdma from list 2) move into their regions in the host test, 98 MiB with a ring of one for the main (158 with four), 94 for the front (142).
+  Unsettled: which of the main's two lists to run (list 1 at the first open, 6640 bytes after the cut; list 3 at the reopen, 6672; on husky one list reset the phone and the other ran), and the front's tail (its last nine words read as a burst header with no body and a record past the buffer: cut, but they may be a half-written list the dump caught, frame 16 being mid-update).
+- The ultrawide's session ran link 0 with the csis0 lanes, SYSREG select 3 then 1, and its first writes stopped the PDMA engine (control 0) and reset the main's link; the engine did not start again until the front camera opened. So its frames reach memory some other way than the PDMA program (the front end's core pages, not trapped in the light build, or another block): its path needs the late-arm capture of an ultrawide session.
+- **IDTs**: the Camera2 matrices (ColorMatrix1/2 as colorTransform1/2 under StandardA and D65, ForwardMatrix1/2, and the unit's own calibrationTransform) give a model-tier Absolute matrix (camera to XYZ by inverting ColorMatrix2, then vsf's XYZ2VSF_RGB), but no sensitivity, and the endpoint's list wants the Absolute entry's scale (ferros_cam list): none was written, so as not to invent a sensitivity. The owner's calibration (as the Pro's 2026-10-21 captures) gives both.
+- The full trap of the front end's 42 pages (husky's recipe) hard-locked a core 24 s into Android's boot ("Watchdog detected hard LOCKUP on cpu 4"): the camera stack's boot probe, trapped access by access. FERROS_HV_ORACLE_LATE (ferros_hv) now traps the pages only from the arm time on; its first capture was flashed when the host's USB controller died (below).
+
+**Left, in order**: the front end's CPU programs with the late-arm build (main, then front, then the ultrawide's path); the main's job laid out for its 20.2 MB image (the image granule shared with the PD output); per camera slot sizes, acknowledgement and tick (the first run's report measures the outputs); `streams: true`; the vault inputs (`cam.oksoko.*`, `cam.leshen.*`); camtest, the view; IDTs (model tier from the matrices above, then the owner's calibration).
+
+**The 8a as left (2026-11-15 afternoon)**: the host's USB card (xhci 0000:04:00.0, the ASM107x card both devices sat on) died at 11:48:24 right after the late-arm build was flashed, so that capture never ran; the owner reset the card, and slot b was flashed back from `/mnt/Harbor/tmp/akitacams/back/boot_b.img` and read back from Android (sha256 fc572ff3, the same), ferros through the gate, attested. Slot a is the bare ferros (BOARDS.md "akita's slots"); nothing camera is in the vault; Android's settings changed for the captures (stay on while plugged in, Pixel Camera's location answer) are put back. The next capture session waits for the 8a on a motherboard port, so a card crash cannot take the Pro with it.
 
 ## The gap to "Lumis opens and shows a live preview"
 
@@ -90,7 +130,7 @@ The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what 
 | the driver | payloads/camera behind the `camera` switch (built 2026-11-14) | streams on the Pro (2026-11-14); the harness out the same day |
 | the front end's answer | its interrupt, SPI 479, in the driver's frame thread (built 2026-11-14) | whether the line fires (else the thread's own tick, said on the console) |
 | the PDMA job | from the vault (`cam.boitata.pdma`), moved into the region in Rust (ferros_cam job, built 2026-11-14) | the vault entry on the Pro |
-| akita's cameras | nothing | power, ID, init at 26 MHz, the receiver and front end from a capture |
+| akita's cameras | power, PROBE (all three answer), inits, the main's and front's receivers and jobs (2026-11-15) | the CPU programs (late-arm capture), the main's job for its 20.2 MB image, the ultrawide's path, then streaming |
 
 ## The endpoint
 

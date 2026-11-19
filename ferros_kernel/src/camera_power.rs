@@ -96,8 +96,9 @@ fn up() -> bool {
         return true;
     }
     // WHY the check: the module is the caller's byte (SYS_POWER's argument); one with no sequence is refused before anything is powered.
+    // husky's main (0) runs its own measured `power_up`; every other module, and every one of akita's, its device-tree sequence (camera.rs `module`).
     let other = match want {
-        0 => None,
+        0 if !crate::board::akita() => None,
         k => match crate::camera::module(k) {
             Some(m) => Some(m),
             None => {
@@ -141,7 +142,7 @@ fn up() -> bool {
             crate::camera::module_bus_up(m);
             let ok = crate::camera::power_module(m, &mut rep);
             // Every step of the sequence into the flash log, the sub-PMIC GPIO readings among them: the front camera's and the tele's power-up is a first try (docs/CAMERA.md "The other cameras").
-            for l in core::str::from_utf8(&rep).unwrap_or("").lines().filter(|l| l.contains(m.name) || l.contains("FAILED") || l.contains("refusing")) {
+            for l in core::str::from_utf8(&rep).unwrap_or("").lines().filter(|l| l.contains(m.name) || l.contains("FAILED") || l.contains("refusing") || l.contains(" mV") || l.contains("pattern")) {
                 crate::flashlog::line(&alloc::format!("camera: {l}"));
             }
             if !ok {
@@ -253,9 +254,10 @@ fn down() -> bool {
     let t0 = crate::platform::cntpct();
     let was = HELD.swap(false, Ordering::AcqRel);
     let m = module();
-    // The held camera's sensor and receiver (ferros_cam cams): `MODULE` is only ever a module `up` accepted (0 to 3), or the main's 0 before any.
-    let cam = ferros_cam::cams::CAMS[m as usize];
-    let (bus, addr) = if m == 0 { (SENSOR_BUS.base, SENSOR_ADDR) } else { (cam.bus, cam.addr) };
+    // The held camera's sensor and receiver (ferros_cam cams, this board's): `MODULE` is only ever a module `up` accepted (0 to 3 on husky, 0 to 2 on akita), or the main's 0 before any.
+    ferros_cam::cams::set_board(if crate::board::akita() { ferros_cam::cams::BOARD_AKITA } else { ferros_cam::cams::BOARD_HUSKY });
+    let cam = ferros_cam::cams::all()[m as usize];
+    let (bus, addr) = if m == 0 && !crate::board::akita() { (SENSOR_BUS.base, SENSOR_ADDR) } else { (cam.bus, cam.addr) };
     let mut rep = alloc::vec::Vec::new();
     let mut steps = alloc::string::String::new();
     if fe_on() {
@@ -285,6 +287,8 @@ fn down() -> bool {
     }
     match crate::camera::module(m) {
         Some(md) if was => crate::camera::power_down_module(md, &mut rep),
+        // akita with nothing held: nothing to undo, and husky's main sequence drives pins that are other things on akita (its ToF reset gpp15-0, the sub-PMIC's GPIO3 and LDO26).
+        _ if crate::board::akita() => {}
         _ => crate::camera::power_down(&mut rep),
     }
     crate::flashlog::line(&alloc::format!("camera: off{} module A#{m} down in A#{} ms{}", steps, ms_since(t0), if was { "" } else { " (it was not on)" }));

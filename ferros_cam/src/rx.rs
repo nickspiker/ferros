@@ -349,6 +349,52 @@ pub const RX_STOP_FRONT: [(usize, u32); 10] = [
     (0x1C04_0020, 0x0),
 ];
 
+// ---------------------------------------------------------------- akita (Pixel 8a)
+
+/// akita's main camera's receiver start (oksoko, Sony IMX787: CSI link 1 at G#1C05_0000, the csis1 lanes G#1C10_1800/1900/1A00), from the hv capture of 2026-11-15 (the light build, the PHY, links, SYSREG_ISPFE and PDMA pages trapped; lines 7-1124, the twelve links' G#5002 resets at the open left out).
+/// It is husky's `RX_START` write for write except four of link 1's words: its channel sizes for the main's 3472 x 4624 (+G#44 G#0D90_1210), its PD channels' (+G#54 G#0364_1210, +G#64 G#0002_1210), and +G#600 (G#7FFF_7FFF where husky's has G#8002_0002); its stop is husky's `RX_STOP`, the same link and lanes.
+pub const RX_START_AKITA_MAIN: [(usize, u32); 87] = akita_main();
+
+const fn akita_main() -> [(usize, u32); 87] {
+    let mut t = RX_START;
+    let mut i = 0;
+    while i < t.len() {
+        t[i].1 = match t[i].0 {
+            0x1C05_0044 => 0x0D90_1210,
+            0x1C05_0054 => 0x0364_1210,
+            0x1C05_0064 => 0x0002_1210,
+            0x1C05_0600 => 0x7FFF_7FFF,
+            _ => t[i].1,
+        };
+        i += 1;
+    }
+    t
+}
+
+/// akita's front camera's receiver start (leshen, Sony IMX712: CSI link 6 at G#1C0A_0000, the csis3 lanes G#1C10_3100..G#1C10_3600, four data lanes), from the same capture's front segment (lines 1411-2591, the links' G#5002 resets left out): every lane's setting cleared, the csis3 lanes set, link 6's channel 0 at 3072 x 4208 (G#0C00_1070) and its PD channel, link 6 started (G#5F01), SYSREG G#1C02_0500 = G#60.
+pub const RX_START_AKITA_FRONT: [(usize, u32); 89] = [
+    (0x1C10_131C, 0x200), (0x1C10_141C, 0x200), (0x1C10_151C, 0x200), (0x1C10_181C, 0x200), (0x1C10_191C, 0x200), (0x1C10_1A1C, 0x200),
+    (0x1C10_231C, 0x200), (0x1C10_241C, 0x200), (0x1C10_251C, 0x200), (0x1C10_281C, 0x200), (0x1C10_291C, 0x200), (0x1C10_2A1C, 0x200),
+    (0x1C10_321C, 0x200), (0x1C10_331C, 0x200), (0x1C10_341C, 0x200), (0x1C10_381C, 0x200), (0x1C10_391C, 0x200), (0x1C10_3A1C, 0x200),
+    (0x1C10_3100, 0x0), (0x1C10_3600, 0x0), (0x1C10_3200, 0x0), (0x1C10_3500, 0x0),
+    (0x1C10_3104, 0x1334), (0x1C10_3108, 0x5), (0x1C10_310C, 0xF0AE), (0x1C10_3110, 0x2), (0x1C10_3114, 0x8600), (0x1C10_3118, 0x4000), (0x1C10_3130, 0x103), (0x1C10_3140, 0x1),
+    (0x1C10_3100, 0x3), (0x1C10_3600, 0x3),
+    (0x1C10_3204, 0x1334), (0x1C10_3208, 0xD), (0x1C10_320C, 0x20AE), (0x1C10_3210, 0x302), (0x1C10_3214, 0x8600), (0x1C10_3218, 0x4000), (0x1C10_3230, 0x137), (0x1C10_3234, 0x3), (0x1C10_3240, 0x1), (0x1C10_3250, 0x81A), (0x1C10_3200, 0x1),
+    (0x1C10_3304, 0x1334), (0x1C10_3308, 0xD), (0x1C10_330C, 0x20AE), (0x1C10_3310, 0x302), (0x1C10_3314, 0x8600), (0x1C10_3318, 0x4000), (0x1C10_3330, 0x137), (0x1C10_3334, 0x3), (0x1C10_3340, 0x1), (0x1C10_3350, 0x81A), (0x1C10_3300, 0x1),
+    (0x1C10_3404, 0x1334), (0x1C10_3408, 0xD), (0x1C10_340C, 0x20AE), (0x1C10_3410, 0x302), (0x1C10_3414, 0x8600), (0x1C10_3418, 0x4000), (0x1C10_3430, 0x137), (0x1C10_3434, 0x3), (0x1C10_3440, 0x1), (0x1C10_3450, 0x81A), (0x1C10_3400, 0x1),
+    (0x1C10_3504, 0x1334), (0x1C10_3508, 0xD), (0x1C10_350C, 0x20AE), (0x1C10_3510, 0x302), (0x1C10_3514, 0x8600), (0x1C10_3518, 0x4000), (0x1C10_3530, 0x137), (0x1C10_3534, 0x3), (0x1C10_3540, 0x1), (0x1C10_3550, 0x81A), (0x1C10_3500, 0x1),
+    (0x1C0A_0690, 0x0), (0x1C0A_0040, 0x30AC), (0x1C0A_0044, 0x0C00_1070), (0x1C0A_0050, 0xB048), (0x1C0A_0054, 0x0001_1070), (0x1C0A_0600, 0x7FFF_7FFF), (0x1C0A_000C, 0xF),
+    (0x1C0A_0004, 0x5F01), (0x1C0A_0020, 0x0), (0x1C0A_0028, 0x0), (0x1C02_0500, 0x60), (0x1C0A_0010, 0x01FF_F1FF), (0x1C0A_0018, 0x7E),
+];
+
+/// akita's front camera's stop, captured (the same capture, its flip back to the rear, lines 2591-2615): the csis3 data lanes off, link 6 reset (G#5F03), three lanes' settings cleared, the CSIS select word cleared, link 6's interrupt masks off.
+pub const RX_STOP_AKITA_FRONT: [(usize, u32); 12] = [
+    (0x1C10_3100, 0x0), (0x1C10_3200, 0x0), (0x1C10_3300, 0x0), (0x1C10_3400, 0x0), (0x1C10_3500, 0x0),
+    (0x1C0A_0004, 0x5F03),
+    (0x1C10_321C, 0x200), (0x1C10_331C, 0x200), (0x1C10_341C, 0x200),
+    (0x1C02_0500, 0x0), (0x1C0A_0010, 0x0), (0x1C0A_0018, 0x0),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,7 +402,7 @@ mod tests {
     /// Each table's writes stay where the driver may write (`inputs::cpu_write_allowed`, or SYSREG_ISPFE's reset word), and each start releases its own link with its own SYSREG word.
     #[test]
     fn the_tables_stay_in_the_receiver() {
-        for t in [&RX_START[..], &RX_STOP[..], &RX_START_UW[..], &RX_STOP_UW[..], &RX_START_FRONT[..], &RX_STOP_FRONT[..]] {
+        for t in [&RX_START[..], &RX_STOP[..], &RX_START_UW[..], &RX_STOP_UW[..], &RX_START_FRONT[..], &RX_STOP_FRONT[..], &RX_START_AKITA_MAIN[..], &RX_START_AKITA_FRONT[..], &RX_STOP_AKITA_FRONT[..]] {
             assert!(t.iter().all(|&(a, _)| crate::inputs::cpu_write_allowed(a) || a == 0x1C02_0500), "{t:X?}");
         }
         assert!(RX_START.contains(&(0x1C02_0500, 2)) && RX_START.contains(&(0x1C05_0004, 0x205E01)));
@@ -365,5 +411,10 @@ mod tests {
         // The ultrawide's link sized as its readout: 4000 x 3000 on channel 0 (G#0BB8_0FA0).
         assert!(RX_START_UW.contains(&(0x1C06_0044, 0x0BB8_0FA0)));
         assert!(RX_START_FRONT.contains(&(0x1C04_0044, 0x0AB0_0F00)));
+        // akita's: the main's is husky's main's but four words of link 1 (its 3472 x 4624), the front's on link 6 with SYSREG G#60, sized 3072 x 4208.
+        let differ = RX_START.iter().zip(RX_START_AKITA_MAIN.iter()).filter(|(h, a)| h != a).count();
+        assert_eq!(differ, 4);
+        assert!(RX_START_AKITA_MAIN.contains(&(0x1C05_0044, 0x0D90_1210)) && RX_START_AKITA_MAIN.contains(&(0x1C02_0500, 2)));
+        assert!(RX_START_AKITA_FRONT.contains(&(0x1C0A_0044, 0x0C00_1070)) && RX_START_AKITA_FRONT.contains(&(0x1C02_0500, 0x60)) && RX_START_AKITA_FRONT.contains(&(0x1C0A_0004, 0x5F01)));
     }
 }
