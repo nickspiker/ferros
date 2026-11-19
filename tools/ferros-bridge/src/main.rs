@@ -1002,6 +1002,13 @@ async fn cmd_store(args: &[String]) {
             p.extend_from_slice(&value);
             (ferros_pt::Op::Write, p)
         }
+        // store extent <key> <bytes> <out>: a single-copy extent (docs/RAW-VIDEO.md, a RAW clip) pulled whole, 768 blocks (3 MiB) a command; store extent-info <key>: its record.
+        Some("extent") if args.len() >= 4 => return extent_pull(&args[1], &args[2], &args[3]).await,
+        Some("extent-info") if args.len() >= 2 => {
+            let mut p = vec![0xFEu8];
+            p.extend_from_slice(args[1].as_bytes());
+            (ferros_pt::Op::Read, p)
+        }
         Some("get") if args.len() >= 2 => (ferros_pt::Op::Read, args[1].as_bytes().to_vec()),
         Some("ls") => (ferros_pt::Op::Read, Vec::new()),
         Some("rm") if args.len() >= 2 => (ferros_pt::Op::Exec, args[1].as_bytes().to_vec()),
@@ -1055,8 +1062,55 @@ async fn cmd_store(args: &[String]) {
             }
         },
         "ls" => print!("{}", String::from_utf8_lossy(body)),
+        "extent-info" if body.len() >= 65 => {
+            let u = |k: usize| u64::from_le_bytes(body[k..k + 8].try_into().unwrap());
+            println!("extent: A#{} blocks from block A#{} of the clips area, A#{} bytes, sealed {}, BLAKE3 {}, at A#{}", u(0), u(57), u(8), body[16] != 0, body[17..49].iter().map(|b| format!("{b:02X}")).collect::<String>(), u(49) as i64);
+        }
         _ => println!("removed"),
     }
+}
+
+/// `store extent <key> <bytes> <out>`: the extent's first `bytes` (rounded up to whole blocks, then cut to `bytes`) into `out`, 768 blocks a command (the kernel's reply is built whole: STORE_VALUE_MAX), with the rate.
+async fn extent_pull(key: &str, bytes: &str, out: &str) {
+    let want: u64 = bytes.parse().unwrap_or_else(|_| {
+        eprintln!("bytes: a decimal count");
+        std::process::exit(1);
+    });
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    const PULL: u64 = 768;
+    let blocks = want.div_ceil(4096);
+    let mut file = std::fs::File::create(out).unwrap_or_else(|e| {
+        eprintln!("{out}: {e}");
+        std::process::exit(1);
+    });
+    let t = std::time::Instant::now();
+    let mut at = 0u64;
+    while at < blocks {
+        let n = (blocks - at).min(PULL);
+        let mut p = vec![0xFFu8];
+        p.extend_from_slice(&at.to_le_bytes());
+        p.extend_from_slice(&(n as u32).to_le_bytes());
+        p.extend_from_slice(key.as_bytes());
+        let cmd = build_cmd(ferros_pt::command::caps::STORE, ferros_pt::Op::Read, &p);
+        let r = ferros_link::pt::call_held(&link, &cmd).await.unwrap_or_else(|e| {
+            eprintln!("block A#{at}: {e}");
+            std::process::exit(1);
+        });
+        if r.first() != Some(&0) || r.len() != 1 + (n as usize) * 4096 {
+            eprintln!("block A#{at}: status {:?}, A#{} bytes", r.first(), r.len());
+            std::process::exit(1);
+        }
+        let keep = ((want - at * 4096).min(n * 4096)) as usize;
+        std::io::Write::write_all(&mut file, &r[1..1 + keep]).unwrap();
+        at += n;
+        if at % (PULL << 6) == 0 {
+            eprintln!("A#{} MiB, A#{} MB/s", (at * 4096) >> 20, (at * 4096) as f64 / 1e6 / t.elapsed().as_secs_f64());
+        }
+    }
+    println!("pulled A#{want} bytes into {out} in A#{} ms (A#{:.1} MB/s)", t.elapsed().as_millis(), want as f64 / 1e6 / t.elapsed().as_secs_f64());
 }
 
 /// One STORE command and its reply: the status byte's meaning on failure, the rest on success.

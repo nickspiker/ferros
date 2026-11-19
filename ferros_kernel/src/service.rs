@@ -232,7 +232,12 @@ enum VaultJob {
     Remove { full: alloc::string::String },
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
+    /// A single-copy extent's blocks (docs/RAW-VIDEO.md: a clip pulled to the host), a UFS command's 1 MiB a call: its full name, the next block, the blocks still to read, what has come; or with `info` its record alone.
+    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, info: bool },
 }
+
+/// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record.
+const EXTENT_PULL: u64 = (STORE_VALUE_MAX >> 12) as u64;
 
 /// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
 const VAULT_PIECE: usize = crate::process::STORE_MAX;
@@ -279,6 +284,16 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             }
             VaultJob::List { out, scope: 0, at: 0, part: alloc::vec::Vec::new() }
         }
+        ferros_pt::Op::Read if params.first() == Some(&0xFF) && params.len() > 13 => {
+            let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
+            let n = u32::from_le_bytes(params[9..13].try_into().ok()?) as u64;
+            // WHY: the count is the host's; the reply is built whole in the kernel's heap, as a get's is (STORE_VALUE_MAX).
+            if n == 0 || n > EXTENT_PULL {
+                return Some(Err(alloc::vec![5]));
+            }
+            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), info: false }
+        }
+        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), info: true },
         ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },
         ferros_pt::Op::Exec => VaultJob::Remove { full: name(params)? },
     };
@@ -344,6 +359,14 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
+        VaultJob::Extent { full, block, left, info, .. } => {
+            // [extent op][block u64][length u32], as process.rs `extent_forward` stamps a process's call.
+            let (op, len) = if *info { (crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32) } else { (crate::process::EOP_READ, ((*left).min((crate::process::EXTENT_MAX >> 12) as u64) << 12) as u32) };
+            rest.push(op);
+            rest.extend_from_slice(&block.to_le_bytes());
+            rest.extend_from_slice(&len.to_le_bytes());
+            vault_stamp(crate::process::VOP_EXTENT, full, &rest)
+        }
     };
     rest.fill(0);
     let Some(msg) = msg else {
@@ -399,6 +422,25 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
             *at = (*at + VAULT_PIECE).min(len);
             if *at >= len {
                 return Some(alloc::vec![0]);
+            }
+        }
+        VaultJob::Extent { block, left, got, info, .. } => {
+            if value == ERR || value == NOTHING {
+                return Some(alloc::vec![if value == NOTHING { 1 } else { 2 }]);
+            }
+            got.extend_from_slice(&bytes);
+            let n = (bytes.len() >> 12) as u64;
+            // A read that brings no whole block would ask for the same blocks for ever: the vault's error.
+            if !*info && n == 0 {
+                return Some(alloc::vec![2]);
+            }
+            *block += n;
+            *left = left.saturating_sub(n); // WHY/PROOF: the vault answers at most the length asked, but its count is its own; a longer answer would wrap the count of blocks left
+            if *info || *left == 0 {
+                let mut r = alloc::vec::Vec::with_capacity(1 + got.len());
+                r.push(0);
+                r.extend_from_slice(got);
+                return Some(r);
             }
         }
         VaultJob::Remove { full } => {

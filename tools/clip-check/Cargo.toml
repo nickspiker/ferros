@@ -1,0 +1,18 @@
+[package]
+name = "clip-check"
+version = "0.1.0"
+edition = "2021"
+description = "A RAW clip pulled from a device read on the host (vsf visual::clip): every frame decoded, the hashed ones against the hashes the device took of the frames as the camera wrote them (std/rawrec's console lines)"
+
+[[bin]]
+name = "clip-check"
+path = "src/main.rs"
+
+[dependencies]
+vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
+blake3 = "1.5"
+
+[profile.release]
+debug = 1
+
+[workspace]
