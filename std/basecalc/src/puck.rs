@@ -93,9 +93,8 @@ pub fn main() {
     }
     let (mut held, mut shown): (u64, Option<(u64, u64)>) = (0, None);
     let mut seen = 0u32;
-    // The dial's state: the inner ring's layer (Shift), the outer ring's page of digits, whether the base follows the device's (it does until overridden; a kept base other than the device's means it was overridden), the side last drawn, and a key pressed since.
+    // The dial's state: the inner ring's layer (Shift), the outer ring's page of digits, (whether the base follows the device's is the calculator's own, kept: `Calc::base_overridden`), the side last drawn, and a key pressed since.
     let (mut layer, mut page) = (0usize, 0usize);
-    let mut following = { let dev = sys::device_base(); dev == 0 || pad.calc.state.base == dev };
     let (mut drawn_d, mut dirty) = (0usize, true);
     loop {
         let (count, on, d, taps) = {
@@ -114,7 +113,7 @@ pub fn main() {
         }
         // The device's base followed until overridden (the settings layer's base keys), its digits paged when it is past the ring.
         let dev = sys::device_base();
-        if following && dev != 0 && pad.calc.state.base != dev {
+        if !pad.calc.base_overridden && dev != 0 && pad.calc.state.base != dev {
             let change = pad.calc.press(Key::Base(dev));
             if change.save {
                 pad.save();
@@ -143,13 +142,13 @@ pub fn main() {
                     None
                 }
                 Act::BaseNext => {
-                    following = false;
+                    pad.calc.base_overridden = true;
                     let next = QUICK.iter().copied().find(|&b| b > base).unwrap_or(QUICK[0]);
                     page = 0;
                     Some(Key::Base(next))
                 }
                 Act::BaseDevice => {
-                    following = true;
+                    pad.calc.base_overridden = false;
                     page = 0;
                     (dev != 0).then_some(Key::Base(dev))
                 }
@@ -197,7 +196,7 @@ pub fn main() {
             Shown::Value(s) => (spans_text(s).trim_start().to_string(), false, false),
             Shown::Error(why) => (why.clone(), true, false),
         };
-        let screen = Screen { expr: &expr, value: &value, error, dim, base: calc.state.base, radians: calc.state.radians, following };
+        let screen = Screen { expr: &expr, value: &value, error, dim, base: calc.state.base, radians: calc.state.radians, following: !calc.base_overridden };
         paint(px, d, &dial, layer, &screen, &mut text, &mut damage);
         // Upright: the display turns it with the circle, and the taps come back in the same frame.
         let mut m = [0u8; 11];

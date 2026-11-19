@@ -53,11 +53,13 @@ pub struct Calc {
     pub second: bool,
     /// The picker of every base is up.
     pub picking: bool,
+    /// The base was chosen here, over the device's (the dial's base keys): kept, so the dial follows the device's base until the person overrides it (owner, 2026-11-18: "It doesn't seem to pull my base setting").
+    pub base_overridden: bool,
 }
 
 impl Calc {
     pub fn new() -> Calc {
-        Calc { state: BasecalcState::new(), expr: String::new(), done: false, value: None, shown: Shown::Nothing, history: Vec::new(), second: false, picking: false }
+        Calc { state: BasecalcState::new(), expr: String::new(), done: false, value: None, shown: Shown::Nothing, history: Vec::new(), second: false, picking: false, base_overridden: false }
     }
 
     /// A calculator as the vault left it: each line run again in order from a fresh engine, under the settings it was typed with, so `&`, assignments and basecalc's random draws come back as they were; then the settings in use.
@@ -71,13 +73,14 @@ impl Calc {
             }
         }
         c.settings(saved.base, saved.digits, saved.radians);
+        c.base_overridden = saved.base_overridden;
         c.reshow();
         c
     }
 
     /// What the vault keeps.
     pub fn saved(&self) -> Saved {
-        Saved { base: self.state.base, digits: self.state.digits, radians: self.state.radians, lines: self.history.iter().map(|e| e.line.clone()).collect() }
+        Saved { base: self.state.base, base_overridden: self.base_overridden, digits: self.state.digits, radians: self.state.radians, lines: self.history.iter().map(|e| e.line.clone()).collect() }
     }
 
     fn settings(&mut self, base: u8, digits: usize, radians: bool) {

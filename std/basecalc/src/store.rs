@@ -20,6 +20,8 @@ pub struct Line {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Saved {
     pub base: u8,
+    /// The base was chosen over the device's (`base_override`, a flag; absent: following the device's, as every document from before it).
+    pub base_overridden: bool,
     pub digits: usize,
     pub radians: bool,
     pub lines: Vec<Line>,
@@ -64,6 +66,7 @@ impl Saved {
         let sections = header.sections(doc, end).map_err(|_| "sections that do not parse")?;
         let top = sections.iter().find(|s| s.name == "basecalc").ok_or("no basecalc section")?;
         let (base, digits, radians) = settings(top)?;
+        let base_overridden = flag(top, "base_override").unwrap_or(false);
         let mut lines = Vec::new();
         for s in sections.iter().filter(|s| s.name == "line") {
             let expr = s.get_field("expr").and_then(|f| f.values.iter().find_map(|v| match v {
@@ -74,7 +77,7 @@ impl Saved {
             let (base, digits, radians) = settings(s)?;
             lines.push(Line { expr, base, digits, radians });
         }
-        Ok(Saved { base, digits, radians, lines })
+        Ok(Saved { base, base_overridden, digits, radians, lines })
     }
 
     /// As a complete VSF document stamped `now` (Eagle Time oscillations), with its provenance hash.
@@ -84,6 +87,9 @@ impl Saved {
         top.add_field("base", VsfType::u(self.base as usize, false));
         top.add_field("digits", VsfType::u(self.digits, false));
         top.add_field("radians", VsfType::u0(self.radians));
+        if self.base_overridden {
+            top.add_field("base_override", VsfType::u0(true));
+        }
         b = b.add_section_direct(top);
         for line in &self.lines {
             let mut s = VsfSection::new("line");

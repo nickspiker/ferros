@@ -317,18 +317,24 @@ pub fn seen(j: usize, i: usize, sx: i64, sy: i64, sr: i64, fc: i64, fs: i64, wid
     }
 }
 
+/// The person's base as the last scene saw it (ferros_sys `device_base`).
+static BASE_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// The scene is drawn: each bound puck's view compared with what it heard last, and told on a change: shown or hidden, large or not, a pixel of diameter, or a turn of half a pixel at its rim.
 pub fn scene_end() {
     let seen = unsafe { SEEN };
     let es = lock();
     let bound = unsafe { &*(&raw const BOUND) };
+    // The person's base changed (Settings, Units): every puck hears its view again, so a face written in the base is written anew (owner, 2026-11-18, on basecalc: "It doesn't seem to pull my base setting").
+    let base = ferros_sys::device_base();
+    let rebased = BASE_SEEN.swap(base, Ordering::AcqRel) != base;
     for (j, b) in bound.iter().enumerate().filter(|(_, b)| **b != [0; 64]) {
         let Some(e) = es.iter_mut().find(|e| &e.id == b) else { continue };
         let (a, n) = (e.view, seen[j]);
         // sin of the angle between the two turns, Q28, times the radius in pixels: past half a pixel at the rim (2^27 · d, in the same units) the face would draw differently.
         let sin = (a.c as i64 * n.s as i64 - a.s as i64 * n.c as i64).abs();
         let turned = sin * n.d as i64 >= 1 << 28;
-        if a.shown != n.shown || a.large != n.large || a.d != n.d || turned {
+        if a.shown != n.shown || a.large != n.large || a.d != n.d || turned || (rebased && n.shown) {
             e.view = n;
             tell(e);
             count(2);

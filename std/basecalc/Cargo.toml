@@ -1,6 +1,6 @@
 [package]
 name = "basecalc-ferros"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "basecalc on ferros as a kist: the owner's calculator (basecalc's own engine: bases 2 to 36, complex numbers, adjustable precision, trig, logs, constants) behind a scientific keypad whose digit block follows the base, under fluor's ferros host, its settings and history as VSF in the kist's vault domain (docs/KISTS.md \"basecalc\", tools/basecalc-build.sh)."
 license = "GPL-3.0"
