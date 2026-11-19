@@ -22,7 +22,16 @@ metadata:
 - the ultrawide's least gain at code 7 (a floor, which needs his approval under the no-clamp rule);
 - motion data as an implicit right, and the accelerometer only while read.
 
+**Decided later the same day:** no gnss mirror on fgtw.org. ferros gets HTTPS (a TLS client): "I think we need https as annoying as it is. So much shit uses it. Think a Google Chrome APK that will likely have to run on ferros." The GPS ephemerides then come straight from the public HTTPS sources (BKG, ESA), fleet-first. Staged after RAW video.
+
 **How to apply:** a "yes" answers only the question it was given to. When an answer is ambiguous, ask which question it answers before recording anything.
 **Coming:** test eSIM profiles, "a little ways out".
 
 Related: [[sensor_mailboxes]], [[gpu_role_layers]], [[feedback_keep_devices_busy]].
+
+**RAW video, later the same day:**
+- **Clip sealing at rest is optional, the coordinator's call.** Chosen: sealed by default, with a per-clip off switch. It lands after the first shootable build; today's first clips are unsealed.
+- **Grading export approved:** "VSF -> cinema DNG or TIFF or png sequence or video or whatever man, I really don't care. plugin maybe for a format ideally but you tell me."
+  - Chosen: a HOST-ONLY tool, `tools/clip-export`, writing a CinemaDNG sequence that keeps the mosaic lossless.
+  - It's the one approved foreign encoder, for grading only; nothing on a device writes DNG.
+  - A Resolve decode plugin is being researched as the ideal.
