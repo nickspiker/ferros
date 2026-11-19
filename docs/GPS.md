@@ -213,6 +213,83 @@ With no last fix of the person's (`gps.last`), the `d0 81` aiding carries the zo
 - The uncertainty stays the replay's (above) unless the driver is asked to write the candidate: `ZONE_UNC_M` = 1 << 21 m (some 2100 km), covering nearly every zone from its principal place.
 - The zone follows the device's choice: found by the cellular network (NITZ and the MCC's country, before any fix) or by an earlier position, or set by hand.
 
+## No fix, 2026-11-18: the replays lost their aiding
+
+Owner, 2026-11-18: "GPS. what's the deal there? ... right now I get nothing. it did work sporatically before."
+Measured on the Pro (boot b976, indoors, night), the driver started by the GPS puck's claim, then twice more by hand.
+
+**What the chip did.** `gpstest 04` (the driver's frames by kind) and its 32 s reports, three starts:
+
+| Start | Replay | What came | Then |
+|---|---|---|---|
+| the puck's claim, 19:57 | `gps.replay` (the kernel's restart gives no input) | 3455 frames in ~95 s: `02 80` ×1768 and its large forms (the measurement stream), `04 81` ×997, `a3 81` ×2, no `01 81` | silent: no HOST_REQ for 23 minutes, the driver asleep in its interrupt wait |
+| `diag "restart gps"`, 20:24 | `gps.replay` | the same: HOST_REQ 2551, 3240, 3139 times in three 32 s reports, 4900 frames, 0 fix messages | silent again ~110 s after power-up |
+| `kill gps`, then the driver spawned with input 01, 20:33 | `gps.replay.sky` | 812 frames, nearly all during the replay; `a0 81` ×5 (the chip's time: GPS week 2445 and a time of week matching the clock: it took the `87 81`) | silent for the 9 minutes watched, no fix (then, about 20:44, the Pro left ferros for Android; the test had only killed and spawned processes, so most likely another session's doing, not checked) |
+
+So the screens showed nothing because there was nothing: no fix message ever came, so no satellites (they ride only in the fix message) and no position. The driver ran and answered; its 32 s report stops when the chip stops, because the loop only wakes for HOST_REQ or a call.
+
+**Why: the replays in the vault are not the ones this document describes.** `tools/gps-replay-scan` (a host tool: every message a replay sends, by RPC and inner class, no payload bytes) on the vault export of that morning (keys/husky/vault-export-2026-11-18, taken before the fresh start and restored after it, so the vault held them before as well):
+- `gps.replay`: 554 records, 9.2 s of lhd's gaps: the patch, the second stage, a host-mode session's start (`1e 81` carrying `8c 81` ×3, `83 81` ×2, `8f 81`, `92 81`, gpsd's periodic `1e 48`), cut off at 9.2 s. No `87 81` time, no `d0 81` place, no `82 81` LTO windows, no configuration strings `10 00`/`17 00`, no `09 00`. The on-chip session of 2026-10-25 had 533 records over 18 s with all of those. This is a host-mode session: the chip becomes gpsd's measurement engine (`02 80`), nobody answers as gpsd would, and it stops after ~100 s. The 554-record replay of lhd's opening (2026-10-25, "554 records in 3.3 s" above) is the likely source; how it came back is not known.
+- `gps.replay.sky`: 509 records, 17.3 s: the on-chip session with its configuration and the `87 81` time, but no `d0 81` (the 517-record sky replay of 2026-10-26 had three, and `8e 81` ×3, `83 81`, `92 81`: by the count, those eight messages are gone, the sequences closed up over them). With no place the chip starts cold; above, a cut or zeroed place cost 5-8 minutes outdoors, and indoors at night it found nothing in 9.
+- The driver's line "position from the zone in effect" was true of what it chose, but neither replay had a `d0 81` to carry it: the place never reached the chip. The driver now counts what the replay carried and says so after the replay (`gps: the replay carried <n> time (87 81), <n> place (d0 81) and <n> 09 00 messages`).
+- The capture traces (lhd2, lhd3, lhd4) were on /mnt/Harbor/tmp, which has been cleared: the 533-record on-chip replay cannot be rebuilt from them.
+
+"It did work sporadically before" fits: the replays with the place and the LTO gave fixes in late October (11-18 s, then 78 s as the LTO aged, 92 s with the last fix and no LTO); by 2026-11-11 the Pro sat for hours with no fix, the first sign of these replays.
+
+Not explained yet: the kernel counted 3.3 million unmasks of `gps-host-req` in that boot before the first start went quiet, against some 2500 HOST_REQ passes the driver counts per 32 s; worth a look at the interrupt's level handling once the chip runs again.
+
+## Proposed: a sky before the lock, and a faster lock (2026-11-18, for the owner)
+
+### The birds before a lock
+
+The sky above a place at a time follows from three things, none of them the chip:
+- **Orbits.** CelesTrak's GP elements (`http://celestrak.org/NORAD/elements/gp.php?GROUP=gnss&FORMAT=tle`, 28 KB for every GNSS satellite; `GROUP=gps-ops` 5 KB) and its GPS almanac (`http://celestrak.org/GPS/almanac/Yuma/almanac.yuma.txt`, 19 KB, the current week's) both answer plain HTTP 200 (checked 2026-11-18), so ferros's own TCP reaches them. NAVCEN's YUMA/SEM did not answer plain HTTP (a timeout; HTTPS redirects). GP elements with SGP4 cover GPS, GLONASS, Galileo, BeiDou and QZSS in one form; a GPS almanac is the IS-GPS-200 Kepler equations, a few dozen lines. Either is good to a few km for a week, under 0.05° of sky.
+- **Time.** ferros's clock: the satellites move about half a degree a minute, so a second of error is nothing.
+- **A rough place.** Its error is what matters: moving the observer 100 km tilts the local horizon by 0.9° and shifts the parallax by up to 0.3°, so about 0.7° of sky per 100 km. A city-level place (10-50 km) is a few tenths of a degree; the zone's principal place (up to ~2000 km) up to ~15°, still the right birds in the right part of the sky except near the horizon.
+
+About 30-45 satellites are above 5° at any time with the four constellations, inside the 64 tracks the driver publishes.
+
+**Where the place comes from, best first, combined (the single egg rule):**
+0. `gps.last`, the person's last fix (identity class, Eagle time stamped): metres, widening with its age.
+1. A cell map the device learns itself: each fix stamps the serving cell (the modem's MCC, MNC, TAC and ECI) with the place, in the identity's vault; a later start in a known cell is good to the cell's size (a few km), and LTE's timing advance gives the distance to the tower in 78 m steps. No outside database, nothing asked of anyone.
+2. fgtw.org's view of the request: the worker's `request.cf` carries a latitude and longitude at city level (workers-rs `Request::cf()`), so the reply to a call the device already makes (the signed exchange) can carry it, signed with the seed's key. Good to tens of km on a home WiFi; over LTE the address is the carrier's gateway, which can be far off (not measured yet).
+3. The zone in effect's principal place (built, 2026-11-11): up to ~2000 km.
+4. The MCC's country.
+
+Each is a circle (a centre and a radius). The tightest circle is used only when every independent looser one agrees with it (its centre inside theirs, widened by both radii); a tight one that two looser ones contradict (an address behind a VPN in another country, say) is dropped and the console says which. The place is the person's: identity class like `gps.last`, never on a measure anyone reads, never in a log.
+
+**Who computes it:** the GPS driver, while it runs (claimed), so the sky still shows only while GPS is in use. It reads `gps.almanac`, a VSF document of the elements (device class: orbits are public), refreshed at most daily by the FGTW node from fgtw.org (fgtw.org fetches CelesTrak and, for more than one source, NAVCEN over HTTPS, and signs the document), or by a plain HTTP fetch of CelesTrak's text with a fixed-column, checksummed parser in one place, as a second path. Each predicted bird is published as a track (`ferros_sys::Sat`) with C/N0 0 and not used: no new bit, a signal heard replaces its prediction by system and number.
+
+**On the GPS rings** (`gps_rings`, the circle's satellites as bubble limbs meeting over the person): three looks, every one C∞.
+- **Predicted** (from the orbits, not heard): the limb at a weight of 2⁻³, in the flavour moved toward white, and faded near the disc's centre by 1 − e^(−(r/r₀)²) (r₀ a quarter of the disc), so the meeting point over the person brightens only with real signal. Faint arcs pointing where each bird is.
+- **Heard** (C/N0 from the chip, not in the fix): weight 1/(1 + e^(−(C/N0 − 28)/4)) / 2, about 0.06 at 20 dB-Hz and 0.48 at 40.
+- **Used in the fix**: weight 1, the full 550 nm flavour, as built.
+
+The GPS puck's sky plot the same way: predicted a hollow ring, heard a disc sized by C/N0, used the `USED` colour.
+
+Pre-fix, in on-chip mode, the chip says nothing per satellite (above, "What the chip sends before a fix"), so before the first fix the circle can show predicted birds only. Heard-but-not-used before a fix needs the host-mode `02 80` measurement stream decoded; not proposed now.
+
+### Aiding the chip so it locks faster
+
+Known, enough to build: the SSI framing, the packet transport and its CRC, the RPC wrapper (`1e`, the inner frame's length + 2, the inner frame's length, 0; e.g. `1e 18 16 00` before the 22-byte time message), the inner frame (class, length, the 16-bit checksum, the trailer counter), `87 81` (week u16, time of week u32 ms, then 1000, likely the time's uncertainty in ms), `d0 81`'s layout (the table above, all but which of +32 and +44 is the uncertainty), and cutting messages from a replay with the sequences and trailer counters closed up (proven 2026-10-26).
+- **Now:** the place is missing from both replays. The driver can put one back: build a `d0 81` from the table (the capture's small integers as they are listed, the place from the list above, +32 and +44 tested both ways) and insert it after the `87 81`, every later frame's sequence and trailer moved on by one, the inverse of the proven cut. With the person's last fix and no LTO this replay gave a first fix at 92 s (2026-10-26).
+- **And the kernel should start the driver on the on-chip replay:** `gps.replay` as stored is a host-mode session (it can never give an on-chip fix); the restart passes no input, so it is what the puck and the map's page get. Either the restart passes input 01 (`gps.replay.sky`), or the store gets a corrected `gps.replay` (the owner's call; nothing was stored on 2026-11-18).
+- **Not known, to reverse:** `8e 81`, `83 81`, `92 81`, `8c 81`, `8f 81`, and `82 81` (the LTO windows gpsd computes from `lto2.dat`). In on-chip mode gpsd uploads no ephemerides (its log: "GenerateAiding() skip because it's onchip ME"), so the on-chip engine's orbit aid is the LTO windows. Two ways in: a fresh capture on rooted Android with gpsd at LOG_DEBUG (its log names what it injects) beside the same day's broadcast ephemerides to correlate field by field, or gpsd's builders read from its disassembly. The capture also brings back a whole on-chip replay.
+
+### Fresh aiding without Google's servers
+
+- The LTO file is Broadcom's (glpals.com, Global Locate), licensed to Google; it still answers plain HTTP (`7day/v5/latest/lto2.dat`, 186 KB on 2026-11-18). Kept as the fallback only, and useless until `82 81` is decoded.
+- Broadcast ephemerides, every constellation, from the IGS: BKG (`https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<year>/<day>/`, `BRDC00WRD_S_…_01D_MN.rnx.gz`, the day so far, updated through the day) and ESA (`ftp://gssc.esa.int/gnss/data/daily/<year>/<day>/`, `brdc<day>0.<yy>n.gz` 58 KB for GPS, `.g` 83 KB for GLONASS, `BRDC00IGS_R_…_MN.rnx.gz` 1.2 MB for all). Neither answers plain HTTP and CDDIS wants an Earthdata login, so they are fetched and converted on fgtw.org or the host: RINEX to a VSF ephemeris document per day, signed, served to the device over plain HTTP. Two sources for one input. Into the chip once its ephemeris or LTO message is decoded; on the screen they are not needed (the almanac is plenty).
+
+### What the owner would see
+
+0. Today: the GPS circle lit and "searching", no rings; the puck's 0 and 0 and an empty sky plot; the map's GPS page counting the chip's messages, which stops ~100 s after GPS turns on, because the chip has gone quiet.
+1. The driver started on the on-chip replay with a place put back: the same screens until the first fix, then rings and dots; about 1.5 minutes near a window (the 2026-10-26 figure), longer indoors.
+2. The predicted sky: the moment GPS turns on, faint arcs for every bird above the horizon, before any lock and indoors too; heard birds brighten as the chip reports them, used birds go full. The point over the person stays dark until there is real signal.
+3. Aided starts (the LTO windows or broadcast ephemerides decoded and injected, the place from the list above): first fixes in seconds to tens of seconds, and more of them indoors.
+
+The 8a (Samsung KEPLER, booted through the modem's `gnss_boot`, data on SPI 21, BOARDS.md): out of scope here. It needs an Android capture of its HAL's traffic (akita-root has Magisk), its firmware path, then a driver of its own; the predicted sky above works there unchanged, since it needs no chip.
+
 ## Next
 
 1. ~~Navigation~~ — done above.

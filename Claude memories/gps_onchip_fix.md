@@ -11,5 +11,7 @@ Found by: gps.xml `IgnoreOnChipRequest="false"` (bind-mounted copy) + `$pglirm,r
 
 Open: on-chip and Android-host fixes disagree by ~150 m N / 40 m E indoors (same under Android, so not a ferros decode bug); the replay depends on that capture's LTO/ephemerides aiding. akita's GPS is a different (Samsung KEPLER) chip ([[akita_pixel8a]]).
 
+**2026-11-18, no fix on the Pro:** the vault's replays are not the ones GPS.md describes. `gps.replay` (554 records) is a host-mode session (no `87 81`, no `d0 81`, no on-chip setup): the chip streams `02 80` measurements ~100 s, then goes silent; the kernel's restart uses it (no input). `gps.replay.sky` (509) is on-chip but has no `d0 81`, so no place reaches the chip (nothing in 9 min indoors). The lhd captures on /mnt/Harbor/tmp are gone. Check a replay with `tools/gps-replay-scan` before trusting it; GPS.md "No fix, 2026-11-18" and the proposals after it.
+
 **Why:** the owner asked for GPS lock; the measurement-decode + own-PVT path was judged hours of RE, the on-chip path was minutes once gpsd's own log was on.
 **How to apply:** never commit coordinates (truncate in output); the replay holds Google's patch and this place's position: vault/Harbor only. See [[gs-google-reference-tree]].

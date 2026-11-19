@@ -767,6 +767,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut d = Deframer { acked: [false; 256], frames: 0, crc_bad: 0, fixes: 0, fix: Fix::default(), fix_at: 0, sky: Sky::new(), sky_at: 0 };
     let mut raw = Buf { b: [0; 8192], n: 0 };
     let (mut at, mut recs, mut late, mut errs) = (4usize, 0u32, 0u32, 0u32);
+    // The aiding the replay itself carries, counted by class as it goes (GPS.md "No fix, 2026-11-18"): the time (`87 81`), the place (`d0 81`), and `09 00`, the on-chip replay's last messages before the chip navigates alone (not yet decoded).
+    // The Pro's replays of 2026-11-18 held no `d0 81` at all, and `gps.replay` none of the three, while the line before the replay said where the place came from: the place was never given to the chip.
+    let mut carried = [0u32; 3];
     let mut rec = [0u8; 4096];
     let mut patched = [0u8; 8192];
     while at + 4 <= total {
@@ -783,6 +786,10 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
         at += 4 + len;
         recs += 1;
+        // The transport escapes only G#B0, G#11 and G#13, so an inner header's `c0 c1` and class stand in the record as they are.
+        for (i, class) in [[0x87u8, 0x81], [0xD0, 0x81], [0x09, 0x00]].iter().enumerate() {
+            carried[i] += rec[..len].windows(4).filter(|w| w[..2] == [0xC0, 0xC1] && w[2..] == class[..]).count() as u32;
+        }
         let out: &[u8] = match patch_aiding(&rec[..len], aid, &mut patched) {
             Some(n) => &patched[..n],
             None => &rec[..len],
@@ -816,6 +823,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     chip.set(MCU_REQ, false);
     say!(grants, "gps: replayed {} records in {} ms ({} SPI errors, {} not acked in time); the chip: {} frames, {} CRC failures\n", recs, now().wrapping_sub(t_all) * 1000 / f, errs, late, d.frames, d.crc_bad);
+    say!(grants, "gps: the replay carried {} time (87 81), {} place (d0 81) and {} 09 00 messages{}\n", carried[0], carried[1], carried[2], if carried[1] == 0 { "; no place message: the chip was given no place" } else { "" });
 
     // HOST_REQ as a level-high external interrupt: pin function EINT (G#F), its control nibble 1, pending cleared, unmasked.
     let far = cap(grants, S_FAR);
