@@ -1,17 +1,21 @@
 ---
 name: feedback-keep-devices-busy
-description: Owner 2026-11-19 - when the phones are set up on the bench (aimed at lit scenes, plugged in), keep them busy every hour; never leave a device idle waiting on a decision or a queue
+description: Owner 2026-11-19 - stage agents, don't swarm them; one planned job per device at a time, few agents, no parallel edits of the same code; but never leave a set-up device idle for hours either
 metadata:
   type: feedback
 ---
 
-The owner set both phones on the bench aimed at lit objects "literally for you" for about 8 hours, and found they had sat mostly idle while agents queued for one device at a time and the coordinator waited on his answers.
+**Two corrections from the owner on the same day:**
+- **Idle devices:** both phones sat on the bench aimed at lit objects "literally for you" for about 8 hours, mostly idle.
+- **Then the opposite fault:** "I'd definitely focus on staging agents rather than keeping all agents busy. that burns more coins and actually wastes time in the long run since edits collide, checkouts happen, touches intersect and things start to clash."
+  - At that point the session had about seven agents running: several queued for the same Pro, edits colliding in the camera driver and ferros_cam (merge conflicts), and helpers spawned by agents.
 
-**Why:** his setup time is the scarce resource; an idle device he prepared is wasted work on his side.
+**Why:** many concurrent agents cost more and finish later: they contend for the one device, collide in the same files, and each merge costs a resolution pass. The owner's setup time is also scarce, so a prepared device shouldn't sit unused for hours.
 
 **How to apply:**
-- When a device is free, give it work at once: verification runs, orientation and colour checks, measurements, regressions, anything that uses the scene he set up.
-- Run host-only work (drivers, decoders, protocol crates) in parallel from the start; don't hold it behind device slots.
-- Don't wait on owner decisions for work that doesn't need them; ask, and keep going on what doesn't depend on the answer.
-- If the host's USB or a device drops, say so at once and move every agent to host work until it's back.
-- Pin every device command to its serial or port, so parallel work never hits the wrong phone ([[bridge_debug_for_two_devices]]).
+- **Stage the work:** a short planned sequence per device, one device-holding agent per phone at a time, the next one started when it reports.
+- **Keep it small:** at most a few agents in total (one per device, plus at most one host-only job).
+- **No overlap:** no two agents editing the same crate or file at once. Sequence them, or have one agent do both.
+- **No helpers:** agents don't spawn helper agents; say so in every brief.
+- **Use the bench:** when a device is set up and free, the next staged job takes it promptly, so it's never idle for hours waiting on a decision.
+- **Pin devices:** every device command names its serial or port ([[bridge_debug_for_two_devices]]).
