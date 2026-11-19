@@ -476,6 +476,11 @@ pub fn serve() {
         unlock();
     }
     let want = WANT.load(Ordering::Acquire);
+    // A core without the current secrets and no blob meant for it asks now, from its own loop, rather than at its first derive: that derive is refused (`ready` does not wait for a blob), and the A510s, which came up after the blob was given up on (`forget_missing`), held nothing until a syscall there asked (Lumis's seals from an A510, refused, 2026-11-19).
+    let g = GEN.load(Ordering::Acquire);
+    if g != 0 && HELD[me()].load(Ordering::Acquire) != g && want & (1 << me()) == 0 && ASKING.load(Ordering::Acquire) & (1 << me()) == 0 {
+        ASKING.fetch_or(1 << me(), Ordering::AcqRel);
+    }
     let asking = ASKING.load(Ordering::Acquire);
     if want & (1 << me()) == 0 && asking == 0 {
         return;

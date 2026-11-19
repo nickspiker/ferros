@@ -409,7 +409,8 @@ pub fn stall_check() {
     let head = (target as u64 + 1) | (me as u64) << 8 | ms << 16 | (holder as u64) << 40 | n << 48;
     // Not answered (its interrupts masked): the UFS lock's holder and site in the ELR's place, the storage locks the stalled core holds in the LR's.
     let (ufs, ranks) = crate::process::stall_extra(target);
-    let words = if d[0] == 0 { [head, 0, ufs, ranks, note_read(0), now] } else { [head, d[0], d[9], d[1], note_read(0), now] };
+    // And in the counter's place the hold's own account (devsched `WHAT`: bit 63 a syscall, its number, x1's low byte, the thread).
+    let words = if d[0] == 0 { [head, 0, ufs, ranks, note_read(0), crate::devsched::WHAT.load(Relaxed)] } else { [head, d[0], d[9], d[1], note_read(0), now] };
     unsafe {
         for (i, &w) in words.iter().enumerate() {
             write_volatile((STALL + i * 8) as *mut u64, w);
@@ -508,6 +509,12 @@ pub fn notes_rotate() {
             write_volatile((MMIO_NOTES + i * 8) as *mut u64, 0);
             core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (MMIO_NOTES + i * 8) as u64, b = in(reg) (MMIO_NOTES + 0x48 + i * 8) as u64);
         }
+        for i in 0..9 {
+            let v = read_volatile((CORE_CRUMB_LAST + i * 8) as *const u64);
+            write_volatile((CORE_CRUMB_LAST + 0x80 + i * 8) as *mut u64, v);
+            write_volatile((CORE_CRUMB_LAST + i * 8) as *mut u64, 0);
+            core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (CORE_CRUMB_LAST + i * 8) as u64, b = in(reg) (CORE_CRUMB_LAST + 0x80 + i * 8) as u64);
+        }
         for i in 0..STALL_WORDS {
             let v = read_volatile((STALL + i * 8) as *const u64);
             write_volatile((STALL + (STALL_WORDS + i) * 8) as *mut u64, v);
@@ -536,6 +543,8 @@ static CRUMB_PREV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static CRUMB_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Per core (MPIDR Aff1): its last `CORE_CRUMB_N` crumbs and their counters, a ring (crumb at 2k, counter at 2k + 1), and its count in the last word.
 pub const CORE_CRUMB_N: usize = 1 << 3;
+/// Each core's last crumb in the report page, a word per core (MPIDR Aff1) at +G#400: the crumb's low 32 bits, and the counter shifted right 10 (about 42 us) in the high 32; cleaned to DRAM, so a watchdog reset leaves it (`bridge read FD600400 48`). The previous boot's at +G#480 (`notes_rotate`).
+pub const CORE_CRUMB_LAST: usize = RAMOOPS_RESULT + 0x400;
 pub static CORE_CRUMBS: [[core::sync::atomic::AtomicU64; 2 * CORE_CRUMB_N + 1]; 16] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2 * CORE_CRUMB_N + 1] }; 16];
 /// The last `CRUMB_RING` long stretches in time order (`crumb`): the counter at the end, and the ticks with the two crumbs (begin << 56 | end << 48).
 pub const CRUMB_RING: usize = 1 << 8;
@@ -577,6 +586,12 @@ pub fn crumb(c: u64) {
     }
     if (4..=8).contains(&core) {
         note(core - 3, c | (core as u64) << 56);
+    }
+    // Every core's last crumb, the A510s' too (the Pro's resets of 2026-11-19 in Lumis's clips: core 0 held the kernel lock from a syscall's entry and nothing said which), kept through the reset.
+    unsafe {
+        let a = CORE_CRUMB_LAST + core % 9 * 8;
+        write_volatile(a as *mut u64, (c & 0xFFFF_FFFF) | (cntpct() >> 10) << 32);
+        core::arch::asm!("dc civac, {a}", a = in(reg) a as u64);
     }
     unsafe {
         write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);

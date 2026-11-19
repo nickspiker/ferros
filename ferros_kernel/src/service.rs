@@ -1079,6 +1079,16 @@ fn stall_lines(freq: u64) -> alloc::string::String {
     if prev_lock & 0xFF != 0 {
         s.push_str(&alloc::format!("lock at the previous boot's end: held by core A#{}, taken at {}\n", (prev_lock & 0xFF) - 1, site_text(prev_lock >> 8)));
     }
+    // Each core's last crumb as the previous boot ended (platform::CORE_CRUMB_LAST): G#90 + n entering syscall n, G#70 + n leaving it, and how long before that boot's last crumb anywhere.
+    let last: [u64; 9] = core::array::from_fn(|c| unsafe { core::ptr::read_volatile((platform::CORE_CRUMB_LAST + 0x80 + c * 8) as *const u64) });
+    let newest = last.iter().map(|w| w >> 32).max().unwrap_or(0);
+    if newest != 0 {
+        s.push_str("last crumbs at the previous boot's end:");
+        for (c, w) in last.iter().enumerate() {
+            s.push_str(&alloc::format!(" core A#{c} G#{:X} A#{} us before;", w & 0xFFFF_FFFF, (newest - (w >> 32)) * 1024 * 1_000_000 / freq));
+        }
+        s.push('\n');
+    }
     for (prev, what) in [(false, "this boot"), (true, "the previous boot")] {
         let w = platform::stall_read(prev);
         if w[0] & 0xFF == 0 {
@@ -1088,7 +1098,8 @@ fn stall_lines(freq: u64) -> alloc::string::String {
         let lock = if holder == 0 { alloc::string::String::from("the lock free") } else { alloc::format!("the lock held by core A#{} from {}", holder - 1, site_text(w[4] >> 8)) };
         let at = if w[1] == 0 {
             let ufs = if w[2] & 0xFF == 0 { alloc::string::String::from("the UFS lock free") } else { alloc::format!("the UFS lock held by core A#{} from {}", (w[2] & 0xFF) - 1, site_text(w[2] >> 8)) };
-            alloc::format!("it did not answer (interrupts masked); {ufs}; the stalled core holds the storage locks G#{:X}", w[3])
+            let hold = if w[5] >> 63 == 0 { alloc::string::String::from("the hold not a syscall's") } else { alloc::format!("the hold syscall A#{} (x1 G#{:X}) by thread A#{}", w[5] & 0xFF, (w[5] >> 8) & 0xFF, (w[5] >> 16) & 0xFFFF) };
+            alloc::format!("it did not answer (interrupts masked); {ufs}; the stalled core holds the storage locks G#{:X}; {hold}", w[3])
         } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
         s.push_str(&alloc::format!("stall ({what}, A#{} caught): core A#{} silent A#{} ms after the last pet, caught by core A#{}, {lock}; {at}\n", w[0] >> 48, (w[0] & 0xFF) - 1, (w[0] >> 16) & 0xFF_FFFF, (w[0] >> 8) & 0xFF));
     }
