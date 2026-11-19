@@ -2177,9 +2177,16 @@ pub fn panic_grants(grants: u64) {
 /// The console line is for a kernel from before SYS_PANIC, whose death line takes the last console line (2026-11-18: GPS and Compass panicked on the 8a with an empty last line, their handler having said nothing).
 /// No allocation: the message is formatted once, into a buffer on the stack.
 pub fn panic_report(name: &str, info: &core::panic::PanicInfo) -> ! {
-    // WHY the flag: formatting the message runs the panicking code's own Display impls, which can panic again, and a second panic comes back here; formatting again would recurse until the stack ran out. The second (and any other thread's at the same time) goes straight to the exit with what the first already told the kernel.
-    static TELLING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !TELLING.swap(true, Ordering::AcqRel) {
+    // WHY the count: formatting the message runs the panicking code's own Display impls, which can panic again, and a second panic comes back here; formatting again would recurse until the stack ran out.
+    // The second tells the kernel where it is with its message only when that needs no formatting (else a fixed one), so a panic inside a panic's message still says where (2026-11-18, panictest 03: it said nothing); a third (or another thread's at the same time) goes straight to the exit.
+    static TELLING: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let nth = TELLING.fetch_add(1, Ordering::AcqRel);
+    if nth == 1 {
+        let (file, line, column) = info.location().map_or(("", 0, 0), |l| (l.file(), l.line(), l.column()));
+        let m = info.message().as_str().unwrap_or("a panic while formatting a panic's message");
+        panic_tell(m.as_bytes(), file.as_bytes(), line, column);
+    }
+    if nth == 0 {
         let mut buf = PanicText { b: [0; PANIC_TEXT], n: 0 };
         let msg = info.message();
         let text: &[u8] = match msg.as_str() {

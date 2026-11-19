@@ -7,7 +7,7 @@
 //!
 //! The ELF must be the build the device ran: nothing on the device names its build yet, so the ELF used and its time are printed with each death, and an ELF newer than the death is flagged.
 //!
-//! Usage: deaths [n = 16] [--blocks k = 2^10] [--elf <name>=<path>]... [--dir <dir>]... [--kernel <elf>] [--raw] [--from <file.vsf>]
+//! Usage: deaths [n = 16] [--blocks k = 2^10] [--elf <name>=<path>]... [--dir <dir>]... [--kernel <elf>] [--exits] [--raw] [--from <file.vsf>]
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,13 @@ impl Names {
                     None => (None, None),
                 };
                 out.push(Place { function, file, line });
+            }
+        }
+        // The function that holds the address (the last place: the others are inlined into it) by its symbol's full path: line tables name a function by its last segment only (`panic_tell`, not `ferros_sys::panic_tell`).
+        if let Some(last) = out.last_mut() {
+            let full = self.symbol(addr);
+            if !full.is_empty() {
+                last.function = full;
             }
         }
         if out.is_empty() {
@@ -215,7 +222,7 @@ fn wall(osc: i64) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("Usage: ferros-bridge deaths [n = 16] [--blocks k = 1024] [--elf <name>=<path>]... [--dir <dir>]... [--kernel <elf>] [--raw] [--from <file.vsf>]");
+    eprintln!("Usage: ferros-bridge deaths [n = 16] [--blocks k = 1024] [--elf <name>=<path>]... [--dir <dir>]... [--kernel <elf>] [--exits] [--raw] [--from <file.vsf>]");
     eprintln!("  the newest n deaths in the flash log (the newest k blocks of its ring), each frame named from its process's ELF");
     std::process::exit(1);
 }
@@ -226,7 +233,7 @@ pub async fn cmd_deaths(args: &[String]) {
     let mut n = 16u32;
     let mut blocks = 1u32 << 10;
     let mut elves = Elves { given: Vec::new(), dirs: Vec::new(), kernel: root.join("target/aarch64-unknown-none/release/ferros_kernel") };
-    let (mut raw, mut from) = (false, None);
+    let (mut raw, mut from, mut exits) = (false, None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -239,6 +246,7 @@ pub async fn cmd_deaths(args: &[String]) {
             "--dir" => elves.dirs.push(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--kernel" => elves.kernel = PathBuf::from(it.next().unwrap_or_else(|| usage())),
             "--raw" => raw = true,
+            "--exits" => exits = true,
             "--from" => from = Some(it.next().unwrap_or_else(|| usage()).clone()),
             v => n = v.parse().unwrap_or_else(|_| usage()),
         }
@@ -254,7 +262,7 @@ pub async fn cmd_deaths(args: &[String]) {
                 eprintln!("{e}");
                 std::process::exit(1);
             });
-            crate::ledger::diag(&link, &format!("log deaths {n} {blocks}")).await
+            crate::ledger::diag(&link, &format!("log deaths {n} {blocks}{}", if exits { " exits" } else { "" })).await
         }
     };
     if raw {
@@ -262,7 +270,8 @@ pub async fn cmd_deaths(args: &[String]) {
         let _ = std::io::stdout().write_all(&run);
         return;
     }
-    let found = view::deaths(&run);
+    // A saved answer (`--from`) may hold exits: shown only with `--exits`, as the device answers.
+    let found: Vec<Dead> = view::deaths(&run).into_iter().filter(|d| exits || d.death.end != death::END_EXIT).collect();
     if found.is_empty() {
         println!("no deaths in the newest A#{blocks} blocks of the flash log (--blocks for more; the ring is A#16384)");
         return;

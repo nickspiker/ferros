@@ -356,11 +356,12 @@ fn answer_locked(n: usize, room: usize) -> Vec<u8> {
 /// `diag "log deaths [n] [blocks]"`: the newest `n` deaths (entries of `kernel.process` or `kernel.panic` that carry a death's fields: ferros_ledger death) found in the newest `blocks` blocks of the ring, each as stored and opened, oldest first, the ring's state first, at most `room` bytes: what `ferros-bridge deaths` reads.
 /// A search, not a read of the chain: `diag log` checks the chain. Every system entry it passes is opened to see its category (the category is sealed), about ten entries a block.
 /// Under the flash log's lock for the whole walk, so the lines said meanwhile wait (`deferred`, or the caller): a diag, never the hot path.
-pub fn deaths(n: usize, blocks: u32, room: usize) -> Vec<u8> {
-    crate::process::LOG.with(|| deaths_locked(n, blocks, room))
+/// `exits`: plain exits too; without it only panics, faults and the kernel's own ends.
+pub fn deaths(n: usize, blocks: u32, room: usize, exits: bool) -> Vec<u8> {
+    crate::process::LOG.with(|| deaths_locked(n, blocks, room, exits))
 }
 
-fn deaths_locked(n: usize, blocks: u32, room: usize) -> Vec<u8> {
+fn deaths_locked(n: usize, blocks: u32, room: usize, exits: bool) -> Vec<u8> {
     let now = time_at(crate::platform::cntpct());
     let (Some(s), Some(key)) = (state(), system_key()) else { return Vec::new() };
     let st = view::State {
@@ -383,8 +384,10 @@ fn deaths_locked(n: usize, blocks: u32, room: usize) -> Vec<u8> {
             return true;
         }
         let Ok(p) = entry::open(stored, &key) else { return true };
-        if p.death.is_none() {
-            return true;
+        match &p.death {
+            None => return true,
+            Some(d) if d.end == ferros_ledger::death::END_EXIT && !exits => return true,
+            Some(_) => {}
         }
         let mut c = doc.to_vec();
         c.extend_from_slice(&view::opened(stored, &p).unwrap_or_default());

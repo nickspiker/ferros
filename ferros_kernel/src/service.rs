@@ -4875,8 +4875,11 @@ pub fn run(mut b: Boot) -> ! {
                             first => resp.extend_from_slice(&crate::flashlog::legacy_blocks(num(first).unwrap_or(0), num(w.next()).unwrap_or(crate::flashlog::LEGACY_STEP).clamp(1, crate::flashlog::LEGACY_STEP))),
                         },
                         Some("bench") => resp.extend_from_slice(crate::flashlog::bench().as_bytes()),
-                        // `diag "log deaths [n] [blocks]"`: the newest n deaths (2^4 if none asked) in the newest `blocks` blocks of the ring (2^10 if none asked, about ten thousand entries; the whole ring is 2^14), as VSF documents for `ferros-bridge deaths`. Nothing is clamped: a count past the ring's ends at the head, and the reply's room cuts the answer.
-                        Some("deaths") => resp.extend_from_slice(&crate::flashlog::deaths(num(w.next()).unwrap_or(1 << 4) as usize, num(w.next()).unwrap_or(1 << 10), (1 << 18) - (1 << 10))),
+                        // `diag "log deaths [n] [blocks] [exits]"`: the newest n deaths (panics and faults, plain exits too with `exits`) (2^4 if none asked) in the newest `blocks` blocks of the ring (2^10 if none asked, about ten thousand entries; the whole ring is 2^14), as VSF documents for `ferros-bridge deaths`. Nothing is clamped: a count past the ring's ends at the head, and the reply's room cuts the answer.
+                        Some("deaths") => {
+                            let (n, blocks) = (num(w.next()).unwrap_or(1 << 4) as usize, num(w.next()).unwrap_or(1 << 10));
+                            resp.extend_from_slice(&crate::flashlog::deaths(n, blocks, (1 << 18) - (1 << 10), w.next() == Some("exits")));
+                        }
                         // `diag log [n]`: the newest n entries (2^8 if none asked), as VSF documents the bridge renders; at most a reply's room (256 KiB less a KiB), the newest kept.
                         // WHY the clamp: the host's number; the ring holds about 2^17 entries a copy, and the room cuts the answer anyway.
                         n => resp.extend_from_slice(&crate::flashlog::answer(num(n).unwrap_or(1 << 8).clamp(1, 1 << 17) as usize, (1 << 18) - (1 << 10))),
