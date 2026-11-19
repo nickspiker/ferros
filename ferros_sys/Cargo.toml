@@ -11,3 +11,5 @@ path = "src/lib.rs"
 [dependencies]
 # Numbers in the device base (SETTINGS.md): `numbers()` hands an app a ready tatau formatter.
 tatau = { path = "../../tatau" }
+# Mailboxes (`mailbox`): the header, the seqlock and the payload layouts, host-tested there.
+ferros_mailbox = { path = "../ferros_mailbox" }

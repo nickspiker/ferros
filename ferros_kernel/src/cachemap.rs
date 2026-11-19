@@ -154,7 +154,27 @@ pub const SURFACE_SLOTS: usize = 16;
 /// G#A00_0000 into the GiB above the arcs' windows: each slot aligned to its 32 MiB (a handle's base must be), and the GPU's view of the surfaces (payloads/gpu: G#C000_0000 plus a surface's distance from G#CA00_0000, the old carve-out's base, which Mahere's build reckons from) starting on a GiB, G#50_0000_0000.
 pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SLOTS * SURFACE_SIZE);
 /// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out.
+/// Also the mailboxes' two windows past the surfaces' (`MBOX_VA`, `MBOX_VIEW_VA`).
 static mut L2_SURF: Table = Table([0; 512]);
+
+/// The mailboxes (2026-11-19, docs/KERNEL.md "Mailboxes"; ferros_mailbox): each one frame of the pool, taken the first time its writer or a reader asks for it (process.rs `mbox_frame`) and kept for the boot, mapped twice.
+/// The writers' window: mailbox k's frame at `MBOX_VA.0 + k * FRAME`, Normal write-back, EL0 read-write, never executable, as a surface's frame.
+/// In the surfaces' GiB past its slots (which end at G#50_2A00_0000), on a 32 MiB boundary of its own: free addresses since the camera's window moved to a GiB of its own (2026-11-15).
+pub const MBOX_VA: (usize, usize) = (0x50_3000_0000, 0x50_3000_0000 + MBOXES * MIB2);
+/// The readers' window: the same frames at `MBOX_VIEW_VA.0 + k * FRAME`, Normal write-back, EL0 read-only (AP[2], which binds EL2 too in the VHE regime, as the camera's view: process.rs `dma_span` leaves the views out), never executable.
+/// Read-only in the table itself, so no reader writes a mailbox thru its view, native or masked.
+/// A masked reader reaches nothing but its capability's region; a native one could still name the writers' window by address, as it could any region in this one shared table (no per-process tables yet: pages_allowed_when_equivalent), and is trusted by its signature, as for every region.
+pub const MBOX_VIEW_VA: (usize, usize) = (0x50_3200_0000, 0x50_3200_0000 + MBOXES * MIB2);
+/// How many mailboxes there are (ferros_mailbox `NAMES`).
+pub const MBOXES: usize = ferros_mailbox::NAMES.len();
+const _: () = assert!(MBOX_VA.0 >= SURF_VA.1 && MBOX_VA.1 <= MBOX_VIEW_VA.0 && MBOX_VIEW_VA.1 <= PUCK_VA.0 && MBOX_VA.0 / GIB == SURF_VA.0 / GIB && (MBOX_VIEW_VA.1 - 1) / GIB == SURF_VA.0 / GIB && MBOX_VA.0 % MIB2 == 0 && MBOX_VIEW_VA.0 % MIB2 == 0 && ferros_mailbox::BYTES == MIB2, "the mailboxes' windows: past the surfaces' slots in their GiB, a frame a mailbox");
+
+/// Mailbox k's frame at `pa` in both windows: read-write at the writer's, read-only at the readers'. Then `surface_unmapped` over both.
+pub fn mbox_map(k: usize, pa: usize) {
+    let t = unsafe { &mut (*(&raw mut L2_SURF)).0 };
+    t[((MBOX_VA.0 + k * MIB2) / MIB2) % 512] = pool(vhe(), pa, BLOCK) | UXN;
+    t[((MBOX_VIEW_VA.0 + k * MIB2) / MIB2) % 512] = pool(vhe(), pa, BLOCK) | UXN | AP_RO;
+}
 
 /// A puck's square (docs/PUCKS.md, 2026-11-18; owner: "supplying a diameter and having the kist return a square vector in sixteen bit that ferros will trim and place"): addresses for two squares the size of the panel's width side by side (the Pro's 1344² at 8 bytes a pixel is 13.8 MiB each), so a puck draws its next square while the display reads the last; a power of two, so a masked puck reaches its slot thru a handle.
 /// Addresses only: a slot maps as many frames as its puck asked for (process.rs `puck_size`), from none to all 32.
