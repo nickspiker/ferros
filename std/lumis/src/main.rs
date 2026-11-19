@@ -29,6 +29,12 @@ use std::sync::{Arc, Mutex};
 /// The UI sets it; the camera thread reads it at each frame and decides whether Lumis stays (owner, 2026-11-17: "lumis, if we're framing up and we go to the deck, should go bye bye, unless I'm doing a continuous save"; and of a calibration, "Basically if continuous save or cal is on").
 static BEHIND: AtomicBool = AtomicBool::new(false);
 
+/// Lumis is leaving and the camera has been (or is being) closed for it: set by whichever thread sends that CLOSE first (`close_to_leave`), so there is one, and the camera thread, back from a wait that came back empty or with a frame, reads nothing more of the view and ends.
+static LEAVING: AtomicBool = AtomicBool::new(false);
+
+/// Held by the camera thread whenever it may read the view (all of its turn but the driver's wait, `Source::next`), and by a thread that closes the camera for Lumis's leaving: the driver takes the view back at CLOSE, so a CLOSE sent from another thread must never land while a frame's rows are being read.
+static VIEW: Mutex<()> = Mutex::new(());
+
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
 const SURFACE: u64 = 3;
@@ -640,6 +646,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
     // The first frame again, now that the integrator exists: the next one (the first went to its sizing and seed).
     loop {
+        // The view read only while this is held (`VIEW`), released for the driver's wait below.
+        let mut reading = VIEW.lock().unwrap();
+        if LEAVING.load(Ordering::Acquire) {
+            drop(reading);
+            finish_leaving(integrator, vault.as_deref());
+        }
         if slit_later.is_some_and(|t| std::time::Instant::now() >= t) && integrator.header[CURRENT_MODE_IDX] != RawMode::Slitscan as u64 {
             println!("lumis: development: Slitscan");
             integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
@@ -683,7 +695,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             reopened = Some((t_close, std::time::Instant::now()));
         }
         let slit_now = src.is_slit();
-        let got = match src.next(&mut turns) {
+        drop(reading);
+        let got = src.next(&mut turns);
+        reading = VIEW.lock().unwrap();
+        // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
+        if LEAVING.load(Ordering::Acquire) {
+            drop(reading);
+            finish_leaving(integrator, vault.as_deref());
+        }
+        let got = match got {
             Some(got) => got,
             // A slit stream that ends (the Pro, 2026-11-18: a stored driver from before the detached slit stops after one; the forge driver's at 1296 and 3236 slits on LATE_CONFIG) ends that driver, not Lumis: whole frames are opened (no CLOSE: the driver closed itself, and a call would start a stored one on demand only to close it), and Slitscan takes its band from them.
             None if slit_now => {
@@ -932,11 +952,43 @@ fn close_camera(name: &str) {
     }
 }
 
-/// Lumis sent behind with no continuous save or calibration running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so.
+/// The camera closed for Lumis's leaving, once whoever asks first (`LEAVING`); the caller holds `VIEW` (the camera thread in its turn, or `close_from_behind`).
+fn close_to_leave(name: &str) {
+    if !LEAVING.swap(true, Ordering::AcqRel) {
+        close_camera(name);
+    }
+}
+
+/// Lumis sent behind with no continuous save or calibration running and no save on its way: anything encoded is kept first, the camera closed, and Lumis ends saying so. Called by the camera thread in its turn (it holds `VIEW`).
 fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> ! {
     keep_saves(vault, header);
-    close_camera(name);
+    close_to_leave(name);
     lumis_core::platform::exit_because("sent behind");
+}
+
+/// The window sent behind with nothing that keeps Lumis (no continuous save or calibration): the camera closed from a thread of its own, not at the camera thread's next frame, which on a long exposure may be years away (2026-11-18, the Pro: a shutter dragged to its last stop, about 14 years, left the driver waiting on that frame and the next Lumis unable to open). It takes `VIEW`, so it waits for a frame being read to be done; the driver answers a CLOSE while a MAP or SLITS waits (ferros cam-serve-while-waiting), and that wait comes back empty. On its own thread so the window never waits on the driver.
+fn close_from_behind(name: String) {
+    let spawned = std::thread::Builder::new().name("lumis-leave".into()).spawn(move || {
+        let _reading = VIEW.lock().unwrap();
+        close_to_leave(&name);
+    });
+    if spawned.is_err() {
+        println!("lumis: no thread to close the camera; it closes at its next frame");
+    }
+}
+
+/// The camera closed for Lumis's leaving while this thread waited on it (`LEAVING`): nothing more is read from the view; a save asked for is started, every save on its way finished and kept, and Lumis ends.
+fn finish_leaving(integrator: &mut lumis_core::CameraIntegrator, vault: Option<&kete::FlatStorage>) -> ! {
+    println!("lumis: the camera closed for leaving; finishing the saves on their way");
+    loop {
+        integrator.try_save();
+        keep_saves(vault, &mut *integrator.header);
+        if !in_flight(integrator.header[FLAGS_IDX]) {
+            lumis_core::platform::exit_because("sent behind");
+        }
+        // A save encoding on its own thread: looked at again every 2^6 ms until it is kept.
+        std::thread::sleep(std::time::Duration::from_millis(1 << 6));
+    }
 }
 
 /// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
@@ -1002,6 +1054,8 @@ struct Lumis {
     screen: Screen,
     menu: Option<Box<MainMenu>>,
     menu_dirty: bool,
+    /// The camera last opened, for the console.
+    camera_name: String,
     /// `DEV_OPEN` has opened its camera (once a launch).
     dev_opened: bool,
     surface: Option<PixelSurface>,
@@ -1029,7 +1083,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1041,6 +1095,7 @@ impl Lumis {
             None => "",
         });
         *self.opened.lock().unwrap() = None;
+        self.camera_name = cam.name.clone();
         self.screen = Screen::Opening;
         let (vault, opened) = (self.vault.clone(), self.opened.clone());
         if std::thread::Builder::new().name("lumis-camera".into()).spawn(move || camera_service(cam, calibration, vault, opened)).is_err() {
@@ -1063,8 +1118,12 @@ impl Lumis {
             self.changed = true;
             return;
         }
-        if matches!(self.screen, Screen::Menu) {
-            lumis_core::platform::exit_because("sent behind");
+        match &self.screen {
+            Screen::Menu => lumis_core::platform::exit_because("sent behind"),
+            // Nothing keeps Lumis (no continuous save or calibration): the camera closed now, not at the camera thread's next frame (`close_from_behind`); the camera thread then finishes any save on its way and ends Lumis.
+            Screen::Camera(ui) if !kept(ui.header[FLAGS_IDX]) => close_from_behind(self.camera_name.clone()),
+            // Kept, or still opening (the camera thread decides as its first frame comes).
+            _ => {}
         }
     }
 
