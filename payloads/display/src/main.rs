@@ -8483,9 +8483,9 @@ fn server(grants: u64) -> ! {
                                 continue;
                             }
                             if puck::is_puck(cir.icon) {
-                                // Its face's turn: gravity's once the AoC reports it, else the camera's and the circle's own (owner, 2026-11-18: "Pucks turn, yes. the whole gravity thing").
+                                // Its face's turn: the camera's and the circle's own, as a kist's icon turns (owner, 2026-11-18: "use it for the screen orientation instead so it rotates with the kists and then we don't have to update with the gravity and then re-render everything every movement and it'll be crisp"; until then gravity's).
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
-                                let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
+                                let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
                                 puck::seen((cir.icon - puck::PUCK0) as usize, i, sx, sy, sr, fc, fs, width);
                             }
                             discs[n] = (i as u16, sx, sy, sr);
@@ -8547,8 +8547,8 @@ fn server(grants: u64) -> ! {
                             if puck::is_puck(cir.icon) {
                                 let j = (cir.icon - puck::PUCK0) as usize;
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
-                                // The face's turn, as `puck::seen` gave it to the puck: gravity's, else the camera's and the circle's own.
-                                let (tc, ts) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
+                                // The face's turn, as `puck::seen` gave it to the puck: the camera's and the circle's own.
+                                let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
                                 let plane = th.plane & 0x00FF_FFFF;
                                 let key = [sr, puck::key(j) ^ stroke << 56, tc, ts, 0, cir.icon as i64];
                                 let d = (2 * ((sr >> 8) + 3)) as usize;
@@ -9811,7 +9811,6 @@ fn server(grants: u64) -> ! {
         let flips = unsafe { TEMPORAL } && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
         let puck_due = puck::due(!flips);
         // The last frame, or when the glows or the scene have come since and emptied it, the last plain deck frame (`LAST_DECK`), drawn with the scene and glows as they are now.
-        puck::regravity(unsafe { GRAV_TURN });
         if puck_due && !screen_off && !app_up {
             if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
                 unsafe { LAST_FRAME = LAST_DECK };
