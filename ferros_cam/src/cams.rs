@@ -48,6 +48,10 @@ pub struct Cam {
     pub line_ps: u64,
     /// The captured init's line length in pixel clocks (CCS line_length_pck), the line `line_ps` was measured at: a longer line takes proportionally longer (ferros_cam ccs `Timing`).
     pub llp: u16,
+    /// The captured init's video timing PLL, (pre_pll_clk_div G#0304, pll_multiplier G#0306), the clock `line_ps` was measured at: an init on another PLL (the main's 1:1, multiplier 215 against the binned 245) runs every line that much longer or shorter (ccs `line_ps_for`). (0, 0) where never read.
+    pub pll: (u16, u16),
+    /// The captured init's frame length in lines (CCS frame_length_lines): its frame period at `line_ps`, the list's `frame_ns` (the main's 21362 lines, 67.27 ms, measured at 67.3 ms apart; the ultrawide's 5081, 33.3 ms, its 30 a second seen; the front's and the tele's read from their inits, never streamed).
+    pub fll: u16,
     pub exposure_lines: u64,
     pub exposure_max_lines: u64,
     /// The 2 x 2 cell's channels, two bits each, top left first (0 R, 1 G, 2 B); black and white; quarter turns clockwise to stand upright.
@@ -109,6 +113,8 @@ pub const MAIN: Cam = Cam {
     skip: job::NO_SKIP,
     line_ps: crate::MAIN_LINE_PS,
     llp: 6320,
+    pll: (3, 245),
+    fll: 0x5372,
     exposure_lines: crate::MAIN_EXPOSURE_MAX_LINES,
     exposure_max_lines: crate::MAIN_EXPOSURE_MAX_LINES,
     cfa: cfa(1, 2, 0, 1),
@@ -149,6 +155,8 @@ pub const ULTRAWIDE: Cam = Cam {
     skip: job::UW_SLOT_SKIP,
     line_ps: 6_561_622,
     llp: 9568,
+    pll: (3, 178),
+    fll: 5081,
     exposure_lines: 4124,
     exposure_max_lines: 5081 - (1 << 6),
     cfa: cfa(2, 1, 1, 0),
@@ -190,6 +198,8 @@ pub const FRONT: Cam = Cam {
     skip: job::NO_SKIP,
     line_ps: 8_350_202,
     llp: 8448,
+    pll: (3, 247),
+    fll: 4001,
     exposure_lines: 1712,
     exposure_max_lines: 1712,
     cfa: cfa(1, 0, 2, 1),
@@ -228,6 +238,8 @@ pub const TELE: Cam = Cam {
     skip: job::NO_SKIP,
     line_ps: 0,
     llp: 5568,
+    pll: (4, 0x173),
+    fll: 5457,
     exposure_lines: 2232,
     exposure_max_lines: 2232,
     cfa: cfa(2, 1, 1, 0),

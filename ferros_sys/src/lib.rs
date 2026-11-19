@@ -1983,6 +1983,11 @@ pub fn wait_world(word: &core::sync::atomic::AtomicU64, expected: u64, deadline:
     svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 1, 0)
 }
 
+/// `wait` that a call to an endpoint this thread polls (a `recv` with the poll flag) also ends, with 3; a call already waiting returns 3 at once. For a server that waits on its own work (a frame its device is making for a call it holds) and on its callers in one wait, the watchdog's clock running as for any plain wait (kernel ≥ 2026-11-11; an older kernel ignores the flag).
+pub fn wait_or_call(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 2, 0)
+}
+
 /// `wait_world` that a call to an endpoint this thread polls (a `recv` with the poll flag) also ends, with 3; a call already waiting returns 3 at once. A server that waits on a doorbell of its own (a word another of its threads rings) and on its callers in one wait: the IP stack's idle wait (kernel ≥ 2026-11-11; an older kernel ignores the flag and the call waits for the deadline).
 pub fn wait_world_or_call(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
     svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 3, 0)
@@ -2041,6 +2046,46 @@ pub fn caller(token: &[u8; 32]) -> Option<u64> {
     match svc(nr::CALLER, off(token.as_ptr()), 0, 0, 0, 0) {
         ERR | NOTHING => None,
         h => Some(h),
+    }
+}
+
+/// `caller_watch`'s answer when the kernel now watches the caller's end (kernel SYS_CALLER x1, 2026-11-18).
+pub const CALLER_WATCHED: u64 = 1 << 62;
+/// The bit the kernel sets in a `caller_watch` word when the process behind the call ends.
+pub const CALLER_ENDED: u64 = 1 << 63;
+
+/// What `caller_watch` found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Watch {
+    /// The caller's end is watched: the word gets `CALLER_ENDED` when it ends. Its holds as `caller` answers them.
+    Watched(u64),
+    /// A kernel from before 2026-11-18: the caller is alive and holds these, but nothing watches its end.
+    Unwatched(u64),
+    /// The process behind the call has ended already (its reply token went with it).
+    Gone,
+    /// A kernel without SYS_CALLER, or a word the kernel refused: nothing known.
+    Unknown,
+}
+
+/// `caller`, and the end of the process behind the call watched from now (kernel SYS_CALLER x1; docs/CAMERA.md "Serving while a frame waits"): when that process ends, any way, the kernel sets `CALLER_ENDED` in `word` (an atomic or, so a count kept in its low bits stays whole) and wakes this process's threads waiting on it. Asked with the call's reply token before replying. One watch a process: a second moves it. The bit is cleared here once the watch is the kernel's (a watch moved away can no longer ring), so an end between the two shows only as the reply to that call failing: the caller checks that reply.
+pub fn caller_watch(token: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> Watch {
+    match svc(nr::CALLER, off(token.as_ptr()), off(word as *const _ as *const u8), 0, 0, 0) {
+        NOTHING => Watch::Gone,
+        ERR => Watch::Unknown,
+        h if h & CALLER_WATCHED != 0 => {
+            word.fetch_and(!CALLER_ENDED, core::sync::atomic::Ordering::SeqCst);
+            Watch::Watched(h & !CALLER_WATCHED)
+        }
+        h => Watch::Unwatched(h),
+    }
+}
+
+/// Whether the process behind a call this process holds is still alive (its reply token still held): false once it has ended, None on a kernel without SYS_CALLER. A server checks it at the moment it needs the answer (another wants what that caller holds), never on a clock.
+pub fn caller_alive(token: &[u8; 32]) -> Option<bool> {
+    match svc(nr::CALLER, off(token.as_ptr()), 0, 0, 0, 0) {
+        NOTHING => Some(false),
+        ERR => None,
+        _ => Some(true),
     }
 }
 

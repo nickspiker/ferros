@@ -60,7 +60,7 @@ pub struct Array {
     pub incs: bool,
     pub crop: bool,
     pub weighting: bool,
-    /// The binning bytes (G#0900, G#0901) a 1:1 mode writes: a guess on every sensor until a capture of Android's maximum-resolution stream (docs/CAMERA.md "The 1:1 capture").
+    /// The binning bytes (G#0900, G#0901) a 1:1 mode writes: a guess on every sensor until a capture of Android's maximum-resolution stream (docs/CAMERA.md "The 1:1 capture"). The guess (`Mode::unbinned`) only; the main's capture says G#22 G#22, with its vendor words.
     pub unbinned: [u8; 2],
     /// The gain the list offers (1024 one): the sensor's own range (`Gain::range`, read at each open and said on the console), written here once measured on the device so the list, built with no camera powered, can carry it; 1024 and 1024 (the captured code alone) until then.
     pub gain: (u64, u64),
@@ -258,6 +258,14 @@ impl Timing {
         (((p.fll as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
     }
 
+    /// Whether a new frame of `new_ns`, begun at counter tick `now`, ends more than `margin_us` before the frame in flight (begun at tick `at`, `flight_ns` long) does, at `hz` ticks a second: the camera driver then cuts the frame in flight rather than let it finish (payloads/camera `exposure_cut`; docs/CAMERA.md "Serving while a frame waits").
+    /// In 128 bits: a frame of the main's widest shift is 14 years of ns, and its product with the counter's 24.576 MHz passes 64 bits; the ticks themselves fit.
+    pub fn cut_due(at: u64, flight_ns: u64, now: u64, new_ns: u64, hz: u64, margin_us: u64) -> bool {
+        let end = at as u128 + flight_ns as u128 * hz as u128 / 1_000_000_000;
+        let new_end = now as u128 + new_ns as u128 * hz as u128 / 1_000_000_000 + margin_us as u128 * hz as u128 / 1_000_000;
+        end > new_end
+    }
+
     /// Whole lines of the mode's line in `ns`, in 128 bits (any u64 of ns over a line of at least 1 ns fits back in 64 bits).
     fn lines(&self, ns: u64) -> u64 {
         (ns as u128 * 1000 / self.line_ps_at(self.llp) as u128) as u64
@@ -279,15 +287,41 @@ impl Timing {
     }
 }
 
+/// The video timing PLL's words (CCS pre_pll_clk_div, pll_multiplier): the pixel clock is the reference over the first times the second.
+pub const PRE_PLL_CLK_DIV: u16 = 0x0304;
+pub const PLL_MULTIPLIER: u16 = 0x0306;
+
+/// Camera `c`'s line time (ps, at its captured line length `Cam::llp`) under the PLL the init in `p` leaves: the measured `Cam::line_ps` scaled by the clocks' ratio, so a line of the same clocks on a slower PLL takes longer.
+/// The main's 1:1 init runs its PLL at 215 where the binned one runs 245 (both over 3 from 24.576 MHz), so its 11600-clock line is 6.586 us, its 6327-line frame 41.7 ms, 24 a second (derived from the init, docs/CAMERA.md "1:1 on the main"; the binned line's 3.1489 us was measured, b933, and is exactly 6320 clocks of 24.576 MHz / 3 x 245).
+/// The camera's own line time where the init leaves the camera's own PLL, or either word unwritten.
+pub fn line_ps_for(c: &Cam, p: &Page) -> u64 {
+    let (pre, mult) = c.pll;
+    match (p.get(PRE_PLL_CLK_DIV), p.get(PLL_MULTIPLIER)) {
+        // WHY the zero tests: the words are the init's (vault data) and the camera's (0, 0) means its PLL was never read; a zero in either would divide by zero, and with no measured clock there is nothing to scale from.
+        (Some(q), Some(m)) if pre != 0 && mult != 0 && m != 0 && (q as u16, m as u16) != c.pll => c.line_ps * mult as u64 * q as u64 / (pre as u64 * m as u64),
+        _ => c.line_ps,
+    }
+}
+
 impl Cam {
     /// The camera's timing as the list offers it, with no sensor powered: the captured init's line and frame, the margin and shift as measured (`ARRAYS`); the driver builds its own at the open from the sensor's own words.
     pub fn listed_timing(&self) -> Timing {
+        self.listed_timing_at(self.line_ps, self.llp, (self.exposure_max_lines + MARGIN as u64) as u16)
+    }
+
+    /// A mode's timing as the list offers it: `m`'s own line and frame (the 1:1 init's, `Mode::captured_full`) at the line time its init's PLL gives (`line_ps_for`), the margin and shift as `listed_timing`'s.
+    /// The main's shift was captured in its 1:1 mode (Android at 16 s, 2026-11-17), so the 1:1 offers it as the binned mode does.
+    pub fn listed_mode_timing(&self, line_ps: u64, m: &Mode) -> Timing {
+        self.listed_timing_at(line_ps, m.llp, m.fll)
+    }
+
+    fn listed_timing_at(&self, line_ps: u64, llp: u16, fll: u16) -> Timing {
         let a = &ARRAYS[self.id as usize];
         Timing {
-            line_ps: self.line_ps,
+            line_ps,
             captured_llp: self.llp,
-            llp: self.llp,
-            fll: (self.exposure_max_lines + MARGIN as u64) as u16,
+            llp,
+            fll,
             coarse_min: 1,
             margin: a.margin.unwrap_or(MARGIN),
             long: a.margin.is_some(),
@@ -398,6 +432,8 @@ pub enum Error {
     Missing(u16),
     /// No 1:1 readout is known for this camera.
     NoFullMode,
+    /// The 1:1 init (`cam.<key>.init.full`) leaves an output of this many columns and rows that is not one pixel per array pixel over its window, or not the array's maximum resolution (`Array::full`): not a 1:1 mode.
+    NotFull(u16, u16),
     /// A slit of no rows, an odd count, or one past the readout.
     Rows(u16),
     /// A window of no columns, one not on 2^4 columns (the RAW10 groups and the front end's line), or one past the readout.
@@ -439,12 +475,29 @@ impl Mode {
         })
     }
 
+    /// The 1:1 mode a 1:1 init leaves the sensor in (`cam.<key>.init.full`, Android's own maximum-resolution init: the main's from the 16 s capture of 2026-11-17, docs/CAMERA.md "1:1 on the main"), `bin` 1.
+    /// Refused unless its output is one pixel per array pixel across its whole window and the array's maximum resolution (`Array::full`): a binned init stored under the 1:1 name would otherwise be driven as 1:1 (a slit's cell, the list's size).
+    pub fn captured_full(init: &[u8], a: &Array) -> Result<Mode, Error> {
+        if a.full.0 == 0 {
+            return Err(Error::NoFullMode);
+        }
+        let mut m = Mode::captured(init, a)?;
+        // In u32 and added, never subtracted: the window's ends are the init's (vault data), and an end before its start would wrap a u16 difference.
+        let whole = |out: u16, start: u16, end: u16| out as u32 * a.unit as u32 + start as u32 == end as u32 + 1;
+        if !whole(m.x_out, m.x_start, m.x_end) || !whole(m.y_out, m.y_start, m.y_end) || (m.x_out, m.y_out) != a.full {
+            return Err(Error::NotFull(m.x_out, m.y_out));
+        }
+        m.bin = 1;
+        Ok(m)
+    }
+
     /// Address units per output row (and column): the increment the init set, or the binning times the unit where the part bins in its binning registers alone (the Sony part).
     pub fn units_per_row(&self, a: &Array) -> u16 {
         if a.incs { self.inc[2] } else { self.bin * a.unit }
     }
 
     /// The 1:1 readout of the same array: every pixel, binning off, the increments one pixel, the output Android's maximum-resolution size (a guess on every sensor, built from the CCS registers alone; the vendor's setfile may carry mode timing this does not change: docs/CAMERA.md "The 1:1 capture").
+    /// Measured on the Pro (2026-11-16): neither the main nor the ultrawide runs it whole (the main ERR_CRC_PH, the ultrawide its binned line width); the 1:1 init Android writes differs from the binned one in its PLL, line, binning (the main G#2222, not G#0011) and about 170 vendor words (docs/CAMERA.md "1:1 on the main"). The driver no longer writes it: its 1:1 kinds replay that init (`captured_full`). Kept for the host tests and the record.
     /// The line length doubles by default: a 1:1 line carries twice the pixels of a binned one at the same link rate (the binned main already sends 4080 RAW10 pixels each 3.2 us, about 13 Gbit/s).
     pub fn unbinned(&self, a: &Array) -> Result<Mode, Error> {
         if a.full.0 == 0 {
@@ -787,6 +840,49 @@ mod tests {
         assert_eq!((p.get(0x0136), p.get(0x0304), p.get(0x0306), p.get(0x0300)), (Some(0x1800), Some(3), Some(245), Some(8)));
     }
 
+    /// The main's 1:1 init (target/cam/main-full.init, local: tools/oracle-i2c `--init` from the 16 s capture of 2026-11-17, integrity 0): Android's 8160 x 6144 mode over the binned mode's own window, one pixel an output pixel, its PLL at 215 (the binned 245), its line 11600 clocks, its frame 6327 lines with 4570 of integration as its last hold before the stream on left them; so 6.586 us a line, 41.7 ms a frame, 24 a second.
+    /// The binned init under the 1:1 name is refused, and a 1:1 slit keeps the quad cell (4 rows).
+    #[test]
+    fn the_main_full_mode() {
+        let Some(full) = local("main-full.init") else { return };
+        let (a, c) = (&ARRAYS[0], &cams::MAIN);
+        let m = Mode::captured_full(&full, a).unwrap();
+        println!("main 1:1: {m:?}");
+        assert_eq!((m.x_start, m.x_end, m.y_start, m.y_end), (16, 0x3FCF, 16, 0x300F));
+        assert_eq!((m.x_out, m.y_out, m.inc, m.bin), (8160, 6144, [2; 4], 1));
+        assert_eq!((m.binning[0], m.binning[1]), (0x22, 0x22));
+        assert_eq!((m.fll, m.llp, m.coarse, m.format), (0x18B7, 11600, 0x11DA, RAW10));
+        let p = Page::of(&full);
+        assert_eq!((p.get(PRE_PLL_CLK_DIV), p.get(PLL_MULTIPLIER), p.get(0x0300), p.get(ANALOGUE_GAIN)), (Some(3), Some(215), Some(8), Some(0x400)));
+        let line = line_ps_for(c, &p);
+        // The clock's own arithmetic: 6320 clocks at 2007.04 MHz is the measured 3.1489 us; 11600 at 1761.28 MHz.
+        let exact = 11600u64 * 3 * 1_000_000_000_000 / (24_576_000 * 215);
+        let t = c.listed_mode_timing(line, &m);
+        assert!(t.line_ps_at(11600).abs_diff(exact) <= 2, "{} {exact}", t.line_ps_at(11600));
+        let frame = t.frame_ns(&t.own(m.coarse));
+        assert!((41_600_000..41_750_000).contains(&frame), "{frame}");
+        println!("main 1:1: a line {} ps, a frame {} ns ({} a second), readout {} us", t.line_ps_at(11600), frame, 1_000_000_000 / frame, t.readout_ps(&t.own(1), 6144) / 1_000_000);
+        // The binned init's own clock leaves the measured line alone.
+        if let Some(binned) = local("cam.frame") {
+            assert_eq!(line_ps_for(c, &Page::of(&binned)), c.line_ps);
+            assert_eq!(Mode::captured_full(&binned, a), Err(Error::NotFull(4080, 3072)));
+        }
+        // Long exposures as the binned mode's: Android's shift ran in this very mode (16 s at shift 6).
+        let p16 = t.plan(16_000_000_000).unwrap();
+        // Android at 16 s in this mode wrote integration G#9446 at shift 6 (the capture's third hold): the plan agrees to a line.
+        assert_eq!((p16.llp, p16.shift), (11600, 6));
+        assert!((p16.coarse as i32 - 0x9446).abs() <= 1, "{:X}", p16.coarse);
+        assert!(t.most_ns() > 13 * 365 * 86400 * 1_000_000_000);
+        // A 1:1 slit: whole quad cells.
+        assert_eq!(m.slit(a, 2, 128, 16), Err(Error::Rows(2)));
+        let s = m.slit(a, 64, 64 + (1 << 7), 16).unwrap();
+        assert_eq!((s.y_end + 1 - s.y_start, (s.y_start - m.y_start) % 8, s.bin), (128, 0, 1));
+        // The mode as the driver writes it in the hold: the init's own registers, phase detect and embedded data off.
+        let ws = m.quiet().writes(a, c);
+        let w: Vec<&[u8]> = ws.iter().collect();
+        assert!(w.contains(&&[0x09u8, 0x00, 0x22, 0x22][..]) && w.contains(&&[0x03u8, 0x42, 0x2D, 0x50][..]) && w.contains(&&[0x07u8, 0x20, 0, 0][..]));
+    }
+
     #[test]
     fn the_ultrawide_and_tele_modes() {
         if let Some(init) = local("uw.init") {
@@ -1066,6 +1162,33 @@ mod tests {
         assert_eq!(p.shift, 6);
         assert!(p.llp > 6320 && (p.llp as u64) < 8000 && p.llp as u64 % LLP_STEP == 0, "{p:?}");
         assert!(ts.readout_ps(&p, 3072) > 11_000_000_000, "{}", ts.readout_ps(&p, 3072));
+    }
+
+    /// The cut (docs/CAMERA.md "Serving while a frame waits"): the owner's shutter dragged to the end (a 14-year frame) and back to 1 s cuts the frame in flight, at any point of it, with the counter's 24.576 MHz (no 64-bit wrap reads it as short); "a 64 s exposure, 5 s in I want 12 s" cuts (the new frame would end 47 s sooner); a new frame ending under the margin (2^20 us) sooner, or later, does not; a frame begun just now at 64 s and asked for 63.5 s does not.
+    #[test]
+    fn the_cut() {
+        let t = cams::MAIN.listed_timing();
+        let t = Timing { fll: 0x5372, coarse_min: 2, ..t };
+        let hz = 24_576_000u64;
+        let margin = 1u64 << 20;
+        let s = |x: u64| x * hz;
+        let years = t.frame_ns(&t.plan(t.most_ns()).unwrap());
+        let one = t.frame_ns(&t.plan(1_000_000_000).unwrap());
+        let at = 1u64 << 40;
+        // A second into the 14-year frame, and 13 years into it.
+        assert!(Timing::cut_due(at, years, at + s(1), one, hz, margin));
+        assert!(Timing::cut_due(at, years, at + s(13 * 365 * 86400), one, hz, margin));
+        // 64 s, 5 s in, now 12 s: about 47 s sooner.
+        let f64s = t.frame_ns(&t.plan(64_000_000_000).unwrap());
+        let f12 = t.frame_ns(&t.plan(12_000_000_000).unwrap());
+        assert!(Timing::cut_due(at, f64s, at + s(5), f12, hz, margin));
+        // 59 s in: the frame in flight ends in about 5 s, before a 12 s one would; let it finish.
+        assert!(!Timing::cut_due(at, f64s, at + s(59), f12, hz, margin));
+        // Inside the margin: 64 s just begun, 63.5 s asked.
+        let f63 = t.frame_ns(&t.plan(63_500_000_000).unwrap());
+        assert!(f63 < f64s && !Timing::cut_due(at, f64s, at, f63, hz, margin));
+        // Longer never cuts.
+        assert!(!Timing::cut_due(at, one, at, years, hz, margin));
     }
 
 

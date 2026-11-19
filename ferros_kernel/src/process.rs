@@ -1821,6 +1821,7 @@ const SYS_ARC: u64 = 40;
 /// offer(op, stow, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the stower alone: x1 the offset of its Stow token (`Object::Stow`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the stower has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Stow right, or for no such op.
 const SYS_OFFER: u64 = 41;
 /// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 32 to 47 the surface slots that process holds (slot k as its own, or inside a region holding it whole: the display server's and the GPU service's `surfaces`; bits 0 to 3 for four surfaces until 2026-11-12), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
+/// x1, since 2026-11-18 (docs/CAMERA.md "Serving while a frame waits"; the Pro that day: the camera driver sat 14 years in a frame's wait for a holder already gone): a word in the server's arc, 8-aligned as SYS_WAIT takes one (0 none, as before): the end of the process behind the call watched (`end_watch`). When that process ends, any way (`end_process`, `kill_locked`), the kernel sets bit 63 of the word (an atomic or, so a count the server keeps in the low bits stays whole) and wakes the server's threads waiting on it (`end_watch_ring`), so a server learns its holder is gone in the wait it already makes, with no poll and no call to fail first. The answer then carries `CALLER_WATCHED`; a kernel from before ignores x1 and never sets it. One watch a process: a second moves it.
 const SYS_CALLER: u64 = 42;
 /// notify(op, …): notes, what kists have waiting on the person (notify.rs, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). No capability for a kist: the kernel knows it by its capsule. Op 0 post: x1/x2 a note (ferros_kist::note, at most note::MAX bytes), a kist's own; or, from a Settings holder that is not a kist, x3 its Settings token and x4 a 32-byte source, the system's note on a kist's behalf → the note's number (0-15) | the kind the kernel decided << 8; NOTHING nobody present, or the kist at a count (WAITING waiting, or POSTS since the person last looked); ERR not a note. Op 1 withdraw: x1 the number (G#FF all) of the caller's own, or the system's with x2 a Settings token and x3 the source → how many went. Op 2, a kist: the note the person opened (x1 its number, x2/x3 a buffer) → the document's length (written whole if it fits), NOTHING when that is not the one opened. Ops 3-6 for a Settings holder that is not a kist (the deck): 3 the list (x1 the token, x2/x3 a buffer) → how many, each `notify::REC` bytes; 4 the doorbell (x1 a word, x2 the token; `BELL_NOTES`); 5 seen (x1 the token, x2 a 32-byte source, x3 a number or G#FF, x4 1 the person opened that note) → how many went; 6 one note's document (x1 the token, x2 [source 32][number u8], x3/x4 a buffer) → its length, NOTHING none. ERR for anything else.
 const SYS_NOTIFY: u64 = 43;
@@ -1833,6 +1834,8 @@ mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 pub const CALLER_KIST: u64 = 1 << 9;
+/// SYS_CALLER's answer when its x1 word now watches the caller's end (`end_watch`).
+pub const CALLER_WATCHED: u64 = 1 << 62;
 pub const ARC_GROW: u64 = 0;
 pub const ARC_SHRINK: u64 = 1;
 pub const ARC_SIZE: u64 = 2;
@@ -5630,9 +5633,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_CALLER => {
             let token = p.read(f.x[0], 32);
-            f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
-                Some(Object::Reply(caller)) if caller != KERNEL_CALLER => proc_of(caller).map_or(NOTHING, |q| caller_holds(q)),
-                _ => NOTHING,
+            let behind = match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Reply(caller)) if caller != KERNEL_CALLER => proc_of(caller).map(|q| (caller_holds(q), q.epoch)),
+                _ => None,
+            };
+            f.x[0] = match behind {
+                None => NOTHING,
+                // x1: its end watched, when the word is the server's (`end_watch`); a word outside its arc resolves or traps (`bad_buf`), and the answer is ERR.
+                Some((holds, epoch)) if f.x[1] != 0 => match end_watch(p, pi, f.x[1], epoch) {
+                    true => holds | CALLER_WATCHED,
+                    false => ERR,
+                },
+                Some((holds, _)) => holds,
             };
             0
         }
@@ -6798,6 +6810,49 @@ fn arc_refill(p: &mut Process, lo: usize, hi: usize) -> Result<(), u64> {
     Ok(())
 }
 
+/// The ends watched (SYS_CALLER x1): (the watcher's slot, its epoch, the word's address in its arc, the epoch of the process it watches). One a watcher, so the table holds at most one a process. Under the kernel lock.
+static mut END_WATCHES: Vec<(usize, u64, usize, u64)> = Vec::new();
+
+/// Process `p` (slot `pi`) watches the end of the process with `watched` (the one behind a call it holds the reply token of): the word at arc offset `at` (8-aligned, inside the arc, as SYS_WAIT takes one) gets bit 63 when that process ends (`end_watch_ring`). A watch it held before is dropped. The word is the process's own and not written now: the server clears the bit itself, after this (a watch moved here can no longer ring), and an end between the two shows as its reply to that call failing. False for a word outside its arc. Under the kernel lock.
+fn end_watch(p: &Process, pi: usize, at: u64, watched: u64) -> bool {
+    // A word outside the arc: the syscall resolves or traps (`bad_buf`).
+    let Some(addr) = p.word(at) else {
+        p.bad_buf(at, 8, true);
+        return false;
+    };
+    let w = unsafe { &mut *(&raw mut END_WATCHES) };
+    w.retain(|e| e.0 != pi);
+    w.push((pi, p.epoch, addr, watched));
+    true
+}
+
+/// The process with `epoch` ended: every word watching it (`end_watch`) gets bit 63, by an atomic or, and its process's threads waiting on that word are woken (0, as a wake), so a server held in a wait for its own device (a frame 14 years long) hears its caller's end in that same wait. A watcher that has ended since (its slot empty, dying, or a successor's), or a word its arc no longer holds (shrunk, or given back as a hole), is never written. The ended process's own watches go with it. Under the kernel lock.
+fn end_watch_ring(epoch: u64) {
+    let kk = k();
+    let w = unsafe { &mut *(&raw mut END_WATCHES) };
+    for &(pi, we, addr, watched) in w.iter() {
+        if watched != epoch {
+            continue;
+        }
+        // WHY the checks: the word was resolved at the registration; the watcher may have ended, or shrunk its arc or given that frame back since, and a write there would land in another process's memory or an unmapped slot.
+        if !kk.procs.get(pi).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == we && !q.dying && addr + 8 <= q.arc.base + q.arc.size && !q.in_hole(addr - q.arc.base, 8)) {
+            continue;
+        }
+        // SAFETY: `addr` is an 8-aligned word inside the watcher's live arc (checked just above, under the lock that every arc change takes), identity-mapped Normal memory the kernel reads and writes as `bell_ring` does.
+        unsafe { (*(addr as *const core::sync::atomic::AtomicU64)).fetch_or(1 << 63, core::sync::atomic::Ordering::SeqCst) };
+        for (t, x) in kk.threads.iter_mut().enumerate() {
+            if let Some(x) = x {
+                if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
+                    x.state = State::Runnable;
+                    x.frame.x[0] = 0;
+                    enqueue_back(t);
+                }
+            }
+        }
+    }
+    w.retain(|&(_, we, _, watched)| watched != epoch && we != epoch);
+}
+
 /// A word in the caller's arc (`at`, 8-aligned and inside the arc as SYS_WAIT takes one) rung for `source` from now, `value` written there at once; one the process registered for the source before is dropped. Under the kernel lock.
 fn bell_register(p: &Process, pi: usize, source: usize, at: u64, value: u64) -> u64 {
     // A word outside the arc: the syscall resolves or traps (`bad_buf`).
@@ -6977,6 +7032,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         pucks_free(p.epoch);
         crate::irqarm::disarm_epoch(p.epoch);
         cam_free(p.epoch);
+        end_watch_ring(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
         claims_orphaned(p.epoch);
@@ -7309,6 +7365,7 @@ fn kill_locked(name: &[u8]) -> bool {
     pucks_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::irqarm::disarm_epoch(kk.procs[i].as_ref().unwrap().epoch);
     cam_free(kk.procs[i].as_ref().unwrap().epoch);
+    end_watch_ring(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
     claims_orphaned(kk.procs[i].as_ref().unwrap().epoch);
