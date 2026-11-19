@@ -141,7 +141,8 @@ fn video_fps(header: &[u64]) -> u32 {
 }
 
 /// A clip started on the held frame `head`, `rows` its rows in the view: the extent opened (as large as the vault gives, from `CLIP_BLOCKS_MOST` halving), generation 0 written, the coder's workers and the writer started. The clip's facts are the still's (the camera's identity and optics, the black and white levels, the 2 x 2 mosaic from the frame), its orientation the EXIF code of the sensor's mount and the hold (as a still's tag), its time the frame's.
-fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing, head: &camera::FrameHeader, rows: &ViewRows) -> Result<Clip, String> {
+/// `digests`: each frame's source hash taken as it is coded (ferros_clip `Mode::source_digests`, about 2^-4 of the coding), for a development run to say (`DEV_VIDEO`) and a host to check the clip against (tools/clip-check).
+fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing, head: &camera::FrameHeader, rows: &ViewRows, digests: bool) -> Result<Clip, String> {
     let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
     let mount = header[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX];
     let held = header[lumis_core::shared_memory::DEVICE_ROTATION_IDX];
@@ -180,7 +181,7 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
             slots: 4,
             blocks,
             at: ferros_clip::eagle_osc(head.time as u64),
-            source_digests: false,
+            source_digests: digests,
         };
         let ext = ferros_clip::ferros::Extent::new(slot, &name);
         match ferros_clip::Recorder::start(&clip_cam, &mode, Box::new(ferros_clip::ferros::ExtentSink(ferros_clip::ferros::Extent::new(slot, &name)))) {
@@ -319,7 +320,7 @@ const DEV_NO_SET: u8 = 1 << 7;
 /// Development, the fourth knobs byte (the input's seventeenth): the 16th frame's mean of each place in a 4 x 4 cell over the middle of the frame (the colour filter's table: a Bayer cell's two greens alike, a quad's 2 x 2 blocks alike); and a VSF 8B save at the 32nd (Lumis's developed frame, kept in the vault as any save).
 const DEV_CELLS: u8 = 1 << 0;
 const DEV_SAVE: u8 = 1 << 1;
-/// Development, the fourth knobs byte: open in RAW video (on a camera that offers it) and record from the 16th frame until the run ends, at the input's 23rd byte's frames a second (`dev_video_fps`; 0 the UI's default): a clip with no tap.
+/// Development, the fourth knobs byte: open in RAW video (on a camera that offers it) and record from the 16th frame until the run ends, at the input's 23rd byte's frames a second (`dev_video_fps`; 0 the UI's default): a clip with no tap. Every 2^3-th frame's source hash is said on the console ("lumis: RAW video: frame <index> source <hex>"), for tools/clip-check against the pulled clip.
 const DEV_VIDEO: u8 = 1 << 2;
 
 /// The input's 23rd byte: DEV_VIDEO's frames a second, 0 when shorter.
@@ -1081,7 +1082,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             // Held for this frame's hand-over only (`seal_at_exit` takes it from another thread otherwise).
             let mut clip = CLIP.lock().unwrap();
             match (asked, clip.is_some(), paced, &got) {
-                (true, false, Some(fps), Got::Frame(head, Taken::View(rows))) => match start_clip(&cam, &integrator.header, ferros_clip::Pacing::of(fps), head, rows) {
+                (true, false, Some(fps), Got::Frame(head, Taken::View(rows))) => match start_clip(&cam, &integrator.header, ferros_clip::Pacing::of(fps), head, rows, dev_knobs4() & DEV_VIDEO != 0) {
                     Ok(c) => *clip = Some(c),
                     Err(e) => {
                         println!("lumis: camera {}: RAW video: no clip ({e})", cam.name);
@@ -1101,7 +1102,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     gain: head.gain,
                     focus: head.focus,
                 };
+                let index = c.rec.stats().frames;
                 let taken = c.rec.frame(&f);
+                if taken == ferros_clip::Taken::Recorded && dev_knobs4() & DEV_VIDEO != 0 && index & ((1 << 3) - 1) == 0 {
+                    let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
+                    println!("lumis: RAW video: frame {index} source {h}");
+                }
                 let st = c.rec.stats();
                 integrator.header[VIDEO_FRAMES_IDX] = st.frames;
                 integrator.header[VIDEO_DROPPED_IDX] = st.dropped;
