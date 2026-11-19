@@ -132,8 +132,17 @@ fn seal_at_exit() {
     }
 }
 
-/// While a clip records, the preview integrates a frame at most this often (2^9 ms, about 2 a second): a frame's hand-over takes 26 to 30 ms of a 33 ms frame at 30 a second, and an integration about 29 ms more on the A510s beside the coder (the Pro, 2026-11-19), which the camera thread then makes up over about five frames; at 2^7 ms it fell behind before it had, and the camera's count stepped past frames lost to the clip.
-const PREVIEW_GAP: std::time::Duration = std::time::Duration::from_millis(1 << 9);
+/// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost.
+const PREVIEW_GAP_LOG2: u32 = 8;
+
+/// The preview's gap while recording: 2^`PREVIEW_GAP_LOG2` ms, or the input's 24th byte's power of two (development: `DEV_VIDEO` runs measure where drops begin).
+fn preview_gap() -> std::time::Duration {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b) as usize;
+    let at = 10 + camera::MODE_BLOCK;
+    let log2 = if n > at && b[at] != 0 { b[at] as u32 } else { PREVIEW_GAP_LOG2 };
+    std::time::Duration::from_millis(1 << log2)
+}
 
 /// The clips extent asked for at most, blocks of `ferros_clip::BLOCK` (2^34 bytes, 16 GiB: about 35 minutes at 30 a second at the codec's measured 2 to 3.5 times), halved on each refusal (no free stretch that long) down to `CLIP_BLOCKS_LEAST`.
 const CLIP_BLOCKS_MOST: u64 = 1 << 22;
@@ -925,6 +934,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut paced: Option<u32> = None;
     // A clip being started (`start_clip` on its own thread): its answer, taken at the first turn after it comes.
     let mut starting: Option<std::sync::mpsc::Receiver<Result<Clip, String>>> = None;
+    // A RAW video preview frame's settings, integrated beside its hand-over this turn.
+    let mut preview_done: Option<(i32, i64, f32)> = None;
     // The last frame's integration, us: said with a RAW video drop that may follow it.
     let mut last_preview_us = 0u64;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
@@ -1208,9 +1219,30 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     focus: head.focus,
                 };
                 let index = c.rec.stats().frames;
-                let t_code = std::time::Instant::now();
-                let taken = c.rec.frame(&f);
-                let code_us = t_code.elapsed().as_micros() as u64;
+                // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"): the hand-over on a scoped thread of its own, the integration here, both done before the next MAP gives the buffer back; the preview then costs the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
+                let preview_now = c.preview.elapsed() >= preview_gap();
+                let (taken, code_us) = if preview_now {
+                    c.preview = std::time::Instant::now();
+                    let rec = &mut c.rec;
+                    let (taken, code_us, pre) = std::thread::scope(|s| {
+                        let coder = s.spawn(|| {
+                            let t = std::time::Instant::now();
+                            let taken = rec.frame(&f);
+                            (taken, t.elapsed().as_micros() as u64)
+                        });
+                        let t = std::time::Instant::now();
+                        let r = integrator.process_rows(rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad());
+                        last_preview_us = t.elapsed().as_micros() as u64;
+                        let (taken, code_us) = coder.join().expect("the hand-over thread does not panic");
+                        (taken, code_us, r)
+                    });
+                    preview_done = Some(pre);
+                    (taken, code_us)
+                } else {
+                    let t_code = std::time::Instant::now();
+                    let taken = c.rec.frame(&f);
+                    (taken, t_code.elapsed().as_micros() as u64)
+                };
                 if taken == ferros_clip::Taken::Recorded && dev_knobs4() & DEV_VIDEO != 0 && index & ((1 << 3) - 1) == 0 {
                     let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
                     println!("lumis: RAW video: frame {index} source {h}");
@@ -1237,13 +1269,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 };
                 if taken == ferros_clip::Taken::Ended {
                     end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "the clip's space is full, or a write failed");
-                } else if c.preview.elapsed() < PREVIEW_GAP {
+                } else if !preview_now {
                     // Not this frame for the preview: the camera's next frame comes first.
                     keep_saves(vault.as_deref(), &mut *integrator.header);
                     frames += 1;
                     continue;
-                } else {
-                    c.preview = std::time::Instant::now();
                 }
             }
         }
@@ -1256,13 +1286,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             integrator.header[lumis_core::shared_memory::SAVE_FORMAT_IDX] = lumis_core::shared_memory::SAVE_FORMAT_VSF8;
             integrator.header[FLAGS_IDX] |= MANUAL_SAVE_BIT;
         }
-        let (iso, shutter_ns, focus) = match got {
+        // A RAW video clip's preview frame was integrated beside its hand-over (above); any other frame is integrated here.
+        let (iso, shutter_ns, focus) = if let Some(r) = preview_done.take() { r } else { match got {
             Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
             // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
             Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
             Got::Slit { rows, .. } => integrator.process_slit(&rows, rows.rows, sent.0, sent.1, sent.2),
-        };
+        } };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
         last_preview_us = (t_after - t_integrate).as_micros() as u64;
