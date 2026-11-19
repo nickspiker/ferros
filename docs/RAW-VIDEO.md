@@ -268,6 +268,44 @@ To check a pulled clip, run clip-check on it: it opens the clip by its index (re
 - **UNMAP**: a deleted or dropped extent's blocks go back to the clips area's free list at once, but they are not unmapped on the flash (ferros sends no UNMAP), so the device's garbage collection and WriteBooster do not know they are free (2026-11-19: 23 agents' test clips, about 44 GB, dropped without one).
 - **The pull** is the bridge's 3 MiB a command thru the kernel's vault channel; a faster path (bulk USB straight from the extent) is open.
 
+### Grading a clip (on the host)
+
+A clip is graded on the owner's computer, never on a device: Opsin (`/mnt/Harbor/Code/opsin`, branch `raw-clips`) opens, plays and grades a clip, and exports it as CinemaDNG for other tools (owner, 2026-11-19: "VSF -> cinema DNG or TIFF or png sequence or video or whatever man"; the one foreign encoder approved, host only).
+Opsin builds against vsf `raw-video` with `clip::edit_generation` and `Reader::visual` (a local vsf commit until the raw-video branch takes it).
+
+1. **Pull it.** The extent's record gives its bytes; the pull writes them:
+   ```bash
+   cargo run -p ferros-bridge -- store extent-info rawrec.clip
+   cargo run -p ferros-bridge -- store extent rawrec.clip <bytes> clip.vsf
+   ```
+   Lumis names its clips `video/<YYYYMMDD_HHMMSS_mmm>.vsf` in its own domain; rawrec's is `rawrec.clip`.
+2. **Check it** against the frames as the camera wrote them (rawrec's hashes; Lumis's DEV_VIDEO run prints them on the console):
+   ```bash
+   tools/clip-check/target/release/clip-check clip.vsf clip.hashes.vsf
+   ```
+3. **Give it its camera's IDT.** A clip from ferros carries no characterization yet (`ferros_clip::Camera::characterization` is `None` in rawrec and Lumis); the IDT is a property of the sensor, appended to the clip as a generation (undo: `vsfinfo undo`):
+   ```bash
+   opsin --characterize clip.vsf "pixel 8 pro calibration data/derived/cam2-main.idt.vsf"
+   ```
+   The device's own copy is the vault's `cam.<key>.idt` (the main is `boitata`).
+4. **Look and grade in Opsin.** `opsin clip.vsf`: `,` `.` a frame, `<` `>` a second, Home and End, Space plays by the frames' own times; exposure, HDR, crop and rotation as for a still; `V` appends the grade to the clip as a generation (no frame's bytes move); `E` a frame as JPEG.
+5. **Export for Resolve.** `D` in the viewer, or:
+   ```bash
+   opsin --export-dng clip.vsf <out folder>
+   opsin --verify-dng clip.vsf <out folder>
+   ```
+   One uncompressed DNG a frame in `<out folder>/<clip>/` (`<clip>_000000.dng` on), the mosaic untouched (10-bit samples as 16-bit words, the clip's CFA, black 64, white 1023), `ColorMatrix1/2`, `ForwardMatrix1/2` and `AsShotNeutral` from the IDT, `FrameRate`, `TimeCodes`, capture times, exposure, gain as ISO (100 at unity), make, model and `UniqueCameraModel`.
+   The colour derivation is Opsin's `src/cinemadng.rs` module doc: `ColorMatrix = (VSF_RGB2XYZ M diag(s))^-1` normalized at D50, the same matrix at Standard A and D65 (the characterization is linear); `ForwardMatrix_L = Bradford(L to D50) ColorMatrix^-1 diag(ColorMatrix W_L)`; `AsShotNeutral` the camera's response to equal-energy light, VSF RGB's white (the Pro's main: 0.545, 1, 0.667).
+   The verify reads every frame back with limbus and compares its samples with the clip's decode bit for bit.
+   In Resolve the folder imports as one clip and its Camera RAW panel develops it from these tags (not yet opened in Resolve: Resolve on this host was not run).
+
+Measured 2026-11-19, the Pro's 256-frame 30/s clip (rawrec's clip256): exported in 4.9 s on the 5950X (6.0 GB), 256 of 256 frames bit exact read back by limbus, and clip-check 256 of 256 bit exact against the camera's frames, so every DNG holds exactly the samples the sensor gave; exiftool -validate OK; RawTherapee develops a frame with the hue Opsin renders the clip in.
+
+**A Resolve plugin that reads VSF clips directly: not possible today.** Resolve's only codec plugin SDK (`/opt/resolve/Developer/CodecPlugin`, the "IO Encode Plugin SDK", Studio only) is encode only: its messages are codec init, process data and container add track and write, for the Deliver page; there is no reader or decoder message, so a plugin cannot add an input format or feed the Camera RAW panel.
+Blackmagic RAW's SDK decodes BRAW only.
+The other route is an OpenFX generator (`/opt/resolve/Developer/OpenFX`, free and Studio): a plugin with a clip path parameter that decodes the frame for the timeline's time and debayers it to scene-linear RGB itself; it would work, but it is not a RAW clip in Resolve (no Camera RAW panel, no media pool clip with its own timecode, the plugin's own debayer).
+So the DNG sequence is the RAW route into Resolve.
+
 ## The format decision (the owner's)
 
 Nothing below is decided; each is a new format or a new place under Rule -1.
