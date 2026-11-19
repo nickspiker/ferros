@@ -2028,6 +2028,18 @@ pub struct ExtentGrant {
 pub const EXTENT_GRANTS_MOST: usize = 1 << 3;
 pub static mut EXTENT_GRANTS: [ExtentGrant; EXTENT_GRANTS_MOST] = [ExtentGrant { holder: 0, first: 0, blocks: 0 }; EXTENT_GRANTS_MOST];
 
+/// A process's end: the extents it was given go (their capabilities die with its cspace), so a clip that ends with its writer no longer holds the A715s' recording ceiling (service.rs `recording`). Under the kernel lock.
+fn extents_free(epoch: u64) {
+    let grants = unsafe { &mut *(&raw mut EXTENT_GRANTS) };
+    for g in grants.iter_mut().filter(|g| g.holder == epoch) {
+        g.holder = 0;
+    }
+    EXTENTS_OPEN.store(grants.iter().any(|g| g.holder != 0), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether any clip's extent is given to a writer now: what holds the A715s at the recording ceiling (service.rs `recording`; the owner, 2026-11-19: any heat cut for RAW video, scoped to an open clip).
+pub static EXTENTS_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// SYS_BLOCK x1 bit 3 on the `clips` window (the vault process's, while it serves a call): give the caller its reply token names the extent of `blocks` blocks from window block `first`; x4 the offset of [the reply token 32][the given token 32, written]. Bit 4 with bit 3: take every extent of that caller back instead (its seal). 0 or ERR. Under the kernel lock.
 /// WHY the bounds: `first` and `blocks` are the vault process's words; an extent outside its window would reach blocks the vault keeps or no window holds.
 fn extent_give(p: &Process, w: &BlockWindow, first: u64, blocks: u64, io_off: u64, take_back: bool) -> u64 {
@@ -2049,6 +2061,7 @@ fn extent_give(p: &Process, w: &BlockWindow, first: u64, blocks: u64, io_off: u6
         }
     }
     if take_back {
+        EXTENTS_OPEN.store(grants.iter().any(|g| g.holder != 0), core::sync::atomic::Ordering::Relaxed);
         return 0;
     }
     if blocks == 0 || first >= w.blocks || blocks > w.blocks - first {
@@ -2057,6 +2070,7 @@ fn extent_give(p: &Process, w: &BlockWindow, first: u64, blocks: u64, io_off: u6
     // A slot free, or one whose holder has ended.
     let Some(i) = grants.iter().position(|g| g.holder == 0 || !k().procs.iter().flatten().any(|r| r.epoch == g.holder && !r.dying)) else { return ERR };
     grants[i] = ExtentGrant { holder: q.epoch, first, blocks };
+    EXTENTS_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
     let t = mint(Object::Extent(i), RIGHT_SEND, q.epoch);
     q.cspace.push(CapEntry { token: t, object: Object::Extent(i), rights: RIGHT_SEND });
     p.write(io_off + 32, &t);
@@ -4193,6 +4207,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         EOP_SEAL => len == 40,
         EOP_INFO => len == EXTENT_INFO,
         EOP_DELETE => len == 0,
+        EOP_SPACE => len == EXTENT_SPACE,
         _ => false,
     };
     if !rel_ok || !len_ok {
@@ -4237,7 +4252,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
             }
         }
     }
-    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN) { len as u64 } else { 0 };
+    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN | EOP_SPACE) { len as u64 } else { 0 };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
         t.what = VOP_EXTENT as u64 | (len as u64) << 8 | block << 32;
@@ -4259,6 +4274,9 @@ pub const EOP_INFO: u8 = 4;
 /// Drop it → 0, NOTHING when the name has none.
 pub const EOP_DELETE: u8 = 5;
 pub const EXTENT_INFO: usize = 8 + 8 + 1 + 32 + 8 + 8;
+/// The recording space, read only (the name any of the caller's, it is not looked up) → the clips area's free blocks; the buffer (`EXTENT_SPACE` bytes, u64 LE each): the area's blocks, the blocks every extent takes, the longest free stretch, the blocks the caller's own domain's extents take, how many they are.
+pub const EOP_SPACE: u8 = 6;
+pub const EXTENT_SPACE: usize = 5 * 8;
 
 /// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.
 fn kist_domain_forward(f: &mut Frame, cur: usize, ep: usize, d: &[u8; 32]) -> u64 {
@@ -4512,6 +4530,13 @@ pub fn vault_stamp_addr(op: u8, scope: &str, addr: &[u8; 32], rest: &[u8]) -> Op
     name.push(1);
     name.extend_from_slice(addr);
     with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(sc.prefix)], &name, rest))
+}
+
+/// A stamp for the kernel's own call on a name in a kist's own domain (the bridge's `store extent --kist`: a RAW clip Lumis recorded, pulled to the host; development builds only), the kist named by its identity as the stower names one (`kist_store_route`): the person's class always, so only while they are present. None with no system secret or a locked class.
+pub fn vault_stamp_kist(op: u8, developer: &[u8; 32], option: &[u8; 32], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let ihi = crate::oracle::ihi(developer, option)?;
+    let d = blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi);
+    with_lock_held_or(|| stamp(op, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], name, rest))
 }
 
 /// A stamp for the kernel's own listing of scope `i` of `STORES` from `offset`, at most `len` bytes (names one per line): every class the scope holds, the person's left out while locked. With its prefix, to make the names whole.
@@ -7626,6 +7651,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         pucks_free(p.epoch);
         crate::irqarm::disarm_epoch(p.epoch);
         cam_free(p.epoch);
+        extents_free(p.epoch);
         end_watch_ring(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
@@ -7961,6 +7987,7 @@ fn kill_locked(name: &[u8]) -> bool {
     pucks_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::irqarm::disarm_epoch(kk.procs[i].as_ref().unwrap().epoch);
     cam_free(kk.procs[i].as_ref().unwrap().epoch);
+    extents_free(kk.procs[i].as_ref().unwrap().epoch);
     end_watch_ring(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
