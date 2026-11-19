@@ -84,7 +84,7 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     put("rotation", u(c.rotation as u64));
     put("idt", abs.matrix.iter().map(|v| VsfType::f5(*v)).collect());
     put("sensitivity", sens.iter().map(|v| VsfType::f5(*v)).collect());
-    // Exposure: one line to the longest offered: past the init's frame where the camera's margin was measured, the frame and then the line lengthened (ferros_cam ccs `Timing::most_ns`; the main and the ultrawide about 1.02 s, at the longest line time the front end took on the Pro); the init's own integration elsewhere.
+    // Exposure: one line to the longest offered, per readout: past the init's frame where the camera's margin was measured, the frame lengthened, then the vendor shift up to the longest its frame counter holds (ferros_cam ccs `Timing::most_ns`, `Lte::frame_bits`: the main 13524 s binned and 28286 s at 1:1, measured on the Pro 2026-11-18; the ultrawide, no shift, its 16-bit frame, 0.430 s); the init's own integration elsewhere. SET refuses past it.
     let t = r.timing;
     put("exposure_min", u(t.line_ps_at(t.llp) / 1000));
     put("exposure_max", u(t.most_ns()));

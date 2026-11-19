@@ -10,6 +10,7 @@
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 //! A fourth byte of 9 drives the driver while a long frame's MAP waits (2026-11-18, docs/CAMERA.md "Serving while a frame waits"): OPEN with the view, the exposure to 2^n s (the sixth byte; 10 if 0), a second thread MAPping, then LIST, STATS and a SET back to 67 ms timed (the frame in flight cut), the exposure long again, and the end by the seventh byte: 0 CLOSE, 1 this process ends with the MAP held, 2 it holds until killed from the host (`00000009` the main, 2^10 s, CLOSE; `00000009001C01` the main, 2^28 s, about 8.5 years, its end; `00000009001C02` the same, killed from the host).
+//! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut) (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
 //! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s).
 #![no_std]
 #![no_main]
@@ -73,7 +74,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let buf = unsafe { &mut *(&raw mut BUF) };
     let t0 = ferros_sys::now();
     // The ladder (fourth byte 5) opens first: a driver spawned by hand ends after a LIST that leaves nothing open, and the OPEN behind it would then start the vault's driver, not the one under test (2026-11-17, b932: the first ladder ran on the stored driver).
-    let n = if matches!(arg(3), 5 | 6 | 9) { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
+    let n = if matches!(arg(3), 5 | 6 | 9 | 10) { 0 } else { call(ep, &[0], &mut buf[..1 << 16]) };
     say!(g, "camtest: LIST A#{} bytes in A#{} ms\n", if n == ERR { 0 } else { n }, ferros_sys::us_since(t0) / 1000);
     if n == ERR {
         ferros_sys::exit(1);
@@ -96,6 +97,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     // A fourth byte of 4: where the analogue gain really ends (owner, 2026-11-17: "Was that a typo?" of 160x), from raw samples thru the view.
     if arg(3) == 4 {
         gain_noise(g, ep, id, arg(0), arg(5), t1);
+    }
+    // A fourth byte of 10: where the main's long exposure really ends (the shift's ceiling), each shift held or not in a window.
+    if arg(3) == 10 {
+        ceiling(g, ep, id, arg(0), arg(5), arg(6), u16::from_le_bytes([arg(8), arg(9)]), t1);
     }
     // A fourth byte of 9: the driver serving while a long frame's MAP waits (LIST, STATS, SET with a cut, then CLOSE or the holder's end).
     if arg(3) == 9 {
@@ -286,7 +291,7 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_l
             sum += m;
             hdr = x;
         }
-        let mut c = [0u8; 103];
+        let mut c = [0u8; 107];
         let cn = call(ep, &[11], &mut c);
         let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
         say!(g, "camtest: exposure A#{ms} ms: header A#{} us; frames A#{} us apart; mean sample A#{} sixteenths; the sensor reads frame A#{} lines of A#{} clocks, integration A#{}{}\n", hdr / 1000, gaps / per as u64, sum / per as u64, be(38), be(40), be(67), if cn == ERR { " (CAPS failed)" } else { "" });
@@ -346,7 +351,7 @@ fn shift_sweep(g: u64, ep: u64, per: u8, top: u8, bottom: u8, t1: u64) -> ! {
             }
             last = now;
         }
-        let mut c = [0u8; 103];
+        let mut c = [0u8; 107];
         let cn = call(ep, &[11], &mut c);
         let be = |k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
         say!(g, "camtest: shift A#{s}: exposure A#{} us asked; frames A#{} us apart; mean A#{} sixteenths; the sensor reads frame A#{} / line A#{} / integration A#{}{}\n", ns / 1000, gaps / per as u64, sum / per as u64, be(38), be(40), be(67), if cn == ERR { " (CAPS failed)" } else { "" });
@@ -741,12 +746,100 @@ extern "C" fn waiter(_: u64) -> ! {
             W_EXP.store(u64::from_le_bytes(h[16..24].try_into().unwrap()), SeqCst);
         }
         W_AT.store(ferros_sys::now(), SeqCst);
+        // The ceiling sweep clears it at its window's start: the first answer after that.
+        let _ = W_FIRST.compare_exchange(0, W_AT.load(SeqCst), SeqCst, SeqCst);
         W_N.fetch_add(1, SeqCst);
         ferros_sys::wake(&W_N, 1);
         if !ok {
             ferros_sys::thread_exit(0);
         }
     }
+}
+
+/// The waiter's first answer since the ceiling sweep last cleared it (counter ticks, 0 none yet).
+static W_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The main's line time at its 1:1 mode's 11600 clocks (ps): `MAIN_LINE_PS` under the 1:1 init's PLL (215 for 245, ferros_cam ccs `line_ps_for`), as the driver derives it.
+const MAIN_FULL_LINE_PS: u64 = 6_586_118;
+
+/// Where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): on 2026-11-18 evening a 2^28 s exposure at shift 31 gave frames at the sensor's floor while 1024 s at shift 13 held.
+/// OPEN with the view (the mode block's kind from the eighth byte: 2 the 1:1), a waiter thread MAPping, then for each shift from `bottom` (14 if 0) to `top` (31 if 0): the shift forced (SET 3) and an exposure of `coarse` lines of 2^shift (2^15 if 0: an exposure that needs exactly that shift, as the least-shift plan would take it), half a unit more so the driver's division lands on `coarse`.
+/// Then 2^20 us for frames of the old timing to pass, and a window of `window` s (8 if 0): the frames the waiter got in it, their spacing, the sensor's own frame counter (G#0005) before and after, and its frame, line, integration and shift words read back (CAPS).
+/// A held frame shows as no frame in the window; frames at the sensor's floor (about 10 ms) or at any other spacing say what the sensor did with it.
+/// After each window the shift back to the least and the exposure to 2^26 ns (67 ms): the frame in flight is cut (`exposure_cut`), and the next frame must come within 4 s, else the run closes there (stop at the first stream whose frames stop).
+fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16, t1: u64) -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let us = |t: u64| ferros_sys::us_since(t);
+    let hz = ferros_sys::freq();
+    let mut r = [0u8; 64];
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
+    say!(g, "camtest: ceiling: OPEN with the view answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, us(t1) / 1000);
+    if n == ERR || r[0] != 0 || n < 48 {
+        ferros_sys::exit(1);
+    }
+    let set = |what: u8, value: u64| -> u8 {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        let mut a = [0xEEu8; 1];
+        if call(ep, &m, &mut a) == ERR { 0xEE } else { a[0] }
+    };
+    let caps = |c: &mut [u8; 107]| -> bool { call(ep, &[11], c) != ERR };
+    let line_ps = if KIND.load(SeqCst) == 2 { MAIN_FULL_LINE_PS } else { MAIN_LINE_PS };
+    let window = if window == 0 { 8 } else { window as u64 };
+    let top = if top == 0 { 31 } else { top };
+    let bottom = if bottom == 0 { 14 } else { bottom };
+    let coarse = if coarse == 0 { 1u16 << 15 } else { coarse };
+    W_EP.store(ep, SeqCst);
+    ferros_sys::thread_spawn(waiter, unsafe { &mut *(&raw mut W_STACK) }, 0);
+    let pause_us = |u: u64| ferros_sys::sleep_until(ferros_sys::now() + hz * u / 1_000_000);
+    pause_us(1 << 20);
+    say!(g, "camtest: ceiling: A#{} frames before the sweep; line A#{line_ps} ps, A#{coarse} lines of 2^shift, shifts A#{bottom} to A#{top}, a window of A#{window} s\n", W_N.load(SeqCst));
+    for s in bottom..=top {
+        // WHY the 128 bits: 65535 lines of 2^31 at 6.6 us is about 9 x 10^20 ps, past 64 bits; the ns fit (about 29 years).
+        let lines = ((coarse as u128) << s) + (1u128 << s >> 1);
+        let ns = (lines * line_ps as u128 / 1000) as u64;
+        let (a, b) = (set(3, s as u64), set(0, ns));
+        let t_set = ferros_sys::now();
+        if a != 0 || b != 0 {
+            say!(g, "camtest: ceiling: shift A#{s}: refused (A#{a} A#{b})\n");
+            let _ = set(3, 0);
+            continue;
+        }
+        pause_us(1 << 20);
+        let mut c0 = [0u8; 107];
+        let ok0 = caps(&mut c0);
+        W_FIRST.store(0, SeqCst);
+        let (n0, ts) = (W_N.load(SeqCst), ferros_sys::now());
+        pause_us(window * 1_000_000);
+        let (n1, t_last, t_first) = (W_N.load(SeqCst), W_AT.load(SeqCst), W_FIRST.load(SeqCst));
+        let mut c1 = [0u8; 107];
+        let ok1 = caps(&mut c1);
+        let got = n1 - n0;
+        let be = |c: &[u8; 107], k: usize| u16::from_be_bytes([c[k], c[k + 1]]);
+        // WHY the zero test: a frame counted in the window whose answer landed just before the window cleared `W_FIRST` leaves it 0 when no later frame came; its time is then unknown, and said as 0.
+        let gap = if got >= 2 && t_first != 0 { (t_last - t_first) * 1_000_000 / hz / (got - 1) } else { 0 };
+        let first = if got >= 1 && t_first != 0 { (t_first - ts) * 1000 / hz } else { 0 };
+        say!(g, "camtest: ceiling: shift A#{s}: A#{} s asked; in A#{window} s A#{got} frames{}, the first A#{first} ms in, A#{gap} us apart; the sensor's count A#{} to A#{}\n", ns / 1_000_000_000, if W_LEN.load(SeqCst) == 0 { " (the waiter ended)" } else { "" }, c0[70], c1[70]);
+        say!(g, "camtest: ceiling: shift A#{s}: the sensor reads frame A#{} line A#{} integration A#{} shift words G#{:04X} G#{:04X}{}\n", be(&c1, 38), be(&c1, 40), be(&c1, 67), be(&c1, 103), be(&c1, 105), if ok0 && ok1 { "" } else { " (a CAPS failed)" });
+        // Back to 67 ms: the long frame in flight cut, the next frame due about 67 ms on.
+        let before = W_N.load(SeqCst);
+        let (a, b) = (set(3, 0), set(0, 1 << 26));
+        let t = ferros_sys::now();
+        let until = t + hz * 4;
+        while W_N.load(SeqCst) == before && ferros_sys::now() < until {
+            ferros_sys::wait(&W_N, before, until);
+        }
+        if W_N.load(SeqCst) == before || W_LEN.load(SeqCst) == 0 {
+            say!(g, "camtest: ceiling: shift A#{s}: NO frame 4 s after the SET back to 67 ms (A#{a} A#{b}); closing\n");
+            break;
+        }
+        say!(g, "camtest: ceiling: shift A#{s}: back at 67 ms (A#{a} A#{b}), the next frame A#{} ms after the SET; A#{} s since this shift's SET\n", (W_AT.load(SeqCst) - t) * 1000 / hz, us(t_set) / 1_000_000);
+        pause_us(1 << 19);
+    }
+    let mut c = [0u8; 4];
+    let n = call(ep, &[4], &mut c);
+    say!(g, "camtest: ceiling done; CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { c[0] as u64 });
+    ferros_sys::exit(0)
 }
 
 /// The driver serving while a frame waits (docs/CAMERA.md "Serving while a frame waits"; the Pro, 2026-11-18: a 13.6-year frame held the driver's one thread in a MAP and a new Lumis sat in LIST): OPEN with the view, a first frame, then the exposure SET to 2^`long_log2` s (2^10 if 0; the main's most is about 2^28.7 s) and a second thread MAPping (it waits for the long frame) while this one, 2^1 s on, times a LIST, a STATS, and a SET back to 2^6 ms (the frame in flight cut: the waiter's next frame should come about 64 ms later, not at the long frame's end); then the exposure long again and, 2^1 s on, the end `how`: 0 CLOSE (timed, the waiter's MAP answered empty), 1 this process ends with the waiter's MAP held and no CLOSE (the driver should close at once on the kernel's watch), 2 the same but held until killed from the host (`diag "kill camtest"`).

@@ -14,7 +14,7 @@
 //! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`; a camera whose 1:1 init is in the vault (`cam.<key>.init.full`) has a second section, the same `id` and `name`, its `mode` 2 and its own size, `cfa_period`, `frame_ns` and exposure range (ferros_cam list `Readout`).
 //! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
-//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 3 (a device test) the vendor shift every later exposure takes (0 the least that fits). `[0]` taken, `[1]` outside the range.
+//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 3 (a device test) the vendor shift every later exposure takes (0 the least that fits; a forced shift is not held to the sensor's frame counter, the plain exposure is: refused past the list's `exposure_max`, the longest the counter holds). `[0]` taken, `[1]` outside the range.
 //! - `4` CLOSE: the view taken back, the stream stopped, the switch off, `[0]`, and the driver ends; its frames go back to the pool wiped.
 //! - `5` MAP + the buffer to give back (G#FF none), with the view: waits for a frame newer than the last mapped and holds its buffer; the frame's 64-byte header (bin 1, the buffer at +40), the samples read in place thru the view (docs/CAMERA.md "The view").
 //! - `6` RELEASE + buffer: the held buffer given back; `[0]`, `[1]` when it was not held.
@@ -1727,7 +1727,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let timing = ccs::Timing { line_ps: ccs::line_ps_for(c, &page), captured_llp: c.llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if sane { margin } else { ccs::MARGIN }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
     say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
-    say!(g, "camera: {}: the vendor shift to A#{}{}; the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
+    say!(g, "camera: {}: the vendor shift to A#{}{}, the frame counter A#{} bits (the longest exposure at shift A#{}); the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.lte.map_or(0, |l| l.frame_bits), timing.lte.map_or(0, |l| timing.shift_most(&l)), timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
     readout_reset();
     if sane && arr.margin.is_some_and(|m| m != margin) {
         say!(g, "camera: {}: the sensor's margin is not the list's: the list's longest exposure is off by the difference\n", c.name);
@@ -2868,13 +2868,13 @@ fn rate(g: u64, windows: u8) -> [u8; 40] {
     out
 }
 
-/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four).
-fn caps(g: u64) -> [u8; 103] {
+/// CAPS: the sensor's registers read back, each as it answers (zeros where the read failed), at fixed places: +0 its data format model type and subtype (G#00C0, two bytes), +2 its sixteen data format descriptors (G#00C2, 32 bytes: (uncompressed bits << 8) | compressed bits each), +34 the integration's least and its margin (G#1004, four bytes), +38 the frame and line length (G#0340, four), +42 the window and output size (G#0344, twelve), +54 the increments (G#0380, eight), +62 the binning (G#0900, three), +65 the data format (G#0112, two), +67 the integration (G#0202, two), +69 mode select (G#0100, one), +70 the frame count (G#0005, one), +71 two bytes, a bit per read that failed (bit 0 the first); since 2026-11-17 also +73 the analogue gain capability (G#0080, twenty bytes), +93 the digital gain limits (G#1084, six), +99 the gain now (G#0204 and G#020E, four); since 2026-11-18 also +103 the vendor shift words (G#0702 and G#0704, four: the main's `Lte`).
+fn caps(g: u64) -> [u8; 107] {
     let c = cam();
     let bus = Bus::of(g, c);
-    let mut out = [0u8; 103];
+    let mut out = [0u8; 107];
     let mut failed = 0u16;
-    let reads: [(u16, usize, usize); 15] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2)];
+    let reads: [(u16, usize, usize); 16] = [(0x00C0, 0, 2), (0x00C2, 2, 32), (0x1004, 34, 4), (0x0340, 38, 4), (0x0344, 42, 12), (0x0380, 54, 8), (0x0900, 62, 3), (0x0112, 65, 2), (0x0202, 67, 2), (0x0100, 69, 1), (0x0005, 70, 1), (0x0080, 73, 20), (0x1084, 93, 6), (0x0204, 99, 2), (0x020E, 101, 2), (0x0702, 103, 4)];
     for (k, &(a, at, n)) in reads.iter().enumerate() {
         if bus.write_read(c.addr, &[(a >> 8) as u8, a as u8], &mut out[at..at + n]).is_err() {
             failed |= 1 << k;
