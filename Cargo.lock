@@ -1045,13 +1045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferros-payload-focustest"
-version = "0.1.0"
-dependencies = [
- "ferros_sys",
-]
-
-[[package]]
 name = "ferros-payload-fptest"
 version = "0.1.0"
 dependencies = [

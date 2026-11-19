@@ -43,7 +43,6 @@ members = [
     "payloads/bt",
     "payloads/usb",
     "payloads/gpstest",
-    "payloads/focustest",
     "payloads/clock",
     "payloads/aliastest",
     "payloads/tidetest",

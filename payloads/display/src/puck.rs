@@ -2,7 +2,7 @@
 //!
 //! - **Who sends.** A puck calls the `puck` endpoint (grant slot 9), and the kernel puts its kist identity (developer key and option) and its square (slot, generation, bytes held) ahead of every call (process.rs `puck_stamp`): a square is kept under that identity, and read only where and as far as the kernel says the puck holds one.
 //! - **Which circle.** The deck (the map) binds each puck's identity to a scene icon, `PUCK0 + j` for its j-th puck (op 73, the system's alone).
-//! - **The view.** Each scene, every bound puck's circle as it shows: on the glass or not, large (at least half the panel across), its diameter, its turn (gravity's, else the camera's and the circle's own). A puck's held WATCH is answered when the view moves (a size by a pixel, a turn by half a pixel at the rim), when a tap passes thru to it (op 74 from the deck), and, for a puck that asked (`call::FRAMES`), at every flip the deck shows. A doorbell, never a poll.
+//! - **The view.** Each scene, every bound puck's circle as it shows: on the glass or not, large (at least half the panel across), its diameter, its turn (the camera's and the circle's own: it turns with the deck). A puck's held WATCH is answered when the view moves (a size by a pixel, a turn by half a pixel at the rim), when a tap passes thru to it (op 74 from the deck), and, for a puck that asked (`call::FRAMES`), at every flip the deck shows. A doorbell, never a poll.
 //! - **The square.** SHOW names a square in the puck's slot; the render thread takes it at the top of its next pass (`due`) and answers then, so from that answer on the puck draws only elsewhere, and this server never reads a square while its puck writes it.
 //! - **Drawing.** The circle's sprite is made from the square when the square, the circle's size or its turn changes: each pixel of the circle sampled from the square (bilinear, the turn between the square's and the circle's undone), trimmed by the circle's C¹ edge, baked (bake.rs `g2t_row`). A circle shown larger than the square or turned since is drawn from it scaled and turned until the puck's next square lands.
 //!
@@ -382,11 +382,6 @@ pub fn key(j: usize) -> i64 {
     let k = es.iter().find(|e| e.id == id && id != [0; 64]).map_or(0, |e| e.seq as i64 + 1);
     unlock();
     k
-}
-
-/// The largest radius of a puck on the glass, Q8: how finely the gravity turn is worth following.
-pub fn largest_r() -> i64 {
-    unsafe { (*(&raw const GEOM)).iter().zip((*(&raw const SEEN)).iter()).filter(|(_, v)| v.shown).map(|(g, _)| g.2).max().unwrap_or(0) }
 }
 
 /// `draw_into`'s rows: a circle's box is at most the panel's width plus its edge, inside the clip; the widest panel ferros drives is under 2^11.

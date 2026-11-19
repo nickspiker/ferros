@@ -6129,8 +6129,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     map.draw();
     t_start[6] = now();
-    // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
-    call(display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
     // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back at rest.
     // FERROS_MAP_START=ipc: the bare cost of a round trip to each server (64 trivial calls each: display info, touch info).
     if option_env!("FERROS_MAP_START") == Some("ipc") {

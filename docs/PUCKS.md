@@ -28,7 +28,7 @@ The display asks; the puck answers with pixels; nothing is parsed.
 
 ### Scaling and turning between squares
 
-- **A square costs its own circle.** At each flip, every puck whose newest square the phase about to show does not hold yet is drawn again there, its circle's box alone (the way the display's clock was drawn between frames); the deck is drawn whole only for a binding, a puck gone, or on a display without the temporal flips. Measured on the 8a: 13.4 ms a box (a 656-pixel circle), where a whole redraw was 35 to 46 ms of scene and 34 to 41 ms of publish.
+- **A square costs its own circle.** At each flip, every puck whose newest square the phase about to show does not hold yet is drawn again there, its circle's box alone (`draw::CLIP` and `CLIP_PHASE`); the deck is drawn whole only for a binding, a puck gone, or on a display without the temporal flips. Measured on the 8a: 13.4 ms a box (a 656-pixel circle), where a whole redraw was 35 to 46 ms of scene and 34 to 41 ms of publish.
 - **A square is sampled once, by every core** (2026-11-20). A new square is drawn into the canvas once; a later phase that lacks it while the canvas holds it whole only publishes the box from the canvas (puck.rs `canvas_holds`: a whole frame, or a redraw of the puck's own box, records the square it drew; a part of a box drawn from a newer square forgets it). The sampling is an item of the scene's list (`Item::Puck`), drawn by bands of rows across the publish workers and the render thread, each with its own rows. Measured on the Pro (a 188k-pixel box): before, 16 to 18 ms a box, all but 1 ms of it the sampling on the render thread alone, redone for each of the four phases; the display's console says each 64 boxes how many were redrawn and how many only published, and what a pass with boxes took.
 - **Gravity turns the faces alone**: past half a pixel at the largest puck's rim, each puck hears its new turn and its box is owed to every phase, never a whole redraw.
 
@@ -119,9 +119,13 @@ A display that ends (a restart, a fault) takes its held calls with it: the kerne
 
 Stored together with a flash of the matching kernel (Claude memories/stored_capsules_need_flashed_kernel.md): the kernel (the `puck` right and its stamp, init's slot 9 the display's `puck` endpoint, the pucks' window, SYS_DMA x1 = 6, BELL_PUCKS, facts 88-89 for the compass), and the capsules display, map, init, kists (ferros_kist's `puck` right) and sensors (the magnetometers). Then the clock, basecalc and the six pucks are stowed like any kist; the clock's version 1 replaces the clock kist of 2026-11-10 (the same option).
 
+## The display draws no circles of its own
+
+Owner, 2026-11-18: "Delete the old clock, yes. none of that business. ferros settings, kists and pucks, that's it." The display's own clock face (icon G#80) and light scope (icon G#82) are gone, with the focus op (25) they took, the gravity turn they followed and payloads/focustest; a circle on the deck is the settings circle, a kist, or a puck. The console's corner clock writes its time with `time_text`. The light scope's data path (the sensors' 16 kHz stream by preference 7, SYS_LIGHT, the Developer page's channel) stays for a scope puck.
+
 ## Not built
 
-- The display's own clock is not yet deleted: nothing names it any more (the deck no longer gives icon G#80 to a kist named Clock), and it goes once the clock puck is seen on the glass (owner: "make another clock proper, then delete the weird wired in one"). The console's corner clock keeps `clock_state`.
+- A puck mid-hand-over when the display restarts waits for an answer that never comes, and needs a restart itself (the development loop only: kill it, restart the map).
 - Frames for a moving puck come only with the 10 Hz temporal flips; with temporal dithering off, a `FRAMES` puck is drawn only when its view changes.
 - A puck's square sampled bilinear only: a circle much smaller than its square while a pinch outruns the puck aliases until the next square.
 - A doorbell on a sensor sample (the compass waits the sample period while shown).
