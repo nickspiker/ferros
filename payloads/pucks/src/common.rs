@@ -27,6 +27,7 @@ pub const S_DOMAIN: u64 = ferros_sys::kist::DOMAIN;
 /// Relocate, the heap, the typeface, the view's watch: the puck's link to its circle. `frames`: the face moves continuously and is drawn at every frame the deck shows (the clock).
 pub fn start(grants: u64, frames: bool) -> Link {
     unsafe { ferros_sys::relocate() };
+    ferros_sys::panic_grants(grants);
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_SIZE) };
     unsafe { GLYPHS = Glyphs::with_arena(ferros_glyphs::FONT, 1 << 15) };
     let link = Link { grants, slot: S_PUCK, square: ferros_sys::kist::SURFACE };
@@ -106,7 +107,8 @@ pub fn say(grants: u64, s: &[u8]) {
     ferros_sys::console(grants, s);
 }
 
+/// Said whole by ferros_sys (its location and message) under the puck's own name, then exit G#DEAD.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }

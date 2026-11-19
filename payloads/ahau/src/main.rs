@@ -3904,8 +3904,8 @@ fn signed(n: i64) -> Line {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 /// The wallpaper seed to the display server (its op 42, `wallpaper`): it makes the person's wallpaper from it, or shows their own.

@@ -94,8 +94,8 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 /// The BTI test's target: a real function, its first instruction `bti c` when built with branch protection.

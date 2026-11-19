@@ -1264,6 +1264,10 @@ ferros_el0_resume:
     str     x1, [x0, #0xA0]
     str     x2, [x0, #0xA8]
     str     x3, [x0, #0x20]
+    // The fault's own record for the next boot's flash log (platform.rs FAULT_RECORD, G#1400 on): ELR, FAR and ESR, its magic "FeFault0" below once the block's is in; the words above are shared with the vault's boot report.
+    str     x1, [x0, #0x1408]
+    str     x2, [x0, #0x1410]
+    str     x3, [x0, #0x1418]
     adrp    x1, __exception_count
     add     x1, x1, :lo12:__exception_count
     ldr     x1, [x1]
@@ -1273,10 +1277,18 @@ ferros_el0_resume:
     movk    x1, #0x6655, lsl #32
     movk    x1, #0x3153, lsl #48
     str     x1, [x0]
+    movz    x1, #0x6546
+    movk    x1, #0x6146, lsl #16
+    movk    x1, #0x6C75, lsl #32
+    movk    x1, #0x3074, lsl #48
+    str     x1, [x0, #0x1400]
     dc      cvac, x0
     add     x1, x0, #0x20
     dc      cvac, x1
     add     x1, x0, #0xA0
+    dc      cvac, x1
+    add     x1, x0, #0x1000
+    add     x1, x1, #0x400
     dc      cvac, x1
     dsb     sy
     mov     w0, #0x0009

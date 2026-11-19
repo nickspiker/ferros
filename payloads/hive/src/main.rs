@@ -402,8 +402,8 @@ impl core::fmt::Write for Line {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 /// Nothing in the hive allocates; its words come thru ferros_lang from fgtw, which links the alloc crate, and a linked alloc wants an allocator. This one refuses every request: an allocation here is a bug, and it fails loud (alloc's error handler, then the panic handler), with no heap carried for it.
 struct NoHeap;

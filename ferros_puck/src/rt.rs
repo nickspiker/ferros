@@ -197,7 +197,8 @@ fn next_offset(shown: Option<(u64, u64)>, bytes: u64) -> u64 {
 
 /// Draw `list` into the square at the view's size and turn and hand it to the display. Nothing while the circle is not on the glass. The display's status (`call::OK`, `REFUSED`, `NOT_ON_DECK`), or None when nothing was drawn.
 pub fn show(link: Link, v: &View, list: &[u8], theme: &crate::square::Theme, glyphs: &mut ferros_glyphs::Glyphs) -> Option<u8> {
-    let ctx = crate::draw::Ctx { now: eagle_now().unwrap_or(0), zone: ferros_sys::zone(), base: ferros_sys::device_base() };
+    // The base's digits: tatau's code without its high bit (G#8C, DLS, is dozenal digits with its own time keeping; 12). Unmasked, DLS reached `char::from_digit` as radix 140 and every puck with a number on its face panicked on the 8a (2026-11-18, GPS and Compass).
+    let ctx = crate::draw::Ctx { now: eagle_now().unwrap_or(0), zone: ferros_sys::zone(), base: ferros_sys::device_base() & 0x7F };
     show_with(link, v, |px, d, turn| crate::square::paint(px, d, turn, list, &ctx, theme, glyphs))
 }
 

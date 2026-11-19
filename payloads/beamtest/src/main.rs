@@ -243,7 +243,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     num(unsafe { FAILED_SIZE }, &mut put);
     put(b"\n");
     console(unsafe { GRANTS }, &m[..n]);
-    ferros_sys::panic_exit()
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).

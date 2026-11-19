@@ -195,9 +195,9 @@ pub fn schema() -> SectionSchema {
         .field(SEALED, TypeConstraint::Wrapped(WRAP))
 }
 
-/// The sealed section: the category, the writer, the words.
+/// The sealed section: the category, the writer, the words, and a death's typed fields when the entry is one (death.rs).
 pub fn payload_schema() -> SectionSchema {
-    SectionSchema::new(PAYLOAD).field(CATEGORY, TypeConstraint::DictKey).field(WRITER, text_constraint()).field(WORDS, text_constraint()).field(REFUSED, TypeConstraint::AnyUnsigned)
+    crate::death::fields(SectionSchema::new(PAYLOAD).field(CATEGORY, TypeConstraint::DictKey).field(WRITER, text_constraint()).field(WORDS, text_constraint()).field(REFUSED, TypeConstraint::AnyUnsigned))
 }
 
 fn bind_schema() -> SectionSchema {
@@ -239,13 +239,20 @@ pub struct Payload {
     pub category: String,
     pub writer: String,
     pub words: String,
-    /// Read back: how many characters of the writer and words were outside the text table and stand as `MARKER` (0 when writing: `build` counts them).
+    /// Read back: how many characters of the writer, the words and a death's text fields were outside the text table and stand as `MARKER` (0 when writing: `build` counts them).
     pub refused: u64,
+    /// A death's typed fields (`kernel.process`, `kernel.panic`), None for any other entry.
+    pub death: Option<crate::death::Death>,
 }
 
 impl Payload {
     pub fn new(category: Category, writer: &str, words: &str) -> Payload {
-        Payload { category: category.name.to_string(), writer: writer.to_string(), words: words.to_string(), refused: 0 }
+        Payload { category: category.name.to_string(), writer: writer.to_string(), words: words.to_string(), refused: 0, death: None }
+    }
+
+    /// A death: its sentence in the words, its fields typed beside them.
+    pub fn death(category: Category, writer: &str, words: &str, death: crate::death::Death) -> Payload {
+        Payload { death: Some(death), ..Payload::new(category, writer, words) }
     }
 }
 
@@ -304,8 +311,12 @@ pub fn build(place: &Place, class: Class, key: &SealKey, payload: &Payload) -> R
     let (writer, r0) = lean(&payload.writer);
     let (words, r1) = lean(&payload.words);
     let mut b = payload_schema().build().set(CATEGORY, VsfType::d(category)).and_then(|b| b.set(WRITER, writer)).and_then(|b| b.set(WORDS, words)).map_err(schema_err)?;
-    if r0 + r1 > 0 {
-        b = b.set(REFUSED, uint(r0 + r1)).map_err(schema_err)?;
+    let mut r2 = 0;
+    if let Some(d) = &payload.death {
+        (b, r2) = crate::death::set(b, d).map_err(schema_err)?;
+    }
+    if r0 + r1 + r2 > 0 {
+        b = b.set(REFUSED, uint(r0 + r1 + r2)).map_err(schema_err)?;
     }
     let mut plain = b.encode().map_err(schema_err)?;
     let ad = bind(place, class.number(), key.id())?;
@@ -415,7 +426,7 @@ pub fn open(s: &Stored, key: &SealKey) -> Result<Payload, Error> {
         }
         let p = SectionBuilder::parse(payload_schema(), &buf).map_err(schema_err)?;
         let text = |name: &str| p.get_value::<String>(name).map_err(schema_err);
-        Ok(Payload { category: text(CATEGORY)?, writer: text(WRITER)?, words: text(WORDS)?, refused: p.get_value::<u64>(REFUSED).unwrap_or(0) })
+        Ok(Payload { category: text(CATEGORY)?, writer: text(WRITER)?, words: text(WORDS)?, refused: p.get_value::<u64>(REFUSED).unwrap_or(0), death: crate::death::get(&p) })
     })();
     // The plaintext wiped on every path, opened or not.
     wipe_vec(&mut buf);

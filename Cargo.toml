@@ -65,6 +65,7 @@ members = [
     "payloads/ahau",
     "payloads/epcall",
     "payloads/buftrap",
+    "payloads/panictest",
     "payloads/keytest",
     "honeycomb",
     "wallpaper",

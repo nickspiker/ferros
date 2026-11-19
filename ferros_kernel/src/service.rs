@@ -2596,17 +2596,19 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::SETTINGS_WRITE = Some(settings_write);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
-        // The last boot's end, if the fault sink or the panic reporter recorded one, into the flash log: a reboot should never be silent.
-        {
-            let w = crate::platform::previous_end();
-            if w.iter().any(|&v| v != 0) {
-                let text: alloc::string::String = w[4].to_le_bytes().iter().chain(w[5].to_le_bytes().iter()).map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect();
-                crate::flashlog::line(&alloc::format!("previous boot ended: panic-num {} heap G#{:X} esr G#{:X} faults {} elr G#{:X} far G#{:X} text {:?}", w[0], w[1], w[2], w[3], w[4], w[5], text));
-                // The kernel heap's last refused allocation (platform.rs `report_panic`, r[6..8]).
-                if w[6] != 0 {
-                    crate::flashlog::line(&alloc::format!("previous boot's kernel heap refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}, the largest free block then A#{}", w[6] & 0xFF_FFFF_FFFF_FFFF, 1u64 << (w[8] >> 56), w[6] >> 56, w[7], w[8] & 0xFF_FFFF_FFFF_FFFF));
-                }
+        // The last boot's end, if the panic reporter or the fault sink left a whole record of it (platform.rs `PANIC_RECORD`, `FAULT_RECORD`), into the flash log as a `kernel.panic` entry with typed fields: a reboot should never be silent, and a clean one says nothing.
+        if let Some(p) = crate::platform::previous_panic() {
+            let mut line = alloc::format!("the kernel panicked in b{} on core A#{} at {}:{}:{}: {} (last crumb G#{:X})", p.boot, p.core, p.file, p.line, p.column, p.message, p.crumb);
+            // The kernel heap's last refused allocation (`report_panic`, r[6..8]), in the words: a measure of the heap, not a field a reader acts on.
+            if p.heap[0] != 0 {
+                line.push_str(&alloc::format!("; the kernel heap had refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}, the largest free block then A#{}", p.heap[0] & 0xFF_FFFF_FFFF_FFFF, 1u64 << (p.heap[2] >> 56), p.heap[0] >> 56, p.heap[1], p.heap[2] & 0xFF_FFFF_FFFF_FFFF));
             }
+            let d = ferros_ledger::death::Death { end: ferros_ledger::death::END_KERNEL_PANIC, message: Some(p.message), file: Some(p.file), line: Some(p.line), column: Some(p.column), of_boot: Some(p.boot), core: Some(p.core), crumb: Some(p.crumb), ..Default::default() };
+            crate::flashlog::kernel_death(&line, d);
+        }
+        if let Some([elr, far, esr]) = crate::platform::previous_fault() {
+            let d = ferros_ledger::death::Death { end: ferros_ledger::death::END_KERNEL_FAULT, esr: Some(esr), far: Some(far), pc: Some(elr), frames: alloc::vec![elr], ..Default::default() };
+            crate::flashlog::kernel_death(&alloc::format!("the kernel faulted early in the boot before: ESR G#{esr:X}, FAR G#{far:X}, ELR G#{elr:X}"), d);
         }
         crate::process::STORE_REMOVE = Some(store_remove);
         crate::process::STORE_KEYS = Some(store_keys);
@@ -4892,6 +4894,11 @@ pub fn run(mut b: Boot) -> ! {
                             first => resp.extend_from_slice(&crate::flashlog::legacy_blocks(num(first).unwrap_or(0), num(w.next()).unwrap_or(crate::flashlog::LEGACY_STEP).clamp(1, crate::flashlog::LEGACY_STEP))),
                         },
                         Some("bench") => resp.extend_from_slice(crate::flashlog::bench().as_bytes()),
+                        // `diag "log deaths [n] [blocks] [exits]"`: the newest n deaths (panics and faults, plain exits too with `exits`) (2^4 if none asked) in the newest `blocks` blocks of the ring (2^10 if none asked, about ten thousand entries; the whole ring is 2^14), as VSF documents for `ferros-bridge deaths`. Nothing is clamped: a count past the ring's ends at the head, and the reply's room cuts the answer.
+                        Some("deaths") => {
+                            let (n, blocks) = (num(w.next()).unwrap_or(1 << 4) as usize, num(w.next()).unwrap_or(1 << 10));
+                            resp.extend_from_slice(&crate::flashlog::deaths(n, blocks, (1 << 18) - (1 << 10), w.next() == Some("exits")));
+                        }
                         // `diag log [n]`: the newest n entries (2^8 if none asked), as VSF documents the bridge renders; at most a reply's room (256 KiB less a KiB), the newest kept.
                         // WHY the clamp: the host's number; the ring holds about 2^17 entries a copy, and the room cuts the answer anyway.
                         n => resp.extend_from_slice(&crate::flashlog::answer(num(n).unwrap_or(1 << 8).clamp(1, 1 << 17) as usize, (1 << 18) - (1 << 10))),

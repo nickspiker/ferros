@@ -41,12 +41,14 @@ const PERSON: &str = "person";
 const SINCE: &str = "since_boot_ms";
 
 fn open_schema() -> SectionSchema {
-    SectionSchema::new(OPEN)
-        .field(ENTRY, TypeConstraint::Blake3Provenance)
-        .field(entry::CATEGORY, TypeConstraint::DictKey)
-        .field(entry::WRITER, entry::text_constraint())
-        .field(entry::WORDS, entry::text_constraint())
-        .field(entry::REFUSED, TypeConstraint::AnyUnsigned)
+    crate::death::fields(
+        SectionSchema::new(OPEN)
+            .field(ENTRY, TypeConstraint::Blake3Provenance)
+            .field(entry::CATEGORY, TypeConstraint::DictKey)
+            .field(entry::WRITER, entry::text_constraint())
+            .field(entry::WORDS, entry::text_constraint())
+            .field(entry::REFUSED, TypeConstraint::AnyUnsigned),
+    )
 }
 
 fn finding_schema() -> SectionSchema {
@@ -104,6 +106,10 @@ pub fn opened(s: &Stored, p: &Payload) -> Result<Vec<u8>, Error> {
         .and_then(|b| b.set(entry::WORDS, lean(&p.words).0));
     if p.refused > 0 {
         b = b.and_then(|b| b.set(entry::REFUSED, uint(p.refused)));
+    }
+    // A death's typed fields, as the entry holds them (read back already lean, so nothing more is replaced).
+    if let Some(d) = &p.death {
+        b = b.and_then(|b| crate::death::set(b, d).map(|(b, _)| b));
     }
     let section = b.and_then(|b| b.encode());
     doc(s.place.time, OPEN, section)
@@ -293,6 +299,46 @@ fn entry_line(s: &Stored, p: Option<&(String, String, String)>, wall: &dyn Fn(i6
     }
 }
 
+/// The opening of entry `s`, when `next` is a `ledger_open` document that names it.
+fn opening(next: &[u8], s: &Stored) -> Option<SectionBuilder> {
+    let (n, _, b, _) = section_of(next).ok()?;
+    if n != OPEN {
+        return None;
+    }
+    let o = SectionBuilder::parse(open_schema(), b).ok()?;
+    (o.get_value::<[u8; 32]>(ENTRY).ok() == Some(s.hash)).then_some(o)
+}
+
+/// A death read out of an answer: where the entry sits, who wrote it and its words, and the death's fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dead {
+    pub seq: u64,
+    pub boot: u64,
+    /// Eagle time in oscillations; None before the device had read its clock.
+    pub time: Option<i64>,
+    pub category: String,
+    pub writer: String,
+    pub words: String,
+    pub death: crate::death::Death,
+}
+
+/// Every opened entry in a run of documents that carries a death (`kernel.process`, `kernel.panic`), oldest first.
+/// Sealed entries and findings are passed over: `render` shows those.
+pub fn deaths(run: &[u8]) -> Vec<Dead> {
+    let docs = match split(run) {
+        Ok(d) => d,
+        Err((at, _)) => split(&run[..at]).unwrap_or_default(),
+    };
+    let mut out = Vec::new();
+    for (k, d) in docs.iter().enumerate() {
+        let Ok(s) = entry::parse(d) else { continue };
+        let Some(o) = docs.get(k + 1).and_then(|next| opening(next, &s)) else { continue };
+        let Some(death) = crate::death::get(&o) else { continue };
+        out.push(Dead { seq: s.place.seq, boot: s.place.boot, time: s.place.time, category: text(&o, entry::CATEGORY), writer: text(&o, entry::WRITER), words: text(&o, entry::WORDS), death });
+    }
+    out
+}
+
 fn render_docs(docs: &[&[u8]], wall: &dyn Fn(i64) -> String) -> Vec<String> {
     let mut lines = Vec::new();
     let mut k = 0usize;
@@ -317,17 +363,9 @@ fn render_docs(docs: &[&[u8]], wall: &dyn Fn(i64) -> String) -> Vec<String> {
                 };
                 // Its opening, if the next document is one and names it.
                 let mut p = None;
-                if let Some(next) = docs.get(k) {
-                    if let Ok((n, _, b, _)) = section_of(next) {
-                        if n == OPEN {
-                            if let Ok(o) = SectionBuilder::parse(open_schema(), b) {
-                                if o.get_value::<[u8; 32]>(ENTRY).ok() == Some(s.hash) {
-                                    p = Some((text(&o, entry::CATEGORY), text(&o, entry::WRITER), with_refused(text(&o, entry::WORDS), num(&o, entry::REFUSED))));
-                                    k += 1;
-                                }
-                            }
-                        }
-                    }
+                if let Some(o) = docs.get(k).and_then(|next| opening(next, &s)) {
+                    p = Some((text(&o, entry::CATEGORY), text(&o, entry::WRITER), with_refused(text(&o, entry::WORDS), num(&o, entry::REFUSED))));
+                    k += 1;
                 }
                 lines.push(entry_line(&s, p.as_ref(), wall));
             }
