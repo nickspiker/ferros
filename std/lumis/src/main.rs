@@ -88,7 +88,7 @@ impl lumis_core::RowSource for SlitRows<'_> {
 
 /// The camera opened again for whole frames, after a slit's open that failed or gave no slit ring (that one closed first): Lumis ends if it fails too, keeping what is encoded.
 fn reopen_whole(cam: &camera::Camera, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> Source {
-    match open(cam, false) {
+    match open(cam, false, None) {
         Ok(s) => s,
         Err(Refused::Why(why)) => {
             keep_saves(vault, header);
@@ -98,34 +98,135 @@ fn reopen_whole(cam: &camera::Camera, vault: Option<&kete::FlatStorage>, header:
     }
 }
 
-/// RAW video's recording (lumis_core RawMode::Video: RECORDING_BIT starts and stops a clip at VIDEO_FPS_IDX frames a second; this writes back VIDEO_FRAMES_IDX). A stand-in for now: each frame the camera hands over while a clip runs is counted as the recorder would be handed it, nothing is written. ferros's recording API (branch raw-video-rec: start a clip with fps and mode, hand frames, stop) takes its place, the sensor then held to a frame every max(1/fps, shutter).
-#[derive(Default)]
-struct Recorder {
-    /// The clip running: when it began and its frames a second.
-    clip: Option<(std::time::Instant, u64)>,
+/// A RAW video clip recording (lumis_core RawMode::Video; owner, 2026-11-19: "VSF video, yes", lossless): the camera opened at the clip's pacing (`open` with a `Pacing`), every whole frame the view hands over coded by ferros_clip's recorder on the A715s and written into a single-copy extent of Lumis's domain (docs/RAW-VIDEO.md Part 4). It runs until STOP (RECORDING_BIT cleared), the extent is full or a write fails (`Taken::Ended`), or Lumis leaves or ends: every one of those seals the clip (`end_clip`).
+struct Clip {
+    rec: ferros_clip::Recorder,
+    /// The camera's name, for the console.
+    cam: String,
+    /// Its frames a second (1 to 60, ferros_clip `Pacing::of`).
+    fps: u32,
+    /// The extent's name in Lumis's domain.
+    name: String,
+    began: std::time::Instant,
+    /// The extent's bytes, as the vault gave them (it may give fewer than asked): what is left of them sets the time left.
+    room: u64,
+    /// When the preview last integrated a frame while this records (`PREVIEW_GAP`).
+    preview: std::time::Instant,
 }
 
-impl Recorder {
-    /// One turn of the camera thread: a clip started or stopped as RECORDING_BIT says, and a whole frame taken while one runs counted (VIDEO_FRAMES_IDX).
-    fn turn(&mut self, name: &str, header: &mut [u64], frame: bool) {
-        use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_FPS_IDX, VIDEO_FRAMES_IDX};
-        let on = header[FLAGS_IDX] & RECORDING_BIT != 0 && header[CURRENT_MODE_IDX] == RawMode::Video as u64;
-        match (on, self.clip) {
-            (true, None) => {
-                let fps = header[VIDEO_FPS_IDX];
-                println!("lumis: camera {name}: RAW video: a clip at {fps} frames a second (the stand-in recorder: frames counted, not written)");
-                self.clip = Some((std::time::Instant::now(), fps));
+/// The clip recording, if any: the camera thread starts it and hands it each frame (holding this only for the frame), and whatever ends Lumis seals it (`seal_at_exit`, from lumis_core's `exit_because` on any thread).
+static CLIP: Mutex<Option<Clip>> = Mutex::new(None);
+
+/// lumis_core `set_before_exit`: a clip recording sealed before Lumis ends, so the Exit button (the UI thread) or an error never leaves one open. The camera thread never ends Lumis while it holds `CLIP` (it seals a clip itself before each of its own exits), so this waits at most for the frame in hand.
+fn seal_at_exit() {
+    if let Some(c) = CLIP.lock().unwrap().take() {
+        end_clip(c, None, "Lumis ending");
+    }
+}
+
+/// While a clip records, the preview integrates a frame at most this often (2^7 ms, about 8 a second): the recorder's coding has the A715s, and the camera's frames must not wait behind the integrator's (a frame not handed over in time is a frame lost to the clip).
+const PREVIEW_GAP: std::time::Duration = std::time::Duration::from_millis(1 << 7);
+
+/// The clips extent asked for at most, blocks of `ferros_clip::BLOCK` (2^34 bytes, 16 GiB: about 35 minutes at 30 a second at the codec's measured 2 to 3.5 times), halved on each refusal (no free stretch that long) down to `CLIP_BLOCKS_LEAST`.
+const CLIP_BLOCKS_MOST: u64 = 1 << 22;
+/// The least worth recording into, 2^28 bytes (about 30 s at 30 a second at 2 times).
+const CLIP_BLOCKS_LEAST: u64 = 1 << 16;
+
+/// The rate RAW video asks of the camera (lumis_core: VIDEO_FPS_IDX, 0 until the UI sets it: the UI's default).
+fn video_fps(header: &[u64]) -> u32 {
+    match header[lumis_core::shared_memory::VIDEO_FPS_IDX] {
+        0 => lumis_core::ui::ui::VIDEO_FPS_DEFAULT as u32,
+        f => f as u32,
+    }
+}
+
+/// A clip started on the held frame `head`, `rows` its rows in the view: the extent opened (as large as the vault gives, from `CLIP_BLOCKS_MOST` halving), generation 0 written, the coder's workers and the writer started. The clip's facts are the still's (the camera's identity and optics, the black and white levels, the 2 x 2 mosaic from the frame), its orientation the EXIF code of the sensor's mount and the hold (as a still's tag), its time the frame's.
+fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing, head: &camera::FrameHeader, rows: &ViewRows) -> Result<Clip, String> {
+    let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
+    let mount = header[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX];
+    let held = header[lumis_core::shared_memory::DEVICE_ROTATION_IDX];
+    let orientation = match (mount + held) % 360 {
+        90 => 6,
+        180 => 3,
+        270 => 8,
+        _ => 1,
+    };
+    let clip_cam = ferros_clip::Camera {
+        width: head.width,
+        height: head.height,
+        stride: rows.line,
+        cfa: ferros_clip::cfa_of_byte(head.cfa),
+        black: head.black,
+        white: head.white,
+        make: "ferros".into(),
+        model: "camera".into(),
+        sensor_module: cam.name.clone(),
+        lens: String::new(),
+        f_number: (cam.f_number > 0.).then_some(cam.f_number),
+        focal_mm: (cam.focal_mm > 0.).then_some(cam.focal_mm),
+        characterization: None,
+        observer: String::new(),
+        orientation,
+    };
+    let name = format!("video/{} video.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()));
+    let mut blocks = CLIP_BLOCKS_MOST;
+    loop {
+        let mode = ferros_clip::Mode {
+            pacing,
+            title: format!("Lumis RAW video, {} a second", pacing.fps),
+            // As std/rawrec, the recorder's harness (30 a second for a lossless minute on the Pro): a worker on each A715, the writer on the A510s, four coded frames waiting for the flash at most.
+            workers: vec![0x00F0; 4],
+            writer: 0x000F,
+            slots: 4,
+            blocks,
+            at: ferros_clip::eagle_osc(head.time as u64),
+            source_digests: false,
+        };
+        let ext = ferros_clip::ferros::Extent::new(slot, &name);
+        match ferros_clip::Recorder::start(&clip_cam, &mode, Box::new(ferros_clip::ferros::ExtentSink(ferros_clip::ferros::Extent::new(slot, &name)))) {
+            Ok(rec) => {
+                let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
+                println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
+                let now = std::time::Instant::now();
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now });
             }
-            (false, Some((began, fps))) => {
-                println!("lumis: camera {name}: RAW video: the clip stopped after {} frames in {} ms ({fps} asked)", header[VIDEO_FRAMES_IDX], began.elapsed().as_millis());
-                self.clip = None;
+            Err(e) if blocks > CLIP_BLOCKS_LEAST => {
+                println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
+                blocks >>= 1;
             }
-            _ => {}
-        }
-        if self.clip.is_some() && frame {
-            header[VIDEO_FRAMES_IDX] += 1;
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// A clip ended: its closing generation written and the extent sealed (ferros_clip `stop`), its counts into the header (when the caller has it: not at Lumis's end), said on the console with why it ended.
+fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
+    use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
+    let ms = clip.began.elapsed().as_millis();
+    let cam = clip.cam;
+    let info = clip.rec.stop();
+    let s = info.stats;
+    if let Some(header) = header {
+        header[VIDEO_FRAMES_IDX] = s.frames;
+        header[VIDEO_DROPPED_IDX] = s.dropped;
+        header[VIDEO_LEFT_S_IDX] = 0;
+        header[FLAGS_IDX] &= !RECORDING_BIT;
+    }
+    let hex: String = info.hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    println!(
+        "lumis: camera {cam}: RAW video: {} ended ({why}): {} frames in {ms} ms, {} dropped, {} paced; {} bytes (coded {} of {}), sealed {hex}; the coding {} us a frame at most, {} on average{}",
+        clip.name,
+        s.frames,
+        s.dropped,
+        s.paced,
+        info.len,
+        s.coded,
+        s.raw,
+        s.code_us_most,
+        // WHY the max: a clip can end with no frame (STOP before its first, its first ones dropped), and the average of none is said as 0.
+        s.code_us_sum / s.frames.max(1),
+        info.error.map(|e| format!("; {e}")).unwrap_or_default()
+    );
 }
 
 /// Whether what was taken is a slit.
@@ -218,8 +319,16 @@ const DEV_NO_SET: u8 = 1 << 7;
 /// Development, the fourth knobs byte (the input's seventeenth): the 16th frame's mean of each place in a 4 x 4 cell over the middle of the frame (the colour filter's table: a Bayer cell's two greens alike, a quad's 2 x 2 blocks alike); and a VSF 8B save at the 32nd (Lumis's developed frame, kept in the vault as any save).
 const DEV_CELLS: u8 = 1 << 0;
 const DEV_SAVE: u8 = 1 << 1;
-/// Development, the fourth knobs byte: offer RAW video with the stand-in recorder (`Recorder`) until ferros's recording API is wired: the mode, the FPS slider and RECORD work, and a clip's frames are counted, not written.
+/// Development, the fourth knobs byte: open in RAW video (on a camera that offers it) and record from the 16th frame until the run ends, at the input's 23rd byte's frames a second (`dev_video_fps`; 0 the UI's default): a clip with no tap.
 const DEV_VIDEO: u8 = 1 << 2;
+
+/// The input's 23rd byte: DEV_VIDEO's frames a second, 0 when shorter.
+fn dev_video_fps() -> u8 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b) as usize;
+    let at = 9 + camera::MODE_BLOCK;
+    if n > at { b[at] } else { 0 }
+}
 /// Development, the input's 18th to 21st bytes: the shutter Lumis opens at, in us (u32 LE; 0 the open's own), for whole frames and slits alike (DEV_SLIT's own seed then gives way); and the 22nd: which settings Lumis sends the driver, bit 0 the gain, 1 the shutter, 2 the focus (0 all, as ever), to find which of them a camera answers by changing its frame.
 fn dev_shutter_us() -> u32 {
     let mut b = [0u8; 1 << 5];
@@ -574,10 +683,14 @@ enum Refused {
 
 /// The camera opened with the view (docs/CAMERA.md "The view"): whole sensor frames read in place, or with `slit` the binned slit's ring (docs/CAMERA.md "The ring drained"), drained by SLITS. A driver or kernel that gives no view answers a plain open, and frames come by copy at `BIN` (never for a slit).
 /// A development spawn's input (`dev_input`): its knobs byte, then optionally the driver's mode block (docs/CAMERA.md "Modes, the bench and the slit": [kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2]), so the preview can be measured with the sensor faster than the init's 15 a second; a kist opened from the map has no input and opens as before. A slit's open takes its own block.
-fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
+/// With `video` (a pacing and the opening shutter, ns) the open is RAW video's: the binned readout at the pacing's frame length, write-back (ferros_clip `Pacing::open_msg`).
+fn open(cam: &camera::Camera, slit: bool, video: Option<(ferros_clip::Pacing, u64)>) -> Result<Source, Refused> {
     let mut ask = vec![camera::OP_OPEN, cam.id, camera::OPEN_VIEW];
     let (knobs, block) = dev_input();
-    if slit {
+    if let Some((pacing, shutter_ns)) = video {
+        ask = pacing.open_msg(cam.id, shutter_ns).to_vec();
+        println!("lumis: camera {}: RAW video: the open at {} a second (frame length {} lines, every {} kept)", cam.name, pacing.fps, pacing.fll, pacing.keep);
+    } else if slit {
         ask.extend_from_slice(&camera::slit_block());
         // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
         ask.push(0);
@@ -630,6 +743,7 @@ fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
         }
         Some(v) => Err(Refused::Why(format!("the view's format {} is not one Lumis reads", v.format))),
         None if slit => Err(Refused::NoSlit),
+        None if video.is_some() => Err(Refused::Why("no view for RAW video: its frames are read in place only".into())),
         None if cam.mode != 0 => Err(Refused::Why(format!("no view for readout {}: it is read in place only", cam.mode))),
         None => {
             println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
@@ -651,7 +765,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     };
     let (knobs, _) = dev_input();
     let dev_slit = dev_knobs2() & DEV_SLIT != 0;
-    let mut src = match open(&cam, dev_slit) {
+    let mut src = match open(&cam, dev_slit, None) {
         Ok(s) => s,
         Err(Refused::Why(why)) => return fail(why),
         Err(Refused::NoSlit) => {
@@ -720,6 +834,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if dev_slit {
         integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
     }
+    // RAW video on the binned main only: the recorder's pacing is that readout's (ferros_clip `Pacing`: its pixel clock and line length, its 3072 rows), and its frames are read in place from the view.
+    let mut video_ok = cam.id == 0 && cam.mode == 0 && (cam.width, cam.height) == (4080, 3072) && matches!(src, Source::View { .. });
+    lumis_core::platform::set_video_offered(video_ok);
+    if video_ok && dev_knobs4() & DEV_VIDEO != 0 {
+        integrator.header[CURRENT_MODE_IDX] = RawMode::Video as u64;
+        integrator.header[lumis_core::shared_memory::VIDEO_FPS_IDX] = dev_video_fps() as u64;
+        println!("lumis: development: RAW video at {} a second, recording from the 16th frame", video_fps(&integrator.header));
+    }
     *opened.lock().unwrap() = Some(Opened::Memory { ptr: integrator.get_shared_memory_ptr() as usize, bytes: app::shared_memory_bytes(first.width, first.height) });
     let gain_of = |iso: i32| (iso as f64 * camera::GAIN_UNITY as f64 / ISO_AT_UNITY) as u64;
     let focus_of = |diopters: f32| cam.focus_min as u64 + ((diopters as f64 / NEAREST_DIOPTERS) * (cam.focus_max - cam.focus_min) as f64) as u64;
@@ -745,8 +867,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut quiet: Option<[u64; 2]> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
     let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
-    // RAW video's recorder: a stand-in until ferros's recording API (raw-video-rec) is wired here.
-    let mut recorder = Recorder::default();
+    // RAW video: the rate the camera is open at (None: opened as ever, not paced), and the clip recording.
+    let mut paced: Option<u32> = None;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
@@ -756,6 +878,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         let mut reading = VIEW.lock().unwrap();
         if LEAVING.load(Ordering::Acquire) {
             drop(reading);
+            if let Some(c) = CLIP.lock().unwrap().take() {
+                end_clip(c, Some(&mut *integrator.header), "Lumis leaving");
+            }
             finish_leaving(integrator, vault.as_deref());
         }
         if slit_later.is_some_and(|t| std::time::Instant::now() >= t) && integrator.header[CURRENT_MODE_IDX] != RawMode::Slitscan as u64 {
@@ -770,7 +895,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             keep_saves(vault.as_deref(), &mut *integrator.header);
             close_camera(&cam.name);
             println!("lumis: camera {}: {}", cam.name, if slit { "Slitscan: opening for slits" } else { "out of Slitscan: opening for whole frames" });
-            src = match open(&cam, slit) {
+            src = match open(&cam, slit, None) {
                 Ok(s) => match &s {
                     Source::Slit { slits, .. } if slits.width != first.width => {
                         println!("lumis: camera {}: its slits are {} wide, its frames {}: Slitscan takes whole frames", cam.name, slits.width, first.width);
@@ -797,6 +922,43 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
             };
             sent = (-1, -1, -1.);
+            paced = None;
+            turns = Turns::default();
+            reopened = Some((t_close, std::time::Instant::now()));
+        }
+        // RAW video's rate is fixed at the camera's open (the driver has no SET for it): entering RAW video, a new rate (the UI holds it while a clip records) or leaving it closes the camera and opens it again, paced or as ever. A clip still recording is ended first (the UI stops it on leaving the mode).
+        let want = if video_ok && integrator.header[CURRENT_MODE_IDX] == RawMode::Video as u64 { Some(video_fps(&integrator.header)) } else { None };
+        if want != paced && !src.is_slit() {
+            if let Some(c) = CLIP.lock().unwrap().take() {
+                end_clip(c, Some(&mut *integrator.header), "the camera reopened");
+            }
+            let t_close = std::time::Instant::now();
+            report(&src, &mut turns, &cam.name);
+            keep_saves(vault.as_deref(), &mut *integrator.header);
+            close_camera(&cam.name);
+            let shutter_ns = f64::from_bits(integrator.header[SHUTTER_NS_IDX]) as u64;
+            src = match want {
+                Some(fps) => match open(&cam, false, Some((ferros_clip::Pacing::of(fps), shutter_ns))) {
+                    Ok(s) => {
+                        paced = want;
+                        s
+                    }
+                    Err(Refused::Why(why)) => {
+                        // Whole frames as ever, and RAW video no longer offered here (the mode stays, a preview of one frame an image).
+                        println!("lumis: camera {}: RAW video's open failed ({why}): whole frames as ever", cam.name);
+                        lumis_core::platform::set_video_offered(false);
+                        video_ok = false;
+                        paced = None;
+                        reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
+                    }
+                    Err(Refused::NoSlit) => unreachable!("RAW video's open is never a slit's"),
+                },
+                None => {
+                    paced = None;
+                    reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
+                }
+            };
+            sent = (-1, -1, -1.);
             turns = Turns::default();
             reopened = Some((t_close, std::time::Instant::now()));
         }
@@ -807,6 +969,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
         if LEAVING.load(Ordering::Acquire) {
             drop(reading);
+            if let Some(c) = CLIP.lock().unwrap().take() {
+                end_clip(c, Some(&mut *integrator.header), "Lumis leaving");
+            }
             finish_leaving(integrator, vault.as_deref());
         }
         let got = match got {
@@ -821,6 +986,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 continue;
             }
             None => {
+                if let Some(c) = CLIP.lock().unwrap().take() {
+                    end_clip(c, Some(&mut *integrator.header), "the camera gave no frame");
+                }
                 // What is encoded already is kept first; a save still encoding is named as lost (lumis_core platform::exit_because).
                 keep_saves(vault.as_deref(), &mut *integrator.header);
                 lumis_core::platform::exit_because(&format!("camera {}: no frame (the driver refused or ended), as Android's camera process ends on a camera error", cam.name));
@@ -836,8 +1004,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             }
         }
         // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save or a calibration runs (it keeps capturing, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
-        let flags = integrator.header[FLAGS_IDX];
         let behind = BEHIND.load(Ordering::Acquire);
+        // Sent behind: a clip ends here, sealed, before anything else decides whether Lumis stays.
+        if behind {
+            if let Some(c) = CLIP.lock().unwrap().take() {
+                end_clip(c, Some(&mut *integrator.header), "Lumis sent behind");
+            }
+        }
+        let flags = integrator.header[FLAGS_IDX];
         let kept = kept(flags);
         let now = match (behind, kept, in_flight(flags)) {
             (false, _, _) => Stay::Front,
@@ -898,7 +1072,56 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sweep_last = now;
             sweep_frames += 1;
         }
-        recorder.turn(&cam.name, &mut *integrator.header, matches!(got, Got::Frame(..)));
+        {
+            use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
+            if video_ok && dev_knobs4() & DEV_VIDEO != 0 && frames == 16 && paced.is_some() {
+                integrator.header[FLAGS_IDX] |= RECORDING_BIT;
+            }
+            let asked = integrator.header[FLAGS_IDX] & RECORDING_BIT != 0;
+            // Held for this frame's hand-over only (`seal_at_exit` takes it from another thread otherwise).
+            let mut clip = CLIP.lock().unwrap();
+            match (asked, clip.is_some(), paced, &got) {
+                (true, false, Some(fps), Got::Frame(head, Taken::View(rows))) => match start_clip(&cam, &integrator.header, ferros_clip::Pacing::of(fps), head, rows) {
+                    Ok(c) => *clip = Some(c),
+                    Err(e) => {
+                        println!("lumis: camera {}: RAW video: no clip ({e})", cam.name);
+                        integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                    }
+                },
+                (false, true, ..) => end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "STOP"),
+                _ => {}
+            }
+            if let (Some(c), Got::Frame(head, Taken::View(rows))) = (&mut *clip, &got) {
+                // SAFETY: the held buffer's rows, `height` lines of `line` bytes from its offset in the view (mapped read-only for the life of the open, this process's until the next MAP gives it back); `frame` codes every band before it returns.
+                let f = ferros_clip::FrameIn {
+                    rows: unsafe { std::slice::from_raw_parts(rows.src as *const u8, head.height * rows.line) },
+                    count: head.count as u64,
+                    eagle_ns: head.time as u64,
+                    exposure_ns: head.exposure_ns,
+                    gain: head.gain,
+                    focus: head.focus,
+                };
+                let taken = c.rec.frame(&f);
+                let st = c.rec.stats();
+                integrator.header[VIDEO_FRAMES_IDX] = st.frames;
+                integrator.header[VIDEO_DROPPED_IDX] = st.dropped;
+                // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not said) before a frame is coded: the clip's first frames can be dropped, and no frame gives no rate.
+                integrator.header[VIDEO_LEFT_S_IDX] = match st.frames {
+                    0 => 0,
+                    n => c.room.saturating_sub(st.coded) / (st.coded / n) / c.fps as u64, // WHY/PROOF: the coded bytes pass the room by up to a frame before the writer finds it full (Taken::Ended), and the subtraction would wrap to years left; st.coded / n is at least a frame's coded header, never 0
+                };
+                if taken == ferros_clip::Taken::Ended {
+                    end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "the clip's space is full, or a write failed");
+                } else if c.preview.elapsed() < PREVIEW_GAP {
+                    // Not this frame for the preview: the camera's next frame comes first.
+                    keep_saves(vault.as_deref(), &mut *integrator.header);
+                    frames += 1;
+                    continue;
+                } else {
+                    c.preview = std::time::Instant::now();
+                }
+            }
+        }
         let k4 = dev_knobs4();
         if let (true, Got::Frame(head, Taken::View(rows))) = (k4 & DEV_CELLS != 0 && frames == 16, &got) {
             say_cells(&cam.name, rows, head.width, head.height);
@@ -954,6 +1177,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         if let Some(r) = run {
             if run_start.elapsed() >= r {
                 println!("lumis: development run of {} s ended after {frames} frames", r.as_secs());
+                if let Some(c) = CLIP.lock().unwrap().take() {
+                    end_clip(c, Some(&mut *integrator.header), "the development run ended");
+                }
                 keep_saves(vault.as_deref(), &mut *integrator.header);
                 close_camera(&cam.name);
                 lumis_core::platform::exit_because("the development run ended");
@@ -1544,10 +1770,7 @@ fn main() {
         });
         // A save on all four A715s, a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
         lumis_core::platform::set_save_threads(4);
-        if dev_knobs4() & DEV_VIDEO != 0 {
-            lumis_core::platform::set_video_offered(true);
-            println!("lumis: development: RAW video offered, with the stand-in recorder");
-        }
+        lumis_core::platform::set_before_exit(seal_at_exit);
         println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     let vault = open_vault();
