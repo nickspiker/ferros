@@ -2,7 +2,7 @@
 //! The first user is the camera (camera-full-rate, 2026-11-18): its next PDMA descriptor released inside the frame's blanking whatever holds the lock.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use ferros_layout::irqarm::{Op, ADVANCE, OPS_MOST, TEST_BITS, TEST_EQ, WRITE};
+use ferros_layout::irqarm::{Op, ADVANCE, OPS_MOST, TEST_BITS, TEST_EQ, UNMASK, WRITE};
 
 /// Lines, by `IRQS` index (process.rs `IRQ_GUARDED`: room for 2^5).
 const LINES: usize = 1 << 5;
@@ -19,8 +19,8 @@ static SEQ: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
 static N: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
 static OPS: [[[AtomicU64; 3]; OPS_MOST]; LINES] = [const { [const { [const { AtomicU64::new(0) }; 3] }; OPS_MOST] }; LINES];
 static EPOCH: [AtomicU64; LINES] = [const { AtomicU64::new(0) }; LINES];
-/// Per slot, for `diag irqs`: runs, runs whose every operation ran (acted), runs a test stopped, runs left because the slot was being rewritten.
-static COUNTS: [[AtomicU64; 4]; LINES] = [const { [const { AtomicU64::new(0) }; 4] }; LINES];
+/// Per slot, for `diag irqs`: runs, runs whose every operation ran (acted), runs a test stopped, runs left because the slot was being rewritten, acted runs that left the line open (UNMASK).
+static COUNTS: [[AtomicU64; 5]; LINES] = [const { [const { AtomicU64::new(0) }; 5] }; LINES];
 
 fn rd(a: u64) -> u32 {
     unsafe { core::ptr::read_volatile(a as *const u32) }
@@ -123,7 +123,7 @@ fn record(t: u64, slot: usize, end: u32, vals: &[u32; 4], nv: usize) {
             e.store(v, Ordering::Relaxed);
         }
     }
-    if end != 0 && end != 0xFF {
+    if (1..=OPS_MOST as u32).contains(&end) {
         let i = STOP_N.fetch_add(1, Ordering::Relaxed) as usize & (STOPS - 1);
         for (e, v) in STOP[i].iter().zip(w) {
             e.store(v, Ordering::Relaxed);
@@ -131,13 +131,13 @@ fn record(t: u64, slot: usize, end: u32, vals: &[u32; 4], nv: usize) {
     }
 }
 
-/// `.Lirq` for an armed line (main.rs `.Lirq_armed`, caller-saved registers saved): its program copied out, kept only if no arm or disarm moved it meanwhile, then run in order, a failed test ending the run.
+/// `.Lirq` for an armed line (main.rs `.Lirq_armed`, caller-saved registers saved): its program copied out, kept only if no arm or disarm moved it meanwhile, then run in order, a failed test ending the run. 1 when the run reached UNMASK: `.Lirq_armed` then leaves the line unmasked (`.Lirq_spi_open`); 0 otherwise.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferros_irq_armed(intid: u64) {
+pub extern "C" fn ferros_irq_armed(intid: u64) -> u64 {
     // `__irq_armed` holds only a slot plus one that `arm` wrote, under `LINES`, and the INTID is the GIC's, under 1020 (`.Lirq` sends nothing past it).
     let slot = unsafe { core::ptr::read_volatile(&raw const __irq_armed[intid as usize]) } as usize;
     if slot == 0 || !ON.load(Ordering::Relaxed) {
-        return;
+        return 0;
     }
     // Taken, before the program runs and long before `.Lirq_spi` masks the line and marks it pending: a SYS_IRQ_WAIT that finds nothing pending meanwhile must not unmask it (`taken`).
     TAKEN[intid as usize].store(1, Ordering::Relaxed);
@@ -158,7 +158,7 @@ pub extern "C" fn ferros_irq_armed(intid: u64) {
     if s & 1 != 0 || SEQ[slot].load(Ordering::Relaxed) != s {
         c[3].fetch_add(1, Ordering::Relaxed);
         record(t, slot, 0xFF, &vals, 0);
-        return;
+        return 0;
     }
     // The words read, in order, for the record: at most two an operation and four kept (the camera's program reads four). WHY the mask: a fifth word (a program of four tests) is still read and tested, only not kept.
     let mut nv = 0usize;
@@ -168,6 +168,7 @@ pub extern "C" fn ferros_irq_armed(intid: u64) {
         v
     };
     let mut stopped = 0u32;
+    let mut open = 0u64;
     for (k, &[w, reg, b]) in prog.iter().take(n).enumerate() {
         let a = (w >> 32) as u32;
         let hit = match w as u32 {
@@ -180,6 +181,12 @@ pub extern "C" fn ferros_irq_armed(intid: u64) {
             }
             WRITE => {
                 wr(reg, b as u32);
+                false
+            }
+            // A read of the device first: its writes above are posted, and the read returns only after the device has taken them (the same device, in order), so its line has had its source cleared before the EOI.
+            UNMASK => {
+                rd(reg);
+                open = 1;
                 false
             }
             _ => false,
@@ -206,7 +213,7 @@ pub extern "C" fn ferros_irq_armed(intid: u64) {
         }
         // WHY the min: `keep` counts past four; four are kept.
         record(t, slot, stopped, &vals, nv.min(4));
-        return;
+        return 0;
     }
     c[1].fetch_add(1, Ordering::Relaxed);
     let last = LAST_ACT[slot].swap(t, Ordering::Relaxed);
@@ -224,8 +231,10 @@ pub extern "C" fn ferros_irq_armed(intid: u64) {
             crate::devsched::FROZEN.store(true, Ordering::Relaxed);
         }
     }
-    // WHY the min: as above.
-    record(t, slot, 0, &vals, nv.min(4));
+    // WHY the min: as above. An acted run that leaves the line open records end G#40.
+    record(t, slot, (open as u32) << 6, &vals, nv.min(4));
+    c[4].fetch_add(open, Ordering::Relaxed);
+    open
 }
 
 /// Every core's last crumbs kept, once (the first freeze: this one's, or devsched's at a late run of a device's waiter, `diag "dev freeze"`), at counter `t`, for `diag "irqs runs"`.
@@ -329,7 +338,7 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
             continue;
         }
         any = true;
-        out.extend_from_slice(alloc::format!(" {} (A#{n} ops) runs A#{}, acted A#{}, stopped by a test A#{}, left mid-arm A#{}; acted to acted A#{} us the most, by 2^k us:", crate::process::IRQS[slot].name, c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed), c[3].load(Ordering::Relaxed), GAP_MOST[slot].load(Ordering::Relaxed)).as_bytes());
+        out.extend_from_slice(alloc::format!(" {} (A#{n} ops) runs A#{}, acted A#{}, stopped by a test A#{}, left mid-arm A#{}, left open A#{}; acted to acted A#{} us the most, by 2^k us:", crate::process::IRQS[slot].name, c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed), c[3].load(Ordering::Relaxed), c[4].load(Ordering::Relaxed), GAP_MOST[slot].load(Ordering::Relaxed)).as_bytes());
         for (k, h) in GAP_HIST[slot].iter().enumerate() {
             let v = h.load(Ordering::Relaxed);
             if v != 0 {
