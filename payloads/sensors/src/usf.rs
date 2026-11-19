@@ -402,6 +402,8 @@ static mut PAIR: [u64; 6] = [0; 6];
 static mut SPECTRAL: [u64; 7] = [0; 7];
 static mut PROX: [u64; 3] = [0; 3];
 static mut MAG: (u64, u64) = (0, 0);
+/// The accelerometer (2026-11-19, the motion mailbox alone, not the block): x | y << 32, z | its sample count << 32, the newest sample's time in counter ticks.
+static mut ACCEL: (u64, u64, u64) = (0, 0, 0);
 static mut SCOPE_FMT: u64 = 0;
 static mut SCOPE_N: u64 = 0;
 static mut SCOPE_MASK: u64 = 0x20;
@@ -435,6 +437,23 @@ pub fn publish() {
     }
 }
 
+/// The motion mailbox's payload (ferros_mailbox::motion): gravity, its last two samples and the field (the block's words in its order), then the accelerometer.
+/// Answers the three sample counts, which move with each sample of any.
+pub fn motion_words(w: &mut [u64; ferros_sys::mailbox::motion::WORDS]) -> (u64, u64, u64) {
+    use ferros_sys::mailbox::motion as m;
+    unsafe {
+        w[m::GRAVITY_XY] = GRAVITY.0;
+        w[m::GRAVITY_Z] = GRAVITY.1;
+        w[m::PAIR..m::PAIR + 6].copy_from_slice(&*(&raw const PAIR));
+        w[m::MAG_XY] = MAG.0;
+        w[m::MAG_Z] = MAG.1;
+        w[m::ACCEL_XY] = ACCEL.0;
+        w[m::ACCEL_Z] = ACCEL.1;
+        w[m::ACCEL_AT] = ACCEL.2;
+        (GRAVITY.1 >> 32, MAG.1 >> 32, ACCEL.1 >> 32)
+    }
+}
+
 /// A sample event: {u32 1, u32 the subscriber's handle, u32 subscription, u16 sensor type, u8 count, u8 bytes per sample}, then each sample {u64 timestamp, the values}.
 fn sample(p: &[u8]) {
     let (Some(ty), Some(&count), Some(&size)) = (u16_at(p, 12), p.get(14), p.get(15)) else { return };
@@ -464,6 +483,15 @@ fn sample(p: &[u8]) {
             // WHY the floor of one: the count is the "a sample has come" flag the kernel reads (zero: none yet), so its wrap past 2^32 skips zero.
             let n = (MAG.1 >> 32) as u32;
             MAG = (w(0) | w(1) << 32, w(2) | (n.wrapping_add(1).max(1) as u64) << 32);
+        }
+        if ty == 1 && size >= 12 {
+            // The accelerometer (type 1, ICM45631 on husky): three f32, m/s², the newest sample, its count and its time on ferros's counter (the AoC's nanoseconds, as gravity's).
+            // WHY the floor of one: the count is a reader's "a sample has come" flag (zero: none yet), so its wrap past 2^32 skips zero.
+            let n = (ACCEL.1 >> 32) as u32;
+            let a = 16 + (count as usize - 1) * (8 + size as usize);
+            let ts = u32_at(p, a).unwrap_or(0) as u64 | (u32_at(p, a + 4).unwrap_or(0) as u64) << 32;
+            let ticks = ((ts & 0x00FF_FFFF_FFFF_FFFF) as u128 * freq() as u128 / 1_000_000_000) as u64;
+            ACCEL = (w(0) | w(1) << 32, w(2) | (n.wrapping_add(1).max(1) as u64) << 32, ticks);
         }
         if ty != 22 || size < 12 {
             return;

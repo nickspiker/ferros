@@ -1681,6 +1681,8 @@ impl Process {
         self.cspace.iter().find_map(|c| match c.object {
             // Never the camera's view: read-only at EL2 too (cachemap `cam_view_map`), so a kernel write into a buffer there would fault under the lock.
             Object::Dma(i) if DMA[i].name == "camera-view" => None,
+            // Nor a mailbox's view, read-only at EL2 as well (cachemap `mbox_map`); a reader names its sequence word to SYS_WAIT alone (`mbox_wait_word`).
+            Object::Dma(i) if mbox_of(i).is_some_and(|m| m.1) => None,
             Object::Dma(i) if region(i).1 > 0 && a >= region(i).0 && end <= region(i).0 + region(i).1 => Some(a),
             _ => None,
         })
@@ -1878,7 +1880,7 @@ const SYS_DETAIL: u64 = 34;
 const SYS_ZONE: u64 = 35;
 /// lang(op, …): the language the shell speaks (lang.rs, SETTINGS.md), a packed ISO 639-3 code (vsf `wl`'s letters; 0 none, English). Op 0, Settings at x1: this device's own language, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_ZONE op 4): the identity's language, x1 the code (0: it has none). Each keeps the settings document, put back as it was when the vault refuses. The state is read from the preferences block (PREF_LANG…), not here. → 0 or ERR.
 const SYS_LANG: u64 = 36;
-/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
+/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, the `gps` endpoint's send right, a kist's granted want, or a GPS mailbox view) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
 /// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. `BELL_IDENTITY` (13, 2026-11-17), for anyone: the identity's lock epoch (`LOCK_EPOCH`), no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
 const SYS_BELL: u64 = 38;
@@ -1899,6 +1901,9 @@ const SYS_THREAD_NAME: u64 = 44;
 const SYS_IRQ_ARM: u64 = 45;
 /// panic(message, length, file, length, line | column << 32): the calling process is panicking (ferros_sys `panic_tell`, from a payload's panic handler or std's hook thru ferros_rt). The kernel keeps the message's first 2^9 bytes and the file's first 2^8 (UTF-8, as the compiler and the panic made them), the line and column, the calling thread's name and the call chain from this call (`frames`), and the process's end carries them to the flash log, the console and the glass (`death_line`). It does not end the process: the exit that follows does. A second report replaces the first. No capability: a process tells only of itself. → 0. A kernel from before answers ERR, and the exit says what it always said.
 const SYS_PANIC: u64 = 46;
+/// mailbox(op, …) (2026-11-19, docs/KERNEL.md "Mailboxes"; owner: "a capability based public read only mailbox so you could have an unlimited number of items accessing it"). Op 0, open: x1 the mailbox (ferros_mailbox `GPS`, `MOTION`, ...), x2 the token offset of the proof (`mbox_open`), x3 an arc offset for the view's token (32 bytes) → the view's base, or ERR.
+/// Everything else is a syscall that was there: SYS_DMA on a mailbox's region maps it (the writer's making the caller its writer), SYS_WAIT on its sequence word waits for a publish, and SYS_WAKE on it by the writer wakes every reader waiting.
+const SYS_MAILBOX: u64 = 47;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
@@ -2562,7 +2567,205 @@ pub static DMA: &[Dma] = &[
     // The pucks' squares (cachemap PUCK_VA, docs/PUCKS.md): each slot alone, a puck's own, handed at its launch in its surface's place (`puck_take`), its frames as it asks (SYS_DMA x1 = 6, `puck_ask`). Must stay consecutive and in order: `puck0() + j` is slot j. Never granted by name, only given. The display reads them by address (it holds the surfaces' window and runs native).
     puck_slot(0), puck_slot(1), puck_slot(2), puck_slot(3), puck_slot(4), puck_slot(5), puck_slot(6), puck_slot(7),
     puck_slot(8), puck_slot(9), puck_slot(10), puck_slot(11), puck_slot(12), puck_slot(13), puck_slot(14), puck_slot(15),
+    // The mailboxes (cachemap MBOX_VA and MBOX_VIEW_VA, docs/KERNEL.md "Mailboxes", 2026-11-19): each one's writer's region (`gps-mailbox`, read-write), then each one's readers' view (`gps-view`, read-only), in ferros_mailbox's order, a frame of the pool behind both from the first ask (`mbox_frame`). Granted by name, or a view opened with a proof (SYS_MAILBOX). Must stay consecutive and in order: `mbox0() + k` is mailbox k's writer's region, `mbox0() + MBOXES + k` its view.
+    mbox_slot(0, false), mbox_slot(1, false), mbox_slot(2, false), mbox_slot(3, false),
+    mbox_slot(0, true), mbox_slot(1, true), mbox_slot(2, true), mbox_slot(3, true),
 ];
+
+/// Mailbox k's writer's region (`view` false) or its readers' view as a DMA region (`DMA`): its frame's address in that window.
+const fn mbox_slot(k: usize, view: bool) -> Dma {
+    if view {
+        Dma { name: ferros_mailbox::VIEW_NAMES[k], base: crate::cachemap::MBOX_VIEW_VA.0 + k * crate::frames::FRAME, size: crate::frames::FRAME }
+    } else {
+        Dma { name: ferros_mailbox::BOX_NAMES[k], base: crate::cachemap::MBOX_VA.0 + k * crate::frames::FRAME, size: crate::frames::FRAME }
+    }
+}
+/// How many mailboxes there are.
+const MBOXES: usize = crate::cachemap::MBOXES;
+const _: () = assert!(MBOXES == 4 && ferros_mailbox::BYTES == crate::frames::FRAME, "the DMA table lists four mailboxes, a frame each");
+/// Where the mailboxes' regions begin in `DMA`.
+fn mbox0() -> usize {
+    DMA.iter().position(|r| r.name == ferros_mailbox::BOX_NAMES[0]).unwrap()
+}
+/// DMA region `i` as a mailbox's: (its number, whether it is the view); None for any other region.
+fn mbox_of(i: usize) -> Option<(usize, bool)> {
+    let m = mbox0();
+    (i >= m && i < m + 2 * MBOXES).then(|| ((i - m) % MBOXES, i - m >= MBOXES))
+}
+/// A mailbox's state: the frame behind it (frames.rs index, None until the first ask; kept for the boot, so a reader's view never moves) and its writer (a process epoch, 0 none).
+#[derive(Clone, Copy)]
+struct Mbox {
+    frame: Option<usize>,
+    writer: u64,
+}
+/// Under the kernel lock.
+static mut MBOX: [Mbox; MBOXES] = [Mbox { frame: None, writer: 0 }; MBOXES];
+/// Mailbox k's sequence word at the readers' window: the address every waiter on it is kept under (`State::Waiting`), whichever window it named.
+fn mbox_view_seq(k: usize) -> usize {
+    crate::cachemap::MBOX_VIEW_VA.0 + k * crate::frames::FRAME + 8 * ferros_mailbox::SEQ
+}
+
+/// Mailbox k's frame, taken from the pool (zeroed: sequence 0, nothing published) and mapped in both windows the first time anyone asks, its writer or a reader; kept for the boot. None when the pool has no frame left. Under the lock.
+fn mbox_frame(k: usize) -> Option<usize> {
+    let m = unsafe { &mut (*(&raw mut MBOX))[k] };
+    if m.frame.is_none() {
+        let f = crate::frames::take_top()?;
+        crate::cachemap::mbox_map(k, crate::frames::pa(f));
+        crate::cachemap::surface_unmapped(crate::cachemap::MBOX_VA.0 + k * crate::frames::FRAME, crate::frames::FRAME);
+        crate::cachemap::surface_unmapped(crate::cachemap::MBOX_VIEW_VA.0 + k * crate::frames::FRAME, crate::frames::FRAME);
+        m.frame = Some(f);
+        let line = alloc::format!("mailbox {}: a frame of the pool at G#{:X}, kept for the boot\n", ferros_mailbox::NAMES[k], crate::frames::pa(f));
+        k_console(&line);
+    }
+    m.frame
+}
+
+/// A line on the kernel's console.
+fn k_console(line: &str) {
+    k().console.extend_from_slice(line.as_bytes());
+}
+
+/// SYS_DMA on a mailbox's region (x1 = 0): its frame (`mbox_frame`), and for the writer's region the caller made its one writer; the region's base. ERR, said on the console: the pool has no frame, or another process writes it (one still ending: its threads leave at their next trap, then `mailboxes_gone` frees it).
+fn mbox_dma(p: &Process, i: usize) -> u64 {
+    let (k, view) = mbox_of(i).unwrap();
+    let name = ferros_mailbox::NAMES[k];
+    if mbox_frame(k).is_none() {
+        k_console(&alloc::format!("mailbox {name}: the frame pool has no frame left\n"));
+        return ERR;
+    }
+    if !view {
+        let m = unsafe { &mut (*(&raw mut MBOX))[k] };
+        if m.writer != 0 && m.writer != p.epoch {
+            k_console(&alloc::format!("mailbox {name}: {} asked to write it while another process does\n", core::str::from_utf8(&p.name).unwrap_or("?")));
+            return ERR;
+        }
+        m.writer = p.epoch;
+    }
+    DMA[i].base as u64
+}
+
+/// The mailbox sequence word a SYS_WAIT names outside the caller's arc (2026-11-19): `off` resolved as any buffer outside the arc is (`span`), at the sequence word of a mailbox whose writer's region or view the caller holds, its frame mapped; the readers' address of that word, under which every waiter on the mailbox is kept. None otherwise (the wait traps as before).
+fn mbox_wait_word(p: &Process, off: u64) -> Option<usize> {
+    let a = ((p.arc.base as u64).wrapping_add(off) & !DMA_ADDR) as usize;
+    p.cspace.iter().find_map(|c| match c.object {
+        Object::Dma(i) => mbox_of(i).filter(|_| region(i).1 > 0 && a == DMA[i].base + 8 * ferros_mailbox::SEQ).map(|(k, _)| mbox_view_seq(k)),
+        _ => None,
+    })
+}
+
+/// The mailbox sequence word a SYS_WAKE names outside the caller's arc: the writer's own, of a mailbox it writes (`MBOX` writer); the readers' address of that word, whose waiters in every process the wake makes runnable. None otherwise (the wake wakes nothing, as before).
+fn mbox_wake_word(p: &Process, off: u64) -> Option<usize> {
+    let a = ((p.arc.base as u64).wrapping_add(off) & !DMA_ADDR) as usize;
+    (0..MBOXES).find(|&k| unsafe { (*(&raw const MBOX))[k].writer } == p.epoch && a == crate::cachemap::MBOX_VA.0 + k * crate::frames::FRAME + 8 * ferros_mailbox::SEQ).map(mbox_view_seq)
+}
+
+/// Up to `count` threads of any process waiting on mailbox word `addr` (`mbox_view_seq`) made runnable, as SYS_WAKE wakes a word's: how many. The one scan of the threads a wake costs whatever reads; the writer makes no call per reader and holds no list of them. Under the lock.
+fn mbox_wake(addr: usize, count: u64) -> u64 {
+    let kk = k();
+    let mut n = 0u64;
+    for i in 0..kk.threads.len() {
+        if n >= count {
+            break;
+        }
+        if let Some(x) = th(i).filter(|x| matches!(x.state, State::Waiting(a, _) if a == addr)) {
+            x.state = State::Runnable;
+            if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+                woken(i, WAKE_WORD);
+                enqueue_back(i);
+            } else {
+                enqueue_woken(i, WAKE_WORD);
+            }
+            tr(TR_WAKE, i, 0xFFFF);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// SYS_MAILBOX op 0: mailbox `id`'s view for the caller, proved by the token at arc offset `proof`; the view's token written at arc offset `out` (the one it holds already, or a new one), answered the view's base (`mbox_dma`). ERR: no such mailbox, the proof refused, no frame.
+/// The proof, per mailbox: GPS, what proves a GPS claim (Settings, the `gps` right as its endpoint's send right) or a GPS view; motion, none (gravity and the field are what SYS_FACTS gives anyone today; a `sensors` right is the owner's to decide, rights_implicit_set); the microphones and the test mailbox are granted by name only.
+fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
+    // WHY the bound: the number is the caller's, an index into the mailboxes.
+    if id >= MBOXES as u64 {
+        return ERR;
+    }
+    let n = id as usize;
+    let held = |at: u64| {
+        let token = p.read(at, 32);
+        p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)).filter(|o| o.1 & RIGHT_SEND != 0).map(|o| o.0)
+    };
+    let proved = match n {
+        ferros_mailbox::GPS => match held(proof) {
+            Some(Object::Settings) => true,
+            Some(Object::Endpoint(e)) => k().endpoints[e].name == b"gps",
+            Some(Object::Dma(i)) => DMA[i].name == ferros_mailbox::VIEW_NAMES[ferros_mailbox::GPS],
+            _ => false,
+        },
+        ferros_mailbox::MOTION => true,
+        _ => false,
+    };
+    if !proved {
+        return ERR;
+    }
+    let vi = mbox0() + MBOXES + n;
+    let base = mbox_dma(p, vi);
+    if base == ERR {
+        return ERR;
+    }
+    let token = match p.cspace.iter().find(|c| c.object == Object::Dma(vi)) {
+        Some(c) => c.token,
+        None => {
+            let t = mint(Object::Dma(vi), RIGHT_SEND, p.epoch);
+            p.cspace.push(CapEntry { token: t, object: Object::Dma(vi), rights: RIGHT_SEND });
+            t
+        }
+    };
+    p.write(out, &token);
+    base
+}
+
+/// The process with `epoch` is gone, every thread of it (its arc is freed next): each mailbox it wrote is marked dead and its payload zeroed (ferros_mailbox `kill`, thru the frame's own address, the kernel's), and every reader waiting on it woken to see so. Called where the arc is freed (`end_process`, `kill_locked`, `drain_dying`'s last thread), never before: a thread of it still on another core could otherwise finish a publish over the mark. Under the lock.
+fn mailboxes_gone(epoch: u64) {
+    for k in 0..MBOXES {
+        let m = unsafe { &mut (*(&raw mut MBOX))[k] };
+        if m.writer != epoch {
+            continue;
+        }
+        m.writer = 0;
+        // A writer was made only after its frame was taken (`mbox_dma`).
+        let f = m.frame.expect("a mailbox's writer has its frame");
+        // SAFETY: the frame is the pool's, kept for this mailbox for the boot, at its own address the kernel's read-write (cachemap `frame_block`), 2 MiB = `WORDS` words.
+        let words = unsafe { core::slice::from_raw_parts(crate::frames::pa(f) as *const core::sync::atomic::AtomicU64, ferros_mailbox::WORDS) };
+        let s = ferros_mailbox::kill(words);
+        let n = mbox_wake(mbox_view_seq(k), u64::MAX);
+        k_console(&alloc::format!("mailbox {}: its writer ended; dead at sequence G#{:X}, A#{n} waiting readers woken\n", ferros_mailbox::NAMES[k], s & !ferros_mailbox::DEAD));
+    }
+}
+
+/// Mailbox k's readers woken to a dead mailbox when no writer holds it (the service loop, when the driver a claim asked for did not start): the sequence moved on, still dead (ferros_mailbox `kill`, nothing published to lose), every waiter woken. Nothing while a writer holds it or before its frame exists (no reader can be waiting then). Under the lock.
+pub fn mailbox_ring_dead(k: usize) {
+    let m = unsafe { (*(&raw const MBOX))[k] };
+    let Some(f) = m.frame.filter(|_| m.writer == 0) else { return };
+    // SAFETY: as `mailboxes_gone`: the frame is this mailbox's for the boot, its own address the kernel's.
+    let words = unsafe { core::slice::from_raw_parts(crate::frames::pa(f) as *const core::sync::atomic::AtomicU64, ferros_mailbox::WORDS) };
+    ferros_mailbox::kill(words);
+    mbox_wake(mbox_view_seq(k), u64::MAX);
+}
+
+/// `diag arcs`'s mailboxes: each one with a frame, its writer, its sequence and its waiting readers.
+fn mailboxes_report(s: &mut alloc::string::String) {
+    let kk = k();
+    for kx in 0..MBOXES {
+        let m = unsafe { (*(&raw const MBOX))[kx] };
+        let Some(f) = m.frame else { continue };
+        let writer = kk.procs.iter().flatten().find(|q| q.epoch == m.writer && m.writer != 0).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned());
+        // SAFETY: as `mailboxes_gone`: the frame is this mailbox's for the boot.
+        let seq = unsafe { core::ptr::read_volatile((crate::frames::pa(f) + 8 * ferros_mailbox::SEQ) as *const u64) };
+        let addr = mbox_view_seq(kx);
+        let waiting = kk.threads.iter().flatten().filter(|x| matches!(x.state, State::Waiting(a, _) if a == addr)).count();
+        let _ = core::fmt::Write::write_fmt(s, format_args!("mailbox A#{kx} {}: writer {}, sequence G#{:X}{}, A#{waiting} readers waiting, frame G#{:X}\n", ferros_mailbox::NAMES[kx], writer.as_deref().unwrap_or("none"), seq & !ferros_mailbox::DEAD, if seq & ferros_mailbox::DEAD != 0 { " dead" } else { "" }, crate::frames::pa(f)));
+    }
+}
 
 /// Slot k of the surfaces' window as a DMA region (`DMA`): its addresses, whatever frames are behind them.
 const fn surface_slot(k: usize) -> Dma {
@@ -2796,6 +2999,10 @@ fn region(i: usize) -> (usize, usize) {
     if DMA[i].name == "camera-view" {
         let v = unsafe { &*(&raw const CAM_VIEW) };
         return (DMA[i].base, if v.holder != 0 { v.n * crate::frames::FRAME } else { 0 });
+    }
+    // A mailbox's region: its frame once taken (`mbox_frame`), nothing before, so no syscall buffer resolves into an unmapped block.
+    if let Some((k, _)) = mbox_of(i) {
+        return (DMA[i].base, if unsafe { (*(&raw const MBOX))[k].frame }.is_some() { DMA[i].size } else { 0 });
     }
     (DMA[i].base, DMA[i].size)
 }
@@ -4833,6 +5040,8 @@ fn drain_dying(cur: usize) -> bool {
     kk.threads[cur] = None;
     if !kk.threads.iter().any(|x| matches!(x, Some(x) if x.proc == pi)) {
         if let Some(p) = kk.procs[pi].take() {
+            // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
+            mailboxes_gone(p.epoch);
             arc_free(p.arc);
             // The slot empty only now: the table changed again (the process count the facts' bell watches, service.rs `bell_facts`).
             PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
@@ -5034,7 +5243,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
             }
         }
-        SYS_WAIT => match p.word(f.x[0]) {
+        // A word in the arc, or a mailbox's sequence word thru a region the caller holds (2026-11-19, `mbox_wait_word`): waiters of every process on one mailbox are kept under its view's address, so its writer's wake finds them all.
+        SYS_WAIT => match p.word(f.x[0]).or_else(|| mbox_wait_word(p, f.x[0])) {
             // A word outside the arc: the syscall resolves or traps (`bad_buf`).
             None => {
                 p.bad_buf(f.x[0], 8, false);
@@ -5074,6 +5284,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
             }
         },
+        // A mailbox's writer waking its readers (2026-11-19): its own sequence word, every process's waiters on that mailbox, in the one scan below (`mbox_wake`).
+        SYS_WAKE if p.word(f.x[0]).is_none() && mbox_wake_word(p, f.x[0]).is_some() => {
+            f.x[0] = mbox_wake(mbox_wake_word(p, f.x[0]).unwrap(), f.x[1]);
+            0
+        }
         SYS_WAKE => {
             // A word outside the arc has no waiter (a wait there is refused): none woken.
             let addr = p.word(f.x[0]);
@@ -5810,6 +6025,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     let proved = match held(f.x[2]) {
                         Some(Object::Settings) => true,
                         Some(Object::Endpoint(e)) => kk.endpoints[e].name == b"gps",
+                        // A GPS mailbox's view (2026-11-19): held only thru one of the two above (SYS_MAILBOX's proof) or granted by name.
+                        Some(Object::Dma(i)) => DMA[i].name == ferros_mailbox::VIEW_NAMES[ferros_mailbox::GPS],
                         _ => false,
                     };
                     // GPS is locked until a person attests (radios at attest), and a GPS switched off refuses every claim (preference 15, bit 4).
@@ -5945,6 +6162,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         None => NOTHING,
                     }
                 }
+                _ => ERR,
+            };
+            0
+        }
+        SYS_MAILBOX => {
+            f.x[0] = match f.x[0] {
+                0 => mbox_open(p, f.x[1], f.x[2], f.x[3]),
                 _ => ERR,
             };
             0
@@ -6496,6 +6720,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     cam_view_drop("the driver closed");
                     0
                 }
+                // A mailbox's region (2026-11-19): its frame taken and mapped at the first ask, the writer's region making the caller its writer (`mbox_dma`).
+                Some(Object::Dma(i)) if f.x[1] == 0 && mbox_of(i).is_some() => mbox_dma(p, i),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
                 Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" || DMA[i].name == "puck" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
@@ -7423,6 +7649,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {
+            // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
+            mailboxes_gone(p.epoch);
             arc_free(p.arc);
         }
     }
@@ -7749,6 +7977,8 @@ fn kill_locked(name: &[u8]) -> bool {
     if elsewhere {
         kk.procs[i].as_mut().unwrap().dying = true;
     } else if let Some(p) = kk.procs[i].take() {
+        // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
+        mailboxes_gone(p.epoch);
         arc_free(p.arc);
     }
     for t in mine {
@@ -8868,6 +9098,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
             cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
         }
     }
+    // The motion mailbox's writer's region goes with the Sensors right too, the slot after the line (2026-11-19, docs/SENSORS.md "The motion mailbox"): the sensors process publishes gravity and the field there for any number of readers, and init's page has no slot left to hand it.
+    let motion = mbox0() + ferros_mailbox::MOTION;
+    if cspace.iter().any(|c| c.object == Object::Sensors) && !cspace.iter().any(|c| c.object == Object::Dma(motion)) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
+        let object = Object::Dma(motion);
+        cspace.push(CapEntry { token: mint(object, RIGHT_SEND | RIGHT_RECV, epoch), object, rights: RIGHT_SEND | RIGHT_RECV });
+    }
     // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
     if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
         surfaces_free(epoch);
@@ -9086,6 +9322,7 @@ pub fn arcs_report() -> alloc::string::String {
     surfaces_report(&mut s);
     blocks_report(&mut s);
     pucks_report(&mut s);
+    mailboxes_report(&mut s);
     s.push_str(&crate::frames::pool_report());
     unlock();
     s

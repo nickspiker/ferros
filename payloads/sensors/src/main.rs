@@ -3,7 +3,10 @@
 //! The kernel keeps the AoC's start — its rails, the firmware through GSA and Trusty: secure-world calls it makes on the `sensors` switch's word (decision 2, 2026-11-01: no FF-A door for EL0). This process turns the switch on, waits for the AoC to come online, then holds the whole conversation: the kernel has no USF of its own. Should it end, init's keeper starts another.
 //!
 //! Spawn: ferros-bridge spawn sensors.bin --name sensors --dma aoc-ipc --hw aoc-mbox --store aoc --sensors --power sensors
-//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch, 6 the AoC's a32 mailbox line (`aoc-mbox-a32`: the kernel adds it after the Sensors right's holder's last slot, as it adds pcie1's line).
+//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch, 6 the AoC's a32 mailbox line (`aoc-mbox-a32`: the kernel adds it after the Sensors right's holder's last slot, as it adds pcie1's line), 7 the motion mailbox's writer's region (`motion-mailbox`, added the same way since 2026-11-19).
+//!
+//! The motion mailbox (ferros_sys::mailbox, ferros_mailbox::motion; docs/SENSORS.md "The motion mailbox"; owner, 2026-11-19: "same with accelerometer, mic, etc."): gravity, its last two samples, the field and the accelerometer, published with each sample of any, for any number of readers waiting on it, none of them calling this process.
+//! The block the kernel reads stays as it was (SYS_FACTS, SYS_LIGHT, the wake rule).
 #![no_std]
 #![no_main]
 
@@ -21,6 +24,8 @@ pub const S_SENSORS: u64 = 4;
 pub const S_POWER: u64 = 5;
 /// The AoC's a32 mailbox line, which the kernel hands with the Sensors right (process.rs): com.google.usf's doorbell.
 pub const S_DOORBELL: u64 = 6;
+/// The motion mailbox's writer's region, which the kernel hands with the Sensors right after the line.
+pub const S_MOTION: u64 = 7;
 
 global_asm!(
     r#"
@@ -65,6 +70,8 @@ static G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 const DISPLAY_DBV: u32 = 1353;
 const DISPLAY_HZ: u32 = 120;
 const GRAVITY_MS: u64 = 10;
+/// The accelerometer's period for the motion mailbox (2026-11-19): 2^4 ms, about 62 a second, the owner's knob.
+const ACCEL_MS: u64 = 1 << 4;
 
 pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -125,6 +132,15 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if let Some(h) = usf::find("MMC56") {
         usf::subscribe(h, 1 << 6, 1, false, &mut out);
     }
+    // The accelerometer for the motion mailbox (2026-11-19), every 2^4 ms, continuous: raw acceleration, gravity included, beside the fused gravity at 10 ms (the same part feeds both, so the AoC samples it anyway).
+    // Found by its name in husky's registry (husky_common.reg "ICM45631 Accelerometer").
+    // Another board names its own part, and without one the mailbox carries gravity and the field alone.
+    match usf::find("ICM45631 Accelerometer") {
+        Some(h) => {
+            usf::subscribe(h, ACCEL_MS, 1, false, &mut out);
+        }
+        None => out.push_str("sensors: no ICM45631 Accelerometer listed: the motion mailbox carries no acceleration\n"),
+    }
     say(&out);
     out.clear();
     // The block is valid from here: the kernel answers from it once the magic is written.
@@ -132,6 +148,14 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { core::ptr::write_volatile(&raw mut (*(&raw mut BLOCK)).0[0], ferros_sys::sensor_block::MAGIC) };
     say("sensors: serving\n");
     let mut scope = 0u8;
+    // The motion mailbox: gravity and the field for any number of readers, published when either has a new sample.
+    // None from a kernel before 2026-11-19 (no such slot): the facts alone, as before.
+    let motion = ferros_sys::mailbox::Writer::take(cap(grants, S_MOTION));
+    if motion.is_none() {
+        say("sensors: no motion mailbox to publish in\n");
+    }
+    let mut motion_seen = (0u64, 0u64, 0u64);
+    let mut motion_w = [0u64; ferros_sys::mailbox::motion::WORDS];
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -139,6 +163,13 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let seen = usf::RUNG.load(core::sync::atomic::Ordering::Acquire);
         usf::drain(None);
         usf::publish();
+        if let Some(w) = &motion {
+            let counts = usf::motion_words(&mut motion_w);
+            if counts != motion_seen {
+                motion_seen = counts;
+                w.publish(ferros_sys::mailbox::motion::KIND, &motion_w);
+            }
+        }
         // The display's state follows the screen (the under-display sensor times its bursts to the panel), and the light scope follows its preference: both the kernel's to watch before the move.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         if off != screen_off {
