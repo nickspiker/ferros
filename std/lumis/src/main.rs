@@ -185,6 +185,13 @@ const DEV_FULL: u8 = 1 << 5;
 const DEV_LONG: u8 = 1 << 6;
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
+/// Development, the third knobs byte (the input's sixteenth, after the second): with `DEV_OPEN`, open readout k - 1 of the list as `list` prints it, 0 the first (or `DEV_FULL`'s); for a run over every camera and mode with no tap.
+fn dev_readout() -> Option<usize> {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b);
+    (n > 2 + camera::MODE_BLOCK && b[2 + camera::MODE_BLOCK] != 0).then(|| b[2 + camera::MODE_BLOCK] as usize - 1)
+}
+
 /// The second knobs byte, 0 when the input is shorter.
 fn dev_knobs2() -> u8 {
     let mut b = [0u8; 1 << 5];
@@ -407,7 +414,7 @@ enum Opened {
 
 /// The camera list as Lumis's menu takes it: each camera at the binning Lumis integrates it at, Camera2's conventions where Lumis's code reads them.
 /// The optical facts (sensor size, focal length, aperture) come from the driver's list since 2026-11-17 (owner: "Missing lens stats on the Lumis page"), so the menu draws each sensor and its field of view.
-/// The menu's entries, one per readout (`list`'s order, which `StartCamera` indexes): a camera's readouts share its group (its `id`), the first carrying the group's size, as Android's Lumis groups a lens's capture modes; each says the widest readout's width as the pixel array's, so the page's pixel size is the sensor's, and the 1:1 readout is `max_res` (Android's maximum resolution).
+/// The menu's entries, one per readout (`list`'s order, which `StartCamera` indexes): a camera's readouts share its group (its `id`), the first carrying the group's size, as Android's Lumis groups a lens's capture modes; each says the widest readout's width as the pixel array's, so the page's pixel size is the sensor's, and a readout of more samples than the camera's first is `max_res` (Android's maximum resolution).
 fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
     cameras
         .iter()
@@ -416,6 +423,8 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
             let group = cameras.iter().filter(|o| o.id == c.id);
             let first = cameras.iter().position(|o| o.id == c.id) == Some(index);
             let (modes, widest) = group.fold((0u32, 0u32), |(n, w), o| (n + 1, w.max(o.width)));
+            // The camera's first readout (its binned one, `list` sorts by mode): a readout of more samples is its maximum resolution (Android's max_res); one of the same or fewer (the tele's 11 degrees, the front's 8.4 MP) is another mode of the lens, not that.
+            let base = cameras.iter().find(|o| o.id == c.id).map_or(0, |o| o.width as u64 * o.height as u64);
             let Some(bayer) = camera::bayer_pattern(c.cfa) else {
                 println!("lumis: camera {} has a colour filter Lumis does not read (G#{:02X}); left out", c.name, c.cfa);
                 return None;
@@ -447,7 +456,7 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 pixel_array_width: widest,
                 mode_count: if first { modes } else { 1 },
                 group_id: c.id as i32,
-                max_res: c.mode != 0,
+                max_res: c.width as u64 * c.height as u64 > base,
                 is_cropped: false,
                 has_cal: false,
             })
@@ -1234,7 +1243,11 @@ impl FluorApp<G2t16> for Lumis {
         match &mut self.screen {
             Screen::Menu if self.knobs & DEV_OPEN != 0 && !self.dev_opened && !self.cameras.is_empty() => {
                 self.dev_opened = true;
-                let index = if dev_knobs2() & DEV_FULL != 0 { self.cameras.iter().position(|c| c.mode != 0).unwrap_or(0) } else { 0 };
+                let index = match dev_readout() {
+                    Some(k) if k < self.cameras.len() => k,
+                    _ if dev_knobs2() & DEV_FULL != 0 => self.cameras.iter().position(|c| c.mode != 0).unwrap_or(0),
+                    _ => 0,
+                };
                 self.open(index, None);
                 return true;
             }
@@ -1395,6 +1408,9 @@ fn list() -> Vec<camera::Camera> {
             // Each camera's readouts together, the binned one first (Android's order: the menu shows a lens by its first readout and offers the rest on its page).
             c.sort_by_key(|c| (c.id, c.mode));
             println!("lumis: {} readouts listed", c.len());
+            for (k, r) in c.iter().enumerate() {
+                println!("lumis: readout {k}: {} (camera {}), mode {}, {} x {}, filter period {}, rotation {}, facing {}, exposures {} ns to {} ns", r.name, r.id, r.mode, r.width, r.height, r.cfa_period, r.rotation, r.facing, r.exposure_min, r.exposure_max);
+            }
             c
         }
         Err(e) => {
