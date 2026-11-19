@@ -127,8 +127,8 @@ pub const ARRAYS: [Array; 4] = [
     // The ultrawide's gain, its own words read on the Pro (b915, 2026-11-17): capability 0, gain = 1024 / (1024 - code) over codes 0 to 1008 (1x to 64x analogue), digital never used. The noise test (camtest 4): no empty codes up to 64x, and the dark noise grows 4.8 times from 8x to 64x (8 times if the gain were after the ADC), so analogue to its stated most.
     // Its integration least and margin, CAPS on the Pro (2026-11-16, b898): 1 and 64.
     Array { unit: 1, period: 4, full: (8000, 6000), samsung: false, incs: false, crop: true, weighting: true, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(64), lte: None, side: None },
-    // The front has never answered ferros, the tele never streamed: neither margin read.
-    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
+    // The front: its margin 5 read at its first opens on the Pro (2026-11-18, b976); its shift is the main's pair of words (G#0702, G#0704, the shift in the high byte), as Android's 1 s hold writes them (shift 1, docs/CAMERA.md "The I2C side without a flash"). Its most is the shift Android uses, 1 (65535 lines of 2^1, about 1.37 s); the field's width and the frame counter are unmeasured (at shift 1 every frame is under 2^17 lines). The tele never streamed: its margin unread.
+    Array { unit: 1, period: 2, full: (0, 0), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: Some(5), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 1, frame_bits: 32 }), side: Some(Side { pd: None, emb: 0x0118 }) },
     Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, UNITY), margin: None, lte: None, side: Some(Side { pd: None, emb: 0x0118 }) },
 ];
 
@@ -1321,9 +1321,13 @@ mod tests {
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
     #[test]
     fn short_cameras_keep_their_frame() {
-        let f = cams::FRONT.listed_timing();
+        let f = cams::TELE.listed_timing();
         assert!(!f.long);
-        assert_eq!(f.most_ns(), cams::FRONT.exposure_max_lines * cams::FRONT.line_ps / 1000);
+        assert_eq!(f.most_ns(), cams::TELE.exposure_max_lines * cams::TELE.line_ps / 1000);
+        // The front, since its margin and shift (2026-11-18): 65535 - 5 lines of 2^1 at its 10.44 us line, about 1.37 s, past Android's 1 s.
+        let f = cams::FRONT.listed_timing();
+        assert!(f.long);
+        assert_eq!(f.most_ns(), (65535 - 5) * 2 * cams::FRONT.line_ps / 1000);
         let m = cams::MAIN.listed_timing();
         assert!(m.long && m.most_ns() > 13_000_000_000);
         let u = cams::ULTRAWIDE.listed_timing();

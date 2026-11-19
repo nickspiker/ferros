@@ -255,6 +255,11 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_l
         // WHY the max: a reply of the header alone has no samples, and the mean would divide by zero and panic the process.
         Some((sum * 16 / cnt.max(1), u64::from_le_bytes(buf[16..24].try_into().unwrap())))
     };
+    // The stream's first frame before the first SET, as Lumis does: the front took no frame at all when a hold came before its first (2026-11-18, twice, docs/CAMERA.md "The other cameras on the Pro"), while every SET mid-stream was taken.
+    if frame().is_none() {
+        say!(g, "camtest: long exposures: no first frame\n");
+        ferros_sys::exit(1);
+    }
     let mut steps = [0u8; 1 << 5];
     let mut k = 0;
     // The first step, 2^`bottom_log2` ms (6 if 0): a ladder of long steps need not walk up from 64 ms.
