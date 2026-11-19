@@ -2045,11 +2045,12 @@ static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
 /// The A715s' ceiling while a RAW clip is recorded (`diag clock clips <kHz>`; 0: none): THERMAL.md "The busy lift"'s 1572 MHz, the least energy for a sustained encode.
 static CLIPS_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
 
-/// Whether a RAW clip is being recorded: the `clips` window was written within the last second.
+/// Whether a RAW clip is being recorded: a clip's extent is given to its writer (from its open to its seal or its writer's end, process.rs `EXTENTS_OPEN`), or, for a writer that writes thru the vault process, the `clips` window was written within the last second.
 fn recording() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let at = crate::process::CLIPS_AT.load(Relaxed);
-    at != 0 && cntpct().wrapping_sub(at) < cntfrq() && CLIPS_KHZ.load(Relaxed) != 0
+    let open = crate::process::EXTENTS_OPEN.load(Relaxed) || (at != 0 && cntpct().wrapping_sub(at) < cntfrq());
+    open && CLIPS_KHZ.load(Relaxed) != 0
 }
 
 /// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `GOV_BUSY_KHZ` while their own load holds the busy lift, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
@@ -2574,6 +2575,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
+    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): the A715s up to A#{} MHz (0: none) while a RAW clip is recorded; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if recording() { "recording" } else { "not recording" }).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
