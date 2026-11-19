@@ -171,6 +171,8 @@ fn dev_input() -> (u8, Vec<u8>) {
 const DEV_UNCACHED: u8 = 1 << 0;
 /// Development, the second knobs byte: the first open is the slit's, and Lumis starts in Slitscan, sized from the camera's list (its whole readout), so one hand-spawned driver (which refuses a second open) drains slits.
 const DEV_SLIT: u8 = 1 << 1;
+/// Development, with `DEV_SLIT`: the second knobs byte's bits 3 and 4 pick the shutter Lumis opens at, 2^-(11 - 2n) s (n 0 to 3: about 1/2000 s, 1/500, 1/128, 1/32), the camera's least (one line) being under the sensor's two.
+const DEV_SLIT_SHUTTER: u32 = 3;
 /// Development, the second knobs byte: whole frames first, then Slitscan by itself 2^12 ms in (no tap: the attest screen takes every touch), so the reopen (CLOSE, and an OPEN that starts a stored driver on demand) runs and is timed; with a driver from before the slit it falls back, and opens whole frames again.
 const DEV_SLIT_LATER: u8 = 1 << 2;
 /// The second knobs byte, 0 when the input is shorter.
@@ -555,7 +557,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut turns = Turns::default();
     let first = if dev_slit {
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
-        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: cam.exposure_min, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0 }
+        let shutter_ns = (1_000_000_000u64 >> 11) << (2 * ((dev_knobs2() >> DEV_SLIT_SHUTTER) & 3));
+        println!("lumis: camera {}: development: the shutter {shutter_ns} ns", cam.name);
+        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0 }
     } else {
         let Some(Got::Frame(first, _)) = src.next(&mut turns) else {
             return fail("no first frame".into());
