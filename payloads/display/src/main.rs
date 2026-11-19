@@ -5668,6 +5668,9 @@ static mut HELM_DRAWN: bool = false;
 /// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), deck [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
 static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
+/// How far the helm's marks are put away (op 54 corner 10, Q16; owner, 2026-11-18, via ferros-52: while an item is dragged on the deck its drop targets grow out of the bottom corners): the map's level a shown frame, on its own spring, so the marks fade as the targets grow and come back as they shrink, C¹ with them. 0 the helm as ever.
+static HELM_HIDE: AtomicU32 = AtomicU32::new(0);
+static mut HELM_HIDE_DRAWN: u32 = 0;
 /// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark), and the ring's glow in bits 24-31 (ferros_glow's state byte: 4 for you, 400 nm; 6 a question, 703 nm, the system waiting on the person, docs/NOTIFY.md "System questions"; 0 from a map before it: for you). As the map last sent it, and as last drawn.
 static HELM_NOTE: AtomicU32 = AtomicU32::new(0);
 static mut HELM_NOTE_DRAWN: u32 = 0;
@@ -5770,6 +5773,16 @@ fn helm_draw(width: usize, height: usize) -> bool {
             HELM_DRAWN = false;
         }
     }
+    // The marks put away (a drag's drop targets): a change redraws the helm.
+    let hide = HELM_HIDE.load(Ordering::Acquire);
+    if hide != unsafe { HELM_HIDE_DRAWN } {
+        unsafe {
+            HELM_HIDE_DRAWN = hide;
+            HELM_DRAWN = false;
+        }
+    }
+    // What of the marks shows: all of it at rest, nothing once the targets have grown whole.
+    let shown = 1. - hide as f32 * (1.0 / 65535.0);
     let (note_icon, note_count) = ((note >> 16) as u8, note as u16);
     // The ring's glow: a map from before op 66 carried it sends none (0), which is for you.
     let note_glow = match (note >> 24) as u8 {
@@ -5839,7 +5852,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
                     continue;
                 }
                 let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
-                let cov = stroke(dist(fx, fy));
+                let cov = stroke(dist(fx, fy)) * shown;
                 let i = row * width + px as usize;
                 if cov > 0.0 {
                     bar[i] = bar[i].under(ring_ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
@@ -5866,7 +5879,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
                     continue;
                 }
                 let q = dist(px as f32 + 0.5, py as f32 + 0.5) / d0;
-                let a = peak * draw::bump_step(1. - libm::log2f(1. + q * q) / octaves);
+                let a = peak * draw::bump_step(1. - libm::log2f(1. + q * q) / octaves) * shown;
                 if a > 0.0 {
                     let i = row * width + px as usize;
                     bar[i] = bar[i].under(black | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
@@ -7254,12 +7267,13 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
         }
-        // 54 `corner light [corner u8: 8 deck, 9 back][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
+        // 54 `corner light [corner u8: 8 deck, 9 back, 10 the marks put away][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
         if op == 54 && n >= 4 {
             let level = u16::from_le_bytes([msg[2], msg[3]]) as u32;
             match msg[1] {
                 8 => HELM_TARGET[0].store(level, Ordering::Release),
                 9 => HELM_TARGET[1].store(level, Ordering::Release),
+                10 => HELM_HIDE.store(level, Ordering::Release),
                 _ => {}
             }
             ferros_sys::reply(&tok, &[0]);

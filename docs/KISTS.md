@@ -265,6 +265,21 @@ So the settings circle's Kists page is the **Deck** (owner, 2026-11-12, of names
 
 **Not yet:** run on a device; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind.
 
+## Drop targets on the deck (2026-11-18)
+
+The owner's design with ferros-52's, accepted: while an item is dragged on the deck (a kist's circle or a puck), targets grow for the length of the drag (payloads/map/src/targets.rs).
+Back and Deck cannot be pressed mid-drag anyway, so their marks fade while the targets show (display op 54, corner 10).
+
+- **About**, out of the bottom-left corner: the item's card on the Deck page (permissions, version, storage, its own settings). The settings circle's About is the About page.
+- **Unstow**, out of the bottom-right corner, never at once: the card with its unstow asked, a kist's sheet or a puck's two taps. The settings circle shows no Unstow.
+- **Stop**, down from the top centre, for an item that runs: ended at once by init's OP_STOP, no confirm, apps and pucks alike. No close first (owner, 2026-11-18: "shutdown? That's called a fuckup"): a ferros app keeps every change as it happens, so there is nothing to shut down, and the camera's driver closes its stream as its holder's process ends, killed or not (forge d70b1c81).
+  - A puck is ended at once and held down: the map launches it again only when its circle is tapped, and it shows its name alone meanwhile (owner: "Stopped puck shows name only"). Held in the map's memory: a reboot starts it again.
+  - One path, `Map::stop`, for the target, the card's Stop and the Deck row's.
+- **After any drop** the dragged item and everything it pushed go back exactly where they stood before the drag (owner: "previous deck arrangement should restore after the target is dropped").
+- **Motion:** each target is a disc about its corner (the top's centre for Stop), its radius the level times a quarter of the span; the level follows the drag on a spring stepped by shown frames (C¹, no timer). The target under the finger is lit, decided by the same disc it is drawn with.
+- **Without a gesture:** each row of Settings, Deck has the same three as buttons (About, Stop while it runs, Unstow).
+- **Words:** the existing "about", "stop" and "unstow", in all sixteen languages.
+
 ## The unstow sheet (2026-11-12)
 
 The owner, 2026-11-12: "upon kist removal, I suspect it may be good to ask if the user wants to clear data? and if so, what categories?", then "Please." to this design.

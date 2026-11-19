@@ -28,6 +28,8 @@ mod notes;
 mod typed;
 /// The WiFi page's picker (docs/WIFI.md "The picker"): the networks in range and remembered, a pick, the passphrase on the keyboard, the join, a network forgotten.
 mod wifi;
+/// The deck's drop targets while an item is dragged: About, Unstow, Stop; and the one Stop path.
+mod targets;
 /// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
 mod camera;
 
@@ -1113,6 +1115,8 @@ enum Choice {
     Answer(u8, u8),
     /// The Deck page: a thing's unstow (its place in the person's list: a kist's opens its unstow sheet, a puck's "remove from the deck" is two taps), and the pandok's stow or update (its row in the directory).
     Unstow(u8),
+    /// A row's Unstow on the Deck page (the deck's Unstow target's path, never at once): its card with its unstow asked (targets.rs `unstow_ask`).
+    UnstowAsk(u8),
     StowListed(u8),
     /// The unstow sheet (docs/KISTS.md "The unstow sheet"): a kind of thing kept or not (`SHEET_*`), where it goes from (true: this device only), and the sheet's Unstow or Cancel.
     UnstowKeep(u8),
@@ -1670,6 +1674,10 @@ struct Map {
     fault: Option<([u8; 32], u8, bool)>,
     /// Kists that started and then stopped abnormally (ferros_kist::launch::why::stopped: a fault, a panic, a kill from outside) while not the one asked last (owner, 2026-11-11: Mahere faulted at once, "no toast or anything"): each said once, as its circle is next tapped, before any launch (`tap_inner`). Dropped when the kernel no longer keeps it (that kist started again since).
     stopped: alloc::vec::Vec<([u8; 32], u8)>,
+    /// The deck's drop targets and the drag they serve (targets.rs).
+    drop: targets::Drop,
+    /// Pucks the person stopped (targets.rs `stop`): never launched again by the map until the person taps their circle; each shows its name alone meanwhile.
+    pucks_held: alloc::vec::Vec<[u8; 32]>,
     /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
@@ -2764,7 +2772,7 @@ impl Map {
         call(self.display, &m[..2 + 64 * n], &mut r);
         for i in 1..self.deck.n() {
             let Some(k) = self.kist(i) else { continue };
-            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) {
+            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) && !self.pucks_held.contains(&k.capsule) {
                 self.launch(i);
             }
         }
@@ -3135,7 +3143,7 @@ impl Map {
         }
         self.nrows = 0;
         match self.view {
-            View::Map => {}
+            View::Map => self.drop_draw(&mut b),
             View::Open(0) => self.settings(&mut b, region),
             View::Open(i) => self.ask_page(&mut b, i, region),
         }
@@ -4691,6 +4699,22 @@ impl Map {
                         m[5..7].copy_from_slice(&(ir as u16).to_le_bytes());
                         m[7] = (ki + 1) as u8;
                         b.op(&m);
+                        // The deck's drop targets as buttons too (owner, 2026-11-18, via ferros-52: "A non-gesture path"): About (its card), Stop while it runs, Unstow (asked on its card, never at once); right of its picture, side by side.
+                        let running = if puck { self.pucks_up.contains(&k.capsule) && !self.pucks_held.contains(&k.capsule) } else { self.kist_state(&k.capsule).is_some_and(|s| s.0 == Msg::Running) };
+                        let acts = [(Msg::PageAbout, Choice::Card(ki as u8), true), (Msg::Stop, Choice::Stop(ki as u8), running), (Msg::Unstow, Choice::UnstowAsk(ki as u8), true)];
+                        let shown = acts.iter().filter(|a| a.2).count() as i64;
+                        let [bfill, bheld, btl, bbr] = ferros_sys::theme::current().button;
+                        let (gap, left) = (uu(1, 2), cx - half + 2 * ir + uu(1, 1));
+                        let bw = (cx + half - uu(1, 1) - left - gap * (shown - 1)) / shown;
+                        for (j, &(word, what, _)) in acts.iter().filter(|a| a.2).enumerate() {
+                            let bx = left + j as i64 * (bw + gap) + bw / 2;
+                            let down = self.pressed == Some(what);
+                            b.button(bx, y - uu(1, 2), bw, uu(3, 2), uu(1, 1), [if down { bheld } else { bfill }, btl, bbr, white()], tr(word));
+                            if hit {
+                                self.push_row(bx - bw / 2, bx + bw / 2, y - uu(3, 2), y + uu(1, 2), what);
+                            }
+                        }
+                        y += uu(5, 2);
                         // A restore or an unstow of it under way, or one that failed.
                         if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE) {
                             progress(self, b, &mut y, j);
@@ -5400,6 +5424,7 @@ impl Map {
                             if !self.pucks_up.contains(&capsule) || self.live.as_ref().is_some_and(|l| !l.contains(&capsule)) {
                                 self.stopped.retain(|s| s.0 != capsule);
                                 self.pucks_up.retain(|c| *c != capsule);
+                                self.pucks_held.retain(|c| *c != capsule);
                                 self.launch(i);
                             }
                             // WHY the casts: a tap that placed a finger on a circle is on the glass, so its pixel fits a u16.
@@ -5701,15 +5726,7 @@ impl Map {
                     }
                     // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the stower (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
                     // A kist's Unstow: its sheet, in the card's place, at its top, at the design's defaults; what it kept for itself counted by the stower meanwhile (stower.rs `size_ask`, drawn when it comes).
-                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| !kist.is_puck()) => {
-                        let kist = &self.kists.kists[k as usize];
-                        self.sheet = Some(Sheet { capsule: kist.capsule, keep_data: false, keep_made: true, keep_answers: true, here_only: false });
-                        if self.sheet_size.is_none_or(|s| s.0 != kist.capsule) {
-                            self.sheet_size = None;
-                        }
-                        stower::size_ask(&kist.capsule, &kist.developer, &kist.option);
-                        self.scroll = 0;
-                    }
+                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| !kist.is_puck()) => self.unstow_sheet(k as usize),
                     Some(Choice::UnstowKeep(r)) => {
                         if let Some(s) = self.sheet.as_mut() {
                             match r {
@@ -5775,17 +5792,7 @@ impl Map {
                         }
                     }
                     // A row on the Deck: its card, at its top; Back: the list, at its top.
-                    Some(Choice::Card(k)) => {
-                        self.card = self.kists.kists.get(k as usize).map(|kist| kist.capsule);
-                        self.scroll = 0;
-                        // A kist that wants the person's people: its choice read for the card (`people_thread`).
-                        if let Some(kist) = self.kists.kists.get(k as usize).filter(|kist| kist.wants.iter().any(|w| w.right == ferros_kist::PEOPLE)) {
-                            let mut m = [27u8; 65];
-                            m[1..33].copy_from_slice(&kist.developer);
-                            m[33..].copy_from_slice(&kist.option);
-                            people_ask(&m);
-                        }
-                    }
+                    Some(Choice::Card(k)) => self.card_open(k as usize),
                     // The People page's add: the keyboard (the attest screen's, as the Fleet page's words) asks for their handle, then a name (fgtw op 15 [2]); how it ended comes back on the page.
                     Some(Choice::PersonAdd) => {
                         people_ask(&[15, 2]);
@@ -5827,18 +5834,16 @@ impl Map {
                         self.card = None;
                         self.scroll = 0;
                     }
-                    // A kist's Stop: init ends its running process (OP_STOP), one shot dead; the kists' bell rings as it ends, and its state follows on the card and its circle (`kists_rang`).
+                    // A kist's Stop, its card's or its row's (targets.rs `stop`: init's OP_STOP at once); the kists' bell rings as it ends, and its state follows on the card and its circle (`kists_rang`).
+                    Some(Choice::UnstowAsk(k)) => {
+                        let said = self.unstow_ask(k as usize + 1);
+                        console(self.grants, said.as_bytes());
+                        console(self.grants, b"\n");
+                    }
                     Some(Choice::Stop(k)) => {
-                        if let Some(kist) = self.kists.kists.get(k as usize) {
-                            let mut m = [0u8; 33];
-                            m[0] = ferros_kist::launch::OP_STOP;
-                            m[1..].copy_from_slice(&kist.capsule);
-                            let mut r = [0u8; 1];
-                            let n = call(cap(self.grants, S_LAUNCH), &m, &mut r);
-                            if n == ferros_sys::ERR || n < 1 || (r[0] != ferros_kist::launch::STOPPED && r[0] != ferros_kist::launch::NOT_RUNNING) {
-                                console(self.grants, b"map: init did not take the stop\n");
-                            }
-                        }
+                        let said = self.stop(k as usize);
+                        console(self.grants, said.as_bytes());
+                        console(self.grants, b"\n");
                     }
                     // Stow or update the directory's kist: the stower fetches, checks and seals it, and the page shows each stage as its doorbell rings.
                     Some(Choice::StowListed(d)) => {
@@ -6038,6 +6043,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         asked: None,
         fault: None,
         stopped: alloc::vec::Vec::new(),
+        drop: targets::Drop::default(),
+        pucks_held: alloc::vec::Vec::new(),
         kists_read: 0,
         live: None,
         ended: alloc::vec::Vec::new(),
@@ -7037,6 +7044,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.settling = true;
                 map.frame_seen = Some(frame_count);
             }
+            // Dropped on a target (targets.rs): the deck back as it stood before the drag, and the target acts. Else the targets go and the drag's arrangement stays.
+            if let Some(said) = map.drop_lift() {
+                console(grants, said.as_bytes());
+                console(grants, b"\n");
+            }
             // Fingers up: the world back to zoom one, then whatever moved (or everything, after a rescale) into the vault, and the view if it changed. The same picture is drawn once more in the rescaled world, so the display holds a frame that matches its scene (its clock redraws replay it).
             // Not while a circle is open or the camera flies: the rescale would move the world under the page and the flight's target.
             if map.view == View::Map && map.target.is_none() {
@@ -7114,7 +7126,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             let before = map.cam;
             let mut scene_moved = false;
-            if nb != grab_n && nb > 0 {
+            let regrab = nb != grab_n && nb > 0;
+            if regrab {
                 grab_n = nb;
                 grab = if nb == 1 {
                     map.grasp(start[both[0]].1, start[both[0]].2)
@@ -7127,6 +7140,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again, and the view it was opened from is not flown back to.
                 map.view = View::Map;
                 map.back = None;
+            }
+            // A one-finger drag of a circle on the deck: its drop targets grow (targets.rs); a second finger, or none held, and they go.
+            if regrab {
+                match grab {
+                    Some(i) if nb == 1 => map.drop_begin(i),
+                    _ => map.drop_cancel(),
+                }
             }
             if nb == 1 {
                 let id = both[0];
@@ -7147,6 +7167,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.push_apart(i);
                     push_us += ferros_sys::us_since(t_p);
                     scene_moved = true;
+                    // The target under the finger lit, by the rule they are drawn with.
+                    map.drop_over(cur[id].1, cur[id].2);
                 } else {
                     // One finger from the air: the plane follows it, its last three frames' movements kept for the fling.
                     map.cam.x -= dx;
@@ -7237,7 +7259,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             sleep_until(now() + freq() / (1 << 3));
             continue;
         }
-        if held == 0 && !map.settling && !qr.settling {
+        if held == 0 && !map.settling && !qr.settling && !map.drop.moving() {
             // WHY the min: two deadlines, the rest's and the second's turn on the clock or About (`tick_at`); the earlier ends the rest, so the second is drawn as it turns rather than up to a rest after.
             let rest = now() + freq() / 30;
             // A note's deadline ends the rest too, as an alarm would (docs/NOTIFY.md "Deadlines").
@@ -7247,6 +7269,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let mut fr = [0u8; 4];
             call(display, &[24], &mut fr);
             frame_count = u32::from_le_bytes(fr);
+        }
+        // The drop targets growing or shrinking, a shown frame at a time, held or not; drawn when they moved.
+        if map.drop_step(frame_count) {
+            map.draw();
         }
         // The settings moving after the lift, stepped once per frame the panel started since the last step (owner, 2026-11-05: "count frames and not rendered frames so the animation stays smooth if we miss a frame"): a pass that missed frames steps them all, then draws once. Each draw arms the next frame, so the count moves while anything does. Settled, the loop goes back to resting.
         if held == 0 && map.settling {
