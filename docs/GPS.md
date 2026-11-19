@@ -327,6 +327,93 @@ For the Photon session that owns fgtw-bootstrap; nothing here changes fgtw.org.
   - the document's creation time (Eagle) is when it was answered.
 - **The device:** checks the signature against the pinned seed key and the nonce, keeps the answer as `gps.rough` (identity class, beside `gps.last`: kvault.rs `IDENTITY` needs the prefix), and the driver adds it as a source circle. A carrier ASN widens it (2^19 m) unless the zone and the last fix agree with it. Over a VPN it lands in the wrong country, which the zone then contradicts and the combination widens to cover both.
 
+## Android's aided session, captured (2026-11-19)
+
+Owner, 2026-11-19: "both get a GPS lock indoors on Android."
+So the Pro's BCM4776 locks indoors with what Android gives it, and ferros had to give it the same.
+
+**How it was captured** (branch gps-indoor-lock, `tools/gps-capture`): the Pro in Android (`diag android`), Magisk root, gpsd's gps.xml bind-mounted with `Log="LOGCAT"` and `LogPriMask="LOG_DEBUG"` (and `IgnoreOnChipRequest="false"` for the on-chip runs), lhd stopped and started again under `tools/gtrace` (every read and write on `/dev/ttyBCM` and the nSTANDBY file, with its bytes), gpsd started after it, `logcat -b all -v monotonic` on the host.
+Five sessions, every frame of each CRC-good: h1, h2, h3 host mode with the framework's normal aiding (Maps open), o2 and o3 on-chip from a cold chip with location switched off (no framework aiding, no other client), then `$pglirm,req_breadcrumb,pvtOnChip,periodSec,1,batchOption,2` into glgpsctrl.
+Files (local only: Google's gpsd, lhd and patch, Broadcom's LTO, the place): keys/husky/captures/gps-2026-11-19/ with SHA256SUMS and B3SUMS; `gps-trace` (tools/gps-trace) reads them back.
+gpsd's LOG_DEBUG log did not come this time (gpsd's own mount namespace saw the edited file; it logged only its `$PGLOR,0,RID` line), so the messages are named below by decoding them, not from its log.
+
+**What Android injects** (the GNSS HAL's log, every session): the time (`Gnss::injectTime`, NTP, about every 5 s at a start), a place (`Gnss::injectLocation`, the network provider's, asked by the HAL "for 10000 millis"), PSDS type 2 (`injectPsdsData`, 48408 bytes, fetched by Play services: Google's predicted orbits) and a request for type 3, and SUPL (`agnssStatusCb type 1`: the SUPL connection, gps.xml `supl.google.com`).
+gps.xml also has gpsd fetch Broadcom's LTO itself (`lto2.dat`, refreshed at the boot) and has it ignore the injected system time (`IgnoreInjectedSystemTime="true"`).
+
+**Time to fix under Android** (gps provider's location elapsed time against the chip's power-up in the trace): 17.5 s (h2) and 10.5 s (h3, a few seconds after h2) in host mode; 42 s after a boot with Play services' aiding; on-chip from a cold chip with no framework aiding, 35.0 s (o2) and 48.7 s (o3), each 1.2 to 2 s after gpsd sent its LTO windows.
+
+**What gpsd sends the chip:**
+
+| Session | Messages host to chip (besides the patch, the second stage and the configuration) |
+|---|---|
+| host mode (h2) | `02 80` ×414 (gpsd's measurement-engine channel, up to 998 bytes), `8c 81` ×23 (418 bytes, about once a second), `83 81` ×2, `8f 81`, `92 81` ×2. No `87 81`, `d0 81` or `82 81`: in host mode gpsd keeps the aiding in its own engine. |
+| on-chip (o2, o3) | configuration `03 00` `06 00` `10 00` `17 00`, `8e 81` ×3, `83 81`, `92 81`, `09 00` ×2 at 12.8 s; then nothing for 20 to 35 s; then `82 81` ×9, the LTO windows (1 + 4 messages of 30 GPS satellites, 1 + 3 of 24 GLONASS); the first fix 1.2 to 2 s later. No `87 81` and no `d0 81` (the framework had injected neither). |
+
+So the one thing a cold chip needs to lock indoors is orbits: the windows.
+
+## The LTO windows are broadcast ephemerides (`82 81` decoded, 2026-11-19)
+
+The message (from its class, little-endian, unescaped): class `82 81`, length u16 (1532 for a full one, 188 for a group's first), the checksum (`87 81`'s rule, checked on all nine), then a header of G#B6 bytes, then records of G#A8 bytes (42 words) from offset G#BC, their count the word at G#68 (8 in a full message).
+The header: a word 0, 24 bytes the same in every message of a session (the LTO file's identity, most likely), zeros, at G#48 and G#4C two words in the GPS group (G#89128D90, G#1207 with G#1_0000 set in the group's first message) and zeros in the GLONASS group. Not decided: those two words.
+
+A GPS record, word by word, in IS-GPS-200's own scaling (semicircles where the ICD has them), checked field by field against BKG's BRDC set for G01 (toe 18:00 GPS) with the window's toe 19:00:16, M0 carried forward by the mean motion: every field agrees to its last bits or (the harmonic terms, which LTO fits) to its size.
+
+| Word | Field | Scale | G01: window / BRDC |
+|---|---|---|---|
+| 0 | PRN | | 1 |
+| 1, 2 | 1, 1 (GLONASS: word 1 a code per satellite, G#201 to G#3E1) | | |
+| 6 | 391 in every GPS record, 61 in every GLONASS one: not decided | | |
+| 8-11 | G#BEEF ×4: filler | | |
+| 12 | TGD | 2^-31 s | -9.31e-9 / -9.31e-9 |
+| 13 | toc | 16 s | 414016 s |
+| 14, 15, 16 | af2, af1, af0 | 2^-55, 2^-43, 2^-31 | af0 1.2396e-4 / 1.2398e-4 |
+| 17 | Crs | 2^-5 m | -55.4 / -55.6 |
+| 18 | Δn | 2^-43 sc/s | 4.506e-9 / 4.506e-9 rad/s |
+| 19 | M0 | 2^-31 sc | -1.4598 / -1.4600 rad (carried 3616 s) |
+| 20 | Cuc | 2^-29 rad | -2.76e-6 / -2.80e-6 |
+| 21 | e | 2^-33 | 0.0022448 / 0.0022449 |
+| 22 | Cus | 2^-29 rad | 7.66e-6 / 7.36e-6 |
+| 23 | √A | 2^-19 √m | 5153.73 / 5153.73 |
+| 24 | toe | 16 s | 414016 / 410400 s |
+| 25, 26 | 1, 15: not decided (fit flag and AODO, likely) | | |
+| 27 | Cic | 2^-29 rad | |
+| 28 | Ω0 | 2^-31 sc | -1.5037 / -1.5037 rad |
+| 29 | Cis | 2^-29 rad | |
+| 30 | i0 | 2^-31 sc | 0.9557 / 0.9556 rad |
+| 31 | Crc | 2^-5 m | 232 / 237 |
+| 32 | ω | 2^-31 sc | 0.1424 / 0.1426 rad |
+| 33 | Ω̇ | 2^-43 sc/s | -8.11e-9 / -8.12e-9 rad/s |
+| 34 | IDOT | 2^-43 sc/s | |
+| 35 | the week mod 1024 | | 397 (2445) |
+| 36 | G#2 in the high half and a small signed number in the low (G#FFF6 for G01), 0 on four satellites: not decided | | |
+
+The GLONASS records have the same Keplerian layout (√A G#9DD4xxxx, 5050 √m: GLONASS's orbit), so gpsd turns GLONASS's own orbits into this form as well.
+
+**What follows:** the chip's on-chip engine takes ephemerides, not a Broadcom format. LTO is only where gpsd gets them. `tools/gps-trace brdc` rebuilds a replay's windows with every GPS record from an IGS BRDC file (the latest set per satellite) and drops the GLONASS group, the header kept, sequences, reliable counters and trailers run on, checksums redone; the rebuild with no new values is the original byte for byte, but for the gaps.
+
+## An indoor fix on ferros (2026-11-19)
+
+Measured on the Pro (b1004, indoors, the zone's place and then the last fix):
+
+| Replay | Time and place | First fix after power-up |
+|---|---|---|
+| `gps.replay.sky` of 2026-11-18 | time, the zone's place (2097 km) | none in 9.5 minutes (2026-11-18) |
+| o2's on-chip session (stored as `gps.replay.sky`) | none (the session carried none) | 38.1 s, 42.2 s |
+| the same, the driver putting the time in (`87 81` from the clock, before the first `8e 81`) and the place after it (`d0 81`, the last fix, 2 km) | both | 14.1, 33.1, 24.0 s (hand-spawned), 20.0 s (the stored driver on a kernel restart) |
+
+The driver (payloads/gps `time_record`) builds the time message from the record before the first `8e 81` (its sequence, reliable counter and trailer plus one), `patch_aiding` fills the clock's time into it, `place_record` builds the place after it, and every frame after them moves on by two.
+The fix is written to `gps.last` (identity class) as it comes, so the next start has the place.
+The replay's windows carry Broadcom's LTO predictions made on 2026-11-19, good for some days: the broadcast ephemerides below replace them.
+
+## Proposed: broadcast ephemerides for the chip (2026-11-19, for the owner)
+
+If the chip fixes from BRDC-built windows (the test is `gps-trace brdc` on the stored replay, GLONASS dropped):
+- **Where from:** the IGS's broadcast navigation files, every constellation, merged from receivers worldwide and updated every 15 minutes: BKG (`https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<year>/<day>/BRDC00WRD_S_<year><day>0000_01D_MN.rnx.gz`, 0.7 MB gzip for the day so far) and ESA (`ftp://gssc.esa.int/gnss/data/daily/<year>/<day>/`). Neither answers plain HTTP, ferros has no TLS, so the fetch is fgtw.org's: the worker fetches BKG (ESA the second source, the single egg rule: the two must agree on every satellite's √A, e and i0 or the satellite is left out), keeps the GPS (and later Galileo, BeiDou) LNAV sets whose toe is within 2 hours of now, and answers a plain HTTP `POST` with a signed VSF document (the seed's key, as its other replies): a section `gps_eph` with `fetched` (Eagle time) and one field per quantity, a column each (`prn`, `week`, `toe`, `toc`, then `af0` … `idot` as `f6` in SI units), the way `gps.orbits` keeps CelesTrak's elements. About 32 × 22 numbers, under 8 KB. The host can do the same over USB (`ferros-bridge`) until the worker has it.
+- **How often:** a set is good for its 4-hour fit interval; the driver asks when its kept set's newest toe is more than 2^12 s behind the clock (about hourly while GPS is in use), never on a timer of its own: at a start, and when a fix's chip time shows the kept set has gone stale.
+- **Kept as:** `gps.eph` in the vault, device class (orbits are public), written whole when fetched (every change hits disk), its signature checked before it is kept.
+- **Into the chip:** the driver builds the `82 81` messages itself from `gps.eph` (the scaling above, one record per satellite, the header words taken from the stored replay's first window until the two undecided words are understood) in place of the replay's windows, after its configuration and the time and place it puts in.
+- **Google:** nothing of Google's is needed. Broadcom's LTO (glpals.com, licensed to Google) stays the fallback only.
+
 ## Next
 
 1. ~~Navigation~~ — done above.

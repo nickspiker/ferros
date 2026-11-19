@@ -350,7 +350,7 @@ fn main() {
             println!("fix messages: A#{n}");
         }
         "lto" => {
-            // The LTO windows (`82 81`), each whole: a long one starts in a `1e 83` frame and runs on in the next host frames whose RPC is `1e 82` (their five header bytes dropped) until its `c0 c4`; then unescaped (`c0 c0` is G#C0). Printed as little-endian 32-bit words, eight a line, with their offsets from the class.
+            // The LTO windows (`82 81`), each whole: a long one starts in one frame and runs on in the next host RPC frames (their headers dropped) until its `c0 c4`; then unescaped (`c0 c0` is G#C0). Printed as little-endian 32-bit words, eight a line, with their offsets from the class.
             let mut cur: Option<Vec<u8>> = None;
             let mut msgs: Vec<(f64, Vec<u8>)> = Vec::new();
             let finish = |raw: &[u8], ms: f64, msgs: &mut Vec<(f64, Vec<u8>)>| {
@@ -375,9 +375,11 @@ fn main() {
             };
             for f in cap.frames.iter().filter(|f| f.host) {
                 let Some((p, _)) = payload(&f.b) else { continue };
-                if p.len() > 5 && p[0] == 0x1E && p[1] == 0x82 {
+                // A continuation: an RPC `1e` frame while a window is open (its header: `1e`, the chunk's length + 2 in one byte, or two with G#80 set in the first, then the chunk's length u16; a chunk can come in a `1e 80` frame as well as a `1e 82`).
+                let h = if p.len() > 1 && p[1] & 0x80 != 0 { 5 } else { 4 };
+                if p.len() > h && p[0] == 0x1E && cur.is_some() && !p[h..].starts_with(&[0xC0, 0xC1]) {
                     if let Some(c) = cur.as_mut() {
-                        c.extend_from_slice(&p[5..]);
+                        c.extend_from_slice(&p[h..]);
                         if p.ends_with(&[0xC0, 0xC4]) {
                             let raw = cur.take().unwrap();
                             finish(&raw, f.ms, &mut msgs);
