@@ -187,9 +187,46 @@ The panel stage on the GPU (GPU-KISTS.md's first choice) moves 4.6 G CPU cycles 
    No timer: the count is looked at on the service loop's passes like the rest of the lift.
    The lift is a ceiling, as for input: the A715s climb above 1065 MHz only as the load asks, and the memory side lifts with it while the screen is lit.
    A saturated A715 cluster was the other sign considered and not built: once lifted the saturation ends, so it would need a hold of its own to keep from flapping, and it would lift for any background load, which the decision kept calm.
+   **Built 2026-11-19 as the busy lift** (section 5): to 1572 MHz only, on the whole cluster saturated, with holds both ways, and only while nothing else lifts.
    Knob: `diag clock cam <n>` (the hold as a shift; 0: a camera stream holds nothing); `diag clock` names what holds the lift now (input, frames, camera) and how many windows the camera alone held.
 4. **The X3's top:** 2914 MHz (3.7 W busy), 2556 (1.9 W) or 2049 (1 W) in the active profile; the top step buys 14 % more speed for twice the power.
 5. **The GPU's clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and the MIF Android pairs with it.
 6. **Sustained or burst:** 120 for as long as the heat allows, then sliding (smooth), or clocks chosen so a lower rate holds forever.
 7. **The divider and the firmware's governor:** leave both as the firmware arms them (today), configure them as Android does (CLKDIVSTEP G#1, the PMIC's warning levels, the governor's trips and gains: writes to cluster and PMIC registers, to be tested one at a time), or switch the divider's triggers off (a sag the divider would have absorbed then reaches the PMIC's own protection, which ends in a reset rather than a slow frame).
 8. **The chip row's words:** whether the device circle names the hottest part (the X3, the GPU, …), which needs those names translated.
+
+## 5. The busy lift (2026-11-19, branch gov-busy-lift)
+
+The Lumis session's saves on the Pro (four encoding threads pinned to the A715s, AV1) ran with the A715s reading "asked 1065 MHz, busy 189-199/256": decision 3's lift comes only with input, frames or a camera stream, so work the person is waiting on but not touching ran at the calm clock.
+A save with Lumis's preview open does hold the camera's lift; the reading came from a window after the save, and the save's own busy share was held under 4/5 by the X3 (KERNEL.md Order item 10: the X3 was saturated by the service loop's own passes, and the encoding threads waited on it).
+
+**The rule (service.rs `GOV_BUSY_KHZ`, `GOV_BUSY_HOLD`):** while nothing else lifts them, the A715s may climb to 1572 MHz once every core of the cluster has been at the governor's saturated mark, 7/8 busy (the least busy core's share, averaged as the governor averages), for 2^4 windows in a row (a quarter second); the lift ends once the load has asked no more than the calm 1065 MHz (the running rate × the averaged busiest share × 5/4, the governor's own `want`) for 2^4 windows in a row.
+Within the ceiling the governor sets the rate as before; not while ferros's thermal policy caps a domain; the X3 and the A510s are unchanged; input, frames and the camera keep their own lift.
+`diag clock busy <kHz>` (0: none) and `diag clock busyhold <n>`; `diag clock` says whether it holds, the least busy core's averaged share and how many windows it held alone.
+
+Why the whole cluster and saturation, not the busiest core over 4/5: at rest on the Pro after a reload the GPS driver polled on one A715 (the busiest core 190 to 205 of 256) and a stuck `kists.1` held another at 256, and a first build on the busiest core over 4/5, then over 7/8, lifted the cluster to 1572 MHz with nobody using the device. A save's four threads hold all four cores at 256.
+
+Why inference and not a "working" hint from the process: the lift begins a quarter second after the cluster saturates, which costs a 5.8 s save about 0.08 s (the quarter second at 1065 instead of 1572 MHz), and the whole-cluster test already leaves out the background loads met; a syscall would be a new API for 1.4 %.
+
+**Why 1572 MHz**, measured on the Pro (Lumis 0.2.23 from lumis-slit hand-spawned with its DEV_SAVE knob, the save asked at the 32nd frame; the X3 fix in; starts at 62-64 C):
+
+| 12.5 MP save (one boot, b991) | the A715s | encoded in | zones at the end (BIG / MID / LITTLE) | dividers |
+|---|---|---|---|---|
+| calm (`lift 0`, `busy 0`) | 1065 MHz | 8.58 s | 65 / 66 / 65 C | none |
+| the busy lift alone (`cam 0`, `gap 20`) | 1572 MHz | 5.76 s (5.76 s again on the final build, b997) | 75 / 73 / 71 C | none |
+| the camera's lift (as today) | 2367 MHz | 5.63 s | 83-88 / 89-90 / 86-89 C | all three clusters stepped |
+
+| 50 MP save | the A715s, the A510s | encoded in | zones after | dividers |
+|---|---|---|---|---|
+| the busy lift alone (b991) | 1572, 1425 MHz | 31.3 s | 82 / 82 / 83 C (peaks 86 / 83 / 84) | none |
+| the camera's lift (b991, as today) | 2367, 1704 MHz | 48.0 s | 86 / 88 / 89 C (peaks 91 / 91 / 93) | all three stepped |
+| the camera's lift capped at 1572 (b988, `lift 1572000`) | 1572, 1704 MHz | 51.4 s | 83 / 86 / 87 C at 30 s | CPUCL0 stepping |
+| the camera's lift (b988) | 2367, 1704 MHz | over 62 s (Lumis's 64 s run ended first) | 88 / 90 / 91 C at 30 s | CPUCL0, CPUCL1 |
+| calm (b988) | 1065, 1425 MHz | over 62 s | 73 / 71 / 69 C at 30 s | none |
+
+- On a 12.5 MP save 1572 MHz gives 98 % of 2367's speed (the work is bound by memory above it) for 1.8 W on the four cores against 6.1 W (`pixel_em`), and never reaches the 88 C divider; 1065 MHz is 1.49 times slower, the clock ratio (bound by the cores there).
+- With the device's other load about 2 W (the panel lit, the camera, the X3), a 12.5 MP save costs about 24 J at 1065 MHz, 22 J at 1572 and 45 J at 2367 (`pixel_em` cores plus 2 W over the encode): 1572 is both the cheapest and nearly the fastest.
+- On a 50 MP save the hot clocks lose outright: at 2367 MHz with the A510s lifted to 1704 the dividers step (CPUCL0's carries the DSU, so every core's memory slows) and the save takes 48 s against 31 s at 1572 with the A510s calm.
+- The camera's lift holds the A715s at 2367 MHz and the A510s at 1704 for the whole of a Lumis session, saves included, and that is where the heat of the Lumis session's saves comes from now that the X3 rests (KERNEL.md item 10). Capping it is the owner's decision (CAMERA.md "The slowdown, measured": the 1572 MHz proposal); these runs add that a capped stream also saves faster.
+
+Not measured: battery power over a save (the power window cuts the charger and was used at rest only: 1.8 to 3.0 W at rest after a reload, swinging with a polling GPS driver more than with anything changed here).
