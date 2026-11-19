@@ -173,6 +173,21 @@ fn absent_wait(absent: &mut u64) {
     }
 }
 
+/// The identity service's state byte (its op 1), waited for however long it takes to answer: init starts it once a person is unlocked, which at a boot that unlocked is about when this screen starts, and its device keys take some 600 ms before it serves (the Pro, b970).
+/// Its first answer already says whether it holds roots: it reads what it keeps before it serves anything (fgtw `load`).
+fn service_state(grants: u64) -> u8 {
+    let svc = cap(grants, S_FGTW_EP);
+    let mut absent = freq() >> 6;
+    loop {
+        let mut out = [0u8; 600];
+        let n = ferros_sys::call_live(svc, &[1], &mut out);
+        if n != ferros_sys::ERR && n != ferros_sys::NOTHING && n >= 1 {
+            return out[0];
+        }
+        absent_wait(&mut absent);
+    }
+}
+
 /// A copy of the roots on this process's stack overwritten in a way the compiler keeps, then a compiler fence, as `roots_thread` wipes its own: the screen's copies of a seed or proof once handed on.
 fn scrub(b: &mut [u8]) {
     for x in b.iter_mut() {
@@ -3437,7 +3452,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         exit(2);
     }
     // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything; or this process started again after attest): no attest screen; the identity service (fgtw) loads its own from that space. The process stays all the same, as the device's keyboard (`host_words`, below, once the keyboard is built; until 2026-11-12 it ended here, and a device unlocked at boot had no keyboard for its kists). Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
-    let at_boot = ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    // Only while the identity service holds that person's roots (`ahau_core::attest_screen`): the kernel's kept seed and the service's kept roots are two keeps, and unlocked with the service holding none (the Pro, b970, 2026-11-18) nothing could hand them over and the device sat with no identity, no screen and no way to type the handle.
+    // The screen comes up then (AUTH.md "Never stuck").
+    let unlocked = ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true);
+    let bound_now = ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    let service = if unlocked && bound_now { service_state(grants) } else { ahau_core::SERVICE_NO_ROOTS };
+    let at_boot = !ahau_core::attest_screen(unlocked, bound_now, service);
+    if unlocked && bound_now && !at_boot {
+        console(grants, b"ahau: unlocked and bound, but the identity service holds no roots: the attest screen, so the handle typed hands them over\n");
+    }
     if at_boot {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).

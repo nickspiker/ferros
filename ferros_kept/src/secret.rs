@@ -85,6 +85,28 @@ pub fn parse(kind: Kind, doc: &[u8]) -> Option<[u8; 32]> {
     kind.untyped(&first(&s, kind.field())?)
 }
 
+
+/// What the identity service does with the roots it keeps when it reads unlock at boot again (fgtw `follow_persist`, each pass; AUTH.md "Unlock at boot").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Follow {
+    /// The setting is as the service last followed it: nothing to do.
+    Unchanged,
+    /// Turned on: the roots, the fleet key and the chain in hand are kept now, so the next boot that unlocks finds them.
+    Keep,
+    /// Turned off: everything of the identity goes from the disk now (off is always safe).
+    Forget,
+}
+
+/// `on` is the setting now, `keeping` whether the service keeps the roots already.
+/// Until 2026-11-18 the service read it only at its start and when roots were handed in, so turning it on after left the roots unkept, while the kernel keeps its own seed at the next unlock with it on: the two keeps could part (the Pro, b970).
+pub fn follow(on: bool, keeping: bool) -> Follow {
+    match (on, keeping) {
+        (true, false) => Follow::Keep,
+        (false, true) => Follow::Forget,
+        _ => Follow::Unchanged,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -109,5 +131,25 @@ mod tests {
     #[test]
     fn raw_bytes_are_not_a_secret_document() {
         assert_eq!(parse(Kind::HandleProof, &[7; 32]), None);
+    }
+
+    /// The disk follows the setting both ways and does nothing while it stands: turned on mid-session keeps, turned off forgets.
+    #[test]
+    fn the_kept_roots_follow_unlock_at_boot() {
+        assert_eq!(follow(true, false), Follow::Keep);
+        assert_eq!(follow(false, true), Follow::Forget);
+        assert_eq!(follow(true, true), Follow::Unchanged);
+        assert_eq!(follow(false, false), Follow::Unchanged);
+        // A pass after each change finds nothing more to do.
+        let mut keeping = false;
+        for on in [true, true, false, false, true] {
+            match follow(on, keeping) {
+                Follow::Keep => keeping = true,
+                Follow::Forget => keeping = false,
+                Follow::Unchanged => {}
+            }
+            assert_eq!(keeping, on);
+            assert_eq!(follow(on, keeping), Follow::Unchanged);
+        }
     }
 }

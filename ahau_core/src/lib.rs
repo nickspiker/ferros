@@ -64,6 +64,17 @@ pub fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
+/// The identity service's state byte (fgtw's op 1) while it holds no identity's roots (fgtw `V_NONE`).
+pub const SERVICE_NO_ROOTS: u8 = 0;
+
+/// Whether the attest screen comes up when ahau starts (AUTH.md "Unlock at boot").
+/// A person unlocked and bound already (unlock at boot, or ahau started again after attest) needs no screen, as long as the identity service holds their roots: `service` is its state byte, asked only then (pass `SERVICE_NO_ROOTS` otherwise).
+/// Unlocked and bound with the service holding nothing is the deadlock the Pro sat in (b970, 2026-11-18): the kernel opened the identity from the seed it keeps, the service kept no roots of its own, and with no screen nothing could hand them over.
+/// The screen comes up then, so the handle typed again hands them over, and no device ever sits unable to attest.
+pub fn attest_screen(unlocked: bool, bound: bool, service: u8) -> bool {
+    !(unlocked && bound) || service == SERVICE_NO_ROOTS
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -105,6 +116,18 @@ mod tests {
     #[test]
     fn refuses_untypeable() {
         assert_eq!(identity_seed("é"), Err(Untypeable('é')));
+    }
+
+    /// The screen is up unless a person is unlocked, bound and in the identity service's hands: every service state but "no roots" (fgtw's V_JOIN 1 to V_SELECTED 10, and any later one) keeps it away.
+    #[test]
+    fn attest_screen_unless_the_service_holds_the_roots() {
+        for state in 0..=255u8 {
+            assert!(attest_screen(false, false, state));
+            assert!(attest_screen(false, true, state));
+            // Unlocked but not bound is a join in progress: the screen comes back.
+            assert!(attest_screen(true, false, state));
+            assert_eq!(attest_screen(true, true, state), state == SERVICE_NO_ROOTS, "{state}");
+        }
     }
 }
 
