@@ -35,7 +35,7 @@
 extern crate alloc;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ferros_cam::cams::{self, Cam};
 use ferros_cam::{ccs, geom, inputs, job};
 use ferros_sys::{cap, console, mmio_read, mmio_write, recv, reply, ERR, NOTHING};
@@ -113,6 +113,10 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         }
         let mut kb = [0u8; 32];
         let Some(idt) = get(g, input_key(&mut kb, c, b"idt"), unsafe { &mut *(&raw mut IDT) }) else { continue };
+        if !LIST_SAID.load(Ordering::Relaxed) {
+            let t = ferros_cam::list::Readout::binned(c).timing;
+            say!(g, "camera: LIST {}: mode A#0, exposure_max A#{} ns\n", c.name, t.most_ns());
+        }
         match ferros_cam::list::section(c, idt) {
             Ok(s) => secs.push(s),
             Err(e) => {
@@ -122,14 +126,21 @@ fn list(g: u64) -> alloc::vec::Vec<u8> {
         }
         // Its 1:1 readout, a second section with the same `id` and `name`, when its 1:1 init is in the vault (`cam.<key>.init.full`; docs/CAMERA.md "1:1 on the main"): its own size, mosaic period, frame period and exposure range, read off that init; opened by the mode block's kind 2.
         if let Some(full) = full_init(g, c) {
+            if let (false, Ok(r)) = (LIST_SAID.load(Ordering::Relaxed), ferros_cam::list::Readout::full(c, full)) {
+                say!(g, "camera: LIST {}: mode A#{}, exposure_max A#{} ns\n", c.name, r.kind, r.timing.most_ns());
+            }
             match ferros_cam::list::Readout::full(c, full).and_then(|r| ferros_cam::list::section_of(c, idt, &r)) {
                 Ok(s) => secs.push(s),
                 Err(e) => say!(g, "camera: cam.{}.init.full gives no 1:1 readout ({e:?}); {}'s 1:1 left out of the list\n", c.key, c.name),
             }
         }
     }
+    LIST_SAID.store(true, Ordering::Relaxed);
     ferros_cam::list::document(secs).unwrap_or_default()
 }
+
+/// Whether this run's first LIST said each readout's longest exposure (once a run: a holder lists at each start).
+static LIST_SAID: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------- registers
 

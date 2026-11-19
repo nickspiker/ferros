@@ -10,7 +10,7 @@
 //! A fourth byte of 3 measures the gain's curve (2026-11-17): the first byte frames per step (16 if 0), the sixth the exposure as 2^n us (the init's if 0), each step 1x to 256x a half stop apart with the mean sample and the header's gain (`1008000300` the main at bin 8; `100800030010` at 2^16 us, about 66 ms; `10080003010C` the ultrawide at 4 ms).
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 //! A fourth byte of 9 drives the driver while a long frame's MAP waits (2026-11-18, docs/CAMERA.md "Serving while a frame waits"): OPEN with the view, the exposure to 2^n s (the sixth byte; 10 if 0), a second thread MAPping, then LIST, STATS and a SET back to 67 ms timed (the frame in flight cut), the exposure long again, and the end by the seventh byte: 0 CLOSE, 1 this process ends with the MAP held, 2 it holds until killed from the host (`00000009` the main, 2^10 s, CLOSE; `00000009001C01` the main, 2^28 s, about 8.5 years, its end; `00000009001C02` the same, killed from the host).
-//! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut) (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
+//! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut), the third byte 1 the driver's plain plan instead of a forced shift (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
 //! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s).
 #![no_std]
 #![no_main]
@@ -100,7 +100,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     // A fourth byte of 10: where the main's long exposure really ends (the shift's ceiling), each shift held or not in a window.
     if arg(3) == 10 {
-        ceiling(g, ep, id, arg(0), arg(5), arg(6), u16::from_le_bytes([arg(8), arg(9)]), t1);
+        ceiling(g, ep, id, arg(0), arg(5), arg(6), u16::from_le_bytes([arg(8), arg(9)]), arg(2) == 1, t1);
     }
     // A fourth byte of 9: the driver serving while a long frame's MAP waits (LIST, STATS, SET with a cut, then CLOSE or the holder's end).
     if arg(3) == 9 {
@@ -766,8 +766,9 @@ const MAIN_FULL_LINE_PS: u64 = 6_586_118;
 /// OPEN with the view (the mode block's kind from the eighth byte: 2 the 1:1), a waiter thread MAPping, then for each shift from `bottom` (14 if 0) to `top` (31 if 0): the shift forced (SET 3) and an exposure of `coarse` lines of 2^shift (2^15 if 0: an exposure that needs exactly that shift, as the least-shift plan would take it), half a unit more so the driver's division lands on `coarse`.
 /// Then 2^20 us for frames of the old timing to pass, and a window of `window` s (8 if 0): the frames the waiter got in it, their spacing, the sensor's own frame counter (G#0005) before and after, and its frame, line, integration and shift words read back (CAPS).
 /// A held frame shows as no frame in the window; frames at the sensor's floor (about 10 ms) or at any other spacing say what the sensor did with it.
+/// The third byte 1: plain, no shift forced, the driver's own plan, which refuses an exposure past the longest the sensor's frame counter holds (`0801000A0011100000FDFF`: 65533 lines of 2^16 taken, of 2^17 refused).
 /// After each window the shift back to the least and the exposure to 2^26 ns (67 ms): the frame in flight is cut (`exposure_cut`), and the next frame must come within 4 s, else the run closes there (stop at the first stream whose frames stop).
-fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16, t1: u64) -> ! {
+fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16, plain: bool, t1: u64) -> ! {
     use core::sync::atomic::Ordering::SeqCst;
     let us = |t: u64| ferros_sys::us_since(t);
     let hz = ferros_sys::freq();
@@ -798,7 +799,8 @@ fn ceiling(g: u64, ep: u64, id: u8, window: u8, top: u8, bottom: u8, coarse: u16
         // WHY the 128 bits: 65535 lines of 2^31 at 6.6 us is about 9 x 10^20 ps, past 64 bits; the ns fit (about 29 years).
         let lines = ((coarse as u128) << s) + (1u128 << s >> 1);
         let ns = (lines * line_ps as u128 / 1000) as u64;
-        let (a, b) = (set(3, s as u64), set(0, ns));
+        // Plain: the driver's own plan (the least shift, refused past the list's `exposure_max`), no shift forced.
+        let (a, b) = (if plain { 0 } else { set(3, s as u64) }, set(0, ns));
         let t_set = ferros_sys::now();
         if a != 0 || b != 0 {
             say!(g, "camtest: ceiling: shift A#{s}: refused (A#{a} A#{b})\n");
