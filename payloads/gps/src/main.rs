@@ -702,6 +702,82 @@ fn place_record(time: &[u8], ints: Option<u32>, out: &mut [u8; 256]) -> Option<u
     Some(o + 2)
 }
 
+/// The time message (`87 81`), as one record to send after `prev` (the record before it): `prev`'s last reliable frame with its sequence, its reliable counter and its RPC trailer counter moved on by one, the RPC header `1e 18 16 00`, then the 18 bytes from the class to the trailer: class, length 16, the checksum, week u16 and time of week u32 ms (left zero for `patch_aiding` to fill from the clock, as it fills every replay's), the uncertainty u32 1000 (the only value gpsd was seen to send, GPS.md "Aiding the chip"), the trailer.
+/// For a replay that carries no time (gpsd sent none in the on-chip sessions of 2026-11-19, the framework's location being off), so the chip need not take the time from the sky.
+/// None when `prev` has no reliable frame with an inner message, or a byte that must not be escaped is G#C0.
+fn time_record(prev: &[u8], out: &mut [u8; 256]) -> Option<usize> {
+    // The record's last reliable frame carrying an inner message, deframed.
+    let mut pf = [0u8; 2048];
+    let mut n = 0usize;
+    let mut s = 0usize;
+    while let Some(start) = prev[s..].windows(2).position(|w| w == [0xB0, 0x00]).map(|p| p + s) {
+        let Some(e) = prev[start + 2..].windows(2).position(|w| w == [0xB0, 0x01]).map(|p| p + start + 2) else { break };
+        let mut f = [0u8; 2048];
+        let (mut j, mut k) = (start + 2, 0usize);
+        while j < e && k < f.len() {
+            if prev[j] == 0xB0 && j + 1 < e {
+                f[k] = match prev[j + 1] { 3 => 0xB0, 4 => 0x11, _ => 0x13 };
+                j += 2;
+            } else {
+                f[k] = prev[j];
+                j += 1;
+            }
+            k += 1;
+        }
+        s = e + 2;
+        if k >= 6 && f[2] & 0x02 != 0 && f[..k].windows(2).any(|w| w == [0xC0, 0xC1]) {
+            pf[..k].copy_from_slice(&f[..k]);
+            n = k;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let pf = &pf[..n];
+    let pp = &pf[payload_start(pf)..n - 1];
+    let z = pp.windows(2).rposition(|w| w == [0xC0, 0xC4])?;
+    let trailer = u16::from_le_bytes([pp[z - 2], pp[z - 1]]).wrapping_add(1);
+    let mut m = [0u8; 18];
+    m[0..2].copy_from_slice(&[0x87, 0x81]);
+    m[2..4].copy_from_slice(&16u16.to_le_bytes());
+    m[12..16].copy_from_slice(&1000u32.to_le_bytes());
+    m[16..18].copy_from_slice(&trailer.to_le_bytes());
+    let ck = m[..4].iter().chain(&m[6..16]).fold(0u16, |a, &b| a.wrapping_add(b as u16));
+    m[4..6].copy_from_slice(&ck.to_le_bytes());
+    if m.contains(&0xC0) {
+        return None;
+    }
+    // [sequence, length 26, flags G#02, the reliable counter, 1e 18 16 00, c0 c1, the message, c0 c4, CRC] (the frame gpsd sent in 2026-10-25's on-chip session: `f5 1a 02 3d 1e 18 16 00 c0 c1 87 81 …`).
+    let mut f = [0u8; 31];
+    f[0] = pf[0].wrapping_add(1);
+    f[1] = 26;
+    f[2] = 0x02;
+    f[3] = pf[3 + (pf[2] & 0x01) as usize].wrapping_add(1);
+    f[4..8].copy_from_slice(&[0x1E, 0x18, 0x16, 0x00]);
+    f[8..10].copy_from_slice(&[0xC0, 0xC1]);
+    f[10..28].copy_from_slice(&m);
+    f[28..30].copy_from_slice(&[0xC0, 0xC4]);
+    f[30] = crc(&f[1..30]);
+    let mut o = 0;
+    out[o..o + 2].copy_from_slice(&[0xB0, 0x00]);
+    o += 2;
+    for &b in &f {
+        match b {
+            0xB0 | 0x11 | 0x13 => {
+                out[o] = 0xB0;
+                out[o + 1] = match b { 0xB0 => 3, 0x11 => 4, _ => 5 };
+                o += 2;
+            }
+            _ => {
+                out[o] = b;
+                o += 1;
+            }
+        }
+    }
+    out[o..o + 2].copy_from_slice(&[0xB0, 0x01]);
+    Some(o + 2)
+}
+
 /// The 32.32 values at +32 and +44 of the place message, whole part: "a few tens" in both captured sessions (GPS.md), which of them the altitude and which an uncertainty not known; the middle of what was seen.
 const AID_X: u32 = 1 << 5;
 const AID_Y: u32 = 1 << 5;
@@ -979,6 +1055,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The place put back (GPS.md "No fix, 2026-11-18": the stored replays carry no `d0 81`): built after the time message's record (`place_record`), sent as a record of its own, and every frame after it moved on by one (`shift`), its sequence and its trailer counter.
     let mut placed = [0u8; 256];
     let mut inject: Option<usize> = None;
+    // The time put in (`time_record`) when the replay carries none: before the replay's first `8e 81`, gpsd's order in 2026-10-25's session (`87 81`, `d0 81`, then `8e 81`); the place follows it as it follows a replay's own. Some(acked) once sent.
+    let mut timed: Option<bool> = None;
+    let mut injected_time = false;
     let mut shift = 0u8;
     let mut nb = Renumber { shift: 0, unshifted: 0, counter: None, renumbered: 0 };
     // Whether the chip acked the place put back: None while none was sent.
@@ -1047,18 +1126,41 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if ns > 0 && !all_acked {
             late += 1;
         }
-        if injected {
+        if injected && injected_time {
+            timed = Some(ns > 0 && all_acked);
+        } else if injected {
             place_acked = Some(ns > 0 && all_acked);
         }
+        let was_time = injected && injected_time;
+        injected_time = false;
+        // Before the first `8e 81`, the time, when the replay has carried none (its frames after it moved on by one).
+        if !injected && timed.is_none() && carried[0] == 0 {
+            let mut next = [0u8; 1 << 6];
+            let next_8e = at + 4 <= total && store_get_at(store, key, at + 4, &mut next).is_some() && has(&next, [0x8E, 0x81]) > 0;
+            if next_8e {
+                match time_record(&rec[..len], &mut placed) {
+                    Some(n) => {
+                        inject = Some(n);
+                        injected_time = true;
+                        shift = 1;
+                        continue;
+                    }
+                    None => {
+                        timed = Some(false);
+                        say!(grants, "gps: the time could not be put in: the record before the first 8e 81 was not as expected\n");
+                    }
+                }
+            }
+        }
         // After the time message, the place: when there is one to give, the replay has given none so far, and its next record is not one (gpsd's order, GPS.md "From the sky": `87 81`, then `d0 81`).
-        if !injected && shift == 0 && aid.pos.is_some() && carried[1] == 0 && has(&rec[..len], [0x87, 0x81]) > 0 {
+        if (!injected && shift == 0 || was_time) && aid.pos.is_some() && carried[1] == 0 && has(&rec[..len], [0x87, 0x81]) > 0 {
             let mut next = [0u8; 1 << 6];
             let next_place = at + 4 <= total && store_get_at(store, key, at + 4, &mut next).is_some() && has(&next, [0xD0, 0x81]) > 0;
             if !next_place {
                 match place_record(&rec[..len], ints, &mut placed) {
                     Some(n) => {
                         inject = Some(n);
-                        shift = 1;
+                        shift += 1;
                     }
                     None => say!(grants, "gps: the place could not be put back: the time message's frame was not as expected\n"),
                 }
@@ -1068,8 +1170,11 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     chip.set(MCU_REQ, false);
     say!(grants, "gps: replayed {} records in {} ms ({} SPI errors, {} not acked in time); the chip: {} frames, {} CRC failures\n", recs, now().wrapping_sub(t_all) * 1000 / f, errs, late, d.frames, d.crc_bad);
     say!(grants, "gps: the replay carried {} time (87 81), {} place (d0 81) and {} 09 00 messages{}\n", carried[0], carried[1], carried[2], if carried[1] == 0 && place_acked.is_none() { "; no place message: the chip was given no place" } else { "" });
+    if let Some(ok) = timed {
+        say!(grants, "gps: the time put in before the first 8e 81 (87 81, from the clock), {} by the chip\n", if ok { "acked" } else { "NOT acked or not built" });
+    }
     if let Some(ok) = place_acked {
-        say!(grants, "gps: a place put back after the time (d0 81), {} by the chip; the frames after it moved on by one ({} trailer counters left as they were)\n", if ok { "acked" } else { "NOT acked" }, nb.unshifted);
+        say!(grants, "gps: a place put back after the time (d0 81), {} by the chip; the frames after it moved on by {} ({} trailer counters left as they were)\n", if ok { "acked" } else { "NOT acked" }, shift, nb.unshifted);
     }
     say!(grants, "gps: {} reliable frames given the next counter (the replay's own jumped where messages were cut)\n", nb.renumbered);
     // Fresh orbits once the chip is searching on its own (in on-chip mode it says nothing until its first fix, some minutes, so the fetch's second or two holds nothing up): when the kept ones are stale and this driver has the network.
