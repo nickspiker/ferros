@@ -670,7 +670,7 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
         .collect()
 }
 
-/// The camera's make, model and id as Lumis on Android writes them (Build.MANUFACTURER, Build.MODEL and the module's Camera2 physical id: Make "Google", Model "Pixel 8 Pro cam 2" for the main), so an IDT from an Android still or the derived files (derived/cam2-main.idt.vsf, cam3-ultrawide, cam4-tele, cam7-front) pastes onto a ferros still or clip without --force, and the main is told from the ultrawide (Opsin's check). The Pro's ids from those files; the 8a's are not known here yet, so its modules say their ferros name; a board ferros does not say keeps the old "ferros" / "camera".
+/// The camera's make, model and id as Lumis on Android writes them (Build.MANUFACTURER, Build.MODEL and the module's Camera2 physical id: Make "Google", Model "Pixel 8 Pro cam 2" for the main), so an IDT from an Android still or the derived files (derived/cam2-main.idt.vsf, cam3-ultrawide, cam4-tele, cam7-front) pastes onto a ferros still or clip without --force, and the main is told from the ultrawide (Opsin's check). The Pro's ids from those files, the 8a's from its camera dump; a module not in the tables says its ferros name, and a board ferros does not say keeps the old "ferros" / "camera".
 fn identity(cam: &camera::Camera) -> CameraIdentity {
     let (make, model, id) = match (sys::board(), cam.name.as_str()) {
         (Some(1), "main") => ("Google", "Pixel 8 Pro", "2"),
@@ -678,6 +678,10 @@ fn identity(cam: &camera::Camera) -> CameraIdentity {
         (Some(1), "tele") => ("Google", "Pixel 8 Pro", "4"),
         (Some(1), "front") => ("Google", "Pixel 8 Pro", "7"),
         (Some(1), name) => ("Google", "Pixel 8 Pro", name),
+        // The 8a's from its dumpsys media.camera (keys/akita/captures-2026-11-18): logical 0's physicals 2 (main) and 3 (ultrawide; 4 is the main's 2x crop), and the front logical 1 with no physical sub-ids, which Android's Lumis lists as itself and names by its logical id.
+        (Some(2), "main") => ("Google", "Pixel 8a", "2"),
+        (Some(2), "ultrawide") => ("Google", "Pixel 8a", "3"),
+        (Some(2), "front") => ("Google", "Pixel 8a", "1"),
         (Some(2), name) => ("Google", "Pixel 8a", name),
         (_, name) => ("ferros", "camera", name),
     };
