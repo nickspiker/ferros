@@ -270,5 +270,5 @@ extern "C" fn cell_thread(_: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     hw::log(&alloc::format!("modem: {info}"));
-    ferros_sys::panic_exit()
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }

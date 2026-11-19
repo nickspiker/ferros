@@ -1,0 +1,21 @@
+[package]
+name = "stdpanic"
+version = "0.1.0"
+edition = "2024"
+description = "A std program that dies on purpose, in a named thread, for the death reports (KERNEL.md \"A process that dies\")"
+
+[[bin]]
+name = "stdpanic"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = "line-tables-only"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

@@ -48,8 +48,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 /// Op 2 SATS (payloads/gps main.rs's header): a line for the list, then one per signal; elevation and azimuth only, never a place.

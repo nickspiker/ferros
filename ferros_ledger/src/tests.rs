@@ -580,6 +580,19 @@ fn a_death_round_trips_typed() {
     assert!(view::render(&run, &|t| alloc::format!("T{t}"))[0].starts_with("b932 T9 display [kernel.process]: display: panicked at"));
     // The message is a typed field, sealed: never in the clear on the flash.
     assert!(!m.blocks.iter().any(|b| b.windows(6).any(|w| w == b"410119")));
+    // The search back from the head: newest first, stopping when asked.
+    let mut seqs = Vec::new();
+    r.back(&mut m, 1 << 10, |_, s| {
+        seqs.push(s.place.seq);
+        true
+    });
+    assert_eq!(seqs, vec![2, 1, 0]);
+    let mut first = Vec::new();
+    r.back(&mut m, 1, |_, s| {
+        first.push(s.place.seq);
+        false
+    });
+    assert_eq!(first, vec![2]);
 }
 
 #[test]

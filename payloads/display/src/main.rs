@@ -10610,7 +10610,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut b = Buf([0; 240], 0);
     let _ = core::fmt::write(&mut b, format_args!("display: PANIC {info}\n"));
     console(grants, &b.0[..b.1]);
-    ferros_sys::panic_exit()
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 /// The console grant for the panic handler (set first thing in `_entry`; `.data`, see ALLOC).
 static mut PANIC_GRANTS: u64 = 1;

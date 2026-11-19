@@ -372,6 +372,30 @@ impl Ring {
         Ok(())
     }
 
+    /// Every entry that verifies in the newest `blocks` blocks, newest first, one block in memory at a time, until `f` answers false: a search (`diag "log deaths"`), not a read of the chain (`newest` checks the chain and names what is wrong; this passes over anything that does not verify).
+    pub fn back<D: Blocks>(&self, dev: &mut D, blocks: u32, mut f: impl FnMut(&[u8], &Stored) -> bool) {
+        if self.empty {
+            return;
+        }
+        let mut k = self.block;
+        // Past the ring's own blocks the walk is back at the head and ends there, whatever `blocks` asks.
+        for _ in 0..blocks {
+            let b = load(dev, self.half, k, usize::MAX);
+            if b.empty {
+                return;
+            }
+            for (_, doc, s) in b.entries.iter().rev() {
+                if !f(doc, s) {
+                    return;
+                }
+            }
+            k = (k + self.half - 1) % self.half;
+            if k == self.block {
+                return;
+            }
+        }
+    }
+
     /// Up to `max` of the newest entries, oldest first, with what was found wrong among them (the chain checked between every two).
     pub fn newest<D: Blocks>(&self, dev: &mut D, max: usize) -> Vec<Item> {
         if self.empty {

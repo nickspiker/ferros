@@ -121,6 +121,104 @@ fn record_panic(info: &core::panic::PanicInfo, core: u64) {
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
         core::arch::asm!("dsb sy");
     }
+    // The whole panic for the next boot's flash log: its own record, sealed by a hash (`PANIC_RECORD`).
+    let mut msg = Buf::<{ ferros_ledger::death::MESSAGE_MAX }>::new();
+    let _ = core::fmt::write(&mut msg, format_args!("{}", info.message()));
+    // WHY the cut: the file's path is the compiler's, any length; the record's field holds 2^8 bytes.
+    let fb = &fb[..fb.len().min(ferros_ledger::death::FILE_MAX)];
+    let words = [crate::flashlog::boot(), core, LAST_CRUMB.load(core::sync::atomic::Ordering::Relaxed), line as u64, col as u64, msg.n as u64, fb.len() as u64, if fail.size != 0 { fail.size as u64 | core << 56 } else { 0 }, fail.caller as u64, fail.largest as u64 | (fail.align.trailing_zeros() as u64) << 56, cntpct()];
+    let mut r = [0u8; RECORD_HASH];
+    for (k, w) in words.iter().enumerate() {
+        r[8 + 8 * k..16 + 8 * k].copy_from_slice(&w.to_le_bytes());
+    }
+    r[..8].copy_from_slice(&PANIC_MAGIC.to_le_bytes());
+    r[RECORD_FILE..RECORD_FILE + fb.len()].copy_from_slice(fb);
+    r[RECORD_MESSAGE..RECORD_MESSAGE + msg.n].copy_from_slice(&msg.buf[..msg.n]);
+    let h = blake3::hash(&r);
+    unsafe {
+        core::ptr::copy_nonoverlapping(r.as_ptr(), PANIC_RECORD as *mut u8, RECORD_HASH);
+        core::ptr::copy_nonoverlapping(h.as_bytes().as_ptr(), (PANIC_RECORD + RECORD_HASH) as *mut u8, 32);
+        ferros_hal::mmio::cache_clean(PANIC_RECORD, RECORD_HASH + 32);
+        core::arch::asm!("dsb sy");
+    }
+}
+
+/// The kernel's panic, whole, for the next boot (owner, 2026-11-18: "is there a way to actually log that so someone doesn't have to put eyes on it and then it vanishes?"): a record of its own in the ramoops page after the report block, which a warm reset keeps.
+/// The report block's words (G#08 to G#A8) are shared with the vault's boot report and the fault sink, so a reboot after a clean run read them as a panic and the next boot's flash log said "previous boot ended" over garbage every time; and they held 16 bytes of the text.
+/// Layout (RAM only, never stored: the next boot turns it into a `kernel.panic` ledger entry with typed fields): the magic, then u64 words (the boot, the core, the last crumb, the line, the column, the message's and the file's lengths, the heap's last refusal in three words as r[6..8], the counter), the file at G#80 (2^8 bytes), the message at G#180 (2^9 bytes), and BLAKE3 over all of that at G#380.
+/// A record is believed only when the magic and the hash both hold: DRAM after a power loss, or Android's pmsg ring after a jump, is never logged as a panic.
+pub const PANIC_RECORD: usize = RAMOOPS_RESULT + 0x1000;
+/// "FePanic0", little-endian.
+const PANIC_MAGIC: u64 = u64::from_le_bytes(*b"FePanic0");
+const RECORD_FILE: usize = 0x80;
+const RECORD_MESSAGE: usize = RECORD_FILE + ferros_ledger::death::FILE_MAX;
+const RECORD_HASH: usize = RECORD_MESSAGE + ferros_ledger::death::MESSAGE_MAX;
+
+/// The fault sink's record (main.rs `.Lexc_recover`, a synchronous exception at EL2 before the vault's report took the block): "FeFault0", then ELR, FAR and ESR, written by the sink's assembly beside the block's shared words.
+/// The magic alone says it was written this way (a 64-bit word decayed DRAM does not make by chance); the hash a panic record carries is not worth the assembly.
+pub const FAULT_RECORD: usize = RAMOOPS_RESULT + 0x1400;
+const FAULT_MAGIC: u64 = u64::from_le_bytes(*b"FeFault0");
+
+/// What the last boot's end left, read once at this boot's `arm_safety` and cleared there.
+pub struct PreviousEnd {
+    pub boot: u64,
+    pub core: u64,
+    pub crumb: u64,
+    pub line: u64,
+    pub column: u64,
+    pub file: alloc::string::String,
+    pub message: alloc::string::String,
+    /// The heap's last refusal (size | core << 56, caller, largest | log2 align << 56), 0 when none.
+    pub heap: [u64; 3],
+}
+
+static mut PREV_PANIC: [u8; RECORD_HASH] = [0; RECORD_HASH];
+static PREV_PANIC_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut PREV_FAULT: [u64; 3] = [0; 3];
+static PREV_FAULT_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The last boot's panic, if a record whose magic and hash hold was left (`PANIC_RECORD`).
+pub fn previous_panic() -> Option<PreviousEnd> {
+    if !PREV_PANIC_OK.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let r = unsafe { &*(&raw const PREV_PANIC) };
+    let w = |k: usize| u64::from_le_bytes(r[8 + 8 * k..16 + 8 * k].try_into().unwrap());
+    // The lengths were written by `record_panic` within their fields, and the hash says these bytes are what it wrote.
+    let (m, f) = (w(5) as usize, w(6) as usize);
+    let text = |b: &[u8]| alloc::string::String::from_utf8_lossy(b).into_owned();
+    Some(PreviousEnd { boot: w(0), core: w(1), crumb: w(2), line: w(3), column: w(4), file: text(&r[RECORD_FILE..RECORD_FILE + f]), message: text(&r[RECORD_MESSAGE..RECORD_MESSAGE + m]), heap: [w(7), w(8), w(9)] })
+}
+
+/// The last boot's early fault (ELR, FAR, ESR), if the sink left its record.
+pub fn previous_fault() -> Option<[u64; 3]> {
+    PREV_FAULT_OK.load(core::sync::atomic::Ordering::Acquire).then(|| unsafe { *(&raw const PREV_FAULT) })
+}
+
+/// At `arm_safety`: the two records read, believed only whole (the panic's magic and hash, the fault's magic), and cleared, so each is logged once.
+fn previous_records() {
+    unsafe {
+        let mut r = [0u8; RECORD_HASH];
+        core::ptr::copy_nonoverlapping(PANIC_RECORD as *const u8, r.as_mut_ptr(), RECORD_HASH);
+        let mut h = [0u8; 32];
+        core::ptr::copy_nonoverlapping((PANIC_RECORD + RECORD_HASH) as *const u8, h.as_mut_ptr(), 32);
+        // WHY the length checks beside the hash: the hash is not keyed, and this DRAM is not the kernel's alone (Android's pmsg ring after a jump, the hv); a record with a good hash and a length past its field would slice past the record and panic this boot, every boot.
+        let lens = u64::from_le_bytes(r[48..56].try_into().unwrap()) as usize <= ferros_ledger::death::MESSAGE_MAX && u64::from_le_bytes(r[56..64].try_into().unwrap()) as usize <= ferros_ledger::death::FILE_MAX;
+        if u64::from_le_bytes(r[..8].try_into().unwrap()) == PANIC_MAGIC && *blake3::hash(&r).as_bytes() == h && lens {
+            *(&raw mut PREV_PANIC) = r;
+            PREV_PANIC_OK.store(true, core::sync::atomic::Ordering::Release);
+        }
+        let f = |k: usize| read_volatile((FAULT_RECORD + 8 * k) as *const u64);
+        if f(0) == FAULT_MAGIC {
+            *(&raw mut PREV_FAULT) = [f(1), f(2), f(3)];
+            PREV_FAULT_OK.store(true, core::sync::atomic::Ordering::Release);
+        }
+        write_volatile(PANIC_RECORD as *mut u64, 0);
+        write_volatile(FAULT_RECORD as *mut u64, 0);
+        ferros_hal::mmio::cache_clean(PANIC_RECORD, 8);
+        ferros_hal::mmio::cache_clean(FAULT_RECORD, 8);
+        core::arch::asm!("dsb sy");
+    }
 }
 
 /// Text into a fixed buffer, the rest dropped: the panic report formats without the heap, which may be what failed.
@@ -159,20 +257,11 @@ pub const WDT_COUNT: u32 = 750;
 /// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
 /// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
 /// 2. Cluster watchdogs armed.
-/// What the result block held when this boot armed the sink: the last boot's end, if it ended in a fault or a panic — panic number, heap word, ESR, fault count, ELR (or the panic text's first 8 bytes), FAR (or the next 8), and the heap's last refused allocation (size and core, caller, largest free and alignment: `report_panic`). The service writes it to the flash log once that is up (`previous_end`), since the block is cleared here and a reboot is otherwise silent.
-pub static PREV_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static mut PREV_WORDS: [u64; 9] = [0; 9];
-
-/// The last boot's end words (see `PREV_END`), zero when it ended cleanly or nothing was recorded.
-pub fn previous_end() -> [u64; 9] {
-    unsafe { *(&raw const PREV_WORDS) }
-}
-
+/// 3. The last boot's end, if it ended in a kernel panic or an early fault: its own records (`PANIC_RECORD`, `FAULT_RECORD`), believed only whole, kept for the service to write to the flash log once that is up (`previous_panic`, `previous_fault`), since they are cleared here and a reboot is otherwise silent.
+/// Until 2026-11-18 the block's shared words were logged instead whenever any was not zero, and the vault's own boot report fills them every boot: every boot after a clean one logged "previous boot ended" over the vault's words.
 pub fn arm_safety() {
+    previous_records();
     unsafe {
-        let r = |off: usize| read_volatile((RAMOOPS_RESULT + off) as *const u64);
-        *(&raw mut PREV_WORDS) = [r(0x08), r(0x10), r(0x20), r(0x28), r(0xA0), r(0xA8), r(0x30), r(0x38), r(0x40)];
-        PREV_END.store(r(0x20) | r(0x28) | r(0x08), core::sync::atomic::Ordering::Relaxed);
         for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8, 0x30, 0x38, 0x40] {
             write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
         }

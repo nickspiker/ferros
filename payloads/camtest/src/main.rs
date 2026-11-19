@@ -836,8 +836,8 @@ fn serve_wait(g: u64, ep: u64, id: u8, long_log2: u8, how: u8, t1: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 ferros_sys::entry!(payload_main);

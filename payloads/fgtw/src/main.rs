@@ -2437,5 +2437,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let _ = core::fmt::Write::write_str(&mut b, "\n");
     let mut r = [0u8; 16];
     ferros_sys::call(cap(unsafe { GRANTS }, 0), &b.b[..b.n], &mut r);
-    ferros_sys::panic_exit()
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }

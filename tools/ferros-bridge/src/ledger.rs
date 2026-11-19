@@ -54,7 +54,7 @@ pub fn cmd_render(path: &str) {
 }
 
 /// One `diag` on an open link: its answer.
-async fn diag(link: &crate::usb::UsbLink, params: &str) -> Vec<u8> {
+pub(crate) async fn diag(link: &crate::usb::UsbLink, params: &str) -> Vec<u8> {
     let cmd = crate::build_cmd(ferros_pt::command::caps::DIAG, ferros_pt::Op::Read, params.as_bytes());
     match crate::pt_send(link, &cmd).await {
         Ok(c) if c.success => {}

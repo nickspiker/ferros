@@ -84,8 +84,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 /// `d`: a plain `diag` through the kernel's PT endpoint, timed, its reply's length and first lines printed.

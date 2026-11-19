@@ -30,3 +30,9 @@ ferros_inject = { path = "../../ferros_inject" }
 ferros_ledger = { path = "../../ferros_ledger", features = ["ring"] }
 # an entry's Eagle time shown as the host's local wall time, for display only
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# `deaths`: a death's frames named from the process's ELF (function, file and line, inlined calls) by gimli's DWARF reader, the symbol table where an ELF has no line tables
+addr2line = { version = "0.25", default-features = false, features = ["loader", "rustc-demangle"] }
+
+[dev-dependencies]
+# the symboliser's test finds its marker function in its own executable
+object = { version = "0.37", default-features = false, features = ["read", "std"] }
