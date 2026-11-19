@@ -259,6 +259,133 @@ fn broadcast_ephemerides_agree_with_the_almanac() {
     assert!(worst < 8., "the worst A#{worst} km");
 }
 
+#[test]
+fn a_window_record_carries_the_orbit_to_its_scaling() {
+    // Every BRDC set encoded into a window record and read back: the satellite where the set puts it, to the ICD scaling's rounding, over its fit interval.
+    let mut v = Vec::new();
+    eph::each_gps(BRDC.as_bytes(), |e| v.push(e));
+    let mut worst: f64 = 0.;
+    for e in &v {
+        let mut rec = [0u8; 0xA8];
+        windows::encode(&mut rec, e, true);
+        let mut back = windows::decode(&rec);
+        back.week = e.week;
+        for dt in [-7200., -3600., 0., 3600., 7200.] {
+            let (a, b) = (eph::gps_ecef(e, e.toe + dt), eph::gps_ecef(&back, e.toe + dt));
+            worst = worst.max(sqrt((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)));
+        }
+        assert_eq!(back.toe, e.toe);
+        assert!((back.af0 - e.af0).abs() < 1e-9);
+    }
+    println!("encoded and read back: the worst A#{worst:.3} m over toe +- 2 h");
+    assert!(worst < 1.);
+}
+
+/// A window message of `n` GPS records (PRN 1 ..= n, every orbit word 0), framed as gpsd frames it: one `1e` frame of at most 1000 bytes of the escaped message each.
+fn synthetic_tail(n: usize, seq0: u8, counter0: u8, trailer: u16) -> Vec<(u16, Vec<u8>)> {
+    let mut m = std::vec![0u8; 0xBC + 0xA8 * n + 2];
+    m[..2].copy_from_slice(&[0x82, 0x81]);
+    let len = (m.len() - 2) as u16;
+    m[2..4].copy_from_slice(&len.to_le_bytes());
+    m[0x4C..0x50].copy_from_slice(&0x1207u32.to_le_bytes());
+    m[0x68..0x6C].copy_from_slice(&(n as u32).to_le_bytes());
+    for r in 0..n {
+        let b = 0xBC + 0xA8 * r;
+        m[b..b + 4].copy_from_slice(&(r as u32 + 1).to_le_bytes());
+        m[b + 4 * 6..b + 4 * 7].copy_from_slice(&391u32.to_le_bytes());
+    }
+    let l = m.len();
+    m[l - 2..].copy_from_slice(&trailer.to_le_bytes());
+    let ck = windows::checksum(&m);
+    m[4..6].copy_from_slice(&ck.to_le_bytes());
+    let mut e = std::vec![0xC0, 0xC1];
+    e.extend_from_slice(&m);
+    e.extend_from_slice(&[0xC0, 0xC4]);
+    let mut out = Vec::new();
+    let (mut seq, mut counter) = (seq0, counter0);
+    for chunk in e.chunks(1000) {
+        let k = chunk.len();
+        let mut p = std::vec![0x1E];
+        if k + 2 >= 0x80 {
+            p.push(0x80 | ((k + 2) >> 8) as u8);
+        }
+        p.push((k + 2) as u8);
+        p.extend_from_slice(&(k as u16).to_le_bytes());
+        p.extend_from_slice(chunk);
+        seq = seq.wrapping_add(1);
+        counter = counter.wrapping_add(1);
+        let big = p.len() >= 256;
+        let mut f = std::vec![seq, p.len() as u8, if big { 0x42 } else { 0x02 }, counter];
+        if big {
+            f.push((p.len() >> 8) as u8);
+        }
+        f.extend_from_slice(&p);
+        let c = windows::crc(&f[1..]);
+        f.push(c);
+        out.push((3u16, windows::escape(&f)));
+    }
+    out
+}
+
+#[test]
+fn windows_rebuilt_carry_the_sets_and_run_on() {
+    // The frame before the windows: sequence G#FD, the reliable counter G#45.
+    let mut pf = std::vec![0xFDu8, 6, 0x02, 0x45, 0x1E, 0x04, 0x02, 0x00, 0xAA, 0xBB];
+    let c = windows::crc(&pf[1..]);
+    pf.push(c);
+    let prev = windows::escape(&pf);
+    let tail = synthetic_tail(8, 0xFD, 0x45, 0x1100);
+    // Only nothing given: the same frames back, but for the gaps after the first.
+    let (same, did) = windows::rebuild(&prev, &tail, &[]).unwrap();
+    assert_eq!(did, windows::Rebuilt { messages: 1, gps: 0, glonass: 0, kept: 8 });
+    assert_eq!(same.len(), tail.len());
+    for (a, b) in same.iter().zip(&tail) {
+        assert_eq!(a.1, b.1);
+    }
+    // Sets for PRN 2 and 5: written, the rest kept; every frame's CRC good, the sequences and counters running on from the frame before, the checksum and trailer right.
+    let mut v = Vec::new();
+    eph::each_gps(BRDC.as_bytes(), |e| v.push(e));
+    let sets: Vec<windows::Set> = v.iter().filter(|e| e.prn == 2 || e.prn == 5).map(|e| windows::Set { system: windows::GPS, number: e.prn, eph: *e }).collect();
+    let (out, did) = windows::rebuild(&prev, &tail, &sets).unwrap();
+    assert_eq!((did.gps, did.kept), (2, 6));
+    let mut stream = Vec::new();
+    for (k, (_, r)) in out.iter().enumerate() {
+        let fs = windows::frames(r);
+        assert_eq!(fs.len(), 1);
+        let f = &fs[0];
+        assert_eq!(windows::crc(&f[1..f.len() - 1]), f[f.len() - 1]);
+        assert_eq!(f[0], 0xFEu8.wrapping_add(k as u8));
+        assert_eq!(f[3], 0x46u8.wrapping_add(k as u8));
+        let p = &f[windows::payload_start(f)..f.len() - 1];
+        stream.extend_from_slice(&p[if p[1] & 0x80 != 0 { 5 } else { 4 }..]);
+    }
+    // The message back, unescaped.
+    let mut m = Vec::new();
+    let mut j = 2;
+    while j + 1 < stream.len() {
+        if stream[j] == 0xC0 && stream[j + 1] == 0xC0 {
+            m.push(0xC0);
+            j += 2;
+        } else if stream[j] == 0xC0 && stream[j + 1] == 0xC4 {
+            break;
+        } else {
+            m.push(stream[j]);
+            j += 1;
+        }
+    }
+    assert_eq!(windows::checksum(&m), u16::from_le_bytes([m[4], m[5]]));
+    assert_eq!(u16::from_le_bytes([m[m.len() - 2], m[m.len() - 1]]), 0x1100);
+    for r in 0..8 {
+        let rec = &m[0xBC + 0xA8 * r..0xBC + 0xA8 * (r + 1)];
+        let d = windows::decode(rec);
+        assert_eq!(u32::from_le_bytes([rec[24], rec[25], rec[26], rec[27]]), 391, "word 6 kept");
+        match sets.iter().find(|s| s.number == d.prn) {
+            Some(s) => assert!((d.sqrt_a - s.eph.sqrt_a).abs() < 1e-5 && d.toe == s.eph.toe),
+            None => assert_eq!(d.sqrt_a, 0.),
+        }
+    }
+}
+
 const BRDC_GLO: &str = include_str!("testdata/brdc-glo-2026-11-19.rnx");
 
 #[test]

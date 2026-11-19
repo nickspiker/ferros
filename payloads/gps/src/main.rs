@@ -29,6 +29,7 @@ use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, st
 mod sky;
 mod net;
 mod predict;
+mod eph;
 use predict::Predict;
 use sky::{Sky, REC, SATS};
 
@@ -869,8 +870,8 @@ fn say_kinds(grants: u64) {
     console(grants, &l.b[..l.n]);
 }
 
-/// The heap the documents are built and read in (vsf's builders allocate): the last fix's a few KiB, the orbits' some 10 KB with every value parsed (a few dozen bytes each), the fetched answer some 28 KB; 512 KiB in .bss holds them all at once.
-const HEAP_BYTES: usize = 1 << 19;
+/// The heap the documents are built and read in (vsf's builders allocate): the last fix's a few KiB, the orbits' some 10 KB with every value parsed (a few dozen bytes each), the fetched answer some 28 KB, the ephemerides' 15 KB parsed the same way and the windows' tail twice (2026-11-19: 512 KiB ran out at an 18 KB allocation with the ephemerides read); 1 MiB in .bss.
+const HEAP_BYTES: usize = 1 << 20;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
@@ -1015,13 +1016,58 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         say!(grants, "gps: the replay is not GNR1\n");
         ferros_sys::exit(1);
     }
+    // The broadcast ephemerides for the chip's windows (eph.rs, GPS.md "Built: the driver's windows from gps.eph"): the kept ones; those within reach of now replace the replay's own windows' orbits, the replay's stay for every satellite they do not cover. How the device gets fresh ones (owner, 2026-11-19): from BKG and ESA over HTTPS once ferros has TLS, fleet-first, never thru fgtw.org; until then the host stores them.
+    let now_gps = gps_ms_now().map(|ms| ms as f64 / 1000.);
+    let sets = eph::load(store).map(|(_, s)| s).unwrap_or_default();
+    let fresh = now_gps.map(|n| eph::fresh(&sets, n)).unwrap_or_default();
+    // The replay's windows rebuilt from them, read from the vault before the chip is powered: the record before the first window, the tail from it, rebuilt (ferros_gnss windows::rebuild); `win_at` where the replay switches to them.
+    let mut rebuilt: Option<alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)>> = None;
+    let mut win_at = total;
+    if !fresh.is_empty() {
+        let mut buf = [0u8; 4096];
+        let (mut p, mut prev) = (4usize, alloc::vec::Vec::new());
+        let mut tail: alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+        while p + 4 <= total {
+            let mut h = [0u8; 4];
+            store_get_at(store, key, p, &mut h);
+            // WHY the min: the length is the stored replay's, as the replay loop below bounds it.
+            let len = (u16::from_le_bytes([h[0], h[1]]) as usize).min(buf.len());
+            let mut got = 0;
+            while got < len {
+                let k = (len - got).min(4096);
+                store_get_at(store, key, p + 4 + got, &mut buf[got..got + k]);
+                got += k;
+            }
+            if win_at == total && ferros_gnss::windows::has_window(&buf[..len]) {
+                win_at = p;
+            }
+            if win_at == total {
+                prev = buf[..len].to_vec();
+            } else {
+                tail.push((u16::from_le_bytes([h[2], h[3]]), buf[..len].to_vec()));
+            }
+            p += 4 + len;
+        }
+        match ferros_gnss::windows::rebuild(&prev, &tail, &fresh) {
+            Some((list, did)) => {
+                say!(grants, "gps: the windows from the broadcast ephemerides: {} GPS and {} GLONASS records ({} kept from the replay), {} messages\n", did.gps, did.glonass, did.kept, did.messages);
+                rebuilt = Some(list);
+            }
+            None => {
+                win_at = total;
+                say!(grants, "gps: the replay's windows could not be rebuilt; its own go\n");
+            }
+        }
+    } else {
+        say!(grants, "gps: no broadcast ephemerides within reach of now: the replay's own windows (the capture's LTO)\n");
+    }
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "gps: power on failed\n");
     }
     chip.set(NSTANDBY, true);
     sleep_ms(250);
     let woke = chip.wake(100);
-    say!(grants, "gps: powered, the chip {} its wake; replaying {} B ({})\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" });
+    say!(grants, "gps: powered, the chip {} its wake; replaying {} B of {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "gps.replay.sky" } else { "gps.replay" });
     // Which place the aid carries, by its sources and how wide it is, never its numbers (the zone's city is public, but a line saying it would say where the person is to a zone).
     match rough {
         Some(r) => {
@@ -1062,11 +1108,20 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut nb = Renumber { shift: 0, unshifted: 0, counter: None, renumbered: 0 };
     // Whether the chip acked the place put back: None while none was sent.
     let mut place_acked: Option<bool> = None;
+    // The next rebuilt window record to send.
+    let mut win_next = 0usize;
     loop {
         let (len, gap, injected) = if let Some(n) = inject.take() {
             rec[..n].copy_from_slice(&placed[..n]);
             // gpsd sent its three a few hundred ms apart; the next record waits as long.
             (n, 1u64 << 7, true)
+        } else if let Some(list) = rebuilt.as_ref().filter(|_| at >= win_at) {
+            // From the first window on, the windows rebuilt from the broadcast ephemerides.
+            let Some((g, r)) = list.get(win_next) else { break };
+            win_next += 1;
+            rec[..r.len()].copy_from_slice(r);
+            recs += 1;
+            (r.len(), *g as u64, false)
         } else {
             if at + 4 > total {
                 break;

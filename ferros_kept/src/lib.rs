@@ -25,6 +25,7 @@
 extern crate alloc;
 
 pub mod deck;
+pub mod eph;
 pub mod gnss;
 pub mod gps;
 pub mod icon;
