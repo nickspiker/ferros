@@ -2,9 +2,11 @@
 //! Built with `--features puck` (tools/basecalc-kist.sh), its capsule declaring `puck`: its square is in its surface's slot (3), its link to the display the first asked slot (7).
 
 use crate::sys;
+use crate::dial::{paint, Act, Dial, Screen, QUICK};
 use crate::window::{open_vault, restore, writer, Pad};
-use basecalc_kist::layout::Circle;
-use fluor::paint::HIT_NONE;
+use basecalc::spans_text;
+use basecalc_kist::calc::Shown;
+use basecalc_kist::keys::{self, Key};
 use fluor::text::TextRenderer;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -91,6 +93,10 @@ pub fn main() {
     }
     let (mut held, mut shown): (u64, Option<(u64, u64)>) = (0, None);
     let mut seen = 0u32;
+    // The dial's state: the inner ring's layer (Shift), the outer ring's page of digits, whether the base follows the device's (it does until overridden; a kept base other than the device's means it was overridden), the side last drawn, and a key pressed since.
+    let (mut layer, mut page) = (0usize, 0usize);
+    let mut following = { let dev = sys::device_base(); dev == 0 || pad.calc.state.base == dev };
+    let (mut drawn_d, mut dirty) = (0usize, true);
     loop {
         let (count, on, d, taps) = {
             let (lock, bell) = &*heard;
@@ -106,41 +112,69 @@ pub fn main() {
         if !on || d == 0 {
             continue;
         }
-        // Each tap on the keys as they were last drawn: its point in the square from the face's frame (Q14 of the radius from the centre), the key the hit map holds there.
-        let side = pad.size.0;
-        let mut pressed = false;
-        for (tx, ty) in taps {
-            if side == 0 {
-                break;
-            }
-            let r = side as f32 * 0.5;
-            let (x, y) = (r + tx as f32 / 16384. * r, r + ty as f32 / 16384. * r);
-            // WHY the bounds: a tap on the circle's rim lands up to a pixel past the square the keys were drawn in.
-            if x < 0. || y < 0. || x >= side as f32 || y >= side as f32 {
-                continue;
-            }
-            let id = pad.hits[y as usize * side + x as usize];
-            if id == HIT_NONE {
-                continue;
-            }
-            let p = pad.drawn[id as usize - 1];
-            let change = pad.calc.press(p.key);
-            if change.relayout {
-                pad.place();
-            }
+        // The device's base followed until overridden (the settings layer's base keys), its digits paged when it is past the ring.
+        let dev = sys::device_base();
+        if following && dev != 0 && pad.calc.state.base != dev {
+            let change = pad.calc.press(Key::Base(dev));
             if change.save {
                 pad.save();
             }
-            pressed = true;
+            page = 0;
+            dirty = true;
+        }
+        // Each tap on the dial as it was last drawn: its point in the face's frame (Q14 of the radius from the centre, the dial upright in it), the key whose cell holds it.
+        let mut dial = Dial::new(pad.calc.state.base, layer, page);
+        for (tx, ty) in taps {
+            let Some(act) = dial.hit(tx as f32 / 16384., ty as f32 / 16384.) else { continue };
+            println!("basecalc: tap at Q14 {tx},{ty}: {act:?}");
+            let base = pad.calc.state.base;
+            let key = match act {
+                Act::Calc(k) => Some(k),
+                // One bracket key: closes when more are open than closed and a value ends the expression, else opens.
+                Act::Paren => {
+                    let units = keys::units(&pad.calc.expr);
+                    let open = units.iter().filter(|u| u.kind == keys::Kind::Opens).count();
+                    let close = units.iter().filter(|u| u.kind == keys::Kind::Closes).count();
+                    let ends_value = units.last().is_some_and(|u| matches!(u.kind, keys::Kind::Digit | keys::Kind::Value | keys::Kind::Closes));
+                    Some(Key::Write(if open > close && ends_value { keys::CLOSE } else { keys::OPEN }))
+                }
+                Act::Shift => {
+                    layer = (layer + 1) % dial.layers;
+                    None
+                }
+                Act::BaseNext => {
+                    following = false;
+                    let next = QUICK.iter().copied().find(|&b| b > base).unwrap_or(QUICK[0]);
+                    page = 0;
+                    Some(Key::Base(next))
+                }
+                Act::BaseDevice => {
+                    following = true;
+                    page = 0;
+                    (dev != 0).then_some(Key::Base(dev))
+                }
+                Act::DigitPage => {
+                    let per = dial.n - 1;
+                    page = (page + 1) % (base as usize).div_ceil(per);
+                    None
+                }
+                Act::None => None,
+            };
+            if let Some(k) = key {
+                let change = pad.calc.press(k);
+                if change.save {
+                    pad.save();
+                }
+            }
+            dirty = true;
+            dial = Dial::new(pad.calc.state.base, layer, page);
         }
         // Drawn again only for a new size or a key pressed: a turn alone is the display's to show (the square is upright and it turns it with the circle).
-        if !pressed && shown.is_some() && side == d {
+        if !dirty && shown.is_some() && drawn_d == d {
             continue;
         }
-        // The pad in the circle: the circle fills the square, and nothing of it is the system's.
-        if pad.size != (d, d) {
-            pad.circle = Some(Circle { cx: d as f32 * 0.5, cy: d as f32 * 0.5, r: d as f32 * 0.5, top: false, bottom: false });
-        }
+        dirty = false;
+        drawn_d = d;
         let bytes = (d * d * 8) as u64;
         let off = next_offset(shown, bytes);
         if off + bytes > held {
@@ -155,7 +189,16 @@ pub fn main() {
         // SAFETY: [base + off, base + off + bytes) lies inside the frames this puck's slot holds (`held`, the kernel's answer), which nothing else writes; the display reads only the square it was last handed, which `next_offset` keeps clear of.
         let px = unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u64, d * d) };
         px.fill(0);
-        pad.draw_all(px, d, d, &mut text, HIT_NONE, &mut damage);
+        let calc = &pad.calc;
+        let expr: String = keys::units(&calc.expr).iter().map(|u| u.label).collect();
+        let (value, error, dim) = match &calc.shown {
+            Shown::Nothing => (String::new(), false, false),
+            Shown::Preview(s) => (spans_text(s).trim_start().to_string(), false, true),
+            Shown::Value(s) => (spans_text(s).trim_start().to_string(), false, false),
+            Shown::Error(why) => (why.clone(), true, false),
+        };
+        let screen = Screen { expr: &expr, value: &value, error, dim, base: calc.state.base, radians: calc.state.radians, following };
+        paint(px, d, &dial, layer, &screen, &mut text, &mut damage);
         // Upright: the display turns it with the circle, and the taps come back in the same frame.
         let mut m = [0u8; 11];
         m[0] = SHOW;

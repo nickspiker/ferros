@@ -5,6 +5,8 @@
 #[cfg(target_os = "ferros")]
 mod cshim;
 #[cfg(all(target_os = "ferros", feature = "puck"))]
+mod dial;
+#[cfg(all(target_os = "ferros", feature = "puck"))]
 mod puck;
 #[cfg(target_os = "ferros")]
 mod sys;

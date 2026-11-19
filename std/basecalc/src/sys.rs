@@ -60,3 +60,9 @@ pub fn puck_size(slot: u64, bytes: u64) -> Option<u64> {
     let n = svc(7, cap(slot), 6, bytes, 0, 0);
     (n != ERR && n < 64 << 20).then_some(n)
 }
+
+/// The device's number base (Settings, Units: ferros_sys `device_base`, the preferences block's byte 0 at arc offset G#FC0): 10 arabic, 12 dozenal (DMS or DLS), 16 hex; 0 when the kernel has set none.
+pub fn device_base() -> u8 {
+    let code = unsafe { ((arc_base() + 0xFC0) as *const u8).read_volatile() };
+    code & 0x7F
+}
