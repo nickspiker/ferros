@@ -258,6 +258,14 @@ impl Timing {
         (((p.fll as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
     }
 
+    /// Whether a new frame of `new_ns`, begun at counter tick `now`, ends more than `margin_us` before the frame in flight (begun at tick `at`, `flight_ns` long) does, at `hz` ticks a second: the camera driver then cuts the frame in flight rather than let it finish (payloads/camera `exposure_cut`; docs/CAMERA.md "Serving while a frame waits").
+    /// In 128 bits: a frame of the main's widest shift is 14 years of ns, and its product with the counter's 24.576 MHz passes 64 bits; the ticks themselves fit.
+    pub fn cut_due(at: u64, flight_ns: u64, now: u64, new_ns: u64, hz: u64, margin_us: u64) -> bool {
+        let end = at as u128 + flight_ns as u128 * hz as u128 / 1_000_000_000;
+        let new_end = now as u128 + new_ns as u128 * hz as u128 / 1_000_000_000 + margin_us as u128 * hz as u128 / 1_000_000;
+        end > new_end
+    }
+
     /// Whole lines of the mode's line in `ns`, in 128 bits (any u64 of ns over a line of at least 1 ns fits back in 64 bits).
     fn lines(&self, ns: u64) -> u64 {
         (ns as u128 * 1000 / self.line_ps_at(self.llp) as u128) as u64
@@ -1066,6 +1074,33 @@ mod tests {
         assert_eq!(p.shift, 6);
         assert!(p.llp > 6320 && (p.llp as u64) < 8000 && p.llp as u64 % LLP_STEP == 0, "{p:?}");
         assert!(ts.readout_ps(&p, 3072) > 11_000_000_000, "{}", ts.readout_ps(&p, 3072));
+    }
+
+    /// The cut (docs/CAMERA.md "Serving while a frame waits"): the owner's shutter dragged to the end (a 14-year frame) and back to 1 s cuts the frame in flight, at any point of it, with the counter's 24.576 MHz (no 64-bit wrap reads it as short); "a 64 s exposure, 5 s in I want 12 s" cuts (the new frame would end 47 s sooner); a new frame ending under the margin (2^20 us) sooner, or later, does not; a frame begun just now at 64 s and asked for 63.5 s does not.
+    #[test]
+    fn the_cut() {
+        let t = cams::MAIN.listed_timing();
+        let t = Timing { fll: 0x5372, coarse_min: 2, ..t };
+        let hz = 24_576_000u64;
+        let margin = 1u64 << 20;
+        let s = |x: u64| x * hz;
+        let years = t.frame_ns(&t.plan(t.most_ns()).unwrap());
+        let one = t.frame_ns(&t.plan(1_000_000_000).unwrap());
+        let at = 1u64 << 40;
+        // A second into the 14-year frame, and 13 years into it.
+        assert!(Timing::cut_due(at, years, at + s(1), one, hz, margin));
+        assert!(Timing::cut_due(at, years, at + s(13 * 365 * 86400), one, hz, margin));
+        // 64 s, 5 s in, now 12 s: about 47 s sooner.
+        let f64s = t.frame_ns(&t.plan(64_000_000_000).unwrap());
+        let f12 = t.frame_ns(&t.plan(12_000_000_000).unwrap());
+        assert!(Timing::cut_due(at, f64s, at + s(5), f12, hz, margin));
+        // 59 s in: the frame in flight ends in about 5 s, before a 12 s one would; let it finish.
+        assert!(!Timing::cut_due(at, f64s, at + s(59), f12, hz, margin));
+        // Inside the margin: 64 s just begun, 63.5 s asked.
+        let f63 = t.frame_ns(&t.plan(63_500_000_000).unwrap());
+        assert!(f63 < f64s && !Timing::cut_due(at, f64s, at, f63, hz, margin));
+        // Longer never cuts.
+        assert!(!Timing::cut_due(at, one, at, years, hz, margin));
     }
 
 

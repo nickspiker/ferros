@@ -27,7 +27,8 @@
 //! OPEN's mode block (docs/CAMERA.md "Modes, the bench and the slit"; owner, 2026-11-15: "straight as fast as possible full frame 1:1 and 2x binned for all back cams ... Then I want the slitscan wired up"): after `[1][id][view]`, `[kind][rows: u16][fll: u16][exposure: u16][flags][ring: log2][line length: u16]`, every field optional (`Spec`).
 //! After the whole block (its `[cols: u16]` too) one byte of view flags (`VIEW_FLAGS`): bit 0 the view write-back (docs/CAMERA.md "A cacheable view").
 //! The mode is written inside the sensor's hold after its init and before stream on, the front end's geometry rewritten to match (ferros_cam ccs, geom), its buffers sized to the mode's frame.
-//! A holder that ends without closing: its waiting FRAME's reply fails, or 2^22 us pass with nobody asking; either closes. The kernel takes the view back when either ends.
+//! A call that waits for a frame (FRAME, MAP, SNAP, SLITS) is held, its reply token kept, and every other call is answered meanwhile (LIST, SET, CLOSE, STATS): a frame 14 years long blocks nothing (docs/CAMERA.md "Serving while a frame waits"). A SET whose frame would end long before the frame in flight cuts that frame (`exposure_cut`).
+//! A holder that ends without closing: the kernel marks the driver's doorbell the moment its process ends (the watch made at its OPEN, kernel SYS_CALLER x1) and the stream closes then; on a kernel without the watch, its held call's reply failing, another's OPEN finding that call's caller gone, or 2^22 us with nobody asking. The kernel takes the view back when either ends.
 #![no_std]
 #![no_main]
 
@@ -900,12 +901,16 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     }
     if nf != 0 {
         FRAME_AT.store(eagle_ns(), Ordering::Release);
+        // The frame now in flight began at this DMA_DONE, at the timing written before it (`exposure_cut` reckons its end from both).
+        FLIGHT_AT.store(t0, Ordering::Relaxed);
+        FLIGHT_NS.store(PERIOD_NS.load(Ordering::Relaxed), Ordering::Relaxed);
         let n = FRAMES.fetch_add(nf as u64, Ordering::AcqRel) + 1;
         if n == 1 {
             let us = ferros_sys::us_since(OPEN_AT.load(Ordering::Relaxed));
             step!(g, "camera: first frame A#{} ms after the open (open step: first frame)\n", us / 1000);
         }
-        ferros_sys::wake(&FRAMES, 4);
+        // The server's doorbell: counted always, rung only while it holds a call that waits for a frame (`WANT`), so a server holding none is not woken a thousand times a second by slits (`door_ring`).
+        door_ring();
     }
     let t = ferros_sys::now() - t0;
     if k < IMG_DUR.len() {
@@ -1075,6 +1080,21 @@ fn exposure_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, p: &ccs::P
         Ok(())
     })();
     bus.write(c.addr, c.release)?;
+    r
+}
+
+/// CCS fast_standby_ctrl (G#0106, one byte): 1, a stream off truncates the frame in flight at once instead of finishing it (CCS's "frame truncation"); 0 (CCS's default, unread on these sensors) finishes it. None of the four local inits writes G#0106 directly (scanned 2026-11-18; Samsung's indirect window not decoded for it).
+const FAST_STANDBY: [u8; 3] = [0x01, 0x06, 0x01];
+
+/// The frame in flight dropped and the exposure's first frame begun now (the coordinator, 2026-11-18, for Lumis: "A SET whose new exposure would end before the frame in flight should drop that frame and start the new one at once ... The cost is one dropped frame"), when `cut_due` says so.
+/// Every exposure change measured mid-stream lands at a frame's start (the hold: the 16 s change of 2026-11-17 night took the frames in flight first, the 8 s step four of them), so nothing in the hold cuts a frame short; the stream goes off and on instead: frame truncation asked (`FAST_STANDBY`), the stream off, the new timing written inside the hold while the sensor stands by (the open's own order: the mode in the hold, then stream on), the stream on.
+/// Unmeasured: whether this sensor truncates (CCS allows a sensor to finish the frame regardless; then the stream on finds it still streaming and the new timing lands at the next frame's start, as without the cut), and whether the front end takes a stream off and on with no close between (the link goes quiet and comes back as at an open's stream on; the front end sees no frame start before the readout, at the frame's end, which the cut never reaches: `CUT_US`).
+fn exposure_cut(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, p: &ccs::Plan) -> Result<(), u32> {
+    bus.write(c.addr, &FAST_STANDBY)?;
+    bus.write(c.addr, c.stream_off)?;
+    let r = exposure_set(bus, c, t, now, p);
+    // On again whatever the writes did: a stream left off sends no frame, and the held call would wait out its whole deadline.
+    bus.write(c.addr, c.stream_on)?;
     r
 }
 
@@ -1699,15 +1719,24 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The first descriptor released and the frame thread on (Linux's start writes +G#10 = G#10 right after the engine's start), or the lead's first descriptors (`LEAD`).
     arm(g);
     wr(g, pd + ferros_cam::PDMA_INDEX, STEP * LEAD.load(Ordering::Relaxed) as u32);
+    FLIGHT_AT.store(ferros_sys::now(), Ordering::Relaxed);
+    FLIGHT_NS.store(PERIOD_NS.load(Ordering::Relaxed), Ordering::Relaxed);
+    CUT_AT.store(0, Ordering::Relaxed);
     RUN.store(1, Ordering::Release);
     ferros_sys::wake(&RUN, 1);
     step!(g, "camera: streaming A#{} ms after the open (open step: stream on)\n", ferros_sys::us_since(t0) / 1000);
     // Mid-stream, when asked: the mode written once the first frame has landed (October's order; the sensor took one change a session and then needed a cold boot).
     if let (Some(m), true) = (mode, s.flags & F_MID != 0) {
         let until = late_tick();
-        while FRAMES.load(Ordering::Acquire) == 0 && ferros_sys::now() < until {
-            ferros_sys::wait(&FRAMES, 0, until);
+        WANT.store(1, Ordering::SeqCst);
+        loop {
+            let d = DOOR.load(Ordering::SeqCst);
+            if FRAMES.load(Ordering::Acquire) != 0 || ferros_sys::now() >= until {
+                break;
+            }
+            ferros_sys::wait(&DOOR, d, until);
         }
+        WANT.store(0, Ordering::SeqCst);
         for wr_ in m.writes(arr, c).iter() {
             bus.write(c.addr, wr_).map_err(Fail::Sensor)?;
         }
@@ -1896,15 +1925,18 @@ fn header(h: &mut [u8], b: usize, bin: usize) {
 const SNAP_REPLY: usize = HEADER + 32;
 
 /// An image and its phase-detect rows as one pair for the host (owner, 2026-11-17: phase detect as data; docs/CAMERA.md "Phase detect as data"): the next frame's buffer held as a MAP holds it (`HOLD_KIST`: given back by the next SNAP or MAP, by RELEASE, or at the close), its image and its PD rows (every ring buffer carries its frame's, `PD_OFF`) said by physical address, so `ferros-bridge read` pulls both while the holder keeps it (tools/camera-pd-pair.sh). Only with the PD rows in the ring (the init's mode, or the PD path asked) and a ring of two or more.
-fn snap(g: u64, o: &mut Open, out: &mut [u8; SNAP_REPLY]) -> bool {
-    let pd_off = PD_OFF.load(Ordering::Relaxed);
-    if pd_off == 0 || o.ring < 2 {
+/// `snap_begin` says whether this open can (and gives back the buffer the kist held); the next frame is then held for it as a MAP's is (`Want::Snap`), and `snap_answer` fills the reply.
+fn snap_begin(g: u64, o: &mut Open) -> bool {
+    if PD_OFF.load(Ordering::Relaxed) == 0 || o.ring < 2 {
         return false;
     }
     if let Some((b, _)) = o.held {
         release(g, o, b);
     }
-    let Some(b) = wait_hold(HOLD_KIST, FRAMES.load(Ordering::Acquire)) else { return false };
+    true
+}
+fn snap_answer(o: &mut Open, b: usize, out: &mut [u8; SNAP_REPLY]) {
+    let pd_off = PD_OFF.load(Ordering::Relaxed);
     o.given = B_COUNT[b].load(Ordering::Relaxed);
     o.held = Some((b, probe_read(b)));
     let buf_pa = o.pa + o.l.slots[job::OLD_SLOT_IMAGE].0 + b as u64 * BUF.load(Ordering::Relaxed);
@@ -1916,7 +1948,6 @@ fn snap(g: u64, o: &mut Open, out: &mut [u8; SNAP_REPLY]) -> bool {
     out[HEADER + 20..HEADER + 24].copy_from_slice(&(COLS.load(Ordering::Relaxed) as u32).to_le_bytes());
     out[HEADER + 24..HEADER + 28].copy_from_slice(&(LINE.load(Ordering::Relaxed) as u32).to_le_bytes());
     out[HEADER + 28..HEADER + 32].copy_from_slice(&((pd_first == [PATTERN; 8]) as u32).to_le_bytes());
-    true
 }
 
 /// The newest written buffer, held for `bit` (`HOLD_KIST` or `HOLD_BIN`) when its frame's count is past `after`: one compare-and-swap with the frame thread's turn, so a buffer is never both held and given to the engine. None when the newest is not past `after` (or there is none yet).
@@ -1934,21 +1965,6 @@ fn hold_newest(bit: u32, after: u64) -> Option<usize> {
 }
 fn unhold(bit: u32, b: usize) {
     STATE.fetch_and(!(1 << (bit + b as u32)), Ordering::AcqRel);
-}
-
-/// Wait for a buffer whose frame is past `after` and hold it for `bit`, until `late_us` passes: the sensor sends one a frame period (67.8 ms at the main's own mode, up to the longest exposure's), so none by then is a stream that stopped (the front end stops for good when it is not answered in time), and the caller is told rather than kept waiting.
-fn wait_hold(bit: u32, after: u64) -> Option<usize> {
-    let until = late_tick();
-    loop {
-        let n = FRAMES.load(Ordering::Acquire);
-        if let Some(b) = hold_newest(bit, after) {
-            return Some(b);
-        }
-        if ferros_sys::now() >= until {
-            return None;
-        }
-        ferros_sys::wait(&FRAMES, n, until);
-    }
 }
 
 /// Buffer `b`'s frame into `OUT`, binned `bin` x `bin` per colour: output sample (ox, oy) is the mean of the bin x bin same-colour samples of its 2 bin x 2 bin block, so the mosaic keeps its phase (the camera's cfa), after its header (`header`). Its length.
@@ -2058,10 +2074,164 @@ fn link_say(g: u64) {
     console(g, &l.b[..l.n]);
 }
 
-/// How long the stream may run with nobody asking before the holder is taken for gone: 2^22 us (it was 64 frames, 4.4 s at 14.5 a second; a slit runs 64 frames in 53 ms).
+/// How long the stream may run with nobody asking before the holder is taken for gone: 2^22 us (it was 64 frames, 4.4 s at 14.5 a second; a slit runs 64 frames in 53 ms). Never while a call of its waits for a frame (`Pending`): that holder is asking.
 const UNASKED_US: u64 = 1 << 22;
-/// The word the idle server waits on: never rung, so only a call or its deadline end the wait.
-static QUIET: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------- serving while a frame waits
+//
+// The server answers every call while a MAP, FRAME, SNAP or SLITS waits for its frame (docs/CAMERA.md "Serving while a frame waits"; the Pro, 2026-11-18: a frame about 13.6 years long held the one server thread in MAP's wait, for a holder already gone, and a new Lumis sat in LIST).
+// Such a call is held (`Pending`: its reply token kept, the server back in its loop), and answered when its frame lands, when the holder closes (empty), or when the stream is taken for stopped (empty, then the driver ends, as before).
+// One wait covers all three: the doorbell `DOOR`, which the frame thread counts at each frame and the kernel marks when the holder's process ends (`CALLER_ENDED`, kernel SYS_CALLER x1), with the calls on the endpoint ending it too (ferros_sys `wait_or_call`).
+
+/// The server's doorbell: frames counted in its low bits (`door_ring`, by the frame thread), `CALLER_ENDED` set by the kernel when the holder's process ends (the watch made at its OPEN, ferros_sys `caller_watch`).
+/// One word for both, so no wake is lost between the server's look and its wait: the kernel's wait returns at once when the word moved since the look, whichever of the two moved it.
+static DOOR: AtomicU64 = AtomicU64::new(0);
+/// Whether the server holds a call that waits for a frame: only then does the frame thread wake it (`door_ring`), so a server holding none sleeps thru a slit stream's thousand frames a second.
+static WANT: AtomicU64 = AtomicU64::new(0);
+/// Whether the kernel watches the holder's end (its answer at the OPEN carried `CALLER_WATCHED`); a kernel from before does not, and a second OPEN then asks whether the holder's held call still has a caller (`caller_alive`).
+static WATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// A frame landed: the doorbell counted, and the server woken when it waits for one (`WANT`). Order: the count first, then the look at `WANT`, both sequentially consistent, against the server's `WANT` then its look at the count: either the server's look sees this frame, or this sees its `WANT` and wakes it.
+fn door_ring() {
+    DOOR.fetch_add(1, Ordering::SeqCst);
+    if WANT.load(Ordering::SeqCst) != 0 {
+        ferros_sys::wake(&DOOR, 1);
+    }
+}
+
+/// The frame in flight: the counter at its start (the DMA_DONE that ended the one before, the stream on for the first) and its period as written before it began (ns), for `cut_due`.
+static FLIGHT_AT: AtomicU64 = AtomicU64::new(0);
+static FLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+/// The last cut (`exposure_cut`): the counter when the stream came back on (0 none since) and the frames counted then, so the first frame after it is said with its time.
+static CUT_AT: AtomicU64 = AtomicU64::new(0);
+static CUT_N: AtomicU64 = AtomicU64::new(0);
+/// How much sooner than the frame in flight a new exposure's frame must end for SET to cut that frame (`cut_due`): 2^20 us. A cut drops the frame in flight and costs a stream off and on; under about a second of difference the frame in flight is simply let finish, as every exposure SET did before, and a slit's or a short frame's change never cuts.
+const CUT_US: u64 = 1 << 20;
+
+/// What a held call waits for: MAP the newest frame past the last it handed out, FRAME the next frame at its bin, SNAP the next frame with its PD rows, SLITS a slit past its count.
+#[derive(Clone, Copy)]
+enum Want {
+    Map,
+    Frame(usize),
+    Snap,
+    Slits,
+}
+
+/// A call held while its frame is on its way: its reply token (SYS_REPLY's, kept until answered), what it waits for, the count its frame must be past, and the counter at which the stream is taken for stopped (`late_tick` at the call, moved later by an exposure that lengthens the frame).
+struct Pending {
+    token: [u8; 32],
+    want: Want,
+    after: u64,
+    until: u64,
+}
+
+/// What became of a held call when looked at.
+enum Tried {
+    Waiting,
+    Answered,
+    /// Its reply failed: its caller has ended.
+    Gone,
+}
+
+/// Binning's measures for the console, every 64 frames served by copy.
+struct Served {
+    n: u64,
+    bin_us: u64,
+    since: u64,
+}
+
+/// A MAP's frame, buffer `b` held for the kist already (`hold_newest`): its record made, a write-back view's lines dropped, its header the reply. False when the reply failed (the holder has ended).
+fn map_answer(g: u64, o: &mut Open, b: usize, token: &[u8; 32]) -> bool {
+    let n = FRAMES.load(Ordering::Acquire);
+    o.asked_at = n;
+    o.given = B_COUNT[b].load(Ordering::Relaxed);
+    // A write-back view: the buffer's lines dropped from every core's caches before the holder hears of it (docs/CAMERA.md "A cacheable view").
+    // Its frame's DMA_DONE came before the hold (`ring_turn` makes a buffer the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer), so what a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone and the holder reads this frame.
+    if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 {
+        let t = lines(g, o, b, 0, BUF.load(Ordering::Relaxed) as usize);
+        o.inv_sum += t;
+        o.inv_max = o.inv_max.max(t);
+    }
+    o.held = Some((b, probe_read(b)));
+    let mut h = [0u8; HEADER];
+    header(&mut h, b, 1);
+    let lat = ferros_sys::now() - B_TICK[b].load(Ordering::Relaxed);
+    o.lat_sum += lat;
+    o.lat_max = o.lat_max.max(lat);
+    o.maps += 1;
+    if o.maps % 64 == 0 {
+        let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
+        say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
+        if o.cached {
+            say!(g, "camera: the write-back view's maintenance at MAP (A#{} bytes a buffer): A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), us(o.inv_sum / 64), us(o.inv_max));
+        }
+        (o.lat_sum, o.lat_max, o.inv_sum, o.inv_max) = (0, 0, 0, 0);
+    }
+    reply(token, &h) != ERR
+}
+
+/// A FRAME's frame, buffer `b` held for the binning already (`hold_newest`): binned into `OUT` and given back to the ring, the reply the binned frame. False when the reply failed (the holder has ended).
+fn frame_answer(g: u64, o: &mut Open, bin: usize, b: usize, token: &[u8; 32], s: &mut Served) -> bool {
+    let n = FRAMES.load(Ordering::Acquire);
+    o.asked_at = n;
+    if n >= 8 && !o.probed {
+        o.probed = true;
+        probe(g, o);
+    }
+    let t = ferros_sys::now();
+    let len = bin_frame(o, bin, b);
+    unhold(HOLD_BIN, b);
+    s.bin_us += ferros_sys::us_since(t);
+    s.n += 1;
+    if s.n % 64 == 0 {
+        let us = ferros_sys::us_since(s.since);
+        let copy_us = COPY_TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / ferros_sys::freq();
+        say!(g, "camera: A#{} frames served, the last 64 in A#{} ms (A#{} us apart), binning A#{} us each on A#{BINNERS} threads (copying out of the region A#{} us of their time); A#{} taken by the front end\n", s.n, us / 1000, us / 64, s.bin_us / 64, copy_us / 64, n);
+        (s.bin_us, s.since) = (0, ferros_sys::now());
+    }
+    reply(token, unsafe { &(&*(&raw const OUT))[..len] }) != ERR
+}
+
+/// The held call looked at: answered when its frame has landed (the newest buffer past its count held for it with one compare-and-swap against the frame thread's turn, `hold_newest`, so a buffer is never both held and given to the engine).
+fn try_pending(g: u64, o: &mut Open, p: &Pending, s: &mut Served) -> Tried {
+    let ok = match p.want {
+        Want::Slits => {
+            if FRAMES.load(Ordering::Acquire) <= p.after {
+                return Tried::Waiting;
+            }
+            reply(&p.token, &slits());
+            true
+        }
+        Want::Map => {
+            let Some(b) = hold_newest(HOLD_KIST, p.after) else { return Tried::Waiting };
+            map_answer(g, o, b, &p.token)
+        }
+        Want::Frame(bin) => {
+            let Some(b) = hold_newest(HOLD_BIN, p.after) else { return Tried::Waiting };
+            frame_answer(g, o, bin, b, &p.token, s)
+        }
+        Want::Snap => {
+            let Some(b) = hold_newest(HOLD_KIST, p.after) else { return Tried::Waiting };
+            let mut out = [0u8; SNAP_REPLY];
+            snap_answer(o, b, &mut out);
+            let w = |k: usize| u64::from_le_bytes(out[HEADER + k..HEADER + k + 8].try_into().unwrap());
+            say!(g, "camera: SNAP frame A#{}: image at G#{:X} (A#{} x A#{} RAW10, G#{:X} a line), its PD rows at G#{:X} (A#{} rows), status G#{:X} (1 the PD rows never written); held as a MAP holds\n", u32::from_le_bytes(out[0..4].try_into().unwrap()), w(0), COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed), LINE.load(Ordering::Relaxed), w(8), w(16) as u32, (w(24) >> 32) as u32);
+            reply(&p.token, &out);
+            true
+        }
+    };
+    if ok { Tried::Answered } else { Tried::Gone }
+}
+
+/// Whether an exposure whose frame lasts `new_ns` should cut the frame in flight (`exposure_cut`): its frame, begun now, would end more than `CUT_US` before the frame in flight does (the coordinator, 2026-11-18, for Lumis: dragging the shutter to 14 years and back must come back at once, not after the 14-year frame).
+/// Never with a slit ring (the open program's armed release and the slits' records follow every slit), and never before the stream's first frame has a start (`FLIGHT_AT` 0).
+fn cut_due(new_ns: u64) -> bool {
+    let at = FLIGHT_AT.load(Ordering::Relaxed);
+    if SLITS.load(Ordering::Relaxed) != 0 || at == 0 {
+        return false;
+    }
+    ccs::Timing::cut_due(at, FLIGHT_NS.load(Ordering::Relaxed), ferros_sys::now(), new_ns, ferros_sys::freq(), CUT_US)
+}
 /// How long a FRAME waits for its frame before the stream is taken for stopped, past the frame period itself (`late_us`): about thirty of the main's ordinary frames, past the sensor's start after stream on.
 const FRAME_LATE_US: u64 = 1 << 21;
 
@@ -2129,32 +2299,81 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut open_cam: Option<Open> = None;
+    // The call held while its frame is on its way (`Pending`): at most one; a second call that would wait while one is held is answered empty (one holder, one thread reading frames).
+    let mut pending: Option<Pending> = None;
     // A driver spawned to stay that has closed its one stream (`stay`): it refuses the next open.
     let mut closed_once = false;
     // Binning's measures, for the console every 64 frames served.
-    let (mut served, mut bin_us, mut since) = (0u64, 0u64, ferros_sys::now());
+    let mut served = Served { n: 0, bin_us: 0, since: ferros_sys::now() };
     // The first receive waits (the call that started this driver is queued already; one spawned by hand waits for its first); after it, a look, so a driver with nothing open and nothing waiting ends.
     let mut poll = false;
     loop {
+        // The doorbell read before anything is looked at: a frame or the holder's end after this read makes the wait below return at once (`DOOR`).
+        WANT.store(pending.is_some() as u64, Ordering::SeqCst);
+        let door = DOOR.load(Ordering::SeqCst);
+        // The holder's process has ended (the kernel's watch, `CALLER_ENDED`): its stream closed now, whatever it waits for, its held call (whose caller is gone with it) let go.
+        if open_cam.is_some() && door & ferros_sys::CALLER_ENDED != 0 {
+            say!(g, "camera: its holder's process has ended (the kernel's watch); closing\n");
+            close(g);
+            if let Some(p) = pending.take() {
+                reply(&p.token, &[]);
+            }
+            open_cam = None;
+            if !stay {
+                ferros_sys::exit(0);
+            }
+            closed_once = true;
+            continue;
+        }
+        // The held call looked at: answered once its frame has landed; its reply failing is its holder gone; past its deadline the stream is taken for stopped, as before.
+        if let (Some(p), Some(o)) = (pending.as_ref(), open_cam.as_mut()) {
+            match try_pending(g, o, p, &mut served) {
+                Tried::Answered => {
+                    pending = None;
+                    o.asked_tick = ferros_sys::now();
+                    if CUT_AT.load(Ordering::Relaxed) != 0 && FRAMES.load(Ordering::Acquire) > CUT_N.load(Ordering::Relaxed) {
+                        say!(g, "camera: the first frame after the cut landed A#{} ms after the stream came back on\n", ferros_sys::us_since(CUT_AT.swap(0, Ordering::Relaxed)) / 1000);
+                    }
+                    continue;
+                }
+                Tried::Gone => {
+                    say!(g, "camera: a frame's reply failed; its holder is gone\n");
+                    close(g);
+                    ferros_sys::exit(0);
+                }
+                Tried::Waiting if ferros_sys::now() >= p.until => {
+                    late(g);
+                    close(g);
+                    reply(&p.token, &[]);
+                    ferros_sys::exit(0);
+                }
+                Tried::Waiting => {}
+            }
+        }
         let got = recv(cap(g, S_SERVE), &mut msg, &mut token, poll);
         poll = true;
         if got == NOTHING {
-            match &open_cam {
+            match (&open_cam, &pending) {
                 // Nothing open and nothing waiting: end (a call after this look starts another driver, process.rs `ON_DEMAND`), unless spawned to stay: then the next receive waits.
-                None if stay => {
+                (None, _) if stay => {
                     poll = false;
                     continue;
                 }
-                None => ferros_sys::exit(0),
-                Some(o) => {
-                    // Open: wait for a call until the holder's deadline (a word nothing rings, so a slit's thousand frames a second do not wake this thread). A holder gone quiet past `UNASKED_US` is gone.
+                (None, _) => ferros_sys::exit(0),
+                // A call held for its frame: wait for a frame, a call or the holder's end (all three end this wait), until the held call's deadline.
+                (Some(_), Some(p)) => {
+                    ferros_sys::wait_or_call(&DOOR, door, p.until);
+                    continue;
+                }
+                (Some(o), None) => {
+                    // Open, nothing held: wait for a call or the holder's end (frames do not ring the doorbell now, `WANT`) until the holder's deadline. A holder gone quiet past `UNASKED_US` is gone.
                     let until = o.asked_tick + ferros_sys::freq() * UNASKED_US / 1_000_000;
                     if ferros_sys::now() >= until {
                         say!(g, "camera: A#{} ms with nobody asking; its holder is gone\n", UNASKED_US / 1000);
                         close(g);
                         ferros_sys::exit(0);
                     }
-                    ferros_sys::wait_world_or_call(&QUIET, 0, until);
+                    ferros_sys::wait_world_or_call(&DOOR, door, until);
                     continue;
                 }
             }
@@ -2165,13 +2384,34 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
         if let Some(o) = open_cam.as_mut() {
             o.asked_tick = ferros_sys::now();
         }
+        // A call that would wait for a frame while one is held already: answered empty (MAP, FRAME, SNAP and SLITS come from the holder's one reading thread).
+        if pending.is_some() && matches!(msg[0], 2 | 5 | 9 | 12) {
+            say!(g, "camera: a second call waiting for a frame (op A#{}) while one is held: answered empty\n", msg[0]);
+            reply(&token, &[]);
+            continue;
+        }
         match msg[0] {
-            // LIST: the cameras that can stream whose inputs and IDT are in the vault (`list`), so a camera shows once its init, program, job and calibration are stored on this device.
+            // LIST: the cameras that can stream whose inputs and IDT are in the vault (`list`), so a camera shows once its init, program, job and calibration are stored on this device. Answered while a frame waits too.
             0 => {
                 reply(&token, &list(g));
             }
             1 => {
                 let c = if got >= 2 { cams::by_id(msg[1]).filter(|c| c.streams) } else { None };
+                // Held by a holder whose process has ended, on a kernel that does not watch ends (`WATCHED` 0): its held call's caller is gone (`caller_alive`), so its stream is closed now and this open is answered 3, to be asked of a driver started fresh (the frame thread here ended with that stream).
+                if let (true, Some(p)) = (open_cam.is_some() && WATCHED.load(Ordering::Relaxed) == 0, pending.as_ref()) {
+                    if ferros_sys::caller_alive(&p.token) == Some(false) {
+                        say!(g, "camera: the holder's held call has no caller (its process ended); closing; this open is answered 3, to be asked again\n");
+                        close(g);
+                        pending = None;
+                        open_cam = None;
+                        reply(&token, &[3]);
+                        if !stay {
+                            ferros_sys::exit(0);
+                        }
+                        closed_once = true;
+                        continue;
+                    }
+                }
                 let r = if c.is_none() {
                     1
                 } else if open_cam.is_some() {
@@ -2248,11 +2488,28 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         }
                     }
                 }
-                reply(&token, &out[..len]);
+                // The holder's end watched from now (kernel SYS_CALLER x1, ferros_sys `caller_watch`): the kernel marks `DOOR` the moment its process ends, any way, and the stream closes then, not after `UNASKED_US` of silence nor when a 14-year frame's reply fails.
+                // Before the reply: the token is the proof the kernel asks for, and the reply spends it.
+                let mut watch = ferros_sys::Watch::Unknown;
+                if r == 0 {
+                    watch = ferros_sys::caller_watch(&token, &DOOR);
+                    WATCHED.store(matches!(watch, ferros_sys::Watch::Watched(_)) as u64, Ordering::Relaxed);
+                    if !matches!(watch, ferros_sys::Watch::Watched(_)) {
+                        say!(g, "camera: the kernel does not watch the holder's end ({watch:?}); a holder gone is found by its reply failing, by another's open, or after A#{} ms of silence\n", UNASKED_US / 1000);
+                    }
+                }
+                // Its reply failing (or the kernel finding no caller behind the token) is the holder gone already: the stream it opened closed at once.
+                let failed = reply(&token, &out[..len]) == ERR;
+                if r == 0 && (failed || watch == ferros_sys::Watch::Gone) {
+                    say!(g, "camera: the open's reply failed; its holder is gone; closing\n");
+                    close(g);
+                    ferros_sys::exit(0);
+                }
                 if r == 3 {
                     ferros_sys::exit(0);
                 }
             }
+            // FRAME `[2][bin]`: the next frame by copy, binned; held until it lands (`Want::Frame`).
             2 => {
                 let Some(o) = open_cam.as_mut() else {
                     reply(&token, &[]);
@@ -2264,35 +2521,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     reply(&token, &[]);
                     continue;
                 }
-                // The next frame: one counted after this request came, its buffer held while it is binned (the newest, `wait_hold`), so the engine is never given it meanwhile.
-                let Some(b) = wait_hold(HOLD_BIN, FRAMES.load(Ordering::Acquire)) else {
-                    late(g);
-                    close(g);
-                    reply(&token, &[]);
-                    ferros_sys::exit(0);
-                };
-                let n = FRAMES.load(Ordering::Acquire);
-                o.asked_at = n;
-                if n >= 8 && !o.probed {
-                    o.probed = true;
-                    probe(g, o);
-                }
-                let t = ferros_sys::now();
-                let len = bin_frame(o, bin, b);
-                unhold(HOLD_BIN, b);
-                bin_us += ferros_sys::us_since(t);
-                served += 1;
-                if served % 64 == 0 {
-                    let us = ferros_sys::us_since(since);
-                    let copy_us = COPY_TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / ferros_sys::freq();
-                    say!(g, "camera: A#{served} frames served, the last 64 in A#{} ms (A#{} us apart), binning A#{} us each on A#{BINNERS} threads (copying out of the region A#{} us of their time); A#{} taken by the front end\n", us / 1000, us / 64, bin_us / 64, copy_us / 64, n);
-                    (bin_us, since) = (0, ferros_sys::now());
-                }
-                if reply(&token, unsafe { &(&*(&raw const OUT))[..len] }) == ERR {
-                    say!(g, "camera: a frame's reply failed; its holder is gone\n");
-                    close(g);
-                    ferros_sys::exit(0);
-                }
+                // The next frame: one counted after this request came, its buffer held while it is binned (the newest, `hold_newest`), so the engine is never given it meanwhile.
+                pending = Some(Pending { token, want: Want::Frame(bin), after: FRAMES.load(Ordering::Acquire), until: late_tick() });
             }
             3 => {
                 let Some(o) = open_cam.as_mut() else {
@@ -2304,31 +2534,50 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 let c = cam();
                 let bus = Bus::of(g, c);
                 let r = match what {
-                    // Exposure (ns): the plan the sensor's timing makes of it (ferros_cam ccs `Timing::plan`: inside the mode's frame, else the frame lengthened, else the line), refused past the longest, never capped.
+                    // Exposure (ns): the plan the sensor's timing makes of it (ferros_cam ccs `Timing::plan`: inside the mode's frame, else the frame lengthened, else the shift), refused past the longest, never capped. Answered while a frame waits too (docs/CAMERA.md "Serving while a frame waits"): it lands at the next frame's start (the hold), or, when the frame in flight would end more than `CUT_US` after the new one would, that frame is cut (`exposure_cut`).
                     0 => match if o.force != 0 { o.timing.plan_shift(value, o.force) } else { o.timing.plan(value) } {
-                        Some(p) => match exposure_set(&bus, c, &o.timing, &o.now, &p) {
-                            Ok(()) => {
-                                if (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift) {
-                                    readout_say(g, "before");
-                                    readout_reset();
-                                    period_set(o.timing.frame_ns(&p));
-                                    say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, o.timing.frame_ns(&p) / 1_000_000);
+                        Some(p) => {
+                            let moved = (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift);
+                            let new_ns = o.timing.frame_ns(&p);
+                            let cut = moved && cut_due(new_ns);
+                            match if cut { exposure_cut(&bus, c, &o.timing, &o.now, &p) } else { exposure_set(&bus, c, &o.timing, &o.now, &p) } {
+                                Ok(()) => {
+                                    if moved {
+                                        readout_say(g, "before");
+                                        readout_reset();
+                                        period_set(new_ns);
+                                        say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, new_ns / 1_000_000);
+                                        // A frame that lengthens moves a held call's deadline with it (`late_tick` counts the frame before and this one for two frames); one that shortens leaves it, as the frame in flight may still be the old one.
+                                        if let Some(h) = pending.as_mut() {
+                                            h.until = h.until.max(late_tick());
+                                        }
+                                    }
+                                    if cut {
+                                        // The frame begun now, at the new timing; the first frame after it is said when it lands.
+                                        let t = ferros_sys::now();
+                                        let left_ms = FLIGHT_AT.load(Ordering::Relaxed) as u128 * 1000 / ferros_sys::freq() as u128 + FLIGHT_NS.load(Ordering::Relaxed) as u128 / 1_000_000 - t as u128 * 1000 / ferros_sys::freq() as u128;
+                                        FLIGHT_AT.store(t, Ordering::Relaxed);
+                                        FLIGHT_NS.store(new_ns, Ordering::Relaxed);
+                                        CUT_N.store(FRAMES.load(Ordering::Acquire), Ordering::Relaxed);
+                                        CUT_AT.store(t, Ordering::Relaxed);
+                                        say!(g, "camera: the frame in flight cut with about A#{left_ms} ms of it left: frame truncation (CCS G#0106), stream off, the new timing, stream on; the next frame due in A#{} ms\n", new_ns / 1_000_000);
+                                    }
+                                    o.now = p;
+                                    NOW_LINES.store((p.coarse as u64) << p.shift, Ordering::Relaxed);
+                                    NOW_NS.store(o.timing.ns(&p), Ordering::Relaxed);
+                                    FLL.store(p.fll as u64, Ordering::Relaxed);
+                                    LLP.store(p.llp as u64, Ordering::Relaxed);
+                                    0
                                 }
-                                o.now = p;
-                                NOW_LINES.store((p.coarse as u64) << p.shift, Ordering::Relaxed);
-                                NOW_NS.store(o.timing.ns(&p), Ordering::Relaxed);
-                                FLL.store(p.fll as u64, Ordering::Relaxed);
-                                LLP.store(p.llp as u64, Ordering::Relaxed);
-                                0
+                                Err(e) => {
+                                    // Some of the hold's writes may have landed: the line and frame are no longer known, so the next exposure writes both.
+                                    o.now.llp = 0;
+                                    o.now.fll = 0;
+                                    say!(g, "camera: an exposure's writes failed (G#{e:X}){}\n", if cut { " in a cut (the stream on tried last)" } else { "" });
+                                    1
+                                }
                             }
-                            Err(e) => {
-                                // Some of the hold's writes may have landed: the line and frame are no longer known, so the next exposure writes both.
-                                o.now.llp = 0;
-                                o.now.fll = 0;
-                                say!(g, "camera: an exposure's writes failed (G#{e:X})\n");
-                                1
-                            }
-                        },
+                        }
                         None => 1,
                     },
                     // Gain (1024 one): the analogue code the sensor's own model gives, digital gain written as one (owner, 2026-11-17: digital gain is after the ADC, so analogue only); past the analogue's most refused, never capped; the frame's header then carries the gain the code makes. With no model, the captured gain alone (1024).
@@ -2355,9 +2604,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 };
                 reply(&token, &[r]);
             }
+            // CLOSE `[4]`: the stream ended thru its own close (the sensor's stream off, the front end's close, the module down) whatever frame is in flight, a held call answered empty (the holder reads it as closed), then `[0]`.
             4 => {
                 if open_cam.is_some() {
                     close(g);
+                }
+                if let Some(p) = pending.take() {
+                    reply(&p.token, &[]);
                 }
                 reply(&token, &[0]);
                 // Spawned to stay: it stays, closed, so the calls after it (a sweep's next OPEN) reach this driver and are refused, never the vault's.
@@ -2367,7 +2620,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 open_cam = None;
                 closed_once = true;
             }
-            // MAP `[5][release]`: the buffer `release` names given back (G#FF none), then the newest written frame past the last one handed out, held until it is given back (here, or by RELEASE, or at the close): the reply its header (`header`, bin 1: the buffer at +40, its place in the view at +48), the samples read in place thru the view.
+            // MAP `[5][release]`: the buffer `release` names given back (G#FF none), then the newest written frame past the last one handed out, held until it is given back (here, or by RELEASE, or at the close): the reply its header (`header`, bin 1: the buffer at +40, its place in the view at +48), the samples read in place thru the view. Held until that frame lands (`Want::Map`).
             5 => {
                 let Some(o) = open_cam.as_mut() else {
                     reply(&token, &[]);
@@ -2385,42 +2638,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 if let Some((b, _)) = o.held {
                     release(g, o, b);
                 }
-                let Some(b) = wait_hold(HOLD_KIST, o.given) else {
-                    late(g);
-                    close(g);
-                    reply(&token, &[]);
-                    ferros_sys::exit(0);
-                };
-                let n = FRAMES.load(Ordering::Acquire);
-                o.asked_at = n;
-                o.given = B_COUNT[b].load(Ordering::Relaxed);
-                // A write-back view: the buffer's lines dropped from every core's caches before the holder hears of it (docs/CAMERA.md "A cacheable view").
-                // Its frame's DMA_DONE came before the hold (`ring_turn` makes a buffer the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer), so what a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone and the holder reads this frame.
-                if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 {
-                    let t = lines(g, o, b, 0, BUF.load(Ordering::Relaxed) as usize);
-                    o.inv_sum += t;
-                    o.inv_max = o.inv_max.max(t);
-                }
-                o.held = Some((b, probe_read(b)));
-                let mut h = [0u8; HEADER];
-                header(&mut h, b, 1);
-                let lat = ferros_sys::now() - B_TICK[b].load(Ordering::Relaxed);
-                o.lat_sum += lat;
-                o.lat_max = o.lat_max.max(lat);
-                o.maps += 1;
-                if o.maps % 64 == 0 {
-                    let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
-                    say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
-                    if o.cached {
-                        say!(g, "camera: the write-back view's maintenance at MAP (A#{} bytes a buffer): A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), us(o.inv_sum / 64), us(o.inv_max));
-                    }
-                    (o.lat_sum, o.lat_max, o.inv_sum, o.inv_max) = (0, 0, 0, 0);
-                }
-                if reply(&token, &h) == ERR {
-                    say!(g, "camera: a MAP's reply failed; its holder is gone\n");
-                    close(g);
-                    ferros_sys::exit(0);
-                }
+                pending = Some(Pending { token, want: Want::Map, after: o.given, until: late_tick() });
             }
             // RELEASE `[6][buffer]`: the held buffer given back → `[0]`, `[1]` when it was not held.
             6 => {
@@ -2452,32 +2670,14 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
             8 => {
                 reply(&token, &stats());
             }
-            // SLITS `[9][after: u32]`: a slit ring's frames past `after` (`slits`).
+            // SLITS `[9][after: u32]`: a slit ring's frames past `after` (`slits`), held until one lands (`Want::Slits`).
             9 => {
-                let Some(_) = open_cam.as_ref() else {
-                    reply(&token, &[]);
-                    continue;
-                };
-                if SLITS.load(Ordering::Relaxed) == 0 {
+                if open_cam.is_none() || SLITS.load(Ordering::Relaxed) == 0 {
                     reply(&token, &[]);
                     continue;
                 }
                 let after = if got >= 5 { u32::from_le_bytes(msg[1..5].try_into().unwrap()) as u64 } else { 0 };
-                let until = late_tick();
-                loop {
-                    let n = FRAMES.load(Ordering::Acquire);
-                    if n > after || ferros_sys::now() >= until {
-                        break;
-                    }
-                    ferros_sys::wait(&FRAMES, n, until);
-                }
-                if FRAMES.load(Ordering::Acquire) <= after {
-                    late(g);
-                    close(g);
-                    reply(&token, &[]);
-                    ferros_sys::exit(0);
-                }
-                reply(&token, &slits());
+                pending = Some(Pending { token, want: Want::Slits, after, until: late_tick() });
             }
             // RATE `[10][windows]`: the sensor's own frame count against the front end's (`rate`).
             10 => {
@@ -2496,21 +2696,18 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 }
                 reply(&token, &caps(g));
             }
-            // SNAP `[12]`: the next frame held with its phase-detect rows, as a MAP holds it (`snap`): the frame's header (bin 1), then both physical addresses and the PD rows' shape; empty when this open cannot (no PD rows in the ring, a ring of one, no frame).
+            // SNAP `[12]`: the next frame held with its phase-detect rows, as a MAP holds it (`snap_begin`, `Want::Snap`): the frame's header (bin 1), then both physical addresses and the PD rows' shape; empty when this open cannot (no PD rows in the ring, a ring of one).
             12 => {
                 let Some(o) = open_cam.as_mut() else {
                     reply(&token, &[]);
                     continue;
                 };
-                let mut out = [0u8; SNAP_REPLY];
-                if !snap(g, o, &mut out) {
-                    say!(g, "camera: SNAP refused (the PD rows in the ring and a ring of two or more only) or no frame came\n");
+                if !snap_begin(g, o) {
+                    say!(g, "camera: SNAP refused (the PD rows in the ring and a ring of two or more only)\n");
                     reply(&token, &[]);
                     continue;
                 }
-                let w = |k: usize| u64::from_le_bytes(out[HEADER + k..HEADER + k + 8].try_into().unwrap());
-                say!(g, "camera: SNAP frame A#{}: image at G#{:X} (A#{} x A#{} RAW10, G#{:X} a line), its PD rows at G#{:X} (A#{} rows), status G#{:X} (1 the PD rows never written); held as a MAP holds\n", u32::from_le_bytes(out[0..4].try_into().unwrap()), w(0), COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed), LINE.load(Ordering::Relaxed), w(8), w(16) as u32, (w(24) >> 32) as u32);
-                reply(&token, &out);
+                pending = Some(Pending { token, want: Want::Snap, after: FRAMES.load(Ordering::Acquire), until: late_tick() });
             }
             _ => {
                 reply(&token, &[]);
