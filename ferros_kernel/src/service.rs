@@ -1158,10 +1158,10 @@ static VAULT_CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vault.ca
 #[cfg(not(ferros_vault_capsule))]
 static VAULT_CARRIED: &[u8] = &[];
 
-/// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
+/// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right, 5 the `clips` block window: its single-copy extents, docs/RAW-VIDEO.md). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
 fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault]
+    alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault, Blocks(b"clips")]
 }
 
 /// The GPS driver's grants in its slot order (payloads/gps): 1 serve gps, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Its own list, as the vault's: init's page is full at 108, and the kernel starts this driver itself, only once a person has attested (radios at attest, GPS locked until then).
@@ -4878,6 +4878,8 @@ pub fn run(mut b: Boot) -> ! {
                         let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
                         // Flags G#0E-G#10 as above; attributes bWBBufferFlushStatus G#1C, bAvailableWriteBoosterBufferSize G#1D (tenths free), bWriteBoosterBufferLifeTimeEst G#1E, dCurrentWriteBoosterBufferSize G#1F (units).
                         resp.extend_from_slice(alloc::format!("writebooster: enabled {} flush {} flush in hibernate {}; flush status {}, available {} tenths, life used {} (1 is under a tenth), current size {} units\n", fmtb(ufs.read_flag(0x0E)), fmtb(ufs.read_flag(0x0F)), fmtb(ufs.read_flag(0x10)), fmt(ufs.read_attribute(0x1C, 0)), fmt(ufs.read_attribute(0x1D, 0)), fmt(ufs.read_attribute(0x1E, 0)), fmt(ufs.read_attribute(0x1F, 0))).as_bytes());
+                        let cw = crate::process::CLIPS_WB_SET.load(core::sync::atomic::Ordering::Relaxed);
+                        resp.extend_from_slice(alloc::format!("clips: writebooster {} this boot (flags accepted G#{:X} of G#7)\n", if cw >> 8 & 1 != 0 { "asked" } else { "not yet asked" }, cw & 7).as_bytes());
                     });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

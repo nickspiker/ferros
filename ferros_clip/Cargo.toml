@@ -1,0 +1,23 @@
+[package]
+name = "ferros_clip"
+version = "0.1.0"
+edition = "2021"
+description = "RAW video clips on ferros (docs/RAW-VIDEO.md): the recorder Lumis hands its camera frames to. Bands coded lossless on pinned worker cores (ferros_rawcodec), the clip written as one VSF document (vsf visual::clip) into a single-copy extent of the vault (SYS_STORE extents), the camera's pacing for any whole frame rate"
+
+[lib]
+name = "ferros_clip"
+path = "src/lib.rs"
+
+[dependencies]
+vsf = { path = "../../vsf", default-features = false, features = ["std"] }
+ferros_rawcodec = { path = "../ferros_rawcodec" }
+blake3 = "1.5"
+
+[features]
+# The device's NEON paths in the band coder (ferros_rawcodec `neon`).
+neon = ["ferros_rawcodec/neon"]
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

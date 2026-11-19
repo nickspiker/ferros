@@ -65,6 +65,21 @@ const OP_DROP: u8 = 4;
 const OP_EXPORT: u8 = 5;
 /// How many values each stamped domain holds and their bytes in all (`ferros_store` `size`, from the heads, no value read): a kist's own domain on its card's unstow sheet (docs/KISTS.md "The unstow sheet"), stamped by the kernel for the stower (process.rs `VOP_SIZE`). The value: the bytes; the reply's bytes: the count of values, u64 LE.
 const OP_SIZE: u8 = 6;
+/// A single-copy extent (process.rs `VOP_EXTENT`, `extent_forward`): rest [extent op][block u64][length u32][bytes]; see `extent`.
+const OP_EXTENT: u8 = 7;
+/// The extent ops (process.rs `EOP_*`).
+const EOP_OPEN: u8 = 0;
+const EOP_WRITE: u8 = 1;
+const EOP_SEAL: u8 = 2;
+const EOP_READ: u8 = 3;
+const EOP_INFO: u8 = 4;
+const EOP_DELETE: u8 = 5;
+/// Grant slot 5: the `clips` block window, the extents' area (process.rs WINDOWS; a kernel from before grants none, and every extent op is refused).
+const S_CLIPS: u64 = 5;
+/// The area's blocks: process.rs CLIPS_BLOCKS (48 GiB); the kernel bounds every call to the window whatever this says.
+const CLIPS_AREA: u64 = 12 << 20;
+/// The largest extent transfer (process.rs EXTENT_MAX): one UFS command.
+const EXTENT_MAX: usize = 1 << 20;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -787,7 +802,8 @@ extern "C" fn work(_: u64) -> ! {
         READER_UP.store(true, Relaxed);
     }
     // One transfer and its stamp each way, with room to spare: in, a set's piece (ferros_sys::STORE_MAX, 256 KiB); out, a get's (ferros_sys::STORE_GET_MAX, 1 MiB since 2026-11-11, the kernel's bound on a forwarded get).
-    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
+    // In, a set's piece (ferros_sys::STORE_MAX) or an extent's write (EXTENT_MAX, a UFS command's 1 MiB), the larger.
+    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX.max(EXTENT_MAX) + (1 << 12)];
     let mut out = alloc::vec![0u8; ferros_sys::STORE_GET_MAX + (1 << 12)];
     // The kernel forwards gets larger than one STORE_MAX transfer only once this process says it answers them (a vault from before would index past its reply buffer); a kernel from before refuses the call and its gets stay at STORE_MAX.
     ferros_sys::vault_gets(cap(grants(), S_VAULT), ferros_sys::STORE_GET_MAX);
@@ -913,6 +929,11 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         } else {
             ERR
         }
+    } else if op == OP_EXTENT {
+        let (_, mut d) = domain_at(m, 7);
+        let r = extent(store, &d, name, rest, out, &mut data);
+        wipe(&mut d);
+        r
     } else if op == OP_DROP {
         // Release (the kernel's own call): each stamped domain dropped whole (ferros_store `drop_domain`), any write of it in progress with it. How many values went.
         let (mut n, mut ok) = (0u64, true);
@@ -920,6 +941,16 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
             let (_, mut d) = domain_at(m, 7 + i * 65);
             let id = *blake3::hash(&d.addr).as_bytes();
             writers.retain(|p| p.domain != id);
+            // Its extents go with it (manifestus `remove_owner`): a clip is the domain's as its values are.
+            if let Some(t) = extents(store) {
+                let mut next = t.clone();
+                if next.remove_owner(&id) > 0 {
+                    match next.store(store.engine(), eagle()) {
+                        Ok(()) => *t = next,
+                        Err(_) => ok = false,
+                    }
+                }
+            }
             match store.drop_domain(&d) {
                 Ok(k) => n += k,
                 Err(_) => ok = false,
@@ -1085,6 +1116,126 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         r
     };
     reply(out, ret, data)
+}
+
+/// The extents' table (manifestus `extent`), read from the vault at its first use and kept: this process alone changes it, and every change is committed before its reply.
+/// None when it does not read (a table over another area): every extent op is refused, said once.
+static mut EXTENTS: Option<manifestus::Extents> = None;
+static mut EXTENTS_READ: bool = false;
+
+fn extents(store: &mut St) -> Option<&'static mut manifestus::Extents> {
+    // SAFETY: the serving thread's alone, as SERVING is.
+    unsafe {
+        if !EXTENTS_READ {
+            EXTENTS_READ = true;
+            match manifestus::Extents::load(store.engine(), CLIPS_AREA) {
+                Ok(t) => {
+                    say!("vault: extents: {} in the clips area, {} of {} blocks taken", t.list().len(), t.taken(), CLIPS_AREA);
+                    EXTENTS = Some(t);
+                }
+                Err(e) => say!("vault: extents: the table did not read ({:?}); every extent op is refused", e),
+            }
+        }
+        (*(&raw mut EXTENTS)).as_mut()
+    }
+}
+
+/// An extent's name in the table: the domain's address key and the caller's name, never stored.
+fn extent_name(d: &Domain, name: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("ferros vault 2026-11-19 extent name");
+    h.update(&d.addr);
+    h.update(name);
+    *h.finalize().as_bytes()
+}
+
+/// One extent request (`OP_EXTENT`): its value, with the reply's bytes in `out[8..]` (their count in `data`).
+fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], data: &mut usize) -> u64 {
+    const NOTHING: u64 = ferros_sys::NOTHING;
+    let (eop, block, len) = (rest[0], u64::from_le_bytes(rest[1..9].try_into().unwrap()), u32::from_le_bytes(rest[9..13].try_into().unwrap()) as usize);
+    let bytes = &rest[13..];
+    let key = extent_name(d, name);
+    let owner = *blake3::hash(&d.addr).as_bytes();
+    let Some(t) = extents(store) else { return ERR };
+    let now = eagle();
+    match eop {
+        EOP_OPEN => {
+            let blocks = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            // A name recorded again starts afresh: its old extent, open or sealed, goes in the same commit; the table changes only once that commit is made.
+            let mut next = t.clone();
+            let had = next.remove(&key).is_some();
+            match next.reserve(key, owner, blocks, now).and_then(|e| next.store(store.engine(), now).map(|()| e)) {
+                Ok(e) => {
+                    *t = next;
+                    say!("vault: extent opened: {} blocks at {} of the clips area{}; {} free at most", e.blocks, e.first, if had { ", over the name's last" } else { "" }, t.largest_free());
+                    e.blocks
+                }
+                Err(err) => {
+                    say!("vault: extent open of {} blocks refused: {:?}; {} free at most", blocks, err, t.largest_free());
+                    ERR
+                }
+            }
+        }
+        EOP_WRITE | EOP_READ => {
+            let n = (len >> 12) as u64;
+            // WHY: the block and the length are the caller's; an extent's own blocks are all it may touch (the kernel bounds the call to the clips window besides).
+            let Some(e) = t.find(&key).copied().filter(|e| e.holds(block, n)) else { return ERR };
+            if eop == EOP_WRITE {
+                if e.sealed {
+                    return ERR;
+                }
+                // One UFS command: the kernel took at most EXTENT_MAX (BLOCK_MAX blocks) for an extent write.
+                if ferros_sys::block_write(cap(grants(), S_CLIPS), e.first + block, &bytes[..len]) == 0 { 0 } else { ERR }
+            } else if ferros_sys::block_read(cap(grants(), S_CLIPS), e.first + block, &mut out[8..8 + len]) == 0 {
+                *data = len;
+                len as u64
+            } else {
+                ERR
+            }
+        }
+        EOP_SEAL => {
+            let length = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let hash: [u8; 32] = bytes[8..40].try_into().unwrap();
+            let mut next = t.clone();
+            match next.seal(&key, length, hash, now).and_then(|_| next.store(store.engine(), now)) {
+                Ok(()) => {
+                    *t = next;
+                    0
+                }
+                Err(err) => {
+                    say!("vault: extent seal of {} bytes refused: {:?}", length, err);
+                    ERR
+                }
+            }
+        }
+        EOP_INFO => match t.find(&key) {
+            Some(e) => {
+                let o = &mut out[8..8 + 65];
+                o[..8].copy_from_slice(&e.blocks.to_le_bytes());
+                o[8..16].copy_from_slice(&e.bytes.to_le_bytes());
+                o[16] = e.sealed as u8;
+                o[17..49].copy_from_slice(&e.hash);
+                o[49..57].copy_from_slice(&e.at.to_le_bytes());
+                o[57..65].copy_from_slice(&e.first.to_le_bytes());
+                *data = 65;
+                e.blocks
+            }
+            None => NOTHING,
+        },
+        EOP_DELETE => {
+            let mut next = t.clone();
+            match next.remove(&key) {
+                Some(_) => match next.store(store.engine(), now) {
+                    Ok(()) => {
+                        *t = next;
+                        0
+                    }
+                    Err(_) => ERR,
+                },
+                None => NOTHING,
+            }
+        }
+        _ => ERR,
+    }
 }
 
 /// The largest value an export carries, and the largest export: the document is built whole in this process's heap (HEAP_BYTES). A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.
