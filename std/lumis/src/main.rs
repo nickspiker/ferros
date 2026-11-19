@@ -1371,7 +1371,9 @@ fn partial_parts(ui: &lumis_core::UserInterface, camera: &[fluor::canvas::PixelR
         }
         parts.push(c);
     }
-    if ui.slider_thickness > 0. && ui.exposure_time_ms > 0 {
+    // The progress band: an exposure's, or in RAW video the recording space's (lumis_core draw_progress, from the platform's space words).
+    let space = ui.in_video() && ui.header[lumis_core::shared_memory::VIDEO_SPACE_TOTAL_IDX] > 0;
+    if ui.slider_thickness > 0. && (ui.exposure_time_ms > 0 || space) {
         // The band is the slider's line widened by its thickness each side, the dot's cup inside it; a float below zero casts to 0, and the host cuts the rect at the frame.
         let t = ui.slider_thickness;
         let (xa, xb) = (ui.slider_start_x.min(ui.slider_end_x), ui.slider_start_x.max(ui.slider_end_x));
