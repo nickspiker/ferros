@@ -1,0 +1,9 @@
+[package]
+name = "oracle-isp"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: an hv oracle capture of the ISP front end (its 42 pages, or the PDMA dump) turned into the camera driver's inputs: the CPU setup and receiver table, the decoded PDMA program, the PDMA job (tools/camera-cpu.py, oracle-decode-pdma.py and camera-pdma-image.py in Rust)"
+
+[workspace]
+
+[dependencies]

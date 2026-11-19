@@ -68,6 +68,25 @@ pub const FRONT_SLOT_BYTES: [u64; SLOTS] = [
 /// No skips: every output at its slot's start (the main camera's job), or its slot's whole granule (the front camera's).
 pub const NO_SKIP: [u64; SLOTS] = [0; SLOTS];
 
+/// Each slot whose bit is set in `named` keeps its whole 16 MiB granule, every captured offset as it is (a job whose outputs are not yet measured, as `FRONT_SLOT_BYTES` was).
+pub const fn whole(named: u32) -> [u64; SLOTS] {
+    let mut s = [0u64; SLOTS];
+    let mut k = 0;
+    while k < SLOTS {
+        if named >> k & 1 == 1 {
+            s[k] = 16 * MIB;
+        }
+        k += 1;
+    }
+    s
+}
+/// The jobs of the 2026-11-18 night captures (docs/CAMERA.md "Every readout, captured"), each slot its job names whole until a run measures it: the tele's 22-degree readout slots 0 to 6, its 11-degree 0 to 5, its 48.8 MP 0 and 2 (a header and the image: no statistics, no PD rows); the ultrawide's 48 MP 0 to 3; the front's 8.42 MP 0 to 4.
+pub const TELE_SLOT_BYTES: [u64; SLOTS] = whole(0x7F);
+pub const TELE11_SLOT_BYTES: [u64; SLOTS] = whole(0x3F);
+pub const TELE48_SLOT_BYTES: [u64; SLOTS] = whole(0x5);
+pub const UW48_SLOT_BYTES: [u64; SLOTS] = whole(0xF);
+pub const FRONT842_SLOT_BYTES: [u64; SLOTS] = whole(0x1F);
+
 /// Where each October slot lands in the region: (offset, bytes), (0, 0) for none; the offset in its 16 MiB granule each slot's first byte stands for (`skip`, 0 for the main camera's); and the region's whole size, in frames.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {

@@ -260,7 +260,7 @@ tools/husky-hv-camall.sh target/hv/tele-i2c.log 8 tele:615:1437
 ```
 Before the first flash, save what slot a runs now (its boot image, or the build and FERROS_HV_* flags it came from), and flash that back after the third capture: `husky-hv.sh` without the oracle flags is not the same build (on 2026-11-06 a saved image was flashed back, /mnt/Harbor/tmp/husky-cam-2026-11-06/boot_a_restore_normal.img).
 Check before using any of it: the tele really streamed in each (the I2C capture holds a G#0100 stream-on to G#2D; the front-end capture holds link writes past the main's; a screenshot of the app showing 5x on the tele, not "crop"), and `tools/oracle-decode-hsi2c.py` reports no LENGTH MISMATCH inside the init.
-From them, as for the front on 2026-11-06: `tools/camera-cpu.py` (the CPU setup, a 'CPR2', and the receiver table), `tools/oracle-decode-pdma.py` then `tools/camera-pdma-image.py --list 2` (the job, a 'CPR3'), `tools/camera-init.py` (the init), all local files (target/cam/tele.*, the vendor's settings).
+From them, as for the front on 2026-11-06: `tools/oracle-isp cpu` (the CPU setup, a 'CPR2', and the receiver table), `tools/oracle-isp pdma` then `tools/oracle-isp image --list 2` (the job, a 'CPR3'), `tools/camera-init.py` (the init), all local files (target/cam/tele.*, the vendor's settings). (Done 2026-11-18 night: "Every readout, captured" below.)
 Then in code: its receiver table into ferros_cam rx, its outputs' slots into a `TELE_SLOT_BYTES`, `streams: true` and its geometry in cams, a list bit; the first run measures the outputs as the ultrawide's did.
 The same three captures with `front:780:1683` instead give the front camera's whole session again, should its 2026-11-06 capture turn out wrong once it answers.
 
@@ -1192,7 +1192,60 @@ tools/husky-hv-longexp.sh end target/hv/tele22-isp.log                         #
 FERROS_PORT=1-2.2 IMG=$I/boot_a_pdma.img tools/husky-hv-longexp.sh flash $G   # the same three readouts with the PDMA dump
 tools/husky-hv-longexp.sh restore $G                                           # boot_a back to the gate; the Pro boots ferros, the identity unlocks at boot
 ```
-Hazards: the whole 64 MiB send failed twice on 2026-11-18 behind the hub at 2-2.2 (husky_flash_paths: the cable), and the prefix route cannot carry a new footer, so a failed send means another port or cable before anything else; the hub (2-2, ASM107x) also dropped every few tens of seconds under Android tonight. If Android does not boot from a capture image (2026-10-29), ABL falls back to boot_b's gate: stop after the first failed boot. Decoding: tools/camera-cpu.py, oracle-decode-pdma.py and camera-pdma-image.py turned the 2026-11-06 front captures into inputs and are Python, which may not run here now: they want Rust ports (in oracle-i2c's manner) before these captures become the tele's `cam.kraken.prog`, `.pdma` and receiver table.
+Hazards: the whole 64 MiB send failed twice on 2026-11-18 behind the hub at 2-2.2 (husky_flash_paths: the cable), and the prefix route cannot carry a new footer, so a failed send means another port or cable before anything else; the hub (2-2, ASM107x) also dropped every few tens of seconds under Android tonight. If Android does not boot from a capture image (2026-10-29), ABL falls back to boot_b's gate: stop after the first failed boot. Decoding: tools/oracle-isp (the Rust port of camera-cpu.py, oracle-decode-pdma.py and camera-pdma-image.py; "Every readout, captured" below).
+
+## Every readout, captured (2026-11-18 night, branch pro-oracle-captures)
+
+The owner wants every camera in every mode on the Pro. Missing after "The I2C side without a flash": the tele (its receiver, CPU setup and job never captured), the ultrawide's 48 MP (its link errored after one frame), the front's 8.42 MP (untried).
+
+**The decoders in Rust** (tools/oracle-isp; the three Python tools removed):
+- `cpu <capture> <a> <b> <c> <out> --link G#1C0A [--name X] [--sysreg]` (camera-cpu.py): the 'CPR2' and the receiver table. The lines: a the line after `oracle armed` (or the previous session's PDMA stop), b the PDMA start (G#1C39_0000 = 1), c the first index advance after it (G#1C39_0010 = G#10). `--sysreg` also takes G#1C02_0504 (the tele's SYSREG pairing word, which camera-cpu.py dropped).
+- `pdma <dump> --list N` (oracle-decode-pdma.py), `image <dump> <out> --list N [--height N] [--set G#reg=G#val]` (camera-pdma-image.py), `cpr2-set` (one CPU word changed, a device test).
+- Each prints an integrity line: oracle lines not whole, `rep` runs, a dump's offsets that skip and its words against the length its `PDMA buffer` line names.
+- Checked on the captures that still exist (the main's own ISP and PDMA dumps went with Harbor tmp): the ultrawide's 2026-10-22 dump gives uw-pdma-writes.txt (`pdma --list 3`) and uw.pdma (= the vault's cam.oksoko.pdma, `image --list 3`) byte for byte; its 42-page capture gives uw.cpr2 (= cam.oksoko.prog) and uw.rx.rs (= ferros_cam rx `RX_START_UW`) byte for byte with `cpu 19264 19862 20036 --link G#1C06`.
+
+**The captures** (keys/husky/captures/oracle-2026-11-18, local only, B3SUMS): the previous agent's two signed images (boot_a_isp.img ad573dd8, boot_a_pdma.img f3d810ce) flashed to boot_a with tools/husky-hv-longexp.sh (boot_b rewritten with the gate's same bytes first; the 64 MiB sends went thru this time, 1.5 s each), Lumis on Android driven by taps from screenshots, one readout a capture boot, 10 to 12 s of preview, EXIT, the crash flush, the zone pulled whole (`end` now checks its sha256 against the device's).
+| capture | lines / lists | integrity |
+|---|---|---|
+| tele22-isp, tele11-isp, tele48-isp | 32789, 23630, 17157 lines | 0 oracle lines not whole; the PDMA start and the close's stop both inside (the whole session fit under the cap) |
+| uw12-isp, uw48-isp, front8-isp | 32789 lines each | 0 not whole; the cap reached mid-stream (the open and many frames inside) |
+| tele22/11/48-pdma | 2 lists each (18B8 / 188C, 1838 / 1800 bytes) | every list whole: offsets contiguous, every word parsed, every block load captured |
+| uw48-pdma, front8-pdma | 3 and 4 lists | the same |
+Every pulled zone's sha256 equalled the device's. Traps: the script took the first adb device for the Pro, with the 8a on Android beside it (`restore` would have sent the 8a to its bootloader; fixed: the Pro's serial alone, ferros by FERROS_PORT); with two readouts a lens's menu puts them at 1872 and 2122 below BACK, with three at 1620, 1872 and 2122 (the first ultrawide capture took the 12 MP: kept, as uw12). After the last, both boot slots back to the gate (read back by `bridge part dump`: d4494f92 both), b983, "identity unlocked at boot".
+
+**What they say:**
+- **The tele** is CSI link 6 (G#1C0A), the csis3 D-PHY's two lanes (G#1C10_3200, 3300) with the common block, SYSREG G#1C02_0500 = G#20 and G#1C02_0504 = 4; its link start word G#205D01; the main's frame acknowledgement (no G#1C35_0148). Its CPU setup 133 writes before the engine and 65 after (48 for the 48.8 MP). Android's job writes its image as 16-bit samples (loch0 format G#1C32_0550 = 2, stride G#1F80); the stored job is made RAW10 packed (format 4, stride G#13C0, `image --set`), as every other camera's, and streams so. Its close stops lanes, link and both SYSREG words before the PDMA (`RX_STOP_TELE`, captured; the driver writes it, the flashed kernel has none for the tele).
+- **The tele's 48.8 MP** writes RAW10 packed itself (stride G#2760), no PD channel, two outputs (a header and the image); its 11 degrees is the 22-degree job with a 248 x 1488 PD channel.
+- **The ultrawide's 48 MP** differs from its 12 MP in the lanes' G#08, G#0C and G#30 words (G#33, G#1662, 1 against G#1F3, G#F6AB, 2): the slower op PLL, which is why the 12 MP's table never settled on it.
+- **The front's 8.42 MP** has the 10.5 MP's receiver with smaller channels; Android's job writes it 16-bit (packed here, stride G#1100).
+
+**Built** (ferros_cam, payloads/camera, camtest):
+- ferros_cam rx: `RX_START_TELE`, `RX_START_TELE11`, `RX_START_TELE48`, `RX_STOP_TELE`, `RX_START_UW48`, `RX_START_FRONT842`. cams: the tele streams; `Alt`, a captured readout replayed whole (its own init, CPU program, job and receiver, nothing rewritten, its measured line and switches), opened by the mode block's kind 8 + k: the ultrawide's `w48` (kind 8), the front's `f8` (kind 8), the tele's `t11` (kind 8) and `t48` (kind 9). Their vault inputs `cam.<key>.<what>.<tag>`.
+- payloads/camera: kind 8 + k; LIST a section per captured readout whose inputs are stored; the spawn's eleventh byte frames any of the 1:1 init, init, CPU program, job and IDT (bits 0 to 4, `--input-file` in that order) for a device test with nothing stored.
+- camtest: at bin 1 a sixth byte sets the exposure to 2^n ms after the first frame (a dim scene's cell table).
+
+**On the Pro** (b983, the flashed gate's kernel, no reload; every driver hand-spawned from target/agent-oracle/bin, one open each, every stream ended by its own close; logs target/agent-oracle/runs):
+| readout | frames | rate | line | mosaic (cell table, the owner's red-lit room) |
+|---|---|---|---|---|
+| tele 22 degrees, 4032 x 3024 | 68 at bin 8, 64 thru the view, all 7 outputs written, link clean, no error word | 30 a second (DMA_DONE 33.24 to 33.40 ms) | 6.1068 us (two pixels a clock) | G B / R G (`104 79` / `164 104` at 2 s) |
+| tele 11 degrees (kind 8) | 64 thru the view, clean | 30 a second | 9.8712 us | G B / R G, Bayer (the sensor remosaics) |
+| tele 48.8 MP (kind 9), 8064 x 6048 | clean | 12 a second (83.3 ms) | 13.2008 us | the quad array, blocks G B / R G |
+| ultrawide 48 MP (kind 8), 8000 x 6000 | 66 thru the view, link clean | 24 a second (41.55 to 41.74 ms) | 5.4067 us | the quad array, blocks R G / G B |
+| front 8.42 MP (kind 8), 3440 x 2448 | 64 thru the view, clean | 30 a second | the 10.5 MP's, 10.4378 us | G R / B G |
+- The ultrawide's 12 MP read R G / G B too (`261 195` / `195 131` at 256 ms): the half turn of its calibration capture's B G / G R, which the init's flip (G#0101 = 3) makes; and the tele's G B / R G is a column from its capture's B G / G R. ferros_cam cams now carries the mosaics measured; the rotations (from the captures) are unchecked on a ferros frame.
+- **The front's 8.42 MP needs FC ctx3 off**: with the processing blocks as captured the engine took the first frame, then stalled inside the second program (its place G#14 against the index G#20), no SHADOW_UPDATE, LATE_CONFIG on both paths; neither the packing (Android's own 16-bit job did the same), nor loch0's timing words (G#1C32_0478, 047C), nor the slim program changed it; detach 1 alone did (`Alt::detach`).
+- Regressions on the same driver: the main (`4008`, 67.2 ms frames) and the front's 10.5 MP (`4001000002`, 41.7 ms) clean; LIST 4560 bytes, eight readouts.
+
+**Long exposures to each sensor's ceiling** (camtest's ladder and ceiling, "The shift's ceiling"'s method):
+- **The tele**: 64 ms to 65.5 s, frames the exposure apart (16.39 s at 16 s, 65.54 s at 65.5 s), the mean doubling each step, the shift words read back. Its own words: integration least 4, margin 4 (Android used 24), gain code / 32 over codes 32 to 2048 (1x to 64x). The ceiling: shifts 14 to 29 held every frame tried (8 << 29 = 2^32 lines and 32770 << 29 among them), 30 and 31 ran at the sensor's floor (19.9 ms) whatever the frame: so no 32-bit wrap as the main's (32770 << 17, which wraps to 2^18 lines on the main, held here), and the field ends at 29. Offered: frames held to 2^32 lines (65531 lines of 2^16, 7.3 hours) as on the main; none past 65.5 s watched land.
+- **The front**: 16386 lines at shifts 14 to 19: 14 to 17 held, 18 frames 5.4724 s apart ((16386 << 18) mod 2^32 = 2^19 lines of 10.4378 us), 19 one at 10 s: the main's 32-bit line counter. Its most 19, its longest 65530 lines of 2^16 (12.45 hours); it was 1.37 s.
+- **The ultrawide**: a 3164-line frame at shift 6 gave frames 1.3287 s apart; shift 7 stopped the stream (no frame for 5.5 s, the driver closed it), and a 555-line frame stopped at 6 (the frame must hold the readout in its own units). Its ceiling stays 6, 27.5 s.
+
+**Slits on the tele**: the binned 64-row slit opens (the window and a 192-line frame read back), but the tele runs no faster than 30 frames a second in this mode whatever the frame length (a 3280-line whole frame, 20 ms, also ran at 33.3 ms), and every slit sets the image path's G#404 with the link's +1C G#40 (a size the link did not expect). With FC ctx3 off and the slim program, 128 slits at 30 a second, 0 lost, each with those words; without, one slit and the stream stopped. Not clean: the tele's frame floor is a vendor word not found, and its window is not only the CCS words.
+
+**Stored** (the Pro's vault, each read back equal): `cam.kraken.init`, `.prog`, `.pdma`, `.idt` (the tele 22 degrees and its IDT, cam4-tele.idt.vsf), `cam.kraken.{init,prog,pdma}.t11` and `.t48`, `cam.oksoko.{init,prog,pdma}.w48`, `cam.dokkaebi.{init,prog,pdma}.f8`. A hand-spawned driver with no input lists all eight readouts and opens the tele from them (68 frames clean). The stored `camera` driver is still the old one: it ignores these (the tele not listed by it) until this branch's driver is stored.
+
+**Left**: this driver into the vault (and Lumis's mode numbers 8 and 9 tried from its menu); the tele's frame floor and slit window; the rotations of the ultrawide and the tele on a ferros frame; noise tests of the tele's and the front's gain ranges; the main's own front-end captures were lost with Harbor tmp (its 1:1 still runs on the binned job rewritten).
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
