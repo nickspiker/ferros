@@ -4850,6 +4850,38 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params.starts_with(b"ufs link") {
+                    // `diag "ufs link [wb on|wb off]"` (docs/RAW-VIDEO.md, 2026-11-19): the link as the UniPro layer has it now (gear, series, lanes, power mode, read from the host's own PA attributes) and the device's WriteBooster (the SLC cache a sustained write runs into: its descriptor fields, the enable flags, the buffer's size and wear); `wb on`/`wb off` set or clear fWriteBoosterEn and the flush flags, which Linux sets at every probe and ferros never did.
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: the vault process drives the flash from other cores.
+                    crate::process::UFS.with(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        ufs.h8_wake_now();
+                        let wb = &cmd.params[8..];
+                        if wb == b" wb on" || wb == b" wb off" {
+                            let on = wb == b" wb on";
+                            // fWriteBoosterEn G#0E, fWBBufferFlushEn G#0F, fWBBufferFlushDuringHibernate G#10 (JEDEC UFS 3.1).
+                            let r: [bool; 3] = core::array::from_fn(|k| if on { ufs.set_flag(0x0E + k as u8) } else { ufs.clear_flag(0x0E + k as u8) });
+                            resp.extend_from_slice(alloc::format!("writebooster {}: accepted {:?}\n", if on { "on" } else { "off" }, r).as_bytes());
+                        }
+                        let pa = |a: u32| match ufs.dme_get(a, 0) { Ok(v) => alloc::format!("A#{v}"), Err(e) => alloc::format!("err G#{e:X}") };
+                        let mode = ufs.dme_get(0x1571, 0).unwrap_or(0xFF);
+                        let modes = |m: u32| match m { 1 => "fast", 2 => "slow", 4 => "fast auto", 5 => "slow auto", 3 => "hibernate", 7 => "unchanged", _ => "?" };
+                        resp.extend_from_slice(alloc::format!("link: tx gear {} rx gear {} (device's rx most {}), series {} (1 A, 2 B), lanes tx {} of {} rx {} of {}, power mode G#{mode:02X} (rx {}, tx {}), termination tx {} rx {}\n", pa(0x1568), pa(0x1583), pa(0x1587), pa(0x156A), pa(0x1560), pa(0x1561), pa(0x1580), pa(0x1581), modes(mode >> 4 & 7), modes(mode & 7), pa(0x1569), pa(0x1584)).as_bytes());
+                        let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
+                        let be32 = |b: &[u8], at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+                        // Device descriptor (JEDEC UFS 3.1): wSpecVersion G#10, bQueueDepth G#21, dExtendedUFSFeaturesSupport G#4F (bit 8 WriteBooster), bWriteBoosterBufferPreserveUserSpaceEn G#53, bWriteBoosterBufferType G#54 (0 per LU, 1 shared), dNumSharedWriteBoosterBufferAllocUnits G#55.
+                        resp.extend_from_slice(alloc::format!("device descriptor len A#{n} ocs A#{ocs}: spec G#{:02X}{:02X}, queue depth A#{}, extended features G#{:08X}, writebooster preserve user space A#{}, type A#{}, shared units A#{}\n", d[0x10], d[0x11], d[0x21], be32(&d, 0x4F), d[0x53], d[0x54], be32(&d, 0x55)).as_bytes());
+                        let (g, gn, gocs) = ufs.read_descriptor(0x07, 0);
+                        // Geometry descriptor: qSegmentSize G#0D (512-byte units), bAllocationUnitSize G#11 (segments), dWriteBoosterBufferMaxNAllocUnits G#4F, bDeviceMaxWriteBoosterLUs G#53, bWriteBoosterBufferCapAdjFac G#54.
+                        resp.extend_from_slice(alloc::format!("geometry descriptor len A#{gn} ocs A#{gocs}: segment A#{} bytes, allocation unit A#{} segments, writebooster most A#{} units, capacity adjustment factor A#{}\n", (be32(&g, 0x0D) as u64) << 9, g[0x11], be32(&g, 0x4F), g[0x54]).as_bytes());
+                        let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("A#{x}"), None => alloc::string::String::from("?") };
+                        let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
+                        // Flags G#0E-G#10 as above; attributes bWBBufferFlushStatus G#1C, bAvailableWriteBoosterBufferSize G#1D (tenths free), bWriteBoosterBufferLifeTimeEst G#1E, dCurrentWriteBoosterBufferSize G#1F (units).
+                        resp.extend_from_slice(alloc::format!("writebooster: enabled {} flush {} flush in hibernate {}; flush status {}, available {} tenths, life used {} (1 is under a tenth), current size {} units\n", fmtb(ufs.read_flag(0x0E)), fmtb(ufs.read_flag(0x0F)), fmtb(ufs.read_flag(0x10)), fmt(ufs.read_attribute(0x1C, 0)), fmt(ufs.read_attribute(0x1D, 0)), fmt(ufs.read_attribute(0x1E, 0)), fmt(ufs.read_attribute(0x1F, 0))).as_bytes());
+                    });
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params.starts_with(b"ufs runs") {
                     // `diag "ufs runs [on|off|reset]"`: SYS_BLOCK's multi-block commands (a run a command, ferros_hal `read_run_lun`) and what the vault process's block calls cost: calls, blocks, time inside them, MB/s, reads and writes. `off` sends every run a block a command again, to measure both on one boot; `reset` zeroes the counts.
                     use core::sync::atomic::Ordering::Relaxed;
