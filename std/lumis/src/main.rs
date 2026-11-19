@@ -112,6 +112,8 @@ struct Clip {
     room: u64,
     /// When the preview last integrated a frame while this records (`PREVIEW_GAP`).
     preview: std::time::Instant,
+    /// The recording space used as it stood when the clip began (`VIDEO_SPACE_USED_IDX`): the bar counts this clip's written bytes on top, not its whole reservation.
+    space_before: u64,
 }
 
 /// The clip recording, if any: the camera thread starts it and hands it each frame (holding this only for the frame), and whatever ends Lumis seals it (`seal_at_exit`, from lumis_core's `exit_because` on any thread).
@@ -170,13 +172,14 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
         orientation,
     };
     let name = format!("video/{} video.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()));
-    let mut blocks = CLIP_BLOCKS_MOST;
+    // The longest free stretch of the clips window, whole (what an OPEN can get: a clip is one stretch), where the vault says it; else from CLIP_BLOCKS_MOST, halving on refusal.
+    let mut blocks = ferros_clip::ferros::space(slot).map_or(CLIP_BLOCKS_MOST, |sp| sp.largest_free_bytes / ferros_clip::BLOCK as u64);
     loop {
         let mode = ferros_clip::Mode {
             pacing,
             title: format!("Lumis RAW video, {} a second", pacing.fps),
-            // As std/rawrec, the recorder's harness (30 a second for a lossless minute on the Pro): a worker on each A715, the writer on the A510s, four coded frames waiting for the flash at most.
-            workers: vec![0x00F0; 4],
+            // As the recorder's agent measured on the Pro (2026-11-19): a worker on each A715 and each A510, the writer on the A510s (on the A715s it dropped 47 of 64 frames), four coded frames waiting for the flash at most.
+            workers: [[0x00F0u64; 4], [0x000F; 4]].concat(),
             writer: 0x000F,
             slots: 4,
             blocks,
@@ -189,7 +192,7 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
                 let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
                 println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now, space_before: header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -197,6 +200,15 @@ fn start_clip(cam: &camera::Camera, header: &[u64], pacing: ferros_clip::Pacing,
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// The recording space into the header (lumis_core's space bar in RAW video): the clips window, and as used what an OPEN cannot get (the window less its longest free stretch: what is really left to record into). Nothing on a kernel or vault without the query (the bar then not drawn).
+fn read_space(header: &mut [u64]) {
+    use lumis_core::shared_memory::{VIDEO_SPACE_TOTAL_IDX, VIDEO_SPACE_USED_IDX};
+    if let Some(sp) = ferros_clip::ferros::store_slot().and_then(ferros_clip::ferros::space) {
+        header[VIDEO_SPACE_TOTAL_IDX] = sp.window_bytes;
+        header[VIDEO_SPACE_USED_IDX] = sp.window_bytes - sp.largest_free_bytes;
     }
 }
 
@@ -212,7 +224,14 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
         header[VIDEO_DROPPED_IDX] = s.dropped;
         header[VIDEO_LEFT_S_IDX] = 0;
         header[FLAGS_IDX] &= !RECORDING_BIT;
+        // The space as the seal left it (the reservation given back past the clip's length).
+        read_space(header);
     }
+    // Under the RECORD button: the clip's name, which the person pulls it by, and why if it ended early.
+    lumis_core::platform::set_video_note(Some(match &info.error {
+        None => clip.name.clone(),
+        Some(e) => format!("{} ended: {e}", clip.name),
+    }));
     let hex: String = info.hash[..8].iter().map(|b| format!("{b:02x}")).collect();
     println!(
         "lumis: camera {cam}: RAW video: {} ended ({why}): {} frames in {ms} ms, {} dropped, {} paced; {} bytes (coded {} of {}), sealed {hex}; the coding {} us a frame at most, {} on average{}",
@@ -942,6 +961,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 Some(fps) => match open(&cam, false, Some((ferros_clip::Pacing::of(fps), shutter_ns))) {
                     Ok(s) => {
                         paced = want;
+                        read_space(&mut *integrator.header);
                         s
                     }
                     Err(Refused::Why(why)) => {
@@ -1111,6 +1131,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 let st = c.rec.stats();
                 integrator.header[VIDEO_FRAMES_IDX] = st.frames;
                 integrator.header[VIDEO_DROPPED_IDX] = st.dropped;
+                integrator.header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] = c.space_before + st.written;
                 // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not said) before a frame is coded: the clip's first frames can be dropped, and no frame gives no rate.
                 integrator.header[VIDEO_LEFT_S_IDX] = match st.frames {
                     0 => 0,
@@ -1435,6 +1456,9 @@ struct Lumis {
     changed: bool,
     /// On the camera screen, a pass that drew no new image and nothing whole: the controls' parts lumis_core repainted (its partial draw), the only rects converted and shown (redraw on change; the owner's go, 2026-11-17). Empty with `changed` false: nothing to show.
     parts: Vec<fluor::canvas::PixelRect>,
+    /// RAW video's RECORD / STOP label and its note as last drawn whole, and when: the buttons are drawn only in a whole draw, so a change is one (at most once a second while a clip records, at once when one starts or stops).
+    video_label: (String, Option<String>, bool),
+    video_drawn: std::time::Instant,
     /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`, `DEV_SCRATCH`).
     knobs: u8,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
@@ -1450,7 +1474,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false), video_drawn: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1494,6 +1518,21 @@ impl Lumis {
         }
     }
 
+}
+
+/// Whether RAW video's RECORD / STOP label wants a whole draw (`Lumis::video_label`, as last drawn whole at `drawn`), noting it as drawn when it does.
+fn video_label_moved(label: &mut (String, Option<String>, bool), drawn: &mut std::time::Instant, ui: &lumis_core::UserInterface) -> bool {
+    if !ui.in_video() {
+        return false;
+    }
+    let recording = ui.header[FLAGS_IDX] & lumis_core::shared_memory::RECORDING_BIT != 0;
+    let now = (ui.get_button_info(6, false).0, lumis_core::platform::video_note(), recording);
+    if now == *label || (now.2 == label.2 && drawn.elapsed() < std::time::Duration::from_secs(1)) {
+        return false;
+    }
+    *label = now;
+    *drawn = std::time::Instant::now();
+    true
 }
 
 impl FluorApp<G2t16> for Lumis {
@@ -1625,6 +1664,7 @@ impl FluorApp<G2t16> for Lumis {
                     || before.4
                     || ui.last_touch_valid
                     || self.finger.is_some()
+                    || video_label_moved(&mut self.video_label, &mut self.video_drawn, ui)
                     // A turn of the device, or the level indicator repainted (lumis_core handle_input_and_draw: past its deadband, or any change after a second): the controls are drawn whole.
                     || (ui.device_rotation, ui.painted_roll, ui.painted_pitch) != before.5;
                 self.parts.clear();
