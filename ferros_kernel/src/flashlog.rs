@@ -149,7 +149,7 @@ pub fn init() -> bool {
         };
         let t = crate::platform::cntpct();
         for f in findings {
-            pre().push(Pending { tick: t, category: category::LEDGER, writer: "kernel".into(), words: alloc::format!("at open, block A#{} byte A#{}: {}", f.block, f.at, f.why) });
+            pre().push(Pending { tick: t, category: category::LEDGER, writer: "kernel".into(), words: alloc::format!("at open, block A#{} byte A#{}: {}", f.block, f.at, f.why), death: None });
         }
         unsafe { STATE = Some(State { ring, dev, part: first, boot }) };
     });

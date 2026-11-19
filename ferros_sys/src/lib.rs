@@ -64,7 +64,9 @@ pub mod nr {
     pub const OFFER: u64 = 41;
     pub const CALLER: u64 = 42;
     pub const NOTIFY: u64 = 43;
+    pub const THREAD_NAME: u64 = 44;
     pub const IRQ_ARM: u64 = 45;
+    pub const PANIC: u64 = 46;
 }
 
 /// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
@@ -2157,9 +2159,62 @@ pub fn console_flash(grants: u64, text: &[u8]) {
     svc(nr::CALL, cap(grants, 0), off(text.as_ptr()), text.len() as u64, off(r.as_mut_ptr()), r.len() as u64 | CONSOLE_FLASH);
 }
 
-/// What a payload's panic handler calls: exit with G#DEAD (the kernel prints `name: exit G#…DEAD`).
+/// Exit with G#DEAD and nothing said: a panic handler that has no `PanicInfo` to hand (`panic_report` is the one to call).
 pub fn panic_exit() -> ! {
     exit(0xDEAD)
+}
+
+/// What a payload's panic handler calls: the panic's message, file, line and column to the kernel (`panic_tell`), then exit with G#DEAD.
+/// The kernel keeps them with the call chain it walks from here, and the process's end goes to the flash log, the console and (with no display) the glass whole: the message, `file:line:column`, the thread, and the frames as offsets into the arc for the host to name (`ferros-bridge deaths`, KERNEL.md "A process that dies").
+/// No allocation: the message is formatted into a buffer on the stack.
+pub fn panic_report(info: &core::panic::PanicInfo) -> ! {
+    // WHY the flag: formatting the message runs the panicking code's own Display impls, which can panic again, and a second panic comes back here; formatting again would recurse until the stack ran out. The second (and any other thread's at the same time) goes straight to the exit with what the first already told the kernel.
+    static TELLING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !TELLING.swap(true, Ordering::AcqRel) {
+        let mut buf = PanicText { b: [0; PANIC_TEXT], n: 0 };
+        let msg = info.message();
+        let text: &[u8] = match msg.as_str() {
+            Some(s) => s.as_bytes(),
+            None => {
+                let _ = core::fmt::write(&mut buf, format_args!("{msg}"));
+                &buf.b[..buf.n]
+            }
+        };
+        let (file, line, column) = info.location().map_or(("", 0, 0), |l| (l.file(), l.line(), l.column()));
+        panic_tell(text, file.as_bytes(), line, column);
+    }
+    exit(0xDEAD)
+}
+
+/// The most of a panic's message `panic_report` formats: the kernel keeps 2^9 bytes of it (ferros_ledger death MESSAGE_MAX).
+const PANIC_TEXT: usize = 1 << 9;
+
+/// Text into a fixed buffer, whole characters only, the rest dropped.
+struct PanicText {
+    b: [u8; PANIC_TEXT],
+    n: usize,
+}
+
+impl core::fmt::Write for PanicText {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // WHY the cut: the message is any length and the buffer is fixed; it is cut at a character boundary so what the kernel gets is still UTF-8.
+        let mut k = s.len().min(PANIC_TEXT - self.n);
+        while !s.is_char_boundary(k) {
+            k -= 1;
+        }
+        self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+        self.n += k;
+        Ok(())
+    }
+}
+
+/// SYS_PANIC: tell the kernel this process is panicking, with its message (UTF-8), the source file as the compiler named it, and the line and column.
+/// The kernel keeps the first 2^9 bytes of the message and 2^8 of the file, the calling thread's name, and the call chain it walks from this call's frame (x29) with the program counter (a frame-pointer walk, each record checked to lie in the arc and above the last).
+/// It does not end the process: the exit that follows does, and its end carries the report. A std program's hook calls it thru ferros_rt, then aborts.
+/// Not inlined, so the walk starts at a frame of its own.
+#[inline(never)]
+pub fn panic_tell(message: &[u8], file: &[u8], line: u32, column: u32) {
+    svc(nr::PANIC, off(message.as_ptr()), message.len() as u64, off(file.as_ptr()), file.len() as u64, line as u64 | (column as u64) << 32);
 }
 
 /// The performance monitors, which the kernel opens to EL0 on every core (ferros_kernel/src/pmu.rs). Core-wide: counts include whatever else ran on the core, so a measurement wants the process pinned and the loop long against a slice. Event counters are 32 bits.

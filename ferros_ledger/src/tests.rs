@@ -436,7 +436,7 @@ fn render() {
 fn preboot_drains_in_order_and_counts_overwrites() {
     let mut b: Preboot<4> = Preboot::new();
     for n in 0..6u64 {
-        b.push(Pending { tick: n, category: category::TEXT, writer: "kernel".into(), words: words(n) });
+        b.push(Pending { tick: n, category: category::TEXT, writer: "kernel".into(), words: words(n), death: None });
     }
     assert_eq!(b.len(), 4);
     let mut got = Vec::new();
@@ -444,7 +444,7 @@ fn preboot_drains_in_order_and_counts_overwrites() {
     assert_eq!(got, vec![2, 3, 4, 5]);
     assert_eq!(lost, 2);
     assert!(b.is_empty());
-    b.push(Pending { tick: 9, category: category::TEXT, writer: "kernel".into(), words: "x".into() });
+    b.push(Pending { tick: 9, category: category::TEXT, writer: "kernel".into(), words: "x".into(), death: None });
     let mut got = Vec::new();
     assert_eq!(b.drain(|p| got.push(p.tick)), 0);
     assert_eq!(got, vec![9]);
@@ -533,4 +533,77 @@ fn a_region_of_old_data_is_never_read_whole() {
     assert!(m.reads < 1 << 9, "the open read A#{} blocks of A#{}", m.reads, 2 * half);
     let items = r2.newest(&mut m, n as usize);
     assert_eq!(entries(&items).len(), n as usize);
+}
+
+fn a_panic() -> crate::death::Death {
+    crate::death::Death {
+        end: crate::death::END_PANIC,
+        exit: Some(0xDEAD),
+        message: Some("range end index 410119 out of range for slice of length 409600".into()),
+        file: Some("payloads/display/src/main.rs".into()),
+        line: Some(4417),
+        column: Some(23),
+        thread: Some("display.2".into()),
+        frames: vec![0x1_2344, 0x1_0F80, 0x3_2000, 0x1_1008],
+        code: Some(0x1000),
+        last_words: Some("display: PANIC range end index 410119".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_death_round_trips_typed() {
+    let half = 4;
+    let mut m = Mem::new(half);
+    let (mut r, _) = Ring::open(&mut m, half);
+    let d = a_panic();
+    let p = Payload::death(category::PROCESS, "display", "display: panicked at payloads/display/src/main.rs:4417:23: range end index 410119 out of range for slice of length 409600", d.clone());
+    r.append(&mut m, 932, Some(9), Class::System, &sys(), &p).unwrap();
+    // A fault, and a plain line between: only the deaths come back from `deaths`.
+    r.append(&mut m, 932, Some(10), Class::System, &sys(), &Payload::new(category::TEXT, "kernel", "camera: on")).unwrap();
+    let fault = crate::death::Death { end: crate::death::END_FAULT, exit: Some(1 << 63), esr: Some(0x9200_0046), far: Some(0x40), pc: Some(0x1_2000), thread: Some("GPS.1".into()), frames: vec![0x1_2000, 0x1_3004], code: Some(0x1000), ..Default::default() };
+    r.append(&mut m, 932, Some(11), Class::System, &sys(), &Payload::death(category::PROCESS, "GPS", "GPS: fault", fault.clone())).unwrap();
+    let mut run = Vec::new();
+    for i in r.newest(&mut m, usize::MAX) {
+        if let Item::Entry { doc, stored, .. } = i {
+            let opened = entry::open(&stored, &sys()).unwrap();
+            run.extend_from_slice(&doc);
+            run.extend_from_slice(&view::opened(&stored, &opened).unwrap());
+        }
+    }
+    let got = view::deaths(&run);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].death, d);
+    assert_eq!((got[0].writer.as_str(), got[0].category.as_str(), got[0].boot, got[0].time), ("display", "kernel.process", 932, Some(9)));
+    assert_eq!(got[1].death, fault);
+    // The words render as any line does.
+    assert!(view::render(&run, &|t| alloc::format!("T{t}"))[0].starts_with("b932 T9 display [kernel.process]: display: panicked at"));
+    // The message is a typed field, sealed: never in the clear on the flash.
+    assert!(!m.blocks.iter().any(|b| b.windows(6).any(|w| w == b"410119")));
+}
+
+#[test]
+fn a_death_is_bounded_to_a_block() {
+    let half = 4;
+    let mut m = Mem::new(half);
+    let (mut r, _) = Ring::open(&mut m, half);
+    let long: String = (0..4000).map(|k| char::from(b'a' + (k % 26) as u8)).collect();
+    let d = crate::death::Death { message: Some(long.clone()), file: Some(long.clone()), last_words: Some(long.clone()), thread: Some(long.clone()), frames: (0..100).map(|k| u64::MAX >> (k % 8)).collect(), ..a_panic() };
+    r.append(&mut m, 1, None, Class::System, &sys(), &Payload::death(category::PROCESS, "x", "x: panicked", d)).unwrap();
+    let items = r.newest(&mut m, usize::MAX);
+    assert_eq!(entries(&items).len(), 1);
+    let back = entry::open(entries(&items)[0], &sys()).unwrap().death.unwrap();
+    assert_eq!(back.message.unwrap().len(), crate::death::MESSAGE_MAX);
+    assert_eq!(back.file.unwrap().len(), crate::death::FILE_MAX);
+    assert_eq!(back.frames.len(), crate::death::FRAMES_MAX);
+}
+
+#[test]
+fn an_older_reader_still_opens_a_death() {
+    // A reader from before the death fields (the payload's schema without them, parsed the default way) keeps the words and passes over the rest.
+    let old = vsf::schema::SectionSchema::new(entry::PAYLOAD).field(entry::CATEGORY, vsf::schema::TypeConstraint::DictKey).field(entry::WRITER, entry::text_constraint()).field(entry::WORDS, entry::text_constraint()).field(entry::REFUSED, vsf::schema::TypeConstraint::AnyUnsigned);
+    let b = crate::entry::payload_schema().build().set(entry::CATEGORY, vsf::VsfType::d(vsf::types::Ascii::new("kernel.process").unwrap())).unwrap().set(entry::WRITER, vsf::VsfType::x("display".into())).unwrap().set(entry::WORDS, vsf::VsfType::x("w".into())).unwrap();
+    let bytes = crate::death::set(b, &a_panic()).unwrap().0.encode().unwrap();
+    let o = vsf::schema::SectionBuilder::parse(old, &bytes).unwrap();
+    assert_eq!(o.get_value::<String>(entry::WORDS).unwrap(), "w");
 }

@@ -341,8 +341,9 @@ impl Ring {
                 return Err(AppendError::Build(Error::Build("one character's entry is larger than a block".into())));
             }
             let (x, y) = w.split_at(cut);
-            let first = Payload { category: payload.category.clone(), writer: payload.writer.clone(), words: x.into(), refused: 0 };
-            let second = Payload { category: payload.category.clone(), writer: payload.writer.clone(), words: y.into(), refused: 0 };
+            // A death's fields go with the first half (they are bounded, death.rs, so the split is always the words').
+            let first = Payload { category: payload.category.clone(), writer: payload.writer.clone(), words: x.into(), refused: 0, death: payload.death.clone() };
+            let second = Payload { category: payload.category.clone(), writer: payload.writer.clone(), words: y.into(), refused: 0, death: None };
             self.append(dev, boot, time, class, key, &first)?;
             return self.append(dev, boot, time, class, key, &second);
         }
