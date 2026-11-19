@@ -202,7 +202,7 @@ The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,0
 
 ### A clip from the Pro to the host
 
-The flashed build (raw-video-rec 247507b2, both slots, 2026-11-19; keys/husky/images/boot_raw-video-rec_247507b2_vaultcarried.img) carries the commands; until raw-video-rec is merged use its bridge and checker:
+The flashed build (raw-video-rec 63916ff9, both slots, 2026-11-19; keys/husky/images/boot_raw-video-rec_63916ff9_vaultcarried.img) carries the commands; until raw-video-rec is merged use its bridge and checker:
 
 ```
 B=/mnt/Harbor/Code/ferros/target/agent-rawrec/bridge/debug/ferros-bridge
