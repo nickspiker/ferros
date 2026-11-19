@@ -210,6 +210,8 @@ pub struct Mode {
     pub blocks: u64,
     /// When it starts, Eagle oscillations.
     pub at: i64,
+    /// Each band's source rows hashed as it is coded ([`Recorder::source_hash`]): a check on the clip, whole, against the frames as the camera wrote them; about 2^-4 of the coding's time.
+    pub source_digests: bool,
 }
 
 /// A worker thread's call to pin itself (`SYS_PIN` on ferros, nothing on a host).
@@ -232,6 +234,8 @@ struct BandOut {
     la: u32,
     lb: u32,
     digest: [u8; 32],
+    /// BLAKE3 of the band's rows as the camera wrote them (each row's samples, the stride's tail left out), when the mode asks (`Mode::source_digests`).
+    src: [u8; 32],
     bytes: Vec<u8>,
 }
 
@@ -268,6 +272,7 @@ struct Pool {
     height: usize,
     stride: usize,
     cfa: rc::Cfa,
+    hash_src: bool,
 }
 
 fn worker(pool: Arc<Pool>, mask: u64) {
@@ -303,8 +308,10 @@ fn worker(pool: Arc<Pool>, mask: u64) {
             let rows = rc::band_rows(pool.height, k);
             let (la, lb) = rc::encode_band(&src[rc::band_src(k, pool.height, pool.width, pool.stride)], pool.stride, pool.width, rows, pool.cfa, &mut work, &mut out);
             let digest = clip::band_digest(&out[..la], &out[la..la + lb]);
+            let srcd = if pool.hash_src { band_source_digest(&src[rc::band_src(k, pool.height, pool.width, pool.stride)], pool.stride, pool.width, rows) } else { [0; 32] };
             {
                 let mut b = slot.bands[k].lock().unwrap();
+                b.src = srcd;
                 b.la = la as u32;
                 b.lb = lb as u32;
                 b.digest = digest;
@@ -337,6 +344,7 @@ pub struct Recorder {
     stats: Stats,
     last_count: Option<u64>,
     last_kept_ns: Option<u64>,
+    last_src: [u8; 32],
 }
 
 impl Recorder {
@@ -383,6 +391,7 @@ impl Recorder {
             height: cam.height,
             stride: cam.stride,
             cfa: if mosaic == Mosaic::Bayer { rc::Cfa::Bayer } else { rc::Cfa::Quad },
+            hash_src: mode.source_digests,
         });
         let workers = mode
             .workers
@@ -396,7 +405,7 @@ impl Recorder {
         let (to_writer, from_rec) = sync_channel::<ToWriter>(slots + 1);
         let (give_back, free) = sync_channel::<Box<Slot>>(slots);
         for _ in 0..slots {
-            give_back.send(Box::new(Slot { meta: FrameMeta { index: 0, at: 0, exposure_s: 0., gain: 0., focus: 0 }, bands: (0..bands).map(|_| Mutex::new(BandOut::default())).collect() })).expect("the free list holds every slot");
+            give_back.send(Box::new(Slot { meta: FrameMeta { index: 0, at: 0, exposure_s: 0., gain: 0., focus: 0 }, bands: (0..bands).map(|k| Mutex::new(BandOut { bytes: touched(rc::max_band_len(cam.width, rc::band_rows(cam.height, k))), ..BandOut::default() })).collect() })).expect("the free list holds every slot");
         }
         let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -408,7 +417,12 @@ impl Recorder {
                 write_clip(cw, head, sink, got, from_rec, give_back, wr, en)
             })
             .map_err(|e| e.to_string())?;
-        Ok(Recorder { pool, workers, to_writer, free, writer: Some(writer), written, ended, pacing: mode.pacing, stats: Stats::default(), last_count: None, last_kept_ns: None })
+        Ok(Recorder { pool, workers, to_writer, free, writer: Some(writer), written, ended, pacing: mode.pacing, stats: Stats::default(), last_count: None, last_kept_ns: None, last_src: [0; 32] })
+    }
+
+    /// The last recorded frame's source hash (`Mode::source_digests`): BLAKE3 of its bands' source digests, each BLAKE3 of the band's packed rows as the camera wrote them; a reader repacks a decoded frame and compares.
+    pub fn source_hash(&self) -> [u8; 32] {
+        self.last_src
     }
 
     pub fn stats(&self) -> Stats {
@@ -457,6 +471,9 @@ impl Recorder {
         self.stats.code_us_sum += us;
         // The clip's own count: every frame it should hold, so a step past one is exactly the frames lost (`index` in vsf clip).
         slot.meta = FrameMeta { index: self.stats.frames + self.stats.dropped, at: eagle_osc(f.eagle_ns), exposure_s: f.exposure_ns as f32 / 1e9, gain: f.gain as f32 / 1024., focus: f.focus };
+        if self.pool.hash_src {
+            self.last_src = source_hash(&slot.bands.iter().map(|b| b.lock().map(|b| b.src).unwrap_or([0; 32])).collect::<Vec<_>>());
+        }
         let coded: u64 = slot.bands.iter().map(|b| b.lock().map(|b| (b.la + b.lb) as u64).unwrap_or(0)).sum();
         self.stats.coded += coded;
         self.stats.raw += (self.pool.height * rc::row_bytes(self.pool.width)) as u64;
@@ -483,6 +500,51 @@ impl Recorder {
         info.stats = Stats { written: info.len, ..self.stats };
         info
     }
+}
+
+/// An empty buffer of `cap` bytes whose pages are already the process's (written once): a frame's first coding then grows nothing, where an arc's growth in the camera loop cost a clip its second frame (2026-11-19).
+fn touched(cap: usize) -> Vec<u8> {
+    let mut v = vec![0u8; cap];
+    v.clear();
+    v
+}
+
+/// The source hash of a frame from its bands' source digests (`Recorder::source_hash`): BLAKE3 of the digests in band order.
+pub fn source_hash(digests: &[[u8; 32]]) -> [u8; 32] {
+    clip::frame_hash(digests)
+}
+
+/// A band's source digest: BLAKE3 of its rows' samples as packed RAW10 (each row `row_bytes(width)` bytes, a stride's tail left out).
+pub fn band_source_digest(rows: &[u8], stride: usize, width: usize, n: usize) -> [u8; 32] {
+    let rb = rc::row_bytes(width);
+    let mut x = blake3::Hasher::new();
+    for y in 0..n {
+        x.update(&rows[y * stride..y * stride + rb]);
+    }
+    *x.finalize().as_bytes()
+}
+
+/// A decoded frame's source hash: its samples packed back to RAW10 band by band, each band's digest as `band_source_digest`, combined as `source_hash`; equal to the recorder's for the frame when the round trip is bit exact.
+pub fn samples_source_hash(px: &[u16], width: usize, height: usize) -> [u8; 32] {
+    let rb = rc::row_bytes(width);
+    let mut packed = vec![0u8; rb * rc::BAND_ROWS];
+    let digests: Vec<[u8; 32]> = (0..rc::bands(height))
+        .map(|k| {
+            let (y0, n) = (rc::band_first_row(k), rc::band_rows(height, k));
+            for y in 0..n {
+                let row = &px[(y0 + y) * width..(y0 + y + 1) * width];
+                let out = &mut packed[y * rb..(y + 1) * rb];
+                for (g, v) in row.chunks_exact(4).enumerate() {
+                    for i in 0..4 {
+                        out[g * 5 + i] = (v[i] >> 2) as u8;
+                    }
+                    out[g * 5 + 4] = (v[0] & 3) as u8 | ((v[1] & 3) << 2) as u8 | ((v[2] & 3) << 4) as u8 | ((v[3] & 3) << 6) as u8;
+                }
+            }
+            band_source_digest(&packed, rb, width, n)
+        })
+        .collect();
+    source_hash(&digests)
 }
 
 /// Eagle nanoseconds as Eagle oscillations (VSF `e6`): the hydrogen line's 1,420,407,826 a second.

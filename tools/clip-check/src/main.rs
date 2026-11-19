@@ -1,104 +1,84 @@
 // clip-check: a RAW clip pulled from a device (`ferros-bridge store extent <key> <bytes> <out>`) read on the host by vsf's clip reader.
-// Every frame is decoded; a frame named in the hash list (std/rawrec's console: `rawrec: hash A#<frame> <BLAKE3 hex>`, the frame's packed rows as the camera wrote them) is packed back to RAW10 and its hash compared.
-// Usage: clip-check <clip> [console log] [out: frame k's samples as RAW10 rows, for a look]
+// Every frame is decoded (on every host core) and its samples packed back to RAW10 band by band and hashed (ferros_clip `samples_source_hash`), then compared with the source hash the recorder's workers took of the frame as the camera wrote it (std/rawrec's `rawrec.hashes`, a VSF document: `index`, `hashes` [n, 32]).
+// Usage: clip-check <clip> [hashes.vsf]
 // Numbers print as A# (decimal) and G# (hex).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use vsf::types::VsfType;
 use vsf::visual::clip::Reader;
 
-fn packed_hash(px: &[u16], w: usize, h: usize) -> [u8; 32] {
-    let mut x = blake3::Hasher::new();
-    let mut row = vec![0u8; w * 5 / 4];
-    for y in 0..h {
-        for g in 0..w / 4 {
-            let v = &px[y * w + g * 4..y * w + g * 4 + 4];
-            for i in 0..4 {
-                row[g * 5 + i] = (v[i] >> 2) as u8;
-            }
-            row[g * 5 + 4] = (v[0] & 3) as u8 | ((v[1] & 3) << 2) as u8 | ((v[2] & 3) << 4) as u8 | ((v[3] & 3) << 6) as u8;
-        }
-        x.update(&row);
-    }
-    *x.finalize().as_bytes()
+fn hashes(path: &str) -> Vec<(u64, [u8; 32])> {
+    let bytes = std::fs::read(path).expect("the hashes");
+    let doc = vsf::container::Document::open(bytes.as_slice()).expect("the hashes document");
+    let s = doc.section(doc.entry("rawrec_hashes").expect("section rawrec_hashes")).expect("the section");
+    let first = |n: &str| s.get_field(n).and_then(|f| f.values.first()).cloned();
+    let (Some(VsfType::t_u6(ix)), Some(VsfType::t_u3(hs))) = (first("index"), first("hashes")) else { panic!("index and hashes") };
+    ix.data.iter().zip(hs.data.chunks(32)).map(|(&i, h)| (i, h.try_into().unwrap())).collect()
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: clip-check <clip> [console log]");
+        eprintln!("usage: clip-check <clip> [hashes.vsf]");
         std::process::exit(1);
     }
-    let bytes = std::fs::read(&args[1]).expect("the clip");
-    let hashes: Vec<(usize, String)> = match args.get(2) {
-        Some(p) => std::fs::read_to_string(p)
-            .expect("the console log")
-            .lines()
-            .filter_map(|l| {
-                let rest = l.split("rawrec: hash A#").nth(1)?;
-                let mut it = rest.split_whitespace();
-                Some((it.next()?.parse().ok()?, it.next()?.to_string()))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let file = std::fs::File::open(&args[1]).expect("the clip");
+    let size = file.metadata().unwrap().len();
+    let want = args.get(2).map(|p| hashes(p)).unwrap_or_default();
     let t = Instant::now();
-    let r = Reader::open(bytes.as_slice()).expect("the clip opens");
+    let r = Reader::open(file).expect("the clip opens");
     let sp = r.spec().clone();
-    println!("clip-check: A#{} bytes, A#{} frames ({}), A#{} x A#{} {:?}, bands of A#{} rows, A#{}/A#{} a second, period A#{} ns, opened in A#{} ms", bytes.len(), r.frames().len(), if r.recovered() { "recovered by its chain" } else { "by its index" }, sp.width, sp.height, sp.mosaic, sp.band_rows, sp.rate_num, sp.rate_den, sp.period_ns, t.elapsed().as_millis());
+    let n = r.frames().len();
+    println!("clip-check: A#{size} bytes, A#{n} frames ({}), A#{} x A#{} {:?}, bands of A#{} rows, A#{}/A#{} a second, period A#{} ns, opened in A#{} ms", if r.recovered() { "recovered by its chain" } else { "by its index" }, sp.width, sp.height, sp.mosaic, sp.band_rows, sp.rate_num, sp.rate_den, sp.period_ns, t.elapsed().as_millis());
     let (w, h) = (sp.width, sp.height);
-    let raw = (w * h * 5 / 4) as u64;
-    let (mut ok, mut bad, mut checked) = (0, 0, 0);
-    let mut prev_at: Option<i64> = None;
-    let (mut gap_most, mut holes) = (0i64, 0u64);
-    let t = Instant::now();
-    for k in 0..r.frames().len() {
-        let e = &r.frames()[k];
-        if k > 0 && e.meta.index != r.frames()[k - 1].meta.index + 1 {
-            holes += e.meta.index - r.frames()[k - 1].meta.index - 1;
-        }
-        if let Some(p) = prev_at {
-            gap_most = gap_most.max(e.meta.at - p);
-        }
-        prev_at = Some(e.meta.at);
-        let px = match r.decode(k) {
-            Ok(px) => px,
-            Err(err) => {
-                println!("clip-check: frame A#{k} did not decode: {err}");
-                bad += 1;
-                continue;
-            }
-        };
-        if let Some((_, want)) = hashes.iter().find(|(f, _)| *f == k) {
-            checked += 1;
-            let got: String = packed_hash(&px, w, h).iter().map(|b| format!("{b:02X}")).collect();
-            if got == *want {
-                ok += 1;
-            } else {
-                bad += 1;
-                println!("clip-check: frame A#{k} DIFFERS from the frame the device hashed");
-            }
-        }
-        if args.get(3).is_some() && k == 0 {
-            let mut out = Vec::with_capacity((raw) as usize);
-            for y in 0..h {
-                for g in 0..w / 4 {
-                    let v = &px[y * w + g * 4..y * w + g * 4 + 4];
-                    for i in 0..4 {
-                        out.push((v[i] >> 2) as u8);
-                    }
-                    out.push((v[0] & 3) as u8 | ((v[1] & 3) << 2) as u8 | ((v[2] & 3) << 4) as u8 | ((v[3] & 3) << 6) as u8);
-                }
-            }
-            std::fs::write(&args[3], &out).expect("the frame's rows");
-        }
-    }
+    // The frames' timing and holes, from the index.
     let osc = vsf::types::eagle_time::OSCILLATIONS_PER_SECOND as f64;
-    let span = match (r.frames().first(), r.frames().last()) {
-        (Some(a), Some(b)) => (b.meta.at - a.meta.at) as f64 / osc,
-        _ => 0.,
-    };
-    println!("clip-check: decoded A#{} frames in A#{} ms; A#{checked} hashed frames checked, A#{ok} bit exact, A#{bad} not; A#{holes} declared holes; the frames span A#{:.3} s, the longest gap A#{:.2} ms; ratio A#{:.2} over the clip", r.frames().len(), t.elapsed().as_millis(), span, gap_most as f64 / osc * 1e3, raw as f64 * r.frames().len() as f64 / bytes.len() as f64);
+    let (mut holes, mut gap_most, mut gap_least) = (0u64, 0i64, i64::MAX);
+    for k in 1..n {
+        let (a, b) = (&r.frames()[k - 1], &r.frames()[k]);
+        holes += b.meta.index - a.meta.index - 1;
+        gap_most = gap_most.max(b.meta.at - a.meta.at);
+        gap_least = gap_least.min(b.meta.at - a.meta.at);
+    }
+    let span = if n > 1 { (r.frames()[n - 1].meta.at - r.frames()[0].meta.at) as f64 / osc } else { 0. };
+    println!("clip-check: the frames span A#{span:.3} s; A#{holes} declared holes; between frames A#{:.3} to A#{:.3} ms", gap_least as f64 / osc * 1e3, gap_most as f64 / osc * 1e3);
+    let t = Instant::now();
+    let next = AtomicUsize::new(0);
+    let (ok, bad, unchecked) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= n {
+                    break;
+                }
+                match r.decode(k) {
+                    Ok(px) => match want.iter().find(|(i, _)| *i == k as u64) {
+                        Some((_, hh)) if ferros_clip::samples_source_hash(&px, w, h) == *hh => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(_) => {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                            println!("clip-check: frame A#{k} DIFFERS from the frame the camera wrote");
+                        }
+                        None => {
+                            unchecked.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                    Err(e) => {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                        println!("clip-check: frame A#{k} did not decode: {e}");
+                    }
+                }
+            });
+        }
+    });
+    let raw = (w * h * 5 / 4) as f64 * n as f64;
+    let (ok, bad, unchecked) = (ok.into_inner(), bad.into_inner(), unchecked.into_inner());
+    println!("clip-check: decoded A#{n} frames in A#{} ms on A#{threads} threads: A#{ok} bit exact against the camera's frames, A#{bad} not, A#{unchecked} with no hash; ratio A#{:.2} over the clip", t.elapsed().as_millis(), raw / size as f64);
     if bad != 0 {
         std::process::exit(2);
     }

@@ -2,7 +2,7 @@
 name = "clip-check"
 version = "0.1.0"
 edition = "2021"
-description = "A RAW clip pulled from a device read on the host (vsf visual::clip): every frame decoded, the hashed ones against the hashes the device took of the frames as the camera wrote them (std/rawrec's console lines)"
+description = "A RAW clip pulled from a device read on the host (vsf visual::clip): every frame decoded and checked against the source hashes the recorder took of the frames as the camera wrote them (std/rawrec stores them as rawrec.hashes)"
 
 [[bin]]
 name = "clip-check"
@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
-blake3 = "1.5"
+ferros_clip = { path = "../../ferros_clip" }
 
 [profile.release]
 debug = 1

@@ -36,7 +36,7 @@ fn sixty_four_frames_bit_exact() {
     let cam = Camera { width: w, height: h, stride, cfa: cfa_of_byte(0x49), black: 64, white: 1023, make: "ferros".into(), model: "test".into(), sensor_module: "main".into(), lens: String::new(), f_number: None, focal_mm: None, characterization: None, observer: String::new(), orientation: 1 };
     let sink = MemSink::default();
     let (bytes, sealed) = (sink.bytes.clone(), sink.sealed.clone());
-    let mode = Mode { pacing: Pacing::of(30), title: "host test".into(), workers: vec![0; 4], writer: 0, slots: 4, blocks: 1 << 14, at: 1 << 40 };
+    let mode = Mode { pacing: Pacing::of(30), title: "host test".into(), workers: vec![0; 4], writer: 0, slots: 4, blocks: 1 << 14, at: 1 << 40, source_digests: true };
     let mut rec = Recorder::start(&cam, &mode, Box::new(sink)).unwrap();
     let mut frames = Vec::new();
     for k in 0..64u64 {
@@ -45,7 +45,10 @@ fn sixty_four_frames_bit_exact() {
         // The writer may lag on a slow host; a frame that finds no slot is dropped and counted, never waited for.
         loop {
             match rec.frame(&f) {
-                Taken::Recorded => break,
+                Taken::Recorded => {
+                    assert_eq!(rec.source_hash(), ferros_clip::samples_source_hash(&px, w, h), "frame {k}'s source hash");
+                    break;
+                }
                 Taken::Dropped => std::thread::yield_now(),
                 t => panic!("frame {k}: {t:?}"),
             }
@@ -73,7 +76,7 @@ fn a_full_extent_ends_the_clip_closed() {
     let sink = MemSink::default();
     let bytes = sink.bytes.clone();
     // 2^5 blocks: 128 KiB, a few frames of about 20 KiB each.
-    let mode = Mode { pacing: Pacing::of(24), title: String::new(), workers: vec![0; 2], writer: 0, slots: 1, blocks: 1 << 5, at: 0 };
+    let mode = Mode { pacing: Pacing::of(24), title: String::new(), workers: vec![0; 2], writer: 0, slots: 1, blocks: 1 << 5, at: 0, source_digests: false };
     let mut rec = Recorder::start(&cam, &mode, Box::new(sink)).unwrap();
     let mut recorded = 0;
     for k in 0..64u64 {

@@ -3,7 +3,7 @@
 //!
 //! The input (hex bytes):
 //! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it.
-//! - record: +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no).
+//! - record (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
 
@@ -72,31 +72,32 @@ fn set(what: u8, v: u64) -> u8 {
     if call(S_CAMERA, &m, &mut a) == ERR { 0xEE } else { a[0] }
 }
 
-/// A frame's packed rows as the camera wrote them, each row's samples only: what its hash covers.
-fn rows_hash(rows: &[u8], stride: usize, w: usize, h: usize) -> [u8; 32] {
-    let rb = w * 5 / 4;
-    let mut x = blake3::Hasher::new();
-    for y in 0..h {
-        x.update(&rows[y * stride..y * stride + rb]);
+/// A value into the vault scope (`SYS_STORE` set, 256 KiB a piece): the hashes for the host.
+fn store_put(slot: u64, name: &str, value: &[u8]) -> bool {
+    const SET: u64 = 1;
+    const AT: u64 = 2;
+    const MORE: u64 = 4;
+    let piece = 1usize << 18;
+    let mut at = 0;
+    while at < value.len() {
+        let n = (value.len() - at).min(piece);
+        let more = if at + n < value.len() { MORE } else { 0 };
+        if svc(13, cap(slot), SET | AT | more | (n as u64) << 8 | (at as u64) << 32, off(name.as_ptr()), name.len() as u64, off(value[at..].as_ptr())) != 0 {
+            return false;
+        }
+        at += n;
     }
-    *x.finalize().as_bytes()
+    true
 }
 
-/// Decoded samples packed back to RAW10 rows (no stride tail) and hashed: equal to `rows_hash` of the frame they came from when the round trip is bit exact.
-fn samples_hash(px: &[u16], w: usize, h: usize) -> [u8; 32] {
-    let mut x = blake3::Hasher::new();
-    let mut row = vec![0u8; w * 5 / 4];
-    for y in 0..h {
-        for g in 0..w / 4 {
-            let v = &px[y * w + g * 4..y * w + g * 4 + 4];
-            for i in 0..4 {
-                row[g * 5 + i] = (v[i] >> 2) as u8;
-            }
-            row[g * 5 + 4] = (v[0] & 3) as u8 | ((v[1] & 3) << 2) as u8 | ((v[2] & 3) << 4) as u8 | ((v[3] & 3) << 6) as u8;
-        }
-        x.update(&row);
-    }
-    *x.finalize().as_bytes()
+/// The frames' source hashes as one VSF document (section `rawrec_hashes`: `index` the clip's frame numbers, `hashes` [n, 32]).
+fn hashes_doc(hashes: &[(u64, [u8; 32])]) -> Vec<u8> {
+    use vsf::types::{Tensor, VsfType};
+    let n = hashes.len();
+    vsf::vsf_builder::VsfBuilder::new()
+        .add_section("rawrec_hashes", vec![("index".to_string(), VsfType::t_u6(Tensor::new(vec![n], hashes.iter().map(|h| h.0).collect()))), ("hashes".to_string(), VsfType::t_u3(Tensor::new(vec![n, 32], hashes.iter().flat_map(|h| h.1).collect())))])
+        .build()
+        .unwrap_or_default()
 }
 
 fn hex(h: &[u8; 32]) -> String {
@@ -200,7 +201,19 @@ fn main() {
     let blocks = (want * raw_frame + (1 << 24)) >> 12;
     let mut workers = vec![0x00F0u64; a715];
     workers.extend(std::iter::repeat_n(0x000Fu64, a510));
-    let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: 0x000F, slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)) };
+    // The settings' frames let pass (a SET reaches the sensor a frame or two later, and an open's first frames come as the stream settles): the clip starts on a steady stream, as Lumis's does.
+    for _ in 0..4 {
+        if !map(held, &mut hd) {
+            println!("rawrec: MAP: no frame while settling");
+            let _ = call(S_CAMERA, &[4], &mut r);
+            return;
+        }
+        held = hd[40];
+    }
+    // The copies kept whole for the check after the clip, their pages taken now and not in the camera loop (at 30 a second and under only: a copy is a few ms).
+    let keep_copies = fps <= 30;
+    let mut copy_bufs: Vec<Vec<u8>> = if keep_copies { (0..4).map(|_| vec![0u8; h * stride]).collect() } else { Vec::new() };
+    let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: [0x000F, 0x00F0, 0x0100][arg(17).min(2) as usize], slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)), source_digests: true };
     let mut rec = match Recorder::start(&cam, &mode, Box::new(ExtentSink(Extent::new(slot, NAME)))) {
         Ok(r) => r,
         Err(e) => {
@@ -210,8 +223,8 @@ fn main() {
         }
     };
     println!("rawrec: recording into {NAME}, A#{blocks} blocks asked; the mosaic G#{:02X}, black A#{}, white A#{}", hd[9], cam.black, cam.white);
-    // Frames hashed as captured: (the clip's frame number, the hash), and the first four kept whole for the check on the device.
-    let mut hashes: Vec<(u64, [u8; 32])> = Vec::new();
+    // Every frame's source hash as the recorder's workers took it (the clip's frame number, the hash), and four frames kept whole (one every 2^6) for the check on the device.
+    let mut hashes: Vec<(u64, [u8; 32])> = Vec::with_capacity(want as usize);
     let mut copies: Vec<(u64, Vec<u8>)> = Vec::new();
     let t0 = Instant::now();
     let mut next_say = 1u64;
@@ -230,10 +243,13 @@ fn main() {
         };
         let before = rec.stats().frames;
         let taken = rec.frame(&f);
-        if taken == Taken::Recorded && before & ((1 << hash_log2) - 1) == 0 {
-            hashes.push((before, rows_hash(f.rows, stride, w, h)));
-            if copies.len() < 4 {
-                copies.push((before, f.rows.to_vec()));
+        if taken == Taken::Recorded {
+            hashes.push((before, rec.source_hash()));
+            if before & ((1 << 6) - 1) == 0 {
+                if let Some(mut b) = copy_bufs.pop() {
+                    b.copy_from_slice(f.rows);
+                    copies.push((before, b));
+                }
             }
         }
         if taken == Taken::Ended {
@@ -293,9 +309,8 @@ fn main() {
     if let Some(i) = ext.info() {
         println!("rawrec: the extent: A#{} blocks from block A#{} of the clips area (partition block A#{}), A#{} bytes, sealed {}", i.blocks, i.first, (6u64 << 20) + i.first, i.bytes, i.sealed);
     }
-    for (k, hh) in &hashes {
-        println!("rawrec: hash A#{k} {}", hex(hh));
-    }
+    let doc = hashes_doc(&hashes);
+    println!("rawrec: A#{} frames' source hashes stored as test.rawrec.hashes ({} bytes): {}", hashes.len(), doc.len(), store_put(slot, "rawrec.hashes", &doc));
     if !verify || info.len == 0 {
         println!("rawrec: ends");
         return;
@@ -311,7 +326,7 @@ fn main() {
     };
     println!("rawrec: read back: A#{} frames by its index (recovered {}), opened in A#{} ms", reader.frames().len(), reader.recovered(), t.elapsed().as_millis());
     let (mut good, mut bad) = (0, 0);
-    for (k, hh) in &hashes {
+    for (k, hh) in hashes.iter().filter(|(k, _)| k & ((1 << hash_log2) - 1) == 0) {
         let px = match reader.decode(*k as usize) {
             Ok(px) => px,
             Err(e) => {
@@ -320,7 +335,7 @@ fn main() {
                 continue;
             }
         };
-        if samples_hash(&px, w, h) == *hh {
+        if ferros_clip::samples_source_hash(&px, w, h) == *hh {
             good += 1;
         } else {
             bad += 1;
@@ -331,6 +346,6 @@ fn main() {
             println!("rawrec: frame A#{k} against its copy, sample for sample: {}", if same { "equal" } else { "DIFFERENT" });
         }
     }
-    println!("rawrec: decoded on the device: A#{good} of A#{} hashed frames bit exact, A#{bad} not, in A#{} ms", hashes.len(), t.elapsed().as_millis());
+    println!("rawrec: decoded on the device: A#{good} of the frames checked (every A#{}-th) bit exact, A#{bad} not, in A#{} ms", 1u64 << hash_log2, t.elapsed().as_millis());
     println!("rawrec: ends");
 }

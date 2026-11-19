@@ -2042,6 +2042,16 @@ static GOV_BUSY_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// Windows the A715s ran busy-lifted with no other lift, and busy lifts begun (`diag clock`).
 static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
 
+/// The A715s' ceiling while a RAW clip is recorded (`diag clock clips <kHz>`; 0: none): THERMAL.md "The busy lift"'s 1572 MHz, the least energy for a sustained encode.
+static CLIPS_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
+
+/// Whether a RAW clip is being recorded: the `clips` window was written within the last second.
+fn recording() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let at = crate::process::CLIPS_AT.load(Relaxed);
+    at != 0 && cntpct().wrapping_sub(at) < cntfrq() && CLIPS_KHZ.load(Relaxed) != 0
+}
+
 /// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `GOV_BUSY_KHZ` while their own load holds the busy lift, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
 fn gov_top(g: &Gov, lifted: bool) -> usize {
     use core::sync::atomic::Ordering::Relaxed;
@@ -2054,6 +2064,8 @@ fn gov_top(g: &Gov, lifted: bool) -> usize {
         (_, false) if g.busy && busy > A715_CALM_KHZ => busy,
         (_, false) => A715_CALM_KHZ,
     };
+    // A RAW clip being recorded (the `clips` window written within the last second, process.rs `CLIPS_AT`) holds the A715s at `CLIPS_KHZ` at most, whatever lifts them (docs/RAW-VIDEO.md: at the camera's 2367 MHz lift a minute at 30/s reached 85 C in 37 s; at 1572 it ended at 75 C).
+    let cap = if g.domain == 3 && recording() { cap.min(CLIPS_KHZ.load(Relaxed)) } else { cap };
     // The highest point at or under the ceiling (the table starts at the floor, which every ceiling is above).
     g.opps.iter().rposition(|&o| o <= cap).unwrap_or(0)
 }
@@ -2545,6 +2557,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"busy"), Some(n)) => GOV_BUSY_KHZ.store(n, Relaxed),
+        (Some(b"clips"), Some(n)) => CLIPS_KHZ.store(n, Relaxed),
         (Some(b"busyhold"), Some(n)) => GOV_BUSY_HOLD.store(n, Relaxed),
         (Some(b"doze"), Some(n)) => DOZE_LOG2.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),

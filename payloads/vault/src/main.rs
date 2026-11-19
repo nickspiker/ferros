@@ -860,7 +860,9 @@ extern "C" fn work(_: u64) -> ! {
         }
         let len = serve(&mut store, &mut writers, &mut export, m, &mut out);
         live_note(store.engine());
-        m.fill(0);
+        // The stamp's keys and the name wiped; an extent's bytes past them are the clip's own, not a secret of the vault's, and zeroing a MiB a write cost the clip's write path (2026-11-19).
+        let wipe_to = if m[0] == OP_EXTENT { m.len().min(1 << 9) } else { m.len() };
+        m[..wipe_to].fill(0);
         ferros_sys::reply(&token, &out[..len]);
     }
 }
@@ -1122,6 +1124,8 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
 /// None when it does not read (a table over another area): every extent op is refused, said once.
 static mut EXTENTS: Option<manifestus::Extents> = None;
 static mut EXTENTS_READ: bool = false;
+/// The extent writes since the last seal: (calls, bytes, ticks in the block calls, the first one's tick).
+static mut EXT_METER: (u64, u64, u64, u64) = (0, 0, 0, 0);
 
 fn extents(store: &mut St) -> Option<&'static mut manifestus::Extents> {
     // SAFETY: the serving thread's alone, as SERVING is.
@@ -1184,7 +1188,19 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
                     return ERR;
                 }
                 // One UFS command: the kernel took at most EXTENT_MAX (BLOCK_MAX blocks) for an extent write.
-                if ferros_sys::block_write(cap(grants(), S_CLIPS), e.first + block, &bytes[..len]) == 0 { 0 } else { ERR }
+                let t0 = ferros_sys::now();
+                let r = ferros_sys::block_write(cap(grants(), S_CLIPS), e.first + block, &bytes[..len]);
+                // The writes' own measure, said at the seal: calls, bytes, time in the block calls, and from the first write.
+                unsafe {
+                    let m = &mut *(&raw mut EXT_METER);
+                    if m.0 == 0 {
+                        m.3 = t0;
+                    }
+                    m.0 += 1;
+                    m.1 += len as u64;
+                    m.2 += ferros_sys::now() - t0;
+                }
+                if r == 0 { 0 } else { ERR }
             } else if ferros_sys::block_read(cap(grants(), S_CLIPS), e.first + block, &mut out[8..8 + len]) == 0 {
                 *data = len;
                 len as u64
@@ -1199,6 +1215,9 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
             match next.seal(&key, length, hash, now).and_then(|_| next.store(store.engine(), now)) {
                 Ok(()) => {
                     *t = next;
+                    let m = unsafe { core::mem::take(&mut *(&raw mut EXT_METER)) };
+                    let f = freq();
+                    say!("vault: extent sealed, {} bytes: {} writes of {} MiB in all, {} ms in the block calls ({} MB/s), {} ms from the first write", length, m.0, m.1 >> 20, m.2 * 1000 / f, m.1 * f / m.2.max(1) / 1_000_000, (ferros_sys::now() - m.3) * 1000 / f);
                     0
                 }
                 Err(err) => {

@@ -2006,6 +2006,8 @@ pub static BLOCKS_SHUT: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// The flash's WriteBooster was asked on this boot (the `clips` window's first write), and what came of it: bits 0-2 the three flags the device accepted, bit 8 asked (`diag "ufs link"` says it).
 pub static CLIPS_WB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub static CLIPS_WB_SET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The counter at the `clips` window's last write: a RAW clip being recorded (service.rs `recording`, the A715s held at `CLIPS_KHZ`).
+pub static CLIPS_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -3957,17 +3959,28 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         Where::Domain(d) => ([KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true]),
     };
     let carried = matches!(eop, EOP_OPEN | EOP_WRITE | EOP_SEAL);
-    let mut rest = Vec::with_capacity(13 + if carried { len } else { 0 });
-    rest.push(eop);
-    rest.extend_from_slice(&block.to_le_bytes());
-    rest.extend_from_slice(&(len as u32).to_le_bytes());
-    if carried {
-        rest.extend_from_slice(&p.read(f.x[4], len));
-    }
-    let Some(msg) = stamp(VOP_EXTENT, &prefix, classes, &name, &rest) else {
+    let mut rest = [0u8; 13];
+    rest[0] = eop;
+    rest[1..9].copy_from_slice(&block.to_le_bytes());
+    rest[9..13].copy_from_slice(&(len as u32).to_le_bytes());
+    let Some(mut msg) = stamp(VOP_EXTENT, &prefix, classes, &name, &rest) else {
         f.x[0] = ERR;
         return 0;
     };
+    // The caller's bytes copied once, from where they lie straight onto the stamp (a MiB a write: the zeroed buffer and the two copies before cost about a millisecond of the clip's write path, measured 2026-11-19).
+    if carried {
+        match p.view(f.x[4], len) {
+            Some(b) => {
+                msg.reserve_exact(len);
+                msg.extend_from_slice(b);
+            }
+            None => {
+                crate::keys::wipe_to_dram(&mut msg);
+                f.x[0] = ERR;
+                return 0;
+            }
+        }
+    }
     let rcap = if matches!(eop, EOP_READ | EOP_INFO) { len as u64 } else { 0 };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
@@ -5103,6 +5116,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         (ok, t)
                     };
                     // The recording region's first write this boot turns the flash's WriteBooster on (docs/RAW-VIDEO.md: its SLC cache took about 33 GB at 1 to 1.7 GB/s where the direct rate is 556 MB/s), with its flushes (when idle, and in hibernate), as Linux does at every probe; the flags are volatile, so it is asked again each boot, and left on.
+                    if write && w.name == "clips" {
+                        CLIPS_AT.store(crate::platform::cntpct(), Relaxed);
+                    }
                     if write && w.name == "clips" && !CLIPS_WB.swap(true, Relaxed) {
                         let r = unlocked(|| {
                             UFS.with(|| {
@@ -5116,8 +5132,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     let t0 = crate::platform::cntpct();
                     let (ok, t_cmd) = if write {
-                        let mut data = alloc::vec![0u8; n << 12];
-                        p.read_into(buf, &mut data);
+                        // One copy from where the caller's bytes lie, no zeroed buffer first (a bad buffer is kept for the trap at the syscall's end, as `read_into` keeps it, and writes zeros).
+                        let data = match p.view(buf, n << 12) {
+                            Some(b) => b.to_vec(),
+                            None => alloc::vec![0u8; n << 12],
+                        };
                         unlocked(|| UFS.with(|| command(Some(&data), None)))
                     } else {
                         if count >= MOVING_BLOCKS {
