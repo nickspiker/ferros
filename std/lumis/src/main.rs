@@ -941,7 +941,7 @@ fn leave(name: &str, vault: Option<&kete::FlatStorage>, header: &mut [u64]) -> !
 
 /// The parts of the screen lumis_core's partial draw writes (draw_screen with the controls up and nothing whole): the two exposure labels, the counters, and the progress band along the exposure slider (drawn only for an exposure longer than nothing).
 /// Overlapping ones made one, so the host gets disjoint rects (fluor `DamageRects`), at most four.
-fn partial_parts(ui: &lumis_core::UserInterface, camera: Option<fluor::canvas::PixelRect>) -> Vec<fluor::canvas::PixelRect> {
+fn partial_parts(ui: &lumis_core::UserInterface, camera: &[fluor::canvas::PixelRect]) -> Vec<fluor::canvas::PixelRect> {
     use fluor::canvas::PixelRect;
     let mut parts = vec![
         PixelRect::new(ui.left_label_x, ui.left_label_y, ui.left_label_end_x, ui.left_label_end_y),
@@ -961,8 +961,8 @@ fn partial_parts(ui: &lumis_core::UserInterface, camera: Option<fluor::canvas::P
         let (ya, yb) = (ui.slider_start_y.min(ui.slider_end_y), ui.slider_start_y.max(ui.slider_end_y));
         parts.push(PixelRect::new((xa - t) as usize, (ya - t) as usize, (xb + t) as usize + 1, (yb + t) as usize + 1));
     }
-    // A new image's own rect (lumis_core screen::camera_rect), beside the controls that tick with it.
-    parts.extend(camera);
+    // What a new image changed of the camera's part (lumis_core screen::camera_damage: the fit view's rect, or the slitscan wiper's band of rows), beside the controls that tick with it.
+    parts.extend_from_slice(camera);
     parts.retain(|r| !r.is_empty());
     // Overlapping parts joined until none overlap.
     let overlap = |a: &PixelRect, b: &PixelRect| a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
@@ -1179,7 +1179,7 @@ impl FluorApp<G2t16> for Lumis {
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
                 // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own), and a turn of the device (the gravity here is a constant).
-                // A new image (its counter, or the exposure's start that moves with it at every completion) is the camera's rect and the controls that tick (`partial_parts` with `camera_rect`): the bars around the image hold controls that did not move. Anything else that moved draws whole.
+                // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
                 let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
                 let other = ui.previous_histogram_counter != before.2
                     || ui.previous_hold_present
@@ -1190,13 +1190,16 @@ impl FluorApp<G2t16> for Lumis {
                     || self.finger.is_some();
                 self.parts.clear();
                 if surface.take_posted() {
-                    let camera = lumis_core::ui::screen::camera_rect(ui).map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1));
-                    if other || self.knobs & DEV_WHOLE != 0 || (new_image && camera.is_none()) {
+                    let camera: Option<Vec<fluor::canvas::PixelRect>> = lumis_core::ui::screen::camera_damage(ui).map(|v| v.into_iter().map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1)).collect());
+                    if other || self.knobs & DEV_WHOLE != 0 {
                         self.changed = true;
                     } else if new_image {
-                        self.parts = partial_parts(ui, camera);
+                        match &camera {
+                            Some(camera) => self.parts = partial_parts(ui, camera),
+                            None => self.changed = true,
+                        }
                     } else if ui.controls_visible {
-                        self.parts = partial_parts(ui, None);
+                        self.parts = partial_parts(ui, &[]);
                     }
                 }
                 if self.finger.is_some() {

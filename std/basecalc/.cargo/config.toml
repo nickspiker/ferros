@@ -1,0 +1,4 @@
+# The host's tests (cargo test --lib, run from this directory): gmp-mpfr-sys 1.6 builds GMP 6.3 with the host's compiler, whose configure tests are C99 and fail under gcc 15's C23 default (basecalc's own .cargo/config.toml says the same).
+# tools/basecalc-build.sh runs cargo from the ferros tree's root, so the ferros build never sees this: its C is built by the script with flags of its own.
+[env]
+CFLAGS = "-std=gnu99"

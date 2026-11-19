@@ -65,7 +65,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
     // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person stows): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space, joined to their fleet's: payloads/fgtw space.rs). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.`, 7 use launch, 8 use kists, 9 use nfc (the NFC page's "add a tag", AUTH.md "Attest with a tag"; the kernel puts the torch after it).
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107]),
-    (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106, 108, 80]),
+    // The map: 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw, 6 the vault scope `kists.`, 7 use launch, 8 use kists, 9 use nfc, 10 use wlan (the WiFi page's picker, 2026-11-18: payloads/map wifi.rs); the kernel adds the torch after them.
+    (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106, 108, 80, 44]),
 ];
 
 #[unsafe(no_mangle)]
@@ -296,6 +297,7 @@ fn wait_person(grants: u64, bound: bool) {
 /// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.
 fn wait_front(grants: u64) {
     // Unlocked and bound already (unlock at boot, or ahau started again after attest): ahau shows no attest screen (ahau main.rs `at_boot`, the same test), so there is no window to wait for (2026-11-18, the 8a: every unlock-at-boot boot waited the whole 4 s before the map).
+    // The one exception is not waited for either: the identity service holding no roots, which ahau learns from fgtw once init has started it, and its attest screen then comes up over whatever has started (AUTH.md "Never stuck").
     if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
         return;
     }

@@ -312,9 +312,9 @@ fn check_here(core: usize) {
     unsafe { core::arch::asm!("msr daifclr, #0xF", options(nostack)) };
 }
 
-/// Worker 0's side: called from its idle loop on every pass (smp.rs). One load when nothing is asked.
-pub fn serve(k: usize) {
-    if k != 0 {
+/// Worker 0's side (core 4, the first A715): called from every worker's idle loop on every pass with its core number (smp.rs). One load when nothing is asked.
+pub fn serve(core: usize) {
+    if core != 4 {
         return;
     }
     let a = ASK.load(Ordering::Acquire);
@@ -330,7 +330,7 @@ pub fn serve(k: usize) {
 
 /// Ask worker 0 and wait for it (a quarter second at most). False if it never answered (no workers: FERROS_SMP=0, or it is busy in a slice).
 fn ask_worker(what: u32) -> bool {
-    if crate::smp::UP.load(Ordering::Acquire) & 1 == 0 {
+    if crate::smp::UP.load(Ordering::Acquire) & (1 << 4) == 0 {
         return false;
     }
     ASK.store(what, Ordering::Release);

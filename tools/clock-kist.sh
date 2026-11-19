@@ -1,5 +1,5 @@
 #!/bin/bash
-# The clock as a stowed kist (KISTS.md; owner, 2026-11-10: "can I get my clock widget kist on the homescreen again?"): a widget, drawn live by the display in the kist's circle (payloads/clock says why the capsule has nothing to run), in a capsule that wants nothing.
+# The clock as a stowed kist (KISTS.md; owner, 2026-11-10: "can I get my clock widget kist on the homescreen again?"): since 2026-11-18 a puck (docs/PUCKS.md; owner: "make another clock proper, then delete the weird wired in one"), its capsule declaring `puck` (its circle on the deck, never asked) and nothing else; it draws its own face into its square (payloads/clock). Version 0 was the capsule with nothing to run that the display drew for by its name.
 # Built masked (tools/ferros-masked-build.sh: the network stower refuses native code), then signed by the owner's developer key with every egg and its whole public bundle (kistcat kist; KISTS.md "Trust on first stow"), its developer's name from the key's public record. Written to target/kists/clock.capsule.vsf, which tools/kistcat/kists.sh lists in the directory.
 # Then stowed, unless --no-stow (docs/KISTS.md "Stowing"): `ferros send` (tools/ferros-send) offers it to the device over USB, its stower checks and seals it as it would one from the directory, and the person attested there says Stow or Cancel on its screen. Its circle appears on the map once stowed.
 # The option is the clock's identity across versions (ORACLE.md §5: minted once, kept). Minted 2026-11-10; never change it.
@@ -15,7 +15,8 @@ M=target/masked/clock
 out=target/kists/clock.capsule.vsf
 cargo run -q --release --manifest-path tools/kistcat/Cargo.toml -- kist --key "$key" --record "$record" \
     --masked $M/clock.bin --text-len "$(cat $M/clock.textlen)" \
-    --name Clock --option e6f06ca18ca2027b99ea0f0a3e5e97916ea81f57b227a8d9c51a5632aac5a35b --version 0 \
+    --name Clock --option e6f06ca18ca2027b99ea0f0a3e5e97916ea81f57b227a8d9c51a5632aac5a35b --version "${VERSION:-1}" \
+    --want puck "its circle on the deck" \
     --out "$out"
 [ "${1:-}" = --no-stow ] && exit 0
 # Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.

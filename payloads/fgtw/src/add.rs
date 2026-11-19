@@ -549,7 +549,7 @@ impl Client {
                             self.log.put(b" ms");
                             self.log.line();
                             // Held (note_members), kept when unlock-at-boot is on, and the fold told to the machine before its answer.
-                            self.persist_set(b"chain", &bytes);
+                            self.keep_chain(&bytes);
                             self.note_members(&blob);
                             self.add_event(Flow::Bound { device, result: Ok(()) });
                         }

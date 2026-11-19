@@ -262,14 +262,20 @@ fn lines(text: &str, name: &str) -> Vec<String> {
 }
 
 /// tools/screencap, built if it is not: the screen as a VSF visual.
-fn shot(out: Option<&String>) {
+/// The capture at the panel's own size, asked of the display server (`panel`): screencap's default is the Pro's 1344 x 2992, and an 8a's 1080 x 2400 frame read at that size came back sheared (2026-11-18).
+fn shot(bridge: &Path, out: Option<&String>) {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest = repo.join("tools/screencap/Cargo.toml");
+    let (w, h) = panel(bridge);
+    // screencap takes the size after the file, so the file is named here as screencap names it by default: target/screen/<Eagle time in hex>.vsf.
+    let out = out.cloned().unwrap_or_else(|| {
+        let dir = repo.join("target/screen");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| fail(&format!("target/screen: {e}")));
+        dir.join(format!("{:x}.vsf", vsf::eagle_time_oscillations())).to_string_lossy().into_owned()
+    });
     let mut c = Command::new("cargo");
     c.args(["run", "-q", "--release", "--manifest-path"]).arg(&manifest).arg("--");
-    if let Some(o) = out {
-        c.arg(o);
-    }
+    c.arg(&out).arg((w as u32).to_string()).arg((h as u32).to_string());
     match c.status() {
         Ok(s) if s.success() => {}
         _ => fail("screencap failed"),
@@ -356,7 +362,7 @@ pub async fn cmd(args: &[String]) {
         }
         "idle" => ev_list.push(ev(0, Ev::Wait { idle: true })),
         "shot" => {
-            shot(words.first());
+            shot(&bridge, words.first());
             return;
         }
         "script" => {
@@ -397,6 +403,6 @@ pub async fn cmd(args: &[String]) {
         std::process::exit(1);
     }
     if take_shot {
-        shot(shot_out.as_ref());
+        shot(&bridge, shot_out.as_ref());
     }
 }

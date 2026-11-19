@@ -173,6 +173,21 @@ fn absent_wait(absent: &mut u64) {
     }
 }
 
+/// The identity service's state byte (its op 1), waited for however long it takes to answer: init starts it once a person is unlocked, which at a boot that unlocked is about when this screen starts, and its device keys take some 600 ms before it serves (the Pro, b970).
+/// Its first answer already says whether it holds roots: it reads what it keeps before it serves anything (fgtw `load`).
+fn service_state(grants: u64) -> u8 {
+    let svc = cap(grants, S_FGTW_EP);
+    let mut absent = freq() >> 6;
+    loop {
+        let mut out = [0u8; 600];
+        let n = ferros_sys::call_live(svc, &[1], &mut out);
+        if n != ferros_sys::ERR && n != ferros_sys::NOTHING && n >= 1 {
+            return out[0];
+        }
+        absent_wait(&mut absent);
+    }
+}
+
 /// A copy of the roots on this process's stack overwritten in a way the compiler keeps, then a compiler fence, as `roots_thread` wipes its own: the screen's copies of a seed or proof once handed on.
 fn scrub(b: &mut [u8]) {
     for x in b.iter_mut() {
@@ -2283,6 +2298,11 @@ impl Ahau {
             // The People page's add (docs/FACETS.md "People"): their handle, then the name the person gives them.
             Mode::Words(2) => tx(Msg::TypeTheirHandle),
             Mode::Words(3) => tx(Msg::WhatDoYouCallThem),
+            // The WiFi page's picker: the passphrase for the network it names.
+            Mode::Words(4) => {
+                let shown = printable(&self.pick.0[..self.pick.1]);
+                sx(ferros_lang::Say::PassphraseFor(core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("")))
+            }
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
@@ -2563,20 +2583,35 @@ impl Ahau {
             if keys & 1 == 1 {
                 self.keys_up();
             } else {
-                let kind = self.words_wanted();
+                let (kind, net) = self.words_asked();
                 if kind == 0 {
                     // Asleep until the keyboard is wanted (its doorbell) or the identity service is asked again (four times a second, as before the keyboard).
                     ferros_sys::wait_world(&KEYS_WANT, keys, now() + freq() / 4);
                     continue;
                 }
                 self.mode = Mode::Words(kind);
+                // A WiFi passphrase: the network it is for (its name on the status line), and the keys' rainbow left as it is, as on the network page (a tint from the typed text would show something of a secret).
+                if kind == 4 {
+                    self.pick = net;
+                }
                 self.wipe();
-                self.retint();
+                if kind != 4 {
+                    self.retint();
+                }
                 self.all();
                 self.show();
-                console(self.grants, if kind == 1 { b"ahau: words wanted: a new device's\n".as_slice() } else { b"ahau: words wanted: a person's handle (the People page)\n" });
+                console(
+                    self.grants,
+                    match kind {
+                        1 => b"ahau: words wanted: a new device's\n".as_slice(),
+                        4 => b"ahau: words wanted: a WiFi passphrase (the WiFi page)\n",
+                        _ => b"ahau: words wanted: a person's handle (the People page)\n",
+                    },
+                );
             }
             let mut polls = 0u32;
+            // Whether the lone finger down now has been offered to the Cancel button (`net_press`), as the attest screen's loop offers its buttons once a landing.
+            let mut press_asked = false;
             while matches!(self.mode, Mode::Words(_) | Mode::Keys) {
                 ferros_sys::pet();
                 // The app in front let the keyboard go (its field lost focus, it went behind, back's tap, the keyboard's own key): down.
@@ -2595,6 +2630,39 @@ impl Ahau {
                     let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                     held[k] = (rec[0], u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
                     k += 1;
+                }
+                // The words' Cancel button (`button_label`), taken as the attest screen's loop takes its buttons: lit at a lone finger's landing above the keys, back at rest if the finger leaves it, a second finger lets it go, and at the lift while still on it the words are let go (fgtw op 15 [0], `end_words`). Until 2026-11-18 this loop never asked, so the button drawn here did nothing (the 8a, the WiFi page's passphrase: Cancel tapped, the keyboard stayed).
+                if matches!(self.mode, Mode::Words(_)) {
+                    if k == 1 {
+                        let (x, y) = (held[0].1, held[0].2);
+                        if !press_asked {
+                            press_asked = true;
+                            if y < self.kb.top as i64 && self.net_press(x, y) {
+                                self.show();
+                            }
+                        } else if self.pressed.get().is_some() {
+                            self.net_follow(x, y);
+                            if self.pressed.get().is_none() {
+                                self.show();
+                            }
+                        }
+                    } else if k >= 2 {
+                        if let Some(e) = self.pressed.take() {
+                            self.net_redraw(e);
+                            self.show();
+                        }
+                    } else {
+                        press_asked = false;
+                        if let Some(e) = self.pressed.take() {
+                            if e == 0 {
+                                console(self.grants, b"ahau: the words cancelled (the Cancel button)\n");
+                                self.end_words(true);
+                                break;
+                            }
+                            self.net_redraw(e);
+                            self.show();
+                        }
+                    }
                 }
                 let mut outs = [Touch::Scrolled; 48];
                 let mut no = 0;
@@ -2649,7 +2717,8 @@ impl Ahau {
                 }
                 // The identity service no longer wants them (matched on its side, the Fleet page closed the flow, the departure gone): the screen goes.
                 polls += 1;
-                if polls % 64 == 0 && matches!(self.mode, Mode::Words(k) if self.words_wanted() != k) {
+                // A WiFi passphrase whose network the page changed (another picked): the screen goes, and comes back for the new one.
+                if polls % 64 == 0 && matches!(self.mode, Mode::Words(k) if { let (w, net) = self.words_asked(); w != k || (k == 4 && net != self.pick) }) {
                     self.end_words(false);
                 }
                 if matches!(self.mode, Mode::Words(_) | Mode::Keys) && (no > 0 || self.follow_layout()) {
@@ -2660,12 +2729,63 @@ impl Ahau {
         }
     }
 
-    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a leaver's.
+    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a person's handle, 3 the name the person gives them, 4 a WiFi network's passphrase.
     fn words_wanted(&self) -> u8 {
-        let mut o = [0u8; 4];
+        self.words_asked().0
+    }
+
+    /// `words_wanted`, with the network a WiFi passphrase is for (kind 4: the reply [4, name length, name]; the WiFi page's picker, payloads/map).
+    fn words_asked(&self) -> (u8, ([u8; 32], usize)) {
+        let mut o = [0u8; 2 + 32];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
+        let mut name = [0u8; 32];
         // A newcomer's words (1), a person's handle (2) and the name the person gives them (3): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 3 { 0 } else { o[0] }
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 4 {
+            return (0, (name, 0));
+        }
+        if o[0] == 4 {
+            // WHY the lengths: the service's reply; an SSID is 1 to 32 octets, and a reply that does not hold its name whole names none.
+            let l = o[1] as usize;
+            if n < 2 || !(1..=32).contains(&l) || 2 + l > n as usize {
+                return (0, (name, 0));
+            }
+            name[..l].copy_from_slice(&o[2..2 + l]);
+            return (4, (name, l));
+        }
+        (o[0], (name, 0))
+    }
+
+    /// Enter on a WiFi network's passphrase (kind 4, the WiFi page's picker): the network named and the passphrase typed handed to the WiFi driver (pcie1 JOIN; joined to another, it leaves that one for this), which keeps them and joins. The request's bytes and the text wiped at once: the passphrase passes thru neither the identity service nor the map, and is never written anywhere but the driver's vault entry.
+    /// Taken, the keyboard goes (op 15 [0]) and the WiFi page shows how the join goes; refused, the reason on the status line and the keyboard stays.
+    fn wifi_enter(&mut self) {
+        let (name, n) = self.pick;
+        let pass = &self.handle[..self.len];
+        if !(8..=63).contains(&pass.len()) || !pass.is_ascii() {
+            self.status(sx(ferros_lang::Say::PassphraseLength { min: 8, max: 63 }).as_str());
+            return;
+        }
+        let mut q = [0u8; 2 + 32 + 63];
+        q[0] = 5;
+        q[1] = n as u8;
+        q[2..2 + n].copy_from_slice(&name[..n]);
+        q[2 + n..2 + n + pass.len()].copy_from_slice(pass);
+        let len = 2 + n + pass.len();
+        let mut out = [0u8; 8];
+        let r = ferros_sys::call_live(cap(self.grants, S_WLAN), &q[..len], &mut out);
+        for b in q.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        match (r, out[0]) {
+            (r, _) if r == ferros_sys::ERR || r == 0 => self.status(tx(ferros_lang::Msg::WifiNotAnswering).as_str()),
+            (_, 0) => {
+                console(self.grants, b"ahau: a WiFi passphrase handed to the WiFi driver; the text wiped\n");
+                self.end_words(true);
+            }
+            (_, 1) => self.status(sx(ferros_lang::Say::PassphraseLength { min: 8, max: 63 }).as_str()),
+            // A driver from before 2026-11-18 joins no other network while joined.
+            (_, 3) => self.status(tx(ferros_lang::Msg::AlreadyOnNetwork).as_str()),
+            _ => self.status(tx(ferros_lang::Msg::CouldNotKeepNetwork).as_str()),
+        }
     }
 
     /// The words as typed to the identity service: a newcomer's, matched at every stroke (fgtw op 11, the live matcher). The answer on the status line; a match ends the words.
@@ -2866,6 +2986,8 @@ impl Ahau {
             // A person's handle as a handle is typed; the name the person gives them, a line.
             Mode::Words(2) => MAX_CHARS,
             Mode::Words(3) => 63,
+            // A WiFi passphrase: WPA2's longest.
+            Mode::Words(4) => 63,
             Mode::Words(_) => WORD_CHARS,
             // WPA2's longest passphrase.
             Mode::Pass => 63,
@@ -2915,6 +3037,11 @@ impl Ahau {
                 self.person_enter();
                 return;
             }
+            // A WiFi passphrase: enter hands it to the WiFi driver.
+            Some(Event::Enter) if self.mode == Mode::Words(4) => {
+                self.wifi_enter();
+                return;
+            }
             // Words: enter sends them as typed (they hold no newline).
             Some(Event::Enter) if matches!(self.mode, Mode::Words(_)) => {
                 self.send_words();
@@ -2943,7 +3070,8 @@ impl Ahau {
         }
         // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press. A passphrase leaves the handle's rainbow as it was: the keys would otherwise show a hash of it.
         let t = now();
-        if !self.net_open() {
+        // A WiFi passphrase (kind 4) leaves the rainbow as it was, as the network page's does.
+        if !self.net_open() && self.mode != Mode::Words(4) {
             self.retint();
         } else if self.mode == Mode::Networks {
             // The filter changed: the list follows.
@@ -3324,7 +3452,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         exit(2);
     }
     // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything; or this process started again after attest): no attest screen; the identity service (fgtw) loads its own from that space. The process stays all the same, as the device's keyboard (`host_words`, below, once the keyboard is built; until 2026-11-12 it ended here, and a device unlocked at boot had no keyboard for its kists). Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
-    let at_boot = ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    // Only while the identity service holds that person's roots (`ahau_core::attest_screen`): the kernel's kept seed and the service's kept roots are two keeps, and unlocked with the service holding none (the Pro, b970, 2026-11-18) nothing could hand them over and the device sat with no identity, no screen and no way to type the handle.
+    // The screen comes up then (AUTH.md "Never stuck").
+    let unlocked = ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true);
+    let bound_now = ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    let service = if unlocked && bound_now { service_state(grants) } else { ahau_core::SERVICE_NO_ROOTS };
+    let at_boot = !ahau_core::attest_screen(unlocked, bound_now, service);
+    if unlocked && bound_now && !at_boot {
+        console(grants, b"ahau: unlocked and bound, but the identity service holds no roots: the attest screen, so the handle typed hands them over\n");
+    }
     if at_boot {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).

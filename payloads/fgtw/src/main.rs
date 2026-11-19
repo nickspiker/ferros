@@ -587,8 +587,10 @@ struct Client {
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
-    /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the device unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set.
+    /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the device unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set, and followed each pass since 2026-11-18 (`follow_persist`): turned on mid-session (the Security page), the roots in hand are kept at once; until then they were kept only if it was on when they were handed in, while the kernel keeps its own seed at the next unlock that has it on, so the two keeps could part (the Pro, b970: the kernel unlocked at boot and this service had nothing).
     persist: bool,
+    /// The last chain adopted, as its bytes (`keep_chain`): kept here as well as on disk, so turning unlock at boot on mid-session keeps it at once with the roots (`follow_persist`). The chain is public; it goes with the identity (`forget_identity`).
+    chain_held: Vec<u8>,
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
     verdict: u8,
     last_lookup_us: u64,
@@ -619,6 +621,8 @@ struct Client {
     selected_by: Option<[u8; 32]>,
     /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
+    /// With `entry` 4 (the WiFi page's picker, payloads/map, 2026-11-18): the network whose passphrase is wanted, its SSID's octets. The keyboard's host types the passphrase and hands it to the WiFi driver itself (pcie1 JOIN): the passphrase never passes thru here, nor thru the map.
+    entry_net: Vec<u8>,
     /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and deck, kept here and synced with their fleet.
     space: space::SpaceSync,
     /// The doorbell (op 21; owner, 2026-11-10: "No polling! ... It should be push or doorbell"): callers waiting for a change (their reply tokens), the change count they are answered with, and what they watch (`watch_state`) when it was last counted.
@@ -704,6 +708,54 @@ impl Client {
         v
     }
 
+    /// A chain adopted: held here (`chain_held`) and kept on disk when unlock at boot is on.
+    fn keep_chain(&mut self, chain: &[u8]) {
+        self.chain_held.clear();
+        self.chain_held.extend_from_slice(chain);
+        self.persist_set(b"chain", chain);
+    }
+
+    /// Unlock at boot as the kernel has it now, followed (`ferros_kept::secret::follow`): turned on (the Security page), the roots, the fleet key and the chain in hand are kept now, each as its document, so the next boot finds them; turned off, everything of the identity goes from the disk at once (off is always safe; AUTH.md).
+    /// Nothing when it has not changed.
+    /// The kernel keeps its own seed at the next unlock that has the setting on, a typed or tagged attest; that unlock hands the roots here (op 4), which keeps them as well.
+    fn follow_persist(&mut self) {
+        use ferros_kept::secret::{Follow, Kind};
+        let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
+        match ferros_kept::secret::follow(on, self.persist) {
+            Follow::Unchanged => {}
+            Follow::Forget => {
+                self.persist = false;
+                self.forget_disk();
+                self.log.put(b"fgtw: unlock at boot off: nothing of the identity on disk");
+                self.log.line();
+            }
+            Follow::Keep => {
+                self.persist = true;
+                if self.hp.is_none() {
+                    self.log.put(b"fgtw: unlock at boot on: no roots in hand yet; the next handed in are kept");
+                    self.log.line();
+                    return;
+                }
+                // Each from where it is held, by reference: no copy of a root on this stack.
+                let mut kept = true;
+                if let Some(s) = self.identity_seed.as_ref() {
+                    kept &= self.persist_secret(Kind::IdentitySeed, b"identity_seed", s);
+                }
+                if let Some(p) = self.hp.as_ref() {
+                    kept &= self.persist_secret(Kind::HandleProof, b"handle_proof", p);
+                }
+                if let Some(k) = self.fleet_key.as_ref() {
+                    kept &= self.persist_secret(Kind::FleetKey, b"fleet_key", k);
+                }
+                if !self.chain_held.is_empty() {
+                    kept &= self.store_set(b"chain", &self.chain_held);
+                }
+                self.log.put(if kept { b"fgtw: unlock at boot on: the roots, fleet key and chain in hand kept for the next boot" } else { b"fgtw: unlock at boot on, but the vault did not take all of the roots (a boot that unlocks shows the attest screen for the handle)" });
+                self.log.line();
+            }
+        }
+    }
+
     /// Everything of the identity gone from the vault (unlock-at-boot off, or a wipe): the seed, proof, chain and fleet key. The handle itself was never on disk.
     fn forget_disk(&self) {
         for key in [&b"identity_seed"[..], b"handle_proof", b"chain", b"fleet_key"] {
@@ -747,6 +799,7 @@ impl Client {
                     if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain) {
                         self.bound = bound;
                         self.note_members(&blob);
+                        self.chain_held = chain.clone();
                         self.log.put(b"fgtw: chain held, ");
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), this device is a member" } else { b" op(s), this device is not in it" });
@@ -1017,7 +1070,7 @@ impl Client {
         match join::adopt_chain(&hp, &seed, &self.me, chain) {
             Ok((blob, true)) => {
                 self.note_members(&blob);
-                self.persist_set(b"chain", chain);
+                self.keep_chain(chain);
                 self.became_bound();
                 self.bound
             }
@@ -1185,6 +1238,7 @@ impl Client {
         self.bound = false;
         wipe_key(&mut self.fleet_key);
         self.members.clear();
+        self.chain_held.clear();
         self.offered.clear();
         self.select_waiting = None;
         self.selected_by = None;
@@ -1534,7 +1588,7 @@ impl Client {
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), THIS DEVICE IS BOUND" } else { b" op(s), not bound yet" });
                         self.log.line();
-                        self.persist_set(b"chain", &chain);
+                        self.keep_chain(&chain);
                         if bound && !self.bound {
                             self.became_bound();
                         }
@@ -1702,6 +1756,9 @@ impl Client {
             if epoch != self.lock_epoch {
                 self.locked_out(epoch);
             }
+            // Unlock at boot switched since the last pass (the Security page, either way): the disk follows at once.
+            // A changed preference wakes every word wait in the system (kernel `write_pref_all`), the idle wait at the end of this loop among them, so the pass comes with the change.
+            self.follow_persist();
             let watch = NET_FLAGS.load(Ordering::Acquire);
             // The ports to read: those the watch named since the last pass, or both every pass without a watch.
             let news = if watch == NO_WATCH { 3 } else { NET_PORTS.swap(0, Ordering::AcqRel) };
@@ -1842,6 +1899,13 @@ impl Client {
                             self.entry = 2;
                             alloc::vec![0]
                         }
+                        // 4: a WiFi network's passphrase, for the network named after it ([15, 4, name length, name]; the WiFi page's picker). Only the name is kept here, never what is typed for it.
+                        // WHY the lengths: another process's message; an SSID is 1 to 32 octets.
+                        15 if got >= 3 && req[1] == 4 && (1..=32).contains(&req[2]) && 3 + req[2] as usize <= got => {
+                            self.entry = 4;
+                            self.entry_net = req[3..3 + req[2] as usize].to_vec();
+                            alloc::vec![0]
+                        }
                         15 if n >= 2 && req[1] == 0 && self.entry == 3 => {
                             self.entry = 0;
                             self.person_no_name();
@@ -1855,7 +1919,15 @@ impl Client {
                             }
                             alloc::vec![0]
                         }
-                        16 => alloc::vec![self.entry_wanted()],
+                        // The words wanted; a WiFi passphrase's with the network's name after it ([4, name length, name]).
+                        16 => match self.entry_wanted() {
+                            4 => {
+                                let mut r = alloc::vec![4, self.entry_net.len() as u8];
+                                r.extend_from_slice(&self.entry_net);
+                                r
+                            }
+                            k => alloc::vec![k],
+                        },
                         _ => alloc::vec![ERR as u8],
                     };
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
@@ -1917,8 +1989,8 @@ impl Client {
                     if !self.persist {
                         self.forget_disk();
                     }
-                    self.persist_secret(ferros_kept::secret::Kind::IdentitySeed, b"identity_seed", &seed);
-                    self.persist_secret(ferros_kept::secret::Kind::HandleProof, b"handle_proof", &hp);
+                    // Whether the vault took both (`persist_set` says true with the setting off, where nothing is to be kept): said below, so the log never claims a keep the vault refused.
+                    let kept = self.persist_secret(ferros_kept::secret::Kind::IdentitySeed, b"identity_seed", &seed) & self.persist_secret(ferros_kept::secret::Kind::HandleProof, b"handle_proof", &hp);
                     self.identity_seed = Some(seed);
                     self.hp = Some(hp);
                     wipe(&mut seed);
@@ -1928,7 +2000,11 @@ impl Client {
                     self.verdict = V_LOOKING;
                     self.last_lookup_us = 0;
                     self.fgtw_asked_us = 0;
-                    self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
+                    self.log.put(match (self.persist, kept) {
+                        (true, true) => b"fgtw: roots set in RAM and kept on disk (unlock at boot on)",
+                        (true, false) => b"fgtw: roots set in RAM; unlock at boot is on, but the vault did not take them (a boot that unlocks shows the attest screen for the handle)",
+                        (false, _) => b"fgtw: roots set in RAM only (nothing of the identity on disk)",
+                    });
                     self.log.line();
                     // The departure and add machines, made with these roots: a departure or an add kept from before a restart is taken up now (with unlock-at-boot off, nothing of the identity is on disk at `load`).
                     self.depart_start();
@@ -2310,7 +2386,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

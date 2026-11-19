@@ -146,18 +146,18 @@ fn scrub_stack() {
 /// The cores that run ferros now: this one and the workers that are up. Before the hop (CPU0, no workers yet) the X3 and every worker, since they will.
 fn running() -> u32 {
     let up = crate::smp::UP.load(Ordering::Acquire);
-    if me() == 0 && up == 0 && crate::board::x3() { AFTER_HOP } else { (1 << me()) | up << 4 }
+    if me() == 0 && up == 0 && crate::board::x3() { AFTER_HOP } else { (1 << me()) | up }
 }
 
-/// This core's index: MPIDR Aff1 (CPU0 0, the A715 workers 4-7, the X3 8).
+/// This core's index: MPIDR Aff1 (the A510s 0-3, CPU0 the boot core among them; the A715s 4-7; the X3 8).
 fn me() -> usize {
     let m: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) m, options(nomem, nostack)) };
     ((m >> 8) & 0xF) as usize
 }
 const CORES: usize = 9;
-/// The cores that run ferros after the hop: the X3 and the four workers.
-pub const AFTER_HOP: u32 = (1 << 8) | (0xF << 4);
+/// The cores that run ferros after the hop: the X3, the four A715s and the four A510s (smp.rs; CPU0 among them, back as a worker once parked). One that never comes up (FERROS_LITTLE=0, a CPU_ON refused) is dropped from the blob's wait by `forget_missing`.
+pub const AFTER_HOP: u32 = (1 << 8) | (0xF << 4) | 0xF;
 
 /// Bumped whenever a secret is set; HELD[core] is the generation that core's registers hold (0 = nothing). PRESENT: bit 0 ira, bit 1 wairua.
 static GEN: AtomicU32 = AtomicU32::new(0);

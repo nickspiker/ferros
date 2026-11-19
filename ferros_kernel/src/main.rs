@@ -661,6 +661,8 @@ _m1_entry:
     movz    x3, #0x0180
     movk    x3, #0x1040, lsl #16
     str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>: masked until a driver's irq_ack (or for good, if no one holds the line)
+// An armed line whose program cleared its own source and asked to stay open (irqarm.rs UNMASK): pending and woken as any line, never masked, so its next event fires whatever its driver is doing.
+.Lirq_spi_open:
     adrp    x1, __irq_stage
     add     x1, x1, :lo12:__irq_stage
     mrs     x2, mpidr_el1
@@ -840,6 +842,7 @@ _m1_entry:
     mrs     x10, fpsr
     stp     x9, x10, [sp, #144]
     bl      ferros_irq_armed
+    mov     x1, x0                 // 1: leave the line open (UNMASK); x1 is the entry's to restore, none of the loads below touch it
     ldp     x9, x10, [sp, #144]
     msr     fpcr, x9
     msr     fpsr, x10
@@ -869,6 +872,7 @@ _m1_entry:
     ldp     x6, x7, [sp, #16]
     ldp     x4, x5, [sp, #0]
     add     sp, sp, #672
+    cbnz    x1, .Lirq_spi_open
     b       .Lirq_spi
 // SGI 2: dump where this core is (process.rs `diag core`): the interrupted ELR/SPSR, both stack pointers, and x0-x3 as saved at entry.
 .Lirq_dump:

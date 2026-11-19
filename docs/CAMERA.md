@@ -101,7 +101,7 @@ The list is a VSF document (the house format for anything structured); a frame i
 | op | request | reply |
 |---|---|---|
 | 0 LIST | `[0]` | a VSF document, a section `camera` per camera the driver can stream whose inputs are in the vault (none: an empty document; "The other cameras") |
-| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2][cols: 2]` ("Modes, the bench and the slit") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, a slit's record offset at 56) |
+| 1 OPEN | `[1][id]`, or `[1][id][1]` for the view, then optionally the mode block `[kind][rows: 2][fll: 2][exposure: 2][flags][ring][line length: 2][cols: 2]` ("Modes, the bench and the slit"), then optionally the view flags (bit 0: write-back, "A cacheable view") | `[0]` open, `[1]` no such camera (or one that cannot stream: the tele), `[2]` another holds it, `[3]` it would not start; with the view given, `[0]` then the view's token (32 bytes) and the ring's shape ("The view"; 64 bytes with a mode block: also the ring's count as a u32 at 48, 1 at 52 for a slit ring, 1 at 53 for a write-back view, a slit's record offset at 56) |
 | 2 FRAME | `[2][bin]` | waits for the next frame: a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample, row by row |
 | 3 SET | `[3][what][value: 8 bytes]` | `[0]` taken, `[1]` outside the range; what: 0 exposure (ns), 1 gain (1024 unity: the sensor's analogue gain alone, by its own CCS model read at the open, digital gain kept at one; past the analogue's most refused, "Gain"), 2 focus (the actuator's position) |
 | 4 CLOSE | `[4]` | the view taken back, the camera stops; it also stops when its holder ends |
@@ -779,6 +779,202 @@ Every open below armed its release (`the descriptor's release armed on the front
 - **The top**: about 106 frames a second at full binned size (line 5696 to 5760 clocks), the link's own limit at 5632; 105 a second held 155 s with a consumer reading and adding every frame.
 - **Heat** (`diag thermal` every 2^5 s, the room cool, no cap anywhere): at 96 a second the hottest zone 37 C to 53 at 32 s, 55, 57, 58, 58 at 160 s; at 105 a second 46 to 61, 64, 65, 65 C at 128 s, then falling to 48 C a minute after the close. The trips are 90 C (X3, A715s) and 95 (A510s).
 - **The one death on this kernel** (fll 3200, frame 4358): the frame thread woken 133 ms late, past a whole frame (the line stays masked until the thread's acknowledgement, so the armed action releases once), behind kernel lock holds of 130, 80, 61, 50 and 43 ms: the AoC firmware's pieces (`aoc.fw.N`) read from the vault under `with_lock` by the service loop's `sensor_step`, each time init's keeper restarted `sensors` (on a RAM-reloaded kernel the AoC never comes online, so every 64 s). With that loop stopped every run was clean. A hold past a frame period still stops the stream: those holds are the lock-holds work (branch lock-holds); the armed action moved the camera's limit from the blanking (0.4 ms at 96 a second) to a frame period (10 ms).
+
+## A cacheable view (2026-11-18, branch cam-cacheable; Lumis on branch lumis-cam-cacheable)
+
+The owner: "if we can actually get 60fps on ferros with the cam I'd be stupidly happy".
+The Lumis session measured its intake at 61.4 a second (kind 1, fll 5170): 53.5 ms a frame on the four A510s, 14.7 to 18.8 on the A715s (which starved the driver's frame thread), 42 to 51 on the X3, every row copied out of the non-cacheable view in 64-byte loads, each its own bus transaction.
+
+**Can the front end snoop instead?** Not as ferros runs it, and Linux never asks it to (the reference tree, /mnt/Harbor/ferros-ref/soc-gs):
+- On zuma only UFS (`zuma-ufs.dtsi:64`) and the JPEG block (`smfc`, `zuma.dtsi:1679`) are `dma-coherent`; no LWIS node is (`zuma-isp.dtsi`, `lwis_isp_fe` at line 164), and the ISPFE SysMMUs (`zuma-sysmmu.dtsi:475-547`) carry no shareability property.
+- The SysMMU v9 has the means: a shareable bit in its page entries (`drivers/iommu/samsung-iommu-v9.c:36` FLPD_SHAREABLE_FLAG, `:40` SLPD_SHAREABLE_FLAG), set only for IOMMU_CACHE mappings (`:606`, `:651`), which the DMA layer asks only for a dma-coherent device, and dropped for IOMMU_PRIV (`:693`); the heaps map uncached buffers non-shareable on purpose (`drivers/dma-buf/heaps/samsung/heap_dma_buf.c:107-112`). PCIe, UFS and the modem's DIT switch theirs in a SYSREG shareability word (`pcie-exynos-rc.h:227-238`); no such word is named for SYSREG_ISPFE (G#1C02_0000).
+- ferros runs the three ISPFE SysMMUs in bypass ("The view": frames land above 4 GiB with S2MPU faults 0), so the bit would need them translating, with page tables, on a path no Pixel kernel ever ran coherent. Not tried; cache maintenance instead.
+
+**What is built:**
+- The kernel maps the view Normal write-back, inner shareable, read-only for EL0 and EL2, never executable, when the driver asks (SYS_DMA x1 = 4 with x3 bit 63; cachemap `cam_view_map`'s `cached`); a kernel from before refuses the bit (it reads as frames past the run) and the driver asks again without it.
+- SYS_DMA x1 = 6 (process.rs `cam_lines`): bytes x2 to x2 + x3 of the driver's run (on `camera`) or of the view (on `camera-view`, by its holder) cleaned and invalidated to the point of coherency, a `dc civac` a line, by the kernel's own alias of the frames (read-write at EL2), with the kernel lock let go (`unlocked`); answered the counter's ticks it took.
+- The driver (payloads/camera): an OPEN asks for it in the byte after the whole mode block (`VIEW_FLAGS`, the seventeenth, bit 0), so a holder that asks a driver from before still gets the non-cacheable view; the 64-byte reply carries 1 at 53 when it was given (never for a slit ring, which has no hand-over). Each MAP cleans and invalidates the buffer it hands over (16 MiB, or 20 with the PD rows) before it answers; each release cleans and invalidates the buffer's probe line before reading it. Its ninth hand-spawn byte (1) skips the MAP's maintenance, a test only.
+- cambench +20: bit 0 the view write-back, bit 1 the frame threads on the A510s, bit 2 a check (16 lines a frame read again from DRAM after the kernel drops them, and compared).
+- Lumis 0.2.18 (std/lumis, branch lumis-cam-cacheable from lumis-damage 810a3fda): asks for the view write-back and unpacks its rows in place (no copy); a second knobs byte after the whole mode block (the input's fifteenth), bit 0 `DEV_UNCACHED`, asks for the non-cacheable view for the comparison.
+
+**Why it is right:** a buffer is handed over only after its frame's DMA_DONE (`ring_turn` makes it the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer, nor the newest while another is free).
+So once its lines are dropped at MAP, whatever a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone, and any line fetched after (by the holder, or by speculation) is the frame's.
+The lines are clean: nothing writes a camera frame thru a write-back alias after the region's take cleaned it (the view is read-only, the kernel's alias untouched until the frames go back), so the clean writes nothing back and the invalidate loses nothing.
+Clean and invalidate, not `dc ivac`: the range is found under the lock and maintained with it let go, and a run given back meanwhile may be another process's frames, whose dirty lines a clean writes out where an invalidate would drop them.
+The probe line at a release: the driver reads its probe non-cacheable, and the architecture does not promise a non-cacheable read sees DRAM while a core holds the line write-back (mismatched attributes), so a write while held could read as none.
+
+**Where the maintenance belongs, and why there:**
+- In the kernel, called by the driver at MAP: correctness stays with the driver and the kernel (a holder that skips nothing can read stale lines), and it is one call a frame.
+- Not EL0 `dc civac` thru SCTLR_EL2.UCI: the bit is global, every EL0 process would get `dc civac`, `dc cvac`, `dc cvau` and `ic ivau` on anything it can read (a flush-and-reload timer, help for row hammering), for no gain: the call is a few microseconds against 0.4 to 1.8 ms of lines.
+- Not the reader a call per row: cambench's check made one call a 5120-byte line at 680 ns, against about 2.8 ns a line in one call over a buffer (715 us for 16 MiB), so per row would cost about 2 ms of calls a frame. Per band (four calls, one a reading thread) would spread the lines over the readers but leave correctness to the kist; not done.
+- Tried and dropped: a driver thread making each new frame's buffer right as it landed, ahead of MAP. 36 to 50 of every 64 were done ahead, MAP still did 9 to 33 itself (the holder asked as the frame landed), the thread's own took 2.5 to 3.7 ms each with Lumis drawing, and the turns were no shorter.
+
+**Measured on the Pro** (cam-cacheable 2db55058 RAM-reloaded over a510-workers 40d28cee, b947, not attested; the main binned, kind 1, fll 5170, exposure 3000 lines: 16.28 ms, 61.4 a second by the driver's clock; the driver hand-spawned with input 01, every stream ended by its own close).
+
+cambench, 128 frames, four threads on the A510s, PD off (16 MiB buffers):
+
+| view | work | a frame | taken | the maintenance at MAP |
+|---|---|---|---|---|
+| non-cacheable | read every line | 41.7 ms | 23 a second, 199 skipped | none |
+| write-back | read every line | 2.8 ms | 61 a second, none skipped | 715 to 778 us on average, 799 at most |
+| write-back | read and u16 add | 9.4 ms (reading 1.4 ms a thread) | 61 a second, 1 skipped | 718 to 785 us, 818 at most |
+
+The check: 0 of 2048 sampled lines differed from DRAM with the maintenance; 0 of 2048 without it too (input `010000000000000001`): with four buffers and 48 MB read between a buffer's turns the old lines are gone from every cache by then, so this ring cannot show the hazard, which the architecture still allows (speculative fills, a smaller ring, a slower reader).
+
+Lumis 0.2.18, hand-spawned (`--use display --use touch --dma surface --ira --domain --entropy --use camera`), 32 s (`DEV_OPEN`), inputs `280100003214B80B0000000000` (the intake on the A510s) and `680100003214B80B0000000000` (bit 6: on the A715s), the non-cacheable runs with `0001` after them; every run about 1968 frames written by the driver, no error word, held buffers written over 0, crowded 0:
+
+| intake | view | the integrator a frame (first 64, last 64) | a turn (first, last) | taken (frames integrated of about 1968) | preview: new images drawn a second (second 4 s window, last) and Lumis's draw | the maintenance at MAP |
+|---|---|---|---|---|---|---|
+| A510s | non-cacheable | 53.3, 53.8 ms | 53.1, 53.9 ms | 18.6 a second (576) | 18.5, 18.5 (13.5 to 15.5 ms) | none |
+| A510s | write-back | 13.2, 17.2 ms | 16.2, 19.4 ms | 61 a second for the first 1300 frames, 48 to 52 at the end (1856) | 56, 26 (13.7 to 27 ms) | 1.1 to 1.7 ms on average, 7.4 at most |
+| A715s | non-cacheable | 7.5, 17.4 ms | 16.0, 18.8 ms | 61 a second, 50 to 53 at the end (1792) | 43, 21 (17 to 35 ms) | none |
+| A715s | write-back (three runs, one with `diag clock cammem on`) | 4.3 to 4.8, 10.4 to 11.2 ms | 16.0, 16.5 to 17.8 ms | 61 a second, 57 to 61 at the end (1920 each) | 45 to 51, 21 to 25 (14.6 to 33.5 ms) | 420 us for the first 200 frames, then 0.7 to 1.8 ms, 8.5 at most |
+
+- **The intake is no longer the wall**: write-back on the A715s takes 1920 of 1968 frames, the integrator 4.3 ms a frame where non-cacheable it was 7.5 to 19; on the A510s it keeps the sensor's 61 a second for about 20 s.
+- **Everything on the CPU slows as a run goes on**, by the same factor in every run: the A715 integrator 4.4 to 10.4 ms, the A510 integrator 13 to 17 (to 25 in one run), Lumis's draw 14.6 to 33 ms, the maintenance 0.42 to 1.6 ms, from about 3 to 8 s into the stream. Not ferros's governor (`diag clock`: the A715s asked 2367 MHz and the A510s 1704 the whole run), not the memory clocks (the same with `cammem on`, MIF 3744 and DSU 1800 held), no thermal cap set (the zones 62 to 66 C after a run, peaks of 89 to 93 C kept since the boot); `diag thermal`'s divider line reads CLKDIVSTEP bits seen on all three clusters (G#80000901 every bit seen). Unmeasured: the cores' real clock during a run (the hardware's divider steps, or the firmware's power limit). With it the preview falls from about 50 to about 25 new images a second.
+- **The non-cacheable A715 run did not starve the driver this time** (no "written while the kist held it", no late frame), the integrator 7.5 ms at first; it slowed to 17 ms with the rest.
+
+**If the front end writes a held buffer** (the Lumis session's "buffer 1 was written while the kist held it", then no frame for 2097 ms, with the A715s starved): `ring_turn` names a buffer neither held nor the newest while one is free (crowded 0 and none free 0 in every run above), so the ring's choice never names a held buffer; read from the code, the write happens only once the stream is already dying, a release missed (the frame thread late past a whole frame, the line masked so the armed action releases once, then LATE_CONFIG), where the engine writes outside the ring's choice. Not reproduced here. What a reader sees then:
+- non-cacheable: each line as DRAM holds it when read, old or new: a torn frame;
+- write-back: lines read before the write as they were (they stay in the caches), lines read after it from DRAM, new: the same torn frame; a line read twice reads the same both times. No worse: the view is read-only, so no dirty line can carry a reader's copy back over the front end's, and the release's probe check (its line dropped first) still counts the write.
+
+**To repeat:** `$B reload` the kernel; `tools/cambench-sweep.sh <out> 01 000100003214B80B00000000020800040000000007 fll 5170` (BIN the directory holding this branch's camera.bin and cambench.bin; the last byte 07: write-back, A510s, check); Lumis with the inputs above after the driver (`--name camera --serve camera --hw hsi2c1 --hw ispfe --hw csis --hw ispfe-sysreg --store cam --power camera --dma camera --irq ispfe0 --hw hsi2c3 --hw hsi2c2 --hw hsi2c4`, input 01).
+
+## The slowdown, measured (2026-11-18, branch slowdown-probe)
+
+"Everything on the CPU slows as a run goes on" (the section above) is two things, neither of them the camera's.
+Measured on the Pro, not attested, the driver hand-spawned with input 01, every stream ended by its own close; the kernel cam-cacheable plus the trace below, RAM-reloaded (b949, then b952).
+
+**The tools added:**
+- corebench's watch (input byte 0 = 3): one probe pinned to each core asked (u16 mask), every 2^-4 s its real clock (PMU cycles over the counter), adds and NEON flops a cycle, and dependent-load chases in its own L2, the shared L3 (4 MiB) and DRAM (64 MiB); a line a measure each second. An optional no-camera load (a u16 mask: each core streams 16 MiB into u16 sums).
+- cambench's window line every 64 frames: the work a frame, and per frame thread its PMU clock over its own busy time, instructions and backend stalls a cycle, L2 and L3 refills.
+- `diag thermal trace [n]` (thermal.rs): each second the zones, the PLL_CON3 rate of CPUCL0, the DSU, CPUCL1 and CPUCL2 (24.576 MHz x M / (P x 2^S)), the three CLKDIVSTEP_STAT words, SYSREG_CPUCL0's MPMM words, the PMIC warning pins (GPA9, GPA10), and how many service-loop passes that second read CPUCL0's CLKDIVSTEP_STAT with bit 31 set (about 2000 passes a second).
+
+**One: ferros's governor, flat, not a slowdown.** cambench, write-back, three A715 threads, u16 add, 2048 frames (33.5 s):
+
+| clocks | work a frame | the threads' real clock | the MAP's maintenance |
+|---|---|---|---|
+| held at the tops (`diag dvfs policy off`, A715 2367, A510 1704, X3 2914, MIF 3744, DSU 1800) | 2.16 ms, first window to last | 2413 MHz | 394 us |
+| the governor | 6.3 to 7.7 ms from the first window | 440 to 780 MHz (the PLL agrees) | 620 to 740 us |
+| the governor, the view non-cacheable | 7.1 to 9.6 ms | 540 to 780 MHz | none |
+| held, non-cacheable | 4.26 ms | 2390 MHz | none |
+
+- The governor aims each cluster's busiest core at 4/5 busy (service.rs `Gov`). Three threads busy about 7 ms of a 16.4 ms frame never reach that, so the A715s sit at or near their floor, 402 MHz. The camera's lift raises their ceiling, not their floor. cambench still took all 61 frames a second, none skipped.
+- The "the A715s asked 2367 MHz" of the section above was the USB diag's own boost: every diag's transfer puts both clusters at their top, and `diag clock`'s "asked" shows it. Its residency showed a time-weighted mean of 524 MHz for the run.
+- With every clock held, nothing slows: 2.16 ms a frame for 2048 frames, the A510 run below 3.69 ms for 2048. The die reached only 49 C and 61 C.
+
+**Two: a hardware clock divider on CPUCL0 (the A510s and the DSU) as the die heats.** Lumis 0.2.18, the intake on the A510s (input `280100003214B80B0000000000`), governed, 32 s (twice, the second with the watch's probes):
+
+| seconds into the stream | 1-4 | 5-8 | 9-12 | 13-16 | 17-20 | 21-24 | 25-28 | 29-32 |
+|---|---|---|---|---|---|---|---|---|
+| new images drawn a second (run 2) | 22 (start) | 55 | 41 | 34 | 31 | 29 | 28 | 27 |
+| Lumis's draw a new image (ms) | 14.0 | 13.8 | 19.2 | 23.6 | 25.1 | 27.1 | 29.0 | 30.2 |
+| CPUCL0 passes stepped (of about 2000 a second) | 0 | 0 to 22 % | 26 to 37 % | 32 to 40 % | 35 to 47 % | 36 to 54 % | 44 to 53 % | 50 to 52 % |
+| LITTLE zone (C) | 66 to 83 | 85 to 87 | 85 to 90 | 85 to 90 | 85 to 90 | 86 to 90 | 86 to 90 | 89 to 91 |
+
+- The steps begin within a second or two of the LITTLE zone reaching 85 to 87 C (the stream's fifth second), grow while it stays there, and stop with the stream (18 % the second it closed at 72 C, 0 at 66 C). Stepping, CPUCL0's CLKDIVSTEP_STAT reads G#80000801; at rest, G#101. CPUCL1's read G#80000801 too in five of the hot seconds (1 Hz reads); CPUCL2's (the X3, at 880 MHz, BIG 79 C) never did.
+- The PLLs held their rates thru the steps: A715 2367, DSU 1800 (and in run 1 the firmware's rates agreed, MIF 3744). A divider downstream of the PLL is invisible to both. One coincidence to untangle: in both runs the governor lifted the A510s from 1098 to 1704 MHz in the same second the steps began (their intake saturating as it slowed, or the lift adding the current that trips it); four A510s held at 1704 MHz on a cool die (61 C, below) never stepped.
+- The cores' clocks barely moved (the probes' PMU cycles: the A715s 2400 to 2000-2300 MHz, the A510s about 1100-1300 as governed). The memory side slowed: dependent-load latency on the A715s L3 88 to 250-330 ns, DRAM 166 to 400-550 ns; on the A510s DRAM 275 to 700 ns. The DSU (the L3 and the cores' way to DRAM) is clocked from CMU_CPUCL0, so its divider slows every cluster at once, the X3's display included. That is why everything slowed by the same factor.
+- The heat: MID and LITTLE went from 48 C to 85-90 C in about 6 s, with the A715s at 2367 MHz (Lumis's UI threads, 1.5 W a core) and the A510s at 1704.
+- Not the camera's traffic: cambench on four A510s at 1719 MHz with everything held at the top, 33 s, 61 C at most: not one stepped pass, 3.69 ms a frame from the first window to the last.
+- Not MPMM: SYSREG_CPUCL0's MPMM words read 0 in every second (MPMMEN 0: Linux sends ACPM the levels at probe, ferros never does). The warning pins read GPA9 G#11 and GPA10 G#0 in every second read (a 1 Hz read can miss a pulse).
+
+
+**What drives CPUCL0's divider, from the reference tree** (/mnt/Harbor/ferros-ref; nothing in it gives the status word's bits):
+- The power firmware's init writes three words to CMU_CPUCL0 (flexpmu_cal_system_zuma.h:15-17): CLKDIVSTEP_SMPL_FLT at +G#834 = G#8000FFFF, CLKDIVSTEP_CON at +G#838 = G#00F041C3, CLKDIVSTEP at +G#830 = G#00210007. Linux's BCL driver then sets CLKDIVSTEP to 1 (zuma-shusky-bcl.dtsi `cpu0_clkdivstep`).
+- CPUCL1, CPUCL2, the GPU and the TPU each get OCP, VDROOP and SMPL filters. CPUCL0, the A510s with the DSU, gets the SMPL filter alone.
+- So the one source wired to CPUCL0's divider is SMPL_WARN: the main PMIC's warning that the battery's voltage has sagged under its level. It is the same line every cluster's divider hears, which fits CPUCL1's status stepping in the same seconds.
+- No TMU trip, ACPM thermal path or DSU source is named for it. ACPM's thermal governor caps through DVFS, and the PLLs never moved.
+
+**Measured instead (b954, 81-82 % battery, the host's port charging): heat, a cluster at a time, at about 88 C; not the battery.**
+- SMPL_WARN_CTRL reads G#68: 2.9 V, below Linux's 3.1 V. OCP_WARN is off on B2M, B3M and B7M (G#0).
+- GPA9's CON word is G#2: pin 4 is an input, so the data bit shows SMPL_WARN_R_L. It never read low.
+- Under 2.4 A of load the cell never fell under 3.93 V, so neither SMPL level was ever near. Setting Linux's 3.1 V could change nothing, and was not tried.
+- **No camera, the watch's load on all eight workers, every clock at its top, 40 s:**
+  - CPUCL0 began stepping the second LITTLE reached 88 C (it read 86 the second before, with nothing stepped). It climbed over 15 s to 50-77 % of passes, with LITTLE at 84-91.
+  - CPUCL2, the X3's, stepped in exactly the five seconds BIG read 88-90 C. The X3 ran only the kernel, and measured 365 MHz (2914 / 8) in those seconds.
+  - CPUCL1 never stepped there (MID at most 87). In the Lumis runs it stepped whenever MID read 88-90.
+  - Each cluster's divider follows its own zone, which a shared electrical warning would not do.
+  - The load's end stopped the steps within the second, but the zones fell under 85 C within that second too.
+  - ACPM's trip counters stayed 0 (ferros never sends TMU_IPC_INIT), and the PLLs never moved. A thermal path into CLKDIVSTEP that the reference tree does not name.
+- **Lumis with the intake on the A715s** (input bit 6), governed, 32 s:
+  - New images 53 a second falling to 27, the draw 14.5 to 28-30 ms, the integrator 4.3 to 9.9 ms.
+  - CPUCL0 stepped from LITTLE's 87 C, CPUCL1 from MID's 88.
+  - The stream died at frame 1783, 29 s in ("no frame in 2129 ms", the A715s starved the frame thread, as the section above saw once); the driver closed itself.
+
+**The governor: what it sees, and a proposal (not built).**
+- **What it sees:** each 64th of a second it takes the busiest core's awake share and moves the level toward the running rate x the averaged share x 5/4, aiming at 4/5 busy (service.rs `Gov`).
+  - The camera lift raises only the ceiling (to 2367 MHz).
+  - Under cambench, three threads busy about 7 ms of a 16.4 ms frame read under 4/5, so the A715s settle at or near their floor, 402 MHz, with a saturated window now and then (time-weighted mean 524 MHz).
+  - Under Lumis the UI threads' load reads saturated and climbs to the ceiling, 2367 MHz, where it stays: that load is what heats the die.
+- **The two loads want opposite things.** cambench keeps 61 a second at the floor, at 3x its held-clock latency (7 ms against 2.16), for little power. Lumis at the ceiling pulls about 6 W from the A715s alone and walks into the divider within 6 s.
+- **Proposal:** a ceiling for the A715s while a camera streams (`CAM_HOLD`'s lift capped), instead of their whole table.
+  - At 1572 MHz an A715 draws 449 mW against 1514 at 2367 (`pixel_em`, THERMAL.md): the four cores go from about 6.1 W to 1.8 W for two thirds of the clock.
+  - cambench's measured points bracket the cost: 2.16 ms a frame at 2413 MHz, 7 ms at about 480. The work is memory-bound, so at 1572 it should land nearer 3 ms than 3.2 (cycles a frame fall with the clock: 5.2 M at 2413, 3.4 M at 480).
+  - The test before any build: `diag clock lift 1572000` and the A510-intake Lumis run again, read for the stepped share and the preview's new images a second (55 falling to 27 today).
+- **No floor is proposed:** a frame-paced consumer that keeps up at the floor (cambench) loses only latency. Lumis's intake keeps up on the A510s.
+- **The test, run (b954): `diag clock lift 1572000`, Lumis with the intake on the A510s, governed, 32 s.**
+  - Not one CPUCL0 step. The zones peaked at 79-80 C, not 90.
+  - New images held at 39 a second from the second window to the last (55 falling to 27 at 2367).
+  - Lumis's draw held at 19.8 ms (13.8 rising to 30). The integrator held 13.0-13.3 ms, with 1920 of 1968 frames integrated (1856 and 1728 at 2367).
+  - The MAP's maintenance held at 427-433 us. The A510s stayed at 1097 MHz.
+  - The ceiling buys a steady preview at about 70 % of the cold start's rate, for about 4 W less on the A715s. The lift went back to 2367000 after the run; the ceiling during a stream is the owner's choice to build.
+
+A reload with this kernel's first trace build (every divider word read every pass, six ACPM rate reads a second) found ACPM answering nothing and the device reset 35 s later (b950, the kernel's core between the clock policy and the heat step, crumb G#D7). The build committed reads only CPUCL0's word every pass and asks ACPM nothing extra.
+
+## Slits under Lumis (2026-11-18, branch slit-robust)
+
+The Lumis session's Slitscan (Lumis lumis-slit d2b67747, later a274d0b9; the driver hand-spawned, input 01; binned 4080 x 64 slits, frame 192 lines, 812 us apart, detached and slim, a ring of 256) died within seconds once Lumis drew and baked on the A715s: run 0b at slit 1296, run 0c at 3235 (with `cammem on`), each on LATE_CONFIG (G#10), though the same driver had drained 261120 slits with nothing drawing.
+Measured on the Pro, not attested, the identity unlocked at boot, RAM reloads b955 to b969 over slowdown-probe, the driver and Lumis hand-spawned (Lumis input `18`, 13 zero bytes, `02`: DEV_OPEN, 16 s, DEV_SLIT), every stream ended by its own close; logs in target/agent-slit-robust/runs of the main checkout.
+
+**What the logs said, read again:**
+- The one "stopped by a test" of every run is the SHADOW_UPDATE-only interrupt at stream on (status 8, before any DMA_DONE). No release was ever refused at a death.
+- Run 0c's `acted A#3237` is its 3236 DMA_DONEs plus one: the program ran twice on one DMA_DONE at the third slit (the place log G#20, G#30, G#50), so the index stood one ahead for the rest of the stream (harmless to the engine, but every slit's record then sat one buffer from its rows).
+- The six lock alarms of 7.8 ms or more were all at Lumis's spawns, none in a stream: process.rs's `build_from` after the gate (the lock taken again at line 7356 for a 22 MiB capsule: 20.6 ms at each spawn) and the host spawn's arc staging (service.rs 5434, 12.2 ms).
+- Every death had the same shape: one slit's DMA_DONE came while the line was still masked by the slit before (the line stays masked from the interrupt to the frame thread's ack), so the armed action never ran for it, its descriptor went unreleased, and the next slit hit LATE_CONFIG. The armed action covers a frame thread late by up to one period; a slit's period is 812 us.
+
+**Why the frame thread was late past a period, each measured** (tools below):
+| cause | measured | fix |
+|---|---|---|
+| the line on the X3: its waiter noticed only when the service loop's pass came round to `run_slice`, no A715 being idle to notice | 865 us behind the battery gauge's poll (crumbs D6 to F4), 6.0 ms once | an armed line follows its waiter's core (process.rs `irq_route`); interrupt to run then at most 39 to 253 us |
+| preempted mid-answer by another line's interrupt on its core, sent to the back of the queue | 4.4 ms behind Lumis's threads (the sensors' line on c6) | a device thread parked unasked in its interrupt's run keeps its place, urgent, and a core is asked for it (`ferros_el0_preempt`, `make_room`) |
+| a slice inherited nearly spent, ended mid-answer | parked 2 ms between two syscalls of one answer | the same |
+| the kernel lock, test-and-set, under Lumis's pool (its threads yielding every 10 us, 56k holds a second) | waits of 852 to 1029 us with no hold that long | a ticket lock (KERNEL.md Order item 8) |
+| its front credit spent (an answer of 60 to 100 us every 812 us, now and then 323) | woken to the back, not urgent, run 2.8 to 9.7 ms late | a device thread's credit leaks a quarter, not an eighth |
+| the frame thread's own cost: 56 register syscalls an answer | 91 us an answer | words that read 0 not written back: 60 us |
+| the acknowledgement clearing a DMA_DONE it never saw (a slit landed between the first read and the ack loop) | run 0b's death (an answer 786 us late, then LATE_CONFIG) | an unseen DMA_DONE left latched, so the line fires again at the ack |
+| SYS_IRQ_WAIT unmasking the line between the interrupt and its mask (the armed program runs first, a few us) | the double release of every run's start, 8 us apart; SHADOW_UPDATE interrupts refired 7 to 10 us later on whole frames | irqarm `TAKEN`: a wait does not unmask a line taken and not yet pending |
+
+**And then the release taken off the frame thread altogether** (ferros_layout irqarm `UNMASK`, KERNEL.md "Armed actions"): a slit ring arms TEST_BITS DMA_DONE, TEST_EQ place index, ADVANCE, WRITE G#1B to the image status (SOF, EOF, SHADOW_UPDATE, DMA_DONE cleared), UNMASK; the driver sets loch0's image interrupt mask (G#1C32_0430, the dtsi's irq-mask-reg) to DMA_DONE alone once its path is on, and counts slits from the engine's index past its own. Each slit's DMA_DONE then fires its own interrupt and its own release whatever the frame thread is doing; a late frame thread takes several slits in one answer. Whole frames keep the three operations: their descriptors are named a frame ahead by the frame thread, which a release it did not see would skip. The hand spawn's tenth byte 1 asks the three for an A/B; a kernel without UNMASK refuses the program and the driver arms the three.
+
+**The runs:**
+| kernel (b) and what it had | runs reaching the 16 s (19678 slits) | the others died at slit |
+|---|---|---|
+| the Lumis session's (slowdown-probe) | 0 of 2 | 1296, 3235 |
+| 955 to 958: the record only, then `dev follow on` by hand | 0 of 6 | 58, 195, 358, 430, 2047, 5481 |
+| 959 to 963: TAKEN, the ack fixes, armed lines following, preempted kept | 1 of 13 | 1283, 2456, 6662, 7348, 7774, 8656, 10245, 11288, 15249, 15853, 16048, 17608 |
+| 965: and the device credit | 0 of 4 | 5603, 6830, 9358, 13442 |
+| 966 to 968: and the ticket lock | 5 of 11 | 1641 to 14304 |
+| 969: and the open program | **7 of 7** | |
+- On b969 each run: every slit released by the kernel and left open (19678 to 19689), one stop (stream on's SHADOW_UPDATE), the gap between acted runs at most 915 to 1044 us, interrupt to run at most 162 us; 0 to 6 answers a run took several slits (5 the most), each a death before; Lumis's own line "A#0 written over while read, A#0 too old to read" every 4096 slits; the hottest zone 62 to 66 C.
+- Whole frames on b969 (Lumis, the init's mode): 239 frames, none written over, no error word, one stop a frame (its SHADOW_UPDATE; 379 stops for 239 frames before TAKEN).
+- Lumis a274d0b9's fallback ("the slits stopped (the driver ended); whole frames again, and Slitscan takes its band from them") appeared after every death up to b968 and never on b969. After it Lumis opened whole frames thru the vault's stored driver once and failed once ("the camera driver did not answer the open"); a hand-spawned driver that exits after its close leaves the stored one to answer.
+
+**A slit's exposure (the Lumis session's SET_EXPOSURE 68800205 ns, refused)**: that refusal was the vault's stored driver (run 1, from before the detached slit). This driver plans a slit's exposure as any mode's (ferros_cam ccs `Timing::plan`): inside the slit's frame the integration alone, past it the frame lengthened to the integration and the margin. cambench's new +21 (an exposure in ns SET halfway thru a slit run), measured on b969: 68.8 ms taken mid-stream (frame 21863 lines, integration 21861, a slit every 68 ms), the slits after it 15 a second, none lost; 1/2000 s taken (159 lines, inside the 192-line frame, nothing else moved), 1232 slits a second after it. Lumis's own first ask in Slitscan, 3148 ns (one line), is refused rightly: the main's least integration is 2 lines.
+
+**A mode switch in place, without the power cycle and the init** (not built; the open's steps as the console times them): switch on 52 to 61 ms, the sensor's init 2064 to 2098 ms (1347 writes: 1.55 ms a write, every register access of the bus controller a syscall and its polls more), the job, engine and receiver about 17 ms, stream on to the first slit about 28 ms. A switch that kept the sensor powered and initialised would stop the stream, close the front end as the close does (its replay, CPU writes), write the new mode's registers in one hold (about 20 writes, some 30 ms at today's bus rate), place the job and start the engine again (17 ms), and take a new region when the ring's size differs (the slit ring 74 frames against the image ring's 64 to 73: about 5 ms each way, the frames given back wiped): about 0.1 to 0.15 s against today's 2.28 s. The front end's side is what every reopen already does with no power cycle of its domain. The sensor's side is the open question: October's mid-stream geometry change left the sensor stuck until a cold boot, but with no real hold (`w16(G#0104, 1)` wrote the release) and its PD channel on; every change since has been inside a real hold with PD and embedded data off for slits, and has never been tried on a streaming sensor without its power cycle. Separately the init itself could be faster: consecutive registers in one auto-increment transfer, the bus's status polled less.
+
+**The tools built for this:**
+- `diag "irqs runs"`: the last 64 armed runs (the counter, the core, how each ended, the words each operation read), the stopped runs kept apart, and at a freeze each core's last 8 crumbs; `diag "irqs freeze <us>"` / `"irqs freeze short <us>"` freeze it, and devsched's trace, at the first gap between acted runs longer or shorter; `diag irqs` adds the acted-to-acted gaps by 2^k us and the runs left open. A `dev freeze` at a late run snapshots the crumbs too.
+- `diag crumbs` and `diag "crumbs ring"`: the X3's longest stretch ending at each service-loop crumb (F0 to F6 added inside the pass) and the last 256 stretches of 2^7 us or more in time order.
+- `diag dev`: woken behind the queue for a spent credit, and the most credit then; `diag sched`: device threads kept at the front when parked mid-run.
+- The driver: the first answers with their lengths and counter times, the timeline's start on the counter (to set beside the kernel's runs), answers that took several slits.
+
+**Open:**
+- r6 (b958, `dev follow on`) died at slit 58 with every answer and every acted run on time and the index one ahead from the double release; not seen again, not understood.
+- A late interrupt on a worker with interrupts open (b965 v4: c6 at EL0 for 886 us before it took the line) was seen once; the open program does not cover an interrupt itself taken late past the blanking.
+- The ticket lock, the device credit and the kept preemption change every process's scheduling, measured here only under Lumis and the camera: worth a Photon scroll and the 96-a-second whole-frame bench before forge.
+- `build_from` holds the lock 20.6 ms for a 22 MiB capsule (each Lumis spawn).
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 

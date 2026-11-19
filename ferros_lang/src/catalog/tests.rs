@@ -40,6 +40,9 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
         (Say::SecurityUnsupported(H), 1),
         (Say::DidNotAnswer(H), 1),
         (Say::RefusedPassphrase(H), 1),
+        (Say::TypeOnKeyboard(H), 1),
+        (Say::JoinedNet(H), 1),
+        (Say::Forgotten(H), 1),
         (Say::PassphraseLength { min: 8, max: 63 }, 0),
     ]
 }

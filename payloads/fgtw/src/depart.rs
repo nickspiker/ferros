@@ -469,7 +469,7 @@ impl Client {
                     };
                     if let Ok(Some(b)) = fetched {
                         if let Ok(bytes) = b.to_vsf_bytes() {
-                            self.persist_set(b"chain", &bytes);
+                            self.keep_chain(&bytes);
                         }
                         self.note_members(&b);
                     }

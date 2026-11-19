@@ -316,14 +316,7 @@ fn arm_here() {
 
 /// The cores a run samples: the kernel's (this one) and every worker that is up.
 fn cores() -> u16 {
-    let mut m = 1u16 << core();
-    let up = crate::smp::UP.load(Relaxed);
-    for (k, &aff) in crate::smp::WORKERS.iter().enumerate() {
-        if up & (1 << k) != 0 {
-            m |= 1 << ((aff >> 8) & 0xF);
-        }
-    }
-    m
+    (1u16 << core()) | crate::smp::UP.load(Relaxed) as u16
 }
 
 /// Whether every tick of the last run is over: a tick that read ON before `stop` cleared it writes for a few microseconds more, and a run started or freed under it would lose its record or take its memory. Two periods after the stop none can be left (a tick held by masked IRQs waits before it reads ON, not after).

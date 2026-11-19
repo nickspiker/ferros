@@ -10,9 +10,13 @@ pub const TEST_EQ: u32 = 2;
 pub const ADVANCE: u32 = 3;
 /// `write(off, b)`.
 pub const WRITE: u32 = 4;
+/// The program's last operation, never another: the line is left unmasked after the run (the kernel masks it otherwise, until the driver's ack), the register at `off` read once first so the writes before it have reached the device.
+/// For a program that clears its own interrupt's source (a WRITE of its status bits), so the next event fires its own interrupt whatever the driver is doing (2026-11-18, slit-robust: the camera's slits 812 us apart, a frame thread one period late lost the next release with the line masked).
+/// Reached only when every test before it passed; a line that still asserts fires again at once, and that run's failed test masks it as before.
+pub const UNMASK: u32 = 5;
 
-/// The most operations a line may be armed with.
-pub const OPS_MOST: usize = 1 << 2;
+/// The most operations a line may be armed with (four until UNMASK: the camera's slit program is five).
+pub const OPS_MOST: usize = 1 << 3;
 /// One operation's bytes: op, offset, a, b, little-endian words.
 pub const OP_BYTES: usize = 16;
 
@@ -70,6 +74,8 @@ pub fn check(bytes: &[u8], grant: usize) -> Result<([Op; OPS_MOST], usize), Refu
             // WHY wrapping: b = 2^32 - 1 (the whole word) is a sane mask whose successor is 0; the test asks that b + 1 has no bit in common with b.
             ADVANCE if o.b == 0 || o.b & o.b.wrapping_add(1) != 0 => return Err(Refusal::Mask),
             ADVANCE => {}
+            UNMASK if k + 1 != n => return Err(Refusal::Op),
+            UNMASK => {}
             _ => return Err(Refusal::Op),
         }
     }
@@ -138,8 +144,37 @@ mod tests {
         for bad in [0u32, 0xE, 0x10, 0x3FF0] {
             assert_eq!(one(Op { op: ADVANCE, off: 0, a: 16, b: bad }), Err(Refusal::Mask), "mask {bad:X}");
         }
-        for op in [0u32, 5, u32::MAX] {
+        for op in [0u32, 6, u32::MAX] {
             assert_eq!(one(Op { op, off: 0, a: 1, b: 1 }), Err(Refusal::Op));
         }
+    }
+
+    /// UNMASK only as the last operation.
+    #[test]
+    fn unmask_last() {
+        let u = Op { op: UNMASK, off: 0x2_0424, a: 0, b: 0 };
+        let w = Op { op: WRITE, off: 0x2_0424, a: 0, b: 0x13 };
+        let (b, n) = bytes(&[w, u]);
+        assert!(check(&b[..n], 1 << 20).is_ok());
+        let (b, n) = bytes(&[u, w]);
+        assert_eq!(check(&b[..n], 1 << 20), Err(Refusal::Op));
+        let (b, n) = bytes(&[u]);
+        assert!(check(&b[..n], 1 << 20).is_ok());
+    }
+
+    /// The camera's slit program (payloads/camera `arm`): the release, then DMA_DONE and the frame's ends cleared, then the line left open.
+    #[test]
+    fn the_cameras_slit_program() {
+        let cam = [
+            Op { op: TEST_BITS, off: 0x2_0424, a: 0x10, b: 0 },
+            Op { op: TEST_EQ, off: 0x9_0014, a: 0, b: 0x9_0010 },
+            Op { op: ADVANCE, off: 0x9_0010, a: 16, b: (1 << 16) - 1 },
+            Op { op: WRITE, off: 0x2_0424, a: 0, b: 0x13 },
+            Op { op: UNMASK, off: 0x2_0424, a: 0, b: 0 },
+        ];
+        let (b, n) = bytes(&cam);
+        let (ops, k) = check(&b[..n], 1 << 20).unwrap();
+        assert_eq!(k, 5);
+        assert_eq!(&ops[..5], &cam);
     }
 }

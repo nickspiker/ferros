@@ -3,7 +3,7 @@
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the old heap region (not read since 2026-11-11: the heap is the display's own arc, grown on demand), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the pucks' endpoint (serve; docs/PUCKS.md, puck.rs: the old heap region until 2026-11-17, not read since 2026-11-11), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -34,6 +34,7 @@
 //! - 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
 //! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
+//! - 73 `puck bind [count u8][count x (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on the `puck` endpoint (slot 9; puck.rs, docs/PUCKS.md); the system's alone. A scene circle with icon G#90 + j is that puck's circle; op 25 with that icon is its focus, its fuller face, still at the 10 Hz flips.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -54,6 +55,7 @@ mod modeset;
 mod neon;
 mod odt;
 mod quick;
+mod puck;
 use odt::{panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -105,9 +107,7 @@ const S_DMA0: u64 = 5;
 const S_DPP0: u64 = 6;
 const S_GPP0: u64 = 7;
 const S_FB: u64 = 8;
-/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); the slot stays so every later one keeps its number.
-#[allow(dead_code)]
-const S_HEAP: u64 = 9;
+/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); since 2026-11-17 the pucks' endpoint, served by puck.rs (`puck::S_PUCK`).
 const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
 const S_SRAMC0: u64 = 12;
@@ -696,6 +696,8 @@ fn icon_decode() -> [u16; 256] {
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
 /// The ferros mark's number, one past the bundle's five (counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`); the bundle carries no raster of it.
 const ICON_FERROS: u8 = 6;
+/// The app icons' mip chains, once built (the server's start): what a page draws a kist's icon from (op 77).
+static mut MIPS: Option<&'static [draw::Mips]> = None;
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
 fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
@@ -749,6 +751,12 @@ static mut CLIP_PHASE: Option<usize> = None;
 static mut CLIP_MASK: u32 = 0;
 /// The last frame a client sent — a camera op alone, or a batch holding one (the map's: `begin`, its overlay, the camera with the keep flag) — as it came: the clock's redraws replay it.
 static mut LAST_FRAME: ([u8; SLOT], usize) = ([0; SLOT], 0);
+/// The last plain deck frame (a batch from `begin`, or a camera op alone) as the map sent it, never emptied by the glows or the scene changing (ops 57, 12, 13, 17 empty `LAST_FRAME` until the next frame): what the pucks' squares are drawn again with when `LAST_FRAME` is empty, the camera as the map last showed it, the scene and glows as they are now (the 8a, 2026-11-18: the map sent glows with no frame after them, and the pucks' squares stopped reaching the glass).
+static mut LAST_DECK: ([u8; SLOT], usize) = ([0; SLOT], 0);
+/// The op that last emptied `LAST_FRAME` (a measure, 2026-11-18: the pucks' squares stopped reaching the glass on the 8a while nothing drew the deck again).
+static LAST_FRAME_CLEARED: AtomicU32 = AtomicU32::new(0);
+/// Back's Escapes the apps did not use (op 76), counted; its low byte rides on op 5.
+static ESC_UNUSED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether a batch (op 15) holds a camera op.
 fn batch_has_camera(m: &[u8]) -> bool {
@@ -807,7 +815,8 @@ fn gravity_poll() -> bool {
         return false;
     }
     // To the face's own resolution: its edge is antialiased in 1/256 of a pixel, so at radius R pixels a turn under 1/(256 R) radians changes no pixel — and R in the clock's Q8 units is 256 R, so the step is 1/R(Q8). Not a dead zone: every turn the glass can show is drawn, at once; one it cannot show is not a frame.
-    let r_q8 = (unsafe { CLOCK_GEOM }.2).max(256) as f32;
+    // WHY the floor: before any face is on the glass the radius is 0, and the step would divide by it.
+    let r_q8 = (unsafe { CLOCK_GEOM }.2).max(puck::largest_r()).max(256) as f32;
     let a = libm::roundf(libm::atan2f(x, y) * r_q8) / r_q8;
     let turn = ((libm::cosf(a) * 16384.0) as i64, (libm::sinf(a) * 16384.0) as i64);
     let changed = unsafe { GRAV_TURN } != Some(turn);
@@ -1283,13 +1292,45 @@ fn freq_ticks() -> u64 {
 }
 
 /// Text centred on (cx, cy) and turned by (c, s), front to back: the clock's digits, which turn with its face.
+/// Draw `s` at `px` pixels with its baseline starting at (x, y), turned by (c, s) on the screen (clockwise for positive s, y down; (1, 0) upright), in `colour` (G#RRGGBB) under what is there. Returns the advance along the baseline. (The glyph engine's canvas draw, kept here since its source is shared with the pucks thru ferros_glyphs, 2026-11-18.)
+#[allow(clippy::too_many_arguments)]
+fn glyph_draw(g: &mut glyphs::Glyphs, px_buf: &mut [Px], width: usize, height: usize, text: &str, x: f32, y: f32, px: f32, turn: (f32, f32), colour: u32) -> f32 {
+    let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+    let solid = draw::opaque(colour & 0x00FF_FFFF);
+    g.cover(text, x, y, px, turn, |sx, sy, a| {
+        // WHY the bounds: a glyph's pixels come from its outline at a pen the caller placed anywhere, so they can fall outside the canvas (or this thread's band of it); the index would then be past the buffer.
+        if sx >= bx0 && sy >= by0 && sx < bx1 && sy < by1 {
+            let p = &mut px_buf[sy as usize * width + sx as usize];
+            *p = draw::under(*p, draw::cover(solid, a));
+        }
+    })
+}
+
 fn text_turned_centre(pixels: &mut [Px], width: usize, height: usize, s: &str, cx: f32, cy: f32, px: f32, turn: (f32, f32), colour: u32) {
     let g = glyph_engine();
     let tw = g.width(s, px);
     // The baseline's start in the text's own frame, (−width/2, +0.36 em) from the centre, turned onto the screen.
     let (fx, fy) = (-tw * 0.5, px * 0.36);
     let (tc, ts) = turn;
-    g.draw(pixels, width, height, s, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, px, turn, colour);
+    glyph_draw(g, pixels, width, height, s, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, px, turn, colour);
+}
+
+/// A puck with no square yet (waiting on its first tap's permissions, or not yet up): its name in its circle, turned with its face, as wide as a chord of three quarters of the circle allows, so the circle reads as that puck rather than an empty one (owner, 2026-11-18, on the 8a: "only the calculator puck shows").
+#[allow(clippy::too_many_arguments)]
+fn puck_name(px: &mut [Px], width: usize, height: usize, cir: &Circle, cx: i64, cy: i64, r: i64, tc: i64, ts: i64, colour: u32) {
+    let Ok(name) = core::str::from_utf8(&cir.label[..cir.len as usize]) else { return };
+    if name.is_empty() {
+        return;
+    }
+    let room = (r >> 8) as f32 * 1.5;
+    // WHY the floor: a name with no advance in the typeface would give a width of 0 to divide by.
+    let w = text_width(&Font, name, 100.).max(1.);
+    // As big as the chord allows, and never past a fifth of the circle's height: a smooth minimum, so the size does not kink as the circle grows.
+    let fit = room / w * 100.;
+    let cap = (r >> 8) as f32 * 0.4;
+    let size = fit * cap / libm::sqrtf(fit * fit + cap * cap);
+    text_turned_centre(px, width, height, name, (cx >> 8) as f32 + 0.5, (cy >> 8) as f32 + 0.5, size, (tc as f32 / 16384., ts as f32 / 16384.), 0xFF00_0000 | colour);
+    ALLOC.reset();
 }
 
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
@@ -1514,7 +1555,7 @@ struct Font;
 /// Text into the canvas, front to back (under what is there), upright, left-aligned at (x, baseline). Returns the advance.
 fn text(c: &mut Canvas, _font: &Font, s: &str, x: f32, baseline: f32, px: f32, colour: u32) -> f32 {
     let (w, h) = (c.width, c.height);
-    glyph_engine().draw(c.pixels, w, h, s, x, baseline, px, (1.0, 0.0), colour)
+    glyph_draw(glyph_engine(), c.pixels, w, h, s, x, baseline, px, (1.0, 0.0), colour)
 }
 
 fn text_width(_font: &Font, s: &str, px: f32) -> f32 {
@@ -2418,6 +2459,34 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 paint::fill_rect(&mut c, x, y, w, h, 0xFF00_0000 | colour(9), None, None);
             }
             Some(draw::Rect { x0: x as i32, y0: y as i32, x1: (x + w.max(1)) as i32, y1: (y + h.max(1)) as i32 })
+        }
+        // 77 `icon [cx i16][cy i16][r u16][scene index u8]`: scene circle i's own picture, upright, in a circle of radius r at (cx, cy) on the page (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): its bundle icon, the ferros mark, a puck's square as it is now (its name's plane until it has one), else the theme's fill.
+        Some(77) if m.len() >= 8 => {
+            let (x, y, r, i) = (i16le(1), i16le(3), u16le(5), m[7] as usize);
+            // WHY the bound: the index is the client's, and the scene holds SCENE_N circles.
+            if i >= unsafe { SCENE_N } {
+                return None;
+            }
+            let cir = unsafe { SCENE[i] };
+            let (cx, cy, rr) = ((x << 8) + 128, (y << 8) + 128, r << 8);
+            let th = ferros_sys::theme::current();
+            if let Some(px) = px {
+                let full = draw::Rect::full(width, height);
+                if puck::is_puck(cir.icon) {
+                    if !puck::draw_into(px, width, full, (cir.icon - puck::PUCK0) as usize, cx, cy, rr, 1 << 14, 0) {
+                        draw::disc(px, width, height, cx, cy, rr, th.plane & 0x00FF_FFFF);
+                    }
+                } else if cir.icon == ICON_FERROS {
+                    draw::logo(px, width, height, cx, cy, rr, 1 << 14, 0, true);
+                    draw::disc(px, width, height, cx, cy, rr, 0);
+                // WHY `get`: the icon is the map's word (1 to the bundle's count, 0 none); a kist with no bundle icon (0, or one this display does not carry) falls to the plain fill below.
+                } else if let Some(mp) = unsafe { MIPS }.and_then(|v| v.get((cir.icon as usize).wrapping_sub(1))) {
+                    draw::icon(px, width, height, cx, cy, rr, 1 << 14, 0, mp);
+                } else {
+                    draw::disc(px, width, height, cx, cy, rr, th.ring & 0x00FF_FFFF);
+                }
+            }
+            Some(draw::Rect { x0: (x - r - 2) as i32, y0: (y - r - 2) as i32, x1: (x + r + 3) as i32, y1: (y + r + 3) as i32 })
         }
         Some(16) if m.len() >= 11 => {
             let (x, y, r) = (i16le(1), i16le(3), u16le(5));
@@ -3375,7 +3444,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7351,13 +7420,24 @@ extern "C" fn receive(grants: u64) -> ! {
         let h = if names_surface(op) { caller_of(&tok) } else { 0 };
         if op == 5 {
             let (w, h) = unsafe { SCREEN_WH };
-            let mut out = [0u8; 13];
+            let mut out = [0u8; 14];
             out[0..2].copy_from_slice(&w.to_le_bytes());
             out[2..4].copy_from_slice(&h.to_le_bytes());
             out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
             out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
             out[12] = app_live() as u8;
+            // 13: the Escapes the apps did not use, counted (op 76), its low byte: the deck tells by a change that the app in front was at its top already (PREF_HELM `BACK_OUT`).
+            out[13] = ESC_UNUSED.load(Ordering::Relaxed) as u8;
             ferros_sys::reply(&tok, &out);
+            continue;
+        }
+        // 76 `escape unused [base u64]`: the app on that surface was handed Back's Escape and did not use it, at its top already (fluor's ferros host, owner 2026-11-18): counted for the deck (op 5 byte 13). Only the surface's holder; anyone else's word is not counted. → [0], or [4] `NOT_YOURS`.
+        if op == 76 && n >= 9 {
+            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
+            if mine.is_some() {
+                ESC_UNUSED.fetch_add(1, Ordering::Relaxed);
+            }
+            ferros_sys::reply(&tok, &[if mine.is_some() { 0 } else { NOT_YOURS }]);
             continue;
         }
         if op == 27 && n >= 13 {
@@ -7391,6 +7471,18 @@ extern "C" fn receive(grants: u64) -> ! {
             // A pass now, so the bars' worker (nudged on every pass) draws the helm with it: an idle screen (a kist in front drawing nothing new) had no pass to show it until the next minute (2026-11-12, on the 8a: a question waited with the Deck button still grey).
             ring_bell();
             ferros_sys::reply(&tok, &[0]);
+            continue;
+        }
+        // 73 `puck bind [count u8][count × (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on `puck` (puck.rs; docs/PUCKS.md). The system's alone: [4] (`NOT_YOURS`) from anyone else.
+        if op == 73 {
+            let r = if system(h) { puck::bind(&msg[1..n]) } else { NOT_YOURS };
+            ferros_sys::reply(&tok, &[r]);
+            continue;
+        }
+        // 74 `puck tap [scene index u8][x u16][y u16]`: a tap on a puck's circle at that screen pixel, passed thru to the puck (puck.rs `tap`; owner, 2026-11-18: "a simple tap passes thru so we can make our dozenal calculator work"). The system's alone: [4] (`NOT_YOURS`) from anyone else.
+        if op == 74 {
+            let r = if system(h) { puck::tap(&msg[1..n]) } else { NOT_YOURS };
+            ferros_sys::reply(&tok, &[r]);
             continue;
         }
         // 56 `quick`: the quick row's state from the map (quick.rs `set`, QUICK.md). → [0][the slide's length u16].
@@ -7756,6 +7848,7 @@ fn server(grants: u64) -> ! {
         }
         v.leak()
     };
+    unsafe { MIPS = Some(mips) };
     heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
@@ -7956,6 +8049,8 @@ fn server(grants: u64) -> ! {
         log.s(b"display: no receive thread\n");
         log.flush();
     }
+    // The pucks' lists arrive on their own endpoint (slot 9; puck.rs), each behind its kist's identity.
+    puck::start(grants);
     // Frame-start interrupts, and only those, on at DECON (the bootloader leaves every source enabled, INT_EN G#303011, with frame-done pending and never cleared); the pending bits cleared first; then the thread that takes them.
     pipe.wr(S_DECON, INT_EN, 0);
     pipe.wr(S_DECON, INT_PEND, !0);
@@ -8136,6 +8231,7 @@ fn server(grants: u64) -> ! {
                 Some(12) => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(12, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe {
@@ -8146,6 +8242,7 @@ fn server(grants: u64) -> ! {
                 Some(13) if m.len() >= 2 => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(13, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
@@ -8170,6 +8267,7 @@ fn server(grants: u64) -> ! {
                 Some(57) if m.len() >= 2 => {
                     // Circles' states (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
                     unsafe { LAST_FRAME.1 = 0 };
+                    LAST_FRAME_CLEARED.store(57, Ordering::Relaxed);
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
@@ -8230,7 +8328,7 @@ fn server(grants: u64) -> ! {
                     cam_key[..m.len().min(18)].copy_from_slice(&m[..m.len().min(18)]);
                     cam_key[13] = 0;
                     let theme_now = ferros_sys::theme::index() as u8;
-                    let plain = clip_k.is_none() && pre == 0 && unsafe { CLEAR_PENDING && { CUR_DMG }.is_empty() && (*(&raw const REGION_REQ)).is_none() && !REGION_ON && (*(&raw const FLIGHT_FRAME)).is_none() } && m.get(13).copied().unwrap_or(0) & 1 == 1 && unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().all(|c| c.icon != WIDGET_CLOCK && c.icon != WIDGET_SCOPE) };
+                    let plain = clip_k.is_none() && pre == 0 && unsafe { CLEAR_PENDING && { CUR_DMG }.is_empty() && (*(&raw const REGION_REQ)).is_none() && !REGION_ON && (*(&raw const FLIGHT_FRAME)).is_none() } && m.get(13).copied().unwrap_or(0) & 1 == 1 && unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().all(|c| c.icon != WIDGET_CLOCK && c.icon != WIDGET_SCOPE && !puck::is_puck(c.icon)) };
                     let moving = m.get(13).copied().unwrap_or(0) & 2 != 0;
                     let shift = match unsafe { *(&raw const PAN) } {
                         Some((a, at, ag, prev)) if plain && moving && at == theme_now && ag == unsafe { SCENE_GEN } && a[9..13] == cam_key[9..13] && a[14..18] == cam_key[14..18] => {
@@ -8369,7 +8467,9 @@ fn server(grants: u64) -> ! {
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
                     // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
+                    // What each puck's circle shows of itself this frame (puck.rs `scene_end`: a held WATCH answered when it changes), gathered in the same pass.
                     if clip_k.is_none() {
+                        puck::scene_start();
                         let discs = hit::discs();
                         let mut n = 0;
                         for i in 0..scene_n {
@@ -8382,9 +8482,16 @@ fn server(grants: u64) -> ! {
                             if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                                 continue;
                             }
+                            if puck::is_puck(cir.icon) {
+                                // Its face's turn: the camera's and the circle's own, as a kist's icon turns (owner, 2026-11-18: "use it for the screen orientation instead so it rotates with the kists and then we don't have to update with the gravity and then re-render everything every movement and it'll be crisp"; until then gravity's).
+                                let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                                puck::seen((cir.icon - puck::PUCK0) as usize, i, sx, sy, sr, fc, fs, width);
+                            }
                             discs[n] = (i as u16, sx, sy, sr);
                             n += 1;
                         }
+                        puck::scene_end();
                         let disc = region.map(|q| { let (gx, gy, gr, _) = ground(&q); (gx, gy, gr) });
                         hit::scene(n, disc);
                     }
@@ -8436,6 +8543,37 @@ fn server(grants: u64) -> ! {
                             let stroke = ferros_sys::theme::index() as i64;
                             let lit = cir.lit != 0;
                             let ri = sr;
+                            // A puck (puck.rs, docs/PUCKS.md): the square its kist drew, trimmed to its circle and placed, turned and scaled from the turn and size it was drawn at to the face's now, the theme's plane under it; cached as an icon is while its key (the square, the size, the turn) stays, drawn straight onto the canvas while the circle moves.
+                            if puck::is_puck(cir.icon) {
+                                let j = (cir.icon - puck::PUCK0) as usize;
+                                let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                // The face's turn, as `puck::seen` gave it to the puck: the camera's and the circle's own.
+                                let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                                let plane = th.plane & 0x00FF_FFFF;
+                                let key = [sr, puck::key(j) ^ stroke << 56, tc, ts, 0, cir.icon as i64];
+                                let d = (2 * ((sr >> 8) + 3)) as usize;
+                                let still = unsafe { LAST_KEY[i] == key };
+                                unsafe { LAST_KEY[i] = key };
+                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
+                                    let (spr, ext) = sprite(i, key, d, |px, d| {
+                                        let c = ((d as i64 / 2) << 8) | 128;
+                                        if !puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts) {
+                                            puck_name(px, d, d, &cir, c, c, ri, tc, ts, th.text2);
+                                        }
+                                        draw::disc(px, d, d, c, c, ri, plane);
+                                    });
+                                    scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
+                                } else {
+                                    let clip = draw::Rect::full(width, height).intersect(unsafe { draw::CLIP });
+                                    if !puck::draw_into(pixels, width, clip, j, sx, sy, ri, tc, ts) {
+                                        puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
+                                    }
+                                    scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
+                                }
+                                let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+                                unsafe { CUR_DMG = CUR_DMG.union(whole) };
+                                continue;
+                            }
                             // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
                             if cir.icon == WIDGET_SCOPE {
                                 // Turned as an icon is: the camera's turn, then the circle's own.
@@ -9332,6 +9470,7 @@ fn server(grants: u64) -> ! {
                 Some(17) if m.len() >= 12 => {
                     unsafe {
                         LAST_FRAME.1 = 0;
+                        LAST_FRAME_CLEARED.store(17, Ordering::Relaxed);
                         SCENE_GEN = SCENE_GEN.wrapping_add(1);
                     }
                     let i = m[1] as usize;
@@ -9665,6 +9804,24 @@ fn server(grants: u64) -> ! {
             rebake_replay = false;
             replay(&mut handle);
         }
+        // The pucks (puck.rs): an app in front hides every puck's circle and the deck coming back shows them (`covered`); gravity turns the pucks' faces by themselves (`regravity`: their views told, their boxes owed to every phase); a binding, a puck gone or, without the flips, a new square (`due`): the deck's last frame drawn again, the pucks' sprites keyed afresh. Only when the deck is what shows; under an app the next frame of the deck draws them.
+        let app_up = unsafe { (*(&raw const APP)).is_some() };
+        puck::covered(app_up || screen_off);
+        // With the temporal flips a new square is drawn into each phase at its flip, the puck's box alone (below, `puck::phase_due`); without them only a whole redraw carries it.
+        let flips = unsafe { TEMPORAL } && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
+        let puck_due = puck::due(!flips);
+        // The last frame, or when the glows or the scene have come since and emptied it, the last plain deck frame (`LAST_DECK`), drawn with the scene and glows as they are now.
+        if puck_due && !screen_off && !app_up {
+            if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
+                unsafe { LAST_FRAME = LAST_DECK };
+            }
+            if unsafe { LAST_FRAME.1 > 0 } {
+                puck::count(3);
+                replay(&mut handle);
+                // A whole frame: every phase gets every puck's newest square as it is published.
+                puck::phase_drew(0, true);
+            }
+        }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
         let flip_due = unsafe { CLIENT_DREW && TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
         // With a widget in focus the flips run at the panel's rate; the clock keeps 10 Hz, drawn into every phase at once (owner, 2026-10-25: the focused widget at full rate, everything else at 10).
@@ -9734,6 +9891,34 @@ fn server(grants: u64) -> ! {
                         CLIP_US = [0; 2];
                         CLOCK_PART_US = [0; 2];
                     }
+                }
+            }
+        }
+        // The pucks between frames (puck.rs): when this pass will flip, each puck whose newest square the phase about to show does not hold yet is drawn again there, its box alone (`draw::CLIP`, `CLIP_PHASE`, as the clock's wedges were), so a square costs its own circle's pixels, not the deck's (the 8a, 2026-11-18: a whole redraw per square was 35 to 46 ms of scene and 34 to 41 ms of publish at about ten squares a second).
+        if flip_due && !screen_off && unsafe { (*(&raw const APP)).is_none() } {
+            if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
+                unsafe { LAST_FRAME = LAST_DECK };
+            }
+            if unsafe { LAST_FRAME.1 > 0 } {
+                let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                let mut boxes = [draw::Rect::EMPTY; puck::N];
+                let nb = puck::phase_due(k, width, height, &mut boxes);
+                let t_box = now();
+                for clip in boxes[..nb].iter().filter(|c| !c.is_empty()) {
+                    puck::count(4);
+                    unsafe {
+                        draw::CLIP = *clip;
+                        CLIP_PHASE = Some(k);
+                    }
+                    replay(&mut handle);
+                    unsafe {
+                        CLIP_PHASE = None;
+                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                    }
+                }
+                if nb > 0 {
+                    puck::phase_drew(k, false);
+                    puck::count_us(ferros_sys::us_since(t_box));
                 }
             }
         }
@@ -9943,6 +10128,12 @@ fn server(grants: u64) -> ! {
                     let lf = &mut *(&raw mut LAST_FRAME);
                     lf.0[..m.len()].copy_from_slice(m);
                     lf.1 = m.len();
+                    // A plain deck frame (no page, no region: its batch opens with `begin`) kept for the pucks as well.
+                    if m.first() == Some(&14) || m.get(3) == Some(&1) {
+                        let ld = &mut *(&raw mut LAST_DECK);
+                        ld.0[..m.len()].copy_from_slice(m);
+                        ld.1 = m.len();
+                    }
                 }
             }
             if dsi_op {
@@ -10055,6 +10246,25 @@ fn server(grants: u64) -> ! {
                 tlog.dec(unsafe { PASSES[1] });
                 tlog.s(b", for an owed phase ");
                 tlog.dec(unsafe { PASSES[2] });
+                // The pucks since the last line (puck.rs `COUNTS`): squares handed over and taken, the frames told to the pucks that move, the views told, the replays they caused.
+                let pc = puck::counts();
+                tlog.s(b"; pucks: squares ");
+                tlog.dec(pc[0]);
+                tlog.s(b" taken, frames ");
+                tlog.dec(pc[1]);
+                tlog.s(b" told, views ");
+                tlog.dec(pc[2]);
+                tlog.s(b" told, replays ");
+                tlog.dec(pc[3]);
+                tlog.s(b" whole and ");
+                tlog.dec(pc[4]);
+                tlog.s(b" of a box (");
+                tlog.dec(if pc[4] > 0 { pc[5] / pc[4] } else { 0 });
+                tlog.s(b" us each)");
+                tlog.s(b"; last frame held ");
+                tlog.dec(unsafe { LAST_FRAME.1 } as u64);
+                tlog.s(b" bytes, last emptied by op ");
+                tlog.dec(LAST_FRAME_CLEARED.load(Ordering::Relaxed) as u64);
                 tlog.s(b"\n");
                 tlog.flush();
                 unsafe { PASSES = [0; 3] };
@@ -10271,6 +10481,10 @@ fn server(grants: u64) -> ! {
             let _ = pipe.present(win);
             frames += 1;
                         FRAMES.store(frames, Ordering::Relaxed);
+            // The deck showed a frame: the pucks that move continuously (the clock) hear it and draw their next square (puck.rs `frame`). Only while the deck is what shows.
+            if unsafe { (*(&raw const APP)).is_none() } {
+                puck::frame();
+            }
         } else if bars_arm {
             // The bars changed this pass (`bars_present`): the phase on the layer, which holds the change (published into all four), armed again for the next frame, as a camera op's frame is (owner, 2026-11-11: "the fps is stupidly bad, especially the console second row slide up/down": the slide showed at the 10 Hz flips). The map steps the slide by these shown frames (op 24), so it runs at the rate they go out.
             pipe.settle(&mut armed, true);

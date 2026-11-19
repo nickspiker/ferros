@@ -25,6 +25,7 @@
 //! - `11` CAPS (a camera open): the sensor's data formats (CCS G#00C0, its descriptors from G#00C2), its integration limits (G#1004) and the mode registers read back (`caps`).
 //!
 //! OPEN's mode block (docs/CAMERA.md "Modes, the bench and the slit"; owner, 2026-11-15: "straight as fast as possible full frame 1:1 and 2x binned for all back cams ... Then I want the slitscan wired up"): after `[1][id][view]`, `[kind][rows: u16][fll: u16][exposure: u16][flags][ring: log2][line length: u16]`, every field optional (`Spec`).
+//! After the whole block (its `[cols: u16]` too) one byte of view flags (`VIEW_FLAGS`): bit 0 the view write-back (docs/CAMERA.md "A cacheable view").
 //! The mode is written inside the sensor's hold after its init and before stream on, the front end's geometry rewritten to match (ferros_cam ccs, geom), its buffers sized to the mode's frame.
 //! A holder that ends without closing: its waiting FRAME's reply fails, or 2^22 us pass with nobody asking; either closes. The kernel takes the view back when either ends.
 #![no_std]
@@ -430,19 +431,25 @@ static LATE_TEST: AtomicU64 = AtomicU64::new(0);
 static PLACE_LOG: [AtomicU64; 1 << 3] = [const { AtomicU64::new(0) }; 1 << 3];
 /// DMA_DONEs whose descriptor the kernel had released already when this thread answered (camera_power.rs `ferros_cam_fast`): the engine's index read past the thread's own.
 static BY_KERNEL: AtomicU64 = AtomicU64::new(0);
+/// Answers that saw more than one frame (an open program's slits released while the thread was away), and the most frames one answer saw.
+static MULTI: AtomicU64 = AtomicU64::new(0);
+static MULTI_MOST: AtomicU64 = AtomicU64::new(0);
 /// The first 2^5 answers' image status (low byte) and counter (above it), said at the close.
 static IMG_LOG: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
+/// The same answers' length (counter ticks, from the status read to the end of `answer`, before the line's ack).
+static IMG_DUR: [AtomicU64; 1 << 5] = [const { AtomicU64::new(0) }; 1 << 5];
 fn img_log_say(g: u64) {
     let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
     let first = IMG_LOG[0].load(Ordering::Relaxed) >> 8;
     let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: the first answers' image status, us from the first:");
-    for e in IMG_LOG.iter() {
+    // The first one's time on the counter (us), to set them beside the kernel's armed runs (`diag "irqs runs"`); each as status@start+its length, the first 2^4 (a line holds no more).
+    let _ = write!(l, "camera: the first answers' image status, from A#{} us on the counter (status@us from the first+us it took):", us(first));
+    for (e, d) in IMG_LOG.iter().zip(IMG_DUR.iter()).take(1 << 4) {
         let v = e.load(Ordering::Relaxed);
         if v == 0 {
             break;
         }
-        let _ = write!(l, " {:X}@{}", v & 0xFF, us((v >> 8) - first));
+        let _ = write!(l, " {:X}@{}+{}", v & 0xFF, us((v >> 8) - first), us(d.load(Ordering::Relaxed)));
     }
     let _ = write!(l, "\n");
     console(g, &l.b[..l.n]);
@@ -480,8 +487,9 @@ fn tl_say(g: u64) {
     // WHY saturating: an open with fewer than 2^5 answers starts at its first.
     let k0 = n.saturating_sub(1 << 5);
     let mut l = Line { b: [0; 256], n: 0 };
-    let _ = write!(l, "camera: the last answers (us after the one before, status, index written, !error words):");
     let mut prev = TL[k0 & 0xFF].load(Ordering::Relaxed) >> 8;
+    // The first one's time on the counter (us), to set the answers beside the kernel's armed runs (`diag "irqs runs"`, the same counter).
+    let _ = write!(l, "camera: the last answers (from A#{} us on the counter; us after the one before, status, index written, !error words):", us(prev));
     for k in k0..n {
         let (v, x) = (TL[k & 0xFF].load(Ordering::Relaxed), TL_IDX[k & 0xFF].load(Ordering::Relaxed));
         let _ = write!(l, " {}:{:X}", us((v >> 8) - prev), v & 0xFF);
@@ -528,6 +536,8 @@ fn err_reset() {
         e.store(0, Ordering::Relaxed);
     }
     BY_KERNEL.store(0, Ordering::Relaxed);
+    MULTI.store(0, Ordering::Relaxed);
+    MULTI_MOST.store(0, Ordering::Relaxed);
 }
 /// What the front end said over the open and says now: the answers' timeline (`tl_say`), the first error, the overflow words, then every acknowledged word and the engine's words (`ack_say`).
 fn fe_say(g: u64, what: &str) {
@@ -705,7 +715,8 @@ fn desc_for(e: u64, r: usize) {
 }
 
 /// A frame's DMA_DONE with a slit ring (docs/CAMERA.md "The slit"): no choice and no hold, every descriptor named its buffer at the open (descriptor e buffer e mod the ring), so frame n lands in buffer (n - 1) mod the ring when its descriptor was released before it began. Its probe says whether it did (else it went where the last one did: `LATE`), its record is written after its rows (ferros_cam job `slit_bytes` leaves it 64 bytes: the frame's count, the counter at its DMA_DONE, its Eagle time, 1 when its probe moved), and the buffer two frames on has its probe patterned (the next frame's buffer may be under the engine already: since 2026-11-18 the kernel releases its descriptor in the interrupt, before this thread runs, so that probe was patterned a frame earlier; the consumer keeps clear of the two oldest buffers: SLITS).
-fn slit_turn(n: u64) {
+/// `newest`: this is the last slit the answer handles (an open program's answer may handle several at once): only then is the probe two on patterned, as the earlier ones' next buffers have landed already.
+fn slit_turn(n: u64, newest: bool) {
     let m = SLITS.load(Ordering::Relaxed) as usize;
     let b = ((n - 1) % m as u64) as usize;
     let moved = probe_read(b) != [PATTERN; 8];
@@ -719,7 +730,9 @@ fn slit_turn(n: u64) {
         core::ptr::write_volatile(rec.add(2), eagle_ns());
         core::ptr::write_volatile(rec.add(3), moved as u64);
     }
-    probe_pattern(((n + 1) % m as u64) as usize);
+    if newest {
+        probe_pattern(((n + 1) % m as u64) as usize);
+    }
     ferros_sys::dma_barrier();
 }
 
@@ -729,20 +742,43 @@ const FE_BASE: usize = 0x1C30_0000;
 static ARMED: AtomicU64 = AtomicU64::new(0);
 
 /// The next descriptor's release armed on the front end's line (SYS_IRQ_ARM, docs/KERNEL.md "Armed actions"): at each interrupt the kernel, before it masks the line and wakes the frame thread and without its lock, tests loch0's DMA_DONE, tests that the engine ran every released program (its place at its index), and advances the index round the ring as `answer` does. The release then never waits for the lock or a core (2026-11-18: the wake 3.3 ms behind a set_pref's hold, a release 2 ms late, both stopped the stream with LATE_CONFIG). `answer` writes the index only while the engine still reads its own, so a kernel that refuses (or lacks) the call leaves the release to the frame thread, as before.
+/// A slit ring's program also clears the frame's image bits (SOF, EOF, SHADOW_UPDATE, DMA_DONE) and leaves the line open (ferros_layout irqarm UNMASK), so each slit's DMA_DONE fires its own interrupt and release whatever the frame thread is doing: the frame thread counts the slits from the engine's index instead (`answer`), and loch0's image interrupt is DMA_DONE alone once its path is on (`IMG_MASK`).
+/// Why (2026-11-18, slit-robust, the Pro): slits 812 us apart under Lumis, and every death was a frame thread one period late with the line masked; scheduling fixes took the deaths from every run to about half, the rest a thread late for other reasons each time. Not for whole frames: their descriptors are named a frame ahead by the frame thread (`ring_turn`), which a release it did not see would skip.
+static OPEN: AtomicU64 = AtomicU64::new(0);
+/// loch0's image interrupt mask (zuma-isp-event-info.dtsi irq-mask-reg of isp_fe_loch0_csis_core_img_proc; the init leaves G#1A: EOF, SHADOW_UPDATE, DMA_DONE).
+const IMG_MASK: usize = 0x1C32_0430;
+/// The image bits an open program clears: SOF, EOF, SHADOW_UPDATE, DMA_DONE.
+const IMG_FRAME_BITS: u32 = ferros_cam::IMG_SOF | ferros_cam::IMG_EOF | ferros_cam::IMG_SHADOW | ferros_cam::IMG_DMA_DONE;
+
 fn arm(g: u64) {
-    use ferros_layout::irqarm::{encode, Op, ADVANCE, OPS_MOST, OP_BYTES, TEST_BITS, TEST_EQ};
+    use ferros_layout::irqarm::{encode, Op, ADVANCE, OPS_MOST, OP_BYTES, TEST_BITS, TEST_EQ, UNMASK, WRITE};
     let index = (ferros_cam::PDMA + ferros_cam::PDMA_INDEX - FE_BASE) as u32;
+    let status = (ferros_cam::IMG_STATUS - FE_BASE) as u32;
     let ops = [
-        Op { op: TEST_BITS, off: (ferros_cam::IMG_STATUS - FE_BASE) as u32, a: ferros_cam::IMG_DMA_DONE, b: 0 },
+        Op { op: TEST_BITS, off: status, a: ferros_cam::IMG_DMA_DONE, b: 0 },
         Op { op: TEST_EQ, off: (ferros_cam::PDMA + 0x14 - FE_BASE) as u32, a: 0, b: index },
         Op { op: ADVANCE, off: index, a: STEP, b: RING_N.load(Ordering::Relaxed) as u32 - 1 },
+        Op { op: WRITE, off: status, a: 0, b: IMG_FRAME_BITS },
+        Op { op: UNMASK, off: status, a: 0, b: 0 },
     ];
     let mut b = [0u8; OPS_MOST * OP_BYTES];
-    let n = encode(&ops, &mut b);
-    let r = ferros_sys::irq_arm(cap(g, S_IRQ), cap(g, S_FE), &b[..n]);
+    // A slit ring tries the open program first; a kernel without UNMASK refuses it, and gets the three operations.
+    let open = SLITS.load(Ordering::Relaxed) != 0 && NO_OPEN.load(Ordering::Relaxed) == 0;
+    let mut r = 1;
+    if open {
+        let n = encode(&ops, &mut b);
+        r = ferros_sys::irq_arm(cap(g, S_IRQ), cap(g, S_FE), &b[..n]);
+    }
+    OPEN.store((open && r == 0) as u64, Ordering::Relaxed);
+    if r != 0 {
+        let n = encode(&ops[..3], &mut b);
+        r = ferros_sys::irq_arm(cap(g, S_IRQ), cap(g, S_FE), &b[..n]);
+    }
     ARMED.store((r == 0) as u64, Ordering::Relaxed);
-    say!(g, "camera: the descriptor's release {}\n", if r == 0 { "armed on the front end's line (the kernel releases it at the interrupt)" } else { "not armed (the kernel refused or lacks SYS_IRQ_ARM): the frame thread releases it" });
+    say!(g, "camera: the descriptor's release {}\n", if r != 0 { "not armed (the kernel refused or lacks SYS_IRQ_ARM): the frame thread releases it" } else if OPEN.load(Ordering::Relaxed) != 0 { "armed on the front end's line, open (the kernel releases it and clears the slit's bits at each interrupt, the line never masked)" } else { "armed on the front end's line (the kernel releases it at the interrupt)" });
 }
+/// A device test (the hand spawn's tenth input byte 1): a slit ring armed with the three operations, the line masked at each interrupt as before, for the A/B.
+static NO_OPEN: AtomicU64 = AtomicU64::new(0);
 
 /// The front end answered once: loch0's image status read; on a frame's DMA_DONE the ring's turn (`ring_turn`) and the engine's index advanced at once; then every acknowledgement made in Linux's order, loch0's paths enabled after the first SHADOW_UPDATE, and the frame counted.
 /// The index first (2026-11-16, kernlock): the next descriptor must be released before the next frame begins, so the frame's blanking (128 lines, about 400 us, at the main's 96 a second) has to hold the interrupt's wake and everything the answer does before the index write; with the 56 acknowledgements ahead of it (about 170 us of register syscalls) the stream lost every other frame and stopped.
@@ -760,7 +796,14 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let last_done = DONE_T.load(Ordering::Relaxed);
     // The answer before this one. WHY wrapping: the first answer (k 0) looks at slot 255, still 0 then.
     let before = TL[k.wrapping_sub(1) & 0xFF].load(Ordering::Relaxed);
-    if img & ferros_cam::IMG_DMA_DONE != 0 {
+    // The frames this answer sees. With an open program (`OPEN`) the kernel released each slit and cleared its bits at its own interrupt, so the engine's index past ours counts them (DMA_DONE is no longer in the status); a slit whose release the kernel's test refused still shows DMA_DONE with the index ours, and this thread releases it. Otherwise one frame on DMA_DONE, released by the kernel already when the index reads past ours, as before.
+    let count = RING_N.load(Ordering::Relaxed) as u32;
+    let dma = img & ferros_cam::IMG_DMA_DONE != 0;
+    let hw = if dma || OPEN.load(Ordering::Relaxed) != 0 { rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX) } else { *idx };
+    // WHY wrapping: the index goes round the ring (`count`, a power of two), and the mask makes the difference the ring's.
+    let by_kernel = (hw.wrapping_sub(*idx) & (count - 1)) / STEP;
+    let nf = if by_kernel != 0 { by_kernel } else { dma as u32 };
+    if nf != 0 {
         if last_done != 0 {
             GAP[0].fetch_min(t0 - last_done, Ordering::Relaxed);
             GAP[1].fetch_max(t0 - last_done, Ordering::Relaxed);
@@ -775,7 +818,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         // WHY the min: the histogram has 2^4 bins, a lag of 2^15 us or more lands in the last.
         LAG_HIST[((64 - us.leading_zeros()) as usize).min(15)].fetch_add(1, Ordering::Relaxed);
     }
-    if img & ferros_cam::IMG_DMA_DONE != 0 {
+    if nf != 0 {
         let late = LATE_TEST.load(Ordering::Relaxed);
         // WHY the bound: the byte is the person's; a shift of 64 or more is no number of microseconds, and past 2^20 (a second) the test is a stall, not a late answer.
         // Bit 7 set: the index on time and the acknowledgements late instead (below), which says whether the index alone is the deadline.
@@ -783,35 +826,38 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
             ferros_sys::delay_us(1 << late);
         }
         // The next descriptor released first, round the ring as the engine's own place goes round it (`RING`): the index is never the engine's place while a frame is owed, so the stream runs as long as it is answered.
-        // Released by the kernel already when it reads past ours (camera_power.rs `ferros_cam_fast`, in the interrupt, before this thread is woken): then only our count follows it. The deadline is the frame's blanking (2026-11-18: a release 2 ms late at 96 a second stopped the stream with LATE_CONFIG), which a wake behind the kernel lock can miss.
-        let count = RING_N.load(Ordering::Relaxed) as u32;
-        let next = (*idx + STEP) & (count - 1);
-        let hw = rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX);
-        if hw == *idx {
-            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, next);
+        // Released by the kernel already when it reads past ours (irqarm.rs, in the interrupt, before this thread is woken): then only our count follows it. The deadline is the frame's blanking (2026-11-18: a release 2 ms late at 96 a second stopped the stream with LATE_CONFIG), which a wake behind the kernel lock can miss.
+        if by_kernel == 0 {
+            wr(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX, (*idx + STEP) & (count - 1));
         } else {
-            BY_KERNEL.fetch_add(1, Ordering::Relaxed);
+            BY_KERNEL.fetch_add(by_kernel as u64, Ordering::Relaxed);
         }
         let done = IDX[0].load(Ordering::Relaxed) as usize;
         if done < PLACE_LOG.len() {
             PLACE_LOG[done].store((rd(g, ferros_cam::PDMA + 0x14) as u64) << 32 | hw as u64, Ordering::Relaxed);
         }
-        *idx = next;
-        wrote = *idx as u64;
+        if nf > 1 {
+            MULTI.fetch_add(1, Ordering::Relaxed);
+            MULTI_MOST.fetch_max(nf as u64, Ordering::Relaxed);
+        }
         let t = ferros_sys::now() - t0;
         IDX[0].fetch_add(1, Ordering::Relaxed);
         IDX[1].fetch_add(t, Ordering::Relaxed);
         IDX[2].fetch_max(t, Ordering::Relaxed);
-        if *idx == 0 {
-            WRAPS.fetch_add(1, Ordering::Relaxed);
+        // Each frame: the buffer it landed in, and (whole frames) a buffer named for the descriptor at the index now, the one released at the next DMA_DONE (by the kernel or by this thread), so it is named a whole frame before it is needed.
+        for j in 0..nf {
+            *idx = (*idx + STEP) & (count - 1);
+            if *idx == 0 {
+                WRAPS.fetch_add(1, Ordering::Relaxed);
+            }
+            let n = FRAMES.load(Ordering::Relaxed) + 1 + j as u64;
+            if SLITS.load(Ordering::Relaxed) != 0 {
+                slit_turn(n, j + 1 == nf);
+            } else {
+                ring_turn(n, Some((*idx / STEP) as u64));
+            }
         }
-        // The buffer this frame landed in, and a buffer named for the descriptor at the index now: the one released at the next DMA_DONE (by the kernel or by this thread), so it is named a whole frame before it is needed.
-        let n = FRAMES.load(Ordering::Relaxed) + 1;
-        if SLITS.load(Ordering::Relaxed) != 0 {
-            slit_turn(n);
-        } else {
-            ring_turn(n, Some((*idx / STEP) as u64));
-        }
+        wrote = *idx as u64;
         let late = LATE_TEST.load(Ordering::Relaxed) & 0x7F;
         if LATE_TEST.load(Ordering::Relaxed) & 0x80 != 0 && late != 0 && late <= 20 && (FRAMES.load(Ordering::Relaxed) + 1) & 0xFF == 0 {
             ferros_sys::delay_us(1 << late);
@@ -820,7 +866,12 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     let mut err = 0u64;
     for (j, &a) in cam().ack.iter().enumerate() {
         let v = rd(g, a);
-        wr(g, a, v);
+        // loch0's image status: a DMA_DONE this answer did not see (latched since its first read) is left latched, so the line fires again at the ack and the kernel's armed action (or the next answer) releases its descriptor (2026-11-18, slit-robust: an answer 786 us late read one DMA_DONE, the next landed during its acknowledgements and was cleared unanswered, its descriptor never released, and the frame after died on LATE_CONFIG).
+        let w = if a == ferros_cam::IMG_STATUS { v & (img | !ferros_cam::IMG_DMA_DONE) } else { v };
+        // A word that read 0 is not written back: writing a write-one-to-clear word 0 clears nothing, and each write is a register syscall (2026-11-18, slit-robust: 56 a answer, about 91 us of the frame thread's every 812 us in a slit stream, past the eighth of a core under which the scheduler keeps a woken device thread at the front; with its credit spent the thread queued behind Lumis's and the slit stream died).
+        if w != 0 {
+            wr(g, a, w);
+        }
         ACK_OR[j].fetch_or(v as u64, Ordering::Relaxed);
         ACK_LAST[j].store(v as u64, Ordering::Relaxed);
         if a == IMG_ERR {
@@ -841,11 +892,15 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         let pd = PD_ON.load(Ordering::Relaxed) != 0;
         wr(g, ferros_cam::LOCH_ENABLE, if pd { ferros_cam::LOCH_ENABLE_IMG_PD } else { ferros_cam::LOCH_ENABLE_IMG_PD & 1 });
         *enabled = true;
-        say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}\n", if pd { " with its PD path" } else { ", its PD path left off" });
+        // An open program clears the frame's bits itself: only DMA_DONE raises loch0's image interrupt from now on, so an EOF or SHADOW_UPDATE after the release never fires a second interrupt that masks the line (mask G#1A as the init leaves it: EOF, SHADOW_UPDATE, DMA_DONE).
+        if OPEN.load(Ordering::Relaxed) != 0 {
+            wr(g, IMG_MASK, ferros_cam::IMG_DMA_DONE);
+        }
+        say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}{}\n", if pd { " with its PD path" } else { ", its PD path left off" }, if OPEN.load(Ordering::Relaxed) != 0 { "; its image interrupt DMA_DONE alone" } else { "" });
     }
-    if img & ferros_cam::IMG_DMA_DONE != 0 {
+    if nf != 0 {
         FRAME_AT.store(eagle_ns(), Ordering::Release);
-        let n = FRAMES.fetch_add(1, Ordering::AcqRel) + 1;
+        let n = FRAMES.fetch_add(nf as u64, Ordering::AcqRel) + 1;
         if n == 1 {
             let us = ferros_sys::us_since(OPEN_AT.load(Ordering::Relaxed));
             step!(g, "camera: first frame A#{} ms after the open (open step: first frame)\n", us / 1000);
@@ -853,6 +908,9 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
         ferros_sys::wake(&FRAMES, 4);
     }
     let t = ferros_sys::now() - t0;
+    if k < IMG_DUR.len() {
+        IMG_DUR[k].store(t, Ordering::Relaxed);
+    }
     BUSY.fetch_add(t, Ordering::Relaxed);
     TL_IDX[k & 0xFF].store(wrote | t << 16, Ordering::Relaxed);
     BUSY_MOST.fetch_max(t, Ordering::Relaxed);
@@ -958,6 +1016,11 @@ struct Open {
     probed: bool,
     /// The view was given to the holder (an OPEN that asked for it).
     view: bool,
+    /// The view is mapped write-back (docs/CAMERA.md "A cacheable view"; the OPEN's `VIEW_FLAGS` byte with `VIEW_CACHED`): every buffer handed over by MAP has its lines cleaned and invalidated first (`lines`), and a held buffer's probe line before its release reads it.
+    cached: bool,
+    /// The maintenance's ticks at MAP (summed and the most, for the console every 64).
+    inv_sum: u64,
+    inv_max: u64,
     /// The count of the last frame handed to the kist (MAP), the buffer it holds and that buffer's probe as handed out, to tell at its release whether anything wrote it meanwhile.
     given: u64,
     held: Option<(usize, [u64; 8])>,
@@ -1613,7 +1676,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: fe == from, gain_model, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -1685,7 +1748,7 @@ fn close(g: u64) {
     // WHY the max: an open that never streamed has no answers, and its mean is read as 0 rather than divided by zero.
     let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
     let (n, a) = (IDX[0].load(Ordering::Relaxed), ANSWERED.load(Ordering::Relaxed));
-    say!(g, "camera: answers A#{a}, A#{} us each on average, A#{} us the most; DMA_DONEs A#{n}, A#{} released by the kernel's interrupt before this thread, the index A#{} us into the answer on average, A#{} us the most\n", us(BUSY.load(Ordering::Relaxed)) / a.max(1), us(BUSY_MOST.load(Ordering::Relaxed)), BY_KERNEL.load(Ordering::Relaxed), us(IDX[1].load(Ordering::Relaxed)) / n.max(1), us(IDX[2].load(Ordering::Relaxed)));
+    say!(g, "camera: answers A#{a}, A#{} us each on average, A#{} us the most; DMA_DONEs A#{n}, A#{} released by the kernel's interrupt before this thread, the index A#{} us into the answer on average, A#{} us the most; answers that took several frames A#{} (A#{} the most)\n", us(BUSY.load(Ordering::Relaxed)) / a.max(1), us(BUSY_MOST.load(Ordering::Relaxed)), BY_KERNEL.load(Ordering::Relaxed), us(IDX[1].load(Ordering::Relaxed)) / n.max(1), us(IDX[2].load(Ordering::Relaxed)), MULTI.load(Ordering::Relaxed), MULTI_MOST.load(Ordering::Relaxed));
 }
 
 /// After the eighth frame, once an open: every output's extent, sampled every 256 bytes against the pattern (docs/CAMERA.md: "measure which of the 22 the main camera's job really writes"): its slot, how many points moved, the last.
@@ -1915,14 +1978,33 @@ fn bin_frame(o: &Open, bin: usize, b: usize) -> usize {
 
 /// An OPEN's reply with the view: `[0]`, the view's token (32 bytes, at 1), the ring's buffers (33), the format (34: 1 MIPI RAW10, 2 RAW12), width and height (u16 at 36, 38), a line's bytes (u32 at 40), a buffer's bytes in the view (u32 at 44).
 /// An OPEN that carried a mode block gets `VIEW_REPLY_MODE` bytes: also the ring's buffers as a u32 (at 48: a slit ring's hundreds), 1 for a slit ring (52), the record's place in a slit buffer (u32 at 56: its rows' bytes); an OPEN without one the 48 bytes Lumis reads.
+/// An OPEN that asked for the view write-back (`VIEW_CACHED`) gets the 64 bytes too, and 1 at 53 when it was given so (0: non-cacheable, a kernel from before or a slit ring).
 const VIEW_REPLY: usize = 48;
 const VIEW_REPLY_MODE: usize = 64;
+/// The OPEN's view byte (`[1][id][view]`): bit 0 the view.
+const VIEW_ASKED: u8 = 1 << 0;
+/// The OPEN's byte after the whole mode block (`VIEW_FLAGS`, its seventeenth), bit 0 (2026-11-18, docs/CAMERA.md "A cacheable view"): the view mapped write-back, each buffer's lines cleaned and invalidated by the kernel as MAP hands it over, so the holder reads it thru its caches.
+/// There, not in the view byte, so a holder that asks it of a driver from before gets the non-cacheable view (that driver reads no byte past the block) rather than none.
+const VIEW_FLAGS: usize = 16;
+const VIEW_CACHED: u8 = 1 << 0;
+/// A device test only (the hand spawn's ninth input byte 1): a write-back view's buffers handed over by MAP without their maintenance, to show what a reader sees without it (stale lines from the last time round the ring).
+static NO_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes `at` to `at + len` of ring buffer `b` cleaned and invalidated in every core's caches by the kernel (SYS_DMA x1 = 6, process.rs `cam_lines`), for a write-back view (docs/CAMERA.md "A cacheable view"): the counter's ticks it took.
+fn lines(g: u64, o: &Open, b: usize, at: usize, len: usize) -> u64 {
+    let off = RING_VA.load(Ordering::Relaxed) as usize - o.va + b * BUF.load(Ordering::Relaxed) as usize + at;
+    ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 6, off as u64, len as u64, 0)
+}
 
 /// The kist's held buffer given back: its hold cleared, and its probe compared with what it read when handed out, which tells whether anything wrote the buffer while it was held (the ring's promise: never; counted, and said the first time).
+/// With a write-back view the probe's line is dropped from the caches first: the holder read it thru them, and a non-cacheable read meeting the line a core kept is not promised to see DRAM (the architecture's mismatched attributes), so a write while held could read as none.
 fn release(g: u64, o: &mut Open, b: usize) {
     let Some((h, then)) = o.held else { return };
     if h != b {
         return;
+    }
+    if o.cached {
+        lines(g, o, b, probe_off(), 64);
     }
     if probe_read(b) != then {
         o.overwritten += 1;
@@ -2033,6 +2115,12 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if input_len > 7 {
         DETACH.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 7) as *const u8) } as u64, Ordering::Relaxed);
     }
+    if input_len > 8 {
+        NO_LINES.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 8) as *const u8) } as u64, Ordering::Relaxed);
+    }
+    if input_len > 9 {
+        NO_OPEN.store(unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 9) as *const u8) } as u64, Ordering::Relaxed);
+    }
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
     for k in 1..BINNERS {
@@ -2121,16 +2209,27 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 out[0] = r;
                 let mut len = 1;
                 if let (0, Some(o)) = (r, open_cam.as_mut()) {
-                    if got >= 3 && msg[2] == 1 && o.ring < VIEW_LEAST {
+                    let asked = got >= 3 && msg[2] & VIEW_ASKED != 0;
+                    if asked && o.ring < VIEW_LEAST {
                         say!(g, "camera: no view: the pool gave a ring of one buffer; frames by copy only\n");
-                    } else if got >= 3 && msg[2] == 1 {
+                    } else if asked {
                         // The image slot whole: a ring of whole frames, or a slit ring rounded up to whole frames of the pool (ferros_cam job `with_image`).
                         let first = o.l.slots[job::OLD_SLOT_IMAGE].0 / job::FRAME;
                         let n = o.l.slots[job::OLD_SLOT_IMAGE].1 / job::FRAME;
                         let mut t = [0u8; 32];
-                        let base = ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32, ferros_sys::off(t.as_mut_ptr()));
+                        // Write-back when asked, but never for a slit ring: its buffers have no holds, so no hand-over at which to make them right (SLITS).
+                        let want = got as usize > VIEW_FLAGS && msg[VIEW_FLAGS] & VIEW_CACHED != 0 && SLITS.load(Ordering::Relaxed) == 0;
+                        let mut give = |cached: bool| ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32 | (cached as u64) << 63, ferros_sys::off(t.as_mut_ptr()));
+                        let mut base = give(want);
+                        o.cached = want && base != ERR;
+                        // A kernel from before the write-back view refuses the bit (it reads as frames past the run): the view as before.
+                        if want && base == ERR {
+                            say!(g, "camera: the kernel gave no write-back view; asking for the non-cacheable one\n");
+                            base = give(false);
+                        }
                         if base != ERR {
                             o.view = true;
+                            out[53] = o.cached as u8;
                             out[1..33].copy_from_slice(&t);
                             out[33] = o.ring as u8;
                             out[34] = if NOW_FORMAT.load(Ordering::Relaxed) == 12 { 2 } else { 1 };
@@ -2141,7 +2240,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                             out[48..52].copy_from_slice(&(o.ring as u32).to_le_bytes());
                             out[52] = (SLITS.load(Ordering::Relaxed) != 0) as u8;
                             out[56..60].copy_from_slice(&((ROWS.load(Ordering::Relaxed) * LINE.load(Ordering::Relaxed)) as u32).to_le_bytes());
-                            len = if got > 3 { VIEW_REPLY_MODE } else { VIEW_REPLY };
+                            len = if got > 3 || want { VIEW_REPLY_MODE } else { VIEW_REPLY };
                             t.fill(0);
                             say!(g, "camera: the view of A#{} buffers given to the holder\n", o.ring);
                         } else {
@@ -2295,6 +2394,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 let n = FRAMES.load(Ordering::Acquire);
                 o.asked_at = n;
                 o.given = B_COUNT[b].load(Ordering::Relaxed);
+                // A write-back view: the buffer's lines dropped from every core's caches before the holder hears of it (docs/CAMERA.md "A cacheable view").
+                // Its frame's DMA_DONE came before the hold (`ring_turn` makes a buffer the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer), so what a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone and the holder reads this frame.
+                if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 {
+                    let t = lines(g, o, b, 0, BUF.load(Ordering::Relaxed) as usize);
+                    o.inv_sum += t;
+                    o.inv_max = o.inv_max.max(t);
+                }
                 o.held = Some((b, probe_read(b)));
                 let mut h = [0u8; HEADER];
                 header(&mut h, b, 1);
@@ -2305,7 +2411,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 if o.maps % 64 == 0 {
                     let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
                     say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
-                    (o.lat_sum, o.lat_max) = (0, 0);
+                    if o.cached {
+                        say!(g, "camera: the write-back view's maintenance at MAP (A#{} bytes a buffer): A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), us(o.inv_sum / 64), us(o.inv_max));
+                    }
+                    (o.lat_sum, o.lat_max, o.inv_sum, o.inv_max) = (0, 0, 0, 0);
                 }
                 if reply(&token, &h) == ERR {
                     say!(g, "camera: a MAP's reply failed; its holder is gone\n");

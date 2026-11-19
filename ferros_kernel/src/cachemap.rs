@@ -156,6 +156,22 @@ pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SL
 /// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out.
 static mut L2_SURF: Table = Table([0; 512]);
 
+/// A puck's square (docs/PUCKS.md, 2026-11-18; owner: "supplying a diameter and having the kist return a square vector in sixteen bit that ferros will trim and place"): addresses for two squares the size of the panel's width side by side (the Pro's 1344² at 8 bytes a pixel is 13.8 MiB each), so a puck draws its next square while the display reads the last; a power of two, so a masked puck reaches its slot thru a handle.
+/// Addresses only: a slot maps as many frames as its puck asked for (process.rs `puck_size`), from none to all 32.
+pub const PUCK_SIZE: usize = 64 << 20;
+/// How many pucks may hold a square at once: slots of the pucks' window (the deck's pucks, display puck.rs `N`).
+pub const PUCK_SLOTS: usize = 16;
+/// The pucks' window: `PUCK_SLOTS` slots of `PUCK_SIZE`, slot j at `PUCK_VA.0 + j * PUCK_SIZE`, the whole of the GiB above the surfaces', one level-2 table; every block maps a frame of its puck's or the blank frame (process.rs `blank_frame`) once the first square is given, so the display's read of a square whose puck just ended or shrank lands on nothing anyone owns.
+pub const PUCK_VA: (usize, usize) = (0x50_4000_0000, 0x50_4000_0000 + PUCK_SLOTS * PUCK_SIZE);
+const _: () = assert!(PUCK_SIZE.is_power_of_two() && PUCK_VA.0 % GIB == 0 && PUCK_VA.1 - PUCK_VA.0 == GIB && PUCK_VA.0 >= SURF_VA.1 && PUCK_VA.1 <= CAM_GIB, "the pucks' window: one GiB of its own, between the surfaces' and the camera's");
+static mut L2_PUCK: Table = Table([0; 512]);
+
+/// Point the pucks' window's 2 MiB block at `va` (inside `PUCK_VA`, 2 MiB aligned) at the frame at `pa`, mapped as a surface's frame is (Normal write-back, EL0 read/write, never executable). Call `surface_unmapped` over the blocks once they are written.
+pub fn puck_map(va: usize, pa: usize) {
+    let e = unsafe { &mut (*(&raw mut L2_PUCK)).0[(va - PUCK_VA.0) / MIB2] };
+    *e = pool(vhe(), pa, BLOCK) | UXN;
+}
+
 /// The camera's GiB (2026-11-15, owner: "full frame 1:1 ... integrating into the buffer"; docs/CAMERA.md "Modes, the bench and the slit"): the driver's window in its first half, the view in its second, one level-2 table of 2 MiB blocks, every one invalid until the driver asks.
 /// Until then both lived in the surfaces' GiB past their slots (224 and 128 MiB), which a ring of 1:1 frames does not fit: the main's 8160 x 6144 RAW10 frame is 60 MiB (G#2800 a line), so its region with a ring of four is about 320 MiB, and the view of that ring 240 MiB.
 const CAM_GIB: usize = 0x51_0000_0000;
@@ -180,9 +196,11 @@ pub const CAM_VIEW_VA: (usize, usize) = (CAM_VA.1, CAM_GIB + GIB);
 const _: () = assert!(CAM_VIEW_VA.0 == CAM_VA.1 && (CAM_VIEW_VA.1 - 1) / GIB == CAM_VA.0 / GIB && CAM_VIEW_VA.0 % MIB2 == 0, "the camera's view: in the camera's GiB, past the driver's window");
 
 /// The camera's view: the block at `va` maps frame `pa`, Normal non-cacheable, EL0 read-only (AP[2], which binds EL2 too in the VHE regime, so the kernel never writes thru it either: process.rs `dma_span` leaves the view out), never executable. Then `surface_unmapped` over what changed.
-pub fn cam_view_map(va: usize, pa: usize) {
+/// With `cached` (2026-11-18, docs/CAMERA.md "A cacheable view") Normal write-back inner shareable instead, the same rights: the front end still does not snoop, so the driver has each buffer's lines cleaned and invalidated as it hands the buffer to the holder (process.rs `cam_lines`), and nothing the cores kept or fetched while the front end wrote it is read.
+/// Every alias of these frames is then cacheable or non-cacheable by role: the kernel's own (write-back, `frame_block`), the driver's window (non-cacheable, `cam_map`) and this one; the lines a write-back reader brings in are clean (nobody writes thru a write-back alias of a camera frame after the region's take cleaned it), so dropping them loses nothing.
+pub fn cam_view_map(va: usize, pa: usize, cached: bool) {
     let e = unsafe { &mut (*(&raw mut L2_CAM)).0[(va / MIB2) % 512] };
-    *e = dma_pool(vhe(), pa, BLOCK) | AP_RO;
+    *e = if cached { pool(vhe(), pa, BLOCK) | UXN | AP_RO } else { dma_pool(vhe(), pa, BLOCK) | AP_RO };
 }
 
 /// The most GPU memory one client may hold (2026-11-13, the coordinator's call, the owner may resize it: a power of two of at least a frame): its block, frames of the pool on demand (process.rs `block_grow`). Mahere at the 8a's 1080 x 2400 names up to 376 cells of a MiB at full detail, which 384 MiB would not quite hold beside its frame regions; 512 MiB does.
@@ -416,6 +434,8 @@ pub fn enable() -> bool {
         }
         // The surfaces' window: its level-2 table in place, every block invalid until the first surface is given out (`surface_map`).
         l1.0[SURF_VA.0 / GIB] = &raw const L2_SURF as u64 | TABLE_OR_PAGE;
+        // The pucks' window: its level-2 table in place, every block invalid until the first square is given out (`puck_map`).
+        l1.0[PUCK_VA.0 / GIB] = &raw const L2_PUCK as u64 | TABLE_OR_PAGE;
         // The camera's GiB: its level-2 table in place, every block invalid until the driver asks for its region (`cam_map`).
         l1.0[CAM_GIB / GIB] = &raw const L2_CAM as u64 | TABLE_OR_PAGE;
         // The GPU blocks' window: its GiBs' level-2 tables in place, every block invalid until a block is given out there (`gpub_map`).
@@ -566,8 +586,24 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
             asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
             a += PAGE;
         }
-        asm!("dsb ish", "isb");
+        tlbi_done();
     }
+}
+
+/// The end of every broadcast TLB invalidation: the DSB that waits for every core, then the invalidation and its DSB once more, then the ISB.
+/// WHY the repeat: Cortex-A510 erratum 2441009 (r0p0 to r1p1; husky's are r1p1, CPU-FEATURES.md): a TLBI and DSB can complete while an access on an A510 that uses the old translation is still in flight. Repeating the TLBI and DSB waits that access out (the erratum's workaround, as Linux's ARM64_WORKAROUND_REPEAT_TLBI). With the A510s running processes (smp.rs), a frame unmapped and then handed on could otherwise still be read or written by one of them.
+#[inline(always)]
+fn tlbi_done() {
+    unsafe { asm!("dsb ish", "tlbi vae1is, xzr", "dsb ish", "isb") };
+}
+
+/// CTR_EL0 as every core that has run ferros reads it, ANDed (each worker adds its own at its start, smp.rs `ferros_core_main`): IDC and DIC (bits 28, 29) set only when every core has them, as Linux sanitises the register across a big.LITTLE system. `sync_exec` skips the clean or the invalidation only on that.
+pub static CTR_ALL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// This core's CTR_EL0 into `CTR_ALL`.
+pub fn ctr_note() -> u64 {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    CTR_ALL.fetch_and(ctr, core::sync::atomic::Ordering::AcqRel) & ctr
 }
 
 /// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
@@ -593,7 +629,7 @@ pub fn grants_page(base: usize, writable: bool) {
         *e = pool_page(true, (*e & OA) as usize, writable, false);
         asm!("dsb ish");
         asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
-        asm!("dsb ish", "isb");
+        tlbi_done();
     }
 }
 
@@ -616,7 +652,7 @@ pub fn guard_pages(base: usize, len: usize) {
             asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
             a += PAGE;
         }
-        asm!("dsb ish", "isb");
+        tlbi_done();
     }
 }
 
@@ -686,8 +722,8 @@ pub fn retable(from: usize, to: usize, pa: usize) {
 
 /// After an arc's frames were copied (a move): the instruction side made to see the code's new copies. Each page EL0 may execute (UXN clear) is cleaned to the point of unification unless the data cache is coherent there already (CTR_EL0.IDC), then the instruction cache invalidated unless it snoops (CTR_EL0.DIC). A native arc is executable whole; a masked one only its code pages.
 pub fn sync_exec(va: usize, len: usize) {
-    let ctr: u64;
-    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    // The weakest of every core's CTR_EL0 (`CTR_ALL`): a move made on an A715 must reach an A510's instruction fetch as well.
+    let ctr = ctr_note();
     if ctr & (1 << 28) == 0 {
         let mut a = va;
         while a < va + len {
@@ -743,7 +779,7 @@ pub fn unmapped(va: usize, len: usize) {
                 a += PAGE;
             }
         }
-        asm!("dsb ish", "isb");
+        tlbi_done();
     }
 }
 
@@ -778,6 +814,6 @@ pub fn surface_unmapped(va: usize, len: usize) {
             asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
             a += MIB2;
         }
-        asm!("dsb ish", "isb");
+        tlbi_done();
     }
 }
