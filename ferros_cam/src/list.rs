@@ -118,7 +118,7 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     put("sensor_height_mm", alloc::vec![VsfType::f5(o.sensor_mm.1)]);
     put("focal_mm", alloc::vec![VsfType::f5(o.focal_mm)]);
     put("f_number", alloc::vec![VsfType::f5(o.f_number)]);
-    // The readout's own field (ferros_cam optics `Optics::field`, owner via the Lumis session, 2026-11-19: what tells two readouts of one lens apart in a menu, the tele's two 4032 x 3024 at 22 and 11 degrees): the sensor's part it reads in mm (its pixels over the array's, `Readout::covered`), the angles across its width, height and diagonal in degrees, and its 35 mm equivalent focal length.
+    // The readout's own field (ferros_cam optics `Optics::field`, owner via the Lumis session, 2026-11-18: what tells two readouts of one lens apart in a menu, the tele's two 4032 x 3024 at 22 and 11 degrees): the sensor's part it reads in mm (its pixels over the array's, `Readout::covered`), the angles across its width, height and diagonal in degrees, and its 35 mm equivalent focal length.
     let fd = o.field(r.covered);
     put("field_width_mm", alloc::vec![VsfType::f5(fd.mm.0)]);
     put("field_height_mm", alloc::vec![VsfType::f5(fd.mm.1)]);

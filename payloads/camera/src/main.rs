@@ -1357,7 +1357,7 @@ impl Spec {
     fn full(&self) -> bool {
         matches!(self.kind, K_FULL | K_SLIT_FULL)
     }
-    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults hold on every camera (2026-11-19: the ultrawide's, the front's and the tele's slits stream detached and slim, and took two frames without). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
+    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults hold on every camera (2026-11-18: the ultrawide's, the front's and the tele's slits stream detached and slim, and took two frames without). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
     fn shape(&self) -> (u8, bool) {
         geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), self.flags & F_SLIM != 0)
     }
