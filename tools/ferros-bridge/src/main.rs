@@ -1019,6 +1019,22 @@ async fn cmd_store(args: &[String]) {
             p.extend_from_slice(args[1].as_bytes());
             (ferros_pt::Op::Read, p)
         }
+        // store extent-list <name> [--kist <capsule|bin>]: every extent of the clips area as records, those of the name's domain marked (the name a scope's full name, `test.x` for std/rawrec's, or with --kist any name: it is not looked up); store extent-drop <first block> <name> [--kist ...]: the domain's extent at that first block dropped (a clip whose name is lost).
+        Some(c @ ("extent-list" | "extent-drop")) if args.len() >= 2 => {
+            let bad = || -> ! { eprintln!("Usage: ferros-bridge store extent-list <name> [--kist <capsule|bin>] | extent-drop <first block> <name> [--kist <capsule|bin>]"); std::process::exit(1) };
+            let (first, name): (u64, &String) = if c == "extent-list" { (0, &args[1]) } else if args.len() >= 3 { (args[1].parse().unwrap_or_else(|_| bad()), &args[2]) } else { bad() };
+            let mut p = vec![if c == "extent-list" { 0xFBu8 } else { 0xFA }];
+            p.extend_from_slice(&first.to_le_bytes());
+            match kist_of(args) {
+                Some(id) => {
+                    p.push(1);
+                    p.extend_from_slice(&id);
+                }
+                None => p.push(0),
+            }
+            p.extend_from_slice(name.as_bytes());
+            (ferros_pt::Op::Read, p)
+        }
         Some("get") if args.len() >= 2 => (ferros_pt::Op::Read, args[1].as_bytes().to_vec()),
         Some("ls") => (ferros_pt::Op::Read, Vec::new()),
         Some("rm") if args.len() >= 2 => (ferros_pt::Op::Exec, args[1].as_bytes().to_vec()),
@@ -1076,6 +1092,16 @@ async fn cmd_store(args: &[String]) {
             let u = |k: usize| u64::from_le_bytes(body[k..k + 8].try_into().unwrap());
             println!("extent: A#{} blocks from block A#{} of the clips area, A#{} bytes, sealed {}, BLAKE3 {}, at A#{}", u(0), u(57), u(8), body[16] != 0, body[17..49].iter().map(|b| format!("{b:02X}")).collect::<String>(), u(49) as i64);
         }
+        "extent-list" if body.len() >= 32 => {
+            let mine = &body[..32];
+            let rows: Vec<&[u8]> = body[32..].chunks_exact(65).collect();
+            println!("extent-list: A#{} extents; this domain's owner {}", rows.len(), mine[..8].iter().map(|b| format!("{b:02X}")).collect::<String>());
+            for r in rows {
+                let u = |k: usize| u64::from_le_bytes(r[k..k + 8].try_into().unwrap());
+                println!("  first A#{} blocks A#{} bytes A#{} sealed {} at A#{} owner {}{}", u(0), u(8), u(16), r[24] != 0, u(25) as i64, r[33..41].iter().map(|b| format!("{b:02X}")).collect::<String>(), if &r[33..65] == mine { " (this domain's)" } else { "" });
+            }
+        }
+        "extent-drop" => println!("dropped"),
         _ => println!("removed"),
     }
 }
