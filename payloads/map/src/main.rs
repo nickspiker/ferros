@@ -26,6 +26,8 @@ mod quick;
 /// Notes on the deck (docs/NOTIFY.md): the kernel's list, the glows, the resting view, the Deck button, the live takeover.
 mod notes;
 mod typed;
+/// The WiFi page's picker (docs/WIFI.md "The picker"): the networks in range and remembered, a pick, the passphrase on the keyboard, the join, a network forgotten.
+mod wifi;
 /// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
 mod camera;
 
@@ -80,8 +82,8 @@ const S_LAUNCH: u64 = 7;
 const S_STOWER: u64 = 8;
 /// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
 const S_NFC: u64 = 9;
-/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11).
-const S_TORCH: u64 = 10;
+/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11), 10 until it granted use wlan before it (2026-11-18, `wifi::S_WLAN`; an init from before leaves 11 empty, and the torch circle is dimmed until init is stored too).
+const S_TORCH: u64 = 11;
 
 /// The NFC page's "add a tag", as the main loop sets it: 0 not adding, else which add this is (counted from 1), so a tag answered for an add that has since ended is never kept. `tag_add_thread` holds the NFC driver's TAG while it is set and keeps the tag it is answered with (SYS_UNLOCK op 7, under Settings), then writes the outcome to TAG_DONE: the add's count << 2, then 1 kept, 2 kept already, 3 not kept. The main loop reads TAG_DONE each pass (a word, no call), as it reads the GPS copy.
 static TAG_ADD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -229,6 +231,78 @@ const ONE: i64 = 1 << 14;
 const SPRING: f64 = core::f64::consts::LN_2;
 
 /// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
+/// Circles of radii `r` packed into a cluster, every one touching (owner, 2026-11-18: "cluster best fit all touching"): the largest first at the centre, the next beside it, and each after where it touches two placed ones nearest the cluster's middle without overlapping any (every tangent pair tried, both sides: n ≤ `MAX`, so n³ tries are nothing). Each centre, in the radii's units, the cluster's area-weighted middle at the origin.
+fn pack(r: &[f64]) -> alloc::vec::Vec<(f64, f64)> {
+    let n = r.len();
+    let mut order: alloc::vec::Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| r[b].partial_cmp(&r[a]).unwrap_or(core::cmp::Ordering::Equal));
+    let mut at = alloc::vec![(0f64, 0f64); n];
+    let mut placed: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for (k, &i) in order.iter().enumerate() {
+        if k == 1 {
+            at[i] = (r[order[0]] + r[i], 0.);
+        } else if k > 1 {
+            // The middle so far, weighted by area, where the cluster pulls toward.
+            let (mut mx, mut my, mut mw) = (0., 0., 0.);
+            for &j in &placed {
+                let w = r[j] * r[j];
+                mx += at[j].0 * w;
+                my += at[j].1 * w;
+                mw += w;
+            }
+            let (mx, my) = (mx / mw, my / mw);
+            let mut best: Option<((f64, f64), f64)> = None;
+            for (pa, &a) in placed.iter().enumerate() {
+                for &b in &placed[pa + 1..] {
+                    // Where circle i touches both a and b: the two crossings of the circles about a and b of radii r_a + r_i and r_b + r_i.
+                    let (ax, ay, bx, by) = (at[a].0, at[a].1, at[b].0, at[b].1);
+                    let (ra, rb) = (r[a] + r[i], r[b] + r[i]);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let d2 = dx * dx + dy * dy;
+                    let d = libm::sqrt(d2);
+                    if d == 0. || d > ra + rb {
+                        continue;
+                    }
+                    let along = (ra * ra - rb * rb + d2) / (2. * d);
+                    let h2 = ra * ra - along * along;
+                    if h2 < 0. {
+                        continue;
+                    }
+                    let h = libm::sqrt(h2);
+                    let (px, py) = (ax + dx * along / d, ay + dy * along / d);
+                    for s in [-1., 1.] {
+                        let c = (px - s * dy * h / d, py + s * dx * h / d);
+                        // Clear of every circle placed (a millionth of a radius of slack for the tangents themselves).
+                        let clear = placed.iter().all(|&j| { let (ex, ey) = (c.0 - at[j].0, c.1 - at[j].1); ex * ex + ey * ey >= (r[j] + r[i]) * (r[j] + r[i]) * (1. - 1e-6) });
+                        if clear {
+                            let score = (c.0 - mx) * (c.0 - mx) + (c.1 - my) * (c.1 - my);
+                            if best.is_none_or(|(_, s0)| score < s0) {
+                                best = Some((c, score));
+                            }
+                        }
+                    }
+                }
+            }
+            // No pair leaves room (never with these sizes): beside the largest, on its far side from the middle.
+            at[i] = best.map_or((at[order[0]].0 - r[order[0]] - r[i], at[order[0]].1), |(c, _)| c);
+        }
+        placed.push(i);
+    }
+    let (mut mx, mut my, mut mw) = (0., 0., 0.);
+    for i in 0..n {
+        let w = r[i] * r[i];
+        mx += at[i].0 * w;
+        my += at[i].1 * w;
+        mw += w;
+    }
+    if mw > 0. {
+        for p in at.iter_mut() {
+            *p = (p.0 - mx / mw, p.1 - my / mw);
+        }
+    }
+    at
+}
+
 fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
     spring_at(x0, v0, t, SPRING)
 }
@@ -947,6 +1021,8 @@ enum Choice {
     ScopeSet(u8),
     /// The keyboard's layout (honeycomb::LAYOUTS: 0 Dvorak, 1 QWERTY).
     Layout(u8),
+    /// A helm choice (the Deck and Back page): the bit of PREF_HELM and whether it is set (ferros_sys `helm`).
+    Helm(u8, bool),
     UnlockAtBoot,
     ProxWake,
     /// About's version line: twelve taps in a row and Developer is a page.
@@ -1021,13 +1097,15 @@ enum Choice {
     /// The NFC page's "add a tag" (or its cancel while it waits), and a kept tag's remove (its place in the list), attest with a tag (AUTH.md).
     TagAdd,
     TagRemove(u8),
+    /// The WiFi page's picker (wifi.rs): a network's row, its buttons.
+    Wifi(wifi::Act),
     /// A live note's page (notes.rs `live_page`, docs/NOTIFY.md "The live takeover"): Answer opens its kist at the note, Decline lets it go.
     LiveAnswer,
     LiveDecline,
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 22] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+const PAGES: [&str; 23] = ["appearance", "units", "keyboard", "security", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -1058,6 +1136,7 @@ fn page_title(key: &'static str) -> &'static str {
         "keyboard" => Msg::PageKeyboard,
         "security" => Msg::PageSecurity,
         "deck" => Msg::PageDeck,
+        "helm" => Msg::PageHelm,
         "permissions" => Msg::PagePermissions,
         "fleet" => Msg::PageFleet,
         "people" => Msg::PagePeople,
@@ -1092,8 +1171,9 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
 
 /// What a right is, in the person's words and language, by its place in ferros_kist::RIGHTS (whose MEANS are the English).
 fn right_name(r: usize) -> &'static str {
-    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera, Msg::RightBeYou, Msg::RightPeople];
-    tr(NAMES[r])
+    // The puck right (12) is never shown to a person (it is never asked): it reads as its English meaning if anything ever names it.
+    const NAMES: [Msg; 12] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera, Msg::RightBeYou, Msg::RightPeople];
+    NAMES.get(r).map_or(ferros_kist::MEANS[r], |m| tr(*m))
 }
 
 /// A theme's name in the person's language, by its place in ferros_sys::theme::THEMES (whose `name`s are the English).
@@ -1220,20 +1300,19 @@ fn group_of(kind: u16) -> usize {
     }
 }
 
-/// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Stowed like any app (payloads/clock, tools/clock-kist.sh), never launched.
-fn widget(name: &str) -> Option<u8> {
-    name.eq_ignore_ascii_case("Clock").then_some(CLOCK_FACE)
-}
+/// The display's first puck icon (display puck.rs `PUCK0`): the j-th puck of the person's list is drawn for icon `PUCK0 + j`, from the square its kist draws (docs/PUCKS.md).
+const PUCK0: u8 = 0x90;
+/// How many pucks the display draws (puck.rs `N`); a puck past them is a plain circle.
+const PUCKS: usize = 1 << 4;
 
-/// The display's clock face as a scene icon (display `WIDGET_CLOCK`, G#80).
-const CLOCK_FACE: u8 = 1 << 7;
-
-/// What a puck's circle shows, by the display's icon for it (`widget`), for its card on the Deck.
-fn puck_shows(icon: u8) -> Msg {
-    match icon {
-        CLOCK_FACE => Msg::TheTime,
-        _ => Msg::Unknown,
+/// The scene icon of the kist at `ki` in the person's list when it is a puck: a capsule that declares `puck` (ferros_kist `PUCK`; never its name: until 2026-11-18 a kist named Clock got the display's own clock face), the j-th such, `PUCK0 + j`; else None.
+fn puck_icon(ks: &[ferros_kist::Kist], ki: usize) -> Option<u8> {
+    let k = &ks[ki];
+    if !k.is_puck() {
+        return None;
     }
+    let j = ks[..ki].iter().filter(|k| k.is_puck()).count();
+    (j < PUCKS).then(|| PUCK0 + j as u8)
 }
 
 /// Why a kist did not start, or stopped after it started (ferros_kist::launch::why), in the person's words: under its open circle (`ask_page`) and on its card.
@@ -1508,6 +1587,14 @@ struct Map {
     recent: alloc::vec::Vec<[u8; 32]>,
     /// The kist this map brought to the front last, while it is still in front (None once the map has the glass again).
     front_kist: Option<[u8; 32]>,
+    /// The deck's circles gathered (owner, 2026-11-18: "for swiping back on the deck, would be nice to make all the circles cluster best fit all touching, and tapping on back reverses back to whatever scatter they were in"): each circle's place in the scatter it came from (world ×256) and the camera then; None while scattered.
+    scatter: Option<(alloc::vec::Vec<(i64, i64)>, Cam)>,
+    /// The display's count of unused Escapes when Back last sent one to the app in front (`escapes_unused`), for PREF_HELM `BACK_OUT`.
+    escape_sent: Option<u8>,
+    /// The circles on their way (`gather`, `scatter_back`): from, to (world ×256), the shown frames so far, and whether this is the way back.
+    gathering: Option<(alloc::vec::Vec<(i64, i64)>, alloc::vec::Vec<(i64, i64)>, i32, bool)>,
+    /// The pucks launched since the person attested, by capsule (docs/PUCKS.md: a puck lives while a person is present, launched once, never by a tap).
+    pucks_up: alloc::vec::Vec<[u8; 32]>,
     /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
     n: usize,
     /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
@@ -1537,6 +1624,8 @@ struct Map {
     tags: [ferros_sys::KeptTag; 1 << 4],
     ntags: usize,
     tag_said: u64,
+    /// The WiFi page's picker (wifi.rs).
+    wifi: wifi::Picker,
     /// How many adds this map has started (`TAG_ADD`'s values).
     tag_adds: u64,
     /// The kist this map last asked init to launch and was told "started" (ferros_kist::launch::STARTED), with the kists' bell count as it stood then (KISTS_WORD): a launch the kernel did not start after all comes back with a later count (ferros_sys::not_started), and only that one is said. Dropped once it is said.
@@ -1897,7 +1986,7 @@ impl Map {
         let name = self.kists.kists[i - 1].name.as_str();
         // The display's bundle (tools/app-icons APPS, 1-based): the kist's icon by its app's name until a kist carries its own (KISTS.md: the list's `icon`).
         const BUNDLED: [&str; 5] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps"];
-        let icon = match widget(name) {
+        let icon = match puck_icon(&self.kists.kists, i - 1) {
             Some(w) => w,
             None => BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1),
         };
@@ -1927,14 +2016,24 @@ impl Map {
     /// The person's list read again, and the kist circles made to match it when a kist came or went (a stow over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
     fn refresh_circles(&mut self) {
         let was = self.placed();
+        // Each circle's icon and name as the display has them: a kist stowed over itself (the clock's version 1, a puck, over its version 0, a plain kist) keeps the count and changes the icon.
+        let looks: Vec<(u8, alloc::string::String)> = (0..self.n).map(|i| { let s = self.spec(i); (s.icon, alloc::string::String::from(s.label)) }).collect();
         if !self.reload_kists() {
             return;
         }
         // WHY: the arrays hold MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         if n == self.n {
-            // As many circles, but a circle may hold another kist now (one unstowed, another stowed): its state follows, drawn with the next frame as a new scene is.
-            let _ = self.send_states(false);
+            // As many circles, but a circle may hold another kist now (one unstowed, another stowed, or a kist stowed over itself as a puck): the scene again when any circle looks different (its icon or its name; 2026-11-18 on the 8a, the clock puck stowed over the clock kist stayed a plain circle and never drew), else its state alone, drawn with the next frame.
+            if (0..n).any(|i| { let s = self.spec(i); looks[i].0 != s.icon || looks[i].1 != s.label }) {
+                self.send_scene();
+                self.draw();
+            } else if self.send_states(false) && !self.app_front {
+                // A frame after the glows, as wherever else they are sent: the display draws nothing again from its last frame once states have come (op 57 empties it, display `LAST_FRAME`), so without one a puck's squares never reached the glass until the next touch (the 8a, 2026-11-18).
+                self.draw();
+            }
+            // A puck may hold another place in the list now: the bindings sent again, a new one launched.
+            self.send_pucks();
             return;
         }
         self.place_circles(n, &was);
@@ -2027,12 +2126,10 @@ impl Map {
         ok
     }
 
-    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
+    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A puck is launched like any kist and is never brought to the front (docs/PUCKS.md). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
     fn launch(&mut self, i: usize) -> u8 {
         let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_STOWED };
-        if widget(&k.name).is_some() {
-            return ferros_kist::launch::RUNNING;
-        }
+        let puck = k.is_puck();
         let mut m = [0u8; 33];
         m[0] = ferros_kist::launch::OP_LAUNCH;
         m[1..].copy_from_slice(&k.capsule);
@@ -2046,6 +2143,15 @@ impl Map {
         let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not stowed", 5 => "the list is not readable", _ => "refused" });
         console(self.grants, l.as_str().as_bytes());
         let capsule = k.capsule;
+        // A puck is never in front and never opened (docs/PUCKS.md): it is up or not, nothing more; a puck that did not start is said on its card as a kist's is.
+        if puck {
+            if r[0] == ferros_kist::launch::STARTED || r[0] == ferros_kist::launch::RUNNING {
+                if !self.pucks_up.contains(&capsule) {
+                    self.pucks_up.push(capsule);
+                }
+            }
+            return r[0];
+        }
         if r[0] == ferros_kist::launch::STARTED {
             self.asked = Some((capsule, bell));
             self.fault = None;
@@ -2163,6 +2269,14 @@ impl Map {
         let mut live = [0u8; 32 * MAX];
         if let Some(k) = ferros_sys::not_started::live(cap(self.grants, S_SETTINGS), &mut live) {
             self.live = Some(live.chunks_exact(32).take(k).map(|c| c.try_into().unwrap()).collect());
+        }
+        // A puck that ended is up no more (2026-11-18 on the 8a: a puck stowed over its running self kept the old process, and one that ended was never started again): launched again by `send_pucks` unless it stopped on a fault, which waits for a tap on its circle, so a broken puck never runs in a loop.
+        if let Some(live) = self.live.as_ref() {
+            let before = self.pucks_up.len();
+            self.pucks_up.retain(|c| live.contains(c));
+            if self.pucks_up.len() != before {
+                self.send_pucks();
+            }
         }
         if self.send_states(false) && !self.app_front {
             self.draw();
@@ -2473,7 +2587,8 @@ impl Map {
             m[at + 12] = a.icon;
             // The settings circle's name in the person's language (its `label` stays the English key its place is kept under); a kist's is its own. The op's field holds 16 bytes, cut at a character's edge (`fit`).
             let label = fit(if i == 0 { tr(Msg::Settings) } else { a.label }, 16).as_bytes();
-            let len = if labels || a.icon == 0 { label.len() } else { 0 };
+            // A puck's name always: the display shows it in the circle until the puck's first square (a puck waiting on its first tap's permissions, or not yet up).
+            let len = if labels || a.icon == 0 || (PUCK0..PUCK0 + PUCKS as u8).contains(&a.icon) { label.len() } else { 0 };
             m[at + 13] = len as u8;
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
@@ -2486,11 +2601,33 @@ impl Map {
             }
         }
         let _ = self.send_states(true);
+        self.send_pucks();
+    }
+
+    /// The pucks to the display and up (docs/PUCKS.md): display op 73 binds each puck's kist identity to its scene icon (`puck_icon`: the j-th puck of the list, `PUCK0 + j`), so the square that kist hands over on `puck` is drawn in that circle and nowhere else; then each puck not yet up is launched by init with its granted rights, once a person is present (the map runs only then), never on a tap. A puck whose wants are not answered waits for its circle's tap, which asks them as a kist's does.
+    fn send_pucks(&mut self) {
+        let mut m = [0u8; 2 + 64 * PUCKS];
+        m[0] = 73;
+        let mut n = 0;
+        for k in self.kists.kists.iter().filter(|k| k.is_puck()).take(PUCKS) {
+            m[2 + 64 * n..34 + 64 * n].copy_from_slice(&k.developer);
+            m[34 + 64 * n..66 + 64 * n].copy_from_slice(&k.option);
+            n += 1;
+        }
+        m[1] = n as u8;
+        let mut r = [0u8; 1];
+        call(self.display, &m[..2 + 64 * n], &mut r);
+        for i in 1..self.n {
+            let Some(k) = self.kist(i) else { continue };
+            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) {
+                self.launch(i);
+            }
+        }
     }
 
     /// Circle `i`'s state as its glow (ferros_glow, display op 57; owner, 2026-11-11, on the Pro: "glow is good! you can nix the test circles and use those colours for realzies"), with the count of things waiting on the person. The settings circle is the system's own, 703 nm (owner: "For the ferros settings specifically, I think 703nm"). A kist circle, from what the kernel last said (`kists_rang`), first that matches:
     /// - for you (400 nm): something waits on the person for it (`waiting`; nothing adds to it yet, there are no notifications).
-    /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
+    /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind).
     /// - stopped (600 nm): the kernel keeps a record for it (ferros_sys::not_started): its last process ended by a fault, a panic or a kill from outside, or its last launch did not start; gone once it starts again.
     /// - not running (a ring of darkness): stowed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
     /// Before the kernel has said (a kernel without op 2), a kist circle has no state: the theme's glow as before.
@@ -2499,9 +2636,6 @@ impl Map {
         let Some(k) = self.kist(i) else { return (Glow::System, 0) };
         if let Some(w) = self.waiting.iter().find(|w| w.0 == k.capsule).filter(|w| w.1 > 0) {
             return (Glow::ForYou, w.1);
-        }
-        if widget(&k.name).is_some() {
-            return (Glow::Running, 0);
         }
         let Some(live) = self.live.as_ref() else { return (Glow::None, 0) };
         if live.contains(&k.capsule) {
@@ -3301,6 +3435,25 @@ impl Map {
                     y += uu(4, 1);
                 }
             }
+            // What Deck and Back do (owner, 2026-11-18: "a settings addition to choose what back and home do"; WINDOWS.md "The helm"): a choice per gesture, each a pair, the default first (PREF_HELM, 0 every default).
+            "helm" => {
+                let helm = ferros_sys::pref(ferros_sys::PREF_HELM);
+                use ferros_sys::helm::*;
+                let rows: [(Msg, u8, [Msg; 2]); 5] = [
+                    (Msg::HelmBackTap, BACK_OUT, [Msg::HelmUpTop, Msg::HelmUpOut]),
+                    (Msg::HelmBackSwipe, BACK_SWIPE_FORWARD, [Msg::HelmRecent, Msg::HelmForward]),
+                    (Msg::HelmBackSwipeDeck, BACK_SWIPE_DECK_RECENT, [Msg::HelmCluster, Msg::HelmRecent]),
+                    (Msg::HelmDeckSwipe, DECK_SWIPE_OUT, [Msg::HelmControls, Msg::HelmToDeck]),
+                    (Msg::HelmDeckSwipeDeck, DECK_SWIPE_DECK_CLUSTER, [Msg::HelmFit, Msg::HelmCluster]),
+                ];
+                for (title, bit, choices) in rows {
+                    b.text(cx, y, note as u16, dim(), 1, tr(title));
+                    y += uu(2, 1);
+                    let names = [tr(choices[0]), tr(choices[1])];
+                    radios(self, b, &mut y, &names, (helm & bit != 0) as usize, &|v| Choice::Helm(bit, v == 1));
+                    y += uu(1, 1);
+                }
+            }
             "keyboard" => {
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::Layout));
                 y += uu(2, 1);
@@ -3580,6 +3733,10 @@ impl Map {
                     mark(self, b, &mut y, 50, tr(Msg::On), !off, Some(Choice::Switch(k as u8)));
                 }
                 fact(b, &mut y, tr(Msg::State), link_state(k, state));
+                // WiFi: the networks, to pick and join or forget (wifi.rs), first under the switch.
+                if k == 1 {
+                    self.wifi_rows(b, &mut y, cx, hit);
+                }
                 let f = ferros_sys::numbers(Style::Glyphs);
                 // Everything the driver publishes (docs/RADIO-CONTROLS.md): its eight slots, then its tracks, grouped (signal, channel, link, counters, motion); tracked satellites listed on their own; then its names and addresses (the detail, read with the Settings capability), then its knobs.
                 let mut words = [ferros_sys::MEASURE_NONE; 8 + ferros_sys::TRACKS_MAX];
@@ -4229,15 +4386,14 @@ impl Map {
                 }
                 if let Some(ki) = open {
                     let k = &ks[ki];
-                    let puck = widget(&k.name);
+                    let puck = puck_icon(&ks, ki);
                     button(self, b, &mut y, tr(Msg::Back), false, Some(Choice::CardBack));
                     row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
                     y -= uu(3, 4);
                     row(self, b, &mut y, note, grey(), tr(if puck.is_some() { Msg::KindPuck } else { Msg::KindKist }), None);
                     let st = self.kist_state(&k.capsule);
-                    if let Some(icon) = puck {
-                        // A puck: what its circle shows (the clock: the time), then its rights and its remove. It is never opened, so it has no state to stop.
-                        fact(b, &mut y, tr(Msg::Shows), tr(puck_shows(icon)));
+                    if puck.is_some() {
+                        // A puck: its rights and its remove. It is never opened, so it has no state to stop.
                     } else {
                         // Who made it: the developer's name as their first kist here gave it (the person's pin), and always their key's first bytes, which is who they are.
                         let mut d = Line::new();
@@ -4370,8 +4526,9 @@ impl Map {
                     row(self, b, &mut y, small, grey(), tr(Msg::NothingStowed), None);
                 }
                 for puck in [false, true] {
-                    for (ki, k) in ks.iter().enumerate().filter(|(_, k)| widget(&k.name).is_some() == puck) {
+                    for (ki, k) in ks.iter().enumerate().filter(|(ki, _)| puck_icon(&ks, *ki).is_some() == puck) {
                         let what = Some(Choice::Card(ki as u8));
+                        let y_top = y;
                         row(self, b, &mut y, uu(3, 2), white(), &k.name, what);
                         y -= uu(3, 4);
                         let mut l = Line::new();
@@ -4381,6 +4538,16 @@ impl Map {
                             l.s(tr(s));
                         }
                         row(self, b, &mut y, note, grey(), l.as_str(), what);
+                        // Its circle's own picture at the row's left (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): the display draws scene circle ki + 1 (op 77), its icon, or a puck's square as it is now.
+                        let ir = uu(3, 2);
+                        let (ix, iy) = (cx - half + ir + uu(1, 2), (y_top + y) / 2 - uu(1, 2));
+                        let mut m = [0u8; 8];
+                        m[0] = 77;
+                        m[1..3].copy_from_slice(&(ix as i16).to_le_bytes());
+                        m[3..5].copy_from_slice(&(iy as i16).to_le_bytes());
+                        m[5..7].copy_from_slice(&(ir as u16).to_le_bytes());
+                        m[7] = (ki + 1) as u8;
+                        b.op(&m);
                         // A restore or an unstow of it under way, or one that failed.
                         if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE) {
                             progress(self, b, &mut y, j);
@@ -4440,7 +4607,7 @@ impl Map {
                 let ks = self.kists.kists.clone();
                 // And who is using each right now (owner, 2026-11-10: "we need to be able to see what kists are using each permission"): a kist holding a claim on it says so by its name (`users`). Only GPS is claimed today; a right nothing marks the use of lists no one as using it.
                 // Only the asked rights: the implicit set (ferros_kist::IMPLICIT) is every kist's, with no default and no answer to turn (owner, 2026-11-12, "Yes on the implicit set").
-                for r in (0..ferros_kist::RIGHTS.len()).filter(|&r| !ferros_kist::implicit(r as u8)) {
+                for r in (0..ferros_kist::RIGHTS.len()).filter(|&r| ferros_kist::asked_right(r as u8)) {
                     row(self, b, &mut y, uu(3, 2), white(), right_name(r), None);
                     let on = self.kists.defaults >> r & 1 == 1;
                     mark(self, b, &mut y, 50, tr(Msg::NewKistsStartOn), on, Some(Choice::Default(r as u8)));
@@ -4756,7 +4923,8 @@ impl Map {
             self.pan = if v == 0. { None } else { Some((ux, uy, v, rx - ix, ry - iy)) };
         }
         let flying = self.step_cam();
-        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
+        let gathering = self.step_gather();
+        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying || gathering
     }
 
     /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and deck: the display's answer kept for the checkbox, and said on the console.
@@ -4841,6 +5009,78 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
+    /// The deck's circles gathered into a cluster, every one touching (`pack`), about the area-weighted middle of where they stand, the scatter kept for Back's tap (`scatter_back`); each goes on the plane's spring, a shown frame a step (`step_gather`), and the camera fits them once they land. Already gathered: the camera fits them again.
+    fn gather(&mut self) -> &'static str {
+        if self.scatter.is_some() && self.gathering.is_none() {
+            self.deck_fly();
+            return "map: deck: the cluster in view";
+        }
+        let n = self.n;
+        let r: alloc::vec::Vec<f64> = (0..n).map(|i| self.rs[i] as f64).collect();
+        let (mut mx, mut my, mut mw) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let w = r[i] * r[i];
+            mx += self.xs[i] as f64 * w;
+            my += self.ys[i] as f64 * w;
+            mw += w;
+        }
+        // WHY the floor: a deck of circles all of radius 0 has no middle to divide by (never: every circle has a radius of at least 1).
+        let mw = mw.max(1.);
+        let (mx, my) = (mx / mw, my / mw);
+        let from: alloc::vec::Vec<(i64, i64)> = (0..n).map(|i| (self.xs[i], self.ys[i])).collect();
+        // World units to ×256: the positions are kept at 256 to a unit, the radii in units.
+        let to: alloc::vec::Vec<(i64, i64)> = pack(&r).iter().map(|p| (libm::round(mx + p.0 * 256.) as i64, libm::round(my + p.1 * 256.) as i64)).collect();
+        if self.scatter.is_none() {
+            self.scatter = Some((from.clone(), self.cam));
+        }
+        self.gathering = Some((from, to, 0, false));
+        self.settling = true;
+        "map: back: the circles gathered, touching"
+    }
+
+    /// Back's tap on a gathered deck: every circle back to where it stood before (`gather`), the camera with them. Whether there was a scatter to go back to.
+    fn scatter_back(&mut self) -> bool {
+        let Some((to, cam)) = self.scatter.take() else { return false };
+        let from: alloc::vec::Vec<(i64, i64)> = (0..self.n).map(|i| (self.xs[i], self.ys[i])).collect();
+        // A circle stowed or unstowed since: as many as both know.
+        let k = from.len().min(to.len());
+        self.gathering = Some((from[..k].to_vec(), to[..k].to_vec(), 0, true));
+        self.fly(cam);
+        self.settling = true;
+        true
+    }
+
+    /// One shown frame of the circles on their way: each at its target plus the plane's spring of its offset (C¹ from rest, no timer: `spring`, as a flight's), sent to the display (op 17). Whether any is still a half pixel or more from its place; landed, a gather fits the camera to the cluster.
+    fn step_gather(&mut self) -> bool {
+        let Some((from, to, t, back)) = self.gathering.take() else { return false };
+        let t = t + 1;
+        let z = self.cam.z as f64;
+        let mut still = false;
+        for i in 0..from.len().min(self.n) {
+            let (ox, oy) = ((from[i].0 - to[i].0) as f64, (from[i].1 - to[i].1) as f64);
+            let (x, vx) = spring(ox, 0., t);
+            let (y, vy) = spring(oy, 0., t);
+            self.xs[i] = to[i].0 + libm::round(x) as i64;
+            self.ys[i] = to[i].1 + libm::round(y) as i64;
+            self.send_move(i);
+            // On the screen: world ×256 at 16.16 pixels a unit, as `step_cam` measures.
+            let px = |v: f64| v.abs() * z / (1u64 << 24) as f64;
+            still |= px(x) >= 0.5 || px(y) >= 0.5 || px(vx) >= 0.5 || px(vy) >= 0.5;
+        }
+        if still {
+            self.gathering = Some((from, to, t, back));
+        } else {
+            for i in 0..to.len().min(self.n) {
+                (self.xs[i], self.ys[i]) = to[i];
+                self.send_move(i);
+            }
+            if !back {
+                self.deck_fly();
+            }
+        }
+        still
+    }
+
     /// Deck's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
     fn full_switch(&mut self) -> Option<bool> {
         let mut r = [0u8; 4];
@@ -4893,6 +5133,15 @@ impl Map {
             return "map: deck: the map already";
         }
         if self.app_front {
+            // Out to the deck at the kist's top, when the person chose it (PREF_HELM `BACK_OUT`): the Escape sent last went unused (the display's count of them moved since, op 5 byte 13), so the kist was at its top already and this tap takes it behind. The first tap at the top is the kist's, the next one the deck's.
+            let out = ferros_sys::pref(ferros_sys::PREF_HELM) & ferros_sys::helm::BACK_OUT != 0;
+            if out && self.escape_sent.is_some_and(|c| self.escapes_unused() != Some(c)) {
+                self.escape_sent = None;
+                if self.send_behind(true) {
+                    return "map: back: at the kist's top, out to the deck";
+                }
+            }
+            self.escape_sent = self.escapes_unused();
             if ferros_sys::window::key(self.display, ferros_sys::window::KEY_ESCAPE).is_some() {
                 return "map: back: Escape to the app in front";
             }
@@ -4900,7 +5149,18 @@ impl Map {
             self.app_front = false;
             self.front_kist = None;
         }
+        // A gathered deck: the circles back where they stood (`scatter_back`).
+        if self.view == View::Map && self.scatter_back() {
+            return "map: back: the circles back where they stood";
+        }
         self.back_step()
+    }
+
+    /// The display's count of the Escapes apps did not use (op 5 byte 13), or None from a display before it.
+    fn escapes_unused(&self) -> Option<u8> {
+        let mut r = [0u8; 16];
+        let n = call(self.display, &[5], &mut r);
+        (n >= 14 && n != ferros_sys::ERR).then_some(r[13])
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -4949,12 +5209,31 @@ impl Map {
             (1, View::Map) => {
                 // A kist stowed or removed since: its circle comes or goes before the tap is placed.
                 self.refresh_circles();
-                if let Some(i) = self.hit(sx, sy) {
+                let hit = self.hit(sx, sy);
+                if let Some(i) = hit {
                     // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list read again first: another of the person's devices may have answered meanwhile.
                     if i > 0 {
                         self.reload_kists();
                         let Some(k) = self.kist(i) else { return };
                         let capsule = k.capsule;
+                        // A puck answered (docs/PUCKS.md "What a tap does"; owner, 2026-11-18: "Tap/drag with one finger moves it, with two scales/rotates and a simple tap passes thru so we can make our dozenal calculator work too"): never opened; the tap goes to the puck itself (display op 74, which knows where the circle was drawn and its face's turn), launched first if it is not up.
+                        if k.is_puck() && !k.unanswered() {
+                            // A tap on a puck that is not up starts it (one that stopped on a fault included: the tap is the person asking again).
+                            if !self.pucks_up.contains(&capsule) || self.live.as_ref().is_some_and(|l| !l.contains(&capsule)) {
+                                self.stopped.retain(|s| s.0 != capsule);
+                                self.pucks_up.retain(|c| *c != capsule);
+                                self.launch(i);
+                            }
+                            // WHY the casts: a tap that placed a finger on a circle is on the glass, so its pixel fits a u16.
+                            let mut m = [0u8; 6];
+                            m[0] = 74;
+                            m[1] = i as u8;
+                            m[2..4].copy_from_slice(&(sx as u16).to_le_bytes());
+                            m[4..6].copy_from_slice(&(sy as u16).to_le_bytes());
+                            let mut r = [0u8; 1];
+                            call(self.display, &m, &mut r);
+                            return;
+                        }
                         // A stop it has not said yet (it crashed while the person was elsewhere, `stopped`): this tap opens the circle on that, once, and the next tap launches.
                         if let Some(s) = self.stopped.iter().position(|s| s.0 == capsule) {
                             let (c, why) = self.stopped.remove(s);
@@ -5051,6 +5330,10 @@ impl Map {
                         self.send_scene();
                     }
                     Some(Choice::Layout(i)) => set(self, ferros_sys::PREF_LAYOUT, i),
+                    Some(Choice::Helm(bit, on)) => {
+                        let was = ferros_sys::pref(ferros_sys::PREF_HELM);
+                        set(self, ferros_sys::PREF_HELM, if on { was | bit } else { was & !bit });
+                    }
                     Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
                     // Off in one tap; on in two, the first arming it with the warning.
                     Some(Choice::UnlockAtBoot) => {
@@ -5138,6 +5421,7 @@ impl Map {
                         self.tag_said = 0;
                         self.tags_read();
                     }
+                    Some(Choice::Wifi(a)) => self.wifi_tap(a),
                     // A neighbour's title: that page, coming in from its side and settling as a swipe does.
                     Some(Choice::Link(k)) => {
                         // Connections' row: that link's own page, straight there.
@@ -5245,7 +5529,7 @@ impl Map {
                     }
                     // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the stower (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
                     // A kist's Unstow: its sheet, in the card's place, at its top, at the design's defaults; what it kept for itself counted by the stower meanwhile (stower.rs `size_ask`, drawn when it comes).
-                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| widget(&kist.name).is_none()) => {
+                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| !kist.is_puck()) => {
                         let kist = &self.kists.kists[k as usize];
                         self.sheet = Some(Sheet { capsule: kist.capsule, keep_data: false, keep_made: true, keep_answers: true, here_only: false });
                         if self.sheet_size.is_none_or(|s| s.0 != kist.capsule) {
@@ -5560,6 +5844,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         app_front: false,
         recent: alloc::vec::Vec::new(),
         front_kist: None,
+        scatter: None,
+        escape_sent: None,
+        gathering: None,
+        pucks_up: alloc::vec::Vec::new(),
         n,
         kists,
         ask: 0,
@@ -5571,6 +5859,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         tags: [ferros_sys::KeptTag::default(); 1 << 4],
         ntags: 0,
         tag_said: 0,
+        wifi: wifi::Picker::new(),
         tag_adds: 0,
         unstow_armed: None,
         person_armed: None,
@@ -5843,6 +6132,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The NFC page's "add a tag" (`tag_add_thread`): asleep until an add starts.
     static mut TAG_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(tag_add_thread, unsafe { &mut *(&raw mut TAG_STACK) }, grants);
+    // The WiFi page's list (`wifi::watch`, asleep while the page does not show) and its requests (`wifi::asker`).
+    static mut WIFI_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(wifi::watch, unsafe { &mut *(&raw mut WIFI_STACK) }, grants);
+    static mut WIFI_ASK_STACK: [u8; 1 << 13] = [0; 1 << 13];
+    ferros_sys::thread_spawn(wifi::asker, unsafe { &mut *(&raw mut WIFI_ASK_STACK) }, grants);
     // The quick row's slow calls (the torch, the identity service's do not disturb), on a thread of their own (quick.rs `worker`).
     static mut QUICK_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(quick::worker, unsafe { &mut *(&raw mut QUICK_STACK) }, grants);
@@ -6013,6 +6307,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let open = matches!(map.view, View::Open(_));
         let page = PAGES[map.page];
         let mut page_dirty = false;
+        // The WiFi page's picker (wifi.rs): its watch follows the page; a new list, or a request's reply, draws it again.
+        page_dirty |= wifi::pass(&mut map, open && page == "WiFi") && open && page == "WiFi";
         // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim.
         if let Some((seq, v)) = gps_take(gps_seen) {
             gps_seen = seq;
@@ -6423,7 +6719,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 if !corner_done && inward > reach && inward > across.abs() {
                     corner_done = true;
                     // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Deck's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
-                    let said = if corner == 8 {
+                    // As the person chose (Settings, Deck and Back: PREF_HELM, owner 2026-11-18), each default as built on 2026-11-11.
+                    let helm = ferros_sys::pref(ferros_sys::PREF_HELM);
+                    use ferros_sys::helm::*;
+                    let said = if corner == 8 && map.app_front && helm & DECK_SWIPE_OUT != 0 && map.send_behind(true) {
+                        "map: deck: the app in front behind (Deck's swipe set to the deck)"
+                    } else if corner == 8 {
                         match map.full_switch() {
                             Some(true) => {
                                 // The quick row goes with the console (`quick::Quick::shut`).
@@ -6431,11 +6732,17 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 "map: deck: full screen, the controls hidden"
                             }
                             Some(false) => "map: deck: full screen off, the controls shown",
+                            None if helm & DECK_SWIPE_DECK_CLUSTER != 0 => map.gather(),
                             None => {
                                 map.deck_fly();
                                 "map: deck: every circle in view, turned to fit them largest"
                             }
                         }
+                    } else if map.app_front && helm & BACK_SWIPE_FORWARD != 0 {
+                        // Forward, the redo of the last step back (owner: "like a redo or a forward browser navigation"): the Again key to the app in front.
+                        if ferros_sys::window::key(map.display, ferros_sys::window::KEY_AGAIN).is_some() { "map: back: forward to the app in front" } else { map.flip() }
+                    } else if !map.app_front && map.view == View::Map && helm & BACK_SWIPE_DECK_RECENT == 0 {
+                        map.gather()
                     } else {
                         map.flip()
                     };
@@ -6650,6 +6957,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.ys[i] += dy;
                     map.send_move(i);
                     map.arranged[i] = true;
+                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    map.scatter = None;
                     move_us += ferros_sys::us_since(t_m);
                     let t_p = now();
                     map.push_apart(i);
@@ -6689,6 +6998,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                     map.send_move(i);
                     map.arranged[i] = true;
+                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    map.scatter = None;
                     map.push_apart(i);
                     scene_moved = true;
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {

@@ -121,6 +121,10 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if let Some(h) = usf::find("VD6282 Spectral") {
         usf::subscribe(h, 200, 1, false, &mut out);
     }
+    // The magnetometers for the compass puck (2026-11-17), every 2^6 ms, continuous: the field the puck turns its dial by while its circle is shown. Found by the part's name (MMC56X3X in husky's registry, SENSORS.md); whether the fused type-6 sensor carries that name is to be read on the device (`diag usf sensors`).
+    if let Some(h) = usf::find("MMC56") {
+        usf::subscribe(h, 1 << 6, 1, false, &mut out);
+    }
     say(&out);
     out.clear();
     // The block is valid from here: the kernel answers from it once the magic is written.

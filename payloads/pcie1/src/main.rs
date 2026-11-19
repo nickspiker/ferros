@@ -13,8 +13,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ferros_sys::svc;
 
-/// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes.
-const HEAP_SIZE: usize = 1 << 16;
+/// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes; and the networks remembered, read and parsed (`kept_all`: two lists of at most 16 networks, a few KiB with the parser's own; 128 KiB since 2026-11-18, twice what the detail alone had, so the lists never take what it needs).
+const HEAP_SIZE: usize = 1 << 17;
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
 static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
@@ -1233,7 +1233,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, sfh: false, tx_ooo: 0, tx_bad: 0, tx_busy: 0, tx_seq: [0; TX_BUFS as usize], mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, sfh: false, tx_ooo: 0, tx_bad: 0, tx_busy: 0, tx_seq: [0; TX_BUFS as usize], mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net::EMPTY; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6, kept: Vec::new(), gone: false, fresh_link: false, served: false, irq: false };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1272,9 +1272,12 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.kv(b"sh.flags (G#400 = trapped)", f);
     }
     if stage >= 11 {
-        if from_store && stage >= 12 {
-            // The boot path: the vault's credential, or one the network page hands in, joined (`connect`); the page served meanwhile.
-            connect(d, &mut m, clm);
+        if from_store && stage >= 14 {
+            // The boot path: a remembered network, or one a page hands in, joined (`connect`; the page served meanwhile), then served, and another joined when a page asks (`keep_joined`).
+            keep_joined(d, &mut m, clm, sh);
+        } else if from_store && stage >= 12 {
+            // A staged run from the vault's files: one join (`connect`).
+            connect(d, &mut m, clm, true, None);
         } else {
             // A staged run: the credential document given as an input file (`ferros-bridge wifi-cred`), if any.
             let c = credential(cred);
@@ -1297,8 +1300,9 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         if stage == 13 && m.keyed {
             dhcp(d, &mut m);
         }
-        if stage >= 14 && m.keyed {
-            serve(d, &mut m, sh);
+        // A staged run serves its one network; another handed in ends it (a staged run joins only what it was given).
+        if stage >= 14 && m.keyed && !from_store && !matches!(serve(d, &mut m, sh), Left::End) {
+            d.put(b"a staged run joins no other network: ending\n");
         }
     }
     let f = d.tcm_rd(sh);
@@ -1390,6 +1394,16 @@ struct Msgbuf {
     rx_up: bool,
     /// Seconds before a kept credential that did not join is tried again (`serve_unjoined`): 64, doubling to 1024, back to 64 on a join.
     retry_s: u64,
+    /// The networks remembered, as the vault last gave them (`kept_all`): each one's name, whose list holds it (0 the person's `wifi.cred`, 1 the device's `wifi.net`), and when this device last joined it. Never the passphrases: those are read from the vault when a network is joined.
+    kept: Vec<(Vec<u8>, u8, Option<i64>)>,
+    /// Between two networks (`leave` until the next `serve`): received frames are dropped, and the IP stack's exchanges are answered "the network went" (op 8 reply bit 1), so it lets the old network's addresses go.
+    gone: bool,
+    /// Serving a network after another in this process (`serve` after `leave`): the first exchange with the IP stack says so (op 8 reply bit 1), however it missed the time between.
+    fresh_link: bool,
+    /// `serve` has run once: what is done once a process (the interrupt's thread, the link's low power states, the firmware's capabilities) is not done again for the next network.
+    served: bool,
+    /// The chip's interrupt proven and in use while serving (`irq_selftest`).
+    irq: bool,
 }
 
 /// A network as the page shows it: its name, the strongest signal seen (dBm), and flags: bit 0 joinable here (WPA2-PSK outside 6 GHz), bit 1 open, bit 2 other security (WEP, WPA, SAE only, enterprise), bits 3, 5 and 6 seen on 5, 2.4 and 6 GHz.
@@ -1401,6 +1415,36 @@ struct Net {
     flags: u8,
     /// The scan it was last seen in (`scan_gen`).
     seen_in: u8,
+    /// Its strongest BSS's noise floor (dBm, 0 when the firmware gave none: bss_info's phy_noise, +80), centre frequency and channel width (MHz, 0 unknown: `chanspec_mhz`), and the access points (BSSes) that answered under its name in the scan.
+    noise: i8,
+    freq: u16,
+    width: u16,
+    aps: u16,
+}
+
+impl Net {
+    const EMPTY: Net = Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0, noise: 0, freq: 0, width: 0, aps: 0 };
+}
+
+/// A chanspec's centre frequency and channel width in MHz (the channel, the centre one for a wide channel, in bits 0-7, the bandwidth in 11-13, the band in 14-15; the centre is the band's base plus 5 MHz a channel: 2.4 GHz 2407, channel 14 at 2484; 5 GHz 5000; 6 GHz 5950), None where the encoding is not one of these.
+fn chanspec_mhz(cs: u32) -> (Option<i64>, Option<i64>) {
+    let ch = (cs & 0xFF) as i64;
+    let mhz = match cs & 0xC000 {
+        0x0000 if ch == 14 => Some(2484),
+        0x0000 => Some(2407 + 5 * ch),
+        0xC000 => Some(5000 + 5 * ch),
+        0x4000 => Some(5950 + 5 * ch),
+        _ => None,
+    };
+    let bw = match cs & 0x3800 {
+        0x1000 => Some(20),
+        0x1800 => Some(40),
+        0x2000 => Some(80),
+        0x2800 => Some(160),
+        0x0000 => Some(320),
+        _ => None,
+    };
+    (mhz, bw)
 }
 
 #[derive(Clone, Copy)]
@@ -1479,6 +1523,12 @@ impl Msgbuf {
         self.rx_frames += 1;
         if i < RX_BUFS {
             let p = self.dma + RX_BASE + 0x800 * i + off;
+            // Between two networks (`leave`): the frame is nobody's, its buffer posted again at once (the next join's own frames among them: the firmware's supplicant keeps what it needs of the handshake).
+            if self.serving && self.gone {
+                self.post_rx(i);
+                self.ring_rx(d);
+                return;
+            }
             if self.serving {
                 // Hold the buffer for a client (re-posted when taken). The completion flags don't separate Ethernet from 802.11 frames here (an EAPOL frame came flagged G#02 too), so everything goes to the client, which ignores what it can't parse. data_len counts the frame from the offset on: subtracting the offset clipped 8 bytes off every frame (DHCP options and router advertisement prefixes lost).
                 if self.rxq_len < self.rxq.len() && len > 0 {
@@ -1740,6 +1790,8 @@ impl Msgbuf {
                 }
                 // MSG_TYPE_FLOW_RING_CREATE_CMPLT: status +8, flow ring id +10.
                 0x04 => self.flow_status = Some(words[2] & 0xFFFF),
+                // MSG_TYPE_FLOW_RING_DELETE_CMPLT (`leave`): the same status and id.
+                0x06 => self.flow_status = Some(words[2] & 0xFFFF),
                 // MSG_TYPE_WL_EVENT: request id = the event buffer, event_data_len at +12; the packet starts rx_dataoffset into the buffer.
                 0x0E => {
                     let b = words[1].wrapping_sub(0x101);
@@ -1842,7 +1894,7 @@ impl Msgbuf {
             }
             q += 2 + l;
         }
-        self.note_net(bi, cs, rssi, if psk && band != b"6G" { 1 } else if sec == b"open" { 2 } else { 4 });
+        self.note_net(bi, cs, rssi, dbr(bi + 80) as i8, if psk && band != b"6G" { 1 } else if sec == b"open" { 2 } else { 4 });
         if self.quiet {
             return;
         }
@@ -1868,6 +1920,10 @@ impl Msgbuf {
     /// A BSS whose SSID is the one to join and whose RSN IE (version 2, group 4, pairwise count + list, AKM count + list, capabilities) offers PSK (00-0F-AC:2), outside 6 GHz (which needs WPA3-SAE): keep the strongest.
     fn consider(&mut self, bi: u32, rsn: u32, l: u32, cs: u32) {
         let n = dbr(bi + 18) as usize;
+        // While a network is served the target is the access point joined (the detail names it), and a scan the page asked for leaves it as it is.
+        if self.serving && !self.gone {
+            return;
+        }
         if self.want_len == 0 || n != self.want_len || cs & 0xC000 == 0x4000 || l < 8 {
             return;
         }
@@ -1919,6 +1975,47 @@ impl Msgbuf {
         }
         at
     }
+    /// NETS's list (op 12, the settings page's picker; docs/WIFI.md "The picker"), at most `NETS_MAX` bytes: [scanning 0/1, count, then per network strongest first: name length, name, signal (dBm, signed byte), flags (as SCAN's), noise floor (dBm, signed byte, 0 unknown), access points (u16 LE), centre frequency and channel width (MHz, u16 LE each, 0 unknown), kept (0 no, 1 in the person's list, 2 in the device's)], then [count of networks remembered, then per network: whose (0 the person's, 1 the device's), 1 if it is the network joined now, name length, name, when this device last joined it (Eagle oscillations, i64 LE; i64::MIN never)]. Never a passphrase.
+    fn nets_reply(&self, scanning: bool, out: &mut [u8]) -> usize {
+        let mut order = [0u8; 32];
+        for (k, o) in order.iter_mut().enumerate() {
+            *o = k as u8;
+        }
+        let order = &mut order[..self.nnets];
+        order.sort_unstable_by(|a, b| self.nets[*b as usize].rssi.cmp(&self.nets[*a as usize].rssi));
+        out[0] = scanning as u8;
+        out[1] = self.nnets as u8;
+        let mut at = 2;
+        for &k in order.iter() {
+            let e = &self.nets[k as usize];
+            let name = &e.name[..e.len as usize];
+            let known = if self.want_len > 0 && name == &self.want[..self.want_len] { 1 << 4 } else { 0 };
+            out[at] = e.len;
+            out[at + 1..at + 1 + name.len()].copy_from_slice(name);
+            at += 1 + name.len();
+            out[at] = e.rssi as i8 as u8;
+            out[at + 1] = e.flags | known;
+            out[at + 2] = e.noise as u8;
+            out[at + 3..at + 5].copy_from_slice(&e.aps.to_le_bytes());
+            out[at + 5..at + 7].copy_from_slice(&e.freq.to_le_bytes());
+            out[at + 7..at + 9].copy_from_slice(&e.width.to_le_bytes());
+            out[at + 9] = self.kept.iter().find(|k| k.0 == name).map_or(0, |k| k.1 + 1);
+            at += 10;
+        }
+        let joined = self.serving && !self.gone && self.keyed && self.linked;
+        out[at] = self.kept.len() as u8;
+        at += 1;
+        for (name, class, when) in &self.kept {
+            out[at] = *class;
+            out[at + 1] = (joined && name[..] == self.want[..self.want_len]) as u8;
+            out[at + 2] = name.len() as u8;
+            out[at + 3..at + 3 + name.len()].copy_from_slice(name);
+            at += 3 + name.len();
+            out[at..at + 8].copy_from_slice(&when.unwrap_or(i64::MIN).to_le_bytes());
+            at += 8;
+        }
+        at
+    }
     /// STATUS's reply: [state: 0 waiting for a network, 1 scanning, 2 joined; the last join's outcome (`outcome`); the name length; the name being joined or kept].
     fn status_reply(&self, state: u8, out: &mut [u8]) -> usize {
         out[0] = state;
@@ -1927,8 +2024,10 @@ impl Msgbuf {
         out[3..3 + self.want_len].copy_from_slice(&self.want[..self.want_len]);
         3 + self.want_len
     }
-    /// One BSS into the network list: a name seen before keeps its strongest signal and gathers the flags; a hidden network (no name) is not listed.
-    fn note_net(&mut self, bi: u32, cs: u32, rssi: i16, flags: u8) {
+    /// One BSS into the network list: a name seen before keeps its strongest signal (and that BSS's noise floor, frequency and width), gathers the flags and counts its access points; a hidden network (no name) is not listed.
+    fn note_net(&mut self, bi: u32, cs: u32, rssi: i16, noise: i8, flags: u8) {
+        let (mhz, bw) = chanspec_mhz(cs);
+        let (freq, width) = (mhz.unwrap_or(0) as u16, bw.unwrap_or(0) as u16);
         // The SSID length is the firmware's byte from the air (0..=255 as a field); the name buffer is 32 bytes (802.11's limit), so a longer one would index past it: bounded, as `bss` bounds its print.
         let n = (dbr(bi + 18) as usize).min(32);
         if n == 0 {
@@ -1945,12 +2044,16 @@ impl Msgbuf {
         if let Some(e) = self.nets[..self.nnets].iter_mut().find(|e| e.len as usize == n && e.name == name) {
             // First sight in this scan: the entry starts over; then the strongest BSS of the name.
             if e.seen_in != g {
-                (e.rssi, e.flags, e.seen_in) = (rssi, 0, g);
+                (e.rssi, e.flags, e.seen_in, e.aps) = (i16::MIN, 0, g, 0);
             }
-            e.rssi = e.rssi.max(rssi);
+            if rssi > e.rssi {
+                (e.rssi, e.noise, e.freq, e.width) = (rssi, noise, freq, width);
+            }
             e.flags |= flags | five;
+            // A BSS is counted once a scan (`bss` drops a BSSID seen already, for the first 96 of them; past that a repeat counts again): a scan of every channel brings a few hundred results at most, far under the counter's 65536.
+            e.aps += 1;
         } else if self.nnets < self.nets.len() {
-            self.nets[self.nnets] = Net { name, len: n as u8, rssi, flags: flags | five, seen_in: g };
+            self.nets[self.nnets] = Net { name, len: n as u8, rssi, flags: flags | five, seen_in: g, noise, freq, width, aps: 1 };
             self.nnets += 1;
         }
     }
@@ -2077,33 +2180,12 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
         (Some(r), Some(n)) => w(k::SNR, (r - n) as i64 * 1000),
         _ => MEASURE_NONE,
     });
-    // The chanspec: the channel (the centre one for a wide channel) in bits 0-7, the bandwidth in 11-13, the band in 14-15; the centre frequency is the band's base plus 5 MHz a channel (2.4 GHz: 2407, channel 14 at 2484; 5 GHz: 5000; 6 GHz: 5950).
+    // The chanspec (`chanspec_mhz`): the centre frequency and the channel's width.
     let cs = match m.get_var(d, b"chanspec", req) {
         Some((0, b, _)) => Some(dr32u(m.resp(b))),
         _ => None,
     };
-    let (freq, bw) = match cs {
-        Some(cs) => {
-            let ch = (cs & 0xFF) as i64;
-            let mhz = match cs & 0xC000 {
-                0x0000 if ch == 14 => Some(2484),
-                0x0000 => Some(2407 + 5 * ch),
-                0xC000 => Some(5000 + 5 * ch),
-                0x4000 => Some(5950 + 5 * ch),
-                _ => None,
-            };
-            let bw = match cs & 0x3800 {
-                0x1000 => Some(20),
-                0x1800 => Some(40),
-                0x2000 => Some(80),
-                0x2800 => Some(160),
-                0x0000 => Some(320),
-                _ => None,
-            };
-            (mhz, bw)
-        }
-        None => (None, None),
-    };
+    let (freq, bw) = cs.map_or((None, None), chanspec_mhz);
     status(4, freq.map_or(MEASURE_NONE, |v| w(k::FREQ, v * 1000)));
     status(5, bw.map_or(MEASURE_NONE, |v: i64| w(k::BANDWIDTH, v * 1000)));
     status(6, ask(m, d, 12, 4).map_or(MEASURE_NONE, |a| w(k::RATE_DOWN, dr32u(a) as i64 * 500_000)));
@@ -2498,24 +2580,39 @@ fn irq_selftest(d: &mut Drv, m: &mut Msgbuf) -> bool {
     ok
 }
 
-fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
+/// Serving `wlan` on the network joined: frames both ways, the page's requests, the corners' measures. Returns how it ended (`Left`): the driver done, or a page asking for another network (or forgetting this one), which `keep_joined` joins in the same process.
+fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
     if !flowring(d, m) {
-        return;
+        return Left::End;
     }
-    // Checksum offload: the firmware fills transmit checksums only with extended (56-byte) tx items, offered by pcie_shared flags2 bit G#40_0000 (TXPOST_EXT); receive completions flag G#800 when it verified a checksum.
-    let f2 = d.tcm_rd(sh + 80);
-    d.kv(b"shared flags2", f2);
-    d.put(if f2 & 0x0040_0000 != 0 { b"tx checksum offload offered (TXPOST_EXT)\n" } else { b"no tx checksum offload (no TXPOST_EXT)\n" });
-    m.sfh = cap_has(d, m, b"host_sfhllc");
-    d.put(if m.sfh { b"tx frames as 802.3 + LLC/SNAP (the firmware's cap names host_sfhllc)\n" } else { b"tx frames as Ethernet (no host_sfhllc in the firmware's cap)\n" });
     m.serving = true;
     m.verbose = false;
-    d.put(b"serving wlan\n");
-    d.flush();
-    enable_l1ss(d);
+    // A network after another (`leave`): frames are the IP stack's again, and its first exchange is told the network changed.
+    m.fresh_link = m.served;
+    m.gone = false;
+    if m.served {
+        d.put(b"serving wlan on the next network\n");
+        d.flush();
+    }
+    // Once a process: the firmware's capabilities, the link's low power states, the chip's interrupt and its thread.
+    let first = !m.served;
+    m.served = true;
+    // Checksum offload: the firmware fills transmit checksums only with extended (56-byte) tx items, offered by pcie_shared flags2 bit G#40_0000 (TXPOST_EXT); receive completions flag G#800 when it verified a checksum.
+    if first {
+        let f2 = d.tcm_rd(sh + 80);
+        d.kv(b"shared flags2", f2);
+        d.put(if f2 & 0x0040_0000 != 0 { b"tx checksum offload offered (TXPOST_EXT)\n" } else { b"no tx checksum offload (no TXPOST_EXT)\n" });
+        m.sfh = cap_has(d, m, b"host_sfhllc");
+        d.put(if m.sfh { b"tx frames as 802.3 + LLC/SNAP (the firmware's cap names host_sfhllc)\n" } else { b"tx frames as Ethernet (no host_sfhllc in the firmware's cap)\n" });
+        d.put(b"serving wlan\n");
+        d.flush();
+        enable_l1ss(d);
+    }
     // The chip's interrupt (the line granted): the root complex's MSI receiver onto the controller's line, the chip's completions onto MSI, the interrupt's thread started, then proven by an ioctl's completion (`irq_selftest`).
-    let irq = WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
-    if irq {
+    let irq = first && WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
+    if !first {
+        // The interrupt as the first network's serving left it (the thread runs on; `leave` kept the line as it was).
+    } else if irq {
         irq_clear(d);
         // ELBI PCIE_IRQ2_EN bit 17 (IRQ_MSI_CTRL_EN_RISING_EDG): an MSI raises SPI 439 (pcie-exynos-rc.c exynos_pcie_rc_msi_init, channel 1 having no separate MSI lines). The A1 step zeroed every enable; the MSI receiver itself (DBI G#820-G#82C) is set since the firmware's download.
         d.set(ELBI, 0x18, 1 << 17);
@@ -2528,7 +2625,12 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     } else if WIFI_IRQ {
         d.put(b"irq: no interrupt grant (fewer than 20 slots): sleeping a millisecond between passes\n");
     }
-    let mut irq = if irq {
+    let mut irq = if !first {
+        // All multicast in again: the radio went down and up for the new network's MAC (`rejoin_as`).
+        let r = m.set_int(d, b"allmulti", 1);
+        d.kv(b"allmulti", r);
+        m.irq
+    } else if irq {
         irq_selftest(d, m)
     } else {
         // All multicast in: IPv6 neighbour discovery lives on 33:33:… groups.
@@ -2536,6 +2638,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         d.kv(b"allmulti", r);
         false
     };
+    m.irq = irq;
     IRQ_ON.store(irq, core::sync::atomic::Ordering::Relaxed);
     // The screen's state as last looked at (the preference block, a memory read): with it on, the corners' measures every 2 s; off, none.
     let mut dark_now = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
@@ -2570,9 +2673,16 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     let mut control_at = 0u64;
     let mut control_gen: Option<u64> = None;
     let mut dark_was = !dark_now;
+    // The pages' held calls (WATCH, NETS) and a scan one of them started: the firmware scans while joined, going off its channel between beacons (docs/WIFI.md "The picker").
+    let mut page = Page::default();
+    let mut scanning = false;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
+        if scanning && m.scan_done {
+            scanning = false;
+        }
+        page.tick(d, m, scanning, true);
         // The interrupt's count before the rings are read: an interrupt taken while this pass runs ends its wait at once.
         let seen = IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire);
         dark_now = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
@@ -2645,7 +2755,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 d.flush();
                 m.serving = false;
                 d.failed = true;
-                return;
+                return Left::End;
             }
             lstates = [0; 8];
             path = Path::default();
@@ -2657,7 +2767,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             d.flush();
             m.serving = false;
             d.failed = true;
-            return;
+            return Left::End;
         }
         let t_rings = d.now();
         let _ = m.pump(d);
@@ -2668,7 +2778,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             d.flush();
             m.serving = false;
             d.failed = true;
-            return;
+            return Left::End;
         }
         // The firmware silent (2026-11-12, the owner's Pro: hundreds of "no ioctl completion" over minutes, no transmit completions, every frame refused, each measure's ioctl waiting out its 3 s so one exchange with ip took A#21 s, and Mahere's tiles never loaded): it ends the same way, the firmware's shared flags and console said after it (`run`), and init's keeper starts it again, the chip brought up afresh.
         if m.silent >= SILENT_MAX {
@@ -2677,7 +2787,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             d.flush();
             m.serving = false;
             d.failed = true;
-            return;
+            return Left::End;
         }
         let rx0 = m.rxq_len;
         m.pump_rx(d);
@@ -2719,6 +2829,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                     _ if rung == u64::MAX => {
                         // The thread's wait refused: not an interrupt grant after all, the sleep from here on.
                         irq = false;
+                        m.irq = false;
                         IRQ_ON.store(false, core::sync::atomic::Ordering::Relaxed);
                         d.put(b"irq: the wait was refused: sleeping a millisecond between passes\n");
                         4
@@ -2802,7 +2913,9 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 }
                 // WHY the max: the high water, for the measure.
                 path.to_ip_most = path.to_ip_most.max(k);
-                out[0] = (m.rxq_len > 0) as u8;
+                // Bit 0: more frames wait. Bit 1, once, on the first exchange of a network after another (`fresh_link`): the IP stack lets the last network's addresses go and asks this one for its own.
+                out[0] = (m.rxq_len > 0) as u8 | (m.fresh_link as u8) << 1;
+                m.fresh_link = false;
                 // A request of 4096 bytes holds fewer than 2^11 frames: the count fits.
                 out[1..3].copy_from_slice(&(refused as u16).to_be_bytes());
                 o
@@ -2812,13 +2925,60 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 out[6] = m.linked as u8;
                 7
             }
-            // The network page while joined: the list from before the join (no scan runs while serving), JOIN refused with 3 (joined already; another network is a later change), and the status.
-            Some(4) => m.scan_reply(false, out),
-            // WATCH while joined: the list from before the join, and the last (no scan runs while serving).
-            Some(7) => watch_reply(m, false, false, out),
-            Some(5) => {
-                out[0] = 3;
-                1
+            // The network page while joined: the list as the last scan left it ([4, 1] starts one: the firmware scans while joined), the pages' held calls (WATCH, NETS), and the status.
+            Some(4) => {
+                if n >= 2 && msg[1] == 1 && !scanning {
+                    escan_start(d, m);
+                    scanning = true;
+                }
+                m.scan_reply(scanning, out)
+            }
+            Some(7 | 12) if n >= 5 => {
+                page.watch(d, m, &mut scanning, true, msg[0], &msg, tok);
+                continue;
+            }
+            // JOIN while joined (2026-11-18, the picker): the network handed in is kept and replied to, then this one is left and that one joined (`keep_joined`). JOIN KEPT the same for a remembered one.
+            Some(5) if n >= 2 && 2 + msg[1] as usize <= n => {
+                let (name, pass) = (&msg[2..2 + msg[1] as usize], &msg[2 + msg[1] as usize..n]);
+                match hand_in(d, m, name, pass) {
+                    Ok(t) => {
+                        let reply = [0, t.list as u8];
+                        return switch(d, m, t, &reply, &tok, &mut ring, &mut page, scanning);
+                    }
+                    Err(e) => {
+                        out[0] = e;
+                        1
+                    }
+                }
+            }
+            Some(13) => {
+                let kept = kept_all(d, m);
+                match req_name(&msg, n).and_then(|name| kept.iter().find(|(k, _)| k.name == name)) {
+                    Some((k, l)) => {
+                        let t = kept_try(k, *l);
+                        return switch(d, m, t, &[0], &tok, &mut ring, &mut page, scanning);
+                    }
+                    None => {
+                        out[0] = 1;
+                        1
+                    }
+                }
+            }
+            // FORGET while joined: the network let go from the lists; the one joined now is left too (`keep_joined`), and another remembered one in range joined.
+            Some(11) => {
+                let name = req_name(&msg, n).map(|s| s.to_vec());
+                out[0] = name.as_ref().map_or(1, |name| forget(d, m, name));
+                let here = out[0] == 0 && name.as_deref() == Some(&m.want[..m.want_len]);
+                if here {
+                    ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
+                    ferros_sys::status(1, ferros_sys::MEASURE_NONE);
+                }
+                svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, 1, 0, 0);
+                if here {
+                    part(d, m, &mut ring, &mut page, scanning);
+                    return Left::Unjoin;
+                }
+                continue;
             }
             Some(6) => m.status_reply(2, out),
             Some(1) => {
@@ -2835,6 +2995,70 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         };
         svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
     }
+}
+
+/// A page's JOIN or JOIN KEPT taken while serving: the link's state published as left with a join under way (STATE 1, JOIN 0: a page reads the facts, not this driver, while the join runs, and must never read this network's state as the next one's), the reply, then `part`; `keep_joined` leaves this network and joins `t`.
+fn switch(d: &mut Drv, m: &Msgbuf, t: Try, reply: &[u8], tok: &[u8; 32], ring: &mut Option<[u8; 32]>, page: &mut Page, scanning: bool) -> Left {
+    ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
+    ferros_sys::status(1, ferros_sys::measure_word(ferros_sys::measure::JOIN, 0));
+    svc(3, tok.as_ptr() as u64 - d.base, reply.as_ptr() as u64 - d.base, reply.len() as u64, 0, 0);
+    d.put(if t.before.is_some() { b"a network handed in by a page while serving\n".as_slice() } else { b"a remembered network a page picked while serving\n" });
+    part(d, m, ring, page, scanning);
+    Left::Switch(t)
+}
+
+/// Before serving ends for another network: the pages' held calls answered (they call again, and wait while the join runs), and the IP stack's held doorbell rung, so its next exchange hears the network went (op 8 reply bit 1) and lets its addresses go.
+fn part(d: &Drv, m: &Msgbuf, ring: &mut Option<[u8; 32]>, page: &mut Page, scanning: bool) {
+    page.answer(d, m, scanning, true);
+    if let Some(t) = ring.take() {
+        let one = [1u8];
+        svc(3, t.as_ptr() as u64 - d.base, one.as_ptr() as u64 - d.base, 1, 0, 0);
+    }
+}
+
+/// The network served left for another (`keep_joined`), as dhd leaves one: disassociated (WLC_DISASSOC 52), its flowring deleted (MSG_TYPE_FLOW_RING_DELETE G#05, flow ring 2, reason 0; answered by G#06 with its status: dhd deletes a station's flowrings as its link goes, dhd_common.c WLC_E_LINK, and creates them again for the next), the IP stack's frames waiting dropped.
+/// The chip, its firmware, the receive buffers and the interrupt's thread stay, so the next network takes a scan and a join, not a bring-up (and Bluetooth is not cycled: the REG_ON rule).
+/// False when the firmware does not answer the delete: the driver ends then, and init's keeper starts it afresh.
+fn leave(d: &mut Drv, m: &mut Msgbuf) -> bool {
+    m.say_tx(d);
+    let req = m.dma + 0x1_3000;
+    for k in 0..12 {
+        db(req + k, 0);
+    }
+    let r = m.ioctl(d, 52, req, 12, 12).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WLC_DISASSOC", r);
+    m.flow_status = None;
+    m.post(d, 0x05, 0, [2, 0, 0, 0, 0, 0, 0, 0]);
+    m.ring(d);
+    let ts = d.now();
+    while m.flow_status.is_none() && d.now().wrapping_sub(ts) < 2 * d.freq {
+        let _ = m.pump(d);
+        m.pump_tx(d);
+        d.us(1000);
+    }
+    d.kv(b"flowring delete status", m.flow_status.unwrap_or(u32::MAX));
+    // The transmit buffers the deleted ring held are the host's again (dhd frees a deleted ring's packets; no completion comes for them), and the next flowring starts at slot 0 (`flowring`); the totals start again with it.
+    (m.tx_busy, m.tx_w, m.tx_done, m.tx_ooo, m.tx_bad) = (0, 0, 0, 0, 0);
+    (m.linked, m.keyed, m.join_failed, m.target) = (false, false, false, None);
+    m.gone = true;
+    // The frames that waited for the IP stack are the last network's: their buffers posted to the chip again.
+    while m.rxq_len > 0 {
+        let i = m.rxq[m.rxq_head].0;
+        m.rxq_head = (m.rxq_head + 1) % m.rxq.len();
+        m.rxq_len -= 1;
+        m.post_rx(i as u32);
+    }
+    m.ring_rx(d);
+    // The corners and the link's page: no link (the join's measure, slot 1, as the caller left it), no names.
+    for s in 2..8 {
+        ferros_sys::status(s, ferros_sys::MEASURE_NONE);
+    }
+    for t in 0..WIFI_TRACKS {
+        ferros_sys::status_track(t, ferros_sys::MEASURE_NONE);
+    }
+    ferros_detail::publish(ferros_sys::control::WIFI, Vec::new());
+    d.flush();
+    m.flow_status == Some(0)
 }
 
 fn ip_put(d: &mut Drv, a: [u8; 4]) {
@@ -3098,22 +3322,204 @@ fn credential(c: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     ferros_detail::network::parse(c)
 }
 
-/// The credential the vault keeps: the person's (`wifi.cred`, readable once someone attests, AUTH.md) before the device's (`wifi.net`, a network joined before anyone attested). A value that is not a credential document (the two-line text file it replaced, 2026-11-09) is dropped, never parsed.
-fn stored_cred(d: &mut Drv) -> Option<(Vec<u8>, Vec<u8>, &'static [u8])> {
-    for key in [&b"cred"[..], b"net"] {
-        let Some(doc) = vault_file(d, key, 0x12_0000) else { continue };
-        match credential(doc) {
-            Some((n, p)) => return Some((n, p, key)),
-            None => {
-                let gone = ferros_sys::store_delete(d.cap(STORE), key);
+use ferros_detail::network::Kept;
+
+/// The vault entries the networks remembered are kept in, by whose they are (docs/WIFI.md "Networks remembered"): 0 the person's (`wifi.cred`, identity class, readable only while someone is attested, AUTH.md), 1 the device's (`wifi.net`, networks joined while nobody was).
+/// Kept on the device, as since 2026-10-26: whether a network joined here should also travel to the person's other devices is the owner's question (settings flow from the identity to the device, never back).
+const LISTS: [&[u8]; 2] = [b"cred", b"net"];
+
+/// A network to join: its name and passphrase (never printed), the list that keeps it (`LISTS`), and for one handed in by a page what that list kept under its name before (Some(None): nothing; None: a network the vault kept already).
+/// A handed-in network that does not join puts that back (`undo`): a mistyped passphrase is not kept, and the one it replaced is not lost.
+struct Try {
+    name: Vec<u8>,
+    pass: Vec<u8>,
+    list: usize,
+    before: Option<Option<Kept>>,
+}
+
+/// The FILES slot the lists are read into, one at a time (1 MiB + 128 KiB in the DMA region's old layout, the credential's place until 2026-11-18).
+const LIST_SLOT: usize = 2;
+
+/// The networks list `k` keeps: Ok with them (none when the entry is absent), Err when the vault refused (the person's while nobody is attested, AUTH.md), or a read failed part way: nothing is written over a list that could not be read.
+/// A value that is not a list is dropped, never parsed further; the one-network document of before 2026-11-18 is written again as a list of one.
+fn list_read(d: &mut Drv, k: usize) -> Result<Vec<Kept>, ()> {
+    let (cap, key) = (d.cap(STORE), LISTS[k]);
+    let mut head = [0u8; 4];
+    let r = ferros_sys::store_read_at(cap, key, 0, &mut head);
+    if r == ERR {
+        return Err(());
+    }
+    if r == ferros_sys::NOTHING {
+        return Ok(Vec::new());
+    }
+    let len = r as usize;
+    // WHY the bound: the length is the vault's word and the scratch is one 64 KiB slot (`FILES`); a list of `MOST` networks is under 2 KiB, so a value past the slot is no list (dropped below).
+    let doc: Option<&[u8]> = if len <= 0x1_0000 {
+        // SAFETY: slot LIST_SLOT of FILES is this function's alone (the lists are read one at a time, on the driver's one thread that reads the vault), and `len` is inside it.
+        let buf = unsafe { core::slice::from_raw_parts_mut((&raw mut FILES as *mut u8).add(LIST_SLOT << 16), len) };
+        let mut piece = [0u8; 4096];
+        let mut off = 0;
+        while off < len {
+            // WHY the min: a piece is what is left of the value or a whole piece, whichever is less (the last piece is short).
+            let n = (len - off).min(piece.len());
+            let r = ferros_sys::store_read_at(cap, key, off, &mut piece[..n]);
+            if r == ERR || r == ferros_sys::NOTHING {
+                return Err(());
+            }
+            buf[off..off + n].copy_from_slice(&piece[..n]);
+            off += n;
+        }
+        piece.fill(0);
+        Some(buf)
+    } else {
+        None
+    };
+    let parsed = doc.and_then(ferros_detail::network::parse_list);
+    // The document's bytes (passphrases among them) gone from the scratch once parsed.
+    if len <= 0x1_0000 {
+        // SAFETY: as above, the slot is this function's, and `len` is inside it.
+        unsafe { core::slice::from_raw_parts_mut((&raw mut FILES as *mut u8).add(LIST_SLOT << 16), len) }.fill(0);
+    }
+    match parsed {
+        Some((nets, old)) => {
+            if old {
+                let ok = list_write(d, k, &nets);
                 d.put(b"wifi.");
                 d.put(key);
-                d.put(if gone == Some(true) { b" dropped: not a credential document\n" } else { b" is not a credential document and could not be dropped\n" });
+                d.put(if ok { b": the one network kept before 2026-11-18, written again as a list\n".as_slice() } else { b": the one network kept before 2026-11-18, not written again as a list (the vault refused)\n" });
                 d.flush();
+            }
+            Ok(nets)
+        }
+        None => {
+            let gone = ferros_sys::store_delete(cap, key);
+            d.put(b"wifi.");
+            d.put(key);
+            d.put(if gone == Some(true) { b" dropped: not a list of networks\n".as_slice() } else { b" is not a list of networks and could not be dropped\n" });
+            d.flush();
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// List `k` written whole (a VSF document, `build_list`; the entry deleted when it keeps none): true when the vault took it.
+fn list_write(d: &mut Drv, k: usize, nets: &[Kept]) -> bool {
+    let cap = d.cap(STORE);
+    if nets.is_empty() {
+        return ferros_sys::store_delete(cap, LISTS[k]).is_some();
+    }
+    match ferros_detail::network::build_list(nets, eagle()) {
+        Some(doc) => ferros_sys::store_set_at(cap, LISTS[k], 0, &doc, false),
+        None => false,
+    }
+}
+
+/// Every network remembered, both lists read again (`list_read`), the person's first; a name both keep is listed once, as the person's. Into `m.kept` (names, whose, when joined: what the page is shown), and returned with the passphrases for the join's choice. A list the vault refused counts as none.
+fn kept_all(d: &mut Drv, m: &mut Msgbuf) -> Vec<(Kept, usize)> {
+    let mut all: Vec<(Kept, usize)> = Vec::new();
+    for k in 0..LISTS.len() {
+        if let Ok(nets) = list_read(d, k) {
+            for n in nets {
+                if !all.iter().any(|(a, _)| a.name == n.name) {
+                    all.push((n, k));
+                }
             }
         }
     }
-    None
+    m.kept = all.iter().map(|(n, k)| (n.name.clone(), *k as u8, n.joined)).collect();
+    all
+}
+
+/// A remembered network as one to join.
+fn kept_try(k: &Kept, list: usize) -> Try {
+    Try { name: k.name.clone(), pass: k.pass.clone(), list, before: None }
+}
+
+/// The best remembered network the last scan saw (`kept`, as `kept_all` gives them): joinable here (WPA2-PSK outside 6 GHz) on a band the band knob allows, not one of `not` (those that failed since the last join), the strongest. None when the scan saw none of them.
+fn best_seen(m: &Msgbuf, kept: &[(Kept, usize)], not: &[Vec<u8>]) -> Option<Try> {
+    let band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
+    // The band knob as `consider` reads it: 1 keeps only 5 GHz (flags bit 3), 2 only 2.4 GHz (bit 5), anything else any.
+    let band_ok = |f: u8| match band {
+        1 => f & 1 << 3 != 0,
+        2 => f & 1 << 5 != 0,
+        _ => true,
+    };
+    m.nets[..m.nnets]
+        .iter()
+        .filter(|e| e.flags & 1 != 0 && band_ok(e.flags) && !not.iter().any(|n| n[..] == e.name[..e.len as usize]))
+        .filter_map(|e| kept.iter().find(|(k, _)| k.name[..] == e.name[..e.len as usize]).map(|(k, l)| (e.rssi, k, *l)))
+        .max_by_key(|(rssi, _, _)| *rssi)
+        .map(|(_, k, l)| kept_try(k, l))
+}
+
+/// A network handed in by a page (JOIN): kept before it is tried, so the join survives a restart, in the person's list while someone is attested, else in the device's. Ok with the network to join; Err with the reply's byte: 1 the name or passphrase is not usable (a name of 1 to 32 octets, a passphrase of 8 to 63 ASCII characters), 2 the vault took neither list.
+fn hand_in(d: &mut Drv, m: &mut Msgbuf, name: &[u8], pass: &[u8]) -> Result<Try, u8> {
+    if !ferros_detail::network::usable(name, pass) || !pass.is_ascii() {
+        return Err(1);
+    }
+    for k in 0..LISTS.len() {
+        let Ok(mut nets) = list_read(d, k) else { continue };
+        let (before, gone) = ferros_detail::network::keep(&mut nets, name, pass);
+        if list_write(d, k, &nets) {
+            if gone.is_some() {
+                d.put(b"sixteen networks kept already: the one joined longest ago let go\n");
+            }
+            let _ = kept_all(d, m);
+            return Ok(Try { name: name.to_vec(), pass: pass.to_vec(), list: k, before: Some(before) });
+        }
+    }
+    Err(2)
+}
+
+/// A handed-in network that did not join: its list put back as it was before (the passphrase kept before back, or the name gone again).
+fn undo(d: &mut Drv, m: &mut Msgbuf, t: &Try) {
+    let Some(before) = &t.before else { return };
+    let Ok(mut nets) = list_read(d, t.list) else { return };
+    nets.retain(|k| k.name != t.name);
+    if let Some(b) = before {
+        nets.push(b.clone());
+    }
+    let ok = list_write(d, t.list, &nets);
+    d.put(match (before.is_some(), ok) {
+        (true, true) => b"the passphrase handed in did not join: the one kept before is back\n".as_slice(),
+        (false, true) => b"the network handed in did not join: not kept\n",
+        _ => b"the network handed in did not join, and the vault refused its list put back\n",
+    });
+    d.flush();
+    let _ = kept_all(d, m);
+}
+
+/// A network joined: when, kept in its list, so the next start tries the one joined last first (`connect`), and a network that has joined once is never let go for a failed join.
+fn joined_now(d: &mut Drv, m: &mut Msgbuf, t: &Try) {
+    if let Ok(mut nets) = list_read(d, t.list) {
+        if let Some(k) = nets.iter_mut().find(|k| k.name == t.name) {
+            k.joined = Some(eagle());
+            if !list_write(d, t.list, &nets) {
+                d.put(b"joined, but the vault refused the time it joined\n");
+            }
+        }
+    }
+    let _ = kept_all(d, m);
+}
+
+/// FORGET: `name` let go from both lists (the person's only while they are attested). The reply's byte: 0 forgotten, 1 no list kept it, 2 the vault refused a write.
+fn forget(d: &mut Drv, m: &mut Msgbuf, name: &[u8]) -> u8 {
+    let (mut found, mut ok) = (false, true);
+    for k in 0..LISTS.len() {
+        let Ok(mut nets) = list_read(d, k) else { continue };
+        let n = nets.len();
+        nets.retain(|x| x.name != name);
+        if nets.len() != n {
+            found = true;
+            ok &= list_write(d, k, &nets);
+        }
+    }
+    let _ = kept_all(d, m);
+    match (found, ok) {
+        (false, _) => 1,
+        (true, true) => 0,
+        (true, false) => 2,
+    }
 }
 
 /// Eagle time now, in oscillations (the vault process's `eagle`): 0 until the kernel has read the PMIC's clock.
@@ -3125,35 +3531,82 @@ fn eagle() -> i64 {
     ((secs as i128 - EPOCH_UNIX) * ops + ticks as i128 * ops / hz as i128) as i64
 }
 
-/// The boot path's join (init's pcie1): the radio up, then a credential — the vault's (`stored_cred`), or one the network page hands in (JOIN, `serve_unjoined`) — scanned for and joined. A join that fails goes back to serving the page; a credential handed in that failed is deleted again (a mistyped passphrase is not kept), and the vault's own is retried when a scan sees its network.
-fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
-    let mut next = stored_cred(d).map(|(n, p, k)| (n, p, k, false));
-    if let Some((n, _, _, _)) = &next {
-        m.set_want(n);
-    }
-    m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
-    radio_up(d, m, clm);
-    // radio_up set this credential's MAC; any other needs the radio brought down first (`rejoin_as`).
-    let mut fresh = true;
-    let mut skip: Option<(Vec<u8>, Vec<u8>, &'static [u8])> = None;
+/// How serving a network ended (`serve`): the driver is done (the link or the firmware lost, init's keeper starts it again), a page handed in another network (or a remembered one) to join instead, or the network joined was forgotten.
+enum Left {
+    End,
+    Switch(Try),
+    Unjoin,
+}
+
+/// The boot path's joins, for as long as the driver runs (init's pcie1, `run`): a network joined (`connect`), served (`serve`), and when a page asks for another (or forgets this one) left (`leave`) and the next joined in the same process: the chip, its firmware and the receive buffers stay; the flowring and the association go (docs/WIFI.md "Another network while joined").
+fn keep_joined(d: &mut Drv, m: &mut Msgbuf, clm: &[u8], sh: u32) {
+    let mut next = None;
+    let mut first = true;
     loop {
-        let (name, pass, key, handed) = match next.take() {
-            Some(c) => c,
+        connect(d, m, clm, first, next.take());
+        first = false;
+        match serve(d, m, sh) {
+            Left::End => return,
+            Left::Switch(t) => {
+                d.put(b"another network handed in while serving: leaving this one\n");
+                if !leave(d, m) {
+                    return;
+                }
+                next = Some(t);
+            }
+            Left::Unjoin => {
+                d.put(b"the network served was forgotten: leaving it\n");
+                if !leave(d, m) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The boot path's join: the radio up the first time, then a network to join, scanned for and joined; returns once one is.
+/// The network: `next` (handed in, or remembered, while the last one was served); else at the first start the remembered one joined last, its MAC set before the radio comes up, so a network in range takes one scan as before 2026-11-18; else the best remembered one a scan sees (`best_seen`); else whatever the page hands in while it is served (`serve_unjoined`).
+/// One that does not join: a handed-in one is put back as it was (`undo`); a remembered one is tried again only after the retry wait (`serve_unjoined`), as are all that failed since the last join.
+fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8], first: bool, mut next: Option<Try>) {
+    let kept = kept_all(d, m);
+    if first {
+        if next.is_none() {
+            next = kept.iter().max_by_key(|(k, _)| k.joined.unwrap_or(i64::MIN)).map(|(k, l)| kept_try(k, *l));
+        }
+        m.set_want(next.as_ref().map_or(&[][..], |t| &t.name[..]));
+        m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
+        radio_up(d, m, clm);
+    }
+    // radio_up set the first network's MAC; any other needs the radio brought down first (`rejoin_as`).
+    let mut fresh = first;
+    let mut failed: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let mut t = match next.take() {
+            Some(t) => t,
             None => {
                 fresh = false;
-                serve_unjoined(d, m, &skip)
+                serve_unjoined(d, m, &failed)
             }
         };
         if fresh {
             m.target = None;
             escan_start(d, m);
             escan_wait(d, m);
+            // The network joined last not in range: the best other one remembered that the scan saw, under its own MAC.
+            if m.target.is_none() {
+                if let Some(o) = best_seen(m, &kept, core::slice::from_ref(&t.name)) {
+                    d.put(b"the network joined last is not in range: another remembered one is\n");
+                    t = o;
+                    rejoin_as(d, m, &t.name);
+                }
+            }
         } else {
-            rejoin_as(d, m, &name);
+            rejoin_as(d, m, &t.name);
         }
         fresh = false;
-        join(d, m, &name, &pass);
+        join(d, m, &t.name, &t.pass);
         if m.keyed {
+            joined_now(d, m, &t);
             m.retry_s = 1 << 6;
             return;
         }
@@ -3165,48 +3618,121 @@ fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
         let _ = m.ioctl(d, 52, req, 12, 12);
         m.linked = false;
         m.join_failed = false;
-        skip = if handed {
-            let _ = ferros_sys::store_delete(d.cap(STORE), key);
-            d.put(b"the credential handed in did not join: deleted\n");
-            d.flush();
-            None
-        } else {
-            Some((name, pass, key))
-        };
+        // The outcome for a page at once (measure JOIN): another remembered network may be joined next without the page served between (`serve_unjoined`).
+        ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
+        if (1..=3).contains(&m.outcome) {
+            ferros_sys::status(1, ferros_sys::measure_word(ferros_sys::measure::JOIN, m.outcome as i64));
+        }
+        undo(d, m, &t);
+        if !failed.contains(&t.name) {
+            failed.push(t.name.clone());
+        }
     }
 }
 
 
-/// The network page's list as last answered to a WATCH (op 7), counted: moved on each time the list or its scanning flag changes, kept across a join that failed so a page waiting from before it is answered at once after.
+/// The network page's list as last answered to a WATCH or NETS (ops 7 and 12), counted: moved on each time the list, its scanning flag or the networks remembered change, kept across a join that failed so a page waiting from before it is answered at once after.
 static PAGE_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// WATCH's reply: [count u32 LE][1 more will come, 0 this is the last (joined: no scan runs while serving)][SCAN's reply (`scan_reply`)].
-fn watch_reply(m: &Msgbuf, scanning: bool, live: bool, out: &mut [u8]) -> usize {
-    out[..4].copy_from_slice(&PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
-    out[4] = live as u8;
-    5 + m.scan_reply(scanning, &mut out[5..])
+/// NETS's reply at most (`nets_reply`): 32 networks of at most 43 bytes, 2 bytes before them, and 32 remembered of at most 43 bytes with their count, 2755 bytes in all, under 4 KiB.
+const NETS_MAX: usize = 1 << 12;
+
+/// The page's held calls (WATCH op 7, the attest screen's; NETS op 12, the settings page's): each answered when the list changes (a network found, a scan begun or ended, a network kept or forgotten), and once more before the loop leaves for a join (a held call nobody answers keeps its caller waiting for good; it calls again, and that call waits in the endpoint while the join runs).
+#[derive(Default)]
+struct Page {
+    held: Vec<([u8; 32], u8)>,
+    answered: u32,
+    last: Vec<u8>,
 }
 
-/// The list's count moved on when it differs from the one last answered (`last`).
-fn watch_count(m: &Msgbuf, scanning: bool, last: &mut Vec<u8>) {
-    let mut b = [0u8; 2048];
-    let n = m.scan_reply(scanning, &mut b);
-    if b[..n] != last[..] {
-        *last = b[..n].to_vec();
-        PAGE_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+impl Page {
+    /// A held call's reply: [count u32 LE][1 more will come, 0 this is the last][SCAN's reply (op 7, `scan_reply`) or NETS's (op 12, `nets_reply`)].
+    fn reply(m: &Msgbuf, scanning: bool, live: bool, op: u8, out: &mut [u8]) -> usize {
+        out[..4].copy_from_slice(&PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        out[4] = live as u8;
+        5 + if op == 12 { m.nets_reply(scanning, &mut out[5..]) } else { m.scan_reply(scanning, &mut out[5..]) }
+    }
+
+    /// The count moved on when the list differs from the one last answered.
+    fn count(&mut self, m: &Msgbuf, scanning: bool) {
+        let mut b = [0u8; NETS_MAX];
+        let n = m.nets_reply(scanning, &mut b);
+        if b[..n] != self.last[..] {
+            self.last = b[..n].to_vec();
+            PAGE_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A WATCH or NETS ([op, count u32 LE]; owner, 2026-11-10: no scan button, the list filling as networks are found): answered at once when the list differs from the caller's count (u32::MAX at a page's opening, never a count given), else held until it changes. One held with nothing new to say starts the next scan, so scans run back to back while a page waits and stop when it closes (it calls no more).
+    fn watch(&mut self, d: &mut Drv, m: &mut Msgbuf, scanning: &mut bool, live: bool, op: u8, msg: &[u8], tok: [u8; 32]) {
+        let theirs = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        self.count(m, *scanning);
+        let now_gen = PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed);
+        // WHY the cap: callers are other processes, each held call keeps 32 bytes until the list moves; a page holds one, and past 4 a caller is answered at once with what there is.
+        if theirs != now_gen || self.held.len() >= 4 {
+            let mut out = [0u8; NETS_MAX + 5];
+            let len = Self::reply(m, *scanning, live, op, &mut out);
+            svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+        } else {
+            if !*scanning {
+                escan_start(d, m);
+                *scanning = true;
+            }
+            self.held.push((tok, op));
+            self.answered = now_gen;
+        }
+    }
+
+    /// Held calls answered once the list moved.
+    fn tick(&mut self, d: &Drv, m: &Msgbuf, scanning: bool, live: bool) {
+        if self.held.is_empty() {
+            return;
+        }
+        self.count(m, scanning);
+        if PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed) != self.answered {
+            self.answer(d, m, scanning, live);
+        }
+    }
+
+    /// Every held call answered with the list as it stands.
+    fn answer(&mut self, d: &Drv, m: &Msgbuf, scanning: bool, live: bool) {
+        let mut out = [0u8; NETS_MAX + 5];
+        for (tok, op) in core::mem::take(&mut self.held) {
+            let len = Self::reply(m, scanning, live, op, &mut out);
+            svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+        }
     }
 }
 
-/// Every held WATCH answered with the list as it stands: when it changed, and before the page loop leaves for a join (a held call nobody answers keeps its caller waiting for good; it calls again, and that call waits in the endpoint while the join runs).
-fn watch_answer(d: &Drv, m: &Msgbuf, scanning: bool, held: &mut Vec<[u8; 32]>) {
-    let mut out = [0u8; 2048];
-    let len = watch_reply(m, scanning, true, &mut out);
-    for tok in core::mem::take(held) {
-        svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+/// The IP stack's held doorbell rung, if one is held (`serve_unjoined` leaving for a join): its next exchange waits in the endpoint for the network the join brings.
+fn ring_rung(d: &Drv, held: &mut Option<[u8; 32]>) {
+    if let Some(t) = held.take() {
+        let one = [1u8];
+        svc(3, t.as_ptr() as u64 - d.base, one.as_ptr() as u64 - d.base, 1, 0, 0);
     }
 }
-/// Before any join (`connect`), the network page's requests on `wlan`, beside the vault looked at four times a second: 3 the MAC (not linked), 4 SCAN ([4, 1] starts a scan unless one runs, [4] reads the list; the reply is the list so far, the last scan's until this one ends, `scan_reply`), 5 JOIN ([5, name length, name, passphrase]: kept in the vault, then joined), 6 STATUS (`status_reply`), 7 WATCH (the page's held call: the list when it changes, `watch_reply`). The radio sends nothing until asked: no scan runs unless a page watches (one after another while it does) or a kept credential is waiting for its network. Returns a credential to join and, for one handed in, the vault key it was kept under. `skip`: the vault's credential that last failed; it is tried again once a scan sees its network.
-fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, &'static [u8])>) -> (Vec<u8>, Vec<u8>, &'static [u8], bool) {
+
+/// A name in a request: [op, name length, name...] whose length runs inside the request and fits an SSID (1 to 32 octets). WHY the checks: the request is another process's bytes.
+fn req_name(msg: &[u8], n: usize) -> Option<&[u8]> {
+    let l = *msg.get(1)? as usize;
+    (n >= 2 && (1..=32).contains(&l) && 2 + l <= n).then(|| &msg[2..2 + l])
+}
+
+/// Before a join (`connect`), the network page's requests on `wlan`, beside the vault's lists looked at four times a second:
+/// - 3 the MAC (not linked); 4 SCAN ([4, 1] starts a scan unless one runs, [4] reads the list; the reply is the list so far, the last scan's until this one ends, `scan_reply`); 6 STATUS (`status_reply`);
+/// - 7 WATCH and 12 NETS, the pages' held calls (`Page`);
+/// - 5 JOIN ([5, name length, name, passphrase]: kept in the vault, then joined, `hand_in`); 13 JOIN KEPT ([13, name length, name]: a remembered network joined now); 11 FORGET ([11, name length, name] → [`forget`'s byte]);
+/// - 8 the IP stack's exchange, answered [2, 0, 0]: no frames, and bit 1, no network (it lets the last network's addresses go).
+/// The radio sends nothing unasked: no scan runs unless a page watches, a remembered network's retry is due, or a list read newly holds a network (the person's becomes readable as they attest). Returns the network to join.
+/// `failed`: the remembered networks that failed since the last join, tried again only by the retry's scan (`m.retry_s`, doubling at each that finds one of them).
+fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, failed: &[Vec<u8>]) -> Try {
+    let mut kept = kept_all(d, m);
+    // The scan just made (a join's, or the first start's) saw a remembered network other than those that failed: joined at once.
+    if let Some(t) = best_seen(m, &kept, failed) {
+        d.put(b"another remembered network is in range: joining it\n");
+        d.flush();
+        return t;
+    }
     d.put(b"no network to join: serving the network page\n");
     d.flush();
     // The corners' WiFi circle: up, no link.
@@ -3216,51 +3742,54 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
     let mut msg = [0u8; 256];
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
-    let mut vault_at = 0u64;
+    let mut vault_at = d.now();
     let mut scanning = false;
-    // WATCH calls held until the list changes, and the list as last answered.
-    let mut held: Vec<[u8; 32]> = Vec::new();
-    let mut held_gen = 0u32;
-    let mut last: Vec<u8> = Vec::new();
-    // A kept credential that did not join is looked for again after `m.retry_s`, which doubles at each try that finds its network (`connect`).
+    // Whether the scan running is the retry's (the failed ones count then).
+    let mut retry_scan = false;
+    let mut page = Page::default();
+    // The IP stack's doorbell: rung once, then held (op 9 below).
+    let mut rung_once = false;
+    let mut ring_held: Option<[u8; 32]> = None;
+    // The remembered networks are looked for again after `m.retry_s`, which doubles at each retry that finds one that failed.
     let mut retry_at = d.now() + m.retry_s * d.freq;
     loop {
         ferros_sys::pet();
         let _ = m.pump(d);
         if scanning && m.scan_done {
             scanning = false;
-            if let Some((name, pass, key)) = skip {
-                if m.nets[..m.nnets].iter().any(|e| e.flags & 1 != 0 && &e.name[..e.len as usize] == &name[..]) {
-                    // The next wait twice this one, up to 1024 s (the modem's policy): this router throttles repeated joins (2026-10-15: association succeeds, the WPA2 handshake fails, for about ten minutes), and a try every 64 s kept the throttle on.
-                    if m.retry_s < 1 << 10 {
-                        m.retry_s <<= 1;
-                    }
-                    watch_answer(d, m, scanning, &mut held);
-                    return (name.clone(), pass.clone(), key, false);
+            let skip: &[Vec<u8>] = if retry_scan { &[] } else { failed };
+            retry_scan = false;
+            if let Some(t) = best_seen(m, &kept, skip) {
+                // The next wait twice this one, up to 1024 s (the modem's policy): an access point refuses joins a while after a session cut off (it holds the old protected association, devbox_network_for_phone_tests), and a try every 64 s kept that going.
+                if failed.contains(&t.name) && m.retry_s < 1 << 10 {
+                    m.retry_s <<= 1;
                 }
+                d.put(b"a remembered network is in range: joining it\n");
+                d.flush();
+                page.answer(d, m, scanning, true);
+                ring_rung(d, &mut ring_held);
+                return t;
             }
         }
-        if skip.is_some() && !scanning && d.now() >= retry_at {
+        if !kept.is_empty() && !scanning && d.now() >= retry_at {
             retry_at = d.now() + m.retry_s * d.freq;
             escan_start(d, m);
             scanning = true;
+            retry_scan = true;
         }
-        // The page's held WATCH calls answered once the list moved (a network found, a scan begun or ended).
-        if !held.is_empty() {
-            watch_count(m, scanning, &mut last);
-            if PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed) != held_gen {
-                watch_answer(d, m, scanning, &mut held);
-            }
-        }
+        // The page's held calls answered once the list moved (a network found, a scan begun or ended).
+        page.tick(d, m, scanning, true);
+        // The lists read again four times a second (nothing rings when a person attests and theirs becomes readable): a network not remembered before starts a scan to look for it.
         if d.now().wrapping_sub(vault_at) >= d.freq / 4 {
             vault_at = d.now();
-            if let Some(c) = stored_cred(d) {
-                if skip.as_ref() != Some(&c) {
-                    d.put(b"network credential readable: joining\n");
-                    d.flush();
-                    watch_answer(d, m, scanning, &mut held);
-                    return (c.0, c.1, c.2, false);
-                }
+            let before: Vec<Vec<u8>> = m.kept.iter().map(|k| k.0.clone()).collect();
+            kept = kept_all(d, m);
+            if m.kept.iter().any(|k| !before.contains(&k.0)) && !scanning {
+                d.put(b"a remembered network became readable: scanning for it\n");
+                d.flush();
+                escan_start(d, m);
+                scanning = true;
+                retry_scan = false;
             }
         }
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
@@ -3269,84 +3798,110 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
                 // A scan running: its results come as the firmware's events, read every millisecond (the interrupt is set up only for serving).
                 ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
             } else {
-                // No scan: nothing comes from the chip unasked, so the wait is for a call (the page's WATCH, a join), the next look at the vault for the credential (a quarter second: nothing rings when a person attests and it becomes readable), or a kept credential's retry (2026-11-13: every millisecond before, the driver's whole time on a device nobody had attested).
+                // No scan: nothing comes from the chip unasked, so the wait is for a call (a page's WATCH, a join), the next look at the vault's lists (a quarter second: nothing rings when a person attests and theirs becomes readable), or the remembered networks' retry (2026-11-13: every millisecond before, the driver's whole time on a device nobody had attested).
                 // WHY the min: the earlier of two deadlines, not a bound on a value.
-                let until = (vault_at + d.freq / 4).min(if skip.is_some() { retry_at } else { u64::MAX });
+                let until = (vault_at + d.freq / 4).min(if kept.is_empty() { u64::MAX } else { retry_at });
                 ferros_sys::wait_world_or_call(&IRQ_RUNG, IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire), until);
             }
             continue;
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
         let n = n as usize;
-        let mut handed = None;
-        // 7 WATCH [count u32 LE]: the page's held call (owner, 2026-11-10: no scan button, the list filling as networks are found). Answered at once when the list differs from the caller's count (u32::MAX at the page's opening, never a count given), else held until it changes; a WATCH with nothing new to say starts the next scan, so scans run back to back while a page waits and stop when it closes (it calls no more).
-        if msg.first() == Some(&7) && n >= 5 {
-            let theirs = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
-            watch_count(m, scanning, &mut last);
-            let now_gen = PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed);
-            // WHY the cap: callers are other processes, each held call keeps 32 bytes until the list moves; the page holds one, and past 4 a caller is answered at once with what there is.
-            if theirs != now_gen || held.len() >= 4 {
-                let len = watch_reply(m, scanning, true, &mut out);
-                svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
-            } else {
-                if !scanning {
-                    escan_start(d, m);
-                    scanning = true;
-                }
-                held.push(tok);
-                held_gen = now_gen;
-            }
+        if matches!(msg.first(), Some(7 | 12)) && n >= 5 {
+            page.watch(d, m, &mut scanning, true, msg[0], &msg, tok);
             continue;
         }
+        let mut next = None;
         let len = match msg.first() {
             Some(3) => {
                 out[..6].copy_from_slice(&m.mac);
                 out[6] = 0;
                 7
             }
-            // [4, 1] starts a scan (unless one runs), [4] or [4, 0] only reads the list (the page watches instead, op 7).
+            // [4, 1] starts a scan (unless one runs), [4] or [4, 0] only reads the list (a page watches instead, op 7 or 12).
             Some(4) => {
                 if n >= 2 && msg[1] == 1 && !scanning {
                     escan_start(d, m);
                     scanning = true;
+                    retry_scan = false;
                 }
                 m.scan_reply(scanning, &mut out)
             }
             Some(5) if n >= 2 && 2 + msg[1] as usize <= n => {
                 let (name, pass) = (&msg[2..2 + msg[1] as usize], &msg[2 + msg[1] as usize..n]);
-                // Kept before it is tried, so the join survives a restart; deleted again if it does not join (`connect`). The person's when someone has attested, else the device's.
-                match ferros_detail::network::build(name, pass, eagle()) {
-                    None => {
-                        out[0] = 1;
+                match hand_in(d, m, name, pass) {
+                    Ok(t) => {
+                        out[0] = 0;
+                        out[1] = t.list as u8;
+                        next = Some(t);
+                        2
                     }
-                    Some(doc) => {
-                        let cap = d.cap(STORE);
-                        let key: Option<&'static [u8]> = [&b"cred"[..], b"net"].into_iter().find(|k| ferros_sys::store_set_at(cap, k, 0, &doc, false));
-                        match key {
-                            Some(k) => {
-                                out[0] = 0;
-                                out[1] = (k == b"net") as u8;
-                                handed = Some((name.to_vec(), pass.to_vec(), k));
-                            }
-                            None => out[0] = 2,
-                        }
+                    Err(e) => {
+                        out[0] = e;
+                        1
                     }
                 }
-                if handed.is_some() { 2 } else { 1 }
+            }
+            Some(13) => match req_name(&msg, n).and_then(|name| kept.iter().find(|(k, _)| k.name == name)) {
+                Some((k, l)) => {
+                    next = Some(kept_try(k, *l));
+                    out[0] = 0;
+                    1
+                }
+                None => {
+                    out[0] = 1;
+                    1
+                }
+            },
+            Some(11) => {
+                out[0] = match req_name(&msg, n) {
+                    Some(name) => {
+                        let name = name.to_vec();
+                        let r = forget(d, m, &name);
+                        kept = kept_all(d, m);
+                        r
+                    }
+                    None => 1,
+                };
+                1
             }
             Some(6) => m.status_reply(if scanning { 1 } else { 0 }, &mut out),
+            // No network: no frames, and bit 1 says so (the IP stack lets the last network's addresses go).
+            Some(8) => {
+                out[..3].copy_from_slice(&[2, 0, 0]);
+                3
+            }
+            // The IP stack's doorbell (op 9): rung at once the first time, so its next exchange hears there is no network (above); held after that (an IP stack from before 2026-11-18 does not hear it and would ring again at once), and rung as the loop leaves for a join, so it waits for the next network in the endpoint. Answered with nothing, it would take this for a driver without the doorbell and never ask again.
+            Some(9) if !rung_once => {
+                rung_once = true;
+                out[0] = 1;
+                1
+            }
+            Some(9) => {
+                if let Some(old) = ring_held.replace(tok) {
+                    let zero = [0u8];
+                    svc(3, old.as_ptr() as u64 - d.base, zero.as_ptr() as u64 - d.base, 1, 0, 0);
+                }
+                continue;
+            }
+            // A frame to send (op 1): refused, no network.
+            Some(1) => {
+                out[0] = 1;
+                1
+            }
             _ => 0,
         };
         // The join under way, for the page (measure JOIN 0), published before the reply: the page reads the facts, not this driver, until the join ends, and must never see an older outcome as this one's.
-        if handed.is_some() {
+        if next.is_some() {
             ferros_sys::status(1, ferros_sys::measure_word(ferros_sys::measure::JOIN, 0));
         }
         svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
-        if let Some((name, pass, key)) = handed {
-            d.put(b"a network handed in by the page: joining\n");
+        if let Some(t) = next {
+            d.put(if t.before.is_some() { b"a network handed in by the page: joining\n".as_slice() } else { b"a remembered network the page picked: joining\n" });
             d.flush();
-            watch_answer(d, m, scanning, &mut held);
-            return (name, pass, key, true);
+            page.answer(d, m, scanning, true);
+            ring_rung(d, &mut ring_held);
+            return t;
         }
     }
 }

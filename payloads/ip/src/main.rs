@@ -1008,6 +1008,11 @@ impl Ip {
         self.txn = EXCH_HEAD;
         if n == ERR {
             self.wifi_down();
+        } else if n >= EXCH_REPLY as u64 && into[0] & 2 != 0 {
+            // Bit 1 (pcie1, 2026-11-18): the network went (the driver between networks), or this is the first exchange on the next one; either way the last network's addresses, routes and servers go, and the driver is asked at once whether a network is joined (DHCP and a router solicitation start on it).
+            self.put(b"WiFi driver says the network changed\n");
+            self.wifi_down();
+            self.wifi_up();
         }
         n
     }

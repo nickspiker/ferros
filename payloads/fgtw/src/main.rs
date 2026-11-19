@@ -619,6 +619,8 @@ struct Client {
     selected_by: Option<[u8; 32]>,
     /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
+    /// With `entry` 4 (the WiFi page's picker, payloads/map, 2026-11-18): the network whose passphrase is wanted, its SSID's octets. The keyboard's host types the passphrase and hands it to the WiFi driver itself (pcie1 JOIN): the passphrase never passes thru here, nor thru the map.
+    entry_net: Vec<u8>,
     /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and deck, kept here and synced with their fleet.
     space: space::SpaceSync,
     /// The doorbell (op 21; owner, 2026-11-10: "No polling! ... It should be push or doorbell"): callers waiting for a change (their reply tokens), the change count they are answered with, and what they watch (`watch_state`) when it was last counted.
@@ -1842,6 +1844,13 @@ impl Client {
                             self.entry = 2;
                             alloc::vec![0]
                         }
+                        // 4: a WiFi network's passphrase, for the network named after it ([15, 4, name length, name]; the WiFi page's picker). Only the name is kept here, never what is typed for it.
+                        // WHY the lengths: another process's message; an SSID is 1 to 32 octets.
+                        15 if got >= 3 && req[1] == 4 && (1..=32).contains(&req[2]) && 3 + req[2] as usize <= got => {
+                            self.entry = 4;
+                            self.entry_net = req[3..3 + req[2] as usize].to_vec();
+                            alloc::vec![0]
+                        }
                         15 if n >= 2 && req[1] == 0 && self.entry == 3 => {
                             self.entry = 0;
                             self.person_no_name();
@@ -1855,7 +1864,15 @@ impl Client {
                             }
                             alloc::vec![0]
                         }
-                        16 => alloc::vec![self.entry_wanted()],
+                        // The words wanted; a WiFi passphrase's with the network's name after it ([4, name length, name]).
+                        16 => match self.entry_wanted() {
+                            4 => {
+                                let mut r = alloc::vec![4, self.entry_net.len() as u8];
+                                r.extend_from_slice(&self.entry_net);
+                                r
+                            }
+                            k => alloc::vec![k],
+                        },
                         _ => alloc::vec![ERR as u8],
                     };
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
@@ -2310,7 +2327,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

@@ -45,3 +45,138 @@ pub fn parse(doc: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     };
     usable(&name, &pass).then_some((name, pass))
 }
+
+/// The networks a vault entry keeps (docs/WIFI.md "Networks remembered"; owner, 2026-11-18: more than one network remembered, each forgettable): one VSF document, section `networks`, a `network` field each.
+/// A field's values are told apart by their type markers, never their places: the name `nw`, the passphrase `a`, and when this device last joined it `e` (Eagle time, `e6`; absent for one handed in and not joined yet).
+const LIST: &str = "networks";
+
+/// Networks one entry keeps at most: sixteen (2^4). A seventeenth kept lets the one joined longest ago go (`keep`).
+pub const MOST: usize = 1 << 4;
+
+/// One network remembered: its SSID's octets, its passphrase (never printed), and when this device last joined it in Eagle oscillations (None: handed in, not joined yet).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Kept {
+    pub name: Vec<u8>,
+    pub pass: Vec<u8>,
+    pub joined: Option<i64>,
+}
+
+fn list_schema() -> SectionSchema {
+    SectionSchema::new(LIST).field("network", TypeConstraint::OneOf(alloc::vec![TypeConstraint::Ssid, TypeConstraint::AsciiText, TypeConstraint::AnyEagleTime]))
+}
+
+/// The document for these networks, made at `eagle`: None if one of them is not usable (`usable`), its passphrase is not ASCII, or there are more than `MOST`.
+pub fn build_list(nets: &[Kept], eagle: i64) -> Option<Vec<u8>> {
+    if nets.len() > MOST {
+        return None;
+    }
+    let mut b = list_schema().build();
+    for k in nets {
+        if !usable(&k.name, &k.pass) {
+            return None;
+        }
+        let mut vals = alloc::vec![VsfType::nw(vsf::Ssid::new(&k.name)?), VsfType::a(vsf::Ascii::from_bytes(&k.pass)?)];
+        if let Some(t) = k.joined {
+            vals.push(VsfType::e(vsf::EtType::e6(t)));
+        }
+        b = b.append_multi("network", vals).ok()?;
+    }
+    let section = b.encode().ok()?;
+    vsf::VsfBuilder::new().creation_time_oscillations(eagle).provenance_only().add_unboxed(LIST, section).build().ok()
+}
+
+/// The networks an entry keeps, and whether it was the one-network document of before 2026-11-18 (`build`), which the caller writes again as a list; that network is taken as joined (at the epoch), so a failed join never forgets it.
+/// None for anything that is neither, or that holds a network that is not usable: the whole value is then not a list, never half of one.
+pub fn parse_list(doc: &[u8]) -> Option<(Vec<Kept>, bool)> {
+    if let Ok(section) = SectionBuilder::parse_document(list_schema(), doc, None) {
+        let mut out = Vec::new();
+        for f in section.get_fields("network") {
+            let (mut name, mut pass, mut joined) = (None, None, None);
+            for v in &f.values {
+                match v {
+                    VsfType::nw(s) => name = Some(s.as_bytes().to_vec()),
+                    VsfType::a(s) => pass = Some(s.as_bytes().to_vec()),
+                    VsfType::e(vsf::EtType::e6(t)) => joined = Some(*t),
+                    _ => return None,
+                }
+            }
+            let (name, pass) = (name?, pass?);
+            if !usable(&name, &pass) || out.len() == MOST {
+                return None;
+            }
+            out.push(Kept { name, pass, joined });
+        }
+        return Some((out, false));
+    }
+    let (name, pass) = parse(doc)?;
+    Some((alloc::vec![Kept { name, pass, joined: Some(0) }], true))
+}
+
+/// `nets` with `name` kept with `pass` (handed in: not joined yet), replacing what that name kept; returns what it kept before under the name (None: nothing).
+/// When `nets` is full the network joined longest ago goes to make room (one never joined counts as joined before any that was); the second value is then that one's name.
+pub fn keep(nets: &mut Vec<Kept>, name: &[u8], pass: &[u8]) -> (Option<Kept>, Option<Vec<u8>>) {
+    let before = nets.iter().position(|k| k.name == name).map(|i| nets.remove(i));
+    let mut gone = None;
+    if nets.len() >= MOST {
+        let (i, _) = nets.iter().enumerate().min_by_key(|(_, k)| k.joined.unwrap_or(i64::MIN)).expect("a full list is not empty");
+        gone = Some(nets.remove(i).name);
+    }
+    nets.push(Kept { name: name.to_vec(), pass: pass.to_vec(), joined: None });
+    (before, gone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(name: &str, pass: &str, joined: Option<i64>) -> Kept {
+        Kept { name: name.as_bytes().to_vec(), pass: pass.as_bytes().to_vec(), joined }
+    }
+
+    #[test]
+    fn list_round_trip() {
+        let nets = alloc::vec![net("pangolin", "a passphrase", Some(1 << 40)), net("café", "another one", None), net("x", "12345678", Some(-5))];
+        let doc = build_list(&nets, 1 << 50).unwrap();
+        assert_eq!(parse_list(&doc), Some((nets, false)));
+        assert_eq!(parse_list(&build_list(&[], 0).unwrap()), Some((alloc::vec![], false)));
+    }
+
+    #[test]
+    fn a_name_is_its_octets() {
+        // An SSID is octets, not text: one that is not UTF-8 is kept bit for bit.
+        let nets = alloc::vec![Kept { name: alloc::vec![0xFF, 0x00, 0x80], pass: b"passphrase".to_vec(), joined: Some(7) }];
+        assert_eq!(parse_list(&build_list(&nets, 0).unwrap()).unwrap().0, nets);
+    }
+
+    #[test]
+    fn the_old_document_reads_as_one_network() {
+        let doc = build(b"pangolin", b"a passphrase", 9).unwrap();
+        assert_eq!(parse_list(&doc), Some((alloc::vec![net("pangolin", "a passphrase", Some(0))], true)));
+    }
+
+    #[test]
+    fn refused() {
+        assert!(build_list(&[net("", "12345678", None)], 0).is_none());
+        assert!(build_list(&[net("n", "short", None)], 0).is_none());
+        assert!(build_list(&[net("n", "not ascii é passphrase", None)], 0).is_none());
+        let many: Vec<Kept> = (0..MOST + 1).map(|_| net("n", "12345678", None)).collect();
+        assert!(build_list(&many, 0).is_none());
+        assert!(parse_list(b"not a document").is_none());
+        let mut doc = build_list(&[net("pangolin", "a passphrase", None)], 0).unwrap();
+        let k = doc.len() - 3;
+        doc[k] ^= 1;
+        assert!(parse_list(&doc).is_none(), "a document whose hash does not verify is no list");
+    }
+
+    #[test]
+    fn keeping() {
+        let mut nets = alloc::vec![net("a", "12345678", Some(3)), net("b", "12345678", Some(1))];
+        assert_eq!(keep(&mut nets, b"a", b"new pass phrase"), (Some(net("a", "12345678", Some(3))), None));
+        assert_eq!(nets, alloc::vec![net("b", "12345678", Some(1)), net("a", "new pass phrase", None)]);
+        let mut full: Vec<Kept> = (0..MOST as i64).map(|k| Kept { name: alloc::vec![b'n', k as u8], pass: b"12345678".to_vec(), joined: Some(k + 10) }).collect();
+        full[5].joined = Some(2);
+        assert_eq!(keep(&mut full, b"new", b"12345678"), (None, Some(alloc::vec![b'n', 5])));
+        assert_eq!(full.len(), MOST);
+        assert_eq!(full.last(), Some(&net("new", "12345678", None)));
+    }
+}

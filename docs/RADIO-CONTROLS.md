@@ -49,7 +49,8 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 - **Knobs:**
   - *Power save* (kept): off, on (PM1, the radio sleeps between beacons), fast (PM2, sleeps after a quiet spell), with the screen (the default since 2026-11-10: PM2 while the screen is off, off while it is on; 150 mW less with the screen off, POWER.md). Applied at once (WLC_SET_PM), and again at every screen change.
   - *Band* (kept): any (5 GHz whenever the network has it), 5 GHz only, 2.4 GHz only. Applied at the next join: switch WiFi off and on. No 2.4 GHz join has held under ferros yet (WIFI.md; the antenna is shared with Bluetooth and nothing coordinates them).
-- **Next:** a scan on demand with its results (names in the detail, signals in tracks), forget the network (the credential is the identity's, `wifi.cred`), roaming (the driver joins with `roam_off`), join a chosen access point, the MCS and spatial streams (`rate_info` layout unchecked).
+- **The picker** (2026-11-18, WIFI.md "The picker and the networks remembered"; built, not yet run on a device): on this page, first under the switch, the networks in range with their measures as numbers, the networks remembered, a network picked, its passphrase on the keyboard, the join (another network while joined, in the same process), and a remembered network forgotten. Its list comes on the driver's NETS (`wlan` op 12), not the detail: names and signals of networks not joined are the page's alone, nothing the kernel keeps.
+- **Next:** roaming (the driver joins with `roam_off`), join a chosen access point, the MCS and spatial streams (`rate_info` layout unchecked).
 
 ### GPS (payloads/gps, BCM4776 on-chip engine)
 

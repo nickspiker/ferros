@@ -687,6 +687,17 @@ pub mod gpu {
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"), a device setting set thru the Settings capability: 0 never set (`audio::DEFAULT_LEVEL`), 1-255 dimmest to loudest, each step a 16th of an octave of amplitude (255 is full scale, 239 half, 1 almost 16 octaves down).
 pub const PREF_VOLUME: u64 = 46;
 
+/// Preference 47: what the helm's two buttons do (owner, 2026-11-18: "a settings addition to choose what back and home do"; docs/WINDOWS.md "The helm"), a choice per bit, 0 each default: bit 0 Back's tap goes out to the deck at a kist's top (else it stays in the kist), bit 1 Back's swipe in a kist goes forward, the Again key to the kist, a redo of its last step back (else to the most recent kist), bit 2 Back's swipe on the deck goes to the most recent kist (else it clusters the circles), bit 3 Deck's swipe in a kist goes to the deck (else it hides or shows the controls), bit 4 Deck's swipe on the deck clusters (else it fits every circle in view).
+pub const PREF_HELM: u64 = 47;
+/// PREF_HELM's bits.
+pub mod helm {
+    pub const BACK_OUT: u8 = 1 << 0;
+    pub const BACK_SWIPE_FORWARD: u8 = 1 << 1;
+    pub const BACK_SWIPE_DECK_RECENT: u8 = 1 << 2;
+    pub const DECK_SWIPE_OUT: u8 = 1 << 3;
+    pub const DECK_SWIPE_DECK_CLUSTER: u8 = 1 << 4;
+}
+
 /// Sound out (docs/AUDIO.md): the system's audio service, which owns the AoC's playback entry point and the speaker amplifiers and mixes every stream into one. A kist reaches it thru the `audio` right (ferros_kist::RIGHTS), a send right on the `audio` endpoint; the service is started by the kernel at the first call (process.rs `ON_DEMAND`) and ends once every stream has closed and played out, so silence holds no arc and the amplifiers sit in reset.
 ///
 /// One format for every stream, the one the AoC's entry point is set up for: 48 kHz, two channels interleaved (left, then right), signed 16-bit little-endian. A stream's ring holds `RING` frames; a write is answered once all its frames are in the ring, so a writer that has more to say waits there, clocked by the hardware (the AoC's playback interrupt frees a period at a time): the reply is the doorbell, no poll and no timer on either side.
@@ -1121,6 +1132,8 @@ pub const BELL_SLOTS: u64 = 12;
 /// The identity service wipes what it holds of the identity when it moves.
 /// Any process may register a word for it: whether a person is present is fact 83 already.
 pub const BELL_IDENTITY: u64 = 13;
+/// The pucks' squares (2026-11-18, docs/PUCKS.md), for the holder of the `surfaces` region (the display): bits 4j to 4j + 3 square slot j's generation (1 to 15) while its puck lives, 0 otherwise ([`surface_generation`] reads it the same way).
+pub const BELL_PUCKS: u64 = 14;
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;
@@ -1128,6 +1141,13 @@ pub const SURFACE_SLOTS: usize = 16;
 pub const SURFACE_BYTES: usize = 32 << 20;
 /// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
 pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
+
+/// How many pucks may hold a square at once (2026-11-18, docs/PUCKS.md; the kernel's cachemap PUCK_SLOTS): slot j at `PUCKS_WINDOW + j * PUCK_BYTES`.
+pub const PUCK_SLOTS: usize = 16;
+/// One square slot's addresses (the kernel's PUCK_SIZE): its frames are only what its puck asked for (`puck_size`).
+pub const PUCK_BYTES: usize = 64 << 20;
+/// The pucks' window, the kernel's cachemap PUCK_VA: where the display reads the squares (it holds the surfaces' window and runs native).
+pub const PUCKS_WINDOW: u64 = 0x50_4000_0000;
 
 /// The most GPU memory one client may hold (the kernel's cachemap GPU_BLOCK_MOST, 2026-11-13): its GPU block, frames of the pool on demand, asked for by `gpu_block_ask`.
 pub const GPU_BLOCK_MOST: usize = 512 << 20;
@@ -1219,7 +1239,7 @@ pub fn pet() {
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 88]);
+pub struct Facts(pub [u64; 90]);
 
 /// The bootloader's lock state (`Facts::boot_lock`; FLASHER.md step 7: re-locking ends setup, leaving it unlocked is the person's known choice).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1340,6 +1360,12 @@ impl Facts {
         };
         let (c0, c1, c2, g0, g1, g2) = (w(20)?, w(21)?, w(22)?, w(23)?, w(24)?, w(25)?);
         Some(([c0[0], c0[1], c1[0], c1[1], c2[0], c2[1]], [g0[0], g0[1], g1[0], g1[1], g2[0], g2[1]], seq))
+    }
+    /// The magnetic field as the AoC last reported it (facts 88 and 89, 2026-11-17: the fused magnetometers, µT, the device's axes, uncalibrated for hard iron: ferros_compass calibrates), and how many samples have come (a new one when it moves).
+    pub fn magnetic(&self) -> Option<([f32; 3], u32)> {
+        let (xy, z) = (self.get(88)?, self.get(89)?);
+        let n = (z >> 32) as u32;
+        (n != 0).then(|| ([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)], n))
     }
     /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the device whatever its own rate.
     pub fn gravity_pair(&self) -> Option<(([f32; 3], u64), ([f32; 3], u64))> {
@@ -1534,6 +1560,9 @@ pub mod sensor_block {
     pub const SCOPE_FMT: usize = 19;
     pub const SCOPE_N: usize = 20;
     pub const SCOPE_MASK: usize = 21;
+    /// The magnetic field (the compass puck): x | y << 32 (f32 bits, µT), then z | sample count << 32.
+    pub const MAG_XY: usize = 22;
+    pub const MAG_Z: usize = 23;
     pub const SCOPE: usize = 32;
     pub const SCOPE_LEN: usize = 65536;
     /// The block's size in u64 words.
@@ -1645,8 +1674,10 @@ pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    let mut b = [0u8; 704];
-    svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
+    // Unknown (all ones) where a kernel from before writes fewer facts than this build reads (88 before 2026-11-17).
+    let mut b = [0xFFu8; 720];
+    // Thru a mutable pointer: the kernel writes the buffer, and an immutable one may be read as the constant it was made.
+    svc(nr::FACTS, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }
 
@@ -2045,6 +2076,12 @@ pub fn gpu_block_ask(cap: u64, log: u32) -> Option<u64> {
     (n != ERR && n <= GPU_BLOCK_MOST as u64).then_some(n)
 }
 
+/// Ask the kernel to resize this puck's square (the grant at `cap`: a puck's surface slot, docs/PUCKS.md) to hold `bytes` past its porch, larger or smaller, in whole frames of the pool; its base (`dma`) never moves. The bytes it holds after, or None: not the caller's square, past `PUCK_BYTES`, more than the pool can give (the console says which), or a kernel from before 2026-11-18.
+pub fn puck_size(cap: u64, bytes: u64) -> Option<u64> {
+    let n = svc(nr::DMA, cap, 6, bytes, 0, 0);
+    (n != ERR && n < PUCK_BYTES as u64).then_some(n)
+}
+
 /// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.
 pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(nr::INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
@@ -2384,6 +2421,8 @@ pub mod window {
     pub const EV_BAKE: u8 = 4;
     /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
     pub const KEY_ESCAPE: u8 = 0x29;
+    /// Again (HID G#79): Back's swipe set to go forward, the redo of the last step back (fluor `NamedKey::Forward`; PREF_HELM `BACK_SWIPE_FORWARD`).
+    pub const KEY_AGAIN: u8 = 0x79;
     /// Enter and backspace, by their USB HID usages: the keyboard's enter and delete keys.
     pub const KEY_ENTER: u8 = 0x28;
     pub const KEY_BACKSPACE: u8 = 0x2A;

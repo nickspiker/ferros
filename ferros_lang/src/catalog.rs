@@ -49,6 +49,26 @@ messages! {
     PageSecurity,
     /// The page listing everything on the deck as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
     PageDeck,
+    /// The helm's page (owner, 2026-11-18: "a settings addition to choose what back and home do"): what Deck and Back do, tapped and swiped, in a kist and on the deck; then its rows' titles and their choices.
+    PageHelm,
+    HelmBackTap,
+    HelmBackSwipe,
+    HelmBackSwipeDeck,
+    HelmDeckSwipe,
+    HelmDeckSwipeDeck,
+    /// Back's tap: up a level to the kist's top and no further (the default), or up and then out to the deck.
+    HelmUpTop,
+    HelmUpOut,
+    /// Back's swipe in a kist: the kist before (the most recent, the default), or forward: the redo of the last step back, the Again key to the kist (owner: "like a redo or a forward browser navigation").
+    HelmRecent,
+    HelmForward,
+    /// On the deck: every circle gathered into a cluster, all touching (Back's tap scatters them back).
+    HelmCluster,
+    /// Deck's swipe in a kist: the controls hidden or shown (the default), or out to the deck.
+    HelmControls,
+    HelmToDeck,
+    /// Deck's swipe on the deck: every circle in view (the default).
+    HelmFit,
     PagePermissions,
     PageFleet,
     PagePower,
@@ -628,6 +648,34 @@ messages! {
     WifiNotAnswering,
     AlreadyOnNetwork,
     CouldNotKeepNetwork,
+    // ---- the WiFi page's picker (payloads/map wifi.rs, 2026-11-18): its headings, its buttons, a network's facts and what the page says ----
+    NetworksInRange,
+    NetworksRemembered,
+    /// The button that asks the keyboard for a network's passphrase.
+    TypePassphrase,
+    /// The same for a network remembered: its passphrase typed again.
+    NewPassphrase,
+    /// A remembered network's button, and its first tap (two taps forget it).
+    Forget,
+    TapAgainForget,
+    /// A network's facts: how many access points answered under its name, its security, when this device last joined it.
+    AccessPoints,
+    Security,
+    LastJoined,
+    NotJoinedYet,
+    /// Whose list keeps a remembered network: the person's (joined while they were attested), the device's (joined while nobody was).
+    KeptForYou,
+    KeptForDevice,
+    /// A network's security, short (WPA2, WPA3, WEP stay).
+    SecurityOpen,
+    SecurityOther,
+    JoinsWpa2Only,
+    /// Under the remembered networks: kept on this device only (whether they should travel with the person is the owner's question).
+    NetworksKeptNote,
+    /// A WiFi driver (or a grant) from before the picker: no list.
+    NoNetworkList,
+    NotRemembered,
+    CouldNotForget,
 
     // ---- the honeycomb keyboard's bar (attest screen, hive): short, they sit on keys ----
     KeyMap,
@@ -695,6 +743,11 @@ pub enum Say<'a> {
     SecurityUnsupported(&'a str),
     DidNotAnswer(&'a str),
     RefusedPassphrase(&'a str),
+    // ---- the WiFi page's picker ----
+    /// The keyboard asked for this network's passphrase.
+    TypeOnKeyboard(&'a str),
+    JoinedNet(&'a str),
+    Forgotten(&'a str),
     /// A passphrase's length, in characters.
     PassphraseLength { min: u64, max: u64 },
 }

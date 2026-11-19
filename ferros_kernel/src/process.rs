@@ -1039,6 +1039,8 @@ pub enum Object {
     NewRegion(u8),
     /// A second surface to be, for a kist's GPU mailbox (GPU-KISTS.md 1.4): a spawn turns it into a free surface when the child already got its window's and another stays free for the next app's window; an empty slot otherwise.
     SpareSurface,
+    /// A puck's square to be (docs/PUCKS.md, 2026-11-18): a spawn turns it into a free slot of the pucks' window with no frames yet, the child's own (`Dma` of a `puck`, `puck_take`); it asks for its frames by SYS_DMA x1 = 6. Handed to a kist that declares `puck` in its surface's place.
+    NewPuck,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -1088,6 +1090,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Stow => (22, 0),
         Object::NewRegion(n) => (23, n as u64),
         Object::SpareSurface => (24, 0),
+        Object::NewPuck => (25, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -1757,7 +1760,7 @@ const SYS_SET_PREF: u64 = 11;
 const PREF_LIVE: u64 = 1 << 8;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
-pub const FACT_COUNT: usize = 88;
+pub const FACT_COUNT: usize = 90;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
@@ -2209,6 +2212,8 @@ const TORCH_DUTY_REACH: i8 = 120;
 const TORCH_TIMEOUT_STEPS: u8 = 10 * (1 << 4) + 1;
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"; ferros_sys::audio is its one encoding), a device setting (the speakers are this device's): 0 never set (the audio service's default, two octaves under full scale), 1-255 dimmest to loudest, a 16th of an octave of amplitude a step. Kept in the device document as `volume`.
 pub const PREF_VOLUME: usize = 46;
+/// Preference 47: what the helm's buttons do (ferros_sys PREF_HELM and its bits), a person's choice kept in the device document as `helm`, 0 every default.
+pub const PREF_HELM: usize = 47;
 /// How many preferences there are: the first block's 32 and the second's 16.
 const PREF_COUNT: usize = 48;
 
@@ -2365,6 +2370,8 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SOUND => value < SOUNDS,
         PREF_DND => value <= 1,
         PREF_RADIOS_BEFORE => value < 1 << 5,
+        // Five choices, a bit each (ferros_sys `helm`).
+        PREF_HELM => value < 1 << 5,
         PREF_TORCH_LEVEL => true,
         PREF_TORCH_STROBE => value <= TORCH_STROBE_STEPS,
         PREF_TORCH_DUTY => (value as i8).unsigned_abs() <= TORCH_DUTY_REACH as u8,
@@ -2428,6 +2435,9 @@ pub static DMA: &[Dma] = &[
     Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
     // The display's 16-bit canvas (cachemap DISPLAY_CANVAS): its back buffer.
     Dma { name: "display-canvas", base: crate::cachemap::DISPLAY_CANVAS.0, size: crate::cachemap::DISPLAY_CANVAS.1 - crate::cachemap::DISPLAY_CANVAS.0 },
+    // The pucks' squares (cachemap PUCK_VA, docs/PUCKS.md): each slot alone, a puck's own, handed at its launch in its surface's place (`puck_take`), its frames as it asks (SYS_DMA x1 = 6, `puck_ask`). Must stay consecutive and in order: `puck0() + j` is slot j. Never granted by name, only given. The display reads them by address (it holds the surfaces' window and runs native).
+    puck_slot(0), puck_slot(1), puck_slot(2), puck_slot(3), puck_slot(4), puck_slot(5), puck_slot(6), puck_slot(7),
+    puck_slot(8), puck_slot(9), puck_slot(10), puck_slot(11), puck_slot(12), puck_slot(13), puck_slot(14), puck_slot(15),
 ];
 
 /// Slot k of the surfaces' window as a DMA region (`DMA`): its addresses, whatever frames are behind them.
@@ -3044,6 +3054,174 @@ fn blocks_report(s: &mut alloc::string::String) {
     let _ = core::fmt::Write::write_fmt(s, format_args!("gpu blocks: A#{n} of A#{GPU_BLOCK_SLOTS} held, A#{} MiB, the most a block A#{} MiB\n", bytes >> 20, crate::cachemap::GPU_BLOCK_MOST >> 20));
 }
 
+/// The pucks' squares (docs/PUCKS.md, 2026-11-18): a slot of the pucks' window per puck, handed at its launch in its surface's place, its frames taken as the puck asks for them (SYS_DMA x1 = 6, `puck_ask`) and given back as it asks for fewer or ends.
+pub const PUCK_SLOTS: usize = crate::cachemap::PUCK_SLOTS;
+const _: () = assert!(PUCK_SLOTS == 16, "the DMA table lists sixteen puck slots");
+/// The most frames behind one square: its slot's addresses.
+const PUCK_FRAMES: usize = crate::cachemap::PUCK_SIZE / crate::frames::FRAME;
+fn puck0() -> usize {
+    DMA.iter().position(|r| r.name == "puck").unwrap()
+}
+/// Slot j of the pucks' window as a DMA region (`DMA`): its addresses whole, whatever frames are behind them, so a masked puck's handle spans the slot from its launch (`handle_of`); what it holds is `PuckSlot::n`.
+const fn puck_slot(j: usize) -> Dma {
+    Dma { name: "puck", base: crate::cachemap::PUCK_VA.0 + j * crate::cachemap::PUCK_SIZE, size: crate::cachemap::PUCK_SIZE }
+}
+
+/// A slot of the pucks' window: whose (a process epoch, 0 free), its generation (1 to 15, new at each hand-out, as a surface slot's), and the frames it holds from its start.
+#[derive(Clone, Copy)]
+struct PuckSlot {
+    owner: u64,
+    generation: u8,
+    n: usize,
+    frames: [u32; PUCK_FRAMES],
+}
+/// Every slot. Under the kernel lock.
+static mut PUCKS: [PuckSlot; PUCK_SLOTS] = [PuckSlot { owner: 0, generation: 0, n: 0, frames: [0; PUCK_FRAMES] }; PUCK_SLOTS];
+/// The squares' bell word as last rung (`BELL_PUCKS`): bits 4j to 4j + 3 slot j's generation while its puck lives, 0 for a slot nobody holds.
+static PUCKS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Give the process with `epoch` a square: the first free slot, no frames yet, every block of it mapping the blank frame (a read of the display's before the puck asks for frames, or after it gives them back, lands on nothing anyone owns). Under the lock.
+fn puck_take(epoch: u64) -> Result<usize, &'static str> {
+    let slots = unsafe { &mut *(&raw mut PUCKS) };
+    let j = slots.iter().position(|s| s.owner == 0).ok_or("no free puck square (all sixteen are in use)")?;
+    let blank = crate::frames::pa(blank_frame().ok_or("the frame pool has no free frame")?);
+    let va = DMA[puck0() + j].base;
+    for b in 0..PUCK_FRAMES {
+        crate::cachemap::puck_map(va + b * crate::frames::FRAME, blank);
+    }
+    crate::cachemap::surface_unmapped(va, crate::cachemap::PUCK_SIZE);
+    let s = &mut slots[j];
+    s.generation = s.generation % 15 + 1;
+    s.owner = epoch;
+    s.n = 0;
+    pucks_ring();
+    Ok(j)
+}
+
+/// Slot j's square resized to `want` frames: the frames it lacks from the top of the pool (zeroed as they are taken), or those past `want` back to the pool (the blank frame mapped where they were, every core told, then each wiped as it goes back). Under the lock.
+fn puck_resize(j: usize, want: usize) -> Result<(), &'static str> {
+    let s = unsafe { &mut (*(&raw mut PUCKS))[j] };
+    let va = DMA[puck0() + j].base;
+    if want > s.n {
+        // The same floor a GPU block keeps: a square taken to the pool's last frames would leave the next process's first frame, or an arc's growth, with none.
+        if crate::frames::free() < want - s.n + BLOCK_RESERVE {
+            return Err("the frame pool has too few free frames for that square");
+        }
+        let had = s.n;
+        for b in had..want {
+            match crate::frames::take_top() {
+                Some(f) => s.frames[b] = f as u32,
+                // WHY: the count above was taken under the same lock, so this is a pool that lied about its free frames: given back whole, loud in the reason.
+                None => {
+                    for &f in &s.frames[had..b] {
+                        crate::frames::give(f as usize);
+                    }
+                    return Err("the frame pool ran out while giving a square");
+                }
+            }
+        }
+        for b in had..want {
+            crate::cachemap::puck_map(va + b * crate::frames::FRAME, crate::frames::pa(s.frames[b] as usize));
+        }
+        crate::cachemap::surface_unmapped(va + had * crate::frames::FRAME, (want - had) * crate::frames::FRAME);
+    } else if want < s.n {
+        let blank = crate::frames::pa(unsafe { SURFACE_BLANK }.unwrap());
+        for b in want..s.n {
+            crate::cachemap::puck_map(va + b * crate::frames::FRAME, blank);
+        }
+        crate::cachemap::surface_unmapped(va + want * crate::frames::FRAME, (s.n - want) * crate::frames::FRAME);
+        for &f in &s.frames[want..s.n] {
+            crate::frames::give(f as usize);
+        }
+    }
+    s.n = want;
+    Ok(())
+}
+
+/// The bytes a square of `n` frames holds past its porch: none without a frame (the porch lies in the first).
+fn square_bytes(n: usize) -> usize {
+    if n == 0 { 0 } else { n * crate::frames::FRAME - crate::cachemap::SURFACE_PORCH }
+}
+
+/// SYS_DMA x1 = 6 (2026-11-18): the caller's own square (DMA region `i`) resized to hold `bytes` past its porch, in whole frames, larger or smaller. Its bytes held after (frames, less the porch), or ERR with why on the console.
+fn puck_ask(p: &Process, i: usize, bytes: u64) -> u64 {
+    let j = i - puck0();
+    let owner = unsafe { (*(&raw const PUCKS))[j].owner };
+    // WHY the bound: `bytes` is the caller's word; past the slot's addresses no frame could be mapped.
+    let r = if owner != p.epoch {
+        Err("not the caller's square")
+    } else if bytes > (crate::cachemap::PUCK_SIZE - crate::cachemap::SURFACE_PORCH) as u64 {
+        Err("past the square's addresses")
+    } else {
+        puck_resize(j, (bytes as usize + crate::cachemap::SURFACE_PORCH).div_ceil(crate::frames::FRAME))
+    };
+    match r {
+        Ok(()) => square_bytes(unsafe { (*(&raw const PUCKS))[j].n }) as u64,
+        Err(why) => {
+            let line = alloc::format!("puck square: {} asked for A#{bytes} bytes: {why}, A#{} MiB of the pool free: refused\n", core::str::from_utf8(&p.name).unwrap_or("?"), (crate::frames::free() * crate::frames::FRAME) >> 20);
+            k().console.extend_from_slice(line.as_bytes());
+            ERR
+        }
+    }
+}
+
+/// The squares of the process with `epoch` back to free, their frames to the pool, and the display rung (`pucks_ring`). Under the lock.
+fn pucks_free(epoch: u64) {
+    let slots = unsafe { &mut *(&raw mut PUCKS) };
+    let mut any = false;
+    for j in 0..PUCK_SLOTS {
+        if slots[j].owner == epoch {
+            // A slot held means a square was given, and giving it made the blank, so the resize to none cannot fail.
+            let _ = puck_resize(j, 0);
+            slots[j].owner = 0;
+            any = true;
+        }
+    }
+    if any {
+        pucks_ring();
+    }
+}
+
+/// The squares' owners for the display (`BELL_PUCKS`), from the kernel's own table: slot j's generation while its owner lives and is not ending, so the display reads a square only under the generation the puck's own call named (display puck.rs).
+fn pucks_ring() {
+    let kk = k();
+    let slots = unsafe { &*(&raw const PUCKS) };
+    let mut live = 0u64;
+    for (j, s) in slots.iter().enumerate() {
+        if s.owner != 0 && kk.procs.iter().flatten().any(|p| p.epoch == s.owner && !p.dying) {
+            live |= (s.generation as u64) << (4 * j);
+        }
+    }
+    if PUCKS_LIVE.swap(live, core::sync::atomic::Ordering::AcqRel) != live {
+        bell_ring(BELL_PUCKS, live);
+    }
+}
+
+/// The square process `p` holds, for the stamp on its `puck` calls (`puck_stamp`): its slot, generation and the bytes it holds past the porch; None when it holds none.
+fn puck_held(p: &Process) -> Option<(u8, u8, u32)> {
+    let p0 = puck0();
+    p.cspace.iter().find_map(|c| match c.object {
+        Object::Dma(i) if i >= p0 && i < p0 + PUCK_SLOTS => {
+            let s = unsafe { &(*(&raw const PUCKS))[i - p0] };
+            (s.owner == p.epoch).then(|| ((i - p0) as u8, s.generation, square_bytes(s.n) as u32))
+        }
+        _ => None,
+    })
+}
+
+/// `diag arcs`'s squares: each held, its owner, generation and size.
+fn pucks_report(s: &mut alloc::string::String) {
+    let kk = k();
+    let slots = unsafe { &*(&raw const PUCKS) };
+    let mut n = 0;
+    for (j, x) in slots.iter().enumerate().filter(|(_, x)| x.owner != 0) {
+        n += 1;
+        let name = kk.procs.iter().flatten().find(|p| p.epoch == x.owner).map(|p| core::str::from_utf8(&p.name).unwrap_or("?")).unwrap_or("(ended)");
+        let _ = core::fmt::Write::write_fmt(s, format_args!("puck square A#{j} {name} generation A#{} A#{} MiB at G#{:X}\n", x.generation, (x.n * crate::frames::FRAME) >> 20, DMA[puck0() + j].base));
+    }
+    let _ = core::fmt::Write::write_fmt(s, format_args!("puck squares: A#{n} of A#{PUCK_SLOTS} held\n"));
+}
+
 /// Whether a thread of process `pi` has a call on the `gpu` endpoint that its server has taken and not answered: a job of its may be on the GPU now. Looked at before the process's reply tokens are dropped (`end_process`, `kill_locked`). Under the lock.
 fn gpu_job_in_flight(pi: usize) -> bool {
     let kk = k();
@@ -3091,6 +3269,24 @@ fn facets_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     out.extend_from_slice(&msg);
     out
 }
+
+/// The kernel's stamp ahead of every call on the `puck` endpoint (docs/PUCKS.md, 2026-11-17): the caller's kist identity as the gate found it at launch, its developer's Ed25519 key and its option (64 bytes), or zeros for a caller that is no kist (the display then finds no circle for it).
+/// Then its square (2026-11-18): the slot, generation and bytes it holds, from the kernel's own table, so the display reads a square only where and as far as its puck holds one.
+/// Lean on purpose: a puck calls at each of its deadlines and, while its circle is in view, at its sensor's rate (the compass), so no alias is derived here as `facets_stamp` does.
+fn puck_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
+    let (developer, option) = p.gate.filter(|_| p.kist).unwrap_or(([0; 32], [0; 32]));
+    let mut out = Vec::with_capacity(PUCK_STAMP + msg.len());
+    out.extend_from_slice(&developer);
+    out.extend_from_slice(&option);
+    // Its square as the kernel holds it (2026-11-18): slot, generation, a zero, then the bytes past the porch, u32; slot G#FF when it holds none.
+    let (slot, generation, bytes) = puck_held(p).unwrap_or((0xFF, 0, 0));
+    out.extend_from_slice(&[slot, generation, 0, 0]);
+    out.extend_from_slice(&bytes.to_le_bytes());
+    out.extend_from_slice(&msg);
+    out
+}
+/// The stamp's length: identity 64, square 8.
+const PUCK_STAMP: usize = 72;
 
 /// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
 /// A block's frames change only as it grows (`block_grow` appends; nothing takes one back while it is held), and a surface's never while it is held, so the regions alone name the frames for a caller: the service keys a client's address space by them.
@@ -3447,6 +3643,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     }
     // A call on the identity service's facets goes in behind the kernel's stamp of the kist that calls (`facets_stamp`).
     let msg = if kk.endpoints[ep].name == b"facets" { facets_stamp(p, msg) } else { msg };
+    // A call on the pucks' endpoint goes in behind the caller's kist identity (`puck_stamp`): the display keys a puck's circle by it, never by anything the puck says.
+    let msg = if kk.endpoints[ep].name == b"puck" { puck_stamp(p, msg) } else { msg };
     kk.endpoints[ep].queue.push_back((cur, msg));
     wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
@@ -5341,6 +5539,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else if source == BELL_IDENTITY {
                 bell_register(p, pi, source, f.x[1], LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire) as u64)
+            } else if source == BELL_PUCKS && holds_surfaces(p) {
+                bell_register(p, pi, source, f.x[1], PUCKS_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -5949,6 +6149,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // x1 = 2 (2026-11-13): the caller's GPU block grown to 2^x2 bytes, answered its size after (`block_ask`); ERR, said on the console, when it is not the caller's block, past the ceiling, or more than the pool can give.
                 Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
+                // x1 = 6 (2026-11-18, docs/PUCKS.md): the caller's puck square resized to hold x2 bytes past its porch (`puck_ask`), answered the bytes it holds after; ERR, said on the console, when it is not the caller's, past the slot, or more than the pool can give.
+                Some(Object::Dma(i)) if DMA[i].name == "puck" && f.x[1] == 6 => puck_ask(p, i, f.x[2]),
                 // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
                 Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, cur, f.x[2], f.x[3] & 1 == 1),
                 // x1 = 4 (2026-11-15, docs/CAMERA.md "The view"): the driver gives the caller of the OPEN it is answering (its reply token at arc offset x2) a read-only view of x3's frames of its run (low half the first, high half how many), the holder's token written at arc offset x4; answered the view's base (`cam_view_give`). x1 = 5: the view taken back, at the driver's close (`cam_view_drop`) → 0.
@@ -5961,7 +6163,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
-                Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
+                Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" || DMA[i].name == "puck" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
             };
             0
@@ -6224,7 +6426,9 @@ const BELL_SLOTS: usize = 12;
 /// The identity service wipes the roots, the person key and the fleet key it holds when it moves (payloads/fgtw `locked_out`).
 /// No capability: whether a person is present is fact 83, anyone's to read, and the epoch says no more than when that changed.
 pub const BELL_IDENTITY: usize = 13;
-const BELLS: usize = 14;
+/// The pucks' squares' (2026-11-18, docs/PUCKS.md), for the holder of the `surfaces` region (the display): its word is `PUCKS_LIVE`, four bits a slot, no count.
+const BELL_PUCKS: usize = 14;
+const BELLS: usize = 15;
 /// The lock epoch last rung into the identity's bell (`identity_bell`).
 static IDENTITY_RUNG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
@@ -6770,6 +6974,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         surfaces_free(p.epoch);
         regions_free(p.epoch);
+        pucks_free(p.epoch);
         crate::irqarm::disarm_epoch(p.epoch);
         cam_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
@@ -7101,6 +7306,7 @@ fn kill_locked(name: &[u8]) -> bool {
     }
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     regions_free(kk.procs[i].as_ref().unwrap().epoch);
+    pucks_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::irqarm::disarm_epoch(kk.procs[i].as_ref().unwrap().epoch);
     cam_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
@@ -7437,6 +7643,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "camera" => (Object::Endpoint(endpoint(b"camera")), RIGHT_SEND),
         // Be you and the person's people (docs/FACETS.md, 2026-11-13): a send right on the identity service's `facets` endpoint, either right the same one. The kernel stamps every call on it with the caller's kist identity and which of the two it was granted (`facets_stamp`), so the service answers each op by the grant and never by the caller's word.
         "be_you" | "people" => (Object::Endpoint(endpoint(b"facets")), RIGHT_SEND),
+        // A puck's circle (docs/PUCKS.md, 2026-11-17): a send right on the display's `puck` endpoint, every call on it stamped with the caller's kist identity (`puck_stamp`), so the display draws a puck's list only into the circle the deck gave that identity and no puck can name another's.
+        "puck" => (Object::Endpoint(endpoint(b"puck")), RIGHT_SEND),
         _ => return None,
     })
 }
@@ -7709,9 +7917,13 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
         // Which facets the person granted (an asked want answered yes, sent as its own code): stamped on the kist's calls on `facets`.
         let facets = wants.iter().zip(l.codes.iter()).fold(0u8, |m, (&w, &c)| m | ((w == c && c == ferros_kist::BE_YOU) as u8) | (((w == c && c == ferros_kist::PEOPLE) as u8) << 1));
         let gpu = kist_gpu();
+        // A puck (its capsule declares `puck`; docs/PUCKS.md) draws its square and never shows a window: in its surface's place a square of the pucks' window (`NewPuck`, frames only as it asks), and its GPU slots empty, so a puck holds no surface slot of the sixteen, none of a surface's 32 MiB, and no GPU block.
+        let puck = wants.contains(&ferros_kist::PUCK);
         let objects: Vec<(Object, u32)> = ferros_kist::slots(&wants)
             .iter()
             .filter_map(|s| match *s {
+                ferros_kist::Slot::Implicit(ferros_kist::SURFACE) if puck => Some((Object::NewPuck, RIGHT_SEND | RIGHT_RECV)),
+                ferros_kist::Slot::Gpu(_) if puck => Some((Object::Empty, 0)),
                 ferros_kist::Slot::Implicit(c) => kist_object(c),
                 ferros_kist::Slot::Asked(i) => kist_object(l.codes[i]),
                 ferros_kist::Slot::Gpu(g) => Some(gpu[g as usize]),
@@ -8139,6 +8351,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
                 Err(why) => {
                     surfaces_free(epoch);
                     regions_free(epoch);
+                    pucks_free(epoch);
                     return Err(why);
                 }
             },
@@ -8160,6 +8373,16 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
                     }
                 }
             }
+            // A puck's square: a free slot of the pucks' window, no frames until it asks. None free: the spawn is refused, as for a surface.
+            Object::NewPuck => match puck_take(epoch) {
+                Ok(j) => Object::Dma(puck0() + j),
+                Err(why) => {
+                    surfaces_free(epoch);
+                    regions_free(epoch);
+                    pucks_free(epoch);
+                    return Err(why);
+                }
+            },
             // The GPU mailbox's second surface: only beside a surface of its own already given, and only while a slot and the frames for another stay free for the next app's window.
             Object::SpareSurface => {
                 let slots = unsafe { &*(&raw const SLOTS) };
@@ -8200,6 +8423,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
         surfaces_free(epoch);
         regions_free(epoch);
+        pucks_free(epoch);
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     // A line that stormed under the process before is this one's to arm again (`irq_ack_guarded`).
@@ -8271,6 +8495,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     };
     // Its surface's owner alive from here: the display's bell says so before the process can show a window on it.
     surfaces_ring();
+    // And its square's, a puck's (2026-11-18, the 8a: `puck_take` rang the squares' bell before the process was in the table, so the newest puck's slot read as nobody's and the display drew nothing for it until another square came or went: only basecalc showed, the clock did not).
+    pucks_ring();
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
@@ -8410,6 +8636,7 @@ pub fn arcs_report() -> alloc::string::String {
     }
     surfaces_report(&mut s);
     blocks_report(&mut s);
+    pucks_report(&mut s);
     s.push_str(&crate::frames::pool_report());
     unlock();
     s

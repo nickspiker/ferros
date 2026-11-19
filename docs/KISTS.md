@@ -196,7 +196,7 @@ The owner judged four dummy circles on the Pro and kept their glows (2026-11-11:
 
 | state | glow (ferros_glow) | means, as built (the owner may correct these) |
 |---|---|---|
-| running | 500 nm, thin | a live process of the kist, in front or behind (deck's tap leaves it alive behind); a widget the display draws itself (the clock) too, as it is live on the glass and never a process |
+| running | 500 nm, thin | a live process of the kist, in front or behind (deck's tap leaves it alive behind); a puck that is up (PUCKS.md) too |
 | stopped | 600 nm, thin | the kernel keeps a record for it: its last process ended by a fault, a panic or a kill from outside, or its last launch did not start (no room, not here, its checks, its capsule unreadable); dropped when it next starts |
 | not running | a ring of darkness | stowed and neither: not launched since boot, or ended by its own exit, the person's relaunch or the person's Stop on its card |
 | for you | 400 nm, heavy, reach by count | something waiting on the person for that kist; nothing sets it yet (no notifications exist): the map's `waiting` list by capsule takes a count when something does |
@@ -215,7 +215,7 @@ The owner, 2026-11-12, of four ways to see a kist's info (twist a circle to flip
 
 So the settings circle's Kists page is the **Deck** (owner, 2026-11-12, of names for the page: "Deck it is!": the home screen is the deck, what is on it is on deck; what a person keeps is in the hold, as items) (ferros_lang `Msg::PageDeck`, all sixteen languages; the map's page key `deck`), and a thing's **card** is the one place its info shows: no flip, no info circle. Wherever this document says "the Kists page", it is the Deck now.
 
-**The list.** Everything on the deck as a circle, by kind: the kists first (opened: apps), then the pucks (live circles never opened, PUCKS.md: today the clock, known by its name, `widget`), each kind a group, so contacts can come as one more. Each row is the thing's name, and under it its kind ("kist", "puck") and a kist's state as its glow says it (running, stopped, not running; nothing before the kernel has said which kists are alive). The whole row opens its card. A restore or an unstow under way shows its bar under its row. Under the list, the **pandok** (the directory, kists.fgtw.org; "available" before): each listed kist, "stowed", or "stow" or "update" with its size. A kist offered over USB stays above everything, the list or a card alike ("Stowing" below), and opens the Deck on it as it opened the Kists page.
+**The list.** Everything on the deck as a circle, by kind: the kists first (opened: apps), then the pucks (live circles never opened, known by their signed `puck` want, PUCKS.md), each kind a group, so contacts can come as one more. Each row is the thing's name, and under it its kind ("kist", "puck") and a kist's state as its glow says it (running, stopped, not running; nothing before the kernel has said which kists are alive). The whole row opens its card. A restore or an unstow under way shows its bar under its row. Under the list, the **pandok** (the directory, kists.fgtw.org; "available" before): each listed kist, "stowed", or "stow" or "update" with its size. A kist offered over USB stays above everything, the list or a card alike ("Stowing" below), and opens the Deck on it as it opened the Kists page.
 
 **A kist's card** (Back above it, which returns to the list; one unstowed meanwhile, here or on another device of theirs, closes it):
 - its name and kind;
@@ -236,7 +236,7 @@ So the settings circle's Kists page is the **Deck** (owner, 2026-11-12, of names
 - **A permission switch** is the Kists page's (`Choice::Answer`): the answer written to the person's list (`kists.list`, identity class), then init's OP_RELAUNCH, which kills a running kist and starts it with the answers as they now stand (nothing for one not running).
 - **Words**: ferros_lang `PageItems`, `KindKist`, `KindPuck`, `Pandok`, `NothingStowed`, `MadeBy`, `FactVersion`, `Size`, `Identity`, `Running`, `Stopped`, `NotRunning`, `Keeps`, `OwnDomain`, `Stop`, `Update`, `Unstow`, `AnswersKept`, `RemoveFromHome`, `TapAgainRemove`, `Shows`, `TheTime`, in all sixteen languages. The pandok's "stowed", "stow" and "update" now come from them too; its other lines ("reading the list of kists" and its neighbours) and the stower's stage words are still English outside ferros_lang.
 
-**Not yet:** run on a device; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind; the map's `widget` (a puck by its name) renamed and replaced by the signed `puck` flag (PUCKS.md).
+**Not yet:** run on a device; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind.
 
 ## The unstow sheet (2026-11-12)
 
@@ -291,6 +291,34 @@ A tick keeps a thing. What is not kept is erased at once: gone means gone, no bi
 
 Lumis (the camera app) is not a fluor app yet: a Kotlin Camera2 front with a GLES preview over JNI and ashmem, and a portable Rust core (`lumis_core`: demosaic, stacking, colour, DNG/TIFF/JXL/VSF writers) that uses raw Bayer frames only and no ISP and no video codecs. As a kist it needs: a camera driver process serving frames (today the camera runs in the kernel's diagnostics, CAMERA.md), with ops to list the cameras, open and close one, set exposure, gain, focus and window, and a ring of cacheable frame buffers it maps, each with its metadata (the exposure taken, the frame's time and count); the sensors' facts as data (black and white levels, the CFA, colour matrices, the active array, ranges, focal lengths: a per-sensor table in the vault); its UI on fluor (the GLES preview, JNI and ashmem go); captures saved to its vault domain instead of MediaStore. Missing on the ferros side: the driver process itself, a second capture without a cold boot, the front end's 50 ms service, cacheable frame memory, the pixel clock (true exposure time) and the gain-to-ISO map, and the front and tele sensors.
 Since 2026-11-12 (docs/CAMERA.md): Lumis's ferros front is built (`rust/lumis-ferros` on Lumis's `ferros` branch, tools/lumis-build.sh and tools/lumis-kist.sh), the camera right is code 9, and the endpoint it calls is specified; the driver is the gap, and the harness cannot run beside today's shell (its output slices are the frame pool and GPU memory now).
+
+## basecalc (2026-11-17)
+
+The owner: "a legit scientific basey calc with nice basey configured buttons".
+basecalc is the owner's calculator (its own repository, beside this one): bases 2 to 36, complex numbers, adjustable precision, trig, logs, constants, `&` for the last result, VSF state and history.
+The kist keeps its engine and puts a keypad in front of it.
+
+- **The engine** is basecalc's own, as a library: basecalc's branch `ferros-engine` splits it into src/lib.rs (the tokenizer, the evaluator over rug's Complex, the formatter, with each piece of text tagged by its role) and the terminal (src/main.rs, behind the default `cli` feature), and adds `evaluate`, a keypad's call; the kist takes it with `default-features = false`.
+Its numbers are rug's, over GMP, MPFR and MPC in C; tools/basecalc-build.sh builds those for ferros from rug's own sources (STD-TARGET.md "basecalc on the device").
+- **The kist** is std/basecalc: the pad as a library with no screen (keys.rs, layout.rs, calc.rs, store.rs, host-tested with `cargo test --lib` from std/basecalc) and the window (window.rs, fluor's ferros host).
+It asks for nothing: slots 1 to 6 are the implicit set (display, touch, surface, ira, its vault domain, entropy).
+- **The digit block follows the base**, read like text from 0 at the top left, digit d at row d / cols and column d % cols, in four families; every base keeps its digits where its family's largest base puts them, so a digit never moves within a family as the base changes, and rows only come and go (layout.rs `digit_grid`):
+
+| Family | Bases | The layout and why |
+|---|---|---|
+| two across | 2, 4 | binary's two keys side by side, the largest keys of any base; quaternary 2 x 2, the row its high bit, the column its low bit |
+| three across (dozenal) | 3, 5, 6, 9, 10, 11, 12 | dozenal 3 x 4: each row a quarter of the dozen (0-2, 3-5, 6-8, 9-B), three across as every decimal keypad is; decimal is dozenal less A and B, so the two share every digit's place; senary two rows of three; nonary 3 x 3, the row its high trit |
+| four across (hex) | 7, 8, 13 to 16 | hex 4 x 4: the row the digit's high two bits, the column its low two (a nibble as two base-4 digits); octal is hex's top two rows, the row its high bit |
+| six across (base 36) | 17 to 36 | base 36 is 6 x 6: the row d / 6, the column d % 6 (two senary digits); every base past hex keeps its places, a row of six at a time |
+
+The dozenal digits are A and B, as basecalc writes them.
+- **The rest of the pad**, top to bottom inside the app's circle: the quick bases (2#, 8#, A#, C#, G#, 10#, and … for the picker of all 35, each with its name); the display (the history, newest at the bottom, each line with its base; the expression as typed; the result in the base in use, its base first, wrapped at basecalc's groups of three, dim while it is a preview of what is typed); the settings row (2nd, rad or deg, and the precision between its two keys, stepping 1, 2, 3, 4, 6, 8, 12, 16 and on to 2^12 digits, shown in the base in use); three rows of six functions on two layers (sin cos tan ln log √, xⁿ x² 1/x |x| mod logₙ, π e i [ , ]; then asin acos atan Re Im arg, ceil floor round int frac sgn, φ γ G rand grand erf); the main block (the digits over four columns, the operators over two: ( ) × ÷ + − . & ⌫ AC); and = alone in the circle's bottom, narrower with the chord.
+- **Keys write basecalc's own syntax**, which the display reads back (`#sin(`, `@pi`, `[0,1]` for i): a value written next to a value is a product (2π is `2*@pi`, since basecalc reads no implied product), an operator after a result goes on from it (`&`), `=` closes open brackets, x² writes two in the base's own digits (binary's `^10`), and a base chosen while an expression is typed finishes it in the base it was typed in first, then shows everything in the new one.
+- **The circle**: the window fills the glass; every key and line of text stays inside the app's circle, and a band on a half the system holds is as wide as the circle's chord at its outer edge (a smooth minimum with the frame's width, so nothing kinks as the frame resizes). Until fluor's `safe-area` branch is on fluor's main, the circle is worked out the display's way (`active_circle`, the panels' cutouts); `--features safe-area` takes the display's own `EV_SAFE` thru `FluorApp::on_safe_area`.
+- **Settings on the circle's back** (a proposed convention, not built): keys.rs `SETTINGS` is the one list of what would move there (2nd, the angle unit, the precision's keys).
+- **Kept** in its vault domain: one VSF document (`basecalc`: base, digits, radians; then a `line` section per history line, its expression as typed (x) and the settings it was typed under), written after each `=` and each change of a setting, by a writer thread. No result is kept: at launch the lines run again in order from a fresh engine, which gives back every result, `&` and basecalc's random draws included; the newest 2^8 lines are kept.
+- **House rules**: front to back with `under` alone (the display's text, each key's label, its body, the ground last); each key's tap area its declared shape (its box with the squircle corners) claimed thru `paint::Shown` (fluor 3512d08); every size a fraction of the circle's diameter or the frame's width; colours authored in VSF RGB.
+- **Capsule**: tools/basecalc-kist.sh, the owner's developer key, option `7a254f7e…eeac1` (minted 2026-11-17), version std/basecalc's. Not yet run on a device.
 
 ## Whose key signs a kist (owner, 2026-11-10)
 

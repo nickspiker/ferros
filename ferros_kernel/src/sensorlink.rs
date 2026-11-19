@@ -21,6 +21,9 @@ pub const PROX: usize = 16;
 pub const SCOPE_FMT: usize = 19;
 pub const SCOPE_N: usize = 20;
 pub const SCOPE_MASK: usize = 21;
+/// The magnetic field (2026-11-17, the compass puck): x | y << 32 (f32 bits, µT, the fused magnetometers as the AoC reports them), then z | sample count << 32.
+pub const MAG_XY: usize = 22;
+pub const MAG_Z: usize = 23;
 pub const SCOPE: usize = 32;
 pub const SCOPE_LEN: usize = 65536;
 /// The block's size in bytes: the header words and the ring.

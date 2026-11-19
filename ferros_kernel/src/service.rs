@@ -1059,7 +1059,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![
         Serve(b"display"),
         Hardware(b"decon0-main"), Hardware(b"decon0-win"), Hardware(b"decon0-wincon"), Hardware(b"dpu-dma0"), Hardware(b"dpp0"), Hardware(b"gpio-gpp0"),
-        Dma(b"display-fb"), Dma(b"display-heap"),
+        // 9: the display serves the pucks' endpoint here (docs/PUCKS.md, 2026-11-17): the slot held the display's old heap region, which the display has not read since 2026-11-11, and init's grants page is full.
+        Dma(b"display-fb"), Serve(b"puck"),
         Hardware(b"dsim0"), Hardware(b"dphy0"), Hardware(b"sramc0"), Hardware(b"hdrcomm0"),
         Serve(b"touch"), Hardware(b"usi2-spi"), Hardware(b"gpio-gpn0"),
         Use(b"display"), Use(b"touch"),
@@ -1226,8 +1227,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
-        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page) (payloads/map).
-        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108],
+        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page), 9 use nfc (the NFC page's add), 10 use wlan (the WiFi page's picker) (payloads/map; as init gives them: with eight a restarted map had no NFC add, its torch was slot 9 not 11, and the WiFi page said the driver gives no list, 2026-11-18 on the 8a).
+        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108, 80, 44],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
@@ -1648,8 +1649,13 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     }
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
-        use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};
+        use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, MAG_XY, MAG_Z, PAIR, PROX, SPECTRAL};
         let w = |i: usize| word(i).unwrap_or(0);
+        // 88-89 the magnetic field, once a sample has come (its count in z's high half; the compass puck, 2026-11-17).
+        if w(MAG_Z) >> 32 != 0 {
+            v[88] = w(MAG_XY);
+            v[89] = w(MAG_Z);
+        }
         if w(GRAVITY_Z) >> 32 != 0 {
             v[12] = w(GRAVITY_XY);
             v[13] = w(GRAVITY_Z);

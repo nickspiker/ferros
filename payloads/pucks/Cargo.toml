@@ -1,0 +1,47 @@
+[package]
+name = "ferros-payload-pucks"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# ferros's own pucks (docs/PUCKS.md), one capsule each, signed with the ferros project key (tools/pucks-kist.sh; memory kist_keys_follow_ownership: ferros is a commons).
+[[bin]]
+name = "puck_tide"
+path = "src/tide.rs"
+
+[[bin]]
+name = "puck_sun"
+path = "src/sun.rs"
+
+[[bin]]
+name = "puck_moon"
+path = "src/moon.rs"
+
+[[bin]]
+name = "puck_compass"
+path = "src/compass.rs"
+
+[[bin]]
+name = "puck_gps"
+path = "src/gps.rs"
+
+[[bin]]
+name = "puck_weather"
+path = "src/weather.rs"
+
+[dependencies]
+ferros_sys = { path = "../../ferros_sys" }
+ferros_heap = { path = "../../ferros_heap" }
+ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
+# The typeface each puck draws its words in (the display's own).
+ferros_glyphs = { path = "../../ferros_glyphs" }
+ferros_faces = { path = "../../ferros_faces" }
+ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
+ferros_sky = { path = "../../ferros_sky" }
+ferros_compass = { path = "../../ferros_compass" }
+ferros_weather = { path = "../../ferros_weather" }
+# The weather's POST to fgtw.org over the `ip` process: the response decoded as it arrives, as the stower's GET does (ferros_kist::fetch).
+ferros_kist = { path = "../../ferros_kist", features = ["process"] }
+libm = "0.2"
+# The compass's kept calibration, a VSF document in its own domain.
+vsf = { path = "../../../vsf", default-features = false }

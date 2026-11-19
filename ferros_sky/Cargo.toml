@@ -1,0 +1,12 @@
+[package]
+name = "ferros_sky"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The sun and the moon for the sun and moon pucks (docs/PUCKS.md): positions, rise and set, twilight, phase and illumination, the next new and full moon, from Eagle time and a place. no_std, libm, host-tested against published references."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2"

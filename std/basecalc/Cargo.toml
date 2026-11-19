@@ -1,0 +1,57 @@
+[package]
+name = "basecalc-ferros"
+version = "0.2.0"
+edition = "2021"
+description = "basecalc on ferros as a kist: the owner's calculator (basecalc's own engine: bases 2 to 36, complex numbers, adjustable precision, trig, logs, constants) behind a scientific keypad whose digit block follows the base, under fluor's ferros host, its settings and history as VSF in the kist's vault domain (docs/KISTS.md \"basecalc\", tools/basecalc-build.sh)."
+license = "GPL-3.0"
+
+[lib]
+name = "basecalc_kist"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basecalc"
+path = "src/main.rs"
+
+[dependencies]
+# The engine, without its terminal (basecalc branch ferros-engine until it is on basecalc's main).
+basecalc = { path = "../../../basecalc", default-features = false }
+# The engine's numbers (rug's Complex over MPC, MPFR and GMP); the same rug the engine takes.
+rug = { version = "1.28", features = ["complex", "integer"] }
+# GMP, MPFR and MPC for ferros come from tools/basecalc-build.sh's own build of rug's C sources (GMP_MPFR_SYS_CACHE), and the crate is told to take a cross build.
+gmp-mpfr-sys = { version = "1.6", features = ["force-cross"] }
+# The settings and the history, a complete VSF document in the kist's vault domain.
+vsf = { path = "../../../vsf", features = ["text-encode"] }
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd"] }
+# The kist's own vault domain (no files on ferros).
+kete = { path = "../../../kete" }
+# getrandom 0.2 through any dependency: its `custom` backend is ferros_rt's, the kernel's entropy (the kist's entropy right).
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+
+[features]
+# basecalc as a puck on the deck (src/puck.rs, docs/PUCKS.md): the pad drawn into the puck's square, its keys pressed by the taps that pass thru.
+puck = []
+# The display's safe area (FluorApp::on_safe_area): needs fluor with the safe-area branch merged (fluor 9d362b9); without it the circle is worked out the display's way (layout::panel_circle).
+safe-area = []
+
+[profile.release]
+panic = "abort"
+debug = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace]
+
+[patch.crates-io]
+# libc with a ferros arm (the C scalar types, for the crates that spell their types through it: rug and gmp-mpfr-sys among them), on every target so the host's tests and the ferros build share one lockfile.
+libc = { path = "../../../ferros-libc" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
