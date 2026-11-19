@@ -1121,9 +1121,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             let asked = integrator.header[FLAGS_IDX] & RECORDING_BIT != 0;
             // Held for this frame's hand-over only (`seal_at_exit` takes it from another thread otherwise).
             let mut clip = CLIP.lock().unwrap();
+            // A clip that starts this turn takes the camera's next frame, not this one: the start can wait seconds (the vault closing and sealing a clip left open, a few seconds a GB), while this frame's buffer is held, and the frames behind it would be lost to the clip (the RAW agent, 2026-11-19).
+            let mut started = false;
             match (asked, clip.is_some(), paced, &got) {
                 (true, false, Some(fps), Got::Frame(head, Taken::View(rows))) => match start_clip(&cam, &integrator.header, ferros_clip::Pacing::of(fps), head, rows, dev_knobs4() & DEV_VIDEO != 0) {
-                    Ok(c) => *clip = Some(c),
+                    Ok(c) => {
+                        *clip = Some(c);
+                        started = true;
+                    }
                     Err(e) => {
                         println!("lumis: camera {}: RAW video: no clip ({e})", cam.name);
                         integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
@@ -1132,7 +1137,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 (false, true, ..) => end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "STOP"),
                 _ => {}
             }
-            if let (Some(c), Got::Frame(head, Taken::View(rows))) = (&mut *clip, &got) {
+            if let (false, Some(c), Got::Frame(head, Taken::View(rows))) = (started, &mut *clip, &got) {
                 // SAFETY: the held buffer's rows, `height` lines of `line` bytes from its offset in the view (mapped read-only for the life of the open, this process's until the next MAP gives it back); `frame` codes every band before it returns.
                 let f = ferros_clip::FrameIn {
                     rows: unsafe { std::slice::from_raw_parts(rows.src as *const u8, head.height * rows.line) },
