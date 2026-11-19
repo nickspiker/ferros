@@ -1308,7 +1308,8 @@ const K_SLIT: u8 = 3;
 const K_SLIT_FULL: u8 = 4;
 /// RAW12 (the sensor's data format, the link's data type, the front end's stride; the core's own format word is not known, docs/CAMERA.md "RAW12").
 const F_RAW12: u8 = 1 << 0;
-/// The mode written after the first frame instead of before stream on: the one order that streamed a slit in October (2026-10-21, one change a session), and the one that left the sensor stuck until a cold boot.
+/// The mode written after the first frame instead of before stream on: the one order that streamed a slit in October (2026-10-21, one change a session), and the one that left the sensor stuck until a cold boot (with no real hold; the close's power cycle unsticks it since).
+/// Always on a camera whose sensor drops a mode written before stream on (`Cam::mode_live`, the tele): its first frame or two then arrive at the init's shape, which loch0 counts as one resolution mismatch before the mode lands.
 const F_MID: u8 = 1 << 1;
 /// loch0's PD path enabled (Linux's G#81); off by default in every mode but the init's, whose PD rows' slot is sized for the binned frame.
 const F_PD: u8 = 1 << 2;
@@ -1351,9 +1352,9 @@ impl Spec {
     fn full(&self) -> bool {
         matches!(self.kind, K_FULL | K_SLIT_FULL)
     }
-    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults are the main's alone: the switches are read off its program, and the ultrawide's slim program took one frame (2026-11-16). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
-    fn shape(&self, main: bool) -> (u8, bool) {
-        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), main, self.flags & F_SLIM != 0)
+    /// The processing blocks' switches off and whether the slim program runs (ferros_cam geom `shape`, host-tested), from the hand spawn's eighth byte (`DETACH`). The defaults hold on every camera (2026-11-19: the ultrawide's, the front's and the tele's slits stream detached and slim, and took two frames without). A 1:1 frame takes a window's defaults: the statistics pipeline is laid out for the binned frame.
+    fn shape(&self) -> (u8, bool) {
+        geom::shape(DETACH.load(Ordering::Relaxed) as u8, self.windowed() || self.full(), self.flags & F_SLIM != 0)
     }
 }
 
@@ -1440,6 +1441,8 @@ fn engine_bytes(full: usize, slim: usize) -> u64 {
 }
 
 fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
+    // A sensor that drops a mode written before stream on (`Cam::mode_live`, the tele) has it written after the first frame.
+    let s = &Spec { flags: s.flags | if c.mode_live { F_MID } else { 0 }, ..*s };
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
     let t0 = ferros_sys::now();
     CAM.store(c.id as u64, Ordering::Relaxed);
@@ -1490,7 +1493,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // A captured readout runs with its own switches (`Alt::detach`, measured) unless the hand spawn's eighth byte overrides them (bit 7), with the slim program when the OPEN asks.
     let (detach, slim) = match alt {
         Some(a) if DETACH.load(Ordering::Relaxed) & 0x80 == 0 => (a.detach, s.flags & F_SLIM != 0),
-        _ => s.shape(c.id == 0),
+        _ => s.shape(),
     };
     let slim_level = if s.flags & F_SLIM2 != 0 { 2 } else { 1 };
     // WHY the bound: the ring's exponent is the caller's byte; past `SLIT_RING_MOST` the slim copies outgrow the engine's area and the view's window.

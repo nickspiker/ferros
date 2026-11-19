@@ -61,6 +61,9 @@ pub struct Cam {
     pub rotation: u8,
     /// Its other readouts, each replayed whole as Android ran it (`Alt`), opened by the mode block's kind `ALT + k`.
     pub alts: &'static [Alt],
+    /// Whether the sensor takes a mode's words only while streaming: written in the hold before stream on, its frame, window and output size are dropped at stream on (the sensor runs its init's mode), so the driver writes the mode after the first frame (payloads/camera `F_MID`).
+    /// The tele (2026-11-19, docs/CAMERA.md "Slits on every camera"): frames of 4000 and 8000 lines written before stream on both ran 30 a second, and a 64-row slit sent whole 4032 x 3024 frames (a front end left at the whole frame took them clean); written after the first frame, 4000 lines ran 40 a second, 8000 lines 20, and the slit 559 a second.
+    pub mode_live: bool,
 }
 
 /// The mode block's kind that opens a camera's readout `alts[k]`: `ALT + k`.
@@ -155,6 +158,7 @@ pub const MAIN: Cam = Cam {
     white: 1023,
     rotation: 1,
     alts: &[],
+    mode_live: false,
 };
 
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
@@ -198,6 +202,7 @@ pub const ULTRAWIDE: Cam = Cam {
     white: 1023,
     rotation: 1,
     alts: &[UW48],
+    mode_live: false,
 };
 
 /// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06; it answers ferros since the LV buck is raised (sub GPIO2, 2026-11-18) and streams with them (docs/CAMERA.md "The other cameras on the Pro").
@@ -242,6 +247,7 @@ pub const FRONT: Cam = Cam {
     white: 1023,
     rotation: 3,
     alts: &[FRONT842],
+    mode_live: false,
 };
 
 /// The folded tele (kraken, Samsung, G#08D5 at G#0000), its 12.2 MP 22-degree readout (4032 x 3024 RAW10, the 48.8 MP array binned 2 x 2): its init from the i2c trace of Lumis on Android opening it (keys/husky/captures/ftrace-2026-11-18, tele22.init, 1142 transfers), its receiver, CPU setup and job from the hv's captures of the same readout (2026-11-18 night, docs/CAMERA.md "Every readout, captured").
@@ -285,6 +291,7 @@ pub const TELE: Cam = Cam {
     white: 1023,
     rotation: 1,
     alts: &[TELE11, TELE48],
+    mode_live: true,
 };
 
 /// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
