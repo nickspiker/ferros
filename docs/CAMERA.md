@@ -922,6 +922,60 @@ Measured on the Pro, not attested, the driver hand-spawned with input 01, every 
 
 A reload with this kernel's first trace build (every divider word read every pass, six ACPM rate reads a second) found ACPM answering nothing and the device reset 35 s later (b950, the kernel's core between the clock policy and the heat step, crumb G#D7). The build committed reads only CPUCL0's word every pass and asks ACPM nothing extra.
 
+## Slits under Lumis (2026-11-18, branch slit-robust)
+
+The Lumis session's Slitscan (Lumis lumis-slit d2b67747, later a274d0b9; the driver hand-spawned, input 01; binned 4080 x 64 slits, frame 192 lines, 812 us apart, detached and slim, a ring of 256) died within seconds once Lumis drew and baked on the A715s: run 0b at slit 1296, run 0c at 3235 (with `cammem on`), each on LATE_CONFIG (G#10), though the same driver had drained 261120 slits with nothing drawing.
+Measured on the Pro, not attested, the identity unlocked at boot, RAM reloads b955 to b969 over slowdown-probe, the driver and Lumis hand-spawned (Lumis input `18`, 13 zero bytes, `02`: DEV_OPEN, 16 s, DEV_SLIT), every stream ended by its own close; logs in target/agent-slit-robust/runs of the main checkout.
+
+**What the logs said, read again:**
+- The one "stopped by a test" of every run is the SHADOW_UPDATE-only interrupt at stream on (status 8, before any DMA_DONE). No release was ever refused at a death.
+- Run 0c's `acted A#3237` is its 3236 DMA_DONEs plus one: the program ran twice on one DMA_DONE at the third slit (the place log G#20, G#30, G#50), so the index stood one ahead for the rest of the stream (harmless to the engine, but every slit's record then sat one buffer from its rows).
+- The six lock alarms of 7.8 ms or more were all at Lumis's spawns, none in a stream: process.rs's `build_from` after the gate (the lock taken again at line 7356 for a 22 MiB capsule: 20.6 ms at each spawn) and the host spawn's arc staging (service.rs 5434, 12.2 ms).
+- Every death had the same shape: one slit's DMA_DONE came while the line was still masked by the slit before (the line stays masked from the interrupt to the frame thread's ack), so the armed action never ran for it, its descriptor went unreleased, and the next slit hit LATE_CONFIG. The armed action covers a frame thread late by up to one period; a slit's period is 812 us.
+
+**Why the frame thread was late past a period, each measured** (tools below):
+| cause | measured | fix |
+|---|---|---|
+| the line on the X3: its waiter noticed only when the service loop's pass came round to `run_slice`, no A715 being idle to notice | 865 us behind the battery gauge's poll (crumbs D6 to F4), 6.0 ms once | an armed line follows its waiter's core (process.rs `irq_route`); interrupt to run then at most 39 to 253 us |
+| preempted mid-answer by another line's interrupt on its core, sent to the back of the queue | 4.4 ms behind Lumis's threads (the sensors' line on c6) | a device thread parked unasked in its interrupt's run keeps its place, urgent, and a core is asked for it (`ferros_el0_preempt`, `make_room`) |
+| a slice inherited nearly spent, ended mid-answer | parked 2 ms between two syscalls of one answer | the same |
+| the kernel lock, test-and-set, under Lumis's pool (its threads yielding every 10 us, 56k holds a second) | waits of 852 to 1029 us with no hold that long | a ticket lock (KERNEL.md Order item 8) |
+| its front credit spent (an answer of 60 to 100 us every 812 us, now and then 323) | woken to the back, not urgent, run 2.8 to 9.7 ms late | a device thread's credit leaks a quarter, not an eighth |
+| the frame thread's own cost: 56 register syscalls an answer | 91 us an answer | words that read 0 not written back: 60 us |
+| the acknowledgement clearing a DMA_DONE it never saw (a slit landed between the first read and the ack loop) | run 0b's death (an answer 786 us late, then LATE_CONFIG) | an unseen DMA_DONE left latched, so the line fires again at the ack |
+| SYS_IRQ_WAIT unmasking the line between the interrupt and its mask (the armed program runs first, a few us) | the double release of every run's start, 8 us apart; SHADOW_UPDATE interrupts refired 7 to 10 us later on whole frames | irqarm `TAKEN`: a wait does not unmask a line taken and not yet pending |
+
+**And then the release taken off the frame thread altogether** (ferros_layout irqarm `UNMASK`, KERNEL.md "Armed actions"): a slit ring arms TEST_BITS DMA_DONE, TEST_EQ place index, ADVANCE, WRITE G#1B to the image status (SOF, EOF, SHADOW_UPDATE, DMA_DONE cleared), UNMASK; the driver sets loch0's image interrupt mask (G#1C32_0430, the dtsi's irq-mask-reg) to DMA_DONE alone once its path is on, and counts slits from the engine's index past its own. Each slit's DMA_DONE then fires its own interrupt and its own release whatever the frame thread is doing; a late frame thread takes several slits in one answer. Whole frames keep the three operations: their descriptors are named a frame ahead by the frame thread, which a release it did not see would skip. The hand spawn's tenth byte 1 asks the three for an A/B; a kernel without UNMASK refuses the program and the driver arms the three.
+
+**The runs:**
+| kernel (b) and what it had | runs reaching the 16 s (19678 slits) | the others died at slit |
+|---|---|---|
+| the Lumis session's (slowdown-probe) | 0 of 2 | 1296, 3235 |
+| 955 to 958: the record only, then `dev follow on` by hand | 0 of 6 | 58, 195, 358, 430, 2047, 5481 |
+| 959 to 963: TAKEN, the ack fixes, armed lines following, preempted kept | 1 of 13 | 1283, 2456, 6662, 7348, 7774, 8656, 10245, 11288, 15249, 15853, 16048, 17608 |
+| 965: and the device credit | 0 of 4 | 5603, 6830, 9358, 13442 |
+| 966 to 968: and the ticket lock | 5 of 11 | 1641 to 14304 |
+| 969: and the open program | **7 of 7** | |
+- On b969 each run: every slit released by the kernel and left open (19678 to 19689), one stop (stream on's SHADOW_UPDATE), the gap between acted runs at most 915 to 1044 us, interrupt to run at most 162 us; 0 to 6 answers a run took several slits (5 the most), each a death before; Lumis's own line "A#0 written over while read, A#0 too old to read" every 4096 slits; the hottest zone 62 to 66 C.
+- Whole frames on b969 (Lumis, the init's mode): 239 frames, none written over, no error word, one stop a frame (its SHADOW_UPDATE; 379 stops for 239 frames before TAKEN).
+- Lumis a274d0b9's fallback ("the slits stopped (the driver ended); whole frames again, and Slitscan takes its band from them") appeared after every death up to b968 and never on b969. After it Lumis opened whole frames thru the vault's stored driver once and failed once ("the camera driver did not answer the open"); a hand-spawned driver that exits after its close leaves the stored one to answer.
+
+**A slit's exposure (the Lumis session's SET_EXPOSURE 68800205 ns, refused)**: that refusal was the vault's stored driver (run 1, from before the detached slit). This driver plans a slit's exposure as any mode's (ferros_cam ccs `Timing::plan`): inside the slit's frame the integration alone, past it the frame lengthened to the integration and the margin. cambench's new +21 (an exposure in ns SET halfway thru a slit run), measured on b969: 68.8 ms taken mid-stream (frame 21863 lines, integration 21861, a slit every 68 ms), the slits after it 15 a second, none lost; 1/2000 s taken (159 lines, inside the 192-line frame, nothing else moved), 1232 slits a second after it. Lumis's own first ask in Slitscan, 3148 ns (one line), is refused rightly: the main's least integration is 2 lines.
+
+**A mode switch in place, without the power cycle and the init** (not built; the open's steps as the console times them): switch on 52 to 61 ms, the sensor's init 2064 to 2098 ms (1347 writes: 1.55 ms a write, every register access of the bus controller a syscall and its polls more), the job, engine and receiver about 17 ms, stream on to the first slit about 28 ms. A switch that kept the sensor powered and initialised would stop the stream, close the front end as the close does (its replay, CPU writes), write the new mode's registers in one hold (about 20 writes, some 30 ms at today's bus rate), place the job and start the engine again (17 ms), and take a new region when the ring's size differs (the slit ring 74 frames against the image ring's 64 to 73: about 5 ms each way, the frames given back wiped): about 0.1 to 0.15 s against today's 2.28 s. The front end's side is what every reopen already does with no power cycle of its domain. The sensor's side is the open question: October's mid-stream geometry change left the sensor stuck until a cold boot, but with no real hold (`w16(G#0104, 1)` wrote the release) and its PD channel on; every change since has been inside a real hold with PD and embedded data off for slits, and has never been tried on a streaming sensor without its power cycle. Separately the init itself could be faster: consecutive registers in one auto-increment transfer, the bus's status polled less.
+
+**The tools built for this:**
+- `diag "irqs runs"`: the last 64 armed runs (the counter, the core, how each ended, the words each operation read), the stopped runs kept apart, and at a freeze each core's last 8 crumbs; `diag "irqs freeze <us>"` / `"irqs freeze short <us>"` freeze it, and devsched's trace, at the first gap between acted runs longer or shorter; `diag irqs` adds the acted-to-acted gaps by 2^k us and the runs left open. A `dev freeze` at a late run snapshots the crumbs too.
+- `diag crumbs` and `diag "crumbs ring"`: the X3's longest stretch ending at each service-loop crumb (F0 to F6 added inside the pass) and the last 256 stretches of 2^7 us or more in time order.
+- `diag dev`: woken behind the queue for a spent credit, and the most credit then; `diag sched`: device threads kept at the front when parked mid-run.
+- The driver: the first answers with their lengths and counter times, the timeline's start on the counter (to set beside the kernel's runs), answers that took several slits.
+
+**Open:**
+- r6 (b958, `dev follow on`) died at slit 58 with every answer and every acted run on time and the index one ahead from the double release; not seen again, not understood.
+- A late interrupt on a worker with interrupts open (b965 v4: c6 at EL0 for 886 us before it took the line) was seen once; the open program does not cover an interrupt itself taken late past the blanking.
+- The ticket lock, the device credit and the kept preemption change every process's scheduling, measured here only under Lumis and the camera: worth a Photon scroll and the 96-a-second whole-frame bench before forge.
+- `build_from` holds the lock 20.6 ms for a 22 MiB capsule (each Lumis spawn).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
