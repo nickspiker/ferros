@@ -1509,8 +1509,29 @@ fn gain_of(g: u64, bus: &Bus, c: &Cam, init: &[u8]) -> (Option<ccs::Gain>, u64, 
 
 /// A device test (the hand spawn's thirteenth byte): the gain write's shape (`gain_set`), and a console line after every gain SET with the sensor's words read back (`gain_say`). 0 the driver's own; 1 the analogue code alone in the hold; 2 the digital gain alone in the hold; 3 the analogue code alone with no hold; 4 Android's per-frame hold on the Sony part (every register a byte: digital, analogue, integration, frame, shift); 5 the driver's own with the frame length written again in the hold; 6 the driver's own, said. Any shape but 0 writes a gain equal to the one set too.
 static GAIN_TEST: AtomicU64 = AtomicU64::new(0);
-/// A device test (the hand spawn's fourteenth byte): the stream on written with its image orientation (CCS G#0101) 0 (3) or 2 (4, Android's for the tele: its frames stood mirrored against the main in Lumis), an A/B of the orientation.
+/// A device test (the hand spawn's fourteenth byte): the stream on written with its image orientation (CCS G#0101) 0 (3) or 2 (4, Android's for the tele and the tele's own since 2026-11-19: its frames stood mirrored against the main in Lumis with 0), an A/B of the orientation; bit 3 (8) adds the sensor's CCS page read back after the first frame (`regs_say`), to compare two stream ons' sensor state (`0B` the flip 0 and its words, `0C` the flip 2 and its words, `08` the camera's own stream on and its words).
 static ORIENT_TEST: AtomicU64 = AtomicU64::new(0);
+
+/// A device test (`ORIENT_TEST` bit 3): the sensor's words at G#0000 to G#10FF read back on the page it streams with (no page write), every 32-byte row not all zero said in hex, so two stream ons' sensor state compare word by word (2026-11-19: whether the tele's flip changes anything beyond G#0101).
+fn regs_say(g: u64, bus: &Bus, c: &Cam) {
+    for a in (0..0x1100u16).step_by(1 << 5) {
+        let mut b = [0u8; 1 << 5];
+        if bus.write_read(c.addr, &a.to_be_bytes(), &mut b).is_err() {
+            say!(g, "camera: regs G#{a:04X}: the read failed\n");
+            continue;
+        }
+        if b.iter().all(|&v| v == 0) {
+            continue;
+        }
+        let mut l = Line { b: [0; 256], n: 0 };
+        let _ = write!(l, "camera: regs G#{a:04X}:");
+        for v in b {
+            let _ = write!(l, " {v:02X}");
+        }
+        let _ = write!(l, "\n");
+        console(g, &l.b[..l.n]);
+    }
+}
 
 /// The gain set inside the sensor's hold (as exposure is: the hold makes the change land whole at a frame's start): the analogue code, then digital gain as `s` has it (always one: analogue only).
 fn gain_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, s: &ccs::GainSet) -> Result<(), u32> {
@@ -2009,10 +2030,10 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     tl_reset();
     err_reset();
     step!(g, "camera: open step: receiver on, lens set; stream on next\n");
-    // A device test (`ORIENT_TEST` 3 or 4): the stream on with its orientation byte (CCS image_orientation, G#0101) 0, or 2 as Android's HAL writes the tele's (keys/husky/captures/ftrace-2026-11-18: `01 00 01 02` at all three of its readouts).
+    // A device test (`ORIENT_TEST` 3 or 4, bit 3 aside): the stream on with its orientation byte (CCS image_orientation, G#0101) 0, or 2 as Android's HAL writes the tele's (keys/husky/captures/ftrace-2026-11-18: `01 00 01 02` at all three of its readouts).
     let orient = ORIENT_TEST.load(Ordering::Relaxed);
-    if (orient == 3 || orient == 4) && c.stream_on.len() == 4 {
-        let o = if orient == 4 { 2 } else { 0 };
+    if (orient & 7 == 3 || orient & 7 == 4) && c.stream_on.len() == 4 {
+        let o = if orient & 7 == 4 { 2 } else { 0 };
         bus.write(c.addr, &[c.stream_on[0], c.stream_on[1], c.stream_on[2], o]).map_err(Fail::Sensor)?;
         say!(g, "camera: orientation test: the stream on with G#0101 = A#{o}\n");
     } else {
@@ -2043,6 +2064,21 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
             bus.write(c.addr, wr_).map_err(Fail::Sensor)?;
         }
         say!(g, "camera: the mode written mid-stream after A#{} frames\n", FRAMES.load(Ordering::Relaxed));
+    }
+    // A device test (`ORIENT_TEST` bit 3): the sensor's words once its first frame has landed (the mode written mid-stream before them, as a stream runs).
+    if ORIENT_TEST.load(Ordering::Relaxed) & 8 != 0 {
+        let until = late_tick();
+        WANT.store(1, Ordering::SeqCst);
+        loop {
+            let d = DOOR.load(Ordering::SeqCst);
+            if FRAMES.load(Ordering::Acquire) != 0 || ferros_sys::now() >= until {
+                break;
+            }
+            ferros_sys::wait(&DOOR, d, until);
+        }
+        WANT.store(0, Ordering::SeqCst);
+        say!(g, "camera: the sensor's words after A#{} frames\n", FRAMES.load(Ordering::Relaxed));
+        regs_say(g, &bus, c);
     }
     Ok(o)
 }
