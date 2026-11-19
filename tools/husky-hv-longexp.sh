@@ -33,7 +33,15 @@ flash_boot() {
     echo "$out"
     if echo "$out" | grep -q FAILED || ! echo "$out" | grep -q OKAY; then echo "== boot_$1 NOT written"; exit 1; fi
 }
-usbserial() { adb devices | awk '$2=="device" && $1 !~ /[:.]/ {print $1; exit}'; }
+# The Pro's serial on adb, never another phone's: with the 8a on Android beside it (2026-11-18), the first device listed was the 8a, and `restore` would have sent it to its bootloader.
+usbserial() {
+    local s
+    for s in $(adb devices | awk 'NR > 1 && $2 == "device" && $1 !~ /[:.]/ {print $1}'); do
+        if [ "$(adb -s "$s" shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = husky ]; then echo "$s"; return; fi
+    done
+}
+# The Pro on ferros: the bridge's port (FERROS_PORT) enumerated as 1209:4665; never `lsusb -d`, which also finds the 8a running ferros.
+pro_on_ferros() { [ -n "${FERROS_PORT:-}" ] && [ "$(cat /sys/bus/usb/devices/$FERROS_PORT/idProduct 2>/dev/null)" = 4665 ]; }
 wait_android() {
     until [ -n "$(usbserial)" ]; do sleep 3; tools/usb-kick.sh --if-wedged >/dev/null 2>&1 || true; done
     device_pin husky
@@ -63,10 +71,13 @@ flash)
     [ -f "$IMG" ] || { echo "no $IMG: run build first"; exit 1; }
     G=${2:?usage: $0 flash <restore image>}
     [ -f "$G" ] || { echo "no $G"; exit 1; }
-    # From ferros (the Pro on USB as 1209:4665): the bridge's fastboot; from Android: adb.
-    if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 ${BRIDGE:-/mnt/Harbor/Code/ferros/target/debug/ferros-bridge} reboot fastboot >/dev/null 2>&1 || true
-    elif [ -n "$(usbserial)" ]; then adb -s "$(usbserial)" reboot bootloader || true; fi
-    for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; tools/usb-kick.sh --if-wedged || true; done
+    # From ferros (the Pro on FERROS_PORT as 1209:4665): the bridge's fastboot; from Android: adb, the Pro's serial alone.
+    S=$(usbserial)
+    if pro_on_ferros; then timeout 60 ${BRIDGE:-/mnt/Harbor/Code/ferros/target/debug/ferros-bridge} reboot fastboot >/dev/null 2>&1 || true
+    elif [ -n "$S" ]; then adb -s "$S" reboot bootloader || true; fi
+    # Pinned first (by the serial last seen, if it is in neither adb nor fastboot yet), so the wait sees the Pro's fastboot alone.
+    device_pin husky
+    for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; done
     device_pin husky
     # No set-active: ABL boots slot a whatever fastboot says, and a set-active of b strands the phone in fastboot (Claude memories/husky_cold_slot_b.md).
     flash_boot b "$G"
@@ -90,8 +101,16 @@ end)
     sleep 10
     wait_android
     until adb shell 'su -c "ls /sys/fs/pstore/console-ramoops-0"' >/dev/null 2>&1; do sleep 3; done
-    adb shell 'su -c "grep -aE \"ferros hv|ferros-mark\" /sys/fs/pstore/console-ramoops-0"' > "$OUT"
-    echo "== $(wc -l < "$OUT") lines -> $OUT"
+    # The whole zone, its sha256 on the device and here (the hub drops the Pro under Android: a pull cut short must not pass), then the hv's lines and the marks.
+    RAW="${OUT%.log}.console-ramoops-0"
+    adb exec-out "su -c 'cat /sys/fs/pstore/console-ramoops-0'" > "$RAW"
+    DEV=$(adb shell "su -c 'sha256sum /sys/fs/pstore/console-ramoops-0'" | awk '{print $1}')
+    HOST=$(sha256sum "$RAW" | awk '{print $1}')
+    [ -n "$DEV" ] && [ "$DEV" = "$HOST" ] || { echo "== the pull of the zone differs from the device's (device $DEV, here $HOST): pull again"; exit 1; }
+    grep -aE "ferros hv|ferros-mark" "$RAW" > "$OUT"
+    echo "== $(wc -l < "$OUT") lines -> $OUT (the zone's sha256 $HOST, the same on the device)"
+    # The isp and pdma captures are read by tools/oracle-isp (cpu, pdma, image), not as I2C.
+    [ "$KIND" = i2c ] || exit 0
     ( cd tools/oracle-i2c && cargo build -q --release )
     D=tools/oracle-i2c/target/release/oracle-i2c
     $D "$OUT" --max-bytes 32 > "${OUT%.log}.xfers"
@@ -103,8 +122,9 @@ restore)
     R=${2:?usage: $0 restore <the image boot_a held before>}
     [ -f "$R" ] || { echo "no $R"; exit 1; }
     S=$(usbserial)
-    [ -n "$S" ] && { device_pin husky; adb -s "$S" reboot bootloader || true; }
-    for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; tools/usb-kick.sh --if-wedged || true; done
+    [ -n "$S" ] && adb -s "$S" reboot bootloader || true
+    device_pin husky
+    for i in $(seq 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; done
     device_pin husky
     flash_boot a "$R"
     fastboot reboot >/dev/null 2>&1

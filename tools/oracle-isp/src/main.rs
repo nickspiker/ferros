@@ -48,14 +48,33 @@ pub struct Cpu {
     pub pre: Vec<(u64, u64)>,
     pub post: Vec<(u64, u64)>,
     pub rx: Vec<(u64, u64)>,
+    /// Integrity: oracle lines in [a, c) that are neither a whole access (`S2 <pa> <R|W><n> <value>`) nor a `rep` run (bytes lost where the hv and the kernel append to the console ring together: memory feedback_oracle_capture_integrity), and `rep` runs (a repeated access: a repeated write is never in a setup, so any inside the window is worth a look).
+    pub garbled: Vec<usize>,
+    pub reps: usize,
+}
+
+/// A whole oracle access line, `S2 <16 hex> <R|W><width> <16 hex>`, or a `rep` run: anything else carrying `ferros hv: S2` lost bytes.
+fn whole(line: &str) -> bool {
+    let Some(k) = line.find("ferros hv: S2 ") else { return true };
+    let t: Vec<&str> = line[k + 14..].split(' ').collect();
+    if t.first() == Some(&"rep") {
+        return t.len() == 2 && is_hex(t[1]);
+    }
+    t.len() == 3 && t[0].len() == 16 && is_hex(t[0]) && (t[1] == "R4" || t[1] == "W4" || t[1] == "R8" || t[1] == "W8" || t[1] == "R2" || t[1] == "W2" || t[1] == "R1" || t[1] == "W1") && t[2].trim_end().len() == 16 && is_hex(t[2].trim_end())
 }
 
 pub fn cpu(text: &str, a: usize, b: usize, c: usize, link: u64) -> Cpu {
-    let (mut pre, mut post, mut rx) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut pre, mut post, mut rx, mut garbled, mut reps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
     for (k, line) in text.split('\n').enumerate() {
         let n = k + 1;
         if n < a || n >= c {
             continue;
+        }
+        if !whole(line) {
+            garbled.push(n);
+        }
+        if line.contains("ferros hv: S2 rep ") {
+            reps += 1;
         }
         let Some((reg, v)) = w4(line) else { continue };
         let phy = (0x1C10_0000..0x1C11_0000).contains(&reg);
@@ -71,7 +90,7 @@ pub fn cpu(text: &str, a: usize, b: usize, c: usize, link: u64) -> Cpu {
             post.push((reg, v));
         }
     }
-    Cpu { pre, post, rx }
+    Cpu { pre, post, rx, garbled, reps }
 }
 
 /// 'CPR2', no buffers, the writes before, an empty program, the writes after: each section a u32 count, then (register, value) as u32 pairs, little-endian.
@@ -101,6 +120,9 @@ pub struct Dump {
     pub words: Vec<u32>,
     pub limit: Option<usize>,
     pub loads: BTreeMap<u32, BTreeMap<u32, u32>>,
+    /// Integrity: list lines whose offset is not the one after the line before (a line lost from the console ring shifts every word after it), and lines naming the dump that did not parse whole.
+    pub gaps: Vec<u64>,
+    pub bad: usize,
 }
 
 /// Eight words of 8 hex digits after a `+<offset>`.
@@ -123,6 +145,7 @@ fn eight(rest: &str) -> Option<Vec<u32>> {
 /// The dump's lists each begin at a `PDMA buffer <iova> length <bytes>` line (one marked unmapped is not a list); `which` picks the list, from 1, as the Python tools counted (and as every past invocation, `--list 2`, names it).
 pub fn dump(text: &str, which: usize) -> Dump {
     let (mut words, mut loads, mut limit, mut k) = (Vec::new(), BTreeMap::<u32, BTreeMap<u32, u32>>::new(), None, 0usize);
+    let (mut gaps, mut bad) = (Vec::new(), 0);
     for line in text.split('\n') {
         if line.contains("PDMA buffer ") && !line.contains("unmapped") {
             k += 1;
@@ -143,7 +166,13 @@ pub fn dump(text: &str, which: usize) -> Dump {
                 && is_hex(&rest[..sp])
                 && let Some(w) = eight(&rest[sp + 1..])
             {
+                let off = hex(&rest[..sp]).unwrap();
+                if off != 4 * words.len() as u64 {
+                    gaps.push(off);
+                }
                 words.extend(w);
+            } else {
+                bad += 1;
             }
         }
         if let Some(p) = line.find("PDMA load ") {
@@ -156,13 +185,18 @@ pub fn dump(text: &str, which: usize) -> Dump {
             {
                 let (reg, off) = (hex(t[0]).unwrap() as u32, hex(off).unwrap() as u32);
                 let m = loads.entry(reg).or_default();
+                if off as usize != 4 * m.len() {
+                    gaps.push(off as u64);
+                }
                 for (j, x) in w.into_iter().enumerate() {
                     m.insert(off + 4 * j as u32, x);
                 }
+            } else {
+                bad += 1;
             }
         }
     }
-    Dump { words, limit, loads }
+    Dump { words, limit, loads, gaps, bad }
 }
 
 // ---- pdma (the decoder) ----
@@ -379,6 +413,20 @@ pub fn image(d: &Dump, height: Option<u32>) -> Job {
 
 // ---- main ----
 
+/// The dump's integrity line: the list's words against the length its `PDMA buffer` line names, offsets that skip, lines that did not parse.
+fn dump_integrity(d: &Dump) -> String {
+    let gaps: Vec<String> = d.gaps.iter().take(8).map(|g| format!("+G#{g:X}")).collect();
+    format!(
+        "integrity: list words A#{} (its length names {}), offsets out of order A#{} {}, dump lines not whole A#{}, block-load registers A#{}",
+        d.words.len(),
+        d.limit.map(|l| format!("A#{l}")).unwrap_or_else(|| "none".into()),
+        d.gaps.len(),
+        gaps.join(" "),
+        d.bad,
+        d.loads.len()
+    )
+}
+
 fn flag(args: &mut Vec<String>, name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     let v = args.get(i + 1).unwrap_or_else(|| panic!("{name} wants a value")).clone();
@@ -412,6 +460,8 @@ fn main() {
             write(&format!("{out}.cpr2"), &cpr2(&r));
             write(&format!("{out}.rx.rs"), rx_rs(&name, &r.rx).as_bytes());
             println!("{} CPU writes before, {} after; receiver start {} writes -> {out}.cpr2, {out}.rx.rs", r.pre.len(), r.post.len(), r.rx.len());
+            let first: Vec<String> = r.garbled.iter().take(8).map(|n| n.to_string()).collect();
+            eprintln!("integrity: oracle lines not whole in the window A#{} (lines {}), rep runs A#{}", r.garbled.len(), first.join(" "), r.reps);
         }
         "pdma" => {
             let base = flag(&mut args, "--base").map(|s| hex(&s).expect("--base G#<block>")).unwrap_or(ISPFE);
@@ -420,7 +470,9 @@ fn main() {
                 Some(p) => read(p),
                 None => std::io::read_to_string(std::io::stdin()).expect("stdin"),
             };
-            let (writes, notes, parsed, total) = decode(&dump(&text, which), base);
+            let d = dump(&text, which);
+            eprintln!("{}", dump_integrity(&d));
+            let (writes, notes, parsed, total) = decode(&d, base);
             let mut out = String::new();
             for n in &notes {
                 out.push_str(n);
@@ -436,7 +488,9 @@ fn main() {
             let which = flag(&mut args, "--list").map(|s| s.parse().expect("--list N")).unwrap_or(1);
             let height = flag(&mut args, "--height").map(|s| s.parse().expect("--height N"));
             let [src, out] = &args[..] else { panic!("{usage}") };
-            let job = image(&dump(&read(src), which), height);
+            let d = dump(&read(src), which);
+            eprintln!("{}", dump_integrity(&d));
+            let job = image(&d, height);
             write(out, &job.file);
             for l in &job.report {
                 println!("{l}");
