@@ -31,6 +31,9 @@ mod platform;
 #[cfg(feature = "pixel8")]
 mod board;
 mod settings;
+// The chords the service loop reads from the keys (power + volume up restarts, power + volume down stops the app in front): pure, tested on the host by tools/chords.
+#[cfg(feature = "pixel8")]
+mod chord;
 // Vol Up + Vol Down → power off, as the key-press interrupt itself (KILLSWITCH.md).
 #[cfg(feature = "pixel8")]
 mod killswitch;

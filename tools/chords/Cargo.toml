@@ -1,0 +1,9 @@
+[package]
+name = "chords"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The chords under ferros and the screenshot's two-finger slide on the host: ferros_kernel/src/chord.rs and payloads/map/src/pair.rs themselves, tested."
+
+# Standalone, outside the ferros workspace's lock.
+[workspace]

@@ -6702,6 +6702,20 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], PUCKS_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else if source == BELL_GPU_CAMERA && p.cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "arena")) {
                 bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_FRONT && holds_surfaces(p) {
+                // The display's own word, read by the kernel and never written (`BELL_FRONT`): kept with the bells' words for its process's life and for `held_in`, nothing written into it now.
+                match p.word(f.x[1]) {
+                    Some(addr) => {
+                        let words = unsafe { &mut *(&raw mut BELL_WORDS) };
+                        words.retain(|w| !(w.0 == pi && w.3 == source));
+                        words.push((pi, p.epoch, addr, source));
+                        0
+                    }
+                    None => {
+                        p.bad_buf(f.x[1], 8, true);
+                        ERR
+                    }
+                }
             } else {
                 ERR
             };
@@ -7622,7 +7636,9 @@ const BELL_PUCKS: usize = 14;
 const BELL_GPU_CAMERA: usize = 15;
 /// The identity's state (SYS_UNLOCK op 11, for an Unlock holder; 2026-11-16, owner: "Yuppers" to the identity doorbell): its word is `ID_WORD`, the state with its own change count. Beside `BELL_IDENTITY` (the lock epoch, anyone's by SYS_BELL), which came to forge first with number 13 (merged 2026-11-20).
 const BELL_ID_STATE: usize = 16;
-const BELLS: usize = 17;
+/// The app in front (2026-11-18, `stop_front`, WINDOWS.md "Stop"), for the holder of the `surfaces` region (the display): not a bell the kernel rings but a word the display keeps and the kernel reads, the app window in front as the display last composed it, its surface slot in bits 0-7, its generation in 8-15, bit 16 set (0 none). Read at power + volume down, so the stop needs nothing of the display at that moment.
+const BELL_FRONT: usize = 17;
+const BELLS: usize = 18;
 /// The lock epoch last rung into the identity's bell (`identity_bell`).
 static IDENTITY_RUNG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// The identity's bell word as last rung (`identity_ring`): bits 0 to 7 SYS_UNLOCK op 0's answer (bit 0 an identity unlocked, bit 1 the device bound, bit 2 the person key held), the change count above bit 8.
@@ -8096,6 +8112,41 @@ fn identity_bell() {
     if IDENTITY_RUNG.swap(e, core::sync::atomic::Ordering::AcqRel) != e {
         bell_ring(BELL_IDENTITY, e as u64);
     }
+}
+
+/// Power + volume down (service.rs, chord.rs; owner, 2026-11-18: "power plus vol down kills", then: Stop ends the app in front immediately, no close message, no grace period): the app in front ended now, one shot dead, as init's OP_STOP ends a kist from the deck's Stop, and no record kept (the person's own act). ferros apps keep every change as it happens, so there is nothing to shut down; the camera driver closes its stream the moment its holder ends.
+/// The app in front is the display's, read from the word it registered (`BELL_FRONT`) and keeps current as it composes: nothing of the display is asked now, so a display or touch the app wedged still lets the chord through.
+/// Nothing on the deck with no app in front, and never a system process (one holding Settings that is not a kist: the map, the attest screen). Returns what happened, for the flash log.
+pub fn stop_front() -> alloc::string::String {
+    with_lock(|| {
+        let words = unsafe { &*(&raw const BELL_WORDS) };
+        let kk = k();
+        // The table never shrinks (procs only grows), so a registered slot is always there to look at.
+        let Some(&(_, _, addr, _)) = words.iter().find(|w| w.3 == BELL_FRONT && kk.procs[w.0].as_ref().is_some_and(|q| q.epoch == w.1 && !q.dying)) else {
+            return alloc::string::String::from("stop: no display has said what is in front; nothing stopped");
+        };
+        // SAFETY: the word was checked inside the display's arc at its registration (`Process::word`), and the arc stays mapped while the process lives (checked just above, under the lock that ends it); a shrink or a release over it is refused (`held_in`).
+        let front = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if front >> 16 & 1 == 0 {
+            return alloc::string::String::from("stop: no app in front; nothing stopped");
+        }
+        let (slot, generation) = ((front & 0xFF) as usize, (front >> 8 & 0xFF) as u8);
+        let slots = unsafe { &*(&raw const SLOTS) };
+        // WHY the bound: the slot is the display's word, read as it stands.
+        let Some(s) = slots.get(slot).filter(|s| s.generation == generation && s.owner != 0) else {
+            return alloc::format!("stop: the window in front (surface {slot}, generation {generation}) has no owner now; nothing stopped");
+        };
+        let Some(pi) = kk.procs.iter().position(|q| matches!(q, Some(q) if q.epoch == s.owner && !q.dying)) else {
+            return alloc::format!("stop: the window in front (surface {slot}) belongs to a process already ending");
+        };
+        let p = kk.procs[pi].as_ref().unwrap();
+        let shown = alloc::string::String::from_utf8_lossy(&p.name).into_owned();
+        if !p.kist && caller_holds(p) & CALLER_SETTINGS != 0 {
+            return alloc::format!("stop: {shown} is the system's; nothing stopped");
+        }
+        kill_at(pi);
+        alloc::format!("stop: {shown} (surface {slot}) ended")
+    })
 }
 
 /// `source` (a link, or `BELL_FACTS`) changed: its count moved on by one and rung. Under the kernel lock: from a syscall, or the service loop thru `with_lock` (service.rs `bell_facts`).
@@ -8595,10 +8646,19 @@ pub fn kill(name: &[u8]) -> bool {
     r
 }
 fn kill_locked(name: &[u8]) -> bool {
-    PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     let kk = k();
     // A live process of that name, never one already ending: a process left `dying` (a thread of it still on a core) ahead of its relaunch in the table was found first, killed again, and the live one ran on (as `kill`'s record and `kist_request` already skip one).
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name && !p.dying)) else { return false };
+    kill_at(i);
+    true
+}
+
+/// End process `i` (alive, not ending) from outside, as `kill_locked` does by name: the stop (`stop_front`) finds its process as its window's owner, by epoch, never by a name. Under the lock.
+fn kill_at(i: usize) {
+    PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+    let kk = k();
+    let name = kk.procs[i].as_ref().unwrap().name.clone();
+    let name = &name[..];
     // The vault process killed (`diag restart vault` starts its successor at once; a bare `diag kill vault` leaves that to the service loop): the store calls queued for it wait for the next one, which the loop starts if none is alive by then.
     if name == VAULT_EP && vault_state() == VAULT_ON {
         VAULT_WANTED.store(true, core::sync::atomic::Ordering::Release);
@@ -8657,7 +8717,6 @@ fn kill_locked(name: &[u8]) -> bool {
     fail_orphaned_calls();
     kk.console.extend_from_slice(name);
     kk.console.extend_from_slice(b": killed\n");
-    true
 }
 
 /// Whether a process of this name is alive (not one ending).

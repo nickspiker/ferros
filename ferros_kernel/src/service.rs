@@ -3002,8 +3002,8 @@ pub fn run(mut b: Boot) -> ! {
     crate::keys::serve();
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
-    // The restart chord arms once power and volume up are not both down: the chord that jumped here from Android (or started this restart) may still be held as this loop starts, and must not restart ferros again.
-    let mut chord_armed = false;
+    // The chords (chord.rs): each arms once its keys are not all down, so the chord that jumped here from Android (or started this restart), or the gate's volume down, still held as this loop starts, fires nothing; a hold fires once.
+    let mut chords = crate::chord::Chords::new();
     let mut ipc_marked = false;
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
@@ -3475,26 +3475,39 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
-        // Power + volume up: ferros restarts, as the chord leaves Android, with no bootloader (owner, 2026-11-10: "Kill everything and reboot but jump style"; restart.rs). Read from the keys' pins on each pass: either key's edge is an interrupt, which wakes this loop.
-        #[cfg(not(shim_handoff))]
-        {
-            let chord = crate::killswitch::power_held() && crate::killswitch::vol_up_held();
-            if chord && chord_armed {
-                crate::restart::restart(b.stub);
-            }
-            chord_armed |= !chord;
-        }
+        // The keys as their pins read this pass (chord.rs): either volume key's edge and the power key's press are interrupts, which wake this loop.
+        let keys = crate::chord::Keys { power: crate::killswitch::power_held(), vol_up: crate::killswitch::vol_up_held(), vol_down: crate::killswitch::vol_down_held() };
         // The power key turns the screen off and on (owner, 2026-10-22): a preference every process sees at once (process.rs PREF_SCREEN_OFF); the display server darkens the panel. The wake policy (proximity) comes later.
+        // A press made with a volume key already down is a chord's (power + volume up restarts, power + volume down stops the app in front), never the screen's.
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
             unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
-            let off = crate::process::pref(crate::process::PREF_SCREEN_OFF) ^ 1;
+            let was = crate::process::pref(crate::process::PREF_SCREEN_OFF);
+            let off = was ^ 1;
             // The proximity wake (owner's rule): a press lights the screen only if nothing is near the sensor. Fails open: with no proximity reading yet (sensors not up, or the AoC failed), the press wakes as before, so a sensor fault never locks the owner out.
             let refused = off == 0 && crate::process::pref(crate::process::PREF_PROX_WAKE) == 1 && crate::sensorlink::prox_near() == Some(true);
-            if refused {
+            if !crate::chord::Chords::press_is_screens(keys) {
+                crate::flashlog::line("power pressed with a volume key down: a chord's, not the screen's");
+            } else if refused {
                 crate::flashlog::line("wake refused: proximity near");
             } else {
                 crate::process::set_pref(crate::process::PREF_SCREEN_OFF, off);
+                chords.toggled(was);
             }
+        }
+        #[cfg(not(shim_handoff))]
+        match chords.step(keys) {
+            // Power + volume up: ferros restarts, as the chord leaves Android, with no bootloader (owner, 2026-11-10: "Kill everything and reboot but jump style"; restart.rs).
+            crate::chord::Act::Restart => crate::restart::restart(b.stub),
+            // Power + volume down: the app in front ended at once, as the deck's Stop ends a kist (owner, 2026-11-18: "power plus vol down kills"; process.rs `stop_front`, WINDOWS.md "Stop"). The press that began it toggled the screen before volume down joined: the screen back as it was.
+            crate::chord::Act::Stop { screen_back } => {
+                if let Some(was) = screen_back {
+                    crate::process::set_pref(crate::process::PREF_SCREEN_OFF, was);
+                }
+                let line = crate::process::stop_front();
+                crate::flashlog::line(&line);
+                crate::process::push_console(alloc::format!("{line}\n").as_bytes());
+            }
+            crate::chord::Act::None => {}
         }
         let now = cntpct();
         // A command from the USB process waiting: no sleep and no time slice before it runs.
@@ -4082,6 +4095,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params.starts_with(b"key ") {
                     // `diag key power` (docs/INPUT-INJECT.md, `ferros-bridge input key`): a press of the power key put where its interrupt puts one (`__power_pressed`, main.rs `.Lirq_power`), so the screen toggle below and the proximity wake rule take it as they take a finger's. Refused while a volume key is physically down: the press would make a chord with it (power + volume up is the hv's jump under Android, both volume keys the kill), and no chord is ever injected. The volume keys themselves have nothing to inject into: the killswitch and the gate read their pins' levels, and nothing queues their presses.
+                    // `diag key stop`: what power + volume down does, the stop of the app in front (process.rs `stop_front`), for testing the stop without hands: the chord itself is two pins' levels and cannot be injected, so this runs its action, not its keys.
                     if cmd.params == b"key power" {
                         if crate::killswitch::volume_key_down() {
                             resp.extend_from_slice(b"key power refused: a volume key is held, and a press now would be a chord\n");
@@ -4089,8 +4103,13 @@ pub fn run(mut b: Boot) -> ! {
                             unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 1) };
                             resp.extend_from_slice(b"key power pressed\n");
                         }
+                    } else if cmd.params == b"key stop" {
+                        let line = crate::process::stop_front();
+                        crate::flashlog::line(&line);
+                        resp.extend_from_slice(line.as_bytes());
+                        resp.push(b'\n');
                     } else {
-                        resp.extend_from_slice(b"key: only `key power`; the volume keys are read as levels (the killswitch, the gate) and nothing queues their presses\n");
+                        resp.extend_from_slice(b"key: `key power`, or `key stop` (the stop chord's action); the volume keys are read as levels (the killswitch, the gate, the chords) and nothing queues their presses\n");
                     }
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

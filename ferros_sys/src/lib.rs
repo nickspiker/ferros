@@ -1444,6 +1444,20 @@ pub const BELL_IDENTITY: u64 = 13;
 pub const BELL_PUCKS: u64 = 14;
 /// The camera on the GPU (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"), for the GPU service alone (the holder of `arena`): counted each time a camera view its holder's GPU calls carried is taken back, so the service unmaps it from that client's space and says so (SYS_DMA x1 = 9 on `arena`).
 pub const BELL_GPU_CAMERA: u64 = 15;
+// Bell 16 is the identity's state, registered by SYS_UNLOCK op 11 (`identity_doorbell`), never by SYS_BELL.
+
+/// The app in front (2026-11-18, docs/WINDOWS.md "Stop"), for the holder of the `surfaces` region (the display): not a bell the kernel rings but the display's own word, which the kernel reads at power + volume down to end the app in front without asking the display anything (`bell_front`, `front_word`).
+pub const BELL_FRONT: u64 = 17;
+
+/// The display's word for the app window in front (`BELL_FRONT`): its surface slot in bits 0-7, its generation in 8-15, bit 16 set; 0 with none.
+pub const fn front_word(slot: usize, generation: u8) -> u64 {
+    1 << 16 | (generation as u64) << 8 | slot as u64
+}
+
+/// `word` registered as the display's word for the app in front (`BELL_FRONT`): the kernel reads it from now, never writes it. False for a caller without the `surfaces` region, or a kernel from before.
+pub fn bell_front(word: &core::sync::atomic::AtomicU64) -> bool {
+    svc(nr::BELL, BELL_FRONT, off(word as *const _ as *const u8), 0, 0, 0) == 0
+}
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;

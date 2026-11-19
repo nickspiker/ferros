@@ -32,6 +32,8 @@ mod wifi;
 mod targets;
 /// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
 mod camera;
+/// The screenshot's two-finger slide on the helm, pure so tools/chords tests it on the host.
+mod pair;
 
 use alloc::vec::Vec;
 use camera::spring_at;
@@ -1589,7 +1591,7 @@ struct Map {
     taps: u8,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
-    /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and deck together switch it, and the display's answer is kept here.
+    /// Whether the display shows its hit map in every fourth frame (display op 58): the Developer page's switch alone switches it (since 2026-11-18; the two-finger slide on the helm is the screenshot), and the display's answer is kept here.
     hit_view: bool,
     /// Whether the display's frame counter is on (display op 72; owner, 2026-11-13: "can we get a fps counter?"): the Developer page's checkbox switches it, and the display's answer is kept here.
     /// Off at every start, never stored, as the hit map's view.
@@ -4790,10 +4792,10 @@ impl Map {
             }
             _ => {
                 // Developer: the panel's and the sensors' knobs (the temporal dither moved to Appearance, 2026-11-12); the light scope's channel a radio group.
-                // The display's hit map in every fourth frame (owner, 2026-11-11: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame"); development builds only, as the display's view is.
+                // The display's hit map in every fourth frame (owner, 2026-11-11: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame"); since 2026-11-18 its one switch (the two-finger slide is the screenshot), wherever this page is: every development build, and a release build after the twelve taps.
+                let on = self.hit_view;
+                mark(self, b, &mut y, 50, tr(Msg::HitMap), on, Some(Choice::HitMap));
                 if DEV {
-                    let on = self.hit_view;
-                    mark(self, b, &mut y, 50, tr(Msg::HitMap), on, Some(Choice::HitMap));
                     // The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): a checkbox each, all on until a reboot unless changed here; an off channel is code 0 on every pixel the panel gets (display op 63).
                     b.text(cx, y, note as u16, dim(), 1, tr(Msg::PanelChannels));
                     y += uu(2, 1);
@@ -5094,7 +5096,18 @@ impl Map {
         self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying || gathering
     }
 
-    /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and deck: the display's answer kept for the checkbox, and said on the console.
+    /// A screenshot (owner, 2026-11-18: "screenshot is the two finger slide"; WINDOWS.md "Screenshot"): the display takes the screen as it is and keeps it as the offer, the clipboard's one held item (display op 84, the system's alone). Acknowledged on the glass at once: both helm buttons lit full while the fingers stay, and faded by the display from the lift (`helm_draw` halves the light each pass), no timer. Said on the console.
+    fn shot(&mut self) {
+        let mut r = [0u8; 4];
+        let taken = call(self.display, &[84], &mut r) >= 1 && r[0] == 0;
+        if taken {
+            self.helm_light(8, 1.0);
+            self.helm_light(9, 1.0);
+        }
+        console(self.grants, if taken { b"map: screenshot asked (the helm's two-finger slide)\n" } else { b"map: screenshot refused by the display\n" });
+    }
+
+    /// The display's hit map in every fourth frame switched (display op 58, toggle), from the Developer page's switch (alone since 2026-11-18, when the two-finger slide became the screenshot): the display's answer kept for the switch, and said on the console.
     fn hit_view_toggle(&mut self) {
         let mut r = [0u8; 4];
         if call(self.display, &[58, 2], &mut r) >= 2 && r[0] == 0 {
@@ -6077,10 +6090,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut r = [0u8; 1];
         call(map.display, &[OP_WINDOWS_STOOD, 0, 0], &mut r);
     }
-    // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
-    if DEV {
+    // The display's hit map view as it stands (op 58, ask), for the Developer page's switch: a map started again finds it as it was left. On every build since 2026-11-18 (the page is there after the twelve taps in a release build).
+    {
         let mut r = [0u8; 4];
         map.hit_view = call(map.display, &[58, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
+    }
+    if DEV {
+        let mut r = [0u8; 4];
         // The panel's channels and the look as the display has them (ops 59 and 60, ask): a map started again finds them as they were left.
         if call(map.display, &[63, 0x80], &mut r) >= 2 && r[0] == 0 {
             map.channels = r[1];
@@ -6253,7 +6269,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut corner_far = false;
     // Measuring (owner, 2026-11-18, on the 8a: "the swipe in from corner gestures don't like to register"): a helm session's furthest travel inward and its travel across then, said as it ends with what the tests made of it.
     let mut corner_best = (0f64, 0f64);
-    // Two fingers on back and deck together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
+    // Two fingers on back and deck together (the screenshot's pair, every build): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their slide up has taken the screenshot this touch.
     let mut pair = 0u8;
     let mut pair_done = false;
     // The quick row (quick.rs): its slide, physics, the rings' drags and the taps; and whether the session's finger landed in its doorway by the camera (a still tap there opens or shuts it).
@@ -6868,8 +6884,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     qr.drag(fy, frame_count);
                 }
             }
-            // Two fingers swiped up from back and deck together (owner, 2026-11-11: "Quick shortcut in dev only is swipe up from both back and home to toggle on/off"): the display's hit map in every fourth frame, once a touch. The second finger's landing is asked of the display as the first's was (op 41); while the two are a pair the corner's own swipe does nothing.
-            if DEV && (corner == 8 || corner == 9) && held >= 2 && pair == 0 {
+            // Two fingers slid up from back and deck together: a screenshot (owner, 2026-11-18: "screenshot is the two finger slide"; WINDOWS.md "Screenshot"), on every build, once a touch. Until then it switched the display's hit map in development builds (owner, 2026-11-11), which is the Developer page's switch alone now. The second finger's landing is asked of the display as the first's was (op 41); while the two are a pair the corner's own swipe does nothing.
+            if (corner == 8 || corner == 9) && held >= 2 && pair == 0 {
                 pair = 2;
                 if let Some(&id) = ids[..held].iter().find(|&&id| (start[id].1, start[id].2) != corner_from) {
                     let (xb, yb) = ((start[id].1 as u16).to_le_bytes(), (start[id].2 as u16).to_le_bytes());
@@ -6880,15 +6896,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
             }
             if pair == 1 && !pair_done && held >= 2 {
-                // Up past a twelfth of the screen's harmonic span (the corner's own threshold until 2026-11-12), both of them.
-                let span = (2 * w * h) as f64 / (w + h) as f64;
-                if ids[..held].iter().filter(|&&id| (start[id].2 - cur[id].2) as f64 > span / 12.).count() >= 2 {
+                // Up past a twelfth of the screen's harmonic span (the corner's own threshold until 2026-11-12), both of them (`pair::slid`).
+                if pair::slid(ids[..held].iter().map(|&id| start[id].2 - cur[id].2), w, h) {
                     pair_done = true;
-                    map.hit_view_toggle();
-                    // The Developer page, if it is on show, draws its checkbox anew.
-                    if !map.app_front && matches!(map.view, View::Open(_)) {
-                        map.draw();
-                    }
+                    map.shot();
                 }
             }
             if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
@@ -6949,9 +6960,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if held == 0 && down {
             down = false;
             map.touching = false;
-            // The helm button let go: its light out (the display fades it).
+            // The helm button let go: its light out (the display fades it). After a screenshot both were lit full (`shot`): both go out, and the display's fade is the acknowledgement's end.
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.0);
+            }
+            if pair_done {
+                map.helm_light(17 - corner, 0.0);
             }
             // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap is each place's own (below): the helm's deck and back, a console circle's, the quick row's.
             let mut tap_thru = !moved;
@@ -6992,7 +7006,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 quick::NOTHING => tap_thru = false,
-                // The helm tapped still: deck or back (`helm_tap`), with an app in front as on the map. Two fingers on back and deck together are the hit map's pair (development builds), never a tap.
+                // The helm tapped still: deck or back (`helm_tap`), with an app in front as on the map. Two fingers on back and deck together are the screenshot's pair, never a tap.
                 8 | 9 => {
                     tap_thru = false;
                     {

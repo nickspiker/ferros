@@ -8,7 +8,7 @@
 //!   - on the deck: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
 //!   - the helm's wedges are the system's, frontmost everywhere, on the deck as over an app: the compose draws the bars in front of the scene (`bars_front`), so the map claims them first in the same walk, and a circle lying under deck or back is behind the button on the glass and to a touch alike (owner, 2026-11-17: "when a kist is under the back or home button the back or home button do not work when we're on deck"; then "as long as the topmost item gets drawn first and under is honored than any filled pixel will skip the hitmap completely"). From 2026-11-12 to 2026-11-17 the deck claimed the wedges behind the map's circles (owner, 2026-11-12, on the 8a: a tap on the settings circle in the bottom right was taken as deck's), a walk in another order than the pixels': the circle took a tap on a button drawn in front of it.
 //! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
-//! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and deck together); never in a release build.
+//! - **Seen on the Developer page** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58, from the Developer page's switch alone since 2026-11-18 (owner: "screenshot is the two finger slide", the gesture that switched it until then; the page is in every development build and in a release build after the twelve taps).
 
 use super::*;
 use core::sync::atomic::AtomicU32;
@@ -394,16 +394,13 @@ pub fn paint_stripe(width: usize, s: draw::Rect) {
     }
 }
 
-/// Whether the development view is on: never in a release build.
+/// Whether the view is on: the Developer page's switch (owner, 2026-11-18: the hit map moves to a switch there), on every build since, the page being the gate (always there in a development build, after the twelve taps in a release build).
 pub fn view() -> bool {
-    DEV && VIEW.load(Ordering::Acquire)
+    VIEW.load(Ordering::Acquire)
 }
 
-/// Op 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8] (status 1 on a release build, which has no view): the receive thread's, answered at once; the render thread is woken to owe the phase its whole screen.
+/// Op 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the receive thread's, answered at once; the render thread is woken to owe the phase its whole screen. Its caller is checked there: the system's, or anyone on a development build.
 pub fn view_op(what: u8) -> [u8; 2] {
-    if !DEV {
-        return [1, 0];
-    }
     let was = VIEW.load(Ordering::Acquire);
     let now = match what {
         0 => false,

@@ -416,7 +416,8 @@ const GPP0_DAT: u64 = 0x0004;
 /// The heap's ceiling: the most the display's arc grows to for its heap (docs/ARCS.md step 2), declared in its image header (`ferros_sys::entry!` below, `grows`), so the kernel sizes the arc's window for it and maps frames only as they are asked for.
 /// Until 2026-11-11 the heap was a fixed 32 MiB region the kernel granted (cachemap DISPLAY_HEAP, `display-heap`), and on the Pro that night the display panicked at start, "memory allocation of 2097152 bytes failed": the quick row's band (+4.2 MiB) and the night's other additions had taken it past 32 MiB. Nothing in the heap is DMA (the back buffer is the canvas region, the framebuffers and the phases their own), so it may lie in any frames of the pool, and move.
 /// A power of two, four times the start as estimated that night (about 27 MiB in this heap on husky, COMPOSITOR.md "Memory"): room for the hit map and what comes after without a rebuild, while the window (the next power of two above it) costs addresses only.
-const HEAP_CEILING: usize = 1 << 27;
+/// 2^28 since 2026-11-18: the screenshot's offer (`offer_keep`) grows the arc by a screen's frame at the first screenshot (30.7 MiB on the Pro), on top of a heap past 64 MiB by then (the flight's plane image alone is another 30.7); under 2^27 that left the render heap's own growth a few MiB. Addresses only, as before: nothing is mapped until asked.
+const HEAP_CEILING: usize = 1 << 28;
 /// The least one grow asks for: four frames, so a heap that keeps growing asks a few times rather than once an allocation (ferros_rt asks the same way).
 const HEAP_GROW_MIN: usize = 8 << 20;
 /// What the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`, 4 MiB): the console worker's and the wallpaper loader's fixed arenas live there (`heap_init`), the rest of the heap above the first stack, where the arc grows.
@@ -2933,6 +2934,9 @@ fn app_live() -> bool {
     })
 }
 
+/// The app window in front as this display last composed it (ferros_sys `BELL_FRONT`, `front_word`; WINDOWS.md "Stop"), kept by `full_follow` and registered with the kernel at start, which reads it at power + volume down and ends that app without asking anything of this process.
+static FRONT: AtomicU64 = AtomicU64::new(0);
+
 /// The windows' owners' doorbell: asleep on the bell word until the kernel rings it (a surface freed as its process ends, or given out), then the render thread woken by its doorbell (`ring_bell`) for a pass, whose top drops every window whose owner is gone. No timer: a process's end is the only thing that wakes it.
 extern "C" fn reaper(_: u64) -> ! {
     let mut seen = SURF_LIVE.load(Ordering::Acquire);
@@ -3037,10 +3041,10 @@ static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), and the system's own (78 and 79, the icon cache; 80, the windows as they stood): their caller's holdings are asked of the kernel as they arrive.
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -4149,6 +4153,56 @@ fn show_parts(log: &mut Log, t_pub: u64, t_wait: u64) {
 /// Where op 30 has the finished frame written instead of a phase (a free surface's pixels), 0 when not capturing.
 static mut CAPTURE: usize = 0;
 
+/// A screenshot asked (op 84, the map's two-finger slide on the helm): taken at the next pass's top (`offer_keep`).
+static SHOT_WANT: AtomicBool = AtomicBool::new(false);
+/// The offer (WINDOWS.md "Screenshot"; the clipboard's model, a capability handoff the input path brokers, Claude memories/clipboard_capability_handoff.md): the one item held for the next paste, a screenshot today, in the frame op 30 makes (working values, a u64 a pixel, white at Q14, the screen's width × height, rows top first).
+/// Its frames are the arc's, grown for it at the first screenshot (`ferros_sys::arc::grow`), never before, and used again by every later one: one screen's worth (30.7 MiB on the Pro, 19.8 on the 8a) from the first screenshot on, none until then. RAM only: nothing of it is ever written to the vault (owner, 2026-11-07: "no 'save to file' stuff").
+/// `OFFER_AT` its address (0 none yet), `OFFER_GEN` a count of offers made (0 none), each kept by the render thread and read by the receive thread (op 85).
+static OFFER_AT: AtomicU64 = AtomicU64::new(0);
+static OFFER_GEN: AtomicU32 = AtomicU32::new(0);
+/// The offer's kind (op 85): none yet, or a screenshot.
+const OFFER_NONE: u8 = 0;
+const OFFER_SHOT: u8 = 1;
+
+/// The frame op 30 just made (`PLANE`) kept as the offer (`OFFER_AT`), replacing the one before; its room grown in the arc the first time. Said on the console with where it came from. False when the arc refused the room (past the ceiling, or the pool out of frames): no offer is made and the one before stays.
+fn offer_keep(width: usize, height: usize, grants: u64, from: &[u8]) -> bool {
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    let words = width * height;
+    let mut at = OFFER_AT.load(Ordering::Acquire) as usize;
+    if at == 0 {
+        match ferros_sys::arc::grow(words * 8) {
+            Ok((_, was)) => at = ferros_sys::arc_base() as usize + was,
+            Err(why) => {
+                l.s(b"display: screenshot from ");
+                l.s(from);
+                l.s(b" not kept: the arc refused its room (why ");
+                l.dec(why);
+                l.s(b")\n");
+                l.flush();
+                return false;
+            }
+        }
+        OFFER_AT.store(at as u64, Ordering::Release);
+    }
+    // SAFETY: `at` is the start of `words` u64s this process grew its arc by (above, or at an earlier screenshot), held by nothing else: the bump heaps start a run of their own above any grow they did not make (`Bump::more`).
+    let to = unsafe { core::slice::from_raw_parts_mut(at as *mut u64, words) };
+    to.copy_from_slice(plane_image(width, height));
+    let g = OFFER_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    l.s(b"display: screenshot from ");
+    l.s(from);
+    l.s(b" kept as the offer, number ");
+    l.dec(g as u64);
+    l.s(b", ");
+    l.dec(width as u64);
+    l.s(b" x ");
+    l.dec(height as u64);
+    l.s(b" working values at ");
+    l.hex(at as u64);
+    l.s(b"\n");
+    l.flush();
+    true
+}
+
 /// The hit map's rows no longer match the windows' layout (`layout_build` sets it, an app publish of the whole screen with the hit map's rows clears it): an app's show writes them only then.
 static mut HITS_STALE: bool = true;
 
@@ -4218,7 +4272,11 @@ fn front_app() -> Option<usize> {
 
 /// `FULL` as the app window in front has it (none in front: off, so the deck always has its bars). True when that changed.
 fn full_follow() -> bool {
-    let f = front_app().is_some_and(|k| unsafe { (*(&raw const WINS))[k] }.is_some_and(|w| w.full));
+    let front = front_app();
+    // The app in front for the kernel's stop (`FRONT`): read at power + volume down, so it follows every change of the windows, here, where `FULL` does.
+    let word = front.and_then(|k| unsafe { (*(&raw const WINS))[k] }.map(|w| ferros_sys::front_word(k, w.generation))).unwrap_or(0);
+    FRONT.store(word, Ordering::Release);
+    let f = front.is_some_and(|k| unsafe { (*(&raw const WINS))[k] }.is_some_and(|w| w.full));
     unsafe {
         let was = FULL;
         FULL = f;
@@ -7368,9 +7426,42 @@ extern "C" fn receive(grants: u64) -> ! {
             front::watch(u32::from_le_bytes(msg[1..5].try_into().unwrap()), &tok);
             continue;
         }
-        // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs; development builds only, status 1 on a release build). Answered here, at once.
+        // 84 `shot` → [0]: a screenshot (WINDOWS.md "Screenshot"; owner, 2026-11-18: "screenshot is the two finger slide"), taken at the render thread's next pass as op 30 takes one and kept as the offer (`offer_keep`). The system's alone: [4] (`NOT_YOURS`) from another caller, so no kist can make one.
+        if op == 84 {
+            if system(h) {
+                SHOT_WANT.store(true, Ordering::Release);
+                ring_bell();
+                ferros_sys::reply(&tok, &[0]);
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
+            }
+            continue;
+        }
+        // 85 `offer` → [0][kind u8: 0 none, 1 a screenshot][number u32][width u16][height u16][address u64]: the offer held for the next paste (`OFFER_AT`), its number counting every offer made; the address is its frame's in this process's arc, on a development build only (the bridge reads it there, tools/screencap `--offer`), 0 on a release build, where only a paste will ever reach it. The system's alone, or anyone's on a development build: [4] otherwise.
+        if op == 85 {
+            if DEV || system(h) {
+                let g = OFFER_GEN.load(Ordering::Acquire);
+                let at = if DEV { OFFER_AT.load(Ordering::Acquire) } else { 0 };
+                let mut r = [0u8; 18];
+                r[1] = if g == 0 { OFFER_NONE } else { OFFER_SHOT };
+                r[2..6].copy_from_slice(&g.to_le_bytes());
+                let (w, ht) = unsafe { SCREEN_WH };
+                r[6..8].copy_from_slice(&w.to_le_bytes());
+                r[8..10].copy_from_slice(&ht.to_le_bytes());
+                r[10..18].copy_from_slice(&at.to_le_bytes());
+                ferros_sys::reply(&tok, &r);
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
+            }
+            continue;
+        }
+        // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs), the Developer page's switch. On every build since 2026-11-18, the page being the gate; on a release build the system's alone ([4], `NOT_YOURS`, from another caller), on a development build anyone's (the bridge's tools), as before. Answered here, at once.
         if op == 58 && n >= 2 {
-            ferros_sys::reply(&tok, &hit::view_op(msg[1]));
+            if DEV || system(h) {
+                ferros_sys::reply(&tok, &hit::view_op(msg[1]));
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS, 0]);
+            }
             continue;
         }
         // 72 `frames [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the frame counter in the console's USB circle (`frames_op`).
@@ -7956,6 +8047,11 @@ fn server(grants: u64) -> ! {
         }
     } else {
         log.s(b"display: no slots bell (a kernel from before 2026-11-12): no window counts as live, this display needs the kernel of its day\n");
+        log.flush();
+    }
+    // The app in front for the kernel (`FRONT`, WINDOWS.md "Stop"): power + volume down reads it. A kernel from before refuses it: the chord then stops nothing.
+    if !ferros_sys::bell_front(&FRONT) {
+        log.s(b"display: the kernel takes no word for the app in front (a kernel from before 2026-11-18): power + volume down stops nothing\n");
         log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
@@ -9833,15 +9929,15 @@ fn server(grants: u64) -> ! {
                 *us = stage_us[2];
             }
         }
-        // The quick row's screencap (QUICK.md; op 56 flag bit 1): taken as op 30 takes one, the pass the bars on the screen hold none of the row, so the row that asked for it is not in it. Until the clipboard exists (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live") the frame stays in the free surface op 30 wrote it to, its address on the console for tools/screencap's reader.
-        if quick::CAPTURE.load(Ordering::Acquire) && unsafe { quick::EMPTY_FRONT } {
-            quick::CAPTURE.store(false, Ordering::Release);
+        // A screenshot (WINDOWS.md "Screenshot"): the two-finger slide on the helm (op 84), or the quick row's screencap (QUICK.md; op 56 flag bit 1), the latter the pass the bars on the screen hold none of the row, so the row that asked for it is not in it. Taken as op 30 takes one, then kept as the offer (`offer_keep`): the clipboard's one held item until the next replaces it (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live").
+        let quick_shot = quick::CAPTURE.load(Ordering::Acquire) && unsafe { quick::EMPTY_FRONT };
+        if quick_shot || SHOT_WANT.swap(false, Ordering::AcqRel) {
+            if quick_shot {
+                quick::CAPTURE.store(false, Ordering::Release);
+            }
             let mut out = [0u8; 16];
-            let len = handle(&[30], &mut out);
-            let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(b"display: quick row screencap (no clipboard yet): ");
-            l.s(&out[..len.min(out.len())]);
-            l.flush();
+            handle(&[30], &mut out);
+            offer_keep(width, height, grants, if quick_shot { b"the quick row" } else { b"the helm's slide" });
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
