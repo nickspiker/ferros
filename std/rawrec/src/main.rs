@@ -253,6 +253,13 @@ fn main() {
         }
     };
     println!("rawrec: recording into {NAME}, A#{blocks} blocks asked; the mosaic G#{:02X}, black A#{}, white A#{}", hd[9], cam.black, cam.white);
+    // A fresh frame after the start: the open may have waited (a clip left open by a writer that died is closed first), and the frame held from before it would put the time in between down as dropped.
+    if !map(held, &mut hd) {
+        println!("rawrec: MAP: no frame after the start");
+        let _ = call(S_CAMERA, &[4], &mut r);
+        return;
+    }
+    held = hd[40];
     // Every frame's source hash as the recorder's workers took it (the clip's frame number, the hash), and four frames kept whole (one every 2^6) for the check on the device.
     let mut hashes: Vec<(u64, [u8; 32])> = Vec::with_capacity(want as usize);
     let mut copies: Vec<(u64, Vec<u8>)> = Vec::new();

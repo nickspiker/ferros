@@ -575,7 +575,6 @@ fn dev_key() -> (String, [u8; 32]) {
 }
 
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
-    use ed25519_dalek::SigningKey;
     let (label, mut seed) = dev_key();
     // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
     let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
@@ -604,7 +603,15 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
             std::process::exit(1);
         });
     }
-    // Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
+    seed.fill(0);
+    plain_capsule(code, masked, text_len)
+}
+
+/// Every capsule but a kist's (the shell's processes, a hand spawn's, under the developer key in $FERROS_DEV_KEY or ferros's) with its one Ed25519 signature: the same bytes for the same code and key, so its identity can be made again (`kist_of`).
+fn plain_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
+    use ed25519_dalek::SigningKey;
+    let (_label, mut seed) = dev_key();
+    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(ferros_kist::capsule::code_section(&c))
@@ -1073,15 +1080,23 @@ async fn cmd_store(args: &[String]) {
     }
 }
 
-/// `--kist <capsule.vsf>`: that kist's identity (developer key, option), as the stower names a kist's own domain.
+/// `--kist <capsule.vsf | payload.bin>`: the identity (developer key, option) whose own domain holds the name, as the kernel gives a process its domain at spawn: a kist capsule's own (a stowed Lumis's, any version); a payload image the way `spawn` signs one by hand (the developer key in $FERROS_DEV_KEY or ferros's, the option the capsule's provenance hash: the exact image a hand-spawned Lumis ran, its domain changing with every build); any other capsule its key and provenance hash.
 fn kist_of(args: &[String]) -> Option<[u8; 64]> {
     let path = args.iter().position(|a| a == "--kist").and_then(|i| args.get(i + 1))?;
-    let capsule = std::fs::read(path).unwrap_or_else(|e| {
+    let file = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
         std::process::exit(1);
     });
-    let (developer, option) = ferros_kist::identity(&capsule).unwrap_or_else(|e| {
-        eprintln!("{path}: not a kist capsule: {e}");
+    let capsule = if file.starts_with("RÅ<".as_bytes()) { file } else { plain_capsule(&file, false, None) };
+    let hp = vsf::file_format::VsfHeader::decode(&capsule).ok().and_then(|(h, _)| match h.provenance_hash {
+        vsf::types::VsfType::hp(b) if b.len() == 32 => <[u8; 32]>::try_from(&b[..]).ok(),
+        _ => None,
+    });
+    let (developer, option) = ferros_kist::identity(&capsule).or_else(|e| match (vsf::file_format::VsfHeader::decode(&capsule).ok().and_then(|(h, _)| h.signer_pubkey), hp) {
+        (Some(vsf::types::VsfType::ke(k)), Some(hp)) if k.len() == 32 => Ok((k[..].try_into().unwrap(), hp)),
+        _ => Err(e),
+    }).unwrap_or_else(|e| {
+        eprintln!("{path}: no identity: {e}");
         std::process::exit(1);
     });
     let mut id = [0u8; 64];

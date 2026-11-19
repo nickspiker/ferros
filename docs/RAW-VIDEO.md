@@ -197,6 +197,9 @@ The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,0
 - **Measured at 30/s, a minute, lossless, four A715s and four A510s:** at the camera's 2367 MHz lift the zones reached 85 C in 37 s (stopped); capped at 1572, 1800 of 1800 frames, none dropped, 75 C at most, every frame decoded bit exact on the host against the hash of the frame the camera wrote (tools/clip-check); straight to the flash, the same, 71 C at most, 170 MB/s over the clip.
 - **The first clip within about a minute of a boot or reload** may drop frames while the system starts its processes (pcie1, the modem, the stower) on the same cores; later clips are clean.
 
+- **A clip left open** (its writer died, the power went, or its seal never came) holds its whole reservation until it is closed. The next open of any clip closes every open extent no live writer holds (the kernel says, SYS_BLOCK x1 bits 3 and 5): the vault process reads it with vsf's clip reader to its last whole frame (each frame's hash and the `prev` chain), writes the closing generation right after that frame, seals the extent at that length and gives its tail back. Nothing is dropped; an extent with no readable clip is sealed empty, its first block kept. Lumis's first clip (2026-11-19, 151 frames, its seal refused, the whole 48 GiB reserved) came back this way at the next open in 3.4 s, all 151 frames decoding, the 19 Lumis hashed matching the camera's frames.
+- **The open's shutter**: the driver refuses an open whose integration does not fit its frame less 32 lines (Lumis's 67.8 ms at 30/s); `Pacing::open_msg` opens with at most that, and `open_needs_set` says when the shutter is to be SET after the first frame.
+
 ### A clip from the Pro to the host
 
 The flashed build (raw-video-rec 247507b2, both slots, 2026-11-19; keys/husky/images/boot_raw-video-rec_247507b2_vaultcarried.img) carries the commands; until raw-video-rec is merged use its bridge and checker:
@@ -209,7 +212,8 @@ $B store extent <clip name> all <clip>.vsf --kist /mnt/Harbor/Code/keys/husky/im
 /mnt/Harbor/Code/ferros/target/agent-rawrec/host/release/clip-check <clip>.vsf
 ```
 
-`--kist` names Lumis's own domain (any Lumis capsule: the identity is the same across versions); without it the name is a scope's (`test.rawrec.clip` for std/rawrec). The pull runs about 24 MB/s over the bridge (a minute at 30/s, 10 GB, takes about 7 minutes). clip-check decodes every frame on every host core and says the frames' timing and holes; given rawrec's `test.rawrec.hashes` it checks every frame against the camera's.
+`--kist` names the domain the clip is in: a stowed Lumis's by any Lumis kist capsule (its identity is the same across versions); a hand-spawned Lumis's by the exact `lumis.bin` it was spawned from (`bridge spawn` signs a payload with the developer key and its own content hash, so each build has a domain of its own: keep the image a clip was recorded with); without `--kist` the name is a scope's (`test.rawrec.clip` for std/rawrec).
+A clip's name is a value's: printable ASCII G#21 to G#7E (no spaces), 1 to 96 bytes; the kernel refuses any other and says why on the console. The pull runs about 24 MB/s over the bridge (a minute at 30/s, 10 GB, takes about 7 minutes). clip-check decodes every frame on every host core and says the frames' timing and holes; given rawrec's `test.rawrec.hashes` it checks every frame against the camera's.
 
 ### What is not done
 

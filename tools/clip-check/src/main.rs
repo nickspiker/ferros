@@ -11,6 +11,19 @@ use vsf::visual::clip::Reader;
 
 fn hashes(path: &str) -> Vec<(u64, [u8; 32])> {
     let bytes = std::fs::read(path).expect("the hashes");
+    // A console log instead (Lumis's `RAW video: frame <k> source <hex>` lines, k the clip's frame).
+    if !bytes.starts_with("RÅ<".as_bytes()) {
+        let hex = |s: &str| -> Option<[u8; 32]> { (s.len() == 64).then(|| core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap_or(0))) };
+        return String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split("RAW video: frame ").nth(1)?.split_whitespace();
+                let k = w.next()?.parse().ok()?;
+                (w.next()? == "source").then_some(())?;
+                Some((k, hex(w.next()?)?))
+            })
+            .collect();
+    }
     let doc = vsf::container::Document::open(bytes.as_slice()).expect("the hashes document");
     let s = doc.section(doc.entry("rawrec_hashes").expect("section rawrec_hashes")).expect("the section");
     let first = |n: &str| s.get_field(n).and_then(|f| f.values.first()).cloned();

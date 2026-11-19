@@ -4004,6 +4004,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         _ => false,
     };
     if !rel_ok || !len_ok {
+        push_console(alloc::format!("extent: {} refused: {}\n", core::str::from_utf8(&p.name).unwrap_or("?"), if !rel_ok { "the name is not printable ASCII (G#21 to G#7E, no spaces) of 1 to 96 bytes" } else { "the buffer's length is not the op's" }).as_bytes());
         f.x[0] = ERR;
         return 0;
     }
@@ -4028,6 +4029,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     rest[1..9].copy_from_slice(&block.to_le_bytes());
     rest[9..13].copy_from_slice(&(len as u32).to_le_bytes());
     let Some(mut msg) = stamp(VOP_EXTENT, &prefix, classes, &name, &rest) else {
+        push_console(alloc::format!("extent: {} refused: its domain's keys are not open (the person's class while they are away)\n", core::str::from_utf8(&p.name).unwrap_or("?")).as_bytes());
         f.x[0] = ERR;
         return 0;
     };
@@ -4039,6 +4041,7 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
                 msg.extend_from_slice(b);
             }
             None => {
+                push_console(alloc::format!("extent: {} refused: its buffer of A#{} bytes at G#{:X} lies in no memory of its own\n", core::str::from_utf8(&p.name).unwrap_or("?"), len, f.x[4]).as_bytes());
                 crate::keys::wipe_to_dram(&mut msg);
                 f.x[0] = ERR;
                 return 0;
@@ -5139,6 +5142,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let give = (f.x[1] & 8 != 0).then(|| {
                 let named = matches!(p.lookup(&token).map(|i| p.cspace[i].object), Some(Object::Blocks(_)));
                 match &window {
+                    // Bit 5 with bit 3: whether a live writer holds the extent from window block x2 (1) or none does (0): the vault recovers an open extent only when nobody is writing it.
+                    Some(w) if named && f.x[1] & 32 != 0 && w.name == "clips" => unsafe { (*(&raw const EXTENT_GRANTS)).iter().any(|g| g.holder != 0 && g.first == f.x[2] && k().procs.iter().flatten().any(|r| r.epoch == g.holder && !r.dying)) as u64 },
                     Some(w) if named => extent_give(p, w, f.x[2], f.x[3], f.x[4], f.x[1] & 16 != 0),
                     _ => ERR,
                 }

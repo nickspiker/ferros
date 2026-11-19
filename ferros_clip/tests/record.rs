@@ -4,6 +4,16 @@ use ferros_clip::{cfa_of_byte, Camera, FrameIn, MemSink, Mode, Pacing, Recorder,
 use vsf::visual::clip::Reader;
 
 #[test]
+fn a_long_shutter_opens_short_then_sets() {
+    // Lumis's 67.8 ms shutter at 30/s: 21342 lines, a 10586-line frame.
+    let p = Pacing::of(30);
+    assert!(p.open_needs_set(67_800_000) && !p.open_needs_set(16_000_000));
+    let m = p.open_msg(0, 67_800_000);
+    let lines = u16::from_le_bytes([m[8], m[9]]) as u64;
+    assert_eq!(lines, p.fll as u64 - ferros_clip::OPEN_MARGIN);
+}
+
+#[test]
 fn space_from_the_vaults_reply() {
     // The vault's EOP_SPACE reply in blocks: a 48 GiB window, 2^20 blocks taken, 2^21 the longest free stretch, 2^18 this app's in 3 clips.
     let mut b = [0u8; 40];

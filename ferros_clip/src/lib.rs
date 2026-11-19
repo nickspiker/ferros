@@ -30,6 +30,8 @@ pub const MAIN_LLP: u64 = 6320;
 /// The longest frame the sensor's 16-bit frame length holds, and the shortest the binned main streams (its 3072 rows and the driver's blank).
 pub const FLL_MOST: u64 = (1 << 16) - 1;
 pub const FLL_LEAST: u64 = 3072 + (1 << 8);
+/// The lines the driver keeps between an integration and its frame's end at the open (payloads/camera, ccs `MARGIN`).
+pub const OPEN_MARGIN: u64 = 1 << 5;
 
 /// How the camera runs for a clip at `fps`: the frame length the open asks for, and every how many frames the recorder keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +62,15 @@ impl Pacing {
     }
 
     /// The camera driver's open with its view for this pacing (payloads/camera `Spec`): `[1][camera][1 = with the view][kind 1, the binned readout][rows][fll][exposure lines][flags][ring][llp][cols][view flags: bit 0 write-back]`.
-    /// `exposure_ns` the opening shutter (the driver lengthens the frame past `fll` when it is longer: the interval is then the shutter's).
+    /// `exposure_ns` the opening shutter, at most the frame less the driver's margin (`ccs::Mode::check`: an integration of more refuses the open, "no such mode (Integration(..))"); a shutter longer than the frame is the caller's SET after the first frame, which lengthens the frame (the interval is then the shutter's). [`Pacing::open_needs_set`] says which.
+    /// Whether a shutter of `exposure_ns` is longer than the open can carry: then SET it (exposure, what 0) after the first frame.
+    pub fn open_needs_set(&self, exposure_ns: u64) -> bool {
+        exposure_ns * MAIN_PIXCLK / (MAIN_LLP * 1_000_000_000) > self.fll as u64 - OPEN_MARGIN
+    }
+
     pub fn open_msg(&self, camera: u8, exposure_ns: u64) -> [u8; 17] {
-        let lines = (exposure_ns * MAIN_PIXCLK / (MAIN_LLP * 1_000_000_000)).max(1).min(FLL_MOST) as u16; // WHY: the open's word is 16 bits of lines and at least one; a longer shutter is the SET's (shift) to set after the first frame
+        // WHY the min: the driver refuses an open whose integration does not fit its frame less the margin (`ccs::Mode::check`, coarse + 32 <= fll); the longer shutter goes by SET once the stream runs (`open_needs_set`). PROOF: Lumis's 67.8 ms shutter at 30/s (21342 lines in a 10586-line frame) was refused, 2026-11-19.
+        let lines = (exposure_ns * MAIN_PIXCLK / (MAIN_LLP * 1_000_000_000)).max(1).min(self.fll as u64 - OPEN_MARGIN) as u16;
         let mut m = [0u8; 17];
         m[0] = 1;
         m[1] = camera;
