@@ -416,8 +416,8 @@ fn siggen(wave: u8, period: u16, amplitude: u32) -> bool {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
 ferros_sys::entry!(audio_main);

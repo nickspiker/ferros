@@ -166,6 +166,47 @@ fn set_word_held(slot: usize, retries: u8, flags: u8) -> u32 {
     MARKED
 }
 
+/// devinfo's second block (LBA 7): the bootloader's key-value records ("DIUS"/"DIFR" entries: avb_veritymode, avb.managed_verity_mode, avb_verify_error_parts, the boot-time table).
+const DEVINFO_KV_LBA: u32 = 7;
+/// Set when the block on the device is not the one the host read (its BLAKE3 differs): nothing written.
+pub const CHANGED: u32 = 0x24;
+
+/// Put devinfo's key-value block back to `want` (the 8a, 2026-11-18: Android's failed disk check left `avb.managed_verity_mode` there, the bootloader's EIO record behind the red "corrupt" screen; the owner's go to restore the morning's copy).
+/// A compare and swap: the block is written only while it still hashes to `now` (what the host read), and both blocks must open with a record ("DIUS"), so a wrong LBA or a stray file never lands.
+/// The first block (LBA 6: the slot words and the factory identity data) is never touched here.
+pub fn set_kv_block(now: &[u8; 32], want: &[u8]) -> u32 {
+    crate::process::UFS.with(|| set_kv_block_held(now, want))
+}
+fn set_kv_block_held(now: &[u8; 32], want: &[u8]) -> u32 {
+    let ufs = UfsController::new(UFS_BASE);
+    if want.len() != ufs.data_buffer().len() || &want[0..4] != b"DIUS" {
+        return BAD_FORMAT;
+    }
+    let read = |ufs: &UfsController| -> Option<alloc::vec::Vec<u8>> {
+        for _ in 0..4 {
+            if ufs.read_block_lun(DEVINFO_LUN, DEVINFO_KV_LBA) == 0 && ufs.last_response_status() == 0 {
+                return Some(ufs.data_buffer().to_vec());
+            }
+        }
+        None
+    };
+    let Some(block) = read(&ufs) else { return READ_FAILED };
+    if &block[0..4] != b"DIUS" {
+        return BAD_FORMAT;
+    }
+    if blake3::hash(&block).as_bytes() != now {
+        return CHANGED;
+    }
+    ufs.data_buffer_mut().copy_from_slice(want);
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_KV_LBA) != 0 || ufs.last_response_status() != 0 {
+        return WRITE_FAILED;
+    }
+    if !matches!(read(&ufs), Some(back) if back == want) {
+        return VERIFY_FAILED;
+    }
+    MARKED
+}
+
 /// Both slots' words as they are now (retries | flags << 8), for `diag slot`.
 pub fn words() -> Option<[u32; 2]> {
     crate::process::UFS.with(words_held)

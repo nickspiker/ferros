@@ -160,6 +160,6 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    ferros_sys::panic_exit()
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }

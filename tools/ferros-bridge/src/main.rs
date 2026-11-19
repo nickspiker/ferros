@@ -6,9 +6,13 @@
 //
 // ledger.rs ── the flash log: `diag log` rendered (`--raw` its VSF documents), log-render <file>, log-legacy <out> [--erase] (the old text log converted once)
 //
+// deaths.rs ── deaths [n]: the flash log's recent deaths (`diag "log deaths"`), each frame named from its process's ELF (addr2line)
+//
 // usb.rs ── UsbLink is ferros-link's (VID G#1209, PID G#4665, FERROS_BUS); here only the development vendor requests on EP0: read_dbg, read_dbg2, gate
 
 extern crate alloc;
+/// `deaths`: the flash log's recent deaths, their frames named from the processes' ELFs (KERNEL.md "A process that dies").
+mod deaths;
 mod input;
 /// The flash log: `diag log` rendered, `log-render`, `log-legacy` (LEDGER.md "Reading it").
 mod ledger;
@@ -60,6 +64,7 @@ fn usage() {
     eprintln!("  diag         Retrieve boot diagnostics from device");
     eprintln!("  diag log [--raw] | diag \"log <n>\"  The flash log's newest entries (256 or n) as lines; --raw writes its VSF documents");
     eprintln!("  log-render <file.vsf>  A saved `diag log --raw` answer or a converted old log, as lines");
+    eprintln!("  deaths [n]   The recent deaths in the flash log: message, file:line, thread, frames named from the ELFs (--elf name=path, --dir, --blocks)");
     eprintln!("  log-legacy <out.vsf> [--erase]  The old 2026-10-20 text log as ledger_legacy documents, once; --erase zeroes it on the device after the file checks");
     eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
     eprintln!("  echo         PT echo test — send pattern, verify round-trip");
@@ -106,6 +111,8 @@ async fn main() {
         "log-render" if args.len() >= 3 => ledger::cmd_render(&args[2]),
         // log-legacy <out.vsf> [--erase]: the 2026-10-20 text log, converted once (ledger.rs).
         "log-legacy" => ledger::cmd_legacy(&args[2..]).await,
+        // deaths [n]: the recent deaths in the flash log, message, place and named frames (deaths.rs).
+        "deaths" => deaths::cmd_deaths(&args[2..]).await,
         "read" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU: on husky a direct PMU read makes the next EL3 call hang)");

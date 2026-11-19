@@ -89,6 +89,14 @@ pub fn input() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts((sys::arc_base() + o) as *const u8, n) }
 }
 
+/// SYS_PANIC: tell the kernel this process is panicking, from std's panic hook (the fork's `default_hook`, STD-TARGET.md): the message, the source file, the line and the column, as the hook has them.
+/// The kernel keeps them with the calling thread's name and the call chain it walks from this call's frame, and the abort that follows ends the process with them: its end goes to the flash log as typed fields and to the console, the frames for `ferros-bridge deaths` to name (KERNEL.md "A process that dies").
+/// A kernel from before answers ERR, which changes nothing. Not inlined, so the walk starts at a frame of its own.
+#[inline(never)]
+pub fn panic_report(message: &str, file: &str, line: u32, column: u32) {
+    sys::svc(nr::PANIC, sys::off(message.as_ptr()), message.len() as u64, sys::off(file.as_ptr()), file.len() as u64, line as u64 | (column as u64) << 32);
+}
+
 /// End the process; the kernel prints `name: exit G#<code>`.
 pub fn exit(code: i32) -> ! {
     sys::svc(nr::EXIT, code as u32 as u64, 0, 0, 0, 0);

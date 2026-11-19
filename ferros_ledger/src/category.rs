@@ -51,9 +51,14 @@ pub const LEDGER: Category = Category { name: "ledger", class: Class::System };
 /// `diag "log bench"`'s timed entries.
 pub const BENCH: Category = Category { name: "bench", class: Class::System };
 
+/// A process's end (`flashlog::death`, process.rs `end_process`): its exit value, and for a panic or a fault the message, the place, the thread and the call chain as typed fields (death.rs).
+pub const PROCESS: Category = Category { name: "kernel.process", class: Class::System };
+/// The kernel's own panic or early fault, found at the next boot in its record and written then (service.rs, platform.rs `record_panic`).
+pub const PANIC: Category = Category { name: "kernel.panic", class: Class::System };
+
 /// Every category this build writes.
 /// A name read back that is not here is shown as it is: a newer writer's category is still a category.
-pub const ALL: [Category; 4] = [TEXT, PERSON_TEXT, LEDGER, BENCH];
+pub const ALL: [Category; 6] = [TEXT, PERSON_TEXT, LEDGER, BENCH, PROCESS, PANIC];
 
 /// The category of a name read back, if this build knows it.
 pub fn find(name: &str) -> Option<Category> {

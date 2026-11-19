@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use ferros_hal::ufs::UfsController;
 use ferros_ledger::category::{self, Category, Class};
+use ferros_ledger::death::Death;
 use ferros_ledger::entry::{self, Payload, SealKey};
 use ferros_ledger::preboot::{Pending, Preboot};
 use ferros_ledger::ring::{Blocks, Finding, Item, Ring, Why, BLOCK};
@@ -149,7 +150,7 @@ pub fn init() -> bool {
         };
         let t = crate::platform::cntpct();
         for f in findings {
-            pre().push(Pending { tick: t, category: category::LEDGER, writer: "kernel".into(), words: alloc::format!("at open, block A#{} byte A#{}: {}", f.block, f.at, f.why) });
+            pre().push(Pending { tick: t, category: category::LEDGER, writer: "kernel".into(), words: alloc::format!("at open, block A#{} byte A#{}: {}", f.block, f.at, f.why), death: None });
         }
         unsafe { STATE = Some(State { ring, dev, part: first, boot }) };
     });
@@ -176,31 +177,41 @@ pub fn boot() -> u64 {
 /// Under the flash log's own lock (process.rs `LOG`), each block a command under the UFS lock: the ring's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block").
 /// Until 2026-11-18 under the kernel lock, so every core waited out each line (to 0.66 ms, `diag lock`); a line said holding the kernel lock (a syscall's) is written once its core lets the lock go (`DEFERRED`).
 pub fn line(text: &str) {
-    put(category::TEXT, "kernel", text)
+    put(category::TEXT, "kernel", text, None)
 }
 
 /// A line in a process's words (its console text the process asked to keep), its name the writer.
 pub fn line_from(writer: &str, text: &str) {
-    put(category::TEXT, writer, text)
+    put(category::TEXT, writer, text, None)
 }
 
 /// A line about the person (category `person.text`): sealed under their key, dropped while nobody is present.
 pub fn personal(text: &str) {
-    put(category::PERSON_TEXT, "kernel", text)
+    put(category::PERSON_TEXT, "kernel", text, None)
+}
+
+/// A process's end (category `kernel.process`, process.rs `death_line`), its writer the process: the sentence in the words, and the exit value, the last line, and a panic's or a fault's report (message, place, thread, frames) as typed fields (ferros_ledger death).
+pub fn death(writer: &str, words: &str, d: Death) {
+    put(category::PROCESS, writer, words, Some(d))
+}
+
+/// The kernel's own end in the boot before, found in its record at this boot (category `kernel.panic`, service.rs).
+pub fn kernel_death(words: &str, d: Death) {
+    put(category::PANIC, "kernel", words, Some(d))
 }
 
 /// Per core: the lines said while it held the kernel lock (a syscall's, a process's end), with the counter at each, written once it lets the lock go (`deferred`, from process.rs `unlock`). Touched by its own core only, which holds the kernel lock while it adds one.
 /// Why (the Pro, 2026-11-18, `diag lock`): each line is a UFS write and its read back, 0.7 to 1.3 ms, and written under the kernel lock every core waited it out: a process's end held the lock 1.0 to 1.56 ms, a driver's kept console line 1 ms. Now only the core that said it waits, and the line keeps the time it was said at.
-static mut DEFERRED: [Vec<(Category, String, String, u64)>; 16] = [const { Vec::new() }; 16];
+static mut DEFERRED: [Vec<(Category, String, String, Option<Death>, u64)>; 16] = [const { Vec::new() }; 16];
 
-fn put(c: Category, writer: &str, words: &str) {
+fn put(c: Category, writer: &str, words: &str, death: Option<Death>) {
     let tick = crate::platform::cntpct();
     let me = crate::process::core();
     if crate::process::holder() == me + 1 {
-        unsafe { (*(&raw mut DEFERRED))[me].push((c, writer.into(), words.into(), tick)) };
+        unsafe { (*(&raw mut DEFERRED))[me].push((c, writer.into(), words.into(), death, tick)) };
         return;
     }
-    crate::process::LOG.with(|| put_locked(c, writer, words, tick))
+    crate::process::LOG.with(|| put_locked(c, writer, words, death, tick))
 }
 
 /// The lines this core said under the kernel lock (`DEFERRED`), in the order said, now that it let the lock go (process.rs `unlock`, after the lock is free). Not while it holds the flash log's lock or a storage lock above it (a ring append under way, or the UFS): they wait for its next unlock.
@@ -212,13 +223,13 @@ pub fn deferred() {
     }
     let lines = core::mem::take(q);
     crate::process::LOG.with(|| {
-        for (c, writer, words, tick) in lines {
-            put_locked(c, &writer, &words, tick);
+        for (c, writer, words, death, tick) in lines {
+            put_locked(c, &writer, &words, death, tick);
         }
     })
 }
 
-fn put_locked(c: Category, writer: &str, words: &str, tick: u64) {
+fn put_locked(c: Category, writer: &str, words: &str, death: Option<Death>, tick: u64) {
     match c.class {
         Class::Personal => {
             // Never the RAM log, never the pre-boot buffer: the person's words go sealed to the flash or nowhere.
@@ -226,7 +237,7 @@ fn put_locked(c: Category, writer: &str, words: &str, tick: u64) {
                 PERSONAL_DROPPED.fetch_add(1, Ordering::Relaxed);
                 return;
             };
-            write(s, &key, c, writer, words, time_at(tick));
+            write(s, &key, c, writer, words, death, time_at(tick));
         }
         Class::System => {
             // The RAM log keeps every system line as it always has when the flash cannot take it yet.
@@ -234,11 +245,11 @@ fn put_locked(c: Category, writer: &str, words: &str, tick: u64) {
             let live = state().and_then(|s| system_key().map(|k| (s, k)));
             let Some((s, key)) = live else {
                 crate::platform::pstore(alloc::format!("flash log: {writer}: {words}\n").as_bytes());
-                pre().push(Pending { tick, category: c, writer: writer.into(), words: words.into() });
+                pre().push(Pending { tick, category: c, writer: writer.into(), words: words.into(), death });
                 return;
             };
             drain(s, &key);
-            write(s, &key, c, writer, words, time_at(tick));
+            write(s, &key, c, writer, words, death, time_at(tick));
         }
     }
 }
@@ -248,15 +259,15 @@ fn drain(s: &mut State, key: &SealKey) {
     if pre().is_empty() {
         return;
     }
-    let lost = pre().drain(|p| write(s, key, p.category, &p.writer, &p.words, time_at(p.tick)));
+    let lost = pre().drain(|p| write(s, key, p.category, &p.writer, &p.words, p.death, time_at(p.tick)));
     if lost > 0 {
         PRE_LOST.fetch_add(lost, Ordering::Relaxed);
-        write(s, key, category::LEDGER, "kernel", &alloc::format!("the pre-boot buffer overwrote A#{lost} entries before the ira was up: they are in the RAM log only"), time_at(crate::platform::cntpct()));
+        write(s, key, category::LEDGER, "kernel", &alloc::format!("the pre-boot buffer overwrote A#{lost} entries before the ira was up: they are in the RAM log only"), None, time_at(crate::platform::cntpct()));
     }
 }
 
-fn write(s: &mut State, key: &SealKey, c: Category, writer: &str, words: &str, time: Option<i64>) {
-    if let Err(e) = s.ring.append(&mut s.dev, s.boot, time, c.class, key, &Payload::new(c, writer, words)) {
+fn write(s: &mut State, key: &SealKey, c: Category, writer: &str, words: &str, death: Option<Death>, time: Option<i64>) {
+    if let Err(e) = s.ring.append(&mut s.dev, s.boot, time, c.class, key, &Payload { death, ..Payload::new(c, writer, words) }) {
         WRITE_FAILS.fetch_add(1, Ordering::Relaxed);
         // A system line the flash refused goes to the RAM log; a personal one never does.
         if c.class == Class::System {
@@ -337,6 +348,57 @@ fn answer_locked(n: usize, room: usize) -> Vec<u8> {
     }
     let mut out = head;
     for c in &chunks[chunks.len() - keep..] {
+        out.extend_from_slice(c);
+    }
+    out
+}
+
+/// `diag "log deaths [n] [blocks]"`: the newest `n` deaths (entries of `kernel.process` or `kernel.panic` that carry a death's fields: ferros_ledger death) found in the newest `blocks` blocks of the ring, each as stored and opened, oldest first, the ring's state first, at most `room` bytes: what `ferros-bridge deaths` reads.
+/// A search, not a read of the chain: `diag log` checks the chain. Every system entry it passes is opened to see its category (the category is sealed), about ten entries a block.
+/// Under the flash log's lock for the whole walk, so the lines said meanwhile wait (`deferred`, or the caller): a diag, never the hot path.
+/// `exits`: plain exits too; without it only panics, faults and the kernel's own ends.
+pub fn deaths(n: usize, blocks: u32, room: usize, exits: bool) -> Vec<u8> {
+    crate::process::LOG.with(|| deaths_locked(n, blocks, room, exits))
+}
+
+fn deaths_locked(n: usize, blocks: u32, room: usize, exits: bool) -> Vec<u8> {
+    let now = time_at(crate::platform::cntpct());
+    let (Some(s), Some(key)) = (state(), system_key()) else { return Vec::new() };
+    let st = view::State {
+        boot: s.boot,
+        next_seq: s.ring.next_seq(),
+        block: s.ring.head_block(),
+        half: HALF,
+        preboot_held: pre().len() as u64,
+        preboot_lost: PRE_LOST.load(Ordering::Relaxed),
+        personal_dropped: PERSONAL_DROPPED.load(Ordering::Relaxed),
+        write_fails: WRITE_FAILS.load(Ordering::Relaxed),
+        person: unsafe { (*(&raw const PERSONAL)).is_some() },
+    };
+    let mut out = view::state(&st, now).unwrap_or_default();
+    // Newest first while walking; each death's two documents, put oldest first after.
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    let mut total = out.len();
+    s.ring.back(&mut s.dev, blocks, |doc, stored| {
+        if stored.class != Class::System.number() {
+            return true;
+        }
+        let Ok(p) = entry::open(stored, &key) else { return true };
+        match &p.death {
+            None => return true,
+            Some(d) if d.end == ferros_ledger::death::END_EXIT && !exits => return true,
+            Some(_) => {}
+        }
+        let mut c = doc.to_vec();
+        c.extend_from_slice(&view::opened(stored, &p).unwrap_or_default());
+        total += c.len();
+        if total > room {
+            return false;
+        }
+        found.push(c);
+        found.len() < n
+    });
+    for c in found.iter().rev() {
         out.extend_from_slice(c);
     }
     out

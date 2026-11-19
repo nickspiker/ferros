@@ -113,6 +113,36 @@ The kernel grew by 89 KB (text 84 KB, data 5 KB) over the build before the ledge
 - The kernel is the ledger's only writer and keeps it itself; the userspace ledger server, its caps and its category registry are not built.
 - The words are text (`x`, or `a` where the lean table lacks an ASCII character). Stage 1 moves the busiest lines to typed fields (below).
 
+### Deaths (2026-11-18)
+
+A process's end and the kernel's own are the first entries with typed fields beside the words (ferros_ledger `death`, KERNEL.md "A process that dies"):
+
+| Category | Writer | When |
+|---|---|---|
+| `kernel.process` | the process | every end: an exit, a panic (its report, SYS_PANIC), a fault (the trap) |
+| `kernel.panic` | `kernel` | at the boot after a kernel panic or an early fault, from its record in the ramoops page (only when the record's magic and hash hold) |
+
+The fields, in the sealed payload after `refused`, each present only when it applies (every number `u`, every text `x` or `a` as the words are, `lean`):
+
+| Field | What |
+|---|---|
+| `end` | 0 exit, 1 panic, 2 fault, 3 the kernel panicked, 4 the kernel faulted, 5 ended from outside (numbers on the flash: append, never renumber) |
+| `exit` | the exit value |
+| `message`, `file`, `line`, `column` | the panic's message (2^9 bytes at most) and where (the file as the compiler named it, 2^8 bytes at most) |
+| `thread` | the thread: the kernel's name (`name.k`) and the one it gave itself |
+| `esr`, `far`, `pc`, `lr` | a fault's syndrome and addresses; a process's PC and LR are offsets into its arc |
+| `frames` | the call chain, innermost first, several values in one field: the PC, then each frame record's return address (offsets into the arc; the kernel's own addresses for `kernel.panic`), at most 2^5 |
+| `code` | where the image starts in the arc (G#1000): `frame - code` is the address in the ELF |
+| `last_words` | the last console line (2^8 bytes at most) |
+| `of_boot`, `core`, `crumb` | the kernel's end: the boot it was in, its core, its last crumb |
+
+- The sentence stays in the words (`display: panicked at payloads/display/src/main.rs:…: range end index …`), for `diag log`; nothing reads the values back out of it.
+- The fields are bounded so an entry stays one block: the ring splits only the words, and a death's fields go with the first half.
+- `ledger_open` carries the same fields, so the answer hands them over opened.
+- A reader from before the fields opens the entry as before: vsf's schema parse passes over a field it does not know.
+- `diag "log deaths [n] [blocks]"` answers with the newest n deaths in the newest blocks (`Ring::back`: block by block from the head, newest first, each system entry opened to see its category); `ferros-bridge deaths` reads it.
+- How long they stay: the ring keeps its entries until it wraps. On the Pro on 2026-11-18 (b976) the ring stood at entry A#13364 in block A#1485 of A#16384, about nine entries a block, so it holds about 147 thousand entries; 13364 entries since the ring began on 2026-11-17 puts it at about ten days of this device's development logging, more on a device left alone.
+
 ### Stage 1: the busiest lines, as typed fields
 
 The ten sites that write most, by how often their path runs, and the fields each would carry instead of words (every number `u` or `i`, every time `e6`, every duration in oscillations, every name `d`):
@@ -124,7 +154,7 @@ The ten sites that write most, by how often their path runs, and the fields each
 | service.rs:3122, heartbeat | up seconds, USB commands, slices | `kernel.heartbeat` | `up` (u, oscillations), `usb_cmds` (u), `slices` (five u) |
 | pd.rs:84/93/133/297, power-domain steps after a jump | domain and step | `kernel.power` | `domain` (d), `step` (u), `status` (u), `serror` (u0) |
 | camera_power.rs:84-259, camera on and off | module, steps, time taken, S2MPUs | `device.camera` | `module` (u), `step` (u), `took` (u, oscillations), `s2mpu_fenced` (u), `result` (u) |
-| process.rs:6289/6351, a process ended or faulted | name, exit value, last line | `kernel.process` | `name` (d), `exit` (u), `esr` (u), `far` (u), `pc` (u), `last_words` (x) |
+| process.rs `death_line`, a process ended, panicked or faulted (built 2026-11-18: "Deaths" above) | name, exit value, last line | `kernel.process` | the writer is the name; `end`, `exit`, `message`, `file`, `line`, `column`, `thread`, `esr`, `far`, `pc`, `lr`, `frames`, `code`, `last_words` |
 | service.rs:1259-1363, restart and on-demand starts | name, capsule bytes, outcome | `kernel.process` | `name` (d), `step` (u), `bytes` (u), `result` (u) |
 | service.rs:2424-2437, USB TCPC role | role, cc, power, switch | `usb.tcpc` | `role` (u), `cc` (u), `power` (u), `switch` (u), `alert` (u) |
 | service.rs:2883-2917 and 3301-3372, kist offers and long commands | bytes, status, milliseconds | `kernel.kist` | `bytes` (u), `status` (u), `took` (u, oscillations), `why` (u) |

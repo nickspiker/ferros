@@ -165,11 +165,11 @@ pub const ULTRAWIDE: Cam = Cam {
     rotation: 1,
 };
 
-/// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06, but its sensor has never answered ferros (docs/CAMERA.md "The other cameras"), so nothing here has run.
+/// The front camera (dokkaebi, Samsung, G#30A1 at G#0000): its init, receiver (link 0) and job were captured on 2026-11-06; it answers ferros since the LV buck is raised (sub GPIO2, 2026-11-18) and streams with them (docs/CAMERA.md "The other cameras on the Pro").
 /// From the init: 3840 x 2736 RAW10 (stride G#12C0 in its front-end program), the integration 1712 lines in a 4001-line frame.
-/// Its line time is a guess: the PLL's 2023 MHz over 8448 pixel clocks is 4.18 µs at one pixel a clock (60 frames a second) or 8.35 µs at a half (30, taken here); so the exposure is offered only up to the init's own until a run measures the frame rate.
+/// Its line, measured (2026-11-18, docs/CAMERA.md "The other cameras on the Pro" and "The I2C side without a flash"): 8448 clocks at 24.576 MHz / 3 x 247 (2023.424 MHz) over vt_pix_clk_div 5 (G#0300) at two pixels a clock, 10.437753 us: ferros took frames of its init's 4001 lines 41.66 to 41.85 ms apart (10.44 us), and Android's 1 s hold (47908 lines of 2^1) runs frames 1.0 s apart. The guess before (8.35 us, 30 a second) reported every exposure 20 % short of what the sensor integrated.
 /// From its two captures (cam 7, 3840 x 2736, the size its init sets): cfa G R / B G, black 64, white 1023; orientation 8 (three quarter turns) in the second, none recorded in the first; derived, its init's crop start even and its stream-on's flip 0 the HAL's write.
-/// Guesses: its acknowledgement and tick, the ultrawide's, as the harness had them.
+/// Its acknowledgement and tick are the ultrawide's, as the harness had them: 64 frames thru the view and 64 at bin 8 ran with them (2026-11-18), no error word.
 /// Its lens actuator (G#0C) is driven as the main's; focus is not offered until its range is measured.
 pub const FRONT: Cam = Cam {
     id: 2,
@@ -196,7 +196,7 @@ pub const FRONT: Cam = Cam {
     stride: 0x12C0,
     sizes: job::FRONT_SLOT_BYTES,
     skip: job::NO_SKIP,
-    line_ps: 8_350_202,
+    line_ps: 10_437_753,
     llp: 8448,
     pll: (3, 247),
     fll: 4001,
@@ -477,8 +477,8 @@ mod tests {
         // The ultrawide's line: 9568 clocks at 24.576 MHz / 3 x 178.
         let ps = 9568u64 * 3 * 1_000_000_000_000 / (24_576_000 * 178);
         assert!(ULTRAWIDE.line_ps.abs_diff(ps) <= 1, "{ps}");
-        // The front's guess: 8448 clocks at half of 24.576 MHz / 3 x 247.
-        let ps = 8448u64 * 6 * 1_000_000_000_000 / (24_576_000 * 247);
+        // The front's line: 8448 clocks at 24.576 MHz / 3 x 247 over vt_pix_clk_div 5, two pixels a clock (measured: 41.66 to 41.85 ms a 4001-line frame).
+        let ps = 8448u64 * 3 * 5 * 1_000_000_000_000 / (2 * 24_576_000 * 247);
         assert!(FRONT.line_ps.abs_diff(ps) <= 1, "{ps}");
     }
 }

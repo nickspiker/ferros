@@ -3,7 +3,7 @@
 # One controller, one target: hsi2c_1 (G#1088_0000), and on it only the main sensor (boitata, G#3D), its transfers alone (FERROS_HV_ORACLE_I2C_TARGET), so the lens and OIS polling on the same bus (seven of every eight transfers after stream on) never crowd the console ring and the whole session fits.
 #
 # Steps, each its own command, each after the coordinator's go:
-#   tools/husky-hv-longexp.sh build              the oracle hv in front of Android's kernel, no ferros, footered and signed with the owner's AVB key: target/hv/boot_a_longexp.img
+#   [KIND=isp|pdma] tools/husky-hv-longexp.sh build   the oracle hv (KIND below) in front of Android's kernel, no ferros, footered and signed with the owner's AVB key: target/hv/boot_a_longexp.img
 #   tools/husky-hv-longexp.sh flash <restore>    the good gate (<restore>, signed: /mnt/Harbor/Code/keys/husky/images/boot_forge_aa6d8ec3.img) to boot_b first, so a capture boot that fails falls back to a good slot; then the capture image to boot_a, and Android boots under it
 #   tools/husky-hv-longexp.sh start              waits for Android past the arming time, quiets the kernel console (pstore integrity), marks the start; then the owner, by hand: open Lumis, the main camera, shutter to 16 s, one shot, wait for it to land
 #   tools/husky-hv-longexp.sh end <out.log>      marks the end, flushes the console ring with a panic (a crash reset keeps it), waits for Android again, pulls the hv's lines, decodes them (tools/oracle-i2c): <out.log>, <out>.holds, <out>.xfers
@@ -15,7 +15,10 @@ set -eu
 cd "$(dirname "$0")/.."
 W=target/hv
 mkdir -p $W
-IMG=${IMG:-$W/boot_a_longexp.img}
+# KIND (build): i2c (the default: hsi2c_1, the main sensor alone, the 2026-11-17 capture), isp (the 42 front-end pages a camera open uses, target/hv/ispfe-pages.txt: the link, its lanes, the CPU setup; "The tele's capture" step 0), pdma (the PDMA engine's page with its mid-stream dump of the program: step 1). The sensors' I2C needs no hv since 2026-11-18 (oracle-i2c --ftrace, docs/CAMERA.md "The I2C side without a flash"): isp and pdma are what is left.
+KIND=${KIND:-i2c}
+case $KIND in i2c) IMG=${IMG:-$W/boot_a_longexp.img} ;; isp|pdma) IMG=${IMG:-$W/boot_a_$KIND.img} ;; *) echo "KIND is i2c, isp or pdma"; exit 2 ;; esac
+PAGES_FILE=${PAGES_FILE:-/mnt/Harbor/Code/ferros/target/hv/ispfe-pages.txt}
 # Android's kernel, as slot a runs it (the boot backup it was unpacked from went with Harbor tmp on 2026-11-17; the main checkout keeps the unpacked Image).
 LINUX=${LINUX:-/mnt/Harbor/Code/ferros/target/hv/Image}
 AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
@@ -42,14 +45,18 @@ build)
     # The capture's knobs: stage 2 with the UFS firewall as every gate runs it (Android may not write ferros's slot), the oracle on hsi2c_1's page, its sensor alone, logging never capped (the ring keeps the newest), armed after ARM_MS; no PMU reads.
     # Built here as tools/husky-hv.sh builds (host only: no device is asked anything): the hv, its flat binary in front of Android's kernel, no ferros packed, the kernel's console at level 4 from boot (pstore integrity).
     cargo build -q -p ferros-mkimg
-    FERROS_HV_STAGE2=1 FERROS_HV_UFS=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 \
-    FERROS_HV_ORACLE_PAGES="G#1088_0000" FERROS_HV_ORACLE_I2C_TARGET=G#3D \
-    FERROS_HV_ORACLE_CAP=$((1 << 20)) FERROS_HV_ORACLE_ARM_AFTER_MS=$ARM_MS \
+    # Per KIND: the pages, the cap (the console ring keeps about 16k lines: the front end's per-frame acknowledgements fill it, so isp logs the open and its first frames only), the dump.
+    case $KIND in
+    i2c) export FERROS_HV_ORACLE_PAGES="G#1088_0000" FERROS_HV_ORACLE_I2C_TARGET=G#3D FERROS_HV_ORACLE_CAP=$((1 << 20)) ;;
+    isp) export FERROS_HV_ORACLE_PAGES="$(cat "$PAGES_FILE")" FERROS_HV_ORACLE_CAP=32768 ;;
+    pdma) export FERROS_HV_ORACLE_PAGES="G#1C39_0000" FERROS_HV_PDMA_DUMP=1 FERROS_HV_ORACLE_CAP=4096 ;;
+    esac
+    FERROS_HV_STAGE2=1 FERROS_HV_UFS=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 FERROS_HV_ORACLE_ARM_AFTER_MS=$ARM_MS \
     cargo build -q -p ferros_hv --target aarch64-unknown-none-softfloat --release
-    aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none-softfloat/release/ferros_hv $W/hv-longexp.bin
-    [ "$(stat -c %s $W/hv-longexp.bin)" -le $((0x180000)) ] || { echo "the hv is over its G#18_0000 pad"; exit 1; }
-    target/debug/ferros-mkimg gate --hv $W/hv-longexp.bin --image "$LINUX" --cmdline "loglevel=4" -o $W/boot_a_longexp_bare.img
-    target/debug/ferros-mkimg avb-footer --key "$AVB_KEY" --google-boot "$AVB_TEMPLATE" --image $W/boot_a_longexp_bare.img -o $IMG
+    aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none-softfloat/release/ferros_hv $W/hv-$KIND.bin
+    [ "$(stat -c %s $W/hv-$KIND.bin)" -le $((0x180000)) ] || { echo "the hv is over its G#18_0000 pad"; exit 1; }
+    target/debug/ferros-mkimg gate --hv $W/hv-$KIND.bin --image "$LINUX" --cmdline "loglevel=4" -o $W/boot_a_${KIND}_bare.img
+    target/debug/ferros-mkimg avb-footer --key "$AVB_KEY" --google-boot "$AVB_TEMPLATE" --image $W/boot_a_${KIND}_bare.img -o $IMG
     echo "== $IMG ($(stat -c %s $IMG) bytes), blake3 $(b3sum --no-names $IMG 2>/dev/null || echo '?')"
     ;;
 flash)
@@ -72,7 +79,7 @@ start)
     adb shell "su -c 'echo 4 > /proc/sys/kernel/printk; echo \"<3>ferros-mark: long exposure: start\" > /dev/kmsg'; input keyevent KEYCODE_WAKEUP" >/dev/null 2>&1
     # The capture image is the one booted: its command line carries loglevel=4 (the gate's carries none), and the hv's region is reserved.
     adb shell 'grep -q loglevel=4 /proc/cmdline && ls /sys/firmware/devicetree/base/reserved-memory/ | grep -q hv' || { echo "== this boot is not the capture image (no loglevel=4 or no hv): stop"; exit 1; }
-    echo "== marked. The owner now: open Lumis, the main camera, shutter to 16 s, take one shot, wait for it to land (about 35 s). Then: $0 end <out.log>"
+    echo "== marked. Now open the readout to capture in Lumis (KIND=i2c: the main at 16 s, one shot, about 35 s; isp and pdma: one readout, 10 s of preview; the cap ends the log). Then: $0 end <out.log>"
     ;;
 end)
     OUT=${2:?usage: $0 end <out.log>}

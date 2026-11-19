@@ -15,6 +15,8 @@ pub struct Pending {
     pub category: Category,
     pub writer: String,
     pub words: String,
+    /// A death's typed fields, when the entry is one.
+    pub death: Option<crate::death::Death>,
 }
 
 /// The buffer: `N` slots, a power of two.

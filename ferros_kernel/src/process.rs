@@ -1267,6 +1267,66 @@ struct Process {
     guards: Vec<(usize, u64)>,
     /// Its register grants for the MMIO syscall without the kernel lock (`mmio_fast`), in a box of its own: the Process moves when the process table grows, the box does not.
     fast: alloc::boxed::Box<Grants>,
+    /// The end of its image's code, an arc offset (CODE plus the checked text of a masked image, the whole image of a native one): a return address past it ends a frame walk (`frames`).
+    text_end: usize,
+    /// The panic it told the kernel of (SYS_PANIC), for its end (`death_line`); None until then.
+    panicked: Option<alloc::boxed::Box<Panicked>>,
+}
+
+/// A panic a process told the kernel of (SYS_PANIC, ferros_sys `panic_tell`), kept for its end: the message, where (the file as the compiler named it, the line and column), the thread, and the call chain from the call (`frames`).
+struct Panicked {
+    message: Vec<u8>,
+    file: Vec<u8>,
+    line: u32,
+    column: u32,
+    thread: Vec<u8>,
+    frames: Vec<u64>,
+}
+
+/// The most frames a death keeps (ferros_ledger death FRAMES_MAX).
+const FRAMES: usize = ferros_ledger::death::FRAMES_MAX;
+
+/// The call chain at a trap, innermost first: `pc`, then the return address of each x29 frame record from `fp`, all as offsets into the process's arc.
+/// WHY each check: x29 and the stack are the process's own to write, and a panicking or faulting process is the likeliest to have them wrong (and a function built without frame pointers uses x29 as it likes).
+/// - A record is read only where `span` resolves all 16 of its bytes (the arc but the frames it gave back, or a DMA region it holds: all mapped for the kernel), and only 8-byte aligned: anywhere else the read would be of unmapped or foreign memory, a fault at EL2 under the kernel lock.
+/// - Each next record must lie above the last (stacks grow down): PROOF the walk ends on any chain, a cycle included.
+/// - At most FRAMES are taken (what the ledger keeps).
+/// - A return address outside the image's code (`text_end`) ends it: past it the records are not frame records, and what they hold is noise.
+fn frames(p: &Process, pc: u64, fp: u64) -> Vec<u64> {
+    let base = p.arc.base as u64;
+    let code = CODE as u64..p.text_end as u64;
+    let mut out = Vec::with_capacity(FRAMES);
+    out.push(pc.wrapping_sub(base));
+    let mut fp = fp;
+    while out.len() < FRAMES && fp & 7 == 0 {
+        let Some(a) = p.span(fp.wrapping_sub(base), 16) else { break };
+        // SAFETY: `span` resolved these 16 bytes inside the process's arc or a DMA region it holds, identity-mapped and the kernel's to read; `a` keeps fp's alignment (the arc and the regions start on pages).
+        let (next, ret) = unsafe { (core::ptr::read_volatile(a as *const u64), core::ptr::read_volatile((a + 8) as *const u64)) };
+        let r = ret.wrapping_sub(base);
+        if !code.contains(&r) {
+            break;
+        }
+        out.push(r);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    out
+}
+
+/// A thread's name for a death: the kernel's (`name.k`), with the name it gave itself (SYS_THREAD_NAME) in brackets when it gave one, as a fault's console line has it.
+fn thread_called(t: usize) -> Vec<u8> {
+    let mut n = thread_name(t);
+    if let Some(x) = k().threads.get(t).and_then(|x| x.as_ref()) {
+        let len = x.label.iter().position(|&c| c == 0).unwrap_or(16);
+        if len != 0 {
+            n.extend_from_slice(b" (");
+            n.extend_from_slice(&x.label[..len]);
+            n.push(b')');
+        }
+    }
+    n
 }
 
 /// What `mmio_fast` reads of a process without the kernel lock. Made at spawn and never changed after (a process's grants are fixed at its spawn: only reply tokens come and go in its cspace, and they are never registers), but for `ended`.
@@ -1829,6 +1889,8 @@ const SYS_NOTIFY: u64 = 43;
 const SYS_THREAD_NAME: u64 = 44;
 /// Arm the caller's interrupt line (x0, an `Irq` token) with a program of register operations inside one of its hardware grants (x1, a `Hardware` token), x2 and x3 the program's address and bytes (ferros_layout irqarm; 0 bytes disarms): run at each interrupt before the line is masked and its waiter woken, without the kernel lock (irqarm.rs; docs/KERNEL.md "Armed actions").
 const SYS_IRQ_ARM: u64 = 45;
+/// panic(message, length, file, length, line | column << 32): the calling process is panicking (ferros_sys `panic_tell`, from a payload's panic handler or std's hook thru ferros_rt). The kernel keeps the message's first 2^9 bytes and the file's first 2^8 (UTF-8, as the compiler and the panic made them), the line and column, the calling thread's name and the call chain from this call (`frames`), and the process's end carries them to the flash log, the console and the glass (`death_line`). It does not end the process: the exit that follows does. A second report replaces the first. No capability: a process tells only of itself. → 0. A kernel from before answers ERR, and the exit says what it always said.
+const SYS_PANIC: u64 = 46;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
@@ -4616,8 +4678,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
         // Not a syscall: the process faulted. It ends; the kernel carries on. Its full state goes to the console first (ESR, ELR/FAR/SP as arc offsets, every register), so a fault is debuggable from the console alone.
         let v = FAULT | ec << 40 | (f.elr.wrapping_sub(base) & 0xFF_FFFF) << 16 | (f.far.wrapping_sub(base) & 0xFFFF);
         fault_report(f, base);
-        // The whole of ESR, FAR and the PC for `end_process`'s line on the glass (the exit value keeps only parts of them).
-        unsafe { *(&raw mut LAST_FAULT) = Some((f.esr, f.far, f.elr.wrapping_sub(base))) };
+        // The whole of ESR, FAR and the PC for `end_process`'s line on the glass and its entry in the flash log (the exit value keeps only parts of them), with the link register (a leaf function's caller, which no frame record holds yet), the call chain from the faulting frame's x29 and the thread.
+        let fault = proc_of(cur).map(|p| Fault { esr: f.esr, far: f.far, pc: f.elr.wrapping_sub(base), lr: f.x[30].wrapping_sub(base), frames: frames(p, f.elr, f.x[29]), thread: thread_called(cur) });
+        unsafe { *(&raw mut LAST_FAULT) = fault };
         return end(f, v);
     }
     let p = proc_of(cur).unwrap();
@@ -4649,6 +4712,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
             }
+            0
+        }
+        SYS_PANIC => {
+            // WHY the mins: the message and the file are the process's, any length; the ledger keeps only their first 2^9 and 2^8 bytes (ferros_ledger death), so only those are read.
+            let message = p.read(f.x[0], (f.x[1] as usize).min(ferros_ledger::death::MESSAGE_MAX));
+            let file = p.read(f.x[2], (f.x[3] as usize).min(ferros_ledger::death::FILE_MAX));
+            let chain = frames(p, f.elr, f.x[29]);
+            p.panicked = Some(alloc::boxed::Box::new(Panicked { message, file, line: f.x[4] as u32, column: (f.x[4] >> 32) as u32, thread: thread_called(cur), frames: chain }));
+            f.x[0] = 0;
             0
         }
         SYS_THREAD_NAME => {
@@ -6958,32 +7030,78 @@ fn link_emptied(name: &[u8]) {
 
 /// Bumped whenever a process is made, ends or is killed: what the service loop watches to act on the process table changing (the GPU's clock, service.rs), with no poll.
 pub static PROCS_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// The fault a process is ending by, whole (ESR, FAR, PC as an offset into its arc), from the EL0 trap's fault branch to `end_process` in the same call.
+/// The fault a process is ending by, whole, from the EL0 trap's fault branch to `end_process` in the same call: ESR, FAR, and the PC and link register as offsets into its arc, the call chain from the faulting frame (`frames`) and the thread.
 /// Under the kernel lock.
-static mut LAST_FAULT: Option<(u64, u64, u64)> = None;
+static mut LAST_FAULT: Option<Fault> = None;
 
-/// A process that died by a fault or a panic, in one line (owner, 2026-11-17: when things go south, say so on the glass): on the console, in the flash log, and on the glass when no display serves to show anything else (the display itself the one that died, or never up), written there straight (glass.rs `notice`).
+struct Fault {
+    esr: u64,
+    far: u64,
+    pc: u64,
+    lr: u64,
+    frames: Vec<u64>,
+    thread: Vec<u8>,
+}
+
+/// The frames as the console shows them: `+G#…` offsets into the arc, innermost first.
+fn frames_text(frames: &[u64]) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for f in frames {
+        s.push_str(&alloc::format!(" +G#{f:X}"));
+    }
+    s
+}
+
+/// A process's end, whole, in the flash log (category `kernel.process`, its fields typed: ferros_ledger death), for every end (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained).
+/// A death by a fault or a panic is also one line on the console, and on the glass when no display serves to show anything else (the display itself the one that died, or never up), written there straight (glass.rs `notice`; owner, 2026-11-17: when things go south, say so on the glass): the message and where for a panic, ESR, FAR and the PC for a fault; the frames on a second console line, for `ferros-bridge deaths` to name.
 /// While a display serves, the glass is its own: a line written under it would stay in the phases its compose-once marks say hold only the background.
-/// Under the kernel lock; a death is rare, never the hot path.
-fn death_line(name: &[u8], value: u64, last: &[u8]) {
+/// Under the kernel lock (the flash log's entry is written once this core lets it go, flashlog.rs `deferred`); a death is rare, never the hot path.
+fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxed::Box<Panicked>>) {
+    use ferros_ledger::death::{Death, END_EXIT, END_FAULT, END_PANIC};
     let who = core::str::from_utf8(name).unwrap_or("?");
+    let text = |b: &[u8]| alloc::string::String::from_utf8_lossy(b).trim_end().into();
+    let last_words: alloc::string::String = text(last);
     let fault = unsafe { (*(&raw mut LAST_FAULT)).take() };
-    let line = if value >> 56 == FAULT >> 56 {
+    let mut d = Death { end: END_EXIT, exit: Some(value), code: Some(CODE as u64), last_words: (!last_words.is_empty()).then(|| last_words.clone()), ..Death::default() };
+    let (line, chain) = if value >> 56 == FAULT >> 56 {
+        d.end = END_FAULT;
         match fault {
-            Some((esr, far, pc)) => alloc::format!("{who}: fault, ESR G#{esr:X}, FAR G#{far:X}, PC +G#{pc:X} in its arc"),
-            None => alloc::format!("{who}: fault, exit G#{value:016X}"),
+            Some(fa) => {
+                let t: alloc::string::String = text(&fa.thread);
+                let line = alloc::format!("{who}: fault, ESR G#{:X}, FAR G#{:X}, PC +G#{:X} LR +G#{:X} in its arc, thread {t}", fa.esr, fa.far, fa.pc, fa.lr);
+                (d.esr, d.far, d.pc, d.lr, d.thread) = (Some(fa.esr), Some(fa.far), Some(fa.pc), Some(fa.lr), Some(t));
+                d.frames = fa.frames;
+                (line, true)
+            }
+            None => (alloc::format!("{who}: fault, exit G#{value:016X}"), false),
         }
     } else if value == 0xDEAD || value == 101 {
-        alloc::format!("{who}: panicked, its last line: {}", core::str::from_utf8(last).unwrap_or("(not text)").trim_end())
+        d.end = END_PANIC;
+        match panicked {
+            Some(p) => {
+                let (m, file, t): (alloc::string::String, alloc::string::String, alloc::string::String) = (text(&p.message), text(&p.file), text(&p.thread));
+                let line = alloc::format!("{who}: panicked at {file}:{}:{}: {m} (thread {t})", p.line, p.column);
+                (d.message, d.file, d.line, d.column, d.thread) = (Some(m), Some(file), Some(p.line as u64), Some(p.column as u64), Some(t));
+                d.frames = p.frames;
+                (line, true)
+            }
+            // A panic handler from before SYS_PANIC (or a kernel's exit with no report): its last line is all there is.
+            None => (alloc::format!("{who}: panicked, its last line: {last_words}"), false),
+        }
     } else {
+        let line = alloc::format!("{who}: ended, exit G#{value:016X}; its last line: {last_words}");
+        crate::flashlog::death(who, &line, d);
         return;
     };
     let kk = k();
     let at = kk.console.pos();
     kk.console.extend_from_slice(line.as_bytes());
     kk.console.push(b'\n');
+    if chain && !d.frames.is_empty() {
+        kk.console.extend_from_slice(alloc::format!("{who}: frames{} (ferros-bridge deaths names them)\n", frames_text(&d.frames)).as_bytes());
+    }
     pstore_since(at);
-    crate::flashlog::line(&line);
+    crate::flashlog::death(who, &line, d);
     let display_serving = name != b"display" && up_locked(b"display");
     crate::glass::notice(line.as_bytes(), !display_serving);
 }
@@ -7047,11 +7165,11 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         kk.console.push(b'\n');
         pstore_since(at);
-        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Said under the kernel lock, written once this core lets it go (flashlog.rs `deferred`).
-        crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
+        // The end in the flash log, whole (`death_line`): its exit value and last line, and a panic's or a fault's report as typed fields. Said under the kernel lock, written once this core lets it go (flashlog.rs `deferred`).
         let last = p.words.clone();
+        let panicked = p.panicked.take();
         vault_ended(p, value);
-        death_line(&name, value, &last);
+        death_line(&name, value, &last, panicked);
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {
@@ -8498,7 +8616,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: CODE + exec_len, panicked: None };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.

@@ -3,7 +3,10 @@
 //! Input: the flushed console (console-ramoops-0), or its `ferros hv: S2 <pa> <R|W><bytes> <value>` lines (HV.md, the register oracle); `ferros hv: S2 rep <N>` repeats the access before it N more times; `ferros-mark: ...` lines written from Android pass thru as `# MARK ...`.
 //! Register map as ferros_kernel hsi2c.rs has it: TX_DATA G#34, RX_DATA G#38, AUTO_CONF G#44 (length bits 0-15, READ bit 16, RUN bit 31), ADDR G#70 (the 7-bit target at bits 10-16).
 //!
-//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--init <out>]
+//! Usage: oracle-i2c <capture.log> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--init <out>]; or oracle-i2c <dir> --ftrace [--adapter N] ...
+//! - `--ftrace`: the input is a directory of the kernel's i2c tracepoints captured on Android with root and no hv (`cpu<N>.raw` ring pages and `format/`; docs/CAMERA.md "The I2C side without a flash"), read as the same transfers, every message whole; `--adapter N` keeps the kernel's bus i2c-N alone. Its integrity line counts pages that missed events, writes whose bytes are not their length, reads unanswered or short.
+//! - `--from <text>`: start at the first `ferros-mark` holding the text, so each open of a session gives its own init and holds.
+//! - `--stream N` (with `--init`): the init between stream on N - 1 and stream on N (from 0), for an open that follows a close which streamed on for a moment.
 //! - Transfers (the default): `G#3D W 02 02 53 5E`, one a line; a transfer longer than `--max-bytes` as its first four bytes, its length and its blake3 (a sensor's settings upload is vendor firmware: its size and identity stay checkable, its bytes stay out of any file meant for the repository).
 //! - `--holds T`: target T's writes as 16-bit CCS register and data: every hold (G#0104 = 1 ... G#0104 = 0) on one line, `hold: 0702=0000 0704=0000 0202=535E 0340=5372`; every write outside a hold on its own line (stream on and off, mode changes); Samsung's indirect window (G#6028, G#602A, G#6F12) said as the page address it writes; reads as `R`. What a long exposure writes is then read straight off it (docs/CAMERA.md "Long exposures").
 //! - `--flat` (with `--holds T`): every write to T one 16-bit word a line at its resolved address, `2001_8D3E=000C` (the page G#FCFC selects, or the indirect window), so two inits diff with sort and join: docs/CAMERA.md "The slit for real" found the side channels this way.
@@ -116,6 +119,218 @@ fn transfers(acc: &[Access], base: u64) -> Vec<Item> {
     items
 }
 
+/// One event's fields by name (offset, size), and its ID, from a tracefs `format` file.
+struct Format {
+    id: u16,
+    fields: Vec<(String, usize, usize)>,
+}
+
+impl Format {
+    fn read(path: &std::path::Path) -> Format {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut id = None;
+        let mut fields = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("ID:") {
+                id = v.trim().parse().ok();
+            }
+            let Some(rest) = line.strip_prefix("field:") else { continue };
+            let parts: Vec<&str> = rest.split(';').map(str::trim).collect();
+            let name = parts[0].split_whitespace().last().unwrap_or("").trim_end_matches("[]").to_string();
+            let num = |key: &str| parts.iter().find_map(|p| p.strip_prefix(key)).and_then(|v| v.parse::<usize>().ok());
+            if let (Some(o), Some(s)) = (num("offset:"), num("size:")) {
+                fields.push((name, o, s));
+            }
+        }
+        Format { id: id.unwrap_or_else(|| panic!("{}: no ID", path.display())), fields }
+    }
+    fn at(&self, name: &str) -> (usize, usize) {
+        self.fields.iter().find(|f| f.0 == name).map(|f| (f.1, f.2)).unwrap_or_else(|| panic!("no field {name}"))
+    }
+}
+
+fn le(d: &[u8], off: usize, size: usize) -> u64 {
+    let mut v = 0u64;
+    for k in 0..size {
+        v |= (d[off + k] as u64) << (8 * k);
+    }
+    v
+}
+
+/// What an ftrace capture said about itself: pages read, pages flagged with missed events, events by kind, writes whose array length is not their `len`, reads with no reply or a reply of another length, transfers whose result was not every message, events per adapter.
+#[derive(Default)]
+struct FtraceReport {
+    pages: usize,
+    missed: usize,
+    events: usize,
+    short_writes: usize,
+    bad_replies: usize,
+    failed: usize,
+    adapters: Vec<(i64, usize)>,
+}
+
+/// An ftrace capture of the kernel's i2c tracepoints (Android with root, no hv: docs/CAMERA.md "The I2C side without a flash") as transfers, markers in place, in time order across the CPUs.
+/// `dir` holds `cpu<N>.raw` (each CPU's `per_cpu/cpuN/trace_pipe_raw`, whole ring pages) and `format/` (the events' tracefs `format` files: i2c_write, i2c_read, i2c_reply, print).
+/// The ring buffer as kernel/trace/ring_buffer.c writes it: 4096-byte pages, a header of the page's time (u64) and its commit (u64: the data's bytes, bit 31 events missed before the page); each event a u32 of type_len (5 bits) and time delta (27), type_len 1 to 28 data of 4 x type_len bytes, 0 data whose length (counting the length word) is the next u32, 29 padding, 30 a time extend (delta = the next u32 << 27 | delta), 31 an absolute time.
+/// A write's bytes are its `buf` array (`__data_loc`: offset in the low 16 bits, length in the high), whole however long, where the text output cuts every message at 64 bytes; a read is its `i2c_reply`'s bytes with the length its `i2c_read` asked.
+/// `adapter`: only that bus (the kernel's i2c-N), else every bus the capture filtered in.
+fn ftrace(dir: &std::path::Path, adapter: Option<i64>) -> (Vec<Item>, FtraceReport) {
+    let f = |n: &str| Format::read(&dir.join("format").join(n));
+    let (fw, fr, fp, fs) = (f("i2c_write"), f("i2c_reply"), f("print"), f("i2c_read"));
+    let fres = f("i2c_result");
+    let mut rep = FtraceReport::default();
+    // (time, cpu, sequence, item or pending read): every event, then sorted by time.
+    let mut evs: Vec<(u64, usize, usize, Ev)> = Vec::new();
+    for cpu in 0..64 {
+        let Ok(raw) = std::fs::read(dir.join(format!("cpu{cpu}.raw"))) else { continue };
+        let mut seq = 0;
+        for page in raw.chunks(4096) {
+            if page.len() < 16 {
+                continue;
+            }
+            rep.pages += 1;
+            let mut t = le(page, 0, 8);
+            let commit = le(page, 8, 8);
+            if commit >> 31 & 1 == 1 {
+                rep.missed += 1;
+            }
+            let size = (commit & 0xF_FFFF) as usize;
+            let end = (16 + size).min(page.len());
+            let mut i = 16;
+            while i + 4 <= end {
+                let h = le(page, i, 4) as u32;
+                let (tl, delta) = (h & 0x1F, (h >> 5) as u64);
+                match tl {
+                    29 => {
+                        // A null padding (no delta) is the rest of the page, empty.
+                        if delta == 0 {
+                            break;
+                        }
+                        let n = le(page, i + 4, 4) as usize;
+                        t += delta;
+                        i += 4 + n.max(4);
+                        continue;
+                    }
+                    30 => {
+                        t += le(page, i + 4, 4) << 27 | delta;
+                        i += 8;
+                        continue;
+                    }
+                    31 => {
+                        t = (t & !((1u64 << 59) - 1)) | (le(page, i + 4, 4) << 27 | delta);
+                        i += 8;
+                        continue;
+                    }
+                    _ => {}
+                }
+                t += delta;
+                let (data, next) = if tl == 0 {
+                    let n = le(page, i + 4, 4) as usize;
+                    (&page[i + 8..i + 4 + n], i + 4 + n)
+                } else {
+                    (&page[i + 4..i + 4 + 4 * tl as usize], i + 4 + 4 * tl as usize)
+                };
+                i = next;
+                rep.events += 1;
+                let ty = le(data, 0, 2) as u16;
+                let get = |fm: &Format, name: &str| {
+                    let (o, s) = fm.at(name);
+                    le(data, o, s)
+                };
+                let bus = |fm: &Format| get(fm, "adapter_nr") as u32 as i32 as i64;
+                let ev = if ty == fp.id {
+                    let (o, _) = fp.at("buf");
+                    let s = String::from_utf8_lossy(&data[o..]).trim_end_matches(['\0', '\n']).to_string();
+                    match s.find("ferros-mark: ") {
+                        Some(k) => Ev::Mark(s[k + 13..].to_string()),
+                        None => continue,
+                    }
+                } else if ty == fw.id || ty == fr.id || ty == fs.id {
+                    let fm = if ty == fw.id { &fw } else if ty == fr.id { &fr } else { &fs };
+                    let b = bus(fm);
+                    if adapter.is_some_and(|a| a != b) {
+                        continue;
+                    }
+                    match rep.adapters.iter_mut().find(|a| a.0 == b) {
+                        Some(a) => a.1 += 1,
+                        None => rep.adapters.push((b, 1)),
+                    }
+                    let (target, len, nr) = (get(fm, "addr") as u8, get(fm, "len") as usize, get(fm, "msg_nr") as u16);
+                    if ty == fs.id {
+                        Ev::Read { bus: b, nr, target, len }
+                    } else {
+                        let loc = get(fm, "buf") as u32;
+                        let (o, n) = ((loc & 0xFFFF) as usize, (loc >> 16) as usize);
+                        let bytes = data[o..o + n].to_vec();
+                        if ty == fw.id { Ev::Write { target, len, bytes } } else { Ev::Reply { bus: b, nr, len, bytes } }
+                    }
+                } else if ty == fres.id {
+                    let b = bus(&fres);
+                    if adapter.is_some_and(|a| a != b) {
+                        continue;
+                    }
+                    Ev::Result { bus: b, nr_msgs: get(&fres, "nr_msgs") as i64, ret: get(&fres, "ret") as u16 as i16 as i64 }
+                } else {
+                    continue;
+                };
+                evs.push((t, cpu, seq, ev));
+                seq += 1;
+            }
+        }
+    }
+    evs.sort_by_key(|e| (e.0, e.1, e.2));
+    let mut items = Vec::new();
+    // A read asked for (bus, message number) waits for its reply, which i2c_transfer traces after the whole transfer.
+    let mut asked: Vec<(i64, u16, u8, usize, usize)> = Vec::new();
+    for (_, _, _, ev) in evs {
+        match ev {
+            Ev::Mark(m) => items.push(Item::Mark(m)),
+            Ev::Write { target, len, bytes } => {
+                if bytes.len() != len {
+                    rep.short_writes += 1;
+                }
+                items.push(Item::Xfer(Xfer { target, read: false, data: bytes, expect: Some(len) }));
+            }
+            Ev::Read { bus, nr, target, len } => {
+                asked.retain(|a| !(a.0 == bus && a.1 == nr));
+                asked.push((bus, nr, target, len, items.len()));
+                items.push(Item::Xfer(Xfer { target, read: true, data: Vec::new(), expect: Some(len) }));
+            }
+            Ev::Reply { bus, nr, len, bytes } => match asked.iter().position(|a| a.0 == bus && a.1 == nr) {
+                Some(k) => {
+                    let a = asked.remove(k);
+                    if a.3 != len || bytes.len() != len {
+                        rep.bad_replies += 1;
+                    }
+                    if let Item::Xfer(x) = &mut items[a.4] {
+                        x.data = bytes;
+                    }
+                }
+                None => rep.bad_replies += 1,
+            },
+            Ev::Result { bus, nr_msgs, ret } => {
+                // Results carry no address: only a bus that carried a filtered message counts, and a failure there may be another device on it (a lens, an EEPROM), so it is said, not refused.
+                if ret != nr_msgs && rep.adapters.iter().any(|a| a.0 == bus) {
+                    rep.failed += 1;
+                }
+            }
+        }
+    }
+    // A read never answered keeps no bytes: its length check says so.
+    rep.bad_replies += asked.len();
+    rep.adapters.sort();
+    (items, rep)
+}
+
+enum Ev {
+    Mark(String),
+    Write { target: u8, len: usize, bytes: Vec<u8> },
+    Read { bus: i64, nr: u16, target: u8, len: usize },
+    Reply { bus: i64, nr: u16, len: usize, bytes: Vec<u8> },
+    Result { bus: i64, nr_msgs: i64, ret: i64 },
+}
+
 fn bytes(d: &[u8], max: Option<usize>) -> String {
     let mut s = String::new();
     match max {
@@ -217,24 +432,32 @@ fn flat(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
 /// A two-byte write followed by a read is one `R` record (the register and the count read); a read alone is an `R` of register 0.
 /// The capture has no times, so the delays are the main's binned table's, which has run since 2026-10-19: 10 ms after each of the first three transfers, 5 ms after a write past 256 bytes (the settings upload), 1 ms after every other write.
 /// Refused (None) when the capture holds no stream on, or a transfer whose byte count is not its programmed length (feedback_oracle_capture_integrity: never replay one).
-fn init_table(items: &[Item], target: u8) -> Option<(Vec<u8>, usize)> {
+/// `nth`: the transfers between stream on `nth - 1` and stream on `nth` (counted from 0; 0 from the start), for a session whose camera streamed before the open wanted (the ultrawide's close streams on for a moment, 2026-11-18).
+fn init_table(items: &[Item], target: u8, nth: usize) -> Option<(Vec<u8>, usize)> {
     let xs: Vec<&Xfer> = items.iter().filter_map(|it| if let Item::Xfer(x) = it { (x.target == target).then_some(x) } else { None }).collect();
     // The stream on is G#0100 on the CCS page: a Samsung part's G#0100 on another page (G#FCFC = G#4001 selects one, the main's init writes G#0100 = G#FFFF there) is not mode_select.
     let mut page = 0x4000u16;
-    let end = xs.iter().position(|x| {
-        if x.read || x.data.len() < 3 {
-            return false;
-        }
-        if x.data[..2] == [0xFC, 0xFC] && x.data.len() >= 4 {
-            page = u16::from_be_bytes([x.data[2], x.data[3]]);
-        }
-        page == 0x4000 && x.data[..2] == [0x01, 0x00] && x.data[2] != 0
-    })?;
-    if xs[..end].iter().any(|x| x.expect.is_some_and(|e| e != x.data.len())) {
+    let ons: Vec<usize> = xs
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| {
+            if x.read || x.data.len() < 3 {
+                return false;
+            }
+            if x.data[..2] == [0xFC, 0xFC] && x.data.len() >= 4 {
+                page = u16::from_be_bytes([x.data[2], x.data[3]]);
+            }
+            page == 0x4000 && x.data[..2] == [0x01, 0x00] && x.data[2] != 0
+        })
+        .map(|(k, _)| k)
+        .collect();
+    let end = *ons.get(nth)?;
+    let start = if nth == 0 { 0 } else { ons[nth - 1] + 1 };
+    if xs[start..end].iter().any(|x| x.expect.is_some_and(|e| e != x.data.len())) {
         return None;
     }
     let mut t = Vec::new();
-    let (mut i, mut n) = (0, 0);
+    let (mut i, mut n) = (start, 0);
     while i < end {
         let x = xs[i];
         if !x.read && x.data.len() == 2 && i + 1 < end && xs[i + 1].read {
@@ -332,7 +555,10 @@ fn holds(items: &[Item], target: u8, max: Option<usize>) -> Vec<String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut path, mut base, mut max, mut focus) = (None, 0x1088_0000u64, None, None);
-    let (mut flat_out, mut is_table) = (false, false);
+    let (mut flat_out, mut is_table, mut ftrace_in) = (false, false, false);
+    let mut adapter: Option<i64> = None;
+    let mut from: Option<String> = None;
+    let mut nth = 0usize;
     let mut init_out: Option<String> = None;
     let mut k = 0;
     while k < args.len() {
@@ -348,6 +574,22 @@ fn main() {
             "--table" => {
                 is_table = true;
                 k += 1;
+            }
+            "--ftrace" => {
+                ftrace_in = true;
+                k += 1;
+            }
+            "--stream" => {
+                nth = args.get(k + 1).and_then(|s| s.parse().ok()).expect("--stream N (the N-th stream on, from 0)");
+                k += 2;
+            }
+            "--from" => {
+                from = Some(args.get(k + 1).expect("--from <text of a mark>").clone());
+                k += 2;
+            }
+            "--adapter" => {
+                adapter = Some(args.get(k + 1).and_then(|s| s.parse().ok()).expect("--adapter N (the kernel's i2c-N)"));
+                k += 2;
             }
             "--base" => {
                 base = args.get(k + 1).and_then(|s| hex(s)).expect("--base G#<controller>");
@@ -368,14 +610,37 @@ fn main() {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: oracle-i2c <capture.log or init table> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--init <out>]");
+        eprintln!("usage: oracle-i2c <capture.log, init table, or ftrace dir> [--base G#1088_0000] [--max-bytes N] [--holds G#3D] [--flat] [--table] [--ftrace [--adapter N]] [--init <out>]");
         std::process::exit(2);
     };
-    let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let items = if is_table { table(&raw, focus.expect("--table needs --holds G#<target> or --flat with --holds")) } else { transfers(&accesses(&String::from_utf8_lossy(&raw)), base) };
+    let items = if ftrace_in {
+        let (items, r) = ftrace(std::path::Path::new(&path), adapter);
+        let buses: Vec<String> = r.adapters.iter().map(|a| format!("i2c-{} {}", a.0, a.1)).collect();
+        eprintln!("# ftrace: {} pages ({} flagged missed events), {} events; messages by bus: {}", r.pages, r.missed, r.events, buses.join(", "));
+        eprintln!("# ftrace integrity: {} write(s) whose bytes are not their length, {} read(s) unanswered or answered short, {} transfer(s) on these buses not completed whole{}", r.short_writes, r.bad_replies, r.failed, if r.missed + r.short_writes + r.bad_replies == 0 { "" } else { " -- DO NOT REPLAY" });
+        if r.missed != 0 && init_out.is_some() {
+            eprintln!("# no init: the ring missed events -- DO NOT REPLAY");
+            std::process::exit(1);
+        }
+        items
+    } else {
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        if is_table { table(&raw, focus.expect("--table needs --holds G#<target> or --flat with --holds")) } else { transfers(&accesses(&String::from_utf8_lossy(&raw)), base) }
+    };
+    // `--from`: the items from the first mark whose text holds it, so one session's later opens each give their own init (a camera opened twice, another readout).
+    let items = match &from {
+        Some(f) => {
+            let Some(k) = items.iter().position(|it| matches!(it, Item::Mark(m) if m.contains(f.as_str()))) else {
+                eprintln!("# no mark holds {f:?}");
+                std::process::exit(1);
+            };
+            items.into_iter().skip(k).collect()
+        }
+        None => items,
+    };
     if let Some(out) = init_out {
         let t = focus.expect("--init needs --holds G#<target>");
-        let Some((table, n)) = init_table(&items, t) else {
+        let Some((table, n)) = init_table(&items, t, nth) else {
             eprintln!("# no init: no stream on to G#{t:02X} in the capture, or a transfer before it whose byte count is not its programmed length -- DO NOT REPLAY");
             std::process::exit(1);
         };
@@ -465,7 +730,7 @@ mod tests {
         let w = |d: &[u8]| Item::Xfer(Xfer { target: 0x3D, read: false, data: d.to_vec(), expect: Some(d.len()) });
         let r = |d: &[u8]| Item::Xfer(Xfer { target: 0x3D, read: true, data: d.to_vec(), expect: Some(d.len()) });
         let mut items = vec![w(&[0, 0]), r(&[8, 0xEF]), w(&[0xFC, 0xFC, 0x40, 0x00]), w(&[1, 4, 1, 1]), w(&[2, 2, 0x11, 0xDA]), w(&[1, 0, 1, 3]), w(&[1, 4, 0, 1])];
-        let (t, n) = init_table(&items, 0x3D).unwrap();
+        let (t, n) = init_table(&items, 0x3D, 0).unwrap();
         assert_eq!(n, 4);
         let mut want = vec![b'R', 0, 2, 0, 0];
         for (d, us) in [(&[0xFCu8, 0xFC, 0x40, 0x00][..], 10_000u32), (&[1, 4, 1, 1], 10_000), (&[2, 2, 0x11, 0xDA], 1_000)] {
@@ -480,10 +745,10 @@ mod tests {
         let back = flat(&table(&t, 0x3D), 0x3D, None);
         assert_eq!(back, vec!["4000_0104=0101", "4000_0202=11DA"]);
         items[4] = Item::Xfer(Xfer { target: 0x3D, read: false, data: vec![2, 2, 0x11], expect: Some(4) });
-        assert!(init_table(&items, 0x3D).is_none());
+        assert!(init_table(&items, 0x3D, 0).is_none());
         items.truncate(5);
         items[4] = w(&[2, 2, 0x11, 0xDA]);
-        assert!(init_table(&items, 0x3D).is_none());
+        assert!(init_table(&items, 0x3D, 0).is_none());
     }
 
     /// An init table read flat: a direct write on the CCS page until G#FCFC moves it, the page after, the indirect window's words at its address in two-byte steps, a byte write alone.
@@ -498,5 +763,87 @@ mod tests {
         t.extend_from_slice(&[b'D', 0, 0, 0, 1, b'R', 0, 2, 0x00, 0x05]);
         let items = table(&t, 0x3D);
         assert_eq!(flat(&items, 0x3D, None), vec!["4000_0720=0001", "2001_8D3E=000C", "2000_12EC=2021", "2000_12EE=3000", "2001_0104=01"]);
+    }
+
+    /// Ring pages as the kernel writes them, read back: two CPUs merged by time (a time extend on one), a write long enough for a length word (type_len 0, past the text output's 64 bytes), a read answered by its reply, a mark, another bus left out by `--adapter`; then `--stream 1` cuts the init after a close's brief stream on.
+    #[test]
+    fn ftrace_pages() {
+        let dir = std::env::temp_dir().join(format!("oracle-i2c-ftrace-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("format")).unwrap();
+        let fmt = |name: &str, id: u16, fields: &str| std::fs::write(dir.join("format").join(name), format!("name: {name}\nID: {id}\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n{fields}")).unwrap();
+        let msg = "\tfield:int adapter_nr;\toffset:8;\tsize:4;\tsigned:1;\n\tfield:__u16 msg_nr;\toffset:12;\tsize:2;\tsigned:0;\n\tfield:__u16 addr;\toffset:14;\tsize:2;\tsigned:0;\n\tfield:__u16 flags;\toffset:16;\tsize:2;\tsigned:0;\n\tfield:__u16 len;\toffset:18;\tsize:2;\tsigned:0;\n";
+        let arr = "\tfield:__data_loc __u8[] buf;\toffset:20;\tsize:4;\tsigned:0;\n";
+        fmt("i2c_write", 840, &format!("{msg}{arr}"));
+        fmt("i2c_read", 841, msg);
+        fmt("i2c_reply", 842, &format!("{msg}{arr}"));
+        fmt("i2c_result", 843, "\tfield:int adapter_nr;\toffset:8;\tsize:4;\tsigned:1;\n\tfield:__u16 nr_msgs;\toffset:12;\tsize:2;\tsigned:0;\n\tfield:__s16 ret;\toffset:14;\tsize:2;\tsigned:1;\n");
+        fmt("print", 5, "\tfield:unsigned long ip;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:char buf[];\toffset:16;\tsize:0;\tsigned:0;\n");
+        // An event's payload: the i2c message fields and its bytes at offset 24.
+        let ev = |ty: u16, bus: i32, nr: u16, addr: u16, d: &[u8]| {
+            let mut p = vec![0u8; 24];
+            p[..2].copy_from_slice(&ty.to_le_bytes());
+            p[8..12].copy_from_slice(&bus.to_le_bytes());
+            p[12..14].copy_from_slice(&nr.to_le_bytes());
+            p[14..16].copy_from_slice(&addr.to_le_bytes());
+            p[18..20].copy_from_slice(&(d.len() as u16).to_le_bytes());
+            p[20..24].copy_from_slice(&(24u32 | (d.len() as u32) << 16).to_le_bytes());
+            p.extend_from_slice(d);
+            p
+        };
+        let mark = |s: &str| {
+            let mut p = vec![0u8; 16];
+            p[..2].copy_from_slice(&5u16.to_le_bytes());
+            p.extend_from_slice(format!("ferros-mark: {s}\n\0").as_bytes());
+            p
+        };
+        // A page: its time, then (delta, payload) events; a payload over 112 bytes takes the length word (type_len 0).
+        let page = |t0: u64, evs: &[(u32, Vec<u8>)], extend: bool| {
+            let mut d = Vec::new();
+            if extend {
+                d.extend_from_slice(&(30u32 | 0 << 5).to_le_bytes());
+                d.extend_from_slice(&1u32.to_le_bytes());
+            }
+            for (delta, p) in evs {
+                let mut p = p.clone();
+                while p.len() % 4 != 0 {
+                    p.push(0);
+                }
+                if p.len() <= 112 {
+                    d.extend_from_slice(&((p.len() / 4) as u32 | delta << 5).to_le_bytes());
+                } else {
+                    d.extend_from_slice(&(delta << 5).to_le_bytes());
+                    d.extend_from_slice(&((p.len() + 4) as u32).to_le_bytes());
+                }
+                d.extend_from_slice(&p);
+            }
+            let mut pg = vec![0u8; 4096];
+            pg[..8].copy_from_slice(&t0.to_le_bytes());
+            pg[8..16].copy_from_slice(&(d.len() as u64).to_le_bytes());
+            pg[16..16 + d.len()].copy_from_slice(&d);
+            pg
+        };
+        let long: Vec<u8> = (0..200u16).map(|k| k as u8).collect();
+        let mut upload = vec![0x6F, 0x12];
+        upload.extend_from_slice(&long);
+        // CPU 0: the mark, the identity read and its reply, the upload, the stream on, the close's stream off and brief on, a write on another bus.
+        let cpu0 = page(100, &[(0, mark("open")), (1, ev(840, 3, 0, 0x1A, &[0, 0x16])), (0, ev(841, 3, 1, 0x1A, &[0, 0])), (2, ev(842, 3, 1, 0x1A, &[7, 0x87])), (1, ev(840, 3, 0, 0x1A, &upload)), (1, ev(840, 3, 0, 0x1A, &[1, 0, 1])), (1, ev(840, 3, 0, 0x1A, &[1, 0, 0])), (1, ev(840, 3, 0, 0x1A, &[1, 0, 1])), (0, ev(840, 2, 0, 0x1A, &[9, 9, 9]))], false);
+        std::fs::write(dir.join("cpu0.raw"), &cpu0).unwrap();
+        // CPU 1, past CPU 0's events by a time extend (1 << 27): the next open's mode write and its stream on.
+        let cpu1 = page(100, &[(0, ev(840, 3, 0, 0x1A, &[3, 0x4C, 0x1F])), (1, ev(840, 3, 0, 0x1A, &[1, 0, 1]))], true);
+        std::fs::write(dir.join("cpu1.raw"), &cpu1).unwrap();
+        let (items, rep) = ftrace(&dir, Some(3));
+        assert_eq!((rep.pages, rep.missed, rep.short_writes, rep.bad_replies), (2, 0, 0, 0));
+        assert_eq!(rep.adapters, vec![(3, 9)]);
+        let h = holds(&items, 0x1A, None);
+        assert_eq!(h[0], "# MARK open");
+        assert_eq!(h[1], "W 00 16");
+        assert_eq!(h[2], "R 07 87");
+        assert!(h[3].starts_with("W [00000000]=000102") && h[3].len() > 400, "{}", h[3]);
+        assert_eq!(&h[4..], ["W 0100=01", "W 0100=00", "W 0100=01", "W 034C=1F", "W 0100=01"]);
+        let (t, n) = init_table(&items, 0x1A, 0).unwrap();
+        assert_eq!((n, t[0]), (2, b'R'));
+        let (t, n) = init_table(&items, 0x1A, 2).unwrap();
+        assert_eq!((n, &t[..6]), (1, &[b'W', 0, 3, 3, 0x4C, 0x1F][..]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

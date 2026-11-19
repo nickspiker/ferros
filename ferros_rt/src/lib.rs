@@ -29,4 +29,4 @@ pub mod thread;
 pub mod time;
 pub mod tlsf;
 
-pub use start::{cap, exit, grants, input};
+pub use start::{cap, exit, grants, input, panic_report};
