@@ -472,3 +472,68 @@ The AP sent four (46 or 47 bytes; their inner ids G#12DE, G#04D4, G#0398, G#12DE
 **The firmware load was not seen:** `/vendor/firmware/kepler.bin` (1026920 bytes on this build) goes over the same SPI as BETP bootloader messages (gnssd's `spi_codeload`), but neither capture holds it, from the hv's start or in the session: the chip kept its firmware across every warm reset (rails on), and gnssd found it running. A cold start (power off and on, the owner's hand on the power key) under the `gnss-boot` image would hold it.
 
 **What a ferros driver needs:** spi_21 in PIO at 32 bits a word with the two handshake lines (no modem, no shared memory); CHPP's transport (reset, sequence and ack, CRC-32, NAK, 1280-byte MTU), discovery and the open of handle G#10; then gnssd's BETP messages: the four the AP sends are in the capture, the chip's answers to read; and, from a cold chip, the code load (kepler.bin over BETP's bootloader messages) once its capture exists.
+
+## akita's KEPLER, decoded, and its driver (2026-11-19)
+
+Branch akita-gnss (from gps-rough-fix, forge merged in).
+The two captures of 2026-11-18 read with `ferros_kepler` (host-tested) thru `tools/gnss-oracle --betp`, and gnssd's own code (the factory image ships it unstripped: `/mnt/Harbor/ferros-ref/akita/location/gnssd/release/gnssd`).
+Nothing here prints or keeps a place: the oracle masks the fix's latitude and longitude even with `--hex`.
+
+**Correction: the messages above are BETP records, not one message each.**
+- A handle G#10 notification is a list of records.
+- The AP's records (gnssd `chppBetpClientSendGnssMessage`) have a 20-byte head: the word u32, the length u32, a u32 (0), the offset to the next record u16 and its size u16 (0 on the last), the head's size u16 (A#20), the length again u16; the datagram is sized for one more head than it fills, sent as 20 zero bytes. `ferros_kepler::ap_datagram` rebuilds the captured ones byte for byte.
+- The chip's (gnssd `chppDispatchBetpNotification`) have a 16-byte head: the word, a record counter u32 (+1 a record, G#FFFF_FFFF on the first after a start), the offset to the next u16, a u16 not used, the data's offset u16 (A#16), the data's length u16.
+- The word's high half is a protocol (2 SiRF's, 3 Samsung's own), the low half SiRF's MID and SID (gnssd's "midsid": the low byte the MID).
+- So the fix session's AP side is four records: G#0002_12DE (no bytes), G#0002_04D4 (G#0F), G#0002_0398 (G#8E, some 50 s in), G#0002_12DE again at Maps' close; at gnssd's start G#0003_7304 with four zero bytes. No aiding: no time, no place went to the chip.
+- The chip sent 362 records of 27 words in the session: G#3448 ×140 (12 bytes), G#720A ×101 (336), G#035B ×14 (32), G#024C ×14 (3), G#7D0A ×11 (68), G#710A ×11, G#FF07 ×11, G#0143 ×8 (160), G#0345 ×7 (48), G#0740 ×7, G#0249 ×6, G#730A ×6 and a few of others; at gnssd's start G#6538 (A#1053 bytes, a text `records=0 gps_week=… gps_tow=… expiration=…`) and G#0D46.
+
+**The fix is G#0143, SiRF's MID 67 SID 1** (`SIRF_MSG_SSB_GNSS_NAV_DATA`), A#160 bytes, laid out as SiRF's geodetic navigation message (MID 41) grown to 32-bit flags (`ferros_kepler::Pvt`):
+
+| Offset | Field |
+|---|---|
+| 0 | navigation valid u32: 0 a full fix, bit 0 a fix not yet over-determined (the session's first two) |
+| 4 | navigation type u32 (G#204, G#206 once fixed) |
+| 8, 10 | GPS week u16 (A#2445), time of week u32 in ms |
+| 22 | UTC: year u16, month, day, hour, minute u8, second u16 in ms, leap seconds u16 (A#18) |
+| 48, 52 | latitude, longitude: i32 in 10^-7 degrees |
+| 56, 60 | altitude above the ellipsoid, above mean sea level: i32 cm |
+| 64, 66, 68 | speed u16 cm/s, course u16 in 0.01 degree, climb i16 cm/s |
+| 80, 84 | horizontal and vertical error estimates u32 cm (A#65 m down to A#14 m, indoors) |
+| 90 | GDOP, PDOP, HDOP, VDOP, TDOP u8 each in fifths (PDOP² = HDOP² + VDOP², GDOP² = PDOP² + TDOP² in all eight) |
+
+The chip sends it once a second once it has a place (8 in the session), and none before.
+
+**The satellites are G#0003_710A** (`ferros_kepler::Sv`): a 37-byte head whose last byte is the count, then 29 bytes a satellite: its number u8, its system u8 (Android's constellation numbers: 1 GPS, 3 GLONASS, 5 BeiDou, 6 Galileo …), a u8 not known, flags u16 (Android's: 1 ephemeris, 2 almanac, 4 used in the fix, 8 carrier known), then C/N0 (dB-Hz), elevation, azimuth (degrees) and the carrier (Hz) as f32, and an f64 not known.
+In the capture: 0 satellites at the ask, 1, 3, 7 (6 used), then 12 and 13 (GPS 7, GLONASS 2, Galileo 4); the GLONASS carriers at 1604 and 1605 MHz, the others at 1575.42.
+
+**The link's habits** (both captures, every packet): the AP's payload packet takes the chip's latest ack as its sequence; the chip's ack moves with every AP packet, bare acks too; the AP answers each chip payload packet with a bare ack (sequence 0, length 0); the chip resends a packet until acked. The AP's TX transfers in the fix capture are all whole: what looked like missing AP packets is this ack habit.
+
+**The bus, from the loud capture's set-up words:** per transfer, CH_CFG 0, SWAP_CFG G#DD, MODE_CFG G#5FFC_0000 (32-bit channel and bus), FB_CLK 0, SLAVE_SEL G#23 (the controller's select, automatic), PACKET_CNT the word count | G#1_0000, the TX words, CH_CFG 3 (2 for a read), the RX words, then CH_CFG 0, PACKET_CNT 0 and a software-reset pulse. At most 16 words a transfer: a 1024-byte read is 16 of them. On the 8a under ferros (2026-11-19): a bare 16-word read runs in 219 µs and the receive level counts bytes, as Linux reads it.
+
+### The core is the CP's
+
+The KEPLER is the GNSS core of the S5300 modem, not a chip of its own, and it is the CP that powers it, resets it and starts its firmware.
+gnssd's CHPP transport (`gnss_device_data_port_chpp_present=1` in gps.cfg) loads it thru the modem's `gnss_boot` io device (SIT channel A#240, `EXYNOS_CH_ID_GNSS_BOOT`), never over SPI:
+- `pcie_init` opens `/dev/gnss_boot`; `pcie_send_message` writes a command and waits up to 2 s for the CP's answer (its first byte the command's low byte, its third the status).
+- `pcie_power_on` G#0202, `pcie_assert_reset` G#0203, `pcie_release_reset` G#0204: two bytes each.
+- `pcie_load_firmware`: the image copied into the CP's `GNSS_FW` memory (4 MiB at 8 MiB into cp_rmem, G#EAC0_0000, cached) by cpif's `IOCTL_LOAD_GNSS_IMAGE` (G#4010_6F41: size u32, offset u32, the buffer's address), then G#0E05 (14 bytes: a u32 from the image's descriptor, 0, the size), answered G#05 with status 0.
+- `pcie_send_blc` G#0E09 (14 bytes: an address in DDR with bit 0 set, the base from `get_ddr_base_address`, and a config value): start the firmware; `pcie_check_crc` checks it.
+- Only then does the core speak CHPP on spi_21.
+
+So the 2026-11-18 note above ("the chip kept its firmware across warm resets", "a cold start would show the load on SPI") was wrong: every Android boot reboots the CP (cbd) and gnssd loads the core again thru gnss_boot, which the hv's spi_21 and GPIO traps cannot see. A cold power-on capture of spi_21 would show nothing more.
+
+### The driver (payloads/gnss_kepler)
+
+- The `gps` endpoint as payloads/gps serves it (FIX 38 bytes, STOP, SATS, WATCH, FRAMES by BETP word), the measures in the same slots, the tracks from G#710A beside the predicted birds (payloads/gps predict.rs, the same file), `gps.last` kept as each fix moves, the zone told of the position: the map's GPS rings, the GPS page and the GPS puck read it unchanged.
+- The same grants as the kernel's `gps` list; the kernel's `gps` switch on the 8a is `kepler_power` (gps.rs): gpp4-3 an output, gpa5-3 an input with its pull-down, spi_21's clocks and setup, its clock halved to 3.07 MHz (the DT's limit 3.125 MHz). No rails: the 8a's tree gives the core none.
+- The session: CHPP reset, discovery (checks the BETP service), the time, the open, gnssd's start record and Maps' two; then the fix and the satellites decoded. Input bit 4 stops after the open; bit 5 makes one bare read first.
+- Spawn: `ferros-bridge spawn gnss_kepler.bin 01 --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req --use udp`.
+
+**On the 8a (b270, warm from Android, this branch's kernel RAM-loaded, the driver hand-spawned):** the switch on, gpp4-3 raised, and gpa5-3 never rose in 100 ms, eight sends at a time every 16 s for minutes: the core is dark. Under ferros the modem process boots the CP from its ROM at every start, so whatever Android had loaded is gone, and nothing sends the gnss_boot commands. No fix, no CHPP byte.
+Also seen that boot: the kernel's own `gps` start on a claim ran the Pro's driver from akita's vault, which ended at once (no `gps.replay`) before touching any power; on the 8a the vault's `gps` capsule should be this driver.
+
+### What comes next, and what it needs
+
+1. **gnssd's boot of the core, traced whole** (`tools/akita-gnss-trace.sh build`, then `run` from Android on slot a with root, then `decode`): gnssd stopped, the core held in reset with gnssd's own G#0203, gnssd run again under gtrace, a Maps session to a fix. It logs every command and answer on `/dev/gnss_boot` with its bytes, the image ioctl's struct, and the whole CHPP session on `/dev/gnss_ipc` (no lost lines, unlike the hv's captures). No flashing, no slot change, nothing on ferros's side. **No hands needed:** the 8a only has to be in Android with Magisk's Shell grant, as it was on 2026-11-18. Not run yet: the 8a was the camera session's.
+2. **The modem process sends them** (payloads/modem): channel 240 on its SIT link, kepler.bin (in vendor_b, 1026920 bytes on the 8a's build; stored in the vault beside the CP's images) copied into GNSS_FW, then the commands in gnssd's order with their answers checked. Then this driver runs as it is.
+3. Aiding (time and place into the chip) once the trace shows the messages: the captured session sent none.

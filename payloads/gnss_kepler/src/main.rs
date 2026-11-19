@@ -15,7 +15,7 @@
 //!
 //! Spawn (the kernel's `gps` grants, payloads/gps's order): ferros-bridge spawn gnss_kepler.bin 01 --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req --use udp
 //! Grant slots: 0 console, 1 the `gps` endpoint, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2 (not used on the 8a), 6 the vault scope `gps.`, 7 the power switch, 8 GNSS to AP's interrupt, 9 `udp` (the orbits).
-//! Input byte 0: bit 4 the link alone (reset, discovery, time, open; no session), for a first look at a chip; anything else (the kernel's start passes 01) the whole session.
+//! Input byte 0: bit 4 the link alone (reset, discovery, time, open; no session), for a first look at a chip; bit 5 one bare 16-word read first (the port alone, no handshake: does the transfer run, how does the level count); anything else (the kernel's start passes 01) the whole session.
 //!
 //! The `gps` endpoint, payloads/gps's ops and layouts: 0 FIX (38 bytes), 1 STOP, 2 SATS (25 bytes a signal), 3 WATCH, 4 FRAMES (here the kinds are BETP words: key `00 00` then the word's four bytes, high first; `[4, k]` answers with no frames kept).
 //! Measures: slot 0 the state (1 searching, 2 a fix), 1 the error estimate, 2 the satellites seen, 3 those used, 4 the best C/N0, 5 altitude, 6 speed, 7 heading.
@@ -672,6 +672,13 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     mmio_write(far, EINT_PEND, PIN);
     mmio_write(far, EINT_MASK, mmio_read(far, EINT_MASK) as u32 & !PIN);
     say!(g, "gps: kepler: powered (the port at 3.07 MHz, 32-bit words); GNSS to AP reads {}{}\n", if io.chip.gnss2ap() { "high (the chip has bytes)" } else { "low" }, if link_only { "; the link alone (input bit 4)" } else { "" });
+    // Input bit 5: one 16-word read with no handshake first, the port alone (a chip that is not ready leaves its output idle): whether the transfer runs and how the receive level counts, then on as asked.
+    if input0 & 0x20 != 0 {
+        let mut rx = [0u8; WORDS * 4];
+        let t = now();
+        let ok = io.chip.words(None, &mut rx);
+        say!(g, "gps: kepler: a bare 16-word read {} in {} us (level in bytes {}, in words {}); first word G#{:08X}\n", if ok { "ran" } else { "never filled" }, now().wrapping_sub(t) * 1_000_000 / f, io.chip.lvl_bytes, io.chip.lvl_words, u32::from_le_bytes([rx[0], rx[1], rx[2], rx[3]]));
+    }
 
     let mut s = State {
         link: kp::Link::default(),

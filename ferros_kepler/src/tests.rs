@@ -124,3 +124,62 @@ fn chip_records_walk() {
     assert_eq!((r0.word, r0.data), (0x0002_6538, &[0xAA, 0xBB][..]));
     assert_eq!((r1.word, r1.data), (0x0002_3448, &[0xCC][..]));
 }
+
+#[test]
+fn datagram_drops_one_that_lost_a_packet() {
+    let mut d: Datagram<64> = Datagram::new();
+    let h = |seq, more| Header { flags: if more { MORE } else { 0 }, code: 0, ack: 0, seq, len: 1 };
+    assert_eq!(d.take(&h(1, true), &[1]), Took::Part);
+    // Seq 2 lost: 3 continues a datagram that is not whole, and 4 ends it; both dropped.
+    assert_eq!(d.take(&h(3, true), &[3]), Took::Part);
+    assert_eq!(d.take(&h(4, false), &[4]), Took::Part);
+    assert_eq!(d.skips, 1);
+    assert_eq!(d.take(&h(5, false), &[5]), Took::Whole);
+    assert_eq!(d.bytes(), &[5]);
+}
+
+/// A made-up fix (no capture's place): the fields where `Pvt` reads them.
+#[test]
+fn pvt_fields() {
+    let mut b = [0u8; Pvt::LEN];
+    b[8..10].copy_from_slice(&2445u16.to_le_bytes());
+    b[10..14].copy_from_slice(&370_382_000u32.to_le_bytes());
+    b[48..52].copy_from_slice(&(-337_000_000i32).to_le_bytes());
+    b[52..56].copy_from_slice(&(1_510_000_000i32).to_le_bytes());
+    b[60..64].copy_from_slice(&7_509i32.to_le_bytes());
+    b[64..66].copy_from_slice(&202u16.to_le_bytes());
+    b[80..84].copy_from_slice(&2_606u32.to_le_bytes());
+    b[92] = 5;
+    let p = Pvt::read(&b).unwrap();
+    assert!(p.has_place());
+    assert_eq!((p.week, p.tow_ms, p.alt_msl_cm, p.speed_cms, p.ehpe_cm, p.hdop_fifths), (2445, 370_382_000, 7_509, 202, 2_606, 5));
+    // -33.7 degrees in 2^-23: -33.7 × 8388608, rounded toward minus infinity.
+    assert_eq!(Pvt::to_units(p.lat_e7), -282_696_090);
+    assert_eq!(Pvt::to_units(p.lon_e7), 1_266_679_808);
+    assert!(Pvt::read(&b[..100]).is_none());
+}
+
+/// A made-up satellite list of two.
+#[test]
+fn sv_list() {
+    let mut b = [0u8; SV_HEAD + 2 * SV_LEN];
+    b[SV_HEAD - 1] = 2;
+    let put = |b: &mut [u8], k: usize, num: u8, sys: u8, flags: u16, cn0: f32, el: f32, az: f32, hz: f32| {
+        let o = SV_HEAD + SV_LEN * k;
+        b[o] = num;
+        b[o + 1] = sys;
+        b[o + 3..o + 5].copy_from_slice(&flags.to_le_bytes());
+        for (i, v) in [cn0, el, az, hz].iter().enumerate() {
+            b[o + 5 + 4 * i..o + 9 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+    };
+    put(&mut b, 0, 7, 1, 0x0D, 27., 48., 58., 1_575_420_000.);
+    put(&mut b, 1, 3, 3, 0x09, 22., 17., 150., 1_605_375_000.);
+    assert_eq!(Sv::count(&b), 2);
+    let s0 = Sv::read(&b, 0).unwrap();
+    let s1 = Sv::read(&b, 1).unwrap();
+    assert!(Sv::read(&b, 2).is_none());
+    assert_eq!((s0.number, s0.ferros_system(), s0.flags & SV_USED != 0, s0.band()), (7, 0, true, 0));
+    assert_eq!((s1.number, s1.ferros_system(), s1.flags & SV_USED != 0), (3, 1, false));
+    assert_eq!((s0.cn0, s0.elevation, s0.azimuth), (27., 48., 58.));
+}
