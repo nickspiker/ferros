@@ -119,6 +119,58 @@ The owner, 2026-11-15: "Might not be a bad idea to work on the 8a cams whilst it
 
 **The 8a as left (2026-11-15 afternoon)**: the host's USB card (xhci 0000:04:00.0, the ASM107x card both devices sat on) died at 11:48:24 right after the late-arm build was flashed, so that capture never ran; the owner reset the card, and slot b was flashed back from `/mnt/Harbor/tmp/akitacams/back/boot_b.img` and read back from Android (sha256 fc572ff3, the same), ferros through the gate, attested. Slot a is the bare ferros (BOARDS.md "akita's slots"); nothing camera is in the vault; Android's settings changed for the captures (stay on while plugged in, Pixel Camera's location answer) are put back. The next capture session waits for the 8a on a motherboard port, so a card crash cannot take the Pro with it.
 
+### akita: the captures of 2026-11-18 (Android 17 on slot a, rooted, under the hv)
+
+Android updated itself into slot a that day (CP3A.261005.005, kernel 6.1.162), so the captures moved there: slot a's boot carries the oracle hv in front of its own kernel, and ferros's gate on slot b is never written (BOARDS.md "akita's slots").
+`tools/akita-hv-camcap.sh` (SLOT=a, AUTO=1) ran every session hands-free over adb (the 8a has no lock screen): the image flashed to boot_a, a capture boot, the session's marks, a sysrq crash, the next boot's ring pulled twice and compared.
+All local: /mnt/Harbor/Code/keys/akita/captures-2026-11-18/ (B3SUMS over every file; the vendor's settings, never the repository).
+
+What Lumis 0.2.8 lists on the 8a: the ultrawide (4208 x 3120, to 16 s), "multiple Back" opening the main at 80 degrees (4624 x 3472, to 16 s) and the main's in-sensor 2x crop at 46 degrees (4624 x 3472 of 0.8 µm pixels, to 16 s), and the front (4208 x 3072, to 1 s).
+Camera2 offers no maximum-resolution mode on any 8a camera (`dumpsys media.camera`: the main's whole array is 4624 x 3472), so the 46 degree crop is the only other main mode.
+
+**The I2C sessions** (one bus a capture, the sensor at G#1A alone, nine set-up words quiet; one capture boot per session, since the main's binned and crop opens alone filled the 2^15-line cap with their frames' holds):
+
+| session | transfers | integrity | inits (transfers before stream on) |
+|---|---|---|---|
+| i2c-main (Lumis binned, crop) | 4257 | 0 | binned 278, crop 289 |
+| i2c-main-16s (Lumis, 16 s) | 1398 | 0 | 278 (the binned one, byte for byte) |
+| i2c-main-gcam (Pixel Camera 1x, 2x) | 2231 | 1 | 1x 278, 2x 206 (a mode switch, no power cycle) |
+| i2c-uw (Lumis binned) | 2234 | 1 | 140 |
+| i2c-uw-16s | 1305 | 1 | 140 (the same) |
+| i2c-uw-gcam (Pixel Camera .5, video) | 2385 | 1 | .5 140, video 143 |
+| i2c-front (Lumis binned) | 3416 | 1 | 119 |
+| i2c-front-1s | 1921 | 1 | 119 (the same) |
+| i2c-front-gcam (photo, video) | 2782 | 1 | photo 119, video 155 |
+
+Every length mismatch is outside every init: each session's last stream off (G#0100 written with two of its three bytes), and once a per-frame hold word in the main's Pixel Camera 2x stream.
+The geometry and timing words, from the inits (CCS):
+- main binned: the whole 9248 x 6944 array read to 4624 x 3472, a line of 9568 clocks, a frame of 4826 lines, PLL multiplier 166 (as 2026-11-15's);
+- main crop (Lumis 46 degrees and Pixel Camera's 2x alike): x the whole width, y G#6C0 to G#145F (3488 rows), out 4624 x 3472, a line of 10320 clocks, frame 6011 lines, PLL 223;
+- ultrawide: 4208 x 3120 of the whole array, a line of 5192 clocks, PLL 122; its video y G#178 to G#AB7, 4208 x 2368, PLL 102;
+- front: 4208 x 3072 (y G#18 to G#C17), a line of 5192, PLL 119; its video 4208 x 2368 as the ultrawide's.
+
+**Long exposures, the holds** (`<session>.holds`): the main (Sony IMX787) shifts its integration and frame by G#3100 (2, 4, then 6 at 16 s: integration G#8ACA and frame G#8B0A lines, each times 2^6, at its 7.036 µs line is 16.0 s), mid-stream, frame by frame as the Pro's Samsung main does with G#0702 and G#0704; the ultrawide and the front (Sony IMX712) shift by G#3004 (the ultrawide 2 then 5 at 16 s; the front 1 at its 1 s).
+Gain G#0204 (analogue) and G#020E (digital, 1) ride in the same holds.
+
+**The ISP sessions** (the late-arm build, FERROS_HV_ORACLE_LATE: no lock at boot this time):
+
+| session | oracle lines | PDMA lists dumped | link, CSIS select |
+|---|---|---|---|
+| isp-main | 28696 | 2 | link 1 (G#1C05), 2 |
+| isp-front | 24147 | 3 | link 6 (G#1C0A), G#60 |
+| isp-main-crop | 20797 | 2 | link 1, 2 |
+| isp-uw (the whole front-end span trapped) | 3029 | 1 | link 0 (G#1C04), 1 |
+
+The main's engine is started (control +0 = 1) in isp-main; in isp-main-crop and isp-uw Android starts it another way (+G#28 = 1, +G#C = 1000), not yet read.
+The ultrawide's frames do go thru a PDMA program this time (list 1 dumped), unlike 2026-11-15's session.
+`cam-oracle cpu` (inputs/akita-main.cpr2: 134 CPU writes before the engine, 54 after; inputs/akita-front.cpr2: 132 and 36) gives the receiver starts too: the main's matches `rx::RX_START_AKITA_MAIN` word for word (2026-11-15's), the front's differs from `RX_START_AKITA_FRONT` in its lane resets and five csis1 base words.
+
+**Streaming from a hand-spawned driver (2026-11-18, nothing stored):** the akita-cams kernel RAM-reloaded (b262; the flashed kernel has no akita camera switch and would run husky's rails), the driver spawned by hand with its inputs in its spawn (`cam-oracle cinp`, payloads/camera `spawn_input`: a 'CINP' set after the 16 knob bytes, read in place of the vault's, with `<key>.slots` in place of the compiled job layout), camtest `1008` (16 frames at bin 8).
+- **main**: PROBE answers G#0787; the open runs to stream on in 610 ms (switch 41 ms, init 276 writes and 2 reads in 544 ms, job placed, engine started, receiver on, 188 CPU writes, none refused); CSI link 1 latches frame start and frame end on channels 0 to 2 (+G#24 = +G#2C = G#7), but the front end never answers: no interrupt on SPI 479, loch0's image status 0, not even SHADOW_UPDATE, in 2.1 s; the same with 2026-11-15's job, today's list 1 and today's list 2. So the link takes frames and nothing reaches loch0: where husky's main stood on 2026-10-20, but one step before (husky's raised SHADOW_UPDATE).
+- **front**: the init runs (117 writes, 2 reads, 153 ms), then the job does not move into its region (`ImageWrites(0, 0)`: none of the lists, 2026-11-15's included, writes the image address register the relocation looks for), so the open is refused (3) before the engine.
+- **ultrawide**: not tried (no CPU program cut from isp-uw yet, no receiver table).
+Next: read Android's engine start of isp-main-crop and isp-uw; the hv snapshot (FERROS_HV_SNAPSHOT, docs/oracle/CAMERA.md) of the front end mid-stream under Android against `diag cam pdma`-style cold reads, as husky's ISPFE_NOC clock was found; which register the front's jobs name its image by.
+
 ## The gap to "Lumis opens and shows a live preview"
 
 | piece | state | left |

@@ -142,6 +142,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) - Android data newer only in the node chain; `diag part f2fs`
 - [Modem: registration, IP, driver](modem_uecap_registration.md) - Verizon LTE/NR + IP under ferros; uecap file service blocker
 - [GPS fix via on-chip engine](gps_onchip_fix.md) - BCM4776's own engine via a replayed gpsd session; payloads/gps
+- [akita KEPLER GNSS](akita_kepler_gnss.md) - CHPP over spi_21 in PIO, BETP in handle G#10; firmware load needs a cold power-on capture
 - [NFC + BT drivers](husky_radios_nfc_bt.md) - nfc/bt processes; WiFi turns BT off before cycling WL_REG_ON; BT off must drive its pins (a reload wedged WiFi)
 - [AoC + USF under ferros](aoc_start_needs_trusty.md) - sensors via Trusty-started AoC, rails, registry scripts with board CDT
 - [husky camera bring-up](husky_camera_bringup.md) - main streams in the driver; ultrawide built in (untested); front/tele: LV buck guess; traps

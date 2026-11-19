@@ -228,3 +228,21 @@ Earlier plan, kept for reference:
 3. The pvtOnChip request: does an on-chip fix reach the AP over SPI?
 
 Assistance (SUPL, LTO) is network-only and optional: without it, a standalone cold start.
+
+## akita's KEPLER, captured under the hv (2026-11-18)
+
+The 8a's GNSS is a Samsung part Google's tree calls KEPLER (`samsung,exynos-gnss`, `gnssif`), not husky's BCM4776 (BOARDS.md "akita's radios").
+Captured with Android 17 on slot a under an oracle hv (tools/akita-hv-camcap.sh, images `gnss` and `gnss-boot`), decoded with `tools/gnss-oracle`; local only, keys/akita/captures-2026-11-18/ (`gnss-*`), since the session's reports carry the place.
+
+**The bus is SPI, nothing else.** spi_21 (USI3_HSI0, G#111E_0000, 3.125 MHz, mode 0) in PIO: no DMA, no shared memory, no mailbox, and the kernel's driver (`gnss_spi.ko`, `gnssif.ko`) neither powers nor resets the chip.
+- Transfers are 32-bit words both ways (TX_DATA +G#18 writes, RX_DATA +G#1C reads; with SWAP_CFG on, each word's little-endian bytes are wire order); PACKET_CNT (+G#20) is written with bit 16 and the word count before each transfer and 0 after.
+- The handshake: AP to GNSS is gpp4-3 (PERIC0 G#1084_0084 bit 3) raised before the AP sends and pulsed before each read; GNSS to AP is gpa5-3, the chip's interrupt (Android's IRQ 226).
+- A send: raise gpp4-3, wait for gpa5-3, one transfer of the message's words, then a read of as many, gpp4-3 low. A read: the chip raises gpa5-3, the AP pulses gpp4-3 and reads 1024 bytes (256 words), again while gpa5-3 stays high; the reads are mostly fill, so a packet can span two.
+- The framing is CHPP (the context hub peripheral protocol): preamble 68 43, an 8-byte transport header (flags, packet code, ack sequence, sequence, length, reserved), the payload, CRC-32; every packet of both captures checks (25 candidates in 99 KB of fill fail, none of them a real packet). Both ends offer CHPP 1.0.0, an MTU of 1280, a window of 1 and a 1000 ms timeout in their transport reset; the AP's NAK code 5 (21 times in the session) is CHPP's out-of-order answer.
+
+**At gnssd's start (a boot):** transport reset and its ack, discovery (handle G#0F, a 42-byte answer naming the chip's one service), the time sync (handle G#02), then the service's open on handle G#10 (cmd 0 asked and answered), its first notification (994 bytes, more following), and the AP's first message to it.
+**A session to a fix** (Maps asked for location; the first fix 10 s after it opened, indoors): every message from then on is on handle G#10, the AP's as client notifications (cmd 2), the chip's as service notifications (cmd 3): Samsung's own protocol (gnssd's BETP client) inside CHPP.
+The AP sent four (46 or 47 bytes; their inner ids G#12DE, G#04D4, G#0398, G#12DE); the chip 189 (28 KB), most of them 34-byte G#3448 messages, the rest G#035B, G#0249 and fragmented 994-byte G#710A to G#730A ones (measurements and reports: the place among them, never printed).
+**The firmware load was not seen:** `/vendor/firmware/kepler.bin` (1026920 bytes on this build) goes over the same SPI as BETP bootloader messages (gnssd's `spi_codeload`), but neither capture holds it, from the hv's start or in the session: the chip kept its firmware across every warm reset (rails on), and gnssd found it running. A cold start (power off and on, the owner's hand on the power key) under the `gnss-boot` image would hold it.
+
+**What a ferros driver needs:** spi_21 in PIO at 32 bits a word with the two handshake lines (no modem, no shared memory); CHPP's transport (reset, sequence and ack, CRC-32, NAK, 1280-byte MTU), discovery and the open of handle G#10; then gnssd's BETP messages: the four the AP sends are in the capture, the chip's answers to read; and, from a cold chip, the code load (kepler.bin over BETP's bootloader messages) once its capture exists.
