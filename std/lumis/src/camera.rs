@@ -120,6 +120,10 @@ pub struct Camera {
     pub mode: u8,
     pub cfa_period: u8,
     pub frame_ns: u64,
+    /// The part of the sensor the readout images, in mm (a crop's smaller than the lens's), its diagonal field of view in degrees and its 35 mm equivalent focal length (ferros cam-slits-all, VSF floats); 0 from a driver before.
+    pub field_mm: (f32, f32),
+    pub fov_diagonal_deg: f32,
+    pub focal_equiv_mm: f32,
 }
 
 /// The list's document, read. A section that misses a field is not a camera Lumis can show, so it is left out and said (a driver bug, not the person's).
@@ -166,6 +170,9 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 mode: u("mode").unwrap_or(0) as u8,
                 cfa_period: u("cfa_period").unwrap_or(2) as u8,
                 frame_ns: u("frame_ns").unwrap_or(0),
+                field_mm: (one("field_width_mm"), one("field_height_mm")),
+                fov_diagonal_deg: one("fov_diagonal_deg"),
+                focal_equiv_mm: one("focal_equiv_mm"),
             })
         })();
         match cam {
@@ -390,6 +397,11 @@ mod tests {
             ("f_number".to_string(), f(&[1.68])),
         ];
         if let Some((mode, _, _, period, frame_ns)) = readout {
+            // The main's fields (cam-slits-all): the binned readout's and the 1:1's alike, the whole sensor.
+            fields.push(("field_width_mm".to_string(), f(&[9.792])));
+            fields.push(("field_height_mm".to_string(), f(&[7.3728])));
+            fields.push(("fov_diagonal_deg".to_string(), f(&[83.22])));
+            fields.push(("focal_equiv_mm".to_string(), f(&[24.36])));
             fields.push(("mode".to_string(), vec![VsfType::u3(mode)]));
             fields.push(("cfa_period".to_string(), vec![VsfType::u3(period)]));
             fields.push(("frame_ns".to_string(), vec![VsfType::u6(frame_ns)]));
@@ -414,9 +426,11 @@ mod tests {
         assert_eq!((c.sensor_mm, c.focal_mm, c.f_number), ((9.792, 7.3728), 6.9, 1.68));
         // A driver before cam-full-res lists no mode fields: the binned readout, Bayer.
         assert_eq!((c.mode, c.cfa_period, c.frame_ns), (0, 2, 0));
+        assert_eq!((c.field_mm, c.fov_diagonal_deg, c.focal_equiv_mm), ((0., 0.), 0., 0.));
         // The 1:1 readout: the same camera (id, name), its own size, a quad filter.
         let full = &cams[1];
         assert_eq!((full.id, full.name.as_str(), full.width, full.height, full.mode, full.cfa_period, full.frame_ns), (0, "main", 8160, 6144, KIND_FULL, 4, 41670368));
+        assert_eq!((full.field_mm, full.fov_diagonal_deg, full.focal_equiv_mm), ((9.792, 7.3728), 83.22, 24.36));
     }
 
     #[test]
