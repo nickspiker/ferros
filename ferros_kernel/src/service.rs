@@ -1763,6 +1763,16 @@ struct PowerWin {
 
 /// The kernel core's idle sleeps and the ticks spent in them (the service loop's idle, plain or deep), for DIAG X3_SLEEPS and the power window's wake count.
 pub static X3_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Wakes of the kernel core's idle `wfe` that went back to sleep with no pass (the doze, `DOZE_LOG2`), for DIAG X3_DOZES.
+pub static X3_DOZES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The doze's bound, as a right shift of the counter's frequency (`diag clock doze <n>`; 9: 2^-9 s, under the event stream's 2.7 ms; 0: no doze, a pass at every wake as before 2026-11-19).
+pub static DOZE_LOG2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(9);
+
+/// Whether the kernel's core has work of its own now, read without the kernel lock: a queued thread it may run (process.rs `RUNNABLE_KERNEL`), a sleeper's deadline due or a device line pending (`run_slice` wakes their waiters), or no worker up (every thread is this core's).
+fn for_this_core() -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    crate::process::RUNNABLE_KERNEL.load(Acquire) != 0 || crate::process::NEXT_WAKE.load(Acquire) <= cntpct() || unsafe { core::ptr::read_volatile(&raw const crate::process::__irq_any) } != 0 || crate::smp::UP.load(Acquire) == 0
+}
 pub static X3_ASLEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// What a power window counts across itself: the kernel core's idle sleeps, the interrupts taken, the ticks asleep, the watchdog pets (a pass of the service loop each, more or less).
@@ -1912,6 +1922,10 @@ struct Gov {
     res: [u64; 16],
     /// Rate requests sent.
     asks: u64,
+    /// The busy lift (`GOV_BUSY_KHZ`): windows in a row the load asked over the calm ceiling, and in a row it asked at or under it; whether the busy lift holds this cluster now.
+    over: u64,
+    under: u64,
+    busy: bool,
 }
 const X3_OPPS: [u32; 15] = [500_000, 880_000, 1_164_000, 1_298_000, 1_557_000, 1_745_000, 1_885_000, 2_049_000, 2_147_000, 2_294_000, 2_363_000, 2_556_000, 2_687_000, 2_850_000, 2_914_000];
 const A715_OPPS: [u32; 15] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000, 1_221_000, 1_328_000, 1_418_000, 1_572_000, 1_836_000, 1_945_000, 2_130_000, 2_245_000, 2_367_000];
@@ -1972,13 +1986,26 @@ fn interactive(now: u64, f: u64) -> bool {
     lift_causes(now, f) != 0
 }
 
-/// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
+/// The A715s' ceiling while their own load holds the busy lift and nobody interacts (`diag clock busy <kHz>`; 0: no busy lift, the calm ceiling as before 2026-11-19).
+/// The busy lift: a load that keeps the cluster's averaged busy share over the governor's 4/5 at the calm ceiling for 2^`GOV_BUSY_HOLD` windows asks more than the calm ceiling gives, so the ceiling rises to this; it falls back once the load has asked at or under the calm ceiling for as long.
+/// The test is on what the load asks (the running rate × the averaged share × 5/4, the governor's own `want`), which stays the same as the clock moves for a paced load and grows with it for one bound by the cores, so a lift begun is not ended by the clock it bought.
+/// Why 1572 MHz (THERMAL.md "The busy lift"): `pixel_em` gives an A715 449 mW there against 208 at 1065 and 1514 at 2367, so a save's whole energy with the device's other 2 W or so is least between 1328 and 1836 MHz, 1572 in the middle; and a 1572 MHz ceiling held the zones at 79-80 C under Lumis's stream where 2367 reached the 88 C divider within 6 s (CAMERA.md "The slowdown, measured").
+static GOV_BUSY_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
+/// The busy lift's hold, as windows in a row (a power of two, `diag clock busyhold <n>`; 4: 16 windows, a quarter second at the 2^-6 s window), both to begin and to end.
+static GOV_BUSY_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(4);
+/// Windows the A715s ran busy-lifted with no other lift, and busy lifts begun (`diag clock`).
+static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
+
+/// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `GOV_BUSY_KHZ` while their own load holds the busy lift, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
 fn gov_top(g: &Gov, lifted: bool) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let busy = GOV_BUSY_KHZ.load(Relaxed);
     let cap = match (g.domain, lifted) {
         (4, _) => u32::MAX,
-        (2, true) if GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed) > A715_CALM_KHZ => u32::MAX,
+        (2, true) if GOV_LIFT_KHZ.load(Relaxed) > A715_CALM_KHZ => u32::MAX,
         (2, _) => A510_CALM_KHZ,
-        (_, true) => GOV_LIFT_KHZ.load(core::sync::atomic::Ordering::Relaxed).max(A715_CALM_KHZ),
+        (_, true) => GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ),
+        (_, false) if g.busy && busy > A715_CALM_KHZ => busy,
         (_, false) => A715_CALM_KHZ,
     };
     // The highest point at or under the ceiling (the table starts at the floor, which every ceiling is above).
@@ -1990,9 +2017,9 @@ const A715_REST_KHZ: u32 = 712_000;
 /// The A510s' middle, likewise: over it they ask the active tier too (their cluster shares the DSU and MIF with the others).
 const A510_REST_KHZ: u32 = 955_000;
 static mut GOV: [Gov; 3] = [
-    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
-    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF0, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
-    Gov { domain: 2, opps: &A510_OPPS, cores: 0xF, level: 324_000, at: 0, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0 },
+    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
+    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF0, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
+    Gov { domain: 2, opps: &A510_OPPS, cores: 0xF, level: 324_000, at: 0, avg: 0, last: 0, sat: 0, idle: [0; 8], res: [0; 16], asks: 0, over: 0, under: 0, busy: false },
 ];
 /// Whether the governor runs (`diag clock gov on|off`; off, the X3 and the A715s follow the tier tables as before 2026-11-13).
 static GOV_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
@@ -2152,6 +2179,18 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         let rate = g.opps[g.at];
         // The rate that would leave the averaged share at 4/5: the running rate × the average × 5/4, in 256ths of the share.
         let want = (rate as u64 * g.avg as u64 * 5 >> 10) as u32;
+        // The busy lift (`GOV_BUSY_KHZ`, the A715s only): what the load asks against the calm ceiling, window by window; 2^`GOV_BUSY_HOLD` in a row over it begin the lift, as many at or under it end it.
+        if g.domain == 3 {
+            let hold = 1u64 << GOV_BUSY_HOLD.load(Relaxed);
+            let over = want > A715_CALM_KHZ && GOV_BUSY_KHZ.load(Relaxed) > A715_CALM_KHZ && !crate::thermal::throttled();
+            (g.over, g.under) = if over { (g.over + 1, 0) } else { (0, g.under + 1) };
+            let was = g.busy;
+            g.busy = if g.busy { g.under < hold } else { g.over >= hold };
+            unsafe {
+                GOV_BUSY_COUNTS[1] += (g.busy && !was) as u64;
+                GOV_BUSY_COUNTS[0] += (g.busy && !lifted) as u64;
+            }
+        }
         // A saturated window: the load wants more than this rate and how much more is unknown, so the level goes at least a step of the ramp past the rate (`GOV_RAMP` 2: a quarter, 500 MHz to the X3's top in eight windows; 0: double, in three).
         let ramp = rate + (rate >> ramp_s);
         let want = if g.sat != 0 && ramp > want { ramp } else { want };
@@ -2423,6 +2462,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
             }
             unsafe { TIER_RES = [0; 4] };
             unsafe { GOV_LIFTED = [0; 3] };
+            unsafe { GOV_BUSY_COUNTS = [0; 2] };
             unsafe { SHARED_LIFTS = 0 };
             unsafe { TIER_WHY = [0; TIER_CAUSES] };
             unsafe { TIER_RUNS = [[0; 12]; 4] };
@@ -2450,6 +2490,9 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"ramp"), Some(n)) => GOV_RAMP.store(n, Relaxed),
         (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
+        (Some(b"busy"), Some(n)) => GOV_BUSY_KHZ.store(n, Relaxed),
+        (Some(b"busyhold"), Some(n)) => GOV_BUSY_HOLD.store(n, Relaxed),
+        (Some(b"doze"), Some(n)) => DOZE_LOG2.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
         (Some(b"cam"), Some(n)) => CAM_HOLD.store(n, Relaxed),
         (Some(b"cammem"), _) => CAM_MEM.store(words.get(2) == Some(&&b"on"[..]), Relaxed),
@@ -2463,6 +2506,9 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let causes = lift_causes(cntpct(), f);
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
+    let a715 = &govs[1];
+    out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while their load asks over A#{} MHz for 2^A#{} windows in a row, until it asks at or under it as long; {} now (A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
+    out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
     out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
     let tr = unsafe { TIER_RES };
@@ -3320,7 +3366,9 @@ pub fn run(mut b: Boot) -> ! {
         }
         // Give one runnable process a time slice (it comes back at the latest when the slice timer fires), unless a command from the USB process waits: that runs first. `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
         platform::crumb(0xD1);
-        let ran = if !inbox_full { crate::process::run_slice() } else { false };
+        // Only when the queue holds a thread this core may run, a sleeper's deadline is due or a device line is pending (`run_slice` wakes their waiters, wherever they run: with every worker busy this core is the one that looks), or no worker is up (every thread is this core's); otherwise `run_slice` would take the lock to find nothing, which every worker's `sev` made it do (2026-11-19).
+        let for_here = for_this_core();
+        let ran = if !inbox_full && for_here { crate::process::run_slice() } else { false };
         platform::crumb(0xD2);
         // Dark and alone (the screen off, no worker up: every thread runs here and every interrupt comes here, the radio agent's routing): tickless (idle.rs). Woken by the next thread's deadline, the loop's own quarter-second duties (the watchdog's pet, the keys' check, the polls), a power window's sample, the UFS link's hibernate, and any interrupt.
         let dark_alone = !inbox_full && !ran && crate::idle::TICKLESS.load(core::sync::atomic::Ordering::Relaxed) && clock_state() == 3 && crate::smp::UP.load(core::sync::atomic::Ordering::Acquire) == 0;
@@ -3363,14 +3411,25 @@ pub fn run(mut b: Boot) -> ! {
                 backstop_ppi = true;
             }
             // Armed at the next sleeping thread's deadline when that is sooner (process::NEXT_WAKE), so deadlines land on time however slow the event stream: with the stream every 2.7 ms (bit 15, 15-25 mW under bit 12's 333 us with the screen off, 2026-10-25) a display waiting on its next flip would otherwise wake up to a stream period late.
-            let next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire);
-            let backstop = next.saturating_sub(cntpct()).clamp(cntfrq() / 20_000, cntfrq() / 500);
-            unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
+            // The doze (`DOZE_LOG2`): a wake that brings nothing for this core (another core's `sev` for its own queue) within 2^-n s of the sleep's start goes back to sleep without a pass.
+            // Measured 2026-11-19 (KERNEL.md "The service loop's lock holds"): under a Lumis save the eight workers' `sev`s woke this core about 4,800 times a second, and each wake ran a whole pass whose crumbs (a clean to DRAM and a barrier each) took 28 % of the X3, its lock holds 25 % before they were made lock-free.
+            // What a pass looks at that no check here sees (a claim, an on-demand server, a launch) waits at most the doze's 2^-9 s, under the event stream's period, so at rest nothing changes: every event-stream wake is past the bound and runs its pass.
+            let doze = cntfrq() >> DOZE_LOG2.load(core::sync::atomic::Ordering::Relaxed);
+            loop {
+                let next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire);
+                let w = cntpct();
+                let backstop = next.saturating_sub(w).clamp(cntfrq() / 20_000, cntfrq() / 500);
+                unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
+                if cntpct().wrapping_sub(w) > cntfrq() / 500 * 3 / 4 {
+                    BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                if DOZE_LOG2.load(core::sync::atomic::Ordering::Relaxed) == 0 || for_this_core() || crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed) || cntpct().wrapping_sub(t) >= doze {
+                    break;
+                }
+                X3_DOZES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             platform::crumb(0xB4);
             let slept = cntpct().wrapping_sub(t);
-            if slept > cntfrq() / 500 * 3 / 4 {
-                BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
             asleep += slept;
             X3_IDLE_TICKS.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
             X3_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3409,6 +3468,10 @@ pub fn run(mut b: Boot) -> ! {
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
         if proc_restore.is_some() {
+            continue;
+        }
+        // The lock only when the inbox says it holds a command (set with it under the lock): every pass took it before 2026-11-19, up to 4,800 a second under a Lumis save.
+        if !crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed) {
             continue;
         }
         let Some(proc_cmd) = crate::process::with_lock(crate::ptlink::take_inbox) else { continue };
@@ -4969,6 +5032,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"X3_SLEEPS=", X3_SLEEPS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                append_hex(&mut resp, b"X3_DOZES=", X3_DOZES.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                 append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                 // The watchdog window's measurement (platform::pet_watchdogs): the longest gap between two pets from any core, when it ended (uptime), and the pets so far.

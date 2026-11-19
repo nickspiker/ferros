@@ -452,9 +452,14 @@ pub static SLICES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::at
 pub static RUNNABLE_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// How many queued threads an A510 may run (`may_run`), readable without the lock: an idle A510 looks only when this is not zero (smp.rs), so with nothing pinned there the A510s never take the lock. Counted only while an A510 is up.
 pub static RUNNABLE_LITTLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// How many queued threads the kernel's core may run (`may_run`), readable without the lock: the service loop gives out a slice only when this is not zero or a sleeper's deadline is due (service.rs), so the passes a busy worker cluster's `sev`s start do not each take the lock for a run queue that holds nothing for it (2026-11-19: 4,800 such passes a second under a Lumis save, every one taking the lock in `run_slice`).
+/// Counted when the queue changes; a change of what a queued thread may run on that leaves the queue as it is (a `diag` switch, cores stopped) is seen at the queue's next change.
+pub static RUNNABLE_KERNEL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn runnable_sync() {
     let q = &k().runnable;
     RUNNABLE_N.store(q.len(), core::sync::atomic::Ordering::Release);
+    let km = kernel_mask();
+    RUNNABLE_KERNEL.store(q.iter().filter(|&&t| mask_of(t) & km != 0).count(), core::sync::atomic::Ordering::Release);
     let little = if cores_up() & MASK_LITTLE == 0 { 0 } else { q.iter().filter(|&&t| mask_of(t) & MASK_LITTLE != 0).count() };
     RUNNABLE_LITTLE.store(little, core::sync::atomic::Ordering::Release);
 }
@@ -4368,7 +4373,8 @@ fn buf_trap(f: &mut Frame, cur: usize, pi: usize, r: u64, b: BufFault, nr: u64, 
 
 /// Who switched each power switch on (a process's epoch; 0 none), and the switches whose owner ended with them on, waiting for the kernel's core (`power_offs_apply`). The owner's rule (2026-11-08): a process's end is one shot dead with no cleanup of its own, and the kernel turns off what it left on. A switch switched on again by another process before that is its, and stays on. Under the kernel lock.
 static mut POWER_OWNER: [u64; 16] = [0; 16];
-static mut POWER_OFF_PENDING: u32 = 0;
+/// Written under the kernel lock only; an atomic so the service loop can see that nothing waits without taking the lock (`power_offs_apply`).
+static POWER_OFF_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Switch `i` set by a process: on, owned by its epoch; off, owned by no one. Not the `android` switch: a launch request, not a power.
 fn power_owned(i: usize, epoch: u64) {
@@ -4377,7 +4383,7 @@ fn power_owned(i: usize, epoch: u64) {
     }
     unsafe {
         POWER_OWNER[i] = epoch;
-        POWER_OFF_PENDING &= !(1 << i);
+        POWER_OFF_PENDING.fetch_and(!(1 << i), core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4387,7 +4393,7 @@ fn power_orphaned(epoch: u64) {
         for i in 0..POWERS.len() {
             if POWER_OWNER[i] == epoch && epoch != 0 {
                 POWER_OWNER[i] = 0;
-                POWER_OFF_PENDING |= 1 << i;
+                POWER_OFF_PENDING.fetch_or(1 << i, core::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -4398,13 +4404,22 @@ pub fn power_offs_apply() {
     if 1u16 << core() != kernel_mask() {
         return;
     }
+    // Nothing waiting: no lock taken.
+    // Before 2026-11-19 every pass took the kernel lock once per switch (13), about 33,000 holds a second at the 2,500 passes a second of a Lumis save, and the X3 spent 36 % of its time waiting for and letting go of the lock here (`flame`, KERNEL.md "The service loop's lock holds").
+    // A bit is set only under the lock by a process's end; one set after this read is seen at the next pass, and one cleared after it (the switch taken again) is read again under the lock below.
+    let waiting = POWER_OFF_PENDING.load(core::sync::atomic::Ordering::Relaxed);
+    if waiting == 0 {
+        return;
+    }
     for i in 0..POWERS.len() {
+        if waiting >> i & 1 == 0 {
+            continue;
+        }
         // Taken under the lock; a switch in `SWITCH_UNLOCKED` switched with it let go (as SYS_POWER switches it, 2026-11-16). A process switching it on again can only do so on this core, so not before this returns: then it owns it and it stays on.
         let free = SWITCH_UNLOCKED.contains(&POWERS[i].name);
         // Whether it was pending, and a switch not in `SWITCH_UNLOCKED` switched under this same hold, as before.
-        let (pending, under) = with_lock(|| unsafe {
-            let p = POWER_OFF_PENDING >> i & 1 != 0;
-            POWER_OFF_PENDING &= !(1 << i);
+        let (pending, under) = with_lock(|| {
+            let p = POWER_OFF_PENDING.fetch_and(!(1 << i), core::sync::atomic::Ordering::Relaxed) >> i & 1 != 0;
             (p, (p && !free).then(|| (POWERS[i].set)(false)))
         });
         let done = if pending && free { Some((POWERS[i].set)(false)) } else { under };
@@ -7650,6 +7665,7 @@ pub fn seal_ok(sealed: &[u8], developer: &[u8; 32], hp: &[u8; 32], m: &crate::or
                 let q = unsafe { &mut *(&raw mut SEAL_MOVES) };
                 if !q.iter().any(|e| e.0 == old) {
                     q.push((old, new));
+                    QUEUED.fetch_or(QUEUED_SEALS, core::sync::atomic::Ordering::Relaxed);
                 }
             });
             Ok(())
@@ -7660,7 +7676,13 @@ pub fn seal_ok(sealed: &[u8], developer: &[u8; 32], hp: &[u8; 32], m: &crate::or
 
 /// The seal moves queued since the last look (`seal_ok`), for the service loop to write. Takes the kernel lock.
 pub fn seal_moves() -> Vec<([u8; 32], [u8; 32])> {
-    with_lock(|| core::mem::take(unsafe { &mut *(&raw mut SEAL_MOVES) }))
+    if QUEUED.load(core::sync::atomic::Ordering::Relaxed) & QUEUED_SEALS == 0 {
+        return Vec::new();
+    }
+    with_lock(|| {
+        QUEUED.fetch_and(!QUEUED_SEALS, core::sync::atomic::Ordering::Relaxed);
+        core::mem::take(unsafe { &mut *(&raw mut SEAL_MOVES) })
+    })
 }
 
 /// Spawn a signed capsule: it must pass the gate (oracle.rs); the oracle's ihi is written into the process's arc at `IHI` and the kernel keeps no copy. Then as `spawn`.
@@ -7796,6 +7818,11 @@ pub struct KistLaunch {
 }
 /// One launch at a time: the service loop streams one capsule through the kernel's channel at once. Under the kernel lock.
 static mut KIST_LAUNCH: Option<KistLaunch> = None;
+/// Whether a launch, a stow or a seal move waits (bits `QUEUED_LAUNCH`, `QUEUED_STOW`, `QUEUED_SEALS`): set under the kernel lock with the queue, read without it by the service loop, which takes the lock only when its bit is set (2026-11-19: the three takes held the lock three times a pass, at up to 4,800 passes a second under a Lumis save).
+pub static QUEUED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const QUEUED_LAUNCH: u32 = 1 << 0;
+const QUEUED_STOW: u32 = 1 << 1;
+const QUEUED_SEALS: u32 = 1 << 2;
 /// A launch being streamed by the service loop, by name: a second ask for it is "already starting" (NOTHING), as for a live one.
 static mut KIST_STARTING: Vec<u8> = Vec::new();
 
@@ -7892,6 +7919,7 @@ fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
         return NOTHING;
     }
     *slot = Some(KistLaunch { name, capsule: capsule[..].try_into().unwrap(), codes });
+    QUEUED.fetch_or(QUEUED_LAUNCH, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("sev") };
     0
 }
@@ -7903,7 +7931,11 @@ pub fn any_dying() -> bool {
 
 /// The service loop takes the waiting launch, marking its name as starting until `kist_done`.
 pub fn kist_take() -> Option<KistLaunch> {
+    if QUEUED.load(core::sync::atomic::Ordering::Relaxed) & QUEUED_LAUNCH == 0 {
+        return None;
+    }
     with_lock(|| {
+        QUEUED.fetch_and(!QUEUED_LAUNCH, core::sync::atomic::Ordering::Relaxed);
         let l = unsafe { (*(&raw mut KIST_LAUNCH)).take() }?;
         unsafe { *(&raw mut KIST_STARTING) = l.name.clone() };
         Some(l)
@@ -8272,13 +8304,20 @@ fn stow_request(p: &Process, pi: usize, req: &[u8], native_ok: bool) -> u64 {
     // The word inside the caller's own arc, as `SYS_WAIT` finds it: aligned, and refused outside the arc.
     let Some(word) = p.word(off) else { return refuse("the word is outside the caller's arc") };
     *slot = Some(KistStow { capsule: req[..32].try_into().unwrap(), native_ok, proc: pi, epoch: p.epoch, word });
+    QUEUED.fetch_or(QUEUED_STOW, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("sev") };
     0
 }
 
 /// The service loop takes the waiting stow (after any launch).
 pub fn stow_take() -> Option<KistStow> {
-    with_lock(|| unsafe { (*(&raw mut KIST_STOW)).take() })
+    if QUEUED.load(core::sync::atomic::Ordering::Relaxed) & QUEUED_STOW == 0 {
+        return None;
+    }
+    with_lock(|| {
+        QUEUED.fetch_and(!QUEUED_STOW, core::sync::atomic::Ordering::Relaxed);
+        unsafe { (*(&raw mut KIST_STOW)).take() }
+    })
 }
 
 /// The stower told a stage: `stage` in bits 56-63, `value` below (the bytes read, or the reason), written into its word and every thread of it waiting there woken. Nothing when the process has ended (its slot empty or a successor's).
