@@ -403,11 +403,15 @@ enum Opened {
 
 /// The camera list as Lumis's menu takes it: each camera at the binning Lumis integrates it at, Camera2's conventions where Lumis's code reads them.
 /// The optical facts (sensor size, focal length, aperture) come from the driver's list since 2026-11-17 (owner: "Missing lens stats on the Lumis page"), so the menu draws each sensor and its field of view.
+/// The menu's entries, one per readout (`list`'s order, which `StartCamera` indexes): a camera's readouts share its group (its `id`), the first carrying the group's size, as Android's Lumis groups a lens's capture modes; each says the widest readout's width as the pixel array's, so the page's pixel size is the sensor's, and the 1:1 readout is `max_res` (Android's maximum resolution).
 fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
     cameras
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
+            let group = cameras.iter().filter(|o| o.id == c.id);
+            let first = cameras.iter().position(|o| o.id == c.id) == Some(index);
+            let (modes, widest) = group.fold((0u32, 0u32), |(n, w), o| (n + 1, w.max(o.width)));
             let Some(bayer) = camera::bayer_pattern(c.cfa) else {
                 println!("lumis: camera {} has a colour filter Lumis does not read (G#{:02X}); left out", c.name, c.cfa);
                 return None;
@@ -436,10 +440,10 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 // Shown as "RAW": full manual control of a raw stream.
                 hardware_level: 1,
                 sensor_orientation: c.rotation as i32 * 90,
-                pixel_array_width: c.width,
-                mode_count: 1,
-                group_id: -1,
-                max_res: false,
+                pixel_array_width: widest,
+                mode_count: if first { modes } else { 1 },
+                group_id: c.id as i32,
+                max_res: c.mode != 0,
                 is_cropped: false,
                 has_cal: false,
             })
@@ -489,9 +493,15 @@ fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
         ask.extend_from_slice(&camera::slit_block());
         // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
         ask.push(0);
-    } else if knobs & DEV_COPY != 0 {
+    } else if knobs & DEV_COPY != 0 && cam.mode == 0 {
         ask.truncate(2);
         println!("lumis: camera {}: the open asks for frames by copy (no view)", cam.name);
+    } else if cam.mode != 0 {
+        // A readout of its own (the 1:1 full resolution): its kind and the rest the driver's (its frame and integration the replayed init's), written back by the view (MAP only: the driver gives no copy at 1:1).
+        ask.push(cam.mode);
+        ask.resize(3 + camera::MODE_BLOCK, 0);
+        ask.push(if dev_knobs2() & DEV_UNCACHED != 0 { 0 } else { camera::OPEN_VIEW_CACHED });
+        println!("lumis: camera {}: the open asks for readout {} ({} x {})", cam.name, cam.mode, cam.width, cam.height);
     } else {
         if !block.is_empty() {
             println!("lumis: camera {}: the open asks for the mode block G#{}", cam.name, block.iter().map(|b| format!("{b:02X}")).collect::<String>());
@@ -532,6 +542,7 @@ fn open(cam: &camera::Camera, slit: bool) -> Result<Source, Refused> {
         }
         Some(v) => Err(Refused::Why(format!("the view's format {} is not one Lumis reads", v.format))),
         None if slit => Err(Refused::NoSlit),
+        None if cam.mode != 0 => Err(Refused::Why(format!("no view for readout {}: it is read in place only", cam.mode))),
         None => {
             println!("lumis: camera {}: no view; frames by copy at bin {BIN}", cam.name);
             // A frame's reply: the header and up to 8 MiB of samples (REPLY_MAX).
@@ -565,7 +576,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
         let shutter_ns = (1_000_000_000u64 >> 11) << (2 * ((dev_knobs2() >> DEV_SLIT_SHUTTER) & 3));
         println!("lumis: camera {}: development: the shutter {shutter_ns} ns", cam.name);
-        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0 }
+        camera::FrameHeader { count: 0, width: cam.width as usize, height: cam.height as usize, bin: 1, cfa: cam.cfa, black: cam.black as u16, white: cam.white as u16, exposure_ns: shutter_ns, gain: camera::GAIN_UNITY, focus: cam.focus_min, time: 0, cfa_period: cam.cfa_period }
     } else {
         let Some(Got::Frame(first, _)) = src.next(&mut turns) else {
             return fail("no first frame".into());
@@ -640,7 +651,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
     let mut quiet: Option<[u64; 2]> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
-    let mut slit_ok = knobs & DEV_COPY == 0;
+    let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
@@ -793,7 +804,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sweep_frames += 1;
         }
         let (iso, shutter_ns, focus) = match got {
-            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., false),
+            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
+            // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
             Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
             Got::Slit { rows, .. } => integrator.process_slit(&rows, rows.rows, sent.0, sent.1, sent.2),
@@ -1368,8 +1380,10 @@ fn list() -> Vec<camera::Camera> {
         return Vec::new();
     }
     match camera::parse_list(&r[..n as usize]) {
-        Ok(c) => {
-            println!("lumis: {} cameras listed", c.len());
+        Ok(mut c) => {
+            // Each camera's readouts together, the binned one first (Android's order: the menu shows a lens by its first readout and offers the rest on its page).
+            c.sort_by_key(|c| (c.id, c.mode));
+            println!("lumis: {} readouts listed", c.len());
             c
         }
         Err(e) => {
