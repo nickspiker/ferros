@@ -1,15 +1,15 @@
-//! basecalc's dial (owner, 2026-11-18: "Think single layer, Warrington or combined wire rope patterns. How many buttons we want How can we tessellate/honeycomb it?" then "Go!"): the puck's keys as a Seale strand, a core and two rings of n, n the base.
+//! basecalc's dial (owner, 2026-11-18: "Think single layer, Warrington or combined wire rope patterns", then "forgot about the middle being the actual readout... I like the staggered two row. Let's go for an optimized warrington so it should be fairly even on the two rows").
 //!
-//! - **The strand.** The display is the core; an inner ring of n smaller keys touches it and each other; an outer ring of n larger keys sits in the inner ring's valleys, touching two inner keys, each other and the puck's rim (`seale`). n is the base from 10 to 16 (the dozenal dial is 1 + 12 + 12).
-//! - **The cells.** Every pixel belongs to the key whose circle it is nearest by power (|p − c|² − r²: a power diagram, the honeycomb keyboard's nearest-centre rule with each key's own size, so two touching keys meet exactly where their circles touch), the core's pixels to the display, the whole clipped by the rim. A key's cell is drawn with a C¹ edge a gutter's width inside its boundary, and a tap is the cell it lands in: drawing and hitting share one rule.
-//! - **The outer ring** holds the base's digits, 0 at the top and clockwise, so the dial shows the base itself. A base above the ring's count pages its digits (the last cell).
-//! - **The inner ring** holds the arithmetic (layer 0); Shift pages it through the rest of basecalc (its functions, constants, the complex keys and the settings), Shift, = and ⌫ staying where they are.
-//! - **The base** follows the device's (Settings, Units: arabic, dozenal or hex) until the settings layer overrides it; following comes back by its key.
+//! - **The strand.** The readout is the core; around it an inner row of n keys and an outer row of 2n staggered by half a key: every other outer key sits over an inner key, the ones between over its seams (a Warrington strand's large and small outer wires). n is the base from 10 to 16: the dozenal dial is 1 + 12 + 24, 36 keys.
+//! - **Optimized to even.** The keys are annular cells, drawn and hit as their regions, so evenness is area: the rows' boundary lies where the inner row holds a third of the ring (m² = c² + (1 − c²)/3), so all 3n keys have the same area; the readout's radius (1/4 + n/64 of the puck's) keeps the inner keys about as deep as they are wide.
+//! - **The keys.** The outer row's keys over the inner ones are the base's digits, 0 at the top and clockwise, so the dial shows its base; the keys between them the arithmetic. The inner row holds Shift (top), AC, = (bottom) and del, its other keys paging thru the rest of basecalc (functions, inverses and parts, constants, the complex keys, the settings) at each Shift.
+//! - **The readout.** A tap there copies the value (owner: "tapping in the middle should copy to clipboard"; the clipboard is a capability handed on a gesture and only partly built, so it is said for now).
+//! - **The words** are ferros's face (ferros_glyphs, Oxanium with tatau's dozenal digits at G#10-G#1B), so a dozenal digit is its own glyph (owner: "use the lower control set of ascii, not 0-B").
+//! - **The base** follows the device's until the settings keys override it; following comes back by its key.
 
 use basecalc_kist::keys::{self, Key, Unit};
-use fluor::canvas::Canvas;
+use ferros_glyphs::Glyphs;
 use fluor::pixel::{Blend, BlendMode, G2t16, Pixel};
-use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme::{dark, fmt, vsf};
 
 /// An authored VSF RGB g2t colour, opaque, as fluor stores it (α and darkness, 8 bits).
@@ -33,47 +33,51 @@ const INK_ERROR: u32 = colour(0x00_D8_40_38);
 pub enum Act {
     /// A key of the calculator itself.
     Calc(Key),
-    /// One bracket key for both (the decimal dial, ten keys a ring): opens, or closes when more are open than closed and a value ends the expression.
-    Paren,
-    /// The inner ring's next layer.
+    /// The inner row's next layer.
     Shift,
     /// The next of the quick bases (2, 8, 10, 12, 16, 36), overriding the device's.
     BaseNext,
     /// Following the device's base again.
     BaseDevice,
-    /// The outer ring's next page of digits (a base above the ring's count).
+    /// The next page of digits (a base past the row's count).
     DigitPage,
-    /// Nothing (a cell past the base's digits).
+    /// The readout: copy its value.
+    Copy,
+    /// Nothing (a cell past the base's digits, or a layer's last cells).
     None,
 }
 
-/// The arithmetic layer before its fixed keys, in the order they are wanted when a ring is short (the dozenal ring takes the first nine).
-const ARITH: [Act; 13] = [
-    Act::Calc(Key::Write(keys::OPEN)),
-    Act::Calc(Key::Write(keys::CLOSE)),
+/// The keys between the digits on the outer row, in order of want (the row takes the first n).
+const BETWEEN: [Act; 16] = [
     Act::Calc(Key::Write(keys::ADD)),
     Act::Calc(Key::Write(keys::SUB)),
     Act::Calc(Key::Write(keys::MUL)),
     Act::Calc(Key::Write(keys::DIV)),
+    Act::Calc(Key::Write(keys::OPEN)),
+    Act::Calc(Key::Write(keys::CLOSE)),
     Act::Calc(Key::Write(keys::POW)),
     Act::Calc(Key::Write(keys::POINT)),
-    Act::Calc(Key::Clear),
     Act::Calc(Key::Write(keys::MOD)),
     Act::Calc(Key::Write(keys::LOGB)),
     Act::Calc(Key::Write(keys::PREV)),
     Act::Calc(Key::Square),
+    Act::Calc(Key::Write(keys::SQRT)),
+    Act::Calc(Key::Write(keys::RECIP)),
+    Act::Calc(Key::Write(keys::PI)),
+    Act::Calc(Key::Write(keys::E)),
 ];
 
-/// Everything else basecalc has, paged across the inner ring by Shift: its functions, inverses and parts, constants, the complex keys, then the settings.
-const MORE: [Act; 39] = [
+/// Everything basecalc has, paged on the inner row by Shift; a key the outer row already holds is left out.
+const MORE: [Act; 44] = [
     Act::Calc(Key::Write(keys::SIN)),
     Act::Calc(Key::Write(keys::COS)),
     Act::Calc(Key::Write(keys::TAN)),
     Act::Calc(Key::Write(keys::LN)),
     Act::Calc(Key::Write(keys::LOG)),
     Act::Calc(Key::Write(keys::SQRT)),
+    Act::Calc(Key::Write(keys::PI)),
+    Act::Calc(Key::Write(keys::E)),
     Act::Calc(Key::Write(keys::ABS)),
-    Act::Calc(Key::Write(keys::LOGB)),
     Act::Calc(Key::Write(keys::RECIP)),
     Act::Calc(Key::Write(keys::ASIN)),
     Act::Calc(Key::Write(keys::ACOS)),
@@ -85,21 +89,25 @@ const MORE: [Act; 39] = [
     Act::Calc(Key::Write(keys::FRAC)),
     Act::Calc(Key::Write(keys::SIGN)),
     Act::Calc(Key::Write(keys::ERF)),
-    Act::Calc(Key::Write(keys::PI)),
-    Act::Calc(Key::Write(keys::E)),
     Act::Calc(Key::Write(keys::PHI)),
     Act::Calc(Key::Write(keys::GAMMA)),
     Act::Calc(Key::Write(keys::CATALAN)),
     Act::Calc(Key::Write(keys::RAND)),
     Act::Calc(Key::Write(keys::GRAND)),
-    Act::Calc(Key::Write(keys::PREV)),
     Act::Calc(Key::Write(keys::I)),
     Act::Calc(Key::Write(keys::CPLX_OPEN)),
     Act::Calc(Key::Write(keys::CPLX_COMMA)),
     Act::Calc(Key::Write(keys::CPLX_CLOSE)),
+    Act::Calc(Key::Write(keys::RE)),
+    Act::Calc(Key::Write(keys::IM)),
+    Act::Calc(Key::Write(keys::ARG)),
     Act::Calc(Key::Write(keys::MOD)),
+    Act::Calc(Key::Write(keys::LOGB)),
+    Act::Calc(Key::Write(keys::PREV)),
     Act::Calc(Key::Square),
-    Act::Calc(Key::Clear),
+    Act::Calc(Key::Write(keys::POW)),
+    Act::Calc(Key::Write(keys::OPEN)),
+    Act::Calc(Key::Write(keys::CLOSE)),
     Act::Calc(Key::Angle),
     Act::Calc(Key::Fewer),
     Act::Calc(Key::More),
@@ -110,145 +118,142 @@ const MORE: [Act; 39] = [
 /// The quick bases the settings layer steps thru.
 pub const QUICK: [u8; 6] = [2, 8, 10, 12, 16, 36];
 
-/// A Seale strand of n around a core in a circle of radius 1: (the core's radius, the inner keys' ring radius and radius, the outer keys' ring radius and radius). The outer keys touch each other and the rim (b = d₂ sin(π/n), d₂ + b = 1); the inner keys touch each other (a = d₁ sin(π/n)) and the outer ones (a + b = |c₁ − c₂| across the half step), solved for d₁ by bisection; the core touches the inner keys.
-pub fn seale(n: usize) -> (f32, f32, f32, f32, f32) {
-    let (s, c) = (f32::sin(core::f32::consts::PI / n as f32), f32::cos(core::f32::consts::PI / n as f32));
-    let d2 = 1. / (1. + s);
-    let b = s * d2;
-    let (mut lo, mut hi) = (0f32, d2);
-    for _ in 0..1 << 6 {
-        let mid = (lo + hi) * 0.5;
-        let a = mid * s;
-        if (a + b) * (a + b) > mid * mid + d2 * d2 - 2. * mid * d2 * c { hi = mid } else { lo = mid }
-    }
-    (lo * (1. - s), lo, lo * s, d2, b)
-}
-
-/// A key on the dial: its centre and radius (unit circle, y down), what it does, and which ring.
-#[derive(Clone, Copy)]
-pub struct Site {
-    pub x: f32,
-    pub y: f32,
-    pub r: f32,
-    pub act: Act,
-    pub outer: bool,
-}
-
-/// The dial for a base and a layer: the core's radius and every key.
-pub struct Dial {
-    pub n: usize,
-    pub core: f32,
-    pub sites: Vec<Site>,
-    /// How many layers Shift steps thru.
-    pub layers: usize,
-}
-
-/// The ring's count for a base: the base itself from 10 to 16 (the dial is its base); a smaller base keeps ten cells (its digits and blank ones), a larger one sixteen with its digits paged. The bounds are the design's (a ring of fewer than ten leaves the arithmetic no room, one of more than sixteen makes keys too small to hit), not a guard.
+/// The row's count for a base: the base itself from 10 to 16 (the dial is its base); a smaller base keeps ten (its digits and blank keys), a larger one sixteen with its digits paged. The bounds are the design's (fewer than ten leaves the arithmetic no room, more than sixteen makes keys too small to hit), not a guard.
 pub fn ring_of(base: u8) -> usize {
     (base as usize).clamp(10, 16)
+}
+
+/// The dial for a base, a layer and a page of digits.
+pub struct Dial {
+    pub n: usize,
+    /// The readout's radius and the rows' boundary, of the puck's radius.
+    pub core: f32,
+    pub mid: f32,
+    /// The inner row (n keys, key k centred k/n of a turn from the top, clockwise) and the outer row (2n, key j centred j/2n).
+    pub inner: Vec<Act>,
+    pub outer: Vec<Act>,
+    /// How many layers Shift steps thru.
+    pub layers: usize,
 }
 
 impl Dial {
     pub fn new(base: u8, layer: usize, page: usize) -> Dial {
         let n = ring_of(base);
-        let (core, d1, a, d2, b) = seale(n);
-        let step = core::f32::consts::TAU / n as f32;
-        let mut sites = Vec::with_capacity(2 * n);
-        // The outer ring: digits from the top, clockwise; a base past the ring pages them, its last cell turning the page.
+        let core = 0.25 + n as f32 / 64.;
+        let mid = f32::sqrt(core * core + (1. - core * core) / 3.);
+        // The outer row: the digits on the keys over the inner ones (even j), a base past the row paging them with its last such key; the arithmetic between.
         let paged = base as usize > n;
         let per = if paged { n - 1 } else { n };
-        for k in 0..n {
-            let t = k as f32 * step;
-            let act = if paged && k == n - 1 {
-                Act::DigitPage
-            } else {
-                let d = page * per + k;
-                if d < base as usize { Act::Calc(Key::Digit(d as u8)) } else { Act::None }
-            };
-            sites.push(Site { x: d2 * f32::sin(t), y: -d2 * f32::cos(t), r: b, act, outer: true });
-        }
-        // The inner ring, half a step round (in the outer ring's valleys): Shift at the top, = at the bottom, ⌫ after it, the layer's keys round the rest.
-        let fixed = 3;
-        let free = n - fixed;
-        let layers = 1 + MORE.len().div_ceil(free);
-        let mut acts: Vec<Act> = if layer == 0 {
-            let mut v: Vec<Act> = ARITH.iter().copied().take(free).collect();
-            // Ten keys a ring: one bracket key for both, and ^ in the room the other bracket leaves.
-            if n == 10 {
-                v.retain(|a| *a != Act::Calc(Key::Write(keys::CLOSE)));
-                v[0] = Act::Paren;
-                v.push(ARITH[6]);
-                v.dedup();
-                v.truncate(free);
-            }
-            v
-        } else {
-            MORE.iter().copied().skip((layer - 1) * free).take(free).collect()
-        };
-        acts.resize(free, Act::None);
+        let outer: Vec<Act> = (0..2 * n)
+            .map(|j| {
+                let k = j / 2;
+                if j % 2 == 1 {
+                    BETWEEN[k]
+                } else if paged && k == n - 1 {
+                    Act::DigitPage
+                } else {
+                    let d = page * per + k;
+                    if d < base as usize { Act::Calc(Key::Digit(d as u8)) } else { Act::None }
+                }
+            })
+            .collect();
+        // The inner row: Shift at the top, = at the bottom with AC before it and del after it, the layer's keys round the rest.
+        let pool: Vec<Act> = MORE.iter().copied().filter(|a| !outer.contains(a)).collect();
+        let free = n - 4;
+        let layers = pool.len().div_ceil(free);
+        let mut it = pool.into_iter().skip(layer % layers * free);
         let bottom = n / 2;
-        let mut ring = Vec::with_capacity(n);
-        let mut it = acts.into_iter();
-        for k in 0..n {
-            ring.push(if k == 0 {
-                Act::Shift
-            } else if k == bottom {
-                Act::Calc(Key::Equals)
-            } else if k == bottom + 1 {
-                Act::Calc(Key::Back)
-            } else {
-                it.next().unwrap_or(Act::None)
-            });
-        }
-        for (k, act) in ring.into_iter().enumerate() {
-            let t = (k as f32 + 0.5) * step;
-            sites.push(Site { x: d1 * f32::sin(t), y: -d1 * f32::cos(t), r: a, act, outer: false });
-        }
-        Dial { n, core, sites, layers }
+        let inner = (0..n)
+            .map(|k| {
+                if k == 0 {
+                    Act::Shift
+                } else if k == bottom - 1 {
+                    Act::Calc(Key::Clear)
+                } else if k == bottom {
+                    Act::Calc(Key::Equals)
+                } else if k == bottom + 1 {
+                    Act::Calc(Key::Back)
+                } else {
+                    it.next().unwrap_or(Act::None)
+                }
+            })
+            .collect();
+        Dial { n, core, mid, inner, outer, layers }
     }
 
-    /// The key a point of the unit circle belongs to (its power-diagram cell), None in the display or past the rim.
+    /// The key at a point of the unit circle (y down, the dial upright): Copy in the readout, None past the rim.
     pub fn hit(&self, x: f32, y: f32) -> Option<Act> {
-        if x * x + y * y > 1. {
+        let r = f32::sqrt(x * x + y * y);
+        if r > 1. {
             return None;
         }
-        let core = x * x + y * y - self.core * self.core;
-        let (k, p) = self.nearest(x, y);
-        (p < core).then(|| self.sites[k].act)
+        if r < self.core {
+            return Some(Act::Copy);
+        }
+        let (outer, k) = self.cell(r, turn_of(x, y));
+        Some(if outer { self.outer[k] } else { self.inner[k] })
     }
 
-    /// The site nearest a point by power, and that power.
-    fn nearest(&self, x: f32, y: f32) -> (usize, f32) {
-        let mut best = (0, f32::MAX);
-        for (k, s) in self.sites.iter().enumerate() {
-            let p = (x - s.x) * (x - s.x) + (y - s.y) * (y - s.y) - s.r * s.r;
-            if p < best.1 {
-                best = (k, p);
-            }
-        }
-        best
+    /// The cell at radius r and turn t: its row (true for the outer) and its key.
+    fn cell(&self, r: f32, t: f32) -> (bool, usize) {
+        let outer = r >= self.mid;
+        let count = if outer { 2 * self.n } else { self.n };
+        // Key k spans half a key either side of k/count: shifted by half a key, the floor is the key (t below 1, so the sum is below count + 1/2 and only count itself wraps).
+        let k = (t * count as f32 + 0.5) as usize;
+        (outer, if k == count { 0 } else { k })
+    }
+}
+
+/// A point's turn from the top, clockwise, in [0, 1).
+fn turn_of(x: f32, y: f32) -> f32 {
+    let t = f32::atan2(x, -y) * (1. / core::f32::consts::TAU);
+    if t < 0. { t + 1. } else { t }
+}
+
+/// Digits as ferros's face draws them: in base 12, tatau's twelve glyphs at G#10-G#1B (owner: "use the lower control set of ascii, not 0-B"); every other base as basecalc writes them. For digit runs only (a function's name keeps its letters).
+pub fn digits(s: &str, base: u8) -> String {
+    if base != 12 {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '0'..='9' => char::from(c as u8 - b'0' + 0x10),
+            'A' => '\u{1A}',
+            'B' => '\u{1B}',
+            _ => c,
+        })
+        .collect()
+}
+
+/// A unit's label in the characters ferros's face has (Oxanium has no superscript n, subscript n, phi or gamma).
+pub fn label(u: Unit) -> &'static str {
+    match u.text {
+        "^" => "x^y",
+        "$" => "logb",
+        "@phi" => "phi",
+        "@gamma" => "gamma",
+        _ => u.label,
     }
 }
 
 /// A key's face and its body's colour.
 fn face(act: Act, base: u8, layer: usize, radians: bool, following: bool) -> (String, u32) {
     match act {
-        Act::Calc(Key::Digit(d)) => (keys::digit_char(d).to_string(), DIGIT),
+        Act::Calc(Key::Digit(d)) => (digits(&keys::digit_char(d).to_string(), base), DIGIT),
         Act::Calc(Key::Equals) => ("=".into(), EQUALS),
-        Act::Calc(Key::Back) => ("\u{232b}".into(), CONTROL),
+        Act::Calc(Key::Back) => ("del".into(), CONTROL),
         Act::Calc(Key::Clear) => ("AC".into(), CONTROL),
         Act::Calc(Key::Angle) => ((if radians { "rad" } else { "deg" }).into(), CONTROL),
         Act::Calc(Key::Fewer) => ("\u{2212}dig".into(), CONTROL),
         Act::Calc(Key::More) => ("+dig".into(), CONTROL),
-        Act::Calc(Key::Write(u)) => (u.label.into(), kind_colour(u)),
+        Act::Calc(Key::Write(u)) => (label(u).into(), kind_colour(u)),
         Act::Calc(k) => (k.label(), FUNCTION),
-        Act::Paren => ("( )".into(), OPERATOR),
         // WHY the floor on the base: the layer is written in the base in use, and a base under 2 has no digits (never: the engine holds 2 to 36).
-        Act::Shift => (if layer == 0 { "\u{21e7}".into() } else { format!("\u{21e7}{}", keys::in_base(layer, base.max(2))) }, if layer == 0 { CONTROL } else { SHIFTED }),
+        Act::Shift => (if layer == 0 { "\u{2191}".into() } else { format!("\u{2191}{}", digits(&keys::in_base(layer, base.max(2)), base)) }, if layer == 0 { CONTROL } else { SHIFTED }),
         Act::BaseNext => (keys::base_label(base), if following { CONTROL } else { SHIFTED }),
         Act::BaseDevice => ("dev#".into(), if following { SHIFTED } else { CONTROL }),
         Act::DigitPage => ("\u{2026}".into(), CONTROL),
-        Act::None => (String::new(), GROUND),
+        Act::Copy | Act::None => (String::new(), GROUND),
     }
 }
 
@@ -272,7 +277,13 @@ fn edge(d: f32) -> f32 {
     }
 }
 
-/// What the display shows: the expression above, the value large, its base under.
+/// A smooth minimum of two distances, `−k·ln(e^(−a/k) + e^(−b/k))` (C∞): rounds a cell's corners by about k with no kink where the nearer edge changes.
+fn soft_min(a: f32, b: f32, k: f32) -> f32 {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    lo - k * f32::ln(1. + f32::exp((lo - hi) / k))
+}
+
+/// What the readout shows, every digit already in ferros's glyphs (`digits`).
 pub struct Screen<'a> {
     pub expr: &'a str,
     pub value: &'a str,
@@ -281,79 +292,89 @@ pub struct Screen<'a> {
     pub base: u8,
     pub radians: bool,
     pub following: bool,
+    /// The readout was tapped (its value copied) since the last key.
+    pub copied: bool,
 }
 
-/// The dial into `px`, a square `d` pixels a side (cleared), upright: front to back, the words first (the display's, then each key's face), then each cell under them, then the ground.
-pub fn paint(px: &mut [G2t16], d: usize, dial: &Dial, layer: usize, screen: &Screen, text: &mut TextRenderer, damage: &mut fluor::canvas::Damage) {
-    let r_px = d as f32 * 0.5;
-    let to_px = |v: f32| r_px + v * r_px;
-    {
-        let mut canvas = Canvas::new(&mut px[..d * d], d, d, damage);
-        // The display in the core: the expression small over the value, the base under, each fitted to the core's chord where it sits.
-        let core = dial.core * r_px;
-        let mut fit = |s: &str, size: f32, y: f32, ink: u32| {
-            if s.is_empty() {
-                return;
-            }
-            // WHY the floors: a line placed past the core (y beyond its radius) has no chord, the root of a negative; a string with no advance would give a width of 0 to divide by.
-            let chord = 2. * f32::sqrt((core * core - y * y).max(0.)) * 0.86;
-            let w = text.measure_text(s, &TextStyle::new(size, ink)).max(1.);
-            let sz = if w > chord { size * chord / w } else { size };
-            text.draw_text_center(&mut canvas, s, r_px, r_px + y, &TextStyle::new(sz, ink), None, None);
-        };
-        fit(screen.expr, core * 0.22, -core * 0.42, INK_DIM);
-        fit(screen.value, core * 0.38, 0., if screen.error { INK_ERROR } else if screen.dim { INK_DIM } else { INK });
-        let under = format!("{}{}", keys::base_label(screen.base), if screen.following { "" } else { " \u{2022}" });
-        fit(&under, core * 0.16, core * 0.5, INK_DIM);
-        let _ = screen.radians;
-        // Each key's face at its centre, as large as its circle allows.
-        for s in &dial.sites {
-            let (label, _) = face(s.act, screen.base, layer, screen.radians, screen.following);
-            if label.is_empty() {
-                continue;
-            }
-            let room = s.r * r_px * 1.5;
-            let size = s.r * r_px * if s.outer { 0.9 } else { 0.8 };
-            // WHY the floor: a face with no advance would give a width of 0 to divide by.
-            let w = text.measure_text(&label, &TextStyle::new(size, INK)).max(1.);
-            let sz = if w > room { size * room / w } else { size };
-            text.draw_text_center(&mut canvas, &label, to_px(s.x), to_px(s.y), &TextStyle::new(sz, INK), None, None);
+/// Words centred on (cx, cy) in ferros's face under what is there, `size` pixels, shrunk to `room` wide if wider.
+fn words(px: &mut [G2t16], d: usize, g: &mut Glyphs, s: &str, cx: f32, cy: f32, size: f32, room: f32, ink: G2t16) {
+    if s.is_empty() {
+        return;
+    }
+    // WHY the floor: words with no advance in the face would give a width of 0 to divide by.
+    let w = g.width(s, size).max(1.);
+    let size = if w > room { size * room / w } else { size };
+    let w = g.width(s, size);
+    let di = d as i64;
+    g.cover(s, cx - w * 0.5, cy + size * 0.36, size, (1., 0.), |x, y, a| {
+        // WHY the bounds: a glyph's pixels come from its outline, and words near the rim can reach past the square.
+        if x >= 0 && y >= 0 && x < di && y < di {
+            let i = y as usize * d + x as usize;
+            px[i] = px[i].under(G2t16::from_cov(ink, a), BlendMode::Normal);
+        }
+    });
+}
+
+/// The dial into `px`, a square `d` pixels a side (cleared), upright: front to back, the words first (the readout's, then each key's face), then each cell under them, then the ground.
+pub fn paint(px: &mut [G2t16], d: usize, dial: &Dial, layer: usize, screen: &Screen, g: &mut Glyphs) {
+    let rp = d as f32 * 0.5;
+    let n = dial.n;
+    let tau = core::f32::consts::TAU;
+    let base = screen.base;
+    let (ink, dim, error) = (G2t16::from_g2t8(INK), G2t16::from_g2t8(INK_DIM), G2t16::from_g2t8(INK_ERROR));
+    // The readout: the expression small above the value, the base (a dot when overridden) or "copied" under it, each fitted to the core's chord where it sits.
+    let core = dial.core * rp;
+    // WHY the floor: a line's height is inside the core by these fractions, so the root's argument stays positive; the floor only spares a NaN if a fraction is ever changed past the core.
+    let chord = |y: f32| 2. * f32::sqrt((core * core - y * y).max(0.)) * 0.86;
+    words(px, d, g, screen.expr, rp, rp - core * 0.45, core * 0.2, chord(core * 0.55), dim);
+    words(px, d, g, screen.value, rp, rp, core * 0.36, chord(core * 0.2), if screen.error { error } else if screen.dim { dim } else { ink });
+    let under = if screen.copied { "copied".to_string() } else { format!("{}{}", keys::base_label(base), if screen.following { "" } else { " \u{2022}" }) };
+    words(px, d, g, &under, rp, rp + core * 0.5, core * 0.15, chord(core * 0.6), dim);
+    // Each key's face at its cell's middle, as big as the cell allows.
+    for (outer, r0, r1, count) in [(false, dial.core, dial.mid, n), (true, dial.mid, 1., 2 * n)] {
+        let rm = (r0 + r1) * 0.5;
+        let depth = (r1 - r0) * rp;
+        let width = tau * rm * rp / count as f32;
+        for k in 0..count {
+            let act = if outer { dial.outer[k] } else { dial.inner[k] };
+            let (s, _) = face(act, base, layer, screen.radians, screen.following);
+            let t = k as f32 / count as f32 * tau;
+            let size = f32::min(depth, width) * if s.chars().count() > 2 { 0.4 } else { 0.55 };
+            words(px, d, g, &s, rp + rm * rp * f32::sin(t), rp - rm * rp * f32::cos(t), size, width * 0.8, ink);
         }
     }
-    // The cells under the words: each pixel's key by power, its colour at the coverage of its cell's edge (a gutter's width in from the boundary to the next key, and the rim), the ground under all.
-    let colours: Vec<G2t16> = dial.sites.iter().map(|s| G2t16::from_g2t8(face(s.act, screen.base, layer, screen.radians, screen.following).1)).collect();
+    // The cells under the words: each pixel's row and key by radius and turn, its distance in from the cell's edges (across the row to the nearer circle, along it to the nearer seam as an arc at this radius, the corners rounded by the soft minimum), a gutter's width in; the readout's disc; the ground under all.
+    let body = |outer: bool, k: usize| G2t16::from_g2t8(face(if outer { dial.outer[k] } else { dial.inner[k] }, base, layer, screen.radians, screen.following).1);
+    let inner_c: Vec<G2t16> = (0..n).map(|k| body(false, k)).collect();
+    let outer_c: Vec<G2t16> = (0..2 * n).map(|k| body(true, k)).collect();
     let (core_px, ground) = (G2t16::from_g2t8(CORE), G2t16::from_g2t8(GROUND));
-    let gutter = r_px * (1. / (1 << 6) as f32);
-    let inv = 1. / r_px;
+    let gutter = rp * (1. / (1 << 6) as f32);
+    let round = gutter * 2.;
+    let inv = 1. / rp;
     for y in 0..d {
-        let uy = (y as f32 + 0.5 - r_px) * inv;
+        let uy = (y as f32 + 0.5 - rp) * inv;
         for x in 0..d {
-            let ux = (x as f32 + 0.5 - r_px) * inv;
-            let rr = ux * ux + uy * uy;
-            let rim = edge((1. - f32::sqrt(rr)) * r_px);
+            let ux = (x as f32 + 0.5 - rp) * inv;
+            let r = f32::sqrt(ux * ux + uy * uy);
+            let rim = edge((1. - r) * rp);
             if rim <= 0. {
                 continue;
             }
-            // The best two sites by power, the core among them: the boundary between the best and the second is the line where their powers are equal, its distance from the point (p₂ − p₁) / 2|c₁ − c₂|.
-            let pc = rr - dial.core * dial.core;
-            let (mut b1, mut p1, mut b2, mut p2) = (usize::MAX, pc, usize::MAX, f32::MAX);
-            for (k, s) in dial.sites.iter().enumerate() {
-                let p = (ux - s.x) * (ux - s.x) + (uy - s.y) * (uy - s.y) - s.r * s.r;
-                if p < p1 {
-                    (b2, p2) = (b1, p1);
-                    (b1, p1) = (k, p);
-                } else if p < p2 {
-                    (b2, p2) = (k, p);
-                }
-            }
-            let at = |k: usize| if k == usize::MAX { (0f32, 0f32) } else { (dial.sites[k].x, dial.sites[k].y) };
-            let ((ax, ay), (bx, by)) = (at(b1), at(b2));
-            // WHY the floor: two sites never share a centre, but the core and a site at the origin would; the distance is the divisor.
-            let sep = f32::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by)).max(1e-6);
-            let inside = (p2 - p1) / (2. * sep) * r_px - gutter * 0.5;
-            let cov = edge(inside) * rim;
-            let cell = if b1 == usize::MAX { core_px } else { colours[b1] };
+            let (cell, inside) = if r < dial.core {
+                (core_px, (dial.core - r) * rp - gutter * 0.5)
+            } else {
+                let t = turn_of(ux, uy);
+                let (outer, k) = dial.cell(r, t);
+                let (count, r0, r1) = if outer { (2 * n, dial.mid, 1.) } else { (n, dial.core, dial.mid) };
+                let across = f32::min(r - r0, r1 - r) * rp;
+                let off = t * count as f32 - k as f32;
+                // The wrapped key 0 sits at t near 1: its offset is past half a key, so one key back.
+                let off = if off > 0.5 { off - count as f32 } else { off };
+                let along = (0.5 - off.abs()) * (tau / count as f32) * r * rp;
+                (if outer { outer_c[k] } else { inner_c[k] }, soft_min(across, along, round) - gutter * 0.5)
+            };
             let i = y * d + x;
+            let cov = edge(inside) * rim;
             if cov > 0. {
                 px[i] = px[i].under(G2t16::from_cov(cell, (cov * 65535.) as u32), BlendMode::Normal);
             }

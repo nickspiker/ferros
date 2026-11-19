@@ -2,12 +2,11 @@
 //! Built with `--features puck` (tools/basecalc-kist.sh), its capsule declaring `puck`: its square is in its surface's slot (3), its link to the display the first asked slot (7).
 
 use crate::sys;
-use crate::dial::{paint, Act, Dial, Screen, QUICK};
+use crate::dial::{digits, label, paint, Act, Dial, Screen, QUICK};
 use crate::window::{open_vault, restore, writer, Pad};
-use basecalc::spans_text;
+use basecalc::{Role, Span};
 use basecalc_kist::calc::Shown;
 use basecalc_kist::keys::{self, Key};
-use fluor::text::TextRenderer;
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The square's slot (its surface's) and the `puck` endpoint (the first asked want).
@@ -77,8 +76,11 @@ pub fn main() {
     let vault = open_vault();
     let calc = vault.as_deref().map(restore).unwrap_or_default();
     let mut pad = Pad::new(calc, vault.map(writer));
-    let mut text = TextRenderer::new();
-    let mut damage = fluor::canvas::Damage::new();
+    // ferros's face, a small cache (the dial's words are a few sizes of a few dozen labels).
+    let Some(mut glyphs) = ferros_glyphs::Glyphs::with_arena(ferros_glyphs::FONT, 1 << 18) else {
+        println!("basecalc: ferros's face does not load");
+        return;
+    };
     let heard = Arc::new((Mutex::new(Heard::default()), Condvar::new()));
     {
         let heard = heard.clone();
@@ -95,7 +97,7 @@ pub fn main() {
     let mut seen = 0u32;
     // The dial's state: the inner ring's layer (Shift), the outer ring's page of digits, (whether the base follows the device's is the calculator's own, kept: `Calc::base_overridden`), the side last drawn, and a key pressed since.
     let (mut layer, mut page) = (0usize, 0usize);
-    let (mut drawn_d, mut dirty) = (0usize, true);
+    let (mut drawn_d, mut dirty, mut copied) = (0usize, true, false);
     loop {
         let (count, on, d, taps) = {
             let (lock, bell) = &*heard;
@@ -129,13 +131,11 @@ pub fn main() {
             let base = pad.calc.state.base;
             let key = match act {
                 Act::Calc(k) => Some(k),
-                // One bracket key: closes when more are open than closed and a value ends the expression, else opens.
-                Act::Paren => {
-                    let units = keys::units(&pad.calc.expr);
-                    let open = units.iter().filter(|u| u.kind == keys::Kind::Opens).count();
-                    let close = units.iter().filter(|u| u.kind == keys::Kind::Closes).count();
-                    let ends_value = units.last().is_some_and(|u| matches!(u.kind, keys::Kind::Digit | keys::Kind::Value | keys::Kind::Closes));
-                    Some(Key::Write(if open > close && ends_value { keys::CLOSE } else { keys::OPEN }))
+                // The readout: its value copied (the clipboard is only partly built: said for now).
+                Act::Copy => {
+                    copied = true;
+                    println!("basecalc: copied {}", value_text(&pad.calc.shown));
+                    None
                 }
                 Act::Shift => {
                     layer = (layer + 1) % dial.layers;
@@ -160,6 +160,7 @@ pub fn main() {
                 Act::None => None,
             };
             if let Some(k) = key {
+                copied = false;
                 let change = pad.calc.press(k);
                 if change.save {
                     pad.save();
@@ -189,15 +190,20 @@ pub fn main() {
         let px = unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u64, d * d) };
         px.fill(0);
         let calc = &pad.calc;
-        let expr: String = keys::units(&calc.expr).iter().map(|u| u.label).collect();
+        // The expression and the value with their digits in ferros's glyphs (digit runs only: a function's name keeps its letters), each unit's label in the face's characters.
+        let radix = calc.state.base;
+        let expr: String = keys::units(&calc.expr)
+            .iter()
+            .map(|u| if u.kind == keys::Kind::Digit { digits(u.label, radix) } else { keys::UNITS.iter().find(|w| w.label == u.label).map_or(u.label.to_string(), |w| label(*w).to_string()) })
+            .collect();
         let (value, error, dim) = match &calc.shown {
             Shown::Nothing => (String::new(), false, false),
-            Shown::Preview(s) => (spans_text(s).trim_start().to_string(), false, true),
-            Shown::Value(s) => (spans_text(s).trim_start().to_string(), false, false),
+            Shown::Preview(s) => (value_of(s, radix), false, true),
+            Shown::Value(s) => (value_of(s, radix), false, false),
             Shown::Error(why) => (why.clone(), true, false),
         };
-        let screen = Screen { expr: &expr, value: &value, error, dim, base: calc.state.base, radians: calc.state.radians, following: !calc.base_overridden };
-        paint(px, d, &dial, layer, &screen, &mut text, &mut damage);
+        let screen = Screen { expr: &expr, value: &value, error, dim, base: radix, radians: calc.state.radians, following: !calc.base_overridden, copied };
+        paint(px, d, &dial, layer, &screen, &mut glyphs);
         // Upright: the display turns it with the circle, and the taps come back in the same frame.
         let mut m = [0u8; 11];
         m[0] = SHOW;
@@ -215,5 +221,25 @@ pub fn main() {
                 }
             }
         }
+    }
+}
+
+/// A value's spans as the readout shows them: the digits (integer, fraction and exponent runs) in ferros's glyphs, the rest as written.
+fn value_of(spans: &[Span], base: u8) -> String {
+    let mut s = String::new();
+    for p in spans {
+        match p.role {
+            Role::LoneInteger | Role::LoneFraction | Role::RealInteger | Role::RealFraction | Role::ImaginaryInteger | Role::ImaginaryFraction | Role::Exponent => s.push_str(&digits(&p.text, base)),
+            _ => s.push_str(&p.text),
+        }
+    }
+    s.trim_start().to_string()
+}
+
+/// The value as text to copy (basecalc's own digits: what a paste is typed as), or nothing.
+fn value_text(shown: &Shown) -> String {
+    match shown {
+        Shown::Value(s) | Shown::Preview(s) => basecalc::spans_text(s).trim_start().to_string(),
+        _ => String::new(),
     }
 }

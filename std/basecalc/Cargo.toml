@@ -1,6 +1,6 @@
 [package]
 name = "basecalc-ferros"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "basecalc on ferros as a kist: the owner's calculator (basecalc's own engine: bases 2 to 36, complex numbers, adjustable precision, trig, logs, constants) behind a scientific keypad whose digit block follows the base, under fluor's ferros host, its settings and history as VSF in the kist's vault domain (docs/KISTS.md \"basecalc\", tools/basecalc-build.sh)."
 license = "GPL-3.0"
@@ -29,6 +29,8 @@ fluor = { path = "../../../fluor", default-features = false, features = ["host-f
 ferros_fluor = { path = "../../ferros_fluor" }
 # The kist's own vault domain (no files on ferros).
 kete = { path = "../../../kete" }
+# ferros's one typeface for the puck's dial (Oxanium with tatau's dozenal digits), the face the display draws its own words in.
+ferros_glyphs = { path = "../../ferros_glyphs" }
 # getrandom 0.2 through any dependency: its `custom` backend is ferros_rt's, the kernel's entropy (the kist's entropy right).
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 
