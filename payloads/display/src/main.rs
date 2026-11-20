@@ -1381,6 +1381,10 @@ static mut FIRST_SHOWS_N: usize = 0;
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// Inside the scene: icons, discs, labels (µs, the last camera op).
 static mut SCENE_US: [u64; 3] = [1; 3];
+/// Measuring the pucks' redraws between frames (a clipped replay, `CLIP_PHASE`): the last one's scene (the circles reaching the clip and the list drawn), the list's part across the cores, the publish, the clear and the clip's pixels, in µs; summed by the pass that runs them and told every 64 (2026-11-20, the Pro: passes of 31 to 38 ms with no calls, several puck boxes at about 7 ms each).
+static mut BOX_LAST: [u64; 5] = [0; 5];
+/// The sums since the last line: the redraws, their whole µs, then `BOX_LAST`'s five.
+static mut BOX_SUM: [u64; 7] = [0; 7];
 /// The map's colours, the glow's strength: the theme (ferros_sys::theme).
 /// The glow that replaced the ring (owner, 2026-10-23: no stroke, so circles can touch; additive glow, 1/distance): its colour, how bright one pixel out by importance (ring 1, ring 2), the distance it holds that brightness (Q8 px), and the floor where it stops. Tunables, by eye.
 const GLOW_SCALE_Q8: i64 = 256;
@@ -8892,7 +8896,10 @@ fn server(grants: u64) -> ! {
                     // A clock refresh (the camera has not moved): only the clock's own rectangle changed.
                     if let Some(k) = clip_k {
                         unsafe {
-                            publish10x4(pixels, width, height, &tabs, if CLIP_MASK != 0 { CLIP_MASK } else { 1 << k }, draw::CLIP.clip(width, height));
+                            let t_pub = now();
+                            let c = draw::CLIP.clip(width, height);
+                            publish10x4(pixels, width, height, &tabs, if CLIP_MASK != 0 { CLIP_MASK } else { 1 << k }, c);
+                            BOX_LAST = [PHASE_US[0], SCENE_US[2], ferros_sys::us_since(t_pub), CLEAR_US, ((c.x1 - c.x0).max(0) * (c.y1 - c.y0).max(0)) as u64];
                             (PREV_DMG, CUR_DMG) = saved_dmg;
                         }
                         ferros_sys::dma_barrier();
@@ -10047,11 +10054,29 @@ fn server(grants: u64) -> ! {
                     unsafe {
                         draw::CLIP = *clip;
                         CLIP_PHASE = Some(k);
+                        BOX_LAST = [0; 5];
                     }
+                    let t_one = now();
                     replay(&mut handle);
                     unsafe {
                         CLIP_PHASE = None;
                         draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                        BOX_SUM[0] += 1;
+                        BOX_SUM[1] += ferros_sys::us_since(t_one);
+                        for q in 0..5 {
+                            BOX_SUM[2 + q] += BOX_LAST[q];
+                        }
+                        if BOX_SUM[0] == 64 {
+                            tlog.s(b"display: puck boxes, 64 redraws, us each: whole ");
+                            for (q, name) in [&b"; scene "[..], b" (of it across the cores ", b"); publish ", b"; clear ", b"; pixels each "].iter().enumerate() {
+                                tlog.dec(BOX_SUM[1 + q] / 64);
+                                tlog.s(name);
+                            }
+                            tlog.dec(BOX_SUM[6] / 64);
+                            tlog.s(b"\n");
+                            tlog.flush();
+                            BOX_SUM = [0; 7];
+                        }
                     }
                 }
                 if nb > 0 {
