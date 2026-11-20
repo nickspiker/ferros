@@ -2,7 +2,7 @@
 //!
 //! - **Scale**: preference 14 is 64ths of an octave (ferros_sys `PREF_SCALE`); the app's RU multiplier is 2^(s/64). The app starts at it, and a change (the Settings page's slider, another kist's pinch) is followed with the layout run again about the frame's centre, as a pinch's step runs it.
 //! - **Theme**: preference 5 picks a row of ferros_sys::theme::THEMES, the device's one table (the map, the display and the pucks draw from it too); it becomes fluor's look (`fluor::theme::set_look`), so every fluor widget draws in it and the app reads the rest (`look().ground`, `accent`, `ring`) for its own drawing.
-//! - **A pinch inside the kist** is the person's app scale: at its end the scale it reached is written as preference 14 (SYS_SET_PREF), for every kist; until the kernel lets a kist write it (today only the Settings holder may), the kist keeps its pinch to itself and says so once.
+//! - **A pinch inside the kist** is the person's app scale (owner, 2026-11-20: "settings pages should modify that, same with apps"): at its end the scale it reached is written as preference 14 (SYS_SET_PREF with the display grant, which the kernel takes for this preference alone), for every kist; a kernel from before that keeps the pinch in the kist and it says so once.
 //!
 //! Reading a preference is a plain read of the process's own grants page, which the kernel writes in place for every process (ferros kernel process.rs: "Reading them needs no capability"); there is no doorbell for a preference, and none is needed: the host's loop passes once a frame while the kist is in front, and the read is two bytes. Behind, nothing is drawn, and the first pass in front again reads them.
 
@@ -101,7 +101,7 @@ mod run {
                     shell.set_zoom(ru_set);
                 } else {
                     refused = true;
-                    println!("ferros_fluor: the pinch's scale stays in this kist: the kernel lets only the Settings holder write the app scale (preference 14)");
+                    println!("ferros_fluor: the pinch's scale stays in this kist: the kernel took no app scale from it (a kernel from before the display grant wrote preference 14, or a scale out of its reach)");
                 }
             }
         })
