@@ -25,6 +25,8 @@ vsf = { path = "../../../vsf", features = ["text-encode"] }
 
 [target.'cfg(target_os = "ferros")'.dependencies]
 fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd"] }
+# The person's app scale and the device's theme, followed (window.rs `run_app`).
+ferros_fluor = { path = "../../ferros_fluor" }
 # The kist's own vault domain (no files on ferros).
 kete = { path = "../../../kete" }
 # getrandom 0.2 through any dependency: its `custom` backend is ferros_rt's, the kernel's entropy (the kist's entropy right).

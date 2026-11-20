@@ -503,7 +503,8 @@ pub fn main() {
     let calc = vault.as_deref().map(restore).unwrap_or_default();
     let pad = Pad::new(calc, vault.map(writer));
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    match fluor::host::ferros::run_app(pad, caps, 1.0, None) {
+    // In the person's app scale and the device's theme, following both, a pinch written back as the app scale with the display grant (ferros_fluor; owner, 2026-11-20: every kist follows them).
+    match ferros_fluor::run_app(pad, caps, None, sys::cap(DISPLAY)) {
         Ok(()) => println!("basecalc: closed"),
         Err(e) => println!("basecalc: {e}"),
     }
