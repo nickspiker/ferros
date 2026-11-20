@@ -7,6 +7,7 @@
 //! - **Diffuse white** (owner, 2026-11-20: "maybe we just convert from sRGB to VSF RGB g2, then assign it g2t and see what it looks like"), two ways, chosen per icon:
 //!   - `place` (the default): the light converted, `tanh(√L)`, so the source's white lands on diffuse white (code 194) and nothing is above it; on any display it looks as the gamma 2 avatar does;
 //!   - `assign`: Photon's gamma 2 codes kept and tagged `g2t`, so a code c means atanh(c)² of white: the source's white becomes 3.28 stops above diffuse white, diffuse white sits where the source had 58 % of its white, and everything brighter reads as highlights.
+//!   - `assign-inside`: assigned inside a polygon of the source's pixels and placed outside it, the two mixed across a feathered edge (Kūaha's lintel, owner 2026-11-20: the cosmos in the doorway assigned, the frame, wall and floor placed).
 //!
 //! **The bundle** (the display's `icons.bin`, ICN3): each app's icon made as above (or taken as it is when its source already is one), decoded by Photon's decoder (the one Photon on ferros draws avatars with), then on the host, once, what the display draws: its codes as `g2t`, the inscribed circle cut with its exact coverage per pixel, and the photopic grey. So the display decodes nothing and draws exactly the pixels the AV1 icon holds.
 //! - ICN3: b"ICN3", count (u8), size (u16 LE), then per icon size x size RGBA (straight alpha) followed by size x size grey, one byte each, the colours and the grey VSF RGB gamma2tanh codes (tanh(√L), 8 bits). The order is the map's (payloads/map `BUNDLED`): icon n is the n-th app, 0 none.
@@ -14,7 +15,7 @@
 //! - Beside it `<name>.vsf` per app (its icon) and `sheet.vsf`, the colours over the greys on black as one VSF visual (8-bit `g2t` plane) Opsin opens.
 //!
 //! Usage:
-//! - `app-icons icon <source> <out.vsf> [--assign]`: one icon (JPEG, PNG, WebP, TIFF; or a 256 x 256 VSF RGB gamma 2 image such as Opsin's orb, which enters at the stage Photon's resize leaves).
+//! - `app-icons icon <source> <out.vsf> [--assign | --assign-inside x,y,x,y,...]`: one icon (JPEG, PNG, WebP, TIFF; or a 256 x 256 VSF RGB gamma 2 image such as Opsin's orb, which enters at the stage Photon's resize leaves).
 //! - `app-icons compare <out.vsf> <icon.vsf>...`: the icons side by side, each cut to its circle on black, as one VSF visual (8-bit `g2t`) for Opsin.
 //! - `app-icons bundle <out dir>`: every app's icon and the bundle.
 use photon_messenger::ui::avatar::{decode_avatar, encode_avatar_rgb_f32, image_to_avatar_rgb_f32_framed, AvatarFrame, AVATAR_SIZE};
@@ -46,10 +47,92 @@ fn fail(msg: String) -> ! {
 }
 
 /// Where the source's white lands in the `g2t` icon (module docs).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum White {
     Place,
     Assign,
+    /// Assigned inside a polygon of the source's pixels, placed outside it, with a feathered edge between ([`assign_mask`]).
+    AssignInside(Vec<(f32, f32)>),
+}
+
+/// The feather's width, source pixels: the Gaussian's σ the polygon's inside is blurred by, so its edge is erf(d / (σ√2)) of the distance d across it, about 2.6 σ from 10 to 90 % (5 pixels at σ = 2).
+const FEATHER: f32 = (1 << 1) as f32;
+
+/// Whether (x, y) is inside the polygon (even-odd crossings of a ray toward +x).
+fn inside(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut odd = false;
+    for k in 0..poly.len() {
+        let ((x0, y0), (x1, y1)) = (poly[k], poly[(k + 1) % poly.len()]);
+        if (y0 > y) != (y1 > y) && x < x0 + (y - y0) * (x1 - x0) / (y1 - y0) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// How much of the assigned mapping each of the icon's pixels takes (0 placed, 1 assigned), from a polygon in the source's pixels (owner, 2026-11-20, Kūaha's lintel: the cosmos in the doorway assigned, its highlights unrolled; the frame, wall and floor placed; "a mask over a brightness blend").
+/// The polygon's inside, sampled at every source pixel of Photon's square, blurred by a Gaussian of σ [`FEATHER`], then averaged over each icon pixel's block. The edge is a C∞ sigmoid of the distance across it (erf, the Gaussian's integral), with no clamp and no step; unlike a sigmoid of the distance to the nearest edge, it has no kink where two edges' nearest regions meet, at the corners.
+/// The square is Photon's for a source without alpha, the centred one; a source with alpha (whose square is its art's) is refused, as its square is not known here.
+fn assign_mask(path: &Path, poly: &[(f32, f32)]) -> Vec<f32> {
+    use image::ImageDecoder;
+    let decoder = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| e.to_string()).and_then(|r| r.into_decoder().map_err(|e| e.to_string())).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+    if decoder.color_type().has_alpha() {
+        fail(format!("{}: a source with alpha frames by its art, so a polygon in its pixels has no known place in the icon", path.display()));
+    }
+    let (w, h) = decoder.dimensions();
+    let side = w.min(h) as usize;
+    let (ox, oy) = (((w as usize - side) / 2) as f32, ((h as usize - side) / 2) as f32);
+    // The kernel, out to 4 σ each side, and the inside sampled that far past the square, so the blur needs no edge rule.
+    let r = (4. * FEATHER).ceil() as usize;
+    let kernel: Vec<f32> = (0..2 * r + 1).map(|i| (-((i as f32 - r as f32).powi(2)) / (2. * FEATHER * FEATHER)).exp()).collect();
+    let sum: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.iter().map(|k| k / sum).collect();
+    let n = side + 2 * r;
+    let mut ind = vec![0f32; n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let (x, y) = (ox + i as f32 - r as f32 + 0.5, oy + j as f32 - r as f32 + 0.5);
+            ind[j * n + i] = inside(poly, x, y) as u32 as f32;
+        }
+    }
+    // Separable: rows over the padded grid, then columns into the square.
+    let mut rows = vec![0f32; n * side];
+    for j in 0..n {
+        for i in 0..side {
+            rows[j * side + i] = (0..2 * r + 1).map(|k| kernel[k] * ind[j * n + i + k]).sum();
+        }
+    }
+    let mut blurred = vec![0f32; side * side];
+    for j in 0..side {
+        for i in 0..side {
+            blurred[j * side + i] = (0..2 * r + 1).map(|k| kernel[k] * rows[(j + k) * side + i]).sum();
+        }
+    }
+    // Each icon pixel: the mean over the source pixels it covers.
+    let mut m = vec![0f32; SIZE * SIZE];
+    for y in 0..SIZE {
+        let (y0, y1) = (y * side / SIZE, (y + 1) * side / SIZE);
+        for x in 0..SIZE {
+            let (x0, x1) = (x * side / SIZE, (x + 1) * side / SIZE);
+            let mut acc = 0.;
+            for j in y0..y1 {
+                for i in x0..x1 {
+                    acc += blurred[j * side + i];
+                }
+            }
+            m[y * SIZE + x] = acc / ((y1 - y0) * (x1 - x0)) as f32;
+        }
+    }
+    m
+}
+
+/// A polygon from the command line: `x,y,x,y,...`, at least three points, in the source's pixels.
+fn parse_polygon(s: &str) -> Vec<(f32, f32)> {
+    let v: Vec<f32> = s.split(',').map(|t| t.trim().parse().unwrap_or_else(|_| fail(format!("--assign-inside: {t:?} is not a number")))).collect();
+    if v.len() < 6 || v.len() % 2 != 0 {
+        fail("--assign-inside takes x,y pairs, at least three".to_string());
+    }
+    v.chunks(2).map(|p| (p[0], p[1])).collect()
 }
 
 /// The `image` section of a VSF image document, by its table of contents.
@@ -125,13 +208,18 @@ fn prepare(path: &Path) -> Vec<f32> {
 }
 
 /// One icon from its source: Photon's prepared picture, its white placed or assigned (module docs), Photon's AV1 encoder, vsf's flat image section tagged `g2t`.
-fn make_icon(path: &Path, white: White) -> Vec<u8> {
+fn make_icon(path: &Path, white: &White) -> Vec<u8> {
     let mut px = prepare(path);
-    if white == White::Place {
-        // Photon's values are √L exactly (gamma 2 of linear light), so L = v²; tanh(√L) puts the source's white (L = 1) on diffuse white.
-        for v in px.iter_mut() {
-            *v = delinearize_gamma2tanh_f32(*v * *v);
-        }
+    // How much of the assigned mapping each pixel takes: none placed, all assigned, the mask's share inside a polygon.
+    let mask = match white {
+        White::Place => vec![0f32; SIZE * SIZE],
+        White::Assign => vec![1f32; SIZE * SIZE],
+        White::AssignInside(poly) => assign_mask(path, poly),
+    };
+    for (i, v) in px.iter_mut().enumerate() {
+        // Photon's values are √L exactly (gamma 2 of linear light), so L = v²; tanh(√L) puts the source's white (L = 1) on diffuse white. Assigned, the value stays v, read as g2t.
+        let k = mask[i / 3];
+        *v = k * *v + (1. - k) * delinearize_gamma2tanh_f32(*v * *v);
     }
     let av1 = encode_avatar_rgb_f32(&px).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
     vsf::builders::compressed_image_encoded(av1, Encoding::Gamma2Tanh).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())))
@@ -200,11 +288,25 @@ fn write_visual(out: &Path, w: usize, h: usize, rgb: &[u8]) {
 }
 
 fn icon_cmd(args: &[String]) {
-    let (white, rest): (White, Vec<&String>) = (if args.iter().any(|a| a == "--assign") { White::Assign } else { White::Place }, args.iter().filter(|a| *a != "--assign").collect());
+    let mut white = White::Place;
+    let mut rest: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--assign" => white = White::Assign,
+            "--assign-inside" => white = White::AssignInside(parse_polygon(it.next().unwrap_or_else(|| usage()))),
+            _ => rest.push(a),
+        }
+    }
     let [src, out] = rest[..] else { usage() };
-    let doc = make_icon(Path::new(src), white);
+    let doc = make_icon(Path::new(src), &white);
     fs::write(out, &doc).unwrap_or_else(|e| fail(format!("{out}: {e}")));
-    println!("app-icons: {src} -> {out} ({} bytes, {SIZE} x {SIZE} AV1, g2t, white {})", doc.len(), if white == White::Place { "placed" } else { "assigned" });
+    let how = match white {
+        White::Place => "placed",
+        White::Assign => "assigned",
+        White::AssignInside(_) => "assigned inside the polygon, placed outside",
+    };
+    println!("app-icons: {src} -> {out} ({} bytes, {SIZE} x {SIZE} AV1, g2t, white {how})", doc.len());
 }
 
 fn compare_cmd(args: &[String]) {
@@ -249,7 +351,7 @@ fn bundle_cmd(args: &[String]) {
         // A source that is already an icon is taken as it is; anything else is made into one by Photon's process, its white placed.
         let doc = match bytes.starts_with("RÅ<".as_bytes()).then(|| read_vsf_source(&bytes)) {
             Some(Ok(VsfSource::Icon(..))) => bytes,
-            _ => make_icon(&path, White::Place),
+            _ => make_icon(&path, &White::Place),
         };
         fs::write(out.join(format!("{}.vsf", name.to_ascii_lowercase())), &doc).unwrap_or_else(|e| fail(format!("{name}: {e}")));
         let codes = decode_icon(&doc, name);
@@ -276,7 +378,7 @@ fn bundle_cmd(args: &[String]) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--assign]\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons bundle <out dir>");
+    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--assign | --assign-inside x,y,x,y,...]\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons bundle <out dir>");
     process::exit(2);
 }
 

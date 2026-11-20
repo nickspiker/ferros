@@ -10,6 +10,8 @@ edition = "2024"
 # Photon's own avatar process (photon_messenger::ui::avatar): the one way a 256 x 256 icon is made and decoded, for contacts and kists alike (owner, 2026-11-20). Needs Photon's `AvatarFrame` (Photon branch `icons`, 2026-11-20).
 photon-messenger = { path = "../../../photon" }
 vsf = { path = "../../../vsf" }
+# A source's size and whether it has alpha, read from its header, for `--assign-inside`'s polygon (decoding only; Photon's own `image`, unified).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "gif", "bmp"] }
 
 # Photon's own patch table, which only its root build applies: its forks of softbuffer, winit and audiopus_sys (Photon's Cargo.toml says why), pinned at the same revisions. Build with OPUS_NO_PKG=1 OPUS_STATIC=1, as Photon's .cargo/config.toml sets them.
 [patch.crates-io]
