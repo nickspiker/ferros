@@ -322,6 +322,10 @@ fn an_item_id_is_a_thing_and_an_older_card_keeps_it() {
     let mut older = bytes.clone();
     older[at + 1] = b'p';
     assert_eq!(ferros_items::Card::parse(&older).unwrap().0.id, card.id, "an hp id reads as the same thing");
+    // To a caller (with its handle) the id rides as the hp a kist built before reads, the same bytes.
+    let handed = card.section(Some(&[3; 32])).unwrap();
+    assert!((0..handed.len() - 36).any(|i| handed[i..i + 2] == *b"hp" && handed[i + 4..i + 36] == id));
+    assert_eq!(ferros_items::Card::parse(&handed).unwrap().0.id, card.id);
     // Any other marker for the id is refused.
     older[at + 1] = b'b';
     assert!(ferros_items::Card::parse(&older).is_err());

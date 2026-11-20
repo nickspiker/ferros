@@ -208,7 +208,9 @@ impl Card {
     /// The card's section bytes (with `handle` when it goes to a caller; never at rest).
     pub fn section(&self, handle: Option<&[u8; 32]>) -> Result<Vec<u8>> {
         let mut b = card_schema().build();
-        b = b.set("id", VsfType::from(self.id)).map_err(fmt)?;
+        // An id as a thing (`ht`) at rest; to a caller (a card with its handle) as the `hp` every kist built before 2026-11-20 reads (Lumis's PHASE build, Kūaha), the same 32 bytes: a kist built since reads either (`ht_of`). Until every stowed kist is rebuilt; then `ht` everywhere.
+        let id_value = |id: &Ht| if handle.is_some() { VsfType::hp(id.as_bytes().to_vec()) } else { VsfType::from(*id) };
+        b = b.set("id", id_value(&self.id)).map_err(fmt)?;
         b = b.set("kind", VsfType::hi(self.kind.to_vec())).map_err(fmt)?;
         b = b.set_multi("kist", alloc::vec![VsfType::ke(self.kist.developer.to_vec()), VsfType::hR(self.kist.option.to_vec()), VsfType::x(self.kist.name.clone())]).map_err(fmt)?;
         if let Some(k) = &self.device {
@@ -229,7 +231,7 @@ impl Card {
             b = b.set("extent_blocks", VsfType::u(x.blocks as usize, false)).map_err(fmt)?;
         }
         for (id, how) in &self.of {
-            b = b.append_multi("of", alloc::vec![VsfType::from(*id), VsfType::u(*how as usize, false)]).map_err(fmt)?;
+            b = b.append_multi("of", alloc::vec![id_value(id), VsfType::u(*how as usize, false)]).map_err(fmt)?;
         }
         for (name, v) in &self.attrs {
             let n = Ascii::new(name.clone()).map_err(fmt)?;
