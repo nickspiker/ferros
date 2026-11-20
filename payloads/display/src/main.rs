@@ -2406,6 +2406,12 @@ fn arena_turn() {
     }
 }
 
+/// Whether circle i's sprite is current for this key and side (`sprite` would blit it, not draw it).
+fn sprite_current(i: usize, key: [i64; 6], d: usize) -> bool {
+    let sp = unsafe { &*(&raw const SPRITES[i]) };
+    sp.valid && sp.key == key && sp.d == d
+}
+
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space; `sprite_room` first says there is room). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
 fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [Px], usize)) -> (&'static [Px], &'static [Px]) {
     unsafe {
@@ -8717,7 +8723,8 @@ fn server(grants: u64) -> ! {
                                 let d = (2 * ((sr >> 8) + 3)) as usize;
                                 let still = unsafe { LAST_KEY[i] == key };
                                 unsafe { LAST_KEY[i] = key };
-                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
+                                // A sprite only where it pays: one current for this drawing is blitted; a new one is made only in a whole frame, where the moves that follow reuse it. A redraw of a box draws the square by bands across the threads instead: made there, a sprite samples the whole square on this thread alone (2026-11-20, the Pro: 10 to 12 ms of each box went into sprites, 2.5 ms by bands).
+                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && (clip_k.is_none() || sprite_current(i, key, d)) && sprite_room(i, d) {
                                     part = 1;
                                     let (spr, ext) = sprite(i, key, d, |px, d| {
                                         let c = ((d as i64 / 2) << 8) | 128;

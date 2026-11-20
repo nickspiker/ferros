@@ -1622,6 +1622,8 @@ struct Map {
     recent: alloc::vec::Vec<[u8; 32]>,
     /// The kist this map brought to the front last, while it is still in front (None once the map has the glass again).
     front_kist: Option<[u8; 32]>,
+    /// The display's frame count as op 5 last gave it (`display_seen`): a smaller one means the display started again.
+    display_frames: u32,
     /// The deck's circles gathered (owner, 2026-11-18: "for swiping back on the deck, would be nice to make all the circles cluster best fit all touching, and tapping on back reverses back to whatever scatter they were in"): each circle's place in the scatter it came from (world ×256) and the camera then; None while scattered.
     scatter: Option<(alloc::vec::Vec<(i64, i64)>, Cam)>,
     /// The display's count of unused Escapes when Back last sent one to the app in front (`escapes_unused`), for PREF_HELM `BACK_OUT`.
@@ -5338,7 +5340,31 @@ impl Map {
     fn app_done(&mut self) -> bool {
         let mut r = [0u8; 16];
         let n = call(self.display, &[5], &mut r);
+        // No window up because the display started again (its frame count went down), not because the app ended: the restart's work, which brings the app back (2026-11-20, the Pro: read first as the app's end, it cleared the kist in front and nothing came back).
+        if n >= 8 && self.display_seen(u32::from_le_bytes([r[4], r[5], r[6], r[7]])) {
+            return false;
+        }
         !(n >= 13 && r[12] == 1)
+    }
+
+    /// The display's frame count as op 5 just gave it: below the last one seen, the display started again, and the new one is handed what the map had given the last (WINDOWS.md "A display started again"): the scene, the icons and the pucks (`send_scene`), and the kist that was in front, launched again. It runs, so init answers with its surface and the display brings it to the front (op 59); its window comes with its next show, and the eight-a-second look then finds it in front, as for a kist just started (marked in front now, the next look at the window, none yet, would take the kist for ended). Whether it had started again.
+    fn display_seen(&mut self, frames: u32) -> bool {
+        let again = frames < self.display_frames;
+        self.display_frames = frames;
+        if !again {
+            return false;
+        }
+        // The kist last brought to the front (home clears it, op 60), while it still runs (one that ended is not started by a restart).
+        let front = self.front_kist.filter(|c| self.live.as_ref().is_some_and(|l| l.contains(c)));
+        ferros_sys::console_flash(self.grants, alloc::format!("map: the display started again (frames A#{frames}); the kist in front {}", if front.is_some() { "launched again" } else { "none" }).as_bytes());
+        self.app_front = false;
+        self.send_scene();
+        self.draw();
+        if let Some(i) = front.and_then(|c| self.circle_of(&c)) {
+            self.launch(i);
+            self.app_front = false;
+        }
+        true
     }
 
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
@@ -5984,6 +6010,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         app_front: false,
         recent: alloc::vec::Vec::new(),
         front_kist: None,
+        display_frames: 0,
         scatter: None,
         escape_sent: None,
         gathering: None,
@@ -6223,8 +6250,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut last_app_check = 0u64;
     // The bells as the pages were last drawn with them (BELLS), the radios' switches (preference 15) likewise, and the second the clock or About last drew (`tick`).
     let mut bells_seen = [0u64; ferros_sys::BELL_FACTS as usize + 1];
-    // The display's frame count as last read on a facts bell: a smaller one means the display restarted.
-    let mut display_frames_seen = 0u32;
     let mut radios_seen = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
     // The torch as last drawn: its answer and its four settings (preferences 42-45).
     const TORCH_PREFS: [u64; 4] = [ferros_sys::PREF_TORCH_LEVEL, ferros_sys::PREF_TORCH_STROBE, ferros_sys::PREF_TORCH_DUTY, ferros_sys::PREF_TORCH_TIMEOUT];
@@ -6482,20 +6507,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 if s == ferros_sys::BELL_FACTS as usize {
                     let mut q = [0u8; 16];
                     if call(map.display, &[5], &mut q) >= 8 {
-                        let frames = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
-                        if frames < display_frames_seen {
-                            console(grants, b"map: the display started again; its scene sent anew\n");
-                            // The app that was in front: the new display has no window of it, and the app heard it is behind as it re-attached (display events.rs `watch`). Launched again it is running, so init answers with its surface and the display brings it to the front (op 59), and it shows its window there (WINDOWS.md "A display started again").
-                            let front = if map.app_front { map.front_kist } else { None };
-                            ferros_sys::console_flash(grants, alloc::format!("map: the display started again (frames A#{frames} after A#{display_frames_seen}); an app in front: {}, the kist in front known: {}", map.app_front, map.front_kist.is_some()).as_bytes());
-                            map.app_front = false;
-                            map.send_scene();
-                            map.draw();
-                            if let Some(i) = front.and_then(|c| map.circle_of(&c)) {
-                                map.launch(i);
-                            }
-                        }
-                        display_frames_seen = frames;
+                        // A frame count below the last one seen: a display that started again (`display_seen`).
+                        map.display_seen(u32::from_le_bytes([q[4], q[5], q[6], q[7]]));
                     }
                 }
             }
@@ -6607,7 +6620,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if map.app_front {
             if map.app_done() {
                 map.app_front = false;
-                map.front_kist = None;
+                // The kist brought to the front is kept: a window not up yet after a raise (op 59 to a display started again, the window coming with the app's next show) reads as none, and a restart then needs to know which kist to bring back (`display_seen`, which brings it back only while it runs).
                 map.draw();
             }
             // Still in front: the touches are its, but the corners are the system's (WINDOWS.md), so they are read on below for a corner gesture, and nothing else is done with them.
