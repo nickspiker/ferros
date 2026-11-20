@@ -55,7 +55,7 @@ mod sys {
     }
 
     /// The grants page is arc offset 0: the handle table in its first 512 bytes, the u32 count at G#200, the 32-byte tokens after it (ferros SANDBOX.md, "Handles").
-    fn cap(slot: u64) -> u64 {
+    pub fn cap(slot: u64) -> u64 {
         0x204 + 32 * slot
     }
 
@@ -540,7 +540,9 @@ fn main() {
     // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
     fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };
-    match fluor::host::ferros::run_app(Ferros { app, waiting }, caps, 1.0, None) {
+    // The person's app scale and the device's theme, followed live, and a pinch's end written back as the app scale with the display's grant (ferros_fluor; owner 2026-11-20: every kist follows the global scale and theme).
+    let scale_token = sys::cap(caps.display);
+    match ferros_fluor::run_app(Ferros { app, waiting }, caps, None, scale_token) {
         Ok(()) => println!("photon: closed"),
         Err(e) => println!("photon: {e}"),
     }
