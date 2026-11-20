@@ -441,7 +441,9 @@ fn packer(p: Arc<Packers>, mask: u64) {
                 if st.quit {
                     return;
                 }
-                if let Some(j) = st.jobs.iter_mut().find(|j| j.next < p.bands) {
+                // A frame's source hashes first: the hand-over waits for them, never for a packing.
+                let at = st.jobs.iter().position(|j| j.hash_only && j.next < p.bands).or_else(|| st.jobs.iter().position(|j| j.next < p.bands));
+                if let Some(j) = at.map(|i| &mut st.jobs[i]) {
                     j.next += 1;
                     break Claim { seq: j.seq, k: j.next - 1, set: j.set, src: j.src, len: j.len, info: j.info, info_len: j.info_len, bodies: j.bodies, bodies_len: j.bodies_len, slot: j.slot_at, hash: j.hash, hash_only: j.hash_only };
                 }
@@ -477,7 +479,12 @@ fn packer(p: Arc<Packers>, mask: u64) {
             b.bytes.extend_from_slice(&out[..la + lb]);
         }
         let mut st = p.st.lock().unwrap();
-        st.jobs.iter_mut().find(|j| j.seq == c.seq).expect("a frame stays queued until its last band").done += 1;
+        let j = st.jobs.iter_mut().find(|j| j.seq == c.seq).expect("a frame stays queued until its last band");
+        j.done += 1;
+        // A frame's source hashes done: its hand-over may return, whatever is still queued ahead of them.
+        if j.hash_only && j.done == p.bands {
+            p.done.notify_all();
+        }
         // The frames whose every band is done go to the writer, in order (the writer's channel holds every slot, so the send never waits); a frame's source hashes alone are done with when theirs are.
         while st.jobs.front().is_some_and(|j| j.done == p.bands) {
             let mut j = st.jobs.pop_front().expect("the front frame");
@@ -769,7 +776,7 @@ impl Recorder {
         };
         g.seq += 1;
         let seq = g.seq;
-        let wait = job_set.is_none() || p.hash_src;
+        let wait = job_set.is_none() || (p.hash_src && !early);
         {
             let mut st = p.st.lock().unwrap();
             if let Some(s) = job_set {
@@ -783,6 +790,18 @@ impl Recorder {
                 }
                 self.last_src = st.last_src;
             }
+            // With the hashes taken while the GPU ran, the hand-over waits for them alone and the packing goes on behind (Lumis's DEV_VIDEO at 60/s, 2026-11-20: waiting for the packing too made a hand-over 16.9 ms and dropped 202 of 1756).
+            if early && job_set.is_some() {
+                let hash_seq = seq - 1;
+                while !st.quit && st.jobs.iter().any(|j| j.seq == hash_seq && j.done < p.bands) {
+                    st = p.done.wait(st).unwrap();
+                }
+            }
+        }
+        if early && job_set.is_some() {
+            // SAFETY: a slot's box lives as long as the recorder (in a job, with the writer, or in the free list), and only a later hand-over (this thread's) writes its digests again; each band's was written under its lock before the hashes counted done.
+            let slot = unsafe { &*slot_at };
+            self.last_src = source_hash(&slot.bands.iter().map(|b| b.lock().map(|b| b.src).unwrap_or([0; 32])).collect::<Vec<_>>());
         }
         let us = micros() - t0;
         self.stats.code_us_most = self.stats.code_us_most.max(us);
