@@ -46,6 +46,9 @@ const CAMERA: u64 = 7;
 /// With the view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?") Lumis integrates and saves whole sensor frames, read in place.
 const BIN: u32 = 2;
 
+/// Each phase-detect half's black, even and odd, in RAW10 counts: measured on the Pro main's pairs against their image's green, the same dark and bright (docs/CAMERA.md "The PD layout, measured": 64.0 to 64.4 and 62.4 to 62.6); no register is known.
+const PD_BLACKS: (f32, f32) = (64., 62.5);
+
 /// Where the camera service's frames come from.
 enum Source {
     /// The view: frames read in place (`base` where this process reads it), the buffer held until the next MAP; the integrator reads each row straight out of it (`ViewRows`), so no whole frame is ever copied.
@@ -544,6 +547,15 @@ struct ViewRows {
     src: usize,
     line: usize,
     cached: bool,
+    /// The frame's phase-detect rows in the same buffer, where the driver gives them (MAP +56 and +60: docs/CAMERA.md "Phase detect as data"): where they start in this process and how many, at the image's line.
+    pd: Option<(usize, usize)>,
+}
+
+impl ViewRows {
+    /// The phase-detect rows as rows of their own (the same line and caching as the image's) and their count.
+    fn pd(&self) -> Option<(ViewRows, usize)> {
+        self.pd.map(|(src, rows)| (ViewRows { src, line: self.line, cached: self.cached, pd: None }, rows))
+    }
 }
 
 impl lumis_core::RowSource for ViewRows {
@@ -575,7 +587,14 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                Some(Got::Frame(m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
+                // The phase view is offered while the frames carry phase-detect rows (the Pro's main), said when that changes.
+                let pd = m.pd_rows != 0 && m.pd_offset != 0;
+                if pd != lumis_core::platform::phase_offered() {
+                    lumis_core::platform::set_phase_offered(pd);
+                    println!("lumis: the phase view {}", if pd { format!("offered: {} phase-detect rows a frame, G#{:X} past the image", m.pd_rows, m.pd_offset) } else { "not offered: the frames carry no phase-detect rows".into() });
+                }
+                let src = *base + m.offset;
+                Some(Got::Frame(m.frame, Taken::View(ViewRows { src, line: view.line, cached: view.cached, pd: pd.then_some((src + m.pd_offset, m.pd_rows)) })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
@@ -1389,7 +1408,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         // A RAW video clip's preview frame was integrated beside its hand-over (above); any other frame is integrated here.
         let (iso, shutter_ns, focus) = if let Some(r) = preview_done.take() { r } else { match got {
-            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
+            // With its phase-detect rows where it has them (the phase view renders them; every other mode passes them over).
+            Got::Frame(head, Taken::View(rows)) => {
+                let pd = rows.pd();
+                let pd = pd.as_ref().map(|(p, n)| lumis_core::PdRows { rows: p, count: *n, blacks: PD_BLACKS });
+                integrator.process_rows_pd(&rows, pd, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad())
+            }
             // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
             Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
