@@ -1,0 +1,10 @@
+[package]
+name = "camera-pd-layout"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: the main camera's phase-detect rows measured against the image they were read with (docs/CAMERA.md \"Phase detect as data\"), and VSF visuals of each pupil half, their sum and their difference"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
