@@ -1768,12 +1768,15 @@ impl Lumis {
         }
     }
 
-    /// The person's app scale as the host now runs Lumis (its RU, which ferros_fluor keeps at preference 14): Lumis's words drawn at it (lumis_core `set_ui_scale`; its layout is fractions of the screen), everything drawn again when it changes.
+    /// The person's app scale as the host now runs Lumis (its RU, 2^(s/64) of preference 14, which ferros_fluor keeps): lumis_core lays its controls out at it (`set_ui_scale`: the camera screen's control block, its buttons, arrows, knobs and words, and the counters, the clips page, the calibration screens; the menu's slots), everything drawn again when it changes; at 1 every layout is the one before the scale.
     fn follow_scale(&mut self, ctx: &mut Context) {
         let ru = ctx.viewport.ru;
         if ru != lumis_core::platform::ui_scale() {
             lumis_core::platform::set_ui_scale(ru);
-            println!("lumis: the app scale {ru}: its words drawn at it");
+            println!("lumis: the app scale {ru}: Lumis laid out at it");
+            if let Some(menu) = self.menu.as_mut() {
+                menu.relayout();
+            }
             self.changed = true;
             self.menu_dirty = true;
             ctx.window.request_redraw();
