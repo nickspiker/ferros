@@ -49,6 +49,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: oracle capture integrity](feedback_oracle_capture_integrity.md) - pstore captures lose bytes; check before replaying
 - [Feedback: USB port wedge](feedback_usb_port_wedge.md) - -71 storm = host port gave up (usb-kick.sh); silent = TCPC switch G#93
 - [Feedback: boot read path](feedback_boot_read_path.md) - happy-path boot is UFS reads only; the SD mirror only on hash failure
+- [Feedback: nested cargo alias](feedback_nested_cargo_alias.md) - a farm under the ferros tree joins both configs' `el0` aliases; spell the build out, inject by `input --save` + spawn
 
 ## Vocabulary
 - [ferros vocabulary](ferros_vocabulary.md) - photon, beam, kist, stow, puck, the deck (Deck/Back), the hold, pandok, GPS
