@@ -15,3 +15,7 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 [dev-dependencies]
 # The kinds' ids checked against their first phrasings (IDEAS.md), as ferros_idea mints them.
 ferros_idea = { path = "../ferros_idea" }
+
+[lints.rust]
+# `kist::Sys` on the device's targets: payloads (`none`) and std kists (`ferros`).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

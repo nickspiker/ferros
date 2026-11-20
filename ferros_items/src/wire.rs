@@ -2,7 +2,8 @@
 //!
 //! A call is the kernel's stamp (the caller's identity, its `items` kinds, the person's items domain keys), then `rest`: [op u8][handle 32][offset u64 LE][length u32 LE][payload].
 //! The payload is a complete VSF document where the call carries one (a proposed card, a find; VSF for control) and the body's bytes for a write (no framing of its own: the transfer is the frame).
-//! The answer is the call's value and bytes: a handle (32), a card or a found document, body bytes.
+//! The answer is the call's value and bytes: a token or handle (32), a card or a found document, body bytes.
+//! The vault side is `serve`, the kist side `kist`.
 //!
 //! The ops keep STORE.md's numbers where it gave them; no versions (owner, §7.5), so `versions` (11) is not one.
 
@@ -14,28 +15,35 @@ use vsf::VsfType;
 
 use crate::{document, sections, Card, Error, Find, Found, Proposed, Result};
 
-/// A new item: payload a `propose` document → the making's handle (32). Needs the `items` right for that kind.
+/// Every answer's value is ferros_sys `ERR` for a refusal (no right to that kind, a handle not the caller's, a malformed call) and `NOTHING` for an item that is gone; otherwise as each op says.
+/// A card or a find answers a complete VSF document; its value is the document's whole length, so a caller whose room was short sees it and asks again with more (`CARD_DOC_MAX` always holds a card).
+/// A new item: payload a `propose` document → the making's token (32), value 0. Needs the `items` right for that kind.
 pub const OP_MAKE: u8 = 0;
-/// Body bytes at the end of the making (handle) → 0.
+/// Body bytes appended to the making (handle: its token), a transfer at a time → value 0.
 pub const OP_WRITE: u8 = 1;
-/// The body committed and the card placed (handle: the making's) → the item's handle (32) then its card section.
+/// The body committed and the card placed (handle: the making's token) → a card document carrying the item's handle.
 pub const OP_FINISH: u8 = 2;
-/// Body bytes at offset, length at most the transfer (handle) → the bytes; the value is the body's size.
+/// Body bytes from `offset`, at most `length` (handle: the item's) → the bytes; the value is the body's size. A single-copy body reads the same way, from its blocks.
 pub const OP_READ: u8 = 3;
-/// The card (handle) → its section.
+/// The card (handle) → a card document.
 pub const OP_CARD: u8 = 4;
-/// A find: payload a `find` document → a `found` document.
+/// A find: payload a `find` document → a `found` document (its cards each with the caller's handle).
 pub const OP_FIND: u8 = 6;
-/// Removed, gone at once (handle) → 0.
+/// Removed, gone at once (handle): its card, its body, a single-copy body's extent → value 0. A clip a live writer still records into is refused.
 pub const OP_REMOVE: u8 = 8;
-/// Keep again in place (handle: the item's) → the making's handle (32).
+/// Keep again in place (handle: the item's) → the making's token (32); then OP_WRITE and OP_FINISH as for a new item.
 pub const OP_KEEP_AGAIN: u8 = 12;
-/// A new item whose body is a single-copy extent: payload a `propose` document, offset the blocks wanted → the making's handle (32) then the extent's SYS_BLOCK capability (32, zeros when the kernel gave none: then the body is written with OP_WRITE_EXTENT).
+/// A new item whose body is a single-copy extent (a RAW clip): payload a `propose` document, `offset` the blocks wanted → the item's handle (32) then the extent's SYS_BLOCK capability (32; zeros when the kernel gave none, and the body is then written with OP_WRITE_EXTENT); the value the blocks reserved. The card is placed at once, so the clip is found while it records.
 pub const OP_MAKE_EXTENT: u8 = 13;
-/// The extent's clip sealed (handle: the making's): payload its length u64 LE and BLAKE3 (32) → the item's handle then its card section; the extent's tail given back.
+/// The clip sealed (handle: the item's): payload its length u64 LE and BLAKE3 (32) → its card document; the extent's tail given back and the caller's own writes ended.
 pub const OP_FINISH_EXTENT: u8 = 14;
-/// Whole blocks of the making's extent at block `offset`, written once (a kernel that gave no capability) → 0.
+/// Whole blocks of the item's extent at block `offset`, at most one UFS command (1 MiB), written once (a caller the kernel gave no capability: the bench) → value 0.
 pub const OP_WRITE_EXTENT: u8 = 15;
+
+/// The room that always holds one card's document (a card is at most `CARD_MAX`, its document's head and the handle less than a KiB more).
+pub const CARD_DOC_MAX: usize = crate::CARD_MAX + (1 << 10);
+/// The most one transfer carries: a body's write, a clip's blocks, a read's room (the kernel's ITEMS_CALL_MAX less the head; ferros_sys STORE_GET_MAX).
+pub const TRANSFER: usize = 1 << 20;
 
 /// The head of a call's rest.
 pub const HEAD: usize = 1 + 32 + 8 + 4;

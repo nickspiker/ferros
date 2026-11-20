@@ -16,6 +16,8 @@
 extern crate alloc;
 
 pub mod kinds;
+pub mod kist;
+pub mod serve;
 pub mod wire;
 
 use alloc::string::String;
@@ -44,6 +46,8 @@ pub const OF_BELONGS: u64 = 1;
 /// The hold's own values in the items domain, never entered in ferros_store's list: names beginning with 2 (a process's names are printable ASCII, the store's books begin with 0, kete's addresses with 1).
 const ROOT: &[u8] = b"\x02root";
 const PENDING: &[u8] = b"\x02pending";
+/// The single-copy bodies not yet sealed: each item's id and when it was made (its page), so a clip whose writer died is found again and its card corrected once the vault has closed it (`open_clips`, `amend_extent`), without reading every page.
+const CLIPS: &[u8] = b"\x02clips";
 const PAGE_TAG: u8 = b'p';
 const BODY_TAG: u8 = b'b';
 
@@ -97,6 +101,14 @@ pub fn maker_tag(developer: &[u8; 32], option: &[u8; 32]) -> [u8; 32] {
 pub struct Extent {
     pub first: u64,
     pub blocks: u64,
+}
+
+impl Extent {
+    /// Whether `n` blocks from block `at` of the extent lie inside it (manifestus `Extent::holds`).
+    pub fn holds(&self, at: u64, n: u64) -> bool {
+        // WHY checked: `at` and `n` are a caller's words; a sum that wraps is outside, not inside.
+        at.checked_add(n).is_some_and(|end| end <= self.blocks)
+    }
 }
 
 /// An item's card (STORE.md "The card, as VSF").
@@ -343,6 +355,11 @@ fn pending_schema() -> SectionSchema {
     SectionSchema::new("pending").field("id", TypeConstraint::Blake3Provenance)
 }
 
+/// The open clips' list: a field `clip` an item, its id (`hp`) and when it was made (`e`), told apart by their types.
+fn clips_schema() -> SectionSchema {
+    SectionSchema::new("clips").field("clip", TypeConstraint::Any)
+}
+
 fn insert_sorted(v: &mut Vec<[u8; 32]>, x: [u8; 32]) -> bool {
     match v.binary_search(&x) {
         Ok(_) => false,
@@ -375,7 +392,8 @@ impl Caller {
     pub fn person() -> Caller {
         Caller::default()
     }
-    fn tag(&self) -> [u8; 32] {
+    /// Who the caller is to the hold: its maker's tag, zeros for the person. Handles and makings are the tag's own.
+    pub fn tag(&self) -> [u8; 32] {
         self.maker.as_ref().map(|m| m.tag()).unwrap_or([0; 32])
     }
     fn may_make(&self, kind: &[u8; 32]) -> bool {
@@ -410,6 +428,28 @@ impl Caller {
         let [makes, opens] = lists;
         let caller = if flags & 4 != 0 { Caller::person() } else { Caller { maker: Some(Maker { developer, option, name: String::from(name) }), makes, opens, device: None, any: flags & 2 != 0 } };
         Some((caller, &s[at..]))
+    }
+
+    /// The stamp as the kernel writes it (process.rs `items_stamp`, `items_person_stamp`), for a host's test of the whole call path; `kist` sets bit 0. `from_stamp` reads it back.
+    pub fn stamp(&self, kist: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let Some(m) = &self.maker else {
+            out.push(1 << 2);
+            out.extend_from_slice(&[0; 69]);
+            return out;
+        };
+        out.push(kist as u8 | (self.any as u8) << 1);
+        out.extend_from_slice(&m.developer);
+        out.extend_from_slice(&m.option);
+        out.push(m.name.len() as u8);
+        out.extend_from_slice(m.name.as_bytes());
+        for list in [&self.makes, &self.opens] {
+            out.extend_from_slice(&(list.len() as u16).to_le_bytes());
+            for k in list {
+                out.extend_from_slice(k);
+            }
+        }
+        out
     }
 }
 
@@ -495,12 +535,14 @@ pub struct Items {
     pages: Vec<Page>,
     handles: Vec<Handle>,
     generation: u64,
+    /// The open clips' list (`CLIPS`), read at its first use.
+    clips: Option<Vec<([u8; 32], i64)>>,
 }
 
 impl Items {
     /// `secret` keys the handles: drawn fresh when the vault process starts, so a handle means nothing to another process and nothing after it.
     pub fn new(secret: [u8; 32]) -> Items {
-        Items { secret, root: None, pages: Vec::new(), handles: Vec::new(), generation: 0 }
+        Items { secret, root: None, pages: Vec::new(), handles: Vec::new(), generation: 0, clips: None }
     }
 
     /// Drop every card held in memory and every handle (the person locked: what is theirs goes, as the vault process drops its plaintext).
@@ -508,6 +550,7 @@ impl Items {
         self.root = None;
         self.pages.clear();
         self.handles.clear();
+        self.clips = None;
     }
 
     /// The root's pages: (start, span) each, oldest first (a bench's view of the index).
@@ -713,6 +756,54 @@ impl Items {
         Ok(out)
     }
 
+    /// The single-copy bodies not yet sealed, each item's id and when it was made: what the vault looks for in its extents' table once a clip's writer is gone (payloads/vault: a clip closed by its recoverer, its card then corrected by `amend_extent`).
+    pub fn open_clips<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<([u8; 32], i64)>> {
+        if let Some(c) = &self.clips {
+            return Ok(c.clone());
+        }
+        let mut out = Vec::new();
+        if let Some(doc) = store.get(d, CLIPS)? {
+            for s in sections(&doc, "clips")? {
+                let p = SectionBuilder::parse(clips_schema(), s).map_err(fmt)?;
+                for f in p.get_fields("clip") {
+                    let id = f.values.iter().find_map(|v| if let VsfType::hp(_) = v { h32(v) } else { None });
+                    let made = f.values.iter().find_map(eagle_of);
+                    if let (Some(id), Some(made)) = (id, made) {
+                        out.push((id, made));
+                    }
+                }
+            }
+        }
+        self.clips = Some(out.clone());
+        Ok(out)
+    }
+
+    /// An item's id put on or taken off the open clips' list, the list written when it changed.
+    fn clips_edit<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, add: bool, now: i64) -> Result<()> {
+        let mut list = self.open_clips(store, d)?;
+        let had = list.iter().any(|(x, _)| x == id);
+        if add == had {
+            return Ok(());
+        }
+        if add {
+            list.push((*id, made));
+        } else {
+            list.retain(|(x, _)| x != id);
+        }
+        if list.is_empty() {
+            store.delete_unlisted(d, CLIPS)?;
+        } else {
+            let mut b = clips_schema().build();
+            for (x, m) in &list {
+                b = b.append_multi("clip", alloc::vec![VsfType::hp(x.to_vec()), e6(*m)]).map_err(fmt)?;
+            }
+            let doc = document(now, "clips", alloc::vec![b.encode().map_err(fmt)?], None)?;
+            store.put_unlisted(d, CLIPS, &doc)?;
+        }
+        self.clips = Some(list);
+        Ok(())
+    }
+
     /// Bodies whose card never landed (a kill between the body's commit and its page's) removed; returns how many. Run at the domain's first request after the vault process starts.
     pub fn sweep<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, now: i64) -> Result<u64> {
         let ids = self.pending(store, d)?;
@@ -833,8 +924,19 @@ impl Items {
 
     /// A new item whose single-copy body is about to be recorded into `extent`: its card placed at once, with no bytes yet, so the item is found (and a clip whose writer dies is still the person's, its card corrected by `seal_extent` or `amend_extent` once the vault has closed it). Returns the caller's handle and the card.
     pub fn make_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, p: Proposed, extent: Extent, now: i64, random: [u8; 32]) -> Result<([u8; 32], Card)> {
-        let mut m = self.make(caller, p, now, random)?;
+        let m = self.make(caller, p, now, random)?;
+        self.begin_extent(store, d, caller, m, extent, now)
+    }
+
+    /// `make_extent` in two steps, for a vault that names the extent by the item's id before reserving it: `make` drafts the card (its id), the extent is reserved under that id, and this places the card with it and puts the item on the open clips' list.
+    pub fn begin_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, mut m: Making, extent: Extent, now: i64) -> Result<([u8; 32], Card)> {
+        if m.again || m.writer.is_some() {
+            return Err(Error::Format);
+        }
         m.card.extent = Some(extent);
+        let (id, made) = (m.card.id, m.card.made);
+        // On the list before the card is placed: a kill between the two leaves an id with no card, which `amend_extent` finds absent and the list lets go.
+        self.clips_edit(store, d, &id, made, true, now)?;
         self.place(store, d, caller, m.card, false, now)
     }
 
@@ -850,7 +952,11 @@ impl Items {
 
     /// The vault's own correction of a single-copy body's card (no caller: the vault process found its clip closed by its recoverer): its extent, length and BLAKE3.
     pub fn amend_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, extent: Extent, len: u64, hash: [u8; 32], now: i64) -> Result<Card> {
-        let (ri, pi, ci) = self.locate(store, d, id, Some(made))?.ok_or(Error::NotFound)?;
+        let Some((ri, pi, ci)) = self.locate(store, d, id, Some(made))? else {
+            // A clip whose card never landed: nothing to correct, and nothing left to look for.
+            self.clips_edit(store, d, id, made, false, now)?;
+            return Err(Error::NotFound);
+        };
         let c = &mut self.pages[pi].cards[ci];
         c.extent = Some(extent);
         c.size = len;
@@ -858,7 +964,25 @@ impl Items {
         c.changed = now;
         let out = c.clone();
         self.save_page(store, d, ri, pi, false, now)?;
+        // Sealed: off the open clips' list once its card says so.
+        self.clips_edit(store, d, id, made, false, now)?;
         Ok(out)
+    }
+
+    /// The vault's own removal of an item by its id (no caller: a single-copy body whose extent is gone from the table, so the card would name blocks nobody holds). The card comes back.
+    pub fn remove_id<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, now: i64) -> Result<Card> {
+        let Some((ri, pi, ci)) = self.locate(store, d, id, Some(made))? else {
+            self.clips_edit(store, d, id, made, false, now)?;
+            return Err(Error::NotFound);
+        };
+        let card = self.pages[pi].cards.remove(ci);
+        if card.extent.is_none() {
+            store.delete_unlisted(d, &body_name(&card.id))?;
+        }
+        self.save_page(store, d, ri, pi, false, now)?;
+        self.drop_handles(id);
+        self.clips_edit(store, d, id, made, false, now)?;
+        Ok(card)
     }
 
     /// The card into its page (replacing the item's own when kept again), the page and, when it changed, the root written.
@@ -922,6 +1046,9 @@ impl Items {
         // The root keeps the page's kinds and makers (a find may read a page with none left of one: never a wrong answer, only a page read), rewritten when the page goes or splits.
         self.save_page(store, d, ri, pi, false, now)?;
         self.drop_handles(&id);
+        if card.extent.is_some() {
+            self.clips_edit(store, d, &id, made, false, now)?;
+        }
         Ok(card)
     }
 
