@@ -50,11 +50,11 @@ fn domain() -> Domain {
 }
 
 fn lumis() -> Caller {
-    Caller { maker: Some(Maker { developer: [1; 32], option: [2; 32], name: "Lumis".into() }), makes: vec![kinds::PHOTO, kinds::RAW_VIDEO], opens: vec![], device: Some([5; 32]) }
+    Caller { maker: Some(Maker { developer: [1; 32], option: [2; 32], name: "Lumis".into() }), makes: vec![kinds::PHOTO, kinds::RAW_VIDEO], opens: vec![], device: Some([5; 32]), any: false }
 }
 
-fn hatch() -> Caller {
-    Caller { maker: Some(Maker { developer: [3; 32], option: [4; 32], name: "Hatch".into() }), makes: vec![], opens: vec![kinds::PHOTO, kinds::RAW_VIDEO, kinds::LIST], device: Some([5; 32]) }
+fn kuaha() -> Caller {
+    Caller { maker: Some(Maker { developer: [3; 32], option: [4; 32], name: "Kūaha".into() }), makes: vec![], opens: vec![kinds::PHOTO, kinds::RAW_VIDEO, kinds::LIST], device: Some([5; 32]), any: false }
 }
 
 /// An hour of oscillations of the hydrogen line, about 2^42.4: a page's narrowest span is 2^42.
@@ -133,14 +133,14 @@ fn make_read_find_keep_again_remove() {
 fn rights_are_the_stamps() {
     let (mut s, d) = (store(1 << 13), domain());
     let mut items = Items::new([1; 32]);
-    let (l, h) = (lumis(), hatch());
-    // Hatch makes nothing; Lumis makes photos and RAW video, not lists.
+    let (l, h) = (lumis(), kuaha());
+    // Kūaha makes nothing; Lumis makes photos and RAW video, not lists.
     assert!(matches!(items.make(&h, photo("x", 1), T0, [0; 32]), Err(Error::Refused)));
     assert!(matches!(items.make(&l, Proposed { kind: kinds::LIST, ..Default::default() }, T0, [0; 32]), Err(Error::Refused)));
     let lh = keep(&mut items, &mut s, &d, &l, photo("mine", 1), T0, b"abc");
-    // A handle is the caller's own: Hatch cannot use Lumis's.
+    // A handle is the caller's own: Kūaha cannot use Lumis's.
     assert!(matches!(items.card(&mut s, &d, &h, &lh), Err(Error::Refused)));
-    // Hatch finds it by kind (it may open photos) and gets its own handle.
+    // Kūaha finds it by kind (it may open photos) and gets its own handle.
     let found = items.find(&mut s, &d, &h, &Find::default()).unwrap();
     assert_eq!(found.total, 1);
     let hh = found.items[0].0;
@@ -177,7 +177,7 @@ fn single_copy_bodies() {
     assert_eq!(items.read(&mut s, &d, &l, &h, 0, &mut out).unwrap(), Read::Extent(x, 1_090_604_642));
     // Found like any item, by kind and attribute.
     let f = Find { kinds: vec![kinds::RAW_VIDEO], wheres: vec![("fps".into(), IS_EQUAL, VsfType::u(30, false))], ..Default::default() };
-    assert_eq!(items.find(&mut s, &d, &hatch(), &f).unwrap().total, 1);
+    assert_eq!(items.find(&mut s, &d, &kuaha(), &f).unwrap().total, 1);
     // Removing it gives the card back with its extent, for the vault to free.
     assert_eq!(items.remove(&mut s, &d, &l, &h, T0).unwrap().extent, Some(x));
     assert_eq!(items.find(&mut s, &d, &l, &Find::default()).unwrap().total, 0);
@@ -262,4 +262,49 @@ fn wire_documents_round_trip() {
     assert_eq!(wire::parse_card_doc(&wire::card_doc(c, h, T0).unwrap()).unwrap(), (*h, c.clone()));
     let call = wire::call(wire::OP_READ, h, 7, 1 << 20, b"pay");
     assert_eq!(wire::parse_call(&call), Some((wire::OP_READ, *h, 7, 1 << 20, &b"pay"[..])));
+}
+
+#[test]
+fn a_clip_kept_as_it_records() {
+    let (mut s, d) = (store(1 << 13), domain());
+    let mut items = Items::new([1; 32]);
+    let l = lumis();
+    let clip = Proposed { kind: kinds::RAW_VIDEO, title: Some("recording".into()), ..Default::default() };
+    let reserved = Extent { first: 100, blocks: 1 << 20 };
+    let (h, c) = items.make_extent(&mut s, &d, &l, clip, reserved, T0, [3; 32]).unwrap();
+    assert_eq!((c.size, c.extent), (0, Some(reserved)));
+    // Found while it records.
+    assert_eq!(items.find(&mut s, &d, &l, &Find::default()).unwrap().total, 1);
+    let sealed = Extent { first: 100, blocks: 1000 };
+    let c = items.seal_extent(&mut s, &d, &l, &h, sealed, 4_000_000, [7; 32], T0 + 1).unwrap();
+    assert_eq!((c.size, c.extent, c.body), (4_000_000, Some(sealed), [7; 32]));
+    // Read from the disk alone: the sealed card.
+    let r = Items::new([2; 32]).find(&mut s, &d, &Caller::person(), &Find::default()).unwrap();
+    assert_eq!(r.items[0].1.extent, Some(sealed));
+    // The vault's own correction of a clip its recoverer closed.
+    let c = items.amend_extent(&mut s, &d, &c.id, c.made, Extent { first: 100, blocks: 900 }, 3_600_000, [8; 32], T0 + 2).unwrap();
+    assert_eq!(c.size, 3_600_000);
+}
+
+#[test]
+fn the_callers_stamp_reads() {
+    let mut s = vec![1u8];
+    s.extend_from_slice(&[3; 32]);
+    s.extend_from_slice(&[4; 32]);
+    s.push(5);
+    s.extend_from_slice(b"lumis");
+    s.extend_from_slice(&1u16.to_le_bytes());
+    s.extend_from_slice(&kinds::RAW_VIDEO);
+    s.extend_from_slice(&2u16.to_le_bytes());
+    s.extend_from_slice(&kinds::PHOTO);
+    s.extend_from_slice(&kinds::SCAN);
+    s.extend_from_slice(b"call");
+    let (c, call) = Caller::from_stamp(&s).unwrap();
+    let m = c.maker.unwrap();
+    assert_eq!((m.developer, m.option, m.name.as_str(), c.makes, c.opens, c.any, call), ([3; 32], [4; 32], "lumis", vec![kinds::RAW_VIDEO], vec![kinds::PHOTO, kinds::SCAN], false, &b"call"[..]));
+    let mut p = vec![4u8];
+    p.extend_from_slice(&[0; 69]);
+    let (c, call) = Caller::from_stamp(&p).unwrap();
+    assert!(c.maker.is_none() && call.is_empty());
+    assert!(Caller::from_stamp(&s[..70]).is_none());
 }

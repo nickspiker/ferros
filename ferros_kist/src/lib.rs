@@ -29,9 +29,9 @@ use vsf::types::EtType;
 use vsf::VsfType;
 
 /// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way).
-pub const RIGHTS: [&str; 13] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck"];
+pub const RIGHTS: [&str; 14] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 13] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck"];
+pub const MEANS: [&str; 14] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
@@ -44,6 +44,52 @@ pub const PEOPLE: u8 = 11;
 pub const PUCK: u8 = 12;
 /// A surface of its own (the implicit right a puck is handed empty).
 pub const SURFACE: u8 = 2;
+/// The person's things (docs/STORE.md part 1, "keep for you", 2026-11-19): keeping items in the hold for the person, of the kinds the capsule's `items` section declares it makes, and opening the kinds it declares it opens and what it made itself. Asked once, as every right outside the implicit set; appended, so every code before it keeps its meaning.
+pub const ITEMS: u8 = 13;
+
+/// A capsule's `items` section (STORE.md "Kinds, and the question asked"): each kind it makes and each it opens, with the developer's reason, signed with the rest of the capsule. A field `make` or `open` per kind: the kind (an idea, `hi`) and its reason (`a`), told apart by their types.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ItemsDecl {
+    pub makes: Vec<([u8; 32], String)>,
+    pub opens: Vec<([u8; 32], String)>,
+}
+
+/// The kinds a capsule declares in its `items` section; none for a capsule without one. A field outside `make` and `open`, or one without its kind, refuses it.
+pub fn items_of(capsule: &[u8]) -> Result<ItemsDecl, &'static str> {
+    let Some(s) = section(capsule, "items")? else { return Ok(ItemsDecl::default()) };
+    let mut d = ItemsDecl::default();
+    for f in &s.fields {
+        let kind = f.values.iter().find_map(|v| match v {
+            VsfType::hi(k) if k.len() == 32 => Some(<[u8; 32]>::try_from(&k[..]).unwrap()),
+            _ => None,
+        });
+        let reason = f.values.iter().find_map(|v| match v {
+            VsfType::a(t) => Some(String::from(t.as_str())),
+            _ => None,
+        });
+        let (Some(kind), Some(reason)) = (kind, reason) else { return Err("an items field without its kind or its reason") };
+        match f.name.as_str() {
+            "make" => d.makes.push((kind, reason)),
+            "open" => d.opens.push((kind, reason)),
+            _ => return Err("an items field that is neither make nor open"),
+        }
+    }
+    Ok(d)
+}
+
+/// The `items` section for the signer (ferros-bridge `capsule --kist`), or none for a declaration of no kinds.
+pub fn items_section(d: &ItemsDecl) -> Option<VsfSection> {
+    if d.makes.is_empty() && d.opens.is_empty() {
+        return None;
+    }
+    let mut s = VsfSection::new("items");
+    for (name, list) in [("make", &d.makes), ("open", &d.opens)] {
+        for (kind, reason) in list {
+            s.fields.push(vsf::VsfField::with_values(name, alloc::vec![VsfType::hi(kind.to_vec()), VsfType::a(vsf::Ascii::checked("reason", reason.clone()))]));
+        }
+    }
+    Some(s)
+}
 
 /// Whether the person is ever asked for right `r`: every right but the implicit set and `PUCK`.
 pub fn asked_right(r: u8) -> bool {
@@ -1347,6 +1393,25 @@ mod tests {
         c.add_field("code", VsfType::v(b'b', alloc::vec![1u8; 16]));
         let bare = vsf::VsfBuilder::new().add_section_direct(c).build().unwrap();
         assert_eq!(declaration(&bare).unwrap().wants.len(), 0);
+    }
+
+    /// The `items` section reads back as written, with the capsule's other sections; a capsule without one declares no kinds; a field neither make nor open refuses it.
+    #[test]
+    fn items_kinds_round_trip_in_a_capsule() {
+        let d = ItemsDecl { makes: alloc::vec![([1; 32], String::from("the photos and clips you take"))], opens: alloc::vec![([1; 32], String::from("to show them")), ([2; 32], String::from("your scans"))] };
+        let (kist, wants) = declaration_sections(&Decl { name: String::from("Lumis"), wants: alloc::vec![(ITEMS, String::from("to keep what you shoot"))] }, Some([5; 32]));
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(kist).add_section_direct(wants.unwrap()).add_section_direct(items_section(&d).unwrap()).build().unwrap();
+        assert_eq!(items_of(&file).unwrap(), d);
+        assert_eq!(want_codes(&file).unwrap(), alloc::vec![ITEMS]);
+        assert!(asked_right(ITEMS));
+        assert_eq!(RIGHTS[ITEMS as usize], "items");
+        assert!(items_section(&ItemsDecl::default()).is_none());
+        let bare = vsf::VsfBuilder::new().provenance_only().add_section_direct(declaration_sections(&decl(), None).0).build().unwrap();
+        assert_eq!(items_of(&bare).unwrap(), ItemsDecl::default());
+        let mut bad = VsfSection::new("items");
+        bad.add_field("delete", VsfType::hi(alloc::vec![1; 32]));
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(bad).build().unwrap();
+        assert!(items_of(&file).is_err());
     }
 
     #[test]

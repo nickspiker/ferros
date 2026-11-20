@@ -234,6 +234,8 @@ enum VaultJob {
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
     /// A single-copy extent's blocks (docs/RAW-VIDEO.md: a clip pulled to the host), a UFS command's 1 MiB a call: its full name, the next block, the blocks still to read, what has come; or with `info` its record alone.
     Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, one: Option<(u8, u32)>, kist: Option<([u8; 32], [u8; 32])> },
+    /// One call on the hold as the person (the bridge's `items`, docs/STORE.md): the call as ferros_items `wire` makes it, sent whole; the answer [0][the value u64 LE][the bytes], the bridge reading the value itself.
+    Items { call: alloc::vec::Vec<u8> },
 }
 
 /// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record. A name in a kist's own domain (a clip Lumis recorded): [G#FD][developer 32][option 32][block u64 LE][blocks u32 LE][name] and [G#FC][developer 32][option 32][name].
@@ -304,6 +306,13 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
                 return Some(Err(alloc::vec![5]));
             }
             VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), one: info.then_some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: Some((developer, option)) }
+        }
+        // A call on the hold as the person (G#F9, the bridge's `items`): [G#F9][the call]. WHY: the length is the host's: at least the call's head, at most one transfer and its head.
+        ferros_pt::Op::Read if params.first() == Some(&0xF9) => {
+            if params.len() < 46 || params.len() > 1 + crate::process::ITEMS_CALL_MAX {
+                return Some(Err(alloc::vec![5]));
+            }
+            VaultJob::Items { call: params[1..].to_vec() }
         }
         // The clips area's records (G#FB) or a drop of one of the domain's extents by its first block (G#FA), for the bridge's `store extent-list` / `extent-drop`: [code][first block u64][1: a kist's domain follows (developer 32, option 32), 0: a scope's][name], the name a scope's full name (or any of the kist's: it is not looked up). Never from a process (`extent_forward` refuses both ops).
         ferros_pt::Op::Read if matches!(params.first(), Some(&0xFB) | Some(&0xFA)) && params.len() > 10 => {
@@ -381,6 +390,7 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
             }
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
+        VaultJob::Items { call } => crate::process::vault_stamp_items(call),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
         VaultJob::Extent { full, block, left, one, kist, .. } => {
             // [extent op][block u64][length u32], as process.rs `extent_forward` stamps a process's call.
@@ -471,6 +481,13 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
                 r.extend_from_slice(got);
                 return Some(r);
             }
+        }
+        VaultJob::Items { .. } => {
+            let mut r = alloc::vec::Vec::with_capacity(9 + bytes.len());
+            r.push(0);
+            r.extend_from_slice(&value.to_le_bytes());
+            r.extend_from_slice(&bytes);
+            return Some(r);
         }
         VaultJob::Remove { full } => {
             return Some(match value {
@@ -5787,6 +5804,7 @@ pub fn run(mut b: Boot) -> ! {
                             15 => crate::process::Grant::Vault,
                             16 => crate::process::Grant::Domain,
                             17 => crate::process::Grant::Kists,
+                            18 => crate::process::Grant::Items,
                             _ => crate::process::Grant::Use(g),
                         });
                     }

@@ -3,7 +3,21 @@
 The hold is where a person's things are kept (owner, 2026-11-11: "the hold? Is that the right word?", then "Yes, and I'd say not worry about the snag. it's common to hold a bag and to put shit in the hold."): kists are stowed, items go in the hold. "Held call" (a doorbell wait) keeps its meaning beside it.
 
 Status: a draft for the owner to mark up, 2026-11-11.
-Nothing here is built.
+Build step 0 begun 2026-11-19 on branch `hold` (handoff below); the rest is not built.
+
+### Handoff, 2026-11-19 (branch `hold`, off raw-video-rec)
+
+The kist that views the hold is **Kūaha** (`kuaha` in code). Built and host-tested, never run on a device:
+- **ferros_store**: `begin_unlisted`, `put_unlisted`, `delete_unlisted` (values off the names list, still on the pending list; a store test).
+- **ferros_items** (no_std, 9 host tests): the card (section `card`; the kist as one `kist` field of `ke`, `hR`, `x`, relations and attributes as repeated `of` and `attr` fields, a single-copy body as `extent_at` and `extent_blocks`), time pages under a root (2^56 oscillations split down to 2^42 while a page passes one piece; 600 items made 6 pages), make, write, finish, read by range, card, find (kinds, maker, time, changed, words, relation, attributes equal, at least, at most, words; four orders; pages of 256), keep again in place, remove, sweep; single-copy bodies (`make_extent` places the card at once, `seal_extent` once the clip is sealed, `amend_extent` for the vault's own correction after its recoverer closed a clip, `remove` gives the extent back for the vault to free); rights from the stamp (`Caller::from_stamp`); `wire`: the calls' rest and the `propose`, `find`, `found` and `card` documents; `kinds`: thirteen kinds minted from their first English phrasings and pinned against `ferros_idea::id`.
+- **ferros_kist**: the right `items` (code 13, asked, "your things") and the capsule's `items` section (`make` and `open` fields: the kind `hi` and the reason `a`), `items_of`, `items_section`, a test.
+- **The kernel** (builds; untested): `Object::Items`, `Process::items` (a kist's kinds from its capsule where the person granted `items`, a development spawn's `--items` grant 18 any kind), `SYS_STORE` x1 bit 7 forwarded as `VOP_ITEMS` 8 with the person's items domain (`items.`, identity class) and the caller's stamp (`items_stamp`), the bridge's job G#F9 as the person (`vault_stamp_items`).
+
+Not built yet, in order: the vault process's `OP_ITEMS` 8 (an `Items` per process, makings held by a random token, extent bodies reserved in the extents' table under `extent_name(items domain, id)` and given to the caller, the read of an extent body thru `ExtentBytes`, a removed item's extent dropped, `sweep` at the domain's first call, `forget` at a lock); the bridge's `items` commands and its `--items` spawn flag (grant 18); ferros_sys calls and a ferros_clip `ItemSink` (Lumis keeping a clip as an item); the `items` right in ferros_lang's catalog (the settings pages fall back to MEANS meanwhile); per-kind answers for opening (a granted `items` lets a kist open every kind it declares, for now).
+
+The §7 questions taken as proposed for this step, for the owner: kinds replace the common area's names for items, names stay for system state (1); a kist opens what it made itself without asking (2); picks are not built (3); a kist's own items (`keeper` 1) are written like the person's, in the person's items domain, not yet in the kist's (4).
+Kinds are minted, not published: their ids are `ferros_idea::id(eng, words)`, pinned in ferros_items `kinds`, and their sheet waits for vsf v11 (IDEAS.md).
+Deviations: no recent list and no persisted generation (a find's `generation` counts this process's changes); the root keeps a removed item's kind and maker until its page goes or splits (a page read, never a wrong answer); a page at 2^42 still too full grows past one piece instead of overflow pages; makers in the root are BLAKE3 of the kist's identity, not small numbers.
 Every part is **Proposed** unless it quotes the owner; the decisions it leans on are cited where they were made (VAULT-OUT.md, KISTS.md, AUTH.md, IDENTITY-SPACE.md, GENESIS.md).
 
 ## The ask

@@ -367,6 +367,8 @@ pub struct Caller {
     pub makes: Vec<[u8; 32]>,
     pub opens: Vec<[u8; 32]>,
     pub device: Option<[u8; 32]>,
+    /// Any kind, made or opened (a development spawn's `--items`, the bench's): never a kist's.
+    pub any: bool,
 }
 
 impl Caller {
@@ -377,14 +379,37 @@ impl Caller {
         self.maker.as_ref().map(|m| m.tag()).unwrap_or([0; 32])
     }
     fn may_make(&self, kind: &[u8; 32]) -> bool {
-        self.maker.is_none() || self.makes.contains(kind)
+        self.maker.is_none() || self.any || self.makes.contains(kind)
     }
     /// It may open (and change, and remove) what it made itself and the kinds it was let open; the person all.
     fn may_open(&self, c: &Card) -> bool {
         match &self.maker {
             None => true,
+            Some(_) if self.any => true,
             Some(m) => (c.kist.developer == m.developer && c.kist.option == m.option) || self.opens.contains(&c.kind),
         }
+    }
+
+    /// The caller from the kernel's stamp (process.rs `items_stamp`): [flags u8: bit 0 a kist, bit 1 any kind, bit 2 the person][developer 32][option 32][name length u8][name][makes u16 LE][kinds][opens u16 LE][kinds]; and the bytes after it, the call. None when it does not read as one.
+    pub fn from_stamp(s: &[u8]) -> Option<(Caller, &[u8])> {
+        let flags = *s.first()?;
+        let developer: [u8; 32] = s.get(1..33)?.try_into().ok()?;
+        let option: [u8; 32] = s.get(33..65)?.try_into().ok()?;
+        let nl = *s.get(65)? as usize;
+        let name = core::str::from_utf8(s.get(66..66 + nl)?).ok()?;
+        let mut at = 66 + nl;
+        let mut lists = [Vec::new(), Vec::new()];
+        for l in lists.iter_mut() {
+            let n = u16::from_le_bytes(s.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            for k in 0..n {
+                l.push(s.get(at + 32 * k..at + 32 * (k + 1))?.try_into().ok()?);
+            }
+            at += 32 * n;
+        }
+        let [makes, opens] = lists;
+        let caller = if flags & 4 != 0 { Caller::person() } else { Caller { maker: Some(Maker { developer, option, name: String::from(name) }), makes, opens, device: None, any: flags & 2 != 0 } };
+        Some((caller, &s[at..]))
     }
 }
 
@@ -803,6 +828,36 @@ impl Items {
         if old.as_ref().is_some_and(|c| c.extent.is_none()) {
             store.delete_unlisted(d, &body_name(&out.1.id))?;
         }
+        Ok(out)
+    }
+
+    /// A new item whose single-copy body is about to be recorded into `extent`: its card placed at once, with no bytes yet, so the item is found (and a clip whose writer dies is still the person's, its card corrected by `seal_extent` or `amend_extent` once the vault has closed it). Returns the caller's handle and the card.
+    pub fn make_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, p: Proposed, extent: Extent, now: i64, random: [u8; 32]) -> Result<([u8; 32], Card)> {
+        let mut m = self.make(caller, p, now, random)?;
+        m.card.extent = Some(extent);
+        self.place(store, d, caller, m.card, false, now)
+    }
+
+    /// The single-copy body sealed: its extent as it now stands (its tail given back), its length and BLAKE3; the card changed in place.
+    pub fn seal_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, handle: &[u8; 32], extent: Extent, len: u64, hash: [u8; 32], now: i64) -> Result<Card> {
+        let (id, made) = self.resolve(caller, handle)?;
+        let c = self.card(store, d, caller, handle)?;
+        if c.extent.is_none() {
+            return Err(Error::Extent);
+        }
+        self.amend_extent(store, d, &id, made, extent, len, hash, now)
+    }
+
+    /// The vault's own correction of a single-copy body's card (no caller: the vault process found its clip closed by its recoverer): its extent, length and BLAKE3.
+    pub fn amend_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, extent: Extent, len: u64, hash: [u8; 32], now: i64) -> Result<Card> {
+        let (ri, pi, ci) = self.locate(store, d, id, Some(made))?.ok_or(Error::NotFound)?;
+        let c = &mut self.pages[pi].cards[ci];
+        c.extent = Some(extent);
+        c.size = len;
+        c.body = hash;
+        c.changed = now;
+        let out = c.clone();
+        self.save_page(store, d, ri, pi, false, now)?;
         Ok(out)
     }
 

@@ -1057,6 +1057,15 @@ pub enum Object {
     NewPuck,
     /// Served by the kernel: a RAW clip's extent of the `clips` window (index into `EXTENT_GRANTS`), given by the vault process to the process whose extent it opened (SYS_BLOCK x1 bit 3), written and read by that process alone by block number within it (docs/RAW-VIDEO.md "The recorder": the clip's bytes go straight to the flash, not thru the vault process).
     Extent(usize),
+    /// Served by the kernel, through the vault process: the hold (docs/STORE.md, 2026-11-19): items kept for the person in their items domain, of the kinds the holder's right names (`Process::items`), every call stamped with who calls and those kinds (`items_forward`), so the vault never takes a kist's word for what it may open.
+    Items,
+}
+
+/// What a holder of `Object::Items` may do (ferros_kist `ItemsDecl`): the kinds it makes and opens as its capsule declares them, or any kind (`any`: a development spawn's `--items`, the bench's).
+pub struct ItemRight {
+    pub any: bool,
+    pub makes: Vec<[u8; 32]>,
+    pub opens: Vec<[u8; 32]>,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -1108,6 +1117,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::SpareSurface => (24, 0),
         Object::NewPuck => (25, 0),
         Object::Extent(i) => (26, i as u64),
+        Object::Items => (27, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -1269,6 +1279,8 @@ struct Process {
     facets: u8,
     /// A kist's capsule address (its vault address, the blake3 of the signed capsule), as launched: what names it in the person's list, for the rights it is using (`CLAIMS`). None for a system process.
     capsule: Option<[u8; 32]>,
+    /// The hold's right (`Object::Items`): the kinds it makes and opens, stamped on its every items call (`items_forward`). None without the right.
+    items: Option<alloc::boxed::Box<ItemRight>>,
     /// The arc's top at spawn (its size, exact mode's limit): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
     floor: usize,
     /// SYS_ARC grows and shrinks granted so far (`diag arcs`).
@@ -4072,6 +4084,91 @@ fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
 
+/// `SYS_STORE` x1 bit 7: a call on the hold (docs/STORE.md "The calls", ferros_items `wire`): x0 the `Object::Items` token, x2/x3 the call (its op, handle, offset, length and payload), x4 the reply's buffer, x1 bits 8-31 its length.
+pub const STORE_ITEMS: u64 = 1 << 7;
+/// The hold's calls forwarded to the vault process (`items_forward`): the person's items domain stamped (`ITEMS_PREFIX`, identity class), rest [the caller's stamp][the call].
+pub const VOP_ITEMS: u8 = 8;
+/// The person's items domain: one domain under their identity class, every kist's items in it, each kept by the card's maker.
+pub const ITEMS_PREFIX: &[u8] = b"items.";
+/// The longest call: an extent's or a body's write of one UFS command, and its head.
+pub const ITEMS_CALL_MAX: usize = EXTENT_MAX + (1 << 6);
+
+/// Who calls on the hold, as the kernel knows it, ahead of its call (payloads/vault `items`): [flags u8: bit 0 a kist, bit 1 any kind, bit 2 the person (the kernel's own call, `items_person_stamp`)][developer 32][option 32][name length u8][name][makes u16 LE][the kinds, 32 each][opens u16 LE][the kinds]. A kist is its gate identity; a development spawn its name under a zero developer key (it has no identity of its own).
+/// WHY the caps: the name and the kinds are the process's own and its capsule's; a name past a byte's count and lists past a u16's are cut, never wrapped.
+fn items_stamp(p: &Process) -> Option<Vec<u8>> {
+    let r = p.items.as_ref()?;
+    let (developer, option) = match p.gate.filter(|_| p.kist) {
+        Some(g) => g,
+        None => ([0; 32], blake3::derive_key("ferros items 2026-11-19 development spawn", &p.name)),
+    };
+    let name = &p.name[..p.name.len().min(255)];
+    let mut out = Vec::with_capacity(70 + name.len() + 32 * (r.makes.len() + r.opens.len()));
+    out.push(p.kist as u8 | (r.any as u8) << 1);
+    out.extend_from_slice(&developer);
+    out.extend_from_slice(&option);
+    out.push(name.len() as u8);
+    out.extend_from_slice(name);
+    for list in [&r.makes, &r.opens] {
+        let n = list.len().min(u16::MAX as usize);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for k in &list[..n] {
+            out.extend_from_slice(k);
+        }
+    }
+    Some(out)
+}
+
+/// The person's own call on the hold (the kernel's channel: the bridge's `items`, the bench and the owner's pulls): every kind, no kist.
+pub fn items_person_stamp() -> Vec<u8> {
+    let mut out = alloc::vec![1u8 << 2];
+    out.extend_from_slice(&[0; 64]);
+    out.extend_from_slice(&[0, 0, 0, 0, 0]);
+    out
+}
+
+/// The kernel's own call on the hold, stamped for the person: the person's items domain's keys, then `rest` (the person's stamp and the call). None while nobody is present.
+pub fn vault_stamp_items(call: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = items_person_stamp();
+    rest.extend_from_slice(call);
+    with_lock_held_or(|| stamp(VOP_ITEMS, ITEMS_PREFIX, &[true], b"", &rest))
+}
+
+/// A call on the hold (`STORE_ITEMS`), forwarded as `VOP_ITEMS`: the person's items domain's keys, the caller's stamp, then its call. Refused without the right, while nobody is present (the person's keys are not open), or for a call or reply past its bounds.
+fn items_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
+    let Some(p) = proc_of(cur) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    let token = p.read(f.x[0], 32);
+    let held = p.lookup(&token).is_some_and(|i| p.cspace[i].object == Object::Items && p.cspace[i].rights & RIGHT_SEND != 0);
+    let (len, call) = (((f.x[1] >> 8) & 0xFF_FFFF) as usize, f.x[3] as usize);
+    // WHY: the lengths are the caller's: a call of at least its head and at most one transfer, a reply no larger than the vault answers.
+    let Some(stamp) = items_stamp(p).filter(|_| held && call >= 45 && call <= ITEMS_CALL_MAX && len <= vault_get_max(ep)) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    let Some(mut msg) = self::stamp(VOP_ITEMS, ITEMS_PREFIX, &[true], b"", &stamp) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    match p.view(f.x[2], call) {
+        Some(b) => {
+            msg.reserve_exact(call);
+            msg.extend_from_slice(b);
+        }
+        None => {
+            crate::keys::wipe_to_dram(&mut msg);
+            f.x[0] = ERR;
+            return 0;
+        }
+    }
+    if let Some(t) = th(cur) {
+        t.called = crate::platform::cntpct();
+        t.what = VOP_ITEMS as u64 | (len as u64) << 8;
+    }
+    call_endpoint(f, cur, ep, msg, f.x[4], len as u64 | STORE_REPLY)
+}
+
 /// The extent ops (x1 bits 0-2 with `STORE_EXTENT`; payloads/vault `extent`).
 /// Open: reserve the u64 of blocks at the start of x4's 32 bytes under the name (a fresh extent; an open one of the same name is dropped first) → the blocks reserved, ERR when no stretch that long is free; the 32 bytes then hold the extent's own SYS_BLOCK capability (`Object::Extent`), or zeros from a vault process that gives none.
 pub const EOP_OPEN: u8 = 0;
@@ -5334,6 +5431,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_STORE if f.x[1] & STORE_ITEMS != 0 => match vault_route() {
+            Some(Ok(ep)) => items_forward(f, cur, ep),
+            _ => {
+                f.x[0] = ERR;
+                0
+            }
+        },
         SYS_STORE if names_stow(p, f) => match kist_store_route(p, f) {
             Ok((ep, d)) => kist_domain_forward(f, cur, ep, &d),
             Err(()) => {
@@ -7933,6 +8037,8 @@ pub enum Grant<'a> {
     Kists,
     /// The right to stow kists (`Object::Stow`): the stower's (payloads/kists).
     Stow,
+    /// The hold, any kind (`Object::Items`; a development spawn's `--items`): a kist's comes from its capsule's declaration instead.
+    Items,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -8133,6 +8239,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "be_you" | "people" => (Object::Endpoint(endpoint(b"facets")), RIGHT_SEND),
         // A puck's circle (docs/PUCKS.md, 2026-11-17): a send right on the display's `puck` endpoint, every call on it stamped with the caller's kist identity (`puck_stamp`), so the display draws a puck's list only into the circle the deck gave that identity and no puck can name another's.
         "puck" => (Object::Endpoint(endpoint(b"puck")), RIGHT_SEND),
+        // The person's things (docs/STORE.md, 2026-11-19): the hold, its kinds the capsule's `items` section (set on the process once it is built, `spawn_kist`).
+        "items" => (Object::Items, RIGHT_SEND),
         _ => return None,
     })
 }
@@ -8356,6 +8464,8 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
         if wants.len() != l.codes.len() || wants.iter().zip(&l.codes).any(|(&w, &c)| c != ferros_kist::EMPTY && c != w) {
             return Err((why::CHECKS, "kist: a right the capsule does not declare in that slot"));
         }
+        // The kinds of the hold it declares (STORE.md part 1), read before its code is moved over the capsule; they matter only where the person granted `items`.
+        let items = ferros_kist::items_of(capsule).map_err(|e| (why::READ, e))?;
         let (co, cl, masked) = locate_code(capsule, total).map_err(|e| (why::READ, e))?;
         let (g, modes) = if masked {
             let (g, m) = kist_sealed(capsule, co, cl, sealed, pre, &address)?;
@@ -8382,9 +8492,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
         }
-        Ok((ihi, cl, modes, wants, (g.developer_pubkey, g.hp), t_build))
+        Ok((ihi, cl, modes, wants, (g.developer_pubkey, g.hp), t_build, items))
     })();
-    let (ihi, cl, modes, wants, gate, t_build) = match r {
+    let (ihi, cl, modes, wants, gate, t_build, items) = match r {
         Ok(x) => x,
         Err(e) => {
             with_lock(|| arc_free(arc));
@@ -8429,6 +8539,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
                     q.capsule = Some(l.capsule);
                     q.gate = Some(gate);
                     q.facets = facets;
+                    // The hold's kinds as its capsule declares them, where the person granted `items` (its slot holds the right, not an empty one); none otherwise.
+                    let granted = wants.iter().zip(l.codes.iter()).any(|(&w, &c)| w == c && c == ferros_kist::ITEMS);
+                    q.items = granted.then(|| alloc::boxed::Box::new(ItemRight { any: false, makes: items.makes.iter().map(|k| k.0).collect(), opens: items.opens.iter().map(|k| k.0).collect() }));
                 }
                 enqueue_back(me);
                 kist_started(&l.capsule);
@@ -8714,6 +8827,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
             Grant::Vault => (Object::Vault, RIGHT_SEND),
             Grant::Domain => (Object::Domain, RIGHT_SEND),
+            Grant::Items => (Object::Items, RIGHT_SEND),
             Grant::Kists => (Object::Kists, RIGHT_SEND),
             Grant::Stow => (Object::Stow, RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
@@ -8941,7 +9055,9 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: CODE + exec_len, panicked: None };
+    // The hold's right as a development spawn has it (`--items`: any kind); a kist's is set from its capsule's declaration once it is built (`spawn_kist`).
+    let items = cspace.iter().any(|c| c.object == Object::Items).then(|| alloc::boxed::Box::new(ItemRight { any: true, makes: Vec::new(), opens: Vec::new() }));
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, items, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: CODE + exec_len, panicked: None };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
