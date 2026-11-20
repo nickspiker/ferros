@@ -105,6 +105,8 @@ struct Clip {
     cam: String,
     /// Its frames a second (1 to 60, ferros_clip `Pacing::of`).
     fps: u32,
+    /// When it began, Eagle oscillations (its row in lumis_core's clips list).
+    at: i64,
     /// The extent's name in Lumis's domain.
     name: String,
     began: std::time::Instant,
@@ -196,6 +198,7 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
     };
     // The stills' stamp with its spaces as underscores: an extent's name is printed ASCII without the space (the kernel's extent_forward takes 0x21 to 0x7E; 2026-11-19, the Pro: every open of "video/<stamp> video.vsf" refused before the vault saw it).
     let name = format!("video/{}.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()).replace(' ', "_"));
+    let at = ferros_clip::eagle_osc(head.time as u64);
     // The longest free stretch of the clips window, whole (what an OPEN can get: a clip is one stretch), where the vault says it; else from CLIP_BLOCKS_MOST, halving on refusal.
     let mut blocks = ferros_clip::ferros::space(slot).map_or(CLIP_BLOCKS_MOST, |sp| sp.largest_free_bytes / ferros_clip::BLOCK as u64);
     loop {
@@ -207,7 +210,7 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
             writer: 0x000F,
             slots: 4,
             blocks,
-            at: ferros_clip::eagle_osc(head.time as u64),
+            at,
             source_digests: digests,
         };
         let ext = ferros_clip::ferros::Extent::new(slot, &name);
@@ -215,8 +218,10 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
             Ok(rec) => {
                 let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
                 println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
+                // Its row in Lumis's clips list from its start (the clips page; a clip never closed shows as such).
+                lumis_core::clips::put(lumis_core::clips::Clip { name: name.clone(), frames: 0, bytes: 0, fps: pacing.fps, at, seal: None });
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, began: now, room, preview: now, dropped: 0, last_count: head.count, first_ns: None, space_before: space_used });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, first_ns: None, space_before: space_used });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -236,6 +241,17 @@ fn read_space(header: &mut [u64]) {
     }
 }
 
+/// lumis_core's clips page deletes a clip's bytes here: the extent of that name in Lumis's domain (its record and blocks; the vault gives the blocks back to the clips area).
+fn delete_clip(name: &str) -> Result<(), String> {
+    let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
+    if ferros_clip::ferros::Extent::new(slot, name).delete() {
+        println!("lumis: RAW video: {name} deleted");
+        Ok(())
+    } else {
+        Err("the vault refused the delete".into())
+    }
+}
+
 /// A clip ended: its closing generation written and the extent sealed (ferros_clip `stop`), its counts into the header (when the caller has it: not at Lumis's end), said on the console with why it ended.
 fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
     use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
@@ -252,6 +268,8 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
         // The space as the seal left it (the reservation given back past the clip's length).
         read_space(header);
     }
+    // Its row in the clips list, closed: its frames, bytes and seal (the seal none if it did not close).
+    lumis_core::clips::put(lumis_core::clips::Clip { name: clip.name.clone(), frames: s.frames, bytes: info.len, fps: clip.fps, at: clip.at, seal: info.error.is_none().then_some(info.hash) });
     // Under the RECORD button: the clip's name, which the person pulls it by, and why if it ended early.
     lumis_core::platform::set_video_note(Some(match &info.error {
         None => clip.name.clone(),
@@ -898,7 +916,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
     }
     // RAW video on the binned main only: the recorder's pacing is that readout's (ferros_clip `Pacing`: its pixel clock and line length, its 3072 rows), and its frames are read in place from the view.
-    let mut video_ok = cam.id == 0 && cam.mode == 0 && (cam.width, cam.height) == (4080, 3072) && matches!(src, Source::View { .. });
+    let video_ok = cam.id == 0 && cam.mode == 0 && (cam.width, cam.height) == (4080, 3072) && matches!(src, Source::View { .. });
     lumis_core::platform::set_video_offered(video_ok);
     if video_ok && dev_knobs4() & DEV_VIDEO != 0 {
         integrator.header[CURRENT_MODE_IDX] = RawMode::Video as u64;
@@ -932,6 +950,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
     // RAW video: the rate the camera is open at (None: opened as ever, not paced), and the clip recording.
     let mut paced: Option<u32> = None;
+    // A rate whose RAW video open the driver refused (until another is chosen).
+    let mut refused_fps: Option<u32> = None;
     // A clip being started (`start_clip` on its own thread): its answer, taken at the first turn after it comes.
     let mut starting: Option<std::sync::mpsc::Receiver<Result<Clip, String>>> = None;
     // A RAW video preview frame's settings, integrated beside its hand-over this turn.
@@ -1008,7 +1028,16 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             reopened = Some((t_close, std::time::Instant::now()));
         }
         // RAW video's rate is fixed at the camera's open (the driver has no SET for it): entering RAW video, a new rate (the UI holds it while a clip records) or leaving it closes the camera and opens it again, paced or as ever. A clip still recording is ended first (the UI stops it on leaving the mode).
-        let want = if video_ok && integrator.header[CURRENT_MODE_IDX] == RawMode::Video as u64 { Some(video_fps(&integrator.header)) } else { None };
+        // A clip deleted from the clips page: the space read again.
+        if integrator.header[FLAGS_IDX] & lumis_core::shared_memory::SPACE_STALE_BIT != 0 {
+            integrator.header[FLAGS_IDX] &= !lumis_core::shared_memory::SPACE_STALE_BIT;
+            read_space(&mut *integrator.header);
+        }
+        // A rate whose open the driver refused is not asked again until another is chosen (the camera then stays at whole frames as ever, and the note under RECORD says why).
+        let want = if video_ok && integrator.header[CURRENT_MODE_IDX] == RawMode::Video as u64 { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
+        if refused_fps.is_some_and(|f| Some(f) != Some(video_fps(&integrator.header))) {
+            refused_fps = None;
+        }
         if want != paced && !src.is_slit() {
             if let Some(c) = CLIP.lock().unwrap().take() {
                 end_clip(c, Some(&mut *integrator.header), "the camera reopened");
@@ -1026,10 +1055,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                         s
                     }
                     Err(Refused::Why(why)) => {
-                        // Whole frames as ever, and RAW video no longer offered here (the mode stays, a preview of one frame an image).
-                        println!("lumis: camera {}: RAW video's open failed ({why}): whole frames as ever", cam.name);
-                        lumis_core::platform::set_video_offered(false);
-                        video_ok = false;
+                        // Whole frames as ever, said under RECORD; this rate is not asked again until another is chosen (2026-11-19, the owner at 60 a second: RAW video was switched off for the session without a word, and RECORD did nothing).
+                        println!("lumis: camera {}: RAW video's open at {fps} a second failed ({why}): whole frames as ever", cam.name);
+                        lumis_core::platform::set_video_note(Some(format!("{fps} a second would not open: {why}")));
+                        refused_fps = Some(fps);
                         paced = None;
                         reopen_whole(&cam, vault.as_deref(), &mut *integrator.header)
                     }
@@ -1206,6 +1235,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     }
                 }
                 (false, true, ..) => end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "STOP"),
+                // RECORD with the camera not at a RAW video rate (its open refused): nothing to record, said.
+                (true, false, false, None, _) if refused_fps.is_some() => {
+                    integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                }
                 _ => {}
             }
             if let (false, Some(c), Got::Frame(head, Taken::View(rows))) = (started, &mut *clip, &got) {
@@ -1949,6 +1982,7 @@ fn main() {
         // A save on all four A715s, a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
         lumis_core::platform::set_save_threads(4);
         lumis_core::platform::set_before_exit(seal_at_exit);
+        lumis_core::clips::set_deleter(delete_clip);
         println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     let vault = open_vault();
