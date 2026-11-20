@@ -31,5 +31,9 @@ done
 FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/ferros.key.vsf}" "$B" capsule "$bin" "$out" --kist Kuaha --option 7ade4957bb21aa6f75736e2fd38dc04a9057632b30d3b8aecc2cabb642d3f187 --version "$version" \
     --want items "to show you what is on this device: your things in the hold, and what each kist keeps" "${opens[@]}"
 [ "$stow" = 1 ] || exit 0
-# Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
-cargo run -p ferros-send -- send "$out"
+# $SEND names a ferros-send already built (an agent's build directory); else it is built here. Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
+if [ -n "${SEND:-}" ]; then
+    "$SEND" send "$out"
+else
+    cargo run -p ferros-send -- send "$out"
+fi
