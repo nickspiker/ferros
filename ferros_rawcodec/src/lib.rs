@@ -484,7 +484,8 @@ fn get_k(br: &mut BitReader, kprev: u32) -> u32 {
     } else if top >= 2 {
         br.skip(3);
         // A corrupt stream can step k below 0 or past 15: the mask keeps every later shift defined, and the samples it gives are wrong, as a corrupt stream's are.
-        kprev.wrapping_add(1 - ((top & 1) << 1)) & 15
+        // The step is +1 or -1 as a u32: 1 less 0 or 2, wrapping (a plain subtraction underflows for -1 and panics in a debug build).
+        kprev.wrapping_add(1u32.wrapping_sub((top & 1) << 1)) & 15
     } else {
         br.skip(2);
         br.get(4)
