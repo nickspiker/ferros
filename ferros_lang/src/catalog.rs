@@ -691,6 +691,78 @@ messages! {
     KeyHide,
     /// The hive's own line over its keyboard (payloads/hive).
     HiveHint,
+
+    // ---- Kūaha (std/kuaha, docs/KISTS.md "Kūaha"): the kist that shows what is on this device; its two views, the find's conditions, an item's card, the device's totals ----
+    /// Its first view: the person's items in the hold (STORE.md's "your things").
+    KuahaThings,
+    /// Its second view: what this device holds, the hold's totals, the RAW clips area, each kist's own storage.
+    KuahaDevice,
+    /// The search line's words before anything is typed.
+    KuahaSearch,
+    /// The kinds' first circle: no kind chosen.
+    KuahaEverything,
+    /// The time condition's choices: none, then the last day, week, month and year back from now.
+    KuahaAnyTime,
+    KuahaPastDay,
+    KuahaPastWeek,
+    KuahaPastMonth,
+    KuahaPastYear,
+    /// The orders (ferros_items ORDER_*).
+    KuahaNewest,
+    KuahaOldest,
+    KuahaByTitle,
+    KuahaLargest,
+    /// The maker condition's first choice: any kist.
+    KuahaAnyMaker,
+    /// The hold with nothing in it. Three lines.
+    KuahaEmpty,
+    /// A find with no answers.
+    KuahaNothingMatches,
+    /// The row under a page of answers that asks for the next.
+    KuahaMore,
+    /// The `items` right answered no (an empty slot). Two lines.
+    KuahaNoRight,
+    /// Every hold call refused with the right held: a kernel or vault from before the hold. Two lines.
+    KuahaHoldSilent,
+    /// An item's card: when it was made; its kind.
+    KuahaMade,
+    KuahaKind,
+    /// An item's remove, its first tap (the second is `TapAgainRemove`).
+    KuahaRemove,
+    /// A remove the hold refused.
+    KuahaNotRemoved,
+    /// Under an item's open, greyed: the hand-off to the kist that opens it is not built (STORE.md step 1).
+    KuahaHandOffLater,
+    /// An item of a kind no kist is known to open.
+    KuahaNoOpener,
+    /// The device's view: its headings and facts.
+    KuahaInTheHold,
+    KuahaClipsArea,
+    KuahaUsed,
+    KuahaFree,
+    KuahaLargestStretch,
+    KuahaKistsKeep,
+    /// A total the device does not count yet (the usage query not on this ferros).
+    KuahaNotCounted,
+    /// A clip still being recorded.
+    KuahaRecording,
+    KuahaTotal,
+    /// The project's kinds of items (ferros_items `kinds`), each its idea's phrasing until the ideas' sheet carries them (IDEAS.md); RAW, GPS and Sega Genesis are names.
+    ItemPhoto,
+    ItemRawVideo,
+    ItemVideo,
+    ItemDocument,
+    ItemScan,
+    ItemList,
+    ItemContact,
+    ItemSong,
+    ItemGpsTrack,
+    ItemFind,
+    ItemCollection,
+    ItemGenesisSave,
+    ItemGenesisRam,
+    /// A kind this build has no words for.
+    ItemOther,
 }
 
 /// A message with holes: names (a kist's, a device's, a network's: never translated), words typed (kept as typed), and numbers (in the person's base: a count is written by `num`, a value the caller formats arrives as a `&str` already written in it).
@@ -750,6 +822,9 @@ pub enum Say<'a> {
     Forgotten(&'a str),
     /// A passphrase's length, in characters.
     PassphraseLength { min: u64, max: u64 },
+    // ---- Kūaha ----
+    /// An item's open, naming the kist that opens its kind (a name, never translated): "open in Opsin".
+    OpenIn(&'a str),
 }
 
 /// A message in language `l`.

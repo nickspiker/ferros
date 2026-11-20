@@ -44,6 +44,7 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
         (Say::JoinedNet(H), 1),
         (Say::Forgotten(H), 1),
         (Say::PassphraseLength { min: 8, max: 63 }, 0),
+        (Say::OpenIn(H), 1),
     ]
 }
 
