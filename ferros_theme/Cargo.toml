@@ -1,0 +1,9 @@
+[package]
+name = "ferros_theme"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The device's themes (preference 5): the one table the map, the display, the pucks and every kist's fluor look (ferros_fluor) draw from. Plain data, no_std, built for any target so a kist's host tests read the same table; ferros_sys::theme re-exports it with the preference that picks a row."
+
+[lib]
+path = "src/lib.rs"

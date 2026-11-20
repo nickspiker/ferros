@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["ferros_rt", "std/hello", "std/probe", "std/fluordemo", "std/photon"]
+exclude = ["ferros_rt", "ferros_fluor", "std/hello", "std/probe", "std/fluordemo", "std/photon"]
 members = [
     "ferros_layout",
     "ferros_ext4",
@@ -86,6 +86,7 @@ members = [
     "ferros_lang",
     "ferros_idea",
     "ferros_items",
+    "ferros_theme",
     "ferros_tz",
     "ferros_console",
     "ferros_glass",
