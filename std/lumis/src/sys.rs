@@ -36,7 +36,8 @@ pub fn grant_count() -> u64 {
     unsafe { ((arc_base() + 0x200) as *const u32).read_volatile() as u64 }
 }
 
-fn cap(slot: u64) -> u64 {
+/// A grant's token as the kernel takes it: its offset in the arc.
+pub fn cap(slot: u64) -> u64 {
     0x204 + 32 * slot
 }
 

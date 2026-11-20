@@ -1744,6 +1744,18 @@ impl Lumis {
         }
     }
 
+    /// The person's app scale as the host now runs Lumis (its RU, which ferros_fluor keeps at preference 14): Lumis's words drawn at it (lumis_core `set_ui_scale`; its layout is fractions of the screen), everything drawn again when it changes.
+    fn follow_scale(&mut self, ctx: &mut Context) {
+        let ru = ctx.viewport.ru;
+        if ru != lumis_core::platform::ui_scale() {
+            lumis_core::platform::set_ui_scale(ru);
+            println!("lumis: the app scale {ru}: its words drawn at it");
+            self.changed = true;
+            self.menu_dirty = true;
+            ctx.window.request_redraw();
+        }
+    }
+
     /// The window sent behind or brought to the front (fluor's `Event::Focused`, from the display's EV_BEHIND and EV_FRONT).
     /// Behind on the menu, Lumis ends at once: no camera is open and nothing is on its way.
     /// Behind with the camera opening or open, the camera thread decides at its next frame: it closes the camera and ends Lumis, unless a continuous save or a calibration runs or a save is on its way (`Stay`).
@@ -1792,6 +1804,7 @@ impl FluorApp<G2t16> for Lumis {
     fn init(&mut self, _ctx: &mut Context) {}
 
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
+        self.follow_scale(ctx);
         let (w, h) = (width as usize, height as usize);
         if (w, h) == (self.width, self.height) {
             return;
@@ -1805,9 +1818,53 @@ impl FluorApp<G2t16> for Lumis {
         ctx.window.request_redraw();
     }
 
+    /// The person's app scale set from outside (ferros_fluor following preference 14: the Settings page, another kist's pinch): Lumis's words drawn at it, never a pinch of the picture (the default would take it as one about the centre).
+    fn on_zoom_set(&mut self, _factor: f32, ctx: &mut Context) {
+        self.follow_scale(ctx);
+    }
+
+    /// On the camera screen a pinch is the picture's (lumis_core `touch::pinch`: open past a half octave for 1:1 about the fingers, close past one for the fit view), so the host leaves the app scale alone and ferros_fluor writes none back; on the menu it is the person's app scale, as in any kist.
+    fn owns_zoom_gesture(&self) -> bool {
+        matches!(self.screen, Screen::Camera(_))
+    }
+
+    fn on_zoom(&mut self, factor: f32, anchor_x: f32, anchor_y: f32, ctx: &mut Context) {
+        if let Screen::Camera(ui) = &mut self.screen {
+            if lumis_core::ui::touch::pinch(ui, factor, anchor_x, anchor_y) {
+                self.changed = true;
+                ctx.window.request_redraw();
+            }
+        }
+    }
+
+    fn on_zoom_end(&mut self, _ctx: &mut Context) {
+        if let Screen::Camera(ui) = &mut self.screen {
+            lumis_core::ui::touch::pinch_end(ui);
+        }
+    }
+
     fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
         if let Event::Focused(focused) = event {
             self.focus(*focused);
+            return EventResponse::Handled;
+        }
+        // A second finger: the host takes the pointer back (a pinch begins) and sends no release for it, so whatever the first finger held lets go without acting.
+        if let Event::CursorLeft = event {
+            if self.finger.take().is_some() {
+                self.pending_up = false;
+                match &mut self.screen {
+                    Screen::Camera(ui) => lumis_core::ui::touch::touch_cancel(ui),
+                    // The finger moved off the menu, then lifted there: a press it held lets go (the move off clears it), nothing opens.
+                    Screen::Menu => {
+                        if let Some(menu) = self.menu.as_mut() {
+                            self.menu_dirty |= app::menu_touch(menu, 2, -1., -1.).redraw;
+                            self.menu_dirty |= app::menu_touch(menu, 1, -1., -1.).redraw;
+                        }
+                    }
+                    Screen::Opening => {}
+                }
+                ctx.window.request_redraw();
+            }
             return EventResponse::Handled;
         }
         // Android's MotionEvent actions, as Lumis's menu reads them.
@@ -2088,7 +2145,8 @@ fn main() {
     }
     let cameras = list();
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    match fluor::host::ferros::run_app(Lumis::new(cameras, vault), caps, 1.0, None) {
+    // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch on the menu is written back as the app scale with the display grant, one on the camera screen is the picture's.
+    match ferros_fluor::run_app(Lumis::new(cameras, vault), caps, None, sys::cap(DISPLAY)) {
         Ok(()) => println!("lumis: closed"),
         Err(e) => println!("lumis: {e}"),
     }
