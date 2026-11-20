@@ -120,6 +120,9 @@ struct Clip {
     last_count: u32,
     /// When the clip last dropped a frame: no preview for 2^10 ms after (the camera thread's time back to the recorder while it falls behind).
     dropped_at: Option<std::time::Instant>,
+    /// The last hand-over's time, us, and the sensor's frame period, us: no preview after a hand-over that took over half the period (the recorder running late).
+    last_code_us: u64,
+    period_us: u64,
     /// When the clip's first frame landed, Eagle ns by the driver's clock: the clip's rate is its frames over the time since, by that clock (VIDEO_RATE_IDX).
     first_ns: Option<i64>,
     /// The recording space used as it stood when the clip began (`VIDEO_SPACE_USED_IDX`): the bar counts this clip's written bytes on top, not its whole reservation.
@@ -139,12 +142,21 @@ fn seal_at_exit() {
 /// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost; at 2^7 (about 7.5 previews a second) a warm 32 s clip lost none of its 871 frames (the coding 30.2 ms on average).
 const PREVIEW_GAP_LOG2: u32 = 7;
 
-/// The preview's gap while recording: 2^`PREVIEW_GAP_LOG2` ms, or the input's 24th byte's power of two (development: `DEV_VIDEO` runs measure where drops begin).
-fn preview_gap() -> std::time::Duration {
+/// Above 30 a second, the preview's gap is one power of two longer (2^8 ms, about 4 previews a second): a minute at 60 a second lost 3 frames, all to previews beside hand-overs in its last warm seconds (2026-11-20; the owner asked for a lock).
+const PREVIEW_GAP_FAST_LOG2: u32 = PREVIEW_GAP_LOG2 + 1;
+
+/// The preview's gap while recording at `fps`: 2^`PREVIEW_GAP_LOG2` ms, or `PREVIEW_GAP_FAST_LOG2` above 30 a second, or the input's 24th byte's power of two (development: `DEV_VIDEO` runs measure where drops begin).
+fn preview_gap(fps: u32) -> std::time::Duration {
     let mut b = [0u8; 1 << 5];
     let n = sys::input(0, &mut b) as usize;
     let at = 10 + camera::MODE_BLOCK;
-    let log2 = if n > at && b[at] != 0 { b[at] as u32 } else { PREVIEW_GAP_LOG2 };
+    let log2 = if n > at && b[at] != 0 {
+        b[at] as u32
+    } else if fps > 30 {
+        PREVIEW_GAP_FAST_LOG2
+    } else {
+        PREVIEW_GAP_LOG2
+    };
     std::time::Duration::from_millis(1 << log2)
 }
 
@@ -224,7 +236,7 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
                 // Its row in Lumis's clips list from its start (the clips page; a clip never closed shows as such).
                 lumis_core::clips::put(lumis_core::clips::Clip { name: name.clone(), frames: 0, bytes: 0, fps: pacing.fps, at, seal: None });
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, dropped_at: None, first_ns: None, space_before: space_used });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, dropped_at: None, last_code_us: 0, period_us: pacing.sensor_ns / 1000, first_ns: None, space_before: space_used });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -941,7 +953,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
-    let run = (knobs & DEV_OPEN != 0).then(|| std::time::Duration::from_secs(1 << (((knobs >> 4) & 3) + 3)));
+    // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
+    let run = (knobs & DEV_OPEN != 0).then(|| {
+        let mut b = [0u8; 1 << 5];
+        let n = sys::input(0, &mut b) as usize;
+        let at = 11 + camera::MODE_BLOCK;
+        let log2 = if n > at && b[at] != 0 { b[at] as u32 } else { ((knobs >> 4) & 3) as u32 + 3 };
+        std::time::Duration::from_secs(1 << log2)
+    });
     let run_start = std::time::Instant::now();
     let sweep: Vec<f64> = if knobs & DEV_OPEN != 0 && knobs & DEV_SWEEP != 0 {
         (0..9).map(|k| (2f64).powi(-13 + 2 * k)).chain([(1 << 4) as f64]).map(|s| s * 1e9).filter(|&ns| ns <= cam.exposure_max as f64).collect()
@@ -1278,7 +1297,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"): the hand-over on a scoped thread of its own, the integration here, both done before the next MAP gives the buffer back; the preview then costs the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
                 // No preview in a clip's first 2^10 ms: its first hand-overs run slow while the coder's workers start (40 to 64 ms on the Pro, 2026-11-20), and a preview beside them lost 8 of the first 9 frames.
                 // Nor in the 2^10 ms after a drop: a warm minute at 60 a second lost its only frames (22, its last 5 s) to previews beside hand-overs as the device heated (2026-11-20); the preview gives the camera thread its time back while it falls behind, and comes back by itself.
-                let preview_now = c.preview.elapsed() >= preview_gap() && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10) && c.dropped_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1 << 10));
+                // Nor after a hand-over that took over half the sensor's period: the recorder is running late, and a preview beside the next would make it later (a minute at 60 a second lost its last frame so, 2026-11-20; the owner asked for a lock).
+                let preview_now = c.preview.elapsed() >= preview_gap(c.fps) && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10) && c.dropped_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1 << 10)) && c.last_code_us <= c.period_us >> 1;
                 let (taken, code_us) = if preview_now {
                     c.preview = std::time::Instant::now();
                     let rec = &mut c.rec;
@@ -1305,6 +1325,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
                     println!("lumis: RAW video: frame {index} source {h}");
                 }
+                c.last_code_us = code_us;
                 let st = c.rec.stats();
                 integrator.header[VIDEO_FRAMES_IDX] = st.frames;
                 integrator.header[VIDEO_DROPPED_IDX] = st.dropped;
