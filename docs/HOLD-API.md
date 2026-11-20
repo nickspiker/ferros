@@ -66,29 +66,25 @@ let p = Proposed { kind: kinds::PHOTO, title: None, attrs: vec![("lens".into(), 
 let (handle, card) = hold.keep(&p, &still_vsf)?;
 ```
 
-A RAW clip, thru ferros_clip's recorder: the `Sink` the recorder writes to becomes an `ItemSink` (ferros_clip is another agent's tonight; specified here, to be written after):
+A RAW clip, thru ferros_clip's recorder: its sink is ferros_clip `items::ItemSink` (branch `clip-items`): `open` is `make_clip`, `write` is `write_clip`, `seal` is `seal_clip`; `ExtentSink` stays beside it.
 
 ```rust
-/// The recorder's sink as an item of the hold: the clip's card placed at its open, its blocks written once straight to the flash, sealed into its card.
-pub struct ItemSink { hold: Hold<Sys>, p: Proposed, clip: Option<Clip>, pub card: Option<Card> }
-
-impl Sink for ItemSink {
-    fn open(&mut self, blocks: u64) -> Result<u64, String> {
-        let c = self.hold.make_clip(&self.p, blocks).map_err(|e| format!("{e:?}"))?;
-        let n = c.blocks;
-        self.clip = Some(c);
-        Ok(n)
-    }
-    fn write(&mut self, block: u64, bytes: &[u8]) -> Result<(), String> {
-        self.hold.write_clip(self.clip.as_ref().ok_or("no clip open")?, block, bytes).map_err(|e| format!("{e:?}"))
-    }
-    fn seal(&mut self, len: u64, hash: [u8; 32]) -> Result<(), String> {
-        let c = self.clip.take().ok_or("no clip open")?;
-        self.card = Some(self.hold.seal_clip(c, len, &hash).map_err(|e| format!("{e:?}"))?);
-        Ok(())
-    }
-}
+// Lumis: the `items` grant's slot, the person's title if any, the clip's start (Mode::at, Eagle oscillations), its own facts.
+let (sink, receipt) = ferros_clip::items::raw_video(ITEMS_SLOT, title, at, vec![("fps".into(), VsfType::u3(fps)), ("camera".into(), VsfType::x(cam.name.clone()))]);
+let rec = ferros_clip::Recorder::start(&camera, &mode, Box::new(sink))?;
+// ... frames ...
+let info = rec.stop();
+let r = receipt.lock().unwrap().clone(); // r.handle from the open, r.direct (straight to the flash), r.card the sealed card
 ```
+
+- `raw_video` stamps the documents with Eagle time now (vsf `eagle_time_oscillations`) and proposes `raw_video_card(title, at, attrs)`: kind RAW video, the attribute `at` (the clip's start, `e6`), then the caller's.
+- `ItemSink::new(Hold<T>, Proposed)` takes any transport and any card (a host test's, another kind).
+- `items::ItemSource::new(hold, handle, size)`: an item's body read by range as a VSF byte source, so `vsf::visual::clip::Reader` opens a clip kept as an item without assembling it (Kūaha's view, rawrec's check).
+- A Lumis built with it needs the `items` right in its capsule, `--makes "RAW video"`, and the slot it lands in.
+
+On the Pro (2026-11-20, hold ddfd6437 flashed, rawrec with `--items` on the GPU path, `clip-items` 22866c30):
+- **A minute at 30/s kept as an item**: 1800 frames, 0 dropped, written straight to the flash (the extent's capability); found by `items find` at 0 bytes while it recorded, sealed at 8,616,222,347 bytes, its card's body the recorder's seal; read back on the device thru `ItemSource`, 225 hashed frames and 4 kept copies bit exact; pulled with `items get` (402 s, 21.4 MB/s) and every one of its 1800 frames bit exact against the camera's on the host (clip-check with rawrec's hashes).
+- **Killed mid-clip** (`diag "kill rawrec"` at 9 s): the camera closed with its holder; the vault's recoverer closed the clip at its 274th whole frame (1,311,290,779 bytes, 6,568,956 blocks given back, in about 0.5 s) and the next `items find` showed the card corrected; pulled, its 274 frames decode against their own samples' hashes.
 
 The proposed card: `kind: kinds::RAW_VIDEO`, a title if the person gave one, attributes such as `fps`, `width`, `height`, `camera` (the sensor's name as `x`), `gain`.
 Its writes are the extent's own SYS_BLOCK capability, as `ExtentSink`'s are: no copy thru the vault, no mirror, the flash's rate (owner, 2026-11-19: "1:1 write speed, with no dupes since it's massive").
