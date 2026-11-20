@@ -6,6 +6,8 @@
 //! | `map.deck` | `circle`, one per circle placed by hand | `kind` `hi`, `thing` `ht` (none for settings), `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
 //! | `map.place.<label>` (until 2026-11-20, read once to migrate) | `place` | `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
 //! | `map.view` | `view` | `x`, `y`, `cos`, `sin` `i` |
+//! | `kists.icons` | `icon`, one per kist with an icon | `thing` `ht`, `icon` `hp` |
+//! | `kists.` at an icon's `hp` (an address) | `decoded` | `icon` `hp`, `rgba` `t_u3` (256 × 256 × 4), `grey` `t_u3` (256 × 256) |
 //! | `map.dev` | `developer` | `unlocked` `u0` |
 //! | `ahau.proof`, `fgtw.handle_proof` | `handle_proof` | `handle_proof` `hP` |
 //! | `fgtw.identity_seed` | `identity_seed` | `identity_seed` `hI` |
@@ -23,6 +25,7 @@ extern crate alloc;
 
 pub mod deck;
 pub mod gps;
+pub mod icon;
 pub mod map;
 pub mod secret;
 pub mod sponsor;
