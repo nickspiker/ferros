@@ -2087,6 +2087,8 @@ static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
 
 /// The A715s' ceiling while a RAW clip is recorded (`diag clock clips <kHz>`; 0: none): THERMAL.md "The busy lift"'s 1572 MHz, the least energy for a sustained encode.
 static CLIPS_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
+/// Whether a recording holds the A715s at `CLIPS_KHZ` rather than under it (`diag clock clipshold <0|1>`): for CPU coders; off, the GPU path's default.
+static CLIPS_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Whether a RAW clip is being recorded: a clip's extent is given to its writer (from its open to its seal or its writer's end, process.rs `EXTENTS_OPEN`), or, for a writer that writes thru the vault process, the `clips` window was written within the last second.
 fn recording() -> bool {
@@ -2320,8 +2322,9 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         if g.level > g.opps[top] {
             g.level = g.opps[top];
         }
-        // A RAW clip recording holds the A715s at `CLIPS_KHZ`, not under it: its coders work in bursts (a frame's bands, then the wait for the next), which the windows read as half a load, and the governor asked 1065 MHz while a frame's coding wanted the whole budget (2026-11-19, 60/s: four A715 coders 24 ms a frame at a fixed 1572, more under the governor's 1065).
-        if g.domain == 3 && recording() {
+        // With `diag clock clipshold 1`, a RAW clip recording holds the A715s at `CLIPS_KHZ`, not under it: CPU coders work in bursts (a frame's bands, then the wait for the next), which the windows read as half a load, and the governor asked 1065 MHz while a frame's coding wanted the whole budget (2026-11-19, 60/s: four A715 coders 24 ms a frame at a fixed 1572, more under the governor's 1065).
+        // Off by default since the recorder codes on the GPU (ferros_clip gpu): its A715 work is a frame's copy and packing, a few ms of each frame, and a held 1572 MHz only spends power.
+        if g.domain == 3 && recording() && CLIPS_HOLD.load(core::sync::atomic::Ordering::Relaxed) != 0 {
             g.level = g.opps[top];
         }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
@@ -2611,6 +2614,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"busy"), Some(n)) => GOV_BUSY_KHZ.store(n, Relaxed),
         (Some(b"clips"), Some(n)) => CLIPS_KHZ.store(n, Relaxed),
+        (Some(b"clipshold"), Some(n)) => CLIPS_HOLD.store(n, Relaxed),
         (Some(b"busyhold"), Some(n)) => GOV_BUSY_HOLD.store(n, Relaxed),
         (Some(b"doze"), Some(n)) => DOZE_LOG2.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
@@ -2627,7 +2631,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
-    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them) and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if recording() { "recording" } else { "not recording" }).as_bytes());
+    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them){} and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if CLIPS_HOLD.load(Relaxed) != 0 { ", held there (clipshold 1)" } else { "" }, if recording() { "recording" } else { "not recording" }).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;

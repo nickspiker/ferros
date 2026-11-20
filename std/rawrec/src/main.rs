@@ -683,8 +683,8 @@ fn main() {
     };
     let raw_frame = (h * w * 5 / 4) as u64;
     let want = if frames_want != 0 { frames_want } else { secs * fps as u64 };
-    // Room for every frame uncoded (the seal gives back what the clip did not use).
-    let blocks = (want * raw_frame + (1 << 24)) >> 12;
+    // Room for every frame uncoded (the seal gives back what the clip did not use), or the longest free stretch when that is less (a minute at 60/s uncoded is 56 GB, the clips window 48 GiB; coded it is about a third).
+    let blocks = ((want * raw_frame + (1 << 24)) >> 12).min(ferros_clip::ferros::space(slot).map_or(u64::MAX, |sp| sp.largest_free_bytes >> 12));
     let mut workers = vec![0x00F0u64; a715];
     workers.extend(std::iter::repeat_n(0x000Fu64, a510));
     // +20, the 60/s experiments: bit 0 the workers one to a core (ferros_clip `spread`), bit 1 no source digests, bit 2 a coder on the X3 too, bit 3 the GPU off.
