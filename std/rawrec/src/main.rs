@@ -293,6 +293,201 @@ fn profile(slot: u64) {
     }
 }
 
+/// Job 7: the band coder's first half on the GPU (ferros_clip gpu, the 60/s work): spawned with `--use camera --store test --use gpu --dma layers` (+1 the GPU service's grant, 0: 3; +2 the GPU block's, 0: 4; +3 runs, 0: 8).
+/// Each run: a frame of the view copied into the block, the kernel run over it, then every band packed (`gpu::pack_band`) by coders claiming bands (+4: 0 four A715s and four A510s, one to a core; 1 four A715s, one to a core; 2 four A715s on the cluster's mask); the first run's bands compared with `encode_band`'s byte for byte.
+fn gpu_bench(slot: u64, inp: &[u8]) {
+    use ferros_rawcodec as rc;
+    let arg = |k: usize| inp.get(k).copied().unwrap_or(0) as u64;
+    let (gs, bs) = (if arg(1) == 0 { 3 } else { arg(1) }, if arg(2) == 0 { 4 } else { arg(2) });
+    let runs = if arg(3) == 0 { 8 } else { arg(3) as usize };
+    let mut ext = Extent::new(slot, "rawrec.prof");
+    let held = ext.open(1).is_ok();
+    let mut r = [0u8; 64];
+    let n = call(S_CAMERA, &Pacing::of(30).open_msg(0, 16_000_000), &mut r);
+    if n == ERR || r[0] != 0 || n < 48 {
+        println!("rawrec: gpu: OPEN refused");
+        return;
+    }
+    let mut tok = [0u8; 32];
+    tok.copy_from_slice(&r[1..33]);
+    let base = svc(SYS_DMA, off(tok.as_ptr()), 0, 0, 0, 0);
+    let (w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    let mut hd = [0u8; 64];
+    let mut mapped = 0xFFu8;
+    let close = |mapped: u8, r: &mut [u8; 64]| {
+        let _ = call(S_CAMERA, &[6, mapped], r);
+        let _ = call(S_CAMERA, &[4], r);
+    };
+    for _ in 0..8 {
+        if call(S_CAMERA, &[5, mapped], &mut hd) == ERR {
+            println!("rawrec: gpu: MAP failed");
+            close(mapped, &mut r);
+            return;
+        }
+        mapped = hd[40];
+    }
+    // SAFETY: the view's buffer the MAP header names, held until the next MAP.
+    let view = |hd: &[u8; 64]| unsafe { core::slice::from_raw_parts((base + u64::from_le_bytes(hd[48..56].try_into().unwrap())) as *const u8, h * stride) };
+    let t = Instant::now();
+    let mut dev = match ferros_clip::gpu::Device::open(gs, bs, w, h, stride) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("rawrec: gpu: {e}");
+            close(mapped, &mut r);
+            return;
+        }
+    };
+    println!("rawrec: gpu: the block grown and the kernel written in A#{} us; A#{w} x A#{h}, A#{stride} bytes a line, recording clocks A#{held}", t.elapsed().as_micros());
+    let nb = rc::bands(h);
+    let masks: Vec<u64> = match arg(4) { 1 => vec![0x0010, 0x0020, 0x0040, 0x0080], 2 => vec![0x00F0; 4], _ => vec![0x0010, 0x0020, 0x0040, 0x0080, 0x0001, 0x0002, 0x0004, 0x0008] };
+    for run in 0..runs {
+        let t0 = Instant::now();
+        // The copy and the run together (`run` is both); the service's own count is the GPU's part.
+        let gpu_us = dev.run(view(&hd));
+        let t_copy = t0.elapsed().as_micros() as u64;
+        let gpu_us = match gpu_us {
+            Ok(us) => us as u64,
+            Err(e) => {
+                println!("rawrec: gpu: run A#{run}: {e}");
+                break;
+            }
+        };
+        let t1 = Instant::now();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (info, bodies) = (dev.info(), dev.bodies());
+        let outs: Vec<Vec<(usize, usize, usize, Vec<u8>)>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = masks
+                .iter()
+                .map(|&m| {
+                    let next = &next;
+                    sc.spawn(move || {
+                        ferros_clip::ferros::pin(m);
+                        let mut mine = Vec::new();
+                        let mut o = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+                        loop {
+                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if k >= nb {
+                                break;
+                            }
+                            let (la, lb) = ferros_clip::gpu::pack_band(info, bodies, k, w, h, &mut o);
+                            mine.push((k, la, lb, if run == 0 { o[..la + lb].to_vec() } else { Vec::new() }));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let pack_us = t1.elapsed().as_micros() as u64;
+        let total = t0.elapsed().as_micros() as u64;
+        let coded: usize = outs.iter().flatten().map(|b| b.1 + b.2).sum();
+        let mut line = format!("rawrec: gpu: run A#{run}: copy and GPU A#{t_copy} us (the GPU A#{gpu_us} us), packing on cores G#{masks:X?} A#{pack_us} us, the frame A#{total} us, coded A#{coded} bytes");
+        if run == 0 {
+            // The check: every band against the CPU coder's, from the frame as copied into the block.
+            let frame = dev.frame();
+            let mut work = Box::new(rc::Work::new());
+            let mut want = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+            let mut bad = 0;
+            for b in outs.iter().flatten() {
+                let rows = rc::band_rows(h, b.0);
+                let (la, lb) = rc::encode_band(&frame[rc::band_src(b.0, h, w, stride)], stride, w, rows, rc::Cfa::Bayer, &mut work, &mut want);
+                if (la, lb) != (b.1, b.2) || want[..la + lb] != b.3[..] {
+                    if bad == 0 {
+                        line += &format!("; band A#{} differs (A#{la}+A#{lb} against the GPU's A#{}+A#{})", b.0, b.1, b.2);
+                    }
+                    bad += 1;
+                }
+            }
+            line += &format!("; A#{bad} of A#{nb} bands differ from encode_band");
+            // Packing one band on one A715 from the block, then from a copy in the process's own memory: whether the block reads slower than ordinary memory.
+            let (ci, cc) = (info.to_vec(), bodies.to_vec());
+            let one = |info: &[u32], bodies: &[u32]| -> u64 {
+                std::thread::scope(|sc| {
+                    sc.spawn(|| {
+                        ferros_clip::ferros::pin(0x0010);
+                        let mut o = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+                        let mut us = 0;
+                        for pass in 0..2 {
+                            let t = Instant::now();
+                            for k in [8usize, 9] {
+                                ferros_clip::gpu::pack_band(info, bodies, k, w, h, &mut o);
+                            }
+                            if pass == 1 {
+                                us = t.elapsed().as_micros() as u64;
+                            }
+                        }
+                        us
+                    })
+                    .join()
+                    .unwrap()
+                })
+            };
+            line += &format!("; two bands packed on an A715 from the block A#{} us, from a copy A#{} us", one(info, bodies), one(&ci, &cc));
+            if bad != 0 {
+                // Which blocks: every block's body against the CPU's codes end to end (`split_codes`), then the same frame run again and checked again (whether the GPU's output changes from run to run).
+                let check = |dev: &ferros_clip::gpu::Device| -> String {
+                    let (info, bodies) = (dev.info(), dev.bodies());
+                    let frame = dev.frame();
+                    let nbk = rc::row_blocks(w);
+                    let mut work = Box::new(rc::Work::new());
+                    let (mut ci, mut cc) = (vec![0u32; rc::BAND_ROWS * nbk], vec![0u16; rc::BAND_ROWS * w]);
+                    let (mut nbad, mut first) = (0usize, String::new());
+                    let mut words_bad = [0usize; 32];
+                    for k in 0..nb {
+                        let rows = rc::band_rows(h, k);
+                        rc::split_codes(&frame[rc::band_src(k, h, w, stride)], stride, w, rows, rc::Cfa::Bayer, &mut work, &mut ci, &mut cc);
+                        for y in 0..rows {
+                            for j in 0..nbk {
+                                let at = ((k * rc::BAND_ROWS + y) << ferros_clip::gpu::BLOCKS_LOG2) + j;
+                                let mut want = [0u32; 32];
+                                let mut pos = 0usize;
+                                for &cd in &cc[y * w + j * rc::BLOCK..y * w + ((j + 1) * rc::BLOCK).min(w)] {
+                                    let l = (cd >> rc::SPLIT_LEN_SHIFT) as usize;
+                                    for s in (0..l).rev() {
+                                        if ((cd & 0x3FF) as u32) >> s & 1 != 0 {
+                                            want[pos >> 5] |= 1 << (31 - (pos & 31));
+                                        }
+                                        pos += 1;
+                                    }
+                                }
+                                let got = &bodies[(at << ferros_clip::gpu::BODY_LOG2) + ferros_clip::gpu::BODY_AT..(at << ferros_clip::gpu::BODY_LOG2) + 32];
+                                let used = pos.div_ceil(32);
+                                let wrong = (0..used).find(|&q| got[q] != want[q]);
+                                let fact_wrong = info[at] & 31 != ci[y * nbk + j] || (info[at] >> rc::SPLIT_BITS_SHIFT) as usize != pos;
+                                if wrong.is_some() || fact_wrong {
+                                    if let Some(q) = wrong {
+                                        words_bad[q] += 1;
+                                    }
+                                    if nbad < 3 {
+                                        let q = wrong.unwrap_or(0);
+                                        first += &format!(" [band A#{k} row A#{y} block A#{j}: A#{pos} bits, facts G#{:X} against G#{:X}; word A#{q} G#{:08X} against G#{:08X}, its byte A#{} of its 64]", info[at], ci[y * nbk + j] | (pos as u32) << rc::SPLIT_BITS_SHIFT, got[q], want[q], ((at << ferros_clip::gpu::BODY_LOG2) * 4 + q * 4) & 63);
+                                    }
+                                    nbad += 1;
+                                }
+                            }
+                        }
+                    }
+                    format!("A#{nbad} blocks wrong, the first wrong word's index in its body A#{:?};{first}", words_bad)
+                };
+                println!("rawrec: gpu: check: {}", check(&dev));
+                let again = dev.go();
+                println!("rawrec: gpu: the same frame again ({again:?}): {}", check(&dev));
+            }
+        }
+        println!("{line}");
+        // The next run on a newer frame.
+        if call(S_CAMERA, &[5, mapped], &mut hd) == ERR {
+            break;
+        }
+        mapped = hd[40];
+    }
+    close(mapped, &mut r);
+    if held {
+        ext.delete();
+    }
+}
+
 /// Job 4: this build's band coder (NEON with `--features neon`) against the scalar one, byte for byte, on frames of the binned main at four gains (+1 the frames at each, 0: 4), then each band decoded and compared with the frame; the times on four A715s.
 fn neon_check(inp: &[u8]) {
     let per = if inp.get(1).copied().unwrap_or(0) == 0 { 4 } else { inp[1] as usize };
@@ -406,6 +601,10 @@ fn main() {
         }
         6 => {
             profile(slot);
+            return;
+        }
+        7 => {
+            gpu_bench(slot, &inp);
             return;
         }
         _ => {}

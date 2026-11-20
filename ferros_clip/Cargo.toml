@@ -15,6 +15,11 @@ blake3 = "1.5"
 # The band coder's first half as a Mali kernel (src/gpu.rs): recorded and compiled by valhall's SSA, run by the GPU service.
 valhall = { path = "../valhall", features = ["ssa"] }
 
+[build-dependencies]
+# The GPU kernels compiled on the host (build.rs), shipped in the binary as words.
+valhall = { path = "../valhall", features = ["ssa"] }
+ferros_rawcodec = { path = "../ferros_rawcodec" }
+
 [features]
 # The device's NEON paths in the band coder (ferros_rawcodec `neon`).
 neon = ["ferros_rawcodec/neon"]

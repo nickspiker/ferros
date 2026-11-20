@@ -691,6 +691,8 @@ fn encode_band_with<const N: bool>(src: &[u8], stride: usize, width: usize, rows
 /// - `codes`, one u16 a residual (rows × width, row-major): its code in bits 0-9 and its length in bits 10-14 (the format's: q zeros, a one and z's low k bits, as the number those bits make; or the escape, ESC zeros then z, as z with its length ESC + BITS).
 pub const SPLIT_SEL: u32 = 1 << 4;
 pub const SPLIT_LEN_SHIFT: u32 = 10;
+/// A GPU's fact word (ferros_clip gpu) carries its block's body length in bits from this bit (`pack_band_bodies`).
+pub const SPLIT_BITS_SHIFT: u32 = 5;
 
 /// Blocks a row of `width` samples is cut into.
 pub const fn row_blocks(width: usize) -> usize {
@@ -778,6 +780,49 @@ pub fn pack_band_strided(info: &[u32], info_stride: usize, codes: &[u16], codes_
             rc.plen[p] = (l0 + l1) as u8;
         }
         pack_row(rc, width, &mut bws);
+    }
+    let [a, b] = bws;
+    let la = a.finish();
+    let lb = b.finish();
+    out.copy_within(half..half + lb, la);
+    (la, lb)
+}
+
+/// The second half over bodies a GPU laid out (ferros_clip gpu): block j of row y has its fact word at `info[y * info_stride + j]` (k, the selection, and its body's length in bits from `SPLIT_BITS_SHIFT`) and its body, its codes end to end most significant bit first in u32 words, from `bodies[(y * info_stride + j) << body_log2]`.
+/// Each block's header (its selection bit in a row with a row above, its k against the block before) then its body's words go into stream j & 1: `encode_band`'s bytes, stream A at out[0..la], B right behind; returns (la, lb).
+pub fn pack_band_bodies(info: &[u32], info_stride: usize, bodies: &[u32], body_log2: u32, width: usize, rows: usize, cfa: Cfa, out: &mut [u8]) -> (usize, usize) {
+    let nb = row_blocks(width);
+    assert!(width & 3 == 0 && width >= MIN_W && width <= MAX_W, "width {width}");
+    assert!(rows >= 1 && info_stride >= nb && info.len() >= (rows - 1) * info_stride + nb, "short split band");
+    let half = max_stream_len(width, rows);
+    assert!(out.len() >= 2 * half, "output below max_band_len");
+    let (sa, sb) = out[..2 * half].split_at_mut(half);
+    let mut bws = [BitWriter::new(sa), BitWriter::new(sb)];
+    let mut kprev = K0;
+    // The most bits a body may say it holds: BLOCK escapes. The writers' room is sized for that (`max_stream_len`), so a fact word past it (a GPU's fault) panics here, never writes past the room.
+    let most = BLOCK as u32 * CODE_MAX;
+    for y in 0..rows {
+        let sel = (y >= cfa.dy(y)) as u32;
+        for j in 0..nb {
+            let at = y * info_stride + j;
+            let v = info[at];
+            let k = v & 15;
+            let (kc, kl) = k_code(k, kprev);
+            kprev = k;
+            let bits = v >> SPLIT_BITS_SHIFT;
+            assert!(bits <= most, "a body of {bits} bits");
+            let bw = &mut bws[j & 1];
+            bw.put(((((v >> 4) & sel) << kl) | kc) as u64, sel + kl);
+            let body = &bodies[at << body_log2..(at << body_log2) + (bits as usize).div_ceil(32)];
+            let whole = (bits >> 5) as usize;
+            for &word in &body[..whole] {
+                bw.put(word as u64, 32);
+            }
+            let rest = bits & 31;
+            if rest != 0 {
+                bw.put((body[whole] >> (32 - rest)) as u64, rest);
+            }
+        }
     }
     let [a, b] = bws;
     let la = a.finish();

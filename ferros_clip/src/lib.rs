@@ -9,7 +9,7 @@
 
 #[cfg(target_os = "ferros")]
 pub mod ferros;
-/// The band coder's first half as a GPU kernel (the 60/s work): `gpu::kernel`, its words for the GPU service, and ferros_rawcodec `pack_band_strided` for the CPU's half.
+/// The band coder's first half as a GPU kernel (the 60/s work): `gpu::kernel`, its words built on the host (`gpu::PREBUILT`), on ferros the GPU service's run (`gpu::Device`), and ferros_rawcodec `pack_band_strided` for the CPU's half.
 pub mod gpu;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
