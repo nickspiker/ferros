@@ -632,6 +632,56 @@ pub fn declaration_sections(d: &Decl, option: Option<[u8; 32]>) -> (VsfSection, 
     (k, Some(w))
 }
 
+/// The capsule's section that carries its icon.
+pub const ICON: &str = "icon";
+
+/// A kist's icon, in the one icon format (owner, 2026-11-20: "the exact same format and process as the Photon avatars so we have a consistent 256x256 g2t ... icon everywhere. friends, kists, except for pucks of course"): a Photon avatar's picture, an AV1 key frame of 256 x 256, 8 bits, VSF YCbCr 4:2:0, and what its codes mean, `g2t` (VSF RGB gamma2tanh, light above diffuse white kept) or gamma 2 (untagged).
+///
+/// In the capsule it is the section `icon`, after the code (so the first 64 KiB the stower keeps and the kernel reads the code's header from are untouched), signed with the rest, so a kist's look is its developer's and nothing on the way can swap it. Its fields are vsf's flat image section's, `pixels` (`v'a'`) and `encoding` (`a`, absent for gamma 2), so the icon document tools/app-icons makes ([`icon_document`]) and the capsule carry the same fields. Read from the capsule by its table of contents, as the declaration is ([`icon_of`]); the person's list does not carry it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Icon {
+    pub av1: Vec<u8>,
+    pub encoding: vsf::visual::Encoding,
+}
+
+/// An icon from a section holding `pixels` (`v'a'`) and, unless gamma 2, `encoding` (`a`): AV1 alone, and only VSF's own encodings (an icon is VSF RGB).
+fn icon_from(s: &VsfSection) -> Result<Icon, &'static str> {
+    let av1 = match s.get_field("pixels").and_then(|f| f.values.first()) {
+        Some(VsfType::v(b'a', a)) if !a.is_empty() => a.clone(),
+        _ => return Err("an icon without its AV1 picture"),
+    };
+    let encoding = match s.get_field("encoding").and_then(|f| f.values.first()) {
+        None => vsf::visual::Encoding::Gamma2,
+        Some(VsfType::a(t)) => match vsf::visual::Encoding::parse(t.as_str()) {
+            Ok(e) if e.is_vsf() => e,
+            _ => return Err("an icon whose encoding is not VSF RGB's own"),
+        },
+        Some(_) => return Err("an icon's encoding that is not text"),
+    };
+    Ok(Icon { av1, encoding })
+}
+
+/// The icon a capsule carries (its `icon` section), or None for a capsule without one.
+pub fn icon_of(capsule: &[u8]) -> Result<Option<Icon>, &'static str> {
+    section(capsule, ICON)?.as_ref().map(icon_from).transpose()
+}
+
+/// An icon from its own document (tools/app-icons `icon`: a complete VSF file, vsf's flat image section `image`).
+pub fn icon_document(doc: &[u8]) -> Result<Icon, &'static str> {
+    icon_from(&section(doc, "image")?.ok_or("no `image` section")?)
+}
+
+/// The capsule's `icon` section for an icon.
+pub fn icon_section(icon: &Icon) -> VsfSection {
+    let mut s = VsfSection::new(ICON);
+    s.add_field("pixels", VsfType::v(b'a', icon.av1.clone()));
+    // Untagged is gamma 2 (vsf's rule), so only another encoding is written.
+    if icon.encoding != vsf::visual::Encoding::Gamma2 {
+        s.add_field("encoding", VsfType::a(vsf::Ascii::checked("encoding", String::from(icon.encoding.as_str()))));
+    }
+    s
+}
+
 impl Kists {
     /// The person's list from its document; an empty list for a document that does not parse (a list never written reads as none stowed).
     pub fn parse(doc: &[u8]) -> Result<Kists, &'static str> {
@@ -1641,8 +1691,8 @@ pub mod capsule {
         Ok(b)
     }
 
-    /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the version when given, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
-    pub fn unsigned(d: &Decl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
+    /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the version when given, the developer's name when given, `kb`), the `wants` section, the code, and the `icon` section when given ([`crate::Icon`]). Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
+    pub fn unsigned(d: &Decl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, icon: Option<&crate::Icon>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
         let (mut k, w) = declaration_sections(d, Some(option));
         if let Some(v) = version {
             if v.0.is_empty() {
@@ -1658,7 +1708,12 @@ pub mod capsule {
         if let Some(w) = w {
             b = b.add_section_direct(w);
         }
-        b.add_section_direct(code_section(code)).build()
+        b = b.add_section_direct(code_section(code));
+        // The icon after the code: the first 64 KiB, which the stower keeps (fetch::HEAD) and the kernel's launch reads the code's header from (process.rs `kist_need`), stay the header, the declaration and the code's start, whatever the icon weighs (up to about 31 KB).
+        if let Some(i) = icon {
+            b = b.add_section_direct(crate::icon_section(i));
+        }
+        b.build()
     }
 
     /// Why [`admit`] refused a capsule.
@@ -1746,7 +1801,7 @@ pub mod capsule {
 
         fn signed(key: &SigningBundle, name: Option<&str>) -> Vec<u8> {
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
-            fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 1, 0])), name, &key.public(), &code, 9).unwrap(), key).unwrap()
+            fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 1, 0])), name, None, &key.public(), &code, 9).unwrap(), key).unwrap()
         }
 
         #[test]
@@ -1765,6 +1820,39 @@ pub mod capsule {
             // The version is in the signed declaration.
             assert_eq!(version_of(&c).unwrap(), Some(Version(alloc::vec![0, 1, 0])));
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
+            // No icon given, none carried.
+            assert_eq!(crate::icon_of(&c).unwrap(), None);
+        }
+
+        #[test]
+        fn the_icon_rides_the_signed_declaration() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            // The icon's own document, as tools/app-icons writes it (vsf's flat image section, `g2t`), read into the capsule's section unchanged.
+            let av1 = alloc::vec![0x12u8, 0, 0x0A, 0x0B, 7, 7, 7];
+            let doc = vsf::builders::compressed_image_encoded(av1.clone(), vsf::visual::Encoding::Gamma2Tanh).unwrap();
+            let icon = crate::icon_document(&doc).unwrap();
+            assert_eq!(icon, crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2Tanh });
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let c = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&icon), &key.public(), &code, 9).unwrap(), &key).unwrap();
+            fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
+            assert_eq!(crate::icon_of(&c).unwrap(), Some(icon));
+            // The declaration reads as before, and the icon sits after the code, out of the first bytes the stower and the kernel read.
+            assert_eq!(declaration(&c).unwrap(), decl());
+            let at = |s: &[u8]| (0..c.len() - s.len()).find(|&i| c[i..i + s.len()] == *s).unwrap();
+            assert!(at(&av1) > at(&[7u8; 256]));
+            // A gamma 2 icon is untagged, as vsf's flat image section has it, and reads back as gamma 2.
+            let plain = crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2 };
+            let s = crate::icon_section(&plain);
+            assert!(s.get_field("encoding").is_none());
+            assert_eq!(crate::icon_from(&s).unwrap(), plain);
+            // A foreign encoding, or pixels that are not AV1, are refused.
+            let mut srgb = VsfSection::new(crate::ICON);
+            srgb.add_field("pixels", VsfType::v(b'a', av1.clone()));
+            srgb.add_field("encoding", VsfType::a(vsf::Ascii::checked("encoding", String::from("srgb"))));
+            assert!(crate::icon_from(&srgb).is_err());
+            let mut raw = VsfSection::new(crate::ICON);
+            raw.add_field("pixels", VsfType::v(b'e', av1));
+            assert!(crate::icon_from(&raw).is_err());
         }
 
         #[test]
@@ -1783,7 +1871,7 @@ pub mod capsule {
             // Another developer's bundle put in whole (signed by them): its Ed25519 key is not the header's.
             let other = SigningBundle::developer(&[4; 32], "TEST_DEVELOPER");
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
-            let mut u = unsigned(&decl(), [5; 32], None, None, &other.public(), &code, 9).unwrap();
+            let mut u = unsigned(&decl(), [5; 32], None, None, None, &other.public(), &code, 9).unwrap();
             // The header names this key, the bundle another: built by hand, as an attacker would.
             let ed_other = other.public().ed25519();
             let ed_mine = key.public().ed25519();

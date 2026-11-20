@@ -487,7 +487,7 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the VSF key at $FERROS_DEV_KEY (default: the ferros key, keys/ferros.key.vsf; section `developer_key` { label a, seed kge }, read thru ferros_kist::secret, the one reader); only its seed is used, and it never leaves this process. A raw key file (the form before 2026-11-10) is refused, naming the conversion (kistcat `devkey convert`). A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME] [--version 0.1.0]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, derived under the key's label, or fgtw's release bundle when the key is Photon's release key.
+/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the VSF key at $FERROS_DEV_KEY (default: the ferros key, keys/ferros.key.vsf; section `developer_key` { label a, seed kge }, read thru ferros_kist::secret, the one reader); only its seed is used, and it never leaves this process. A raw key file (the form before 2026-11-10) is refused, naming the conversion (kistcat `devkey convert`). A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME] [--version 0.1.0] [--icon <icon .vsf>]`; the icon in the one icon format, tools/app-icons `icon`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, derived under the key's label, or fgtw's release bundle when the key is Photon's release key.
 /// `--text-len N`: for a masked capsule, how many bytes of the image are instructions (the rest is read-only data).
 fn text_len_arg(args: &[String]) -> Option<usize> {
     args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
@@ -595,7 +595,18 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
                 std::process::exit(1);
             })
         });
-        let unsigned = ferros_kist::capsule::unsigned(&d, option, version.as_ref(), developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
+        // `--icon <file.vsf>`: the kist's icon document (tools/app-icons `icon`, the one icon format), carried in its signed declaration (ferros_kist::Icon).
+        let icon = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--icon").map(|w| {
+            let doc = std::fs::read(&w[1]).unwrap_or_else(|e| {
+                eprintln!("--icon {}: {e}", w[1]);
+                std::process::exit(1);
+            });
+            ferros_kist::icon_document(&doc).unwrap_or_else(|e| {
+                eprintln!("--icon {}: {e} (make it with tools/app-icons icon)", w[1]);
+                std::process::exit(1);
+            })
+        });
+        let unsigned = ferros_kist::capsule::unsigned(&d, option, version.as_ref(), developer.as_deref(), icon.as_ref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
             eprintln!("Capsule build failed: {e}");
             std::process::exit(1);
         });

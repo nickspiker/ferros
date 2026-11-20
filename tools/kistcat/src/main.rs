@@ -31,7 +31,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
+    eprintln!("usage:\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
     exit(2)
 }
 
@@ -707,7 +707,7 @@ mod tests {
         let image = [7u8; 64];
         let code = ferros_kist::capsule::Code { image: &image, masked: true, text: Some(64), fixed: None, bti: false, exact: false };
         if eggs {
-            return fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], Some(&version()), None, &key.public(), &code, 3).unwrap(), key).unwrap();
+            return fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], Some(&version()), None, None, &key.public(), &code, 3).unwrap(), key).unwrap();
         }
         let (k, _) = ferros_kist::declaration_sections(&d, Some([5; 32]));
         let pubkey = key.keypair().public.to_bytes();
@@ -748,7 +748,7 @@ mod tests {
         let key = developer();
         let d = ferros_kist::Decl { name: "Clock".into(), wants: vec![] };
         let code = ferros_kist::capsule::Code { image: &[7u8; 64], masked: true, text: Some(64), fixed: None, bti: false, exact: false };
-        let c = fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], None, None, &key.public(), &code, 3).unwrap(), &key).unwrap();
+        let c = fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], None, None, None, &key.public(), &code, 3).unwrap(), &key).unwrap();
         assert!(capsule_entry(&c, "x".into(), None).unwrap_err().contains("no version"));
         // The build's own `--version` is gone: the capsule carries it.
         assert!(parse_args(&["--capsule".into(), "c.vsf".into(), "--version".into(), "0.1.0".into()]).is_err());
@@ -828,7 +828,7 @@ mod tests {
     }
 }
 
-/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first stow). `--want` is for the rights the person is asked for; the implicit set (ferros_kist::IMPLICIT, KISTS.md "The implicit set") every kist is handed without one.
+/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first stow). `--want` is for the rights the person is asked for; the implicit set (ferros_kist::IMPLICIT, KISTS.md "The implicit set") every kist is handed without one.
 /// - The key is the developer's secret (`devkey new`: section `developer_key` { label a, seed kge }); the bundle is derived from it under its label, used here and dropped, and nothing of it is printed or copied.
 /// - The code is a sandboxed image from tools/ferros-masked-build.sh (its flat .bin, and its text length: the .textlen file beside it), as the bridge's `capsule --masked --text-len` takes them; the network stower refuses native code.
 /// - `--record`: the developer's public record (`devkey new --record`), checked with every egg and that it names this key; its name goes into the declaration as `developer`, which the directory lists and the person's pin keeps.
@@ -841,6 +841,7 @@ fn kist(args: &[String]) {
     let mut option: Option<[u8; 32]> = None;
     let mut version: Option<Version> = None;
     let mut record: Option<PathBuf> = None;
+    let mut icon_path: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut fixed: Option<u32> = None;
     let (mut bti, mut exact) = (false, false);
@@ -856,6 +857,7 @@ fn kist(args: &[String]) {
             "--option" => option = Some(parse_hex32(&val()).unwrap_or_else(|e| fail(e))),
             "--version" => version = Some(parse_version(&val()).unwrap_or_else(|e| fail(e))),
             "--record" => record = Some(val().into()),
+            "--icon" => icon_path = Some(val().into()),
             "--out" => out = Some(val().into()),
             "--fixed" => fixed = Some(val().parse().unwrap_or_else(|_| fail("--fixed takes K, the arc's size 2^K"))),
             "--bti" => bti = true,
@@ -904,9 +906,14 @@ fn kist(args: &[String]) {
     if text == 0 || text > code.len() {
         fail(format!("--text-len {text}: the image is {} bytes", code.len()));
     }
+    // `--icon`: the kist's icon document (tools/app-icons `icon`), carried in the signed declaration (ferros_kist::Icon).
+    let icon = icon_path.map(|p| {
+        let doc = std::fs::read(&p).unwrap_or_else(|e| fail(format!("{}: {e}", p.display())));
+        ferros_kist::icon_document(&doc).unwrap_or_else(|e| fail(format!("{}: {e}", p.display())))
+    });
     let decl = ferros_kist::Decl { name, wants };
     let c = ferros_kist::capsule::Code { image: &code, masked: true, text: Some(text), fixed, bti, exact };
-    let unsigned = ferros_kist::capsule::unsigned(&decl, option, Some(&version), developer.as_deref(), &public, &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
+    let unsigned = ferros_kist::capsule::unsigned(&decl, option, Some(&version), developer.as_deref(), icon.as_ref(), &public, &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
     let capsule = fgtw::release::sign_release(unsigned, &signer).unwrap_or_else(|e| fail(e));
     drop(signer);
     // Checked as the device checks it, before it is written: every egg against the bundle it carries, with nothing pinned yet.

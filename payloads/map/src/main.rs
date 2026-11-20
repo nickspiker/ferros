@@ -149,7 +149,7 @@ struct Spec<'a> {
 }
 
 /// The one built-in circle: the system's own, the device's settings. It never lights (lit means a person sent you something).
-const CIRCLES: [Spec<'static>; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
+const CIRCLES: [Spec<'static>; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 7 }];
 /// The most circles the map holds: settings and the kists the person stowed (KISTS.md), each a kist circle after it.
 const MAX: usize = 1 << 4;
 // The deck's fit holds every circle the map does.
@@ -1984,8 +1984,8 @@ impl Map {
             return Spec { label: c.label, ring: c.ring, lit: c.lit, share: c.share, icon: c.icon };
         }
         let name = self.kists.kists[i - 1].name.as_str();
-        // The display's bundle (tools/app-icons APPS, 1-based): the kist's icon by its app's name until a kist carries its own (KISTS.md: the list's `icon`).
-        const BUNDLED: [&str; 5] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps"];
+        // The display's bundle (tools/app-icons APPS, 1-based, made from each app's icon in the one icon format): the kist's icon by its app's name, until the deck draws the icon a kist's capsule carries (KISTS.md "Icons": decoded once at stow, not built yet).
+        const BUNDLED: [&str; 6] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps", "Kuaha"];
         let icon = match puck_icon(&self.kists.kists, i - 1) {
             Some(w) => w,
             None => BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1),

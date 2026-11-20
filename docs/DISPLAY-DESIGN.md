@@ -64,7 +64,7 @@ Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel
 **Content** (all VSF RGB, gamma 2 — the code is √light):
 - the 8-bit canvas the display server composites (white = 255, nothing above);
 - an app's 16-bit surface (white = Q14, to 4.0 = 16× white in light; bit 48 = no dither);
-- icons: sRGB assets through vsf's SRGB2VSF_RGB colorimetrically (no adaptation), stored as gamma2tanh codes (`tools/app-icons`), decoded to the canvas's gamma 2;
+- icons: since 2026-11-20 the one icon format (KISTS.md "Icons": a Photon avatar's AV1 picture, 256 x 256, tagged `g2t`, made by Photon's own avatar process from each app's source), decoded on the host and stored in the bundle as gamma2tanh codes (`tools/app-icons bundle`), decoded to the canvas's gamma 2;
 - the map's own colours (greys, white, amber) authored as VSF RGB gamma-2 codes.
 Two things skip the pipe on purpose: the ramps test screen (op 21, straight through the tone table) and the kernel's own screens before the server starts (8-bit, panel-native).
 

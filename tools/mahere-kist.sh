@@ -13,7 +13,11 @@ version=${MAHERE_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$mahere/
 [ -n "$version" ] || { echo "no version: set MAHERE_VERSION or check $mahere/Cargo.toml" >&2; exit 1; }
 out=target/mahere.capsule.vsf
 B=target/debug/ferros-bridge
-FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Mahere --option 4d725960dc438254d7f9cdc981d34b521840db34957187cdb1d4ce06e60621de --version "$version" \
+# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/mahere.vsf); $MAHERE_ICON wins.
+icon=${MAHERE_ICON:-target/icons/mahere.vsf}
+icon_arg=()
+[ -f "$icon" ] && icon_arg=(--icon "$icon")
+FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Mahere --option 4d725960dc438254d7f9cdc981d34b521840db34957187cdb1d4ce06e60621de --version "$version" "${icon_arg[@]}" \
     --want gps "to show where you are on the map" \
     --want udp "to fetch the map from Mahere's servers as you look around, keeping it on this device"
 # Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
