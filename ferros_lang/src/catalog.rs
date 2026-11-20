@@ -692,7 +692,7 @@ messages! {
     /// The hive's own line over its keyboard (payloads/hive).
     HiveHint,
 
-    // ---- Kūaha (std/kuaha, docs/KISTS.md "Kūaha"): the kist that shows what is on this device; its two views, the find's conditions, an item's card, the device's totals ----
+    // ---- Kūaha (its own repository, ../kuaha; docs/KISTS.md "Kūaha"): the kist that shows what is on this device; its two views, the find's conditions, an item's card, the device's totals ----
     /// Its first view: the person's items in the hold (STORE.md's "your things").
     KuahaThings,
     /// Its second view: what this device holds, the hold's totals, the RAW clips area, each kist's own storage.
