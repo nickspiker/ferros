@@ -83,7 +83,7 @@ fn usage() {
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
-    eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | kinds   The hold, as the person (`items` alone for the flags)");
+    eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | usage | kinds   The hold, as the person (`items` alone for the flags)");
     eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");

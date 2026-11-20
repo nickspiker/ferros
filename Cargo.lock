@@ -1429,6 +1429,7 @@ dependencies = [
  "blake3",
  "ferros_heap",
  "ferros_items",
+ "ferros_kist",
  "ferros_store",
  "ferros_sys",
  "manifestus",

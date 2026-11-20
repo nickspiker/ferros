@@ -961,9 +961,12 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         wipe(&mut d);
         r
     } else if op == OP_ITEMS {
-        let (_, mut d) = domain_at(m, 7);
-        let r = items(store, &d, rest, out, &mut data, token);
-        wipe(&mut d);
+        // The person's items domain first; a usage call's others after it (process.rs `items_domains`): their kists' list, then each named kist's own domain.
+        let mut doms: Vec<Domain> = (0..count).map(|i| domain_at(m, 7 + i * 65).1).collect();
+        let r = items(store, &doms, rest, out, &mut data, token);
+        for d in doms.iter_mut() {
+            wipe(d);
+        }
         r
     } else if op == OP_DROP {
         // Release (the kernel's own call): each stamped domain dropped whole (ferros_store `drop_domain`), any write of it in progress with it. How many values went.
@@ -1626,16 +1629,27 @@ fn random32() -> [u8; 32] {
 }
 
 /// One call on the hold (`OP_ITEMS`): its value, with the reply's bytes in `out[8..]` (their count in `data`).
-fn items(store: &mut St, d: &Domain, rest: &[u8], out: &mut [u8], data: &mut usize, token: &[u8; 32]) -> u64 {
+fn items(store: &mut St, doms: &[Domain], rest: &[u8], out: &mut [u8], data: &mut usize, token: &[u8; 32]) -> u64 {
+    let Some(d) = doms.first() else { return ERR };
     // Clips the hold's writers left open go to the recoverer as for any extent request, so a card waiting on one is corrected soon after.
     recover_kick(store);
     // SAFETY: the serving thread's alone, as SERVING is.
     let server = unsafe { (*(&raw mut HOLD)).get_or_insert_with(|| ferros_items::serve::Server::new(random32())) };
     // The call's op, for a refusal's line on the console.
-    let op = ferros_items::Caller::from_stamp(rest).and_then(|(_, call)| call.first().copied()).unwrap_or(u8::MAX);
+    let call = ferros_items::Caller::from_stamp(rest).map(|(_, call)| call).unwrap_or(&[]);
+    let op = call.first().copied().unwrap_or(u8::MAX);
     let mut clips = ItemClips { token };
     let mut random = random32;
-    let a = server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips);
+    let a = if op == ferros_items::wire::OP_USAGE && doms.len() >= 2 {
+        let Some((_, _, _, len, ids)) = ferros_items::wire::parse_call(call) else { return ERR };
+        let t = now();
+        let kists = kists_usage(store, &doms[1], &doms[2..], ids);
+        let a = server.usage(store, d, kists, &mut out[8..], len as usize, eagle(), &mut clips);
+        say!("vault: items: usage with A#{} kists sized in {} ms", doms.len() - 2, (now() - t) * 1000 / freq());
+        a
+    } else {
+        server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips)
+    };
     if let Some(why) = &a.why {
         if !matches!(why, ferros_items::Error::NotFound) {
             say!("vault: items op {} refused: {:?}", op, why);
@@ -1643,6 +1657,39 @@ fn items(store: &mut St, d: &Domain, rest: &[u8], out: &mut [u8], data: &mut usi
     }
     *data = a.data;
     a.value
+}
+
+/// A usage call's kists: every kist of the person's list (`list` in their `kists.` domain) by name, and each one the call named (`ids`, [developer 32][option 32] each, in the order the kernel stamped their domains `named`) sized: its values and their bytes from their heads (ferros_store `size`: the names list and one head a value, no value read), and the clips area's blocks its own extents take. A named kist the list does not hold (unstowed since) is answered without a name.
+fn kists_usage(store: &mut St, list: &Domain, named: &[Domain], ids: &[u8]) -> Vec<ferros_items::wire::KistUse> {
+    let mut out: Vec<ferros_items::wire::KistUse> = match store.get(list, b"list") {
+        Ok(Some(doc)) => match ferros_kist::Kists::parse(&doc) {
+            Ok(k) => k.kists.iter().map(|k| ferros_items::wire::KistUse { developer: k.developer, option: k.option, name: k.name.clone(), ..Default::default() }).collect(),
+            Err(e) => {
+                say!("vault: items: the person's kists list does not read: {}", e);
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
+    let table = extents(store).map(|t| t.list().to_vec()).unwrap_or_default();
+    for (d, id) in named.iter().zip(ids.chunks_exact(64)) {
+        let (developer, option): ([u8; 32], [u8; 32]) = (id[..32].try_into().unwrap(), id[32..].try_into().unwrap());
+        let owner = *blake3::hash(&d.addr).as_bytes();
+        let (values, bytes) = match store.size(d) {
+            Ok((v, b)) => (Some(v), Some(b)),
+            Err(_) => (None, None),
+        };
+        let clip_blocks = table.iter().filter(|e| e.owner == owner).map(|e| e.blocks).sum();
+        let i = match out.iter().position(|k| k.developer == developer && k.option == option) {
+            Some(i) => i,
+            None => {
+                out.push(ferros_items::wire::KistUse { developer, option, ..Default::default() });
+                out.len() - 1
+            }
+        };
+        (out[i].values, out[i].bytes, out[i].clip_blocks) = (values, bytes, clip_blocks);
+    }
+    out
 }
 
 /// The clips area and its extents' table as the hold uses them (ferros_items `serve::Clips`): the same table and recoverer as the extent requests (`extent`), the extent given to the caller the reply token names.
@@ -1727,6 +1774,10 @@ impl ferros_items::serve::Clips<St> for ItemClips<'_> {
             }
             Err(_) => Err(()),
         }
+    }
+    fn space(&mut self, s: &mut St) -> Option<ferros_items::wire::ClipsUse> {
+        let t = extents(s)?;
+        Some(ferros_items::wire::ClipsUse { blocks: t.area, taken: t.taken(), largest_free: t.largest_free() })
     }
     fn record(&mut self, s: &mut St, name: &[u8; 32]) -> Option<ferros_items::serve::Rec> {
         let e = extents(s)?.find(name).copied()?;

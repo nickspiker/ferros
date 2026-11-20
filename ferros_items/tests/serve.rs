@@ -123,6 +123,10 @@ impl Clips<S> for MemClips {
         let e = *self.table(s).find(name)?;
         Some(Rec { extent: Extent { first: e.first, blocks: e.blocks }, bytes: e.bytes, hash: e.hash, sealed: e.sealed })
     }
+    fn space(&mut self, s: &mut S) -> Option<wire::ClipsUse> {
+        let t = self.table(s);
+        Some(wire::ClipsUse { blocks: t.area, taken: t.taken(), largest_free: t.largest_free() })
+    }
 }
 
 /// The device in one place: the vault process's server, its store and clips, the person's items domain, the clock and the entropy.
@@ -368,6 +372,34 @@ fn rights_makings_and_the_person() {
     // A new vault process (a fresh server over the same disk): the same items.
     b.borrow_mut().server = Server::new([43; 32]);
     assert_eq!(person.find(&Find::default()).unwrap().total, 3);
+}
+
+/// What is on the device: the hold's totals by kind (whoever made them, whatever the asker may open), the clips area, and the kists the vault found with their domains' sizes.
+#[test]
+fn usage_shows_the_whole_device() {
+    let b = Bench::new(true);
+    let (mut l, mut k) = (hold(&b, &lumis()), hold(&b, &kuaha()));
+    l.keep(&Proposed { kind: kinds::PHOTO, ..Default::default() }, &bytes(1000, 1)).unwrap();
+    l.keep(&Proposed { kind: kinds::PHOTO, ..Default::default() }, &bytes(3000, 2)).unwrap();
+    let clip = l.make_clip(&Proposed { kind: kinds::RAW_VIDEO, ..Default::default() }, 100).unwrap();
+    l.write_clip(&clip, 0, &bytes(8192, 3)).unwrap();
+    l.seal_clip(clip, 6000, &[1; 32]).unwrap();
+    let u = k.usage().unwrap();
+    let photo = u.kinds.iter().find(|x| x.kind == kinds::PHOTO).unwrap();
+    let raw = u.kinds.iter().find(|x| x.kind == kinds::RAW_VIDEO).unwrap();
+    assert_eq!((photo.items, photo.bytes, raw.items, raw.bytes), (2, 4000, 1, 6000));
+    assert_eq!(u.clips, Some(wire::ClipsUse { blocks: AREA, taken: 2, largest_free: AREA - 2 }));
+    assert!(u.kists.is_empty(), "the kists are the vault's to add");
+    // The vault's part: the kists from the person's list, sized where named; the document carries them whole.
+    let kist = wire::KistUse { developer: [1; 32], option: [2; 32], name: "Lumis".into(), values: Some(12), bytes: Some(1 << 20), clip_blocks: 2 };
+    let plain = wire::KistUse { developer: [3; 32], option: [4; 32], name: "Kūaha".into(), ..Default::default() };
+    let mut bb = b.borrow_mut();
+    let bb = &mut *bb;
+    let mut out = vec![0u8; 1 << 14];
+    let a = bb.server.usage(&mut bb.store, &bb.d, vec![kist.clone(), plain.clone()], &mut out, 1 << 14, T0, &mut bb.clips);
+    let u = wire::parse_usage(&out[..a.value as usize]).unwrap();
+    assert_eq!(u.kists, vec![kist, plain]);
+    assert_eq!(u.kinds.len(), 2);
 }
 
 #[test]
