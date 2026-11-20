@@ -205,7 +205,7 @@ pub struct Stats {
     /// Frames lost: no slot, or the camera's own count stepping past one between frames handed over.
     pub dropped: u64,
     pub paced: u64,
-    /// Bytes coded and handed to the writer.
+    /// Bytes coded and handed to the writer. On the GPU path frames are packed behind the hand-over, so this lags `frames` by the frames still being packed (a few); it is never 0 once a frame is recorded (the first one waits for its packing).
     pub coded: u64,
     pub raw: u64,
     /// Bytes the writer has written.
@@ -776,7 +776,8 @@ impl Recorder {
         };
         g.seq += 1;
         let seq = g.seq;
-        let wait = job_set.is_none() || (p.hash_src && !early);
+        // The clip's first frame waits for its packing too, once: `stats().coded` is then never 0 once a frame is recorded, as on the CPU path (Lumis divides the room left by the bytes a frame has coded to: 2026-11-20, a 0 there panicked it at its first frame).
+        let wait = job_set.is_none() || (p.hash_src && !early) || self.stats.frames == 0;
         {
             let mut st = p.st.lock().unwrap();
             if let Some(s) = job_set {
