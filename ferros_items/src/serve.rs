@@ -121,6 +121,12 @@ impl Server {
         self.domain = None;
     }
 
+    /// The domain dropped whole (release): every item's card and stored body, the hold's lists; what was held goes. The clips' extents are the vault's to drop, by `clip_owner`. How many items went.
+    pub fn drop_domain<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> crate::Result<u64> {
+        self.forget();
+        self.items.drop_all(store, d)
+    }
+
     /// Open clips whose extent is sealed by now (their writer finished without saying so, or died and the vault's recoverer closed them) get their sealed card; one whose extent is gone from the table loses its card (it would name blocks nobody holds). How many cards changed.
     pub fn reconcile<A: BlockDev, B: BlockDev, N: Nonces, X: Clips<Store<A, B, N>>>(&mut self, store: &mut Store<A, B, N>, d: &Domain, now: i64, clips: &mut X) -> u64 {
         let Ok(open) = self.items.open_clips(store, d) else { return 0 };

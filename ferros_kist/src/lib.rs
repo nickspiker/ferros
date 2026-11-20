@@ -1708,6 +1708,11 @@ pub mod capsule {
 
     /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the version when given, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
     pub fn unsigned(d: &Decl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
+        unsigned_with_items(d, &ItemsDecl::default(), option, version, developer_name, bundle, code, made)
+    }
+
+    /// `unsigned` with the kinds of the hold the kist makes and opens (its `items` section, after `wants`; docs/STORE.md part 1): what a kist asking for the `items` right declares.
+    pub fn unsigned_with_items(d: &Decl, items: &ItemsDecl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
         let (mut k, w) = declaration_sections(d, Some(option));
         if let Some(v) = version {
             if v.0.is_empty() {
@@ -1722,6 +1727,9 @@ pub mod capsule {
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(bundle.ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k);
         if let Some(w) = w {
             b = b.add_section_direct(w);
+        }
+        if let Some(s) = items_section(items) {
+            b = b.add_section_direct(s);
         }
         b.add_section_direct(code_section(code)).build()
     }
@@ -1830,6 +1838,20 @@ pub mod capsule {
             // The version is in the signed declaration.
             assert_eq!(version_of(&c).unwrap(), Some(Version(alloc::vec![0, 1, 0])));
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
+        }
+
+        /// A kist asking for `items` carries its kinds in the signed capsule, read back by the kernel's `items_of` at launch; the signature still verifies.
+        #[test]
+        fn the_items_kinds_are_signed_with_the_capsule() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let d = Decl { name: String::from("Lumis"), wants: alloc::vec![(ITEMS, String::from("to keep what you shoot"))] };
+            let items = ItemsDecl { makes: alloc::vec![([1; 32], String::from("the stills and clips you take"))], opens: alloc::vec![([2; 32], String::from("your scans"))] };
+            let c = fgtw::release::sign_release(unsigned_with_items(&d, &items, [5; 32], None, None, &key.public(), &code, 9).unwrap(), &key).unwrap();
+            fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
+            assert_eq!(items_of(&c).unwrap(), items);
+            assert_eq!(want_codes(&c).unwrap(), alloc::vec![ITEMS]);
+            assert_eq!(items_of(&signed(&key, None)).unwrap(), ItemsDecl::default());
         }
 
         #[test]

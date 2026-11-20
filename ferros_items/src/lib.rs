@@ -756,6 +756,35 @@ impl Items {
         Ok(out)
     }
 
+    /// Every item of the domain gone (release: the person's items leave the device with their domains, AUTH.md): each page's stored bodies, the pages, the root and the hold's lists. The hold's values are off ferros_store's list, so `drop_domain` alone would leave them; the vault calls this first. Single-copy bodies' extents are the vault's to drop (by their owner tag). How many items went.
+    pub fn drop_all<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<u64> {
+        self.forget();
+        self.load_root(store, d)?;
+        let root = self.root.take().ok_or(Error::Format)?;
+        let mut n = 0;
+        for r in &root {
+            if let Some(doc) = store.get(d, &r.name())? {
+                for s in sections(&doc, "card")? {
+                    let c = Card::parse(s)?.0;
+                    if c.extent.is_none() {
+                        store.delete_unlisted(d, &body_name(&c.id))?;
+                    }
+                    n += 1;
+                }
+            }
+            store.delete_unlisted(d, &r.name())?;
+        }
+        // A body whose card never landed is on the pending list: it goes too.
+        for id in self.pending(store, d)? {
+            store.delete_unlisted(d, &body_name(&id))?;
+        }
+        for name in [ROOT, PENDING, CLIPS] {
+            store.delete_unlisted(d, name)?;
+        }
+        self.forget();
+        Ok(n)
+    }
+
     /// The single-copy bodies not yet sealed, each item's id and when it was made: what the vault looks for in its extents' table once a clip's writer is gone (payloads/vault: a clip closed by its recoverer, its card then corrected by `amend_extent`).
     pub fn open_clips<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<([u8; 32], i64)>> {
         if let Some(c) = &self.clips {

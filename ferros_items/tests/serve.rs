@@ -369,3 +369,30 @@ fn rights_makings_and_the_person() {
     b.borrow_mut().server = Server::new([43; 32]);
     assert_eq!(person.find(&Find::default()).unwrap().total, 3);
 }
+
+#[test]
+fn release_drops_the_whole_hold() {
+    let b = Bench::new(true);
+    let mut l = hold(&b, &lumis());
+    let before = {
+        let mut bb = b.borrow_mut();
+        let bb = &mut *bb;
+        // The extents' table is the vault's own value, there before and after.
+        bb.clips.table(&mut bb.store);
+        bb.store.engine().live_counts()
+    };
+    for k in 0..3u8 {
+        l.keep(&Proposed { kind: kinds::PHOTO, title: Some(format!("p{k}")), ..Default::default() }, &bytes(200_000, k)).unwrap();
+    }
+    let mut bb = b.borrow_mut();
+    let bb = &mut *bb;
+    let kept = bb.store.engine().live_counts();
+    // As the vault's OP_DROP does: the hold's own values, then ferros_store's domain (its books).
+    assert_eq!(bb.server.drop_domain(&mut bb.store, &bb.d).unwrap(), 3);
+    bb.store.drop_domain(&bb.d).unwrap();
+    let after = bb.store.engine().live_counts();
+    eprintln!("live blocks: {before:?} before, {kept:?} kept, {after:?} after the drop");
+    // What stays is the engine's index skeleton, never a piece of a body (three bodies are a dozen pieces).
+    assert!(after.0 + after.1 < 8 && kept.0 + kept.1 > 12, "every body, page and list of the hold is gone");
+    assert_eq!(Server::new([1; 32]).items.find(&mut bb.store, &bb.d, &Caller::person(), &Find::default()).unwrap().total, 0);
+}

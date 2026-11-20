@@ -4094,9 +4094,12 @@ pub const ITEMS_PREFIX: &[u8] = b"items.";
 pub const ITEMS_CALL_MAX: usize = EXTENT_MAX + (1 << 6);
 
 /// Who calls on the hold, as the kernel knows it, ahead of its call (payloads/vault `items`): [flags u8: bit 0 a kist, bit 1 any kind, bit 2 the person (the kernel's own call, `items_person_stamp`)][developer 32][option 32][name length u8][name][makes u16 LE][the kinds, 32 each][opens u16 LE][the kinds]. A kist is its gate identity; a development spawn its name under a zero developer key (it has no identity of its own).
-/// WHY the caps: the name and the kinds are the process's own and its capsule's; a name past a byte's count and lists past a u16's are cut, never wrapped.
+/// WHY the bounds: the name and the kinds are the process's own and its capsule's; a name past a byte's count is cut, never wrapped; a list past `ITEMS_KINDS_MOST` refuses the call (None) rather than cut a right silently, since the stamp and a transfer must fit the vault's room for one message (payloads/vault: a transfer and 64 KiB).
 fn items_stamp(p: &Process) -> Option<Vec<u8>> {
     let r = p.items.as_ref()?;
+    if r.makes.len() > ITEMS_KINDS_MOST || r.opens.len() > ITEMS_KINDS_MOST {
+        return None;
+    }
     let (developer, option) = match p.gate.filter(|_| p.kist) {
         Some(g) => g,
         None => ([0; 32], blake3::derive_key("ferros items 2026-11-19 development spawn", &p.name)),
@@ -4109,14 +4112,16 @@ fn items_stamp(p: &Process) -> Option<Vec<u8>> {
     out.push(name.len() as u8);
     out.extend_from_slice(name);
     for list in [&r.makes, &r.opens] {
-        let n = list.len().min(u16::MAX as usize);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-        for k in &list[..n] {
+        out.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        for k in list.iter() {
             out.extend_from_slice(k);
         }
     }
     Some(out)
 }
+
+/// The most kinds a kist's `items` right names in either list (makes, opens): 2^8 of each is 16 KiB of stamp, inside the vault's room beside a transfer.
+pub const ITEMS_KINDS_MOST: usize = 1 << 8;
 
 /// The person's own call on the hold (the kernel's channel: the bridge's `items`, the bench and the owner's pulls): every kind, no kist.
 pub fn items_person_stamp() -> Vec<u8> {
@@ -4464,7 +4469,8 @@ pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'s
 
 /// Stamps dropping every one of the person's domains in the vault process (each scope that holds the person's names), for release: made while their keys still exist, sent by the service loop before its restart (service.rs). Empty while they are locked: nothing could be stamped, and what is on the disk is already unopenable once release renews the device-only secret.
 pub fn vault_stamp_drops() -> Vec<Vec<u8>> {
-    with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix.as_bytes(), &[true], &[], &[])).collect())
+    // The person's items domain goes with them (docs/STORE.md "Removal": release drops their items with their domains), its clips' extents with it (the vault drops a domain's extents by its owner tag).
+    with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix.as_bytes(), &[true], &[], &[])).chain(stamp(VOP_DROP, ITEMS_PREFIX, &[true], &[], &[])).collect())
 }
 
 /// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early with 1, which a poll loop reads as "look again"). `handoff`: the caller blocks right after on this core, so the server runs here next (`handoff`); the kernel's own call (`vault_call`) carries on, and the server is woken to the front (`enqueue_woken`). Until 2026-11-11 a sleeping poller woken this way went to the back of the run queue: the WiFi driver waited ~9.7 ms for a core behind Mahere's threads on each of ip's calls.

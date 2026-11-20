@@ -67,6 +67,8 @@ const OP_EXPORT: u8 = 5;
 const OP_SIZE: u8 = 6;
 /// A single-copy extent (process.rs `VOP_EXTENT`, `extent_forward`): rest [extent op][block u64][length u32][bytes]; see `extent`.
 const OP_EXTENT: u8 = 7;
+/// A call on the hold (process.rs `VOP_ITEMS`, `items_forward`; docs/STORE.md "The calls"): the person's items domain stamped, rest [the caller's stamp][the call]; answered by ferros_items `serve::Server` (`items`).
+const OP_ITEMS: u8 = 8;
 /// The extent ops (process.rs `EOP_*`).
 const EOP_OPEN: u8 = 0;
 const EOP_WRITE: u8 = 1;
@@ -814,7 +816,8 @@ extern "C" fn work(_: u64) -> ! {
     }
     // One transfer and its stamp each way, with room to spare: in, a set's piece (ferros_sys::STORE_MAX, 256 KiB); out, a get's (ferros_sys::STORE_GET_MAX, 1 MiB since 2026-11-11, the kernel's bound on a forwarded get).
     // In, a set's piece (ferros_sys::STORE_MAX) or an extent's write (EXTENT_MAX, a UFS command's 1 MiB), the larger.
-    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX.max(EXTENT_MAX) + (1 << 12)];
+    // And a hold's call: a transfer of a body or a clip's blocks, behind its caller's stamp (its kinds, 32 bytes each, up to process.rs ITEMS_KINDS_MOST of each list), hence the 64 KiB beside it.
+    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX.max(EXTENT_MAX) + (1 << 16)];
     let mut out = alloc::vec![0u8; ferros_sys::STORE_GET_MAX + (1 << 12)];
     // The kernel forwards gets larger than one STORE_MAX transfer only once this process says it answers them (a vault from before would index past its reply buffer); a kernel from before refuses the call and its gets stay at STORE_MAX.
     ferros_sys::vault_gets(cap(grants(), S_VAULT), ferros_sys::STORE_GET_MAX);
@@ -862,6 +865,10 @@ extern "C" fn work(_: u64) -> ! {
             // The person locked (or unlocked) since the last request: what this process holds of theirs goes.
             store.forget();
             writers.retain(|p| !p.person);
+            // The hold's index, makings and handles are the person's too.
+            if let Some(s) = unsafe { (*(&raw mut HOLD)).as_mut() } {
+                s.forget();
+            }
             if let Some(mut x) = export.take() {
                 x.fill(0);
             }
@@ -951,6 +958,11 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         let r = extent(store, &d, name, rest, out, &mut data, token);
         wipe(&mut d);
         r
+    } else if op == OP_ITEMS {
+        let (_, mut d) = domain_at(m, 7);
+        let r = items(store, &d, rest, out, &mut data, token);
+        wipe(&mut d);
+        r
     } else if op == OP_DROP {
         // Release (the kernel's own call): each stamped domain dropped whole (ferros_store `drop_domain`), any write of it in progress with it. How many values went.
         let (mut n, mut ok) = (0u64, true);
@@ -968,6 +980,12 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                         Err(_) => ok = false,
                     }
                 }
+            }
+            // The hold's values are off ferros_store's list (ferros_items `drop_all`), so they go first; a domain that holds none reads one absent root.
+            let hold = unsafe { (*(&raw mut HOLD)).get_or_insert_with(|| ferros_items::serve::Server::new(random32())) };
+            match hold.drop_domain(store, &d) {
+                Ok(k) => n += k,
+                Err(_) => ok = false,
             }
             match store.drop_domain(&d) {
                 Ok(k) => n += k,
@@ -1579,6 +1597,127 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
     }
 }
 
+/// The hold (ferros_items `serve::Server`): made at the first items call, its handles keyed by 32 bytes drawn then, so a handle means nothing to another vault process. The serving thread's alone.
+static mut HOLD: Option<ferros_items::serve::Server> = None;
+
+/// 32 fresh bytes from the session's wairua (the hold's handle key, its makings' tokens, its items' ids).
+fn random32() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    if ferros_sys::entropy(cap(grants(), S_ENTROPY), &mut b) == ERR {
+        panic!("vault: no entropy for the hold");
+    }
+    b
+}
+
+/// One call on the hold (`OP_ITEMS`): its value, with the reply's bytes in `out[8..]` (their count in `data`).
+fn items(store: &mut St, d: &Domain, rest: &[u8], out: &mut [u8], data: &mut usize, token: &[u8; 32]) -> u64 {
+    // Clips the hold's writers left open go to the recoverer as for any extent request, so a card waiting on one is corrected soon after.
+    recover_kick(store);
+    // SAFETY: the serving thread's alone, as SERVING is.
+    let server = unsafe { (*(&raw mut HOLD)).get_or_insert_with(|| ferros_items::serve::Server::new(random32())) };
+    // The call's op, for a refusal's line on the console.
+    let op = ferros_items::Caller::from_stamp(rest).and_then(|(_, call)| call.first().copied()).unwrap_or(u8::MAX);
+    let mut clips = ItemClips { token };
+    let mut random = random32;
+    let a = server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips);
+    if let Some(why) = &a.why {
+        if !matches!(why, ferros_items::Error::NotFound) {
+            say!("vault: items op {} refused: {:?}", op, why);
+        }
+    }
+    *data = a.data;
+    a.value
+}
+
+/// The clips area and its extents' table as the hold uses them (ferros_items `serve::Clips`): the same table and recoverer as the extent requests (`extent`), the extent given to the caller the reply token names.
+struct ItemClips<'a> {
+    token: &'a [u8; 32],
+}
+
+impl ferros_items::serve::Clips<St> for ItemClips<'_> {
+    fn open(&mut self, s: &mut St, name: [u8; 32], owner: [u8; 32], blocks: u64, now: i64) -> Option<ferros_items::Extent> {
+        let t = extents(s)?;
+        let mut next = t.clone();
+        match next.reserve(name, owner, blocks, now).and_then(|e| next.store(s.engine(), now).map(|()| e)) {
+            Ok(e) => {
+                *t = next;
+                say!("vault: items: a clip's extent opened, {} blocks at {} of the clips area; {} free at most", e.blocks, e.first, t.largest_free());
+                Some(ferros_items::Extent { first: e.first, blocks: e.blocks })
+            }
+            Err(err) => {
+                say!("vault: items: a clip's extent of {} blocks refused: {:?}; {} free at most", blocks, err, t.largest_free());
+                None
+            }
+        }
+    }
+    fn give(&mut self, name: &[u8; 32], x: ferros_items::Extent) -> Option<[u8; 32]> {
+        // Given, the clip's bytes go straight to the flash; refused (the bench's call, a kernel from before), they come thru this process and the extent is kept off the recoverer while it records.
+        let given = extent_give(self.token, x.first, x.blocks, false);
+        let through = unsafe { &mut *(&raw mut THROUGH) };
+        through.retain(|n| n != name);
+        if given.is_none() {
+            through.push(*name);
+        }
+        given
+    }
+    fn take_back(&mut self) {
+        let _ = extent_give(self.token, 0, 0, true);
+    }
+    fn write(&mut self, at: u64, bytes: &[u8]) -> bool {
+        ferros_sys::block_write(cap(grants(), S_CLIPS), at, bytes) == 0
+    }
+    fn read(&mut self, at: u64, buf: &mut [u8]) -> bool {
+        ferros_sys::block_read(cap(grants(), S_CLIPS), at, buf) == 0
+    }
+    fn seal(&mut self, s: &mut St, name: &[u8; 32], len: u64, hash: [u8; 32], now: i64) -> Option<ferros_items::Extent> {
+        if unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == *name) {
+            recover_commit(s, true);
+        }
+        let t = extents(s)?;
+        let mut next = t.clone();
+        match next.seal(name, len, hash, now).and_then(|e| next.store(s.engine(), now).map(|()| e)) {
+            Ok(e) => {
+                *t = next;
+                unsafe { (*(&raw mut THROUGH)).retain(|n| n != name) };
+                say!("vault: items: a clip sealed, {} bytes in {} blocks at {} of the clips area", len, e.blocks, e.first);
+                Some(ferros_items::Extent { first: e.first, blocks: e.blocks })
+            }
+            Err(err) => {
+                say!("vault: items: a clip's seal of {} bytes refused: {:?}", len, err);
+                None
+            }
+        }
+    }
+    fn remove(&mut self, s: &mut St, name: &[u8; 32], now: i64) -> Result<(), ()> {
+        // Not while the recoverer may still write in it: its recovery is let finish first.
+        if unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == *name) {
+            recover_commit(s, true);
+        }
+        let Some(t) = extents(s) else { return Err(()) };
+        let Some(e) = t.find(name).copied() else { return Ok(()) };
+        // Not while a live writer holds its blocks (the kernel says, SYS_BLOCK x1 bits 3 and 5: 1 held): freed under it, they could be another clip's before its writes stop.
+        if !e.sealed && ferros_sys::svc(ferros_sys::nr::BLOCK, cap(grants(), S_CLIPS), 8 | 32, e.first, 0, 0) == 1 {
+            say!("vault: items: the clip at {} is still being recorded; not removed", e.first);
+            return Err(());
+        }
+        let mut next = t.clone();
+        next.remove(name);
+        match next.store(s.engine(), now) {
+            Ok(()) => {
+                *t = next;
+                unsafe { (*(&raw mut THROUGH)).retain(|n| n != name) };
+                say!("vault: items: a clip removed, {} blocks at {} of the clips area free again", e.blocks, e.first);
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+    fn record(&mut self, s: &mut St, name: &[u8; 32]) -> Option<ferros_items::serve::Rec> {
+        let e = extents(s)?.find(name).copied()?;
+        Some(ferros_items::serve::Rec { extent: ferros_items::Extent { first: e.first, blocks: e.blocks }, bytes: e.bytes, hash: e.hash, sealed: e.sealed })
+    }
+}
+
 /// The largest value an export carries, and the largest export: the document is built whole in this process's heap (HEAP_BYTES). A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.
 const EXPORT_VALUE_MAX: u64 = 1 << 20;
 const EXPORT_MAX: u64 = 1 << 22;
@@ -1706,6 +1845,8 @@ fn op_name(op: u8) -> &'static str {
         OP_DROP => "a drop",
         OP_EXPORT => "an export",
         OP_SIZE => "a size",
+        OP_EXTENT => "an extent call",
+        OP_ITEMS => "a call on the hold",
         OP_MIGRATE => "the migration",
         _ => "no request",
     }
