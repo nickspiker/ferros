@@ -8,6 +8,7 @@
 //! Its grant slots, as ferros lays out a kist that declares only the camera (ferros_kist `slots`): 1 display, 2 touch, 3 surface, 4 ira, 5 its vault domain, 6 entropy, 7 camera (an empty slot when the person said no), then the GPU's three and sound out, which it does not use.
 
 mod camera;
+mod hold;
 mod sys;
 
 use fluor::coord::Coord;
@@ -98,17 +99,17 @@ fn reopen_whole(cam: &camera::Camera, vault: Option<&kete::FlatStorage>, header:
     }
 }
 
-/// A RAW video clip recording (lumis_core RawMode::Video; owner, 2026-11-19: "VSF video, yes", lossless): the camera opened at the clip's pacing (`open` with a `Pacing`), every whole frame the view hands over coded by ferros_clip's recorder on the A715s and written into a single-copy extent of Lumis's domain (docs/RAW-VIDEO.md Part 4). It runs until STOP (RECORDING_BIT cleared), the extent is full or a write fails (`Taken::Ended`), or Lumis leaves or ends: every one of those seals the clip (`end_clip`).
+/// A RAW video clip recording (lumis_core RawMode::Video; owner, 2026-11-19: "VSF video, yes", lossless): the camera opened at the clip's pacing (`open` with a `Pacing`), every whole frame the view hands over coded by ferros_clip's recorder and written into the person's hold as an item of kind RAW video, its body a single-copy extent written straight to the flash (docs/HOLD-API.md "Lumis"). It runs until STOP (RECORDING_BIT cleared), the extent is full or a write fails (`Taken::Ended`), or Lumis leaves or ends: every one of those seals the clip (`end_clip`).
 struct Clip {
     rec: ferros_clip::Recorder,
     /// The camera's name, for the console.
     cam: String,
     /// Its frames a second (1 to 60, ferros_clip `Pacing::of`).
     fps: u32,
-    /// When it began, Eagle oscillations (its row in lumis_core's clips list).
-    at: i64,
-    /// The extent's name in Lumis's domain.
+    /// When it began, as the stills' stamp (local time): the clip as the console and the note under RECORD name it.
     name: String,
+    /// The item's handle from its open and its card from its seal (ferros_clip `items::Receipt`).
+    receipt: Arc<Mutex<ferros_clip::items::Receipt>>,
     began: std::time::Instant,
     /// The extent's bytes, as the vault gave them (it may give fewer than asked): what is left of them sets the time left.
     room: u64,
@@ -178,6 +179,10 @@ fn video_fps(header: &[u64]) -> u32 {
 /// `facts`: the sensor's mount and the hold (degrees) and the recording space used, as the header had them; `line` the view's bytes a row. Run on a thread of its own (`camera_service`): the extent's open can wait minutes (the vault closing and sealing a clip left open, a few seconds a GB), and the camera thread must go on taking frames meanwhile, or the driver closes.
 fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip::Pacing, head: camera::FrameHeader, line: usize, digests: bool) -> Result<Clip, String> {
     let (mount, held, space_used) = facts;
+    if !hold::held() {
+        return Err("your things were not given to Lumis: no clip can be kept".into());
+    }
+    // The vault domain's grant asks the recording space (the clips area is one, the hold's clips in it).
     let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
     // No room for a frame uncoded (the most a frame codes to): not started, said instead (the coordinator, 2026-11-19: the clips area at 63 MB free).
     let frame_bytes = (head.height * line) as u64;
@@ -210,8 +215,8 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
         observer: String::new(),
         orientation,
     };
-    // The stills' stamp with its spaces as underscores: an extent's name is printed ASCII without the space (the kernel's extent_forward takes 0x21 to 0x7E; 2026-11-19, the Pro: every open of "video/<stamp> video.vsf" refused before the vault saw it).
-    let name = format!("video/{}.vsf", lumis_core::capture_stamp(std::time::SystemTime::now()).replace(' ', "_"));
+    // When it began as the stills' stamp: what the console and the note under RECORD call it (the hold names it by its card).
+    let name = lumis_core::capture_stamp(std::time::SystemTime::now());
     let at = ferros_clip::eagle_osc(head.time as u64);
     // The longest free stretch of the clips window, whole (what an OPEN can get: a clip is one stretch), where the vault says it; else from CLIP_BLOCKS_MOST, halving on refusal.
     let mut blocks = ferros_clip::ferros::space(slot).map_or(CLIP_BLOCKS_MOST, |sp| sp.largest_free_bytes / ferros_clip::BLOCK as u64);
@@ -227,16 +232,23 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
             at,
             source_digests: digests,
         };
-        let ext = ferros_clip::ferros::Extent::new(slot, &name);
-        match ferros_clip::Recorder::start(&clip_cam, &mode, Box::new(ferros_clip::ferros::ExtentSink(ferros_clip::ferros::Extent::new(slot, &name)))) {
+        // The card Lumis proposes (HOLD-API.md "Lumis"): kind RAW video, no title (the person gives none here), its start (`raw_video` adds `at`), its rate, its frame's size and the camera's name.
+        let attrs = vec![
+            ("fps".to_string(), vsf::VsfType::u(pacing.fps as usize, false)),
+            ("width".to_string(), vsf::VsfType::u(head.width, false)),
+            ("height".to_string(), vsf::VsfType::u(head.height, false)),
+            ("camera".to_string(), vsf::VsfType::x(cam.name.clone())),
+        ];
+        let (sink, receipt) = ferros_clip::items::raw_video(hold::ITEMS, None, at, attrs);
+        let got = Arc::new(std::sync::atomic::AtomicU64::new(blocks));
+        match ferros_clip::Recorder::start(&clip_cam, &mode, Box::new(hold::Counted { sink, got: got.clone() })) {
             Ok(rec) => {
-                let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
-                // What codes it: the GPU when Lumis holds its grants (a kist's GPU slots, a spawn's --use gpu --dma layers; 60 a second held on the Pro, 2026-11-20), else the CPU's workers and why.
-                println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation}); coded by {}", cam.name, pacing.fps, room >> 20, rec.gpu_note());
-                // Its row in Lumis's clips list from its start (the clips page; a clip never closed shows as such).
-                lumis_core::clips::put(lumis_core::clips::Clip { name: name.clone(), frames: 0, bytes: 0, fps: pacing.fps, at, seal: None });
+                let room = got.load(Ordering::Relaxed) * ferros_clip::BLOCK as u64;
+                let direct = receipt.lock().unwrap().direct;
+                // What codes it: the GPU when Lumis holds its grants (a kist's GPU slots, a spawn's --use gpu --dma layers; 60 a second held on the Pro, 2026-11-20), else the CPU's workers and why. Where it goes: straight to the flash (the clip's own extent capability) or thru the vault.
+                println!("lumis: camera {}: RAW video: recording {name} into the hold at {} a second ({} MiB of room, {}, orientation {orientation}); coded by {}", cam.name, pacing.fps, room >> 20, if direct { "straight to the flash" } else { "thru the vault" }, rec.gpu_note());
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, dropped_at: None, last_code_us: 0, period_us: pacing.sensor_ns / 1000, first_ns: None, space_before: space_used });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, name, receipt, began: now, room, preview: now, dropped: 0, last_count: head.count, dropped_at: None, last_code_us: 0, period_us: pacing.sensor_ns / 1000, first_ns: None, space_before: space_used });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -256,18 +268,7 @@ fn read_space(header: &mut [u64]) {
     }
 }
 
-/// lumis_core's clips page deletes a clip's bytes here: the extent of that name in Lumis's domain (its record and blocks; the vault gives the blocks back to the clips area).
-fn delete_clip(name: &str) -> Result<(), String> {
-    let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
-    if ferros_clip::ferros::Extent::new(slot, name).delete() {
-        println!("lumis: RAW video: {name} deleted");
-        Ok(())
-    } else {
-        Err("the vault refused the delete".into())
-    }
-}
-
-/// A clip ended: its closing generation written and the extent sealed (ferros_clip `stop`), its counts into the header (when the caller has it: not at Lumis's end), said on the console with why it ended.
+/// A clip ended: its closing generation written and the item sealed (ferros_clip `stop`: its card then carries the length and the seal), its counts into the header (when the caller has it: not at Lumis's end), said on the console with why it ended.
 fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
     use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
     let ms = clip.began.elapsed().as_millis();
@@ -286,14 +287,17 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
         // The space as the seal left it (the reservation given back past the clip's length).
         read_space(header);
     }
-    // Its row in the clips list, closed: its frames, bytes and seal (the seal none if it did not close).
-    lumis_core::clips::put(lumis_core::clips::Clip { name: clip.name.clone(), frames: s.frames, bytes: info.len, fps: clip.fps, at: clip.at, seal: info.error.is_none().then_some(info.hash) });
-    // Under the RECORD button: the clip's name, which the person pulls it by, and why if it ended early.
+    // Under the RECORD button: the clip kept as the person's (Kūaha shows it), and why if it ended early.
     lumis_core::platform::set_video_note(Some(match &info.error {
-        None => clip.name.clone(),
+        None => format!("{} kept, {} frames", clip.name, s.frames),
         Some(e) => format!("{} ended: {e}", clip.name),
     }));
     let hex: String = info.hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    // The item as its seal left it: its id, which the bench finds it by (`ferros-bridge items find --kind "RAW video"`), and its card's size.
+    match &clip.receipt.lock().unwrap().card {
+        Some(c) => println!("lumis: camera {cam}: RAW video: {} is item {} in the hold, {} bytes", clip.name, c.id[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), c.size),
+        None => println!("lumis: camera {cam}: RAW video: {} not sealed into the hold (the vault closes it at its last whole frame)", clip.name),
+    }
     println!(
         "lumis: camera {cam}: RAW video: {} ended ({why}): {} frames in {ms} ms, {} dropped, {} paced; {} bytes (coded {} of {}), sealed {hex}; the coding {} us a frame at most, {} on average{}",
         clip.name,
@@ -1483,8 +1487,24 @@ fn report(src: &Source, turns: &mut Turns, name: &str) {
 
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
 /// Each save goes into the vault as a bulk value (kete `write_device_bulk`: kept out of the read cache, which would otherwise hold a second copy of every still), is read back from the vault itself (`read_device_bulk`, never the cache) and compared with what was written (blake3 of both), so "kept" means the vault gives the file back whole: one console line with its size, its encode's time, the write's, the read's, and the match.
+/// A still (every save but a calibration's maps) goes to the person's hold as an item of kind photo (`hold::keep_still`: kept, read back and compared the same way), so Kūaha shows it; the vault domain keeps it only when the hold is not given, and the calibration maps, which are Lumis's own.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
     while let Some(lumis_core::PendingSave { bytes, name, encode_ms }) = lumis_core::get_pending_save() {
+        let photo = !name.starts_with("cal_");
+        if photo && hold::held() {
+            let kept = match hold::keep_still(&bytes) {
+                Ok((write_ms, read_ms, card)) => {
+                    println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", card.id[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len(), card.body[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    true
+                }
+                Err(e) => {
+                    println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept in the hold: {e}", bytes.len());
+                    false
+                }
+            };
+            app::save_done(header, kept);
+            continue;
+        }
         let key = format!("save/{name}");
         let t = std::time::Instant::now();
         let kept = match vault {
@@ -1525,7 +1545,7 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
             }
         };
         // A calibration map is not a photo: it never counts (as on Android).
-        app::save_done(header, kept && !name.starts_with("cal_"));
+        app::save_done(header, kept && photo);
     }
 }
 
@@ -2056,10 +2076,12 @@ fn main() {
         });
         // A save on all four A715s, a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
         lumis_core::platform::set_save_threads(4);
-        lumis_core::platform::set_before_exit(seal_at_exit);
-        lumis_core::clips::set_deleter(delete_clip);
         println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
+    // Whatever the intake's placement: a clip recording is sealed before Lumis ends, and the clips page lists and removes Lumis's clips in the person's hold.
+    lumis_core::platform::set_before_exit(seal_at_exit);
+    lumis_core::clips::set_hold(lumis_core::clips::Hold { list: hold::list_clips, remove: hold::remove_clip });
+    println!("lumis: the hold (your things) {}", if hold::held() { format!("in slot {}", hold::ITEMS) } else { format!("not given (slot {} empty): stills kept in Lumis's own domain, no RAW clips", hold::ITEMS) });
     let vault = open_vault();
     if let Some(v) = &vault {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));
