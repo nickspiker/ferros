@@ -714,17 +714,23 @@ pub fn icon_of(capsule: &[u8]) -> Result<Option<Icon>, &'static str> {
 
 /// The content identity (`hp`) of the icon a capsule carries: the BLAKE3 of its `icon` section's bytes as the capsule holds them, signed with the rest (ferros_thing `icon`), or None for a capsule without one. What the deck and the display know the icon by: the same icon in two builds of a kist is one icon, decoded once.
 pub fn icon_hp(capsule: &[u8]) -> Result<Option<ferros_thing::Hp>, &'static str> {
-    let (header, _) = VsfHeader::decode(capsule).map_err(|_| "not a VSF file")?;
-    let Some(entry) = header.fields.iter().find(|f| f.name == ICON) else { return Ok(None) };
-    let start = entry.offset_bytes;
-    // WHY: the offset is the file's own; one past its end has no section to parse.
-    if start >= capsule.len() {
-        return Err("a section past the file's end");
-    }
-    let mut end = start;
-    // The section parsed, so its bytes are exactly the ones read: an icon that does not parse has no identity.
-    icon_from(&VsfSection::parse(capsule, &mut end).map_err(|_| "a section that does not parse")?)?;
-    Ok(Some(ferros_thing::icon(&capsule[start..end])))
+    let Some((at, len)) = icon_span(capsule)? else { return Ok(None) };
+    // WHY `get`: the span is the file's own table of contents; one past its end is no icon.
+    icon_section_hp(capsule.get(at..at.checked_add(len).ok_or("a section past the file's end")?).ok_or("a section past the file's end")?).map(Some)
+}
+
+/// Where a capsule's `icon` section lies (offset and length, by its table of contents), read from its first bytes alone (the header: the stower reads the section itself from the vault, never the whole capsule); None for a capsule without one.
+pub fn icon_span(head: &[u8]) -> Result<Option<(usize, usize)>, &'static str> {
+    let (header, _) = VsfHeader::decode(head).map_err(|_| "not a VSF file")?;
+    Ok(header.fields.iter().find(|f| f.name == ICON).map(|e| (e.offset_bytes, e.size_bytes)))
+}
+
+/// An `icon` section's content identity: the bytes of the section as the capsule holds them, from the start of its span ([`icon_span`]) to where it parses to, once they read as an icon; a section that is no icon has none.
+pub fn icon_section_hp(span: &[u8]) -> Result<ferros_thing::Hp, &'static str> {
+    let mut end = 0;
+    // The table of contents names it (`icon_span`); its fields say whether it is an icon.
+    icon_from(&VsfSection::parse(span, &mut end).map_err(|_| "a section that does not parse")?)?;
+    Ok(ferros_thing::icon(&span[..end]))
 }
 
 /// An icon from its own document (tools/app-icons `icon`: a complete VSF file, vsf's flat image section `image`).

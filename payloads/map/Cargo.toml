@@ -16,6 +16,8 @@ ferros_detail = { path = "../../ferros_detail" }
 ferros_heap = { path = "../../ferros_heap" }
 # The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync.
 ferros_kept = { path = "../../ferros_kept" }
+# Each circle as a thing (`ht`) and its icon by content (`hp`).
+ferros_thing = { path = "../../ferros_thing" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }
 # Kists (KISTS.md): the person's list for the kist circles, the first-launch question and the permission pages.

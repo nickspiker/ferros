@@ -269,7 +269,7 @@ One section `card` per item, every value typed, nothing positional:
 
 | field | type | |
 |---|---|---|
-| `id` | `hp` | the item's provenance: BLAKE3 of 32 random bytes drawn when it is made and its first card, so the same bytes kept twice are two items, and nobody can confirm a guess |
+| `id` | `ht` | the item as a thing (owner, 2026-11-20: the same across its edits), minted when it is first kept: BLAKE3 of 32 random bytes drawn then and its first card (ferros_thing `hold_item`), so the same bytes kept twice are two items, and nobody can confirm a guess. A card kept 2026-11-19 or 20 carries the same 32 bytes as `hp`, read as the same thing |
 | `kind` | `hi` | the idea naming its kind |
 | `kist` | section: `developer` `ke`, `option` `hR`, `name` `a` | the kist that made it, and its name then, so the card still reads after it is removed |
 | `device` | `ke` | the device it was made on |

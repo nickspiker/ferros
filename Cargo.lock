@@ -993,9 +993,11 @@ dependencies = [
  "ferros_dsc",
  "ferros_dsi",
  "ferros_glow",
+ "ferros_kept",
  "ferros_lang",
  "ferros_puck",
  "ferros_sys",
+ "ferros_thing",
  "fluor",
  "libm",
  "orb",
@@ -1168,8 +1170,10 @@ version = "0.1.0"
 dependencies = [
  "ferros_detail",
  "ferros_heap",
+ "ferros_kept",
  "ferros_kist",
  "ferros_sys",
+ "ferros_thing",
  "fgtw",
 ]
 
@@ -1184,6 +1188,7 @@ dependencies = [
  "ferros_kist",
  "ferros_lang",
  "ferros_sys",
+ "ferros_thing",
  "libm",
  "tatau",
 ]

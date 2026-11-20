@@ -558,6 +558,12 @@ enum Task {
 }
 
 extern "C" fn worker(grants: u64) -> ! {
+    // The kists stowed before the icon index (2026-11-20), or while a stow's index write failed: each one's icon put in it once, at the start, from the capsule already here.
+    if let Some(list) = ferros_kist::store::read(cap(grants, S_KISTS)) {
+        for k in &list.kists {
+            index_icon(grants, Some(&k.capsule), &k.developer, &k.option);
+        }
+    }
     loop {
         ferros_sys::pet();
         let w = WORK.load(Ordering::Acquire);
@@ -705,6 +711,7 @@ fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         return Err(WHY_VAULT);
     }
     unhide(grants, &e.developer, &e.option);
+    index_icon(grants, Some(&e.capsule), &e.developer, &e.option);
     // An update: the version it replaced is named by no kist of the person's any more.
     if let Some(o) = old.filter(|o| *o != e.capsule && list.by_capsule(o).is_none()) {
         drop_capsule(grants, &o);
@@ -744,6 +751,8 @@ fn unstow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
             drop_capsule(grants, &k.capsule);
         }
     }
+    // Off this deck: its icon out of the index here.
+    index_icon(grants, None, &job.developer, &job.option);
     let mut cleared = None;
     if job.unstow & UNSTOW_CLEAR_DATA != 0 {
         stage(i, STAGE_STORING, 0, 0);
@@ -864,6 +873,7 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
                     }
                 }
                 let mut l = Vec::new();
+                index_icon(grants, Some(&job.capsule), &k.developer, &k.option);
                 l.extend_from_slice(b"kists: restored ");
                 l.extend_from_slice(k.name.as_bytes());
                 l.extend_from_slice(b", checked and sealed\n");
@@ -1065,6 +1075,7 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
         return Err(WHY_VAULT);
     }
     unhide(grants, &job.developer, &job.option);
+    index_icon(grants, Some(&job.capsule), &job.developer, &job.option);
     if let Some(old) = old.filter(|c| *c != job.capsule && list.by_capsule(c).is_none()) {
         drop_capsule(grants, &old);
     }
@@ -1131,6 +1142,40 @@ fn offer_reply(s: &State, capsule: &[u8; 32]) -> Vec<u8> {
 /// The capsule's bytes in the vault dropped (a failed stow, an unstow, an update's old version).
 fn drop_capsule(grants: u64, capsule: &[u8; 32]) {
     let _ = ferros_sys::store_delete_addr(cap(grants, S_CAPSULES), capsule);
+}
+
+/// The icon a stowed kist's capsule carries, by its content identity (`hp`: ferros_kist `icon_section_hp`), put in the icon index (`kists.icons`, ferros_kept::icon), device data the map reads each circle's icon from; None for a kist whose capsule carries none, or once it is unstowed here. Only the section is read from the vault: the header's first bytes for where it lies, then its own bytes.
+/// Decoding it once into what the display draws (`kists.` at the `hp`) is the next step (KISTS.md "Icons": a small std process at stow) and is not built: until it is, the map finds no decoded icon and the circle shows the theme's fill.
+fn index_icon(grants: u64, capsule: Option<&[u8; 32]>, developer: &[u8; 32], option: &[u8; 32]) {
+    let hp = capsule.and_then(|c| {
+        let caps = cap(grants, S_CAPSULES);
+        let mut head = alloc::vec![0u8; 1 << 16];
+        let n = ferros_sys::store_get_addr_at(caps, c, 0, &mut head)?;
+        let (at, len) = ferros_kist::icon_span(&head[..n.min(head.len())]).ok()??;
+        // WHY: the span is the capsule's word (signed, but read before anything trusts the section); an icon is 5 to 31 KB, so a section past 1 MiB is none and is not read.
+        if len > 1 << 20 {
+            return None;
+        }
+        let mut section = alloc::vec![0u8; len];
+        let got = ferros_sys::store_get_addr_at(caps, c, at, &mut section)?;
+        if got < at + len {
+            return None;
+        }
+        ferros_kist::icon_section_hp(&section).ok()
+    });
+    let list_cap = cap(grants, S_KISTS);
+    let mut b = alloc::vec![0u8; 1 << 16];
+    let mut icons = match ferros_sys::store_read_at(list_cap, ferros_kept::icon::INDEX, 0, &mut b) {
+        ferros_sys::NOTHING => Vec::new(),
+        n if n != ferros_sys::ERR && (n as usize) <= b.len() => ferros_kept::icon::read_index(&b[..n as usize]).unwrap_or_default(),
+        _ => return,
+    };
+    if ferros_kept::icon::set(&mut icons, ferros_thing::kist(developer, option), hp) {
+        let ok = ferros_kept::icon::index(&icons, ferros_detail::eagle_now()).is_some_and(|d| ferros_sys::store_set(list_cap, ferros_kept::icon::INDEX, &d));
+        if !ok {
+            say(b"kists: the vault did not take the icon index\n");
+        }
+    }
 }
 
 /// Stages 0 to 3 for one capsule from one URL: fetched into the vault as it streams, its signature checked (its blake3, its size, its identity, every egg against the developer bundle it carries, and that bundle the one the person pinned for its developer), committed, then checked and sealed by the kernel. On any failure its bytes are dropped. Returns what was taken in (its first bytes carry its declaration) and what to pin.

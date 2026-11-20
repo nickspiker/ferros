@@ -684,34 +684,59 @@ fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, 
 }
 
 
-/// The bundle's codes to canvas values, 16 bits: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 working values with white at Q14 — so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255) now the canvas has the headroom. ICN2 (gamma 2 codes, white at 255): c × 16384 / 255.
+/// An icon's codes to canvas values, 16 bits: icons hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256; KISTS.md "Icons"), the canvas gamma 2 working values with white at Q14, so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255).
+/// The range: c/256 is 0 to 255/256, so atanh is 0 to 3.12 and the value 0.5 to A#51_1xx, inside a u16.
 fn icon_decode() -> [u16; 256] {
-    let g2t = ICONS.len() >= 4 && &ICONS[..4] == b"ICN3";
     let mut t = [0u16; 256];
     for (c, e) in t.iter_mut().enumerate() {
-        let v = if g2t { libm::atanhf(c as f32 / 256.0) * 16384.0 + 0.5 } else { c as f32 * 16384.0 / 255.0 + 0.5 };
-        *e = if v.is_nan() || v < 0.0 { 0 } else if v > 65535.0 { 65535 } else { v as u16 };
+        *e = (libm::atanhf(c as f32 / 256.) * 16384. + 0.5) as u16;
     }
     t
 }
 
-/// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
-static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
-/// The ferros mark's number, one past the bundle's six (counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`); the bundle carries no raster of it.
+/// The ferros mark's scene icon: drawn from logo.vsf's geometry (`draw::logo`), the one icon the display carries.
 const ICON_FERROS: u8 = 7;
-/// The app icons' mip chains, once built (the server's start): what a page draws a kist's icon from (op 77).
-static mut MIPS: Option<&'static [draw::Mips]> = None;
+/// The scene icon of the cache's first slot; slot k is `ICON_SLOT0 + k` (owner, 2026-11-20: the display keeps the icons it is handed by their `hp`, and carries no kist's icon of its own).
+const ICON_SLOT0: u8 = 0x40;
+/// The cache's slots: each holds one icon's texels as the map handed them (to bake again at a brightness change) and its chain (`draw::Mips`), made at the start, before the heap's mark, and filled in place. A slot is about 1.8 MB (the chain's 91_552 texels in two planes of 8 bytes, the texels' A#327_680 bytes), so eight are 14 MB, where the bundle's six chains were 8.8.
+const ICON_SLOTS: usize = 1 << 3;
+/// An icon's side in texels (ferros_kept::icon `SIDE`).
+const ICON_SIDE: usize = ferros_kept::icon::SIDE;
 
-/// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
-fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
-    if n == 0 || ICONS.len() < 7 || !(&ICONS[..4] == b"ICN2" || &ICONS[..4] == b"ICN3") || n > ICONS[4] {
-        return None;
-    }
-    let size = u16::from_le_bytes([ICONS[5], ICONS[6]]) as usize;
-    let at = 7 + (n as usize - 1) * size * size * 5;
-    let px = ICONS.get(at..at + size * size * 4)?;
-    let grey = ICONS.get(at + size * size * 4..at + size * size * 5)?;
-    Some((px, grey, size))
+/// One slot of the icon cache: the texels (straight `g2t` RGBA, then the grey) and the chain made from them.
+struct IconSlot {
+    texels: &'static mut [u8],
+    mips: draw::Mips,
+}
+
+/// The cache's slots, made at the start; which icon each holds, by `hp` (ferros_kept::icon `Cache`); and the icon arriving in pieces (op 79). Touched on the render thread only, between frames (ops 78 and 79), as the bundle's chains were filled at a brightness change.
+static mut ICON_SLOT: Option<&'static mut [IconSlot]> = None;
+static mut ICON_CACHE: Option<ferros_kept::icon::Cache<()>> = None;
+static mut ICON_PIECES: Option<ferros_kept::icon::Pieces> = None;
+
+/// The slot a scene icon names, when it is a slot that holds an icon.
+fn icon_slot(icon: u8) -> Option<usize> {
+    let k = (icon as usize).wrapping_sub(ICON_SLOT0 as usize);
+    // SAFETY: the render thread's alone (ops 78 and 79 run on it, between frames).
+    (k < ICON_SLOTS && unsafe { (*(&raw const ICON_CACHE)).as_ref() }.is_some_and(|c| c.get(k).is_some())).then_some(k)
+}
+
+/// A scene icon's chain, when it names a slot that holds an icon.
+fn icon_mips(icon: u8) -> Option<&'static draw::Mips> {
+    let k = icon_slot(icon)?;
+    // SAFETY: as `icon_slot`; the slots live for the process.
+    let slots: &'static [IconSlot] = unsafe { (*(&raw const ICON_SLOT)).as_deref()? };
+    Some(&slots[k].mips)
+}
+
+/// A scene icon's texels: its RGBA, its grey, and its side, when it names a slot that holds an icon.
+fn icon(icon: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
+    let k = icon_slot(icon)?;
+    // SAFETY: as `icon_mips`.
+    let slots: &'static [IconSlot] = unsafe { (*(&raw const ICON_SLOT)).as_deref()? };
+    let t: &'static [u8] = &*slots[k].texels;
+    let n = ICON_SIDE * ICON_SIDE * 4;
+    Some((&t[..n], &t[n..], ICON_SIDE))
 }
 /// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
 const WIDGET_CLOCK: u8 = 0x80;
@@ -2528,8 +2553,8 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 } else if cir.icon == ICON_FERROS {
                     draw::logo(px, width, height, cx, cy, rr, 1 << 14, 0, true);
                     draw::disc(px, width, height, cx, cy, rr, 0);
-                // WHY `get`: the icon is the map's word (1 to the bundle's count, 0 none); a kist with no bundle icon (0, or one this display does not carry) falls to the plain fill below.
-                } else if let Some(mp) = unsafe { MIPS }.and_then(|v| v.get((cir.icon as usize).wrapping_sub(1))) {
+                // The icon the scene names by a slot of the cache that holds one (`icon_mips`); a kist whose icon the display does not hold (0, or a slot empty) falls to the plain fill below.
+                } else if let Some(mp) = icon_mips(cir.icon) {
                     draw::icon(px, width, height, cx, cy, rr, 1 << 14, 0, mp);
                 } else {
                     draw::disc(px, width, height, cx, cy, rr, th.ring & 0x00FF_FFFF);
@@ -5735,10 +5760,10 @@ fn present_bench(width: usize, log: &mut Log) {
 }
 
 /// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers, and from its source once the brightness settles (`wall_refresh`); the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
-fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
+fn rebake(width: usize, height: usize) {
     let decode = icon_decode();
-    for (i, m) in mips.iter().enumerate() {
-        if let Some((px, grey, _)) = icon(i as u8 + 1) {
+    for k in 0..ICON_SLOTS {
+        if let (Some((px, grey, _)), Some(m)) = (icon(ICON_SLOT0 + k as u8), icon_mips(ICON_SLOT0 + k as u8)) {
             m.fill(px, grey, &decode);
         }
     }
@@ -7887,17 +7912,18 @@ fn server(grants: u64) -> ! {
     let mut dev_seen = 0u64;
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
-    let mips: &'static [draw::Mips] = {
+    // The icon cache's slots (`IconSlot`), each a chain made from empty texels, kept for the process; filled in place as the map hands icons over (op 79).
+    {
         let decode = icon_decode();
-        let mut v = alloc::vec::Vec::new();
-        let mut n = 1u8;
-        while let Some((px, grey, size)) = icon(n) {
-            v.push(draw::Mips::build(px, grey, size, &decode));
-            n += 1;
+        let blank = alloc::vec![0u8; ferros_kept::icon::TEXELS];
+        let n = ICON_SIDE * ICON_SIDE * 4;
+        let slots: alloc::vec::Vec<IconSlot> = (0..ICON_SLOTS).map(|_| IconSlot { texels: alloc::vec![0u8; ferros_kept::icon::TEXELS].leak(), mips: draw::Mips::build(&blank[..n], &blank[n..], ICON_SIDE, &decode) }).collect();
+        unsafe {
+            ICON_SLOT = Some(slots.leak());
+            ICON_CACHE = Some(ferros_kept::icon::Cache::new(ICON_SLOTS));
+            ICON_PIECES = Some(ferros_kept::icon::Pieces::default());
         }
-        v.leak()
-    };
-    unsafe { MIPS = Some(mips) };
+    }
     heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
@@ -8327,6 +8353,52 @@ fn server(grants: u64) -> ! {
                         at += 30;
                     }
                 }
+                // 78 `icon have [hp 32]`: the cache's slot holding that icon as its scene icon (`ICON_SLOT0` + k), or 0 when it holds none (the map then hands it over, op 79). The system's alone, as op 79.
+                Some(78) if m.len() >= 33 => {
+                    let hp = ferros_thing::Hp::from_bytes(m[1..33].try_into().expect("33 bytes or more, by the arm's guard"));
+                    // SAFETY: the render thread's alone, between frames.
+                    let slot = unsafe { (*(&raw mut ICON_CACHE)).as_mut() }.and_then(|c| c.slot(&hp));
+                    out[0] = if !system(unsafe { HOLDS }) { 0 } else { slot.map_or(0, |k| ICON_SLOT0 + k as u8) };
+                }
+                // 79 `icon put [hp 32][offset u32][texels…]`: a piece of an icon's texels (ferros_kept::icon: straight `g2t` RGBA, then the grey, `TEXELS` in all), in order from 0. → [0 more due][1 built, then its slot][2 dropped: out of order, past the size, no room, or not the system's].
+                // Only the system hands icons over (the map, which read it from the vault under that `hp`): a kist's pieces would put its pixels under another kist's icon.
+                Some(79) if m.len() >= 37 => {
+                    let hp = ferros_thing::Hp::from_bytes(m[1..33].try_into().expect("33 bytes or more, by the arm's guard"));
+                    let offset = u32::from_le_bytes([m[33], m[34], m[35], m[36]]) as usize;
+                    len = 2;
+                    // SAFETY: the render thread's alone, between frames (as `rebake` fills the chains).
+                    let done = if system(unsafe { HOLDS }) { unsafe { (*(&raw mut ICON_PIECES)).as_mut() }.map(|p| p.take(&hp, offset, &m[37..])) } else { None };
+                    match done {
+                        Some(None) => out[0] = 0,
+                        None => out[0] = 2,
+                        Some(Some(texels)) => {
+                            // The slots the scene shows now stay; the new icon takes its own slot, an empty one, or the one used longest ago.
+                            let keep: alloc::vec::Vec<usize> = unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().filter_map(|c| icon_slot(c.icon)).collect() };
+                            match unsafe { (*(&raw mut ICON_CACHE)).as_mut() }.and_then(|c| c.put(hp, (), &keep)) {
+                                None => out[0] = 2,
+                                Some(k) => {
+                                    // SAFETY: as above; the slot's texels are `TEXELS` long, as `take` returns them.
+                                    let slots = unsafe { (*(&raw mut ICON_SLOT)).as_mut() }.expect("the icon slots are made at the start");
+                                    slots[k].texels.copy_from_slice(&texels);
+                                    let n = ICON_SIDE * ICON_SIDE * 4;
+                                    slots[k].mips.fill(&slots[k].texels[..n], &slots[k].texels[n..], &icon_decode());
+                                    // What was drawn from that slot before is another icon's: every sprite made again, the last frame and the plane's images not reused.
+                                    unsafe {
+                                        for s in 0..256 {
+                                            SPRITES[s].valid = false;
+                                            SPRITES[s].cap = 0;
+                                        }
+                                        ARENA_NEXT = 0;
+                                        LAST_FRAME.1 = 0;
+                                        SCENE_GEN = SCENE_GEN.wrapping_add(1);
+                                    }
+                                    out[0] = 1;
+                                    out[1] = ICON_SLOT0 + k as u8;
+                                }
+                            }
+                        }
+                    }
+                }
                 Some(57) if m.len() >= 2 => {
                     // Circles' states (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
                     unsafe { LAST_FRAME.1 = 0 };
@@ -8729,7 +8801,7 @@ fn server(grants: u64) -> ! {
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
                             let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
                             let fill = if lit { th.lit & 0x00FF_FFFF } else { th.plane & 0x00FF_FFFF };
-                            let mp = mips.get((cir.icon as usize).wrapping_sub(1));
+                            let mp = icon_mips(cir.icon);
                             let d = (2 * ((sr >> 8) + 3)) as usize;
                             let mut r = draw::Rect::EMPTY;
                             let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
@@ -10426,7 +10498,7 @@ fn server(grants: u64) -> ! {
             bake::set(white, peak_e);
             bake_consts();
             tabs = bake::now().odt;
-            rebake(mips, width, height);
+            rebake(width, height);
             wall_unlock();
             settle_owed = true;
             // The map's last frame drawn again with the new bake, at the top of the next pass (where the clock's replays run), which the bell starts at once.

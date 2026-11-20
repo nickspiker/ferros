@@ -12,7 +12,7 @@
 //!
 //! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
 //!
-//! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
+//! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault, in the one deck document (`map.deck`, ferros_kept::deck) by what the circle is (its thing, `ht`), never its name, and wins over the seeded place from then on.
 //!
 //! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the stower, payloads/kists: the Deck page stows, updates and unstows through it, stower.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
 
@@ -38,6 +38,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
 use ferros_lang::{Fleet as FleetMsg, Lang, Msg, Say};
 use tatau::Style;
+use ferros_kept::deck::{self, CircleId, Deck};
 
 /// A message in the person's language (ferros_lang), read at draw time like every preference.
 fn tr(m: Msg) -> &'static str {
@@ -132,7 +133,49 @@ extern "C" fn tag_add_thread(grants: u64) -> ! {
 }
 
 /// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
-const HEAP_SIZE: usize = 1 << 18;
+/// And an icon handed to the display (`send_icons`): its decoded document (A#327_8xx bytes) and its texels, one icon at a time; so a MiB since 2026-11-20.
+const HEAP_SIZE: usize = 1 << 20;
+/// The most of the deck document read (ferros_kept::deck): a place is under 200 bytes, so this holds hundreds.
+const DECK_MAX: usize = 1 << 16;
+/// The most of the stower's icon index read (ferros_kept::icon `INDEX`): an entry is under 100 bytes.
+const ICONS_MAX: usize = 1 << 16;
+/// Display ops for the icon cache (payloads/display, ferros_kept::icon `Cache`): whether it holds an icon built, by its `hp`; and a piece of an icon's texels.
+const OP_ICON_HAVE: u8 = 78;
+const OP_ICON_PUT: u8 = 79;
+/// The texels in one `OP_ICON_PUT`: a call's message is at most 4 KiB, less the op, the icon and the offset.
+const ICON_PIECE: usize = 4032;
+
+/// The stower's icon index (`kists.icons`): each kist's icon by its thing; none when absent or not one this build reads (the circles then show no icon).
+fn read_icons(grants: u64) -> Vec<(ferros_thing::Ht, ferros_thing::Hp)> {
+    let mut b = alloc::vec![0u8; ICONS_MAX];
+    match ferros_sys::store_read_at(cap(grants, S_KIST_LIST), ferros_kept::icon::INDEX, 0, &mut b) {
+        ferros_sys::NOTHING | ferros_sys::ERR => Vec::new(),
+        n if n as usize > ICONS_MAX => Vec::new(),
+        n => ferros_kept::icon::read_index(&b[..n as usize]).unwrap_or_default(),
+    }
+}
+
+/// A decoded icon from the vault (`kists.` at its `hp`, ferros_kept::icon): its texels, only when the value is that icon; None when absent or not one.
+fn read_decoded(grants: u64, icon: &ferros_thing::Hp) -> Option<Vec<u8>> {
+    let c = cap(grants, S_KIST_LIST);
+    let mut piece = alloc::vec![0u8; ferros_sys::STORE_MAX];
+    let total = ferros_sys::store_get_addr_at(c, icon.as_bytes(), 0, &mut piece)?;
+    // WHY: the length is the vault's word for a value under this name; a decoded icon is about A#330_000 bytes, so anything past 1 MiB is not one and is not read.
+    if total > 1 << 20 {
+        return None;
+    }
+    let mut doc = Vec::with_capacity(total);
+    doc.extend_from_slice(&piece[..total.min(piece.len())]);
+    while doc.len() < total {
+        let n = ferros_sys::store_get_addr_at(c, icon.as_bytes(), doc.len(), &mut piece)?;
+        if n != total {
+            return None;
+        }
+        let take = (total - doc.len()).min(piece.len());
+        doc.extend_from_slice(&piece[..take]);
+    }
+    ferros_kept::icon::read_decoded(&doc, icon)
+}
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
 static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
@@ -1501,10 +1544,14 @@ struct Map {
     display: u64,
     w: i64,
     h: i64,
-    /// Circles in world units ×256, and radii in world units.
-    xs: [i64; MAX],
-    ys: [i64; MAX],
-    rs: [i64; MAX],
+    /// The circles (ferros_kept::deck, owner 2026-11-20): settings, then a kist circle for each kist in the person's list (at most `MAX`), each its thing, its place in world units ×256, its radius in world units, its own turn (its icon; two fingers in a circle twist it), its icon by content, and whether it was moved by hand since arranging began.
+    deck: Deck,
+    /// The places kept by hand, as the deck document (`map.deck`) holds them, each by its circle's thing: written whole at every change.
+    kept: deck::Kept,
+    /// Each kist's icon by its thing, as the stower's index (`kists.icons`) said when the person's list was last read.
+    icons: Vec<(ferros_thing::Ht, ferros_thing::Hp)>,
+    /// The icons the display holds built, each with its slot (the scene's icon byte), as it last answered.
+    icon_slots: Vec<(ferros_thing::Hp, u8)>,
     cam: Cam,
     view: View,
     /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what).
@@ -1570,11 +1617,6 @@ struct Map {
     slide: Option<(Choice, f64)>,
     knob: Option<(Choice, f64, f64, i32)>,
     nrows: usize,
-    /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
-    rc: [i64; MAX],
-    rsn: [i64; MAX],
-    /// Circles moved or sized by hand since arranging began, to keep when it ends.
-    arranged: [bool; MAX],
     /// An app is in front (a kist, or one the map did not start: a bridge spawn), and it has the touches.
     app_front: bool,
     /// The kists brought to the front, most recent first, by capsule (owner, 2026-11-11: back's swipe "flip to the previous kist"): a kist launched or raised goes to the head; each once.
@@ -1589,8 +1631,6 @@ struct Map {
     gathering: Option<(alloc::vec::Vec<(i64, i64)>, alloc::vec::Vec<(i64, i64)>, i32, bool)>,
     /// The pucks launched since the person attested, by capsule (docs/PUCKS.md: a puck lives while a person is present, launched once, never by a tap).
     pucks_up: alloc::vec::Vec<[u8; 32]>,
-    /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
-    n: usize,
     /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
     kists: ferros_kist::Kists,
     /// The first-launch question on an open kist circle: each unanswered want's switch as the person has it now, a bit per want (started from their defaults).
@@ -1971,20 +2011,31 @@ fn zone_words(l: &mut Line, id: &str, with_region: bool) {
 }
 
 impl Map {
-    /// Circle `i` as the scene draws it: settings first, then each stowed kist, its name its label and its icon the display's bundled one for that app (tools/app-icons order), or none.
+    /// Circle `i` as the scene draws it: settings first (the ferros mark), then each stowed kist, its name its label and its icon the one its capsule carries, by the slot the display holds it in (`send_icons`), or none while the display does not hold it.
     fn spec(&self, i: usize) -> Spec<'_> {
         if i == 0 {
             let c = &CIRCLES[0];
             return Spec { label: c.label, ring: c.ring, lit: c.lit, share: c.share, icon: c.icon };
         }
         let name = self.kists.kists[i - 1].name.as_str();
-        // The display's bundle (tools/app-icons APPS, 1-based, made from each app's icon in the one icon format): the kist's icon by its app's name, until the deck draws the icon a kist's capsule carries (KISTS.md "Icons": decoded once at stow, not built yet).
-        const BUNDLED: [&str; 6] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps", "Kuaha"];
         let icon = match puck_icon(&self.kists.kists, i - 1) {
             Some(w) => w,
-            None => BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1),
+            None => self.deck.circles.get(i).and_then(|c| c.icon).and_then(|h| self.icon_slots.iter().find(|s| s.0 == h)).map_or(0, |s| s.1),
         };
         Spec { label: name, ring: 1, lit: 0, share: KIST_SHARE, icon }
+    }
+
+    /// The deck's circles for `n` circles of the person's list as it is now, each at the origin at its share's radius, upright: settings, then each kist as its thing (a puck's kind when it is one), with its icon from the stower's index.
+    fn fresh_deck(&self, n: usize) -> Deck {
+        let mut d = Deck { circles: Vec::with_capacity(n) };
+        d.circles.push(deck::Circle::new(CircleId::Settings, radius_of(CIRCLES[0].share)));
+        for k in self.kists.kists.iter().take(n - 1) {
+            let t = k.thing();
+            let mut c = deck::Circle::new(if k.is_puck() { CircleId::Puck(t) } else { CircleId::Kist(t) }, radius_of(KIST_SHARE));
+            c.icon = self.icons.iter().find(|(x, _)| *x == t).map(|(_, h)| *h);
+            d.circles.push(c);
+        }
+        d
     }
 
     fn label(&self, i: usize) -> &str {
@@ -2001,6 +2052,7 @@ impl Map {
         match ferros_kist::store::read_here(cap(self.grants, S_KIST_LIST)) {
             Some(k) => {
                 self.kists = k;
+                self.icons = read_icons(self.grants);
                 true
             }
             None => false,
@@ -2011,14 +2063,17 @@ impl Map {
     fn refresh_circles(&mut self) {
         let was = self.placed();
         // Each circle's icon and name as the display has them: a kist stowed over itself (the clock's version 1, a puck, over its version 0, a plain kist) keeps the count and changes the icon.
-        let looks: Vec<(u8, alloc::string::String)> = (0..self.n).map(|i| { let s = self.spec(i); (s.icon, alloc::string::String::from(s.label)) }).collect();
+        let looks: Vec<(u8, alloc::string::String)> = (0..self.deck.n()).map(|i| { let s = self.spec(i); (s.icon, alloc::string::String::from(s.label)) }).collect();
         if !self.reload_kists() {
             return;
         }
-        // WHY: the arrays hold MAX circles (as at start).
+        // WHY: the scene holds MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
-        if n == self.n {
-            // As many circles, but a circle may hold another kist now (one unstowed, another stowed, or a kist stowed over itself as a puck): the scene again when any circle looks different (its icon or its name; 2026-11-18 on the 8a, the clock puck stowed over the clock kist stayed a plain circle and never drew), else its state alone, drawn with the next frame.
+        let fresh = self.fresh_deck(n);
+        // The same circles (each the same thing, of the same kind, showing the same icon): placed where they stand.
+        if n == self.deck.n() && fresh.circles.iter().zip(&self.deck.circles).all(|(a, b)| a.id == b.id && a.icon == b.icon) {
+            self.send_icons();
+            // As many circles, the same things: the scene again when any circle looks different (its icon's slot or its name; 2026-11-18 on the 8a, the clock puck stowed over the clock kist stayed a plain circle and never drew), else its state alone, drawn with the next frame.
             if (0..n).any(|i| { let s = self.spec(i); looks[i].0 != s.icon || looks[i].1 != s.label }) {
                 self.send_scene();
                 self.draw();
@@ -2039,7 +2094,7 @@ impl Map {
         if !self.reload_kists() {
             return;
         }
-        // WHY: the arrays hold MAX circles (as at start).
+        // WHY: the scene holds MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         self.place_circles(n, &was);
         if self.load_view() {
@@ -2047,31 +2102,30 @@ impl Map {
         }
     }
 
-    /// Each circle on the deck now, by its label, and its place (x, y, radius, turn): taken before the person's list is read again, which may change which kist each index is.
-    fn placed(&self) -> Vec<(alloc::string::String, [i64; 5])> {
-        (0..self.n).map(|i| (alloc::string::String::from(self.label(i)), [self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]])).collect()
+    /// Each circle on the deck now, by what it is, and its place: taken before the person's list is read again, which may change which kist each index is.
+    fn placed(&self) -> Vec<(CircleId, deck::Place)> {
+        self.deck.circles.iter().map(|c| (c.id, c.place())).collect()
     }
 
-    /// `n` circles placed by the seeded fit, a circle already on the deck (`was`, by its label) where it stands, each kept place winning (`load_places_near`), pushed apart, and the scene sent. Until 2026-11-12 every circle went back to its seed first, so one the vault kept no place for jumped (owner, on the 8a: "sometimes that ferros logo just BOOP!": the settings circle, its place taken out of the vault by the fleet's sync, sent off the deck at its last size whenever the fleet wrote).
-    fn place_circles(&mut self, n: usize, was: &[(alloc::string::String, [i64; 5])]) {
-        self.n = n;
-        for i in 1..MAX {
-            self.rs[i] = if i < n { radius_of(KIST_SHARE) } else { 0 };
-            self.rc[i] = ONE;
-            self.rsn[i] = 0;
+    /// `n` circles placed by the seeded fit, a circle already on the deck (`was`, by what it is) where it stands, each kept place winning (`load_places_near`), pushed apart, and the scene sent. Until 2026-11-12 every circle went back to its seed first, so one the vault kept no place for jumped (owner, on the 8a: "sometimes that ferros logo just BOOP!": the settings circle, its place taken out of the vault by the fleet's sync, sent off the deck at its last size whenever the fleet wrote).
+    fn place_circles(&mut self, n: usize, was: &[(CircleId, deck::Place)]) {
+        self.deck = self.fresh_deck(n);
+        // WHY: a circle open when the deck shrank (its kist unstowed on another device) is no circle now; the deck shows instead of an index past the circles.
+        if matches!(self.view, View::Open(i) if i >= n) {
+            self.view = View::Map;
         }
-        let (mut xs, mut ys) = ([0i64; MAX], [0i64; MAX]);
-        place(&self.rs[..n], &mut xs[..n], &mut ys[..n]);
-        for i in 0..n {
-            self.xs[i] = xs[i] << 8;
-            self.ys[i] = ys[i] << 8;
+        let rs: Vec<i64> = self.deck.circles.iter().map(|c| c.r).collect();
+        let (mut xs, mut ys) = (alloc::vec![0i64; n], alloc::vec![0i64; n]);
+        place(&rs, &mut xs, &mut ys);
+        for (c, (x, y)) in self.deck.circles.iter_mut().zip(xs.iter().zip(&ys)) {
+            c.at = deck::At { x: x << 8, y: y << 8 };
         }
         // The vault's places win; a circle it keeps none for that is already on the deck stays where it stands; a new one (a kist just stowed) goes with the settings circle, about which the seeds are laid.
         let mut held = self.load_places();
         for i in 0..n {
             if held >> i & 1 == 0 {
-                if let Some((_, p)) = was.iter().find(|(l, _)| l.as_str() == self.label(i)) {
-                    [self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]] = *p;
+                if let Some((_, p)) = was.iter().find(|(id, _)| id.same(&self.deck.circles[i].id)) {
+                    self.deck.circles[i].set_place(p);
                     held |= 1 << i;
                 }
             }
@@ -2090,11 +2144,11 @@ impl Map {
 
     /// Every circle not in `held` (a bit a circle) still at its seed, which is laid about the settings circle at the origin: moved by where settings stands now.
     fn with_settings(&mut self, held: u32) {
-        let (dx, dy) = (self.xs[0], self.ys[0]);
-        for i in 1..self.n {
+        let (dx, dy) = (self.deck.circles[0].at.x, self.deck.circles[0].at.y);
+        for i in 1..self.deck.n() {
             if held >> i & 1 == 0 {
-                self.xs[i] += dx;
-                self.ys[i] += dy;
+                self.deck.circles[i].at.x += dx;
+                self.deck.circles[i].at.y += dy;
             }
         }
     }
@@ -2170,7 +2224,7 @@ impl Map {
 
     /// The kist circle holding `capsule`, if it is still stowed.
     fn circle_of(&self, capsule: &[u8; 32]) -> Option<usize> {
-        (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == *capsule))
+        (1..self.deck.n()).find(|&i| self.kist(i).is_some_and(|k| k.capsule == *capsule))
     }
 
     /// Deck (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app in front behind (display op 60, the app told so); the map is on the glass as it was left once it draws (`draw`, or the caller's own frame). Whether an app went behind.
@@ -2283,7 +2337,7 @@ impl Map {
         if self.view != View::Map || self.settling || self.touching || self.app_front {
             return;
         }
-        let Some(i) = (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == capsule)) else {
+        let Some(i) = (1..self.deck.n()).find(|&i| self.kist(i).is_some_and(|k| k.capsule == capsule)) else {
             self.fault = None;
             return;
         };
@@ -2314,16 +2368,48 @@ impl Map {
         (cx as i64, cy as i64, r as i64)
     }
 
-    /// A circle's vault key, relative to the map's scope: `place.<label>`, so a circle keeps its place however the table grows.
-    fn place_key(&self, i: usize, key: &mut [u8; 32]) -> usize {
-        let l = self.label(i).as_bytes();
-        key[..6].copy_from_slice(b"place.");
-        // WHY: a vault name is at most 32 bytes here; a kist's name past 26 is cut, and a space (a vault name holds none) becomes an underscore.
-        let n = l.len().min(26);
-        for (d, &s) in key[6..6 + n].iter_mut().zip(l) {
-            *d = if s == b' ' { b'_' } else { s };
+    /// A value of the map's scope whole, up to `max` bytes: Ok(None) absent, Err refused or past `max` (a deck document past it is none this build reads, ferros_kept::deck `CIRCLES_MAX`).
+    fn read_value(&self, key: &[u8], max: usize) -> Result<Option<Vec<u8>>, ()> {
+        let mut b = alloc::vec![0u8; max];
+        match ferros_sys::store_read_at(cap(self.grants, S_STORE), key, 0, &mut b) {
+            ferros_sys::NOTHING => Ok(None),
+            ferros_sys::ERR => Err(()),
+            n if n as usize > max => Err(()),
+            n => {
+                b.truncate(n as usize);
+                Ok(Some(b))
+            }
         }
-        6 + n
+    }
+
+    /// The deck document read into `kept` (ferros_kept::deck: every place kept by hand, by each circle's thing). Absent, the places kept the old way (`place.<label>`, until 2026-11-20) become it once: the document written, the old values dropped; an old value that is no place document leaves them all as they are (ferros_kept::deck `migrate`). A document this build does not read is no places, as an old place that did not read was.
+    fn load_deck(&mut self) {
+        match self.read_value(deck::KEY, DECK_MAX) {
+            Ok(Some(doc)) => self.kept = deck::read(&doc).unwrap_or_default(),
+            Ok(None) => {
+                let circles: Vec<(CircleId, &str)> = (0..self.deck.n()).map(|i| (self.deck.circles[i].id, self.label(i))).collect();
+                let mut refused = false;
+                let migrated = deck::migrate(&circles, |k| self.read_small(k).unwrap_or_else(|_| {
+                    refused = true;
+                    None
+                }));
+                self.kept = match migrated {
+                    Some((kept, old)) if !refused && !old.is_empty() => {
+                        let c = cap(self.grants, S_STORE);
+                        if deck::document(&kept, ferros_sys::eagle_now()).is_some_and(|d| ferros_sys::store_set(c, deck::KEY, &d)) {
+                            for k in &old {
+                                let _ = ferros_sys::store_delete(c, k);
+                            }
+                            console(self.grants, b"map: the places kept by name are the deck document now\n");
+                        }
+                        kept
+                    }
+                    Some((kept, _)) => kept,
+                    None => deck::Kept::default(),
+                };
+            }
+            Err(()) => {}
+        }
     }
 
     /// A small value of the map's scope whole: Ok(None) absent, Err refused.
@@ -2338,31 +2424,30 @@ impl Map {
         }
     }
 
-    /// The arrangement made by hand, from the vault: each circle's place as its document (ferros_kept::map, the one definition ferros_space syncs too): x and y in world units ×256, the radius, and its turn as cos and sin in Q14. Which circles it placed, a bit each (MAX is 16).
+    /// The arrangement made by hand, from the vault's deck document (ferros_kept::deck, the one definition ferros_space syncs too): each circle's place by its thing, x and y in world units ×256, the radius, and its turn as cos and sin in Q14 (a turn that is not one left upright). Which circles it placed, a bit each (MAX is 16).
     fn load_places(&mut self) -> u32 {
+        self.load_deck();
         let mut loaded = 0u32;
-        for i in 0..self.n {
-            let mut key = [0u8; 32];
-            let kl = self.place_key(i, &mut key);
-            let Some([x, y, r, c, sn]) = self.read_small(&key[..kl]).ok().flatten().and_then(|d| ferros_kept::map::read_place(&d)) else { continue };
-            self.xs[i] = x;
-            self.ys[i] = y;
-            self.rs[i] = r;
-            if c.abs() <= ONE && sn.abs() <= ONE && c * c + sn * sn > ONE * ONE / 2 {
-                self.rc[i] = c;
-                self.rsn[i] = sn;
-            }
+        for i in 0..self.deck.n() {
+            let Some(p) = self.kept.get(&self.deck.circles[i].id).copied() else { continue };
+            self.deck.circles[i].set_place(&p);
             loaded |= 1 << i;
         }
         loaded
     }
 
-    /// Keep circle i's place in the vault, as its document.
-    fn save_place(&self, i: usize) -> bool {
-        let mut key = [0u8; 32];
-        let kl = self.place_key(i, &mut key);
-        let Some(doc) = ferros_kept::map::place(&[self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]], ferros_sys::eagle_now()) else { return false };
-        ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &doc)
+    /// Keep the places of the circles `moved` in the vault: the deck document read again (the identity service may have written another device's move into it since), each moved circle's place set in it, and it written whole. True when the vault took it, or nothing changed.
+    fn save_places(&mut self, moved: &[usize]) -> bool {
+        self.load_deck();
+        let mut changed = false;
+        for &i in moved {
+            let c = self.deck.circles[i];
+            changed |= self.kept.set(c.id, c.place());
+        }
+        if !changed {
+            return true;
+        }
+        deck::document(&self.kept, ferros_sys::eagle_now()).is_some_and(|d| ferros_sys::store_set(cap(self.grants, S_STORE), deck::KEY, &d))
     }
 
     /// No two circles overlap: after circle `held` moved or grew, every overlapping pair is pushed apart along the line between their centres until they touch (with a hair of air), the held one never moving — so a push carries on through the neighbours (owner, 2026-10-22). A few rounds settle it; every circle that moved is redrawn and kept when the fingers lift.
@@ -2370,10 +2455,10 @@ impl Map {
         const AIR: i64 = 4;
         for _ in 0..8 {
             let mut any = false;
-            for a in 0..self.n {
-                for b in a + 1..self.n {
-                    let (dx, dy) = (self.xs[b] - self.xs[a], self.ys[b] - self.ys[a]);
-                    let want = (self.rs[a] + self.rs[b] + AIR) << 8;
+            for a in 0..self.deck.n() {
+                for b in a + 1..self.deck.n() {
+                    let (dx, dy) = (self.deck.circles[b].at.x - self.deck.circles[a].at.x, self.deck.circles[b].at.y - self.deck.circles[a].at.y);
+                    let want = (self.deck.circles[a].r + self.deck.circles[b].r + AIR) << 8;
                     let d2 = dx * dx + dy * dy;
                     if d2 >= want * want {
                         continue;
@@ -2384,13 +2469,13 @@ impl Map {
                     let gap = want - d;
                     // The held circle stays where the fingers are; between two others, each gives half.
                     let (ka, kb) = if a == held { (0, gap) } else if b == held { (gap, 0) } else { (gap / 2, gap - gap / 2) };
-                    self.xs[a] -= ux * ka >> 14;
-                    self.ys[a] -= uy * ka >> 14;
-                    self.xs[b] += ux * kb >> 14;
-                    self.ys[b] += uy * kb >> 14;
+                    self.deck.circles[a].at.x -= ux * ka >> 14;
+                    self.deck.circles[a].at.y -= uy * ka >> 14;
+                    self.deck.circles[b].at.x += ux * kb >> 14;
+                    self.deck.circles[b].at.y += uy * kb >> 14;
                     for i in [a, b] {
                         if i != held {
-                            self.arranged[i] = true;
+                            self.deck.circles[i].arranged = true;
                             self.send_move(i);
                         }
                     }
@@ -2415,8 +2500,8 @@ impl Map {
     fn covers_screen(&self, i: usize) -> bool {
         [(0, 0), (self.w, 0), (0, self.h), (self.w, self.h)].iter().all(|&(sx, sy)| {
             let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
-            let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
-            dx * dx + dy * dy <= self.rs[i] * self.rs[i]
+            let (dx, dy) = ((wx - self.deck.circles[i].at.x) >> 8, (wy - self.deck.circles[i].at.y) >> 8);
+            dx * dx + dy * dy <= self.deck.circles[i].r * self.deck.circles[i].r
         })
     }
 
@@ -2424,8 +2509,8 @@ impl Map {
     fn zoom_limits(&self) -> (i64, i64) {
         let mut sum_r2 = 0i64;
         let mut r_min = i64::MAX;
-        for i in 0..self.n {
-            let r = self.rs[i].max(1);
+        for i in 0..self.deck.n() {
+            let r = self.deck.circles[i].r.max(1);
             sum_r2 += r * r;
             r_min = r_min.min(r);
         }
@@ -2439,14 +2524,14 @@ impl Map {
     /// The radius circle `i` may take, given the others: within RADIUS_RATIO of the smallest and the largest of them.
     fn radius_limits(&self, i: usize) -> (i64, i64) {
         // Alone, a circle has nothing to be within a ratio of (the search below would leave lo at i64::MAX and lo × RADIUS_RATIO would overflow), so the screen bounds it instead, at the zoom it is held at: from a 64th of the screen's width across to the width itself (past three quarters of the width it is a place, and the fingers move the plane anyway). Two fingers on a kist circle size it, the only one too (owner, 2026-11-07: until then a lone circle kept its size and only turned).
-        if self.n == 1 {
+        if self.deck.n() == 1 {
             return (((self.w >> 7) << 16) / self.cam.z, ((self.w >> 1) << 16) / self.cam.z);
         }
         let (mut lo, mut hi) = (i64::MAX, 1i64);
-        for j in 0..self.n {
+        for j in 0..self.deck.n() {
             if j != i {
-                lo = lo.min(self.rs[j].max(1));
-                hi = hi.max(self.rs[j]);
+                lo = lo.min(self.deck.circles[j].r.max(1));
+                hi = hi.max(self.deck.circles[j].r);
             }
         }
         ((hi / RADIUS_RATIO).max(1), (lo * RADIUS_RATIO).max(1))
@@ -2455,9 +2540,9 @@ impl Map {
     /// The circles may not leave the screen entirely: their joint bounding box on the panel must still touch it (owner, 2026-10-23: "at least one edge has to be touching so we don't lose the circles"). Called after every camera change; the camera is pulled back by the overshoot.
     fn keep_on_screen(&mut self) {
         let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-        for i in 0..self.n {
-            let (sx, sy) = self.cam.screen(self.w, self.h, self.xs[i], self.ys[i]);
-            let sr = (self.rs[i] * self.cam.z >> 16).max(1);
+        for i in 0..self.deck.n() {
+            let (sx, sy) = self.cam.screen(self.w, self.h, self.deck.circles[i].at.x, self.deck.circles[i].at.y);
+            let sr = (self.deck.circles[i].r * self.cam.z >> 16).max(1);
             x0 = x0.min(sx - sr);
             y0 = y0.min(sy - sr);
             x1 = x1.max(sx + sr);
@@ -2479,11 +2564,11 @@ impl Map {
         if z == Z_ONE {
             return;
         }
-        for i in 0..self.n {
-            self.xs[i] = self.xs[i] * z / Z_ONE;
-            self.ys[i] = self.ys[i] * z / Z_ONE;
-            self.rs[i] = (self.rs[i] * z / Z_ONE).max(1);
-            self.arranged[i] = true;
+        for i in 0..self.deck.n() {
+            self.deck.circles[i].at.x = self.deck.circles[i].at.x * z / Z_ONE;
+            self.deck.circles[i].at.y = self.deck.circles[i].at.y * z / Z_ONE;
+            self.deck.circles[i].r = (self.deck.circles[i].r * z / Z_ONE).max(1);
+            self.deck.circles[i].arranged = true;
         }
         self.cam.x = self.cam.x * z / Z_ONE;
         self.cam.y = self.cam.y * z / Z_ONE;
@@ -2511,23 +2596,23 @@ impl Map {
     /// Whether, with circle `i` moved by (dx, dy), every circle still has a neighbour within one screen diagonal of it (edge to edge) at the zoom-out limit — distance, not a bounding box, so no orientation and no rectangles (owner, 2026-10-23: "so it never exceeds the screen diagonal; don't want weird rectangles floating around"). Zooming all the way out then always shows a connected set.
     fn fits_when_out(&self, i: usize, dx: i64, dy: i64) -> bool {
         // Alone, a circle is its own connected set: with no neighbour the nearest distance below stays i64::MAX and every move would be refused.
-        if self.n == 1 {
+        if self.deck.n() == 1 {
             return true;
         }
         let (z_out, _) = self.zoom_limits();
         // Positions ×256 and radii in world units: the gap in world units ×256, against the diagonal brought to world ×256 at the zoom-out limit.
         let diag = isqrt(self.w * self.w + self.h * self.h);
         let limit = ((diag << 16) / z_out.max(1)) << 8;
-        let pos = |j: usize| if j == i { (self.xs[j] + dx, self.ys[j] + dy) } else { (self.xs[j], self.ys[j]) };
-        for a in 0..self.n {
+        let pos = |j: usize| if j == i { (self.deck.circles[j].at.x + dx, self.deck.circles[j].at.y + dy) } else { (self.deck.circles[j].at.x, self.deck.circles[j].at.y) };
+        for a in 0..self.deck.n() {
             let (ax, ay) = pos(a);
             let mut nearest = i64::MAX;
-            for b in 0..self.n {
+            for b in 0..self.deck.n() {
                 if b == a {
                     continue;
                 }
                 let (bx, by) = pos(b);
-                let d = isqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by)) - ((self.rs[a] + self.rs[b]) << 8);
+                let d = isqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by)) - ((self.deck.circles[a].r + self.deck.circles[b].r) << 8);
                 nearest = nearest.min(d);
             }
             if nearest > limit {
@@ -2539,13 +2624,15 @@ impl Map {
 
     /// Keep every circle moved since the last time in the vault.
     fn save_arranged(&mut self) {
-        for i in 0..self.n {
-            if self.arranged[i] {
-                self.arranged[i] = false;
-                if !self.save_place(i) {
-                    console(self.grants, b"map: the vault did not take a place\n");
-                }
-            }
+        let moved: Vec<usize> = (0..self.deck.n()).filter(|&i| self.deck.circles[i].arranged).collect();
+        if moved.is_empty() {
+            return;
+        }
+        for &i in &moved {
+            self.deck.circles[i].arranged = false;
+        }
+        if !self.save_places(&moved) {
+            console(self.grants, b"map: the vault did not take the deck\n");
         }
     }
 
@@ -2553,29 +2640,68 @@ impl Map {
     fn hit(&self, sx: i64, sy: i64) -> Option<usize> {
         let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
         let mut best: Option<usize> = None;
-        for i in 0..self.n {
-            let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
-            if dx * dx + dy * dy <= self.rs[i] * self.rs[i] && best.is_none_or(|b| self.rs[i] < self.rs[b]) {
+        for i in 0..self.deck.n() {
+            let (dx, dy) = ((wx - self.deck.circles[i].at.x) >> 8, (wy - self.deck.circles[i].at.y) >> 8);
+            if dx * dx + dy * dy <= self.deck.circles[i].r * self.deck.circles[i].r && best.is_none_or(|b| self.deck.circles[i].r < self.deck.circles[b].r) {
                 best = Some(i);
             }
         }
         best
     }
 
+    /// Each kist circle's icon to the display (owner, 2026-11-20: the display keeps a cache by `hp` and the map hands it what it lacks): asked by its `hp` (`OP_ICON_HAVE`); one the display does not hold read decoded from the vault and handed over in pieces (`put_icon`). The slots it answers are the scene's icon bytes (`spec`); an icon not decoded yet, or with no room, draws the theme's fill.
+    fn send_icons(&mut self) {
+        let mut slots: Vec<(ferros_thing::Hp, u8)> = Vec::new();
+        for i in 1..self.deck.n() {
+            let Some(h) = self.deck.circles[i].icon else { continue };
+            if slots.iter().any(|(x, _)| *x == h) {
+                continue;
+            }
+            let mut m = [0u8; 33];
+            m[0] = OP_ICON_HAVE;
+            m[1..].copy_from_slice(h.as_bytes());
+            let mut r = [0u8; 1];
+            let slot = if call(self.display, &m, &mut r) >= 1 && r[0] != 0 { r[0] } else { self.put_icon(&h) };
+            if slot != 0 {
+                slots.push((h, slot));
+            }
+        }
+        self.icon_slots = slots;
+    }
+
+    /// One icon's texels to the display in pieces, from the start, in order (ferros_kept::icon `Pieces`): its slot once built, 0 when there is no decoded icon in the vault yet, the display dropped it, or it has no room.
+    fn put_icon(&self, h: &ferros_thing::Hp) -> u8 {
+        let Some(t) = read_decoded(self.grants, h) else { return 0 };
+        let mut m = alloc::vec![0u8; 37 + ICON_PIECE];
+        m[0] = OP_ICON_PUT;
+        m[1..33].copy_from_slice(h.as_bytes());
+        // The answer: [0 more due, 1 built (then the slot), 2 dropped][slot].
+        let mut r = [0u8; 2];
+        for (k, piece) in t.chunks(ICON_PIECE).enumerate() {
+            m[33..37].copy_from_slice(&((k * ICON_PIECE) as u32).to_le_bytes());
+            m[37..37 + piece.len()].copy_from_slice(piece);
+            if call(self.display, &m[..37 + piece.len()], &mut r) < 2 || r[0] == 2 {
+                return 0;
+            }
+        }
+        if r[0] == 1 { r[1] } else { 0 }
+    }
+
     /// The whole scene to the display server: clear, then every circle in one call, then every circle's state (a fresh scene has none: `send_states`).
     fn send_scene(&mut self) {
+        self.send_icons();
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         let mut r = [0u8; 4];
         call(self.display, &[12], &mut r);
         let mut m = [0u8; 2 + 30 * MAX];
         m[0] = 13;
-        m[1] = self.n as u8;
-        for i in 0..self.n {
+        m[1] = self.deck.n() as u8;
+        for i in 0..self.deck.n() {
             let a = self.spec(i);
             let at = 2 + i * 30;
-            m[at..at + 4].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
-            m[at + 4..at + 8].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
-            m[at + 8..at + 10].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
+            m[at..at + 4].copy_from_slice(&((self.deck.circles[i].at.x >> 8) as i32).to_le_bytes());
+            m[at + 4..at + 8].copy_from_slice(&((self.deck.circles[i].at.y >> 8) as i32).to_le_bytes());
+            m[at + 8..at + 10].copy_from_slice(&(self.deck.circles[i].r as u16).to_le_bytes());
             m[at + 10] = a.ring;
             m[at + 11] = a.lit;
             m[at + 12] = a.icon;
@@ -2589,8 +2715,8 @@ impl Map {
         call(self.display, &m, &mut r);
         self.send_crowd();
         // The circles' own turns ride on `scene move`: a fresh scene starts every circle upright.
-        for i in 0..self.n {
-            if self.rc[i] != ONE || self.rsn[i] != 0 {
+        for i in 0..self.deck.n() {
+            if self.deck.circles[i].turn.c != ONE || self.deck.circles[i].turn.s != 0 {
                 self.send_move(i);
             }
         }
@@ -2611,7 +2737,7 @@ impl Map {
         m[1] = n as u8;
         let mut r = [0u8; 1];
         call(self.display, &m[..2 + 64 * n], &mut r);
-        for i in 1..self.n {
+        for i in 1..self.deck.n() {
             let Some(k) = self.kist(i) else { continue };
             if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) {
                 self.launch(i);
@@ -2658,7 +2784,7 @@ impl Map {
         let mut m = [0u8; 2 + 4 * MAX];
         m[0] = 57;
         let mut count = 0;
-        for i in 0..self.n {
+        for i in 0..self.deck.n() {
             let (g, n) = self.state(i);
             let s = (g as u8, n);
             if !all && self.sent[i] == s {
@@ -2716,10 +2842,10 @@ impl Map {
         let mut ys = [0i64; 256];
         let mut rs = [0i64; 256];
         let mut k = 0;
-        for i in 0..self.n {
-            xs[k] = self.xs[i] >> 8;
-            ys[k] = self.ys[i] >> 8;
-            rs[k] = self.rs[i];
+        for i in 0..self.deck.n() {
+            xs[k] = self.deck.circles[i].at.x >> 8;
+            ys[k] = self.deck.circles[i].at.y >> 8;
+            rs[k] = self.deck.circles[i].r;
             k += 1;
         }
         let own = k;
@@ -2755,11 +2881,11 @@ impl Map {
         let mut m = [0u8; 16];
         m[0] = 17;
         m[1] = i as u8;
-        m[2..6].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
-        m[6..10].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
-        m[10..12].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
-        m[12..14].copy_from_slice(&(self.rc[i] as i16).to_le_bytes());
-        m[14..16].copy_from_slice(&(self.rsn[i] as i16).to_le_bytes());
+        m[2..6].copy_from_slice(&((self.deck.circles[i].at.x >> 8) as i32).to_le_bytes());
+        m[6..10].copy_from_slice(&((self.deck.circles[i].at.y >> 8) as i32).to_le_bytes());
+        m[10..12].copy_from_slice(&(self.deck.circles[i].r as u16).to_le_bytes());
+        m[12..14].copy_from_slice(&(self.deck.circles[i].turn.c as i16).to_le_bytes());
+        m[14..16].copy_from_slice(&(self.deck.circles[i].turn.s as i16).to_le_bytes());
         let mut r = [0u8; 4];
         call(self.display, &m, &mut r);
     }
@@ -2790,12 +2916,12 @@ impl Map {
     /// The circles as the display draws them: its scene holds whole world units (`send_scene`), so the fit takes the same, and the outermost circle touches its edge on the glass, not a world unit off it.
     fn deck_fit_at(&self, c: i64, s: i64) -> (Cam, f64) {
         let mut discs = [(0f64, 0f64, 0f64); camera::MAX];
-        for i in 0..self.n {
-            discs[i] = (((self.xs[i] >> 8) << 8) as f64, ((self.ys[i] >> 8) << 8) as f64, (self.rs[i] << 8) as f64);
+        for i in 0..self.deck.n() {
+            discs[i] = (((self.deck.circles[i].at.x >> 8) << 8) as f64, ((self.deck.circles[i].at.y >> 8) << 8) as f64, (self.deck.circles[i].r << 8) as f64);
         }
         let (_, ay, ar) = self.arrived();
         let room = camera::Room { half_w: self.w as f64 * 0.5, radius: ar as f64 };
-        let (wx, wy, z) = camera::fit_at(&discs[..self.n], c as f64 / ONE as f64, s as f64 / ONE as f64, room);
+        let (wx, wy, z) = camera::fit_at(&discs[..self.deck.n()], c as f64 / ONE as f64, s as f64 / ONE as f64, room);
         let (lo, hi) = self.zoom_limits();
         let mut cam = Cam { x: libm::round(wx) as i64, y: libm::round(wy) as i64, z: (z as i64).clamp(lo, hi), c, s };
         // The camera's centre is the panel's: it stands off the fit's middle by the big circle's offset from the panel's centre, as `at` does.
@@ -2808,7 +2934,7 @@ impl Map {
     /// The camera that has arrived at circle i: the circle on the active circle (`arrived`), the circle an app lives in, however much larger than the screen that is (no zoom limit here: arriving, the map's own circle becomes the app's). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
     fn at(&self, i: usize) -> Cam {
         let (_, ay, ar) = self.arrived();
-        let mut cam = Cam { x: self.xs[i], y: self.ys[i], z: (ar << 16) / self.rs[i].max(1), c: self.cam.c, s: self.cam.s };
+        let mut cam = Cam { x: self.deck.circles[i].at.x, y: self.deck.circles[i].at.y, z: (ar << 16) / self.deck.circles[i].r.max(1), c: self.cam.c, s: self.cam.s };
         let (dx, dy) = cam.delta(0, self.h / 2 - ay);
         cam.x += dx;
         cam.y += dy;
@@ -3036,8 +3162,8 @@ impl Map {
         let unit = |r: i64| ((self.w << 8) * r / (48 * ar)) as f32 * k;
         match (self.view, self.target) {
             (View::Open(i), Some(_)) => {
-                let (sx, sy) = self.cam.screen(self.w, self.h, self.xs[i], self.ys[i]);
-                let r = (self.rs[i] * self.cam.z) >> 16;
+                let (sx, sy) = self.cam.screen(self.w, self.h, self.deck.circles[i].at.x, self.deck.circles[i].at.y);
+                let r = (self.deck.circles[i].r * self.cam.z) >> 16;
                 (sx, sy, r, unit(r) as i64)
             }
             _ => (ax, ay, ar, unit(ar) as i64),
@@ -5009,19 +5135,19 @@ impl Map {
             self.deck_fly();
             return "map: deck: the cluster in view";
         }
-        let n = self.n;
-        let r: alloc::vec::Vec<f64> = (0..n).map(|i| self.rs[i] as f64).collect();
+        let n = self.deck.n();
+        let r: alloc::vec::Vec<f64> = (0..n).map(|i| self.deck.circles[i].r as f64).collect();
         let (mut mx, mut my, mut mw) = (0f64, 0f64, 0f64);
         for i in 0..n {
             let w = r[i] * r[i];
-            mx += self.xs[i] as f64 * w;
-            my += self.ys[i] as f64 * w;
+            mx += self.deck.circles[i].at.x as f64 * w;
+            my += self.deck.circles[i].at.y as f64 * w;
             mw += w;
         }
         // WHY the floor: a deck of circles all of radius 0 has no middle to divide by (never: every circle has a radius of at least 1).
         let mw = mw.max(1.);
         let (mx, my) = (mx / mw, my / mw);
-        let from: alloc::vec::Vec<(i64, i64)> = (0..n).map(|i| (self.xs[i], self.ys[i])).collect();
+        let from: alloc::vec::Vec<(i64, i64)> = (0..n).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect();
         // World units to ×256: the positions are kept at 256 to a unit, the radii in units.
         let to: alloc::vec::Vec<(i64, i64)> = pack(&r).iter().map(|p| (libm::round(mx + p.0 * 256.) as i64, libm::round(my + p.1 * 256.) as i64)).collect();
         if self.scatter.is_none() {
@@ -5035,7 +5161,7 @@ impl Map {
     /// Back's tap on a gathered deck: every circle back to where it stood before (`gather`), the camera with them. Whether there was a scatter to go back to.
     fn scatter_back(&mut self) -> bool {
         let Some((to, cam)) = self.scatter.take() else { return false };
-        let from: alloc::vec::Vec<(i64, i64)> = (0..self.n).map(|i| (self.xs[i], self.ys[i])).collect();
+        let from: alloc::vec::Vec<(i64, i64)> = (0..self.deck.n()).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect();
         // A circle stowed or unstowed since: as many as both know.
         let k = from.len().min(to.len());
         self.gathering = Some((from[..k].to_vec(), to[..k].to_vec(), 0, true));
@@ -5050,12 +5176,12 @@ impl Map {
         let t = t + 1;
         let z = self.cam.z as f64;
         let mut still = false;
-        for i in 0..from.len().min(self.n) {
+        for i in 0..from.len().min(self.deck.n()) {
             let (ox, oy) = ((from[i].0 - to[i].0) as f64, (from[i].1 - to[i].1) as f64);
             let (x, vx) = spring(ox, 0., t);
             let (y, vy) = spring(oy, 0., t);
-            self.xs[i] = to[i].0 + libm::round(x) as i64;
-            self.ys[i] = to[i].1 + libm::round(y) as i64;
+            self.deck.circles[i].at.x = to[i].0 + libm::round(x) as i64;
+            self.deck.circles[i].at.y = to[i].1 + libm::round(y) as i64;
             self.send_move(i);
             // On the screen: world ×256 at 16.16 pixels a unit, as `step_cam` measures.
             let px = |v: f64| v.abs() * z / (1u64 << 24) as f64;
@@ -5064,8 +5190,8 @@ impl Map {
         if still {
             self.gathering = Some((from, to, t, back));
         } else {
-            for i in 0..to.len().min(self.n) {
-                (self.xs[i], self.ys[i]) = to[i];
+            for i in 0..to.len().min(self.deck.n()) {
+                (self.deck.circles[i].at.x, self.deck.circles[i].at.y) = to[i];
                 self.send_move(i);
             }
             if !back {
@@ -5097,8 +5223,8 @@ impl Map {
         // Development builds: the circles fitted (world ×256 x and y, the radius) and the camera they were fitted from, so a swipe can be replayed on the host (tools/deck-fit).
         if DEV {
             let mut s = alloc::format!("map: deck: from x A#{} y A#{} zoom G#{:X} turn A#{} A#{}; circles", self.cam.x, self.cam.y, self.cam.z, self.cam.c, self.cam.s);
-            for i in 0..self.n {
-                let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" A#{},A#{},A#{}", self.xs[i], self.ys[i], self.rs[i]));
+            for i in 0..self.deck.n() {
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" A#{},A#{},A#{}", self.deck.circles[i].at.x, self.deck.circles[i].at.y, self.deck.circles[i].r));
             }
             s.push('\n');
             console(self.grants, s.as_bytes());
@@ -5777,18 +5903,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     t_start[2] = now();
     // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
-    let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
-    let mut xs = [0i64; MAX];
-    let mut ys = [0i64; MAX];
-    place(&rs[..n], &mut xs[..n], &mut ys[..n]);
     let mut map = Map {
         grants,
         display,
         w,
         h,
-        xs: xs.map(|x| x << 8),
-        ys: ys.map(|y| y << 8),
-        rs,
+        deck: Deck::default(),
+        kept: deck::Kept::default(),
+        icons: read_icons(grants),
+        icon_slots: Vec::new(),
         cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
         rows: [(0, 0, 0, 0, Choice::Labels); 64],
@@ -5832,9 +5955,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         slide: None,
         knob: None,
         nrows: 0,
-        rc: [ONE; MAX],
-        rsn: [0; MAX],
-        arranged: [false; MAX],
         app_front: false,
         recent: alloc::vec::Vec::new(),
         front_kist: None,
@@ -5842,7 +5962,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         escape_sent: None,
         gathering: None,
         pucks_up: alloc::vec::Vec::new(),
-        n,
         kists,
         ask: 0,
         zone_pick: None,
@@ -5880,6 +5999,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         opening: None,
         open_pending: None,
     };
+    // The circles sized by share and laid by the seeded fit, once; the places kept by hand win below (`load_places_near`).
+    map.deck = map.fresh_deck(n);
+    {
+        let rs: Vec<i64> = map.deck.circles.iter().map(|c| c.r).collect();
+        let (mut xs, mut ys) = (alloc::vec![0i64; n], alloc::vec![0i64; n]);
+        place(&rs, &mut xs, &mut ys);
+        for (c, (x, y)) in map.deck.circles.iter_mut().zip(xs.iter().zip(&ys)) {
+            c.at = deck::At { x: x << 8, y: y << 8 };
+        }
+    }
     // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
     if DEV {
         let mut r = [0u8; 4];
@@ -5922,7 +6051,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     map.rest = map.cam;
     // A development build can start arrived at a circle, its page open, without a finger: FERROS_MAP_START=o<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
-        if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < map.n {
+        if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < map.deck.n() {
             let i = (v[1] - b'0') as usize;
             map.cam = map.at(i);
             map.view = View::Open(i);
@@ -6453,11 +6582,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // FERROS_MAP_START=open (development, measuring the flight with no one at the panel): three seconds after start and every two seconds after, while nothing moves, a tap on the settings circle opens it and the next tap, low at the left outside the open circle, closes it; eight flights.
         // FERROS_MAP_START=outhold: one flight in, then the flight out held at its eighth frame (the camera and the fade where they are, nothing stepped), for a capture of the screen mid-flight.
         // FERROS_MAP_START=kist (development, the first launch with no one at the panel): three seconds after start a tap on the last kist circle (the newest stowed); two seconds on, if the question is up, a tap on its "start".
-        if option_env!("FERROS_MAP_START") == Some("kist") && map.n > 1 && synth_open < 2 && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
+        if option_env!("FERROS_MAP_START") == Some("kist") && map.deck.n() > 1 && synth_open < 2 && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
             synth_open += 1;
             synth_open_at = now();
             if map.view == View::Map {
-                let (sx, sy) = map.cam.screen(w, h, map.xs[map.n - 1], map.ys[map.n - 1]);
+                let (sx, sy) = map.cam.screen(w, h, map.deck.circles[map.deck.n() - 1].at.x, map.deck.circles[map.deck.n() - 1].at.y);
                 map.tap(1, sx, sy);
             } else if let Some(r) = map.rows[..map.nrows].iter().find(|r| r.4 == Choice::AskGo).copied() {
                 map.tap(1, (r.0 + r.1) / 2, (r.2 + r.3) / 2);
@@ -6467,7 +6596,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             synth_open += 1;
             synth_open_at = now();
             if map.view == View::Map {
-                let (sx, sy) = map.cam.screen(w, h, map.xs[0], map.ys[0]);
+                let (sx, sy) = map.cam.screen(w, h, map.deck.circles[0].at.x, map.deck.circles[0].at.y);
                 map.tap(1, sx, sy);
             } else {
                 map.tap(1, 4, h - 4);
@@ -6943,14 +7072,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if nb == 1 {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
-                if let Some(i) = grab {
+                // WHY the filter: the deck is rebuilt under a held finger when the person's list or arrangement is read again (a stow, the identity service's sync), and it may hold fewer circles than when the finger took one: the index the finger took is past them, and indexing it would panic.
+                if let Some(i) = grab.filter(|&i| i < map.deck.n()) {
                     // One finger from a circle: the circle follows it, pushing the others aside — as far as everything still fits at the zoom-out limit.
                     let t_m = now();
                     let (dx, dy) = if map.fits_when_out(i, dx, dy) { (dx, dy) } else { (0, 0) };
-                    map.xs[i] += dx;
-                    map.ys[i] += dy;
+                    map.deck.circles[i].at.x += dx;
+                    map.deck.circles[i].at.y += dy;
                     map.send_move(i);
-                    map.arranged[i] = true;
+                    map.deck.circles[i].arranged = true;
                     // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
                     map.scatter = None;
                     move_us += ferros_sys::us_since(t_m);
@@ -6972,26 +7102,26 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (d0, d1) = (dist16(pa, pb), dist16(ca, cb));
                 let (m0x, m0y) = ((pa.0 + pb.0) / 2, (pa.1 + pb.1) / 2);
                 let (m1x, m1y) = ((ca.0 + cb.0) / 2, (ca.1 + cb.1) / 2);
-                if let Some(i) = grab {
+                if let Some(i) = grab.filter(|&i| i < map.deck.n()) {
                     // Both fingers in one circle: it follows the point between them and grows or shrinks with their spread.
                     let (dx, dy) = map.cam.delta(m1x - m0x, m1y - m0y);
                     let (dx, dy) = if map.fits_when_out(i, dx, dy) { (dx, dy) } else { (0, 0) };
-                    map.xs[i] += dx;
-                    map.ys[i] += dy;
+                    map.deck.circles[i].at.x += dx;
+                    map.deck.circles[i].at.y += dy;
                     if d0 > 8 * 16 && d1 > 8 * 16 {
                         let (lo, hi) = map.radius_limits(i);
-                        map.rs[i] = (map.rs[i] * d1 / d0).clamp(lo, hi.max(lo));
+                        map.deck.circles[i].r = (map.deck.circles[i].r * d1 / d0).clamp(lo, hi.max(lo));
                         // And turns with their twist, as the plane does.
                         let (ax, ay, bx, by) = (pb.0 - pa.0, pb.1 - pa.1, cb.0 - ca.0, cb.1 - ca.1);
                         let (dot, cross) = (ax * bx + ay * by, ax * by - ay * bx);
                         let ab = (d0 * d1 >> 8).max(1);
-                        let (c, sn) = ((map.rc[i] * dot - map.rsn[i] * cross) / ab, (map.rsn[i] * dot + map.rc[i] * cross) / ab);
+                        let (c, sn) = ((map.deck.circles[i].turn.c * dot - map.deck.circles[i].turn.s * cross) / ab, (map.deck.circles[i].turn.s * dot + map.deck.circles[i].turn.c * cross) / ab);
                         let len = isqrt(c * c + sn * sn).max(1);
-                        map.rc[i] = c * ONE / len;
-                        map.rsn[i] = sn * ONE / len;
+                        map.deck.circles[i].turn.c = c * ONE / len;
+                        map.deck.circles[i].turn.s = sn * ONE / len;
                     }
                     map.send_move(i);
-                    map.arranged[i] = true;
+                    map.deck.circles[i].arranged = true;
                     // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
                     map.scatter = None;
                     map.push_apart(i);
