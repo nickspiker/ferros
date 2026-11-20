@@ -231,6 +231,13 @@ Each run started at 45 to 50 C, the charger cut for the measure (`diag power`). 
 
 **Where the power goes.** Recording adds about 1.3 W over the camera alone at 30/s on the GPU path (1.6 W on the CPU); the camera stream itself is most of it: 4.9 W against 1.8 W idle, the A715s 173/256 busy at 1572 MHz with nothing coded. That load (device threads on the A715s while the camera streams) is the next thing to measure (tools/flame) for a cooler desert.
 
+**Lumis's own path at 60/s** (2026-11-20, hand-spawned with the GPU's grants, cool starts at 45 C; lumis-rawvideo baeea3fd merged with this branch):
+- With DEV_VIDEO (source digests) the hand-over used to wait for its frame's packing: 16.9 ms on average, about 10 frames a second dropped from 13 s on. Since 6f7d2269 it waits for the frame's hashes alone (taken while the GPU runs): 55 of 1757 dropped in 32 s.
+- Without digests (the deck's path): 32 s at 60/s, 0 of 1759 dropped, the hand-over 8.1 ms, the GPU 6.1 ms. A whole minute: 0 dropped for about 30 s, then 200 to 420 dropped as the SoC passes 87 C (the GPU's runs stretching to 22 to 34 ms, the clusters' dividers stepping).
+- The heat is Lumis's beside the recorder's: 9.7 W at the battery recording with its preview off, against rawrec's 7.8 W for the same recording (71 C at a minute). Lumis's UI made a pass for every camera frame while recording (about 54 a second, 4.3 ms draw and 8.5 ms present each, with no new preview image). Capping the A510s at 1425 MHz while recording, or packing on the A715s alone, changed neither the heat nor the drops (measured, not kept).
+- A clip's first frame on the GPU path waits for its packing (7f31de4d): Lumis divides the room left by `stats().coded / frames`, and a 0 there panicked it at its first frame.
+- A kernel RAM-reloaded without its carried vault (FERROS_VAULT_CAPSULE) starts the stored vault, which predates the extent list and drop: `store extent-list` then says "vault error".
+
 **Not done yet**: the camera ring read by the GPU in place (the S2MPU fence opened to it read-only while recording) instead of the copy into the block; the bodies written compactly (each block's body touches its own cache line: about 25 MB a frame written by the GPU and read by the CPU against 4.8 MB of code); the GPU at a lower clock when the rate leaves room (the kernel's GPU clock is its top or its floor); the quad array (the GPU codes Bayer only; a quad clip stays on the CPU).
 
 ### A clip from the Pro to the host
