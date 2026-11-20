@@ -2,7 +2,7 @@
 //!
 //! - **An icon's `hp`** is the BLAKE3 of the `icon` section its capsule carries (ferros_kist `icon_hp`): the same icon in two builds of a kist is one icon.
 //! - **The index** (`kists.icons`, [`INDEX`], device data the stower writes at stow): a section `icon` per kist with an icon, `thing` (`ht`, the kist) and `icon` (`hp`, its icon now). The map reads it to know each circle's icon; the person's list does not carry it (KISTS.md "Icons").
-//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is), `rgba` (`t_u3`, side × side × 4: straight VSF RGB `g2t` codes with the circle's coverage in alpha) and `grey` (`t_u3`, side × side: the photopic luminance, `g2t`). Side is [`SIDE`].
+//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is) and `rgba` (`t_u3`, side × side × 4: straight VSF RGB `g2t` codes with the circle's coverage in alpha, [`texels`]). Side is [`SIDE`], the icon's own size, never the size it is drawn at.
 //! - **The display's cache** ([`Cache`]): a few icons built for drawing, each in a slot found by its `hp`; one missing is asked of the map, which sends its texels in pieces ([`Pieces`]).
 
 use crate::document;
@@ -16,8 +16,8 @@ use vsf::VsfType;
 pub const INDEX: &[u8] = b"icons";
 /// An icon's side in texels: a Photon avatar's (KISTS.md "Icons": one format, 256 × 256).
 pub const SIDE: usize = 1 << 8;
-/// A decoded icon's texels as the map hands them to the display: the RGBA, then the grey.
-pub const TEXELS: usize = SIDE * SIDE * 5;
+/// A decoded icon's texels as the map hands them to the display: 256 KiB of straight `g2t` RGBA (the photopic grey is gone: nothing drew it).
+pub const TEXELS: usize = SIDE * SIDE * 4;
 /// The most kists the index holds: far past any deck, so an index past it is none this build reads.
 pub const INDEX_MAX: usize = 1 << 10;
 
@@ -80,45 +80,73 @@ pub fn set(icons: &mut Vec<(Ht, Hp)>, thing: Ht, icon: Option<Hp>) -> bool {
     }
 }
 
-fn texels_ok(v: &VsfType, depth: usize) -> bool {
-    match v {
-        VsfType::t_u3(t) => t.data.len() == SIDE * SIDE * depth && t.shape.iter().product::<usize>() == t.data.len(),
-        _ => false,
-    }
-}
-
 fn decoded_schema() -> SectionSchema {
-    let rgba = TypeConstraint::Custom { name: "rgba", description: "side x side x 4 bytes", validator: alloc::sync::Arc::new(|v: &VsfType| texels_ok(v, 4)) };
-    let grey = TypeConstraint::Custom { name: "grey", description: "side x side bytes", validator: alloc::sync::Arc::new(|v: &VsfType| texels_ok(v, 1)) };
-    SectionSchema::new("decoded").field("icon", TypeConstraint::Blake3Provenance).field("rgba", rgba).field("grey", grey)
+    let rgba = TypeConstraint::Custom {
+        name: "rgba",
+        description: "side x side x 4 bytes",
+        validator: alloc::sync::Arc::new(|v: &VsfType| matches!(v, VsfType::t_u3(t) if t.data.len() == TEXELS && t.shape.iter().product::<usize>() == TEXELS)),
+    };
+    SectionSchema::new("decoded").field("icon", TypeConstraint::Blake3Provenance).field("rgba", rgba)
 }
 
-/// A decoded icon's document: the icon it is, its RGBA and grey (each the side squared, by 4 and by 1), stamped at `eagle`. None for texels of another size.
-pub fn decoded(icon: &Hp, rgba: &[u8], grey: &[u8], eagle: i64) -> Option<Vec<u8>> {
-    if rgba.len() != SIDE * SIDE * 4 || grey.len() != SIDE * SIDE {
+/// A decoded icon's document: the icon it is and its RGBA ([`TEXELS`]), stamped at `eagle`. None for texels of another size.
+pub fn decoded(icon: &Hp, rgba: &[u8], eagle: i64) -> Option<Vec<u8>> {
+    if rgba.len() != TEXELS {
         return None;
     }
-    let b = decoded_schema()
-        .build()
-        .set("icon", VsfType::from(*icon))
-        .ok()?
-        .set("rgba", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE, 4], rgba.to_vec())))
-        .ok()?
-        .set("grey", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE], grey.to_vec())))
-        .ok()?;
+    let b = decoded_schema().build().set("icon", VsfType::from(*icon)).ok()?.set("rgba", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE, 4], rgba.to_vec()))).ok()?;
     document("decoded", b.encode().ok()?, eagle)
 }
 
-/// A decoded icon read back as the display takes it ([`TEXELS`]: the RGBA, then the grey), only when it is the icon asked for: a value under one `hp` that says it is another is none.
+/// A decoded icon read back as the display takes it (its RGBA, [`TEXELS`]), only when it is the icon asked for: a value under one `hp` that says it is another is none.
 pub fn read_decoded(doc: &[u8], want: &Hp) -> Option<Vec<u8>> {
     let s = SectionBuilder::parse_document(decoded_schema(), doc, None).ok()?;
     let first = |name: &str| s.get_fields(name).first().and_then(|f| f.values.first()).cloned();
     if Hp::from_vsf(&first("icon")?).ok()? != *want {
         return None;
     }
-    let (Some(VsfType::t_u3(rgba)), Some(VsfType::t_u3(grey))) = (first("rgba"), first("grey")) else { return None };
-    let mut out = rgba.data;
-    out.extend_from_slice(&grey.data);
+    match first("rgba") {
+        Some(VsfType::t_u3(rgba)) => Some(rgba.data),
+        _ => None,
+    }
+}
+
+/// The share of each texel inside the icon's inscribed circle, in 255ths, measured on a 16 x 16 grid per texel (tools/app-icons made the bundle's alpha the same way): the circle is cut where it is drawn, and its edge's coverage rides in alpha.
+fn coverage(x: usize, y: usize) -> u8 {
+    // In 32nds of a texel, from the centre: the grid's points at x + (i + ½)/16 texels, the centre and the radius at SIDE/2.
+    let r = (SIDE as i64) << 4;
+    let mut inside = 0u32;
+    for j in 0..16i64 {
+        for i in 0..16i64 {
+            let (dx, dy) = (((x as i64) << 5) + 2 * i + 1 - r, ((y as i64) << 5) + 2 * j + 1 - r);
+            inside += (dx * dx + dy * dy <= r * r) as u32;
+        }
+    }
+    // 0 to 256 points to 0 to 255, rounded.
+    ((inside * 255 + 128) >> 8) as u8
+}
+
+/// What the display draws from a decoded icon picture (vsf::visual::av1 `decode` of its AV1, three planes of side x side 8-bit codes, R then G then B): straight `g2t` RGBA, the inscribed circle's coverage in alpha (KISTS.md "Icons"). `gamma2`: the codes are gamma 2 (an untagged icon), each taken to its `g2t` code thru its light. None for planes of another size.
+pub fn texels(planes: &[u16], gamma2: bool) -> Option<Vec<u8>> {
+    let n = SIDE * SIDE;
+    if planes.len() != 3 * n {
+        return None;
+    }
+    let g2t = |c: u16| -> u8 {
+        if gamma2 {
+            let v = c as f32 / 256.;
+            vsf::colour::convert::delinearize_gamma2tanh_u8_f32(v * v)
+        } else {
+            c as u8
+        }
+    };
+    let mut out = Vec::with_capacity(TEXELS);
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let i = y * SIDE + x;
+            out.extend_from_slice(&[g2t(planes[i]), g2t(planes[n + i]), g2t(planes[2 * n + i]), coverage(x, y)]);
+        }
+    }
     Some(out)
 }
 
@@ -228,16 +256,42 @@ mod tests {
 
     #[test]
     fn a_decoded_icon_round_trips_and_is_only_itself() {
-        let rgba: Vec<u8> = (0..SIDE * SIDE * 4).map(|i| (i * 7) as u8).collect();
-        let grey: Vec<u8> = (0..SIDE * SIDE).map(|i| (i * 3) as u8).collect();
-        let doc = decoded(&hp(9), &rgba, &grey, 1 << 45).unwrap();
-        let t = read_decoded(&doc, &hp(9)).unwrap();
-        assert_eq!(t.len(), TEXELS);
-        assert_eq!((&t[..rgba.len()], &t[rgba.len()..]), (&rgba[..], &grey[..]));
+        let rgba: Vec<u8> = (0..TEXELS).map(|i| (i * 7) as u8).collect();
+        let doc = decoded(&hp(9), &rgba, 1 << 45).unwrap();
+        assert_eq!(read_decoded(&doc, &hp(9)), Some(rgba.clone()));
         assert_eq!(read_decoded(&doc, &hp(8)), None, "a value that says it is another icon");
-        assert_eq!(decoded(&hp(9), &rgba[1..], &grey, 1), None);
-        assert_eq!(decoded(&hp(9), &rgba, &grey[1..], 1), None);
+        assert_eq!(decoded(&hp(9), &rgba[1..], 1), None);
+        assert!(doc.len() < TEXELS + (1 << 10), "the icon at its own size: {} bytes", doc.len());
         std::println!("a decoded icon: {} bytes", doc.len());
+    }
+
+    /// A decoded picture made what the display draws: `g2t` codes kept, gamma 2 codes taken to `g2t` thru their light, the inscribed circle's coverage in alpha (opaque at the centre, none in the corners, partial on the edge, and the same at the four quarters).
+    #[test]
+    fn texels_are_the_codes_inside_the_circle() {
+        let n = SIDE * SIDE;
+        let mut planes = alloc::vec![0u16; 3 * n];
+        for i in 0..n {
+            planes[i] = 200;
+            planes[n + i] = 128;
+            planes[2 * n + i] = 10;
+        }
+        let t = texels(&planes, false).unwrap();
+        assert_eq!(t.len(), TEXELS);
+        let at = |x: usize, y: usize| &t[(y * SIDE + x) * 4..(y * SIDE + x) * 4 + 4];
+        assert_eq!(at(128, 128), &[200, 128, 10, 255]);
+        assert_eq!(at(0, 0)[3], 0);
+        assert_eq!(at(SIDE - 1, SIDE - 1)[3], 0);
+        let edge = at(37, 37)[3];
+        assert!(edge > 0 && edge < 255, "a texel on the circle is partly inside: {edge}");
+        assert_eq!((at(SIDE - 38, 37)[3], at(37, SIDE - 38)[3], at(SIDE - 38, SIDE - 38)[3]), (edge, edge, edge), "the circle is the same in its four quarters");
+        // Gamma 2: white stays white's code under tanh's headroom, black stays black.
+        let g = texels(&planes.iter().map(|_| 0).collect::<Vec<u16>>(), true).unwrap();
+        assert_eq!(&g[(128 * SIDE + 128) * 4..(128 * SIDE + 128) * 4 + 3], &[0, 0, 0]);
+        let w = texels(&alloc::vec![255u16; 3 * n], true).unwrap();
+        let c = w[(128 * SIDE + 128) * 4];
+        assert_eq!(c, vsf::colour::convert::delinearize_gamma2tanh_u8_f32((255. / 256.) * (255. / 256.)));
+        assert!(c < 255 && c > 180, "gamma 2's white lands on g2t's diffuse white, below the headroom: {c}");
+        assert_eq!(texels(&planes[1..], false), None);
     }
 
     #[test]

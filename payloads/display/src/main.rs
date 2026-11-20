@@ -698,12 +698,12 @@ fn icon_decode() -> [u16; 256] {
 const ICON_FERROS: u8 = 7;
 /// The scene icon of the cache's first slot; slot k is `ICON_SLOT0 + k` (owner, 2026-11-20: the display keeps the icons it is handed by their `hp`, and carries no kist's icon of its own).
 const ICON_SLOT0: u8 = 0x40;
-/// The cache's slots: each holds one icon's texels as the map handed them (to bake again at a brightness change) and its chain (`draw::Mips`), made at the start, before the heap's mark, and filled in place. A slot is about 1.8 MB (the chain's 91_552 texels in two planes of 8 bytes, the texels' A#327_680 bytes), so eight are 14 MB, where the bundle's six chains were 8.8.
-const ICON_SLOTS: usize = 1 << 3;
+/// The cache's slots, one for every circle the deck holds (payloads/map `MAX`, 16; coordinator, 2026-11-20: no thrashing): each holds one icon at its own size, 256 x 256, as the map handed it over (256 KiB of `g2t` RGBA, to bake again at a brightness change), and its chain (`draw::Mips`: the levels from 256 down to 4, A#91_552 texels of 8 bytes, 716 KiB), made at the start, before the heap's mark, and filled in place. Drawn scaled from them (`draw::icon`), never kept at a circle's size. 16 slots are 15.5 MiB.
+const ICON_SLOTS: usize = 1 << 4;
 /// An icon's side in texels (ferros_kept::icon `SIDE`).
 const ICON_SIDE: usize = ferros_kept::icon::SIDE;
 
-/// One slot of the icon cache: the texels (straight `g2t` RGBA, then the grey) and the chain made from them.
+/// One slot of the icon cache: the texels (straight `g2t` RGBA, 256 x 256) and the chain made from them.
 struct IconSlot {
     texels: &'static mut [u8],
     mips: draw::Mips,
@@ -729,14 +729,13 @@ fn icon_mips(icon: u8) -> Option<&'static draw::Mips> {
     Some(&slots[k].mips)
 }
 
-/// A scene icon's texels: its RGBA, its grey, and its side, when it names a slot that holds an icon.
-fn icon(icon: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
+/// A scene icon's texels (straight `g2t` RGBA) and its side, when it names a slot that holds an icon.
+fn icon(icon: u8) -> Option<(&'static [u8], usize)> {
     let k = icon_slot(icon)?;
     // SAFETY: as `icon_mips`.
     let slots: &'static [IconSlot] = unsafe { (*(&raw const ICON_SLOT)).as_deref()? };
     let t: &'static [u8] = &*slots[k].texels;
-    let n = ICON_SIDE * ICON_SIDE * 4;
-    Some((&t[..n], &t[n..], ICON_SIDE))
+    Some((t, ICON_SIDE))
 }
 /// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
 const WIDGET_CLOCK: u8 = 0x80;
@@ -5763,8 +5762,8 @@ fn present_bench(width: usize, log: &mut Log) {
 fn rebake(width: usize, height: usize) {
     let decode = icon_decode();
     for k in 0..ICON_SLOTS {
-        if let (Some((px, grey, _)), Some(m)) = (icon(ICON_SLOT0 + k as u8), icon_mips(ICON_SLOT0 + k as u8)) {
-            m.fill(px, grey, &decode);
+        if let (Some((px, _)), Some(m)) = (icon(ICON_SLOT0 + k as u8), icon_mips(ICON_SLOT0 + k as u8)) {
+            m.fill(px, &decode);
         }
     }
     unsafe {
@@ -5972,7 +5971,7 @@ fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, 
     let reach = r / frac as f32;
     // The icon's disc inside the stroke (2 pixels wide on the radius's inside).
     let ri = r - 2.0;
-    let art = icon(icon_n).map(|(px, _, size)| (px, size, icon_decode()));
+    let art = icon(icon_n).map(|(px, size)| (px, size, icon_decode()));
     let (x0, x1, y0, y1) = ((x - r - reach - 2.0) as i64, (x + r + reach + 2.0) as i64, (y - r - reach - 2.0) as i64, (y + r + reach + 2.0) as i64);
     for py in y0..=y1 {
         // WHY the test: the glow's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
@@ -7916,8 +7915,7 @@ fn server(grants: u64) -> ! {
     {
         let decode = icon_decode();
         let blank = alloc::vec![0u8; ferros_kept::icon::TEXELS];
-        let n = ICON_SIDE * ICON_SIDE * 4;
-        let slots: alloc::vec::Vec<IconSlot> = (0..ICON_SLOTS).map(|_| IconSlot { texels: alloc::vec![0u8; ferros_kept::icon::TEXELS].leak(), mips: draw::Mips::build(&blank[..n], &blank[n..], ICON_SIDE, &decode) }).collect();
+        let slots: alloc::vec::Vec<IconSlot> = (0..ICON_SLOTS).map(|_| IconSlot { texels: alloc::vec![0u8; ferros_kept::icon::TEXELS].leak(), mips: draw::Mips::build(&blank, ICON_SIDE, &decode) }).collect();
         unsafe {
             ICON_SLOT = Some(slots.leak());
             ICON_CACHE = Some(ferros_kept::icon::Cache::new(ICON_SLOTS));
@@ -8360,7 +8358,7 @@ fn server(grants: u64) -> ! {
                     let slot = unsafe { (*(&raw mut ICON_CACHE)).as_mut() }.and_then(|c| c.slot(&hp));
                     out[0] = if !system(unsafe { HOLDS }) { 0 } else { slot.map_or(0, |k| ICON_SLOT0 + k as u8) };
                 }
-                // 79 `icon put [hp 32][offset u32][texels…]`: a piece of an icon's texels (ferros_kept::icon: straight `g2t` RGBA, then the grey, `TEXELS` in all), in order from 0. → [0 more due][1 built, then its slot][2 dropped: out of order, past the size, no room, or not the system's].
+                // 79 `icon put [hp 32][offset u32][texels…]`: a piece of an icon's texels (ferros_kept::icon: straight `g2t` RGBA at the icon's own size, `TEXELS` in all), in order from 0. → [0 more due][1 built, then its slot][2 dropped: out of order, past the size, no room, or not the system's].
                 // Only the system hands icons over (the map, which read it from the vault under that `hp`): a kist's pieces would put its pixels under another kist's icon.
                 Some(79) if m.len() >= 37 => {
                     let hp = ferros_thing::Hp::from_bytes(m[1..33].try_into().expect("33 bytes or more, by the arm's guard"));
@@ -8380,8 +8378,7 @@ fn server(grants: u64) -> ! {
                                     // SAFETY: as above; the slot's texels are `TEXELS` long, as `take` returns them.
                                     let slots = unsafe { (*(&raw mut ICON_SLOT)).as_mut() }.expect("the icon slots are made at the start");
                                     slots[k].texels.copy_from_slice(&texels);
-                                    let n = ICON_SIDE * ICON_SIDE * 4;
-                                    slots[k].mips.fill(&slots[k].texels[..n], &slots[k].texels[n..], &icon_decode());
+                                    slots[k].mips.fill(slots[k].texels, &icon_decode());
                                     // What was drawn from that slot before is another icon's: every sprite made again, the last frame and the plane's images not reused.
                                     unsafe {
                                         for s in 0..256 {
