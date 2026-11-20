@@ -587,8 +587,8 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                // The phase view is offered while the frames carry phase-detect rows (the Pro's main), said when that changes.
-                let pd = m.pd_rows != 0 && m.pd_offset != 0;
+                // The phase view is offered while the frames carry phase-detect rows in the layout ferros measured (the Pro main binned: a pair every two columns, a PD row every four image rows; docs/CAMERA.md "The PD layout, measured"), said when that changes. The 1:1 readout keeps its PD rows too, in a layout not measured, so it is not offered there.
+                let pd = m.pd_rows != 0 && m.pd_offset != 0 && m.pd_rows << 2 == m.frame.height;
                 if pd != lumis_core::platform::phase_offered() {
                     lumis_core::platform::set_phase_offered(pd);
                     println!("lumis: the phase view {}", if pd { format!("offered: {} phase-detect rows a frame, G#{:X} past the image", m.pd_rows, m.pd_offset) } else { "not offered: the frames carry no phase-detect rows".into() });
