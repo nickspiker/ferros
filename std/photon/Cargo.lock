@@ -2132,6 +2132,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
 
 [[package]]
+name = "ferros_fluor"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "ferros_theme",
+ "fluor",
+]
+
+[[package]]
+name = "ferros_mailbox"
+version = "0.1.0"
+
+[[package]]
+name = "ferros_sys"
+version = "0.1.0"
+dependencies = [
+ "ferros_mailbox",
+ "ferros_theme",
+ "tatau",
+]
+
+[[package]]
+name = "ferros_theme"
+version = "0.1.0"
+
+[[package]]
 name = "ff"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5051,6 +5077,7 @@ name = "photon-ferros"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305 0.11.0-rc.3",
+ "ferros_fluor",
  "fgtw",
  "fluor",
  "getrandom 0.2.17",
@@ -7061,6 +7088,10 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "tatau"
+version = "0.1.0"
 
 [[package]]
 name = "tempfile"
