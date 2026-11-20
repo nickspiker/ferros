@@ -75,6 +75,11 @@ const EOP_READ: u8 = 3;
 const EOP_INFO: u8 = 4;
 const EOP_DELETE: u8 = 5;
 const EOP_SPACE: u8 = 6;
+/// The kernel's own channel only (the bridge's `store extent-list` / `extent-drop`; process.rs `extent_forward` refuses both from a process): the area's extents as records, and an extent dropped by its first block, its domain's alone. An extent's name is a derived key, never stored, so a clip whose name is lost (a writer that died before saying it) is found and dropped by these.
+const EOP_LIST: u8 = 7;
+const EOP_DROP_AT: u8 = 8;
+/// One record of EOP_LIST: first, blocks, bytes (u64 LE each), sealed (u8), at (i64 LE), owner (32).
+const LIST_ROW: usize = 8 + 8 + 8 + 1 + 8 + 32;
 /// Grant slot 5: the `clips` block window, the extents' area (process.rs WINDOWS; a kernel from before grants none, and every extent op is refused).
 const S_CLIPS: u64 = 5;
 /// The area's blocks: process.rs CLIPS_BLOCKS (48 GiB); the kernel bounds every call to the window whatever this says.
@@ -1419,7 +1424,7 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
     // Clips left open by a writer that is gone are handed to the recoverer (`recover_kick`): an OPEN takes a free stretch at once and never waits for them.
     recover_kick(store);
     // But an extent this request removes or replaces is not one the recoverer may still be writing in: its recovery is let finish first (a few hundred ms since 2026-11-19).
-    if matches!(eop, EOP_OPEN | EOP_DELETE) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == key) {
+    if (matches!(eop, EOP_OPEN | EOP_DELETE) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == key)) || (eop == EOP_DROP_AT && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.1 == block)) {
         recover_commit(store, true);
     }
     let Some(t) = extents(store) else { return ERR };
@@ -1537,6 +1542,37 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
                     Err(_) => ERR,
                 },
                 None => NOTHING,
+            }
+        }
+        EOP_LIST => {
+            // The caller's own domain's owner first (how a host tells its extents from others'), then a record an extent, as many as the buffer holds; the value: how many there are.
+            out[8..40].copy_from_slice(&owner);
+            let rows = len.saturating_sub(32) / LIST_ROW; // WHY/PROOF: the length is the kernel's stamp of the host's ask; one under 32 lists no record rather than wrapping to a huge count
+            let mut o = 40;
+            for e in t.list().iter().take(rows) {
+                out[o..o + 8].copy_from_slice(&e.first.to_le_bytes());
+                out[o + 8..o + 16].copy_from_slice(&e.blocks.to_le_bytes());
+                out[o + 16..o + 24].copy_from_slice(&e.bytes.to_le_bytes());
+                out[o + 24] = e.sealed as u8;
+                out[o + 25..o + 33].copy_from_slice(&e.at.to_le_bytes());
+                out[o + 33..o + 65].copy_from_slice(&e.owner);
+                o += LIST_ROW;
+            }
+            *data = o - 8;
+            t.list().len() as u64
+        }
+        EOP_DROP_AT => {
+            // Only the caller's own domain's extent at that first block: no domain drops another's.
+            let Some(e) = t.list().iter().find(|e| e.first == block && e.owner == owner).copied() else { return NOTHING };
+            let mut next = t.clone();
+            next.remove(&e.name);
+            match next.store(store.engine(), now) {
+                Ok(()) => {
+                    *t = next;
+                    say!("vault: extent at {} dropped by its first block ({} blocks, {} bytes, sealed {}); {} free at most", e.first, e.blocks, e.bytes, e.sealed, t.largest_free());
+                    0
+                }
+                Err(_) => ERR,
             }
         }
         _ => ERR,

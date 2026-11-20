@@ -233,7 +233,7 @@ enum VaultJob {
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
     /// A single-copy extent's blocks (docs/RAW-VIDEO.md: a clip pulled to the host), a UFS command's 1 MiB a call: its full name, the next block, the blocks still to read, what has come; or with `info` its record alone.
-    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, info: bool, kist: Option<([u8; 32], [u8; 32])> },
+    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, one: Option<(u8, u32)>, kist: Option<([u8; 32], [u8; 32])> },
 }
 
 /// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record. A name in a kist's own domain (a clip Lumis recorded): [G#FD][developer 32][option 32][block u64 LE][blocks u32 LE][name] and [G#FC][developer 32][option 32][name].
@@ -291,9 +291,9 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             if n == 0 || n > EXTENT_PULL {
                 return Some(Err(alloc::vec![5]));
             }
-            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), info: false, kist: None }
+            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), one: None, kist: None }
         }
-        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), info: true, kist: None },
+        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), one: Some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: None },
         ferros_pt::Op::Read if matches!(params.first(), Some(&0xFD) | Some(&0xFC)) && params.len() > 65 => {
             let (developer, option): ([u8; 32], [u8; 32]) = (params[1..33].try_into().ok()?, params[33..65].try_into().ok()?);
             let info = params[0] == 0xFC;
@@ -303,7 +303,19 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             if (!info && (n == 0 || n > EXTENT_PULL)) || rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
                 return Some(Err(alloc::vec![5]));
             }
-            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), info, kist: Some((developer, option)) }
+            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), one: info.then_some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: Some((developer, option)) }
+        }
+        // The clips area's records (G#FB) or a drop of one of the domain's extents by its first block (G#FA), for the bridge's `store extent-list` / `extent-drop`: [code][first block u64][1: a kist's domain follows (developer 32, option 32), 0: a scope's][name], the name a scope's full name (or any of the kist's: it is not looked up). Never from a process (`extent_forward` refuses both ops).
+        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFB) | Some(&0xFA)) && params.len() > 10 => {
+            let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
+            let (kist, at) = if params[9] == 1 { (Some((params.get(10..42)?.try_into().ok()?, params.get(42..74)?.try_into().ok()?)), 74) } else { (None, 10) };
+            let rel = params.get(at..)?;
+            // WHY: the name is the host's: a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
+            if rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
+                return Some(Err(alloc::vec![5]));
+            }
+            let one = if params[0] == 0xFB { (crate::process::EOP_LIST, 1 << 16) } else { (crate::process::EOP_DROP_AT, 0) };
+            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: 0, got: alloc::vec::Vec::new(), one: Some(one), kist }
         }
         ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },
         ferros_pt::Op::Exec => VaultJob::Remove { full: name(params)? },
@@ -370,9 +382,12 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
-        VaultJob::Extent { full, block, left, info, kist, .. } => {
+        VaultJob::Extent { full, block, left, one, kist, .. } => {
             // [extent op][block u64][length u32], as process.rs `extent_forward` stamps a process's call.
-            let (op, len) = if *info { (crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32) } else { (crate::process::EOP_READ, ((*left).min((crate::process::EXTENT_MAX >> 12) as u64) << 12) as u32) };
+            let (op, len) = match one {
+                Some(o) => *o,
+                None => (crate::process::EOP_READ, ((*left).min((crate::process::EXTENT_MAX >> 12) as u64) << 12) as u32),
+            };
             rest.push(op);
             rest.extend_from_slice(&block.to_le_bytes());
             rest.extend_from_slice(&len.to_le_bytes());
@@ -438,19 +453,19 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
                 return Some(alloc::vec![0]);
             }
         }
-        VaultJob::Extent { block, left, got, info, .. } => {
+        VaultJob::Extent { block, left, got, one, .. } => {
             if value == ERR || value == NOTHING {
                 return Some(alloc::vec![if value == NOTHING { 1 } else { 2 }]);
             }
             got.extend_from_slice(&bytes);
             let n = (bytes.len() >> 12) as u64;
             // A read that brings no whole block would ask for the same blocks for ever: the vault's error.
-            if !*info && n == 0 {
+            if one.is_none() && n == 0 {
                 return Some(alloc::vec![2]);
             }
             *block += n;
             *left = left.saturating_sub(n); // WHY/PROOF: the vault answers at most the length asked, but its count is its own; a longer answer would wrap the count of blocks left
-            if *info || *left == 0 {
+            if one.is_some() || *left == 0 {
                 let mut r = alloc::vec::Vec::with_capacity(1 + got.len());
                 r.push(0);
                 r.extend_from_slice(got);
@@ -2072,6 +2087,8 @@ static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
 
 /// The A715s' ceiling while a RAW clip is recorded (`diag clock clips <kHz>`; 0: none): THERMAL.md "The busy lift"'s 1572 MHz, the least energy for a sustained encode.
 static CLIPS_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
+/// Whether a recording holds the A715s at `CLIPS_KHZ` rather than under it (`diag clock clipshold <0|1>`): for CPU coders; off, the GPU path's default.
+static CLIPS_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Whether a RAW clip is being recorded: a clip's extent is given to its writer (from its open to its seal or its writer's end, process.rs `EXTENTS_OPEN`), or, for a writer that writes thru the vault process, the `clips` window was written within the last second.
 fn recording() -> bool {
@@ -2303,6 +2320,11 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         }
         // Over the ceiling (a lift ended, or a load that grew past it): at the ceiling, and the decay goes on from there.
         if g.level > g.opps[top] {
+            g.level = g.opps[top];
+        }
+        // With `diag clock clipshold 1`, a RAW clip recording holds the A715s at `CLIPS_KHZ`, not under it: CPU coders work in bursts (a frame's bands, then the wait for the next), which the windows read as half a load, and the governor asked 1065 MHz while a frame's coding wanted the whole budget (2026-11-19, 60/s: four A715 coders 24 ms a frame at a fixed 1572, more under the governor's 1065).
+        // Off by default since the recorder codes on the GPU (ferros_clip gpu): its A715 work is a frame's copy and packing, a few ms of each frame, and a held 1572 MHz only spends power.
+        if g.domain == 3 && recording() && CLIPS_HOLD.load(core::sync::atomic::Ordering::Relaxed) != 0 {
             g.level = g.opps[top];
         }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
@@ -2592,6 +2614,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"busy"), Some(n)) => GOV_BUSY_KHZ.store(n, Relaxed),
         (Some(b"clips"), Some(n)) => CLIPS_KHZ.store(n, Relaxed),
+        (Some(b"clipshold"), Some(n)) => CLIPS_HOLD.store(n, Relaxed),
         (Some(b"busyhold"), Some(n)) => GOV_BUSY_HOLD.store(n, Relaxed),
         (Some(b"doze"), Some(n)) => DOZE_LOG2.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
@@ -2608,7 +2631,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
-    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them) and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if recording() { "recording" } else { "not recording" }).as_bytes());
+    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them){} and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if CLIPS_HOLD.load(Relaxed) != 0 { ", held there (clipshold 1)" } else { "" }, if recording() { "recording" } else { "not recording" }).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
