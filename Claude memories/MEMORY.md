@@ -68,6 +68,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Permissions asked once, ever](permissions_asked_once.md) - per person, per kist, per permission; travels to all devices
 - [Sensor mailboxes](sensor_mailboxes.md) - drivers publish to a cap-gated read-only mailbox; unlimited readers wait on its sequence, never call the driver
 - [App scale and theme are global](app_scale_theme_global.md) - every kist follows PREF_SCALE (RU) + PREF_THEME, implicit; deck has its own scale; fluor host applies them
+- [Thing identity `ht`](thing_identity_ht.md) - stable 32-byte thing id (ht) beside content hp and kind hi; h-marker newtypes; deck keyed by (kind, Ht), icons by Hp
 - [Implicit rights](rights_implicit_set.md) - display, touch, surface, domain, entropy, ira, audio out, GPU: never asked
 - [GPU is implicit](gpu_implicit.md) - no GPU permission ever; isolation between clients is the protection
 - [Notifications: in view](notifications_in_view.md) - in the deck's resting view can notify, out of view silent; three kinds
