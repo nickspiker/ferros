@@ -1385,6 +1385,12 @@ static mut SCENE_US: [u64; 3] = [1; 3];
 static mut BOX_LAST: [u64; 5] = [0; 5];
 /// The sums since the last line: the redraws, their whole µs, then `BOX_LAST`'s five.
 static mut BOX_SUM: [u64; 7] = [0; 7];
+/// The boxes only published from the canvas (it held the square already, `puck::canvas_holds`) since the last line, and their µs; the passes that had boxes, the µs their boxes took in all, and the most one pass took.
+static mut BOX_PUB: [u64; 2] = [0; 2];
+/// The scene loop's µs in the last camera op by what each circle was: 0 a puck by bands (`Item::Puck`), 1 a puck into its sprite, 2 a puck's name, 3 anything else; and their sums over the redraws since the last line.
+static mut SCENE_PART: [u64; 4] = [0; 4];
+static mut BOX_PARTS: [u64; 4] = [0; 4];
+static mut BOX_PASS: [u64; 3] = [0; 3];
 /// The map's colours, the glow's strength: the theme (ferros_sys::theme).
 /// The glow that replaced the ring (owner, 2026-10-23: no stroke, so circles can touch; additive glow, 1/distance): its colour, how bright one pixel out by importance (ring 1, ring 2), the distance it holds that brightness (Q8 px), and the floor where it stops. Tunables, by eye.
 const GLOW_SCALE_Q8: i64 = 256;
@@ -2882,6 +2888,8 @@ enum Item {
     Icon(i64, i64, i64, i64, i64, usize, bool),
     /// A glow: centre, radius, colour, peak, its reach divisor (`GLOW_FRACTION`, a for-you glow's smaller) and its multiply (Q16, 0 none; `state_glow`).
     Glow(i64, i64, i64, u32, u32, i64, u32),
+    /// A puck's square sampled into its circle (`puck::draw_into`): the puck, centre, radius (Q8), the face's turn (Q14). On the list so its rows are drawn by bands across the threads (2026-11-20, the Pro: 14 ms a box on the render thread alone).
+    Puck(usize, i64, i64, i64, i64, i64),
 }
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
@@ -2895,6 +2903,8 @@ impl Item {
         match *self {
             Item::Blit(_, _, d, _, oy) => (oy, oy + d as i64),
             Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
+            // Its edge a row further up than a disc's (`puck::draw_into` starts a row above the circle).
+            Item::Puck(_, _, y, r, _, _) => (((y - r) >> 8) - 1, ((y + r) >> 8) + 3),
             Item::Glow(_, y, r, _, _, frac, _) => {
                 let reach = r + r / frac + 256;
                 ((y - reach) >> 8, ((y + reach) >> 8) + 3)
@@ -2922,6 +2932,11 @@ impl Item {
                 } else {
                     draw::glow(px, width, height, x, y, r, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
                 }
+            }
+            Item::Puck(j, x, y, r, c, s) => {
+                // Inside this thread's band of the frame's clip (`draw::bounds`), as every item draws.
+                let (x0, y0, x1, y1) = draw::bounds(width, height);
+                puck::draw_into(px, width, draw::Rect { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32, y1: y1 as i32 }, j, x, y, r, c, s);
             }
         }
     }
@@ -8605,12 +8620,14 @@ fn server(grants: u64) -> ! {
                     // The clean window is the open circle's ground alone (owner, 2026-11-07: "can we not draw any other circles other than the nav and console?"): no circle of the map, not the open one's own mark, no glow; the bars are their own layer.
                     let scene_n = if skip_scene || remade { 0 } else { unsafe { SCENE_N } };
                     let mut t_phase = now();
-                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
+                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3]; SCENE_PART = [0; 4] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
                     arena_turn();
                     // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
                     // What each puck's circle shows of itself this frame (puck.rs `scene_end`: a held WATCH answered when it changes), gathered in the same pass.
                     if clip_k.is_none() {
+                        // A whole frame: the canvas holds again only what this frame draws of each puck (`canvas_drew` below).
+                        puck::canvas_forget();
                         puck::scene_start();
                         let discs = hit::discs();
                         let mut n = 0;
@@ -8647,7 +8664,11 @@ fn server(grants: u64) -> ! {
                         let mut nglow = 0usize;
                         // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
                         let th = ferros_sys::theme::current();
+                        // Measuring (2026-11-20): each circle's time in this loop by what it was (`SCENE_PART`), the last one's added as the next starts.
+                        let (mut t_part, mut part) = (now(), 3usize);
                         for i in 0..scene_n {
+                            unsafe { SCENE_PART[part] += ferros_sys::us_since(t_part) };
+                            (t_part, part) = (now(), 3);
                             let cir = unsafe { SCENE[i] };
                             // World to screen, Q8 pixels: offset, turn, zoom, centre.
                             let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
@@ -8697,6 +8718,7 @@ fn server(grants: u64) -> ! {
                                 let still = unsafe { LAST_KEY[i] == key };
                                 unsafe { LAST_KEY[i] = key };
                                 if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
+                                    part = 1;
                                     let (spr, ext) = sprite(i, key, d, |px, d| {
                                         let c = ((d as i64 / 2) << 8) | 128;
                                         if !puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts) {
@@ -8705,14 +8727,22 @@ fn server(grants: u64) -> ! {
                                         draw::disc(px, d, d, c, c, ri, plane);
                                     });
                                     scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
+                                } else if puck::has_square(j) {
+                                    // Its square by bands across the threads, with the rest of the list (`Item::Puck`), the plane under it.
+                                    part = 0;
+                                    scene_push(Item::Puck(j, sx, sy, ri, tc, ts), pixels, width, height);
+                                    scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
                                 } else {
-                                    let clip = draw::Rect::full(width, height).intersect(unsafe { draw::CLIP });
-                                    if !puck::draw_into(pixels, width, clip, j, sx, sy, ri, tc, ts) {
-                                        puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
-                                    }
+                                    part = 2;
+                                    puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
                                     scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
                                 }
-                                let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+                                let whole = puck::box_of(sx, sy, sr, width, height);
+                                // What the canvas now holds of this puck: its newest square whole when the clip covered its whole box (a whole frame, whose clip is everything, or a redraw of its own box), else a part (a pan's strip, another box; `canvas_drew`). Not for the flight's plane image, which is drawn into a surface of its own.
+                                if pre != 2 {
+                                    let c = unsafe { draw::CLIP };
+                                    puck::canvas_drew(j, c.x0 <= whole.x0 && c.y0 <= whole.y0 && c.x1 >= whole.x1 && c.y1 >= whole.y1);
+                                }
                                 unsafe { CUR_DMG = CUR_DMG.union(whole) };
                                 continue;
                             }
@@ -8856,6 +8886,7 @@ fn server(grants: u64) -> ! {
                             let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
                             unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                         }
+                        unsafe { SCENE_PART[part] += ferros_sys::us_since(t_part) };
                         let t_g = now();
                         for &g in &glows[..nglow] {
                             scene_push(g, pixels, width, height);
@@ -8900,6 +8931,9 @@ fn server(grants: u64) -> ! {
                             let c = draw::CLIP.clip(width, height);
                             publish10x4(pixels, width, height, &tabs, if CLIP_MASK != 0 { CLIP_MASK } else { 1 << k }, c);
                             BOX_LAST = [PHASE_US[0], SCENE_US[2], ferros_sys::us_since(t_pub), CLEAR_US, ((c.x1 - c.x0).max(0) * (c.y1 - c.y0).max(0)) as u64];
+                            for q in 0..4 {
+                                BOX_PARTS[q] += SCENE_PART[q];
+                            }
                             (PREV_DMG, CUR_DMG) = saved_dmg;
                         }
                         ferros_sys::dma_barrier();
@@ -9499,8 +9533,14 @@ fn server(grants: u64) -> ! {
                             frames += 1;
                             FRAMES.store(frames, Ordering::Relaxed);
                         }
+                    } else if sk < SURFACES && m[2] != 0 && live_gen(sk) == m[2] {
+                        // No window yet, but the surface lives under that generation: an app from before this display started again (WINDOWS.md "A display started again"), told it was behind when it re-attached (events.rs `watch`). Told it is in front now, it draws whole and shows, and its show makes its window here, in front.
+                        events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        last_interaction = now();
+                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: no window yet, told it is in front", m[2]).as_bytes());
                     } else {
                         out[0] = 3;
+                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: refused (live generation A#{}, a window {})", m[2], if sk < SURFACES { live_gen(sk) } else { 0 }, if sk < SURFACES { unsafe { WINS[sk] }.map_or(alloc::string::String::from("none"), |w| alloc::format!("of generation A#{}", w.generation)) } else { alloc::string::String::from("none") }).as_bytes());
                     }
                 }
                 Some(60) => {
@@ -10046,42 +10086,95 @@ fn server(grants: u64) -> ! {
             }
             if unsafe { LAST_FRAME.1 > 0 } {
                 let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                let mut boxes = [draw::Rect::EMPTY; puck::N];
+                let mut boxes = [(0usize, draw::Rect::EMPTY); puck::N];
                 let nb = puck::phase_due(k, width, height, &mut boxes);
                 let t_box = now();
-                for clip in boxes[..nb].iter().filter(|c| !c.is_empty()) {
+                for &(j, clip) in boxes[..nb].iter().filter(|(_, c)| !c.is_empty()) {
                     puck::count(4);
-                    unsafe {
-                        draw::CLIP = *clip;
-                        CLIP_PHASE = Some(k);
-                        BOX_LAST = [0; 5];
-                    }
                     let t_one = now();
-                    replay(&mut handle);
-                    unsafe {
-                        CLIP_PHASE = None;
-                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
-                        BOX_SUM[0] += 1;
-                        BOX_SUM[1] += ferros_sys::us_since(t_one);
-                        for q in 0..5 {
-                            BOX_SUM[2 + q] += BOX_LAST[q];
+                    // The canvas holds this square whole already (an earlier phase drew it, or the last whole frame did): the box published into this phase from it, nothing drawn again (2026-11-20: each phase sampled the same square again, 16 ms a box).
+                    if puck::canvas_holds(j) {
+                        // SAFETY: `back` is the canvas, a full screen of the display's own, which only this thread writes; the publish only reads it.
+                        let canvas = unsafe { core::slice::from_raw_parts(back as *const Px, width * height) };
+                        publish10x4(canvas, width, height, &tabs, 1 << k, clip);
+                        unsafe {
+                            BOX_PUB[0] += 1;
+                            BOX_PUB[1] += ferros_sys::us_since(t_one);
                         }
-                        if BOX_SUM[0] == 64 {
-                            tlog.s(b"display: puck boxes, 64 redraws, us each: whole ");
-                            for (q, name) in [&b"; scene "[..], b" (of it across the cores ", b"); publish ", b"; clear ", b"; pixels each "].iter().enumerate() {
-                                tlog.dec(BOX_SUM[1 + q] / 64);
-                                tlog.s(name);
+                    } else {
+                        unsafe {
+                            draw::CLIP = clip;
+                            CLIP_PHASE = Some(k);
+                            BOX_LAST = [0; 5];
+                        }
+                        replay(&mut handle);
+                        unsafe {
+                            CLIP_PHASE = None;
+                            draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                            BOX_SUM[0] += 1;
+                            BOX_SUM[1] += ferros_sys::us_since(t_one);
+                            for q in 0..5 {
+                                BOX_SUM[2 + q] += BOX_LAST[q];
                             }
-                            tlog.dec(BOX_SUM[6] / 64);
+                        }
+                    }
+                    unsafe {
+                        // Every 64 boxes, either way: the redraws' parts, the publishes from the canvas, and what the passes with boxes spent on them.
+                        if BOX_SUM[0] + BOX_PUB[0] == 64 {
+                            tlog.s(b"display: puck boxes, 64: A#");
+                            tlog.dec(BOX_SUM[0]);
+                            tlog.s(b" redrawn");
+                            // WHY the test: an average over no redraws has no value to say (and would divide by zero).
+                            if BOX_SUM[0] > 0 {
+                                tlog.s(b", us each: whole ");
+                                for (q, name) in [&b"; scene "[..], b" (of it across the cores ", b"); publish ", b"; clear ", b"; pixels each "].iter().enumerate() {
+                                    tlog.dec(BOX_SUM[1 + q] / BOX_SUM[0]);
+                                    tlog.s(name);
+                                }
+                                tlog.dec(BOX_SUM[6] / BOX_SUM[0]);
+                                tlog.s(b"; the circles' loop by kind, us each: pucks by bands ");
+                                for (q, name) in [&b", pucks into sprites "[..], b", pucks' names ", b", the rest "].iter().enumerate() {
+                                    tlog.dec(BOX_PARTS[q] / BOX_SUM[0]);
+                                    tlog.s(name);
+                                }
+                                tlog.dec(BOX_PARTS[3] / BOX_SUM[0]);
+                            }
+                            tlog.s(b"; A#");
+                            tlog.dec(BOX_PUB[0]);
+                            tlog.s(b" published from the canvas");
+                            // WHY the test: as above, no publishes, no average.
+                            if BOX_PUB[0] > 0 {
+                                tlog.s(b", us each ");
+                                tlog.dec(BOX_PUB[1] / BOX_PUB[0]);
+                            }
+                            tlog.s(b"; A#");
+                            tlog.dec(BOX_PASS[0]);
+                            tlog.s(b" passes with boxes");
+                            // WHY the test: a line can come before any pass with boxes has ended (the 64th box is in this pass).
+                            if BOX_PASS[0] > 0 {
+                                tlog.s(b", their boxes us a pass ");
+                                tlog.dec(BOX_PASS[1] / BOX_PASS[0]);
+                                tlog.s(b", the most ");
+                                tlog.dec(BOX_PASS[2]);
+                            }
                             tlog.s(b"\n");
                             tlog.flush();
                             BOX_SUM = [0; 7];
+                            BOX_PUB = [0; 2];
+                            BOX_PARTS = [0; 4];
+                            BOX_PASS = [0; 3];
                         }
                     }
                 }
                 if nb > 0 {
                     puck::phase_drew(k, false);
-                    puck::count_us(ferros_sys::us_since(t_box));
+                    let us = ferros_sys::us_since(t_box);
+                    puck::count_us(us);
+                    unsafe {
+                        BOX_PASS[0] += 1;
+                        BOX_PASS[1] += us;
+                        BOX_PASS[2] = BOX_PASS[2].max(us);
+                    }
                 }
             }
         }
@@ -10140,6 +10233,14 @@ fn server(grants: u64) -> ! {
                         l.s(b" dropped: its process ended\n");
                         l.flush();
                     }
+                }
+            }
+            // Apps that re-attached from an earlier display (events.rs `watch`) heard they are behind: a window one already made here by a show goes behind too, so the glass and the app agree until the deck brings it to the front (op 59).
+            let reattached = events::reattached();
+            for sk in (0..SURFACES).filter(|&sk| reattached >> sk & 1 == 1) {
+                if let Some(w) = (*(&raw mut WINS))[sk].as_mut().filter(|w| !w.back) {
+                    w.back = true;
+                    gone = true;
                 }
             }
             if gone {
