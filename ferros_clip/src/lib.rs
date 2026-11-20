@@ -11,6 +11,8 @@
 pub mod ferros;
 /// The band coder's first half as a GPU kernel (the 60/s work): `gpu::kernel`, its words built on the host (`gpu::PREBUILT`), on ferros the GPU service's run (`gpu::Device`), and ferros_rawcodec `pack_band_strided` for the CPU's half.
 pub mod gpu;
+/// The recorder's sink as an item of the hold (`items::ItemSink`, docs/HOLD-API.md): the clip a card in the person's hold, found while it records.
+pub mod items;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};

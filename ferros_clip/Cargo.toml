@@ -14,6 +14,8 @@ ferros_rawcodec = { path = "../ferros_rawcodec" }
 blake3 = "1.5"
 # The band coder's first half as a Mali kernel (src/gpu.rs): recorded and compiled by valhall's SSA, run by the GPU service.
 valhall = { path = "../valhall", features = ["ssa"] }
+# The hold's kist side (items::ItemSink): a clip kept as an item of the person's hold.
+ferros_items = { path = "../ferros_items" }
 
 [build-dependencies]
 # The GPU kernels compiled on the host (build.rs), shipped in the binary as words.
@@ -34,3 +36,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 # The GPU kernel run on valhall's emulator against the CPU's first half (tests/gpu.rs).
 valhall = { path = "../valhall", features = ["ssa", "sim"] }
+# The hold's server over a RAM vault and clips area, as ferros_items' own tests run it (tests/items.rs).
+ferros_store = { path = "../store" }
+manifestus = { path = "../../manifestus", default-features = false }
