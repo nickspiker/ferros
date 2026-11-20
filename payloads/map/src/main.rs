@@ -176,17 +176,11 @@ fn fill() -> u32 {
 }
 
 /// The controls (owner, 2026-11-08: "add in the fluor elements like sliders (for brightness) and buttons", then "radio buttons and checkboxes ... very against the switch design"): fluor's button and slider, a radio's ring and a checkbox's squircle, drawn by the display (ops 47-50, COMPOSITOR.md "Controls").
-/// A button's colours by theme, G#RRGGBB VSF RGB codes at gamma 2 as every op's: its fill, its fill while held (or armed, the first tap of two), and its edge on the top-left and the bottom-right of the anti-diagonal, light then shadow, lit from the top left as the keys are (owner, 2026-11-09; until then shadow then light, fluor's old raised bevel, which read sunken) (fluor's BUTTON_FILL, BUTTON_HELD, TEXTBOX_SHADOW_EDGE and TEXTBOX_LIGHT_EDGE on grey, whose dark codes are the same at gamma 2; the other themes' in their own hues).
+/// A button's colours by theme are the device theme's own (ferros_sys::theme `Theme::button`: fill, held, light edge, shadow edge), which fluor's ferros host gives every kist too.
 /// The Fleet page's Add on a selected device: VSF RGB primary green (0, 1, 0), its held fill and its edge darker greens, the label black (owner, 2026-11-10: "a distinct green add").
 const GREEN: u32 = 0x00FF00;
 const GREEN_HELD: u32 = 0x00A000;
 const GREEN_EDGE: u32 = 0x006000;
-const BUTTON_LOOK: [[u32; 4]; 4] = [
-    [0x1A214C, 0x3C4CA8, 0x423F36, 0x2A3336],
-    [0x162238, 0x2E4C78, 0x48525E, 0x1A2028],
-    [0x3A2414, 0x6E4424, 0x5A4A3A, 0x241A12],
-    [0x380A06, 0x6A160C, 0x4A120C, 0x180404],
-];
 /// The radio's and the checkbox's look, one of three for the owner to pick from (2026-11-08): 0 a pixel's stroke and the fill alike in the theme's mark colour (white in the default theme, owner 2026-11-08: "no amber"); 1 that hairline round a fill of the theme's text colour, the checkbox ticked in the ground's; 2 fluor's stroke (a 32nd of the label's size, plus a pixel) in the secondary text colour, filled with the theme's lit colour and ticked.
 const MARK_LOOK: u8 = 0;
 /// The development look's orange (G#RRGGBB, VSF RGB codes at gamma 2): full red, green at half its light, no blue; the hairlines' on development builds and the Developer page's "release look" row while it is off.
@@ -3171,7 +3165,7 @@ impl Map {
         }
         y += uu(1, 1);
         // The button that starts it: fluor's, held while a finger is on it.
-        let [bf, bh, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+        let [bf, bh, tl, br] = ferros_sys::theme::current().button;
         b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(3, 2), [if self.pressed == Some(Choice::AskGo) { bh } else { bf }, tl, br, white()], tr(Msg::Start));
         if live {
             self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::AskGo);
@@ -3275,7 +3269,7 @@ impl Map {
         };
         // The controls (COMPOSITOR.md "Controls"), each in a row's place and pitch, tappable across the row as a row is. A button: fluor's pill, sixteen units wide (a longer label grows it), two high, centred on the text's middle, held while a finger is down on it, and in its held fill while `armed` (the first tap of two).
         let button = |m: &mut Map, b: &mut Batch, y: &mut i64, t: &str, armed: bool, what: Option<Choice>| {
-            let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+            let [fill, held, tl, br] = ferros_sys::theme::current().button;
             let down = armed || what.is_some() && m.pressed == what;
             b.button(cx, *y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { held } else { fill }, tl, br, white()], t);
             if let (true, Some(c)) = (hit, what) {
@@ -3678,7 +3672,7 @@ impl Map {
                             let (bw, off) = (uu(7, 1), uu(4, 1));
                             let yes_down = self.pressed == Some(Choice::FleetConfirm);
                             b.button(cx - off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if yes_down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], fleet(FleetMsg::YesPill).as_str());
-                            let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+                            let [fill, held, tl, br] = ferros_sys::theme::current().button;
                             let no_down = self.pressed == Some(Choice::FleetAdd);
                             b.button(cx + off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if no_down { held } else { fill }, tl, br, white()], fleet(FleetMsg::NoPill).as_str());
                             if hit {

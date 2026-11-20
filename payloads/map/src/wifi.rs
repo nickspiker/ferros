@@ -485,7 +485,7 @@ impl Map {
                 *y += uu(3, 1);
                 return;
             }
-            let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+            let [fill, held, tl, br] = ferros_sys::theme::current().button;
             let down = armed || m.pressed == Some(Choice::Wifi(a));
             b.button(cx, *y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { held } else { fill }, tl, br, white()], t);
             if hit {

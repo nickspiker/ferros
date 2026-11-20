@@ -6576,6 +6576,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let (index, value, live) = ((f.x[1] & 0xFF) as usize, f.x[2] as u8, f.x[1] & PREF_LIVE != 0);
             // Do not disturb is the identity's (PREF_DND): only its service writes it (as SYS_LANG op 2 the language), by name and never a kist, no Settings needed; a Settings holder never does (a device setting is never written into an identity's preference, SETTINGS.md).
             let held = if index == PREF_DND { !p.kist && p.name.as_slice() == b"fgtw" } else { held };
+            // WHY: the person's app scale is any app's to change (owner, 2026-11-20: "settings pages should modify that, same with apps"; every kist follows it, ferros_fluor), so a pinch inside a kist sets it for every kist: for this preference alone the display grant, which every kist holds (the implicit set), is the right.
+            let held = held || (index == PREF_SCALE && matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Endpoint(e), r)) if e == endpoint(b"display") && r & RIGHT_SEND != 0));
             // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
             let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
             f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {

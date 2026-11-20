@@ -1819,11 +1819,16 @@ name = "ferros_sys"
 version = "0.1.0"
 dependencies = [
  "ferros_mailbox",
+ "ferros_theme",
  "tatau",
 ]
 
 [[package]]
 name = "ferros_tcp"
+version = "0.1.0"
+
+[[package]]
+name = "ferros_theme"
 version = "0.1.0"
 
 [[package]]

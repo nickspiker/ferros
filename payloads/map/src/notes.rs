@@ -281,7 +281,7 @@ impl Map {
         let y = (top + bottom) / 2;
         let words = self.live_words.clone();
         b.text(cx, y - uu(3, 1), uu(5, 4) as u16, white(), 1, words.as_deref().unwrap_or(tr(Msg::ForYouNow)));
-        let [bf, bh, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+        let [bf, bh, tl, br] = ferros_sys::theme::current().button;
         let live = self.target.is_none();
         for (dy, c, m) in [(uu(1, 1), Choice::LiveAnswer, Msg::Answer), (uu(4, 1), Choice::LiveDecline, Msg::Decline)] {
             b.button(cx, y + dy - uu(1, 2), uu(16, 1), uu(2, 1), uu(3, 2), [if self.pressed == Some(c) { bh } else { bf }, tl, br, white()], tr(m));

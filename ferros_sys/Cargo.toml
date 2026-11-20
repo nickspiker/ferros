@@ -13,3 +13,5 @@ path = "src/lib.rs"
 tatau = { path = "../../tatau" }
 # Mailboxes (`mailbox`): the header, the seqlock and the payload layouts, host-tested there.
 ferros_mailbox = { path = "../ferros_mailbox" }
+# The device's themes, the one table (moved out of here 2026-11-20 so a kist's host tests read it too); re-exported as `theme`.
+ferros_theme = { path = "../ferros_theme" }
