@@ -229,6 +229,13 @@ static mut UFS_BUF: UfsBuffers = UfsBuffers {
     data: [0; 4096],
 };
 
+/// The most commands `run_queued` keeps in flight (transfer slots 1 to QUEUE_MOST; the controller has 32, CAP's NUTRS).
+pub const QUEUE_MOST: usize = 1 << 3;
+
+/// `run_queued`'s command descriptors, one a slot (slot 0 keeps UFS_BUF's): development, docs/RAW-VIDEO.md.
+#[unsafe(link_section = ".bss.dma.ufs")] // device DMA: kept uncached by the kernel's cache map; its own pages so the HSI2 S2MPU can allow UFS exactly these
+static mut QUEUE: [Ucd; QUEUE_MOST] = [const { Ucd { cmd_upiu: [0; 512], rsp_upiu: [0; 512], prdt: [PrdtEntry { base_addr_lo: 0, base_addr_hi: 0, reserved: 0, size: 0 }; PRDT_SLOTS] } }; QUEUE_MOST];
+
 /// Probe result from UFS controller.
 #[derive(Default)]
 pub struct UfsProbe {
@@ -555,6 +562,12 @@ impl UfsController {
     /// QUERY SET FLAG (write function): true when the device accepted it. `fPowerOnWPEn` (G#03) makes every power-on-protected LU read-only until the next reset.
     pub fn set_flag(&self, idn: u8) -> bool {
         let (tsf, ocs) = self.query_tsf_fn(0x81, 0x06, idn, 0);
+        ocs == ocs::SUCCESS && tsf[3] == 0
+    }
+
+    /// QUERY CLEAR FLAG (write function): true when the device accepted it.
+    pub fn clear_flag(&self, idn: u8) -> bool {
+        let (tsf, ocs) = self.query_tsf_fn(0x81, 0x07, idn, 0);
         ocs == ocs::SUCCESS && tsf[3] == 0
     }
 
@@ -901,6 +914,116 @@ impl UfsController {
             }
         }
         true
+    }
+
+    /// Development (docs/RAW-VIDEO.md, 2026-11-19): the flash's rate at a queue deeper than one.
+    /// `cmds` commands of `n` blocks (1 to RUN_MAX) at consecutive places from `lba` of `lun`, up to `depth` (1 to QUEUE_MOST) in flight at once in transfer slots 1 to `depth`, every command's data the same `n` blocks at `buf` (device DMA memory, identity-mapped).
+    /// A measure, not a store: every write carries the same bytes and every read lands on the same bytes, so the data is the bounce's whatever it held.
+    /// Returns (commands completed with OCS 0 and SCSI status 0, the ticks from the first doorbell to the last completion).
+    /// The PRDT's stride must be known (`PRDT_STRIDE` 16 or 128); 0 commands otherwise.
+    pub fn run_queued(&self, lun: u8, lba: u32, n: usize, cmds: usize, depth: usize, buf: usize, write: bool) -> (usize, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stride = PRDT_STRIDE.load(Relaxed) as usize;
+        if !(stride == 16 || stride == 128) {
+            return (0, 0);
+        }
+        self.h8_wake();
+        unsafe {
+            let list = &raw mut UFS_BUF.utrd as *mut u32;
+            let q = &raw mut QUEUE;
+            // Each slot's command descriptor: a READ(10) or WRITE(10) UPIU, its tag the slot, the PRDT the n blocks at buf.
+            let fill = |s: usize, at: u32| {
+                let u = &raw mut (*q)[s - 1];
+                core::ptr::write_bytes(u as *mut u8, 0, 1024);
+                let c = &raw mut (*u).cmd_upiu as *mut u8;
+                let cdb = rw10(if write { scsi::WRITE_10 } else { scsi::READ_10 }, at, n as u16);
+                let len = (n << 12) as u32;
+                for (k, b) in [upiu::COMMAND, if write { upiu::FLAG_WRITE } else { upiu::FLAG_READ }, lun, s as u8, 0].iter().enumerate() {
+                    c.add(k).write(*b);
+                }
+                for (k, b) in len.to_be_bytes().iter().enumerate() {
+                    c.add(12 + k).write(*b);
+                }
+                for (k, b) in cdb.iter().enumerate() {
+                    c.add(16 + k).write(*b);
+                }
+                let p = &raw mut (*u).prdt as *mut u8;
+                core::ptr::write_bytes(p, 0, n * stride);
+                for i in 0..n {
+                    prdt_at(p, i * stride, buf + (i << 12));
+                }
+                let ucd = u as usize as u64;
+                let d = list.add(s * 8);
+                d.write_volatile((1 << 24) | ((if write { 1 } else { 2 }) << 25));
+                d.add(1).write_volatile(0);
+                d.add(2).write_volatile(0xF);
+                d.add(3).write_volatile(0);
+                d.add(4).write_volatile(ucd as u32);
+                d.add(5).write_volatile((ucd >> 32) as u32);
+                d.add(6).write_volatile((0x0080 << 16) | 0x0080);
+                d.add(7).write_volatile((0x0100 << 16) | n as u32);
+                crate::mmio::cache_clean(u as usize, 1024 + n * stride);
+                crate::mmio::cache_clean(d as usize, 32);
+            };
+            crate::mmio::cache_clean(buf, n << 12);
+            core::arch::asm!("dsb sy");
+            let nexus_before = self.hci(vs::UTRL_NEXUS_TYPE);
+            let mask = ((1u32 << depth) - 1) << 1;
+            self.hci_w(vs::UTRL_NEXUS_TYPE, nexus_before | mask);
+            let (mut issued, mut done, mut ok) = (0usize, 0usize, 0usize);
+            let t0 = ticks();
+            let mut last = t0;
+            // Slot s's place while it is in flight, to check its answer.
+            let mut busy = 0u32;
+            while done < cmds {
+                // Every free slot given the next command, one doorbell write for all of them.
+                let mut ring = 0u32;
+                for s in 1..=depth {
+                    if issued < cmds && busy & 1 << s == 0 {
+                        fill(s, lba + (issued * n) as u32);
+                        busy |= 1 << s;
+                        ring |= 1 << s;
+                        issued += 1;
+                    }
+                }
+                if ring != 0 {
+                    core::arch::asm!("dsb sy");
+                    self.write_reg(regs::UTRLDBR, ring);
+                }
+                // Wait for any slot of ours to finish (its doorbell bit cleared), at most a second.
+                let since = ticks();
+                let mut fin;
+                loop {
+                    fin = busy & !self.read_reg(regs::UTRLDBR);
+                    if fin != 0 || ticks().wrapping_sub(since) > tick_hz() {
+                        break;
+                    }
+                }
+                if fin == 0 {
+                    UFS_LOST.fetch_add(1, Relaxed);
+                    break;
+                }
+                last = ticks();
+                for s in 1..=depth {
+                    if fin & 1 << s != 0 {
+                        let d = list.add(s * 8);
+                        crate::mmio::cache_invalidate(d as usize, 32);
+                        let u = &raw const (*q)[s - 1];
+                        crate::mmio::cache_invalidate(&raw const (*u).rsp_upiu as usize, 512);
+                        ok += (d.add(2).read_volatile() & 0xFF == 0 && (*u).rsp_upiu[7] == 0) as usize;
+                        done += 1;
+                    }
+                }
+                busy &= !fin;
+            }
+            self.write_reg(regs::IS, regs::IS_UTRCS);
+            self.hci_w(vs::UTRL_NEXUS_TYPE, nexus_before);
+            if !write {
+                crate::mmio::cache_invalidate(buf, n << 12);
+            }
+            H8_LAST_USE.store(ticks(), Relaxed);
+            (ok, last - t0)
+        }
     }
 
     /// Learn the PRDT entry stride (`PRDT_STRIDE`) from blocks `lba` and `lba + 1` of `lun`, with `scratch` as six blocks of device-DMA memory: the two blocks are read a command each for reference, then together by one READ(10) whose second entry is written both at the standard offset (16) and at the inline-encryption one (128), each to its own block of `scratch` filled with a pattern; whichever receives the second block is the stride. Under either reading of the table every entry the controller takes points into `scratch`. The second block equal to the pattern: nothing learned (0), the next run asks again; the run command failing or landing anywhere else: multi-entry commands refused (1). Returns the stride as it now stands.

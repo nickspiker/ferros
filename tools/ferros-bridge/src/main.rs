@@ -575,7 +575,6 @@ fn dev_key() -> (String, [u8; 32]) {
 }
 
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
-    use ed25519_dalek::SigningKey;
     let (label, mut seed) = dev_key();
     // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
     let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
@@ -604,7 +603,15 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
             std::process::exit(1);
         });
     }
-    // Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
+    seed.fill(0);
+    plain_capsule(code, masked, text_len)
+}
+
+/// Every capsule but a kist's (the shell's processes, a hand spawn's, under the developer key in $FERROS_DEV_KEY or ferros's) with its one Ed25519 signature: the same bytes for the same code and key, so its identity can be made again (`kist_of`).
+fn plain_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
+    use ed25519_dalek::SigningKey;
+    let (_label, mut seed) = dev_key();
+    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(ferros_kist::capsule::code_section(&c))
@@ -1002,6 +1009,45 @@ async fn cmd_store(args: &[String]) {
             p.extend_from_slice(&value);
             (ferros_pt::Op::Write, p)
         }
+        // store extent <key> <bytes> <out> [--kist <capsule.vsf>]: a single-copy extent (docs/RAW-VIDEO.md, a RAW clip) pulled whole, 768 blocks (3 MiB) a command; store extent-info <key> [--kist <capsule.vsf>]: its record. With --kist the name is in that kist's own domain (Lumis's clips: any Lumis capsule names Lumis).
+        Some("extent") if args.len() >= 4 => return extent_pull(&args[1], &args[2], &args[3], kist_of(args)).await,
+        Some("extent-info") if args.len() >= 2 => {
+            let mut p = match kist_of(args) {
+                Some(id) => [&[0xFCu8][..], &id[..]].concat(),
+                None => vec![0xFEu8],
+            };
+            p.extend_from_slice(args[1].as_bytes());
+            (ferros_pt::Op::Read, p)
+        }
+        // store extent-drop-orphan <first block>: a sealed extent at that first block dropped whatever domain owns it (development builds; for an extent whose owning build no longer exists, so no --kist can name its domain).
+        Some("extent-drop-orphan") if args.len() >= 2 => {
+            let first: u64 = args[1].parse().unwrap_or_else(|_| {
+                eprintln!("Usage: ferros-bridge store extent-drop-orphan <first block>");
+                std::process::exit(1)
+            });
+            let mut p = vec![0xF8u8];
+            p.extend_from_slice(&first.to_le_bytes());
+            // A scope's name, never looked up: the kernel's G#F8 takes the name field as G#FA does.
+            p.push(0);
+            p.extend_from_slice(b"test.orphan");
+            (ferros_pt::Op::Read, p)
+        }
+        // store extent-list <name> [--kist <capsule|bin>]: every extent of the clips area as records, those of the name's domain marked (the name a scope's full name, `test.x` for std/rawrec's, or with --kist any name: it is not looked up); store extent-drop <first block> <name> [--kist ...]: the domain's extent at that first block dropped (a clip whose name is lost).
+        Some(c @ ("extent-list" | "extent-drop")) if args.len() >= 2 => {
+            let bad = || -> ! { eprintln!("Usage: ferros-bridge store extent-list <name> [--kist <capsule|bin>] | extent-drop <first block> <name> [--kist <capsule|bin>]"); std::process::exit(1) };
+            let (first, name): (u64, &String) = if c == "extent-list" { (0, &args[1]) } else if args.len() >= 3 { (args[1].parse().unwrap_or_else(|_| bad()), &args[2]) } else { bad() };
+            let mut p = vec![if c == "extent-list" { 0xFBu8 } else { 0xFA }];
+            p.extend_from_slice(&first.to_le_bytes());
+            match kist_of(args) {
+                Some(id) => {
+                    p.push(1);
+                    p.extend_from_slice(&id);
+                }
+                None => p.push(0),
+            }
+            p.extend_from_slice(name.as_bytes());
+            (ferros_pt::Op::Read, p)
+        }
         Some("get") if args.len() >= 2 => (ferros_pt::Op::Read, args[1].as_bytes().to_vec()),
         Some("ls") => (ferros_pt::Op::Read, Vec::new()),
         Some("rm") if args.len() >= 2 => (ferros_pt::Op::Exec, args[1].as_bytes().to_vec()),
@@ -1055,8 +1101,111 @@ async fn cmd_store(args: &[String]) {
             }
         },
         "ls" => print!("{}", String::from_utf8_lossy(body)),
+        "extent-info" if body.len() >= 65 => {
+            let u = |k: usize| u64::from_le_bytes(body[k..k + 8].try_into().unwrap());
+            println!("extent: A#{} blocks from block A#{} of the clips area, A#{} bytes, sealed {}, BLAKE3 {}, at A#{}", u(0), u(57), u(8), body[16] != 0, body[17..49].iter().map(|b| format!("{b:02X}")).collect::<String>(), u(49) as i64);
+        }
+        "extent-list" if body.len() >= 32 => {
+            let mine = &body[..32];
+            let rows: Vec<&[u8]> = body[32..].chunks_exact(65).collect();
+            println!("extent-list: A#{} extents; this domain's owner {}", rows.len(), mine[..8].iter().map(|b| format!("{b:02X}")).collect::<String>());
+            for r in rows {
+                let u = |k: usize| u64::from_le_bytes(r[k..k + 8].try_into().unwrap());
+                println!("  first A#{} blocks A#{} bytes A#{} sealed {} at A#{} owner {}{}", u(0), u(8), u(16), r[24] != 0, u(25) as i64, r[33..41].iter().map(|b| format!("{b:02X}")).collect::<String>(), if &r[33..65] == mine { " (this domain's)" } else { "" });
+            }
+        }
+        "extent-drop" | "extent-drop-orphan" => println!("dropped"),
         _ => println!("removed"),
     }
+}
+
+/// `--kist <capsule.vsf | payload.bin>`: the identity (developer key, option) whose own domain holds the name, as the kernel gives a process its domain at spawn: a kist capsule's own (a stowed Lumis's, any version); a payload image the way `spawn` signs one by hand (the developer key in $FERROS_DEV_KEY or ferros's, the option the capsule's provenance hash: the exact image a hand-spawned Lumis ran, its domain changing with every build); any other capsule its key and provenance hash.
+fn kist_of(args: &[String]) -> Option<[u8; 64]> {
+    let path = args.iter().position(|a| a == "--kist").and_then(|i| args.get(i + 1))?;
+    let file = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
+        std::process::exit(1);
+    });
+    let capsule = if file.starts_with("RÅ<".as_bytes()) { file } else { plain_capsule(&file, false, None) };
+    let hp = vsf::file_format::VsfHeader::decode(&capsule).ok().and_then(|(h, _)| match h.provenance_hash {
+        vsf::types::VsfType::hp(b) if b.len() == 32 => <[u8; 32]>::try_from(&b[..]).ok(),
+        _ => None,
+    });
+    let (developer, option) = ferros_kist::identity(&capsule).or_else(|e| match (vsf::file_format::VsfHeader::decode(&capsule).ok().and_then(|(h, _)| h.signer_pubkey), hp) {
+        (Some(vsf::types::VsfType::ke(k)), Some(hp)) if k.len() == 32 => Ok((k[..].try_into().unwrap(), hp)),
+        _ => Err(e),
+    }).unwrap_or_else(|e| {
+        eprintln!("{path}: no identity: {e}");
+        std::process::exit(1);
+    });
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(&developer);
+    id[32..].copy_from_slice(&option);
+    Some(id)
+}
+
+/// `store extent <key> <bytes|all> <out> [--kist <capsule.vsf>]`: the extent's first `bytes` (`all`: its sealed length, from its record; a count rounded up to whole blocks, then cut to it) into `out`, 768 blocks a command (the kernel's reply is built whole: STORE_VALUE_MAX), with the rate.
+async fn extent_pull(key: &str, bytes: &str, out: &str, kist: Option<[u8; 64]>) {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let named = |head: u8| -> Vec<u8> {
+        match kist {
+            Some(id) => [&[head - 2][..], &id[..]].concat(),
+            None => vec![head],
+        }
+    };
+    let want: u64 = match bytes {
+        "all" => {
+            let mut p = named(0xFE);
+            p.extend_from_slice(key.as_bytes());
+            let r = ferros_link::pt::call_held(&link, &build_cmd(ferros_pt::command::caps::STORE, ferros_pt::Op::Read, &p)).await.unwrap_or_else(|e| {
+                eprintln!("{key}: {e}");
+                std::process::exit(1);
+            });
+            if r.first() != Some(&0) || r.len() < 66 || r[17] == 0 {
+                eprintln!("{key}: no sealed extent (status {:?})", r.first());
+                std::process::exit(1);
+            }
+            u64::from_le_bytes(r[9..17].try_into().unwrap())
+        }
+        b => b.parse().unwrap_or_else(|_| {
+            eprintln!("bytes: a decimal count, or all");
+            std::process::exit(1);
+        }),
+    };
+    const PULL: u64 = 768;
+    let blocks = want.div_ceil(4096);
+    let mut file = std::fs::File::create(out).unwrap_or_else(|e| {
+        eprintln!("{out}: {e}");
+        std::process::exit(1);
+    });
+    let t = std::time::Instant::now();
+    let mut at = 0u64;
+    while at < blocks {
+        let n = (blocks - at).min(PULL);
+        let mut p = named(0xFF);
+        p.extend_from_slice(&at.to_le_bytes());
+        p.extend_from_slice(&(n as u32).to_le_bytes());
+        p.extend_from_slice(key.as_bytes());
+        let cmd = build_cmd(ferros_pt::command::caps::STORE, ferros_pt::Op::Read, &p);
+        let r = ferros_link::pt::call_held(&link, &cmd).await.unwrap_or_else(|e| {
+            eprintln!("block A#{at}: {e}");
+            std::process::exit(1);
+        });
+        if r.first() != Some(&0) || r.len() != 1 + (n as usize) * 4096 {
+            eprintln!("block A#{at}: status {:?}, A#{} bytes", r.first(), r.len());
+            std::process::exit(1);
+        }
+        let keep = ((want - at * 4096).min(n * 4096)) as usize;
+        std::io::Write::write_all(&mut file, &r[1..1 + keep]).unwrap();
+        at += n;
+        if at % (PULL << 6) == 0 {
+            eprintln!("A#{} MiB, A#{} MB/s", (at * 4096) >> 20, (at * 4096) as f64 / 1e6 / t.elapsed().as_secs_f64());
+        }
+    }
+    println!("pulled A#{want} bytes into {out} in A#{} ms (A#{:.1} MB/s)", t.elapsed().as_millis(), want as f64 / 1e6 / t.elapsed().as_secs_f64());
 }
 
 /// One STORE command and its reply: the status byte's meaning on failure, the rest on success.

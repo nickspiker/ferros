@@ -232,7 +232,12 @@ enum VaultJob {
     Remove { full: alloc::string::String },
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
+    /// A single-copy extent's blocks (docs/RAW-VIDEO.md: a clip pulled to the host), a UFS command's 1 MiB a call: its full name, the next block, the blocks still to read, what has come; or with `info` its record alone.
+    Extent { full: alloc::string::String, block: u64, left: u64, got: alloc::vec::Vec<u8>, one: Option<(u8, u32)>, kist: Option<([u8; 32], [u8; 32])> },
 }
+
+/// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record. A name in a kist's own domain (a clip Lumis recorded): [G#FD][developer 32][option 32][block u64 LE][blocks u32 LE][name] and [G#FC][developer 32][option 32][name].
+const EXTENT_PULL: u64 = (STORE_VALUE_MAX >> 12) as u64;
 
 /// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
 const VAULT_PIECE: usize = crate::process::STORE_MAX;
@@ -278,6 +283,44 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
                 None => {}
             }
             VaultJob::List { out, scope: 0, at: 0, part: alloc::vec::Vec::new() }
+        }
+        ferros_pt::Op::Read if params.first() == Some(&0xFF) && params.len() > 13 => {
+            let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
+            let n = u32::from_le_bytes(params[9..13].try_into().ok()?) as u64;
+            // WHY: the count is the host's; the reply is built whole in the kernel's heap, as a get's is (STORE_VALUE_MAX).
+            if n == 0 || n > EXTENT_PULL {
+                return Some(Err(alloc::vec![5]));
+            }
+            VaultJob::Extent { full: name(&params[13..])?, block, left: n, got: alloc::vec::Vec::new(), one: None, kist: None }
+        }
+        ferros_pt::Op::Read if params.first() == Some(&0xFE) => VaultJob::Extent { full: name(&params[1..])?, block: 0, left: 0, got: alloc::vec::Vec::new(), one: Some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: None },
+        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFD) | Some(&0xFC)) && params.len() > 65 => {
+            let (developer, option): ([u8; 32], [u8; 32]) = (params[1..33].try_into().ok()?, params[33..65].try_into().ok()?);
+            let info = params[0] == 0xFC;
+            let (block, n, at) = if info { (0, 0, 65) } else { (u64::from_le_bytes(params.get(65..73)?.try_into().ok()?), u32::from_le_bytes(params.get(73..77)?.try_into().ok()?) as u64, 77) };
+            let rel = params.get(at..)?;
+            // WHY: the count and the name are the host's: the reply is built whole in the kernel's heap (STORE_VALUE_MAX), and a name is a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
+            if (!info && (n == 0 || n > EXTENT_PULL)) || rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
+                return Some(Err(alloc::vec![5]));
+            }
+            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), one: info.then_some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: Some((developer, option)) }
+        }
+        // The clips area's records (G#FB) or a drop of one of the domain's extents by its first block (G#FA), for the bridge's `store extent-list` / `extent-drop`: [code][first block u64][1: a kist's domain follows (developer 32, option 32), 0: a scope's][name], the name a scope's full name (or any of the kist's: it is not looked up). Never from a process (`extent_forward` refuses both ops).
+        // G#F8, the bridge's `store extent-drop-orphan`: a sealed extent dropped by its first block whatever domain owns it, for one whose owning build no longer exists (development builds only, as this whole path is; the name is not looked up).
+        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFB) | Some(&0xFA) | Some(&0xF8)) && params.len() > 10 => {
+            let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
+            let (kist, at) = if params[9] == 1 { (Some((params.get(10..42)?.try_into().ok()?, params.get(42..74)?.try_into().ok()?)), 74) } else { (None, 10) };
+            let rel = params.get(at..)?;
+            // WHY: the name is the host's: a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
+            if rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
+                return Some(Err(alloc::vec![5]));
+            }
+            let one = match params[0] {
+                0xFB => (crate::process::EOP_LIST, 1 << 16),
+                0xFA => (crate::process::EOP_DROP_AT, 0),
+                _ => (crate::process::EOP_DROP_ORPHAN, 0),
+            };
+            VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: 0, got: alloc::vec::Vec::new(), one: Some(one), kist }
         }
         ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },
         ferros_pt::Op::Exec => VaultJob::Remove { full: name(params)? },
@@ -344,6 +387,20 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
+        VaultJob::Extent { full, block, left, one, kist, .. } => {
+            // [extent op][block u64][length u32], as process.rs `extent_forward` stamps a process's call.
+            let (op, len) = match one {
+                Some(o) => *o,
+                None => (crate::process::EOP_READ, ((*left).min((crate::process::EXTENT_MAX >> 12) as u64) << 12) as u32),
+            };
+            rest.push(op);
+            rest.extend_from_slice(&block.to_le_bytes());
+            rest.extend_from_slice(&len.to_le_bytes());
+            match kist {
+                Some((dev, opt)) => crate::process::vault_stamp_kist(crate::process::VOP_EXTENT, dev, opt, full.as_bytes(), &rest),
+                None => vault_stamp(crate::process::VOP_EXTENT, full, &rest),
+            }
+        }
     };
     rest.fill(0);
     let Some(msg) = msg else {
@@ -399,6 +456,25 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
             *at = (*at + VAULT_PIECE).min(len);
             if *at >= len {
                 return Some(alloc::vec![0]);
+            }
+        }
+        VaultJob::Extent { block, left, got, one, .. } => {
+            if value == ERR || value == NOTHING {
+                return Some(alloc::vec![if value == NOTHING { 1 } else { 2 }]);
+            }
+            got.extend_from_slice(&bytes);
+            let n = (bytes.len() >> 12) as u64;
+            // A read that brings no whole block would ask for the same blocks for ever: the vault's error.
+            if one.is_none() && n == 0 {
+                return Some(alloc::vec![2]);
+            }
+            *block += n;
+            *left = left.saturating_sub(n); // WHY/PROOF: the vault answers at most the length asked, but its count is its own; a longer answer would wrap the count of blocks left
+            if one.is_some() || *left == 0 {
+                let mut r = alloc::vec::Vec::with_capacity(1 + got.len());
+                r.push(0);
+                r.extend_from_slice(got);
+                return Some(r);
             }
         }
         VaultJob::Remove { full } => {
@@ -1023,6 +1099,16 @@ fn stall_lines(freq: u64) -> alloc::string::String {
     if prev_lock & 0xFF != 0 {
         s.push_str(&alloc::format!("lock at the previous boot's end: held by core A#{}, taken at {}\n", (prev_lock & 0xFF) - 1, site_text(prev_lock >> 8)));
     }
+    // Each core's last crumb as the previous boot ended (platform::CORE_CRUMB_LAST): G#90 + n entering syscall n, G#70 + n leaving it, and how long before that boot's last crumb anywhere.
+    let last: [u64; 9] = core::array::from_fn(|c| unsafe { core::ptr::read_volatile((platform::CORE_CRUMB_LAST + 0x80 + c * 8) as *const u64) });
+    let newest = last.iter().map(|w| w >> 32).max().unwrap_or(0);
+    if newest != 0 {
+        s.push_str("last crumbs at the previous boot's end:");
+        for (c, w) in last.iter().enumerate() {
+            s.push_str(&alloc::format!(" core A#{c} G#{:X} A#{} us before;", w & 0xFFFF_FFFF, (newest - (w >> 32)) * 1024 * 1_000_000 / freq));
+        }
+        s.push('\n');
+    }
     for (prev, what) in [(false, "this boot"), (true, "the previous boot")] {
         let w = platform::stall_read(prev);
         if w[0] & 0xFF == 0 {
@@ -1030,7 +1116,11 @@ fn stall_lines(freq: u64) -> alloc::string::String {
         }
         let holder = (w[0] >> 40) & 0xFF;
         let lock = if holder == 0 { alloc::string::String::from("the lock free") } else { alloc::format!("the lock held by core A#{} from {}", holder - 1, site_text(w[4] >> 8)) };
-        let at = if w[1] == 0 { alloc::string::String::from("it did not answer (interrupts masked)") } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
+        let at = if w[1] == 0 {
+            let ufs = if w[2] & 0xFF == 0 { alloc::string::String::from("the UFS lock free") } else { alloc::format!("the UFS lock held by core A#{} from {}", (w[2] & 0xFF) - 1, site_text(w[2] >> 8)) };
+            let hold = if w[5] >> 63 == 0 { alloc::string::String::from("the hold not a syscall's") } else { alloc::format!("the hold syscall A#{} (x1 G#{:X}) by thread A#{}", w[5] & 0xFF, (w[5] >> 8) & 0xFF, (w[5] >> 16) & 0xFFFF) };
+            alloc::format!("it did not answer (interrupts masked); {ufs}; the stalled core holds the storage locks G#{:X}; {hold}", w[3])
+        } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
         s.push_str(&alloc::format!("stall ({what}, A#{} caught): core A#{} silent A#{} ms after the last pet, caught by core A#{}, {lock}; {at}\n", w[0] >> 48, (w[0] & 0xFF) - 1, (w[0] >> 16) & 0xFF_FFFF, (w[0] >> 8) & 0xFF));
     }
     s
@@ -1158,10 +1248,10 @@ static VAULT_CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vault.ca
 #[cfg(not(ferros_vault_capsule))]
 static VAULT_CARRIED: &[u8] = &[];
 
-/// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
+/// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right, 5 the `clips` block window: its single-copy extents, docs/RAW-VIDEO.md). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
 fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault]
+    alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault, Blocks(b"clips")]
 }
 
 /// The GPS driver's grants in its slot order (payloads/gps): 1 serve gps, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Its own list, as the vault's: init's page is full at 108, and the kernel starts this driver itself, only once a person has attested (radios at attest, GPS locked until then).
@@ -2000,6 +2090,19 @@ static GOV_BUSY_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// Windows the A715s ran busy-lifted with no other lift, and busy lifts begun (`diag clock`).
 static mut GOV_BUSY_COUNTS: [u64; 2] = [0; 2];
 
+/// The A715s' ceiling while a RAW clip is recorded (`diag clock clips <kHz>`; 0: none): THERMAL.md "The busy lift"'s 1572 MHz, the least energy for a sustained encode.
+static CLIPS_KHZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1_572_000);
+/// Whether a recording holds the A715s at `CLIPS_KHZ` rather than under it (`diag clock clipshold <0|1>`): for CPU coders; off, the GPU path's default.
+static CLIPS_HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Whether a RAW clip is being recorded: a clip's extent is given to its writer (from its open to its seal or its writer's end, process.rs `EXTENTS_OPEN`), or, for a writer that writes thru the vault process, the `clips` window was written within the last second.
+fn recording() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let at = crate::process::CLIPS_AT.load(Relaxed);
+    let open = crate::process::EXTENTS_OPEN.load(Relaxed) || (at != 0 && cntpct().wrapping_sub(at) < cntfrq());
+    open && CLIPS_KHZ.load(Relaxed) != 0
+}
+
 /// A cluster's highest operating point allowed now: the X3's whole table; the A715s' up to `GOV_LIFT_KHZ` while lifted, else up to `GOV_BUSY_KHZ` while their own load holds the busy lift, else up to `A715_CALM_KHZ`; the A510s' whole table while lifted (and the lift on), else up to `A510_CALM_KHZ`.
 fn gov_top(g: &Gov, lifted: bool) -> usize {
     use core::sync::atomic::Ordering::Relaxed;
@@ -2011,6 +2114,13 @@ fn gov_top(g: &Gov, lifted: bool) -> usize {
         (_, true) => GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ),
         (_, false) if g.busy && busy > A715_CALM_KHZ => busy,
         (_, false) => A715_CALM_KHZ,
+    };
+    // A RAW clip being recorded (the `clips` window written within the last second, process.rs `CLIPS_AT`) holds the A715s at `CLIPS_KHZ` at most, whatever lifts them (docs/RAW-VIDEO.md: at the camera's 2367 MHz lift a minute at 30/s reached 85 C in 37 s; at 1572 it ended at 75 C).
+    // It is also the recording's own lift, so every clip codes at the clocks its minutes were measured at whatever else lifts or not: the A715s up to `CLIPS_KHZ` and the A510s their whole table, from the clip's open to its seal only (2026-11-19: the first clip after a RAM reload, with no camera lift yet, coded its A510 bands at their calm 324 MHz, 54 ms a frame, and dropped 47 of 64).
+    let cap = match (g.domain, recording()) {
+        (3, true) => CLIPS_KHZ.load(Relaxed),
+        (2, true) => u32::MAX,
+        _ => cap,
     };
     // The highest point at or under the ceiling (the table starts at the floor, which every ceiling is above).
     g.opps.iter().rposition(|&o| o <= cap).unwrap_or(0)
@@ -2215,6 +2325,11 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         }
         // Over the ceiling (a lift ended, or a load that grew past it): at the ceiling, and the decay goes on from there.
         if g.level > g.opps[top] {
+            g.level = g.opps[top];
+        }
+        // With `diag clock clipshold 1`, a RAW clip recording holds the A715s at `CLIPS_KHZ`, not under it: CPU coders work in bursts (a frame's bands, then the wait for the next), which the windows read as half a load, and the governor asked 1065 MHz while a frame's coding wanted the whole budget (2026-11-19, 60/s: four A715 coders 24 ms a frame at a fixed 1572, more under the governor's 1065).
+        // Off by default since the recorder codes on the GPU (ferros_clip gpu): its A715 work is a frame's copy and packing, a few ms of each frame, and a held 1572 MHz only spends power.
+        if g.domain == 3 && recording() && CLIPS_HOLD.load(core::sync::atomic::Ordering::Relaxed) != 0 {
             g.level = g.opps[top];
         }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
@@ -2503,6 +2618,8 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
         (Some(b"lift"), Some(n)) => GOV_LIFT_KHZ.store(n, Relaxed),
         (Some(b"busy"), Some(n)) => GOV_BUSY_KHZ.store(n, Relaxed),
+        (Some(b"clips"), Some(n)) => CLIPS_KHZ.store(n, Relaxed),
+        (Some(b"clipshold"), Some(n)) => CLIPS_HOLD.store(n, Relaxed),
         (Some(b"busyhold"), Some(n)) => GOV_BUSY_HOLD.store(n, Relaxed),
         (Some(b"doze"), Some(n)) => DOZE_LOG2.store(n, Relaxed),
         (Some(b"hold"), Some(n)) => GOV_HOLD.store(n, Relaxed),
@@ -2519,6 +2636,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     let why = ["input", "frames", "camera"].iter().enumerate().filter(|(k, _)| causes >> k & 1 != 0).map(|(_, n)| *n).collect::<alloc::vec::Vec<_>>().join("+");
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
+    out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them){} and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if CLIPS_HOLD.load(Relaxed) != 0 { ", held there (clipshold 1)" } else { "" }, if recording() { "recording" } else { "not recording" }).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
@@ -4851,6 +4969,40 @@ pub fn run(mut b: Boot) -> ! {
                     let key = if &cmd.params[..] == b"pin on" { 0 } else { crate::process::pin_key(&cmd.params[8..]) };
                     crate::process::PIN_OFF.store(key, Relaxed);
                     resp.extend_from_slice(alloc::format!("pin off: {}\n", if key == 0 { "none".into() } else { alloc::string::String::from_utf8_lossy(&cmd.params[8..]).into_owned() }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"ufs link") {
+                    // `diag "ufs link [wb on|wb off]"` (docs/RAW-VIDEO.md, 2026-11-19): the link as the UniPro layer has it now (gear, series, lanes, power mode, read from the host's own PA attributes) and the device's WriteBooster (the SLC cache a sustained write runs into: its descriptor fields, the enable flags, the buffer's size and wear); `wb on`/`wb off` set or clear fWriteBoosterEn and the flush flags, which Linux sets at every probe and ferros never did.
+                    // Under the UFS lock (process.rs `UFS`), as every UFS command: the vault process drives the flash from other cores.
+                    crate::process::UFS.with(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        ufs.h8_wake_now();
+                        let wb = &cmd.params[8..];
+                        if wb == b" wb on" || wb == b" wb off" {
+                            let on = wb == b" wb on";
+                            // fWriteBoosterEn G#0E, fWBBufferFlushEn G#0F, fWBBufferFlushDuringHibernate G#10 (JEDEC UFS 3.1).
+                            let r: [bool; 3] = core::array::from_fn(|k| if on { ufs.set_flag(0x0E + k as u8) } else { ufs.clear_flag(0x0E + k as u8) });
+                            resp.extend_from_slice(alloc::format!("writebooster {}: accepted {:?}\n", if on { "on" } else { "off" }, r).as_bytes());
+                        }
+                        let pa = |a: u32| match ufs.dme_get(a, 0) { Ok(v) => alloc::format!("A#{v}"), Err(e) => alloc::format!("err G#{e:X}") };
+                        let mode = ufs.dme_get(0x1571, 0).unwrap_or(0xFF);
+                        let modes = |m: u32| match m { 1 => "fast", 2 => "slow", 4 => "fast auto", 5 => "slow auto", 3 => "hibernate", 7 => "unchanged", _ => "?" };
+                        resp.extend_from_slice(alloc::format!("link: tx gear {} rx gear {} (device's rx most {}), series {} (1 A, 2 B), lanes tx {} of {} rx {} of {}, power mode G#{mode:02X} (rx {}, tx {}), termination tx {} rx {}\n", pa(0x1568), pa(0x1583), pa(0x1587), pa(0x156A), pa(0x1560), pa(0x1561), pa(0x1580), pa(0x1581), modes(mode >> 4 & 7), modes(mode & 7), pa(0x1569), pa(0x1584)).as_bytes());
+                        let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
+                        let be32 = |b: &[u8], at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+                        // Device descriptor (JEDEC UFS 3.1): wSpecVersion G#10, bQueueDepth G#21, dExtendedUFSFeaturesSupport G#4F (bit 8 WriteBooster), bWriteBoosterBufferPreserveUserSpaceEn G#53, bWriteBoosterBufferType G#54 (0 per LU, 1 shared), dNumSharedWriteBoosterBufferAllocUnits G#55.
+                        resp.extend_from_slice(alloc::format!("device descriptor len A#{n} ocs A#{ocs}: spec G#{:02X}{:02X}, queue depth A#{}, extended features G#{:08X}, writebooster preserve user space A#{}, type A#{}, shared units A#{}\n", d[0x10], d[0x11], d[0x21], be32(&d, 0x4F), d[0x53], d[0x54], be32(&d, 0x55)).as_bytes());
+                        let (g, gn, gocs) = ufs.read_descriptor(0x07, 0);
+                        // Geometry descriptor: qSegmentSize G#0D (512-byte units), bAllocationUnitSize G#11 (segments), dWriteBoosterBufferMaxNAllocUnits G#4F, bDeviceMaxWriteBoosterLUs G#53, bWriteBoosterBufferCapAdjFac G#54.
+                        resp.extend_from_slice(alloc::format!("geometry descriptor len A#{gn} ocs A#{gocs}: segment A#{} bytes, allocation unit A#{} segments, writebooster most A#{} units, capacity adjustment factor A#{}\n", (be32(&g, 0x0D) as u64) << 9, g[0x11], be32(&g, 0x4F), g[0x54]).as_bytes());
+                        let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("A#{x}"), None => alloc::string::String::from("?") };
+                        let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
+                        // Flags G#0E-G#10 as above; attributes bWBBufferFlushStatus G#1C, bAvailableWriteBoosterBufferSize G#1D (tenths free), bWriteBoosterBufferLifeTimeEst G#1E, dCurrentWriteBoosterBufferSize G#1F (units).
+                        resp.extend_from_slice(alloc::format!("writebooster: enabled {} flush {} flush in hibernate {}; flush status {}, available {} tenths, life used {} (1 is under a tenth), current size {} units\n", fmtb(ufs.read_flag(0x0E)), fmtb(ufs.read_flag(0x0F)), fmtb(ufs.read_flag(0x10)), fmt(ufs.read_attribute(0x1C, 0)), fmt(ufs.read_attribute(0x1D, 0)), fmt(ufs.read_attribute(0x1E, 0)), fmt(ufs.read_attribute(0x1F, 0))).as_bytes());
+                        let cw = crate::process::CLIPS_WB_SET.load(core::sync::atomic::Ordering::Relaxed);
+                        resp.extend_from_slice(alloc::format!("clips: writebooster {} this boot (flags accepted G#{:X} of G#7)\n", if cw >> 8 & 1 != 0 { "asked" } else { "not yet asked" }, cw & 7).as_bytes());
+                    });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

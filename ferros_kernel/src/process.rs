@@ -199,6 +199,15 @@ pub struct Rank {
     pub kernel_waits: [core::sync::atomic::AtomicU64; 4],
 }
 
+/// For the stall record (platform.rs `stall_check`): the UFS lock's holder and where it took it, in the kernel lock note's form (bits 0-7 the core + 1, 8-31 the line, 32-63 the file's first four bytes), and the storage locks `core` holds (`RANKS`).
+/// Why (2026-11-19, the Pro, b1016): a watchdog reset with core 0 silent and IRQs masked holding the kernel lock taken at syscall entry, during a RAW clip's direct writes; whether a UFS wait was behind it was not recorded.
+pub fn stall_extra(core: usize) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let site = UFS.site.load(Relaxed);
+    let ufs = UFS.holder.load(Relaxed) as u64 & 0xFF | site << 8;
+    (ufs, RANKS[core & 15].load(Relaxed) as u64)
+}
+
 impl Rank {
     const fn new(rank: u32, name: &'static str) -> Self {
         use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -1046,6 +1055,8 @@ pub enum Object {
     SpareSurface,
     /// A puck's square to be (docs/PUCKS.md, 2026-11-18): a spawn turns it into a free slot of the pucks' window with no frames yet, the child's own (`Dma` of a `puck`, `puck_take`); it asks for its frames by SYS_DMA x1 = 6. Handed to a kist that declares `puck` in its surface's place.
     NewPuck,
+    /// Served by the kernel: a RAW clip's extent of the `clips` window (index into `EXTENT_GRANTS`), given by the vault process to the process whose extent it opened (SYS_BLOCK x1 bit 3), written and read by that process alone by block number within it (docs/RAW-VIDEO.md "The recorder": the clip's bytes go straight to the flash, not thru the vault process).
+    Extent(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -1096,6 +1107,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::NewRegion(n) => (23, n as u64),
         Object::SpareSurface => (24, 0),
         Object::NewPuck => (25, 0),
+        Object::Extent(i) => (26, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -2008,6 +2020,71 @@ pub fn ufs_runs_on() -> bool {
 pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 /// The owner's fresh start is zeroing the flash (service.rs `vault fresh`): every SYS_BLOCK refused from then to its reset, since the block calls no longer hold the kernel lock that keeps the other cores out while it runs.
 pub static BLOCKS_SHUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The flash's WriteBooster was asked on this boot (the `clips` window's first write), and what came of it: bits 0-2 the three flags the device accepted, bit 8 asked (`diag "ufs link"` says it).
+pub static CLIPS_WB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static CLIPS_WB_SET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The counter at the `clips` window's last write: a RAW clip being recorded (service.rs `recording`, the A715s held at `CLIPS_KHZ`).
+pub static CLIPS_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A clip's extent given to the process recording it (`Object::Extent`): its holder (the process's epoch, 0 a free slot), its first block within the `clips` window and its blocks. Under the kernel lock.
+#[derive(Clone, Copy)]
+pub struct ExtentGrant {
+    pub holder: u64,
+    pub first: u64,
+    pub blocks: u64,
+}
+/// Extents given at once at most: one a recording process, a few recording together.
+pub const EXTENT_GRANTS_MOST: usize = 1 << 3;
+pub static mut EXTENT_GRANTS: [ExtentGrant; EXTENT_GRANTS_MOST] = [ExtentGrant { holder: 0, first: 0, blocks: 0 }; EXTENT_GRANTS_MOST];
+
+/// A process's end: the extents it was given go (their capabilities die with its cspace), so a clip that ends with its writer no longer holds the A715s' recording ceiling (service.rs `recording`). Under the kernel lock.
+fn extents_free(epoch: u64) {
+    let grants = unsafe { &mut *(&raw mut EXTENT_GRANTS) };
+    for g in grants.iter_mut().filter(|g| g.holder == epoch) {
+        g.holder = 0;
+    }
+    EXTENTS_OPEN.store(grants.iter().any(|g| g.holder != 0), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether any clip's extent is given to a writer now: what holds the A715s at the recording ceiling (service.rs `recording`; the owner, 2026-11-19: any heat cut for RAW video, scoped to an open clip).
+pub static EXTENTS_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SYS_BLOCK x1 bit 3 on the `clips` window (the vault process's, while it serves a call): give the caller its reply token names the extent of `blocks` blocks from window block `first`; x4 the offset of [the reply token 32][the given token 32, written]. Bit 4 with bit 3: take every extent of that caller back instead (its seal). 0 or ERR. Under the kernel lock.
+/// WHY the bounds: `first` and `blocks` are the vault process's words; an extent outside its window would reach blocks the vault keeps or no window holds.
+fn extent_give(p: &Process, w: &BlockWindow, first: u64, blocks: u64, io_off: u64, take_back: bool) -> u64 {
+    if w.name != "clips" {
+        return ERR;
+    }
+    let token = p.read(io_off, 32);
+    let holder = match p.lookup(&token).map(|i| p.cspace[i].object) {
+        Some(Object::Reply(t)) if t != KERNEL_CALLER => proc_of(t).filter(|q| q.epoch != p.epoch && !q.dying),
+        _ => None,
+    };
+    let Some(q) = holder else { return ERR };
+    let grants = unsafe { &mut *(&raw mut EXTENT_GRANTS) };
+    // The holder's earlier extents go: one clip at a time a process (and all of them at a take back).
+    for (i, g) in grants.iter_mut().enumerate() {
+        if g.holder == q.epoch {
+            g.holder = 0;
+            q.cspace.retain(|c| !matches!(c.object, Object::Extent(j) if j == i));
+        }
+    }
+    if take_back {
+        EXTENTS_OPEN.store(grants.iter().any(|g| g.holder != 0), core::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    if blocks == 0 || first >= w.blocks || blocks > w.blocks - first {
+        return ERR;
+    }
+    // A slot free, or one whose holder has ended.
+    let Some(i) = grants.iter().position(|g| g.holder == 0 || !k().procs.iter().flatten().any(|r| r.epoch == g.holder && !r.dying)) else { return ERR };
+    grants[i] = ExtentGrant { holder: q.epoch, first, blocks };
+    EXTENTS_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
+    let t = mint(Object::Extent(i), RIGHT_SEND, q.epoch);
+    q.cspace.push(CapEntry { token: t, object: Object::Extent(i), rights: RIGHT_SEND });
+    p.write(io_off + 32, &t);
+    0
+}
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -3668,7 +3745,26 @@ pub struct BlockWindow {
 }
 
 /// The windows (VAULT-OUT.md, block window first cut): the kernel keeps the UFS driver and moves blocks; it does not hold values, parse them or seal them. `vault`: the vault process's two mirrors, 8 GiB each, from 4 GiB into the partition (past the flash log at 1 GiB and the kernel's own vault at 2 GiB to 2.5 GiB; every ferros partition is at least 77 GiB).
-pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }];
+/// What the partition holds, by the code that places it: the old ferros_vault file at its start (shim, 256 blocks), the old text log at 1 GiB and the flash log's ring after it to 1 GiB + 192 MiB (flashlog.rs), the kernel's vault at 2 GiB to 2.5 GiB (kvault.rs), the vault process at 4 GiB to 20 GiB (`vault` above); from 20 GiB to the partition's end (128 GiB on husky, 77.7 GiB on akita) nothing else is written by any code (docs/RAW-VIDEO.md, proven 2026-11-19).
+/// `clips` (docs/RAW-VIDEO.md "The recorder", 2026-11-19): the vault process's single-copy extents (manifestus `extent`), RAW video written once at the flash's rate, no mirror; 48 GiB from 24 GiB in, inside the proven-free stretch on both boards (`CLIPS_*` below hold it there at build time).
+/// `rawbench` (development): the flash's sustained rate measured by std/rawbench, 32 GiB from 72 GiB in, past `clips` (it writes the same bytes everywhere); on akita (77.7 GiB) it lies past the partition's end and the kernel refuses it.
+#[cfg(not(ferros_production))]
+pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }, BlockWindow { name: "clips", offset: CLIPS_OFFSET, blocks: CLIPS_BLOCKS }, BlockWindow { name: "rawbench", offset: RAWBENCH_OFFSET, blocks: 1 << 23 }];
+#[cfg(ferros_production)]
+pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }, BlockWindow { name: "clips", offset: CLIPS_OFFSET, blocks: CLIPS_BLOCKS }];
+
+/// The `clips` window: 6 x 2^20 blocks in (24 GiB), 12 x 2^20 blocks long (48 GiB).
+pub const CLIPS_OFFSET: u64 = 6 << 20;
+pub const CLIPS_BLOCKS: u64 = 12 << 20;
+/// The development `rawbench` window's start: 18 x 2^20 blocks (72 GiB), past `clips`.
+pub const RAWBENCH_OFFSET: u64 = 18 << 20;
+/// The stretch nothing else writes: from the vault process's window's end (20 GiB) to the smallest ferros partition's end (akita's, A#20357627 blocks, 77.7 GiB; husky's is A#33554427).
+pub const PROVEN_FREE_FROM: u64 = (1 << 20) + (1 << 22);
+pub const PROVEN_FREE_TO: u64 = 20_357_627;
+// The hard bound on the recording region, at build time: `clips` inside the proven-free stretch, so a clip can never land on the vault's mirrors, the flash log or the kernel's vault, nor past akita's partition.
+const _: () = assert!(CLIPS_OFFSET >= PROVEN_FREE_FROM && CLIPS_OFFSET + CLIPS_BLOCKS <= PROVEN_FREE_TO);
+// rawbench (development) writes the same bytes all over its window: never over `clips`.
+const _: () = assert!(RAWBENCH_OFFSET >= CLIPS_OFFSET + CLIPS_BLOCKS);
 
 pub static STORES: &[StoreScope] = &[
     // The map's own state: the arrangement the owner made by hand.
@@ -4038,6 +4134,9 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         f.x[0] = ERR;
         return 0;
     };
+    if f.x[1] & STORE_EXTENT != 0 {
+        return extent_forward(f, cur, ep, wh);
+    }
     let (set, more, del, list, raw) = (f.x[1] & 1 != 0, f.x[1] & 4 != 0, f.x[1] & 8 != 0, f.x[1] & 16 != 0, f.x[1] & 32 != 0);
     let offset = if f.x[1] & 2 != 0 { f.x[1] >> 32 } else { 0 };
     let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
@@ -4093,6 +4192,116 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
 
+/// `SYS_STORE` x1 bit 6: a single-copy extent of the vault process (docs/RAW-VIDEO.md "The recorder"): bulk data such as a RAW video clip, written once at the flash's rate into the `clips` window, no mirror, its record (where, how long, its BLAKE3) kept by the vault under the caller's name in the caller's domain.
+pub const STORE_EXTENT: u64 = 1 << 6;
+/// The largest transfer of an extent's write or read: one UFS command (BLOCK_MAX blocks, 1 MiB).
+pub const EXTENT_MAX: usize = BLOCK_MAX as usize * 4096;
+
+/// An extent call (x1 bit 6), forwarded as `VOP_EXTENT`: x1 bits 0-2 the extent op (`EOP_*`), bit 5 the name a 32-byte address, bits 8-31 the length of the caller's buffer at x4, bits 32-63 a block within the extent; x2/x3 the name, as every store call.
+/// Rest: [extent op u8][block u64][length u32][the caller's bytes: open its blocks u64, write the blocks' bytes, seal its length u64 and BLAKE3; nothing for read, info and delete].
+fn extent_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
+    let Some(p) = proc_of(cur) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    // A refusal's reason on the console, written as `push_console` writes it but without taking the kernel lock, which this syscall holds and which is not reentrant.
+    // 63916ff9 called `push_console` here: a refused call spun on its own core's lock with interrupts masked until the watchdog reset the Pro (Lumis's seals from an A510, which held no keys, 2026-11-19).
+    let say = |why: &str| {
+        let line = alloc::format!("extent: {} refused: {why}\n", core::str::from_utf8(&p.name).unwrap_or("?"));
+        k().console.extend_from_slice(line.as_bytes());
+        crate::platform::pstore(line.as_bytes());
+    };
+    let (eop, raw) = ((f.x[1] & 7) as u8, f.x[1] & 32 != 0);
+    let block = f.x[1] >> 32;
+    let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
+    let rel = p.read(f.x[2], (f.x[3] as usize).min(97));
+    // WHY: the op, the name and the length are the caller's: a name as a value's (printable ASCII up to 96 bytes, or a 32-byte address); a write or read whole blocks of at most one UFS command; an open its block count, a seal its length and hash, an info its record's buffer.
+    let rel_ok = if raw { rel.len() == 32 } else { !rel.is_empty() && rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) };
+    let len_ok = match eop {
+        EOP_OPEN => len == 32,
+        EOP_WRITE | EOP_READ => len != 0 && len & 4095 == 0 && len <= EXTENT_MAX && (eop == EOP_WRITE || len <= vault_get_max(ep)),
+        EOP_SEAL => len == 40,
+        EOP_INFO => len == EXTENT_INFO,
+        EOP_DELETE => len == 0,
+        EOP_SPACE => len == EXTENT_SPACE,
+        _ => false,
+    };
+    if !rel_ok || !len_ok {
+        say(if !rel_ok { "the name is not printable ASCII (G#21 to G#7E, no spaces) of 1 to 96 bytes" } else { "the buffer's length is not the op's" });
+        f.x[0] = ERR;
+        return 0;
+    }
+    let mut name = Vec::with_capacity(33);
+    if raw {
+        name.push(1);
+    }
+    name.extend_from_slice(&rel);
+    let (prefix, classes): (Vec<u8>, &[bool]) = match wh {
+        Where::Scope(sc) => {
+            let mut full = alloc::string::String::from(sc.prefix);
+            if !raw {
+                full.extend(rel.iter().map(|&b| b as char));
+            }
+            (sc.prefix.as_bytes().to_vec(), if crate::kvault::identity_class(&full) { &[true] } else { &[false] })
+        }
+        Where::Domain(d) => ([KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true]),
+    };
+    let carried = matches!(eop, EOP_OPEN | EOP_WRITE | EOP_SEAL);
+    let mut rest = [0u8; 13];
+    rest[0] = eop;
+    rest[1..9].copy_from_slice(&block.to_le_bytes());
+    rest[9..13].copy_from_slice(&(len as u32).to_le_bytes());
+    let Some(mut msg) = stamp(VOP_EXTENT, &prefix, classes, &name, &rest) else {
+        say("its domain's keys are not open (the person's class while they are away, or this core holds no copy of the keys yet)");
+        f.x[0] = ERR;
+        return 0;
+    };
+    // The caller's bytes copied once, from where they lie straight onto the stamp (a MiB a write: the zeroed buffer and the two copies before cost about a millisecond of the clip's write path, measured 2026-11-19).
+    if carried {
+        match p.view(f.x[4], len) {
+            Some(b) => {
+                msg.reserve_exact(len);
+                msg.extend_from_slice(b);
+            }
+            None => {
+                say(&alloc::format!("its buffer of A#{} bytes at G#{:X} lies in no memory of its own", len, f.x[4]));
+                crate::keys::wipe_to_dram(&mut msg);
+                f.x[0] = ERR;
+                return 0;
+            }
+        }
+    }
+    let rcap = if matches!(eop, EOP_READ | EOP_INFO | EOP_OPEN | EOP_SPACE) { len as u64 } else { 0 };
+    if let Some(t) = th(cur) {
+        t.called = crate::platform::cntpct();
+        t.what = VOP_EXTENT as u64 | (len as u64) << 8 | block << 32;
+    }
+    call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
+}
+
+/// The extent ops (x1 bits 0-2 with `STORE_EXTENT`; payloads/vault `extent`).
+/// Open: reserve the u64 of blocks at the start of x4's 32 bytes under the name (a fresh extent; an open one of the same name is dropped first) → the blocks reserved, ERR when no stretch that long is free; the 32 bytes then hold the extent's own SYS_BLOCK capability (`Object::Extent`), or zeros from a vault process that gives none.
+pub const EOP_OPEN: u8 = 0;
+/// Write the buffer's whole blocks at the block in x1's top half, inside the extent, once, not read back → 0.
+pub const EOP_WRITE: u8 = 1;
+/// Seal: the extent's length in bytes (u64 LE) and its BLAKE3 (32 bytes) recorded; its blocks past the length freed → 0.
+pub const EOP_SEAL: u8 = 2;
+/// Read the buffer's length of whole blocks from the block in x1's top half → the bytes read.
+pub const EOP_READ: u8 = 3;
+/// Its record into the buffer (`EXTENT_INFO` bytes: blocks u64, bytes u64, sealed u8, BLAKE3 32, recorded at Eagle i64, the vault's first block u64) → the blocks, NOTHING when the name has none.
+pub const EOP_INFO: u8 = 4;
+/// Drop it → 0, NOTHING when the name has none.
+pub const EOP_DELETE: u8 = 5;
+pub const EXTENT_INFO: usize = 8 + 8 + 1 + 32 + 8 + 8;
+/// The recording space, read only (the name any of the caller's, it is not looked up) → the clips area's free blocks; the buffer (`EXTENT_SPACE` bytes, u64 LE each): the area's blocks, the blocks every extent takes, the longest free stretch, the blocks the caller's own domain's extents take, how many they are.
+pub const EOP_SPACE: u8 = 6;
+/// The kernel's own channel only, for the bridge (service.rs `store_job` G#FB and G#FA; refused from a process here, as every op past EOP_SPACE is): the clips area's records (the caller's domain's owner hash, then first, blocks, bytes, sealed, at, owner a record), and a drop of the caller's domain's extent at a first block (its name a derived key that may be lost).
+pub const EOP_LIST: u8 = 7;
+pub const EOP_DROP_AT: u8 = 8;
+/// The kernel's own channel only (service.rs `store_job` G#F8, development builds): a sealed extent dropped by its first block whatever domain owns it, for one whose owning build no longer exists; refused from a process as every op past EOP_SPACE is.
+pub const EOP_DROP_ORPHAN: u8 = 9;
+pub const EXTENT_SPACE: usize = 5 * 8;
+
 /// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.
 fn kist_domain_forward(f: &mut Frame, cur: usize, ep: usize, d: &[u8; 32]) -> u64 {
     let op = match (f.x[1] & 8 != 0, f.x[1] & 16 != 0) {
@@ -4126,6 +4335,8 @@ pub const VOP_DROP: u8 = 4;
 pub const VOP_EXPORT: u8 = 5;
 /// How many values each stamped domain holds and their bytes in all (a kist's own domain, sized for its unstow sheet: `kist_domain_forward`): name and rest empty. The value: the bytes, or ERR; the reply's bytes: the count of values, u64 LE.
 pub const VOP_SIZE: u8 = 6;
+/// A single-copy extent (`extent_forward`): name the caller's, rest [extent op][block u64][length u32][bytes]. The value and reply by op (`EOP_*`).
+pub const VOP_EXTENT: u8 = 7;
 
 /// `SYS_UNLOCK` op 5 while the vault process serves, for a caller holding the Unlock right: its endpoint.
 fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
@@ -4343,6 +4554,13 @@ pub fn vault_stamp_addr(op: u8, scope: &str, addr: &[u8; 32], rest: &[u8]) -> Op
     name.push(1);
     name.extend_from_slice(addr);
     with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(sc.prefix)], &name, rest))
+}
+
+/// A stamp for the kernel's own call on a name in a kist's own domain (the bridge's `store extent --kist`: a RAW clip Lumis recorded, pulled to the host; development builds only), the kist named by its identity as the stower names one (`kist_store_route`): the person's class always, so only while they are present. None with no system secret or a locked class.
+pub fn vault_stamp_kist(op: u8, developer: &[u8; 32], option: &[u8; 32], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let ihi = crate::oracle::ihi(developer, option)?;
+    let d = blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi);
+    with_lock_held_or(|| stamp(op, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], name, rest))
 }
 
 /// A stamp for the kernel's own listing of scope `i` of `STORES` from `offset`, at most `len` bytes (names one per line): every class the scope holds, the person's left out while locked. With its prefix, to make the names whole.
@@ -5147,14 +5365,59 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_ARC => arc_call(f, cur, pi),
         SYS_BLOCK => {
             let token = p.read(f.x[0], 32);
+            // A window by name, or a clip's extent given to this process: an extent is the `clips` window narrowed to its own blocks (so every bound below holds it there).
             let window = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
-                Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i),
+                Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i).map(|w| BlockWindow { name: w.name, offset: w.offset, blocks: w.blocks }),
+                Some((Object::Extent(i), r)) if r & RIGHT_SEND != 0 => {
+                    let g = unsafe { (*(&raw const EXTENT_GRANTS))[i] };
+                    (g.holder == p.epoch).then_some(BlockWindow { name: "clips", offset: CLIPS_OFFSET + g.first, blocks: g.blocks })
+                }
                 _ => None,
             };
+            // Bit 3: the vault process gives (or, with bit 4, takes back) a clip's extent of its `clips` window (`extent_give`).
+            let give = (f.x[1] & 8 != 0).then(|| {
+                let named = matches!(p.lookup(&token).map(|i| p.cspace[i].object), Some(Object::Blocks(_)));
+                match &window {
+                    // Bit 5 with bit 3: whether a live writer holds the extent from window block x2 (1) or none does (0): the vault recovers an open extent only when nobody is writing it.
+                    Some(w) if named && f.x[1] & 32 != 0 && w.name == "clips" => unsafe { (*(&raw const EXTENT_GRANTS)).iter().any(|g| g.holder != 0 && g.first == f.x[2] && k().procs.iter().flatten().any(|r| r.epoch == g.holder && !r.dying)) as u64 },
+                    Some(w) if named => extent_give(p, w, f.x[2], f.x[3], f.x[4], f.x[1] & 16 != 0),
+                    _ => ERR,
+                }
+            });
+            let window = window.as_ref();
             let (write, timed, count, at, buf) = (f.x[1] & 1 != 0, f.x[1] & 2 != 0, (f.x[1] >> 8) & 0xFFFF, f.x[2], f.x[3]);
             f.x[0] = match (window, crate::ufs_device::part()) {
+                _ if give.is_some() => give.unwrap_or(ERR),
                 // The owner's fresh start is zeroing the flash (service.rs `vault fresh`): nothing more is read or written before its reset.
                 _ if BLOCKS_SHUT.load(core::sync::atomic::Ordering::SeqCst) => ERR,
+                // Op bit 2 (development, docs/RAW-VIDEO.md): the flash at a queue deeper than one, on the `rawbench` window only (it writes the same bytes everywhere, so never where anything is kept): x4's low 32 bits commands of `count` blocks at consecutive places from `at`, its bits 32-39 the depth (1 to QUEUE_MOST); every command's data the caller's `count` blocks (a write) or the bounce (a read, nothing copied back).
+                // The answer: x1 the ticks from the first doorbell to the last completion, x2 the commands that completed well.
+                // WHY the bounds: the commands, depth and place are the process's; all of them inside the window, the depth inside the slots the HAL keeps.
+                #[cfg(not(ferros_production))]
+                (Some(w), Some((first, blocks))) if f.x[1] & 4 != 0 && w.name == "rawbench" && (1..=BLOCK_MAX).contains(&count) && (1..=ferros_hal::ufs::QUEUE_MOST as u64).contains(&(f.x[4] >> 32 & 0xFF)) && (f.x[4] & 0xFFFF_FFFF) != 0 && at < w.blocks && (f.x[4] & 0xFFFF_FFFF) * count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let base = (first as u64 + w.offset + at) as u32;
+                    let (n, cmds, depth) = (count as usize, (f.x[4] & 0xFFFF_FFFF) as usize, (f.x[4] >> 32 & 0xFF) as usize);
+                    let mut data = alloc::vec![0u8; n << 12];
+                    if write {
+                        p.read_into(buf, &mut data);
+                    }
+                    let (ok, ticks) = unlocked(|| {
+                        UFS.with(|| {
+                            let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                            let run = (&raw mut UFS_RUN) as usize;
+                            if ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+                                u.probe_prdt_stride(0, base, run);
+                            }
+                            // SAFETY: the bounce holds RUN_MAX blocks and n is at most BLOCK_MAX (RUN_MAX), checked above; it is touched only under the UFS lock, held here.
+                            unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) }.copy_from_slice(&data);
+                            u.run_queued(0, base, n, cmds, depth, run, write)
+                        })
+                    });
+                    f.x[1] = ticks;
+                    f.x[2] = ok as u64;
+                    if ok == cmds { 0 } else { ERR }
+                }
                 // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
                 (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
                     use core::sync::atomic::Ordering::Relaxed;
@@ -5182,10 +5445,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         }
                         (ok, t)
                     };
+                    // The recording region's first write this boot turns the flash's WriteBooster on (docs/RAW-VIDEO.md: its SLC cache took about 33 GB at 1 to 1.7 GB/s where the direct rate is 556 MB/s), with its flushes (when idle, and in hibernate), as Linux does at every probe; the flags are volatile, so it is asked again each boot, and left on.
+                    if write && w.name == "clips" {
+                        CLIPS_AT.store(crate::platform::cntpct(), Relaxed);
+                    }
+                    if write && w.name == "clips" && !CLIPS_WB.swap(true, Relaxed) {
+                        let r = unlocked(|| {
+                            UFS.with(|| {
+                                let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                u.h8_wake_now();
+                                // fWriteBoosterEn G#0E, fWBBufferFlushEn G#0F, fWBBufferFlushDuringHibernate G#10 (JEDEC UFS 3.1).
+                                (0..3u8).fold(0u64, |acc, k| acc | (u.set_flag(0x0E + k) as u64) << k)
+                            })
+                        });
+                        CLIPS_WB_SET.store(r | 1 << 8, Relaxed);
+                    }
                     let t0 = crate::platform::cntpct();
                     let (ok, t_cmd) = if write {
-                        let mut data = alloc::vec![0u8; n << 12];
-                        p.read_into(buf, &mut data);
+                        // One copy from where the caller's bytes lie, no zeroed buffer first (a bad buffer is kept for the trap at the syscall's end, as `read_into` keeps it, and writes zeros).
+                        let data = match p.view(buf, n << 12) {
+                            Some(b) => b.to_vec(),
+                            None => alloc::vec![0u8; n << 12],
+                        };
                         unlocked(|| UFS.with(|| command(Some(&data), None)))
                     } else {
                         if count >= MOVING_BLOCKS {
@@ -5284,6 +5565,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 0
             }
         },
+        // An extent lives only in the vault process: the kernel's own vault has none.
+        SYS_STORE if f.x[1] & STORE_EXTENT != 0 => {
+            f.x[0] = ERR;
+            0
+        }
         SYS_STORE => {
             let token = p.read(f.x[0], 32);
             let scope = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -7391,6 +7677,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         pucks_free(p.epoch);
         crate::irqarm::disarm_epoch(p.epoch);
         cam_free(p.epoch);
+        extents_free(p.epoch);
         end_watch_ring(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
@@ -7726,6 +8013,7 @@ fn kill_locked(name: &[u8]) -> bool {
     pucks_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::irqarm::disarm_epoch(kk.procs[i].as_ref().unwrap().epoch);
     cam_free(kk.procs[i].as_ref().unwrap().epoch);
+    extents_free(kk.procs[i].as_ref().unwrap().epoch);
     end_watch_ring(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);

@@ -1087,6 +1087,12 @@ fn cmd_gate(args: &[String]) {
         eprintln!("ferros {} B packed at G#{:X}", fer.len(), LOAD + at);
     }
     let kernel = lz4_legacy_compress(&blob);
+    // The frame checked by decompressing it before it goes anywhere (2026-11-19: a gate cut short after it was made, its last LZ4 block truncated, and ABL said "failed to uncompress lz4 kernel": the Pro sat in fastboot).
+    match lz4_legacy_decompress(&kernel) {
+        Ok(back) if back == blob => {}
+        Ok(back) => die("lz4", format!("the frame decompresses to {} bytes, not the blob's {}", back.len(), blob.len())),
+        Err(e) => die("lz4", format!("the frame does not decompress: {e}")),
+    }
     // --os-version <hex>: the header's os_version (0 unless given, as mkbootimg.py wrote; the cold image carries G#2000_01A3).
     let os_version = args.iter().position(|a| a == "--os-version").and_then(|i| args.get(i + 1)).map(|v| u32::from_str_radix(v.trim_start_matches("G#").trim_start_matches("0x").replace('_', "").as_str(), 16).unwrap_or_else(|e| die("--os-version", e))).unwrap_or(0);
     let boot = boot_img_v4(&kernel, os_version, &cmdline);

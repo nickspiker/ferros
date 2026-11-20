@@ -1,0 +1,37 @@
+[package]
+name = "rawrec"
+version = "0.1.0"
+edition = "2021"
+description = "The RAW video recorder's test harness on the device (docs/RAW-VIDEO.md \"The recorder\"): the binned main recorded lossless into a vault extent thru ferros_clip at a chosen rate, frames counted and dropped ones said, the clip read back and decoded on the device against frames hashed as they were captured"
+
+[[bin]]
+name = "rawrec"
+path = "src/main.rs"
+
+[dependencies]
+ferros_clip = { path = "../../ferros_clip" }
+vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
+blake3 = "1.5"
+# Job 4: this build's band coder against the scalar one.
+ferros_rawcodec = { path = "../../ferros_rawcodec" }
+# Job 3: what sealing a clip would cost (XChaCha20-Poly1305, as the vault seals its values).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
+
+[features]
+# The band coder's hand-written NEON (ferros_rawcodec `neon`), checked here against the scalar coder before it is trusted.
+neon = ["ferros_clip/neon", "ferros_rawcodec/neon"]

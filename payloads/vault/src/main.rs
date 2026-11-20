@@ -65,6 +65,29 @@ const OP_DROP: u8 = 4;
 const OP_EXPORT: u8 = 5;
 /// How many values each stamped domain holds and their bytes in all (`ferros_store` `size`, from the heads, no value read): a kist's own domain on its card's unstow sheet (docs/KISTS.md "The unstow sheet"), stamped by the kernel for the stower (process.rs `VOP_SIZE`). The value: the bytes; the reply's bytes: the count of values, u64 LE.
 const OP_SIZE: u8 = 6;
+/// A single-copy extent (process.rs `VOP_EXTENT`, `extent_forward`): rest [extent op][block u64][length u32][bytes]; see `extent`.
+const OP_EXTENT: u8 = 7;
+/// The extent ops (process.rs `EOP_*`).
+const EOP_OPEN: u8 = 0;
+const EOP_WRITE: u8 = 1;
+const EOP_SEAL: u8 = 2;
+const EOP_READ: u8 = 3;
+const EOP_INFO: u8 = 4;
+const EOP_DELETE: u8 = 5;
+const EOP_SPACE: u8 = 6;
+/// The kernel's own channel only (the bridge's `store extent-list` / `extent-drop`; process.rs `extent_forward` refuses both from a process): the area's extents as records, and an extent dropped by its first block, its domain's alone. An extent's name is a derived key, never stored, so a clip whose name is lost (a writer that died before saying it) is found and dropped by these.
+const EOP_LIST: u8 = 7;
+const EOP_DROP_AT: u8 = 8;
+/// The bridge's `store extent-drop-orphan` (the kernel's own channel, development builds): a sealed extent at a first block dropped whatever domain owns it, for one whose owning build no longer exists.
+const EOP_DROP_ORPHAN: u8 = 9;
+/// One record of EOP_LIST: first, blocks, bytes (u64 LE each), sealed (u8), at (i64 LE), owner (32).
+const LIST_ROW: usize = 8 + 8 + 8 + 1 + 8 + 32;
+/// Grant slot 5: the `clips` block window, the extents' area (process.rs WINDOWS; a kernel from before grants none, and every extent op is refused).
+const S_CLIPS: u64 = 5;
+/// The area's blocks: process.rs CLIPS_BLOCKS (48 GiB); the kernel bounds every call to the window whatever this says.
+const CLIPS_AREA: u64 = 12 << 20;
+/// The largest extent transfer (process.rs EXTENT_MAX): one UFS command.
+const EXTENT_MAX: usize = 1 << 20;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -786,8 +809,14 @@ extern "C" fn work(_: u64) -> ! {
     } else {
         READER_UP.store(true, Relaxed);
     }
+    if ferros_sys::thread_spawn(recoverer, unsafe { &mut *RECOVER_STACK_MEM.0.get() }, 0) == ERR {
+        say!("vault: the recoverer did not start; clips left open are closed inside the extent requests");
+    } else {
+        RECOVERER_UP.store(true, Relaxed);
+    }
     // One transfer and its stamp each way, with room to spare: in, a set's piece (ferros_sys::STORE_MAX, 256 KiB); out, a get's (ferros_sys::STORE_GET_MAX, 1 MiB since 2026-11-11, the kernel's bound on a forwarded get).
-    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
+    // In, a set's piece (ferros_sys::STORE_MAX) or an extent's write (EXTENT_MAX, a UFS command's 1 MiB), the larger.
+    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX.max(EXTENT_MAX) + (1 << 12)];
     let mut out = alloc::vec![0u8; ferros_sys::STORE_GET_MAX + (1 << 12)];
     // The kernel forwards gets larger than one STORE_MAX transfer only once this process says it answers them (a vault from before would index past its reply buffer); a kernel from before refuses the call and its gets stay at STORE_MAX.
     ferros_sys::vault_gets(cap(grants(), S_VAULT), ferros_sys::STORE_GET_MAX);
@@ -799,6 +828,8 @@ extern "C" fn work(_: u64) -> ! {
     // The lazy open's walk (above): stepped while no request waits, a step at a time (WALK_STEP pointers, a few ms), so a request waits for at most one step. Done once settled; a step that fails stops the walk (the eager open's refusal, met later): reads go on from the index, and every write fails with the walk's error, said here once.
     let mut walking = !store.engine().settled();
     let t_walk = now();
+    // Clips the last boot's writers left open (the power went, a reset): to the recoverer at once, so they are closed before anyone records again.
+    recover_kick(&mut store);
 
     loop {
         let n = if walking {
@@ -838,13 +869,17 @@ extern "C" fn work(_: u64) -> ! {
             }
         }
         epoch = Some(e);
+        // A clip the recoverer finished goes into the table before any request is served (an atomic's look when none did).
+        recover_commit(&mut store, false);
         // Old entries wait in the kernel's vault: they move before this request is served, so it never finds a name between the two vaults (gone from the kernel's, not yet here).
         if m[1] & 1 != 0 {
             migrate(&mut store);
         }
-        let len = serve(&mut store, &mut writers, &mut export, m, &mut out);
+        let len = serve(&mut store, &mut writers, &mut export, m, &mut out, &token);
         live_note(store.engine());
-        m.fill(0);
+        // The stamp's keys and the name wiped; an extent's bytes past them are the clip's own, not a secret of the vault's, and zeroing a MiB a write cost the clip's write path (2026-11-19).
+        let wipe_to = if m[0] == OP_EXTENT { m.len().min(1 << 9) } else { m.len() };
+        m[..wipe_to].fill(0);
         ferros_sys::reply(&token, &out[..len]);
     }
 }
@@ -864,7 +899,7 @@ fn wipe(d: &mut Domain) {
 }
 
 /// One stamped request into `out` (the reply: the syscall's value, then the caller's bytes); returns the reply's length.
-fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>>, m: &[u8], out: &mut [u8]) -> usize {
+fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>>, m: &[u8], out: &mut [u8], token: &[u8; 32]) -> usize {
     const NOTHING: u64 = ferros_sys::NOTHING;
     let (op, count) = (m[0], m[6] as usize);
     let at_name = 7 + count * 65;
@@ -913,6 +948,11 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         } else {
             ERR
         }
+    } else if op == OP_EXTENT {
+        let (_, mut d) = domain_at(m, 7);
+        let r = extent(store, &d, name, rest, out, &mut data, token);
+        wipe(&mut d);
+        r
     } else if op == OP_DROP {
         // Release (the kernel's own call): each stamped domain dropped whole (ferros_store `drop_domain`), any write of it in progress with it. How many values went.
         let (mut n, mut ok) = (0u64, true);
@@ -920,6 +960,17 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
             let (_, mut d) = domain_at(m, 7 + i * 65);
             let id = *blake3::hash(&d.addr).as_bytes();
             writers.retain(|p| p.domain != id);
+            // Its extents go with it (manifestus `remove_owner`): a clip is the domain's as its values are, once the recoverer is out of any of them.
+            recover_commit(store, true);
+            if let Some(t) = extents(store) {
+                let mut next = t.clone();
+                if next.remove_owner(&id) > 0 {
+                    match next.store(store.engine(), eagle()) {
+                        Ok(()) => *t = next,
+                        Err(_) => ok = false,
+                    }
+                }
+            }
             match store.drop_domain(&d) {
                 Ok(k) => n += k,
                 Err(_) => ok = false,
@@ -1085,6 +1136,463 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         r
     };
     reply(out, ret, data)
+}
+
+/// The extents' table (manifestus `extent`), read from the vault at its first use and kept: this process alone changes it, and every change is committed before its reply.
+/// None when it does not read (a table over another area): every extent op is refused, said once.
+static mut EXTENTS: Option<manifestus::Extents> = None;
+static mut EXTENTS_READ: bool = false;
+/// The extent writes since the last seal: (calls, bytes, ticks in the block calls, the first one's tick).
+static mut EXT_METER: (u64, u64, u64, u64) = (0, 0, 0, 0);
+
+fn extents(store: &mut St) -> Option<&'static mut manifestus::Extents> {
+    // SAFETY: the serving thread's alone, as SERVING is.
+    unsafe {
+        if !EXTENTS_READ {
+            EXTENTS_READ = true;
+            match manifestus::Extents::load(store.engine(), CLIPS_AREA) {
+                Ok(t) => {
+                    say!("vault: extents: {} in the clips area, {} of {} blocks taken", t.list().len(), t.taken(), CLIPS_AREA);
+                    EXTENTS = Some(t);
+                }
+                Err(e) => say!("vault: extents: the table did not read ({:?}); every extent op is refused", e),
+            }
+        }
+        (*(&raw mut EXTENTS)).as_mut()
+    }
+}
+
+/// An extent's name in the table: the domain's address key and the caller's name, never stored.
+fn extent_name(d: &Domain, name: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("ferros vault 2026-11-19 extent name");
+    h.update(&d.addr);
+    h.update(name);
+    *h.finalize().as_bytes()
+}
+
+/// The kernel's SYS_BLOCK x1 bit 3 on the clips window (process.rs `extent_give`): the extent `first`, `blocks` given to the caller the reply token names, its capability back (None: refused, or a kernel from before); with `take_back` that caller's extents taken back.
+fn extent_give(token: &[u8; 32], first: u64, blocks: u64, take_back: bool) -> Option<[u8; 32]> {
+    let mut io = [0u8; 64];
+    io[..32].copy_from_slice(token);
+    let r = ferros_sys::svc(ferros_sys::nr::BLOCK, cap(grants(), S_CLIPS), 8 | (take_back as u64) << 4, first, blocks, ferros_sys::off(io.as_ptr()));
+    io[..32].fill(0);
+    (r == 0 && !take_back).then(|| io[32..].try_into().unwrap())
+}
+
+/// A clip's extent as a VSF byte source (vsf `container::ByteSource`): its blocks of the clips window, each miss reading only the blocks the request covers (a UFS command's run at most) and keeping them, since the clip reader asks for small pieces next to each other (a frame's header, its closing bytes) and for a checked frame's samples whole.
+/// A miss read a whole run before (2026-11-19): a frame's header and its closing bytes cost two MiB, and a recovery's walk read the clip twice over.
+struct ExtentBytes {
+    first: u64,
+    blocks: u64,
+    /// The blocks kept: the first (u64::MAX: none) and how many.
+    at: core::cell::Cell<u64>,
+    n: core::cell::Cell<u64>,
+    buf: core::cell::RefCell<Vec<u8>>,
+    /// The block reads: calls, bytes, ticks in them.
+    meter: core::cell::Cell<(u64, u64, u64)>,
+}
+
+impl ExtentBytes {
+    fn new(first: u64, blocks: u64) -> ExtentBytes {
+        ExtentBytes { first, blocks, at: core::cell::Cell::new(u64::MAX), n: core::cell::Cell::new(0), buf: core::cell::RefCell::new(alloc::vec![0u8; RUN_MAX << 12]), meter: core::cell::Cell::new((0, 0, 0)) }
+    }
+}
+
+impl vsf::container::ByteSource for ExtentBytes {
+    fn len(&self) -> u64 {
+        self.blocks << 12
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), vsf::container::SourceError> {
+        // WHY: the offset and length are the clip reader's, from the clip's own bytes; past the extent is outside the source.
+        if offset.checked_add(out.len() as u64).is_none_or(|e| e > self.len()) {
+            return Err(vsf::container::SourceError::OutOfRange { offset, len: out.len() as u64, size: self.len() });
+        }
+        let end = offset + out.len() as u64;
+        let mut done = 0usize;
+        while done < out.len() {
+            let at = offset + done as u64;
+            let blk = at >> 12;
+            let mut buf = self.buf.borrow_mut();
+            if self.at.get() == u64::MAX || blk < self.at.get() || blk >= self.at.get() + self.n.get() {
+                // The blocks the rest of the request covers, a run at most; at least one, since `blk` is inside the extent (the range check above).
+                let n = (end.div_ceil(4096) - blk).min(RUN_MAX as u64).min(self.blocks - blk);
+                let t0 = ferros_sys::now();
+                if ferros_sys::block_read(cap(grants(), S_CLIPS), self.first + blk, &mut buf[..(n as usize) << 12]) != 0 {
+                    self.at.set(u64::MAX);
+                    return Err(vsf::container::SourceError::Io("the clips window refused a read".into()));
+                }
+                let (c, b, t) = self.meter.get();
+                self.meter.set((c + 1, b + (n << 12), t + ferros_sys::now() - t0));
+                self.at.set(blk);
+                self.n.set(n);
+            }
+            let from = (at - (self.at.get() << 12)) as usize;
+            let k = (out.len() - done).min(((self.n.get() as usize) << 12) - from);
+            out[done..done + k].copy_from_slice(&buf[from..from + k]);
+            done += k;
+        }
+        Ok(())
+    }
+}
+
+/// Clips left open by a writer that is gone (it died, the power went) are closed by the recoverer, a thread of this process on an A510, never inside a request: each clip read to its last whole frame, its closing generation written right after that frame, the extent sealed at that length and its tail given back.
+/// Never dropped: they are the person's footage. An extent whose clip does not read (its writer died before its first bytes) is sealed at no bytes, its first block kept.
+/// Until 2026-11-19 this ran inside the next OPEN on the serving thread, hashing every frame's samples: a Lumis clip killed at 2,525 frames (18 GB) held that OPEN and every other vault request for 89 s, the camera's thread waiting in it until its driver closed, the Pro at 89 C.
+/// Now the walk reads the frames' headers alone (vsf `Reader::open_headers`) and the samples of the last `RECOVER_CHECKED` frames are checked (`check_tail`): a recorder writes its frames in order, so a torn write tears the tail.
+const RECOVER_CHECKED: usize = 1 << 3;
+const RECOVER_STACK: usize = 1 << 17;
+static RECOVER_STACK_MEM: Region<RECOVER_STACK> = Region(UnsafeCell::new([0; RECOVER_STACK]));
+/// The jobs posted and finished (a sequence each; equal: the recoverer idle).
+static RECOVER_REQ: AtomicU64 = AtomicU64::new(0);
+static RECOVER_DONE: AtomicU64 = AtomicU64::new(0);
+/// The job (its extent's first block and blocks), written by the serving thread before RECOVER_REQ moves, read by the recoverer after; its answer, written by the recoverer before RECOVER_DONE moves.
+static mut RECOVER_JOB: (u64, u64) = (0, 0);
+static mut RECOVER_OUT: Option<Recovered> = None;
+/// The extent being recovered (serving thread only): its name, first block and blocks, matched again at the commit.
+static mut RECOVERING: Option<([u8; 32], u64, u64)> = None;
+static RECOVERER_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Extents opened without their blocks given to the caller (a kernel that refused `extent_give`): written thru this process, held by no writer the kernel knows of, so never taken for left open.
+static mut THROUGH: Vec<[u8; 32]> = Vec::new();
+
+/// What a recovery found and what it cost.
+struct Recovered {
+    len: u64,
+    hash: [u8; 32],
+    frames: usize,
+    /// Frames whose samples were checked.
+    checked: usize,
+    /// Ticks: the headers' walk, the tail's check, the closing generation's write.
+    walk: u64,
+    check: u64,
+    write: u64,
+    /// The block reads: calls, bytes, ticks.
+    reads: (u64, u64, u64),
+}
+
+extern "C" fn recoverer(_: u64) -> ! {
+    // An A510: the recovery goes at the vault's own pace, never at the big cores' heat (the old one ran on the X3 for 89 s).
+    ferros_sys::pin(ferros_sys::CORES_LITTLE);
+    let mut seen = 0;
+    loop {
+        let r = RECOVER_REQ.load(Acquire);
+        if r == seen {
+            ferros_sys::wait(&RECOVER_REQ, r, 0);
+            continue;
+        }
+        seen = r;
+        let (first, blocks) = unsafe { RECOVER_JOB };
+        let out = recover_clip(first, blocks);
+        // SAFETY: the serving thread reads RECOVER_OUT only once RECOVER_DONE says this job is done.
+        unsafe { *(&raw mut RECOVER_OUT) = Some(out) };
+        RECOVER_DONE.store(r, Release);
+        ferros_sys::wake(&RECOVER_DONE, 1);
+    }
+}
+
+/// Hand the recoverer the next open extent no live writer holds (the kernel says, SYS_BLOCK x1 bits 3 and 5), if it is idle. From the serving thread: at the start, at every extent request and after each commit.
+fn recover_kick(store: &mut St) {
+    if unsafe { (*(&raw const RECOVERING)).is_some() } {
+        return;
+    }
+    let Some(t) = extents(store) else { return };
+    let through = unsafe { &*(&raw const THROUGH) };
+    let next = t.list().iter().filter(|e| !e.sealed && !through.contains(&e.name)).find(|e| ferros_sys::svc(ferros_sys::nr::BLOCK, cap(grants(), S_CLIPS), 8 | 32, e.first, 0, 0) == 0).copied();
+    let Some(e) = next else { return };
+    if !RECOVERER_UP.load(Relaxed) {
+        // No thread (it did not start): here, as before, rather than never.
+        let out = recover_clip(e.first, e.blocks);
+        recover_seal(store, e.name, e.first, e.blocks, out);
+        return;
+    }
+    unsafe {
+        RECOVER_JOB = (e.first, e.blocks);
+        RECOVERING = Some((e.name, e.first, e.blocks));
+    }
+    say!("vault: extent at {}: its writer is gone; its clip is closed beside the requests, on an A510", e.first);
+    RECOVER_REQ.fetch_add(1, Release);
+    ferros_sys::wake(&RECOVER_REQ, 1);
+}
+
+/// A finished recovery sealed into the table (every request looks first); `wait` waits for one in flight (an extent about to be removed or replaced: its blocks are not given while the recoverer may still write in them).
+fn recover_commit(store: &mut St, wait: bool) {
+    let Some((name, first, blocks)) = (unsafe { *(&raw const RECOVERING) }) else { return };
+    loop {
+        let d = RECOVER_DONE.load(Acquire);
+        if d == RECOVER_REQ.load(Acquire) {
+            break;
+        }
+        if !wait {
+            return;
+        }
+        ferros_sys::wait(&RECOVER_DONE, d, 0);
+    }
+    unsafe { RECOVERING = None };
+    let Some(out) = (unsafe { (*(&raw mut RECOVER_OUT)).take() }) else { return };
+    recover_seal(store, name, first, blocks, out);
+    recover_kick(store);
+}
+
+fn recover_seal(store: &mut St, name: [u8; 32], first: u64, blocks: u64, out: Recovered) {
+    let Some(t) = extents(store) else { return };
+    // The extent may have gone meanwhile (its domain dropped): nothing to seal.
+    if !t.list().iter().any(|e| e.name == name && e.first == first && !e.sealed) {
+        return;
+    }
+    let mut next = t.clone();
+    let ms = |k: u64| k * 1000 / freq();
+    match next.seal(&name, out.len, out.hash, eagle()).and_then(|_| next.store(store.engine(), eagle())) {
+        Ok(()) => {
+            *t = next;
+            say!(
+                "vault: extent at {} recovered: its writer was gone; {} frames, sealed at {} bytes, {} blocks given back; the headers' walk {} ms, the last {} frames' samples checked in {} ms, the closing written in {} ms; block reads {} of {} MiB in {} ms",
+                first,
+                out.frames,
+                out.len,
+                blocks - out.len.div_ceil(4096).max(1),
+                ms(out.walk),
+                out.checked,
+                ms(out.check),
+                ms(out.write),
+                out.reads.0,
+                out.reads.1 >> 20,
+                ms(out.reads.2)
+            );
+        }
+        Err(err) => say!("vault: extent at {} could not be sealed after its recovery: {:?}", first, err),
+    }
+}
+
+/// The clip in an open extent closed at its last whole frame; length 0 when it does not read as a clip. On the recoverer.
+fn recover_clip(first: u64, blocks: u64) -> Recovered {
+    let mut o = Recovered { len: 0, hash: [0; 32], frames: 0, checked: 0, walk: 0, check: 0, write: 0, reads: (0, 0, 0) };
+    let t0 = ferros_sys::now();
+    let mut r = match vsf::visual::clip::Reader::open_headers(ExtentBytes::new(first, blocks)) {
+        Ok(r) => r,
+        Err(err) => {
+            say!("vault: extent at {}: no clip in it ({}); sealed empty", first, err);
+            return o;
+        }
+    };
+    let t1 = ferros_sys::now();
+    o.walk = t1 - t0;
+    if r.recovered() {
+        o.checked = r.check_tail(RECOVER_CHECKED);
+    }
+    let t2 = ferros_sys::now();
+    o.check = t2 - t1;
+    o.reads = r.source().meter.get();
+    let end = r.end();
+    (o.len, o.frames) = (end, r.frames().len());
+    let closing = match r.repair("ferros vault") {
+        Ok(c) => c,
+        Err(err) => {
+            say!("vault: extent at {}: its closing generation was not made ({}); sealed at its frames' end", first, err);
+            return o;
+        }
+    };
+    // The closing generation from `end`: the block holding `end` read first, its bytes before `end` kept.
+    let b0 = end >> 12;
+    let lead = (end & 4095) as usize;
+    let total = (lead + closing.len()).div_ceil(4096);
+    if b0 + total as u64 > blocks {
+        say!("vault: extent at {}: no room for its closing generation; sealed at its frames' end", first);
+        return o;
+    }
+    let mut out = alloc::vec![0u8; total << 12];
+    if lead != 0 && ferros_sys::block_read(cap(grants(), S_CLIPS), first + b0, &mut out[..4096]) != 0 {
+        return o;
+    }
+    out[lead..lead + closing.len()].copy_from_slice(&closing);
+    for (k, chunk) in out.chunks(RUN_MAX << 12).enumerate() {
+        if ferros_sys::block_write(cap(grants(), S_CLIPS), first + b0 + (k * RUN_MAX) as u64, chunk) != 0 {
+            say!("vault: extent at {}: its closing generation's write was refused; sealed at its frames' end", first);
+            return o;
+        }
+    }
+    o.write = ferros_sys::now() - t2;
+    o.len = end + closing.len() as u64;
+    o.hash = *blake3::hash(&closing).as_bytes();
+    o
+}
+
+/// One extent request (`OP_EXTENT`): its value, with the reply's bytes in `out[8..]` (their count in `data`).
+fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], data: &mut usize, token: &[u8; 32]) -> u64 {
+    const NOTHING: u64 = ferros_sys::NOTHING;
+    let (eop, block, len) = (rest[0], u64::from_le_bytes(rest[1..9].try_into().unwrap()), u32::from_le_bytes(rest[9..13].try_into().unwrap()) as usize);
+    let bytes = &rest[13..];
+    let t_in = ferros_sys::now();
+    let key = extent_name(d, name);
+    let owner = *blake3::hash(&d.addr).as_bytes();
+    // Clips left open by a writer that is gone are handed to the recoverer (`recover_kick`): an OPEN takes a free stretch at once and never waits for them.
+    recover_kick(store);
+    // But an extent this request removes or replaces is not one the recoverer may still be writing in: its recovery is let finish first (a few hundred ms since 2026-11-19).
+    if (matches!(eop, EOP_OPEN | EOP_DELETE) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == key)) || (matches!(eop, EOP_DROP_AT | EOP_DROP_ORPHAN) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.1 == block)) {
+        recover_commit(store, true);
+    }
+    let Some(t) = extents(store) else { return ERR };
+    let now = eagle();
+    match eop {
+        EOP_OPEN => {
+            let blocks = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            // A name recorded again starts afresh: its old extent, open or sealed, goes in the same commit; the table changes only once that commit is made.
+            let mut next = t.clone();
+            let had = next.remove(&key).is_some();
+            match next.reserve(key, owner, blocks, now).and_then(|e| next.store(store.engine(), now).map(|()| e)) {
+                Ok(e) => {
+                    *t = next;
+                    // The extent's blocks given to the caller for its own writes (a kernel from 2026-11-19 on): the clip's bytes then go straight to the flash, not thru this process. Refused, the caller writes thru the vault (EOP_WRITE) as before.
+                    let given = extent_give(token, e.first, e.blocks, false);
+                    let through = unsafe { &mut *(&raw mut THROUGH) };
+                    through.retain(|n| *n != key);
+                    if let Some(tok) = given {
+                        out[8..40].copy_from_slice(&tok);
+                        *data = 32;
+                    } else {
+                        through.push(key);
+                    }
+                    let f = freq();
+                    say!("vault: extent opened: {} blocks at {} of the clips area{}{}; {} free at most; served in {} us{}", e.blocks, e.first, if had { ", over the name's last" } else { "" }, if given.is_some() { ", given to the caller" } else { "" }, t.largest_free(), (ferros_sys::now() - t_in) * 1_000_000 / f, if unsafe { (*(&raw const RECOVERING)).is_some() } { ", a recovery running beside it" } else { "" });
+                    e.blocks
+                }
+                Err(err) => {
+                    say!("vault: extent open of {} blocks refused: {:?}; {} free at most", blocks, err, t.largest_free());
+                    ERR
+                }
+            }
+        }
+        EOP_WRITE | EOP_READ => {
+            let n = (len >> 12) as u64;
+            // WHY: the block and the length are the caller's; an extent's own blocks are all it may touch (the kernel bounds the call to the clips window besides).
+            let Some(e) = t.find(&key).copied().filter(|e| e.holds(block, n)) else { return ERR };
+            if eop == EOP_WRITE {
+                if e.sealed {
+                    return ERR;
+                }
+                // One UFS command: the kernel took at most EXTENT_MAX (BLOCK_MAX blocks) for an extent write.
+                let t0 = ferros_sys::now();
+                let r = ferros_sys::block_write(cap(grants(), S_CLIPS), e.first + block, &bytes[..len]);
+                // The writes' own measure, said at the seal: calls, bytes, time in the block calls, and from the first write.
+                unsafe {
+                    let m = &mut *(&raw mut EXT_METER);
+                    if m.0 == 0 {
+                        m.3 = t0;
+                    }
+                    m.0 += 1;
+                    m.1 += len as u64;
+                    m.2 += ferros_sys::now() - t0;
+                }
+                if r == 0 { 0 } else { ERR }
+            } else if ferros_sys::block_read(cap(grants(), S_CLIPS), e.first + block, &mut out[8..8 + len]) == 0 {
+                *data = len;
+                len as u64
+            } else {
+                ERR
+            }
+        }
+        EOP_SEAL => {
+            let length = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let hash: [u8; 32] = bytes[8..40].try_into().unwrap();
+            let mut next = t.clone();
+            match next.seal(&key, length, hash, now).and_then(|_| next.store(store.engine(), now)) {
+                Ok(()) => {
+                    *t = next;
+                    // Sealed: the caller's own writes end (it holds no extent any more).
+                    let _ = extent_give(token, 0, 0, true);
+                    let m = unsafe { core::mem::take(&mut *(&raw mut EXT_METER)) };
+                    let f = freq();
+                    say!("vault: extent sealed, {} bytes: {} writes of {} MiB in all, {} ms in the block calls ({} MB/s), {} ms from the first write", length, m.0, m.1 >> 20, m.2 * 1000 / f, m.1 * f / m.2.max(1) / 1_000_000, (ferros_sys::now() - m.3) * 1000 / f);
+                    0
+                }
+                Err(err) => {
+                    say!("vault: extent seal of {} bytes refused: {:?}", length, err);
+                    ERR
+                }
+            }
+        }
+        EOP_INFO => match t.find(&key) {
+            Some(e) => {
+                let o = &mut out[8..8 + 65];
+                o[..8].copy_from_slice(&e.blocks.to_le_bytes());
+                o[8..16].copy_from_slice(&e.bytes.to_le_bytes());
+                o[16] = e.sealed as u8;
+                o[17..49].copy_from_slice(&e.hash);
+                o[49..57].copy_from_slice(&e.at.to_le_bytes());
+                o[57..65].copy_from_slice(&e.first.to_le_bytes());
+                *data = 65;
+                e.blocks
+            }
+            None => NOTHING,
+        },
+        EOP_SPACE => {
+            // Read only: the area, what every extent takes, the longest free stretch, this domain's own extents' blocks and count (Lumis's recording space).
+            let (mine, n) = t.list().iter().filter(|e| e.owner == owner).fold((0u64, 0u64), |(b, c), e| (b + e.blocks, c + 1));
+            let free = t.area - t.taken();
+            for (k, v) in [t.area, t.taken(), t.largest_free(), mine, n].iter().enumerate() {
+                out[8 + k * 8..16 + k * 8].copy_from_slice(&v.to_le_bytes());
+            }
+            *data = 40;
+            free
+        }
+        EOP_DELETE => {
+            let mut next = t.clone();
+            match next.remove(&key) {
+                Some(_) => match next.store(store.engine(), now) {
+                    Ok(()) => {
+                        *t = next;
+                        0
+                    }
+                    Err(_) => ERR,
+                },
+                None => NOTHING,
+            }
+        }
+        EOP_LIST => {
+            // The caller's own domain's owner first (how a host tells its extents from others'), then a record an extent, as many as the buffer holds; the value: how many there are.
+            out[8..40].copy_from_slice(&owner);
+            let rows = len.saturating_sub(32) / LIST_ROW; // WHY/PROOF: the length is the kernel's stamp of the host's ask; one under 32 lists no record rather than wrapping to a huge count
+            let mut o = 40;
+            for e in t.list().iter().take(rows) {
+                out[o..o + 8].copy_from_slice(&e.first.to_le_bytes());
+                out[o + 8..o + 16].copy_from_slice(&e.blocks.to_le_bytes());
+                out[o + 16..o + 24].copy_from_slice(&e.bytes.to_le_bytes());
+                out[o + 24] = e.sealed as u8;
+                out[o + 25..o + 33].copy_from_slice(&e.at.to_le_bytes());
+                out[o + 33..o + 65].copy_from_slice(&e.owner);
+                o += LIST_ROW;
+            }
+            *data = o - 8;
+            t.list().len() as u64
+        }
+        EOP_DROP_AT => {
+            // Only the caller's own domain's extent at that first block: no domain drops another's.
+            let Some(e) = t.list().iter().find(|e| e.first == block && e.owner == owner).copied() else { return NOTHING };
+            let mut next = t.clone();
+            next.remove(&e.name);
+            match next.store(store.engine(), now) {
+                Ok(()) => {
+                    *t = next;
+                    say!("vault: extent at {} dropped by its first block ({} blocks, {} bytes, sealed {}); {} free at most", e.first, e.blocks, e.bytes, e.sealed, t.largest_free());
+                    0
+                }
+                Err(_) => ERR,
+            }
+        }
+        EOP_DROP_ORPHAN => {
+            // Any domain's, but only a sealed one: an open extent may still have a writer, or is the recoverer's to close.
+            let Some(e) = t.list().iter().find(|e| e.first == block && e.sealed).copied() else { return NOTHING };
+            let mut next = t.clone();
+            next.remove(&e.name);
+            match next.store(store.engine(), now) {
+                Ok(()) => {
+                    *t = next;
+                    say!("vault: orphan extent at {} dropped by its first block, owner {:02X}{:02X}{:02X}{:02X}.. ({} blocks, {} bytes); {} free at most", e.first, e.owner[0], e.owner[1], e.owner[2], e.owner[3], e.blocks, e.bytes, t.largest_free());
+                    0
+                }
+                Err(_) => ERR,
+            }
+        }
+        _ => ERR,
+    }
 }
 
 /// The largest value an export carries, and the largest export: the document is built whole in this process's heap (HEAP_BYTES). A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.

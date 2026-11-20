@@ -1,0 +1,25 @@
+[package]
+name = "rawbench"
+version = "0.1.0"
+edition = "2024"
+description = "The RAW video shooter's measures on the device (docs/RAW-VIDEO.md): the flash's sustained write and read thru SYS_BLOCK on the rawbench window, and the lossless RAW codec's encode speed per core on a real frame"
+
+[[bin]]
+name = "rawbench"
+path = "src/main.rs"
+
+[dependencies]
+# The lossless codec prototype (docs/RAW-VIDEO.md), no_std, measured here on the device.
+raw-codec = { path = "../../tools/raw-codec" }
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
