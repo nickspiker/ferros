@@ -1600,6 +1600,14 @@ pub fn store_delete_addr(cap: u64, addr: &[u8; 32]) -> Option<bool> {
     }
 }
 
+/// SYS_STORE x1 bit 7: a call on the hold (docs/STORE.md, docs/HOLD-API.md), on an `items` grant (process.rs `Object::Items`).
+pub const STORE_ITEMS: u64 = 1 << 7;
+
+/// One call on the hold: `call` as ferros_items `wire::call` makes it (at most a transfer and its head), the answer's bytes into `reply`; the value (ERR refused, NOTHING gone). ferros_items `kist::Hold` makes the calls; a payload hands it `kist::Sys { cap }` with this grant's token, or calls this.
+pub fn items_call(cap: u64, call: &[u8], reply: &mut [u8]) -> u64 {
+    svc(nr::STORE, cap, STORE_ITEMS | (reply.len() as u64) << 8, off(call.as_ptr()), call.len() as u64, off(reply.as_mut_ptr()))
+}
+
 /// The scope's addresses, 32 bytes each, concatenated: read like a large value from `offset`; returns the listing's whole length.
 pub fn store_addrs(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, 32 | 16 | 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(b"".as_ptr()), 0, off(buf.as_mut_ptr()));

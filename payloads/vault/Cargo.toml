@@ -12,6 +12,10 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }
 ferros_store = { path = "../../store" }
+# The hold (docs/STORE.md): the person's items, served in their items domain (`OP_ITEMS`).
+ferros_items = { path = "../../ferros_items" }
+# The person's list of stowed kists (`kists.list`), read for the hold's usage call: each kist's name beside its domain's size.
+ferros_kist = { path = "../../ferros_kist" }
 manifestus = { path = "../../../manifestus", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 vsf = { path = "../../../vsf", default-features = false }

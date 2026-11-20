@@ -29,9 +29,9 @@ use vsf::types::EtType;
 use vsf::VsfType;
 
 /// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way).
-pub const RIGHTS: [&str; 13] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck"];
+pub const RIGHTS: [&str; 14] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 13] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck"];
+pub const MEANS: [&str; 14] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
@@ -44,6 +44,52 @@ pub const PEOPLE: u8 = 11;
 pub const PUCK: u8 = 12;
 /// A surface of its own (the implicit right a puck is handed empty).
 pub const SURFACE: u8 = 2;
+/// The person's things (docs/STORE.md part 1, "keep for you", 2026-11-19): keeping items in the hold for the person, of the kinds the capsule's `items` section declares it makes, and opening the kinds it declares it opens and what it made itself. Asked once, as every right outside the implicit set; appended, so every code before it keeps its meaning.
+pub const ITEMS: u8 = 13;
+
+/// A capsule's `items` section (STORE.md "Kinds, and the question asked"): each kind it makes and each it opens, with the developer's reason, signed with the rest of the capsule. A field `make` or `open` per kind: the kind (an idea, `hi`) and its reason (`a`), told apart by their types.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ItemsDecl {
+    pub makes: Vec<([u8; 32], String)>,
+    pub opens: Vec<([u8; 32], String)>,
+}
+
+/// The kinds a capsule declares in its `items` section; none for a capsule without one. A field outside `make` and `open`, or one without its kind, refuses it.
+pub fn items_of(capsule: &[u8]) -> Result<ItemsDecl, &'static str> {
+    let Some(s) = section(capsule, "items")? else { return Ok(ItemsDecl::default()) };
+    let mut d = ItemsDecl::default();
+    for f in &s.fields {
+        let kind = f.values.iter().find_map(|v| match v {
+            VsfType::hi(k) if k.len() == 32 => Some(<[u8; 32]>::try_from(&k[..]).unwrap()),
+            _ => None,
+        });
+        let reason = f.values.iter().find_map(|v| match v {
+            VsfType::a(t) => Some(String::from(t.as_str())),
+            _ => None,
+        });
+        let (Some(kind), Some(reason)) = (kind, reason) else { return Err("an items field without its kind or its reason") };
+        match f.name.as_str() {
+            "make" => d.makes.push((kind, reason)),
+            "open" => d.opens.push((kind, reason)),
+            _ => return Err("an items field that is neither make nor open"),
+        }
+    }
+    Ok(d)
+}
+
+/// The `items` section for the signer (ferros-bridge `capsule --kist`), or none for a declaration of no kinds.
+pub fn items_section(d: &ItemsDecl) -> Option<VsfSection> {
+    if d.makes.is_empty() && d.opens.is_empty() {
+        return None;
+    }
+    let mut s = VsfSection::new("items");
+    for (name, list) in [("make", &d.makes), ("open", &d.opens)] {
+        for (kind, reason) in list {
+            s.fields.push(vsf::VsfField::with_values(name, alloc::vec![VsfType::hi(kind.to_vec()), VsfType::a(vsf::Ascii::checked("reason", reason.clone()))]));
+        }
+    }
+    Some(s)
+}
 
 /// Whether the person is ever asked for right `r`: every right but the implicit set and `PUCK`.
 pub fn asked_right(r: u8) -> bool {
@@ -1349,6 +1395,25 @@ mod tests {
         assert_eq!(declaration(&bare).unwrap().wants.len(), 0);
     }
 
+    /// The `items` section reads back as written, with the capsule's other sections; a capsule without one declares no kinds; a field neither make nor open refuses it.
+    #[test]
+    fn items_kinds_round_trip_in_a_capsule() {
+        let d = ItemsDecl { makes: alloc::vec![([1; 32], String::from("the photos and clips you take"))], opens: alloc::vec![([1; 32], String::from("to show them")), ([2; 32], String::from("your scans"))] };
+        let (kist, wants) = declaration_sections(&Decl { name: String::from("Lumis"), wants: alloc::vec![(ITEMS, String::from("to keep what you shoot"))] }, Some([5; 32]));
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(kist).add_section_direct(wants.unwrap()).add_section_direct(items_section(&d).unwrap()).build().unwrap();
+        assert_eq!(items_of(&file).unwrap(), d);
+        assert_eq!(want_codes(&file).unwrap(), alloc::vec![ITEMS]);
+        assert!(asked_right(ITEMS));
+        assert_eq!(RIGHTS[ITEMS as usize], "items");
+        assert!(items_section(&ItemsDecl::default()).is_none());
+        let bare = vsf::VsfBuilder::new().provenance_only().add_section_direct(declaration_sections(&decl(), None).0).build().unwrap();
+        assert_eq!(items_of(&bare).unwrap(), ItemsDecl::default());
+        let mut bad = VsfSection::new("items");
+        bad.add_field("delete", VsfType::hi(alloc::vec![1; 32]));
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(bad).build().unwrap();
+        assert!(items_of(&file).is_err());
+    }
+
     #[test]
     fn a_want_outside_the_vocabulary_refuses_the_declaration() {
         let mut w = VsfSection::new("wants");
@@ -1643,6 +1708,11 @@ pub mod capsule {
 
     /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the version when given, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
     pub fn unsigned(d: &Decl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
+        unsigned_with_items(d, &ItemsDecl::default(), option, version, developer_name, bundle, code, made)
+    }
+
+    /// `unsigned` with the kinds of the hold the kist makes and opens (its `items` section, after `wants`; docs/STORE.md part 1): what a kist asking for the `items` right declares.
+    pub fn unsigned_with_items(d: &Decl, items: &ItemsDecl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
         let (mut k, w) = declaration_sections(d, Some(option));
         if let Some(v) = version {
             if v.0.is_empty() {
@@ -1657,6 +1727,9 @@ pub mod capsule {
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(bundle.ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k);
         if let Some(w) = w {
             b = b.add_section_direct(w);
+        }
+        if let Some(s) = items_section(items) {
+            b = b.add_section_direct(s);
         }
         b.add_section_direct(code_section(code)).build()
     }
@@ -1765,6 +1838,20 @@ pub mod capsule {
             // The version is in the signed declaration.
             assert_eq!(version_of(&c).unwrap(), Some(Version(alloc::vec![0, 1, 0])));
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
+        }
+
+        /// A kist asking for `items` carries its kinds in the signed capsule, read back by the kernel's `items_of` at launch; the signature still verifies.
+        #[test]
+        fn the_items_kinds_are_signed_with_the_capsule() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let d = Decl { name: String::from("Lumis"), wants: alloc::vec![(ITEMS, String::from("to keep what you shoot"))] };
+            let items = ItemsDecl { makes: alloc::vec![([1; 32], String::from("the stills and clips you take"))], opens: alloc::vec![([2; 32], String::from("your scans"))] };
+            let c = fgtw::release::sign_release(unsigned_with_items(&d, &items, [5; 32], None, None, &key.public(), &code, 9).unwrap(), &key).unwrap();
+            fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
+            assert_eq!(items_of(&c).unwrap(), items);
+            assert_eq!(want_codes(&c).unwrap(), alloc::vec![ITEMS]);
+            assert_eq!(items_of(&signed(&key, None)).unwrap(), ItemsDecl::default());
         }
 
         #[test]

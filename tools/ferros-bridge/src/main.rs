@@ -15,6 +15,8 @@ extern crate alloc;
 mod deaths;
 mod input;
 /// The flash log: `diag log` rendered, `log-render`, `log-legacy` (LEDGER.md "Reading it").
+// The hold on the device, as the person (docs/STORE.md): `items find | card | get | put | rm | kinds`.
+mod items;
 mod ledger;
 /// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
 #[path = "../../../ferros_detail/src/network.rs"]
@@ -81,6 +83,7 @@ fn usage() {
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
+    eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | usage | kinds   The hold, as the person (`items` alone for the flags)");
     eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
@@ -132,6 +135,7 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        "items" => items::cmd_items(&args[2..]).await,
         // part list | dump <name> <out> | gpt <lu> <primary> <backup>: Android's partitions read block for block thru the development `diag lun`, for the per-unit backups (part.rs).
         "part" => part::cmd(&args[2..]).await,
         // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
@@ -396,6 +400,8 @@ async fn main() {
                     // --domain: its own vault domain (syscall 13 on its own data, KISTS.md); --kists: the right to launch kists (init's).
                     "--domain" => { grants.push((16, String::new())); i += 1; }
                     "--kists" => { grants.push((17, String::new())); i += 1; }
+                    // --items: the hold, any kind (a development spawn's; a kist's kinds come from its capsule's `items` section): docs/STORE.md, ferros_items `kist::Hold`.
+                    "--items" => { grants.push((18, String::new())); i += 1; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -533,6 +539,33 @@ fn kist_arg() -> Option<ferros_kist::Decl> {
     Some(ferros_kist::Decl { name, wants })
 }
 
+/// A kist's kinds of the hold from the command line (docs/STORE.md part 1, its capsule's `items` section): each `--makes KIND REASON` and `--opens KIND REASON`, the kind by its first phrasing (`ferros-bridge items kinds`), the reason printable ASCII. They count only where the kist also wants `items` and the person granted it.
+fn items_arg() -> ferros_kist::ItemsDecl {
+    let args: Vec<String> = std::env::args().collect();
+    let mut d = ferros_kist::ItemsDecl::default();
+    for (i, a) in args.iter().enumerate() {
+        let list = match a.as_str() {
+            "--makes" => &mut d.makes,
+            "--opens" => &mut d.opens,
+            _ => continue,
+        };
+        let (Some(k), Some(why)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("{a} takes a kind and its reason");
+            std::process::exit(1);
+        };
+        let Some(kind) = ferros_items::kinds::by_phrasing(k) else {
+            eprintln!("{a} {k}: not one of the project's kinds (`ferros-bridge items kinds`)");
+            std::process::exit(1);
+        };
+        if why.is_empty() || !why.bytes().all(|b| (0x20..0x7F).contains(&b)) {
+            eprintln!("{a} {k}: a reason of printable ASCII");
+            std::process::exit(1);
+        }
+        list.push((kind, why.clone()));
+    }
+    d
+}
+
 /// `--option HEX`: the kist's option, 32 bytes (64 hex digits), written as the capsule's provenance hash: the identity that stays the same across versions (ORACLE.md §5, "the developer mints it once, keeps it stable"), so the person's answers and the kist's domain carry over an update. Without it the hash is computed from the content, and every build is a new kist.
 fn option_arg() -> Option<[u8; 32]> {
     let args: Vec<String> = std::env::args().collect();
@@ -594,7 +627,7 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
                 std::process::exit(1);
             })
         });
-        let unsigned = ferros_kist::capsule::unsigned(&d, option, version.as_ref(), developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
+        let unsigned = ferros_kist::capsule::unsigned_with_items(&d, &items_arg(), option, version.as_ref(), developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
             eprintln!("Capsule build failed: {e}");
             std::process::exit(1);
         });

@@ -806,6 +806,7 @@ dependencies = [
  "ed25519-dalek",
  "ferros-link",
  "ferros_inject",
+ "ferros_items",
  "ferros_kist",
  "ferros_ledger",
  "ferros_pt",
@@ -1106,6 +1107,17 @@ dependencies = [
  "ferros_lang",
  "ferros_sys",
  "honeycomb",
+]
+
+[[package]]
+name = "ferros-payload-holdtest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_items",
+ "ferros_sys",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1434,6 +1446,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_heap",
+ "ferros_items",
+ "ferros_kist",
  "ferros_store",
  "ferros_sys",
  "manifestus",
@@ -1632,6 +1646,17 @@ dependencies = [
 name = "ferros_inject"
 version = "0.1.0"
 dependencies = [
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros_items"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_idea",
+ "ferros_store",
+ "manifestus",
  "vsf 0.11.0",
 ]
 
