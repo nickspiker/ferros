@@ -407,6 +407,8 @@ const DEV_SAVE: u8 = 1 << 1;
 const DEV_VIDEO: u8 = 1 << 2;
 /// Development, the fourth knobs byte: with DEV_VIDEO, take and say the source hashes (tools/clip-check); without, a DEV_VIDEO clip is coded as a deck's is (the hashes held each hand-over for its own packing: 202 of 1760 frames lost at 60 a second against 55, the RAW agent, 2026-11-20).
 const DEV_HASHES: u8 = 1 << 3;
+/// Development, the fourth knobs byte: with DEV_VIDEO, stay in RAW video without recording (the idle preview's heat measured).
+const DEV_VIDEO_IDLE: u8 = 1 << 4;
 
 /// The input's 23rd byte: DEV_VIDEO's frames a second, 0 when shorter.
 fn dev_video_fps() -> u8 {
@@ -1229,7 +1231,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         {
             use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
-            if video_ok && dev_knobs4() & DEV_VIDEO != 0 && frames == 16 && paced.is_some() {
+            if video_ok && dev_knobs4() & (DEV_VIDEO | DEV_VIDEO_IDLE) == DEV_VIDEO && frames == 16 && paced.is_some() {
                 integrator.header[FLAGS_IDX] |= RECORDING_BIT;
             }
             let asked = integrator.header[FLAGS_IDX] & RECORDING_BIT != 0;
