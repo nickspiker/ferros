@@ -683,6 +683,154 @@ fn encode_band_with<const N: bool>(src: &[u8], stride: usize, width: usize, rows
     (la, lb)
 }
 
+// ---------------------------------------------------------------- the split coder
+
+/// The band coder cut in two (the 60/s work, 2026-11-19): a first half that is the same for every block apart (the residuals, each block's selection and k, each residual's code and length: a GPU's work, one invocation a block), and the serial second half (each block's k against the one before it, the bits packed into the two streams: the CPU's), whose output is `encode_band`'s byte for byte.
+/// The first half's output, a band at a time, row by row:
+/// - `info`, one u32 a block (rows × blocks a row, row-major): its k in bits 0-3 and its selection in bit 4 (0 in a row without a row above);
+/// - `codes`, one u16 a residual (rows × width, row-major): its code in bits 0-9 and its length in bits 10-14 (the format's: q zeros, a one and z's low k bits, as the number those bits make; or the escape, ESC zeros then z, as z with its length ESC + BITS).
+pub const SPLIT_SEL: u32 = 1 << 4;
+pub const SPLIT_LEN_SHIFT: u32 = 10;
+/// A GPU's fact word (ferros_clip gpu) carries its block's body length in bits from this bit (`pack_band_bodies`).
+pub const SPLIT_BITS_SHIFT: u32 = 5;
+
+/// Blocks a row of `width` samples is cut into.
+pub const fn row_blocks(width: usize) -> usize {
+    width.div_ceil(BLOCK)
+}
+
+/// The split coder's first half on the CPU: the reference a GPU kernel's output is held to, one band of packed rows into `info` and `codes` (see above).
+pub fn split_codes(src: &[u8], stride: usize, width: usize, rows: usize, cfa: Cfa, work: &mut Work, info: &mut [u32], codes: &mut [u16]) {
+    let rb = row_bytes(width);
+    let nb = row_blocks(width);
+    assert!(width & 3 == 0 && width >= MIN_W && width <= MAX_W, "width {width}");
+    assert!(rows >= 1 && src.len() >= (rows - 1) * stride + rb && info.len() >= rows * nb && codes.len() >= rows * width, "short band");
+    for y in 0..rows {
+        let ci = y & 3;
+        let dy = cfa.dy(y);
+        let has_up = y >= dy;
+        let ui = y.wrapping_sub(dy) & 3;
+        unpack_row(&src[y * stride..y * stride + rb], &mut work.rows[ci][PAD..PAD + width]);
+        left_pad(&mut work.rows, ci, has_up.then_some(ui));
+        let [m0, m1] = &mut work.m;
+        if has_up {
+            residuals::<false, AVG4>(cfa, &work.rows[ci], &work.rows[ui], width, m0);
+            residuals::<false, MED>(cfa, &work.rows[ci], &work.rows[ui], width, m1);
+        } else {
+            residuals::<false, LEFT>(cfa, &work.rows[ci], &work.rows[ci], width, m0);
+        }
+        let mut x = 0;
+        let mut j = 0;
+        while x < width {
+            let n = if width - x < BLOCK { width - x } else { BLOCK };
+            let s0 = block_sum::<false>(&m0[x..x + n]);
+            let (best, s) = if has_up {
+                let s1 = block_sum::<false>(&m1[x..x + n]);
+                let b = s1 < s0;
+                (b as u32, if b { s1 } else { s0 })
+            } else {
+                (0, s0)
+            };
+            let chunk = if best == 1 { &m1[x..x + n] } else { &m0[x..x + n] };
+            let mean = if n == BLOCK { s >> BLOCK_LOG2 } else { s / n as u32 };
+            let k = 31 - (mean | 1).leading_zeros();
+            info[y * nb + j] = k | best << 4;
+            let (l, c) = (&mut work.rc.lens[x..x + n], &mut work.rc.codes[x..x + n]);
+            codes_scalar(chunk, k, l, c);
+            for ((o, &l), &c) in codes[y * width + x..y * width + x + n].iter_mut().zip(l.iter()).zip(c.iter()) {
+                *o = c | l << SPLIT_LEN_SHIFT;
+            }
+            x += n;
+            j += 1;
+        }
+        right_pad(&mut work.rows[ci], width);
+    }
+}
+
+/// The split coder's second half: a band's `info` and `codes` (the first half's, from a GPU or `split_codes`) packed into its two streams, `encode_band`'s output byte for byte: stream A at out[0..la], B right behind it; returns (la, lb). `out` holds `max_band_len(width, rows)` bytes.
+pub fn pack_band(info: &[u32], codes: &[u16], width: usize, rows: usize, cfa: Cfa, work: &mut Work, out: &mut [u8]) -> (usize, usize) {
+    pack_band_strided(info, row_blocks(width), codes, width, width, rows, cfa, work, out)
+}
+
+/// `pack_band` over a first half whose rows lie `info_stride` facts and `codes_stride` codes apart (a GPU's rows padded to a power of two of blocks, ferros_clip `gpu`).
+pub fn pack_band_strided(info: &[u32], info_stride: usize, codes: &[u16], codes_stride: usize, width: usize, rows: usize, cfa: Cfa, work: &mut Work, out: &mut [u8]) -> (usize, usize) {
+    let nb = row_blocks(width);
+    assert!(width & 3 == 0 && width >= MIN_W && width <= MAX_W, "width {width}");
+    assert!(rows >= 1 && info_stride >= nb && codes_stride >= width && info.len() >= (rows - 1) * info_stride + nb && codes.len() >= (rows - 1) * codes_stride + width, "short split band");
+    let half = max_stream_len(width, rows);
+    assert!(out.len() >= 2 * half, "output below max_band_len");
+    let (sa, sb) = out[..2 * half].split_at_mut(half);
+    let mut bws = [BitWriter::new(sa), BitWriter::new(sb)];
+    let mut kprev = K0;
+    let rc = &mut work.rc;
+    for y in 0..rows {
+        let sel = (y >= cfa.dy(y)) as u32;
+        for j in 0..nb {
+            let v = info[y * info_stride + j];
+            let k = v & 15;
+            let (kc, kl) = k_code(k, kprev);
+            kprev = k;
+            rc.hcode[j] = (((v >> 4 & 1) << kl) | kc) as u8;
+            rc.hlen[j] = (sel + kl) as u8;
+        }
+        // Two codes joined, the first above the second, as `block_codes` joins them (a block holds a multiple of 4).
+        for (p, c) in codes[y * codes_stride..y * codes_stride + width].chunks_exact(2).enumerate() {
+            let (l0, l1) = ((c[0] >> SPLIT_LEN_SHIFT) as u64, (c[1] >> SPLIT_LEN_SHIFT) as u64);
+            rc.pcode[p] = (((c[0] & 0x3FF) as u64) << l1) | (c[1] & 0x3FF) as u64;
+            rc.plen[p] = (l0 + l1) as u8;
+        }
+        pack_row(rc, width, &mut bws);
+    }
+    let [a, b] = bws;
+    let la = a.finish();
+    let lb = b.finish();
+    out.copy_within(half..half + lb, la);
+    (la, lb)
+}
+
+/// The second half over bodies a GPU laid out (ferros_clip gpu): block j of row y has its fact word at `info[y * info_stride + j]` (k, the selection, and its body's length in bits from `SPLIT_BITS_SHIFT`) and its body, its codes end to end most significant bit first in u32 words, from `bodies[(y * info_stride + j) << body_log2]`.
+/// Each block's header (its selection bit in a row with a row above, its k against the block before) then its body's words go into stream j & 1: `encode_band`'s bytes, stream A at out[0..la], B right behind; returns (la, lb).
+pub fn pack_band_bodies(info: &[u32], info_stride: usize, bodies: &[u32], body_log2: u32, width: usize, rows: usize, cfa: Cfa, out: &mut [u8]) -> (usize, usize) {
+    let nb = row_blocks(width);
+    assert!(width & 3 == 0 && width >= MIN_W && width <= MAX_W, "width {width}");
+    assert!(rows >= 1 && info_stride >= nb && info.len() >= (rows - 1) * info_stride + nb, "short split band");
+    let half = max_stream_len(width, rows);
+    assert!(out.len() >= 2 * half, "output below max_band_len");
+    let (sa, sb) = out[..2 * half].split_at_mut(half);
+    let mut bws = [BitWriter::new(sa), BitWriter::new(sb)];
+    let mut kprev = K0;
+    // The most bits a body may say it holds: BLOCK escapes. The writers' room is sized for that (`max_stream_len`), so a fact word past it (a GPU's fault) panics here, never writes past the room.
+    let most = BLOCK as u32 * CODE_MAX;
+    for y in 0..rows {
+        let sel = (y >= cfa.dy(y)) as u32;
+        for j in 0..nb {
+            let at = y * info_stride + j;
+            let v = info[at];
+            let k = v & 15;
+            let (kc, kl) = k_code(k, kprev);
+            kprev = k;
+            let bits = v >> SPLIT_BITS_SHIFT;
+            assert!(bits <= most, "a body of {bits} bits");
+            let bw = &mut bws[j & 1];
+            bw.put(((((v >> 4) & sel) << kl) | kc) as u64, sel + kl);
+            let body = &bodies[at << body_log2..(at << body_log2) + (bits as usize).div_ceil(32)];
+            let whole = (bits >> 5) as usize;
+            for &word in &body[..whole] {
+                bw.put(word as u64, 32);
+            }
+            let rest = bits & 31;
+            if rest != 0 {
+                bw.put((body[whole] >> (32 - rest)) as u64, rest);
+            }
+        }
+    }
+    let [a, b] = bws;
+    let la = a.finish();
+    let lb = b.finish();
+    out.copy_within(half..half + lb, la);
+    (la, lb)
+}
+
 /// Decode one band from its two streams into `dst` (u16 samples, `dst_stride` samples a row); returns the bytes of A and of B it used, la and lb for a whole stream.
 /// Panics on a bad geometry or a short dst; a corrupt stream decodes to wrong samples, never to a read outside a slice.
 pub fn decode_band(a: &[u8], b: &[u8], width: usize, rows: usize, cfa: Cfa, work: &mut Work, dst: &mut [u16], dst_stride: usize) -> (usize, usize) {

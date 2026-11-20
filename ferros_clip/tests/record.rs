@@ -129,3 +129,52 @@ fn pacing_for_every_whole_rate() {
         eprintln!("fps A#{fps}: fll A#{} keep A#{} sensor A#{} ns, the clip's frame A#{} ns ({:+.1} ppm)", p.fll, p.keep, p.sensor_ns, p.period_ns, err_ppm);
     }
 }
+
+#[test]
+fn coders_spread_one_to_a_core() {
+    use ferros_clip::spread;
+    assert_eq!(spread(&[0x00F0; 4]), vec![0x10, 0x20, 0x40, 0x80]);
+    assert_eq!(spread(&[0x00F0, 0x000F, 0x00F0, 0x000F, 0x00F0]), vec![0x10, 0x1, 0x20, 0x2, 0x40]);
+    // More workers than cores: round again.
+    assert_eq!(spread(&[0x0003; 3]), vec![0x1, 0x2, 0x1]);
+    assert_eq!(spread(&[0x0100]), vec![0x0100]);
+}
+
+/// 32 frames recorded on the CPU coders, or on the GPU path with the host's stand-in for the GPU (`gpu::HostDevice`), the source hash asked for or not: the clip's bytes, and its frames decoded against the samples.
+fn record(gpu: bool, digests: bool) -> Vec<u8> {
+    let (w, h, stride) = (1024usize, 320usize, 1280usize);
+    let cam = Camera { width: w, height: h, stride, cfa: cfa_of_byte(0x49), black: 64, white: 1023, make: "ferros".into(), model: "test".into(), sensor_module: "main".into(), lens: String::new(), f_number: None, focal_mm: None, characterization: None, observer: String::new(), orientation: 1 };
+    let sink = MemSink::default();
+    let bytes = sink.bytes.clone();
+    // As many slots as frames: the writer never makes the hand-over drop one, so both paths' clips hold the same frames.
+    let mode = Mode { pacing: Pacing::of(30), title: "host test".into(), workers: vec![0; 4], writer: 0, slots: 32, blocks: 1 << 14, at: 1 << 40, source_digests: digests };
+    let mut rec = if gpu { Recorder::start_gpu(&cam, &mode, Box::new(sink), ferros_clip::gpu::HostDevice::new(w, h, stride)).unwrap() } else { Recorder::start(&cam, &mode, Box::new(sink)).unwrap() };
+    let mut frames = Vec::new();
+    for k in 0..32u64 {
+        let (packed, px) = frame(w, h, stride, k);
+        let f = FrameIn { rows: &packed, count: 100 + k, eagle_ns: 1_000_000_000_000 + k * 33_334_420, exposure_ns: 1 << 20, gain: 2048, focus: 7 };
+        assert_eq!(rec.frame(&f), Taken::Recorded, "frame {k}");
+        if digests {
+            assert_eq!(rec.source_hash(), ferros_clip::samples_source_hash(&px, w, h), "frame {k}'s source hash");
+        }
+        frames.push(px);
+    }
+    assert_eq!(rec.gpu().is_some(), gpu, "{}", rec.gpu_note());
+    let info = rec.stop();
+    assert!(info.error.is_none(), "{:?}", info.error);
+    assert_eq!(info.stats.frames, 32);
+    let clip = bytes.lock().unwrap()[..info.len as usize].to_vec();
+    let r = Reader::open(clip.as_slice()).unwrap();
+    assert_eq!(r.frames().len(), 32);
+    for (k, px) in frames.iter().enumerate() {
+        assert_eq!(&r.decode(k).unwrap(), px, "frame {k}");
+    }
+    clip
+}
+
+#[test]
+fn the_gpu_path_writes_the_cpu_path_s_clip() {
+    let cpu = record(false, true);
+    assert!(record(true, true) == cpu, "the GPU path's clip, source hashes asked");
+    assert!(record(true, false) == record(false, false), "the GPU path's clip, packed behind the hand-over");
+}

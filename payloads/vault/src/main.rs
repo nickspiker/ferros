@@ -80,6 +80,8 @@ const EOP_SPACE: u8 = 6;
 /// The kernel's own channel only (the bridge's `store extent-list` / `extent-drop`; process.rs `extent_forward` refuses both from a process): the area's extents as records, and an extent dropped by its first block, its domain's alone. An extent's name is a derived key, never stored, so a clip whose name is lost (a writer that died before saying it) is found and dropped by these.
 const EOP_LIST: u8 = 7;
 const EOP_DROP_AT: u8 = 8;
+/// The bridge's `store extent-drop-orphan` (the kernel's own channel, development builds): a sealed extent at a first block dropped whatever domain owns it, for one whose owning build no longer exists.
+const EOP_DROP_ORPHAN: u8 = 9;
 /// One record of EOP_LIST: first, blocks, bytes (u64 LE each), sealed (u8), at (i64 LE), owner (32).
 const LIST_ROW: usize = 8 + 8 + 8 + 1 + 8 + 32;
 /// Grant slot 5: the `clips` block window, the extents' area (process.rs WINDOWS; a kernel from before grants none, and every extent op is refused).
@@ -1442,7 +1444,7 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
     // Clips left open by a writer that is gone are handed to the recoverer (`recover_kick`): an OPEN takes a free stretch at once and never waits for them.
     recover_kick(store);
     // But an extent this request removes or replaces is not one the recoverer may still be writing in: its recovery is let finish first (a few hundred ms since 2026-11-19).
-    if (matches!(eop, EOP_OPEN | EOP_DELETE) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == key)) || (eop == EOP_DROP_AT && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.1 == block)) {
+    if (matches!(eop, EOP_OPEN | EOP_DELETE) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.0 == key)) || (matches!(eop, EOP_DROP_AT | EOP_DROP_ORPHAN) && unsafe { *(&raw const RECOVERING) }.is_some_and(|r| r.1 == block)) {
         recover_commit(store, true);
     }
     let Some(t) = extents(store) else { return ERR };
@@ -1588,6 +1590,20 @@ fn extent(store: &mut St, d: &Domain, name: &[u8], rest: &[u8], out: &mut [u8], 
                 Ok(()) => {
                     *t = next;
                     say!("vault: extent at {} dropped by its first block ({} blocks, {} bytes, sealed {}); {} free at most", e.first, e.blocks, e.bytes, e.sealed, t.largest_free());
+                    0
+                }
+                Err(_) => ERR,
+            }
+        }
+        EOP_DROP_ORPHAN => {
+            // Any domain's, but only a sealed one: an open extent may still have a writer, or is the recoverer's to close.
+            let Some(e) = t.list().iter().find(|e| e.first == block && e.sealed).copied() else { return NOTHING };
+            let mut next = t.clone();
+            next.remove(&e.name);
+            match next.store(store.engine(), now) {
+                Ok(()) => {
+                    *t = next;
+                    say!("vault: orphan extent at {} dropped by its first block, owner {:02X}{:02X}{:02X}{:02X}.. ({} blocks, {} bytes); {} free at most", e.first, e.owner[0], e.owner[1], e.owner[2], e.owner[3], e.blocks, e.bytes, t.largest_free());
                     0
                 }
                 Err(_) => ERR,
