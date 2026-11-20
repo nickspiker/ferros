@@ -3,7 +3,7 @@
 //!
 //! The input (hex bytes):
 //! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 6 the per-core profile, 7 the GPU bench, 8 the camera alone (the power baseline), 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
-//! - record (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip).
+//! - record (+21 the `items` grant's slot: the clip kept as an item of the hold, ferros_clip `items::ItemSink`, spawned with `--items` after the other grants; 0 the scope's extent) (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
 
@@ -98,6 +98,27 @@ fn hashes_doc(hashes: &[(u64, [u8; 32])]) -> Vec<u8> {
         .add_section("rawrec_hashes", vec![("index".to_string(), VsfType::t_u6(Tensor::new(vec![n], hashes.iter().map(|h| h.0).collect()))), ("hashes".to_string(), VsfType::t_u3(Tensor::new(vec![n, 32], hashes.iter().flat_map(|h| h.1).collect())))])
         .build()
         .unwrap_or_default()
+}
+
+/// Where a recorded clip is read back from: the scope's extent by its name, or the hold's item by its handle.
+enum Src {
+    Ext(ExtentSource),
+    Item(ferros_clip::items::ItemSource<ferros_items::kist::Sys>),
+}
+
+impl vsf::container::ByteSource for Src {
+    fn len(&self) -> u64 {
+        match self {
+            Src::Ext(s) => s.len(),
+            Src::Item(s) => s.len(),
+        }
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), vsf::container::SourceError> {
+        match self {
+            Src::Ext(s) => s.read_at(offset, buf),
+            Src::Item(s) => s.read_at(offset, buf),
+        }
+    }
 }
 
 fn hex(h: &[u8; 32]) -> String {
@@ -751,7 +772,17 @@ fn main() {
     let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: [0x000F, 0x00F0, 0x0100][arg(17).min(2) as usize], slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)), source_digests: arg(20) & 2 == 0 };
     // +20 bit 3: the GPU path off (the CPU coders alone, as before the 60/s work).
     ferros_clip::gpu::enable(arg(20) & 8 == 0);
-    let mut rec = match Recorder::start(&cam, &mode, Box::new(ExtentSink(Extent::new(slot, &name)))) {
+    // +21: the clip kept as an item of the hold (ferros_clip `items::ItemSink`) thru the `items` grant in that slot (`--items`, after the other grants), else the extent of the scope's name.
+    let items_slot = arg(21) as u64;
+    let receipt = (items_slot != 0).then(|| {
+        let at = ferros_clip::eagle_osc(w8(&hd, 32));
+        ferros_clip::items::raw_video(items_slot, Some(format!("rawrec A#{fps} a second")), at, vec![("fps".into(), vsf::VsfType::u3(fps as u8)), ("width".into(), vsf::VsfType::u4(w as u16)), ("height".into(), vsf::VsfType::u4(h as u16))])
+    });
+    let (sink, receipt): (Box<dyn ferros_clip::Sink>, _) = match receipt {
+        Some((s, r)) => (Box::new(s), Some(r)),
+        None => (Box::new(ExtentSink(Extent::new(slot, &name))), None),
+    };
+    let mut rec = match Recorder::start(&cam, &mode, sink) {
         Ok(r) => r,
         Err(e) => {
             println!("rawrec: the recorder did not start: {e}");
@@ -858,6 +889,14 @@ fn main() {
         println!("rawrec: the GPU: A#{} frames run, A#{} us a frame at most, A#{} on average; packed behind the hand-over A#{} us at most, A#{} on average{}", g.runs, g.run_us_most, g.run_us_sum / g.runs.max(1), g.behind_us_most, g.behind_us_sum / g.runs.max(1), g.failed.map(|e| format!("; the GPU failed: {e}")).unwrap_or_default());
     }
     println!("rawrec: seal {}", hex(&info.hash));
+    // The item's receipt: its handle, its writes' path, its sealed card.
+    let item = receipt.as_ref().map(|r| r.lock().unwrap().clone());
+    if let Some(r) = &item {
+        match &r.card {
+            Some(c) => println!("rawrec: kept as an item of the hold: id {}, A#{} bytes, body {}, straight to the flash {}, its extent {:?}", hex(&c.id), c.size, hex(&c.body), r.direct, c.extent.map(|x| (x.first, x.blocks))),
+            None => println!("rawrec: the item was not sealed (handle {}, straight to the flash {})", r.handle.map(|h| hex(&h)).unwrap_or_default(), r.direct),
+        }
+    }
     if let Some(i) = ext.info() {
         println!("rawrec: the extent: A#{} blocks from block A#{} of the clips area (partition block A#{}), A#{} bytes, sealed {}", i.blocks, i.first, (6u64 << 20) + i.first, i.bytes, i.sealed);
         println!("rawrec: the recording space: {:?}", ferros_clip::ferros::space(slot));
@@ -870,7 +909,12 @@ fn main() {
     }
     // The clip read back from the flash and decoded here: every hashed frame against its hash, the copies sample for sample.
     let t = Instant::now();
-    let reader = match vsf::visual::clip::Reader::open(ExtentSource { extent: Extent::new(slot, &name), len: info.len }) {
+    // An item's body read thru the hold by its handle (ferros_clip `items::ItemSource`), else the extent by its name.
+    let src = match item.as_ref().and_then(|r| r.handle) {
+        Some(handle) => Src::Item(ferros_clip::items::ItemSource::new(ferros_items::kist::Hold::new(ferros_items::kist::Sys { cap: 0x204 + 32 * items_slot }, vsf::types::eagle_time::eagle_time_oscillations), handle, info.len)),
+        None => Src::Ext(ExtentSource { extent: Extent::new(slot, &name), len: info.len }),
+    };
+    let reader = match vsf::visual::clip::Reader::open(src) {
         Ok(r) => r,
         Err(e) => {
             println!("rawrec: the clip did not open from the flash: {e}");
