@@ -3,7 +3,8 @@
 //! | Value | Section | Fields |
 //! |---|---|---|
 //! | `gps.last` | `last_fix` | `at` `w` (the place), `when` `e` (when the fix came, on the real clock; absent when the clock was not read) |
-//! | `map.place.<label>` | `place` | `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
+//! | `map.deck` | `circle`, one per circle placed by hand | `kind` `hi`, `thing` `ht` (none for settings), `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
+//! | `map.place.<label>` (until 2026-11-20, read once to migrate) | `place` | `x`, `y` `i` (world ×256), `radius` `u`, `cos`, `sin` `i` (Q14) |
 //! | `map.view` | `view` | `x`, `y`, `cos`, `sin` `i` |
 //! | `map.dev` | `developer` | `unlocked` `u0` |
 //! | `ahau.proof`, `fgtw.handle_proof` | `handle_proof` | `handle_proof` `hP` |
@@ -20,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod deck;
 pub mod gps;
 pub mod map;
 pub mod secret;

@@ -10,6 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 vsf = { path = "../../vsf", default-features = false }
+# The deck's circles by their thing (`ht`) and kind (`hi`).
+ferros_thing = { path = "../ferros_thing" }
 # vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The last fix's degrees thru vsf's position type (a rounding without std).

@@ -17,6 +17,15 @@ pub const PLACE: &str = "place";
 pub const VIEW: &str = "view";
 pub const DEVELOPER: &str = "developer";
 
+/// A circle's old vault name in the map's scope (until 2026-11-20, read only to migrate to the deck document, ferros_kept::deck): `place.` and its label, a space as an underscore, cut at 26 bytes (a name in the map's scope held 32).
+pub fn place_key(label: &str) -> Vec<u8> {
+    let mut k = b"place.".to_vec();
+    for &c in label.as_bytes().iter().take(26) {
+        k.push(if c == b' ' { b'_' } else { c });
+    }
+    k
+}
+
 /// The radii a place may have: 1 to 2¹⁶ − 1 world units, what the map has always taken (a radius of 0 draws nothing, and the map's loader refused 2¹⁶ and past before this document existed).
 fn radius_ok(r: i64) -> bool {
     (1..1 << 16).contains(&r)

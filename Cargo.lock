@@ -1666,6 +1666,7 @@ name = "ferros_kept"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_thing",
  "libm",
  "vsf 0.11.0",
 ]
@@ -1798,6 +1799,7 @@ dependencies = [
  "ferros_kept",
  "ferros_kist",
  "ferros_ledger",
+ "ferros_thing",
  "fgtw",
  "vsf 0.11.0",
 ]
