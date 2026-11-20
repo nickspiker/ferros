@@ -9,6 +9,8 @@
 
 #[cfg(target_os = "ferros")]
 pub mod ferros;
+/// The band coder's first half as a GPU kernel (the 60/s work): `gpu::kernel`, its words for the GPU service, and ferros_rawcodec `pack_band_strided` for the CPU's half.
+pub mod gpu;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -531,6 +533,38 @@ impl Recorder {
         info.stats = Stats { written: info.len, ..self.stats };
         info
     }
+}
+
+/// The coders' cores, one each: the k-th worker given a mask runs on that mask's (k mod its cores)-th core, so four workers on the A715s' mask are one on each A715.
+/// Four threads sharing a cluster's mask were run on fewer cores than they asked for (2026-11-19, the Pro, rawrec job 6: a frame's 48 bands on four A715 threads with the shared mask G#00F0 in 52 ms, pinned one to a core in 24 ms; the kernel wakes one idle core for a queued thread, and the rest of the cluster sleeps on until its timer).
+pub fn spread(masks: &[u64]) -> Vec<u64> {
+    let mut seen: Vec<(u64, u32)> = Vec::new();
+    masks
+        .iter()
+        .map(|&m| {
+            let k = match seen.iter_mut().find(|s| s.0 == m) {
+                Some(s) => {
+                    s.1 += 1;
+                    s.1 - 1
+                }
+                None => {
+                    seen.push((m, 1));
+                    0
+                }
+            };
+            let n = m.count_ones();
+            if n == 0 {
+                return m;
+            }
+            // The (k mod n)-th set bit of the mask.
+            let mut left = m;
+            for _ in 0..k % n {
+                left &= left - 1;
+            }
+            // Its lowest set bit (x & -x in two's complement: a bit trick, not an overflow guard).
+            left & left.wrapping_neg()
+        })
+        .collect()
 }
 
 /// An empty buffer of `cap` bytes whose pages are already the process's (written once): a frame's first coding then grows nothing, where an arc's growth in the camera loop cost a clip its second frame (2026-11-19).

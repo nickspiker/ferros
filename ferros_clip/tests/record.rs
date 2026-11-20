@@ -129,3 +129,13 @@ fn pacing_for_every_whole_rate() {
         eprintln!("fps A#{fps}: fll A#{} keep A#{} sensor A#{} ns, the clip's frame A#{} ns ({:+.1} ppm)", p.fll, p.keep, p.sensor_ns, p.period_ns, err_ppm);
     }
 }
+
+#[test]
+fn coders_spread_one_to_a_core() {
+    use ferros_clip::spread;
+    assert_eq!(spread(&[0x00F0; 4]), vec![0x10, 0x20, 0x40, 0x80]);
+    assert_eq!(spread(&[0x00F0, 0x000F, 0x00F0, 0x000F, 0x00F0]), vec![0x10, 0x1, 0x20, 0x2, 0x40]);
+    // More workers than cores: round again.
+    assert_eq!(spread(&[0x0003; 3]), vec![0x1, 0x2, 0x1]);
+    assert_eq!(spread(&[0x0100]), vec![0x0100]);
+}

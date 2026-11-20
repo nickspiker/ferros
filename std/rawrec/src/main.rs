@@ -177,6 +177,122 @@ fn neon_frame(rows: &[u8], w: usize, h: usize, stride: usize) -> (usize, u64, u6
     (differ, ts, tn, coded)
 }
 
+/// Job 6: where a frame's coding goes, per core kind (the 60/s work, 2026-11-19): one frame from the view, its 48 bands on one core of each kind in turn, the band coder, the coded bands' BLAKE3 (`band_digest`), the source rows' BLAKE3 (`band_source_digest`) and the copy of the coded bytes timed apart; then the coder alone on four A715s, four A510s and all eight. Run under the recording's clocks: a one-block extent is held open meanwhile (the A715s at 1572 MHz, the A510s at their top).
+fn profile(slot: u64) {
+    use ferros_rawcodec as rc;
+    let mut ext = Extent::new(slot, "rawrec.prof");
+    let held = ext.open(1).is_ok();
+    let mut r = [0u8; 64];
+    let n = call(S_CAMERA, &Pacing::of(30).open_msg(0, 16_000_000), &mut r);
+    if n == ERR || r[0] != 0 || n < 48 {
+        println!("rawrec: profile: OPEN refused");
+        return;
+    }
+    let mut tok = [0u8; 32];
+    tok.copy_from_slice(&r[1..33]);
+    let base = svc(SYS_DMA, off(tok.as_ptr()), 0, 0, 0, 0);
+    let (w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    let mut hd = [0u8; 64];
+    let mut mapped = 0xFFu8;
+    for _ in 0..8 {
+        if call(S_CAMERA, &[5, mapped], &mut hd) == ERR {
+            println!("rawrec: profile: MAP failed");
+            let _ = call(S_CAMERA, &[4], &mut r);
+            return;
+        }
+        mapped = hd[40];
+    }
+    // SAFETY: the view's buffer this MAP names, held until the next MAP.
+    let view = unsafe { core::slice::from_raw_parts((base + u64::from_le_bytes(hd[48..56].try_into().unwrap())) as *const u8, h * stride) };
+    // The same frame copied into the process's own memory: the copy's rate is the view's read rate, and every step below runs on both.
+    let mut copy = vec![0u8; view.len()];
+    let t = Instant::now();
+    copy.copy_from_slice(view);
+    let cu = t.elapsed().as_micros() as u64;
+    let t = Instant::now();
+    let mut again = vec![0u8; view.len()];
+    again.copy_from_slice(&copy);
+    let cc = t.elapsed().as_micros() as u64;
+    println!("rawrec: profile: the frame (A#{} bytes) copied out of the view in A#{cu} us (A#{} MB/s); from memory to memory A#{cc} us (A#{} MB/s)", view.len(), view.len() as u64 / cu.max(1), view.len() as u64 / cc.max(1));
+    for (from, rows) in [("the view", view), ("a copy", &copy[..])] {
+    let nb = rc::bands(h);
+    println!("rawrec: profile: from {from}: NEON A#{}, recording clocks A#{held}, A#{nb} bands of A#{w} x A#{} rows", rc::NEON as u8, rc::BAND_ROWS);
+    for (what, mask) in [("an A715", 0x0010u64), ("an A510", 0x0001), ("the X3", 0x0100)] {
+        let (te, tb, ts, tc) = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                ferros_clip::ferros::pin(mask);
+                let mut work = Box::new(rc::Work::new());
+                let mut o = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+                let mut keep = vec![0u8; o.len()];
+                let (mut te, mut tb, mut ts, mut tc) = (0u64, 0u64, 0u64, 0u64);
+                for pass in 0..2 {
+                    for k in 0..nb {
+                        let n = rc::band_rows(h, k);
+                        let src = &rows[rc::band_src(k, h, w, stride)];
+                        let t0 = Instant::now();
+                        let (la, lb) = rc::encode_band(src, stride, w, n, rc::Cfa::Bayer, &mut work, &mut o);
+                        let t1 = Instant::now();
+                        let _ = vsf::visual::clip::band_digest(&o[..la], &o[la..la + lb]);
+                        let t2 = Instant::now();
+                        let _ = ferros_clip::band_source_digest(src, stride, w, n);
+                        let t3 = Instant::now();
+                        keep[..la + lb].copy_from_slice(&o[..la + lb]);
+                        let t4 = Instant::now();
+                        // The second pass counts: the first warms the caches and the code.
+                        if pass == 1 {
+                            te += (t1 - t0).as_micros() as u64;
+                            tb += (t2 - t1).as_micros() as u64;
+                            ts += (t3 - t2).as_micros() as u64;
+                            tc += (t4 - t3).as_micros() as u64;
+                        }
+                    }
+                }
+                (te, tb, ts, tc)
+            })
+            .join()
+            .unwrap()
+        });
+        println!("rawrec: profile: on {what}, a frame: the coder A#{} us, the coded bands' BLAKE3 A#{} us, the source's BLAKE3 A#{} us, the copy A#{} us", te, tb, ts, tc);
+    }
+    for (what, masks) in [("four A715s", vec![0x00F0u64; 4]), ("four A715s, each its own", vec![0x0010u64, 0x0020, 0x0040, 0x0080]), ("two A715s, each its own", vec![0x0010u64, 0x0020]), ("four A510s", vec![0x000F; 4]), ("four A715s and four A510s", [vec![0x00F0u64; 4], vec![0x000F; 4]].concat())] {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let t = Instant::now();
+        let per: Vec<(u64, usize)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = masks
+                .iter()
+                .map(|&m| {
+                    let next = &next;
+                    sc.spawn(move || {
+                        ferros_clip::ferros::pin(m);
+                        let mut work = Box::new(rc::Work::new());
+                        let mut o = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
+                        let (t0, mut done) = (Instant::now(), 0);
+                        loop {
+                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if k >= nb {
+                                break;
+                            }
+                            let src = &rows[rc::band_src(k, h, w, stride)];
+                            rc::encode_band(src, stride, w, rc::band_rows(h, k), rc::Cfa::Bayer, &mut work, &mut o);
+                            done += 1;
+                        }
+                        (t0.elapsed().as_micros() as u64, done)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        println!("rawrec: profile: the coder on {what}, bands claimed as each frees: A#{} us a frame; bands each A#{:?}", t.elapsed().as_micros(), per.iter().map(|p| p.1).collect::<Vec<_>>());
+    }
+    }
+    let _ = call(S_CAMERA, &[6, mapped], &mut r);
+    let _ = call(S_CAMERA, &[4], &mut r);
+    if held {
+        ext.delete();
+    }
+}
+
 /// Job 4: this build's band coder (NEON with `--features neon`) against the scalar one, byte for byte, on frames of the binned main at four gains (+1 the frames at each, 0: 4), then each band decoded and compared with the frame; the times on four A715s.
 fn neon_check(inp: &[u8]) {
     let per = if inp.get(1).copied().unwrap_or(0) == 0 { 4 } else { inp[1] as usize };
@@ -288,6 +404,10 @@ fn main() {
             neon_check(&inp);
             return;
         }
+        6 => {
+            profile(slot);
+            return;
+        }
         _ => {}
     }
     let fps = if arg(1) == 0 { 30 } else { arg(1).min(60) } as u32;
@@ -368,6 +488,14 @@ fn main() {
     let blocks = (want * raw_frame + (1 << 24)) >> 12;
     let mut workers = vec![0x00F0u64; a715];
     workers.extend(std::iter::repeat_n(0x000Fu64, a510));
+    // +20, the 60/s experiments: bit 0 the workers one to a core (ferros_clip `spread`), bit 1 no source digests, bit 2 a coder on the X3 too.
+    if arg(20) & 4 != 0 {
+        workers.push(0x0100);
+    }
+    if arg(20) & 1 != 0 {
+        workers = ferros_clip::spread(&workers);
+    }
+    println!("rawrec: the coders' cores G#{:?}, source digests A#{}", workers.iter().map(|m| format!("{m:X}")).collect::<Vec<_>>(), (arg(20) & 2 == 0) as u8);
     // The settings' frames let pass (a SET reaches the sensor a frame or two later, and an open's first frames come as the stream settles): the clip starts on a steady stream, as Lumis's does.
     for _ in 0..4 {
         if !map(held, &mut hd) {
@@ -380,7 +508,7 @@ fn main() {
     // The copies kept whole for the check after the clip, their pages taken now and not in the camera loop (at 30 a second and under only: a copy is a few ms).
     let keep_copies = fps <= 30;
     let mut copy_bufs: Vec<Vec<u8>> = if keep_copies { (0..4).map(|_| vec![0u8; h * stride]).collect() } else { Vec::new() };
-    let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: [0x000F, 0x00F0, 0x0100][arg(17).min(2) as usize], slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)), source_digests: true };
+    let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: [0x000F, 0x00F0, 0x0100][arg(17).min(2) as usize], slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)), source_digests: arg(20) & 2 == 0 };
     let mut rec = match Recorder::start(&cam, &mode, Box::new(ExtentSink(Extent::new(slot, &name)))) {
         Ok(r) => r,
         Err(e) => {

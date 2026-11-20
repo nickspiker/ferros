@@ -2320,6 +2320,10 @@ fn governor(now: u64, f: u64, boost: bool) -> u8 {
         if g.level > g.opps[top] {
             g.level = g.opps[top];
         }
+        // A RAW clip recording holds the A715s at `CLIPS_KHZ`, not under it: its coders work in bursts (a frame's bands, then the wait for the next), which the windows read as half a load, and the governor asked 1065 MHz while a frame's coding wanted the whole budget (2026-11-19, 60/s: four A715 coders 24 ms a frame at a fixed 1572, more under the governor's 1065).
+        if g.domain == 3 && recording() {
+            g.level = g.opps[top];
+        }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
         gov_ask(g, at, f);
     }
