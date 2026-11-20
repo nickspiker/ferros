@@ -2471,6 +2471,60 @@ mod hvcore {
         }
     }
 
+    /// Every layer's DMA engine (zuma-drm-dpu.dtsi): L0-L6 at G#1990_0000 + k·G#1000 on DPUF0, L7-L13 at G#19D0_0000 + k·G#1000 on DPUF1. Linux programs all fourteen from EL1, so none is a secure word.
+    const LAYER_DMAS: [usize; 2] = [0x1990_0000, 0x19D0_0000];
+    /// DECON0's window control words (WINCON), window w at + w·G#1000, eight windows; bit 0 enables the window.
+    const DECON0_WINCON: usize = 0x194A_0000;
+    /// RDMA_ENABLE's bits (cal_9865 regs-dpp.h): the engine busy, and the force that copies every SFR into its shadow (the active copy, + G#400) at once.
+    const IDMA_OP_STATUS: u32 = 1 << 2;
+    const IDMA_SFR_UPDATE_FORCE: u32 = 1 << 4;
+    /// RDMA_IRQ as it reads out of reset (every source masked, the line off), with every pending source cleared in the same write (IDMA_ALL_IRQ_CLEAR, IDMA_ALL_IRQ_MASK).
+    const IDMA_IRQ_RESET: u32 = 0xDFB << 16 | 0xDFB << 1;
+    /// RDMA_IN_CTRL_0 as it reads out of reset (an unused layer on the jumped Pro, 2026-11-20): IC_MAX G#40, no compression, no rotation, format 0, alpha 0.
+    const IDMA_IN_CTRL_RESET: u32 = 0x0040_0000;
+    /// The DMA words that say what the engine fetches and from where (regs-dpp.h): the source size, offset and image size, the block, the four plane addresses and strides, SBWC's and AFBC's parameters, AFBC recovery. Each reads 0 out of reset.
+    const IDMA_FETCH_WORDS: [usize; 17] = [0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x64, 0x70, 0x80];
+
+    /// Android's layers taken out of every DMA engine before translation goes off: the jump is a killswitch, and nothing Android set up is adopted (owner, 2026-11-04).
+    /// The jump of 2026-11-20 (the Pro, b1053) left four layers loaded with Android's AFBC buffers at its IOVAs (L0 and L7 at G#F900_0000 and G#E900_0000, L2, L9), their shadows included. ferros's first frame latched L0's as Android left it, read G#F900_1F80 as a physical address, the DPU's S2MPU denied it, and DMA0 stayed busy for good: one frame start, then a black screen.
+    /// Each engine: idle waited for (a frame ends within 1/64 s), its interrupts masked and cleared, every fetch word to its reset value, then the update forced so the shadows hold the same: no layer can fetch thru an Android address again, whatever triggers it.
+    /// Measured on the jumped Pro before building this: the force copies SFR to shadow at once on an idle engine and clears itself; the soft reset (IDMA_SRESET) never completed on an idle engine, so it is not used.
+    /// Every window off as well (WINCON, latched at the next frame start, which only ferros triggers).
+    /// An engine still busy after its wait is left as it is (forcing an update under a running fetch is not safe) and named in the line; ferros's display server owns layer 0 again before its first frame either way.
+    fn crowbar_layers(f: u64) {
+        let (mut busy, mut loaded, mut held) = (0u64, 0u64, 0u64);
+        for (h, &half) in LAYER_DMAS.iter().enumerate() {
+            for k in 0..7usize {
+                let (d, bit) = (half + k * 0x1000, 1u64 << (h * 7 + k));
+                // WHY bounded: a DMA engine that never goes idle (a fetch the interconnect never answers) must not hang the jump, which would end in the APM watchdog with Android already stopped; 1/64 s is two frames at 120 Hz.
+                let t0 = now().0;
+                while rd(d) & IDMA_OP_STATUS != 0 && now().0.wrapping_sub(t0) < f >> 6 {}
+                if rd(d) & IDMA_OP_STATUS != 0 {
+                    busy |= bit;
+                    continue;
+                }
+                if rd(d + 0x440) != 0 || rd(d + 0x444) != 0 || rd(d + 0x40) != 0 || rd(d + 0x44) != 0 {
+                    loaded |= bit;
+                }
+                wr(d + 0x04, IDMA_IRQ_RESET);
+                wr(d + 0x08, IDMA_IN_CTRL_RESET);
+                for &o in IDMA_FETCH_WORDS.iter() {
+                    wr(d + o, 0);
+                }
+                wr(d, rd(d) | IDMA_SFR_UPDATE_FORCE);
+                if rd(d + 0x408) != IDMA_IN_CTRL_RESET || rd(d + 0x440) != 0 || rd(d + 0x444) != 0 {
+                    held |= bit;
+                }
+            }
+        }
+        for w in 0..8usize {
+            wr(DECON0_WINCON + w * 0x1000, 0);
+        }
+        unsafe { asm!("dsb sy") };
+        let (mut a, mut b, mut c) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+        super::pstore::log(&[b"ferros hv: jump -- layers (bit k = Lk): Android's loaded ", super::pstore::hex(loaded, &mut a), b", busy and left ", super::pstore::hex(busy, &mut b), b", shadow not taken ", super::pstore::hex(held, &mut c), b"; every window off\n"]);
+    }
+
     fn now() -> (u64, u64) {
         let (t, f): (u64, u64);
         unsafe { asm!("mrs {t}, cntpct_el0", "mrs {f}, cntfrq_el0", t = out(reg) t, f = out(reg) f) };
@@ -2661,6 +2715,9 @@ mod hvcore {
         }
         let (t1, _) = now();
         while now().0.wrapping_sub(t1) < f >> 4 {}
+        if dpu_on {
+            crowbar_layers(f);
+        }
         set(19, 2);
         gic_quiet();
         set(19, 3);

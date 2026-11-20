@@ -405,6 +405,9 @@ const IDMA_ALPHA_OPAQUE: u32 = 0xFF << 24;
 /// DPP_COM_IO_CON bit 7: the DPP takes the DMA's frame alpha.
 const DPP_ALPHA_SEL: u32 = 1 << 7;
 const IDMA_IRQ_CLEAR: u32 = 0xDFB << 16;
+/// RDMA_ENABLE: the engine busy (bit 2), and the force copying every SFR into its shadow at once (bit 4, self-clearing).
+const IDMA_OP_STATUS: u32 = 1 << 2;
+const IDMA_SFR_UPDATE_FORCE: u32 = 1 << 4;
 /// The TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
 
@@ -1470,6 +1473,31 @@ impl Pipe {
         self.wr(S_DPP0, 0x0094, 0);
         self.wr(S_SRAMC0, 0x0014, (height - 1) << 16);
         self.wr(S_HDRCOMM0, 0x0020, height << 16 | width);
+    }
+    /// After a jump, before the first frame: layer 0 wholly ferros's, never a word of Android's.
+    /// The jump of 2026-11-20 (the Pro, b1053): the first frame was armed on DMA0 as Android left it (AFBC, both planes at its IOVA G#F900_0000, the scaler on in DPP0 and SRAMC0); that frame fetched G#F900_1F80 as a physical address, the DPU's S2MPU denied it, DMA0 stayed busy, and no frame started again.
+    /// `program_layer`, then every other word ferros depends on as ferros wants it (cal_9865 regs-dpp.h): IN_CTRL_0, the DPP's IO_CON and HDR-common's format exact (no bit of Android's kept), no block mode, planes 1-3 and every stride 0, no SBWC or AFBC parameter, no AFBC recovery, the DPP's colour conversion and sub-sampling off, SRAMC's mode 0 (Android left its scaler and alpha bits on, G#3100).
+    /// Then DMA0's update forced while it is idle (RDMA_ENABLE bit 4: its shadow, the copy it fetches with, takes the SFRs at once; measured on the jumped Pro), so the first frame cannot latch anything else; the DPP, SRAMC and HDR-common shadows take theirs at that frame's start.
+    /// Returns RDMA_ENABLE before the force (bit 2: busy, then not forced) and the shadow's IN_CTRL_0, P0 and P1 after it.
+    fn own_layer(&self, win: u32, fb: usize, width: u32, height: u32) -> [u32; 4] {
+        self.program_layer(win, fb, width, height);
+        let ten = unsafe { TEN };
+        self.wr(S_DMA0, RDMA_IN_CTRL_0, IDMA_ALPHA_OPAQUE | 0x40 << 16 | if ten { 19 << 8 } else { IDMA_BGRX8888 });
+        for off in [0x0020, 0x0024, 0x0044, 0x0048, 0x004C, 0x0050, 0x0054, 0x0058, 0x005C, 0x0064, 0x0070, 0x0080] {
+            self.wr(S_DMA0, off, 0);
+        }
+        let fmt = if ten { 1 | 1 << 6 } else { 0 };
+        self.wr(S_DPP0, 0x0038, fmt | DPP_ALPHA_SEL);
+        for off in [0x0040, 0x0044, 0x0048, 0x004C, 0x0050, 0x0054, 0x0060, 0x0064] {
+            self.wr(S_DPP0, off, 0);
+        }
+        self.wr(S_SRAMC0, 0x0010, 0);
+        self.wr(S_HDRCOMM0, 0x000C, fmt);
+        let en = self.rd(S_DMA0, 0x0000);
+        if en & IDMA_OP_STATUS == 0 {
+            self.wr(S_DMA0, 0x0000, en | IDMA_SFR_UPDATE_FORCE);
+        }
+        [en, self.rd(S_DMA0, 0x0408), self.rd(S_DMA0, 0x0440), self.rd(S_DMA0, 0x0444)]
     }
     /// One frame: the window's and the global shadow update, the TE trigger unmasked until a frame starts (the frame-start interrupt's count, `frame_no`) (or a quarter second), then masked again. Returns (frames advanced, RDMA_IRQ).
     fn present(&self, win: u32) -> (bool, u32) {
@@ -8046,6 +8074,20 @@ fn server(grants: u64) -> ! {
     PANEL_SCREEN.store(screen_off as u64, Ordering::Release);
     // A frame armed and not yet seen to start (Pipe::arm / settle).
     // The modeset re-sent the panel its PPS, raster and rate, and the panel drops what it was showing: black from here to the first client frame (464 to 1033 ms after the press, measured 2026-11-05). The layer is still on the boot ring's surface, so one frame now puts the ring back until the attest screen replaces it. Armed, not waited for (the frame-start count is not running yet; waiting cost a quarter second): the main loop's settle masks the trigger once the frame has started. A cold or jumped panel has shown nothing yet: the same frame is its first.
+    // After a jump there is no ring of ferros's on the layer, only what Android left there: layer 0 is made wholly ferros's first (`own_layer`), on the phase or framebuffer the first frame shows (near black until the first client frame).
+    if jumped {
+        let r = pipe.own_layer(win, layer_fb(fb), width as u32, height as u32);
+        log.s(if r[0] & IDMA_OP_STATUS != 0 { b"display: layer 0 owned after the jump, but DMA0 was busy: not forced; RDMA_ENABLE " as &[u8] } else { b"display: layer 0 owned after the jump, DMA0's update forced; RDMA_ENABLE " });
+        log.hex(r[0]);
+        log.s(b", its shadow IN_CTRL_0 ");
+        log.hex(r[1]);
+        log.s(b" P0 ");
+        log.hex(r[2]);
+        log.s(b" P1 ");
+        log.hex(r[3]);
+        log.s(b"\n");
+        log.flush();
+    }
     let mut armed: Option<u32> = Some(pipe.arm(win));
     // Whether this pass swapped in bars that changed: armed for the next frame at the pass's end (the flip's place).
     let mut bars_present = false;
