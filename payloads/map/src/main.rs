@@ -2659,6 +2659,10 @@ impl Map {
     /// Each kist circle's icon to the display (owner, 2026-11-20: the display keeps a cache by `hp` and the map hands it what it lacks): asked by its `hp` (`OP_ICON_HAVE`); one the display does not hold read decoded from the vault and handed over in pieces (`put_icon`). The slots it answers are the scene's icon bytes (`spec`); an icon not decoded yet, or with no room, draws the theme's fill.
     fn send_icons(&mut self) {
         let mut slots: Vec<(ferros_thing::Hp, u8)> = Vec::new();
+        // What it did, one line for the flash log whenever an icon was handed over (the Pro, 2026-11-20: the icons indexed and decoded, none on the glass): each circle's icon by its hp's first bytes and the slot it got, or 0 for none.
+        // Only then: a pass where the display held every icon says nothing, so a scene sent again writes no flash.
+        let mut said = alloc::format!("map: icons: A#{} in the index;", self.icons.len());
+        let mut handed = false;
         for i in 1..self.deck.n() {
             let Some(h) = self.deck.circles[i].icon else { continue };
             if slots.iter().any(|(x, _)| *x == h) {
@@ -2668,17 +2672,25 @@ impl Map {
             m[0] = OP_ICON_HAVE;
             m[1..].copy_from_slice(h.as_bytes());
             let mut r = [0u8; 1];
-            let slot = if call(self.display, &m, &mut r) >= 1 && r[0] != 0 { r[0] } else { self.put_icon(&h) };
+            let have = call(self.display, &m, &mut r);
+            let (slot, how) = if have >= 1 && r[0] != 0 { (r[0], "held") } else { handed = true; (self.put_icon(&h), "handed") };
+            let _ = write!(said, " circle A#{i} G#{:02X}{:02X}{:02X}{:02X} {how} slot G#{slot:02X};", h.as_bytes()[0], h.as_bytes()[1], h.as_bytes()[2], h.as_bytes()[3]);
             if slot != 0 {
                 slots.push((h, slot));
             }
+        }
+        if handed {
+            ferros_sys::console_flash(self.grants, said.as_bytes());
         }
         self.icon_slots = slots;
     }
 
     /// One icon's texels to the display in pieces, from the start, in order (ferros_kept::icon `Pieces`): its slot once built, 0 when there is no decoded icon in the vault yet, the display dropped it, or it has no room.
     fn put_icon(&self, h: &ferros_thing::Hp) -> u8 {
-        let Some(t) = read_decoded(self.grants, h) else { return 0 };
+        let Some(t) = read_decoded(self.grants, h) else {
+            console(self.grants, b"map: icons: no decoded icon in the vault for one\n");
+            return 0;
+        };
         let mut m = alloc::vec![0u8; 37 + ICON_PIECE];
         m[0] = OP_ICON_PUT;
         m[1..33].copy_from_slice(h.as_bytes());
@@ -2687,7 +2699,9 @@ impl Map {
         for (k, piece) in t.chunks(ICON_PIECE).enumerate() {
             m[33..37].copy_from_slice(&((k * ICON_PIECE) as u32).to_le_bytes());
             m[37..37 + piece.len()].copy_from_slice(piece);
-            if call(self.display, &m[..37 + piece.len()], &mut r) < 2 || r[0] == 2 {
+            let n = call(self.display, &m[..37 + piece.len()], &mut r);
+            if n < 2 || r[0] == 2 {
+                ferros_sys::console_flash(self.grants, alloc::format!("map: icons: the display refused piece A#{k}: answer A#{n} bytes, G#{:02X}", r[0]).as_bytes());
                 return 0;
             }
         }

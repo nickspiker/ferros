@@ -3515,9 +3515,10 @@ static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), and the system's own (78 and 79, the icon cache): their caller's holdings are asked of the kernel as they arrive.
+/// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7473,9 +7474,9 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 static mut SCREEN_WH: (u16, u16) = (0, 0);
 static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
-/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
+/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns, an icon's slot): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard; 2026-11-20: ops 78 and 79, so no icon slot ever came back).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71 | 78 | 79)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -8368,7 +8369,10 @@ fn server(grants: u64) -> ! {
                     let done = if system(unsafe { HOLDS }) { unsafe { (*(&raw mut ICON_PIECES)).as_mut() }.map(|p| p.take(&hp, offset, &m[37..])) } else { None };
                     match done {
                         Some(None) => out[0] = 0,
-                        None => out[0] = 2,
+                        None => {
+                            ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: icon put refused: the caller is not the system (holds G#{:X})", unsafe { HOLDS }).as_bytes());
+                            out[0] = 2;
+                        }
                         Some(Some(texels)) => {
                             // The slots the scene shows now stay; the new icon takes its own slot, an empty one, or the one used longest ago.
                             let keep: alloc::vec::Vec<usize> = unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().filter_map(|c| icon_slot(c.icon)).collect() };
@@ -8389,6 +8393,7 @@ fn server(grants: u64) -> ! {
                                         LAST_FRAME.1 = 0;
                                         SCENE_GEN = SCENE_GEN.wrapping_add(1);
                                     }
+                                    ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: icon G#{:02X}{:02X}{:02X}{:02X} built in slot A#{k}", hp.as_bytes()[0], hp.as_bytes()[1], hp.as_bytes()[2], hp.as_bytes()[3]).as_bytes());
                                     out[0] = 1;
                                     out[1] = ICON_SLOT0 + k as u8;
                                 }
