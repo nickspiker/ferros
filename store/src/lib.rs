@@ -225,6 +225,8 @@ fn pending_schema() -> SectionSchema {
 pub struct Writer {
     /// Whether this write keeps the domain's books (its name in the list, its id in the pending list): every write a caller makes; not the books' own.
     books: bool,
+    /// Whether a new name joins the domain's list of names: every write `begin` starts; not one `begin_unlisted` starts (the hold's bodies and index, whose own index is their list, STORE.md "One change ferros_store needs"), which the pending list still covers.
+    listed: bool,
     name: Vec<u8>,
     head_addr: [u8; 32],
     id: [u8; 32],
@@ -529,8 +531,15 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         self.writer(d, name, true)
     }
 
+    /// Start writing `name` afresh without entering it in the domain's list of names: a value whose caller keeps its own index of it (the hold, ferros_items), so a keep does not rewrite a list as long as the domain (4 MB at 100,000 items, STORE.md). An interrupted write is still on the pending list for `sweep`; the value is not among `names`, `size`, `export` or `drop_domain`'s, so its caller removes it (`delete_unlisted`).
+    pub fn begin_unlisted(&mut self, d: &Domain, name: &[u8]) -> Writer {
+        let mut w = self.writer(d, name, true);
+        w.listed = false;
+        w
+    }
+
     fn writer(&mut self, d: &Domain, name: &[u8], books: bool) -> Writer {
-        Writer { head_addr: Self::head_addr(d, name), id: self.fresh_id(), len: 0, piece: Vec::with_capacity(PIECE), sealed: Vec::new(), written: 0, books, name: name.to_vec() }
+        Writer { head_addr: Self::head_addr(d, name), id: self.fresh_id(), len: 0, piece: Vec::with_capacity(PIECE), sealed: Vec::new(), written: 0, books, listed: books, name: name.to_vec() }
     }
 
     /// The next bytes of the value being written.
@@ -594,7 +603,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             self.drop_pieces(d, old)?;
         }
         if w.books {
-            if old.is_none() {
+            if old.is_none() && w.listed {
                 let name = w.name.clone();
                 self.edit_list(d, NAMES, names_schema, "name", |l| l.push(VsfType::v(b'r', name)))?;
             }
@@ -634,6 +643,22 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let name = name.to_vec();
         self.edit_list(d, NAMES, names_schema, "name", |l| l.retain(|v| !matches!(v, VsfType::v(b'r', n) if *n == name)))?;
         Ok(true)
+    }
+
+    /// Remove a value written with `begin_unlisted`: its head (gone at once), then its pieces; no list to edit. Returns whether it was there.
+    pub fn delete_unlisted(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
+        let Some((at, h)) = self.head(d, name)? else { return Ok(false) };
+        self.vault.delete(&at, (self.now)())?;
+        self.drop_pieces(d, &h)?;
+        self.forget();
+        Ok(true)
+    }
+
+    /// Write `value` whole as an unlisted value (`begin_unlisted`, `write`, `finish`).
+    pub fn put_unlisted(&mut self, d: &Domain, name: &[u8], value: &[u8]) -> Result<()> {
+        let mut w = self.begin_unlisted(d, name);
+        self.write(d, &mut w, value)?;
+        self.finish(d, w)
     }
 
     /// The domain's names, as callers wrote them (the vault's own entries are not among them).
@@ -801,6 +826,31 @@ mod tests {
         fn flush(&mut self) -> manifestus::Result<()> {
             Ok(())
         }
+    }
+
+    /// An unlisted value reads back like any other, never enters the list of names, survives a listed write beside it, and goes with `delete_unlisted`; an interrupted large one is swept.
+    #[test]
+    fn unlisted_values_stay_off_the_names_list() {
+        let mut s = store(1 << 13);
+        let d = domain(5);
+        let big = bytes(3 * PIECE + 7, 2);
+        s.put_unlisted(&d, b"\x02body", &big).unwrap();
+        s.put(&d, b"listed", b"hello").unwrap();
+        assert_eq!(s.names(&d).unwrap(), std::vec![b"listed".to_vec()]);
+        assert_eq!(s.get(&d, b"\x02body").unwrap().unwrap(), big);
+        // Kept again in place: still unlisted.
+        s.put_unlisted(&d, b"\x02body", b"small").unwrap();
+        assert_eq!(s.names(&d).unwrap().len(), 1);
+        assert_eq!(s.get(&d, b"\x02body").unwrap().unwrap(), b"small");
+        assert!(s.delete_unlisted(&d, b"\x02body").unwrap());
+        assert!(s.get(&d, b"\x02body").unwrap().is_none());
+        assert!(!s.delete_unlisted(&d, b"\x02body").unwrap());
+        assert_eq!(s.names(&d).unwrap().len(), 1);
+        // A large unlisted write left unfinished is on the pending list, and swept.
+        let mut w = s.begin_unlisted(&d, b"\x02torn");
+        s.write(&d, &mut w, &bytes(40 * PIECE, 3)).unwrap();
+        drop(w);
+        assert!(s.sweep(&d).unwrap() > 0);
     }
 
     /// A value written in one stretch reads back right in runs of about RUN_BLOCKS, the leaves between pieces read over (2026-11-17: one run a piece before the gaps were bridged).

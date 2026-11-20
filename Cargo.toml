@@ -85,6 +85,7 @@ members = [
     "ferros_kist",
     "ferros_lang",
     "ferros_idea",
+    "ferros_items",
     "ferros_tz",
     "ferros_console",
     "ferros_glass",
