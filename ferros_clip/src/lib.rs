@@ -359,6 +359,164 @@ fn worker(pool: Arc<Pool>, mask: u64) {
     }
 }
 
+/// A frame for the GPU path's coders: its bands packed from a GPU run's set, or (`set` None, after the GPU failed) coded whole from its rows.
+struct PackJob {
+    seq: u64,
+    set: Option<usize>,
+    /// The frame's rows: the set's copy, or the camera's buffer (the hand-over then waits for the frame).
+    src: *const u8,
+    len: usize,
+    info: *const u32,
+    info_len: usize,
+    bodies: *const u32,
+    bodies_len: usize,
+    /// Taken by the coder that finishes the frame, for the writer.
+    slot: Option<Box<Slot>>,
+    /// Bands claimed, and bands done.
+    next: usize,
+    done: usize,
+    /// When it was handed over, for the time to its last band.
+    t0: u64,
+}
+// SAFETY: a job's pointers are read only until its last band is done: the set stays busy (the hand-over writes no set that is), a CPU job's hand-over waits for it, and its slot is in the job.
+unsafe impl Send for PackJob {}
+
+struct PackState {
+    jobs: std::collections::VecDeque<PackJob>,
+    busy: [bool; gpu::SETS],
+    /// The last frame handed to the writer.
+    sent: u64,
+    last_src: [u8; 32],
+    quit: bool,
+}
+
+/// The GPU path's coders: frames packed behind the hand-over, in order to the writer.
+struct Packers {
+    st: Mutex<PackState>,
+    work: Condvar,
+    done: Condvar,
+    bands: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    cfa: rc::Cfa,
+    hash_src: bool,
+    to_writer: SyncSender<ToWriter>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    coded: AtomicU64,
+    /// Hand-over to the last band, microseconds: the most and the sum.
+    behind_most: AtomicU64,
+    behind_sum: AtomicU64,
+}
+
+/// One of a frame's bands as a coder claimed it.
+struct Claim {
+    seq: u64,
+    k: usize,
+    set: Option<usize>,
+    src: *const u8,
+    len: usize,
+    info: *const u32,
+    info_len: usize,
+    bodies: *const u32,
+    bodies_len: usize,
+    slot: *const Slot,
+}
+
+fn packer(p: Arc<Packers>, mask: u64) {
+    pin(mask);
+    let mut work = Box::new(rc::Work::new());
+    let mut out = vec![0u8; rc::max_band_len(p.width, rc::BAND_ROWS)];
+    loop {
+        let c = {
+            let mut st = p.st.lock().unwrap();
+            loop {
+                if st.quit {
+                    return;
+                }
+                if let Some(j) = st.jobs.iter_mut().find(|j| j.next < p.bands) {
+                    j.next += 1;
+                    break Claim { seq: j.seq, k: j.next - 1, set: j.set, src: j.src, len: j.len, info: j.info, info_len: j.info_len, bodies: j.bodies, bodies_len: j.bodies_len, slot: &**j.slot.as_ref().expect("a frame's slot stays with it until its last band") };
+                }
+                st = p.work.wait(st).unwrap();
+            }
+        };
+        // SAFETY: a job's buffers and its slot stay until its every band is done (its set busy, the hand-over waiting for a CPU job, the slot in the job).
+        let src = unsafe { core::slice::from_raw_parts(c.src, c.len) };
+        let slot = unsafe { &*c.slot };
+        let rows = rc::band_rows(p.height, c.k);
+        let band_src = &src[rc::band_src(c.k, p.height, p.width, p.stride)];
+        let (la, lb) = match c.set {
+            Some(_) => {
+                let (info, bodies) = unsafe { (core::slice::from_raw_parts(c.info, c.info_len), core::slice::from_raw_parts(c.bodies, c.bodies_len)) };
+                gpu::pack_band(info, bodies, c.k, p.width, p.height, &mut out)
+            }
+            None => rc::encode_band(band_src, p.stride, p.width, rows, p.cfa, &mut work, &mut out),
+        };
+        let digest = clip::band_digest(&out[..la], &out[la..la + lb]);
+        let srcd = if p.hash_src { band_source_digest(band_src, p.stride, p.width, rows) } else { [0; 32] };
+        {
+            let mut b = slot.bands[c.k].lock().unwrap();
+            b.src = srcd;
+            b.la = la as u32;
+            b.lb = lb as u32;
+            b.digest = digest;
+            b.bytes.clear();
+            b.bytes.extend_from_slice(&out[..la + lb]);
+        }
+        let mut st = p.st.lock().unwrap();
+        st.jobs.iter_mut().find(|j| j.seq == c.seq).expect("a frame stays queued until its last band").done += 1;
+        // The frames whose every band is done go to the writer, in order (the writer's channel holds every slot, so the send never waits).
+        while st.jobs.front().is_some_and(|j| j.done == p.bands) {
+            let mut j = st.jobs.pop_front().expect("the front frame");
+            let slot = j.slot.take().expect("a frame's slot until it is sent");
+            if p.hash_src {
+                st.last_src = source_hash(&slot.bands.iter().map(|b| b.lock().map(|b| b.src).unwrap_or([0; 32])).collect::<Vec<_>>());
+            }
+            let coded: u64 = slot.bands.iter().map(|b| b.lock().map(|b| (b.la + b.lb) as u64).unwrap_or(0)).sum();
+            p.coded.fetch_add(coded, Ordering::Relaxed);
+            let behind = micros() - j.t0;
+            p.behind_most.fetch_max(behind, Ordering::Relaxed);
+            p.behind_sum.fetch_add(behind, Ordering::Relaxed);
+            if let Some(s) = j.set {
+                st.busy[s] = false;
+            }
+            st.sent = j.seq;
+            if p.to_writer.send(ToWriter::Frame(slot)).is_err() {
+                p.ended.store(true, Ordering::Relaxed);
+            }
+            p.done.notify_all();
+        }
+    }
+}
+
+/// The GPU path's state in the recorder (the 60/s work, 2026-11-19).
+struct GpuMode {
+    dev: gpu::Device,
+    packers: Arc<Packers>,
+    next_set: usize,
+    seq: u64,
+    /// The GPU failed once: every frame after is coded on the CPU, the hand-over waiting for it.
+    failed: Option<String>,
+    run_most: u64,
+    run_sum: u64,
+    runs: u64,
+}
+
+/// What the GPU path did (`Recorder::gpu`).
+#[derive(Debug, Clone, Default)]
+pub struct GpuStats {
+    /// Frames run on the GPU, and the GPU's time for them as the service measured it, microseconds.
+    pub runs: u64,
+    pub run_us_most: u64,
+    pub run_us_sum: u64,
+    /// From a frame's hand-over to its last band packed, microseconds.
+    pub behind_us_most: u64,
+    pub behind_us_sum: u64,
+    /// Why the GPU stopped being used, if it did.
+    pub failed: Option<String>,
+}
+
 enum ToWriter {
     Frame(Box<Slot>),
     Close,
@@ -378,11 +536,54 @@ pub struct Recorder {
     last_count: Option<u64>,
     last_kept_ns: Option<u64>,
     last_src: [u8; 32],
+    gpu: Option<GpuMode>,
+    gpu_note: String,
 }
 
 impl Recorder {
     /// Start a clip: the extent opened, generation 0 written, the workers and the writer started.
-    pub fn start(cam: &Camera, mode: &Mode, mut sink: Box<dyn Sink>) -> Result<Recorder, String> {
+    /// On ferros a Bayer clip is coded on the GPU when the process holds the GPU's grants (`ferros::gpu_grants`) and a kernel was built for its geometry (`gpu::prebuilt`), the workers then packing behind the hand-over; otherwise, or with `gpu::enable(false)`, on the workers alone. [`Recorder::gpu_note`] says which and why.
+    pub fn start(cam: &Camera, mode: &Mode, sink: Box<dyn Sink>) -> Result<Recorder, String> {
+        #[cfg(target_os = "ferros")]
+        {
+            let dev = if !gpu::enabled() {
+                Err("the GPU turned off (gpu::enable)".to_string())
+            } else if cam.cfa.len() != 4 {
+                Err("a quad mosaic: the GPU codes Bayer only".to_string())
+            } else {
+                match ferros::gpu_grants() {
+                    Some((s, b)) => gpu::Device::open(s, b, cam.width, cam.height, cam.stride).map_err(|e| format!("the GPU in grants A#{s} and A#{b}: {e}")),
+                    None => Err("no GPU grants".to_string()),
+                }
+            };
+            match dev {
+                Ok(d) => Self::start_with(cam, mode, sink, Some(d), "the GPU".to_string()),
+                Err(e) => Self::start_with(cam, mode, sink, None, format!("the CPU: {e}")),
+            }
+        }
+        #[cfg(not(target_os = "ferros"))]
+        Self::start_with(cam, mode, sink, None, "the CPU".to_string())
+    }
+
+    /// Start a clip coded on the given GPU (Bayer only): its workers pack each frame's bands behind the hand-over.
+    pub fn start_gpu(cam: &Camera, mode: &Mode, sink: Box<dyn Sink>, dev: gpu::Device) -> Result<Recorder, String> {
+        if cam.cfa.len() != 4 {
+            return Err("the GPU codes Bayer only".into());
+        }
+        Self::start_with(cam, mode, sink, Some(dev), "the GPU".to_string())
+    }
+
+    /// What codes this clip: the GPU, or the CPU and why.
+    pub fn gpu_note(&self) -> &str {
+        &self.gpu_note
+    }
+
+    /// The GPU path's counts, when the clip is coded on the GPU.
+    pub fn gpu(&self) -> Option<GpuStats> {
+        self.gpu.as_ref().map(|g| GpuStats { runs: g.runs, run_us_most: g.run_most, run_us_sum: g.run_sum, behind_us_most: g.packers.behind_most.load(Ordering::Relaxed), behind_us_sum: g.packers.behind_sum.load(Ordering::Relaxed), failed: g.failed.clone() })
+    }
+
+    fn start_with(cam: &Camera, mode: &Mode, mut sink: Box<dyn Sink>, dev: Option<gpu::Device>, gpu_note: String) -> Result<Recorder, String> {
         let mosaic = match cam.cfa.len() {
             4 => Mosaic::Bayer,
             16 => Mosaic::Quad,
@@ -426,14 +627,6 @@ impl Recorder {
             cfa: if mosaic == Mosaic::Bayer { rc::Cfa::Bayer } else { rc::Cfa::Quad },
             hash_src: mode.source_digests,
         });
-        let workers = mode
-            .workers
-            .iter()
-            .map(|&m| {
-                let p = pool.clone();
-                std::thread::Builder::new().name("clip coder".into()).spawn(move || worker(p, m)).map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let slots = mode.slots.max(1);
         let (to_writer, from_rec) = sync_channel::<ToWriter>(slots + 1);
         let (give_back, free) = sync_channel::<Box<Slot>>(slots);
@@ -442,6 +635,50 @@ impl Recorder {
         }
         let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The workers: the band coders, or on the GPU path the packers behind the hand-over.
+        let gpu = dev.map(|dev| GpuMode {
+            dev,
+            packers: Arc::new(Packers {
+                st: Mutex::new(PackState { jobs: std::collections::VecDeque::new(), busy: [false; gpu::SETS], sent: 0, last_src: [0; 32], quit: false }),
+                work: Condvar::new(),
+                done: Condvar::new(),
+                bands,
+                width: cam.width,
+                height: cam.height,
+                stride: cam.stride,
+                cfa: rc::Cfa::Bayer,
+                hash_src: mode.source_digests,
+                to_writer: to_writer.clone(),
+                ended: ended.clone(),
+                coded: AtomicU64::new(0),
+                behind_most: AtomicU64::new(0),
+                behind_sum: AtomicU64::new(0),
+            }),
+            next_set: 0,
+            seq: 0,
+            failed: None,
+            run_most: 0,
+            run_sum: 0,
+            runs: 0,
+        });
+        let workers = mode
+            .workers
+            .iter()
+            .map(|&m| {
+                let b = std::thread::Builder::new().name("clip coder".into());
+                match &gpu {
+                    Some(g) => {
+                        let p = g.packers.clone();
+                        b.spawn(move || packer(p, m))
+                    }
+                    None => {
+                        let p = pool.clone();
+                        b.spawn(move || worker(p, m))
+                    }
+                }
+                .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let (wr, en, wmask) = (written.clone(), ended.clone(), mode.writer);
         let writer = std::thread::Builder::new()
             .name("clip writer".into())
@@ -450,7 +687,7 @@ impl Recorder {
                 write_clip(cw, head, sink, got, from_rec, give_back, wr, en)
             })
             .map_err(|e| e.to_string())?;
-        Ok(Recorder { pool, workers, to_writer, free, writer: Some(writer), written, ended, pacing: mode.pacing, stats: Stats::default(), last_count: None, last_kept_ns: None, last_src: [0; 32] })
+        Ok(Recorder { pool, workers, to_writer, free, writer: Some(writer), written, ended, pacing: mode.pacing, stats: Stats::default(), last_count: None, last_kept_ns: None, last_src: [0; 32], gpu, gpu_note })
     }
 
     /// The last recorded frame's source hash (`Mode::source_digests`): BLAKE3 of its bands' source digests, each BLAKE3 of the band's packed rows as the camera wrote them; a reader repacks a decoded frame and compares.
@@ -459,7 +696,72 @@ impl Recorder {
     }
 
     pub fn stats(&self) -> Stats {
-        Stats { written: self.written.load(Ordering::Relaxed), ..self.stats }
+        let behind = self.gpu.as_ref().map_or(0, |g| g.packers.coded.load(Ordering::Relaxed));
+        Stats { written: self.written.load(Ordering::Relaxed), coded: self.stats.coded + behind, ..self.stats }
+    }
+
+    /// The GPU path's hand-over: the frame copied into a free set and run on the GPU, its bands then packed by the workers behind (the hand-over waits for them only when the frame's source hash is asked for, or after the GPU failed, when the workers code the frame from the camera's buffer).
+    fn frame_gpu(&mut self, f: &FrameIn, mut slot: Box<Slot>) -> Taken {
+        let t0 = micros();
+        let g = self.gpu.as_mut().expect("the GPU path");
+        slot.meta = FrameMeta { index: self.stats.frames + self.stats.dropped, at: eagle_osc(f.eagle_ns), exposure_s: f.exposure_ns as f32 / 1e9, gain: f.gain as f32 / 1024., focus: f.focus };
+        let p = g.packers.clone();
+        let set = g.next_set;
+        // The set free: the frame that used it last packed.
+        {
+            let mut st = p.st.lock().unwrap();
+            while st.busy[set] {
+                st = p.done.wait(st).unwrap();
+            }
+        }
+        let run = if g.failed.is_some() { Err(String::new()) } else { g.dev.run(set, f.rows) };
+        let (job_set, src, len) = match run {
+            Ok(us) => {
+                g.next_set = (set + 1) % gpu::SETS;
+                g.runs += 1;
+                g.run_most = g.run_most.max(us as u64);
+                g.run_sum += us as u64;
+                let fr = g.dev.frame(set);
+                (Some(set), fr.as_ptr(), fr.len())
+            }
+            Err(e) => {
+                if g.failed.is_none() {
+                    g.failed = Some(e);
+                }
+                (None, f.rows.as_ptr(), f.rows.len())
+            }
+        };
+        let (info, bodies) = match job_set {
+            Some(s) => (g.dev.info(s), g.dev.bodies(s)),
+            None => (&[][..], &[][..]),
+        };
+        g.seq += 1;
+        let seq = g.seq;
+        let wait = job_set.is_none() || p.hash_src;
+        {
+            let mut st = p.st.lock().unwrap();
+            if let Some(s) = job_set {
+                st.busy[s] = true;
+            }
+            st.jobs.push_back(PackJob { seq, set: job_set, src, len, info: info.as_ptr(), info_len: info.len(), bodies: bodies.as_ptr(), bodies_len: bodies.len(), slot: Some(slot), next: 0, done: 0, t0 });
+            p.work.notify_all();
+            if wait {
+                while st.sent < seq && !st.quit {
+                    st = p.done.wait(st).unwrap();
+                }
+                self.last_src = st.last_src;
+            }
+        }
+        let us = micros() - t0;
+        self.stats.code_us_most = self.stats.code_us_most.max(us);
+        self.stats.code_us_sum += us;
+        self.stats.raw += (p.height * rc::row_bytes(p.width)) as u64;
+        if self.ended.load(Ordering::Relaxed) {
+            return Taken::Ended;
+        }
+        self.stats.frames += 1;
+        self.last_kept_ns = Some(f.eagle_ns);
+        Taken::Recorded
     }
 
     /// Hand a frame over: coded before this returns (the buffer may then go back to the camera), written behind.
@@ -484,6 +786,10 @@ impl Recorder {
             self.stats.dropped += 1;
             return Taken::Dropped;
         };
+        assert!(f.rows.len() >= (self.pool.height - 1) * self.pool.stride + rc::row_bytes(self.pool.width), "a frame shorter than its rows");
+        if self.gpu.is_some() {
+            return self.frame_gpu(f, slot);
+        }
         let t0 = micros();
         // Code every band on the workers; wait for the last.
         assert!(f.rows.len() >= (self.pool.height - 1) * self.pool.stride + rc::row_bytes(self.pool.width), "a frame shorter than its rows");
@@ -520,6 +826,14 @@ impl Recorder {
 
     /// End the clip: the closing generation written and the extent sealed.
     pub fn stop(mut self) -> ClipInfo {
+        // The GPU path's frames still being packed go to the writer first.
+        if let Some(g) = &self.gpu {
+            let mut st = g.packers.st.lock().unwrap();
+            while !st.jobs.is_empty() {
+                st = g.packers.done.wait(st).unwrap();
+            }
+        }
+        let stats = self.stats();
         let _ = self.to_writer.send(ToWriter::Close);
         let mut info = self.writer.take().expect("the writer runs until stop").join().unwrap_or_else(|_| ClipInfo { stats: Stats::default(), len: 0, hash: [0; 32], write_us: 0, error: Some("the writer died".into()) });
         {
@@ -527,10 +841,15 @@ impl Recorder {
             st.quit = true;
             self.pool.work.notify_all();
         }
+        if let Some(g) = &self.gpu {
+            g.packers.st.lock().unwrap().quit = true;
+            g.packers.work.notify_all();
+            g.packers.done.notify_all();
+        }
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
-        info.stats = Stats { written: info.len, ..self.stats };
+        info.stats = Stats { written: info.len, ..stats };
         info
     }
 }

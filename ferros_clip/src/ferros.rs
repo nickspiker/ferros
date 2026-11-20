@@ -205,8 +205,19 @@ const CALL: u64 = 1;
 const DMA: u64 = 7;
 /// The client's GPU block in the GPU's own view (ferros_sys `gpu::ARENA_VA`).
 const ARENA_VA: u64 = 0x8000_0000;
+/// The most a GPU block may be (ferros_sys `GPU_BLOCK_MOST`).
+const GPU_BLOCK_MOST: u64 = 512 << 20;
 
-/// The band coder's first half on the GPU (crate::gpu): the GPU service's grant and the process's GPU block (a spawn's `--use gpu --dma layers`, a kist's ferros_sys `gpu::kist_slots`), the host-built kernel uploaded once, then a frame copied in and run.
+/// The GPU's grants, (the service, the block), when the process holds them: the first grant that is a GPU block (the kernel answers an ask for one frame, 2^21 bytes, with the block's size, growing an empty one to that frame, and ERR for any other grant), the GPU service the grant before it, as both a kist's (ferros_sys `gpu::kist_slots`: the service at wants + 1, its block at wants + 2) and a spawn's `--use gpu --dma layers` lay them out.
+pub fn gpu_grants() -> Option<(u64, u64)> {
+    (2..grant_count().min(64)).find(|&s| {
+        let n = svc(DMA, cap(s), 2, 21, 0, 0);
+        n != ERR && n <= GPU_BLOCK_MOST
+    })
+    .map(|s| (s - 1, s))
+}
+
+/// The band coder on the GPU (crate::gpu): the GPU service's grant and the process's GPU block, the host-built kernel written once, then a frame copied into a set and run.
 pub struct GpuDevice {
     service: u64,
     block: *mut u8,
@@ -215,7 +226,7 @@ pub struct GpuDevice {
     height: usize,
 }
 
-// SAFETY: the block is this process's for its life (the kernel never takes a GPU block back), and only the recorder's frame call writes it, while the coders read it only between a run's end and the frame call's return.
+// SAFETY: the block is this process's for its life (the kernel never takes a GPU block back); the recorder writes a set only while no coder reads it (its busy flag), and the coders read a set only between its run's end and that flag's clearing.
 unsafe impl Send for GpuDevice {}
 unsafe impl Sync for GpuDevice {}
 
@@ -226,7 +237,7 @@ impl GpuDevice {
         let layout = crate::gpu::Layout::of(height, stride);
         let size = svc(DMA, cap(block), 2, layout.log as u64, 0, 0);
         // WHY: the kernel answers ERR for a grant that is no GPU block or a frame pool short of the size, and a kernel from before 2026-11-13 answers the base instead (past any block's size).
-        if size == ERR || size > 1 << 29 || size < 1 << layout.log {
+        if size == ERR || size > GPU_BLOCK_MOST || size < 1 << layout.log {
             return Err(format!("the GPU block in grant A#{block} did not grow to 2^A#{} bytes (G#{size:X})", layout.log));
         }
         let base = svc(DMA, cap(block), 0, 0, 0, 0);
@@ -234,21 +245,26 @@ impl GpuDevice {
             return Err(format!("grant A#{block} is no DMA region"));
         }
         let d = GpuDevice { service, block: base as *mut u8, layout, kernel, height };
-        // SAFETY: the block is `size` bytes at `base`, the words far under the frame's MiB.
+        // SAFETY: the block is `size` bytes at `base`, the words far under the first frame's MiB.
         unsafe { core::ptr::copy_nonoverlapping(kernel.words.as_ptr() as *const u8, d.block, kernel.words.len() * 8) };
         Ok(d)
     }
 
-    /// The frame's rows copied into the block and the kernel run over them; the GPU's time, microseconds, as the service measured it.
-    pub fn run(&mut self, rows: &[u8]) -> Result<u32, String> {
+    /// The frame's rows copied into set `set`.
+    pub fn put(&mut self, set: usize, rows: &[u8]) {
         let n = rows.len().min(self.height * self.kernel.stride);
-        // SAFETY: the layout gives the frame `height * stride` bytes and more at `frame`.
-        unsafe { core::ptr::copy_nonoverlapping(rows.as_ptr(), self.block.add(self.layout.frame), n) };
-        self.go()
+        // SAFETY: the layout gives a set's frame `height * stride` bytes and more.
+        unsafe { core::ptr::copy_nonoverlapping(rows.as_ptr(), self.block.add(self.layout.frame[set]), n) };
     }
 
-    /// The kernel run over the frame as it lies in the block now.
-    pub fn go(&mut self) -> Result<u32, String> {
+    /// The frame's rows copied into set `set` and the kernel run over them; the GPU's time, microseconds, as the service measured it.
+    pub fn run(&mut self, set: usize, rows: &[u8]) -> Result<u32, String> {
+        self.put(set, rows);
+        self.go(set)
+    }
+
+    /// The kernel run over set `set`'s frame as it lies in the block now.
+    pub fn go(&mut self, set: usize) -> Result<u32, String> {
         let invocations = (self.height << crate::gpu::BLOCKS_LOG2) as u32;
         let mut msg = [0u8; 18 + 8 * 64];
         msg[0] = 1;
@@ -257,7 +273,8 @@ impl GpuDevice {
         msg[7..9].copy_from_slice(&(self.kernel.words.len() as u16).to_le_bytes());
         msg[9..13].copy_from_slice(&(invocations >> 4).to_le_bytes());
         msg[13..17].copy_from_slice(&1u32.to_le_bytes());
-        let mut u = vec![ARENA_VA + self.layout.codes as u64, ARENA_VA + self.layout.frame as u64, ARENA_VA + self.layout.info as u64];
+        let l = &self.layout;
+        let mut u = vec![ARENA_VA + l.codes[set] as u64, ARENA_VA + l.frame[set] as u64, ARENA_VA + l.info[set] as u64];
         u.extend_from_slice(self.kernel.consts);
         msg[17] = u.len() as u8;
         for (i, v) in u.iter().enumerate() {
@@ -276,21 +293,21 @@ impl GpuDevice {
         }
     }
 
-    /// The frame as it lies in the block.
-    pub fn frame(&self) -> &[u8] {
+    /// Set `set`'s frame as it lies in the block.
+    pub fn frame(&self, set: usize) -> &[u8] {
         // SAFETY: the layout's frame.
-        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.frame), self.height * self.kernel.stride) }
+        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.frame[set]), self.height * self.kernel.stride) }
     }
 
-    /// Every block's facts, `1 << BLOCKS_LOG2` a row, after a run.
-    pub fn info(&self) -> &[u32] {
-        // SAFETY: the layout's facts, written by the last run.
-        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.info) as *const u32, self.height << crate::gpu::BLOCKS_LOG2) }
+    /// Every block's facts, `1 << BLOCKS_LOG2` a row, after a run into set `set`.
+    pub fn info(&self, set: usize) -> &[u32] {
+        // SAFETY: the layout's facts, written by the set's last run.
+        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.info[set]) as *const u32, self.height << crate::gpu::BLOCKS_LOG2) }
     }
 
-    /// Every block's body, 2^`BODY_LOG2` words a block, after a run.
-    pub fn bodies(&self) -> &[u32] {
-        // SAFETY: the layout's bodies, written by the last run.
-        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.codes) as *const u32, self.height << crate::gpu::BLOCKS_LOG2 << crate::gpu::BODY_LOG2) }
+    /// Every block's body slot, 2^`BODY_LOG2` words a block, after a run into set `set`.
+    pub fn bodies(&self, set: usize) -> &[u32] {
+        // SAFETY: the layout's bodies, written by the set's last run.
+        unsafe { core::slice::from_raw_parts(self.block.add(self.layout.codes[set]) as *const u32, self.height << crate::gpu::BLOCKS_LOG2 << crate::gpu::BODY_LOG2) }
     }
 }

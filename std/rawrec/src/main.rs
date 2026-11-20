@@ -1,5 +1,5 @@
 //! rawrec: the RAW video recorder's test harness (docs/RAW-VIDEO.md "The recorder").
-//! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`.
+//! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`; with `--use gpu --dma layers` after them a Bayer clip is coded on the GPU (ferros_clip `gpu`, +20 bit 3 turns it off).
 //!
 //! The input (hex bytes):
 //! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
@@ -344,7 +344,7 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
     for run in 0..runs {
         let t0 = Instant::now();
         // The copy and the run together (`run` is both); the service's own count is the GPU's part.
-        let gpu_us = dev.run(view(&hd));
+        let gpu_us = dev.run(0, view(&hd));
         let t_copy = t0.elapsed().as_micros() as u64;
         let gpu_us = match gpu_us {
             Ok(us) => us as u64,
@@ -355,7 +355,7 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
         };
         let t1 = Instant::now();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (info, bodies) = (dev.info(), dev.bodies());
+        let (info, bodies) = (dev.info(0), dev.bodies(0));
         let outs: Vec<Vec<(usize, usize, usize, Vec<u8>)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = masks
                 .iter()
@@ -385,7 +385,7 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
         let mut line = format!("rawrec: gpu: run A#{run}: copy and GPU A#{t_copy} us (the GPU A#{gpu_us} us), packing on cores G#{masks:X?} A#{pack_us} us, the frame A#{total} us, coded A#{coded} bytes");
         if run == 0 {
             // The check: every band against the CPU coder's, from the frame as copied into the block.
-            let frame = dev.frame();
+            let frame = dev.frame(0);
             let mut work = Box::new(rc::Work::new());
             let mut want = vec![0u8; rc::max_band_len(w, rc::BAND_ROWS)];
             let mut bad = 0;
@@ -427,8 +427,8 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
             if bad != 0 {
                 // Which blocks: every block's body against the CPU's codes end to end (`split_codes`), then the same frame run again and checked again (whether the GPU's output changes from run to run).
                 let check = |dev: &ferros_clip::gpu::Device| -> String {
-                    let (info, bodies) = (dev.info(), dev.bodies());
-                    let frame = dev.frame();
+                    let (info, bodies) = (dev.info(0), dev.bodies(0));
+                    let frame = dev.frame(0);
                     let nbk = rc::row_blocks(w);
                     let mut work = Box::new(rc::Work::new());
                     let (mut ci, mut cc) = (vec![0u32; rc::BAND_ROWS * nbk], vec![0u16; rc::BAND_ROWS * w]);
@@ -471,7 +471,7 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
                     format!("A#{nbad} blocks wrong, the first wrong word's index in its body A#{:?};{first}", words_bad)
                 };
                 println!("rawrec: gpu: check: {}", check(&dev));
-                let again = dev.go();
+                let again = dev.go(0);
                 println!("rawrec: gpu: the same frame again ({again:?}): {}", check(&dev));
             }
         }
@@ -687,7 +687,7 @@ fn main() {
     let blocks = (want * raw_frame + (1 << 24)) >> 12;
     let mut workers = vec![0x00F0u64; a715];
     workers.extend(std::iter::repeat_n(0x000Fu64, a510));
-    // +20, the 60/s experiments: bit 0 the workers one to a core (ferros_clip `spread`), bit 1 no source digests, bit 2 a coder on the X3 too.
+    // +20, the 60/s experiments: bit 0 the workers one to a core (ferros_clip `spread`), bit 1 no source digests, bit 2 a coder on the X3 too, bit 3 the GPU off.
     if arg(20) & 4 != 0 {
         workers.push(0x0100);
     }
@@ -704,10 +704,13 @@ fn main() {
         }
         held = hd[40];
     }
-    // The copies kept whole for the check after the clip, their pages taken now and not in the camera loop (at 30 a second and under only: a copy is a few ms).
-    let keep_copies = fps <= 30;
+    // The copies kept whole for the check after the clip, their pages taken now and not in the camera loop (at 30 a second and under, or without source digests, when they are the only check: a copy is a few ms).
+    let digests = arg(20) & 2 == 0;
+    let keep_copies = fps <= 30 || !digests;
     let mut copy_bufs: Vec<Vec<u8>> = if keep_copies { (0..4).map(|_| vec![0u8; h * stride]).collect() } else { Vec::new() };
     let mode = Mode { pacing, title: format!("rawrec A#{fps} a second"), workers, writer: [0x000F, 0x00F0, 0x0100][arg(17).min(2) as usize], slots, blocks, at: ferros_clip::eagle_osc(w8(&hd, 32)), source_digests: arg(20) & 2 == 0 };
+    // +20 bit 3: the GPU path off (the CPU coders alone, as before the 60/s work).
+    ferros_clip::gpu::enable(arg(20) & 8 == 0);
     let mut rec = match Recorder::start(&cam, &mode, Box::new(ExtentSink(Extent::new(slot, &name)))) {
         Ok(r) => r,
         Err(e) => {
@@ -717,6 +720,7 @@ fn main() {
         }
     };
     println!("rawrec: recording into {name}, A#{blocks} blocks asked; the mosaic G#{:02X}, black A#{}, white A#{}", hd[9], cam.black, cam.white);
+    println!("rawrec: coded on {}", rec.gpu_note());
     // A fresh frame after the start: the open may have waited (a clip left open by a writer that died is closed first), and the frame held from before it would put the time in between down as dropped.
     if !map(held, &mut hd) {
         println!("rawrec: MAP: no frame after the start");
@@ -767,6 +771,9 @@ fn main() {
             hot = hottest();
             let wr = st.written;
             println!("rawrec: A#{el} s: A#{} frames (+A#{}), A#{} dropped, A#{} paced, A#{} MB written (A#{} MB/s), ratio A#{}.{:02}, coding A#{} us a frame at most, A#{} on average, hottest A#{hot} C", st.frames, st.frames - last_frames, st.dropped, st.paced, wr >> 20, (wr - last_written) >> 20, st.raw / st.coded.max(1), st.raw * 100 / st.coded.max(1) % 100, st.code_us_most, st.code_us_sum / st.frames.max(1));
+            if let Some(g) = rec.gpu() {
+                println!("rawrec: A#{el} s: the GPU A#{} us a frame at most, A#{} on average; packed behind the hand-over A#{} us at most, A#{} on average{}", g.run_us_most, g.run_us_sum / g.runs.max(1), g.behind_us_most, g.behind_us_sum / g.runs.max(1), g.failed.map(|e| format!("; the GPU failed: {e}")).unwrap_or_default());
+            }
             last_frames = st.frames;
             last_written = wr;
             // An unknown fact reads all ones: only a real reading (under 2^10 C) ends the run.
@@ -782,6 +789,7 @@ fn main() {
         held = hd[40];
     }
     let el = t0.elapsed();
+    let gs = rec.gpu();
     let info = rec.stop();
     let _ = call(S_CAMERA, &[6, held], &mut r);
     let n = call(S_CAMERA, &[4], &mut r);
@@ -806,6 +814,9 @@ fn main() {
         s.code_us_sum / s.frames.max(1),
         info.error.as_ref().map(|e| format!("; {e}")).unwrap_or_default()
     );
+    if let Some(g) = gs {
+        println!("rawrec: the GPU: A#{} frames run, A#{} us a frame at most, A#{} on average; packed behind the hand-over A#{} us at most, A#{} on average{}", g.runs, g.run_us_most, g.run_us_sum / g.runs.max(1), g.behind_us_most, g.behind_us_sum / g.runs.max(1), g.failed.map(|e| format!("; the GPU failed: {e}")).unwrap_or_default());
+    }
     println!("rawrec: seal {}", hex(&info.hash));
     if let Some(i) = ext.info() {
         println!("rawrec: the extent: A#{} blocks from block A#{} of the clips area (partition block A#{}), A#{} bytes, sealed {}", i.blocks, i.first, (6u64 << 20) + i.first, i.bytes, i.sealed);
@@ -837,7 +848,9 @@ fn main() {
                 continue;
             }
         };
-        if ferros_clip::samples_source_hash(&px, w, h) == *hh {
+        // Without source digests the recorder keeps no frame's hash: the copies below are the check.
+        if !digests {
+        } else if ferros_clip::samples_source_hash(&px, w, h) == *hh {
             good += 1;
         } else {
             bad += 1;
@@ -846,6 +859,13 @@ fn main() {
         if let Some((_, raw)) = copies.iter().find(|(c, _)| c == k) {
             let same = (0..h).all(|y| (0..w / 4).all(|g| (0..4).all(|i| px[y * w + g * 4 + i] == ((raw[y * stride + g * 5 + i] as u16) << 2 | ((raw[y * stride + g * 5 + 4] >> (2 * i)) & 3) as u16))));
             println!("rawrec: frame A#{k} against its copy, sample for sample: {}", if same { "equal" } else { "DIFFERENT" });
+            if !digests {
+                if same {
+                    good += 1;
+                } else {
+                    bad += 1;
+                }
+            }
         }
     }
     println!("rawrec: decoded on the device: A#{good} of the frames checked (every A#{}-th) bit exact, A#{bad} not, in A#{} ms", 1u64 << hash_log2, t.elapsed().as_millis());
