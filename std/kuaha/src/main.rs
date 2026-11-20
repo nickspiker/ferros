@@ -133,6 +133,9 @@ mod window {
                 Event::KeyboardInput { event } if event.state == ElementState::Pressed => match &event.logical_key {
                     Key::Named(NamedKey::Backspace) => self.k.backspace(),
                     Key::Named(NamedKey::Enter) => self.k.enter(),
+                    // At the trunk, Back passes on: the host takes it out to the deck.
+                    Key::Named(NamedKey::Escape) if !self.k.back() => return EventResponse::Pass,
+                    Key::Named(NamedKey::Escape) => {}
                     _ => return EventResponse::Pass,
                 },
                 Event::Focused(front) => self.k.focus(*front),

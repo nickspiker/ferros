@@ -418,3 +418,30 @@ fn every_language_and_base_draws() {
         println!("{}", s.write(&format!("71-theme-{theme}")));
     }
 }
+
+/// Back goes up a level at a time: the keyboard, an armed remove, an open card, the device's view; at the trunk it says so, and the deck takes it.
+#[test]
+fn back_goes_up_a_level_at_a_time() {
+    let (b, _rec) = stocked();
+    let mut src = source(&b);
+    let mut k = Kuaha::new(None, loc().now);
+    let mut s = Screen::new();
+    pump(&mut k, &mut src);
+    let h = k.model.found.ready().unwrap()[2].0;
+    tap(&mut k, &mut s, &mut src, |x| *x == Hit::Item(h));
+    tap(&mut k, &mut s, &mut src, |x| *x == Hit::Remove(h));
+    assert!(k.back());
+    assert_eq!(k.model.armed, None);
+    assert!(k.back());
+    assert_eq!(k.model.open, None);
+    // Any tap but the search line's ends typing, so the keyboard is its own level.
+    tap(&mut k, &mut s, &mut src, |x| *x == Hit::Search);
+    assert_eq!(k.wants_keyboard(), Some(true));
+    assert!(k.back());
+    assert_eq!(k.wants_keyboard(), Some(false));
+    assert!(!k.back());
+    tap(&mut k, &mut s, &mut src, |x| *x == Hit::Tab(View::Device));
+    assert!(k.back());
+    assert_eq!(k.model.view, View::Things);
+    assert!(!k.back());
+}

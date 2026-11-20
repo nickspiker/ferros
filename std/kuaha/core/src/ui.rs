@@ -299,6 +299,23 @@ impl Kuaha {
         self.set_typing(false);
     }
 
+    /// Back (the helm's Escape, owner 2026-11-18: "back continues up a level until stopping at the trunk of the kist"): the keyboard put away, an armed remove disarmed, an open card closed, the device's view left for the things; false at the trunk, where Back goes on to the deck.
+    pub fn back(&mut self) -> bool {
+        if self.typing {
+            self.set_typing(false);
+        } else if self.model.armed.is_some() {
+            self.model.disarm();
+        } else if self.model.open.is_some() {
+            self.model.open = None;
+        } else if self.model.view == View::Device {
+            self.model.set_view(View::Things);
+            self.scroll = 0.;
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// One shown frame: the physics stepped once. True while anything still moves.
     pub fn tick(&mut self) -> bool {
         self.recent = [self.recent[1], self.recent[2], self.this_frame];

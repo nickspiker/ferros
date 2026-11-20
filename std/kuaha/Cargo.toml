@@ -37,5 +37,9 @@ opt-level = 3
 [workspace]
 members = ["core"]
 
+[patch.crates-io]
+# libc with a ferros arm (rav1d, thru fluor's icon decoding, spells its C types thru it), on every target so the core's host tests and the ferros build share one lockfile (as basecalc's).
+libc = { path = "../../../ferros-libc" }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
