@@ -30,6 +30,14 @@ struct Queue {
     held: Option<([u8; 32], u32)>,
 }
 
+/// The surfaces whose app re-attached from an earlier display (`watch`), bit k surface k: the render thread puts their windows behind (`reattached`).
+static REATTACHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The surfaces whose app re-attached since the last call, cleared as read (the render thread's, once a pass).
+pub fn reattached() -> u32 {
+    REATTACHED.swap(0, Ordering::AcqRel)
+}
+
 const EMPTY: Queue = Queue { generation: 0, n: 0, behind: false, ring: [0; EVENTS], nb: 0, bytes: [0; BYTES], at: [0; EVENTS], held: None };
 static mut QUEUES: [Queue; SURFACES] = [EMPTY; SURFACES];
 static LOCK: AtomicBool = AtomicBool::new(false);
@@ -114,6 +122,17 @@ pub fn watch(k: usize, generation: u8, seen: u32, tok: &[u8; 32]) {
     let qs = lock();
     let q = &mut qs[k];
     own(q, generation);
+    // A count this display never gave, on a surface it has told nothing (2026-11-20, docs/WINDOWS.md "A display started again"): the caller watched an earlier display, which ended. This one has no window of it on the glass, so the app hears it is behind (it draws nothing until brought to the front, op 59), and a window it already made here by a show goes behind with it (`reattached`). Without this the app heard "in front" from a fresh queue and kept drawing over the deck, or lost its window and its touches.
+    // The count goes one past what the caller saw, so the watch is answered with that one event whatever it saw (set to 1, a caller that had seen one event, the safe area at its first show, was held and never heard it: the Pro, 2026-11-20, Kuaha stayed asleep and a later "front" changed nothing for it).
+    let reattached = q.n == 0 && seen != 0;
+    if reattached {
+        q.behind = true;
+        q.n = seen.wrapping_add(1);
+        let i = (q.n.wrapping_sub(1)) as usize % EVENTS;
+        q.ring[i] = (ferros_sys::window::EV_BEHIND as u16) << 8;
+        q.at[i] = q.nb;
+        REATTACHED.fetch_or(1 << k, Ordering::AcqRel);
+    }
     if let Some((old, s)) = q.held.take() {
         answer(q, s, &old);
     }
@@ -123,4 +142,8 @@ pub fn watch(k: usize, generation: u8, seen: u32, tok: &[u8; 32]) {
         q.held = Some((*tok, seen));
     }
     unlock();
+    if reattached {
+        // A restart's work, so in the flash log; said outside the lock.
+        ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: surface A#{k}'s app re-attached from an earlier display (it had seen A#{seen} events): told it is behind").as_bytes());
+    }
 }

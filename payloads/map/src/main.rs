@@ -2187,8 +2187,9 @@ impl Map {
         // Running on a surface (init's RUNNING with the surface and its generation): its window to the front instead of a second copy (owner, 2026-11-11: a running kist's circle tapped "brings it to the front").
         let raised = r[0] == ferros_kist::launch::RUNNING && n == 3 && ferros_sys::window::front(self.display, r[1], r[2]);
         let mut l = Line::new();
-        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not stowed", 5 => "the list is not readable", _ => "refused" });
-        console(self.grants, l.as_str().as_bytes());
+        let _ = write!(l, "map: launch {}: {}{}", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not stowed", 5 => "the list is not readable", _ => "refused" }, if r[0] == 1 && !raised && !puck { alloc::format!(" (surface A#{} generation A#{}, answer A#{n} bytes; the display did not bring it to the front)", r[1], r[2]) } else { alloc::string::String::new() });
+        // In the flash log: a launch is a tap, and the console ring is mostly the display's own lines (2026-11-20, finding why a re-attached app did not come back).
+        ferros_sys::console_flash(self.grants, l.as_str().as_bytes());
         let capsule = k.capsule;
         // A puck is never in front and never opened (docs/PUCKS.md): it is up or not, nothing more; a puck that did not start is said on its card as a kist's is.
         if puck {
@@ -6484,8 +6485,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let frames = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
                         if frames < display_frames_seen {
                             console(grants, b"map: the display started again; its scene sent anew\n");
+                            // The app that was in front: the new display has no window of it, and the app heard it is behind as it re-attached (display events.rs `watch`). Launched again it is running, so init answers with its surface and the display brings it to the front (op 59), and it shows its window there (WINDOWS.md "A display started again").
+                            let front = if map.app_front { map.front_kist } else { None };
+                            ferros_sys::console_flash(grants, alloc::format!("map: the display started again (frames A#{frames} after A#{display_frames_seen}); an app in front: {}, the kist in front known: {}", map.app_front, map.front_kist.is_some()).as_bytes());
+                            map.app_front = false;
                             map.send_scene();
                             map.draw();
+                            if let Some(i) = front.and_then(|c| map.circle_of(&c)) {
+                                map.launch(i);
+                            }
                         }
                         display_frames_seen = frames;
                     }
