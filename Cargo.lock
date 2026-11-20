@@ -1189,6 +1189,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-mbtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-memprobe"
 version = "0.1.0"
 
@@ -1680,6 +1687,7 @@ dependencies = [
  "ferros_kist",
  "ferros_layout",
  "ferros_ledger",
+ "ferros_mailbox",
  "ferros_pieces",
  "ferros_pt",
  "ferros_sandbox",
@@ -1726,6 +1734,10 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "vsf 0.11.0",
 ]
+
+[[package]]
+name = "ferros_mailbox"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_pieces"
@@ -1806,6 +1818,7 @@ dependencies = [
 name = "ferros_sys"
 version = "0.1.0"
 dependencies = [
+ "ferros_mailbox",
  "tatau",
 ]
 

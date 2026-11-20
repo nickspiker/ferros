@@ -21,7 +21,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: single egg rule](feedback_single_egg_rule.md) - critical inputs (entropy) from several independent sources
 - [Feedback: NO TIMERS](feedback_no_animations.md) - no waits/delays (dev Ready? 1 s only); post-lift motion = shown-frame physics
 - [Feedback: no polling](feedback_no_polling.md) - push or doorbell; a timer only for a proven real deadline
-- [Feedback: keep devices busy](feedback_keep_devices_busy.md) - phones set up on the bench get work every hour; host work in parallel; never idle on a queue
+- [Feedback: stage agents, keep the bench used](feedback_keep_devices_busy.md) - one staged job per device, few agents, no overlapping edits, no helpers; but never idle a set-up device for hours
 - [Feedback: stop is immediate](feedback_stop_is_immediate.md) - stopping an app or puck is OP_STOP at once; no close message, no grace, no shutdown
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) - one branchless path; owner picks
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
@@ -55,6 +55,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Pucks draw squares](pucks_draw_squares.md) - on the 8a; deck = settings, kists, pucks only (display widgets deleted); basecalc dial
 
 ## Owner decisions and design
+- [Owner decisions 2026-11-19](owner_decisions_2026_11_19.md) - approved: RAW video first, heat any method, GPU fence + host Mesa; NOT approved: gnss/fgtw fetch, camera cap, A510s, gain floor, motion right
 - [Owner directions 2026-10-27](owner_directions_2026_10_27.md) - windows, arcs, drivers out, attest at boot, HashMap rule
 - [No baked apps](no_baked_apps.md) - one built-in circle (settings); no identity = no way past attest
 - [ferros attest is OS-level](ferros_attest_os_level.md) - payloads/ahau at boot; ira unlocks drivers, identity the rest

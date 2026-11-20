@@ -226,22 +226,14 @@ fn long_ladder(g: u64, ep: u64, id: u8, bin: u8, per: u8, top_log2: u8, bottom_l
     // A frame's mean sample (every 16th binned sample, in 16ths) and the header's exposure (ns); None when no frame came.
     let mut frame = || -> Option<(u64, u64)> {
         if view {
-            // MAP, giving back the buffer held; the mean of a sample's high eight bits (every 65th byte of every 16th line: always a sample's high byte), times 4 for ten bits and 16 for sixteenths, as the binned means.
+            // MAP, giving back the buffer held; the mean over whole 2 x 2 cells in sixteenths, as the binned means (until 2026-11-19 every 65th byte of every 16th line: the cell's top left place alone, one colour).
             let n = call(ep, &[5, held], &mut buf[..64]);
             if n == ERR || n < 64 {
                 return None;
             }
             held = buf[40];
             let at = base + u64::from_le_bytes(buf[48..56].try_into().unwrap()) as usize;
-            let (mut sum, mut cnt) = (0u64, 0u64);
-            for y in (0..vh).step_by(1 << 4) {
-                for x in (0..vw * 5 / 4).step_by(65) {
-                    sum += unsafe { core::ptr::read_volatile((at + y * stride + x) as *const u8) } as u64;
-                    cnt += 1;
-                }
-            }
-            // WHY the max: a view of no rows would divide by zero and panic the process.
-            return Some((sum * 4 * 16 / cnt.max(1), u64::from_le_bytes(buf[16..24].try_into().unwrap())));
+            return Some((cell_mean16(at, stride, vw, vh), u64::from_le_bytes(buf[16..24].try_into().unwrap())));
         }
         let n = call(ep, &[2, bin], buf);
         if n == ERR || n < 64 {
@@ -599,22 +591,56 @@ fn cells(g: u64, at: usize, stride: usize, w: usize, h: usize) {
     for dy in 0..4 {
         say!(g, "camtest: cell row A#{dy}: A#{} A#{} A#{} A#{} (A#{n} cells)\n", m(dy * 4), m(dy * 4 + 1), m(dy * 4 + 2), m(dy * 4 + 3));
     }
-    // The frame's profile (2026-11-19, the tele's flip): the mean of 2^3 bands of rows, top first, and of 2^3 bands of columns, left first, from the same samples; a flip or a mirror of the readout reverses one of them against a run without it on a still scene, which a cell table (the whole frame's means by place) cannot show.
+    // The frame's profile over whole 2 x 2 cells (the four places' mean, all ten bits): 2^3 bands of rows, top first, 2^3 bands of columns, left first, and the 2^3 x 2^3 grid of the same, so two readouts of a still scene compare region by region whatever colour each place holds; a flip or a mirror of the readout reverses one axis against a run without it.
+    // Until 2026-11-19 the bands sampled every 16th sample of every 16th line: always the cell's top left place, one colour, which a flip changes (the tele's G#0101 = 2 put red there in place of green, and its "2.5 times as bright" frame was its red channel against its green; docs/CAMERA.md "The tele's orientation").
     let (mut rows, mut cols, mut rn, mut cn) = ([0u64; 8], [0u64; 8], [0u64; 8], [0u64; 8]);
-    for y in (0..h).step_by(1 << 4) {
-        for x in (0..w).step_by(1 << 4) {
-            let v = unsafe { core::ptr::read_volatile((at + y * stride + x / 4 * 5 + x % 4) as *const u8) } as u64;
+    let (mut grid, mut gn) = ([[0u64; 8]; 8], [[0u64; 8]; 8]);
+    let (mut all, mut an) = (0u64, 0u64);
+    for cy in (0..h / 2).step_by(1 << 3) {
+        for cx in (0..w / 2).step_by(1 << 3) {
+            let (x, y) = (cx * 2, cy * 2);
+            let v = sample(at, stride, x, y) + sample(at, stride, x + 1, y) + sample(at, stride, x, y + 1) + sample(at, stride, x + 1, y + 1);
             let (by, bx) = (y * 8 / h, x * 8 / w);
             rows[by] += v;
-            rn[by] += 1;
+            rn[by] += 4;
             cols[bx] += v;
-            cn[bx] += 1;
+            cn[bx] += 4;
+            grid[by][bx] += v;
+            gn[by][bx] += 4;
+            all += v;
+            an += 4;
         }
     }
-    // WHY the max: a frame under 2^3 rows or columns leaves a band with no samples, and its mean would divide by zero and panic the process.
-    let b = |s: &[u64; 8], c: &[u64; 8], k: usize| 4 * s[k] / c[k].max(1);
+    // WHY the max: a frame under 2^4 rows or columns leaves a band with no cells, and its mean would divide by zero and panic the process.
+    let b = |s: &[u64; 8], c: &[u64; 8], k: usize| s[k] / c[k].max(1);
+    say!(g, "camtest: whole cells: the frame's mean A#{} (A#{} samples)\n", all / an.max(1), an);
     say!(g, "camtest: bands of rows, top first: A#{} A#{} A#{} A#{} A#{} A#{} A#{} A#{}\n", b(&rows, &rn, 0), b(&rows, &rn, 1), b(&rows, &rn, 2), b(&rows, &rn, 3), b(&rows, &rn, 4), b(&rows, &rn, 5), b(&rows, &rn, 6), b(&rows, &rn, 7));
     say!(g, "camtest: bands of columns, left first: A#{} A#{} A#{} A#{} A#{} A#{} A#{} A#{}\n", b(&cols, &cn, 0), b(&cols, &cn, 1), b(&cols, &cn, 2), b(&cols, &cn, 3), b(&cols, &cn, 4), b(&cols, &cn, 5), b(&cols, &cn, 6), b(&cols, &cn, 7));
+    for (k, (s, c)) in grid.iter().zip(gn.iter()).enumerate() {
+        say!(g, "camtest: grid row A#{k}: A#{} A#{} A#{} A#{} A#{} A#{} A#{} A#{}\n", b(s, c, 0), b(s, c, 1), b(s, c, 2), b(s, c, 3), b(s, c, 4), b(s, c, 5), b(s, c, 6), b(s, c, 7));
+    }
+}
+
+/// Sample (x, y) of a RAW10 frame at `at`, lines of `stride` bytes, all ten bits: four samples' high bytes, then a byte of their low bits (sample x % 4's at bit 2 (x % 4)).
+fn sample(at: usize, stride: usize, x: usize, y: usize) -> u64 {
+    let p = at + y * stride + x / 4 * 5;
+    let hi = unsafe { core::ptr::read_volatile((p + x % 4) as *const u8) } as u64;
+    let lo = unsafe { core::ptr::read_volatile((p + 4) as *const u8) } as u64;
+    hi << 2 | lo >> (2 * (x % 4)) & 3
+}
+
+/// A frame's mean over whole 2 x 2 cells (every 2^4th cell across and down, all ten bits), in sixteenths: every colour place alike, so a flip or a shift of the mosaic leaves it as it was.
+fn cell_mean16(at: usize, stride: usize, w: usize, h: usize) -> u64 {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for cy in (0..h / 2).step_by(1 << 4) {
+        for cx in (0..w / 2).step_by(1 << 4) {
+            let (x, y) = (cx * 2, cy * 2);
+            sum += sample(at, stride, x, y) + sample(at, stride, x + 1, y) + sample(at, stride, x, y + 1) + sample(at, stride, x + 1, y + 1);
+            n += 4;
+        }
+    }
+    // WHY the max: a view of no whole cell would divide by zero and panic the process.
+    sum * 16 / n.max(1)
 }
 
 /// Bin 1 (docs/CAMERA.md "The view"): OPEN with the view, `frames` MAPs, each frame read in place thru the view, CLOSE, then the token tried once more. Said on the console: the view's base and shape, each MAP's wait, the first and last frame's header and mean (a sample's high eight bits every 52 samples of every 16th line), a whole frame copied out with 64-byte loads (what a kist pays to take one), and whether the token still answers after the close (it must not). With `write` set, a store into the view after the last frame: the view is read-only, so camtest ends on that fault, which is the test.
@@ -674,14 +700,8 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, gain_lo
         last_count = count;
         if k == 0 || k + 1 == frames {
             let at = base as usize + u64::from_le_bytes(h64[48..56].try_into().unwrap()) as usize;
-            let (mut sum, mut cnt) = (0u64, 0u64);
-            for y in (0..h).step_by(1 << 4) {
-                // Every 65th byte of the line's samples: a multiple of five, so always a sample's high eight bits (MIPI RAW10: four of those, then their low bits).
-                for x in (0..w * 5 / 4).step_by(65) {
-                    sum += unsafe { core::ptr::read_volatile((at + y * stride + x) as *const u8) } as u64;
-                    cnt += 1;
-                }
-            }
+            // The mean over whole cells (until 2026-11-19 every 65th byte of every 16th line: the cell's top left place alone, one colour).
+            let mean16 = cell_mean16(at, stride, w, h);
             // A whole frame out of the view, 64 bytes a load, as a kist takes one (into a scratch line, so nothing but the reads is timed).
             let t = ferros_sys::now();
             let mut acc = 0u64;
@@ -694,7 +714,7 @@ fn view(g: u64, ep: u64, id: u8, frames: u32, write: bool, exp_log2: u8, gain_lo
             }
             let copy_us = ferros_sys::us_since(t);
             cells(g, at, stride, w, h);
-            say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; its PD rows at +G#{:X}, A#{} of them; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, u32::from_le_bytes(h64[56..60].try_into().unwrap()), u16::from_le_bytes([h64[60], h64[61]]), 4 * sum / cnt.max(1), acc & 0xFF);
+            say!(g, "camtest: MAP A#{k}: buffer A#{} count A#{count} (A#{skipped} skipped) exposure A#{} us at Eagle A#{} s, answered in A#{us} us; its PD rows at +G#{:X}, A#{} of them; mean sample about A#{} of A#1023; a frame read in A#{copy_us} us (G#{:X})\n", h64[40], u64::from_le_bytes(h64[16..24].try_into().unwrap()) / 1000, u64::from_le_bytes(h64[32..40].try_into().unwrap()) / 1_000_000_000, u32::from_le_bytes(h64[56..60].try_into().unwrap()), u16::from_le_bytes([h64[60], h64[61]]), mean16 / 16, acc & 0xFF);
         }
     }
     say!(g, "camtest: A#{got} frames mapped, A#{} us apart on average, A#{most} us the longest\n", if got > 1 { waits / (got - 1) as u64 } else { 0 });

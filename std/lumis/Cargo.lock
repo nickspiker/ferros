@@ -1256,6 +1256,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_clip"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_rawcodec",
+ "valhall",
+ "vsf",
+]
+
+[[package]]
+name = "ferros_rawcodec"
+version = "0.1.0"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2576,9 +2590,10 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lumis-ferros"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "blake3",
+ "ferros_clip",
  "fluor",
  "getrandom 0.2.17",
  "kete",
@@ -5426,6 +5441,10 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valhall"
+version = "0.1.0"
 
 [[package]]
 name = "version-compare"

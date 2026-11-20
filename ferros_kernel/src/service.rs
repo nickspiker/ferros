@@ -3101,6 +3101,10 @@ pub fn run(mut b: Boot) -> ! {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"gps", &mut rep);
                 crate::flashlog::line(&alloc::format!("gps claimed (A#{} claims): {}", crate::process::gps_claims(), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                // Not started: the GPS mailbox's readers woken to a dead mailbox (`mailbox_ring_dead`), as a driver's end would wake them, so none waits on a publish that will not come.
+                if !(rep.starts_with(b"gps") && rep.ends_with(b" started\n")) {
+                    crate::process::with_lock(|| crate::process::mailbox_ring_dead(ferros_mailbox::GPS));
+                }
                 // Refused for room, as the stower's above: the next arc back brings another try while the claim stands.
                 if rep.windows(18).any(|w| w == b"arc pool exhausted") {
                     gps_on = false;

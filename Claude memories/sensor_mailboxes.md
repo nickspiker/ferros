@@ -19,3 +19,12 @@ Owner (2026-11-19), after the GPS driver ran out of WATCH slots with six watcher
 - New sensor or measurement drivers publish this way. Existing ones (GPS fixes and tracks, sensorlink's accelerometer, gyro and others, the mic) move to it.
 - The capability is the permission: implicit rights stay implicit ([[rights_implicit_set]]), while location and the mic are asked once ([[permissions_asked_once]]).
 - Related: [[gps_onchip_fix]], [[kernel_out_moves]].
+
+**Built 2026-11-19 (branch mailboxes; KERNEL.md "Mailboxes", SENSORS.md "The motion mailbox"), run on the Pro (b1005): 64 readers woken by every publish, none torn or skipped, the writer 12.6 us a publish with one reader and 122 us with 64:**
+- A mailbox is a DMA region pair over one pool frame kept for the boot: `<name>-mailbox` read-write (the writer's), `<name>-view` read-only (EL0 and EL2).
+- SYS_DMA maps it (the writer's region makes the one writer); SYS_WAIT on the sequence word waits; the writer's SYS_WAKE on it wakes every process's waiters; SYS_MAILBOX (47) op 0 opens a view with a proof (GPS: Settings, the `gps` right, a GPS view; motion: none yet, as public as SYS_FACTS).
+- The kernel marks it dead and zeroes it once the writer's process is gone (where the arc is freed, all three paths).
+- ferros_mailbox: the seqlock and the layouts, host-tested; ferros_sys::mailbox: Writer and Reader; payloads/mbtest measures (64 readers).
+- Sensors publish `motion` (gravity, the field, the accelerometer every 2^4 ms).
+- The GPS move (driver into slot 10, map, GPS puck and ferros_puck `gps_fix` reading, WATCH and SYS_CLAIM op 3 removed) was written in commit 93e7d55e and taken back out on the coordinator's word: it is staged after gps-indoor-lock merges. The kernel grants the driver nothing new yet: `gps-mailbox` joins `gps_grants` with the move.
+- Open for the owner: whether motion is an asked right; the mic (a PCM ring, the `mic` right) once the audio service captures.
