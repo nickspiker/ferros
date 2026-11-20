@@ -1656,6 +1656,7 @@ dependencies = [
  "blake3",
  "ferros_idea",
  "ferros_store",
+ "ferros_thing",
  "manifestus",
  "vsf 0.11.0",
 ]
@@ -1707,6 +1708,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_sys",
+ "ferros_thing",
  "fgtw",
  "tatau",
  "vsf 0.11.0",
@@ -1830,6 +1832,15 @@ version = "0.1.0"
 [[package]]
 name = "ferros_theme"
 version = "0.1.0"
+
+[[package]]
+name = "ferros_thing"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_idea",
+ "vsf 0.11.0",
+]
 
 [[package]]
 name = "ferros_tide"

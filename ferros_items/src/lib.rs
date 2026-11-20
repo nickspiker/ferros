@@ -27,6 +27,7 @@ use manifestus::BlockDev;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::types::{Ascii, EtType};
 use vsf::VsfType;
+pub use ferros_thing::Ht;
 
 /// A card is bounded to one 4 KiB block (STORE.md "The card"): a kind that wants more puts it in its body.
 pub const CARD_MAX: usize = 1 << 12;
@@ -114,7 +115,7 @@ impl Extent {
 /// An item's card (STORE.md "The card, as VSF").
 #[derive(Clone, Debug, PartialEq)]
 pub struct Card {
-    pub id: [u8; 32],
+    pub id: Ht,
     pub kind: [u8; 32],
     pub kist: Maker,
     /// The device it was made on, when the stamp names one.
@@ -130,7 +131,7 @@ pub struct Card {
     pub body: [u8; 32],
     pub extent: Option<Extent>,
     /// Relations: another item's id and how (`OF_*`).
-    pub of: Vec<([u8; 32], u64)>,
+    pub of: Vec<(Ht, u64)>,
     /// The kind's own facts, by name and type.
     pub attrs: Vec<(String, VsfType)>,
     pub keeper: u64,
@@ -141,14 +142,14 @@ pub struct Card {
 pub struct Proposed {
     pub kind: [u8; 32],
     pub title: Option<String>,
-    pub of: Vec<([u8; 32], u64)>,
+    pub of: Vec<(Ht, u64)>,
     pub attrs: Vec<(String, VsfType)>,
     pub keeper: u64,
 }
 
 fn card_schema() -> SectionSchema {
     SectionSchema::new("card")
-        .field("id", TypeConstraint::Blake3Provenance)
+        .field("id", item_id())
         .field("kind", TypeConstraint::Idea)
         .field("kist", TypeConstraint::Any)
         .field("device", TypeConstraint::Ed25519Key)
@@ -178,6 +179,20 @@ fn eagle_of(v: &VsfType) -> Option<i64> {
     }
 }
 
+/// An item's id read back: a thing (`ht`, since 2026-11-20), or the same 32 bytes as the `hp` the hold wrote them as from 2026-11-19, so every item kept then keeps its id and its body. Written only as `ht`; an item kept again is written so.
+pub(crate) fn ht_of(v: &VsfType) -> Option<Ht> {
+    match v {
+        VsfType::ht(_) => Ht::from_vsf(v).ok(),
+        VsfType::hp(b) => <[u8; 32]>::try_from(b.as_slice()).ok().map(Ht::from_bytes),
+        _ => None,
+    }
+}
+
+/// The id's constraint: a thing, or the `hp` an item was given before (`ht_of`).
+fn item_id() -> TypeConstraint {
+    TypeConstraint::Custom { name: "item id", description: "an item's id (ht, or hp before 2026-11-20)", validator: alloc::sync::Arc::new(|v: &VsfType| matches!(v, VsfType::ht(b) | VsfType::hp(b) if b.len() == 32)) }
+}
+
 fn h32(v: &VsfType) -> Option<[u8; 32]> {
     match v {
         VsfType::hp(b) | VsfType::hb(b) | VsfType::hi(b) | VsfType::ke(b) | VsfType::hR(b) => b.as_slice().try_into().ok(),
@@ -193,7 +208,7 @@ impl Card {
     /// The card's section bytes (with `handle` when it goes to a caller; never at rest).
     pub fn section(&self, handle: Option<&[u8; 32]>) -> Result<Vec<u8>> {
         let mut b = card_schema().build();
-        b = b.set("id", VsfType::hp(self.id.to_vec())).map_err(fmt)?;
+        b = b.set("id", VsfType::from(self.id)).map_err(fmt)?;
         b = b.set("kind", VsfType::hi(self.kind.to_vec())).map_err(fmt)?;
         b = b.set_multi("kist", alloc::vec![VsfType::ke(self.kist.developer.to_vec()), VsfType::hR(self.kist.option.to_vec()), VsfType::x(self.kist.name.clone())]).map_err(fmt)?;
         if let Some(k) = &self.device {
@@ -214,7 +229,7 @@ impl Card {
             b = b.set("extent_blocks", VsfType::u(x.blocks as usize, false)).map_err(fmt)?;
         }
         for (id, how) in &self.of {
-            b = b.append_multi("of", alloc::vec![VsfType::hp(id.to_vec()), VsfType::u(*how as usize, false)]).map_err(fmt)?;
+            b = b.append_multi("of", alloc::vec![VsfType::from(*id), VsfType::u(*how as usize, false)]).map_err(fmt)?;
         }
         for (name, v) in &self.attrs {
             let n = Ascii::new(name.clone()).map_err(fmt)?;
@@ -244,7 +259,7 @@ impl Card {
         }
         let mut of = Vec::new();
         for f in s.get_fields("of") {
-            let id = f.values.iter().find_map(|v| if let VsfType::hp(_) = v { h32(v) } else { None });
+            let id = f.values.iter().find_map(ht_of);
             let how = f.values.iter().find_map(|v| v.as_u64());
             if let (Some(id), Some(how)) = (id, how) {
                 of.push((id, how));
@@ -263,7 +278,7 @@ impl Card {
             _ => None,
         };
         let card = Card {
-            id: one("id").as_ref().and_then(h32).ok_or(Error::Format)?,
+            id: one("id").as_ref().and_then(ht_of).ok_or(Error::Format)?,
             kind: one("kind").as_ref().and_then(h32).ok_or(Error::Format)?,
             kist,
             device: one("device").as_ref().and_then(h32),
@@ -341,9 +356,9 @@ fn page_name(start: i64, span: u8) -> Vec<u8> {
     n
 }
 
-fn body_name(id: &[u8; 32]) -> Vec<u8> {
+fn body_name(id: &Ht) -> Vec<u8> {
     let mut n = alloc::vec![2u8, BODY_TAG];
-    n.extend_from_slice(id);
+    n.extend_from_slice(id.as_bytes());
     n
 }
 
@@ -352,7 +367,7 @@ fn page_schema() -> SectionSchema {
 }
 
 fn pending_schema() -> SectionSchema {
-    SectionSchema::new("pending").field("id", TypeConstraint::Blake3Provenance)
+    SectionSchema::new("pending").field("id", item_id())
 }
 
 /// The open clips' list: a field `clip` an item, its id (`hp`) and when it was made (`e`), told apart by their types.
@@ -504,7 +519,7 @@ pub struct Making {
 }
 
 impl Making {
-    pub fn id(&self) -> &[u8; 32] {
+    pub fn id(&self) -> &Ht {
         &self.card.id
     }
     pub fn card(&self) -> &Card {
@@ -524,7 +539,7 @@ pub enum Read {
 struct Handle {
     token: [u8; 32],
     caller: [u8; 32],
-    id: [u8; 32],
+    id: Ht,
     made: i64,
 }
 
@@ -536,7 +551,7 @@ pub struct Items {
     handles: Vec<Handle>,
     generation: u64,
     /// The open clips' list (`CLIPS`), read at its first use.
-    clips: Option<Vec<([u8; 32], i64)>>,
+    clips: Option<Vec<(Ht, i64)>>,
 }
 
 impl Items {
@@ -564,11 +579,11 @@ impl Items {
         self.generation
     }
 
-    fn handle_for(&mut self, caller: &Caller, id: &[u8; 32], made: i64) -> [u8; 32] {
+    fn handle_for(&mut self, caller: &Caller, id: &Ht, made: i64) -> [u8; 32] {
         let tag = caller.tag();
         let mut h = blake3::Hasher::new_keyed(&self.secret);
         h.update(&tag);
-        h.update(id);
+        h.update(id.as_bytes());
         let token = *h.finalize().as_bytes();
         if let Err(i) = self.handles.binary_search_by(|x| x.token.cmp(&token)) {
             self.handles.insert(i, Handle { token, caller: tag, id: *id, made });
@@ -577,14 +592,14 @@ impl Items {
     }
 
     /// The item a caller's handle names: only a handle given to that caller.
-    fn resolve(&self, caller: &Caller, token: &[u8; 32]) -> Result<([u8; 32], i64)> {
+    fn resolve(&self, caller: &Caller, token: &[u8; 32]) -> Result<(Ht, i64)> {
         match self.handles.binary_search_by(|x| x.token.cmp(token)) {
             Ok(i) if self.handles[i].caller == caller.tag() => Ok((self.handles[i].id, self.handles[i].made)),
             _ => Err(Error::Refused),
         }
     }
 
-    fn drop_handles(&mut self, id: &[u8; 32]) {
+    fn drop_handles(&mut self, id: &Ht) {
         self.handles.retain(|h| h.id != *id);
     }
 
@@ -722,7 +737,7 @@ impl Items {
     }
 
     /// The items domain's pending list: ids whose body is being written, so a body whose card never landed is found again (`sweep`).
-    fn pending_edit<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], add: bool, now: i64) -> Result<()> {
+    fn pending_edit<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, add: bool, now: i64) -> Result<()> {
         let mut ids = self.pending(store, d)?;
         if add {
             if ids.contains(id) {
@@ -740,18 +755,18 @@ impl Items {
             store.delete_unlisted(d, PENDING)?;
             return Ok(());
         }
-        let b = pending_schema().build().set_multi("id", ids.iter().map(|x| VsfType::hp(x.to_vec())).collect()).map_err(fmt)?;
+        let b = pending_schema().build().set_multi("id", ids.iter().map(|x| VsfType::from(*x)).collect()).map_err(fmt)?;
         let doc = document(now, "pending", alloc::vec![b.encode().map_err(fmt)?], None)?;
         store.put_unlisted(d, PENDING, &doc)?;
         Ok(())
     }
 
-    fn pending<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<[u8; 32]>> {
+    fn pending<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<Ht>> {
         let Some(doc) = store.get(d, PENDING)? else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         for s in sections(&doc, "pending")? {
             let p = SectionBuilder::parse(pending_schema(), s).map_err(fmt)?;
-            out.extend(p.get_fields("id").iter().flat_map(|f| f.values.iter().filter_map(h32)));
+            out.extend(p.get_fields("id").iter().flat_map(|f| f.values.iter().filter_map(ht_of)));
         }
         Ok(out)
     }
@@ -806,7 +821,7 @@ impl Items {
     }
 
     /// The single-copy bodies not yet sealed, each item's id and when it was made: what the vault looks for in its extents' table once a clip's writer is gone (payloads/vault: a clip closed by its recoverer, its card then corrected by `amend_extent`).
-    pub fn open_clips<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<([u8; 32], i64)>> {
+    pub fn open_clips<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<(Ht, i64)>> {
         if let Some(c) = &self.clips {
             return Ok(c.clone());
         }
@@ -815,7 +830,7 @@ impl Items {
             for s in sections(&doc, "clips")? {
                 let p = SectionBuilder::parse(clips_schema(), s).map_err(fmt)?;
                 for f in p.get_fields("clip") {
-                    let id = f.values.iter().find_map(|v| if let VsfType::hp(_) = v { h32(v) } else { None });
+                    let id = f.values.iter().find_map(ht_of);
                     let made = f.values.iter().find_map(eagle_of);
                     if let (Some(id), Some(made)) = (id, made) {
                         out.push((id, made));
@@ -828,7 +843,7 @@ impl Items {
     }
 
     /// An item's id put on or taken off the open clips' list, the list written when it changed.
-    fn clips_edit<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, add: bool, now: i64) -> Result<()> {
+    fn clips_edit<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: i64, add: bool, now: i64) -> Result<()> {
         let mut list = self.open_clips(store, d)?;
         let had = list.iter().any(|(x, _)| x == id);
         if add == had {
@@ -844,7 +859,7 @@ impl Items {
         } else {
             let mut b = clips_schema().build();
             for (x, m) in &list {
-                b = b.append_multi("clip", alloc::vec![VsfType::hp(x.to_vec()), e6(*m)]).map_err(fmt)?;
+                b = b.append_multi("clip", alloc::vec![VsfType::from(*x), e6(*m)]).map_err(fmt)?;
             }
             let doc = document(now, "clips", alloc::vec![b.encode().map_err(fmt)?], None)?;
             store.put_unlisted(d, CLIPS, &doc)?;
@@ -870,7 +885,7 @@ impl Items {
     }
 
     /// Where an item's card is: (root entry, held page, card index); `made` narrows the pages to read.
-    fn locate<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: Option<i64>) -> Result<Option<(usize, usize, usize)>> {
+    fn locate<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: Option<i64>) -> Result<Option<(usize, usize, usize)>> {
         self.load_root(store, d)?;
         let n = self.root.as_ref().ok_or(Error::Format)?.len();
         for ri in 0..n {
@@ -892,12 +907,8 @@ impl Items {
             return Err(Error::Refused);
         }
         let kist = caller.maker.clone().unwrap_or_default();
-        let mut h = blake3::Hasher::new_derive_key("ferros items 2026-11-19 id");
-        h.update(&random);
-        h.update(&p.kind);
-        h.update(&kist.tag());
-        h.update(&now.to_le_bytes());
-        let id = *h.finalize().as_bytes();
+        // A thing minted once (ferros_thing `hold_item`, the context ids have had since 2026-11-19).
+        let id = ferros_thing::hold_item(&random, &ferros_thing::Hi::from_bytes(p.kind), &kist.tag(), now);
         let card = Card { id, kind: p.kind, kist, device: caller.device, person: None, made: now, changed: now, title: p.title, size: 0, body: [0; 32], extent: None, of: p.of, attrs: p.attrs, keeper: p.keeper };
         if card.section(None)?.len() > CARD_MAX {
             return Err(Error::TooLarge);
@@ -1000,7 +1011,7 @@ impl Items {
     }
 
     /// The vault's own correction of a single-copy body's card (no caller: the vault process found its clip closed by its recoverer): its extent, length and BLAKE3.
-    pub fn amend_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, extent: Extent, len: u64, hash: [u8; 32], now: i64) -> Result<Card> {
+    pub fn amend_extent<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: i64, extent: Extent, len: u64, hash: [u8; 32], now: i64) -> Result<Card> {
         let Some((ri, pi, ci)) = self.locate(store, d, id, Some(made))? else {
             // A clip whose card never landed: nothing to correct, and nothing left to look for.
             self.clips_edit(store, d, id, made, false, now)?;
@@ -1019,7 +1030,7 @@ impl Items {
     }
 
     /// The vault's own removal of an item by its id (no caller: a single-copy body whose extent is gone from the table, so the card would name blocks nobody holds). The card comes back.
-    pub fn remove_id<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &[u8; 32], made: i64, now: i64) -> Result<Card> {
+    pub fn remove_id<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: i64, now: i64) -> Result<Card> {
         let Some((ri, pi, ci)) = self.locate(store, d, id, Some(made))? else {
             self.clips_edit(store, d, id, made, false, now)?;
             return Err(Error::NotFound);
@@ -1150,7 +1161,7 @@ impl Items {
 }
 
 /// Whether a card meets a find's conditions past its pages' (kind, maker, time, changed, relation, words, attributes).
-fn matches(c: &Card, f: &Find, of: Option<&[u8; 32]>, words: Option<&str>) -> bool {
+fn matches(c: &Card, f: &Find, of: Option<&Ht>, words: Option<&str>) -> bool {
     if !f.kinds.is_empty() && !f.kinds.contains(&c.kind) {
         return false;
     }

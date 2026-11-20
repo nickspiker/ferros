@@ -12,6 +12,8 @@ path = "src/lib.rs"
 vsf = { path = "../../vsf", default-features = false }
 # A version in the person's number base (`write_version`): the map's Kists page, the kist list kistcat writes. no_std, no dependencies; the kernel already links it.
 tatau = { path = "../../tatau" }
+# A kist's thing identity (`ht`, from its developer and option) and its icon's content identity (`hp`).
+ferros_thing = { path = "../ferros_thing" }
 # vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The list read and written through a process's `kists.` grant (init, the map): only where ferros_sys's calls exist.

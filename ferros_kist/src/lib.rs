@@ -712,6 +712,21 @@ pub fn icon_of(capsule: &[u8]) -> Result<Option<Icon>, &'static str> {
     section(capsule, ICON)?.as_ref().map(icon_from).transpose()
 }
 
+/// The content identity (`hp`) of the icon a capsule carries: the BLAKE3 of its `icon` section's bytes as the capsule holds them, signed with the rest (ferros_thing `icon`), or None for a capsule without one. What the deck and the display know the icon by: the same icon in two builds of a kist is one icon, decoded once.
+pub fn icon_hp(capsule: &[u8]) -> Result<Option<ferros_thing::Hp>, &'static str> {
+    let (header, _) = VsfHeader::decode(capsule).map_err(|_| "not a VSF file")?;
+    let Some(entry) = header.fields.iter().find(|f| f.name == ICON) else { return Ok(None) };
+    let start = entry.offset_bytes;
+    // WHY: the offset is the file's own; one past its end has no section to parse.
+    if start >= capsule.len() {
+        return Err("a section past the file's end");
+    }
+    let mut end = start;
+    // The section parsed, so its bytes are exactly the ones read: an icon that does not parse has no identity.
+    icon_from(&VsfSection::parse(capsule, &mut end).map_err(|_| "a section that does not parse")?)?;
+    Ok(Some(ferros_thing::icon(&capsule[start..end])))
+}
+
 /// An icon from its own document (tools/app-icons `icon`: a complete VSF file, vsf's flat image section `image`).
 pub fn icon_document(doc: &[u8]) -> Result<Icon, &'static str> {
     icon_from(&section(doc, "image")?.ok_or("no `image` section")?)
@@ -1122,6 +1137,11 @@ impl Want {
 }
 
 impl Kist {
+    /// The kist as a thing (`ht`): from its developer and option, the same across its versions and whether it is a puck now or not (ferros_thing `kist`).
+    pub fn thing(&self) -> ferros_thing::Ht {
+        ferros_thing::kist(&self.developer, &self.option)
+    }
+
     /// Whether its capsule declares `PUCK`: a puck, a live circle on the deck never opened (docs/PUCKS.md).
     pub fn is_puck(&self) -> bool {
         self.wants.iter().any(|w| w.right == PUCK)
@@ -1896,6 +1916,7 @@ pub mod capsule {
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
             // No icon given, none carried.
             assert_eq!(crate::icon_of(&c).unwrap(), None);
+            assert_eq!(crate::icon_hp(&c).unwrap(), None);
         }
 
         #[test]
@@ -1909,7 +1930,17 @@ pub mod capsule {
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
             let c = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&icon), &key.public(), &code, 9).unwrap(), &key).unwrap();
             fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
-            assert_eq!(crate::icon_of(&c).unwrap(), Some(icon));
+            assert_eq!(crate::icon_of(&c).unwrap(), Some(icon.clone()));
+            // Its content identity is the BLAKE3 of the section as written; another build of the kist with the same icon has the same one, another icon another.
+            let hp = crate::icon_hp(&c).unwrap().unwrap();
+            assert_eq!(hp, ferros_thing::icon(&crate::icon_section(&icon).encode()));
+            let again = fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 2])), None, Some(&icon), &key.public(), &code, 10).unwrap(), &key).unwrap();
+            assert_eq!(crate::icon_hp(&again).unwrap(), Some(hp));
+            let other = crate::Icon { av1: alloc::vec![0x12u8, 0, 0x0A, 0x0B, 8], encoding: vsf::visual::Encoding::Gamma2Tanh };
+            let changed = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&other), &key.public(), &code, 9).unwrap(), &key).unwrap();
+            assert_ne!(crate::icon_hp(&changed).unwrap(), Some(hp));
+            // The kist is the same thing in all three.
+            assert_eq!(identity(&c).unwrap(), identity(&changed).unwrap());
             // The declaration reads as before, and the icon sits after the code, out of the first bytes the stower and the kernel read.
             assert_eq!(declaration(&c).unwrap(), decl());
             let at = |s: &[u8]| (0..c.len() - s.len()).find(|&i| c[i..i + s.len()] == *s).unwrap();

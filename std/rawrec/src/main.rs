@@ -893,7 +893,7 @@ fn main() {
     let item = receipt.as_ref().map(|r| r.lock().unwrap().clone());
     if let Some(r) = &item {
         match &r.card {
-            Some(c) => println!("rawrec: kept as an item of the hold: id {}, A#{} bytes, body {}, straight to the flash {}, its extent {:?}", hex(&c.id), c.size, hex(&c.body), r.direct, c.extent.map(|x| (x.first, x.blocks))),
+            Some(c) => println!("rawrec: kept as an item of the hold: id {}, A#{} bytes, body {}, straight to the flash {}, its extent {:?}", hex(c.id.as_bytes()), c.size, hex(&c.body), r.direct, c.extent.map(|x| (x.first, x.blocks))),
             None => println!("rawrec: the item was not sealed (handle {}, straight to the flash {})", r.handle.map(|h| hex(&h)).unwrap_or_default(), r.direct),
         }
     }

@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use ferros_store::{Domain, Nonces, Store};
 use manifestus::BlockDev;
 
-use crate::{wire, Caller, Card, Error, Extent, Items, Making, Read};
+use crate::{wire, Caller, Card, Error, Extent, Ht, Items, Making, Read};
 
 /// The syscall's answers for a refusal and an absence (ferros_sys `ERR`, `NOTHING`).
 pub const ERR: u64 = u64::MAX;
@@ -54,10 +54,10 @@ pub trait Clips<S> {
 }
 
 /// A single-copy body's name in the extents' table: the items domain's address key and the item's id, never stored (the table carries no keys).
-pub fn clip_name(d: &Domain, id: &[u8; 32]) -> [u8; 32] {
+pub fn clip_name(d: &Domain, id: &Ht) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key("ferros items 2026-11-19 clip name");
     h.update(&d.addr);
-    h.update(id);
+    h.update(id.as_bytes());
     *h.finalize().as_bytes()
 }
 

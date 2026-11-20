@@ -159,12 +159,12 @@ pub async fn cmd_items(args: &[String]) {
             let h = handle_of(&args[1]);
             let c = hold.card(&h).unwrap_or_else(|e| fail(e));
             show(&h, &c);
-            println!("  id {}, body BLAKE3 {}, changed {}, keeper A#{}", hex(&c.id), hex(&c.body), wall(c.changed), c.keeper);
+            println!("  id {}, body BLAKE3 {}, changed {}, keeper A#{}", hex(c.id.as_bytes()), hex(&c.body), wall(c.changed), c.keeper);
             for (name, v) in &c.attrs {
                 println!("  {name}: {v:?}");
             }
             for (id, how) in &c.of {
-                println!("  of {} as A#{how}", hex(id));
+                println!("  of {} as A#{how}", hex(id.as_bytes()));
             }
         }
         "get" if args.len() >= 3 => {

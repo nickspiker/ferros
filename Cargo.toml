@@ -94,6 +94,7 @@ members = [
     "ferros_glass",
     "ferros_space",
     "ferros_kept",
+    "ferros_thing",
     "ferros_inject",
     "valhall",
     "ferros_sandbox",

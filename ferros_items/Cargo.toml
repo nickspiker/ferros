@@ -11,6 +11,8 @@ manifestus = { path = "../../manifestus", default-features = false }
 # x-full: titles and kists' names are `x`, words a person reads in any script.
 vsf = { path = "../../vsf", default-features = false, features = ["x-full"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
+# An item's id is a thing (`ht`), minted once (ferros_thing `hold_item`).
+ferros_thing = { path = "../ferros_thing" }
 
 [dev-dependencies]
 # The kinds' ids checked against their first phrasings (IDEAS.md), as ferros_idea mints them.
