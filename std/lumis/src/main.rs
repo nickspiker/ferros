@@ -118,6 +118,8 @@ struct Clip {
     dropped: u64,
     /// The camera's count of the frame last handed over.
     last_count: u32,
+    /// When the clip last dropped a frame: no preview for 2^10 ms after (the camera thread's time back to the recorder while it falls behind).
+    dropped_at: Option<std::time::Instant>,
     /// When the clip's first frame landed, Eagle ns by the driver's clock: the clip's rate is its frames over the time since, by that clock (VIDEO_RATE_IDX).
     first_ns: Option<i64>,
     /// The recording space used as it stood when the clip began (`VIDEO_SPACE_USED_IDX`): the bar counts this clip's written bytes on top, not its whole reservation.
@@ -222,7 +224,7 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
                 // Its row in Lumis's clips list from its start (the clips page; a clip never closed shows as such).
                 lumis_core::clips::put(lumis_core::clips::Clip { name: name.clone(), frames: 0, bytes: 0, fps: pacing.fps, at, seal: None });
                 let now = std::time::Instant::now();
-                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, first_ns: None, space_before: space_used });
+                return Ok(Clip { rec, cam: cam.name.clone(), fps: pacing.fps, at, name, began: now, room, preview: now, dropped: 0, last_count: head.count, dropped_at: None, first_ns: None, space_before: space_used });
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: RAW video: {e}; asking half", cam.name);
@@ -391,6 +393,8 @@ const DEV_CELLS: u8 = 1 << 0;
 const DEV_SAVE: u8 = 1 << 1;
 /// Development, the fourth knobs byte: open in RAW video (on a camera that offers it) and record from the 16th frame until the run ends, at the input's 23rd byte's frames a second (`dev_video_fps`; 0 the UI's default): a clip with no tap. Every 2^3-th frame's source hash is said on the console ("lumis: RAW video: frame <index> source <hex>"), for tools/clip-check against the pulled clip.
 const DEV_VIDEO: u8 = 1 << 2;
+/// Development, the fourth knobs byte: with DEV_VIDEO, take and say the source hashes (tools/clip-check); without, a DEV_VIDEO clip is coded as a deck's is (the hashes held each hand-over for its own packing: 202 of 1760 frames lost at 60 a second against 55, the RAW agent, 2026-11-20).
+const DEV_HASHES: u8 = 1 << 3;
 
 /// The input's 23rd byte: DEV_VIDEO's frames a second, 0 when shorter.
 fn dev_video_fps() -> u8 {
@@ -1238,7 +1242,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) => {
                     let h = &integrator.header;
                     let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX], h[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX]);
-                    let (c, head, line, digests) = (cam.clone(), *head, rows.line, dev_knobs4() & DEV_VIDEO != 0);
+                    let (c, head, line, digests) = (cam.clone(), *head, rows.line, dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES);
                     let (tx, rx) = std::sync::mpsc::channel();
                     match std::thread::Builder::new().name("lumis-clip-start".into()).spawn(move || {
                         let _ = tx.send(start_clip(&c, facts, ferros_clip::Pacing::of(fps), head, line, digests));
@@ -1273,7 +1277,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 let index = c.rec.stats().frames;
                 // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"): the hand-over on a scoped thread of its own, the integration here, both done before the next MAP gives the buffer back; the preview then costs the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
                 // No preview in a clip's first 2^10 ms: its first hand-overs run slow while the coder's workers start (40 to 64 ms on the Pro, 2026-11-20), and a preview beside them lost 8 of the first 9 frames.
-                let preview_now = c.preview.elapsed() >= preview_gap() && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10);
+                // Nor in the 2^10 ms after a drop: a warm minute at 60 a second lost its only frames (22, its last 5 s) to previews beside hand-overs as the device heated (2026-11-20); the preview gives the camera thread its time back while it falls behind, and comes back by itself.
+                let preview_now = c.preview.elapsed() >= preview_gap() && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10) && c.dropped_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1 << 10));
                 let (taken, code_us) = if preview_now {
                     c.preview = std::time::Instant::now();
                     let rec = &mut c.rec;
@@ -1296,7 +1301,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     let taken = c.rec.frame(&f);
                     (taken, t_code.elapsed().as_micros() as u64)
                 };
-                if taken == ferros_clip::Taken::Recorded && dev_knobs4() & DEV_VIDEO != 0 && index & ((1 << 3) - 1) == 0 {
+                if taken == ferros_clip::Taken::Recorded && dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES && index & ((1 << 3) - 1) == 0 {
                     let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
                     println!("lumis: RAW video: frame {index} source {h}");
                 }
@@ -1307,6 +1312,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 if st.dropped != c.dropped {
                     println!("lumis: camera {}: RAW video: {} dropped at clip frame {index} ({:?}; the camera's count {} after {}; this frame's hand-over {code_us} us; the last preview's integration {last_preview_us} us)", cam.name, st.dropped - c.dropped, taken, head.count, c.last_count);
                     c.dropped = st.dropped;
+                    c.dropped_at = Some(std::time::Instant::now());
                 }
                 c.last_count = head.count;
                 integrator.header[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX] = c.space_before + st.written;
@@ -1315,10 +1321,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 if st.frames > 1 && head.time > first {
                     integrator.header[lumis_core::shared_memory::VIDEO_RATE_IDX] = ((st.frames - 1) as f64 * 1e9 / (head.time - first) as f64).to_bits();
                 }
-                // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not said) before a frame is coded: the clip's first frames can be dropped, and no frame gives no rate.
-                integrator.header[VIDEO_LEFT_S_IDX] = match st.frames {
+                // The room left at the bytes a frame has coded to so far, at the clip's rate; 0 (not known, not said) until a frame's bytes are counted: no frame yet, or frames handed over whose packing has not yet counted its bytes (the GPU path's first frame, 2026-11-20: coded 0 after one frame, and a division by it panicked a recording from the deck).
+                let per_frame = match st.frames {
                     0 => 0,
-                    n => c.room.saturating_sub(st.coded) / (st.coded / n) / c.fps as u64, // WHY/PROOF: the coded bytes pass the room by up to a frame before the writer finds it full (Taken::Ended), and the subtraction would wrap to years left; st.coded / n is at least a frame's coded header, never 0
+                    n => st.coded / n,
+                };
+                integrator.header[VIDEO_LEFT_S_IDX] = match per_frame {
+                    0 => 0,
+                    b => c.room.saturating_sub(st.coded) / b / c.fps as u64, // WHY/PROOF: the coded bytes pass the room by up to a frame before the writer finds it full (Taken::Ended), and the subtraction would wrap to years left
                 };
                 if taken == ferros_clip::Taken::Ended {
                     end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "the clip's space is full, or a write failed");
@@ -1642,6 +1652,8 @@ struct Lumis {
     /// RAW video's RECORD / STOP label and its note as last drawn whole, and when: the buttons are drawn only in a whole draw, so a change is one (at most once a second while a clip records, at once when one starts or stops).
     video_label: (String, Option<String>, bool, u64, bool),
     video_drawn: std::time::Instant,
+    /// When the camera screen last made a pass (while recording, a pass is made only when something on it changes, `tick`).
+    ui_pass: std::time::Instant,
     /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`, `DEV_SCRATCH`).
     knobs: u8,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
@@ -1657,7 +1669,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1827,6 +1839,12 @@ impl FluorApp<G2t16> for Lumis {
             Screen::Opening => {}
             Screen::Camera(ui) => {
                 use lumis_core::shared_memory::CAL_SHOW_RESULT_BIT;
+                // While a RAW video clip records, a pass only for a new preview image, a finger, or every 2^9 ms (the counters, the space bar, the UI's heartbeat, which the integrator wants within 1.6 s): a pass a display frame, a 4.3 ms draw and an 8.5 ms present with nothing new, was most of the 2 W more Lumis drew than the recorder's harness and the heat that cost a minute at 60 a second its frames (the RAW agent, 2026-11-20).
+                let recording = ui.in_video() && ui.header[FLAGS_IDX] & lumis_core::shared_memory::RECORDING_BIT != 0;
+                if recording && self.finger.is_none() && !self.pending_up && ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] == ui.previous_image_counter && self.ui_pass.elapsed() < std::time::Duration::from_millis(1 << 9) {
+                    return false;
+                }
+                self.ui_pass = std::time::Instant::now();
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
                 let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
                 let t = std::time::Instant::now();
