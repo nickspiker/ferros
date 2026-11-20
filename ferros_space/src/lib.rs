@@ -511,8 +511,8 @@ fn labelled(list: &Kists) -> Vec<(CircleId, &str)> {
     v
 }
 
-/// The deck document (`map.deck`): absent, read, or present and not one this build reads. Absent with places kept the old way (`map.place.<label>`, until 2026-11-20): those made one deck document, written, and the old values dropped, once, here or by the map, whichever runs first; a copy that kept no place has no deck still.
-fn deck_held(list: &Kists, store: &mut impl Store, now: i64) -> Result<Held<Kept>, ()> {
+/// The map's deck document (`map.deck`), read only: absent, read, or present and not one this build reads. Absent with places kept the old way (`map.place.<label>`, until 2026-11-20): those read as the deck, until the map migrates them (it is the deck document's one writer); an old value that does not read keeps every place out. A copy that kept no place has no deck still.
+fn deck_held(list: &Kists, store: &mut impl Store) -> Result<Held<Kept>, ()> {
     if let Some(b) = store.get(Scope::Map, deck::KEY)? {
         return Ok(match deck::read(&b) {
             Some(k) => Held::Read(k),
@@ -532,47 +532,64 @@ fn deck_held(list: &Kists, store: &mut impl Store, now: i64) -> Result<Held<Kept
     if refused {
         return Err(());
     }
-    // An old value that is no place document: nothing migrates, every place kept out until it reads.
+    // An old value that is no place document: every place kept out until it reads.
     let Some((kept, old)) = migrated else { return Ok(Held::Out("an old place this build does not read")) };
-    if old.is_empty() {
-        return Ok(Held::Absent);
-    }
-    let doc = deck::document(&kept, now).ok_or(())?;
-    if !store.set(Scope::Map, deck::KEY, &doc) {
-        return Err(());
-    }
-    for k in &old {
-        if !store.remove(Scope::Map, k) {
-            return Err(());
-        }
-    }
-    Ok(Held::Read(kept))
+    Ok(if old.is_empty() { Held::Absent } else { Held::Read(kept) })
 }
 
-/// One circle's place in the deck document set (Some) or dropped (None), the document written whole. False when the vault refused; true with nothing written for a deck this build does not read (its places are kept out of the sync, so no write for them comes).
-fn deck_write(list: &Kists, store: &mut impl Store, id: CircleId, place: Option<Place>, now: i64) -> bool {
+/// The fleet's places the map has not taken yet (`map.deck.synced`, ferros_kept::deck `SYNCED`: this sync is its one writer), and when that copy was written. A copy that does not read is none: this sync wrote it, and writes it again whole.
+fn synced(store: &mut impl Store) -> Result<(Kept, Option<i64>), ()> {
+    Ok(match store.get(Scope::Map, deck::SYNCED)? {
+        Some(b) => (deck::read(&b).unwrap_or_default(), ferros_kept::created(&b)),
+        None => (Kept::default(), None),
+    })
+}
+
+/// The synced copy written whole, or dropped when nothing waits. False when the vault refused.
+fn synced_write(store: &mut impl Store, kept: &Kept, now: i64) -> bool {
+    if kept.places.is_empty() {
+        return store.remove(Scope::Map, deck::SYNCED);
+    }
+    // Every radius in it is one the map takes (`deck_write`), so the builder refusing is the vault's kind of failure: refused.
+    deck::document(kept, now).is_some_and(|doc| store.set(Scope::Map, deck::SYNCED, &doc))
+}
+
+/// One circle's place from the fleet, for the map to take (owner, 2026-11-20: the map is `map.deck`'s one writer; the sync hands it the fleet's changes and never writes it): set in the synced copy. A removal changes nothing here: a place the device holds outranks a removal (`sync` stamps it past the tombstone), so a removal reaches only a circle this device has no place for, and one waiting in the copy is dropped. False when the vault refused.
+fn deck_write(store: &mut impl Store, id: CircleId, place: Option<Place>, now: i64) -> bool {
     // A place whose radius the map does not take has no document: the copy keeps what it has, and next pass offers it to the space.
     if place.is_some_and(|p| !deck::radius_ok(p.r)) {
         return true;
     }
-    let mut kept = match deck_held(list, store, now) {
-        Ok(Held::Read(k)) => k,
-        Ok(Held::Absent) => Kept::default(),
-        Ok(Held::Out(_)) => return true,
-        Err(()) => return false,
-    };
+    let Ok((mut kept, _)) = synced(store) else { return false };
     let changed = match place {
         Some(p) => kept.set(id, p),
         None => kept.remove(&id),
     };
-    if !changed {
-        return true;
+    !changed || synced_write(store, &kept, now)
+}
+
+/// The places on the device as the sync reads them: the map's deck document, overlaid with the fleet's places still waiting for the map in the synced copy (they are the device's from the moment they were handed over, so the map's older place never reads as the person's change); and what of the copy the map has taken dropped from it first (ferros_kept::deck `taken`).
+fn device_places(list: &Kists, store: &mut impl Store, now: i64) -> Result<Held<Kept>, ()> {
+    let held = deck_held(list, store)?;
+    let deck_made = match store.get(Scope::Map, deck::KEY)? {
+        Some(b) => ferros_kept::created(&b),
+        None => None,
+    };
+    let (mut waiting, made) = synced(store)?;
+    let base = match &held {
+        Held::Read(k) => k.clone(),
+        Held::Absent => Kept::default(),
+        Held::Out(why) => return Ok(Held::Out(why)),
+    };
+    if deck::taken(&mut waiting, &base, deck_made, made) && !synced_write(store, &waiting, now) {
+        return Err(());
     }
-    match deck::document(&kept, now) {
-        Some(doc) => store.set(Scope::Map, deck::KEY, &doc),
-        // Every radius read or set is one the map takes, so the builder refusing is the vault's kind of failure: refused.
-        None => false,
+    if waiting.places.is_empty() {
+        return Ok(held);
     }
+    let mut over = base;
+    deck::take(&mut over, &waiting);
+    Ok(Held::Read(over))
 }
 
 /// What the device's copy holds now: every fact, in `scope` for the arrangement, and the places and view kept out of the sync (their ids for `managed`, and what each is).
@@ -620,7 +637,7 @@ fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32
     let mut circles = vec![Circle::Settings];
     circles.extend(list.kists.iter().map(|k| Circle::Kist(k.developer, k.option)));
     // Every place is in the one deck document: read whole, or every place kept out of the sync while it is not one this build reads.
-    match deck_held(list, store, now)? {
+    match device_places(list, store, now)? {
         Held::Absent => {}
         Held::Read(kept) => {
             for c in &circles {
@@ -750,11 +767,11 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
         }
         // Into the deck document, the circle by its thing (`deck_write`).
         Write::Set { kind: kind::PLACE, id, value, .. } => match (place_of(&id).and_then(|(_, c)| circle_of(list, &c)), ints_of::<5>(&value)) {
-            (Some(c), Some(p)) => deck_write(list, store, c, Some(Place::from_ints(&p)), now),
+            (Some(c), Some(p)) => deck_write(store, c, Some(Place::from_ints(&p)), now),
             _ => true,
         },
         Write::Remove { kind: kind::PLACE, id } => match place_of(&id).and_then(|(_, c)| circle_of(list, &c)) {
-            Some(c) => deck_write(list, store, c, None, now),
+            Some(c) => deck_write(store, c, None, now),
             None => true,
         },
         Write::Set { kind: kind::VIEW, value, .. } => match ints_of::<4>(&value).map(|v| ferros_kept::map::view(&v, now)) {
@@ -888,6 +905,9 @@ mod tests {
         for (k, v) in m {
             if k == b"view" {
                 out.insert(k.clone(), read_view(v).unwrap().to_vec());
+            } else if k == deck::SYNCED {
+                // What the fleet sent and the map has not taken: the map takes it (`map_runs`) before anything is compared.
+                continue;
             } else if k == deck::KEY {
                 for (id, p) in deck::read(v).unwrap().places {
                     out.insert(id.thing().map_or(b"settings".to_vec(), |t| t.as_bytes().to_vec()), p.ints().to_vec());
@@ -904,19 +924,50 @@ mod tests {
         CircleId::Kist(ferros_thing::kist(&k.0, &k.1))
     }
 
-    /// A circle's place in the device's deck document.
-    fn place_at(v: &Vault, id: CircleId) -> Option<[i64; 5]> {
+    /// The Eagle time after the deck document and the synced copy: what the map stamps a write with (its clock moves on; the tests' other documents carry made-up times).
+    fn after(v: &Vault) -> i64 {
+        [deck::KEY, deck::SYNCED].iter().filter_map(|k| v.map.get(*k).and_then(|d| ferros_kept::created(d))).max().unwrap_or(0) + 1
+    }
+
+    /// The map, as payloads/map `load_deck` does it, the deck document's one writer: its deck read (or the old per-label places migrated once, the old values deleted), the fleet's places waiting in the synced copy taken, and the deck written when anything changed.
+    fn map_runs(v: &mut Vault) {
+        let list = read_list(v).unwrap();
+        let (mut kept, mut changed) = match v.map.get(deck::KEY) {
+            Some(d) => (deck::read(d).unwrap_or_default(), false),
+            None => match deck::migrate(&labelled(&list), |k| v.map.get(k).cloned()) {
+                Some((k, old)) => {
+                    for o in &old {
+                        v.map.remove(o);
+                    }
+                    (k, !old.is_empty())
+                }
+                None => return,
+            },
+        };
+        let synced = v.map.get(deck::SYNCED).and_then(|d| deck::read(d)).unwrap_or_default();
+        changed |= deck::take(&mut kept, &synced);
+        if changed {
+            let at = after(v);
+            v.map.insert(deck::KEY.to_vec(), deck::document(&kept, at).unwrap());
+        }
+    }
+
+    /// A circle's place on the device as the person sees it: the map run first (it takes what the fleet sent), then its deck document.
+    fn place_at(v: &mut Vault, id: CircleId) -> Option<[i64; 5]> {
+        map_runs(v);
         v.map.get(deck::KEY).and_then(|d| deck::read(d)).and_then(|k| k.get(&id).map(|p| p.ints()))
     }
 
-    /// A circle's place set (or dropped) in the device's deck document, as the map writes it.
+    /// A circle's place set (or dropped) by the person, as the map writes it: what the fleet sent taken first, the deck stamped after everything before.
     fn put_place(v: &mut Vault, id: CircleId, p: Option<[i64; 5]>) {
+        map_runs(v);
         let mut k = v.map.get(deck::KEY).and_then(|d| deck::read(d)).unwrap_or_default();
         match p {
             Some(p) => k.set(id, Place::from_ints(&p)),
             None => k.remove(&id),
         };
-        v.map.insert(deck::KEY.to_vec(), deck::document(&k, 1 << 40).unwrap());
+        let at = after(v);
+        v.map.insert(deck::KEY.to_vec(), deck::document(&k, at).unwrap());
     }
 
     /// A vault in memory: its two scopes by name. `locked` refuses every read, as a vault with nobody present does.
@@ -944,10 +995,12 @@ mod tests {
             Ok(self.scope(s).get(key).cloned())
         }
         fn set(&mut self, s: Scope, key: &[u8], value: &[u8]) -> bool {
+            assert!(!(s == Scope::Map && (key == deck::KEY || key.starts_with(b"place."))), "the sync never writes the map's deck (owner, 2026-11-20: the map is its one writer)");
             self.scope(s).insert(key.to_vec(), value.to_vec());
             true
         }
         fn remove(&mut self, s: Scope, key: &[u8]) -> bool {
+            assert!(!(s == Scope::Map && (key == deck::KEY || key.starts_with(b"place."))), "the sync never removes the map's deck or its old places");
             self.scope(s).remove(key);
             true
         }
@@ -975,15 +1028,16 @@ mod tests {
         l.kists[p].wants[1].answer = Some((true, 1003));
         let mut v = Vault::default();
         v.set(Scope::Kists, ferros_kist::LIST, &l.build(1004).unwrap());
-        v.set(Scope::Map, &place_key("settings"), &encode_place(&[-5 << 8, 7 << 8, 300, 0, ONE]));
-        v.set(Scope::Map, &place_key("Mahere"), &encode_place(&[900 << 8, -40 << 8, 180, -ONE, 0]));
-        v.set(Scope::Map, &place_key("Photon"), &encode_place(&[-700 << 8, 650 << 8, 220, 11585, -11585]));
+        v.map.insert(place_key("settings"), encode_place(&[-5 << 8, 7 << 8, 300, 0, ONE]));
+        v.map.insert(place_key("Mahere"), encode_place(&[900 << 8, -40 << 8, 180, -ONE, 0]));
+        v.map.insert(place_key("Photon"), encode_place(&[-700 << 8, 650 << 8, 220, 11585, -11585]));
         v.set(Scope::Map, b"view", &encode_view(&[12 << 8, -3 << 8, 11585, 11585]));
         v
     }
 
     /// The device's copy as the person sees it: the list (answers and defaults), every place and the view.
     fn seen(v: &mut Vault) -> (Kists, BTreeMap<Vec<u8>, Vec<i64>>) {
+        map_runs(v);
         (read_list(v).unwrap(), said(&v.map))
     }
 
@@ -1086,7 +1140,7 @@ mod tests {
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2401).unwrap();
         assert_eq!(seen(&mut a), seen(&mut b));
         assert_eq!(read_list(&mut a).unwrap().kists[1].wants[1].answer, Some((false, 2200)));
-        assert_eq!(place_at(&a, kc(MAHERE)).unwrap()[0], 1 << 8);
+        assert_eq!(place_at(&mut a, kc(MAHERE)).unwrap()[0], 1 << 8);
         // The other device switches its deck sync off, then the Pro moves settings: the other keeps its own.
         set_deck_sync(&mut sb, &OTHER, false, 2500);
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2501).unwrap();
@@ -1095,13 +1149,13 @@ mod tests {
         sa.merge(hand_over(&sb));
         sb.merge(hand_over(&sa));
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap();
-        assert_ne!(place_at(&b, CircleId::Settings), place_at(&a, CircleId::Settings), "opted out: its own arrangement");
+        assert_ne!(place_at(&mut b, CircleId::Settings), place_at(&mut a, CircleId::Settings), "opted out: its own arrangement");
         assert_eq!(read_list(&mut b).unwrap(), read_list(&mut a).unwrap(), "kists and answers still follow");
         // Its own arrangement is in the space too: reset that device and it comes back to its own, not the fleet's.
         let mut reset = Vault::default();
         let (mut sr, mut br) = (hand_over(&sb), Baseline::default());
         sync(&mut sr, &mut br, &mut reset, &OTHER, 2800).unwrap();
-        assert_eq!(said(&reset.map), said(&b.map));
+        assert_eq!(seen(&mut reset).1, seen(&mut b).1);
     }
 
     /// The 8a, 2026-11-12: the space held a removal of the settings circle's place (a copy had lost it while the circle stood), and the 8a's place for it was taken back out within one sync of every save. A place the device holds wins over a removal now: back in the space, kept on the device, and handed to a sibling.
@@ -1120,13 +1174,13 @@ mod tests {
         let o = sync(&mut sa, &mut ba, &mut a, &PRO, 2200).unwrap();
         assert!(o.space_changed, "the place goes back into the space");
         assert_eq!(o.wrote, 0, "and is not taken back out");
-        assert_eq!(place_at(&a, CircleId::Settings), Some(kept));
+        assert_eq!(place_at(&mut a, CircleId::Settings), Some(kept));
         assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2300).unwrap(), Outcome::default(), "settled");
         // A sibling that had taken the removal gets the place.
         let mut b = Vault::default();
         let (mut sb, mut bb) = (hand_over(&sa), Baseline::default());
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2400).unwrap();
-        assert_eq!(place_at(&b, CircleId::Settings), Some(kept));
+        assert_eq!(place_at(&mut b, CircleId::Settings), Some(kept));
     }
 
     /// Unstowed on one device: gone from the other too, the answers kept on both and in the space; stowed again later (the stower stamps when), it wins over the unstow's tombstone and asks nothing anywhere. Its source and version travel with it.
@@ -1356,8 +1410,9 @@ mod tests {
         sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
         let mahere = place_id(&FLEET, &Circle::Kist(MAHERE.0, MAHERE.1));
         let (was, view_was) = (sa.get(kind::PLACE, &mahere).unwrap().clone(), sa.get(kind::VIEW, &view_id(&FLEET)).unwrap().clone());
+        map_runs(&mut a);
         let deck_was = a.map[deck::KEY].clone();
-        a.set(Scope::Map, deck::KEY, b"not a deck");
+        a.map.insert(deck::KEY.to_vec(), b"not a deck".to_vec());
         a.set(Scope::Map, b"view", &[1, 2, 3]);
         // The person answers something here at the same time: that still goes out.
         let mut l = read_list(&mut a).unwrap();
@@ -1374,12 +1429,49 @@ mod tests {
         assert_eq!(o.kept_out.len(), 2);
         assert_eq!(a.map[deck::KEY], b"not a deck".to_vec());
         // Readable again: read, and the space's newer place is taken.
-        a.set(Scope::Map, deck::KEY, &deck_was);
+        a.map.insert(deck::KEY.to_vec(), deck_was);
         a.set(Scope::Map, b"view", &encode_view(&[12 << 8, -3 << 8, 11585, 11585]));
         let o = sync(&mut sa, &mut ba, &mut a, &PRO, 3200).unwrap();
         assert!(o.kept_out.is_empty());
-        assert_eq!(place_at(&a, kc(MAHERE)), Some([7, 8, 90, ONE, 0]));
+        assert_eq!(place_at(&mut a, kc(MAHERE)), Some([7, 8, 90, ONE, 0]));
         assert!(sa.entries().iter().all(|e| !e.gone));
+    }
+
+    /// The map is the deck document's one writer (owner, 2026-11-20; every sync here runs on a vault that refuses the sync a write to it): a move from the fleet waits in the synced copy, reads as the device's own until the map takes it (never pushed back as the map's older place), and goes from the copy once taken. A move the person makes while one waits wins and goes out.
+    #[test]
+    fn the_map_is_the_decks_one_writer() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        map_runs(&mut a);
+        let (mut sb, mut bb, mut b) = (hand_over(&sa), Baseline::default(), Vault::default());
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
+        // The other device moves Mahere; the Pro syncs it in.
+        put_place(&mut b, kc(MAHERE), Some([5 << 8, 6 << 8, 170, ONE, 0]));
+        assert!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2200).unwrap().space_changed);
+        sa.merge(hand_over(&sb));
+        let deck_was = a.map[deck::KEY].clone();
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2300).unwrap();
+        assert_eq!(a.map[deck::KEY], deck_was, "the sync left the map's deck alone");
+        assert!(a.map.contains_key(deck::SYNCED), "the move waits for the map");
+        // Before the map takes it, a sync reads it as the device's: nothing goes back out.
+        assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2400).unwrap(), Outcome::default());
+        // The map takes it; the next sync drops it from the copy.
+        assert_eq!(place_at(&mut a, kc(MAHERE)), Some([5 << 8, 6 << 8, 170, ONE, 0]));
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2500).unwrap();
+        assert!(!a.map.contains_key(deck::SYNCED));
+        // A move from the fleet waiting while the person moves the same circle here: the person's goes out and stays.
+        put_place(&mut b, kc(MAHERE), Some([1 << 8, 1 << 8, 160, ONE, 0]));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2600).unwrap();
+        sa.merge(hand_over(&sb));
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2700).unwrap();
+        put_place(&mut a, kc(MAHERE), Some([9 << 8, 9 << 8, 150, ONE, 0]));
+        assert!(sync(&mut sa, &mut ba, &mut a, &PRO, 2800).unwrap().space_changed);
+        assert!(!a.map.contains_key(deck::SYNCED));
+        assert_eq!(place_at(&mut a, kc(MAHERE)), Some([9 << 8, 9 << 8, 150, ONE, 0]));
+        sb.merge(hand_over(&sa));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2900).unwrap();
+        assert_eq!(place_at(&mut b, kc(MAHERE)), Some([9 << 8, 9 << 8, 150, ONE, 0]));
     }
 
     /// The places kept the old way (`map.place.<label>`) become the deck document at the first sync, the old values dropped; a kist renamed afterwards keeps its place, and the other device sees the same deck.
@@ -1389,11 +1481,15 @@ mod tests {
         assert!(a.map.keys().any(|k| k.starts_with(b"place.")));
         let (mut sa, mut ba) = (Space::new(), Baseline::default());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
-        assert!(!a.map.keys().any(|k| k.starts_with(b"place.")), "the old values dropped");
-        assert_eq!(place_at(&a, CircleId::Settings), Some([-5 << 8, 7 << 8, 300, 0, ONE]));
-        assert_eq!(place_at(&a, kc(MAHERE)), Some([900 << 8, -40 << 8, 180, -ONE, 0]));
-        assert_eq!(place_at(&a, kc(PHOTON)), Some([-700 << 8, 650 << 8, 220, 11585, -11585]));
-        assert_eq!(said(&a.map), said(&arranged_pro().map).into_iter().map(|(k, v)| (if k == place_key("Mahere") { ferros_thing::kist(&MAHERE.0, &MAHERE.1).as_bytes().to_vec() } else if k == place_key("Photon") { ferros_thing::kist(&PHOTON.0, &PHOTON.1).as_bytes().to_vec() } else if k == place_key("settings") { b"settings".to_vec() } else { k }, v)).collect(), "every place and the view as they were");
+        assert!(a.map.keys().any(|k| k.starts_with(b"place.")), "the sync only reads the old values: the map is the deck's one writer");
+        assert!(!a.map.contains_key(deck::KEY));
+        map_runs(&mut a);
+        assert!(!a.map.keys().any(|k| k.starts_with(b"place.")), "the map migrated them, the old values dropped");
+        assert!(sync(&mut sa, &mut ba, &mut a, &PRO, 2050).unwrap() == Outcome::default(), "the migration is no change to the space");
+        assert_eq!(place_at(&mut a, CircleId::Settings), Some([-5 << 8, 7 << 8, 300, 0, ONE]));
+        assert_eq!(place_at(&mut a, kc(MAHERE)), Some([900 << 8, -40 << 8, 180, -ONE, 0]));
+        assert_eq!(place_at(&mut a, kc(PHOTON)), Some([-700 << 8, 650 << 8, 220, 11585, -11585]));
+        assert_eq!(seen(&mut a).1, said(&arranged_pro().map).into_iter().map(|(k, v)| (if k == place_key("Mahere") { ferros_thing::kist(&MAHERE.0, &MAHERE.1).as_bytes().to_vec() } else if k == place_key("Photon") { ferros_thing::kist(&PHOTON.0, &PHOTON.1).as_bytes().to_vec() } else if k == place_key("settings") { b"settings".to_vec() } else { k }, v)).collect(), "every place and the view as they were");
         // Renamed on another device: the place stays with the kist.
         let (mut sb, mut bb, mut b) = (hand_over(&sa), Baseline::default(), Vault::default());
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
@@ -1404,8 +1500,8 @@ mod tests {
         sa.merge(hand_over(&sb));
         sync(&mut sa, &mut ba, &mut a, &PRO, 2200).unwrap();
         assert_eq!(read_list(&mut a).unwrap().kists[0].name, "Mahere Maps");
-        assert_eq!(place_at(&a, kc(MAHERE)), Some([900 << 8, -40 << 8, 180, -ONE, 0]));
-        assert_eq!(said(&a.map), said(&b.map));
+        assert_eq!(place_at(&mut a, kc(MAHERE)), Some([900 << 8, -40 << 8, 180, -ONE, 0]));
+        assert_eq!(seen(&mut a).1, seen(&mut b).1);
     }
 
     /// The person's zone: none until chosen; chosen on one device, it crosses the fleet sealed; the later choice wins even from a device whose clock runs behind; the device's own copy is never touched by the sync (identity to device only, by the identity service).

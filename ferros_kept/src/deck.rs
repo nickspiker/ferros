@@ -14,8 +14,30 @@ use ferros_thing::{kinds, Hi, Hp, Ht};
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
-/// The deck document's name in the map's scope.
+/// The deck document's name in the map's scope. Its one writer is the map (owner, 2026-11-20).
 pub const KEY: &[u8] = b"deck";
+/// The places the person's fleet sent that the map has not taken yet, a deck document of its own in the map's scope, whose one writer is the identity service's sync (ferros_space): the map reads it and takes each place into the deck ([`take`]); the sync drops what the map has taken ([`taken`]). So `map.deck` has one writer, and a place from the fleet never races the map's own write.
+pub const SYNCED: &[u8] = b"deck.synced";
+
+/// The fleet's places taken into the map's own: each place in `synced` set in `kept`. Whether anything changed (the map then writes its deck document, stamped after the synced copy, which tells the sync it was taken).
+pub fn take(kept: &mut Kept, synced: &Kept) -> bool {
+    let mut changed = false;
+    for (id, p) in &synced.places {
+        changed |= kept.set(*id, *p);
+    }
+    changed
+}
+
+/// What of the synced copy the map has taken: a place its deck holds the same, or every one once its deck document was written after the synced copy (the map takes the whole copy every time it reads its deck, `take`). The places still waiting stay in `synced`. Whether any was dropped.
+pub fn taken(synced: &mut Kept, deck: &Kept, deck_made: Option<i64>, synced_made: Option<i64>) -> bool {
+    let n = synced.places.len();
+    if matches!((deck_made, synced_made), (Some(d), Some(s)) if d > s) {
+        synced.places.clear();
+    } else {
+        synced.places.retain(|(id, p)| deck.get(id) != Some(p));
+    }
+    synced.places.len() != n
+}
 /// Its section, one per circle placed by hand.
 pub const SECTION: &str = "circle";
 /// The most circles one document holds: far past any deck (the map draws 16), so a document past it is no deck this build reads.
@@ -424,6 +446,34 @@ mod tests {
         }
         assert_eq!(read(&doc), Some(kept));
         assert_eq!(migrate(&circles, |k| vault.get(k).cloned()), Some((Kept::default(), vec![])));
+    }
+
+    /// The fleet's places wait in the synced copy until the map takes them: taken when its deck holds them, or all at once when its deck was written after the copy.
+    #[test]
+    fn the_map_takes_the_fleets_places() {
+        let mut deck = Kept::default();
+        deck.set(kist(1), place(1, 1, 10, map::ONE, 0));
+        let mut synced = Kept::default();
+        synced.set(kist(1), place(5, 5, 10, map::ONE, 0));
+        synced.set(kist(2), place(7, 7, 20, map::ONE, 0));
+        // Not taken yet: both wait.
+        assert!(!taken(&mut synced.clone(), &deck, Some(10), Some(20)));
+        assert!(take(&mut deck, &synced));
+        assert!(!take(&mut deck, &synced), "taken twice is no change");
+        assert_eq!(deck.get(&kist(1)), Some(&place(5, 5, 10, map::ONE, 0)));
+        // The deck holds them: dropped from the copy, whatever the stamps.
+        let mut s = synced.clone();
+        assert!(taken(&mut s, &deck, Some(10), Some(20)));
+        assert!(s.places.is_empty());
+        // The person moved one after the map took the copy: the deck was written after it, so the copy goes whole and the move stands.
+        deck.set(kist(1), place(9, 9, 10, map::ONE, 0));
+        let mut s = synced.clone();
+        assert!(taken(&mut s, &deck, Some(30), Some(20)));
+        assert!(s.places.is_empty());
+        // Same stamps (no clock yet): only what the deck holds the same goes.
+        let mut s = synced.clone();
+        assert!(taken(&mut s, &deck, Some(20), Some(20)));
+        assert_eq!(s.places, vec![(kist(1), place(5, 5, 10, map::ONE, 0))]);
     }
 
     #[test]

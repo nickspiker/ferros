@@ -2408,7 +2408,15 @@ impl Map {
                     None => deck::Kept::default(),
                 };
             }
-            Err(()) => {}
+            Err(()) => return,
+        }
+        // The places the person's fleet sent, waiting in the identity service's synced copy (`map.deck.synced`, whose one writer is the sync): taken into the deck and written, stamped after the copy, which tells the sync they are taken (ferros_kept::deck `take`, `taken`). The map is the deck document's one writer (owner, 2026-11-20).
+        if let Ok(Some(doc)) = self.read_value(deck::SYNCED, DECK_MAX) {
+            if let Some(synced) = deck::read(&doc) {
+                if deck::take(&mut self.kept, &synced) && !deck::document(&self.kept, ferros_sys::eagle_now()).is_some_and(|d| ferros_sys::store_set(cap(self.grants, S_STORE), deck::KEY, &d)) {
+                    console(self.grants, b"map: the vault did not take the deck\n");
+                }
+            }
         }
     }
 
