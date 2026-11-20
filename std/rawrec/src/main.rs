@@ -2,7 +2,7 @@
 //! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`; with `--use gpu --dma layers` after them a Bayer clip is coded on the GPU (ferros_clip `gpu`, +20 bit 3 turns it off).
 //!
 //! The input (hex bytes):
-//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
+//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 6 the per-core profile, 7 the GPU bench, 8 the camera alone (the power baseline), 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
 //! - record (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
@@ -488,6 +488,42 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
     }
 }
 
+/// Job 8: the camera alone, the baseline a recording's power is measured against: the binned main at +1 frames a second (0: 30) for +4 seconds (u16 LE, 0: 64), every frame taken (MAP) and given back, nothing coded or written; the hottest zone every 2^4 s.
+fn camera_only(inp: &[u8]) {
+    let arg = |k: usize| inp.get(k).copied().unwrap_or(0) as u64;
+    let fps = if arg(1) == 0 { 30 } else { arg(1).min(60) } as u32;
+    let secs = match arg(4) | arg(5) << 8 {
+        0 => 64,
+        s => s,
+    };
+    let mut r = [0u8; 64];
+    let n = call(S_CAMERA, &Pacing::of(fps).open_msg(0, 0), &mut r);
+    if n == ERR || r[0] != 0 || n < 48 {
+        println!("rawrec: camera only: OPEN refused");
+        return;
+    }
+    let mut hd = [0u8; 64];
+    let mut held = 0xFFu8;
+    let t0 = Instant::now();
+    let (mut frames, mut next) = (0u64, 0u64);
+    while t0.elapsed().as_secs() < secs {
+        if call(S_CAMERA, &[5, held], &mut hd) == ERR {
+            println!("rawrec: camera only: MAP failed");
+            break;
+        }
+        held = hd[40];
+        frames += 1;
+        let el = t0.elapsed().as_secs();
+        if el >= next {
+            next = el + (1 << 4);
+            println!("rawrec: camera only: A#{el} s: A#{frames} frames, hottest A#{} C", hottest());
+        }
+    }
+    let _ = call(S_CAMERA, &[6, held], &mut r);
+    let _ = call(S_CAMERA, &[4], &mut r);
+    println!("rawrec: camera only: A#{frames} frames in A#{} ms at A#{fps} a second, hottest A#{} C", t0.elapsed().as_millis(), hottest());
+}
+
 /// Job 4: this build's band coder (NEON with `--features neon`) against the scalar one, byte for byte, on frames of the binned main at four gains (+1 the frames at each, 0: 4), then each band decoded and compared with the frame; the times on four A715s.
 fn neon_check(inp: &[u8]) {
     let per = if inp.get(1).copied().unwrap_or(0) == 0 { 4 } else { inp[1] as usize };
@@ -605,6 +641,10 @@ fn main() {
         }
         7 => {
             gpu_bench(slot, &inp);
+            return;
+        }
+        8 => {
+            camera_only(&inp);
             return;
         }
         _ => {}

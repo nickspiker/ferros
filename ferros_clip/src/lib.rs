@@ -370,8 +370,13 @@ struct PackJob {
     info_len: usize,
     bodies: *const u32,
     bodies_len: usize,
-    /// Taken by the coder that finishes the frame, for the writer.
+    /// Taken by the coder that finishes the frame, for the writer; None for a frame's source hashes alone (`hash_only`).
     slot: Option<Box<Slot>>,
+    /// The frame's slot, where its bands go.
+    slot_at: *const Slot,
+    /// The bands' source digests taken with the packing, or (`hash_only`) alone: a frame whose source hash is asked has them taken while the GPU runs, from the set's copy, its packing after.
+    hash: bool,
+    hash_only: bool,
     /// Bands claimed, and bands done.
     next: usize,
     done: usize,
@@ -421,6 +426,8 @@ struct Claim {
     bodies: *const u32,
     bodies_len: usize,
     slot: *const Slot,
+    hash: bool,
+    hash_only: bool,
 }
 
 fn packer(p: Arc<Packers>, mask: u64) {
@@ -436,7 +443,7 @@ fn packer(p: Arc<Packers>, mask: u64) {
                 }
                 if let Some(j) = st.jobs.iter_mut().find(|j| j.next < p.bands) {
                     j.next += 1;
-                    break Claim { seq: j.seq, k: j.next - 1, set: j.set, src: j.src, len: j.len, info: j.info, info_len: j.info_len, bodies: j.bodies, bodies_len: j.bodies_len, slot: &**j.slot.as_ref().expect("a frame's slot stays with it until its last band") };
+                    break Claim { seq: j.seq, k: j.next - 1, set: j.set, src: j.src, len: j.len, info: j.info, info_len: j.info_len, bodies: j.bodies, bodies_len: j.bodies_len, slot: j.slot_at, hash: j.hash, hash_only: j.hash_only };
                 }
                 st = p.work.wait(st).unwrap();
             }
@@ -446,18 +453,23 @@ fn packer(p: Arc<Packers>, mask: u64) {
         let slot = unsafe { &*c.slot };
         let rows = rc::band_rows(p.height, c.k);
         let band_src = &src[rc::band_src(c.k, p.height, p.width, p.stride)];
-        let (la, lb) = match c.set {
-            Some(_) => {
-                let (info, bodies) = unsafe { (core::slice::from_raw_parts(c.info, c.info_len), core::slice::from_raw_parts(c.bodies, c.bodies_len)) };
-                gpu::pack_band(info, bodies, c.k, p.width, p.height, &mut out)
-            }
-            None => rc::encode_band(band_src, p.stride, p.width, rows, p.cfa, &mut work, &mut out),
-        };
-        let digest = clip::band_digest(&out[..la], &out[la..la + lb]);
-        let srcd = if p.hash_src { band_source_digest(band_src, p.stride, p.width, rows) } else { [0; 32] };
-        {
+        if c.hash_only {
+            let srcd = band_source_digest(band_src, p.stride, p.width, rows);
+            slot.bands[c.k].lock().unwrap().src = srcd;
+        } else {
+            let (la, lb) = match c.set {
+                Some(_) => {
+                    let (info, bodies) = unsafe { (core::slice::from_raw_parts(c.info, c.info_len), core::slice::from_raw_parts(c.bodies, c.bodies_len)) };
+                    gpu::pack_band(info, bodies, c.k, p.width, p.height, &mut out)
+                }
+                None => rc::encode_band(band_src, p.stride, p.width, rows, p.cfa, &mut work, &mut out),
+            };
+            let digest = clip::band_digest(&out[..la], &out[la..la + lb]);
+            let srcd = c.hash.then(|| band_source_digest(band_src, p.stride, p.width, rows));
             let mut b = slot.bands[c.k].lock().unwrap();
-            b.src = srcd;
+            if let Some(s) = srcd {
+                b.src = s;
+            }
             b.la = la as u32;
             b.lb = lb as u32;
             b.digest = digest;
@@ -466,10 +478,13 @@ fn packer(p: Arc<Packers>, mask: u64) {
         }
         let mut st = p.st.lock().unwrap();
         st.jobs.iter_mut().find(|j| j.seq == c.seq).expect("a frame stays queued until its last band").done += 1;
-        // The frames whose every band is done go to the writer, in order (the writer's channel holds every slot, so the send never waits).
+        // The frames whose every band is done go to the writer, in order (the writer's channel holds every slot, so the send never waits); a frame's source hashes alone are done with when theirs are.
         while st.jobs.front().is_some_and(|j| j.done == p.bands) {
             let mut j = st.jobs.pop_front().expect("the front frame");
-            let slot = j.slot.take().expect("a frame's slot until it is sent");
+            let Some(slot) = j.slot.take() else {
+                p.done.notify_all();
+                continue;
+            };
             if p.hash_src {
                 st.last_src = source_hash(&slot.bands.iter().map(|b| b.lock().map(|b| b.src).unwrap_or([0; 32])).collect::<Vec<_>>());
             }
@@ -714,7 +729,24 @@ impl Recorder {
                 st = p.done.wait(st).unwrap();
             }
         }
-        let run = if g.failed.is_some() { Err(String::new()) } else { g.dev.run(set, f.rows) };
+        let slot_at: *const Slot = &*slot;
+        // With the source hash asked, the frame's copy first and its bands' source digests taken by the workers while the GPU runs (2026-11-19, the Pro: Lumis's DEV_VIDEO run at 60/s took 20.6 ms a hand-over with them taken after the GPU, and dropped 69 of 249).
+        let early = p.hash_src && g.failed.is_none();
+        let run = if g.failed.is_some() {
+            Err(String::new())
+        } else if early {
+            g.dev.put(set, f.rows);
+            let fr = g.dev.frame(set);
+            g.seq += 1;
+            {
+                let mut st = p.st.lock().unwrap();
+                st.jobs.push_back(PackJob { seq: g.seq, set: None, src: fr.as_ptr(), len: fr.len(), info: core::ptr::null(), info_len: 0, bodies: core::ptr::null(), bodies_len: 0, slot: None, slot_at, hash: true, hash_only: true, next: 0, done: 0, t0 });
+                p.work.notify_all();
+            }
+            g.dev.go(set)
+        } else {
+            g.dev.run(set, f.rows)
+        };
         let (job_set, src, len) = match run {
             Ok(us) => {
                 g.next_set = (set + 1) % gpu::SETS;
@@ -743,7 +775,7 @@ impl Recorder {
             if let Some(s) = job_set {
                 st.busy[s] = true;
             }
-            st.jobs.push_back(PackJob { seq, set: job_set, src, len, info: info.as_ptr(), info_len: info.len(), bodies: bodies.as_ptr(), bodies_len: bodies.len(), slot: Some(slot), next: 0, done: 0, t0 });
+            st.jobs.push_back(PackJob { seq, set: job_set, src, len, info: info.as_ptr(), info_len: info.len(), bodies: bodies.as_ptr(), bodies_len: bodies.len(), slot: Some(slot), slot_at, hash: p.hash_src && !early, hash_only: false, next: 0, done: 0, t0 });
             p.work.notify_all();
             if wait {
                 while st.sent < seq && !st.quit {
