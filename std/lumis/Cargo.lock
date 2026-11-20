@@ -1312,6 +1312,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_fluor"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "ferros_theme",
+ "fluor",
+]
+
+[[package]]
 name = "ferros_items"
 version = "0.1.0"
 dependencies = [
@@ -1320,6 +1329,10 @@ dependencies = [
  "manifestus",
  "vsf",
 ]
+
+[[package]]
+name = "ferros_mailbox"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_rawcodec"
@@ -1334,6 +1347,19 @@ dependencies = [
  "manifestus",
  "vsf",
 ]
+
+[[package]]
+name = "ferros_sys"
+version = "0.1.0"
+dependencies = [
+ "ferros_mailbox",
+ "ferros_theme",
+ "tatau",
+]
+
+[[package]]
+name = "ferros_theme"
+version = "0.1.0"
 
 [[package]]
 name = "fiat-crypto"
@@ -2543,8 +2569,6 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 [[package]]
 name = "libc"
 version = "0.2.183"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libflate"
@@ -2667,10 +2691,11 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lumis-ferros"
-version = "0.2.25"
+version = "0.2.27"
 dependencies = [
  "blake3",
  "ferros_clip",
+ "ferros_fluor",
  "ferros_items",
  "fluor",
  "getrandom 0.2.17",
@@ -5010,6 +5035,10 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "tatau"
+version = "0.1.0"
 
 [[package]]
 name = "tempfile"

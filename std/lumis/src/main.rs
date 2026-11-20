@@ -46,6 +46,9 @@ const CAMERA: u64 = 7;
 /// With the view (docs/CAMERA.md "The view"; owner, 2026-11-15: "why the ridiculously low camera resolution?") Lumis integrates and saves whole sensor frames, read in place.
 const BIN: u32 = 2;
 
+/// Each phase-detect half's black, even and odd, in RAW10 counts: measured on the Pro main's pairs against their image's green, the same dark and bright (docs/CAMERA.md "The PD layout, measured": 64.0 to 64.4 and 62.4 to 62.6); no register is known.
+const PD_BLACKS: (f32, f32) = (64., 62.5);
+
 /// Where the camera service's frames come from.
 enum Source {
     /// The view: frames read in place (`base` where this process reads it), the buffer held until the next MAP; the integrator reads each row straight out of it (`ViewRows`), so no whole frame is ever copied.
@@ -544,6 +547,15 @@ struct ViewRows {
     src: usize,
     line: usize,
     cached: bool,
+    /// The frame's phase-detect rows in the same buffer, where the driver gives them (MAP +56 and +60: docs/CAMERA.md "Phase detect as data"): where they start in this process and how many, at the image's line.
+    pd: Option<(usize, usize)>,
+}
+
+impl ViewRows {
+    /// The phase-detect rows as rows of their own (the same line and caching as the image's) and their count.
+    fn pd(&self) -> Option<(ViewRows, usize)> {
+        self.pd.map(|(src, rows)| (ViewRows { src, line: self.line, cached: self.cached, pd: None }, rows))
+    }
 }
 
 impl lumis_core::RowSource for ViewRows {
@@ -575,7 +587,14 @@ impl Source {
                 *held = m.buffer;
                 let t1 = std::time::Instant::now();
                 t.wait += (t1 - t0).as_micros() as u64;
-                Some(Got::Frame(m.frame, Taken::View(ViewRows { src: *base + m.offset, line: view.line, cached: view.cached })))
+                // The phase view is offered while the frames carry phase-detect rows (the Pro's main), said when that changes.
+                let pd = m.pd_rows != 0 && m.pd_offset != 0;
+                if pd != lumis_core::platform::phase_offered() {
+                    lumis_core::platform::set_phase_offered(pd);
+                    println!("lumis: the phase view {}", if pd { format!("offered: {} phase-detect rows a frame, G#{:X} past the image", m.pd_rows, m.pd_offset) } else { "not offered: the frames carry no phase-detect rows".into() });
+                }
+                let src = *base + m.offset;
+                Some(Got::Frame(m.frame, Taken::View(ViewRows { src, line: view.line, cached: view.cached, pd: pd.then_some((src + m.pd_offset, m.pd_rows)) })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
@@ -1389,7 +1408,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         // A RAW video clip's preview frame was integrated beside its hand-over (above); any other frame is integrated here.
         let (iso, shutter_ns, focus) = if let Some(r) = preview_done.take() { r } else { match got {
-            Got::Frame(head, Taken::View(rows)) => integrator.process_rows(&rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad()),
+            // With its phase-detect rows where it has them (the phase view renders them; every other mode passes them over).
+            Got::Frame(head, Taken::View(rows)) => {
+                let pd = rows.pd();
+                let pd = pd.as_ref().map(|(p, n)| lumis_core::PdRows { rows: p, count: *n, blacks: PD_BLACKS });
+                integrator.process_rows_pd(&rows, pd, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad())
+            }
             // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
             Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
@@ -1744,6 +1768,18 @@ impl Lumis {
         }
     }
 
+    /// The person's app scale as the host now runs Lumis (its RU, which ferros_fluor keeps at preference 14): Lumis's words drawn at it (lumis_core `set_ui_scale`; its layout is fractions of the screen), everything drawn again when it changes.
+    fn follow_scale(&mut self, ctx: &mut Context) {
+        let ru = ctx.viewport.ru;
+        if ru != lumis_core::platform::ui_scale() {
+            lumis_core::platform::set_ui_scale(ru);
+            println!("lumis: the app scale {ru}: its words drawn at it");
+            self.changed = true;
+            self.menu_dirty = true;
+            ctx.window.request_redraw();
+        }
+    }
+
     /// The window sent behind or brought to the front (fluor's `Event::Focused`, from the display's EV_BEHIND and EV_FRONT).
     /// Behind on the menu, Lumis ends at once: no camera is open and nothing is on its way.
     /// Behind with the camera opening or open, the camera thread decides at its next frame: it closes the camera and ends Lumis, unless a continuous save or a calibration runs or a save is on its way (`Stay`).
@@ -1792,6 +1828,7 @@ impl FluorApp<G2t16> for Lumis {
     fn init(&mut self, _ctx: &mut Context) {}
 
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
+        self.follow_scale(ctx);
         let (w, h) = (width as usize, height as usize);
         if (w, h) == (self.width, self.height) {
             return;
@@ -1805,9 +1842,53 @@ impl FluorApp<G2t16> for Lumis {
         ctx.window.request_redraw();
     }
 
+    /// The person's app scale set from outside (ferros_fluor following preference 14: the Settings page, another kist's pinch): Lumis's words drawn at it, never a pinch of the picture (the default would take it as one about the centre).
+    fn on_zoom_set(&mut self, _factor: f32, ctx: &mut Context) {
+        self.follow_scale(ctx);
+    }
+
+    /// On the camera screen a pinch is the picture's (lumis_core `touch::pinch`: open past a half octave for 1:1 about the fingers, close past one for the fit view), so the host leaves the app scale alone and ferros_fluor writes none back; on the menu it is the person's app scale, as in any kist.
+    fn owns_zoom_gesture(&self) -> bool {
+        matches!(self.screen, Screen::Camera(_))
+    }
+
+    fn on_zoom(&mut self, factor: f32, anchor_x: f32, anchor_y: f32, ctx: &mut Context) {
+        if let Screen::Camera(ui) = &mut self.screen {
+            if lumis_core::ui::touch::pinch(ui, factor, anchor_x, anchor_y) {
+                self.changed = true;
+                ctx.window.request_redraw();
+            }
+        }
+    }
+
+    fn on_zoom_end(&mut self, _ctx: &mut Context) {
+        if let Screen::Camera(ui) = &mut self.screen {
+            lumis_core::ui::touch::pinch_end(ui);
+        }
+    }
+
     fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
         if let Event::Focused(focused) = event {
             self.focus(*focused);
+            return EventResponse::Handled;
+        }
+        // A second finger: the host takes the pointer back (a pinch begins) and sends no release for it, so whatever the first finger held lets go without acting.
+        if let Event::CursorLeft = event {
+            if self.finger.take().is_some() {
+                self.pending_up = false;
+                match &mut self.screen {
+                    Screen::Camera(ui) => lumis_core::ui::touch::touch_cancel(ui),
+                    // The finger moved off the menu, then lifted there: a press it held lets go (the move off clears it), nothing opens.
+                    Screen::Menu => {
+                        if let Some(menu) = self.menu.as_mut() {
+                            self.menu_dirty |= app::menu_touch(menu, 2, -1., -1.).redraw;
+                            self.menu_dirty |= app::menu_touch(menu, 1, -1., -1.).redraw;
+                        }
+                    }
+                    Screen::Opening => {}
+                }
+                ctx.window.request_redraw();
+            }
             return EventResponse::Handled;
         }
         // Android's MotionEvent actions, as Lumis's menu reads them.
@@ -2088,7 +2169,8 @@ fn main() {
     }
     let cameras = list();
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    match fluor::host::ferros::run_app(Lumis::new(cameras, vault), caps, 1.0, None) {
+    // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch on the menu is written back as the app scale with the display grant, one on the camera screen is the picture's.
+    match ferros_fluor::run_app(Lumis::new(cameras, vault), caps, None, sys::cap(DISPLAY)) {
         Ok(()) => println!("lumis: closed"),
         Err(e) => println!("lumis: {e}"),
     }
