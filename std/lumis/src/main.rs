@@ -986,6 +986,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut starting: Option<std::sync::mpsc::Receiver<Result<Clip, String>>> = None;
     // A RAW video preview frame's settings, integrated beside its hand-over this turn.
     let mut preview_done: Option<(i32, i64, f32)> = None;
+    // When RAW video's preview last integrated a frame while not recording.
+    let mut idle_preview = std::time::Instant::now();
     // The last frame's integration, us: said with a RAW video drop that may follow it.
     let mut last_preview_us = 0u64;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
@@ -1360,6 +1362,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     continue;
                 }
             }
+        }
+        // RAW video not recording: the preview integrates a frame only every preview gap (2^7 ms at 30 a second or under, 2^8 above), the camera's other frames taken and given back: it integrated every frame, and after a 24 a second clip the A510s reached 88 C with nothing recording (the coordinator, 2026-11-20, for the desert).
+        if let (Some(fps), true) = (paced, CLIP.lock().unwrap().is_none() && starting.is_none()) {
+            if idle_preview.elapsed() < preview_gap(fps) {
+                keep_saves(vault.as_deref(), &mut *integrator.header);
+                frames += 1;
+                continue;
+            }
+            idle_preview = std::time::Instant::now();
         }
         let k4 = dev_knobs4();
         if let (true, Got::Frame(head, Taken::View(rows))) = (k4 & DEV_CELLS != 0 && frames == 16, &got) {
@@ -1860,9 +1871,10 @@ impl FluorApp<G2t16> for Lumis {
             Screen::Opening => {}
             Screen::Camera(ui) => {
                 use lumis_core::shared_memory::CAL_SHOW_RESULT_BIT;
-                // While a RAW video clip records, a pass only for a new preview image, a finger, or every 2^9 ms (the counters, the space bar, the UI's heartbeat, which the integrator wants within 1.6 s): a pass a display frame, a 4.3 ms draw and an 8.5 ms present with nothing new, was most of the 2 W more Lumis drew than the recorder's harness and the heat that cost a minute at 60 a second its frames (the RAW agent, 2026-11-20).
-                let recording = ui.in_video() && ui.header[FLAGS_IDX] & lumis_core::shared_memory::RECORDING_BIT != 0;
-                if recording && self.finger.is_none() && !self.pending_up && ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] == ui.previous_image_counter && self.ui_pass.elapsed() < std::time::Duration::from_millis(1 << 9) {
+                // In RAW video (a clip recording or not), a pass only for a new preview image, a finger, or every 2^9 ms (the counters, the space bar, the UI's heartbeat, which the integrator wants within 1.6 s): a pass a display frame, a 4.3 ms draw and an 8.5 ms present with nothing new, was most of the 2 W more Lumis drew than the recorder's harness and the heat that cost a minute at 60 a second its frames (the RAW agent, 2026-11-20).
+                // Not recording too: the idle screen made a pass every display frame as well (the coordinator, 2026-11-20, for the desert).
+                let video = ui.in_video();
+                if video && self.finger.is_none() && !self.pending_up && ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] == ui.previous_image_counter && self.ui_pass.elapsed() < std::time::Duration::from_millis(1 << 9) {
                     return false;
                 }
                 self.ui_pass = std::time::Instant::now();
