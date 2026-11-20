@@ -126,6 +126,8 @@ Branch `hold` ddfd6437 (raw-video-rec b3c55355 merged), RAM-reloaded, then flash
 - **The cold boot**: the vault from the kernel image, identity unlocked at boot, the vault's 125 names and the clips area's extents as before, both slots read back equal.
 - **Lumis** (lumis-rv21.bin hand-spawned with `--use gpu --dma layers`): 796 frames in 13.3 s at 60 a second, 0 dropped, coded on the GPU, with an 8 ms shutter (at the scene's own 67 ms exposure the camera gives 15 frames a second: 186 frames in 12.6 s, none dropped). Note that Lumis reserves the whole free clips area for a recording, so a kist's `make_clip` is refused while Lumis records.
 
+**Stowing a kist that asks for `items`** needs a stower, init and map that know the right (code 13): one from before refuses its capsule (reason 16, NOT_KIST). On the Pro (b1048) the stower and init (masked, sealed) and the map (native) were stored from `hold` 999fddb0, the old ones kept in target/agent-hold/stower/old-*.vsf; after a cold boot every puck started again, and Kūaha (capsule 8da57037...) was stowed automatically in developer mode, `items` unanswered until its first start asks.
+
 ## How it is wired
 
 - The kist's call: `SYS_STORE` x1 bit 7, x0 the `items` token, x2/x3 the call (ferros_items `wire`: [op][handle 32][offset u64][length u32][payload]), x4 the reply's room, x1 bits 8-31 its length.
