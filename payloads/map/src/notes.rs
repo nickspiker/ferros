@@ -144,7 +144,7 @@ impl Map {
                 latest = Some((n.seq, i));
             }
         }
-        // A bundled icon (1-5, the display's ICN bundle); a widget's or none: 0, the ring alone.
+        // A bundled icon (1-6, the display's ICN bundle); a widget's or none: 0, the ring alone.
         let icon = latest.map_or(0, |(_, i)| self.spec(i).icon);
         let icon = if icon >= 0x80 { 0 } else { icon };
         // WHY the cap: as the circles' counts (`notes_rang`), the op's field is 16 bits.

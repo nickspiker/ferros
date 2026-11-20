@@ -1,4 +1,4 @@
-# A host tool, kept out of the ferros workspace on purpose: it needs fluor with std and its icon decoder, and inside the workspace that feature set could be unified into the no_std payload builds that also depend on fluor.
+# A host tool, kept out of the ferros workspace on purpose: it links Photon's library (its avatar process, rav1e and rav1d, the desktop's dependencies), none of which may be unified into the no_std payload builds.
 [package]
 name = "app-icons"
 version = "0.1.0"
@@ -7,6 +7,20 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-fluor = { path = "../../../fluor", default-features = false, features = ["std", "text", "icon"] }
+# Photon's own avatar process (photon_messenger::ui::avatar): the one way a 256 x 256 icon is made and decoded, for contacts and kists alike (owner, 2026-11-20). Needs Photon's `AvatarFrame` (Photon branch `icons`, 2026-11-20).
+photon-messenger = { path = "../../../photon" }
 vsf = { path = "../../../vsf" }
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+# A source's size and whether it has alpha, read from its header, for `--assign-inside`'s polygon (decoding only; Photon's own `image`, unified).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "gif", "bmp"] }
+
+# Photon's own patch table, which only its root build applies: its forks of softbuffer, winit and audiopus_sys (Photon's Cargo.toml says why), pinned at the same revisions. Build with OPUS_NO_PKG=1 OPUS_STATIC=1, as Photon's .cargo/config.toml sets them.
+[patch.crates-io]
+softbuffer = { git = "https://github.com/nickspiker/softbuffer", rev = "0f07510a1edd3f7320fdc4b207f14d64b692c410" }
+winit = { git = "https://github.com/nickspiker/winit", rev = "a98203e873ad638b483999f3ae0e8314736b78a3" }
+audiopus_sys = { git = "https://github.com/nickspiker/audiopus_sys", rev = "1b9aac825b34690416b44c7d48057dae51834492" }
+
+# Photon refuses a release profile (its build.rs), so this builds as a development profile with every crate optimised: rav1e and the Lanczos resize take seconds unoptimised.
+[profile.dev]
+opt-level = 3
+[profile.dev.package."*"]
+opt-level = 3

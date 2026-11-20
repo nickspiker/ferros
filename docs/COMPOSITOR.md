@@ -142,7 +142,7 @@ The budget on husky (1344 × 2992), what lives for the process (before the heap'
 |---|---|---|
 | The typeface's glyph cache (2 Mi samples of u16) and its table | 4.1 MiB | `glyphs::Glyphs::new` |
 | The present table, the g2t table | 0.25 MiB | `server` |
-| The icons' mip chains | about 4.4 MiB | `draw::Mips::build` |
+| The icons' mip chains (six since Kūaha, 2026-11-20) | about 5.3 MiB | `draw::Mips::build` |
 | The bars: `BAR` (the chrome rows), `BAR_W` and its back buffer (to the quick row's floor, 8 bytes a pixel) | about 15 MiB | `server`, QUICK.md "Memory" |
 | The quick row's six sprites | 2.1 MiB | `quick::init` |
 | The hit map (a u16 a pixel) and the bars' ids (two) | 7.7 + about 2.8 MiB | `hit::alloc`, "The hit map" below |

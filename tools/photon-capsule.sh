@@ -14,7 +14,11 @@ fi
 pkg=${PHOTON_FERROS_PKG:-$here/std/photon}
 version=${PHOTON_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$pkg/../../../photon/Cargo.toml" | head -n 1)}
 [ -n "$version" ] || { echo "no version: set PHOTON_VERSION or check $pkg/../../../photon/Cargo.toml" >&2; exit 1; }
-FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}" "$here/target/debug/ferros-bridge" capsule "$1" "$2" --kist Photon --option 8c2411c6bf1c10a45d8021340b2dae4a7c69774235069eddd85abbdc6959eb74 --version "$version" \
+# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/photon.vsf); $PHOTON_ICON wins.
+icon=${PHOTON_ICON:-$here/target/icons/photon.vsf}
+icon_arg=()
+[ -f "$icon" ] && icon_arg=(--icon "$icon")
+FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}" "$here/target/debug/ferros-bridge" capsule "$1" "$2" --kist Photon --option 8c2411c6bf1c10a45d8021340b2dae4a7c69774235069eddd85abbdc6959eb74 --version "$version" "${icon_arg[@]}" \
     --want display "to show your conversations on the screen" \
     --want touch "to read your taps and typing" \
     --want surface "to draw in a window of its own" \

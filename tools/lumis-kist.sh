@@ -25,7 +25,11 @@ version=${LUMIS_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$lumis/ru
 [ -n "$version" ] || { echo "no version: set LUMIS_VERSION or check $lumis/rust/Cargo.toml" >&2; exit 1; }
 out=target/lumis.capsule.vsf
 B=target/debug/ferros-bridge
-FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Lumis --option 0b94129b0c3896fa4663993540f730cb623d26de226823b11bb4037c97066556 --version "$version" \
+# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/lumis.vsf); $LUMIS_ICON wins.
+icon=${LUMIS_ICON:-target/icons/lumis.vsf}
+icon_arg=()
+[ -f "$icon" ] && icon_arg=(--icon "$icon")
+FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Lumis --option 0b94129b0c3896fa4663993540f730cb623d26de226823b11bb4037c97066556 --version "$version" "${icon_arg[@]}" \
     --want camera "to show you what each camera sees and take its raw frames, kept on this device"
 [ "$stow" = 1 ] || exit 0
 # Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
