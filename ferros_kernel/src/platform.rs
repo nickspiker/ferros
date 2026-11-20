@@ -419,6 +419,11 @@ pub fn stall_check() {
     }
 }
 
+/// How many stalls the catcher has caught this boot (the service loop writes each new one to the flash log, so it survives a power-off, where the record in DRAM does not).
+pub fn stalls() -> u64 {
+    STALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The stall record: this boot's (`prev` false) or the previous boot's.
 pub fn stall_read(prev: bool) -> [u64; STALL_WORDS] {
     let base = if prev { STALL + STALL_WORDS * 8 } else { STALL };

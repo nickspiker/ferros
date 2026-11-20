@@ -132,9 +132,11 @@ extern "C" fn tag_add_thread(grants: u64) -> ! {
     }
 }
 
-/// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
-/// And an icon handed to the display (`send_icons`): its decoded document (A#327_8xx bytes) and its texels, one icon at a time; so a MiB since 2026-11-20.
-const HEAP_SIZE: usize = 1 << 20;
+/// And an icon handed to the display (`send_icons`): its decoded document (A#262_311 bytes), the section parsed from it and its texels, each about 256 KiB, one icon at a time (the Pro, b1063: with a 1 MiB heap the map panicked on a 256 KiB allocation at its first icon).
+/// Since 2026-11-20 not a static in the image (which a flat image carries whole: the map's grew past the 3 MiB a value holds) but the zeroed tail the kernel maps after .bss for an image whose heap grows (`entry!(…, grows HEAP_CEILING)`): its first 4 MiB (the kernel's HEAP_START), less a cache line.
+const HEAP_SIZE: usize = (1 << 22) - (1 << 7);
+/// The ceiling the image header declares: the kernel sizes the arc's window for it, and maps the first 4 MiB at spawn.
+const HEAP_CEILING: usize = 1 << 22;
 /// The most of the deck document read (ferros_kept::deck): a place is under 200 bytes, so this holds hundreds.
 const DECK_MAX: usize = 1 << 16;
 /// The most of the stower's icon index read (ferros_kept::icon `INDEX`): an entry is under 100 bytes.
@@ -158,27 +160,24 @@ fn read_icons(grants: u64) -> Vec<(ferros_thing::Ht, ferros_thing::Hp)> {
 /// A decoded icon from the vault (`kists.` at its `hp`, ferros_kept::icon): its texels, only when the value is that icon; None when absent or not one.
 fn read_decoded(grants: u64, icon: &ferros_thing::Hp) -> Option<Vec<u8>> {
     let c = cap(grants, S_KIST_LIST);
-    let mut piece = alloc::vec![0u8; ferros_sys::STORE_MAX];
-    let total = ferros_sys::store_get_addr_at(c, icon.as_bytes(), 0, &mut piece)?;
-    // WHY: the length is the vault's word for a value under this name; a decoded icon is about A#330_000 bytes, so anything past 1 MiB is not one and is not read.
+    // Its length first (a get answers the whole length, whatever it copies), then the value read straight into one buffer of that size, a transfer at a time: no second buffer beside it.
+    let mut probe = [0u8; 1];
+    let total = ferros_sys::store_get_addr_at(c, icon.as_bytes(), 0, &mut probe)?;
+    // WHY: the length is the vault's word for a value under this name; a decoded icon is A#262_311 bytes, so anything past 1 MiB is not one and is not read.
     if total > 1 << 20 {
         return None;
     }
-    let mut doc = Vec::with_capacity(total);
-    doc.extend_from_slice(&piece[..total.min(piece.len())]);
-    while doc.len() < total {
-        let n = ferros_sys::store_get_addr_at(c, icon.as_bytes(), doc.len(), &mut piece)?;
-        if n != total {
+    let mut doc = alloc::vec![0u8; total];
+    let mut at = 0;
+    while at < total {
+        let end = (at + ferros_sys::STORE_MAX).min(total);
+        if ferros_sys::store_get_addr_at(c, icon.as_bytes(), at, &mut doc[at..end])? != total {
             return None;
         }
-        let take = (total - doc.len()).min(piece.len());
-        doc.extend_from_slice(&piece[..take]);
+        at = end;
     }
     ferros_kept::icon::read_decoded(&doc, icon)
 }
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
 #[global_allocator]
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
@@ -5891,7 +5890,11 @@ fn dist16(a: (i64, i64), b: (i64, i64)) -> i64 {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The circles' labels are `&'static str`, absolute addresses fixed at link time; linked position-independent, they are relocations this applies before anything reads them. Without it the first label read faulted at its link-time address, G#D9B (2026-10-21).
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    // The heap: the zeroed tail the kernel maps past .bss (`entry!(…, grows HEAP_CEILING)`), from the first cache line past .bss and its 16 bytes, as ip takes it.
+    unsafe extern "C" {
+        static __image_end: u8;
+    }
+    unsafe { ALLOC.init(((&raw const __image_end) as usize + 16 + 63) & !63, HEAP_SIZE) };
     // The deck's start by part, to the console with "deck drawn" (2026-11-12, measuring attest to the deck): [the display's size, the person's kists read, the places kept, the scene sent, the view kept, the first draw], counter ticks at each end.
     let mut t_start = [now(); 7];
     let display = cap(grants, S_DISPLAY);
@@ -7242,4 +7245,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(payload_main);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

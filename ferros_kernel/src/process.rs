@@ -7757,7 +7757,12 @@ fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxe
         }
     } else {
         let line = alloc::format!("{who}: ended, exit G#{value:016X}; its last line: {last_words}");
-        crate::flashlog::death(who, &line, d);
+        // The USB process ends after its tries with nothing plugged in and is started again, every 2^4 s: kept once, then counted.
+        if name == b"usb" {
+            crate::flashlog::death_once(crate::flashlog::once::USB_END, who, &line, d);
+        } else {
+            crate::flashlog::death(who, &line, d);
+        }
         return;
     };
     let kk = k();

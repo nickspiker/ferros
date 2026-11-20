@@ -157,7 +157,7 @@ pub fn power(on: bool) -> bool {
         let _ = crate::platform::open_usb_dma_path();
         crate::checklist::dot(5);
         crate::board::probe(85);
-        crate::flashlog::line("usb: the link readied for the USB process");
+        crate::flashlog::line_once(crate::flashlog::once::USB_LINK, "usb: the link readied for the USB process");
         crate::board::probe_log(8);
     }
     true
