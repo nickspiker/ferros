@@ -1633,7 +1633,7 @@ struct Lumis {
     /// On the camera screen, a pass that drew no new image and nothing whole: the controls' parts lumis_core repainted (its partial draw), the only rects converted and shown (redraw on change; the owner's go, 2026-11-17). Empty with `changed` false: nothing to show.
     parts: Vec<fluor::canvas::PixelRect>,
     /// RAW video's RECORD / STOP label and its note as last drawn whole, and when: the buttons are drawn only in a whole draw, so a change is one (at most once a second while a clip records, at once when one starts or stops).
-    video_label: (String, Option<String>, bool),
+    video_label: (String, Option<String>, bool, u64, bool),
     video_drawn: std::time::Instant,
     /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`, `DEV_SCRATCH`).
     knobs: u8,
@@ -1650,7 +1650,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false), video_drawn: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1697,12 +1697,14 @@ impl Lumis {
 }
 
 /// Whether RAW video's RECORD / STOP label wants a whole draw (`Lumis::video_label`, as last drawn whole at `drawn`), noting it as drawn when it does.
-fn video_label_moved(label: &mut (String, Option<String>, bool), drawn: &mut std::time::Instant, ui: &lumis_core::UserInterface) -> bool {
+fn video_label_moved(label: &mut (String, Option<String>, bool, u64, bool), drawn: &mut std::time::Instant, ui: &lumis_core::UserInterface) -> bool {
     if !ui.in_video() {
         return false;
     }
     let recording = ui.header[FLAGS_IDX] & lumis_core::shared_memory::RECORDING_BIT != 0;
-    let now = (ui.get_button_info(6, false).0, lumis_core::platform::video_note(), recording);
+    // The dropped count under STOP, and whether it is red (climbing within the last 2^10 ms): a change of either redraws, so red goes when the count holds.
+    let climbing = ui.video_drops_rose.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(1 << 10));
+    let now = (ui.get_button_info(6, false).0, lumis_core::platform::video_note(), recording, ui.header[lumis_core::shared_memory::VIDEO_DROPPED_IDX], climbing);
     if now == *label || (now.2 == label.2 && drawn.elapsed() < std::time::Duration::from_secs(1)) {
         return false;
     }
