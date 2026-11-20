@@ -7,7 +7,7 @@
 //! | `KIST` | developer `ke`, option `hp` | capsule `hb`, name `a`, then per want (slot order) right `u`, reason `a` | a `kist` section of `kists.list` |
 //! | `ANSWER` | developer, option, right `u` | granted `u` (1 or 0); the entry's stamp is when | a want's answer in `kists.list`, or an unstowed kist's kept answer (its `kept` section) |
 //! | `DEFAULT` | right `u` | on `u` | `kists.list`'s `defaults` |
-//! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>`, a `place` document (ferros_kept::map) |
+//! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | the map's deck document (`map.deck`, ferros_kept::deck: the map its one writer), read; the fleet's places written to `map.deck.synced` for the map to take. The id stays (developer, option) so a fleet device on an older build still syncs; moving it to the circle's `ht` is a later step (coordinator, 2026-11-20) |
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view`, a `view` document |
 //! | `DECK_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |

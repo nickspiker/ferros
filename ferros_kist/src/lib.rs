@@ -727,10 +727,15 @@ pub fn icon_span(head: &[u8]) -> Result<Option<(usize, usize)>, &'static str> {
 
 /// An `icon` section's content identity: the bytes of the section as the capsule holds them, from the start of its span ([`icon_span`]) to where it parses to, once they read as an icon; a section that is no icon has none.
 pub fn icon_section_hp(span: &[u8]) -> Result<ferros_thing::Hp, &'static str> {
+    icon_section_read(span).map(|(hp, _)| hp)
+}
+
+/// An `icon` section read from its span: its content identity ([`icon_section_hp`]) and the icon (its AV1 and encoding), for the decoder at stow.
+pub fn icon_section_read(span: &[u8]) -> Result<(ferros_thing::Hp, Icon), &'static str> {
     let mut end = 0;
     // The table of contents names it (`icon_span`); its fields say whether it is an icon.
-    icon_from(&VsfSection::parse(span, &mut end).map_err(|_| "a section that does not parse")?)?;
-    Ok(ferros_thing::icon(&span[..end]))
+    let icon = icon_from(&VsfSection::parse(span, &mut end).map_err(|_| "a section that does not parse")?)?;
+    Ok((ferros_thing::icon(&span[..end]), icon))
 }
 
 /// An icon from its own document (tools/app-icons `icon`: a complete VSF file, vsf's flat image section `image`).

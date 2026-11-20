@@ -1794,7 +1794,8 @@ fn endpoint(name: &[u8]) -> usize {
 }
 
 /// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`. The audio service the same way (docs/AUDIO.md, 2026-11-11): started by a kist's first call on `audio`, ended by itself once every stream has played out.
-pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio", b"camera"];
+/// The icon decoder too (std/icondec, 2026-11-20): started by the stower's first call on `icons` at a stow, ended by itself once it has handed an icon back.
+pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio", b"camera", b"icons"];
 /// The on-demand servers a call found missing since the service loop last looked (`on_demand_take`).
 static ON_DEMAND_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

@@ -24,6 +24,9 @@ ed25519-dalek = "2"
 ferros_kist = { path = "../../ferros_kist", features = ["bundle"] }
 # the hold (docs/STORE.md): `items`, the same calls a kist makes (ferros_items `kist::Hold`) over the bench's STORE job
 ferros_items = { path = "../../ferros_items" }
+# `icon seed`: a decoded icon checked (ferros_kept::icon) and stored under its `hp` (ferros_thing).
+ferros_kept = { path = "../../ferros_kept" }
+ferros_thing = { path = "../../ferros_thing" }
 # a kist capsule is signed with every scheme of its developer's bundle and checked at stow (fgtw::release: Photon's release key, owner 2026-11-10: "no single eggs")
 fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "sign"] }
 # input injection scripts (docs/INPUT-INJECT.md): built here, played on the device by payloads/inject

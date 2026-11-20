@@ -12,6 +12,21 @@ use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::types::Tensor;
 use vsf::VsfType;
 
+/// The icon decoder's endpoint (`icons`, std/icondec), the stower's alone: an icon's AV1 in, its texels out.
+pub mod dec {
+    /// `[OP_AV1][encoding][offset u32 LE][last u8][bytes…]`: a piece of the icon's AV1, in order from 0; the last decodes it. → [0] taken (on the last: decoded), [1] not an icon this decodes (refused, or out of order).
+    pub const OP_AV1: u8 = 0;
+    /// `[OP_TEXELS][offset u32 LE]`: the decoded texels from `offset`, at most [`PIECE`] bytes. The decoder ends itself once it has handed over the last.
+    pub const OP_TEXELS: u8 = 1;
+    /// The icon's encoding: its codes `g2t`, or gamma 2 (untagged, vsf's rule), which the decoder takes to `g2t`.
+    pub const G2T: u8 = 0;
+    pub const GAMMA2: u8 = 1;
+    /// The bytes one call carries either way: a call's message is at most 4 KiB, less the op and the header.
+    pub const PIECE: usize = 4032;
+    /// The most AV1 an icon is: they are 5 to 31 KB, so past 64 KiB is no icon.
+    pub const AV1_MAX: usize = 1 << 16;
+}
+
 /// The index's name in the `kists.` scope.
 pub const INDEX: &[u8] = b"icons";
 /// An icon's side in texels: a Photon avatar's (KISTS.md "Icons": one format, 256 × 256).
