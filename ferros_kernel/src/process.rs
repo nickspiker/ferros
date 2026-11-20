@@ -4135,7 +4135,35 @@ pub fn items_person_stamp() -> Vec<u8> {
 pub fn vault_stamp_items(call: &[u8]) -> Option<Vec<u8>> {
     let mut rest = items_person_stamp();
     rest.extend_from_slice(call);
-    with_lock_held_or(|| stamp(VOP_ITEMS, ITEMS_PREFIX, &[true], b"", &rest))
+    let doms = items_domains(call)?;
+    with_lock_held_or(|| stamp_domains(VOP_ITEMS, &doms.iter().map(|p| (&p[..], true)).collect::<Vec<_>>(), b"", &rest))
+}
+
+/// ferros_items `wire::OP_USAGE`: what is on the device, read only.
+pub const ITEMS_OP_USAGE: u8 = 16;
+/// The most kists one usage call names (ferros_items `wire::USAGE_KISTS`): each one's domain keys are derived in the call, under the kernel lock.
+pub const ITEMS_USAGE_KISTS: usize = 1 << 6;
+/// The person's list of stowed kists' scope, read by the vault for a usage call's names.
+const KISTS_PREFIX: &[u8] = b"kists.";
+
+/// The domains a call on the hold is stamped with, all the person's: their items domain; for a usage call also their kists' list (`kists.`) and the own domain of each kist the call names ([developer 32][option 32] each, as the stower names one: `kist_store_route`). None for a usage call naming more than `ITEMS_USAGE_KISTS` or not whole identities, or while no oracle secret is open.
+/// A kist's domain sized this way says how much a stowed kist keeps for itself, never what: the vault answers its values' count and bytes from their heads alone.
+fn items_domains(call: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut v = alloc::vec![ITEMS_PREFIX.to_vec()];
+    if call.first() == Some(&ITEMS_OP_USAGE) {
+        // WHY: the payload is the caller's: whole identities, a bounded count of them (each costs a derivation here).
+        let ids = call.get(45..)?;
+        if ids.len() % 64 != 0 || ids.len() / 64 > ITEMS_USAGE_KISTS {
+            return None;
+        }
+        v.push(KISTS_PREFIX.to_vec());
+        for id in ids.chunks_exact(64) {
+            let developer: [u8; 32] = id[..32].try_into().unwrap();
+            let ihi = crate::oracle::ihi(&developer, &id[32..])?;
+            v.push([KIST_DOMAIN_PREFIX, &blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi)[..]].concat());
+        }
+    }
+    Some(v)
 }
 
 /// A call on the hold (`STORE_ITEMS`), forwarded as `VOP_ITEMS`: the person's items domain's keys, the caller's stamp, then its call. Refused without the right, while nobody is present (the person's keys are not open), or for a call or reply past its bounds.
@@ -4152,21 +4180,20 @@ fn items_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
         f.x[0] = ERR;
         return 0;
     };
-    let Some(mut msg) = self::stamp(VOP_ITEMS, ITEMS_PREFIX, &[true], b"", &stamp) else {
+    let Some(b) = p.view(f.x[2], call) else {
         f.x[0] = ERR;
         return 0;
     };
-    match p.view(f.x[2], call) {
-        Some(b) => {
-            msg.reserve_exact(call);
-            msg.extend_from_slice(b);
-        }
-        None => {
-            crate::keys::wipe_to_dram(&mut msg);
-            f.x[0] = ERR;
-            return 0;
-        }
-    }
+    let Some(doms) = items_domains(b) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    let Some(mut msg) = stamp_domains(VOP_ITEMS, &doms.iter().map(|p| (&p[..], true)).collect::<Vec<_>>(), b"", &stamp) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    msg.reserve_exact(call);
+    msg.extend_from_slice(b);
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
         t.what = VOP_ITEMS as u64 | (len as u64) << 8;
@@ -4193,6 +4220,8 @@ pub const EOP_SPACE: u8 = 6;
 /// The kernel's own channel only, for the bridge (service.rs `store_job` G#FB and G#FA; refused from a process here, as every op past EOP_SPACE is): the clips area's records (the caller's domain's owner hash, then first, blocks, bytes, sealed, at, owner a record), and a drop of the caller's domain's extent at a first block (its name a derived key that may be lost).
 pub const EOP_LIST: u8 = 7;
 pub const EOP_DROP_AT: u8 = 8;
+/// The kernel's own channel only (service.rs `store_job` G#F8, development builds): a sealed extent dropped by its first block whatever domain owns it, for one whose owning build no longer exists; refused from a process as every op past EOP_SPACE is.
+pub const EOP_DROP_ORPHAN: u8 = 9;
 pub const EXTENT_SPACE: usize = 5 * 8;
 
 /// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.

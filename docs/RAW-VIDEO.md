@@ -16,7 +16,7 @@ The owner (2026-11-19): a RAW video shooter on ferros, graded later, lossless if
 | 1:1 24/s | 1504 MB/s | no | 650 MB/s at 2.3x: the cache covers about 50 s, then a 1 GB backlog | 61 ms a frame on four A715s at 2367 MHz: 16/s, short of 24 |
 
 - **Lossless fits the internal flash in every mode but 1:1**, and binned 24 and 30 even fit uncompressed.
-- **The wall is the CPU, not the flash**: 60/s binned is heat-limited and 1:1 at 24/s is compute-limited with this codec on the CPU. Both want a faster encoder (hand-written NEON, the A510s alongside, or the Mali GPU) before anything else.
+- **The wall was the CPU, not the flash**: 60/s binned was heat-limited and 1:1 at 24/s compute-limited with this codec on the CPU. Since 2026-11-19 the band coder runs on the Mali GPU (Part 4, "On the GPU"): 60/s binned for a minute, none dropped, 71 C at most.
 - The visually lossless mode (below) adds ratio (about 3.5 to 3.9x at s = 1) but not speed: it runs the same coder.
 - Lossless stays the default.
 
@@ -188,18 +188,57 @@ The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,0
 - `recorder.stop()`: the closing generation and the seal; `ClipInfo` (the counts, the clip's length, its seal, the writer's time, an error if any). The clip is the extent under its name in Lumis's domain; `Extent::info` reads its record, `ferros::ExtentSource` reads it back as a VSF byte source for `vsf::visual::clip::Reader`.
 
 - `ferros::space(slot)`: the recording space in bytes (the window, free, the longest free stretch, which is what an open can get, this domain's clips and their count); the vault's read-only EOP_SPACE.
+- The GPU (since 2026-11-19, nothing to change in a caller): `Recorder::start` codes a Bayer clip on the GPU when the process holds the GPU's grants (a kist's `gpu::kist_slots`, a spawn's `--use gpu --dma layers`), else on the workers; `recorder.gpu_note()` says which and why, `recorder.gpu()` the GPU's counts (`GpuStats`: frames run, the GPU's time, the time from a hand-over to its last band packed, a failure). `gpu::enable(false)` keeps a clip on the CPU; `Recorder::start_gpu` takes a device by hand (`gpu::HostDevice` on a host, for tests).
 - Lumis's choices that matter, measured with std/rawrec: workers four A715s and four A510s, the writer on the A510s (on the A715s it took a coder's core: 47 of 64 frames dropped), and Lumis's own preview work thinned while recording (a frame's coding takes about 23 of its 33 ms).
 
 ### The write path and the clocks (2026-11-19, the Pro)
 
 - **Straight to the flash.** At the open the vault process gives the recording process its extent's own SYS_BLOCK capability (`Object::Extent`: the `clips` window narrowed to the extent's blocks, so every bound of the window holds it); `Extent::write` uses it, and the clip's bytes no longer pass thru the vault process. The seal takes it back, and so does the writer's end. 736 to 792 MB/s while writing (one copy into the kernel, then the bounce, queue depth one), against 266 thru the vault.
-- **The recording's own clocks**, from a clip's open to its seal or its writer's end (`EXTENTS_OPEN`, service.rs `recording`): the A715s run up to 1572 MHz (`diag clock clips <kHz>`, 0 off) and the A510s up to their top, whatever else lifts or not; `diag clock` says it. Not a cap on camera streams in general.
+- **The recording's own clocks**, from a clip's open to its seal or its writer's end (`EXTENTS_OPEN`, service.rs `recording`): the A715s run up to 1572 MHz (`diag clock clips <kHz>`, 0 off) and the A510s up to their top, whatever else lifts or not; `diag clock` says it. Not a cap on camera streams in general. `diag clock clipshold 1` holds the A715s at that rate rather than under it (for CPU coders at 60/s); off by default since the GPU path.
 - **Measured at 30/s, a minute, lossless, four A715s and four A510s:** at the camera's 2367 MHz lift the zones reached 85 C in 37 s (stopped); capped at 1572, 1800 of 1800 frames, none dropped, 75 C at most, every frame decoded bit exact on the host against the hash of the frame the camera wrote (tools/clip-check); straight to the flash, the same, 71 C at most, 170 MB/s over the clip.
 - **The first clip within about a minute of a boot or reload** may drop frames while the system starts its processes (pcie1, the modem, the stower) on the same cores; later clips are clean.
 
 - **A clip left open** (its writer died, the power went, or its seal never came) holds its whole reservation until it is closed. The vault process's recoverer, a thread on an A510, closes every open extent no live writer holds (the kernel says, SYS_BLOCK x1 bits 3 and 5), handed one at a time at the vault's start, at every extent request and after each one it finishes: it walks the clip's frames by their headers (vsf `Reader::open_headers`: each frame's fields, `prev` and closing bytes, about 24 KiB a frame), checks the samples of the last 8 frames against their hashes from the end back (`check_tail`: a torn frame ends the clip before it; a recorder writes its frames in order, so a torn write tears the tail), writes the closing generation right after the last whole frame, and the serving thread seals the extent at that length at its next request and gives its tail back. Nothing is dropped; an extent with no readable clip is sealed empty, its first block kept.
   Never inside a request: an OPEN takes a free stretch at once (3 to 5 ms) while the recoverer works beside it; only an OPEN or DELETE of the name being recovered waits for it. Until 2026-11-19 (4d1cbdf3) the next OPEN itself did the recovery on the serving thread, reading and hashing every frame's samples: a Lumis clip killed at 2,525 frames (18 GB) held that OPEN, every vault request and the camera's thread for 89 s, the Pro reaching 89 C. Measured since (b1031): 587 frames (2.8 GB) in 557 ms (headers 287 ms, the last 8 frames 268 ms, 1237 block reads of 48 MiB); 310 frames (1.5 GB) in 730 ms, the clip then read back sealed by its index with all 310 frames decoding against their hashes (rawrec job 5).
 - **The open's shutter**: the driver refuses an open whose integration does not fit its frame less 32 lines (Lumis's 67.8 ms at 30/s); `Pacing::open_msg` opens with at most that, and `open_needs_set` says when the shutter is to be SET after the first frame.
+
+### On the GPU (2026-11-19, the 60/s work)
+
+The owner: "60FPS lock with 2x headroom on GPU or whatever's clever so I can shoot 24 in desert heat and not blink about it."
+
+**The split.** The band coder is cut in two (ferros_rawcodec `split_codes` and `pack_band`, byte for byte `encode_band`'s). The GPU does everything a block can do alone: one Valhall kernel (ferros_clip/src/gpu_kernel.rs, an invocation a block of 32 samples of one row, the whole frame in one run) reads the RAW10 rows, makes both residuals of every sample (Left or Avg4, and MED), the block's sums, the selection and k, every residual's code, and lays the block's codes end to end into a bit string (its body). The CPU chains each block's k code from the block before and copies the bodies' words into the band's two streams (`pack_band_bodies`), BLAKE3s the coded bands, and writes. The kernel is compiled on the host by valhall's SSA recorder (ferros_clip/build.rs) and shipped in the binary as words; the device never runs a compiler.
+
+**Bit exact.** tests/gpu.rs runs the kernel on valhall's emulator over a Pro frame against `split_codes` and `encode_band`; tests/record.rs records with `gpu::HostDevice` (the GPU's work on the host's CPU) and compares the whole clip with the CPU path's, byte for byte; on the Pro, rawrec job 7 compares every band of a frame with `encode_band`, and recordings decode bit exact on the device (rawrec's kept copies sample for sample, and the source hashes).
+Two traps found on the Pro: one invocation's stores to one address do not land in the order they were made (storing a body word at every code left about 40 of 393k blocks a frame missing their last codes, different blocks each run: each word is now stored once, whole, the partial stores going to a scratch word in the body's own cache line); and valhall's SSA recorder is one global (two tests recording at once corrupt each other: they take a lock).
+
+**The kernel**: 2332 instructions an invocation, 64 registers, 5.9 ms a frame of 4080 x 3072 at the GPU's 890 MHz (ALU-bound: 393,216 invocations). From 4610 instructions and 9 ms: both residuals kept in registers from the one pass over the frame, a five-instruction zigzag (the residual's ten bits at the top of the word, flipped when negative, shifted down), five instructions a sample's extraction, the Left/Avg4 choice made before its residual.
+
+**The recorder** (ferros_clip): the GPU block grown to two sets (frame, bodies, facts: 256 MiB); a frame's hand-over copies it into a free set (1.7 ms) and runs the GPU (5.9 ms), then returns; four A715 and four A510 workers pack its bands behind it (about 5 ms) and the frames go to the writer in order. With the source hash asked (Lumis's DEV_VIDEO), the workers hash the bands from the set's copy while the GPU runs, and the hand-over waits for its frame.
+
+**Measured on the Pro** (this branch's kernel RAM-reloaded, rawrec, the binned main, lossless, four A715 and four A510 workers, the writer on the A510s, straight to the flash):
+
+| run | frames, dropped | hand-over a frame | hottest | the battery's draw (screen on) |
+|---|---|---|---|---|
+| 60/s, a minute | 3600, 0 | 7.6 ms average, 9.0 most (the GPU 5.9, at most 6.5) | 71 C (52 at 5 s, 62 at 23 s, 66 at 35 s, 69 at 53 s) | 7.8 W |
+| 60/s, 128 frames, source digests on | 128, 0 | 11.1 ms average, 20.2 most | 54 C | |
+| 24/s, 5 minutes | 7200, 0 | 7.6 ms | 62 C at a minute, 64 at two, 65 at four, 67 at five | 5.75 W |
+| 30/s, 4 minutes, GPU | 7200, 0 | 7.7 ms | 65 C at a minute, 68 at two, 70 at four | 6.19 W |
+| 30/s, 4 minutes, CPU (as Lumis recorded before) | 7200, 0 | 16.9 ms, 38.4 most | 70 C at a minute, 74 at two, 78 at four and climbing | 6.5 W |
+| the camera alone, 30/s, nothing coded (rawrec job 8) | | | 60 C | 4.9 W |
+| idle, the deck lit | | | | 1.8 W |
+
+Each run started at 45 to 50 C, the charger cut for the measure (`diag power`). The clips decoded bit exact on the device: the minute's four kept frames sample for sample, the digests run's 16 against their source hashes.
+
+**Where the power goes.** Recording adds about 1.3 W over the camera alone at 30/s on the GPU path (1.6 W on the CPU); the camera stream itself is most of it: 4.9 W against 1.8 W idle, the A715s 173/256 busy at 1572 MHz with nothing coded. That load (device threads on the A715s while the camera streams) is the next thing to measure (tools/flame) for a cooler desert.
+
+**Lumis's own path at 60/s** (2026-11-20, hand-spawned with the GPU's grants, cool starts at 45 C; lumis-rawvideo baeea3fd merged with this branch):
+- With DEV_VIDEO (source digests) the hand-over used to wait for its frame's packing: 16.9 ms on average, about 10 frames a second dropped from 13 s on. Since 6f7d2269 it waits for the frame's hashes alone (taken while the GPU runs): 55 of 1757 dropped in 32 s.
+- Without digests (the deck's path): 32 s at 60/s, 0 of 1759 dropped, the hand-over 8.1 ms, the GPU 6.1 ms. A whole minute: 0 dropped for about 30 s, then 200 to 420 dropped as the SoC passes 87 C (the GPU's runs stretching to 22 to 34 ms, the clusters' dividers stepping).
+- The heat is Lumis's beside the recorder's: 9.7 W at the battery recording with its preview off, against rawrec's 7.8 W for the same recording (71 C at a minute). Lumis's UI made a pass for every camera frame while recording (about 54 a second, 4.3 ms draw and 8.5 ms present each, with no new preview image). Capping the A510s at 1425 MHz while recording, or packing on the A715s alone, changed neither the heat nor the drops (measured, not kept).
+- A clip's first frame on the GPU path waits for its packing (7f31de4d): Lumis divides the room left by `stats().coded / frames`, and a 0 there panicked it at its first frame.
+- A kernel RAM-reloaded without its carried vault (FERROS_VAULT_CAPSULE) starts the stored vault, which predates the extent list and drop: `store extent-list` then says "vault error".
+
+**Not done yet**: the camera ring read by the GPU in place (the S2MPU fence opened to it read-only while recording) instead of the copy into the block; the bodies written compactly (each block's body touches its own cache line: about 25 MB a frame written by the GPU and read by the CPU against 4.8 MB of code); the GPU at a lower clock when the rate leaves room (the kernel's GPU clock is its top or its floor); the quad array (the GPU codes Bayer only; a quad clip stays on the CPU).
 
 ### A clip from the Pro to the host
 
@@ -225,7 +264,7 @@ To check a pulled clip, run clip-check on it: it opens the clip by its index (re
 ### What is not done
 
 - **The clip is not sealed (encrypted) at rest.** Every vault value is sealed with its domain's key; an extent's blocks are the clip's plain bytes, found only thru the record in the (sealed, mirrored) table, but readable by anyone holding the raw flash. Next (the coordinator's call, 2026-11-19): sealed by default under the domain's key, a per-clip switch off, its cost at 30/s measured first.
-- **Copies.** A write still goes thru the kernel's heap and the bounce at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue.
+- **Copies.** A write still goes thru the kernel's heap and the bounce at queue depth one; the next step is the UFS DMA reading the coded bands in place, completion by interrupt, and a queue. On the GPU path a frame is also copied once into the GPU block (1.7 ms; "On the GPU").
 - **UNMAP**: a deleted or dropped extent's blocks go back to the clips area's free list at once, but they are not unmapped on the flash (ferros sends no UNMAP), so the device's garbage collection and WriteBooster do not know they are free (2026-11-19: 23 agents' test clips, about 44 GB, dropped without one).
 - **The pull** is the bridge's 3 MiB a command thru the kernel's vault channel; a faster path (bulk USB straight from the extent) is open.
 

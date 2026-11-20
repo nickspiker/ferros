@@ -83,7 +83,7 @@ fn usage() {
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
-    eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | kinds   The hold, as the person (`items` alone for the flags)");
+    eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | usage | kinds   The hold, as the person (`items` alone for the flags)");
     eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
@@ -1052,6 +1052,19 @@ async fn cmd_store(args: &[String]) {
             p.extend_from_slice(args[1].as_bytes());
             (ferros_pt::Op::Read, p)
         }
+        // store extent-drop-orphan <first block>: a sealed extent at that first block dropped whatever domain owns it (development builds; for an extent whose owning build no longer exists, so no --kist can name its domain).
+        Some("extent-drop-orphan") if args.len() >= 2 => {
+            let first: u64 = args[1].parse().unwrap_or_else(|_| {
+                eprintln!("Usage: ferros-bridge store extent-drop-orphan <first block>");
+                std::process::exit(1)
+            });
+            let mut p = vec![0xF8u8];
+            p.extend_from_slice(&first.to_le_bytes());
+            // A scope's name, never looked up: the kernel's G#F8 takes the name field as G#FA does.
+            p.push(0);
+            p.extend_from_slice(b"test.orphan");
+            (ferros_pt::Op::Read, p)
+        }
         // store extent-list <name> [--kist <capsule|bin>]: every extent of the clips area as records, those of the name's domain marked (the name a scope's full name, `test.x` for std/rawrec's, or with --kist any name: it is not looked up); store extent-drop <first block> <name> [--kist ...]: the domain's extent at that first block dropped (a clip whose name is lost).
         Some(c @ ("extent-list" | "extent-drop")) if args.len() >= 2 => {
             let bad = || -> ! { eprintln!("Usage: ferros-bridge store extent-list <name> [--kist <capsule|bin>] | extent-drop <first block> <name> [--kist <capsule|bin>]"); std::process::exit(1) };
@@ -1134,7 +1147,7 @@ async fn cmd_store(args: &[String]) {
                 println!("  first A#{} blocks A#{} bytes A#{} sealed {} at A#{} owner {}{}", u(0), u(8), u(16), r[24] != 0, u(25) as i64, r[33..41].iter().map(|b| format!("{b:02X}")).collect::<String>(), if &r[33..65] == mine { " (this domain's)" } else { "" });
             }
         }
-        "extent-drop" => println!("dropped"),
+        "extent-drop" | "extent-drop-orphan" => println!("dropped"),
         _ => println!("removed"),
     }
 }

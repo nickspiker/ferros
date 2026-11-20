@@ -114,6 +114,7 @@ fn usage() -> ! {
     eprintln!("  get <handle> <out> [--from N] [--bytes N]   The body (or a range of it) streamed into out, a MiB a command");
     eprintln!("  put <kind> <file> [--title T] [--clip]      A file kept as an item; --clip: a single-copy body (a RAW clip), written once, never mirrored");
     eprintln!("  rm <handle>                             Removed, gone at once (no bin)");
+    eprintln!("  usage                                   What is on the device: the hold by kind, the clips area, each stowed kist's own domain");
     std::process::exit(1)
 }
 
@@ -215,6 +216,27 @@ pub async fn cmd_items(args: &[String]) {
             };
             println!("kept in A#{} ms:", t.elapsed().as_millis());
             show(&h, &c);
+        }
+        "usage" => {
+            let t = std::time::Instant::now();
+            let u = hold.usage().unwrap_or_else(|e| fail(e));
+            println!("what is on the device ({} ms):", t.elapsed().as_millis());
+            let (n, b) = u.kinds.iter().fold((0, 0), |(n, b), k| (n + k.items, b + k.bytes));
+            println!("the hold: A#{n} items, A#{b} bytes");
+            for k in &u.kinds {
+                println!("  {:28} A#{} items, A#{} bytes", kinds::phrasing(&k.kind).map(String::from).unwrap_or_else(|| hex(&k.kind[..8])), k.items, k.bytes);
+            }
+            if let Some(c) = u.clips {
+                println!("the clips area: A#{} blocks (A#{} GiB), A#{} taken, A#{} free, the longest free stretch A#{} blocks", c.blocks, c.blocks >> 18, c.taken, c.blocks - c.taken, c.largest_free);
+            }
+            println!("the stowed kists' own domains:");
+            for k in &u.kists {
+                let size = match (k.values, k.bytes) {
+                    (Some(v), Some(b)) => format!("A#{v} values, A#{b} bytes"),
+                    _ => String::from("not sized"),
+                };
+                println!("  {:16} {size}, its clips A#{} blocks", if k.name.is_empty() { "(not in the list)" } else { k.name.as_str() }, k.clip_blocks);
+            }
         }
         "rm" if args.len() >= 2 => {
             hold.remove(&handle_of(&args[1])).unwrap_or_else(|e| fail(e));

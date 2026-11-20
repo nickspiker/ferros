@@ -145,6 +145,38 @@ impl<T: Transport> Hold<T> {
         Ok((done, size))
     }
 
+    /// One usage call sizing `kists` (each its developer and option; at most `wire::USAGE_KISTS`).
+    pub fn usage_of(&mut self, kists: &[([u8; 32], [u8; 32])]) -> Result<wire::Usage> {
+        let mut payload = Vec::with_capacity(kists.len() << 6);
+        for (d, o) in kists {
+            payload.extend_from_slice(d);
+            payload.extend_from_slice(o);
+        }
+        let mut room = alloc::vec![0u8; 1 << 14];
+        let mut n = self.call(wire::OP_USAGE, &[0; 32], 0, &payload, &mut room)? as usize;
+        if n > room.len() {
+            room.resize(n, 0);
+            n = self.call(wire::OP_USAGE, &[0; 32], 0, &payload, &mut room)? as usize;
+        }
+        // WHY: the value is the vault's; an answer that grew past its room between the two asks is refused, not read short.
+        wire::parse_usage(room.get(..n).ok_or(Error::TooLarge)?)
+    }
+
+    /// What is on the device, read only: the hold's totals by kind, the clips area, and every stowed kist with its own domain's size (one call to learn the kists, then one a `wire::USAGE_KISTS` of them to size them).
+    pub fn usage(&mut self) -> Result<wire::Usage> {
+        let mut u = self.usage_of(&[])?;
+        let ids: Vec<([u8; 32], [u8; 32])> = u.kists.iter().map(|k| (k.developer, k.option)).collect();
+        for batch in ids.chunks(wire::USAGE_KISTS) {
+            let sized = self.usage_of(batch)?;
+            for s in sized.kists.into_iter().filter(|s| s.bytes.is_some()) {
+                if let Some(k) = u.kists.iter_mut().find(|k| k.developer == s.developer && k.option == s.option) {
+                    *k = s;
+                }
+            }
+        }
+        Ok(u)
+    }
+
     /// Removed, gone at once: its card, its body, a clip's extent. No bin.
     pub fn remove(&mut self, handle: &[u8; 32]) -> Result<()> {
         self.call(wire::OP_REMOVE, handle, 0, &[], &mut []).map(|_| ())

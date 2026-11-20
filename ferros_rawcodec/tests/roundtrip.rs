@@ -79,16 +79,27 @@ struct Coders {
     out: Vec<u8>,
     pout: Vec<u8>,
     dst: Vec<u16>,
+    info: Vec<u32>,
+    codes: Vec<u16>,
+    sout: Vec<u8>,
 }
 
 impl Coders {
     fn new() -> Coders {
-        Coders { work: Box::new(Work::new()), pwork: Box::new(raw_codec::Work::new()), out: Vec::new(), pout: Vec::new(), dst: Vec::new() }
+        Coders { work: Box::new(Work::new()), pwork: Box::new(raw_codec::Work::new()), out: Vec::new(), pout: Vec::new(), dst: Vec::new(), info: Vec::new(), codes: Vec::new(), sout: Vec::new() }
     }
-    /// One band: encode, the prototype identity, decode, compare; returns la + lb.
+    /// One band: encode, the prototype identity, the split coder's identity, decode, compare; returns la + lb.
     fn band(&mut self, src: &[u8], stride: usize, w: usize, rows: usize, cfa: Cfa, want: &[u16], what: &str) -> usize {
         self.out.resize(max_band_len(w, rows), 0);
         let (la, lb) = encode_band(src, stride, w, rows, cfa, &mut self.work, &mut self.out);
+        // The split coder (a GPU's first half, the CPU's packing) gives the same bytes.
+        self.info.resize(rows * row_blocks(w), 0);
+        self.codes.resize(rows * w, 0);
+        self.sout.resize(max_band_len(w, rows), 0);
+        split_codes(src, stride, w, rows, cfa, &mut self.work, &mut self.info, &mut self.codes);
+        let (sa, sb) = pack_band(&self.info, &self.codes, w, rows, cfa, &mut self.work, &mut self.sout);
+        assert_eq!((sa, sb), (la, lb), "{what}: the split coder's lengths");
+        assert!(self.sout[..sa + sb] == self.out[..la + lb], "{what}: the split coder's bytes differ");
         let pcfa = if cfa == Cfa::Quad { raw_codec::Cfa::Quad } else { raw_codec::Cfa::Bayer };
         self.pout.resize(raw_codec::max_encoded_len(w, rows), 0);
         let pn = raw_codec::encode_band(src, stride, w, rows, pcfa, &raw_codec::Params::DEFAULT, None, &mut self.pwork, &mut self.pout);
@@ -221,6 +232,24 @@ fn real_frames() {
             assert_eq!(n, coded);
         }
         let packed = w * h * 10 / 8;
-        println!("{}: A#{} x A#{}, coded A#{} bytes, ratio A#{:.3}, A#{:.3} bits a pixel, encode A#{:.1} ms (one core), identity and round trip exact", t[0], w, h, coded, packed as f64 / coded as f64, coded as f64 * 8. / (w * h) as f64, best * 1e3);
+        // The split coder's halves timed apart: the first (a GPU's) and the packing (the CPU's), the best of four.
+        let nb = row_blocks(w);
+        let (mut info, mut codes) = (vec![0u32; BAND_ROWS * nb], vec![0u16; BAND_ROWS * w]);
+        let (mut first, mut second) = (f64::MAX, f64::MAX);
+        for _ in 0..4 {
+            let (mut a, mut b) = (0f64, 0f64);
+            for k in 0..bands(h) {
+                let rows = band_rows(h, k);
+                let t0 = Instant::now();
+                split_codes(&raw[band_src(k, h, w, stride)], stride, w, rows, cfa, &mut c.work, &mut info, &mut codes);
+                let t1 = Instant::now();
+                pack_band(&info, &codes, w, rows, cfa, &mut c.work, &mut out);
+                a += (t1 - t0).as_secs_f64();
+                b += t1.elapsed().as_secs_f64();
+            }
+            first = first.min(a);
+            second = second.min(b);
+        }
+        println!("{}: A#{} x A#{}, coded A#{} bytes, ratio A#{:.3}, A#{:.3} bits a pixel, encode A#{:.1} ms (one core), split: first half A#{:.1} ms, packing A#{:.1} ms; identity and round trip exact", t[0], w, h, coded, packed as f64 / coded as f64, coded as f64 * 8. / (w * h) as f64, best * 1e3, first * 1e3, second * 1e3);
     }
 }

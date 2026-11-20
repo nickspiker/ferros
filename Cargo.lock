@@ -1110,6 +1110,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-holdtest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_heap",
+ "ferros_items",
+ "ferros_sys",
+ "vsf 0.11.0",
+]
+
+[[package]]
 name = "ferros-payload-httptest"
 version = "0.1.0"
 dependencies = [
@@ -1429,6 +1440,7 @@ dependencies = [
  "blake3",
  "ferros_heap",
  "ferros_items",
+ "ferros_kist",
  "ferros_store",
  "ferros_sys",
  "manifestus",

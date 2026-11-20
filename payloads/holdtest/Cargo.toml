@@ -1,0 +1,17 @@
+[package]
+name = "ferros-payload-holdtest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "holdtest"
+path = "src/main.rs"
+
+[dependencies]
+ferros_sys = { path = "../../ferros_sys" }
+ferros_heap = { path = "../../ferros_heap" }
+# The hold's calls as a kist makes them (`kist::Hold` over `kist::Sys`), the kinds.
+ferros_items = { path = "../../ferros_items" }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+vsf = { path = "../../../vsf", default-features = false }

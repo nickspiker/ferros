@@ -49,6 +49,8 @@ pub trait Clips<S> {
     fn remove(&mut self, s: &mut S, name: &[u8; 32], now: i64) -> Result<(), ()>;
     /// Its record, None when the table has none.
     fn record(&mut self, s: &mut S, name: &[u8; 32]) -> Option<Rec>;
+    /// The area's blocks, the blocks every extent takes, the longest free stretch; None without a table.
+    fn space(&mut self, s: &mut S) -> Option<wire::ClipsUse>;
 }
 
 /// A single-copy body's name in the extents' table: the items domain's address key and the item's id, never stored (the table carries no keys).
@@ -152,6 +154,36 @@ impl Server {
         n
     }
 
+    /// Before every call: another person's domain, or the first call since the vault started or the person locked, and what was held goes and the domain is swept once (a body whose card never landed); then the open clips reconciled.
+    fn enter<A: BlockDev, B: BlockDev, N: Nonces, X: Clips<Store<A, B, N>>>(&mut self, store: &mut Store<A, B, N>, d: &Domain, now: i64, clips: &mut X) {
+        let owner = clip_owner(d);
+        if self.domain != Some(owner) {
+            self.forget();
+            self.domain = Some(owner);
+            let _ = self.items.sweep(store, d, now);
+        }
+        self.reconcile(store, d, now, clips);
+    }
+
+    /// What is on the device (`wire::OP_USAGE`, read only): the hold's totals by kind, the clips area, and `kists` as the vault found them (each stowed kist from the person's list, sized where the call named it and the kernel stamped its domain). The call's rights were the kernel's to check (the `items` right, the person present).
+    pub fn usage<A: BlockDev, B: BlockDev, N: Nonces, X: Clips<Store<A, B, N>>>(&mut self, store: &mut Store<A, B, N>, d: &Domain, kists: Vec<wire::KistUse>, out: &mut [u8], room: usize, now: i64, clips: &mut X) -> Answer {
+        self.enter(store, d, now, clips);
+        let kinds = match self.items.totals(store, d) {
+            Ok(t) => t.into_iter().map(|(kind, items, bytes)| wire::KindUse { kind, items, bytes }).collect(),
+            Err(e) => return refused(e),
+        };
+        let u = wire::Usage { kinds, clips: clips.space(store), kists };
+        match wire::usage(&u, now) {
+            Ok(doc) => {
+                // WHY: the room is the caller's; the value says the whole length, so a short room asks again with more.
+                let n = doc.len().min(room).min(out.len());
+                out[..n].copy_from_slice(&doc[..n]);
+                ok(doc.len() as u64, n)
+            }
+            Err(e) => refused(e),
+        }
+    }
+
     /// One call: `rest` is [the caller's stamp][the call] (process.rs `items_forward`), `out` the reply's room after its value word; `random` draws 32 fresh bytes.
     pub fn serve<A: BlockDev, B: BlockDev, N: Nonces, X: Clips<Store<A, B, N>>>(&mut self, store: &mut Store<A, B, N>, d: &Domain, rest: &[u8], out: &mut [u8], now: i64, random: &mut dyn FnMut() -> [u8; 32], clips: &mut X) -> Answer {
         let Some((caller, call)) = Caller::from_stamp(rest) else { return refused(Error::Format) };
@@ -159,13 +191,7 @@ impl Server {
         // WHY: the length is the caller's: the reply fills no more than the room the kernel gave it.
         let room = out.len().min(len as usize);
         let owner = clip_owner(d);
-        if self.domain != Some(owner) {
-            // Another person's domain, or the first call since the vault started or the person locked: what was held goes, and the domain is swept once (a body whose card never landed).
-            self.forget();
-            self.domain = Some(owner);
-            let _ = self.items.sweep(store, d, now);
-        }
-        self.reconcile(store, d, now, clips);
+        self.enter(store, d, now, clips);
         let tag = caller.tag();
         match op {
             wire::OP_MAKE | wire::OP_KEEP_AGAIN => {
@@ -312,6 +338,8 @@ impl Server {
                     Err(e) => refused(e),
                 }
             }
+            // The kists' part is the vault's (it reads the person's list and sizes the domains the kernel stamped, then calls `usage`); here the hold and the clips area alone.
+            wire::OP_USAGE => self.usage(store, d, Vec::new(), out, room, now, clips),
             _ => refused(Error::Format),
         }
     }

@@ -756,6 +756,26 @@ impl Items {
         Ok(out)
     }
 
+    /// The hold's totals by kind, every item counted whoever made it: (kind, items, body bytes), kinds in order (what is on the device, `serve` OP_USAGE). Reads every page once; they stay held as a find's do.
+    pub fn totals<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<Vec<([u8; 32], u64, u64)>> {
+        self.load_root(store, d)?;
+        let n = self.root.as_ref().ok_or(Error::Format)?.len();
+        let mut out: Vec<([u8; 32], u64, u64)> = Vec::new();
+        for ri in 0..n {
+            let pi = self.page(store, d, ri)?;
+            for c in &self.pages[pi].cards {
+                match out.binary_search_by(|t| t.0.cmp(&c.kind)) {
+                    Ok(i) => {
+                        out[i].1 += 1;
+                        out[i].2 += c.size;
+                    }
+                    Err(i) => out.insert(i, (c.kind, 1, c.size)),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Every item of the domain gone (release: the person's items leave the device with their domains, AUTH.md): each page's stored bodies, the pages, the root and the hold's lists. The hold's values are off ferros_store's list, so `drop_domain` alone would leave them; the vault calls this first. Single-copy bodies' extents are the vault's to drop (by their owner tag). How many items went.
     pub fn drop_all<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<u64> {
         self.forget();
