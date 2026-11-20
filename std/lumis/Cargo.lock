@@ -1261,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_rawcodec",
+ "valhall",
  "vsf",
 ]
 
@@ -5440,6 +5441,10 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valhall"
+version = "0.1.0"
 
 [[package]]
 name = "version-compare"

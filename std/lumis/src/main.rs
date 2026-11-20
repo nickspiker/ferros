@@ -217,7 +217,8 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
         match ferros_clip::Recorder::start(&clip_cam, &mode, Box::new(ferros_clip::ferros::ExtentSink(ferros_clip::ferros::Extent::new(slot, &name)))) {
             Ok(rec) => {
                 let room = ext.info().map_or(blocks, |i| i.blocks) * ferros_clip::BLOCK as u64;
-                println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation})", cam.name, pacing.fps, room >> 20);
+                // What codes it: the GPU when Lumis holds its grants (a kist's GPU slots, a spawn's --use gpu --dma layers; 60 a second held on the Pro, 2026-11-20), else the CPU's workers and why.
+                println!("lumis: camera {}: RAW video: recording {name} at {} a second ({} MiB of room, orientation {orientation}); coded by {}", cam.name, pacing.fps, room >> 20, rec.gpu_note());
                 // Its row in Lumis's clips list from its start (the clips page; a clip never closed shows as such).
                 lumis_core::clips::put(lumis_core::clips::Clip { name: name.clone(), frames: 0, bytes: 0, fps: pacing.fps, at, seal: None });
                 let now = std::time::Instant::now();
@@ -257,6 +258,9 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
     use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
     let ms = clip.began.elapsed().as_millis();
     let cam = clip.cam;
+    // The GPU's own counts, when it coded the clip (the hand-over's time is code_us_* on that path, the GPU's runs and the packers behind it these).
+    // WHY the max: a clip can end before the GPU has run a frame, and the average of none is said as 0.
+    let gpu = clip.rec.gpu().map(|g| format!("; the GPU: {} runs, {} us at most, {} on average; the packers behind it {} us at most{}", g.runs, g.run_us_most, g.run_us_sum / g.runs.max(1), g.behind_us_most, g.failed.map(|e| format!(", failed: {e}")).unwrap_or_default())).unwrap_or_default();
     let info = clip.rec.stop();
     let s = info.stats;
     if let Some(header) = header {
@@ -290,6 +294,9 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
         s.code_us_sum / s.frames.max(1),
         info.error.map(|e| format!("; {e}")).unwrap_or_default()
     );
+    if !gpu.is_empty() {
+        println!("lumis: camera {cam}: RAW video: {}{gpu}", clip.name);
+    }
 }
 
 /// Whether what was taken is a slit.
