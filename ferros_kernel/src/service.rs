@@ -306,7 +306,8 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: n, got: alloc::vec::Vec::new(), one: info.then_some((crate::process::EOP_INFO, crate::process::EXTENT_INFO as u32)), kist: Some((developer, option)) }
         }
         // The clips area's records (G#FB) or a drop of one of the domain's extents by its first block (G#FA), for the bridge's `store extent-list` / `extent-drop`: [code][first block u64][1: a kist's domain follows (developer 32, option 32), 0: a scope's][name], the name a scope's full name (or any of the kist's: it is not looked up). Never from a process (`extent_forward` refuses both ops).
-        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFB) | Some(&0xFA)) && params.len() > 10 => {
+        // G#F8, the bridge's `store extent-drop-orphan`: a sealed extent dropped by its first block whatever domain owns it, for one whose owning build no longer exists (development builds only, as this whole path is; the name is not looked up).
+        ferros_pt::Op::Read if matches!(params.first(), Some(&0xFB) | Some(&0xFA) | Some(&0xF8)) && params.len() > 10 => {
             let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
             let (kist, at) = if params[9] == 1 { (Some((params.get(10..42)?.try_into().ok()?, params.get(42..74)?.try_into().ok()?)), 74) } else { (None, 10) };
             let rel = params.get(at..)?;
@@ -314,7 +315,11 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             if rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
                 return Some(Err(alloc::vec![5]));
             }
-            let one = if params[0] == 0xFB { (crate::process::EOP_LIST, 1 << 16) } else { (crate::process::EOP_DROP_AT, 0) };
+            let one = match params[0] {
+                0xFB => (crate::process::EOP_LIST, 1 << 16),
+                0xFA => (crate::process::EOP_DROP_AT, 0),
+                _ => (crate::process::EOP_DROP_ORPHAN, 0),
+            };
             VaultJob::Extent { full: alloc::string::String::from_utf8(rel.to_vec()).ok()?, block, left: 0, got: alloc::vec::Vec::new(), one: Some(one), kist }
         }
         ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },

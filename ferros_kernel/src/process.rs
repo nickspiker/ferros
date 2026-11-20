@@ -4091,6 +4091,8 @@ pub const EOP_SPACE: u8 = 6;
 /// The kernel's own channel only, for the bridge (service.rs `store_job` G#FB and G#FA; refused from a process here, as every op past EOP_SPACE is): the clips area's records (the caller's domain's owner hash, then first, blocks, bytes, sealed, at, owner a record), and a drop of the caller's domain's extent at a first block (its name a derived key that may be lost).
 pub const EOP_LIST: u8 = 7;
 pub const EOP_DROP_AT: u8 = 8;
+/// The kernel's own channel only (service.rs `store_job` G#F8, development builds): a sealed extent dropped by its first block whatever domain owns it, for one whose owning build no longer exists; refused from a process as every op past EOP_SPACE is.
+pub const EOP_DROP_ORPHAN: u8 = 9;
 pub const EXTENT_SPACE: usize = 5 * 8;
 
 /// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.
