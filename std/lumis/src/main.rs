@@ -1048,7 +1048,19 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             close_camera(&cam.name);
             src = match want {
                 // Opened with no shutter of its own (the open's least, a line), as std/rawrec opens: the driver takes no integration past the paced frame at the open ("no such mode (Integration(21342, 10586))", 2026-11-19, the Pro: Lumis's 67 ms in a 30 a second frame), while a SET is planned, the frame lengthened when the shutter is longer; the settings are all sent again after a reopen.
-                Some(fps) => match open(&cam, false, Some((ferros_clip::Pacing::of(fps), 0))) {
+                // The stored driver ends at the CLOSE and starts again on demand; an OPEN that lands while the old one exits finds no server ("the camera driver did not answer the open", 2026-11-19, the Pro: answered 3 ms after the CLOSE, the owner's 60 a second lost to it), so a refused one is asked again, 2^8 ms apart, up to 2^2 times.
+                Some(fps) => match (0..1 << 2).find_map(|k| {
+                    if k > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1 << 8));
+                    }
+                    match open(&cam, false, Some((ferros_clip::Pacing::of(fps), 0))) {
+                        Err(Refused::Why(why)) if k + 1 < 1 << 2 => {
+                            println!("lumis: camera {}: RAW video's open at {fps} a second refused ({why}); asking again", cam.name);
+                            None
+                        }
+                        r => Some(r),
+                    }
+                }).expect("the last try answers") {
                     Ok(s) => {
                         paced = want;
                         read_space(&mut *integrator.header);
@@ -1253,7 +1265,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 };
                 let index = c.rec.stats().frames;
                 // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"): the hand-over on a scoped thread of its own, the integration here, both done before the next MAP gives the buffer back; the preview then costs the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
-                let preview_now = c.preview.elapsed() >= preview_gap();
+                // No preview in a clip's first 2^10 ms: its first hand-overs run slow while the coder's workers start (40 to 64 ms on the Pro, 2026-11-20), and a preview beside them lost 8 of the first 9 frames.
+                let preview_now = c.preview.elapsed() >= preview_gap() && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10);
                 let (taken, code_us) = if preview_now {
                     c.preview = std::time::Instant::now();
                     let rec = &mut c.rec;
