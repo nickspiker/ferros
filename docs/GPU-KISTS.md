@@ -502,6 +502,18 @@ The camera ring cacheable by default: camtest 11 again, every word of every fram
 
 **The flashed kernel with the new service** (the 8a rebooted to forge fe1783a0 at the end, the new `gpu` stored): the service starts ("the clock the kernel's (no gpu-clock grant)"), calls work (gputest's Mandelbrot, 0 of 4096 off), a queue's open is refused cleanly (status 1: that kernel has no hold), the fence clean. So the new service stays stored.
 
+### Measured on the Pro (2026-11-20, forge 5465ef7f flashed)
+
+forge 5465ef7f (gpu-kists-lumis merged) flashed on both of the Pro's slots (the gate's own hv "18259 ufs core" reused, the Linux Image keys/husky/images/linux_Image_husky_2026-10-17, the vault carried; signed, read back equal: keys/husky/images/boot_gpu-kists_5465ef7f_vaultcarried.img, blake3 f1eb53ae...; the slots before in keys/husky/images/before-gpu-kists-2026-11-20/, the `gpu` capsule before in keys/husky/capsules-before-gpu-kists-2026-11-20/). Cold boot thru the hv's gate: the vault from the kernel image, identity unlocked at boot, the deck's 12 circles and their icons, the seven pucks, the new GPU service serving calls and queues, the clock by the queues.
+
+- **Submit to done** (gputest 0E; least / mean / most, µs): an empty kernel one at a time, submit to wake 54 / 66 / 607, the GPU's own 1 / 4 / 354, doorbell to the GPU's start 8 / 9 / 154; four in flight 22 µs a job; thru calls 74 / 91 / 121. The band coder thru the queue 5413 / 5938 / 6347 (the GPU's own 5204 / 5697 / 6057), thru calls 5368 / 5798 / 6683. Lumis's ops (0F): 0 wrong.
+- **A RAW clip at 60 a second, coded on the GPU** (std/rawrec, the binned main, four A715 and four A510 workers, 16 s): 960 frames, 0 dropped, the GPU 5.8 ms a frame on average (7.0 the most), the hand-over 11.1 ms, 940 MB/s while writing, sealed; read back by its index and every 8th frame decoded on the device bit exact (120 of 120); 77 C at the end. With the A715s alone it dropped 8 a second (the packing is the CPU's). Deleted after.
+- **The camera ring on the GPU** (camtest 11, the main, 4080 × 3072): every word of every frame equal to the CPU's view; a whole frame's copy 935 µs non-cacheable, 849 cacheable with the invalidate; a store into it a permission fault; CLOSE with a job in flight stopped it (`E_CAMERA`), unmapped after.
+- **A kernel a display frame** (gputest 10): at rest the Pro's display starts a frame only at its dither's flips (every 100 ms; 8.35 ms the shortest spacing), and injected drags did not make it present faster, so the run went at about 10 frames a second: the clock 1 turn up and 1 down for the run; frame start to an empty job's end 40 / 492 / 664 and 43 / 385 / 646 µs, the cores powering off between 100 ms frames (the delay 1.25 times the shortest spacing seen, 10.4 ms). To measure at 120 under a kist that draws every frame.
+- The GPU's fence clean after every run.
+
+Not done on the Pro: the camera in Lumis and a Lumis recording by hand (the deck's circles are not placed from the host without the screen), and the jump (the owner's to be around for).
+
 ## 4. Open questions for the owner
 
 0. **The kernel's form in a capsule:** WGSL text means a parser for untrusted text on the device (the rule against string parsers); proposal: WGSL parsed on the developer's side, the capsule carrying a typed form (naga's IR as VSF, or SPIR-V), validated on the device.
