@@ -63,6 +63,7 @@ members = [
     "payloads/gpu",
     "payloads/wintest",
     "payloads/gputest",
+    "payloads/compbench",
     "payloads/hive",
     "payloads/ahau",
     "payloads/epcall",

@@ -1,0 +1,19 @@
+[package]
+name = "compbench-check"
+version = "0.1.0"
+edition = "2021"
+description = "The compose bench's GPU kernels (payloads/compbench) run on the host in valhall's emulator and checked against fluor's own compose of the same frame: the G2t16 output bit for bit, the bake and the present to within their float rounding"
+
+[[bin]]
+name = "compbench-check"
+path = "src/main.rs"
+
+[dependencies]
+valhall = { path = "../../valhall", features = ["ssa", "sim"] }
+fluor = { path = "../../../fluor", default-features = false, features = ["std"] }
+libm = "0.2"
+
+[profile.release]
+debug = 1
+
+[workspace]

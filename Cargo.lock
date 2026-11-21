@@ -975,6 +975,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-compbench"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "fluor",
+ "libm",
+ "valhall",
+]
+
+[[package]]
 name = "ferros-payload-copybench"
 version = "0.1.0"
 dependencies = [

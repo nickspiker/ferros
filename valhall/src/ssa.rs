@@ -1852,7 +1852,12 @@ fn compile_rec(rec: Rec) -> Compiled {
             }
         }
     }
-    k.last().end();
+    // A kernel whose stores are all inside its loop ends on the loop's branch, which carries its own flow (reconverge), and the loop's exit is bound past it: a NOP ends it there, the exit's landing (compbench's half-row walk, 2026-11-21).
+    if k.last_flow() != 0 {
+        k.nop().end();
+    } else {
+        k.last().end();
+    }
     let words = k.finish().to_vec();
     for (p, at) in patches {
         params[p as usize].words.push(at);
