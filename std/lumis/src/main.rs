@@ -1005,6 +1005,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut quiet: Option<[u64; 2]> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
     let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
+    // Said once at the open, as every other reason Slitscan takes whole frames is (the slit is the driver's binned mode's, so another readout of the camera, its 1:1 or a crop, has none of its own).
+    if cam.mode != 0 {
+        println!("lumis: camera {}: readout {} ({} x {}) has no slit of its own: Slitscan takes whole frames on it", cam.name, cam.mode, cam.width, cam.height);
+    }
     // RAW video: the rate the camera is open at (None: opened as ever, not paced), and the clip recording.
     let mut paced: Option<u32> = None;
     // A rate whose RAW video open the driver refused (until another is chosen).
