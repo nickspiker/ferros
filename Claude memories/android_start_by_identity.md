@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 434f1d40-b023-4c88-80b3-11913c5cd18f
-  modified: 2026-11-21T20:53:55.349Z
+  modified: 2026-11-21T20:56:14.425Z
 ---
 
 Owner, 2026-11-21, asked whether the hv should hold the ira and wairua under Android so both OSes share one machine identity: "Since the long term goal is to not Android, maybe we keep the plate and papers since it would match if ferros was not installed. Not opposed to triggering a reboot to enter Android as long as ferros controls it, i.e. Android cannot be started unless the attested identity chose to start it."
@@ -17,7 +17,7 @@ Owner, 2026-11-21, asked whether the hv should hold the ira and wairua under And
 
 **Still binding from 2026-11-01** ([[android_behind_attestation]]): turning on the Android-only-by-identity mode for a person needs the disclaimer and typed confirmation first (it costs emergency calling without the handle).
 
-**How to apply:** remove every path that starts Android without the attested identity (the gate's volume-down choice, `diag android` without a present identity, the 8a's separate slot a, which reboots into itself). The hv must hide the ANDROID_ONCE flag from Linux so Android cannot set its own next boot.
+**How to apply:** remove every production path that starts Android without the attested identity (the gate itself is development-only, below; `diag android` without a present identity, the 8a's separate slot a, which reboots into itself). The hv must hide the ANDROID_ONCE flag from Linux so Android cannot set its own next boot.
 
 Related: [[ferros_attest_os_level]], [[hv_chords_decided]], [[ufs_firewall_decided]].
 
