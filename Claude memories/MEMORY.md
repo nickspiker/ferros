@@ -93,6 +93,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [ferros wake policy](ferros_wake_policy_prox_gate.md) - lights only on power press + prox far + no touch; nothing turns it off
 - [Colourspace pinned: VSF gamma2tanh](colourspace_pinned_vsf_gamma2tanh.md) - panel roll-off is THE profile, also for Mahere
 - [Android behind attestation](android_behind_attestation.md) - off by default, opt in after attest + disclaimer; no launcher
+- [Android starts by identity](android_start_by_identity.md) - Android keeps Google's plate and papers; starts only by a ferros reboot the attested identity chose; start-into setting
 - [hv chords](hv_chords_decided.md) - power+vol up jumps to ferros, vol up+down kills; hv core 3 takes the key SPIs
 - [UFS firewall decided](ufs_firewall_decided.md) - hv refuses Android boot-chain writes + UFS reset; built 2026-11-01
 - [Firmware validate on demand](firmware_validate_on_demand.md) - no per-boot chain hashing; informational, never a green badge
