@@ -903,8 +903,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
     };
     let mut turns = Turns::default();
-    // The last frame taken, by the driver's count and Eagle ns: the sensor's rate from one to the next (`set_sensor_rate`).
-    let mut last_frame: Option<(u32, i64)> = None;
+    // The last frame or slit taken (whether a slit, the driver's count, Eagle ns): the sensor's rate from one to the next (`set_sensor_rate`).
+    let mut last_frame: Option<(bool, u64, i64)> = None;
     let first = if dev_slit {
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
         let shutter_ns = match dev_shutter_us() {
@@ -1011,6 +1011,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     }
     // RAW video: the rate the camera is open at (None: opened as ever, not paced), and the clip recording.
     let mut paced: Option<u32> = None;
+    // The driver's count from which frames run at `paced`'s length after a frame length SET in place (0: from the open).
+    let mut paced_from: u64 = 0;
     // A rate whose RAW video open the driver refused (until another is chosen).
     let mut refused_fps: Option<u32> = None;
     // A clip being started (`start_clip` on its own thread): its answer, taken at the first turn after it comes.
@@ -1051,6 +1053,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             println!("lumis: development: Slitscan");
             integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
         }
+        // Out of Slitscan on whole frames, slits are asked for again at the next entry: a slit that failed or stopped once (a driver restart, a refused open) cost Slitscan its slits for the rest of the camera's session, its reason said once and every later entry silent on whole frames (the owner, 2026-11-20: "it's doing it again ... it actually says 14.9:F"). Each entry tries once and says why when it cannot.
+        if !slit_ok && !wants_slits(&integrator.header) && !src.is_slit() && knobs & DEV_COPY == 0 && cam.mode == 0 {
+            slit_ok = true;
+        }
         // Slitscan takes slits, every other mode whole frames: the camera is closed (the driver ends) and opened again for the other (owner, 2026-11-18: "Do wire it up so I get more than 30 lines per second"). The new driver starts at the init's settings, so the integrator's are sent again.
         if slit_ok && wants_slits(&integrator.header) != src.is_slit() {
             let slit = !src.is_slit();
@@ -1088,6 +1094,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             sent = (-1, -1, -1.);
             paced = None;
             turns = Turns::default();
+            // A reopen starts the driver's count over: its frames are at their length from the first.
+            paced_from = 0;
             reopened = Some((t_close, std::time::Instant::now()));
         }
         // RAW video's rate is fixed at the camera's open (the driver has no SET for it): entering RAW video, a new rate (the UI holds it while a clip records) or leaving it closes the camera and opens it again, paced or as ever. A clip still recording is ended first (the UI stops it on leaving the mode).
@@ -1100,6 +1108,31 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         let want = if video_ok && integrator.header[CURRENT_MODE_IDX] == RawMode::Video as u64 { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
         if refused_fps.is_some_and(|f| Some(f) != Some(video_fps(&integrator.header))) {
             refused_fps = None;
+        }
+        // Into or out of RAW video, or a new rate, on a camera streaming whole frames: the frame length SET in place (ferros_clip `Pacing::set_msg`, payloads/camera SET what 4; the owner, 2026-11-20: "from still to video, why the mode switch? it takes like 5 seconds"), the camera left running; only a refused SET (a driver from before it, a frame it cannot hold) closes and opens it again below. The frames at the new length are those SET_SETTLES or more past the last one taken (`paced_from`): no clip starts before them.
+        if want != paced && !src.is_slit() {
+            let msg = match want {
+                Some(fps) => ferros_clip::Pacing::of(fps).set_msg(),
+                None => ferros_clip::set_open_fll_msg(),
+            };
+            let mut r = [0u8; 4];
+            let n = sys::call_live(CAMERA, &msg, &mut r);
+            if n != sys::ERR && n >= 1 && r[0] == 0 {
+                if let Some(c) = CLIP.lock().unwrap().take() {
+                    end_clip(c, Some(&mut *integrator.header), "the rate changed");
+                }
+                paced_from = last_frame.map_or(0, |(_, c, _)| c + ferros_clip::SET_SETTLES);
+                match want {
+                    Some(fps) => {
+                        println!("lumis: camera {}: RAW video at {fps} a second, the frame length set in place (no reopen)", cam.name);
+                        read_space(&mut *integrator.header);
+                    }
+                    None => println!("lumis: camera {}: out of RAW video, the open's frame length set back in place (no reopen)", cam.name),
+                }
+                paced = want;
+            } else {
+                println!("lumis: camera {}: the frame length SET was refused ({}): the camera is opened again", cam.name, if n == sys::ERR { "no answer".to_string() } else { format!("answer {}", r[0]) });
+            }
         }
         if want != paced && !src.is_slit() {
             if let Some(c) = CLIP.lock().unwrap().take() {
@@ -1146,6 +1179,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             };
             sent = (-1, -1, -1.);
             turns = Turns::default();
+            paced_from = 0;
             reopened = Some((t_close, std::time::Instant::now()));
         }
         let slit_now = src.is_slit();
@@ -1169,6 +1203,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 src = reopen_whole(&cam, vault.as_deref(), &mut *integrator.header);
                 sent = (-1, -1, -1.);
                 turns = Turns::default();
+                paced_from = 0;
                 continue;
             }
             None => {
@@ -1221,14 +1256,16 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         } else if quiet != Some(heartbeat) {
             quiet = None;
         }
-        // F, the sensor's own rate (the owner, 2026-11-20): the frames the driver counted since the last one taken over the time its clock says passed, at every frame taken (one the preview passes over too), not Lumis's intake.
-        // WHY the order check: the count and the time are the driver's, and both start over when the camera reopens; that frame only starts the next measure.
-        if let Got::Frame(head, _) = &got {
-            if let Some((c0, t0)) = last_frame.filter(|&(c0, t0)| head.count > c0 && head.time > t0) {
-                integrator.set_sensor_rate((head.count - c0) as f64 * 1e9 / (head.time - t0) as f64);
-            }
-            last_frame = Some((head.count, head.time));
+        // F, the sensor's own rate (the owner, 2026-11-20): the frames, or in Slitscan the slits, the driver counted since the last one taken over the time its clock says passed, at every one taken (one the preview passes over too), not Lumis's intake. A slit's count and time are its record's (the owner: "the :Fps number up top is wrong for slitscan. I doubt it's 14": it kept the whole frames' rate).
+        // WHY the order and kind checks: the count and the time are the driver's, both start over when the camera reopens, and a slit's count is not a frame's; such a one only starts the next measure.
+        let stamp = match &got {
+            Got::Frame(head, _) => (false, head.count as u64, head.time),
+            Got::Slit { count, time, .. } => (true, *count, *time),
+        };
+        if let Some((_, c0, t0)) = last_frame.filter(|&(slit, c0, t0)| slit == stamp.0 && stamp.1 > c0 && stamp.2 > t0) {
+            integrator.set_sensor_rate((stamp.1 - c0) as f64 * 1e9 / (stamp.2 - t0) as f64);
         }
+        last_frame = Some(stamp);
         // A continuous save or a calibration integrates on: the integrator never ends Lumis on a quiet UI while either runs (lumis ferros-cal-behind).
         // Otherwise, behind (or in front again before the UI has drawn), nothing is integrated: the save on its way is the image already made, so it is started if asked for and not yet begun, kept when encoded, and Lumis leaves once nothing is left on its way.
         if !kept && quiet.is_some() {
@@ -1299,7 +1336,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
             }
             match (asked, clip.is_some(), starting.is_some(), paced, &got) {
-                (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) => {
+                (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) if head.count as u64 >= paced_from => {
                     let h = &integrator.header;
                     let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX], h[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX]);
                     let (c, head, line, digests) = (cam.clone(), *head, rows.line, dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES);
