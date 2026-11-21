@@ -1,8 +1,11 @@
 ---
 name: feedback-one-line
-description: Owner 2026-11-20 - ferros is one straight line: forge only, zero branches, no worktrees; agents commit straight to forge (fetch, rebase, push), one shared build farm, deleted leftovers
+description: "Owner 2026-11-20 - ferros is one straight line: forge only, zero branches, no worktrees; agents commit straight to forge (fetch, rebase, push), one shared build farm, deleted leftovers"
 metadata:
+  node_type: memory
   type: feedback
+  originSessionId: 434f1d40-b023-4c88-80b3-11913c5cd18f
+  modified: 2026-11-21T21:35:01.650Z
 ---
 
 Owner, 2026-11-20, on finding ~200 agent worktrees, 374 local and 124 remote branches, and Harbor 97% full: "I'd prefer to be on one straight line and it sounds like it got shrapneled pretty hard. Delete all, yes, should be zero branches."
@@ -11,6 +14,8 @@ Owner, 2026-11-20, on finding ~200 agent worktrees, 374 local and 124 remote bra
 - ferros has one branch, `forge`, locally and on origin. No feature branches, no tags as stand-ins for branches.
 - Work lands as linear commits on forge: fetch, rebase, push. No merge commits.
 - No per-agent worktrees: never `isolation: "worktree"` for ferros agents, never `.claude/worktrees`, never `target/agent-<name>` farms. One shared build farm; an agent that must not touch the owner's main checkout uses that one farm, sequentially (staged agents, [[feedback_keep_devices_busy]]).
+- The farm is /mnt/Harbor/Code/ferros/target/farm/ferros (a detached worktree; siblings symlinked beside it). ONE agent in it at a time: on 2026-11-21 two ran there at once, one pushed the other's commits and popped a stranger's stash. A second job waits, or works read-only. Never `git stash` in it.
+- Inside the farm `cargo el0` fails (the main checkout's .cargo alias array is appended to the farm's); run the expanded command. A string alias does not fix it (cargo refuses to merge a string into the main checkout's array).
 - Anything left over is deleted once its work is on forge.
 
 **Why:** the branches and worktrees scattered work (real GPS work sat on unmerged branches for days), caused collisions and confusion, and filled Harbor: each farm was 2 to 50 GB of build output, and the hourly btrfs snapshots kept every deleted build too.
