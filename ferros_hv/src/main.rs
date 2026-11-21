@@ -402,6 +402,8 @@ unsafe fn stage2_protect() {
     }
     done |= (whole as u64) << 1;
     report(0xD8, done);
+    let mut h = [0u8; 16];
+    pstore::log(&[b"\nferros hv: stage 2 keeps Linux off (bit 0 the ONCE page read-only, bit 1 the hv unmapped): ", pstore::hex(done, &mut h), b"\n"]);
 }
 
 /// Whether a stage-2 fault at `pa` is one of `stage2_protect`'s.

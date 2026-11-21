@@ -843,7 +843,7 @@ fn disclaimer_document() -> Option<alloc::vec::Vec<u8>> {
 
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The person's standing choice is still to be applied this boot (owner, 2026-11-21: "Start into: ferros / Android", PREF_START_INTO): set by main.rs only for a boot nobody answered (a production boot, or a development gate's untouched second; not a press of power, the chord's FERROS_ONCE, a refused recovery boot, the jump or a reload), taken by the service loop at the first attest: with the setting at Android on a device that allows it, the launch (`ANDROID_REQ`).
+/// The person's standing choice is still to be applied this boot (owner, 2026-11-21: "Start into: ferros / Android", settings.rs `START_ANDROID`): set by main.rs only for a boot nobody answered (a production boot, or a development gate's untouched second; not a press of power, the chord's FERROS_ONCE, a refused recovery boot, the jump or a reload), taken by the service loop at the first attest: with the setting at Android on a device that allows it, the launch (`ANDROID_REQ`).
 pub static START_INTO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A completed departure released the identity (SYS_UNLOCK op 4): the service loop restarts the device, which comes back at the attest screen (AUTH.md's "no way back to the attest screen" gap, closed the plain way).
 static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -3335,7 +3335,7 @@ pub fn run(mut b: Boot) -> ! {
         #[cfg(not(shim_handoff))]
         if START_INTO.load(core::sync::atomic::Ordering::Relaxed) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
             START_INTO.store(false, core::sync::atomic::Ordering::Relaxed);
-            let android = crate::process::pref(crate::process::PREF_START_INTO) == 1;
+            let android = crate::settings::START_ANDROID.load(core::sync::atomic::Ordering::Relaxed);
             let allowed = ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
             if android && allowed {
                 crate::flashlog::line("start into: Android, the person's choice, after the attest");
@@ -4046,6 +4046,19 @@ pub fn run(mut b: Boot) -> ! {
                         platform::crumb(0xC7);
                         platform::reboot();
                     }
+                    continue;
+                }
+                // `diag "start into ferros"` / `"start into android"`: what this device starts into (settings.rs `START_ANDROID`), as the Settings page's op 13 sets it, kept in the device document. Android only while a person is present on a device that allows Android; ferros always.
+                if cmd.params == b"start into ferros" || cmd.params == b"start into android" {
+                    let on = cmd.params == b"start into android";
+                    let ok = !on || (crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) && ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2);
+                    let kept = ok && {
+                        crate::settings::START_ANDROID.store(on, core::sync::atomic::Ordering::Relaxed);
+                        keep_settings_now()
+                    };
+                    let say = alloc::format!("start into: {}\n", match (ok, kept) { (false, _) => "refused (Android needs a person present on a device that allows it)", (true, true) => if on { "Android, kept" } else { "ferros, kept" }, (true, false) => "set, but the document was NOT kept" });
+                    crate::flashlog::line(say.trim_end());
+                    queue_pt_response(&mut pt_out_data, say.as_bytes());
                     continue;
                 }
                 // `diag recovery clear`: Android's recovery request in misc answered "no" (owner, 2026-11-02 and 2026-11-21): the bootloader message's command and arguments zeroed, nothing else in misc (slot.rs `misc_clear_recovery`). Only with a person present, as the launch that does the same.

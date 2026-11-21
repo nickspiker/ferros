@@ -342,8 +342,6 @@ pub const PREF_THEME: u64 = 5;
 pub const PREF_SCOPE: u64 = 7;
 /// Preference 6: the proximity wake, 0 off or 1 on (the kernel refuses a wake press while proximity reads near).
 pub const PREF_PROX_WAKE: u64 = 6;
-/// Preference 8: what this device starts into (owner, 2026-11-21), 0 ferros (the default) or 1 Android: the attested identity's standing choice, applied after the attest of a boot nobody answered. The kernel takes Android only while a person is present on a device that allows Android (`android_accept`); ferros always.
-pub const PREF_START_INTO: u64 = 8;
 /// Preference 12: the honeycomb keyboard's layout, 0 Dvorak (the default) or 1 QWERTY with Q on the bottom row (honeycomb::LAYOUTS).
 pub const PREF_LAYOUT: u64 = 12;
 /// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the device unlocks without typing — a stolen device then holds the identity).
@@ -3093,8 +3091,12 @@ pub enum Android {
     Off = 1,
     /// Android on again, for a person who accepted the disclaimer before.
     OnAgain = 2,
-    /// The state: bit 0 this device allows Android, bit 1 the person present accepted the disclaimer.
+    /// The state: bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android.
     State = 3,
+    /// What this device starts into (the person's standing choice, applied after the attest of a boot nobody answered): ferros, always taken.
+    StartIntoFerros = 4,
+    /// Android: only while a person is present on a device that allows Android.
+    StartIntoAndroid = 5,
 }
 
 /// Ask the kernel `what` (`Android`) with the Settings right `cap`: 1 done (or the state's bits), 0 refused, None without the right or a vault.

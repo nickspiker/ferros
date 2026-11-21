@@ -2379,6 +2379,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         // In the ferros partition (1 GiB in, ufs_device::locate), on both boards. Never akita's `klog` again (2026-11-06): that partition is the bootloader's, its first block ABL's own record, which the flash log's header overwrote at every boot; ABL then booted without its persistent record ("unable to get a real pram"), left the display down, and every ferros boot died before its gate, a power cycle not helping. `klog` was put back from the morning's backup.
         let ok = flashlog::init();
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
+        // The gate's one-shot words as this boot finds them (ferros_hv gate.rs: FERROS_ONCE, RECOVERY_ONCE, ANDROID_ONCE at G#FD60_0FE8, F0, F8), which the hv's gate clears before it starts ferros: anything but zeros here says a clear did not hold (the 8a, 2026-11-21).
+        let once = unsafe { [0xFD60_0FE8usize, 0xFD60_0FF0, 0xFD60_0FF8].map(|a| core::ptr::read_volatile(a as *const u64)) };
+        if once != [0; 3] {
+            flashlog::line(&alloc::format!("gate words still set at ferros's start: G#{:X} G#{:X} G#{:X}", once[0], once[1], once[2]));
+        }
         // How ABL saw the reset that started this boot, kept where the next bootloader run cannot overwrite it (platform::abl_reset_lines). Only when ABL booted this ferros on husky: a reload has no ABL run of its own, a jump's log is Android's boot's, and akita's log place is not measured.
         if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() && !board::akita() {
             flashlog::line(&alloc::format!("bootloader saw: {}", platform::abl_reset_lines()));

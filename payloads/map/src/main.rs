@@ -1067,7 +1067,7 @@ enum Choice {
     Helm(u8, bool),
     UnlockAtBoot,
     ProxWake,
-    /// The Android page (docs/BOOT.md "Android only by the identity's choice"): what this device starts into (preference 8: 0 ferros, 1 Android), start Android now (two taps), Android off, on again (a person who accepted before), and the disclaimer's agreement (the keyboard asks for the handle).
+    /// The Android page (docs/BOOT.md "Android only by the identity's choice"): what this device starts into (0 ferros, 1 Android: SYS_UNLOCK op 13, requests 4 and 5), start Android now (two taps), Android off, on again (a person who accepted before), and the disclaimer's agreement (the keyboard asks for the handle).
     StartInto(u8),
     AndroidNow,
     AndroidOff,
@@ -3637,8 +3637,8 @@ impl Map {
                 if allowed {
                     b.text(cx, y, note as u16, dim(), 1, tr(Msg::StartInto));
                     y += uu(2, 1);
-                    let now_s = ferros_sys::pref(ferros_sys::PREF_START_INTO);
-                    radios(self, b, &mut y, &["ferros", "Android"], now_s as usize, &|i| Choice::StartInto(i as u8));
+                    let now_s = (st >> 2 & 1) as usize;
+                    radios(self, b, &mut y, &["ferros", "Android"], now_s, &|i| Choice::StartInto(i as u8));
                     y += uu(1, 1);
                     notes(b, &mut y, tr(Msg::StartIntoNote));
                     y += uu(1, 1);
@@ -5596,7 +5596,9 @@ impl Map {
                         }
                     }
                     // The Android page (docs/BOOT.md "Android only by the identity's choice"). What it starts into: the kernel takes Android only while a person is present on a device that allows it.
-                    Some(Choice::StartInto(v)) => set(self, ferros_sys::PREF_START_INTO, v),
+                    Some(Choice::StartInto(v)) => {
+                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), if v == 1 { ferros_sys::Android::StartIntoAndroid } else { ferros_sys::Android::StartIntoFerros });
+                    }
                     // Start Android now, on the second tap: the kernel leaves the hv's gate its word and resets (the person present checked there again).
                     Some(Choice::AndroidNow) => {
                         if self.android_armed {
@@ -6482,7 +6484,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The Android page follows the kernel's state while it shows: read at a wake, never on a timer.
         if matches!(map.view, View::Open(_)) && PAGES[map.page] == "Android" && !map.settling {
-            let a = ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0) | (ferros_sys::pref(ferros_sys::PREF_START_INTO) as u64) << 8;
+            let a = ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0);
             if a != android_seen {
                 android_seen = a;
                 map.draw();

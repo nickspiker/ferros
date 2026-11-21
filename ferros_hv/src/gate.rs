@@ -346,6 +346,11 @@ fn take_once() -> (bool, bool, bool) {
     };
     let r = (word(ANDROID_ONCE_ADDR, ANDROID_ONCE), word(RECOVERY_ONCE_ADDR, RECOVERY_ONCE), word(FERROS_ONCE_ADDR, FERROS_ONCE));
     unsafe { asm!("dsb sy") };
+    // Which words this boot found, and that each reads 0 once cleared (the 8a, 2026-11-21: two Android reboots in a row went on into Android with no ferros between them; this line says whether a word was there and whether the clear held).
+    let after = |at: usize| unsafe { read_volatile(at as *const u64) };
+    let flag = |b: bool| if b { b"1" as &[u8] } else { b"0" };
+    let mut h = [0u8; 16];
+    super::pstore::log(&[b"\nferros hv: gate words found: android ", flag(r.0), b" recovery ", flag(r.1), b" ferros ", flag(r.2), b"; after clearing, their OR ", super::pstore::hex(after(ANDROID_ONCE_ADDR) | after(RECOVERY_ONCE_ADDR) | after(FERROS_ONCE_ADDR), &mut h), b"\n"]);
     r
 }
 

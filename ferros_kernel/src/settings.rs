@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
-use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_DND, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_RADIOS_BEFORE, PREF_RADIOS_OFF, PREF_SCALE, PREF_SCOPE, PREF_SOUND, PREF_START_INTO, PREF_THEME, PREF_TORCH_DUTY, PREF_TORCH_LEVEL, PREF_TORCH_STROBE, PREF_TORCH_TIMEOUT, PREF_UNLOCK_AT_BOOT, PREF_VOLUME, PREF_HELM};
+use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_DND, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_RADIOS_BEFORE, PREF_RADIOS_OFF, PREF_SCALE, PREF_SCOPE, PREF_SOUND, PREF_THEME, PREF_TORCH_DUTY, PREF_TORCH_LEVEL, PREF_TORCH_STROBE, PREF_TORCH_TIMEOUT, PREF_UNLOCK_AT_BOOT, PREF_VOLUME, PREF_HELM};
 
 /// The vault key and the section name.
 pub const KEY: &str = "device";
 const SECTION: &str = "device";
 
 /// Each kept preference: its field name and its index in the preferences block. The screen's on/off (preference 2) is not kept: it is the power key's, every boot starts lit. Do not disturb is the identity's as its service last wrote it (`dnd_identity`, as `language_identity`), never read back into the identity.
-pub const FIELDS: [(&str, usize); 21] = [
+pub const FIELDS: [(&str, usize); 20] = [
     ("base", PREF_BASE),
     ("labels", PREF_LABELS),
     ("brightness", PREF_BRIGHTNESS),
@@ -22,7 +22,6 @@ pub const FIELDS: [(&str, usize); 21] = [
     ("scope", PREF_SCOPE),
     ("layout", PREF_LAYOUT),
     ("unlock_at_boot", PREF_UNLOCK_AT_BOOT),
-    ("start_into", PREF_START_INTO),
     ("scale", PREF_SCALE),
     ("radios_off", PREF_RADIOS_OFF),
     ("radios_before", PREF_RADIOS_BEFORE),
@@ -37,6 +36,10 @@ pub const FIELDS: [(&str, usize); 21] = [
 ];
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";
+/// What this device starts into (owner, 2026-11-21: "Start into: ferros / Android"; docs/BOOT.md "Android only by the identity's choice"): 0 ferros (the default), 1 Android, the attested identity's standing choice. Kept here and in the kernel alone, never in the preferences block: until the same day it was preference 8, which the kernel still writes as slot 0's surface generation for a display from before 2026-11-12 (process.rs `PREF_SURFACES`), so a window's generation became "Android" in the document and the 8a started into Android unasked (measured: b297-b299).
+const START_INTO: &str = "start_into";
+/// The setting in effect (`START_INTO`): set from the document at boot, by SYS_UNLOCK op 13 (the Settings page; Android only while a person is present on a device that allows it) and by `diag "start into ..."`; read by the service loop after the attest of a boot nobody answered (service.rs `START_INTO`).
+pub static START_ANDROID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The zone (owner, 2026-11-10: "Proper zone too"; zone.rs): this device's own choice, its IANA id by hand (`zone`; none: `tz` is the offset) and whether it is automatic (`zone_auto`, 1 the default); whether the device follows the identity's (`zone_follow`, 1 the default); the identity's as its service last wrote it (`zone_identity_auto` present once it has, `zone_identity` its id); the zone last found here and what found it (`zone_found`, `zone_found_by`: 1 the network, 2 a position).
 const ZONE: &str = "zone";
 const ZONE_AUTO: &str = "zone_auto";
@@ -71,7 +74,7 @@ fn schema() -> SectionSchema {
     for (name, _, _) in KNOBS {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s = s.field(TZ, TypeConstraint::AnySigned);
+    s = s.field(TZ, TypeConstraint::AnySigned).field(START_INTO, TypeConstraint::AnyUnsigned);
     for name in [ZONE, ZONE_IDENTITY, ZONE_FOUND] {
         s = s.field(name, TypeConstraint::AsciiText);
     }
@@ -112,6 +115,7 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
         };
         b = b.set(name, VsfType::u(v as usize, false)).ok()?;
     }
+    b = b.set(START_INTO, VsfType::u(START_ANDROID.load(core::sync::atomic::Ordering::Relaxed) as usize, false)).ok()?;
     let tz = crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed);
     b = b.set(TZ, VsfType::i(tz as isize)).ok()?;
     let z = crate::zone::state();
@@ -160,6 +164,11 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
             }
             n += 1;
         }
+    }
+    // What the device starts into: Android only for exactly 1.
+    if let Some(v) = first(START_INTO).and_then(|v| v.as_u64()) {
+        START_ANDROID.store(v == 1, core::sync::atomic::Ordering::Relaxed);
+        n += 1;
     }
     // The knobs as kept; a driver ignores a value it cannot use, so none is range-checked here.
     for (name, link, slot) in KNOBS {
