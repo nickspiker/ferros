@@ -2363,8 +2363,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The gate chose Android (development builds only: volume down at this gate or at the hv's; a production build has no gate): the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault), ANDROID_ONCE left for the hv's gate, slot a active, then a plain reset. Android lives on slot a on both boards (akita's since 2026-11-18, BOARDS.md), whose hv gate takes the word and goes to Android, once. The way back is a reboot: no word, so the gate gives ferros (owner, 2026-11-21: Android starts only by ferros's hand).
     // Cleaned to DRAM, since the gate reads it with the caches off.
     if cfg!(not(ferros_production)) && gate_choice == ready::Choice::Android && link_up {
-        platform::android_once();
         if slot::set_active(0) == slot::MARKED {
+            platform::android_once();
             platform::crumb(0xC7);
             platform::reboot();
         }

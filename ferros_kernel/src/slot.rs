@@ -253,3 +253,44 @@ fn set_active_held(slot: usize) -> u32 {
     }
     MARKED
 }
+
+/// misc's bootloader message (AOSP bootloader_message.h, at the partition's start): `command`, 32 bytes at 0 ("boot-recovery" makes the bootloader start recovery at every boot until recovery clears it), `status` 32 at 32, `recovery`, the arguments, 768 at 64.
+const BCB_COMMAND: core::ops::Range<usize> = 0..32;
+const BCB_RECOVERY: core::ops::Range<usize> = 64..64 + 768;
+/// No partition named `misc` was found.
+pub const NO_MISC: u32 = 0x25;
+
+/// Clear Android's recovery request in misc: the bootloader message's command and its arguments, nothing else in the partition (owner, 2026-11-02: a "no" to a recovery request clears the command and arguments; 2026-11-21: an attested launch of Android is that "no", the person chose Android and not recovery; docs/BOOT.md "Android only by the identity's choice").
+/// Without it a recovery request Android left (a `reboot recovery`, RescueParty, an update) makes every boot a recovery boot, which the hv's gate refuses without RECOVERY_ONCE: Android unreachable, every start bounced to ferros (the 8a, 2026-11-21).
+/// MARKED when cleared (read back), ALREADY when there was nothing to clear, else why not (READ_FAILED, WRITE_FAILED, VERIFY_FAILED, NO_MISC).
+pub fn misc_clear_recovery() -> u32 {
+    let Some(p) = crate::partfs::find("misc") else { return NO_MISC };
+    crate::process::UFS.with(|| {
+        let ufs = UfsController::new(UFS_BASE);
+        let lba = p.first as u32;
+        let read = |ufs: &UfsController| -> Option<alloc::vec::Vec<u8>> {
+            // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
+            for _ in 0..4 {
+                if ufs.read_block_lun(p.lun, lba) == 0 && ufs.last_response_status() == 0 {
+                    return Some(ufs.data_buffer().to_vec());
+                }
+            }
+            None
+        };
+        let Some(block) = read(&ufs) else { return READ_FAILED };
+        if block[BCB_COMMAND].iter().all(|&b| b == 0) && block[BCB_RECOVERY].iter().all(|&b| b == 0) {
+            return ALREADY;
+        }
+        let mut want = block.clone();
+        want[BCB_COMMAND].fill(0);
+        want[BCB_RECOVERY].fill(0);
+        ufs.data_buffer_mut().copy_from_slice(&want);
+        if ufs.write_block_lun(p.lun, lba) != 0 || ufs.last_response_status() != 0 {
+            return WRITE_FAILED;
+        }
+        if !matches!(read(&ufs), Some(back) if back == want) {
+            return VERIFY_FAILED;
+        }
+        MARKED
+    })
+}

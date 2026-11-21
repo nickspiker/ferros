@@ -3347,13 +3347,23 @@ pub fn run(mut b: Boot) -> ! {
         // A launch of Android the attested identity chose (the "Start into" setting, "start Android now" on the Settings page, the `android` switch): the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
         if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
-            // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
-            let r = crate::slot::set_active(0);
-            crate::platform::android_once();
-            crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
-            if r == crate::slot::MARKED {
-                platform::crumb(0xC7);
-                platform::reboot();
+            // Android's own recovery request first (a `reboot recovery`, RescueParty, an update left in misc): the person chose Android, not recovery, which is the "no" that clears its command and arguments (slot.rs `misc_clear_recovery`). Left there, the bootloader starts recovery, the hv's gate refuses it without RECOVERY_ONCE, and the launch lands in ferros again (the 8a, 2026-11-21). Not cleared: no reset, the log says why.
+            let m = crate::slot::misc_clear_recovery();
+            if m == crate::slot::MARKED {
+                crate::flashlog::line("android: Android's recovery request in misc cleared (the person chose Android)");
+            }
+            if m != crate::slot::MARKED && m != crate::slot::ALREADY {
+                crate::flashlog::line(&alloc::format!("android: not launching: misc's recovery request could not be cleared (G#{m:X})"));
+            } else {
+                // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
+                let r = crate::slot::set_active(0);
+                crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
+                // The word only with the reset, so none waits for a later boot.
+                if r == crate::slot::MARKED {
+                    crate::platform::android_once();
+                    platform::crumb(0xC7);
+                    platform::reboot();
+                }
             }
         }
         // A part of a kist offered to stow that came while a kist job held the kernel's channel: its put started now that the channel is free (the part's command kept in `vault_cmd`); its reply waits for the put, as a store command's does.
@@ -4021,9 +4031,14 @@ pub fn run(mut b: Boot) -> ! {
                         continue;
                     }
                     // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
-                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
-                    // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once.
-                    crate::platform::android_once();
+                    // Android's own recovery request in misc cleared first, as the service loop's launch does (slot.rs `misc_clear_recovery`): a person present chose Android. Not cleared: no reset.
+                    let m = crate::slot::misc_clear_recovery();
+                    resp.extend_from_slice(alloc::format!("misc's recovery request: {}\n", match m { crate::slot::MARKED => "cleared", crate::slot::ALREADY => "none", _ => "NOT cleared" }).as_bytes());
+                    let r = if m != crate::slot::MARKED && m != crate::slot::ALREADY { m } else if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
+                    // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once: only when resetting, so no word waits for a later boot.
+                    if r == crate::slot::MARKED {
+                        crate::platform::android_once();
+                    }
                     resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     if r == crate::slot::MARKED {
@@ -4031,6 +4046,25 @@ pub fn run(mut b: Boot) -> ! {
                         platform::crumb(0xC7);
                         platform::reboot();
                     }
+                    continue;
+                }
+                // `diag recovery clear`: Android's recovery request in misc answered "no" (owner, 2026-11-02 and 2026-11-21): the bootloader message's command and arguments zeroed, nothing else in misc (slot.rs `misc_clear_recovery`). Only with a person present, as the launch that does the same.
+                #[cfg(not(shim_handoff))]
+                if cmd.params == b"recovery clear" {
+                    let r = if crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) { Some(crate::slot::misc_clear_recovery()) } else { None };
+                    crate::flashlog::line(&match r {
+                        Some(crate::slot::MARKED) => alloc::string::String::from("recovery clear: Android's recovery request in misc cleared (the person present said no)"),
+                        Some(crate::slot::ALREADY) => alloc::string::String::from("recovery clear: misc held no recovery request"),
+                        Some(e) => alloc::format!("recovery clear: misc not cleared (G#{e:X})"),
+                        None => alloc::string::String::from("recovery clear: refused: no one has attested"),
+                    });
+                    let say = match r {
+                        Some(crate::slot::MARKED) => alloc::string::String::from("recovery clear: cleared\n"),
+                        Some(crate::slot::ALREADY) => alloc::string::String::from("recovery clear: nothing to clear\n"),
+                        Some(e) => alloc::format!("recovery clear: failed (G#{e:X})\n"),
+                        None => alloc::string::String::from("recovery clear: refused: no one has attested\n"),
+                    };
+                    queue_pt_response(&mut pt_out_data, say.as_bytes());
                     continue;
                 }
                 if cmd.params == b"recovery" {
