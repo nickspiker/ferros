@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: feedback
   originSessionId: 434f1d40-b023-4c88-80b3-11913c5cd18f
-  modified: 2026-11-21T21:35:01.650Z
+  modified: 2026-11-21T23:11:34.032Z
 ---
 
 Owner, 2026-11-20, on finding ~200 agent worktrees, 374 local and 124 remote branches, and Harbor 97% full: "I'd prefer to be on one straight line and it sounds like it got shrapneled pretty hard. Delete all, yes, should be zero branches."
@@ -15,6 +15,7 @@ Owner, 2026-11-20, on finding ~200 agent worktrees, 374 local and 124 remote bra
 - Work lands as linear commits on forge: fetch, rebase, push. No merge commits.
 - No per-agent worktrees: never `isolation: "worktree"` for ferros agents, never `.claude/worktrees`, never `target/agent-<name>` farms. One shared build farm; an agent that must not touch the owner's main checkout uses that one farm, sequentially (staged agents, [[feedback_keep_devices_busy]]).
 - The farm is /mnt/Harbor/Code/ferros/target/farm/ferros (a detached worktree; siblings symlinked beside it). ONE agent in it at a time: on 2026-11-21 two ran there at once, one pushed the other's commits and popped a stranger's stash. A second job waits, or works read-only. Never `git stash` in it.
+- Across sessions: anyone may BUILD in the farm with their own CARGO_TARGET_DIR under target/farm/ (e.g. target/farm/lumis-target), reverting any tracked file a build dirties. Git work (edits to tracked files, checkout, commit, push) takes the lock first: `mkdir target/farm/GIT-LOCK` (fails if held) with a `holder` file naming the session or agent; `rm -r` it once pushed.
 - Inside the farm `cargo el0` fails (the main checkout's .cargo alias array is appended to the farm's); run the expanded command. A string alias does not fix it (cargo refuses to merge a string into the main checkout's array).
 - Anything left over is deleted once its work is on forge.
 
