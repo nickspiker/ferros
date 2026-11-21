@@ -17,7 +17,7 @@ const SIDE_SHIFT: u32 = 6;
 const PIXELS: usize = 1 << (2 * SIDE_SHIFT);
 const MAX_ITER: u32 = 64;
 
-struct Line([u8; 160], usize);
+struct Line([u8; 320], usize);
 impl core::fmt::Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
@@ -31,7 +31,7 @@ impl core::fmt::Write for Line {
 }
 macro_rules! say {
     ($g:expr, $($a:tt)*) => {{
-        let mut l = Line([0; 160], 0);
+        let mut l = Line([0; 320], 0);
         let _ = core::fmt::write(&mut l, format_args!($($a)*));
         console($g, &l.0[..l.1]);
     }};
@@ -1063,11 +1063,13 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     // Input 16: the display's frames, a queued job a frame.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 16 {
-        frame_test(grants, arena);
+        let hold = input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } == 1;
+        frame_test(grants, arena, hold);
     }
     // Input 15: Lumis's back-end ops against the CPU.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 15 {
-        lumis_ops_test(grants, arena);
+        let flags = if input_len > 1 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } } else { 0 };
+        lumis_ops_test(grants, arena, flags);
     }
     // Input [14, n]: the queue (GPU-KISTS.md "The queue"): n frames of the band coder (0: 16).
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 14 {
@@ -1176,7 +1178,8 @@ mod band {
 }
 
 /// Lumis's back-end needs on the device (input 15; valhall tests/sim.rs `lumis_ops_against_the_cpu`, the same kernel and checks): 8- and 16-bit loads, integer multiply-add, shifts, an atomic add into a histogram from 2^11 invocations at once, a v2f16 multiply-add; every word against the CPU.
-fn lumis_ops_test(grants: u64, arena: usize) -> ! {
+/// A second input byte, for finding what a fence fault comes from: bit 0 no atomics, bit 1 the narrow loads as 32-bit loads, bit 2 hold the block at the end until killed (its frames in `diag arcs`).
+fn lumis_ops_test(grants: u64, arena: usize, flags: u8) -> ! {
     use valhall::ssa::{self, F, H, U};
     const N: u32 = 1 << 11;
     const IN: usize = 2 << 20;
@@ -1184,8 +1187,7 @@ fn lumis_ops_test(grants: u64, arena: usize) -> ! {
     ssa::begin();
     ssa::reserve(3);
     let g = ssa::gid();
-    let b = ssa::load8(1, g, 0, 3);
-    let h = ssa::load16(1, g, 1, 1);
+    let (b, h) = if flags & 2 == 0 { (ssa::load8(1, g, 0, 3), ssa::load16(1, g, 1, 1)) } else { (ssa::load(1, g, 2, 0) & U::splat(0xFF), ssa::load(1, g, 2, 4) & U::splat(0xFFFF)) };
     let w = ssa::load(1, g, 2, 0);
     let m = g.mul_add(U::splat(2_654_435_761), w);
     let s = (m >> 7) ^ (b << 9) ^ h.shl_by(g & U::splat(7)) ^ w.shr_by(U::splat(3));
@@ -1195,8 +1197,10 @@ fn lumis_ops_test(grants: u64, arena: usize) -> ! {
     ssa::store(0, 4, 4, s);
     ssa::store(0, 4, 8, q.to_bits());
     ssa::store(0, 4, 12, b | h << 8);
-    ssa::atomic_add(2, b & U::splat(15), 2, 0, U::splat(1));
-    ssa::atomic_add(2, U::splat(0), 0, 64, h);
+    if flags & 1 == 0 {
+        ssa::atomic_add(2, b & U::splat(15), 2, 0, U::splat(1));
+        ssa::atomic_add(2, U::splat(0), 0, 64, h);
+    }
     let c = ssa::compile();
     let wr8 = |at: usize, v: u8| unsafe { core::ptr::write_volatile((arena + at) as *mut u8, v) };
     let r32 = |at: usize| unsafe { core::ptr::read_volatile((arena + at) as *const u32) };
@@ -1230,6 +1234,13 @@ fn lumis_ops_test(grants: u64, arena: usize) -> ! {
     }
     wrong[4] = (0..16).filter(|&j| r32(HIST + 4 * j) != hist[j]).count() as u32 + (r32(HIST + 64) != sum) as u32;
     say!(grants, "gputest: Lumis's ops, A#{N} invocations, A#{} words: status A#{}, A#{} us; wrong: multiply-add A#{}, shifts A#{}, f16 pair A#{}, narrow loads A#{}, atomic histogram and sum A#{} (of 17)\n", c.words.len(), reply.0, reply.1, wrong[0], wrong[1], wrong[2], wrong[3], wrong[4]);
+    if flags & 4 != 0 {
+        say!(grants, "gputest: holding its block until killed\n");
+        static NEVER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        loop {
+            ferros_sys::wait(&NEVER, 0, 0);
+        }
+    }
     exit(if reply.0 == 0 && wrong.iter().all(|&x| x == 0) { 0 } else { 1 });
 }
 
@@ -1427,7 +1438,7 @@ fn queue_test(grants: u64, arena: usize, frames: u32) -> ! {
 
 /// The display's frames (input 16; GPU-KISTS.md "The display's frames"): the frame mailbox opened (no proof), 2^7 frames waited for, each answered with the empty kernel thru a queue as Lumis's layer would be: the frames' spacing, the wake's lateness (the reader's counter less the publish's), and the frame start to the job's end.
 /// The display must be presenting (on the Pro a frame starts only with a new picture: a finger on the deck, a kist drawing).
-fn frame_test(grants: u64, arena: usize) -> ! {
+fn frame_test(grants: u64, arena: usize, hold: bool) -> ! {
     use ferros_sys::gpu::queue::*;
     use ferros_sys::gpu::PRELOAD_X;
     use ferros_sys::mailbox::{frame, Got, Reader, FRAME};
@@ -1453,6 +1464,15 @@ fn frame_test(grants: u64, arena: usize) -> ! {
         say!(grants, "gputest frames: the kernel was not loaded\n");
         exit(1);
     };
+    // A second input byte 1: the GPU's clock held up for the run (the service's op 6), so the frames' times without the clock's turns are measured against those with them.
+    let set_hold = |on: bool| {
+        let mut r = [1u8; 1];
+        call(cap(grants, S_GPU), &[6, on as u8], &mut r);
+        r[0] == 0
+    };
+    if hold {
+        say!(grants, "gputest frames: the clock held up: {}\n", set_hold(true));
+    }
     const N: usize = 1 << 7;
     let (mut gap, mut late, mut done) = ([0u64; N], [0u64; N], [0u64; N]);
     let mut seen = r.seq();
@@ -1479,6 +1499,9 @@ fn frame_test(grants: u64, arena: usize) -> ! {
         last_starts = starts;
     }
     let (g, l, d) = (spread(&gap[1..]), spread(&late), spread(&done));
+    if hold {
+        set_hold(false);
+    }
     say!(grants, "gputest frames: A#{N} frames: spacing A#{}/A#{}/A#{} us (least/mean/most), A#{skipped} starts missed; the wake A#{}/A#{}/A#{} us late; frame start to the job's end A#{}/A#{}/A#{} us\n", g.0, g.1, g.2, l.0, l.1, l.2, d.0, d.1, d.2);
     q.close();
     exit(0);
@@ -1505,7 +1528,7 @@ fn run_band(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u6
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Where and why, on the console: grants are slot 0 at arc offset 0 (the console token), as every payload's.
-    let mut l = Line([0; 160], 0);
+    let mut l = Line([0; 320], 0);
     let _ = core::fmt::write(&mut l, format_args!("gputest: panic: {}\n", info));
     console(0, &l.0[..l.1]);
     exit(0xDEAD);

@@ -2542,6 +2542,8 @@ pub static GPU_BY_SWITCH: core::sync::atomic::AtomicBool = core::sync::atomic::A
 pub static GPU_CLOCK_UPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static GPU_CLOCK_DOWNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static GPU_CLOCK_LONGEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The turns' ticks summed, for their mean.
+pub static GPU_CLOCK_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The `gpu-clock` switch (2026-11-20, docs/GPU-KISTS.md "Power and clock by events"; the owner, 2026-11-11: "the GPU powers up when work is queued and gates when its queue empties, as events, never a timer"): on when the GPU service has a job queued or running, off when its queues are empty, each turn made by the service at that event.
 /// The GPU at its top (G3D 890, G3DL2 900 MHz) while on and the screen lit, at its floor (150 / 160 MHz) while off or dark; the dark profile's own turn follows it (`clock_policy`). On the kernel's core, as every switch, with the lock let go (`SWITCH_UNLOCKED`): its ACPM requests are the clock policy's, made on this same core, never beside them.
@@ -2567,7 +2569,9 @@ pub fn gpu_clock(on: bool) -> bool {
         let _ = crate::acpm::dvfs_get(8);
         GPU_CLOCK_DOWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    GPU_CLOCK_LONGEST.fetch_max(cntpct().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
+    let took = cntpct().wrapping_sub(t0);
+    GPU_CLOCK_LONGEST.fetch_max(took, core::sync::atomic::Ordering::Relaxed);
+    GPU_CLOCK_TICKS.fetch_add(took, core::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -2698,7 +2702,8 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
     out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them){} and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if CLIPS_HOLD.load(Relaxed) != 0 { ", held there (clipshold 1)" } else { "" }, if recording() { "recording" } else { "not recording" }).as_bytes());
-    out.extend_from_slice(alloc::format!("GPU clock (docs/GPU-KISTS.md \"Power and clock by events\"): {} by {}; the switch up A#{} times, down A#{}, its longest turn A#{} us\n", if unsafe { GPU_CLOCKED } { "up" } else { "at its floor" }, if GPU_BY_SWITCH.load(Relaxed) { "the service's queue (gpu-clock)" } else { "the service's being alive" }, GPU_CLOCK_UPS.load(Relaxed), GPU_CLOCK_DOWNS.load(Relaxed), GPU_CLOCK_LONGEST.load(Relaxed) * 1_000_000 / f).as_bytes());
+    // WHY the max: before the first turn the count is 0, and the mean of no turns is shown as 0.
+    out.extend_from_slice(alloc::format!("GPU clock (docs/GPU-KISTS.md \"Power and clock by events\"): {} by {}; the switch up A#{} times, down A#{}, a turn A#{} us on average, its longest A#{} us\n", if unsafe { GPU_CLOCKED } { "up" } else { "at its floor" }, if GPU_BY_SWITCH.load(Relaxed) { "the service's queue (gpu-clock)" } else { "the service's being alive" }, GPU_CLOCK_UPS.load(Relaxed), GPU_CLOCK_DOWNS.load(Relaxed), GPU_CLOCK_TICKS.load(Relaxed) * 1_000_000 / f / (GPU_CLOCK_UPS.load(Relaxed) + GPU_CLOCK_DOWNS.load(Relaxed)).max(1), GPU_CLOCK_LONGEST.load(Relaxed) * 1_000_000 / f).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
@@ -4975,6 +4980,13 @@ pub fn run(mut b: Boot) -> ! {
                         *pass = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
                     }
                     resp.extend_from_slice(alloc::format!("canvas {} MiB cleaned: {} us as the display left it, {} us again (clean lines)\n", (hi - lo) >> 20, us[0], us[1]).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
+                if cmd.params == b"gpu fence" {
+                    // The GPU's fence's latched fault (2026-11-20, docs/GPU-KISTS.md "Measured on the 8a"): every VID's address (both words), its info decoded as pKVM's s2mpu.h does (type 23:21, 2 a permission; bit 20 a write; length 19:16; id 15:0) and info2, then cleared (INTERRUPT_CLEAR), so the next run's is its own.
+                    resp.extend_from_slice(crate::s2mpu::gpu_fault_take().as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

@@ -952,6 +952,7 @@ name = "ferros-payload-camtest"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
+ "valhall",
 ]
 
 [[package]]

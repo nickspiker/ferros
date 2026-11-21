@@ -816,8 +816,13 @@ pub mod gpu {
             /// The service told this process's memory now (op 5): after a camera OPEN, its view is mapped read-only in this process's GPU space at `CAMERA_VA` (a buffer at its place in the view, the MAP header's +48, is at `CAMERA_VA` plus that place); after a CLOSE it is gone. Whether the camera is mapped, or None (refused).
             /// Wait for the queue's jobs that read the camera before its CLOSE: one still in flight is stopped when the view goes, and the queue ends (`E_CAMERA`).
             pub fn refresh(&self) -> Option<bool> {
+                self.refresh_mapped(false)
+            }
+
+            /// `refresh`, the camera mapped cacheable on the GPU when `cached`, each job of this process then invalidating the GPU's caches before it runs (a development measure against the non-cacheable default; docs/GPU-KISTS.md "The camera ring on the GPU").
+            pub fn refresh_mapped(&self, cached: bool) -> Option<bool> {
                 let mut reply = [1u8; 2];
-                let r = super::super::call(self.service, &[5], &mut reply);
+                let r = super::super::call(self.service, &[5, cached as u8], &mut reply);
                 (r == 2 && reply[0] == 0).then_some(reply[1] != 0)
             }
 

@@ -488,6 +488,28 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     }
 }
 
+/// The GPU's fence's latched faults as lines, then cleared (`diag gpu fence`, development builds): each VID's address from both words (+4 low, +8 high), FAULT_INFO decoded as pKVM's s2mpu.h decodes it (type 23:21: 1 a table walk, 2 a permission; bit 20 a write; length 19:16; id 15:0), and INFO2. None while pd_g3d is off.
+pub fn gpu_fault_take() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
+        s.push_str("gpu fence: the GPU's domain is off\n");
+        return s;
+    }
+    let st = rd(GPU_S2MPU, FAULT_STATUS);
+    let _ = writeln!(s, "gpu fence: fault status G#{st:X}");
+    for vid in 0..VIDS {
+        if st & (1 << vid) != 0 {
+            let pa = rd(GPU_S2MPU, fault_pa_low(vid)) as u64 | (rd(GPU_S2MPU, fault_pa_low(vid) + 4) as u64) << 32;
+            let info = rd(GPU_S2MPU, fault_info(vid));
+            let _ = writeln!(s, "gpu fence: VID A#{vid} at G#{pa:X}: type A#{} ({}), a {}, length A#{}, id G#{:X}; info G#{info:X}, info2 G#{:X}", (info >> 21) & 7, match (info >> 21) & 7 { 1 => "a table walk", 2 => "a permission", _ => "another" }, if info >> 20 & 1 == 1 { "write" } else { "read" }, (info >> 16) & 15, info & 0xFFFF, rd(GPU_S2MPU, fault_info2(vid)));
+        }
+    }
+    wr(GPU_S2MPU, INTERRUPT_CLEAR, 0xFF);
+    let _ = writeln!(s, "gpu fence: cleared, status now G#{:X}", rd(GPU_S2MPU, FAULT_STATUS));
+    s
+}
+
 fn faults(out: &mut alloc::vec::Vec<u8>, base: usize) {
     use crate::platform::append_hex;
     let st = rd(base, FAULT_STATUS);

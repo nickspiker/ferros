@@ -94,8 +94,9 @@ struct Slot {
     nregions: usize,
     frames: [u64; ferros_sys::gpu::FRAMES],
     nframes: usize,
-    /// Its client's camera view is mapped in its space.
+    /// Its client's camera view is mapped in its space; and mapped cacheable on the GPU, each job invalidating the GPU's caches first (op 5's byte, a development measure: non-cacheable by default).
     camera: bool,
+    camera_cached: bool,
     /// Its address space's root while a client is bound.
     root: usize,
     insert: usize,
@@ -121,7 +122,7 @@ struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: false, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
 }
 
 struct State {
@@ -144,6 +145,8 @@ static SLOT_BELL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static CALL_BELL: AtomicU64 = AtomicU64::new(0);
 /// The clock's want, 1 while any job is in flight: `clock` turns the switch to it.
 static WANT: AtomicU64 = AtomicU64::new(0);
+/// The clock held up whatever the queues hold (op 6, a development measure: the frame's cost of the turns, docs/GPU-KISTS.md "Power and clock by events").
+static CLOCK_HOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 static mut EVENTS_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut CLOCK_STACK: [u8; 1 << 13] = [0; 1 << 13];
@@ -243,6 +246,18 @@ fn group_end(g: &Gpu, sh: &Shared, k: usize) -> bool {
     unsafe { core::arch::asm!("dmb osh") };
     glb_doorbell(g, sh, 1 << k);
     g.wait(100, |_| sh.rd(cout) & 7 == 0)
+}
+
+/// The GPU's L2 and its cores' load-store caches cleaned and invalidated, the rest invalidated (GPU_COMMAND FLUSH_CACHES: panthor `GPU_FLUSH_CACHES(CACHE_CLEAN | CACHE_INV, CACHE_CLEAN | CACHE_INV, CACHE_INV)`, G#2_3304), CLEAN_CACHES_COMPLETED (GPU_IRQ bit 17) waited for; false when it did not complete in 64 ms.
+/// Found on the 8a (2026-11-20): a job's group ended mid-job (a CLOSE with the camera's job in flight) left its command stream's timestamp store dirty in the L2, with no end-of-job flush to write it out; the next client's job's flush wrote it after the client's memory had gone back to the pool, and the GPU's fence refused the write (G#8_9240_1A40, a permission fault, a write). Had those frames been another client's by then, the write would have landed in that client's memory.
+/// So every group ended with a job in it is followed by this before its memory may go (`queue_end`, `reap`), as kbase flushes the GPU's caches when it takes a context's address space down.
+fn caches_flush(g: &Gpu) -> bool {
+    const CLEAN_CACHES_COMPLETED: u32 = 1 << 17;
+    g.wr(GPU_IRQ_CLEAR, CLEAN_CACHES_COMPLETED);
+    g.wr(GPU_COMMAND, 4 | 0x233 << 8);
+    let ok = g.wait(64, |g| g.rd(GPU_IRQ_RAWSTAT) & CLEAN_CACHES_COMPLETED != 0);
+    g.wr(GPU_IRQ_CLEAR, CLEAN_CACHES_COMPLETED);
+    ok
 }
 
 /// Address space `n` given `root`: the walks and lines of whatever tables it had dropped first (LOCKADDR over the whole 48-bit space, LOCK, FLUSH_PT, which cleans and invalidates the L2 and the MMU's cached walks with it: kbase's sequence for changed mappings on arch 11, ferros-csf-spec.md), then TRANSCFG, TRANSTAB, MEMATTR and UPDATE (`Gpu::install`).
@@ -358,7 +373,7 @@ fn land(st: &mut State, k: usize, now: u64) -> Flight {
     sl.len -= 1;
     sl.head_since = now;
     st.inflight -= 1;
-    if st.inflight == 0 {
+    if st.inflight == 0 && !CLOCK_HOLD.load(Ordering::Relaxed) {
         WANT.store(0, Ordering::Release);
         ferros_sys::wake(&WANT, 1);
     }
@@ -370,6 +385,10 @@ fn queue_end(st: &mut State, k: usize, why: u64, unbind: bool) -> Option<usize> 
     let s = svc();
     let now = ferros_sys::now();
     if st.slots[k].running && !group_end(&s.g, &s.sh, k) {
+        stuck(s.grants, k);
+    }
+    // A job stopped mid-way leaves its writes in the GPU's caches: written out now, while its memory is still its client's (`caches_flush`).
+    if st.slots[k].len > 0 && !caches_flush(&s.g) {
         stuck(s.grants, k);
     }
     st.slots[k].running = false;
@@ -459,7 +478,7 @@ fn reap(st: &mut State, k: usize, now: u64, wake: &mut Option<usize>) -> bool {
         say!(s.grants, "gpu: slot {k} (epoch A#{epoch}): a job {}: CS_FAULT G#{cf:X} ({}), CS_FAULT_INFO G#{info:X}, CS_STATUS_CMD_PTR G#{ptr:X}; its group ended\n", if cs { "faulted" } else { "did not finish in its guard" }, exception(cf));
     }
     // The job ended with its group, whatever state it is in (past its guard, stalled, faulted): no other client's job waits behind it, and its group starts afresh at its client's next job or queue.
-    if !group_end(&s.g, &s.sh, k) {
+    if !group_end(&s.g, &s.sh, k) || !caches_flush(&s.g) {
         stuck(s.grants, k);
     }
     st.slots[k].running = false;
@@ -575,7 +594,7 @@ extern "C" fn slot_thread(k: u64) -> ! {
                 let seq = st.slots[k].seq;
                 if ok {
                     let rec = qu.gpu + r.record_offset(n) as u64;
-                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + 0x40, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
+                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + 0x40, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, invalidate: st.slots[k].camera && st.slots[k].camera_cached };
                     let mut words = [0u64; q::JOB_WORDS_MOST];
                     let len = q::job_words(&d, &mut words);
                     append(s, &mut st.slots[k], k, &words[..len]);
@@ -666,7 +685,7 @@ fn tables(s: &Svc, sl: &mut Slot, camera: bool) {
                 }
             } else if is_camera(b, sz) {
                 if camera {
-                    t.map_block(&mut tm, CAMERA_VA + off, pa, BLOCK_RO | NC | NX, TABLE);
+                    t.map_block(&mut tm, CAMERA_VA + off, pa, BLOCK_RO | if sl.camera_cached { 0 } else { NC } | NX, TABLE);
                     sl.camera = true;
                 }
             } else if s.surfaces_ok {
@@ -843,7 +862,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
         }
         // The client's block: the first region inside the arena (a client holds one; a holder of the whole arena, a development spawn's `--dma arena`, gets the whole).
         let block = stamp.regions().iter().copied().find(|&(b, sz)| arena_ok && b as usize >= arena && b as usize + sz as usize <= arena + arena_bytes);
-        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=5).contains(&m[0])) else {
+        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=6).contains(&m[0])) else {
             ferros_sys::reply(&token, &reply[..reply_len]);
             continue;
         };
@@ -919,11 +938,34 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             }
             // Its memory looked at again (2026-11-20): its address space made from this call's stamp when it changed (a camera view given since: mapped read-only at `CAMERA_VA`), `[0][the camera mapped u8]`.
             5 => {
-                let cam = with(|st| slot_for(st, &stamp, bbase, bsize).map(|k| st.slots[k].camera));
+                // `[5][1]`: the camera mapped cacheable on the GPU, every job of the client invalidating the GPU's caches before it runs (the measure against non-cacheable); `[5]` or `[5][0]` non-cacheable. A change remakes its tables.
+                let cached = m.len() > 1 && m[1] == 1;
+                let cam = with(|st| {
+                    let k = slot_for(st, &stamp, bbase, bsize)?;
+                    if st.slots[k].camera_cached != cached {
+                        st.slots[k].camera_cached = cached;
+                        tables(s, &mut st.slots[k], true);
+                        if st.slots[k].running && !space_install(&s.g, k + 1, st.slots[k].root) {
+                            say!(s.grants, "gpu: slot {k}'s address space did not take its new tables\n");
+                        }
+                    }
+                    Some(st.slots[k].camera)
+                });
                 match cam {
                     Some(c) => ferros_sys::reply(&token, &[0, c as u8]),
                     None => ferros_sys::reply(&token, &[1, 0]),
                 };
+                continue;
+            }
+            // `[6][1]` the GPU's clock held up whatever is queued, `[6][0]` let go (a development measure: what the turns cost a frame), `[0]`.
+            6 => {
+                let on = m.len() > 1 && m[1] == 1;
+                with(|st| {
+                    CLOCK_HOLD.store(on, Ordering::Relaxed);
+                    WANT.store((on || st.inflight > 0) as u64, Ordering::Release);
+                });
+                ferros_sys::wake(&WANT, 1);
+                ferros_sys::reply(&token, &[0]);
                 continue;
             }
             // Its queue closed: what runs stopped, what waits lost.
@@ -991,7 +1033,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             wr64(sl.flag + CALL_STAMPS + 8, 0);
             wr64(sl.flag + CALL_STAMPS + 16, 0);
             let seq = sl.seq;
-            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
+            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, invalidate: sl.camera && sl.camera_cached };
             let mut jw = [0u64; q::JOB_WORDS_MOST];
             let len = q::job_words(&d, &mut jw);
             append(s, sl, k, &jw[..len]);

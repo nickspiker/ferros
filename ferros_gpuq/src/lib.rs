@@ -292,6 +292,8 @@ pub struct Dispatch {
     pub stamps: Option<u64>,
     pub sync: u64,
     pub value: u32,
+    /// The GPU's L2 and load-store caches cleaned and invalidated before the run (FLUSH_CACHE2 mode 3 for both, and its WAIT): a job reading memory a device writes without snooping thru a cacheable mapping (the camera ring cacheable, measured against non-cacheable: docs/GPU-KISTS.md "The camera ring on the GPU").
+    pub invalidate: bool,
 }
 
 /// The most words `job_words` writes.
@@ -332,6 +334,11 @@ pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
     put(mv32(37, d.groups.0));
     put(mv32(38, d.groups.1));
     put(mv32(39, 1));
+    if d.invalidate {
+        put(mv32(74, 0));
+        put(0x2400_4A00_0000_0233);
+        put(0x0300_0000_0001_0000);
+    }
     if let Some(at) = d.stamps {
         put(mv48(STAMP_REG, at));
         put(store_state(STAMP_REG, 8, 0));

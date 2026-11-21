@@ -111,6 +111,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 5 && bin == 1 {
         long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
+    // A fourth byte of 11: the camera ring read in place by this process's GPU queue (docs/GPU-KISTS.md "The camera ring on the GPU").
+    if arg(3) == 11 {
+        camera_gpu(g, ep, id, frames, t1);
+    }
     if bin == 1 {
         view(g, ep, id, frames, arg(3) == 2, arg(5), arg(6), t1);
     }
@@ -1003,6 +1007,147 @@ fn serve_wait(g: u64, ep: u64, id: u8, long_log2: u8, how: u8, t1: u64) -> ! {
                 ferros_sys::sleep_until(ferros_sys::now() + (ferros_sys::freq() << 10));
             }
         }
+    }
+}
+
+/// The GPU's kernels of the camera test: each invocation one 32-bit word, u0 the source, u1 the destination (both 64-bit addresses), the global id X preloaded in r60.
+/// `copy`: dst[gid] = src[gid]; `poke`: src[gid] = gid (into the read-only camera: must fault).
+fn kernel_copy(k: &mut valhall::Kernel<8>) {
+    use valhall::*;
+    k.shaddx_u64(pair(2), u(0), pair(60), 2);
+    k.load_i32(r(0), pair(2), 0, Slot::S0).wait(Slot::S0);
+    k.shaddx_u64(pair(4), u(1), pair(60), 2);
+    k.store_i32(r(0), pair(4), 0, Slot::S0).end();
+}
+fn kernel_poke(k: &mut valhall::Kernel<8>) {
+    use valhall::*;
+    k.shaddx_u64(pair(2), u(0), pair(60), 2);
+    k.store_i32(r(60), pair(2), 0, Slot::S0).end();
+}
+
+/// The camera ring on the GPU (fourth byte 11, G#0B; docs/GPU-KISTS.md "The camera ring on the GPU"): the holder's queue reads its frames in place, read-only, gone at CLOSE.
+/// Spawn: `camtest.bin 1001000B --use camera --use gpu --dma layers-32` (the first byte the frames, the fifth the camera).
+/// - OPEN with the view, a GPU queue in its block, `refresh`: the camera mapped.
+/// - Each frame MAPped: the whole frame copied by the GPU from `CAMERA_VA` into its block, every word compared with the CPU's read of the view, the GPU's time said; non-cacheable for the first half of the frames, cacheable with an invalidate a job for the second (the measure the coordinator asked).
+/// - A job storing into the ring: it must fault in its own space, read-only (the queue opened again after).
+/// - A long job in flight (the frame copied 2^5 times over), then CLOSE at once: the job stopped and lost, the queue ended `E_CAMERA`; then `refresh` says unmapped and a job reading the ring faults.
+fn camera_gpu(g: u64, ep: u64, id: u8, frames: u32, t1: u64) -> ! {
+    use ferros_sys::gpu::queue::*;
+    use ferros_sys::gpu::{ARENA_VA, CAMERA_VA, PRELOAD_X};
+    let (gpu, blk) = (cap(g, 2), cap(g, 3));
+    let mut r = [0u8; 64];
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
+    say!(g, "camtest gpu: OPEN with the view answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 || n < 48 {
+        ferros_sys::exit(1);
+    }
+    let tok = unsafe { &mut *(&raw mut VIEW_TOKEN) };
+    tok.copy_from_slice(&r[1..33]);
+    let toff = ferros_sys::off(tok.as_ptr());
+    let base = ferros_sys::dma(toff) as usize;
+    let (w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    // The block grown to hold a frame's copy past the queue and the code: 2^26.
+    let size = ferros_sys::gpu_block_ask(blk, 26);
+    let arena = ferros_sys::dma(blk) as usize;
+    const Q_AT: usize = 0;
+    const CODE_AT: usize = 1 << 20;
+    const OUT_AT: usize = 2 << 20;
+    let wr = |at: usize, v: u64| unsafe { core::ptr::write_volatile((arena + at) as *mut u64, v) };
+    let mut kc = valhall::Kernel::<8>::new();
+    kernel_copy(&mut kc);
+    let cw = kc.finish().to_vec_free();
+    let mut kp = valhall::Kernel::<8>::new();
+    kernel_poke(&mut kp);
+    let pw = kp.finish().to_vec_free();
+    for (i, &x) in cw.0[..cw.1].iter().enumerate() {
+        wr(CODE_AT + 8 * i, x);
+    }
+    for (i, &x) in pw.0[..pw.1].iter().enumerate() {
+        wr(CODE_AT + 4096 + 8 * i, x);
+    }
+    let mut q = match Queue::open(gpu, blk, Q_AT, 2) {
+        Ok(q) => q,
+        Err(e) => {
+            say!(g, "camtest gpu: the queue did not open (G#{e:X}); block A#{} MiB\n", size.unwrap_or(0) >> 20);
+            ferros_sys::exit(1);
+        }
+    };
+    let (Some(kcopy), Some(kpoke)) = (q.kernel(CODE_AT, cw.1, PRELOAD_X), q.kernel(CODE_AT + 4096, pw.1, PRELOAD_X)) else {
+        say!(g, "camtest gpu: a kernel was not loaded\n");
+        ferros_sys::exit(1);
+    };
+    let mapped = q.refresh();
+    say!(g, "camtest gpu: the view at G#{base:X}, A#{w} x A#{h}, A#{stride} bytes a line; the block A#{} MiB; the camera mapped on the GPU: {:?}\n", size.unwrap_or(0) >> 20, mapped);
+    let words = stride * h / 4;
+    let groups = (words / 16) as u32;
+    let mut held = 0xFFu8;
+    let mut h64 = [0u8; 64];
+    let mut place = 0u64;
+    let (mut nc, mut cc) = ((0u64, 0u32), (0u64, 0u32));
+    for k in 0..frames {
+        let cached = k >= frames / 2;
+        if k == frames / 2 {
+            say!(g, "camtest gpu: the camera cacheable on the GPU now: {:?}\n", q.refresh_mapped(true));
+        }
+        let n = call(ep, &[5, held], &mut h64);
+        if n == ERR || n < 64 {
+            say!(g, "camtest gpu: MAP A#{k}: no frame\n");
+            break;
+        }
+        held = h64[40];
+        place = u64::from_le_bytes(h64[48..56].try_into().unwrap());
+        let job = q.submit(&Job { kernel: kcopy, groups: (groups, 1), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }).unwrap();
+        let d = q.wait(job);
+        // Every word of the GPU's copy against the CPU's read of the same buffer thru the view.
+        let mut wrong = 0u32;
+        for i in 0..words {
+            let a = unsafe { core::ptr::read_volatile((base + place as usize + 4 * i) as *const u32) };
+            let b = unsafe { core::ptr::read_volatile((arena + OUT_AT + 4 * i) as *const u32) };
+            wrong += (a != b) as u32;
+        }
+        let us = d.gpu_ticks().unwrap_or(0) * 1_000_000 / ferros_sys::freq();
+        let acc = if cached { &mut cc } else { &mut nc };
+        acc.0 += us;
+        acc.1 += 1;
+        if k == 0 || k == frames / 2 || k + 1 == frames || wrong != 0 || d.status != S_DONE {
+            say!(g, "camtest gpu: frame A#{k} (buffer A#{held}, {}): status A#{}, GPU A#{us} us for A#{} KiB, A#{wrong} of A#{words} words differ from the CPU's view\n", if cached { "cacheable" } else { "non-cacheable" }, d.status, words >> 8);
+        }
+    }
+    // WHY the max: a run whose frames stopped before either half has no frame there, and its mean is said as 0.
+    say!(g, "camtest gpu: a frame's copy on the GPU: non-cacheable A#{} us on average over A#{}, cacheable with an invalidate a job A#{} us over A#{}\n", nc.0 / nc.1.max(1) as u64, nc.1, cc.0 / cc.1.max(1) as u64, cc.1);
+    // A store into the ring: read-only, so a fault in this client's own space.
+    let job = q.submit(&Job { kernel: kpoke, groups: (1, 1), uniforms: &[CAMERA_VA + place] }).unwrap();
+    let d = q.wait(job);
+    say!(g, "camtest gpu: a store into the camera: status A#{} at GPU address G#{:X}, AS_FAULTSTATUS G#{:X} (the queue ended A#{}); opened again {}\n", d.status, d.fault_address, d.fault_status, q.ended(), q.reopen());
+    let _ = q.refresh_mapped(false);
+    // A long job in flight at CLOSE: the frame copied 2^5 times over (the second axis repeats the first), the CLOSE at once.
+    let long = q.submit(&Job { kernel: kcopy, groups: (groups, 1 << 5), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }).unwrap();
+    let t = ferros_sys::now();
+    let mut c = [0u8; 4];
+    let n = call(ep, &[4], &mut c);
+    let close_us = ferros_sys::us_since(t);
+    let d = q.wait(long);
+    say!(g, "camtest gpu: CLOSE G#{:X} in A#{close_us} us with a long job in flight: the job's status A#{}, the queue ended A#{} (5: the camera went)\n", if n == ERR { 0xEEE } else { c[0] as u64 }, d.status, q.ended());
+    // After the CLOSE: unmapped, and a job reading where the ring was faults.
+    let reopened = q.reopen();
+    let mapped = q.refresh();
+    let job = q.submit(&Job { kernel: kcopy, groups: (1, 1), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }).unwrap();
+    let d = q.wait(job);
+    say!(g, "camtest gpu: after the CLOSE: opened again {reopened}, the camera mapped {:?}; a job reading the ring: status A#{} at G#{:X}, AS_FAULTSTATUS G#{:X}\n", mapped, d.status, d.fault_address, d.fault_status);
+    q.close();
+    ferros_sys::exit(0)
+}
+
+/// A kernel's words out of its builder into a fixed array (no allocator here): the words and how many.
+trait Free {
+    fn to_vec_free(&self) -> ([u64; 8], usize);
+}
+impl Free for [u64] {
+    fn to_vec_free(&self) -> ([u64; 8], usize) {
+        let mut a = [0u64; 8];
+        a[..self.len()].copy_from_slice(self);
+        (a, self.len())
     }
 }
 

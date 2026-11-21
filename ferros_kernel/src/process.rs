@@ -3477,7 +3477,8 @@ fn cam_free(epoch: u64) {
     }
     crate::cachemap::surface_unmapped(crate::cachemap::CAM_VA.0, c.n * crate::frames::FRAME);
     // While a GPU space may still map them (`GPU_CAM` stale: its holder's view was taken back above, or before), kept from the pool, and admitted to the GPU as they were, until the GPU service says it stopped that client's jobs and unmapped them (`gpu_cam_settled` shuts them out then): a job still reading one is stopped by the service, never by a fence closed under it. Else shut out of the fence (none admitted, as no space maps them) and given back.
-    if unsafe { (*(&raw const GPU_CAM)).stale } != 0 {
+    let held = unsafe { (*(&raw const GPU_CAM)).stale } != 0;
+    if held {
         // One run waits at a time: a second given back before the first's unmap was said (a driver started and ended within it) leaves the first out of the pool for the boot, never in it while a GPU space may reach it.
         unsafe { (*(&raw mut GPU_CAM)).drain = (c.first, c.n) };
     } else {
@@ -3486,7 +3487,7 @@ fn cam_free(epoch: u64) {
             crate::frames::give(f);
         }
     }
-    let line = alloc::format!("camera region: A#{} frames from G#{:X} wiped back into the pool, S2MPUs G#{shut:X} first (0 while the switch is off)\n", c.n, crate::frames::pa(c.first));
+    let line = alloc::format!("camera region: A#{} frames from G#{:X} {}, S2MPUs G#{shut:X} first (0 while the switch is off)\n", c.n, crate::frames::pa(c.first), if held { "held from the pool until the GPU service unmaps them" } else { "wiped back into the pool" });
     k().console.extend_from_slice(line.as_bytes());
     *c = Cam { owner: 0, first: 0, n: 0 };
 }

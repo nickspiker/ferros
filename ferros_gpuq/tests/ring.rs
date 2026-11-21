@@ -41,7 +41,7 @@ fn old_words(spd: u64, tsd: u64, fau: u64, nu: u32, groups: (u32, u32), max_thre
 #[test]
 fn words_without_stamps_are_the_old_ones() {
     for (groups, mt) in [((1u32, 1u32), 1024u32), ((1024, 1), 1024), ((84, 2992), 1024), ((24576, 1), 768), ((3, 1), 1024)] {
-        let d = Dispatch { spd: 0x3100_0000, tsd: 0x3100_0040, fau: 0x3100_0080, uniforms: 7, groups, max_threads: mt, stamps: None, sync: 0x3200_0200, value: 1 };
+        let d = Dispatch { spd: 0x3100_0000, tsd: 0x3100_0040, fau: 0x3100_0080, uniforms: 7, groups, max_threads: mt, stamps: None, sync: 0x3200_0200, value: 1, invalidate: false };
         let mut out = [0u64; JOB_WORDS_MOST];
         let n = job_words(&d, &mut out);
         assert_eq!(&out[..n], &old_words(d.spd, d.tsd, d.fau, 7, groups, mt, d.sync)[..], "{groups:?}");
@@ -55,7 +55,7 @@ fn field(w: u64, start: u32, size: u32) -> u64 {
 
 #[test]
 fn stamps_are_store_state_timestamps() {
-    let d = Dispatch { spd: 0x3100_0400, tsd: 0x3100_0040, fau: 0x8000_1040, uniforms: 3, groups: (256, 1), max_threads: 1024, stamps: Some(0x8000_1240), sync: 0x3200_0240, value: 0x1234_5678 };
+    let d = Dispatch { spd: 0x3100_0400, tsd: 0x3100_0040, fau: 0x8000_1040, uniforms: 3, groups: (256, 1), max_threads: 1024, stamps: Some(0x8000_1240), sync: 0x3200_0240, value: 0x1234_5678, invalidate: true };
     let mut out = [0u64; JOB_WORDS_MOST];
     let n = job_words(&d, &mut out);
     let w = &out[..n];
@@ -76,6 +76,9 @@ fn stamps_are_store_state_timestamps() {
     let run = w.iter().position(|&x| field(x, 56, 8) == 4).unwrap();
     let wait3 = w.iter().position(|&x| x == 0x0300_0000_0008_0000).unwrap();
     assert!(mv < stores[0].0 && stores[0].0 < run && run < wait3 && wait3 < stores[1].0, "start stamp before the run, end stamp after its wait");
+    // The invalidate: FLUSH_CACHE2 (opcode 36) with L2 and LSC mode 3 (clean and invalidate), before the run.
+    let inv = w.iter().position(|&x| x == 0x2400_4A00_0000_0233).unwrap();
+    assert!(inv < run && field(w[inv], 0, 4) == 3 && field(w[inv], 4, 4) == 3 && field(w[inv], 56, 8) == 36);
     // The end: the sync word set to the value (SYNC_SET32 last, its value in r72).
     assert_eq!(*w.last().unwrap(), 0x2600_4648_0000_0000);
     assert!(w.contains(&mv32(72, 0x1234_5678)));
