@@ -903,6 +903,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
     };
     let mut turns = Turns::default();
+    // The last frame taken, by the driver's count and Eagle ns: the sensor's rate from one to the next (`set_sensor_rate`).
+    let mut last_frame: Option<(u32, i64)> = None;
     let first = if dev_slit {
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
         let shutter_ns = match dev_shutter_us() {
@@ -1214,6 +1216,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             quiet = Some(heartbeat);
         } else if quiet != Some(heartbeat) {
             quiet = None;
+        }
+        // F, the sensor's own rate (the owner, 2026-11-20): the frames the driver counted since the last one taken over the time its clock says passed, at every frame taken (one the preview passes over too), not Lumis's intake.
+        // WHY the order check: the count and the time are the driver's, and both start over when the camera reopens; that frame only starts the next measure.
+        if let Got::Frame(head, _) = &got {
+            if let Some((c0, t0)) = last_frame.filter(|&(c0, t0)| head.count > c0 && head.time > t0) {
+                integrator.set_sensor_rate((head.count - c0) as f64 * 1e9 / (head.time - t0) as f64);
+            }
+            last_frame = Some((head.count, head.time));
         }
         // A continuous save or a calibration integrates on: the integrator never ends Lumis on a quiet UI while either runs (lumis ferros-cal-behind).
         // Otherwise, behind (or in front again before the UI has drawn), nothing is integrated: the save on its way is the image already made, so it is started if asked for and not yet begun, kept when encoded, and Lumis leaves once nothing is left on its way.
