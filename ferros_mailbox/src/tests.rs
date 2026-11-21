@@ -1,4 +1,4 @@
-//! Host tests: a publish reads back whole, a read racing a publish is never taken for one, the kernel's end of a writer, a new writer after it, and the GPS layout's round trip.
+//! Host tests: a publish reads back whole, a read racing a publish is never taken for one, the kernel's end of a writer, a new writer after it, and the GPS and thermometer layouts' round trips.
 
 extern crate std;
 use super::*;
@@ -152,4 +152,30 @@ fn the_names_line_up() {
     assert_eq!(NAMES[MOTION], "motion");
     assert_eq!(NAMES[MIC], "mic");
     assert_eq!(NAMES[TEST], "test");
+    assert_eq!(NAMES[FRAME], "frame");
+    assert_eq!(NAMES[THERMO], "thermo");
+}
+
+#[test]
+fn thermo_round_trip() {
+    let mut r = [thermo::Range::default(); thermo::RANGES];
+    r[thermo::NORMAL] = thermo::Range { samples: u32::MAX, floats: 7, aoc_ns: u64::MAX - 3, at: 1 << 40, raw: [0.; thermo::FLOATS] };
+    for k in 0..7 {
+        r[thermo::NORMAL].raw[k] = 31.5 + k as f32 * -0.25;
+    }
+    r[thermo::EXTENDED] = thermo::Range { samples: 1, floats: 1 << 6, aoc_ns: 5, at: 6, raw: [f32::NAN; thermo::FLOATS] };
+    let mut w = [0u64; thermo::WORDS];
+    thermo::encode(&r, &mut w);
+    let d = thermo::decode(&w).unwrap();
+    assert_eq!(d[thermo::NORMAL], r[thermo::NORMAL]);
+    assert_eq!(d[thermo::NORMAL].sensor(), 31.5);
+    assert_eq!(d[thermo::NORMAL].object(), 31.25);
+    // NaN is never equal to itself: the bits come back as they went.
+    let e = d[thermo::EXTENDED];
+    assert_eq!((e.samples, e.floats, e.aoc_ns, e.at), (1, 1 << 6, 5, 6));
+    assert!(e.raw.iter().all(|f| f.to_bits() == f32::NAN.to_bits()));
+    // The temperatures' word is the object (float 1), then the sensor (float 0), as a reader of the word alone takes them.
+    assert_eq!(f32::from_bits(w[thermo::TEMPS] as u32), 31.25);
+    assert_eq!(f32::from_bits((w[thermo::TEMPS] >> 32) as u32), 31.5);
+    assert_eq!(thermo::decode(&w[..thermo::WORDS - 1]), None);
 }

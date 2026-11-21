@@ -29,6 +29,10 @@ path = "src/gps.rs"
 name = "puck_weather"
 path = "src/weather.rs"
 
+[[bin]]
+name = "puck_thermo"
+path = "src/thermo.rs"
+
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }

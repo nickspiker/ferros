@@ -2629,8 +2629,8 @@ pub static DMA: &[Dma] = &[
     puck_slot(0), puck_slot(1), puck_slot(2), puck_slot(3), puck_slot(4), puck_slot(5), puck_slot(6), puck_slot(7),
     puck_slot(8), puck_slot(9), puck_slot(10), puck_slot(11), puck_slot(12), puck_slot(13), puck_slot(14), puck_slot(15),
     // The mailboxes (cachemap MBOX_VA and MBOX_VIEW_VA, docs/KERNEL.md "Mailboxes", 2026-11-19): each one's writer's region (`gps-mailbox`, read-write), then each one's readers' view (`gps-view`, read-only), in ferros_mailbox's order, a frame of the pool behind both from the first ask (`mbox_frame`). Granted by name, or a view opened with a proof (SYS_MAILBOX). Must stay consecutive and in order: `mbox0() + k` is mailbox k's writer's region, `mbox0() + MBOXES + k` its view.
-    mbox_slot(0, false), mbox_slot(1, false), mbox_slot(2, false), mbox_slot(3, false), mbox_slot(4, false),
-    mbox_slot(0, true), mbox_slot(1, true), mbox_slot(2, true), mbox_slot(3, true), mbox_slot(4, true),
+    mbox_slot(0, false), mbox_slot(1, false), mbox_slot(2, false), mbox_slot(3, false), mbox_slot(4, false), mbox_slot(5, false),
+    mbox_slot(0, true), mbox_slot(1, true), mbox_slot(2, true), mbox_slot(3, true), mbox_slot(4, true), mbox_slot(5, true),
 ];
 
 /// Mailbox k's writer's region (`view` false) or its readers' view as a DMA region (`DMA`): its frame's address in that window.
@@ -2643,7 +2643,7 @@ const fn mbox_slot(k: usize, view: bool) -> Dma {
 }
 /// How many mailboxes there are.
 const MBOXES: usize = crate::cachemap::MBOXES;
-const _: () = assert!(MBOXES == 5 && ferros_mailbox::BYTES == crate::frames::FRAME, "the DMA table lists five mailboxes, a frame each");
+const _: () = assert!(MBOXES == 6 && ferros_mailbox::BYTES == crate::frames::FRAME, "the DMA table lists six mailboxes, a frame each");
 /// Where the mailboxes' regions begin in `DMA`.
 fn mbox0() -> usize {
     DMA.iter().position(|r| r.name == ferros_mailbox::BOX_NAMES[0]).unwrap()
@@ -2793,7 +2793,7 @@ fn wake_range(lo: usize, hi: usize) -> u64 {
 }
 
 /// SYS_MAILBOX op 0: mailbox `id`'s view for the caller, proved by the token at arc offset `proof`; the view's token written at arc offset `out` (the one it holds already, or a new one), answered the view's base (`mbox_dma`). ERR: no such mailbox, the proof refused, no frame.
-/// The proof, per mailbox: GPS, what proves a GPS claim (Settings, the `gps` right as its endpoint's send right) or a GPS view; motion, none (gravity and the field are what SYS_FACTS gives anyone today; a `sensors` right is the owner's to decide, rights_implicit_set); the microphones and the test mailbox are granted by name only.
+/// The proof, per mailbox: GPS, what proves a GPS claim (Settings, the `gps` right as its endpoint's send right) or a GPS view; motion, none (gravity and the field are what SYS_FACTS gives anyone today; a `sensors` right is the owner's to decide, rights_implicit_set); the thermometer and the display's frames, none (the owner's, 2026-11-20); the microphones and the test mailbox are granted by name only.
 fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
     // WHY the bound: the number is the caller's, an index into the mailboxes.
     if id >= MBOXES as u64 {
@@ -2814,6 +2814,8 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
         ferros_mailbox::MOTION => true,
         // The display's frames: when a picture starts on the glass is what everyone sees (2026-11-20).
         ferros_mailbox::FRAME => true,
+        // The IR thermometer (owner, 2026-11-20: open, no permission necessary, an implicit right as the display or the GPU).
+        ferros_mailbox::THERMO => true,
         _ => false,
     };
     if !proved {
@@ -2828,6 +2830,20 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
         Some(c) => c.token,
         None => {
             let t = mint(Object::Dma(vi), RIGHT_SEND, p.epoch);
+            // The view's handle in the grants page's table (2026-11-20, the thermometer puck): masked code reaches a region only thru its handle (SANDBOX.md "Handles"), and the table was written only at the build, so a masked reader that opened a view held it and could not read it (ferros_sys::mailbox `View`).
+            // At the first free pair past the slots the build wrote (the page's token count): for a process that opens one view, its grant count, which it knows from its own layout. Not the capability's place in `cspace`, which a server's reply capabilities move.
+            // WHY the bound: the table holds `(TOKENS - HANDLES) / 16` pairs; a view opened with none free still serves native readers and the waits, and has no handle.
+            // SAFETY: the grants page is the arc's first page, the kernel's to read at its own address; the count and the pairs are words the kernel wrote.
+            let built = unsafe { core::ptr::read_volatile((p.arc.base + TOKENS) as *const u32) } as usize;
+            let free = (built..(TOKENS - HANDLES) / 16).find(|&s| unsafe { core::ptr::read_volatile((p.arc.base + HANDLES + 16 * s) as *const u64) } == 0);
+            if let Some(slot) = free {
+                let (b, m) = handle_of(Object::Dma(vi));
+                // The grants page is read-only at every level: opened for the write, closed after, as a preference's (`write_pref_all`).
+                crate::cachemap::grants_page(p.arc.base, true);
+                p.write_grants((HANDLES + 16 * slot) as u64, &b.to_le_bytes());
+                p.write_grants((HANDLES + 16 * slot + 8) as u64, &m.to_le_bytes());
+                crate::cachemap::grants_page(p.arc.base, false);
+            }
             p.cspace.push(CapEntry { token: t, object: Object::Dma(vi), rights: RIGHT_SEND });
             t
         }
@@ -9688,6 +9704,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let motion = mbox0() + ferros_mailbox::MOTION;
     if cspace.iter().any(|c| c.object == Object::Sensors) && !cspace.iter().any(|c| c.object == Object::Dma(motion)) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
         let object = Object::Dma(motion);
+        cspace.push(CapEntry { token: mint(object, RIGHT_SEND | RIGHT_RECV, epoch), object, rights: RIGHT_SEND | RIGHT_RECV });
+    }
+    // The thermometer's mailbox's writer's region the same way, the slot after motion's (2026-11-20, docs/SENSORS.md "The thermo mailbox"): the sensors process publishes the MLX90632's temperatures there.
+    let thermo = mbox0() + ferros_mailbox::THERMO;
+    if cspace.iter().any(|c| c.object == Object::Sensors) && !cspace.iter().any(|c| c.object == Object::Dma(thermo)) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
+        let object = Object::Dma(thermo);
         cspace.push(CapEntry { token: mint(object, RIGHT_SEND | RIGHT_RECV, epoch), object, rights: RIGHT_SEND | RIGHT_RECV });
     }
     // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.

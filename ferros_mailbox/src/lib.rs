@@ -9,7 +9,7 @@
 //! The header, eight words:
 //! - word 0, `SEQ`: the sequence, even while the words are whole and odd while a publish is under way, bit 63 (`DEAD`) set by the kernel when the writer's process has ended.
 //!   Readers wait on this word (SYS_WAIT), the writer's wake (SYS_WAKE) ends every wait on it.
-//! - word 1, `KIND`: the payload's layout, the writer's tag (`gps::KIND`, `motion::KIND`), so a reader never takes one layout for another.
+//! - word 1, `KIND`: the payload's layout, the writer's tag (`gps::KIND`, `motion::KIND`, `thermo::KIND`), so a reader never takes one layout for another.
 //! - word 2, `LEN`: how many payload words the writer published.
 //! - word 3, `AT`: the counter (CNTVCT) at the publish, so a reader measures how late it woke.
 //! - words 4 to 7: not yet used, zero.
@@ -45,7 +45,7 @@ pub const AT: usize = 3;
 pub const DEAD: u64 = 1 << 63;
 
 /// The mailboxes, by number: the kernel's regions are `<name>-mailbox` (the writer's) and `<name>-view` (a reader's) for each, in this order.
-pub const NAMES: [&str; 5] = ["gps", "motion", "mic", "test", "frame"];
+pub const NAMES: [&str; 6] = ["gps", "motion", "mic", "test", "frame", "thermo"];
 /// The GPS driver's: its fix and its tracks, the predicted birds among them (`gps`).
 pub const GPS: usize = 0;
 /// The sensors process's: gravity, the magnetometers and the accelerometer (`motion`).
@@ -56,10 +56,12 @@ pub const MIC: usize = 2;
 pub const TEST: usize = 3;
 /// The kernel's own, for anyone (2026-11-20, docs/GPU-KISTS.md "The display's frames"; Lumis: "a display frame event, so a kernel runs once per display frame"): published at every frame the display starts on the glass (`frame`).
 pub const FRAME: usize = 4;
+/// The sensors process's IR thermometer (2026-11-20, docs/SENSORS.md "The thermo mailbox"): the MLX90632's object and sensor temperatures, both ranges (`thermo`).
+pub const THERMO: usize = 5;
 /// The writers' regions, by number.
-pub const BOX_NAMES: [&str; 5] = ["gps-mailbox", "motion-mailbox", "mic-mailbox", "test-mailbox", "frame-mailbox"];
+pub const BOX_NAMES: [&str; 6] = ["gps-mailbox", "motion-mailbox", "mic-mailbox", "test-mailbox", "frame-mailbox", "thermo-mailbox"];
 /// The readers' regions, by number.
-pub const VIEW_NAMES: [&str; 5] = ["gps-view", "motion-view", "mic-view", "test-view", "frame-view"];
+pub const VIEW_NAMES: [&str; 6] = ["gps-view", "motion-view", "mic-view", "test-view", "frame-view", "thermo-view"];
 
 /// One publish under way: the sequence made odd at `begin`, the words written with `put`, the sequence even and two on at `finish`.
 /// For a payload built in place (a ring's new samples); `publish` is the whole of it for a payload in hand.
@@ -118,7 +120,14 @@ pub enum Got {
 /// Read a mailbox's payload into `out` (as many words as fit) from the readers' `words` (the whole mailbox, header first), once.
 /// `Fresh` only when the sequence was even and the same before and after the copy: the words are one publish's.
 pub fn try_read(words: &[AtomicU64], out: &mut [u64]) -> Got {
-    let s0 = words[SEQ].load(Ordering::Acquire);
+    try_read_by(|i| words[i].load(Ordering::Relaxed), out)
+}
+
+/// `try_read` with each word loaded by `load` (word `i` of the mailbox, header first, a single-copy-atomic aligned load), for a reader that reaches the view only thru its handle (masked code: ferros_sys::mailbox `View`). The fences are this function's, so the seqlock is the one `try_read` runs.
+pub fn try_read_by(load: impl Fn(usize) -> u64, out: &mut [u64]) -> Got {
+    let s0 = load(SEQ);
+    // The sequence is seen before any payload word is read (the acquire of Boehm's first load).
+    fence(Ordering::Acquire);
     if s0 & 1 != 0 {
         return Got::Busy { seq: s0 };
     }
@@ -128,17 +137,17 @@ pub fn try_read(words: &[AtomicU64], out: &mut [u64]) -> Got {
     if s0 == 0 {
         return Got::Never;
     }
-    let kind = words[KIND].load(Ordering::Relaxed);
-    let len = words[LEN].load(Ordering::Relaxed) as usize;
-    let at = words[AT].load(Ordering::Relaxed);
+    let kind = load(KIND);
+    let len = load(LEN) as usize;
+    let at = load(AT);
     // WHY the min: `len` is the writer's word, read under no lock; the copy stays inside the reader's buffer and the mailbox whatever it says (a torn `len` is caught by the sequence below).
     let n = len.min(out.len()).min(PAYLOAD_MAX);
     for (i, o) in out[..n].iter_mut().enumerate() {
-        *o = words[HEADER + i].load(Ordering::Relaxed);
+        *o = load(HEADER + i);
     }
     // The copy's loads are done before the sequence is read again (Boehm's reader).
     fence(Ordering::Acquire);
-    let s1 = words[SEQ].load(Ordering::Relaxed);
+    let s1 = load(SEQ);
     if s1 != s0 {
         return Got::Busy { seq: s1 };
     }
@@ -302,6 +311,108 @@ pub mod frame {
     pub const ARMED: usize = 1;
     /// The payload's words.
     pub const WORDS: usize = 2;
+}
+
+/// The sensors process's IR thermometer mailbox (payloads/sensors; docs/SENSORS.md "The thermo mailbox"; owner, 2026-11-20): the Pro's MLX90632 as Google's AoC firmware reports it over USF, its normal range (USF type 56, "MLX90632 FIR Temperature") and its extended range (type 67, "MLX90632 FIR Extended Temperature"), published with every sample of either.
+/// Each range is a block of `RANGE_WORDS`: the object's and the sensor's own temperature, how many samples have come and how many floats each carried, the newest sample's time as the AoC stamped it and on ferros's counter, then every float of that sample as it came, so the ones not yet named are there to read.
+/// The values are the AoC's, uncalibrated by ferros (the owner's blackbodies come later).
+pub mod thermo {
+    /// The layout's tag: "THERMO" and its version, 0.
+    pub const KIND: u64 = 0x5448_4552_4D4F_0000;
+    /// The ranges: normal (USF type 56), then extended (type 67).
+    pub const RANGES: usize = 2;
+    pub const NORMAL: usize = 0;
+    pub const EXTENDED: usize = 1;
+    /// The most floats of a sample kept: the Pro's normal range carries 6, its extended 2 (measured 2026-11-20); a sample with more keeps its first `FLOATS`, and says how many it had.
+    pub const FLOATS: usize = 1 << 3;
+    /// A sample's floats as the AoC sends them (docs/SENSORS.md "The thermo mailbox" says what each is, and what shows it):
+    /// 0 the sensor's own temperature (the MLX90632's die, Ta), °C; 1 the object's (To), °C; then, the normal range only, the chip's raw words as whole numbers:
+    /// 2 and 3 the object signal of this measurement and of the one before (the Linux driver's object_new_raw and object_old_raw), 4 and 5 the ambient words (RAM_6 and RAM_9: ambient_new_raw and ambient_old_raw).
+    pub const SENSOR_C: usize = 0;
+    pub const OBJECT_C: usize = 1;
+    pub const OBJECT_NEW: usize = 2;
+    pub const OBJECT_OLD: usize = 3;
+    pub const AMBIENT_NEW: usize = 4;
+    pub const AMBIENT_OLD: usize = 5;
+    /// In a range's block, word 0: the object's temperature | the sensor's own << 32 (f32 bits, °C: the sample's floats 1 and 0).
+    pub const TEMPS: usize = 0;
+    /// Word 1: the samples so far (zero: none yet) | the floats the newest sample carried << 32.
+    pub const COUNT: usize = 1;
+    /// Word 2: the newest sample's time as the AoC stamped it (its nanoseconds, the word as sent).
+    pub const AOC_NS: usize = 2;
+    /// Word 3: the same time on ferros's counter (CNTVCT ticks), as the motion mailbox's.
+    pub const AT: usize = 3;
+    /// Words 4 on: the newest sample's floats, two a word, float 2k in the low half.
+    pub const RAW: usize = 4;
+    /// A range's words.
+    pub const RANGE_WORDS: usize = RAW + FLOATS / 2;
+    /// The payload's words: the ranges' blocks, normal first.
+    pub const WORDS: usize = RANGES * RANGE_WORDS;
+
+    /// One range as published.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub struct Range {
+        /// The samples so far: zero until the first.
+        pub samples: u32,
+        /// The floats the newest sample carried (more than `FLOATS` when it had more than were kept).
+        pub floats: u32,
+        pub aoc_ns: u64,
+        pub at: u64,
+        /// The newest sample's floats, the first `floats` (at most `FLOATS`) of them its own, the rest zero.
+        pub raw: [f32; FLOATS],
+    }
+
+    impl Default for Range {
+        fn default() -> Range {
+            Range { samples: 0, floats: 0, aoc_ns: 0, at: 0, raw: [0.; FLOATS] }
+        }
+    }
+
+    impl Range {
+        /// The object's temperature, °C, as the AoC reports it.
+        pub fn object(&self) -> f32 {
+            self.raw[OBJECT_C]
+        }
+        /// The sensor's own temperature (the MLX90632's die, its ambient), °C.
+        pub fn sensor(&self) -> f32 {
+            self.raw[SENSOR_C]
+        }
+        /// The range's words into `w` (`RANGE_WORDS` of them).
+        pub fn encode(&self, w: &mut [u64]) {
+            let pair = |a: f32, b: f32| a.to_bits() as u64 | (b.to_bits() as u64) << 32;
+            w[TEMPS] = pair(self.raw[OBJECT_C], self.raw[SENSOR_C]);
+            w[COUNT] = self.samples as u64 | (self.floats as u64) << 32;
+            w[AOC_NS] = self.aoc_ns;
+            w[AT] = self.at;
+            for k in 0..FLOATS / 2 {
+                w[RAW + k] = pair(self.raw[2 * k], self.raw[2 * k + 1]);
+            }
+        }
+        /// A range from its words (`RANGE_WORDS` of them).
+        pub fn decode(w: &[u64]) -> Range {
+            let mut raw = [0f32; FLOATS];
+            for k in 0..FLOATS / 2 {
+                raw[2 * k] = f32::from_bits(w[RAW + k] as u32);
+                raw[2 * k + 1] = f32::from_bits((w[RAW + k] >> 32) as u32);
+            }
+            Range { samples: w[COUNT] as u32, floats: (w[COUNT] >> 32) as u32, aoc_ns: w[AOC_NS], at: w[AT], raw }
+        }
+    }
+
+    /// Both ranges' words into the payload `w`.
+    pub fn encode(r: &[Range; RANGES], w: &mut [u64; WORDS]) {
+        for (k, range) in r.iter().enumerate() {
+            range.encode(&mut w[k * RANGE_WORDS..(k + 1) * RANGE_WORDS]);
+        }
+    }
+
+    /// Both ranges from a payload; None for one shorter than the layout (a reader's buffer cut short, or another layout).
+    pub fn decode(w: &[u64]) -> Option<[Range; RANGES]> {
+        if w.len() < WORDS {
+            return None;
+        }
+        Some([Range::decode(&w[..RANGE_WORDS]), Range::decode(&w[RANGE_WORDS..WORDS])])
+    }
 }
 
 #[cfg(test)]
