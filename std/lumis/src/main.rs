@@ -1051,6 +1051,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             println!("lumis: development: Slitscan");
             integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
         }
+        // Out of Slitscan on whole frames, slits are asked for again at the next entry: a slit that failed or stopped once (a driver restart, a refused open) cost Slitscan its slits for the rest of the camera's session, its reason said once and every later entry silent on whole frames (the owner, 2026-11-20: "it's doing it again ... it actually says 14.9:F"). Each entry tries once and says why when it cannot.
+        if !slit_ok && !wants_slits(&integrator.header) && !src.is_slit() && knobs & DEV_COPY == 0 && cam.mode == 0 {
+            slit_ok = true;
+        }
         // Slitscan takes slits, every other mode whole frames: the camera is closed (the driver ends) and opened again for the other (owner, 2026-11-18: "Do wire it up so I get more than 30 lines per second"). The new driver starts at the init's settings, so the integrator's are sent again.
         if slit_ok && wants_slits(&integrator.header) != src.is_slit() {
             let slit = !src.is_slit();
