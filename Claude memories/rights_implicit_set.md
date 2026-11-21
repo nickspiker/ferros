@@ -1,6 +1,6 @@
 ---
 name: rights-implicit-set
-description: "Implicit for every kist, never asked (owner 2026-11-12): display, touch, surface, its own domain, entropy, its ira-sealed key, sound out, and the GPU"
+description: "Implicit for every kist, never asked (owner 2026-11-12): display, touch, surface, its own domain, entropy, its ira-sealed key, sound out, the GPU; and the IR thermometer (2026-11-20)"
 metadata:
   type: feedback
 ---
@@ -10,3 +10,5 @@ Owner, 2026-11-12, "Yes on the implicit set", to my proposal: a kist you chose t
 **Why:** questions only for what matters; every needless prompt teaches yes.
 
 **How to apply:** never put these in a kist's asked wants or a permission screen. Questions are for the rest (network, place/GPS, camera, mic, sensors, radios, people, being you, the hold, always on: proposed 2026-11-12, not yet decided). Related: [[permissions-asked-once]].
+
+**Added 2026-11-20:** the IR thermometer (the `thermo` mailbox): "open, no permission necessary". The other sensors (motion included) stay undecided.

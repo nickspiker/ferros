@@ -67,10 +67,10 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Settings flow identity to device only](settings_identity_to_device_only.md) - never device to identity; settings are spec VSF
 - [Permissions asked once, ever](permissions_asked_once.md) - per person, per kist, per permission; travels to all devices
 - [Sensor mailboxes](sensor_mailboxes.md) - drivers publish to a cap-gated read-only mailbox; unlimited readers wait on its sequence, never call the driver
-- [IR thermometer](ir_thermometer.md) - MLX90632 into a `thermo` mailbox + puck; owner has blackbodies for calibration; asked-vs-implicit undecided
+- [IR thermometer](ir_thermometer.md) - MLX90632 into a `thermo` mailbox + puck, open (no permission); owner has blackbodies for calibration
 - [App scale and theme are global](app_scale_theme_global.md) - every kist follows PREF_SCALE (RU) + PREF_THEME, implicit; deck has its own scale; fluor host applies them
 - [Thing identity `ht`](thing_identity_ht.md) - stable 32-byte thing id (ht) beside content hp and kind hi; h-marker newtypes; deck keyed by (kind, Ht), icons by Hp
-- [Implicit rights](rights_implicit_set.md) - display, touch, surface, domain, entropy, ira, audio out, GPU: never asked
+- [Implicit rights](rights_implicit_set.md) - display, touch, surface, domain, entropy, ira, audio out, GPU, IR thermometer: never asked
 - [GPU is implicit](gpu_implicit.md) - no GPU permission ever; isolation between clients is the protection
 - [Notifications: in view](notifications_in_view.md) - in the deck's resting view can notify, out of view silent; three kinds
 - [Clipboard = capability handoff](clipboard_capability_handoff.md) - no buffer; one-shot caps on gesture; fleet doorbell
