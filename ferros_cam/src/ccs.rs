@@ -329,6 +329,11 @@ impl Timing {
         (((p.coarse as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
     }
 
+    /// The exposure a plan gives (ns), rounded up: what `plan` takes to give back the plan's own lines at the mode's line (a frame length SET plans the exposure in force again; from `ns`, rounded down, `lines` came back a line short: 16 lines planned as 15 on the Pro, 2026-11-20).
+    pub fn ns_ceil(&self, p: &Plan) -> u64 {
+        (((p.coarse as u128) << p.shift) * self.line_ps_at(p.llp) as u128).div_ceil(1000) as u64
+    }
+
     /// A plan's frame period (ns), in 128 bits as `ns`.
     pub fn frame_ns(&self, p: &Plan) -> u64 {
         (((p.fll as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
@@ -1251,6 +1256,14 @@ mod tests {
         }
         // Back to the open's own frame: the plan is the open's again.
         assert_eq!(open.plan(4_000_000).unwrap().fll, 0x5372);
+        // The exposure in force planned again keeps its lines: every integration from the least to past a frame, against a slit's 192 lines and a 384-line SET (the Pro, 2026-11-20: 16 lines came back 15 from `ns`).
+        for fll in [192u16, 384, 5293] {
+            let t = Timing { fll, ..open };
+            for c in [2u16, 15, 16, 17, 190, 1000, 21342] {
+                let now = Plan { llp: 6320, fll: 0x5372, coarse: c, shift: 0 };
+                assert_eq!(t.plan(t.ns_ceil(&now)).unwrap().coarse, c, "{fll} {c}");
+            }
+        }
     }
 
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.

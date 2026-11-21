@@ -3191,7 +3191,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         } else {
                             let before = o.timing.fll;
                             o.timing.fll = fll as u16;
-                            let ns = o.timing.ns(&o.now);
+                            let ns = o.timing.ns_ceil(&o.now);
                             match if o.force != 0 { o.timing.plan_shift(ns, o.force) } else { o.timing.plan(ns) } {
                                 Some(p) => match plan_apply(g, o, &bus, c, &p, &mut pending, "frame length") {
                                     0 => {
