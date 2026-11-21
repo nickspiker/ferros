@@ -1,8 +1,9 @@
 //! The boot gate in the hv (BOOT.md "Dual Boot"): ABL has prepared Android completely (kernel, ramdisks, bootconfig, DTB, and the secure world's boot state, which only the bootloader can set), and before Linux runs the hv asks.
 //!
-//! Screen: ABL's splash surface, saved first, then black with a green triangle at the power key and a Google-coloured chevron at volume down (the same picture as ferros's own gate, ready.rs). No words: nothing here can know the person's language (owner, 2026-10-27: "wordless").
-//! Keys: power = ferros; volume down = Android; volume up = hold (cancels the one-second auto-choice of dev builds); both volume keys = the kill chord.
-//! Android: the splash pixels and the layer registers are put back exactly as ABL left them, and the hv carries on to Linux as before. ferros: the cold ferros image packed at the end of the boot blob is copied to its link address and entered at EL2 with ABL's DTB, the way ABL would; a marker in the hv's report page tells it the gate has been answered so it doesn't ask again.
+//! Who starts Android (owner, 2026-11-21): only ferros, by a reboot it triggers once the attested identity chose Android (the "Start into" setting or "start Android now"). The hv goes on into Linux only on ferros's one-shot word (ANDROID_ONCE, or RECOVERY_ONCE for a recovery boot), in a page Android cannot write (main.rs `stage2_protect`); every other boot is ferros, or fastboot when no ferros is packed (`ask`).
+//! Screen (development builds only; a production build has no gate screen): ABL's splash surface, saved first, then black with a green triangle at the power key and a Google-coloured chevron at volume down (the same picture as ferros's own gate, ready.rs). No words: nothing here can know the person's language (owner, 2026-10-27: "wordless").
+//! Keys (development builds): power = ferros; volume down = Android, by way of ferros (it leaves ANDROID_ONCE and resets); volume up = hold (cancels the one-second auto-choice); both volume keys = the kill chord.
+//! Android: the screen is left as ABL left it (the word is answered with nothing shown), and the hv carries on to Linux as before. ferros: the cold ferros image packed at the end of the boot blob is copied to its link address and entered at EL2 with ABL's DTB, the way ABL would; a marker in the hv's report page tells it the gate has been answered so it doesn't ask again.
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -38,7 +39,7 @@ const FERROS_MAGIC: &[u8; 8] = b"FERROSGT";
 /// In the hv's report page: "gate answered, ferros" for ferros's ready.rs; ferros clears it.
 pub const GATE_MARK_ADDR: usize = crate::HV_BASE as usize + 0x3FF_FF10;
 pub const GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
-/// In the ramoops result block, the end of its first page (the hv report page at G#A_FFFF_0000 does not survive a PSCI reset; this block does, measured 2026-10-21): ferros's `diag android` leaves this word before resetting, so the next gate answers "Android" by itself, once, with the screen untouched: the host can switch between the two without anyone at the keys.
+/// In the ramoops result block, the end of its first page (the hv report page at G#A_FFFF_0000 does not survive a PSCI reset; this block does, measured 2026-10-21): ferros leaves this word before resetting when the attested identity chose Android (kernel service.rs `ANDROID_REQ`: the "Start into" setting, "start Android now", `diag android` with a person present; or a development gate's volume down), so the next gate answers "Android" by itself, once, with the screen untouched. It is the only way into Android (`ask`).
 pub const ANDROID_ONCE_ADDR: usize = 0xFD60_0FF8;
 pub const ANDROID_ONCE: u64 = 0x414E_4452_4F49_4431; // "ANDROID1"
 /// The word before it: ferros asked for a recovery boot (`diag recovery`; later its attest-gated setting). Without it a recovery boot (Android's sideload and rescue, the way round the reflash lock) goes to ferros instead (owner, 2026-11-01: no reflash without the handle). Taken once, as ANDROID_ONCE is.
@@ -330,46 +331,71 @@ fn vol_up() -> bool {
     rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
 }
 
-/// Ask. Without a packed ferros image there is nothing to choose: Android, screen untouched. A recovery boot is not asked: Android's recovery only when ferros left RECOVERY_ONCE, else ferros (telemetry how = 4).
-pub fn ask(dtb: usize) -> Choice {
-    if ferros_image().is_none() {
+/// Whether this is a production build (FERROS_PRODUCTION set at build time, as the kernel's): no gate screen, no keys asked.
+const PRODUCTION: bool = option_env!("FERROS_PRODUCTION").is_some();
+// A capture build (FERROS_HV_ORACLE) without a packed ferros goes to Android with no flag (`no_ferros`): a development door for the register captures, never in a production build.
+const _: () = assert!(!(PRODUCTION && cfg!(hv_oracle)), "a production hv is never an oracle build");
+
+/// The three one-shot words as this boot found them, each cleared at once: a word counts for the boot right after it was left, never later (a word left behind by a reset that did not take it must not decide a boot after that one).
+fn take_once() -> (bool, bool, bool) {
+    let word = |at: usize, want: u64| unsafe {
+        let p = at as *mut u64;
+        let yes = read_volatile(p) == want;
+        write_volatile(p, 0);
+        yes
+    };
+    let r = (word(ANDROID_ONCE_ADDR, ANDROID_ONCE), word(RECOVERY_ONCE_ADDR, RECOVERY_ONCE), word(FERROS_ONCE_ADDR, FERROS_ONCE));
+    unsafe { asm!("dsb sy") };
+    r
+}
+
+/// No ferros packed in this image and no word from ferros for Android: there is nothing this boot may start (owner, 2026-11-21: Android starts only when the attested identity chose it, by a reboot ferros triggers). The bootloader's fastboot instead, where the host or the person decides; a capture build (FERROS_HV_ORACLE, development only) goes to Android as before, since a capture is its whole point.
+fn no_ferros() -> Choice {
+    if cfg!(hv_oracle) {
         return Choice::Android;
     }
+    super::chord::to_fastboot(b"\nferros hv: gate -- no ferros packed and no word from ferros for Android: fastboot\n")
+}
+
+/// Ask. The hv goes on into Android only on ferros's word: ANDROID_ONCE for a normal boot, RECOVERY_ONCE for a recovery boot (owner, 2026-11-21: Android starts only when the attested identity chose it, by a reboot ferros triggers; the words live in a page Android cannot write, main.rs `stage2_protect`). Everything else is ferros, or fastboot when no ferros is packed (`no_ferros`).
+/// A recovery boot without its word goes to ferros (telemetry how = 4); the power + volume up chord's FERROS_ONCE goes to ferros without asking (how = 5).
+/// A production build shows nothing and asks nothing: ferros (how = 7). A development build shows the gate: power = ferros, the second untouched = ferros, volume down = Android by way of ferros (how = 3: ferros reads the answer and leaves ANDROID_ONCE before the vault opens, then resets, so this hv still starts Android only on the word), volume up holds.
+/// What the untouched second gives follows the person's "Start into" setting, which lives in the vault this gate cannot read: ferros takes the timer's answer (how = 2) as "no one chose", and after the attest reboots into Android when the person's setting says Android (ferros_kernel service.rs `START_INTO`).
+pub fn ask(dtb: usize) -> Choice {
+    let packed = ferros_image().is_some();
+    let (android, recovery_once, ferros_once) = take_once();
     if recovery(dtb) {
-        unsafe {
-            if read_volatile(RECOVERY_ONCE_ADDR as *const u64) == RECOVERY_ONCE {
-                write_volatile(RECOVERY_ONCE_ADDR as *mut u64, 0);
-                asm!("dsb sy");
-                return Choice::Android;
-            }
-        }
-        gate_telemetry(4, 0, 0);
-        return Choice::Ferros;
-    }
-    unsafe {
-        if read_volatile(FERROS_ONCE_ADDR as *const u64) == FERROS_ONCE {
-            write_volatile(FERROS_ONCE_ADDR as *mut u64, 0);
-            asm!("dsb sy");
-            gate_telemetry(5, 0, 0);
-            return Choice::Ferros;
-        }
-        if read_volatile(ANDROID_ONCE_ADDR as *const u64) == ANDROID_ONCE {
-            write_volatile(ANDROID_ONCE_ADDR as *mut u64, 0);
-            asm!("dsb sy");
-            // FERROS_GATE_PANEL_TEST builds: the marker path also paints the gate and restores the splash, exactly as the key path does — so the key path's effect on Linux's display handover can be tested from the host (`bridge diag android`), with no finger (2026-10-23: Android chosen by key came up with its display stuck on the logo; by marker it was fine).
-            if option_env!("FERROS_GATE_PANEL_TEST").is_some() {
-                let c = rd(GPA4_CON) & !(0xF << (POWER_PIN * 4));
-                wr(GPA4_CON, c);
-                if let Some(p) = adopt() {
-                    draw(&p);
-                    present(&p);
-                    let t = now();
-                    while now().wrapping_sub(t) < freq() {}
-                    restore(&p);
-                }
-            }
+        if recovery_once {
             return Choice::Android;
         }
+        gate_telemetry(4, 0, 0);
+        return if packed { Choice::Ferros } else { no_ferros() };
+    }
+    if android {
+        // FERROS_GATE_PANEL_TEST builds: the marker path also paints the gate and restores the splash, exactly as the key path once did, so the effect of the gate's screen on Linux's display handover can be tested from the host (`bridge diag android`), with no finger (2026-10-23: Android chosen by key came up with its display stuck on the logo; by marker it was fine).
+        if option_env!("FERROS_GATE_PANEL_TEST").is_some() {
+            let c = rd(GPA4_CON) & !(0xF << (POWER_PIN * 4));
+            wr(GPA4_CON, c);
+            if let Some(p) = adopt() {
+                draw(&p);
+                present(&p);
+                let t = now();
+                while now().wrapping_sub(t) < freq() {}
+                restore(&p);
+            }
+        }
+        return Choice::Android;
+    }
+    if !packed {
+        return no_ferros();
+    }
+    if ferros_once {
+        gate_telemetry(5, 0, 0);
+        return Choice::Ferros;
+    }
+    if PRODUCTION {
+        gate_telemetry(7, 0, 0);
+        return Choice::Ferros;
     }
     // The power pin as a plain input (ABL may leave it as a wakeup interrupt; Linux sets it up again).
     let c = rd(GPA4_CON) & !(0xF << (POWER_PIN * 4));
@@ -384,10 +410,10 @@ pub fn ask(dtb: usize) -> Choice {
     let mut held = false;
     // Keys must be up once before a press counts (a key held from before the gate, e.g. power from switching on, is not an answer).
     let mut armed = false;
-    // Telemetry for ferros's DIAG (GATE_ANSWER, GATE_MS; ready.rs reads them beside the mark): how the gate was answered — 1 power, 2 the dev timer, 3 volume down — and when, in ms from the screen, plus how long the power pin read pressed before it was first seen up (the owner, 2026-10-23: a press right after Ready? seems to take three quarters of a second unless volume up is held first).
+    // Telemetry for ferros's DIAG (GATE_ANSWER, GATE_MS; ready.rs reads them beside the mark): how the gate was answered (1 power, 2 the dev timer, 3 volume down) and when, in ms from the screen, plus how long the power pin read pressed before it was first seen up (the owner, 2026-10-23: a press right after Ready? seems to take three quarters of a second unless volume up is held first).
     let mut pressed_at_start_ms = 0u64;
     let mut first_up: Option<u64> = None;
-    let choice = loop {
+    loop {
         for &w in &WATCHDOGS {
             wr(w + 0x08, 0xFFFF);
         }
@@ -403,11 +429,11 @@ pub fn ask(dtb: usize) -> Choice {
             }
         } else if pw {
             gate_telemetry(1, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
-            break Choice::Ferros;
-        // Volume down: Android, on development builds only. A production gate offers no Android: it opens from within ferros, behind an attest (the map's Android circle, the kernel's `android` switch; owner, 2026-11-01 and 2026-11-04).
-        } else if dn && option_env!("FERROS_PRODUCTION").is_none() {
+            break;
+        // Volume down: Android, by way of ferros (above). Development builds only: a production build never gets here.
+        } else if dn {
             gate_telemetry(3, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
-            break Choice::Android;
+            break;
         }
         // Volume up holds (the dev timer cancelled) and takes the marks off, once: the screen goes black and waits for power.
         if up && !held {
@@ -419,18 +445,15 @@ pub fn ask(dtb: usize) -> Choice {
         held |= up;
         if !held && now().wrapping_sub(t0) > f {
             gate_telemetry(2, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
-            break Choice::Ferros;
+            break;
         }
         let t = now();
         while now().wrapping_sub(t) < f / 100 {}
-    };
-    if let Some(p) = &panel {
-        match choice {
-            Choice::Android => restore(p),
-            Choice::Ferros => answered(p),
-        }
     }
-    choice
+    if let Some(p) = &panel {
+        answered(p);
+    }
+    Choice::Ferros
 }
 
 /// ABL's bootconfig in the initrd it loaded: (its text's address, its length, its checksum's address), found through the DTB's /chosen linux,initrd-start and -end and the trailer bootconfig ends with (size, checksum, `#BOOTCONFIG\n`). None when there is none or it does not add up.
@@ -519,7 +542,7 @@ fn recovery(dtb: usize) -> bool {
 
 /// Android from whichever slot this gate is on. Only slot a holds an Android (slot b's own system partitions are stock or empty), and ABL names the booted slot to the kernel in bootconfig, `androidboot.slot_suffix = "_b"`, the blob at the end of the initrd (data, LE u32 size, LE u32 byte-sum checksum, "#BOOTCONFIG\n"). Rewrite the suffix to `_a` there and lower the checksum by one, so Android mounts slot a's partitions and the choice is a jump, not a slot switch and a reboot (owner, 2026-10-23: identical slots, no flags). The initrd bounds come from the DTB's /chosen. Returns whether a suffix was rewritten (already `_a`, or nothing found: untouched).
 pub fn android_from_slot_a(dtb: usize) -> bool {
-    // akita keeps Android on slot b and the hv on boot_b, so the bootconfig already names the slot Android lives on: nothing to rewrite.
+    // akita: Android lives on slot a since 2026-11-18 (BOARDS.md), with companions of its own build that slot b does not carry; ferros makes slot a active before it leaves the word (kernel main.rs, service.rs), so this gate starts Android from slot a, whose bootconfig already says _a. Nothing to rewrite.
     if cfg!(hv_akita) {
         return false;
     }
@@ -565,7 +588,7 @@ fn name_is_n(a: usize, want: &[u8]) -> bool {
     true
 }
 
-/// The gate's answer for ferros's DIAG, beside the mark: how (1 power, 2 timer, 3 volume down), when (ms from the screen), and how long the power pin read pressed from the start (ms; 0 = it was up at once).
+/// The gate's answer for ferros's DIAG, beside the mark: how (1 power, 2 the dev timer, 3 volume down: Android by way of ferros, 4 a recovery boot without its word, 5 the chord's FERROS_ONCE, 7 a production build, which asks nothing), when (ms from the screen), and how long the power pin read pressed from the start (ms; 0 = it was up at once).
 fn gate_telemetry(how: u64, ms: u64, pressed_ms: u64) {
     unsafe {
         write_volatile((GATE_MARK_ADDR + 8) as *mut u64, how | ms << 8 | pressed_ms << 32);

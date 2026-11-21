@@ -39,6 +39,9 @@ global_asm!(include_str!("header.s"));
 
 mod gate;
 
+// A hv that hands Linux EL2 keeps nothing from it (not the ONCE page, not itself): a bisection knob, never in a production build.
+const _: () = assert!(!(option_env!("FERROS_PRODUCTION").is_some() && cfg!(hv_linux_at_el2)), "a production hv never hands Linux EL2");
+
 global_asm!(
     r#"
 .section .text.boot, "ax"
@@ -325,24 +328,31 @@ unsafe fn take_l3() -> *mut u64 {
     (&raw mut L3POOL[n]) as *mut u64
 }
 
-/// Refine the map down to the 4 KiB page holding `ipa` and mark it invalid, so an EL1&0 access to it faults to EL2 (EC G#24). Splits the covering 1 GiB block into 2 MiB blocks and the covering 2 MiB block into 4 KiB pages, both identity, on the way down. Called once, on the primary, before any secondary starts.
-unsafe fn stage2_unmap(ipa: u64) {
+/// The level-2 table under the 1 GiB block holding `ipa`, splitting the block into 2 MiB identity blocks the first time; null when the pool is used up (the block stays whole).
+unsafe fn stage2_l2(ipa: u64) -> *mut u64 {
     let s2 = (&raw mut STAGE2) as *mut u64;
     let l1i = (ipa >> 30) as usize;
     let e1 = read_volatile(s2.add(l1i));
-    let l2 = if e1 & 0b11 == 0b11 {
-        (e1 & S2_ADDR) as *mut u64
-    } else {
-        let t = take_l2();
-        if t.is_null() {
-            return;
-        }
-        for j in 0..512u64 {
-            write_volatile(t.add(j as usize), (((l1i as u64) << 30) | (j << 21)) | S2_BLOCK);
-        }
-        write_volatile(s2.add(l1i), (t as u64 & S2_ADDR) | 0b11);
-        t
-    };
+    if e1 & 0b11 == 0b11 {
+        return (e1 & S2_ADDR) as *mut u64;
+    }
+    let t = take_l2();
+    if t.is_null() {
+        return t;
+    }
+    for j in 0..512u64 {
+        write_volatile(t.add(j as usize), (((l1i as u64) << 30) | (j << 21)) | S2_BLOCK);
+    }
+    write_volatile(s2.add(l1i), (t as u64 & S2_ADDR) | 0b11);
+    t
+}
+
+/// Refine the map down to the 4 KiB page holding `ipa` and give it the descriptor `desc` (0: invalid, so an EL1&0 access to it faults to EL2, EC G#24). Splits the covering 1 GiB block into 2 MiB blocks and the covering 2 MiB block into 4 KiB pages, both identity, on the way down. Called once, on the primary, before any secondary starts. Whether it was done (false: a pool used up, the page left as it was).
+unsafe fn stage2_page(ipa: u64, desc: u64) -> bool {
+    let l2 = stage2_l2(ipa);
+    if l2.is_null() {
+        return false;
+    }
     let l2i = ((ipa >> 21) & 0x1FF) as usize;
     let e2 = read_volatile(l2.add(l2i));
     let l3 = if e2 & 0b11 == 0b11 {
@@ -350,7 +360,7 @@ unsafe fn stage2_unmap(ipa: u64) {
     } else {
         let t = take_l3();
         if t.is_null() {
-            return;
+            return false;
         }
         let base2 = (ipa >> 21) << 21;
         for k in 0..512u64 {
@@ -359,8 +369,72 @@ unsafe fn stage2_unmap(ipa: u64) {
         write_volatile(l2.add(l2i), (t as u64 & S2_ADDR) | 0b11);
         t
     };
-    let l3i = ((ipa >> 12) & 0x1FF) as usize;
-    write_volatile(l3.add(l3i), 0);
+    write_volatile(l3.add(((ipa >> 12) & 0x1FF) as usize), desc);
+    true
+}
+
+/// The page holding `ipa` unmapped (`stage2_page` with an invalid descriptor).
+unsafe fn stage2_unmap(ipa: u64) {
+    stage2_page(ipa, 0);
+}
+
+/// What Android may never write (owner, 2026-11-21: "Android cannot be started unless the attested identity chose to start it"; HV.md "What Android cannot write").
+/// The ONCE page, G#FD60_0000: the gate's one-shot words (gate.rs ANDROID_ONCE, RECOVERY_ONCE, FERROS_ONCE), ferros's report block and the hv's own trails, in the pmsg half of ramoops. Mapped read-only: Android's pmsg ring runs thru it (its writes are dropped there, so its reads at the next boot find ferros's words where its own log was), and nothing of Android's can leave a word that starts Android or recovery at the next boot.
+/// The hv's own 64 MiB (HV_BASE): its code, its stacks, these tables and its report page. Unmapped, a 2 MiB block at a time: a Linux with root could otherwise rewrite the hv that enforces the rest (the firewall, this page). Linux never maps it (the DTB's no-map node), so nothing honest is in the way.
+/// DMA masters are not under this map (the S2MPUs fence them, HV.md); this is the CPUs' half.
+const ONCE_PAGE: u64 = 0xFD60_0000;
+/// A 4 KiB identity page, read-only for EL1&0 (S2AP 01), otherwise as `S2_PAGE`.
+const S2_PAGE_RO: u64 = (S2_PAGE & !(0b11 << 6)) | (0b01 << 6);
+
+/// Installed first in `stage2_base`, before any other target takes a table: two level-2 tables and one level-3 table of the pools, which are then still whole, so none of it can fail for want of a table. Where each part stands goes to report +G#D8 (bit 0 the ONCE page, bit 1 the hv's region), read by ferros after a jump.
+unsafe fn stage2_protect() {
+    let mut done = stage2_page(ONCE_PAGE, ONCE_PAGE | S2_PAGE_RO) as u64;
+    let mut whole = true;
+    let mut at = HV_BASE;
+    while at < HV_BASE + HV_SIZE {
+        let l2 = stage2_l2(at);
+        if l2.is_null() {
+            whole = false;
+            break;
+        }
+        write_volatile(l2.add(((at >> 21) & 0x1FF) as usize), 0);
+        at += 1 << 21;
+    }
+    done |= (whole as u64) << 1;
+    report(0xD8, done);
+}
+
+/// Whether a stage-2 fault at `pa` is one of `stage2_protect`'s.
+fn protected(pa: u64) -> bool {
+    pa & !0xFFF == ONCE_PAGE || (HV_BASE..HV_BASE + HV_SIZE).contains(&pa)
+}
+
+/// The faulting access's physical address (identity map: IPA == PA).
+fn fault_pa() -> u64 {
+    let (far, hpfar): (u64, u64);
+    unsafe { asm!("mrs {a}, far_el2", "mrs {b}, hpfar_el2", a = out(reg) far, b = out(reg) hpfar) };
+    ((hpfar >> 4) << 12) | (far & 0xFFF)
+}
+
+/// An EL1&0 access `stage2_protect` refused: a write is dropped, a read answers 0, and the instruction is stepped past. Counted at report +G#C8 (writes) and +G#D0 (reads), the last address at +G#E0, the first eight in pstore.
+/// A load or store without a syndrome (a pair, or one with writeback) is stepped past too, its registers untouched: Linux's own pmsg writes are single-register stores (memcpy_toio, ISV = 1), so only code that is not Linux's ring lands here.
+fn refuse(esr: u64, frame: &mut [u64; 32]) {
+    let pa = fault_pa();
+    let (isv, wnr, srt) = ((esr >> 24) & 1, (esr >> 6) & 1, ((esr >> 16) & 0x1F) as usize);
+    if isv == 1 && wnr == 0 && srt != 31 {
+        frame[srt] = 0;
+    }
+    bump(if wnr == 1 { 0xC8 } else { 0xD0 });
+    report(0xE0, pa);
+    unsafe {
+        if read_volatile((REPORT + 0xC8) as *const u64) + read_volatile((REPORT + 0xD0) as *const u64) <= 8 {
+            let (elr, mut h0, mut h1, mut h2) = { let e: u64; asm!("mrs {v}, elr_el2", v = out(reg) e); (e, [0u8; 16], [0u8; 16], [0u8; 16]) };
+            pstore::log(&[if wnr == 1 { b"\nferros hv: a write Android may not make, dropped: " as &[u8] } else { b"\nferros hv: a read Android may not make, answered 0: " }, pstore::hex(pa, &mut h0), b" from ", pstore::hex(elr, &mut h1), b" ESR ", pstore::hex(esr, &mut h2), b"\n"]);
+        }
+        let elr: u64;
+        asm!("mrs {v}, elr_el2", v = out(reg) elr);
+        asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+    }
 }
 
 /// Single-step support for the oracle (FERROS_HV_ORACLE_STEP): per core, the page being stepped over and the guest state the step borrowed (SPSR_EL2 I/F bits, MDSCR_EL1, MDCR_EL2).
@@ -732,6 +806,8 @@ unsafe fn stage2_base() -> u64 {
         for i in 0..1024u64 {
             write_volatile(s2.add(i as usize), (i << 30) | S2_BLOCK);
         }
+        // What Android may never write, before any other target takes a table (`stage2_protect`).
+        stage2_protect();
         // One shot per cold start: a capture is read back through a warm reset (sysrq crash) into the next boot, and with the PCIe ch0 pages trapped that next boot hung in the root-complex probe every time and overwrote the capture (2026-10-19). The capture boot leaves a marker in the hv's report page, which survives a warm reset as pstore does; the boot that finds it traps nothing and clears it.
         let oneshot = (REPORT + 0xFF00) as *mut u64;
         let skip = cfg!(hv_oracle) && read_volatile(oneshot) == ORACLE_ONESHOT;
@@ -1032,9 +1108,10 @@ unsafe fn configure_el2() {
     // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
     // The flush is local: this core's EL1 TLB is empty on a first boot and after a power-down anyway, and a broadcast (ALLE1IS) on every resume of nine cores would be a DVM storm.
     // VTCR_EL2: T0SZ 24 (40-bit IPA), SL0 1 (start at level 1), IRGN/ORGN write-back, SH inner, TG0 4 KiB, PS 40-bit, RES1 bit 31.
-    let vttbr = if cfg!(hv_stage2) || cfg!(hv_ufs) || cfg!(hv_core) { stage2_base() } else { 0 };
+    // Stage 2 always (owner, 2026-11-21): without it nothing keeps Linux from the ONCE page or the hv itself (`stage2_protect`), so Android could leave the word that starts it again. FERROS_HV_STAGE2 is kept as a name only.
+    let vttbr = stage2_base();
     asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1", "dsb nsh", "isb", v = in(reg) vttbr, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
-    if cfg!(hv_stage2) || cfg!(hv_ufs) || cfg!(hv_core) {
+    {
         let hcr: u64;
         asm!("mrs {h}, hcr_el2", h = out(reg) hcr);
         asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr | 1); // VM
@@ -1140,6 +1217,12 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
                     pstore::log(&[if k == 2 { b"ferros hv: hvcore -- gs_perf_mon kept from probing (core 3 is the hv's)\n" as &[u8] } else { b"ferros hv: hvcore -- gs_perf_mon compatible not found\n" }]);
                 }
             }
+            // Linux's pmsg ring kept out of the ONCE page, which is read-only to Linux (`stage2_protect`).
+            let mut h = [0u8; 16];
+            pstore::log(&match fdt::shrink_pmsg(DTB_COPY as usize, ONCE_PAGE) {
+                Some(n) => [b"\nferros hv: pmsg ends at the ONCE page, its size now " as &[u8], pstore::hex(n, &mut h), b"\n"],
+                None => [b"\nferros hv: pmsg not shrunk (no ramoops node of the layout measured); the ONCE page stays read-only" as &[u8], b"", b"\n"],
+            });
             unsafe {
                 let mut a = DTB_COPY;
                 while a < DTB_COPY + len as u64 {
@@ -1378,6 +1461,8 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
             }
         }
+        // A write to the ONCE page, or any access to the hv's own memory (`stage2_protect`): refused, never emulated or handed back.
+        0x24 if protected(fault_pa()) => refuse(esr, frame),
         0x24 => {
             // Stage-2 data abort from EL1&0: an access to a page the oracle unmapped. The hv runs at EL2, which is not under stage 2, so it performs the real access against the device register, hands the guest the result, logs it, and steps past the instruction. Only the single-register syndrome form (ISV = 1, what readl/writel compile to) is emulated; a pair or other ISV = 0 access is logged and skipped (the driver may miss it, but the hv does not guess).
             let (far, hpfar): (u64, u64);
@@ -1724,7 +1809,7 @@ mod chord {
         }
     }
 
-    /// The dev escape: both volume keys held while the hv starts (before Linux) send the phone to fastboot — the fastboot reboot mode stamped through EL3 and the cluster watchdogs fired, the path measured to land there (~20 s). A broken slot-a build otherwise retries forever (the slot is marked successful). Never returns.
+    /// The dev escape: both volume keys held while the hv starts (before Linux) send the phone to fastboot (`to_fastboot`). A broken slot-a build otherwise retries forever (the slot is marked successful).
     pub fn early_to_fastboot_if_held() {
         // FERROS_HV_NO_EARLY_FASTBOOT=1: the escape off, for telling whether it is what sends a board to fastboot (akita, 2026-11-06).
         if cfg!(hv_no_early_fastboot) {
@@ -1738,7 +1823,12 @@ mod chord {
             }
             ms(10);
         }
-        super::pstore::log(&[b"\nferros hv: volume keys held at start -- fastboot\n"]);
+        to_fastboot(b"\nferros hv: volume keys held at start -- fastboot\n");
+    }
+
+    /// The bootloader's fastboot, by the path measured to land there: the fastboot reboot mode stamped through EL3, the reset marked clean in the DSS header, the cluster watchdogs fired (~20 s). Never returns.
+    pub fn to_fastboot(why: &[u8]) -> ! {
+        super::pstore::log(&[why]);
         unsafe {
             write_volatile((DSS_HEADER + 0x300) as *mut u32, 0xCAFE);
             write_volatile((DSS_HEADER + 0x100) as *mut u32, 0);
@@ -2155,6 +2245,73 @@ mod fdt {
             }
         }
         done
+    }
+
+    /// The pmsg half of ramoops ends where the ONCE page starts (owner, 2026-11-21; main.rs `stage2_protect`): Linux lays its zones out from the region's base, no dmesg records (record-size 0 here: none are allocated and none take room), the console, ftrace, then pmsg, so pmsg starts at base + console-size + ftrace-size (G#FD5F_F000 on husky and akita, 2 MiB: zuma-rmem.dtsi `ramoops_mem@fd3ff000`, console-size and pmsg-size 2 MiB, no record-size). Its `pmsg-size` becomes `page - start` (4 KiB) when the page falls inside it, in place (same length), so Linux's own ring never runs into the read-only page and its user copies (pmsg is written with copy_from_user, stores in pairs with writeback, which a dropped write would leave unadvanced) never fault there. Returns the new size, or None when the node or the layout is not the one measured (the tree then left as it was; the page stays read-only either way).
+    pub fn shrink_pmsg(dtb: usize, page: u64) -> Option<u64> {
+        if rd32(dtb) != MAGIC {
+            return None;
+        }
+        let strings = dtb + rd32(dtb + 12) as usize;
+        let mut p = dtb + rd32(dtb + 8) as usize;
+        let end = p + rd32(dtb + 36) as usize;
+        let (mut depth, mut node) = (0u32, None::<u32>);
+        // (address, length) of reg, record-size, console-size, ftrace-size, pmsg-size in the ramoops node.
+        let mut found: [Option<(usize, usize)>; 5] = [None; 5];
+        let names: [&[u8]; 5] = [b"reg", b"record-size", b"console-size", b"ftrace-size", b"pmsg-size"];
+        while p < end {
+            let tok = rd32(p);
+            p += 4;
+            match tok {
+                BEGIN_NODE => {
+                    let name = p;
+                    let mut n = 0usize;
+                    while rd8(p + n) != 0 {
+                        n += 1;
+                    }
+                    p = (p + n + 1 + 3) & !3;
+                    depth += 1;
+                    if node.is_none() && n >= 7 && (0..7).all(|k| rd8(name + k) == b"ramoops"[k]) {
+                        node = Some(depth);
+                    }
+                }
+                END_NODE => {
+                    if node == Some(depth) {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                PROP => {
+                    let len = rd32(p) as usize;
+                    let name = strings + rd32(p + 4) as usize;
+                    if node == Some(depth) {
+                        for (k, want) in names.iter().enumerate() {
+                            if name_eq(name, want) {
+                                found[k] = Some((p + 8, len));
+                            }
+                        }
+                    }
+                    p = (p + 8 + len + 3) & !3;
+                }
+                NOP => {}
+                _ => return None,
+            }
+        }
+        let value = |k: usize| found[k].filter(|&(_, len)| len == 4 || len == 8).map(|(at, len)| cells(at, len));
+        let (reg, reg_len) = found[0]?;
+        // reg with two address cells and one or two size cells (zuma-rmem.dtsi: `<0 0xfd3ff000 0x400000>`, reserved-memory's #address-cells 2, #size-cells 1); anything else is not the layout measured.
+        if !(reg_len == 12 || reg_len == 16) || value(1).unwrap_or(0) != 0 {
+            return None;
+        }
+        let base = cells(reg, 8);
+        let start = base + value(2).unwrap_or(0) + value(3).unwrap_or(0);
+        let (at, len) = found[4]?;
+        let size = cells(at, len);
+        if !(start < page && page < start + size) {
+            return None;
+        }
+        set_cells(at, len, page - start);
+        Some(page - start)
     }
 }
 
