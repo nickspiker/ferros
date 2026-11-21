@@ -48,7 +48,7 @@ Z    0.01    5.71  144.53
 
 ## The full profile (2026-10-22)
 
-Measured with the same i1 Pro through `tools/display-profile.sh`: 227 readings, every one spectral (380–730 nm, 10 nm), the raw spotread output kept beside the CSV (`oracle/display/husky-hk3/profile-20261022/`: `readings.csv`, `spotread.log`, `report.md` from `tools/display-profile-report.py`). The shell was off for the session (vault `home.off`), so only the kernel's measurement patch reached the panel: a disc 1 cm across (193 px at 489 ppi, checked with a ruler) at the centre, the instrument on it throughout. Same unit, same 8 bpc path as above, ABL's panel state.
+Measured with the same i1 Pro through `tools/display-profile.sh`: 227 readings, every one spectral (380–730 nm, 10 nm), the raw spotread output kept beside the CSV (`oracle/display/husky-hk3/profile-20261022/`: `readings.csv`, `spotread.log`, `report.md` from `tools/panel-white report`). The shell was off for the session (vault `home.off`), so only the kernel's measurement patch reached the panel: a disc 1 cm across (193 px at 489 ppi, checked with a ruler) at the centre, the instrument on it throughout. Same unit, same 8 bpc path as above, ABL's panel state.
 
 **No limiter.** A full white screen gets what a 1 cm spot gets, at every brightness:
 
@@ -146,7 +146,7 @@ The owner sees the HK3's emission at roughly 94-97 % duty at every brightness, A
 
 Until today the present stage had no gamut matrix: VSF RGB went straight to the panel's primaries, with only per-channel gains putting the white at E. Greys were right (the gains are the white), colour was close but off on the red-green axis (greens leaned yellow, reds orange); blue was already right.
 
-**The matrix** (`tools/panel-white-e.py`, the DBV 3307 spectra integrated against VSF RGB's own colour-matching functions — Stockman & Sharpe 10° through vsf's LMS2VSF_RGB, no other space in between): rows panel R, G, B; columns VSF R, G, B; absolute (E in is E on the glass), so its row sums are E's gains.
+**The matrix** (`tools/panel-white`, the DBV 3307 spectra integrated against VSF RGB's own colour-matching functions — Stockman & Sharpe 10° through vsf's LMS2VSF_RGB, no other space in between): rows panel R, G, B; columns VSF R, G, B; absolute (E in is E on the glass), so its row sums are E's gains.
 
 ```
 +1.3596  −0.3725  +0.0129   sum 1.0000

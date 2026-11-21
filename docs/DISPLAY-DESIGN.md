@@ -83,7 +83,7 @@ Sixteen black pixels skip all of it.
 
 **Measured** (PMU on the cores, `ferros_sys::pmu`; synthetic pans, `FERROS_MAP_START=drag|crowd`): the ODT 86 cycles per 16 pixels on the X3 (1.9 ns a pixel), a full-frame publish 5.2 ms banded; the map's seven circles 120 frames for 120 updates at ~3.7 ms an update; a 207-circle crowd 174 frames for 175 updates (scene 3.2 ms — glow 1.8, blits 1.2 — publish 3.0). Processes build without strict-align (`cargo el0`), which is what lets NEON loads and stores be single instructions.
 
-**Tunables** (payloads/display): `GLOW_FRACTION` (12), `GLOW_OCT_LOG2` (2: four octaves), `GLOW_PEAK`, `PUB_SHARE`, `PUB_SPLIT_ROWS`; the ODT and E's gains come from `tools/panel-white-e.py`.
+**Tunables** (payloads/display): `GLOW_FRACTION` (12), `GLOW_OCT_LOG2` (2: four octaves), `GLOW_PEAK`, `PUB_SHARE`, `PUB_SPLIT_ROWS`; the ODT and E's gains come from `tools/panel-white`.
 
 ## 6b. The DQE on zuma: its map, what it can do, and whether it could carry the bake (2026-11-12)
 

@@ -1442,7 +1442,7 @@ fn testcard(pixels: &mut [Px], width: usize, height: usize) {
 /// The present stage's policy (DISPLAY-CALIB.md, "Decided", 2026-10-22): the panel driven at its measured peak (HBM: 1467 cd/m² of native white on this unit) and white at 133 cd/m².
 const PEAK_NITS: f32 = 1467.0;
 const WHITE_NITS: f32 = 133.0;
-/// White is equal-energy E (owner): solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white-e.py`, the DBV 3307 readings), E needs R 1.0, G 0.7394, B 0.8172 of each channel's light — the ODT's row sums below; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15: the ramps (op 21) apply them to the one table directly.
+/// White is equal-energy E (owner): solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white`, the DBV 3307 readings), E needs R 1.0, G 0.7394, B 0.8172 of each channel's light — the ODT's row sums below; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15: the ramps (op 21) apply them to the one table directly.
 fn e_code_q15() -> [u32; 3] {
     // akita's from its own profile (tools/panel-white at DBV 3175, γ 2.23, 2026-11-08): E white keeps 81.1 % of its native white's light.
     if ferros_sys::akita() { [32768, 28858, 29589] } else { [32768, 28548, 29883] }

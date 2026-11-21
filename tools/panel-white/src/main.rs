@@ -1,7 +1,11 @@
-//! A panel's ODT (VSF RGB → panel linear RGB) and its equal-energy (E) white, from the i1 Pro's measured spectra, in VSF RGB under VSF's observer (Stockman & Sharpe 2000 10°): the Rust of tools/panel-white-e.py (owner rule: no Python), for any profile written by tools/display-profile.sh or tools/akita-profile.sh.
+//! A panel's ODT (VSF RGB → panel linear RGB) and its equal-energy (E) white, from the i1 Pro's measured spectra, in VSF RGB under VSF's observer (Stockman & Sharpe 2000 10°): the Rust of tools/panel-white-e.py (owner rule: no Python; it gives that script's ODT_HUSKY digits on the 2026-10-22 profile at DBV 3307), for any profile written by tools/display-profile.sh or tools/akita-profile.sh.
 //! Each primary's spectrum (spotread, 10 nm steps, its `colours` reading at the DBV given) integrated against VSF RGB's own colour-matching functions (vsf's cone fundamentals through LMS2VSF_RGB, 1 nm) gives the panel's primaries in VSF RGB. From them: the gains (largest 1) that make R + G + B equal E in linear light and their code multipliers g^(1/γ) in Q15; how much of native white's light E keeps (photopic, vsf's LMS2PHOTOPIC through VSF_RGB2LMS); and the ODT, the primaries' matrix inverted and scaled so its largest row sums to 1 (its row sums are the gains).
 //!
-//! Usage: panel-white <profile dir> <dbv label as logged, e.g. 3175 or hbm> <panel gamma>
+//! Also printed, as the Python did: the 1931 answer for the gains (from the readings' XYZ, for comparison only), the panel's primaries in VSF RGB (E-scaled: a negative or a channel above 1 is outside the panel's reach), the photopic weights, and the ODT and weights as payloads/display's odt.rs writes them.
+//!
+//! Usage: panel-white <profile dir> <dbv label as logged, e.g. 3175 or hbm> <panel gamma>; or `panel-white report <profile dir> [--md out.md]` (report.rs).
+mod report;
+
 use vsf::colour::spectral::{LMS2PHOTOPIC, LMS2VSF_RGB, LMS_2000_10DEG_1NM, VSF_RGB2LMS};
 
 /// A column-major vsf matrix applied to a vector.
@@ -27,6 +31,9 @@ fn solve(m: [[f64; 3]; 3], rhs: [f64; 3]) -> [f64; 3] {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.get(1).map(String::as_str) == Some("report") {
+        return report::report(&a[2..]);
+    }
     let (dir, dbv, gamma) = (&a[1], &a[2], a[3].parse::<f64>().unwrap());
     let log = std::fs::read_to_string(format!("{dir}/spotread.log")).unwrap();
     // A reading's spectrum: its block's "Spectrum from lo to hi nm in n steps" and the line after.
@@ -72,13 +79,37 @@ fn main() {
     let q: Vec<String> = g.iter().map(|x| format!("{:.4} (Q15 {})", x.powf(1. / gamma), (x.powf(1. / gamma) * 32768.).round())).collect();
     println!("  code multipliers g^(1/{gamma}): {}", q.join(" "));
     println!("  E white keeps {:.1} % of native white's light (photopic)", 100. * e / native);
+    // The same gains under CIE 1931 2° (X = Y = Z), from each primary's reading's own XYZ ("Result is XYZ:" after its spectrum), for comparison only.
+    let xyz = |label: &str| -> [f64; 3] {
+        let at = log.find(&format!("=== colours {label} dbv={dbv} ")).unwrap();
+        let block = &log[at..];
+        let s = block.find("Spectrum from ").unwrap();
+        let r = block[s..].find("Result is XYZ: ").unwrap() + s + 15;
+        let w: Vec<f64> = block[r..].split_whitespace().take(3).map(|v| v.trim_end_matches(',').parse().unwrap()).collect();
+        [w[0], w[1], w[2]]
+    };
+    let x = [xyz("red"), xyz("green"), xyz("blue")];
+    let g31 = solve(core::array::from_fn(|r| core::array::from_fn(|c| x[c][r])), [1.; 3]);
+    let top31 = g31.iter().cloned().fold(f64::MIN, f64::max);
+    println!("for comparison, E under CIE 1931 2° (X = Y = Z): R {:.4} G {:.4} B {:.4}", g31[0] / top31, g31[1] / top31, g31[2] / top31);
     // The ODT: the primaries' matrix inverted, scaled so its largest row sums to 1.
     let cols: [[f64; 3]; 3] = core::array::from_fn(|j| solve(m, core::array::from_fn(|i| if i == j { 1. } else { 0. })));
     let o: [[f64; 3]; 3] = core::array::from_fn(|i| core::array::from_fn(|j| cols[j][i]));
     let top = o.iter().map(|r| r.iter().sum::<f64>()).fold(f64::MIN, f64::max);
     println!("ODT, VSF RGB -> panel linear RGB (rows: panel R, G, B; columns: VSF R, G, B; row sums = E's gains):");
+    let o = o.map(|r| r.map(|x| x / top));
     for r in o {
-        let r = r.map(|x| x / top);
         println!("  {:+.4}  {:+.4}  {:+.4}   sum {:.4}", r[0], r[1], r[2], r.iter().sum::<f64>());
     }
+    // The ODT inverted: the panel's primaries in VSF RGB, one per column, E-scaled.
+    let icols: [[f64; 3]; 3] = core::array::from_fn(|j| solve(o, core::array::from_fn(|i| if i == j { 1. } else { 0. })));
+    println!("the panel's primaries in VSF RGB (columns: panel R, G, B at full code, E-scaled):");
+    for i in 0..3 {
+        println!("  {:+.4}  {:+.4}  {:+.4}", icols[0][i], icols[1][i], icols[2][i]);
+    }
+    println!("photopic luminance on VSF RGB (sums to 1): {:.6} {:.6} {:.6}", photopic[0], photopic[1], photopic[2]);
+    println!("for payloads/display (ODT rows, LUM):");
+    let rows: Vec<String> = o.iter().map(|r| format!("[{:.6}, {:.6}, {:.6}]", r[0], r[1], r[2])).collect();
+    println!("  [{}]", rows.join(", "));
+    println!("  [{:.6}, {:.6}, {:.6}]", photopic[0], photopic[1], photopic[2]);
 }
