@@ -176,6 +176,8 @@ Repeated three times, the same every time.
 
 **What it means.** The GPU can read what the CPU just drew, and write what the CPU then reads, with no cache maintenance and no copy, as long as the pages are mapped coherent in the GPU's tables. COHERENCY_ENABLE stays at none: setting ACE-Lite broke every access. For the present stage, the canvas needs neither the 0.7-2.4 ms clean nor a copy; what it needs is the GPU's fence widened to the canvas (and to the phases, for its output).
 
+**The GPU's own L2 is not kept coherent** (2026-11-21, GPU-KISTS.md section 3, "The queue's uniforms read stale"): the GPU snoops the CPU's caches on a miss, but nothing drops a line the GPU's L2 already holds when the CPU writes that memory, so a job read what an earlier job had left there (a queue record's uniforms, a pane the CPU rewrote: up to 683 of 2^10 jobs wrong). Every job now ends with the L2 and load-store caches cleaned and invalidated (`ferros_gpuq::END_FLUSH`), not only cleaned: about 50 µs more for an empty job alone, 8 µs a job pipelined, nothing seen on a 6 ms job.
+
 **Not measured yet:** what snooping costs in bandwidth against non-cacheable access.
 
 ## The present stage on the GPU: bit-exact (2026-11-05)

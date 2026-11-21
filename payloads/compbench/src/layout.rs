@@ -26,8 +26,10 @@ pub const CODE_AT: usize = (2 << 20) + (256 << 10);
 pub const CODE_STEPS: usize = 1 << 12;
 /// The present's blue-noise thresholds (the display's neon.rs `BLUE`), a byte each, 16 × 16.
 pub const BLUE_AT: usize = (2 << 20) + (512 << 10);
-/// Results the bench keeps for itself.
+/// The clip kernel's sink: its stores outside the rect land in the first 2^8 words here (kernel.rs, a row's own word).
 pub const SCRATCH_AT: usize = 3 << 20;
+/// Results the bench keeps for itself across a GPU job: past the clip's sink. (Until 2026-11-21 they were kept at `SCRATCH_AT`, and the clip's outside stores overwrote the copy of a patch's first 16 rows: the "64 of 256 patch pixels reverted" of GPU-KISTS.md section 3 was that, not the GPU's L2.)
+pub const KEEP_AT: usize = SCRATCH_AT + (64 << 10);
 pub const CHROME_AT: usize = 4 << 20;
 pub const PANE_AT: usize = 8 << 20;
 /// The GPU's output: G2t16 or baked pixels, a full screen.

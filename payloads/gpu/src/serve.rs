@@ -94,7 +94,7 @@ struct Slot {
     nregions: usize,
     frames: [u64; ferros_sys::gpu::FRAMES],
     nframes: usize,
-    /// Its client's camera view is mapped in its space; and mapped cacheable on the GPU, each job invalidating the GPU's caches first (the default since 2026-11-20; op 5's byte 0 maps it non-cacheable, the measure).
+    /// Its client's camera view is mapped in its space; and mapped cacheable on the GPU, every job ending with the GPU's caches invalidated (`q::END_FLUSH`; the default since 2026-11-20; op 5's byte 0 maps it non-cacheable, the measure).
     camera: bool,
     camera_cached: bool,
     /// Its address space's root while a client is bound.
@@ -672,7 +672,7 @@ extern "C" fn slot_thread(k: u64) -> ! {
                 let seq = st.slots[k].seq;
                 if ok {
                     let rec = qu.gpu + r.record_offset(n) as u64;
-                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + 0x40, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, invalidate: st.slots[k].camera && st.slots[k].camera_cached };
+                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + 0x40, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
                     let mut words = [0u64; q::JOB_WORDS_MOST];
                     let len = q::job_words(&d, &mut words);
                     append(s, &mut st.slots[k], k, &words[..len]);
@@ -730,7 +730,7 @@ fn bind(s: &Svc, sl: &mut Slot, stamp: &Stamp, bbase: u64, bsize: u64) {
     tables(s, sl, true);
 }
 
-/// A slot's client's address space made from what its bind kept, in the slot's other pool of table pages, then installed (`space_install`: the old walks and lines dropped first) when its group runs, else at its next start: the slot's own pages (its stream and descriptors read-only, its sequence page, its code read-only and the only executable pages), its block's frames read-write at `ARENA_VA`, each surface frame by frame at its place from `SURFACES_VA`, and (`camera`) its camera view read-only at `CAMERA_VA`, cacheable on the GPU with the GPU's caches invalidated before each of the client's jobs (`Dispatch::invalidate`: the front end writes the ring with no snooping, and a line the GPU's L2 kept from a lap before would be the last lap's), non-cacheable when the client asked (op 5's byte 0).
+/// A slot's client's address space made from what its bind kept, in the slot's other pool of table pages, then installed (`space_install`: the old walks and lines dropped first) when its group runs, else at its next start: the slot's own pages (its stream and descriptors read-only, its sequence page, its code read-only and the only executable pages), its block's frames read-write at `ARENA_VA`, each surface frame by frame at its place from `SURFACES_VA`, and (`camera`) its camera view read-only at `CAMERA_VA`, cacheable on the GPU, every job ending with the GPU's caches invalidated (`q::END_FLUSH`: the front end writes the ring with no snooping, and a line the GPU's L2 kept from a lap before would be the last lap's), non-cacheable when the client asked (op 5's byte 0).
 /// Two pools a slot, so tables the GPU may be walking are never written: a running group's space moves to the new ones at once (2026-11-20: a block grown or a camera view given while a queue runs). Under the lock.
 fn tables(s: &Svc, sl: &mut Slot, camera: bool) {
     let pool = sl.pools[sl.cur ^ 1];
@@ -1016,7 +1016,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             }
             // Its memory looked at again (2026-11-20): its address space made from this call's stamp when it changed (a camera view given since: mapped read-only at `CAMERA_VA`), `[0][the camera mapped u8]`.
             5 => {
-                // The camera mapped cacheable on the GPU (the coordinator, 2026-11-20, after the 8a's measure: 1.4 to 1.7 times faster), every job of the client invalidating the GPU's L2 and load-store caches before it runs, so a frame landed since the last job is read from DRAM: `[5]` or `[5][1]`; `[5][0]` non-cacheable (the measure). A change remakes its tables.
+                // The camera mapped cacheable on the GPU (the coordinator, 2026-11-20, after the 8a's measure: 1.4 to 1.7 times faster), every job ending with the GPU's L2 and load-store caches invalidated (`q::END_FLUSH`, since 2026-11-21; a start-of-job invalidate for the camera's holder before), so a frame landed since the last job is read from DRAM: `[5]` or `[5][1]`; `[5][0]` non-cacheable (the measure). A change remakes its tables.
                 let cached = !(m.len() > 1 && m[1] == 0);
                 let cam = with(|st| {
                     let k = slot_for(st, &stamp, bbase, bsize)?;
@@ -1111,7 +1111,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             wr64(sl.flag + CALL_STAMPS + 8, 0);
             wr64(sl.flag + CALL_STAMPS + 16, 0);
             let seq = sl.seq;
-            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, invalidate: sl.camera && sl.camera_cached };
+            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
             let mut jw = [0u64; q::JOB_WORDS_MOST];
             let len = q::job_words(&d, &mut jw);
             append(s, sl, k, &jw[..len]);

@@ -451,7 +451,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, BIG_VA, big, 16, PAGE_RW | NC | NX, TABLE);
     // The picture a show renders (input bit 0): 1024 x 2048 escape counts, 8 MiB. Mapped with the rest before the address space is installed: the GPU caches its page-table walks in the L2, so a page mapped after it could meet a stale table line.
     let img = m.alloc(IMG_W * IMG_H * 4 / PAGE);
-    // Input bit 2: the picture and the bench's buffers cached on the GPU side (MEMATTR index 0, write-back; every compute stream ends with an L2 clean), else non-cacheable (index 5).
+    // Input bit 2: the picture and the bench's buffers cached on the GPU side (MEMATTR index 0, write-back; every compute stream ends with the L2 cleaned and invalidated, `ferros_gpuq::END_FLUSH`), else non-cacheable (index 5).
     let bulk = if in0 & 4 != 0 { 0 } else { NC };
     as1.map(&mut m, IMG_VA, img, IMG_W * IMG_H * 4 / PAGE, PAGE_RW | bulk | NX, TABLE);
     // The present-stage bench's output (input bit 1): a 32-bit word for each of the 1M 64-bit pixels the picture's 8 MiB holds as its input.
@@ -1115,7 +1115,7 @@ impl Compute {
             0x04 << 56 | axis << 14 | inc,
             0x0300_0000_0008_0000,
             mv32(74, 0),
-            0x2400_4A00_0000_0211,
+            ferros_gpuq::END_FLUSH,
             0x0300_0000_0001_0000,
             mv48(70, done),
             mv32(72, 1),

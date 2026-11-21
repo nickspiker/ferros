@@ -292,9 +292,13 @@ pub struct Dispatch {
     pub stamps: Option<u64>,
     pub sync: u64,
     pub value: u32,
-    /// The GPU's L2 and load-store caches cleaned and invalidated before the run (FLUSH_CACHE2 mode 3 for both, and its WAIT): a job reading memory a device writes without snooping thru a cacheable mapping (the camera ring cacheable, measured against non-cacheable: docs/GPU-KISTS.md "The camera ring on the GPU").
-    pub invalidate: bool,
 }
+
+/// The flush every job ends with: FLUSH_CACHE2 (opcode 36, genxml v11 "CS FLUSH_CACHE2") with the L2 and the load-store caches cleaned and invalidated (mode 3 each, bits 0-3 and 4-7), the others invalidated (2, bits 8-11), its flush id in r74.
+/// Invalidated, not only cleaned: the GPU snoops the CPU's caches on a miss but nothing invalidates the GPU's L2 when the CPU (or a device that does not snoop, the camera's front end) writes memory a job read.
+/// A line kept from one job would be read by the next as it was: a queue record's uniforms reused every 2^depth jobs ran the job before's rect (the Pro, 2026-11-21, 7 of 12 wrong), and a NEON patch ending mid-line had its bytes written back over by the GPU's old copy of the line.
+/// At the end rather than before the next run: a client's lines enter the L2 only thru its own jobs (one stream, one job at a time), so the state at a job's start is the state at the last one's end, and one flush a job does both.
+pub const END_FLUSH: u64 = 0x2400_4A00_0000_0233;
 
 /// The most words `job_words` writes.
 pub const JOB_WORDS_MOST: usize = 32;
@@ -304,7 +308,7 @@ pub const JOB_WORDS_MOST: usize = 32;
 /// - With stamps: r76:r77 = the result line, its timestamp at + 8 before the run.
 /// - RUN_COMPUTE (the task's axis and size as Mesa's gallium chooses them, pan_csf.c: along X while the threads fit the core's limit, a task of every workgroup when they all fit; a row a task for a grid of more than one row); WAIT on its entry.
 /// - With stamps: the timestamp at + 16, after the run's WAIT.
-/// - FLUSH_CACHE2 (clean L2 and LSC, invalidate the others) and its WAIT; SYNC_SET32 the sync word = `value`, whose update raises the group's interrupt.
+/// - `END_FLUSH` (clean and invalidate L2 and LSC, invalidate the others) and its WAIT; SYNC_SET32 the sync word = `value`, whose update raises the group's interrupt.
 pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
     let (axis, inc) = if d.groups.1 > 1 {
         (1u64, 1u64)
@@ -334,11 +338,6 @@ pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
     put(mv32(37, d.groups.0));
     put(mv32(38, d.groups.1));
     put(mv32(39, 1));
-    if d.invalidate {
-        put(mv32(74, 0));
-        put(0x2400_4A00_0000_0233);
-        put(0x0300_0000_0001_0000);
-    }
     if let Some(at) = d.stamps {
         put(mv48(STAMP_REG, at));
         put(store_state(STAMP_REG, 8, 0));
@@ -349,7 +348,7 @@ pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
         put(store_state(STAMP_REG, 16, 0));
     }
     put(mv32(74, 0));
-    put(0x2400_4A00_0000_0211);
+    put(END_FLUSH);
     put(0x0300_0000_0001_0000);
     put(mv48(70, d.sync));
     put(mv32(72, d.value));
