@@ -349,3 +349,31 @@ pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
     put(0x2600_4648_0000_0000);
     n
 }
+
+/// A layer's tile coverage (COMPOSITOR.md rule 2; docs/GPU-KISTS.md "Layers", 2026-11-20): a byte a tile of 2^`TILE_LOG2` pixels square, row by row, the screen's tiles across (`tiles_across`) times down, in the layer's surface `AT` bytes from the slot's start (past the pixels on both boards: the Pro's 1344 × 2992 at 8 bytes a pixel end 30.7 MiB in).
+/// A kernel counts each tile's pixels that hold anything and that are opaque (an atomic add a pixel, or one an invocation over its own pixels), and `class` makes the byte from the two counts; `CHANGED` set where the tile differs from the buffer's last publish.
+/// The display reads it with the buffer's show (not yet: the display composes a layer by its window's rectangle and the show's changed rectangle today).
+pub mod coverage {
+    pub const TILE_LOG2: u32 = 6;
+    pub const AT: usize = (32 << 20) - (64 << 10);
+    pub const EMPTY: u8 = 0;
+    pub const PARTIAL: u8 = 1;
+    pub const OPAQUE: u8 = 2;
+    pub const CHANGED: u8 = 1 << 7;
+
+    /// The tiles across a screen `width` pixels wide (a partial tile at the right edge counts).
+    pub const fn tiles_across(width: usize) -> usize {
+        (width + (1 << TILE_LOG2) - 1) >> TILE_LOG2
+    }
+
+    /// A tile's class from its pixels that hold anything (`any`) and that are opaque (`opaque`) of the `pixels` it covers on the screen.
+    pub const fn class(any: u32, opaque: u32, pixels: u32) -> u8 {
+        if any == 0 {
+            EMPTY
+        } else if opaque == pixels {
+            OPAQUE
+        } else {
+            PARTIAL
+        }
+    }
+}

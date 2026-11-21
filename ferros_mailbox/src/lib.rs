@@ -45,7 +45,7 @@ pub const AT: usize = 3;
 pub const DEAD: u64 = 1 << 63;
 
 /// The mailboxes, by number: the kernel's regions are `<name>-mailbox` (the writer's) and `<name>-view` (a reader's) for each, in this order.
-pub const NAMES: [&str; 4] = ["gps", "motion", "mic", "test"];
+pub const NAMES: [&str; 5] = ["gps", "motion", "mic", "test", "frame"];
 /// The GPS driver's: its fix and its tracks, the predicted birds among them (`gps`).
 pub const GPS: usize = 0;
 /// The sensors process's: gravity, the magnetometers and the accelerometer (`motion`).
@@ -54,10 +54,12 @@ pub const MOTION: usize = 1;
 pub const MIC: usize = 2;
 /// A test writer's (payloads/mbtest): the readers' measure without a radio.
 pub const TEST: usize = 3;
+/// The kernel's own, for anyone (2026-11-20, docs/GPU-KISTS.md "The display's frames"; Lumis: "a display frame event, so a kernel runs once per display frame"): published at every frame the display starts on the glass (`frame`).
+pub const FRAME: usize = 4;
 /// The writers' regions, by number.
-pub const BOX_NAMES: [&str; 4] = ["gps-mailbox", "motion-mailbox", "mic-mailbox", "test-mailbox"];
+pub const BOX_NAMES: [&str; 5] = ["gps-mailbox", "motion-mailbox", "mic-mailbox", "test-mailbox", "frame-mailbox"];
 /// The readers' regions, by number.
-pub const VIEW_NAMES: [&str; 4] = ["gps-view", "motion-view", "mic-view", "test-view"];
+pub const VIEW_NAMES: [&str; 5] = ["gps-view", "motion-view", "mic-view", "test-view", "frame-view"];
 
 /// One publish under way: the sequence made odd at `begin`, the words written with `put`, the sequence even and two on at `finish`.
 /// For a payload built in place (a ring's new samples); `publish` is the whole of it for a payload in hand.
@@ -287,6 +289,19 @@ pub mod motion {
     pub const ACCEL_AT: usize = 12;
     /// The payload's words.
     pub const WORDS: usize = 13;
+}
+
+/// The display's frames (2026-11-20, docs/GPU-KISTS.md "The display's frames"): the kernel publishes at every frame start it takes for the display (DECON0's frame-start interrupt), the header's `AT` that start's counter.
+/// A kist waits on it to run a kernel once a frame (its layer published for the frame after).
+/// On the Pro a frame starts only when the display arms a picture (the panel holds its image between), so at rest nothing is published; on the 8a the controller sends a frame on every TE, 120 a second at rest.
+pub mod frame {
+    /// The layout's tag: "FRAME" and its version, 0.
+    pub const KIND: u64 = 0x4652_414D_4500_0000;
+    /// Word 0: frames started since boot; word 1: pictures the display armed since boot (a start with no new picture leaves it).
+    pub const STARTS: usize = 0;
+    pub const ARMED: usize = 1;
+    /// The payload's words.
+    pub const WORDS: usize = 2;
 }
 
 #[cfg(test)]

@@ -1061,6 +1061,10 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
         say!(grants, "gputest: no layer arena\n");
         exit(1);
     }
+    // Input 16: the display's frames, a queued job a frame.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 16 {
+        frame_test(grants, arena);
+    }
     // Input 15: Lumis's back-end ops against the CPU.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 15 {
         lumis_ops_test(grants, arena);
@@ -1419,6 +1423,65 @@ fn queue_test(grants: u64, arena: usize, frames: u32) -> ! {
     q.close();
     say!(grants, "gputest queue: {}\n", if ok { "all as expected" } else { "NOT as expected" });
     exit(if ok { 0 } else { 1 });
+}
+
+/// The display's frames (input 16; GPU-KISTS.md "The display's frames"): the frame mailbox opened (no proof), 2^7 frames waited for, each answered with the empty kernel thru a queue as Lumis's layer would be: the frames' spacing, the wake's lateness (the reader's counter less the publish's), and the frame start to the job's end.
+/// The display must be presenting (on the Pro a frame starts only with a new picture: a finger on the deck, a kist drawing).
+fn frame_test(grants: u64, arena: usize) -> ! {
+    use ferros_sys::gpu::queue::*;
+    use ferros_sys::gpu::PRELOAD_X;
+    use ferros_sys::mailbox::{frame, Got, Reader, FRAME};
+    let mut token = [0u8; 32];
+    let Some(r) = Reader::open(FRAME, 0, &mut token) else {
+        say!(grants, "gputest frames: the frame mailbox did not open (a kernel from before it?)\n");
+        exit(1);
+    };
+    let mut q = match Queue::open(cap(grants, S_GPU), cap(grants, S_ARENA), Q_AT, 2) {
+        Ok(q) => q,
+        Err(e) => {
+            say!(grants, "gputest frames: the queue did not open (G#{e:X})\n");
+            exit(1);
+        }
+    };
+    let mut e = Kernel::<32>::new();
+    e.nop().end();
+    let words = e.finish().to_vec();
+    for (i, &w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + K_AT + 8 * i) as *mut u64, w) };
+    }
+    let Some(ke) = q.kernel(K_AT, words.len(), PRELOAD_X) else {
+        say!(grants, "gputest frames: the kernel was not loaded\n");
+        exit(1);
+    };
+    const N: usize = 1 << 7;
+    let (mut gap, mut late, mut done) = ([0u64; N], [0u64; N], [0u64; N]);
+    let mut seen = r.seq();
+    let (mut last_at, mut last_starts, mut skipped) = (0u64, 0u64, 0u64);
+    let mut out = [0u64; frame::WORDS];
+    for i in 0..N {
+        seen = r.wait(seen, 0);
+        let woke = ferros_sys::now();
+        let Got::Fresh { at, seq, .. } = r.read(&mut out) else {
+            say!(grants, "gputest frames: the mailbox is dead or empty\n");
+            exit(1);
+        };
+        seen = seq;
+        let starts = out[frame::STARTS];
+        if i > 0 {
+            gap[i] = at.wrapping_sub(last_at);
+            skipped += starts - last_starts - 1;
+        }
+        late[i] = woke.wrapping_sub(at);
+        let n = q.submit(&Job { kernel: ke, groups: (1, 1), uniforms: &[] }).unwrap();
+        let d = q.wait(n);
+        done[i] = d.seen.wrapping_sub(at);
+        last_at = at;
+        last_starts = starts;
+    }
+    let (g, l, d) = (spread(&gap[1..]), spread(&late), spread(&done));
+    say!(grants, "gputest frames: A#{N} frames: spacing A#{}/A#{}/A#{} us (least/mean/most), A#{skipped} starts missed; the wake A#{}/A#{}/A#{} us late; frame start to the job's end A#{}/A#{}/A#{} us\n", g.0, g.1, g.2, l.0, l.1, l.2, d.0, d.1, d.2);
+    q.close();
+    exit(0);
 }
 
 /// A call (op 1) with code at 0 in the block: its status, the service's µs, and the GPU's own µs when the reply carries it (a service of 2026-11-20 on).

@@ -2194,11 +2194,29 @@ fn irq_pending_take(intid: u32) -> bool {
             // Frames going out: the clock policy's sign that something is animating at more than the rest flips (a focused widget).
             if intid == IRQ_DECON0_FRAME_START {
                 FRAME_STARTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // The frame mailbox published by whoever took it, once its walk of the threads is over (`frame_mailbox_flush`): its wake walks them too.
+                FRAME_DUE.store(true, core::sync::atomic::Ordering::Release);
             }
         }
         v != 0
     }
 }
+/// A display frame start taken and not yet published in the frame mailbox (`frame_mailbox_flush`).
+static FRAME_DUE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The display's frames (2026-11-20, docs/GPU-KISTS.md "The display's frames"; Lumis: "a display frame event, so a kernel runs once per display frame"): at a frame start taken for the display (`irq_pending_take`), the frame mailbox (ferros_mailbox `FRAME`, the kernel its one writer, any process its reader) published with the starts and the pictures armed so far, the header's time the counter now, and every reader waiting woken. Its frame taken from the pool at the first start (`mbox_frame`); none to take, nothing published. Under the lock, after any walk of the threads.
+fn frame_mailbox_flush() {
+    if !FRAME_DUE.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(f) = mbox_frame(ferros_mailbox::FRAME) else { return };
+    // SAFETY: the frame is the pool's, kept for this mailbox for the boot, at its own address the kernel's read-write (cachemap `frame_block`), 2 MiB = `WORDS` words; the kernel is its one writer (nobody is granted `frame-mailbox`), under the lock.
+    let words = unsafe { core::slice::from_raw_parts(crate::frames::pa(f) as *const core::sync::atomic::AtomicU64, ferros_mailbox::WORDS) };
+    let payload = [FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed), PRESENTS.load(core::sync::atomic::Ordering::Relaxed)];
+    ferros_mailbox::publish(words, ferros_mailbox::frame::KIND, crate::platform::cntpct(), &payload);
+    mbox_wake(mbox_view_seq(ferros_mailbox::FRAME), u64::MAX);
+}
+
 /// The storm guard's per-line state, by `IRQS` index (2026-11-13): a modem build that acked its MSI line without clearing the CP's MSI status watchdog-reset the 8a (PREV_EXIT G#A3, inside SYS_IRQ_ACK).
 /// A level line its device still asserts fires again the moment it is unmasked: each ack then costs an interrupt, a wake SGI to every core and a preemption, as fast as the driver can ack, and nothing the driver does ends it.
 /// Room for `1 << 5` lines: `IRQS` holds fewer, and an index past it panics (a table grown past this wants this grown with it).
@@ -2611,8 +2629,8 @@ pub static DMA: &[Dma] = &[
     puck_slot(0), puck_slot(1), puck_slot(2), puck_slot(3), puck_slot(4), puck_slot(5), puck_slot(6), puck_slot(7),
     puck_slot(8), puck_slot(9), puck_slot(10), puck_slot(11), puck_slot(12), puck_slot(13), puck_slot(14), puck_slot(15),
     // The mailboxes (cachemap MBOX_VA and MBOX_VIEW_VA, docs/KERNEL.md "Mailboxes", 2026-11-19): each one's writer's region (`gps-mailbox`, read-write), then each one's readers' view (`gps-view`, read-only), in ferros_mailbox's order, a frame of the pool behind both from the first ask (`mbox_frame`). Granted by name, or a view opened with a proof (SYS_MAILBOX). Must stay consecutive and in order: `mbox0() + k` is mailbox k's writer's region, `mbox0() + MBOXES + k` its view.
-    mbox_slot(0, false), mbox_slot(1, false), mbox_slot(2, false), mbox_slot(3, false),
-    mbox_slot(0, true), mbox_slot(1, true), mbox_slot(2, true), mbox_slot(3, true),
+    mbox_slot(0, false), mbox_slot(1, false), mbox_slot(2, false), mbox_slot(3, false), mbox_slot(4, false),
+    mbox_slot(0, true), mbox_slot(1, true), mbox_slot(2, true), mbox_slot(3, true), mbox_slot(4, true),
 ];
 
 /// Mailbox k's writer's region (`view` false) or its readers' view as a DMA region (`DMA`): its frame's address in that window.
@@ -2625,7 +2643,7 @@ const fn mbox_slot(k: usize, view: bool) -> Dma {
 }
 /// How many mailboxes there are.
 const MBOXES: usize = crate::cachemap::MBOXES;
-const _: () = assert!(MBOXES == 4 && ferros_mailbox::BYTES == crate::frames::FRAME, "the DMA table lists four mailboxes, a frame each");
+const _: () = assert!(MBOXES == 5 && ferros_mailbox::BYTES == crate::frames::FRAME, "the DMA table lists five mailboxes, a frame each");
 /// Where the mailboxes' regions begin in `DMA`.
 fn mbox0() -> usize {
     DMA.iter().position(|r| r.name == ferros_mailbox::BOX_NAMES[0]).unwrap()
@@ -2677,6 +2695,11 @@ fn mbox_dma(p: &Process, i: usize) -> u64 {
         return ERR;
     }
     if !view {
+        // The frame mailbox is the kernel's to write (`frame_mailbox_flush`): a process given its writer's region by name would be a second writer under one seqlock.
+        if k == ferros_mailbox::FRAME {
+            k_console(&alloc::format!("mailbox {name}: {} asked to write it: the kernel writes it\n", core::str::from_utf8(&p.name).unwrap_or("?")));
+            return ERR;
+        }
         let m = unsafe { &mut (*(&raw mut MBOX))[k] };
         if m.writer != 0 && m.writer != p.epoch {
             k_console(&alloc::format!("mailbox {name}: {} asked to write it while another process does\n", core::str::from_utf8(&p.name).unwrap_or("?")));
@@ -2789,6 +2812,8 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
             _ => false,
         },
         ferros_mailbox::MOTION => true,
+        // The display's frames: when a picture starts on the glass is what everyone sees (2026-11-20).
+        ferros_mailbox::FRAME => true,
         _ => false,
     };
     if !proved {
@@ -2865,6 +2890,33 @@ const _: () = assert!(SURFACE_SLOTS == 16, "the DMA table lists sixteen surface 
 fn surface0() -> usize {
     DMA.iter().position(|r| r.name == "surface").unwrap()
 }
+/// The most surfaces one process holds that it asked for (SYS_DMA x1 = 10): a kist's two layers, each a mailbox of two buffers (2026-11-20, docs/GPU-KISTS.md "Layers").
+const SURFACES_ASKED_MOST: usize = 4;
+
+/// SYS_DMA x1 = 10 on a surface the caller holds (2026-11-20, docs/GPU-KISTS.md "Layers"; Lumis: "layers as mailboxes, at least two per kist"): another surface of its own, its token written at arc offset `out`, answered its base past the porch as SYS_DMA answers a surface's. A window on it is a layer the display composes front to back with the caller's others; two of them make a layer's mailbox (op 22's 36-byte form). ERR, said on the console: the caller holds `SURFACES_ASKED_MOST` already, no slot is free, or the pool is short. Under the lock.
+fn surface_ask(p: &mut Process, out: u64) -> u64 {
+    let s0 = surface0();
+    let held = p.cspace.iter().filter(|c| matches!(c.object, Object::Dma(i) if i >= s0 && i < s0 + SURFACE_SLOTS)).count();
+    let name = alloc::string::String::from_utf8_lossy(&p.name).into_owned();
+    if held >= SURFACES_ASKED_MOST {
+        k_console(&alloc::format!("surface ask: {name} holds A#{held} surfaces, the most a process asks for\n"));
+        return ERR;
+    }
+    match surface_take(p.epoch) {
+        Ok(k) => {
+            let t = mint(Object::Dma(s0 + k), RIGHT_SEND | RIGHT_RECV, p.epoch);
+            p.cspace.push(CapEntry { token: t, object: Object::Dma(s0 + k), rights: RIGHT_SEND | RIGHT_RECV });
+            p.write(out, &t);
+            surfaces_ring();
+            (region(s0 + k).0 + crate::cachemap::SURFACE_PORCH) as u64
+        }
+        Err(why) => {
+            k_console(&alloc::format!("surface ask: {name}: {why}\n"));
+            ERR
+        }
+    }
+}
+
 /// The frames behind one surface.
 const SURFACE_FRAMES: usize = crate::cachemap::SURFACE_SIZE / crate::frames::FRAME;
 
@@ -5688,6 +5740,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         0
                     } else if irq_pending_take(intid) {
                         // Back at once: the interrupt came while the thread was not waiting (devsched: a late wait, and how long the interrupt sat).
+                        frame_mailbox_flush();
                         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                         // WHY saturating: the stamp is another core's counter read (devsched `ran`).
                         crate::devsched::late(i, crate::platform::cntpct().saturating_sub(unsafe { core::ptr::read_volatile(&raw const __irq_at[intid as usize]) }));
@@ -7216,6 +7269,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // x1 = 2 (2026-11-13): the caller's GPU block grown to 2^x2 bytes, answered its size after (`block_ask`); ERR, said on the console, when it is not the caller's block, past the ceiling, or more than the pool can give.
                 Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
+                // x1 = 10 (2026-11-20, docs/GPU-KISTS.md "Layers"): on a surface the caller holds, another surface of its own, its token written at arc offset x2 (`surface_ask`).
+                Some(Object::Dma(i)) if DMA[i].name == "surface" && f.x[1] == 10 => surface_ask(p, f.x[2]),
                 // x1 = 6 (2026-11-18, docs/PUCKS.md): the caller's puck square resized to hold x2 bytes past its porch (`puck_ask`), answered the bytes it holds after; ERR, said on the console, when it is not the caller's, past the slot, or more than the pool can give.
                 Some(Object::Dma(i)) if DMA[i].name == "puck" && f.x[1] == 6 => puck_ask(p, i, f.x[2]),
                 // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
@@ -8366,6 +8421,7 @@ fn wake_sleepers() {
             }
         }
     }
+    frame_mailbox_flush();
     deadlines_sync();
 }
 

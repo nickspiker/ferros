@@ -1248,7 +1248,7 @@ pub mod claim {
 /// - A reader holds the `<name>-view` region, granted at its spawn (`Reader::map`) or opened with a proof (`Reader::open`: the GPS right, Settings); it waits for the next publish (`wait`) and reads a whole one (`read`), never calling the writer.
 /// - The kernel marks the mailbox dead when the writer's process ends and zeroes its payload (`Got::Dead`); a new writer's first publish brings it back.
 pub mod mailbox {
-    pub use ferros_mailbox::{gps, motion, Got, Publish, AT, BOX_NAMES, DEAD, GPS, HEADER, KIND, LEN, MIC, MOTION, NAMES, PAYLOAD_MAX, SEQ, TEST, VIEW_NAMES, WORDS};
+    pub use ferros_mailbox::{frame, gps, motion, Got, Publish, AT, BOX_NAMES, DEAD, FRAME, GPS, HEADER, KIND, LEN, MIC, MOTION, NAMES, PAYLOAD_MAX, SEQ, TEST, VIEW_NAMES, WORDS};
     use super::{dma, now, nr, off, svc, wait, wait_world, wake, ERR};
     use core::sync::atomic::AtomicU64;
 
@@ -2378,6 +2378,12 @@ pub fn gpu_block_ask(cap: u64, log: u32) -> Option<u64> {
     (n != ERR && n <= GPU_BLOCK_MOST as u64).then_some(n)
 }
 
+/// Another surface of this process's own (kernel SYS_DMA x1 = 10 on a surface it holds, at `held`; 2026-11-20, docs/GPU-KISTS.md "Layers"): its token written into `out` (the caller keeps it: `dma(off(out))` answers the surface's base past its porch again), its base past the porch now. A window on it is a layer the display composes front to back with the caller's others, and two make a layer's mailbox (`window::show_buffer`, op 22's 36-byte form). At most four a process; None past that, with no slot free or the pool short (the console says which), or on a kernel from before.
+pub fn surface_ask(held: u64, out: &mut [u8; 32]) -> Option<u64> {
+    let n = svc(nr::DMA, held, 10, off(out.as_mut_ptr()), 0, 0);
+    (n != ERR && n != 0).then_some(n)
+}
+
 /// Ask the kernel to resize this puck's square (the grant at `cap`: a puck's surface slot, docs/PUCKS.md) to hold `bytes` past its porch, larger or smaller, in whole frames of the pool; its base (`dma`) never moves. The bytes it holds after, or None: not the caller's square, past `PUCK_BYTES`, more than the pool can give (the console says which), or a kernel from before 2026-11-18.
 pub fn puck_size(cap: u64, bytes: u64) -> Option<u64> {
     let n = svc(nr::DMA, cap, 6, bytes, 0, 0);
@@ -2695,6 +2701,30 @@ pub mod window {
         m[23..25].copy_from_slice(&changed.2.to_le_bytes());
         m[25..27].copy_from_slice(&changed.3.to_le_bytes());
         m[27] = mode;
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r);
+        r[0] == 0
+    }
+
+    /// A layer's mailbox show (op 22's 36-byte form, GPU-KISTS.md 1.4 and "Layers"): the window on surface `base` shows the pixels of surface `buffer` (the caller's own, `super::surface_ask`) from this show on, `show_full`'s other fields as there. Answered once the display has taken it, so the buffer shown before is no longer read and is the caller's to draw into again: two buffers a layer, swapped show by show.
+    /// A window keeps its place in the stack across shows that leave its place, level, format and mode as they were: a kist's layers are stacked by their first shows, the one shown first behind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_buffer(display: u64, base: u64, buffer: u64, x: u16, y: u16, w: u16, h: u16, level: u8, format: u8, changed: (u16, u16, u16, u16), mode: u8) -> bool {
+        let mut m = [0u8; 36];
+        m[0] = 22;
+        m[1..3].copy_from_slice(&x.to_le_bytes());
+        m[3..5].copy_from_slice(&y.to_le_bytes());
+        m[5..7].copy_from_slice(&w.to_le_bytes());
+        m[7..9].copy_from_slice(&h.to_le_bytes());
+        m[9..17].copy_from_slice(&base.to_le_bytes());
+        m[17] = level;
+        m[18] = format;
+        m[19..21].copy_from_slice(&changed.0.to_le_bytes());
+        m[21..23].copy_from_slice(&changed.1.to_le_bytes());
+        m[23..25].copy_from_slice(&changed.2.to_le_bytes());
+        m[25..27].copy_from_slice(&changed.3.to_le_bytes());
+        m[27] = mode;
+        m[28..36].copy_from_slice(&buffer.to_le_bytes());
         let mut r = [0u8; 4];
         call(display, &m, &mut r);
         r[0] == 0

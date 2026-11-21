@@ -210,3 +210,20 @@ fn gone_marks() {
     assert_eq!(r.ended(), E_SERVICE);
     assert_eq!(r.done(), 1, "the count without the mark");
 }
+
+/// The coverage map: its classes, and room for both boards' screens past their pixels in a 32 MiB surface slot.
+#[test]
+fn coverage_map() {
+    use coverage::*;
+    assert_eq!(class(0, 0, 4096), EMPTY);
+    assert_eq!(class(4096, 4096, 4096), OPAQUE);
+    assert_eq!(class(10, 0, 4096), PARTIAL);
+    assert_eq!(class(4096, 4095, 4096), PARTIAL);
+    // A right-edge tile of the Pro (1344 = 21 tiles) and the 8a (1080: 16 whole, one of 56 pixels across).
+    assert_eq!((tiles_across(1344), tiles_across(1080)), (21, 17));
+    assert_eq!(class(56 * 64, 56 * 64, 56 * 64), OPAQUE);
+    for (w, h) in [(1344usize, 2992usize), (1080, 2400)] {
+        let tiles = tiles_across(w) * tiles_across(h);
+        assert!(64 + w * h * 8 <= AT && AT + tiles <= 32 << 20, "{w} x {h}");
+    }
+}
