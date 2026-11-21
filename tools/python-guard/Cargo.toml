@@ -2,7 +2,7 @@
 name = "python-guard"
 version = "0.1.0"
 edition = "2024"
-description = "The fail-closed Python gate behind every pre-commit and pre-push hook: no Python in any of the owner's repos: a Python source, a python shebang, a build script or Rust Command that runs it — except what ~/.config/git/python-allow names"
+description = "The fail-closed Python gate behind every pre-commit and pre-push hook: no Python in any of the owner's repos: a Python source, a python shebang, a build script or Rust Command that runs it: except what ~/.config/git/python-allow names"
 
 [[bin]]
 name = "python-guard"

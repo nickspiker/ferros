@@ -1,7 +1,7 @@
 //! python-guard: no Python in any commit of the owner's (his rule, 2026-11-21: not portable, not deterministic, not safe, and its code can't be copy-pasted unless the indentation matches exactly). Fail closed.
 //!
 //!   python-guard staged                  what pre-commit is about to commit (the index)
-//!   python-guard push <tip> <rev-args…>  the files the pushed commits (`<rev-args>`, as `git log` takes them) add or change, as they stand at `<tip>` — pre-push's backstop for `--no-verify`
+//!   python-guard push <tip> <rev-args…>  the files the pushed commits (`<rev-args>`, as `git log` takes them) add or change, as they stand at `<tip>`: pre-push's backstop for `--no-verify`
 //!
 //! A file is refused when it is added or changed (deleting Python is always allowed) and it is:
 //! - a Python source by name: .py .pyw .pyi .pyx .pxd .ipynb
@@ -151,7 +151,7 @@ fn main() -> ExitCode {
     };
     // A git that cannot list the files is a failure to check, and a failure to check refuses.
     let Some(names) = names else {
-        eprintln!("python-guard: git could not list the files to check in {repo} — refusing (fail-closed).");
+        eprintln!("python-guard: git could not list the files to check in {repo}: refusing (fail-closed).");
         return ExitCode::FAILURE;
     };
     let mut files: Vec<String> = names.split(|&b| b == 0).filter(|n| !n.is_empty()).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
@@ -167,7 +167,7 @@ fn main() -> ExitCode {
 
     // One cat-file for every file: requests written on a thread while the answers are read here, so neither pipe can fill and stall the other.
     let Ok(mut child) = Command::new("git").args(["cat-file", "--batch", "-Z"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
-        eprintln!("python-guard: could not run git cat-file — refusing (fail-closed).");
+        eprintln!("python-guard: could not run git cat-file: refusing (fail-closed).");
         return ExitCode::FAILURE;
     };
     let mut stdin = child.stdin.take().expect("piped stdin");
@@ -184,23 +184,23 @@ fn main() -> ExitCode {
     for f in &files {
         let mut header = Vec::new();
         if out.read_until(0, &mut header).unwrap_or(0) == 0 {
-            eprintln!("python-guard: git cat-file ended early — refusing (fail-closed).");
+            eprintln!("python-guard: git cat-file ended early: refusing (fail-closed).");
             return ExitCode::FAILURE;
         }
         header.pop();
-        // "<spec> missing": not there at the tip (removed later in the push) — nothing to check.
+        // "<spec> missing": not there at the tip (removed later in the push): nothing to check.
         if header.ends_with(b" missing") {
             continue;
         }
         let size: usize = String::from_utf8_lossy(&header).rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut content = vec![0u8; size + 1];
         if out.read_exact(&mut content).is_err() {
-            eprintln!("python-guard: git cat-file ended early — refusing (fail-closed).");
+            eprintln!("python-guard: git cat-file ended early: refusing (fail-closed).");
             return ExitCode::FAILURE;
         }
         content.pop();
         if let Some(why) = verdict(f, &content) {
-            bad.push(format!("  {f} — {why}"));
+            bad.push(format!("  {f}: {why}"));
         }
     }
     let _ = writer.join();
