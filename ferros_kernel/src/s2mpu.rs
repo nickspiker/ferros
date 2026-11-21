@@ -279,13 +279,18 @@ fn gpu_table(g: usize) -> (*mut Smpt, bool) {
 
 /// The GPU's fence over a frame at `pa` (2 MiB, so in one GiB): read and write when `on`, no access when not, 64 words of a table and four lines cleaned; and, when the fence is up and pd_g3d powered, a table made for a new GiB put in the L1 for every VID. Each frame of a surface as it is given out and as it is given back (process.rs `surface_take`, `surface_release`), then `gpu_sync` once. Under the kernel lock.
 pub fn gpu_admit(pa: usize, on: bool) {
+    gpu_admit_word(pa, if on { 0xCCCC_CCCC } else { 0 });
+}
+
+/// `gpu_admit` with the table's words for the frame given: eight pages' nibbles a word.
+fn gpu_admit_word(pa: usize, word: u32) {
     let len = crate::frames::FRAME;
     let g = pa >> 30;
     let (t, new) = gpu_table(g);
     // A word of the table holds eight pages' nibbles: every nibble G#C (read and write) or 0.
     let w0 = (pa - (g << 30)) >> 15;
     let words = unsafe { &mut (&mut *t).0[w0..w0 + (len >> 15)] };
-    words.fill(if on { 0xCCCC_CCCC } else { 0 });
+    words.fill(word);
     clean(words.as_ptr() as usize, len >> 13);
     if GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed) != 1 || unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         return;
@@ -296,6 +301,11 @@ pub fn gpu_admit(pa: usize, on: bool) {
             wr(GPU_S2MPU, l1_attr(vid, g), L2TABLE_EN);
         }
     }
+}
+
+/// The GPU's fence over a frame at `pa` read-only (SMPT nibble G#4 a page): a camera frame its holder's GPU jobs read in place (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"; the owner: the ring read-only to its holder's GPU while it holds the camera open). Shut again by `gpu_admit(pa, false)`, then `gpu_sync`. Under the kernel lock.
+pub fn gpu_admit_ro(pa: usize) {
+    gpu_admit_word(pa, 0x4444_4444);
 }
 
 /// After `gpu_admit` over a surface's frames: the S2MPU's cached entries invalidated and synced, when the fence is up and pd_g3d powered (else the tables are read afresh when it is fenced). Under the kernel lock.

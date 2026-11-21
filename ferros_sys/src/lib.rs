@@ -590,7 +590,7 @@ pub mod gpu {
     /// The most regions a stamp names that the service maps (a client holds a block and a surface or two).
     pub const REGIONS: usize = 8;
     /// The most frames a stamp carries: four surfaces of 16 frames and a block at the ceiling (`super::GPU_BLOCK_MOST`).
-    pub const FRAMES: usize = 64 + super::GPU_BLOCK_MOST / FRAME as usize;
+    pub const FRAMES: usize = 64 + super::GPU_BLOCK_MOST / FRAME as usize + CAMERA_VIEW_BYTES as usize / FRAME as usize;
     /// A frame: what a surface's and a GPU block's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
     pub const FRAME: u64 = 1 << 21;
 
@@ -618,7 +618,18 @@ pub mod gpu {
 
     /// Whether a region lies in a window of frames: a surface (the surfaces' window) or a GPU block (the blocks' window, since 2026-11-13), whose frames the stamp carries.
     pub const fn in_window(b: u64, size: u64) -> bool {
-        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64)
+        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64) || is_camera(b, size)
+    }
+
+    /// The camera's view window (the kernel's cachemap CAM_VIEW_VA): a stamp names the camera view there for its holder alone, with its frames (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"); the service maps them read-only at `CAMERA_VA`.
+    pub const CAMERA_VIEW_WINDOW: u64 = 0x51_2000_0000;
+    pub const CAMERA_VIEW_BYTES: u64 = 512 << 20;
+    /// Where a client's GPU space maps its camera view, read-only: the view's first frame at `CAMERA_VA`, the rest after it as the CPU sees them from the view's base.
+    pub const CAMERA_VA: u64 = 0x1_0000_0000;
+
+    /// Whether a region is the camera's view.
+    pub const fn is_camera(b: u64, size: u64) -> bool {
+        b >= CAMERA_VIEW_WINDOW && b + size <= CAMERA_VIEW_WINDOW + CAMERA_VIEW_BYTES
     }
 
     /// Whether a region is a GPU block: in the blocks' window.
@@ -702,7 +713,7 @@ pub mod gpu {
     /// let e = q.wait(n);                                                   // e.status, e.gpu_ticks(), e.fault_address
     /// ```
     pub mod queue {
-        pub use ferros_gpuq::{Ended, Job, DEPTH_MOST_LOG2, E_CLOSED, E_FAULT, E_OVERRUN, E_SERVICE, S_DONE, S_FAILED, S_LOST, S_OUTSIDE, S_REFUSED, UNIFORMS_MOST};
+        pub use ferros_gpuq::{Ended, Job, DEPTH_MOST_LOG2, E_CAMERA, E_CLOSED, E_FAULT, E_OVERRUN, E_SERVICE, S_DONE, S_FAILED, S_LOST, S_OUTSIDE, S_REFUSED, UNIFORMS_MOST};
         use core::sync::atomic::AtomicU64;
 
         /// A queue open on the GPU service.
@@ -800,6 +811,14 @@ pub mod gpu {
                 let mut reply = [1u8; 1];
                 let r = super::super::call(self.service, &msg, &mut reply);
                 r == 1 && reply[0] == 0
+            }
+
+            /// The service told this process's memory now (op 5): after a camera OPEN, its view is mapped read-only in this process's GPU space at `CAMERA_VA` (a buffer at its place in the view, the MAP header's +48, is at `CAMERA_VA` plus that place); after a CLOSE it is gone. Whether the camera is mapped, or None (refused).
+            /// Wait for the queue's jobs that read the camera before its CLOSE: one still in flight is stopped when the view goes, and the queue ends (`E_CAMERA`).
+            pub fn refresh(&self) -> Option<bool> {
+                let mut reply = [1u8; 2];
+                let r = super::super::call(self.service, &[5], &mut reply);
+                (r == 2 && reply[0] == 0).then_some(reply[1] != 0)
             }
 
             /// The queue closed: a job still running stopped, the rest lost.
@@ -1362,6 +1381,8 @@ pub const BELL_SLOTS: u64 = 12;
 pub const BELL_IDENTITY: u64 = 13;
 /// The pucks' squares (2026-11-18, docs/PUCKS.md), for the holder of the `surfaces` region (the display): bits 4j to 4j + 3 square slot j's generation (1 to 15) while its puck lives, 0 otherwise ([`surface_generation`] reads it the same way).
 pub const BELL_PUCKS: u64 = 14;
+/// The camera on the GPU (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"), for the GPU service alone (the holder of `arena`): counted each time a camera view its holder's GPU calls carried is taken back, so the service unmaps it from that client's space and says so (SYS_DMA x1 = 9 on `arena`).
+pub const BELL_GPU_CAMERA: u64 = 15;
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;

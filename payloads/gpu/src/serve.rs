@@ -21,7 +21,8 @@ use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::mem::rd64;
 use ferros_gpuq as q;
-use ferros_sys::gpu::{is_block, Key, Stamp, OUTSIDE, SURFACES_PA, UNCHECKED};
+use ferros_sys::gpu::{is_block, is_camera, Key, Stamp, CAMERA_VA, OUTSIDE, SURFACES_PA, UNCHECKED};
+use ferros_sys::BELL_GPU_CAMERA;
 
 /// Each slot's command stream: 4 pages, room for the deepest queue's jobs and a call's (ferros_gpuq `JOB_WORDS_MOST` words a job, padded to 64 bytes: 17 jobs in flight at most, 4352 bytes).
 const RING_PAGES: usize = 4;
@@ -32,6 +33,8 @@ const SPD_AT: usize = 0x400;
 /// In a slot's sequence page (mapped at `OUT_VA`): the word each job's stream sets to its sequence at its end, and the line a call's stamps land in (its start at + 8, its end at + 16).
 const SEQ_AT: usize = 0x240;
 const CALL_STAMPS: usize = 0x278;
+/// A level-2 block of 2 MiB, read-only (BLOCK_RW with AP's read-only bit, as PAGE_RO is PAGE_RW's): a camera view's frames (2026-11-20).
+const BLOCK_RO: u64 = 0x4C1;
 
 /// What the threads share, fixed before they start.
 struct Svc {
@@ -83,7 +86,16 @@ struct Slot {
     desc: usize,
     flag: usize,
     code: usize,
-    pool: usize,
+    /// Its two pools of table pages (`tables`), and which holds the tables in use.
+    pools: [usize; 2],
+    cur: usize,
+    /// What its client's last stamp named (`bind`), kept to make its tables again: the regions, and the frames of those in a window, in order.
+    regions: [(u64, u64); ferros_sys::gpu::REGIONS],
+    nregions: usize,
+    frames: [u64; ferros_sys::gpu::FRAMES],
+    nframes: usize,
+    /// Its client's camera view is mapped in its space.
+    camera: bool,
     /// Its address space's root while a client is bound.
     root: usize,
     insert: usize,
@@ -108,6 +120,10 @@ struct Slot {
     head_since: u64,
 }
 
+impl Slot {
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+}
+
 struct State {
     slots: [Slot; SLOTS],
     jobs: u64,
@@ -118,7 +134,8 @@ struct State {
 }
 
 static mut SVC: Option<Svc> = None;
-static mut ST: Option<State> = None;
+/// Filled in place by `serve` before any thread starts (a slot is about 6 KiB: seven built on the main thread's stack and moved would be 40 KiB of it).
+static mut ST: State = State { slots: [const { Slot::EMPTY }; SLOTS], jobs: 0, inflight: 0, call: (0, 0, 0, 0, 0) };
 /// The lock over `ST` and the firmware's shared interface: three states, Drepper's futex mutex (0 free, 1 held, 2 held with waiters).
 static LOCK: AtomicU64 = AtomicU64::new(0);
 /// Each slot thread's doorbell while its slot has no queue: moved when one opens there.
@@ -130,6 +147,9 @@ static WANT: AtomicU64 = AtomicU64::new(0);
 
 static mut EVENTS_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut CLOCK_STACK: [u8; 1 << 13] = [0; 1 << 13];
+static mut CAMERA_STACK: [u8; 1 << 14] = [0; 1 << 14];
+/// The camera's bell word (`camera_watch`): the kernel writes its count here and wakes it.
+static CAMERA_BELL: AtomicU64 = AtomicU64::new(0);
 static mut SLOT_STACKS: [[u8; 1 << 14]; SLOTS] = [[0; 1 << 14]; SLOTS];
 
 fn svc() -> &'static Svc {
@@ -156,7 +176,7 @@ fn unlock() {
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     lock();
     // SAFETY: `ST` is set before any thread starts and touched only here, under the lock.
-    let r = f(unsafe { (*(&raw mut ST)).as_mut().unwrap() });
+    let r = f(unsafe { &mut *(&raw mut ST) });
     unlock();
     r
 }
@@ -332,7 +352,12 @@ fn queue_end(st: &mut State, k: usize, why: u64, unbind: bool) -> Option<usize> 
     let qu = st.slots[k].queue.take();
     while st.slots[k].len > 0 {
         let f = land(st, k, now);
-        if let (Some(qu), true) = (qu, f.job != CALL) {
+        if f.job == CALL {
+            // A call's job ended with the group: its caller answered 2 (the main thread waits on the bell).
+            st.call = (2, ((now - f.submitted) * 1_000_000 / s.g.f) as u32, 0, 0, 0);
+            CALL_BELL.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&CALL_BELL, 1);
+        } else if let Some(qu) = qu {
             qu.ring().end(f.job, q::S_LOST, f.submitted, now, (0, 0), 0);
         }
     }
@@ -561,50 +586,82 @@ extern "C" fn slot_thread(k: u64) -> ! {
 
 /// Slot `k` bound to the client of `stamp`: its address space from the stamp alone (its block's frames in 2 MiB entries from `ARENA_VA`, each surface frame by frame at its place, and the slot's own pages). Under the lock; the slot's group has ended.
 fn bind(s: &Svc, sl: &mut Slot, stamp: &Stamp, bbase: u64, bsize: u64) {
-    let mut tm = Mem::new(sl.pool);
+    // The stamp's regions and their frames kept with the slot, so its tables can be made again without the client (a camera view taken back, `camera_watch`).
+    sl.nregions = stamp.n;
+    sl.regions[..stamp.n].copy_from_slice(stamp.regions());
+    sl.nframes = 0;
+    for i in 0..stamp.n {
+        for pa in stamp.frames_of(i) {
+            sl.frames[sl.nframes] = pa;
+            sl.nframes += 1;
+        }
+    }
+    sl.client = Some(stamp.key());
+    sl.block = (bbase, bsize);
+    sl.kist = stamp.kist;
+    tables(s, sl, true);
+}
+
+/// A slot's client's address space made from what its bind kept, in the slot's other pool of table pages, then installed (`space_install`: the old walks and lines dropped first) when its group runs, else at its next start: the slot's own pages (its stream and descriptors read-only, its sequence page, its code read-only and the only executable pages), its block's frames read-write at `ARENA_VA`, each surface frame by frame at its place from `SURFACES_VA`, and (`camera`) its camera view read-only at `CAMERA_VA`, non-cacheable on the GPU (the front end writes the ring with no snooping, and a line the GPU's L2 kept from a lap before would be the last lap's).
+/// Two pools a slot, so tables the GPU may be walking are never written: a running group's space moves to the new ones at once (2026-11-20: a block grown or a camera view given while a queue runs). Under the lock.
+fn tables(s: &Svc, sl: &mut Slot, camera: bool) {
+    let pool = sl.pools[sl.cur ^ 1];
+    let mut tm = Mem::new(pool);
     let t = Table::new(&mut tm);
     t.map(&mut tm, RING_VA, sl.ring, RING_PAGES, PAGE_RO | NC | NX, TABLE);
     t.map(&mut tm, DESC_VA, sl.desc, 1, PAGE_RO | NC | NX, TABLE);
     t.map(&mut tm, OUT_VA, sl.flag, 1, PAGE_RW | NC | NX, TABLE);
     t.map(&mut tm, CODE_BIG_VA, sl.code, CODE_PAGES + KERNEL_PAGES, PAGE_RO | NC, TABLE);
-    if is_block(bbase, bsize) {
-        // The block's frames in 2 MiB blocks from `ARENA_VA` (2026-11-13: frames of the pool, wherever it had them), in the stamp's order, which is the CPU's from the block's base.
-        let bi = stamp.regions().iter().position(|&r| r == (bbase, bsize)).unwrap();
-        for (j, pa) in stamp.frames_of(bi).enumerate() {
-            t.map_block(&mut tm, ARENA_VA + j as u64 * ferros_sys::gpu::FRAME, pa as usize, BLOCK_RW | 6 << 2 | 2 << 8 | NX, TABLE);
-        }
-    } else {
+    let (bbase, bsize) = sl.block;
+    if !is_block(bbase, bsize) {
         // A kernel from before 2026-11-13: a block of the fixed arena, at its physical address.
         t.map(&mut tm, ARENA_VA, bbase as usize, bsize as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
     }
-    for (i, &(b, sz)) in stamp.regions().iter().enumerate() {
-        if is_block(b, sz) {
+    let mut at = 0;
+    sl.camera = false;
+    for i in 0..sl.nregions {
+        let (b, sz) = sl.regions[i];
+        if !ferros_sys::gpu::in_window(b, sz) {
             continue;
         }
-        for (j, pa) in stamp.frames_of(i).enumerate() {
-            if s.surfaces_ok {
-                t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA) + j as u64 * ferros_sys::gpu::FRAME, pa as usize, ferros_sys::gpu::FRAME as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+        let n = (sz / ferros_sys::gpu::FRAME) as usize;
+        for j in 0..n.min(sl.nframes - at) {
+            let pa = sl.frames[at + j] as usize;
+            let off = j as u64 * ferros_sys::gpu::FRAME;
+            if is_block(b, sz) {
+                // The block's frames in 2 MiB blocks from `ARENA_VA` (2026-11-13: frames of the pool, wherever it had them), in the stamp's order, which is the CPU's from the block's base.
+                if (b, sz) == (bbase, bsize) {
+                    t.map_block(&mut tm, ARENA_VA + off, pa, BLOCK_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                }
+            } else if is_camera(b, sz) {
+                if camera {
+                    t.map_block(&mut tm, CAMERA_VA + off, pa, BLOCK_RO | NC | NX, TABLE);
+                    sl.camera = true;
+                }
+            } else if s.surfaces_ok {
+                t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA) + off, pa, ferros_sys::gpu::FRAME as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
             }
         }
+        at += n;
     }
-    // The pool's size is the bound on any stamp the kernel writes (a block of 2 MiB entries in one level-2 table, at most the four surfaces in pages): past it is a bug here, loud.
+    // The pool's size is the bound on any stamp the kernel writes (a block's and a camera view's 2 MiB entries in level-2 tables, at most the four surfaces in pages): past it is a bug here, loud.
     assert!(tm.used() <= TABLE_PAGES * PAGE, "gpu: a client's tables outgrew their slot");
     sl.root = t.root;
-    sl.client = Some(stamp.key());
-    sl.block = (bbase, bsize);
-    sl.kist = stamp.kist;
-    sl.kernels = 0;
-    sl.code_used = 0;
-    // The thread storage descriptor every job of the slot names: no local storage (G#8000_0000 packed as log2), as since 2026-11-04.
-    for k in 0..8 {
-        wr32(sl.desc + 0x40 + 4 * k, if k == 1 { 0x1F } else { 0 });
-    }
+    sl.cur ^= 1;
 }
 
-/// The slot of the client of `stamp`: its own if bound, else a free one, else the one used longest ago that holds no queue (its group ended, its space given the new client's tables). None when every slot holds an open queue. Under the lock.
+/// The slot of the client of `stamp`: its own if bound (its tables made again in place when its memory changed: a block grown, a surface or a camera view given or taken), else a free one, else the one used longest ago that holds no queue and no job (its group ended, its space given the new client's tables). None when every slot is held so. Under the lock.
 fn slot_for(st: &mut State, stamp: &Stamp, bbase: u64, bsize: u64) -> Option<usize> {
     let s = svc();
-    if let Some(k) = st.slots.iter().position(|sl| sl.client == Some(stamp.key())) {
+    if let Some(k) = st.slots.iter().position(|sl| sl.client.is_some_and(|c| c.epoch == stamp.epoch)) {
+        // A camera view in the stamp that its tables lack: taken back and given again since its bind (`camera_watch` made them without it), the same frames, so the same key.
+        let camera_back = !st.slots[k].camera && stamp.regions().iter().any(|&(b, sz)| is_camera(b, sz));
+        if st.slots[k].client != Some(stamp.key()) || camera_back {
+            bind(s, &mut st.slots[k], stamp, bbase, bsize);
+            if st.slots[k].running && !space_install(&s.g, k + 1, st.slots[k].root) {
+                say!(s.grants, "gpu: slot {k}'s address space did not take its new tables\n");
+            }
+        }
         return Some(k);
     }
     let k = (0..SLOTS).filter(|&k| st.slots[k].queue.is_none() && st.slots[k].len == 0).min_by_key(|&k| (st.slots[k].client.is_some(), st.slots[k].used))?;
@@ -612,8 +669,58 @@ fn slot_for(st: &mut State, stamp: &Stamp, bbase: u64, bsize: u64) -> Option<usi
         stuck(s.grants, k);
     }
     st.slots[k].running = false;
+    st.slots[k].kernels = 0;
+    st.slots[k].code_used = 0;
     bind(s, &mut st.slots[k], stamp, bbase, bsize);
+    // The thread storage descriptor every job of the slot names: no local storage (G#8000_0000 packed as log2), as since 2026-11-04.
+    for j in 0..8 {
+        wr32(st.slots[k].desc + 0x40 + 4 * j, if j == 1 { 0x1F } else { 0 });
+    }
     Some(k)
+}
+
+/// The camera's bell (the kernel's `BELL_GPU_CAMERA`): a camera view whose holder's GPU calls carried it was taken back (its CLOSE, its holder's end, a view given anew). That client's jobs are stopped (its group ended; its queue ends `E_CAMERA`), the view unmapped from its space with the GPU's TLB and walk caches flushed (`space_install`), and the kernel told (SYS_DMA x1 = 9), which only then shuts the frames out of the fence and lets them serve anyone else.
+/// Also at the service's start: a stale epoch left by a service before this one, whose GPU this one has reset.
+extern "C" fn camera_watch(_: u64) -> ! {
+    let s = svc();
+    let arena = cap(s.grants, S_ARENA);
+    let registered = ferros_sys::bell(BELL_GPU_CAMERA, &CAMERA_BELL);
+    loop {
+        let seen = CAMERA_BELL.load(Ordering::Acquire);
+        let stale = ferros_sys::svc(ferros_sys::nr::DMA, arena, 9, 0, 0, 0);
+        if stale != 0 && stale != ferros_sys::ERR {
+            let mut wakes = [None; SLOTS];
+            with(|st| {
+                for k in 0..SLOTS {
+                    // Its client the stale one, or gone (a slot let go keeps its last tables until it is bound again).
+                    if !(st.slots[k].camera && st.slots[k].client.is_none_or(|c| c.epoch == stale)) {
+                        continue;
+                    }
+                    // A job still running is stopped before the unmap (the owner's condition): its queue ends, every job of it lost.
+                    if st.slots[k].len > 0 {
+                        wakes[k] = queue_end(st, k, q::E_CAMERA, false).map(|a| a + q::DONE * 8);
+                        say!(s.grants, "gpu: slot {k}: the camera view went with a job in flight: its group ended, its queue ended\n");
+                    }
+                    let sl = &mut st.slots[k];
+                    tables(s, sl, false);
+                    if !space_install(&s.g, k + 1, sl.root) {
+                        say!(s.grants, "gpu: slot {k}'s address space did not take its tables without the camera\n");
+                    }
+                }
+            });
+            for w in wakes.into_iter().flatten() {
+                // SAFETY: as in `events`.
+                ferros_sys::wake(unsafe { &*(w as *const AtomicU64) }, u64::MAX);
+            }
+            ferros_sys::svc(ferros_sys::nr::DMA, arena, 9, stale, 0, 0);
+            continue;
+        }
+        if !registered {
+            // A kernel without the bell has no camera on the GPU to settle: nothing more to watch.
+            ferros_sys::thread_exit(0);
+        }
+        ferros_sys::wait(&CAMERA_BELL, seen, 0);
+    }
 }
 
 /// The resident service: the threads started, then the calls taken one at a time.
@@ -625,14 +732,16 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
     // A client's surfaces are mapped for it only when the kernel fences them in for the GPU (granted here, the whole region, s2mpu::fence_gpu).
     let surfaces = ferros_sys::dma(cap(grants, S_SURFACES));
     let surfaces_ok = surfaces == ferros_sys::SURFACES_WINDOW && ferros_sys::dma_size(cap(grants, S_SURFACES), SURFACES_BYTES as u64) == Some(SURFACES_BYTES as u64);
-    let slots: [Slot; SLOTS] = core::array::from_fn(|k| {
-        let ring = m.alloc(RING_PAGES);
-        let desc = m.alloc(1);
-        let flag = m.alloc(1);
-        let code = m.alloc(CODE_PAGES + KERNEL_PAGES);
-        let pool = m.alloc(TABLE_PAGES);
-        Slot { mem: slot_mem[k], ring, desc, flag, code, pool, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight::default(); FLIGHT], head: 0, len: 0, head_since: 0 }
-    });
+    // SAFETY: no other thread runs yet; the slots are filled in place.
+    let slots = unsafe { &mut (*(&raw mut ST)).slots };
+    for (k, sl) in slots.iter_mut().enumerate() {
+        sl.mem = slot_mem[k];
+        sl.ring = m.alloc(RING_PAGES);
+        sl.desc = m.alloc(1);
+        sl.flag = m.alloc(1);
+        sl.code = m.alloc(CODE_PAGES + KERNEL_PAGES);
+        sl.pools = [m.alloc(TABLE_PAGES), m.alloc(TABLE_PAGES)];
+    }
     let mmu = cap(grants, S_MMU);
     // The grants page's count (G#200, ferros_sys::cap) says whether slot 8 was given: the kernel that gives it is the one that stamps every call on `gpu` (2026-11-12). A kernel from before stamps nothing, so a request's first bytes would be the client's own, naming any memory: the service then serves nothing, each request answered 1 at once (its clients draw on the CPU, as with no GPU service), until the kernel is the stamping one.
     let count = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64;
@@ -670,7 +779,6 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
     let clock_ok = count > S_CLOCK;
     unsafe {
         *(&raw mut SVC) = Some(Svc { g: Gpu { regs: g.regs, grants: g.grants, f: g.f }, sh: Shared { pa: sh.pa }, cores, max_threads: g.rd(THREAD_MAX_THREADS), grants, irq: cap(grants, S_IRQ), surfaces_ok, stamps, stamp_offset });
-        *(&raw mut ST) = Some(State { slots, jobs: 0, inflight: 0, call: (0, 0, 0, 0, 0) });
     }
     let s = svc();
     ferros_sys::thread_spawn(events, unsafe { &mut *(&raw mut EVENTS_STACK) }, 0);
@@ -680,6 +788,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
     if clock_ok {
         ferros_sys::thread_spawn(clock, unsafe { &mut *(&raw mut CLOCK_STACK) }, cap(grants, S_CLOCK));
     }
+    ferros_sys::thread_spawn(camera_watch, unsafe { &mut *(&raw mut CAMERA_STACK) }, 0);
     say!(grants, "gpu: serving `gpu`, a group and an address space a client ({} at once), calls and queues: the arena {} ({} MiB), the surfaces {}, the clock {}\n", SLOTS, if arena_ok { "granted" } else { "not granted" }, arena_bytes >> 20, if surfaces_ok { "fenced in" } else { "not granted" }, if clock_ok { "by the queues (gpu-clock)" } else { "the kernel's (no gpu-clock grant)" });
     let mut msg = [0u8; 1 << 13];
     let mut token = [0u8; 32];
@@ -703,7 +812,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
         }
         // The client's block: the first region inside the arena (a client holds one; a holder of the whole arena, a development spawn's `--dma arena`, gets the whole).
         let block = stamp.regions().iter().copied().find(|&(b, sz)| arena_ok && b as usize >= arena && b as usize + sz as usize <= arena + arena_bytes);
-        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=4).contains(&m[0])) else {
+        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=5).contains(&m[0])) else {
             ferros_sys::reply(&token, &reply[..reply_len]);
             continue;
         };
@@ -775,6 +884,15 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
                         true
                     });
                 ferros_sys::reply(&token, &[!ok as u8]);
+                continue;
+            }
+            // Its memory looked at again (2026-11-20): its address space made from this call's stamp when it changed (a camera view given since: mapped read-only at `CAMERA_VA`), `[0][the camera mapped u8]`.
+            5 => {
+                let cam = with(|st| slot_for(st, &stamp, bbase, bsize).map(|k| st.slots[k].camera));
+                match cam {
+                    Some(c) => ferros_sys::reply(&token, &[0, c as u8]),
+                    None => ferros_sys::reply(&token, &[1, 0]),
+                };
                 continue;
             }
             // Its queue closed: what runs stopped, what waits lost.

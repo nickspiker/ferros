@@ -2984,6 +2984,10 @@ pub fn gpu_refence() {
             crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), true);
         }
     }
+    let (first, n) = unsafe { (*(&raw const GPU_CAM)).admitted };
+    for f in first..first + n {
+        crate::s2mpu::gpu_admit_ro(crate::frames::pa(f));
+    }
 }
 
 /// `diag arcs`'s surfaces: each slot held, its owner, generation and frames' first address.
@@ -3235,6 +3239,10 @@ fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64, 
         return ERR;
     }
     cam_view_drop("given anew");
+    // A GPU space that may still map the frames (the view before, its GPU unmap not yet said): the frames shut out of its fence before this holder's frames land in them.
+    if unsafe { (*(&raw const GPU_CAM)).stale } != 0 {
+        gpu_cam_shut();
+    }
     let (first, n) = (first as usize, n as usize);
     for j in 0..n {
         crate::cachemap::cam_view_map(crate::cachemap::CAM_VIEW_VA.0 + j * crate::frames::FRAME, crate::frames::pa(c.first + first + j), cached);
@@ -3247,6 +3255,91 @@ fn cam_view_give(p: &Process, reply_off: u64, first: u64, n: u64, out_off: u64, 
     p.write(out_off, &t);
     say(&alloc::format!("A#{n} frames of its run from A#{first} shown read-only{} to {} at G#{:X}", if cached { ", write-back" } else { "" }, core::str::from_utf8(&q.name).unwrap_or("?"), crate::cachemap::CAM_VIEW_VA.0));
     crate::cachemap::CAM_VIEW_VA.0 as u64
+}
+
+/// The camera's frames on the GPU (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"; the owner, the same day: the ring read-only to its holder's GPU whenever it holds the camera open, "unless it's a security issue").
+/// The conditions that make it the same as the CPU view the holder already has: the holder alone (its calls on `gpu` carry the view in their stamp, `gpu_stamp`, no other's), read-only (the GPU's fence admits the frames read-only, `s2mpu::gpu_admit_ro`, and the service maps them read-only), and gone from its GPU address space when the view goes, before the frames serve anyone else.
+/// - `admitted`: the frames (first index in the pool, count) the GPU's fence reads, from the holder's first GPU call carrying the view until the view is taken back and the service has unmapped it.
+/// - `mapped`: the epoch whose GPU calls carried the view.
+/// - `stale`: an epoch whose GPU address space may still map frames of a view taken back, until the GPU service says it has stopped that client's jobs and unmapped them with its TLB flushed (SYS_DMA x1 = 9, `gpu_cam_settled`). Meanwhile no stamp carries a view, a view given anew finds the old frames shut out of the fence first, and a run given back waits in `drain` instead of the pool.
+struct GpuCam {
+    admitted: (usize, usize),
+    mapped: u64,
+    stale: u64,
+    drain: (usize, usize),
+}
+/// Under the kernel lock.
+static mut GPU_CAM: GpuCam = GpuCam { admitted: (0, 0), mapped: 0, stale: 0, drain: (0, 0) };
+// ferros_sys::gpu `CAMERA_VIEW_WINDOW` and `CAMERA_VIEW_BYTES` name the view's window to the GPU service, which reads a stamp's camera frames by them.
+const _: () = assert!(crate::cachemap::CAM_VIEW_VA.0 == 0x51_2000_0000 && crate::cachemap::CAM_VIEW_VA.1 - crate::cachemap::CAM_VIEW_VA.0 == 512 << 20, "ferros_sys::gpu's camera view window");
+
+/// The admitted camera frames shut out of the GPU's fence. Under the lock.
+fn gpu_cam_shut() {
+    let g = unsafe { &mut *(&raw mut GPU_CAM) };
+    if g.admitted.1 == 0 {
+        return;
+    }
+    for f in g.admitted.0..g.admitted.0 + g.admitted.1 {
+        crate::s2mpu::gpu_admit(crate::frames::pa(f), false);
+    }
+    crate::s2mpu::gpu_sync();
+    g.admitted = (0, 0);
+}
+
+/// The view taken back while its holder's GPU calls carried it: that epoch stale until the GPU service has unmapped it, the service's bell rung (`BELL_GPU_CAMERA`). The frames stay admitted meanwhile, so a job of the holder's still reading one is stopped by the service, not by the fence (a bus fault the GPU may not ride out); a view given anew shuts them first (`cam_view_give`). Under the lock.
+fn gpu_cam_taken(holder: u64) {
+    let g = unsafe { &mut *(&raw mut GPU_CAM) };
+    if holder == 0 || g.mapped != holder {
+        gpu_cam_shut();
+        return;
+    }
+    g.mapped = 0;
+    g.stale = holder;
+    bell_count(BELL_GPU_CAMERA);
+}
+
+/// SYS_DMA x1 = 9 on `arena`, the GPU service's: with `epoch` 0, the stale epoch now (0: none); with the stale epoch, the service says it has stopped that client's jobs and unmapped the camera's frames from its address space with the GPU's TLB flushed: the frames shut out of the fence, a run given back meanwhile returned to the pool now. → the stale epoch (asked), 0 (settled), ERR (not the stale epoch). Under the lock.
+fn gpu_cam_settled(epoch: u64) -> u64 {
+    let g = unsafe { &mut *(&raw mut GPU_CAM) };
+    if epoch == 0 {
+        return g.stale;
+    }
+    if g.stale != epoch {
+        return ERR;
+    }
+    g.stale = 0;
+    gpu_cam_shut();
+    let (first, n) = g.drain;
+    g.drain = (0, 0);
+    for f in first..first + n {
+        crate::frames::give(f);
+    }
+    if n > 0 {
+        let line = alloc::format!("camera region: A#{n} frames held for the GPU's unmap wiped back into the pool\n");
+        k().console.extend_from_slice(line.as_bytes());
+    }
+    0
+}
+
+/// The camera view for a caller's GPU stamp (`gpu_stamp`): when it holds the view and no other epoch is stale, the view's region in the camera's view window and its frames' physical addresses, its frames admitted read-only to the GPU's fence, and the caller marked as the one whose GPU space maps them. None otherwise. Under the lock.
+fn gpu_cam_stamp(p: &Process) -> Option<((usize, usize), Vec<u64>)> {
+    let v = unsafe { &*(&raw const CAM_VIEW) };
+    let c = unsafe { &*(&raw const CAM) };
+    let g = unsafe { &mut *(&raw mut GPU_CAM) };
+    if v.holder != p.epoch || v.n == 0 || g.stale != 0 {
+        return None;
+    }
+    let first = c.first + v.first;
+    if g.admitted != (first, v.n) {
+        gpu_cam_shut();
+        for f in first..first + v.n {
+            crate::s2mpu::gpu_admit_ro(crate::frames::pa(f));
+        }
+        crate::s2mpu::gpu_sync();
+        g.admitted = (first, v.n);
+    }
+    g.mapped = p.epoch;
+    Some(((crate::cachemap::CAM_VIEW_VA.0, v.n * crate::frames::FRAME), (first..first + v.n).map(|f| crate::frames::pa(f) as u64).collect()))
 }
 
 /// The view taken back (the driver's close, SYS_DMA x1 = 5; either end of it ending, `cam_free`; a new view given): every block of it the blank frame (still read-only, so a reader in a frame as it goes reads zeros of nobody's, process.rs `blank_frame`), every TLB told, then the holder's capability gone, so SYS_DMA on its token answers ERR. Under the lock.
@@ -3266,6 +3359,7 @@ fn cam_view_drop(why: &str) {
     if let Some(q) = kk.procs.iter_mut().flatten().find(|q| q.epoch == v.holder) {
         q.cspace.retain(|c| !matches!(c.object, Object::Dma(i) if i == vi));
     }
+    gpu_cam_taken(v.holder);
     let line = alloc::format!("camera view: taken back ({why}), A#{} frames\n", v.n);
     kk.console.extend_from_slice(line.as_bytes());
     *v = CamView { holder: 0, driver: 0, first: 0, n: 0, cached: false };
@@ -3330,8 +3424,15 @@ fn cam_free(epoch: u64) {
         crate::cachemap::cam_map(crate::cachemap::CAM_VA.0 + j * crate::frames::FRAME, None);
     }
     crate::cachemap::surface_unmapped(crate::cachemap::CAM_VA.0, c.n * crate::frames::FRAME);
-    for f in c.first..c.first + c.n {
-        crate::frames::give(f);
+    // While a GPU space may still map them (`GPU_CAM` stale: its holder's view was taken back above, or before), kept from the pool, and admitted to the GPU as they were, until the GPU service says it stopped that client's jobs and unmapped them (`gpu_cam_settled` shuts them out then): a job still reading one is stopped by the service, never by a fence closed under it. Else shut out of the fence (none admitted, as no space maps them) and given back.
+    if unsafe { (*(&raw const GPU_CAM)).stale } != 0 {
+        // One run waits at a time: a second given back before the first's unmap was said (a driver started and ended within it) leaves the first out of the pool for the boot, never in it while a GPU space may reach it.
+        unsafe { (*(&raw mut GPU_CAM)).drain = (c.first, c.n) };
+    } else {
+        gpu_cam_shut();
+        for f in c.first..c.first + c.n {
+            crate::frames::give(f);
+        }
     }
     let line = alloc::format!("camera region: A#{} frames from G#{:X} wiped back into the pool, S2MPUs G#{shut:X} first (0 while the switch is off)\n", c.n, crate::frames::pa(c.first));
     k().console.extend_from_slice(line.as_bytes());
@@ -3868,6 +3969,11 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
                 frames.extend(slots[i - s0].frames.iter().map(|&f| crate::frames::pa(f as usize) as u64));
             }
         }
+    }
+    // The camera's view, its holder's alone (2026-11-20, `GPU_CAM`): its frames read-only to its GPU jobs while it holds the view, last, so a stamp's other regions keep their order.
+    if let Some((r, f)) = gpu_cam_stamp(p) {
+        regions.push(r);
+        frames.extend(f);
     }
     let mut out = Vec::with_capacity(10 + 16 * regions.len() + 8 * frames.len() + msg.len());
     out.extend_from_slice(&p.epoch.to_le_bytes());
@@ -6482,6 +6588,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire) as u64)
             } else if source == BELL_PUCKS && holds_surfaces(p) {
                 bell_register(p, pi, source, f.x[1], PUCKS_LIVE.load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_GPU_CAMERA && p.cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "arena")) {
+                bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -7124,6 +7232,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // x1 = 7 (2026-11-20, docs/GPU-KISTS.md "The queue"): the GPU service holds epoch x2's GPU work (x3 = 1; x4 its queue's `SUBMIT` word, 0 none), or lets it go (x3 = 0) once that client's group has ended (`gpu_hold`). x1 = 8: whether epoch x2 is alive (`gpu_alive`).
                 Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 7 => gpu_hold(f.x[2], f.x[3] == 1, f.x[4]),
                 Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 8 => gpu_alive(f.x[2]),
+                // x1 = 9 (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"): x2 0, the epoch whose GPU space may still map a camera view taken back; x2 that epoch, the service has stopped its jobs and unmapped the view (`gpu_cam_settled`).
+                Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 9 => gpu_cam_settled(f.x[2]),
                 // A mailbox's region (2026-11-19): its frame taken and mapped at the first ask, the writer's region making the caller its writer (`mbox_dma`).
                 Some(Object::Dma(i)) if f.x[1] == 0 && mbox_of(i).is_some() => mbox_dma(p, i),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
@@ -7392,7 +7502,9 @@ const BELL_SLOTS: usize = 12;
 pub const BELL_IDENTITY: usize = 13;
 /// The pucks' squares' (2026-11-18, docs/PUCKS.md), for the holder of the `surfaces` region (the display): its word is `PUCKS_LIVE`, four bits a slot, no count.
 const BELL_PUCKS: usize = 14;
-const BELLS: usize = 15;
+/// The camera on the GPU (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"), for the GPU service (the holder of `arena`): counted each time a camera view its holder's GPU calls carried is taken back, so the service unmaps it from that client's address space and says so (`gpu_cam_settled`).
+const BELL_GPU_CAMERA: usize = 15;
+const BELLS: usize = 16;
 /// The lock epoch last rung into the identity's bell (`identity_bell`).
 static IDENTITY_RUNG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.

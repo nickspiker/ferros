@@ -63,11 +63,13 @@ pub const S_OUTSIDE: u64 = 4;
 pub const S_LOST: u64 = 6;
 pub const S_REFUSED: u64 = 7;
 
-/// Why a queue ended (`ENDED`): a job of its failed (every later one lost); it was closed; the client submitted past its depth or named a record it could not have filled; the service let it go (restarted, or its slot taken).
+/// Why a queue ended (`ENDED`): a job of its failed (every later one lost); it was closed; the client submitted past its depth or named a record it could not have filled; the service let it go (restarted, or its slot taken); its camera view went with a job in flight.
 pub const E_FAULT: u64 = 1;
 pub const E_CLOSED: u64 = 2;
 pub const E_OVERRUN: u64 = 3;
 pub const E_SERVICE: u64 = 4;
+/// The camera view the queue's client held was taken back (its CLOSE, or a view given anew) while a job of it was in flight: the service stops it before it unmaps the view (docs/GPU-KISTS.md "The camera ring on the GPU"); wait for the queue's jobs before a CLOSE to keep it running.
+pub const E_CAMERA: u64 = 5;
 
 /// The queue's bytes at depth 2^`depth_log2`: its header and records.
 pub const fn bytes(depth_log2: u32) -> usize {
