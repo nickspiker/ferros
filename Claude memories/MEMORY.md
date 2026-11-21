@@ -22,6 +22,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: NO TIMERS](feedback_no_animations.md) - no waits/delays (dev Ready? 1 s only); post-lift motion = shown-frame physics
 - [Feedback: no polling](feedback_no_polling.md) - push or doorbell; a timer only for a proven real deadline
 - [Feedback: stage agents, keep the bench used](feedback_keep_devices_busy.md) - one staged job per device, few agents, no overlapping edits, no helpers; but never idle a set-up device for hours
+- [Feedback: one straight line](feedback_one_line.md) - ferros = forge only, zero branches, no worktrees; commit straight to forge; one shared farm
 - [Feedback: stop is immediate](feedback_stop_is_immediate.md) - stopping an app or puck is OP_STOP at once; no close message, no grace, no shutdown
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) - one branchless path; owner picks
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
