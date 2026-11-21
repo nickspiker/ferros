@@ -1,4 +1,4 @@
-//! oracle-i2c: an hv oracle capture of an Exynos USI HS-I2C controller (auto mode) turned back into I2C transfers, as tools/oracle-decode-hsi2c.py does, in Rust (Python is not allowed here); and with `--holds`, one sensor's CCS writes read out of them, each grouped-parameter hold on one line.
+//! oracle-i2c: an hv oracle capture of an Exynos USI HS-I2C controller (auto mode) turned back into I2C transfers, as tools/oracle-decode-hsi2c.py did, in Rust (Python is not allowed here); and with `--holds`, one sensor's CCS writes read out of them, each grouped-parameter hold on one line.
 //!
 //! Input: the flushed console (console-ramoops-0), or its `ferros hv: S2 <pa> <R|W><bytes> <value>` lines (HV.md, the register oracle); `ferros hv: S2 rep <N>` repeats the access before it N more times; `ferros-mark: ...` lines written from Android pass thru as `# MARK ...`.
 //! Register map as ferros_kernel hsi2c.rs has it: TX_DATA G#34, RX_DATA G#38, AUTO_CONF G#44 (length bits 0-15, READ bit 16, RUN bit 31), ADDR G#70 (the 7-bit target at bits 10-16).

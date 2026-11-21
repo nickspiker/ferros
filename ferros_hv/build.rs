@@ -75,7 +75,7 @@ fn main() {
     let i2c_target: u64 = std::env::var("FERROS_HV_ORACLE_I2C_TARGET").map(|v| parse(&v)).unwrap_or(0);
     assert!(i2c_target < 1 << 7, "FERROS_HV_ORACLE_I2C_TARGET: {i2c_target:#x} is not a 7-bit address");
     std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\npub const ORACLE_QUIET: [u64; {}] = [{}];\npub const ORACLE_ARM_AFTER_MS: u64 = {};\npub const ORACLE_CENSUS: bool = {};\npub const ORACLE_SMC_CAP: u64 = {};\npub const ORACLE_I2C_TARGET: u64 = {};\n", pages.len(), list.join(", "), cap, gap, quiet.len(), qlist.join(", "), after, census, smc_cap, i2c_target)).unwrap();
-    // FERROS_HV_SNAP_LIST: a file of register addresses, one hex address per line (tools/camera-snap-list.py writes one), that a FERROS_HV_SNAPSHOT=1 build reads and logs mid-stream: Linux's live register state, for a diff against a cold ferros reading the same list. Generated into OUT_DIR/snap_list.rs.
+    // FERROS_HV_SNAP_LIST: a file of register addresses, one hex address per line (the camera's, built once in 2026-10, is local at target/hv/snap-list.txt; docs/oracle/CAMERA.md says what it holds), that a FERROS_HV_SNAPSHOT=1 build reads and logs mid-stream: Linux's live register state, for a diff against a cold ferros reading the same list. Generated into OUT_DIR/snap_list.rs.
     println!("cargo:rerun-if-env-changed=FERROS_HV_SNAP_LIST");
     let snap: Vec<String> = match std::env::var("FERROS_HV_SNAP_LIST") {
         Ok(path) => {

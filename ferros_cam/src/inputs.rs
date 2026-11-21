@@ -78,7 +78,7 @@ impl<'a> Pairs<'a> {
     }
 }
 
-/// A 'CPR2' (tools/camera-prog.py): 'CPR2', a count of buffer addresses and the addresses (unused here: the PDMA job carries its own), then three sections of a count and that many (register, value) pairs: the CPU's writes before the PDMA start, the program (which the PDMA job carries instead), the CPU's writes after it.
+/// A 'CPR2' (tools/cam-oracle `cpu`): 'CPR2', a count of buffer addresses and the addresses (unused here: the PDMA job carries its own), then three sections of a count and that many (register, value) pairs: the CPU's writes before the PDMA start, the program (which the PDMA job carries instead), the CPU's writes after it.
 pub struct Prog<'a> {
     pub before: Pairs<'a>,
     pub program: Pairs<'a>,

@@ -1,4 +1,4 @@
-//! cam-oracle: a camera's hv oracle captures (docs/oracle/CAMERA.md) turned into what the camera driver replays, the Rust port of the Python tools the Pro's cameras were brought up with (tools/oracle-decode-hsi2c.py, camera-init.py, camera-cpu.py, oracle-decode-pdma.py, camera-pdma-image.py), same inputs, same outputs.
+//! cam-oracle: a camera's hv oracle captures (docs/oracle/CAMERA.md) turned into what the camera driver replays, the Rust port of the Python tools the Pro's cameras were brought up with (tools/oracle-decode-hsi2c.py, camera-init.py, camera-cpu.py, oracle-decode-pdma.py, camera-pdma-image.py, camera-close.py, and camera-raw10.py's figures), same inputs, same outputs.
 //! Everything it writes carries the sensor vendor's settings: write it under target/ or the scratch disk, never into the repository.
 //!
 //! - `cam-oracle i2c <capture.log> [--base G#1088_0000] [--max-bytes N]`: one line per I2C transfer, the integrity line on stderr.
@@ -10,7 +10,8 @@
 //! - `cam-oracle cinp <out> <name>=<file> ...`: a device test's inputs as one 'CINP' set, for the camera driver's hand spawn (`--input-file`), so nothing is stored.
 //! - `cam-oracle cinp-split <in.cinp> <dir>`: a set back into its files.
 //! - `cam-oracle prog-text <in.cpr2> <out.txt>` and `prog-build <in.txt> <out.cpr2>`: a CPU program as text and back, for merging captures that lost lines (the 8a's ISP captures, 2026-11-19: docs/CAMERA.md "The 8a's main: the cause").
-//! - `cam-oracle raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame in numbers (each cell place's mean, the fill pattern's lines, a 16 x 12 map of the mean).
+//! - `cam-oracle raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame in numbers (its exposure and focus figures as tools/camera-raw10.py printed them, each cell place's mean, the fill pattern's lines, a 16 x 12 map of the mean).
+//! - `cam-oracle close <capture.log> <out.rs>`: Linux's camera close (ferros_kernel/src/camera_close.rs) from a capture of the front end (tools/camera-close.py).
 //! - `cam-oracle job-set <in.cpr3> <out.cpr3> <register>=<value> ...`: a program's writes of a register given another value (the 8a's main image path made RAW10 packed).
 //! - `cam-oracle job-len <in.cpr3> <out.cpr3> <bytes>`: the program cut to a length, every descriptor given it (the 8a's ultrawide: a dump that ran one word past the program).
 
@@ -812,7 +813,7 @@ fn cmd_job_len(args: Vec<String>) {
     std::fs::write(&args[1], &out).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
 }
 
-/// `raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame as the front end wrote it (MIPI RAW10 packed), said in numbers: the mean of each place of a `period` x `period` cell (2 if not given) with every sample counted, the samples at 0, at 1023 and the driver's pattern, and a 16 x 12 map of the mean over the frame (whole cells), so a frame is read as a scene, a flat field or garbage without a picture (2026-11-19, the 8a's cameras).
+/// `raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame as the front end wrote it (MIPI RAW10 packed), said in numbers: its exposure and focus figures first (percentiles, the share saturated, the sharpness: what tools/camera-raw10.py printed, for tools/camera-pull.sh), then the mean of each place of a `period` x `period` cell (2 if not given) with every sample counted, the samples at 0, at 1023 and the driver's pattern, and a 16 x 12 map of the mean over the frame (whole cells), so a frame is read as a scene, a flat field or garbage without a picture (2026-11-19, the 8a's cameras).
 fn cmd_raw10(args: Vec<String>) {
     if args.len() < 4 {
         die("raw10 <frame.raw10> <width> <height> <stride> [period]");
@@ -828,6 +829,47 @@ fn cmd_raw10(args: Vec<String>) {
         let g = &b[y * stride + x / 4 * 5..];
         ((g[x % 4] as u16) << 2) | ((g[4] as u16 >> (2 * (x % 4))) & 3)
     };
+    // Exposure and focus first (what tools/camera-raw10.py printed): percentiles of every sample, as numpy takes them (linear between the two order statistics either side), from the 1024-bin histogram, which holds the sorted samples exactly; the share at 1020 or more; and the sharpness, the mean squared difference of each sample from the same colour two along, across plus down.
+    let mut hist = [0u64; 1 << 10];
+    let (mut across, mut down) = (0u64, 0u64);
+    for y in 0..h {
+        for x in 0..w {
+            let v = sample(x, y);
+            hist[v as usize] += 1;
+            if x >= 2 {
+                let d = v as i64 - sample(x - 2, y) as i64;
+                across += (d * d) as u64;
+            }
+            if y >= 2 {
+                let d = v as i64 - sample(x, y - 2) as i64;
+                down += (d * d) as u64;
+            }
+        }
+    }
+    let n = (w * h) as u64;
+    // The k-th smallest sample (from 0); every q below is under 100, so the order statistic above a percentile is always a sample.
+    let kth = |k: u64| -> f64 {
+        let mut seen = 0;
+        for (v, &c) in hist.iter().enumerate() {
+            seen += c;
+            if seen > k {
+                return v as f64;
+            }
+        }
+        die("percentile past the last sample")
+    };
+    let pct: Vec<String> = [0.1, 1., 50., 99., 99.9]
+        .iter()
+        .map(|q| {
+            let at = q / 100. * (n - 1) as f64;
+            let lo = at.floor();
+            let (a, b) = (kth(lo as u64), kth(lo as u64 + 1));
+            format!("{:.1}", a + (b - a) * (at - lo))
+        })
+        .collect();
+    let sat: u64 = hist[1020..].iter().sum();
+    let sharp = across as f64 / (h * (w - 2)) as f64 + down as f64 / ((h - 2) * w) as f64;
+    println!("percentiles 0.1/1/50/99/99.9: [{}]  saturated {:.3}%  sharpness {sharp:.1}", pct.join(", "), 100. * sat as f64 / n as f64);
     let mut cell = vec![(0u64, 0u64); p * p];
     let (mut zero, mut full) = (0u64, 0u64);
     let (gw, gh) = (16, 12);
@@ -878,10 +920,37 @@ fn cmd_raw10(args: Vec<String>) {
     }
 }
 
+/// `close <capture.log> <out.rs>`: Linux's camera close as ferros_kernel/src/camera_close.rs holds it (tools/camera-close.py in Rust): every CPU write of the capture from its "camera close" mark to the end, in order, one line each, the way the full front-end capture of a camera open (target/hv/ispfe-full-raw.log, 2026-10-19) gave the 223 writes the kernel replays.
+fn cmd_close(args: Vec<String>) {
+    if args.len() != 2 {
+        die("close <capture.log> <out.rs>");
+    }
+    let text = read_text(&args[0]);
+    let mut on = false;
+    let mut writes = Vec::new();
+    for line in text.lines() {
+        if line.contains("ferros-mark: camera close") {
+            on = true;
+        }
+        if let Some((a, b'W', v)) = access(line) {
+            if on {
+                writes.push((a, v));
+            }
+        }
+    }
+    let mut out = format!("//! Linux's camera close, every CPU write to the ISP front end in order, from the oracle capture (`cam-oracle close`; do not edit by hand).\n\npub const CLOSE: [(usize, u32); {}] = [\n", writes.len());
+    for (a, v) in &writes {
+        out += &format!("    (0x{a:X}, 0x{v:X}),\n");
+    }
+    out += "];\n";
+    std::fs::write(&args[1], out).unwrap_or_else(|e| die(&format!("{}: {e}", args[1])));
+    println!("{} writes", writes.len());
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build | raw10 | job-set | job-len (see the source's header)");
+        die("i2c | init | marks | cpu | pdma | pdma-image | cinp | cinp-split | prog-text | prog-build | raw10 | close | job-set | job-len (see the source's header)");
     }
     let cmd = args.remove(0);
     match cmd.as_str() {
@@ -896,6 +965,7 @@ fn main() {
         "prog-text" => cmd_prog_text(args),
         "prog-build" => cmd_prog_build(args),
         "raw10" => cmd_raw10(args),
+        "close" => cmd_close(args),
         "job-set" => cmd_job_set(args),
         "job-len" => cmd_job_len(args),
         _ => die(&format!("unknown command {cmd}")),

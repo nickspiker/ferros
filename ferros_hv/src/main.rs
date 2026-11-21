@@ -508,7 +508,7 @@ unsafe fn xplant(idx: u64) {
 }
 static mut SNAPS: u32 = 0;
 
-/// Live-state snapshot (FERROS_HV_SNAPSHOT): when the camera stack advances the PDMA's descriptor index to G#100 (sixteen frames into a stream), read every register in SNAP_LIST and log it, `SN addr value`, zeros included so a missing line means a lost line. The list holds only registers known to exist (tools/camera-snap-list.py), since a read into a hole can stall the bus. First trigger only.
+/// Live-state snapshot (FERROS_HV_SNAPSHOT): when the camera stack advances the PDMA's descriptor index to G#100 (sixteen frames into a stream), read every register in SNAP_LIST and log it, `SN addr value`, zeros included so a missing line means a lost line. The list holds only registers known to exist (docs/oracle/CAMERA.md "snapshot"), since a read into a hole can stall the bus. First trigger only.
 unsafe fn snapshot() {
     if read_volatile(&raw const SNAPS) != 0 {
         return;

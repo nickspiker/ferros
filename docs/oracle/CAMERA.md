@@ -2,7 +2,7 @@
 
 The `diag cam` tools named below are the bring-up harness, retired 2026-11-14 once the camera driver (payloads/camera, docs/CAMERA.md) streamed on the Pro: their code is in forge's history before that commit, and this file stays the record of what they found.
 
-Captured with the hv oracle (HV.md): the camera's control buses unmapped from the stage-2 map, every access trapped at EL2, emulated against the real register and logged. Decoded back to I2C transactions with `tools/oracle-decode-hsi2c.py`.
+Captured with the hv oracle (HV.md): the camera's control buses unmapped from the stage-2 map, every access trapped at EL2, emulated against the real register and logged. Decoded back to I2C transactions with `tools/oracle-i2c` (or `cam-oracle i2c`; a transfer cut short by `--max-bytes` now carries a blake3 digest, the decodes committed here a blake2b one from the first, Python, decoder).
 
 ## The buses (husky, from the live device tree)
 
@@ -41,7 +41,7 @@ Exynos USI HS-I2C in auto mode, the same block `ferros_kernel/src/hsi2c.rs` alre
 - **Arm after boot, mark from Android.** The hv's counter tracks the kernel's printk clock closely, so `_ARM_AFTER_MS=60000` skips the boot probe. `echo "<3>ferros-mark: ..." > /dev/kmsg` lands in the same console ring as the hv's lines, so the decoder shows exactly where the app opened and closed.
 - One chatty bus still starves a shared cap: capture one bus at a time.
 - Identical consecutive accesses collapse into a `rep N` line (the decoder replays them). That did not help on this controller, whose poll alternates between registers; the quiet list is what worked.
-- **One sensor alone** (2026-11-17): `FERROS_HV_ORACLE_I2C_TARGET=G#3D` logs an HS-I2C controller's accesses only while its ADDR word selects that target, and only the four that carry a transfer (ADDR and AUTO_CONF writes, TX writes, RX reads). On the main's bus the lens and OIS polling are seven of every eight transfers after stream on, so a long session (a 16 s exposure) fits the ring with the cap off. `tools/oracle-i2c` decodes in Rust as `oracle-decode-hsi2c.py` does, with the same integrity line, and `--holds G#3D` prints each grouped-parameter hold on one line (docs/CAMERA.md "Long exposures").
+- **One sensor alone** (2026-11-17): `FERROS_HV_ORACLE_I2C_TARGET=G#3D` logs an HS-I2C controller's accesses only while its ADDR word selects that target, and only the four that carry a transfer (ADDR and AUTO_CONF writes, TX writes, RX reads). On the main's bus the lens and OIS polling are seven of every eight transfers after stream on, so a long session (a 16 s exposure) fits the ring with the cap off. `tools/oracle-i2c` decodes with an integrity line, and `--holds G#3D` prints each grouped-parameter hold on one line (docs/CAMERA.md "Long exposures").
 - **The main's per-frame hold** under Android is G#0702 = 0, G#0704 = 0 (Samsung's frame and integration shifts, a long exposure's), G#020E, G#0204, G#0202 and G#0340, every frame (cam-open3).
 
 ## Capture recipe (main camera)
@@ -55,7 +55,7 @@ FERROS_HV_ORACLE_ARM_AFTER_MS=60000 tools/husky-hv.sh --flash
 adb shell 'su -c "echo \"<3>ferros-mark: camera open\" > /dev/kmsg"; am start -a android.media.action.STILL_IMAGE_CAMERA; sleep 8; input keyevent KEYCODE_HOME; su -c "echo \"<3>ferros-mark: closed\" > /dev/kmsg; echo c > /proc/sysrq-trigger"'
 # after the reboot:
 adb shell 'su -c "grep -aE \"ferros hv|ferros-mark\" /sys/fs/pstore/console-ramoops-0"' > capture.log
-tools/oracle-decode-hsi2c.py capture.log --max-bytes 32
+cargo run -q --release --manifest-path tools/oracle-i2c/Cargo.toml -- capture.log --max-bytes 32
 ```
 
 ## Power-up (captured 2026-10-19)
@@ -89,7 +89,7 @@ Next: the receive side (the CSI receiver and its DMA in the ISP front end, behin
 - **The combo D-PHY's PMU isolation must be bypassed** (PMU G#3EBC bit 0, `__set_phy_isolation`): a PMU write the oracle never sees. Without it the PHY's per-lane registers read 0 after being written; with it the lane status words reach G#3 (Linux's ready value).
 - **Receiver configured** (camera_rx.rs: the D-PHY common/lane settings, CSI link 1's virtual-channel/data-type/lane setup and start G#205E01, the CSIS reset that releases link 1), all from the capture.
 
-**Correction (same evening): the first replayed init was corrupt.** The hv and the kernel both append to the pstore console ring and cannot lock against each other; under the kernel's level-7 console traffic (and the hv's stats line from another core) captured lines were occasionally clobbered. The sensor upload was programmed as 6528 bytes and captured as 6521, and five short writes came out with wrong lengths. Captures are now taken with `echo 4 > /proc/sys/kernel/printk` (markers at level 3 still print) and the stats line off in oracle builds, and `tools/oracle-decode-hsi2c.py` checks every transfer against its programmed length. The recapture is byte-exact up to stream-on (1347 writes, 2 reads). The no-frames result below was taken with the corrupt init and has to be re-run.
+**Correction (same evening): the first replayed init was corrupt.** The hv and the kernel both append to the pstore console ring and cannot lock against each other; under the kernel's level-7 console traffic (and the hv's stats line from another core) captured lines were occasionally clobbered. The sensor upload was programmed as 6528 bytes and captured as 6521, and five short writes came out with wrong lengths. Captures are now taken with `echo 4 > /proc/sys/kernel/printk` (markers at level 3 still print) and the stats line off in oracle builds, and the decoder (`tools/oracle-i2c`) checks every transfer against its programmed length. The recapture is byte-exact up to stream-on (1347 writes, 2 reads). The no-frames result below was taken with the corrupt init and has to be re-run.
 
 **Streaming works (2026-10-19, with the clean init).** `diag cam stream` from a cold boot: the sensor's frame counter (G#0005) runs 01, 02, 03 … 0E over one second (about 14 frames per second), with G#0006 = G#03 as under Linux, and CSI link 1 latches its interrupt sources (G#14 = G#100, G#1C = 1) and fills its per-channel status and counter words at G#634–G#6C4. The master-clock pad samples low even while the clock runs, so pad readback in a clock-output function says nothing; the clock was never the problem.
 
@@ -136,7 +136,7 @@ Three results, all from the existing capture: **the oracle traps reads as well a
 
 **The output test could not have seen a dark frame.** Its sampled-page check counted a probe point only when it read neither the pattern nor zero. Every point is patterned before the run, so a point that reads zero *was written*, and a frame of a dark scene is mostly zeroes — precisely the result the test exists to detect. It now counts any departure from the pattern, samples every 256 bytes rather than every 4096, and reports how many points went to zero and the span between the first and last. The re-run still shows nothing written, so the conclusion survives, but it now rests on a test that could have contradicted it. `PDMA_BUFS` is also 18 while the program carries 21 output addresses (all correctly remapped into ferros memory), so the last three slices are neither patterned nor probed.
 
-**The per-frame interrupt acknowledgement is load-bearing.** `tools/camera-prog.py` stops extracting CPU writes "before the per-frame interrupt handling", so 21 registers Linux reads and writes straight back on every frame appear in neither the replayed CPU writes nor the PDMA program. They look like bookkeeping and are not: unacknowledged, `G#1C32_008C` sticks at G#81 where Linux alternates it with G#1. Acknowledging all 28 in the captured order (`FRAME_ACK` in camera.rs: three words in G#1C35_01xx, the two G#1C32 channel blocks, six more in G#1C35, and the nine `G#1C33_x300`) clears it — it reads G#81 on the frame it fires and G#0 after.
+**The per-frame interrupt acknowledgement is load-bearing.** The CPU-setup extraction (then a script, now `cam-oracle cpu`) stops extracting CPU writes "before the per-frame interrupt handling", so 21 registers Linux reads and writes straight back on every frame appear in neither the replayed CPU writes nor the PDMA program. They look like bookkeeping and are not: unacknowledged, `G#1C32_008C` sticks at G#81 where Linux alternates it with G#1. Acknowledging all 28 in the captured order (`FRAME_ACK` in camera.rs: three words in G#1C35_01xx, the two G#1C32 channel blocks, six more in G#1C35, and the nine `G#1C33_x300`) clears it — it reads G#81 on the frame it fires and G#0 after.
 
 **What is left: the front end takes one frame and stops asking for another.** With the acknowledgement in, the status words fire once and go quiet. Linux, per frame, steps the buffer index `+G#49C` through 0, 1, 2, 3 and the write pointer `+G#124` through G#74000, G#74800, G#75000, G#75800 — four buffers rotating, G#800 apart. ferros holds `+G#49C` at 0 and `+G#124` at G#75800 forever, while CSI link 1 keeps counting and the sensor's counter runs to 06.
 
@@ -146,7 +146,7 @@ Linux's descriptor ring is count G#3E8 and the HAL builds a **fresh list per fra
 
 ### The register map was in the tree all along
 
-`zuma-isp-event-info.dtsi` (7847 lines) names every interrupt source, mask, overflow and reset register of every block in the ISP, and `dt-bindings/lwis/platform/zuma/*.h` names every bit. LWIS's *logic* is a passthrough, which is why it was written off — but its device tree is where the front end's register semantics are written down in the open. `tools/gen-isp-events.py` generates `ferros_kernel/src/camera_events.rs` from it: 203 sources with named bits. `diag cam events` reads them all and prints the ones reporting, counting a source as interesting when its status is live **or** its mask is armed — an armed mask with no status is a channel that was set up and never fired.
+`zuma-isp-event-info.dtsi` (7847 lines) names every interrupt source, mask, overflow and reset register of every block in the ISP, and `dt-bindings/lwis/platform/zuma/*.h` names every bit. LWIS's *logic* is a passthrough, which is why it was written off — but its device tree is where the front end's register semantics are written down in the open. The bring-up harness generated `ferros_kernel/src/camera_events.rs` from it: 203 sources with named bits. `diag cam events` read them all and printed the ones reporting, counting a source as interesting when its status is live **or** its mask is armed — an armed mask with no status is a channel that was set up and never fired.
 
 That immediately re-read words this driver had been printing for days. `CSIS_LINK1 + G#14 = G#100`, recorded as the link "latching its interrupt sources", is **ERR_DESKEW_OVER** — a D-PHY lane deskew overflow. The rest of the snapshot decodes as `+G#1C` LINE_END, `+G#24` FRAME_START on channels 0-2, `+G#2C` FRAME_END on channels 0-2.
 
@@ -166,7 +166,7 @@ isp_fe_ctx0_pdma_err             +G#34    = G#0                           mask G
 ### Ruled out, each cheaply and each worth not repeating
 
 - **Ordering.** Linux starts the PDMA before enabling the link (capture lines 1421 then 1573) where ferros did the reverse. Reordered to match: identical result.
-- **The per-frame interrupt acknowledgement.** `tools/camera-prog.py` stops extracting "before the per-frame interrupt handling", so 21 registers Linux reads and writes straight back each frame were in neither the replay nor the program. They are real — unacknowledged, G#1C32_008C sticks at G#81 instead of alternating with G#1 — and `FRAME_ACK` in camera.rs now does all 28 in captured order, which clears it. It did not produce a frame.
+- **The per-frame interrupt acknowledgement.** The CPU-setup extraction stops extracting "before the per-frame interrupt handling", so 21 registers Linux reads and writes straight back each frame were in neither the replay nor the program. They are real — unacknowledged, G#1C32_008C sticks at G#81 instead of alternating with G#1 — and `FRAME_ACK` in camera.rs now does all 28 in captured order, which clears it. It did not produce a frame.
 - **Missing boot-time initialisation.** The oracle was armed sixty seconds in, on purpose, to skip the boot probe, so any one-time setup before a camera open was never captured. The capture exposes it anyway: a register Linux **reads as non-zero before ever writing it** was set up earlier. `diag cam preexist` compares all 45 such registers on a cold ferros — 36 match, and the nine that differ are all interrupt status from Linux's prior session. There is no missing boot init.
 - **A DMA on the link, to bypass the front end.** The csis-link-phy space has only `int0/int1/fs_int/fe_int` per context across all 12 contexts, no DMA. The front end's `csis_core` *is* the minimal DMA; there is nothing to route around.
 - **VOTF.** `lwis_votf` serves rgbp/yuvp/tnr/mcsc/gdc/gse — downstream blocks, not the CSIS-to-front-end path.
@@ -238,22 +238,20 @@ The configuration is legible enough to say it is right. Link 1's channels: CH0 R
 
 **The wide census closes the "unseen page" lead.** `FERROS_HV_ORACLE_CENSUS=1` now logs each page's first read and first write separately and hands a page back to the guest after its first write, so the census can span thousands of pages without trapping a streaming camera. The bitmap is sized from the target list (it was fixed at 2048 pages). Armed over the whole ISP span G#1C00_0000-G#1D8F_FFFF plus CMU_TOP (G#2604_0000-G#2604_FFFF), plus every EL3 call (`FERROS_HV_ORACLE_SMC=1`), through boot and one marked camera open, it found 182 pages (`target/hv/isp-wide-census-raw.log`). Inside the front end, the only pages missing from the 42-page capture are its SYSMMUs and S2MPUs. Every other ISP block (G#1C40 to G#1D8F) gets its CMU control word, sysreg, S2MPU and SYSMMU set at boot, and during the open a handful of enables, none of them upstream of the front end. The open makes **no EL3 calls at all**. So no CPU write was being missed.
 
-**The hv can now snapshot Linux's live registers.** `FERROS_HV_SNAPSHOT=1` with `FERROS_HV_SNAP_LIST=<file>` reads a list of registers when the camera stack advances the PDMA's descriptor index to G#100, sixteen frames into a stream, and logs every value. The list comes from `tools/camera-snap-list.py`: 2914 registers known to exist, drawn from these sources:
+**The hv can now snapshot Linux's live registers.** `FERROS_HV_SNAPSHOT=1` with `FERROS_HV_SNAP_LIST=<file>` reads a list of registers when the camera stack advances the PDMA's descriptor index to G#100, sixteen frames into a stream, and logs every value. The list (built once by a script that went with the harness, c5f24d02; the list itself is local at target/hv/snap-list.txt, one hex address a line, which is all the hv reads): 2914 registers known to exist, drawn from these sources:
 - every CMU_TOP and CMU_ISPFE register in cmucal-sfr.c;
 - every address in the front-end capture;
 - every register the PDMA program writes, minus the G#1C36 block-load region;
 - every LWIS event status and mask register;
 - CSI links 0 and 1.
 
-The same script turns the log into `ferros_kernel/src/camera_snap.rs`. `diag cam pdma` reads the same list three frames into its own stream (`snap_compare`) and reports every word that differs.
+The same script turned the log into `ferros_kernel/src/camera_snap.rs`, and `diag cam pdma` read the same list three frames into its own stream (`snap_compare`) and reported every word that differed (both gone with the harness).
 
 Capture:
 ```
-tools/camera-snap-list.py > target/hv/snap-list.txt
 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 FERROS_HV_SNAPSHOT=1 FERROS_HV_SNAP_LIST=$PWD/target/hv/snap-list.txt \
 FERROS_HV_ORACLE_PAGES=G#1C39_0000 FERROS_HV_ORACLE_CAP=256 FERROS_HV_ORACLE_ARM_AFTER_MS=60000 HV_CMDLINE=loglevel=4 tools/husky-hv.sh --no-ferros --flash
 # past 62 s: mark, open the camera 10 s, close, mark, sysrq c; then pull "ferros hv|ferros-mark" from console-ramoops-0
-tools/camera-snap-list.py --rust target/hv/cam-snapshot-linux.log
 ```
 
 **The front end's clock was a quarter of Linux's.** CMU_TOP's `MUX_CLKCMU_ISPFE_NOC` / `DIV_CLKCMU_ISPFE_NOC` (G#2604_10BC / G#2604_18B4) read 4 / 0 under Linux: PLL_SHARED1_D4 undivided, 465 MHz (SHARED1 = 24.576 MHz × 227 / 3). A cold ferros has 1 / 5: PLL_SHARED3_D1 ÷ 6, 111 MHz (SHARED3 = × 108 / 4). That clock feeds the front end's bus, the CSI links' ACLK and the D-PHY clock. Linux never writes it from the CPU: the camera's DVFS request goes to the ACPM firmware, which sets it, so no register capture could have shown it. `fe_up` now sets it, mux first so the clock only slows on the way.
@@ -272,7 +270,7 @@ Those are requests the hardware consumes when a frame arrives, and ours are stil
 
 ## First frame (2026-10-21, night)
 
-**The front end's local channels were never enabled.** Linux writes G#81 to G#1C32_00A0 right after acknowledging the first SHADOW_UPDATE (capture access 531, after the PDMA index write at 458), and the image path's SOF follows. G#81 is loch0's image (bit 0) and PD (bit 7) paths, the same layout as the aggregate word. It is a plain write, not a read-and-write-back acknowledgement, so neither the setup extraction (`camera-prog.py` stops "before the per-frame interrupt handling") nor `FRAME_ACK` (read-back pairs only) carried it. The live snapshot did show it (Linux G#81, ferros 0), and it was first misread as status. Its partners: G#1C32_00B0, written 1 then G#80 during setup, is the request; G#1C32_00A4, written 1 then G#80 at stop, is the disable.
+**The front end's local channels were never enabled.** Linux writes G#81 to G#1C32_00A0 right after acknowledging the first SHADOW_UPDATE (capture access 531, after the PDMA index write at 458), and the image path's SOF follows. G#81 is loch0's image (bit 0) and PD (bit 7) paths, the same layout as the aggregate word. It is a plain write, not a read-and-write-back acknowledgement, so neither the setup extraction (it stops "before the per-frame interrupt handling") nor `FRAME_ACK` (read-back pairs only) carried it. The live snapshot did show it (Linux G#81, ferros 0), and it was first misread as status. Its partners: G#1C32_00B0, written 1 then G#80 during setup, is the request; G#1C32_00A4, written 1 then G#80 at stop, is the disable.
 
 With it, `diag cam pdma` gets, every frame:
 - G#1B (SOF, EOF, SHADOW_UPDATE, DMA_DONE) on both of loch0's paths;
@@ -298,7 +296,7 @@ Also ruled out tonight, worth not repeating:
 
 84 reads the position back; it tracks the target within 30 ms across G#0800 to G#7800.
 
-`diag cam pdma sweep=<start>:<step>` steps eight positions while streaming and copies a frame at each to G#9800_0000 + k × 16 MiB. `tools/camera-pull.sh <prefix> <base>` and `tools/camera-raw10.py` fetch and decode. Over a floor about a metre away, sharpness on 8 × 8-binned frames peaks at G#3800 and falls off on both sides. The crop resolves cable braid and dust at half resolution.
+`diag cam pdma sweep=<start>:<step>` steps eight positions while streaming and copies a frame at each to G#9800_0000 + k × 16 MiB. `tools/camera-pull.sh <prefix> <base>` fetches a frame and prints its figures (`cam-oracle raw10`). Over a floor about a metre away, sharpness on 8 × 8-binned frames peaks at G#3800 and falls off on both sides. The crop resolves cable braid and dust at half resolution.
 
 **Exposure is already long.** The captured init's last per-frame block sets integration G#535E (21342 lines) in a G#5372-line frame at analogue gain G#0400. The "20 lines" seen earlier is an intermediate value. Copying Linux's block from the older open capture (integration G#0A56, frame length G#2959) doubled the frame rate and stalled the core. So `exp=`/`gain=` now write only what is asked, inside the hold. The hold is the four-byte write `01 04 01 01` and its release `01 04 00 01`: G#0104 is one byte, G#0105 stays 1.
 
@@ -338,7 +336,7 @@ Two traps:
 `cam pdma` used to work once per boot, and the second one hung. Measured with flash-log marks at every stage:
 - **The domain prepare call (SMC G#8200_0410) never returns the second time.** It is now made once per boot.
 - **The D-PHY isolation bypass's EL3 write (PMU G#3EBC) hung the same way.** Also once per boot now: the bit stays set until reset.
-- **The front end needs Linux's teardown.** With both fixes the second run completes, but its front end takes no frames. `tools/camera-close.py` extracts every CPU write from the capture's "camera close" mark onward: the PDMA's last index, PHY lanes off, the local channels disabled (G#1C32_00A4 = G#80 then 1), processing blocks cleared, PDMA stopped, links and core reset. That is 223 writes in `camera_close.rs`, replayed at the end of every run.
+- **The front end needs Linux's teardown.** With both fixes the second run completes, but its front end takes no frames. `cam-oracle close` extracts every CPU write from the capture's "camera close" mark onward: the PDMA's last index, PHY lanes off, the local channels disabled (G#1C32_00A4 = G#80 then 1), processing blocks cleared, PDMA stopped, links and core reset. That is 223 writes in `camera_close.rs`, replayed at the end of every run.
 - **The sensor needs a power cycle** (`diag cam off`, `diag cam up`) or it does not stream again.
 
 Sequence: `cam bus`, `cam up`, `cam pdma …`, then for each further run `cam off`, `cam up`, `cam pdma …`. Two consecutive runs both take frames (buffer index 0 to 6).
@@ -370,7 +368,7 @@ Still to capture for each: its CSI link and PHY lanes (an ISP front-end capture 
 
 What it took, all from captures of a Linux switch from the main camera to the ultrawide:
 - **Power** from the existing module table (`power_module`): camera-PMIC LDO1, 8, sub-PMIC LDO12, LDO2, 4, 6 through the overvoltage guard, load switch G#1711, reset gpp6-3. It answers **G#0787 (Sony IMX787)** at G#0016.
-- **Sensor init:** 231 writes including a 4034-byte settings upload, from the single-bus I2C capture (`tools/camera-init.py`, integrity 0). Stream on is G#0100 = 1 alone (the main's write also carries orientation).
+- **Sensor init:** 231 writes including a 4034-byte settings upload, from the single-bus I2C capture (`cam-oracle init`, integrity 0). Stream on is G#0100 = 1 alone (the main's write also carries orientation).
 - **Receiver:** CSI **link 2** (G#1C06_0000) and the **csis2 D-PHY lanes** at G#1C10_2300/2400/2500, with the same lane values as the main's csis1 lanes, SYSREG G#1C02_0500 = 4 (`camera_rx_uw.rs`, from `tools/camera-cpu.py`).
 - **Front end:** the same 4495-register PDMA program with its own values: geometry G#FA0 × G#BB8, stride G#13C0, request words G#8D where the main has G#8F. Its CPU setup comes from the capture with the 25 address registers dropped; the program sets those.
 - **The image builder** now remaps the 25 address registers by name and maps each 16 MiB IOVA granule to one slot, offset kept (`tools/camera-pdma-image.py`). The guessed IOVA window failed on this session's addresses, and two registers hold a base and an offset into the same buffer. The image body still pins to slot 2, so it lands at G#A200_0000 for either camera.

@@ -1,4 +1,4 @@
-//! Linux's camera close, every CPU write to the ISP front end in order, from the oracle capture (tools/camera-close.py; do not edit by hand).
+//! Linux's camera close, every CPU write to the ISP front end in order, from the oracle capture (`cam-oracle close`; do not edit by hand).
 
 pub const CLOSE: [(usize, u32); 223] = [
     (0x1C32008C, 0x1),
