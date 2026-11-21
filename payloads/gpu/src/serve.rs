@@ -275,6 +275,30 @@ fn guard(s: &Svc, kist: bool) -> u64 {
     s.g.f / 1000 * if kist { GUARD_KIST_MS } else { GUARD_SYSTEM_MS }
 }
 
+/// When slot `sl`'s oldest job's guard passes, as a wait's deadline: 0 (none) while nothing of it is in flight. Under the lock.
+fn guard_at(s: &Svc, sl: &Slot) -> u64 {
+    if sl.len == 0 { 0 } else { sl.head_since + guard(s, sl.kist) }
+}
+
+/// Slot `k` looked at after a wait that may have reached its guard: a late oldest job ends with its group (`reap`, which also lands any that ended and answers a call's), the `DONE` word to wake returned. The main thread's call bell is moved here when a call's job ended, as `events` moves it.
+fn guard_check(k: usize) -> Option<usize> {
+    let s = svc();
+    let (w, call) = with(|st| {
+        let at = guard_at(s, &st.slots[k]);
+        if at == 0 || ferros_sys::now() < at {
+            return (None, false);
+        }
+        let mut w = None;
+        let call = reap(st, k, ferros_sys::now(), &mut w);
+        (w, call)
+    });
+    if call {
+        CALL_BELL.fetch_add(1, Ordering::Release);
+        ferros_sys::wake(&CALL_BELL, 1);
+    }
+    w
+}
+
 /// SYS_DMA on the blocks' window (`arena`): x1 = 7 hold or let go of an epoch's GPU work with its queue word, 8 whether an epoch lives (process.rs `gpu_hold`, `gpu_alive`).
 fn hold(epoch: u64, on: bool, word: usize) -> bool {
     ferros_sys::svc(ferros_sys::nr::DMA, cap(svc().grants, S_ARENA), 7, epoch, on as u64, word as u64) == 0
@@ -461,12 +485,11 @@ fn reap(st: &mut State, k: usize, now: u64, wake: &mut Option<usize>) -> bool {
 }
 
 /// The GPU's job interrupt, on a thread of its own: each group's events acknowledged as kbase does (CSG_ACK's IDLE, SYNC_UPDATE and progress bits into CSG_REQ, CSG_IRQ_ACK = CSG_IRQ_REQ), then every slot's jobs that ended landed (`reap`), its client's `DONE` woken, a call's main thread woken.
-/// Its one deadline is the oldest job's guard (a real one: a runaway kernel is stopped at it, GPU-KISTS.md 1.5), no other.
+/// No deadline here: a job's guard is its waiter's (`guard_check`), the slot's thread for a queue's jobs and the main thread for a call's, each asleep until its own slot's oldest job's guard at most, so a job put in flight while this thread sleeps is guarded all the same.
 extern "C" fn events(_: u64) -> ! {
     let s = svc();
     loop {
-        let deadline = with(|st| st.slots.iter().filter(|sl| sl.len > 0).map(|sl| sl.head_since + guard(s, sl.kist)).min()).unwrap_or(0);
-        let r = ferros_sys::irq_wait(s.irq, deadline);
+        let r = ferros_sys::irq_wait(s.irq, 0);
         let now = ferros_sys::now();
         let mut wakes = [None; SLOTS];
         let call = with(|st| {
@@ -581,8 +604,14 @@ extern "C" fn slot_thread(k: u64) -> ! {
             // SAFETY: as above.
             ferros_sys::wake(unsafe { &*(w as *const AtomicU64) }, u64::MAX);
         }
+        // Asleep until the next job, the client's end or the close (`GONE`), or the oldest job's guard (`guard_at`: none while nothing is in flight).
+        let deadline = with(|st| guard_at(s, &st.slots[k]));
         // SAFETY: the word is `SLOT_BELL[k]` or the queue's `SUBMIT`, in a block held while the queue is open; a queue closed or ended after this look is marked `GONE` there first, so the wait returns at once.
-        ferros_sys::wait(unsafe { &*waiting.0 }, waiting.1, 0);
+        ferros_sys::wait(unsafe { &*waiting.0 }, waiting.1, deadline);
+        if let Some(w) = guard_check(k) {
+            // SAFETY: as in `events`.
+            ferros_sys::wake(unsafe { &*(w as *const AtomicU64) }, u64::MAX);
+        }
     }
 }
 
@@ -985,8 +1014,14 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             Some(Some(k)) => k,
         };
         // The call's job waited for (`events` moves the bell when it ends, done or failed): the next request is taken only after it.
+        // Its guard is this thread's: asleep until the job ends or its guard passes, then the slot looked at (`guard_check`), which ends a late job with its group and answers the call.
         while CALL_BELL.load(Ordering::Acquire) == bell {
-            ferros_sys::wait(&CALL_BELL, bell, 0);
+            let deadline = with(|st| guard_at(s, &st.slots[k]));
+            ferros_sys::wait(&CALL_BELL, bell, deadline);
+            if let Some(w) = guard_check(k) {
+                // SAFETY: as in `events`.
+                ferros_sys::wake(unsafe { &*(w as *const AtomicU64) }, u64::MAX);
+            }
         }
         let (status, us, gpu_us, addr, fstatus) = with(|st| st.call);
         reply[0] = status;
