@@ -287,6 +287,25 @@ messages! {
     /// Two lines.
     AttestAtBootNote,
 
+    // ---- the Android page (owner, 2026-11-21: Android starts only when the attested identity chose it; docs/BOOT.md "Android only by the identity's choice"); "ferros" and "Android" are names and stay ----
+    /// The heading over the choice of what this device starts into: ferros or Android.
+    StartInto,
+    /// Two lines: what choosing Android there does.
+    StartIntoNote,
+    /// The button that restarts into Android now (its first tap; the second is `TapAgainStartAndroid`).
+    StartAndroidNow,
+    TapAgainStartAndroid,
+    TurnAndroidOff,
+    /// For a person who accepted the disclaimer before: no disclaimer again (once per person).
+    TurnAndroidOn,
+    AndroidOffHere,
+    /// The button under the disclaimer: the attest screen's keyboard asks for the person's own handle again (the typed confirmation, no tap and no hold).
+    AndroidAgree,
+    /// The keyboard's prompt for that confirmation. Two lines.
+    RetypeForAndroid,
+    /// The disclaimer in full (owner, 2026-11-01, android_behind_attestation; the one place "phone" is right, it names what is lost). Three paragraphs. Its number is kernel service.rs `DISCLAIMER_VERSION`: a changed text gets the next one.
+    AndroidDisclaimer,
+
     // ---- the NFC page: attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-11) ----
     /// The heading over the tags kept to attest with.
     TagAttest,

@@ -2305,6 +2305,8 @@ impl Ahau {
             }
             // The Security page's attest at boot: the person's own handle again (docs/AUTH.md "Unlock at boot").
             Mode::Words(5) => tx(Msg::RetypeForAttestAtBoot),
+            // The Android page's agreement: the person's own handle again, after the disclaimer.
+            Mode::Words(6) => tx(Msg::RetypeForAndroid),
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
@@ -2742,8 +2744,8 @@ impl Ahau {
         let mut o = [0u8; 2 + 32];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
         let mut name = [0u8; 32];
-        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4) and the person's own handle again for attest at boot (5): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 5 {
+        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4) the person's own handle again for attest at boot (5) and for the Android disclaimer (6): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 6 {
             return (0, (name, 0));
         }
         if o[0] == 4 {
@@ -2826,6 +2828,44 @@ impl Ahau {
             }
             None => {
                 console(self.grants, b"ahau: attest at boot: the kernel gave no reply (one before 2026-11-17?)\n");
+                self.end_words(true);
+            }
+        }
+    }
+
+    /// Enter on the Android page's agreement (owner, 2026-11-01 and 2026-11-21; docs/BOOT.md "Android only by the identity's choice"): the disclaimer was read in full on that page, and the person's own handle typed again (shown as typed: a handle is not a password) is the typed confirmation. The kernel compares its seed with the person present's (SYS_UNLOCK op 14); one, it keeps their acceptance and this device allows Android.
+    fn android_enter(&mut self) {
+        use ahau_core::retype::{read, REPLY_MAX};
+        if self.len == 0 {
+            return;
+        }
+        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
+        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
+            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
+            return;
+        };
+        let mut doc = [0u8; REPLY_MAX];
+        let n = ferros_sys::android_accept(cap(self.grants, S_UNLOCK), &seed, &mut doc);
+        scrub(&mut seed);
+        let mut why = [0u8; 64];
+        // WHY the filter: the length is the kernel's whole document; one longer than the buffer was cut and is not read.
+        match n.filter(|&n| n <= doc.len()).and_then(|n| read(&doc[..n], &mut why)) {
+            Some((r, _)) if !r.error => {
+                console(self.grants, b"ahau: the Android disclaimer accepted (the handle typed again is the person present's); Android allowed on this device\n");
+                self.end_words(true);
+            }
+            Some((r, _)) if r.present && !r.matched => {
+                console(self.grants, b"ahau: the Android disclaimer: the handle typed again does not match; nothing changed\n");
+                self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
+            }
+            Some((_, w)) => {
+                console(self.grants, b"ahau: Android not allowed: ");
+                console(self.grants, &why[..w]);
+                console(self.grants, b"\n");
+                self.end_words(true);
+            }
+            None => {
+                console(self.grants, b"ahau: the Android disclaimer: the kernel gave no reply (one before 2026-11-21?)\n");
                 self.end_words(true);
             }
         }
@@ -3027,7 +3067,7 @@ impl Ahau {
     fn type_char(&mut self, c: char) {
         let limit = match self.mode {
             // A person's handle as a handle is typed; the name the person gives them, a line.
-            Mode::Words(2 | 5) => MAX_CHARS,
+            Mode::Words(2 | 5 | 6) => MAX_CHARS,
             Mode::Words(3) => 63,
             // A WiFi passphrase: WPA2's longest.
             Mode::Words(4) => 63,
@@ -3088,6 +3128,11 @@ impl Ahau {
             // The person's own handle again (attest at boot): enter hands it to the kernel to compare, as a person's handle is handed on.
             Some(Event::Enter) if self.mode == Mode::Words(5) => {
                 self.retype_enter();
+                return;
+            }
+            // The person's own handle again (the Android disclaimer's agreement): handed to the kernel to compare.
+            Some(Event::Enter) if self.mode == Mode::Words(6) => {
+                self.android_enter();
                 return;
             }
             // Words: enter sends them as typed (they hold no newline).

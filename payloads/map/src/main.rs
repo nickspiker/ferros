@@ -1067,6 +1067,12 @@ enum Choice {
     Helm(u8, bool),
     UnlockAtBoot,
     ProxWake,
+    /// The Android page (docs/BOOT.md "Android only by the identity's choice"): what this device starts into (preference 8: 0 ferros, 1 Android), start Android now (two taps), Android off, on again (a person who accepted before), and the disclaimer's agreement (the keyboard asks for the handle).
+    StartInto(u8),
+    AndroidNow,
+    AndroidOff,
+    AndroidOn,
+    AndroidAgree,
     /// About's version line: twelve taps in a row and Developer is a page.
     Version,
     /// A neighbour page's title: one page that way.
@@ -1149,7 +1155,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 23] = ["appearance", "units", "keyboard", "security", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+const PAGES: [&str; 24] = ["appearance", "units", "keyboard", "security", "Android", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -1652,6 +1658,8 @@ struct Map {
     unstow_armed: Option<u8>,
     /// The People page's remove, armed by a first tap on that person's row.
     person_armed: Option<u8>,
+    /// The Android page's "start Android now", its first tap taken (the second restarts into Android).
+    android_armed: bool,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
     card: Option<[u8; 32]>,
     /// The unstow sheet open on a kist's card, in the card's place (docs/KISTS.md "The unstow sheet"): what is kept and from where, as the person has it so far. Gone with the card.
@@ -3622,6 +3630,34 @@ impl Map {
                 mark(self, b, &mut y, 50, tr(Msg::AttestAtBoot), on, Some(Choice::UnlockAtBoot));
                 notes(b, &mut y, tr(Msg::AttestAtBootNote));
             }
+            // Android on this device (owner, 2026-11-21: Android keeps Google's own identity and starts only when the attested identity chose it, by a reboot ferros triggers; docs/BOOT.md "Android only by the identity's choice"). Off until the person has read the disclaimer in full here and typed their own handle again (2026-11-01: no tap, no hold; once per person). On: what this device starts into, Android now, and off again.
+            "Android" => {
+                let st = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0);
+                let (allowed, accepted) = (st & 1 == 1, st & 2 == 2);
+                if allowed {
+                    b.text(cx, y, note as u16, dim(), 1, tr(Msg::StartInto));
+                    y += uu(2, 1);
+                    let now_s = ferros_sys::pref(ferros_sys::PREF_START_INTO);
+                    radios(self, b, &mut y, &["ferros", "Android"], now_s as usize, &|i| Choice::StartInto(i as u8));
+                    y += uu(1, 1);
+                    notes(b, &mut y, tr(Msg::StartIntoNote));
+                    y += uu(1, 1);
+                    // Two taps: the first arms it, the second restarts into Android (a stray tap must not end the session).
+                    let armed = self.android_armed;
+                    button(self, b, &mut y, tr(if armed { Msg::TapAgainStartAndroid } else { Msg::StartAndroidNow }), armed, Some(Choice::AndroidNow));
+                    button(self, b, &mut y, tr(Msg::TurnAndroidOff), false, Some(Choice::AndroidOff));
+                } else if accepted {
+                    row(self, b, &mut y, small, grey(), tr(Msg::AndroidOffHere), None);
+                    button(self, b, &mut y, tr(Msg::TurnAndroidOn), false, Some(Choice::AndroidOn));
+                } else {
+                    // The disclaimer in full, then the typed confirmation: the attest screen's keyboard asks for the person's own handle (fgtw op 15 [6], kind 6), which the kernel compares and keeps (SYS_UNLOCK op 14).
+                    row(self, b, &mut y, small, grey(), tr(Msg::AndroidOffHere), None);
+                    for para in tr(Msg::AndroidDisclaimer).split('\n') {
+                        row(self, b, &mut y, note, white(), para, None);
+                    }
+                    button(self, b, &mut y, tr(Msg::AndroidAgree), false, Some(Choice::AndroidAgree));
+                }
+            }
             "people" => {
                 // The person's people (docs/FACETS.md "People", D5): the people of their identity space, on every device of theirs; each with the name the person gave them and a remove in two taps; "add a person" opens the keyboard for their handle (shown as typed: a handle is not a password), then a name; how the last add ended under it. Nothing here shows a handle: none is kept.
                 let ps = self.fleet.people;
@@ -5499,6 +5535,9 @@ impl Map {
                 if !matches!(row, Some(Choice::Unstow(_))) {
                     self.unstow_armed = None;
                 }
+                if row != Some(Choice::AndroidNow) {
+                    self.android_armed = false;
+                }
                 // The clock's (or the language's) word on a choice that did not take stays until the next tap.
                 self.zone_note = None;
                 let set = |m: &Map, pref: u64, v: u8| {
@@ -5556,6 +5595,25 @@ impl Map {
                             people_ask(&[15, 5]);
                         }
                     }
+                    // The Android page (docs/BOOT.md "Android only by the identity's choice"). What it starts into: the kernel takes Android only while a person is present on a device that allows it.
+                    Some(Choice::StartInto(v)) => set(self, ferros_sys::PREF_START_INTO, v),
+                    // Start Android now, on the second tap: the kernel leaves the hv's gate its word and resets (the person present checked there again).
+                    Some(Choice::AndroidNow) => {
+                        if self.android_armed {
+                            self.android_armed = false;
+                            let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::StartNow);
+                        } else {
+                            self.android_armed = true;
+                        }
+                    }
+                    Some(Choice::AndroidOff) => {
+                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::Off);
+                    }
+                    Some(Choice::AndroidOn) => {
+                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::OnAgain);
+                    }
+                    // The disclaimer's agreement: the keyboard asks for the person's own handle again (kind 6 on the attest screen's keyboard), which the kernel compares with the person present's and keeps their acceptance itself (SYS_UNLOCK op 14).
+                    Some(Choice::AndroidAgree) => people_ask(&[15, 6]),
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
                     // Adding a device (payloads/fgtw ops 8, 10, 12, 15): the flow opened and closed, a nearby device picked, a pick confirmed, the keyboard asked for the newcomer's words (1) or a leaver's (2), which the attest screen (ahau) hosts.
                     Some(Choice::FleetAdd) => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 1]),
@@ -6050,6 +6108,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         tag_adds: 0,
         unstow_armed: None,
         person_armed: None,
+        android_armed: false,
         card: None,
         sheet: None,
         sheet_size: None,
@@ -6252,6 +6311,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut theme_seen = ferros_sys::pref(ferros_sys::PREF_THEME);
     let mut scale_seen = ferros_sys::pref(ferros_sys::PREF_SCALE);
     let mut unlock_boot_seen = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT);
+    // The Android page's state as last drawn (allowed, accepted, and what the device starts into): it changes under the keyboard (the disclaimer's agreement) and from the bridge.
+    let mut android_seen = u64::MAX;
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0i64, 0i64); 16];
@@ -6418,6 +6479,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if ub != unlock_boot_seen {
             unlock_boot_seen = ub;
             map.draw();
+        }
+        // The Android page follows the kernel's state while it shows: read at a wake, never on a timer.
+        if matches!(map.view, View::Open(_)) && PAGES[map.page] == "Android" && !map.settling {
+            let a = ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0) | (ferros_sys::pref(ferros_sys::PREF_START_INTO) as u64) << 8;
+            if a != android_seen {
+                android_seen = a;
+                map.draw();
+            }
         }
 
         // The identity service's copy, when its doorbell has rung (`fgtw_poller`): taken in, and the Fleet page drawn again while it shows. Nothing here asks fgtw anything.

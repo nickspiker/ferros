@@ -1911,6 +1911,11 @@ impl Client {
                             self.entry = 5;
                             alloc::vec![0]
                         }
+                        // 6: the person's own handle again, to agree to the Android disclaimer (the Settings page's Android page; docs/BOOT.md "Android only by the identity's choice"). As 5: the keyboard's host compares it thru the kernel (SYS_UNLOCK op 14) and ends it with op 15 [0]; nothing of it comes here.
+                        15 if n >= 2 && req[1] == 6 => {
+                            self.entry = 6;
+                            alloc::vec![0]
+                        }
                         15 if n >= 2 && req[1] == 0 && self.entry == 3 => {
                             self.entry = 0;
                             self.person_no_name();
