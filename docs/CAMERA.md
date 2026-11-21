@@ -1154,6 +1154,9 @@ Measured on the Pro, not attested, the identity unlocked at boot, RAM reloads b9
 **Open:**
 - r6 (b958, `dev follow on`) died at slit 58 with every answer and every acted run on time and the index one ahead from the double release; not seen again, not understood.
 - A late interrupt on a worker with interrupts open (b965 v4: c6 at EL0 for 886 us before it took the line) was seen once; the open program does not cover an interrupt itself taken late past the blanking.
+- **Lumis's slit death of 2026-11-20 (b1069, t5215206), not reproduced.** Lumis's slit (192 lines, 16 of integration) after RAW video at 60/s and a one-frame whole open: the first slit 27.9 ms after stream on, its answer 2257 us (about 1 ms in every healthy open), the second slit 2321 us later with LATE_CONFIG (G#10 at G#20438), then the line quiet; both descriptors had been released by the kernel's armed action.
+  cambench on the vault's driver, the same day: the slit alone, three times right after a 60/s paced whole-frame run, and once after 60/s plus a 16-frame whole open with its PD path: every run 1024 slits at 1232 a second, no error word, the first answer 975 to 1009 us.
+  So the death needs something Lumis does around the open (its threads, the GPU, a recording just ended) that cambench does not; the long first answer is the one measured difference. The other "failure" Lumis reported (t5185653) was a healthy stream Lumis itself closed after its first slit. `diag "irqs freeze 1500"` is left armed so the next one keeps each core's crumbs.
 - The ticket lock, the device credit and the kept preemption change every process's scheduling, measured here only under Lumis and the camera: worth a Photon scroll and the 96-a-second whole-frame bench before forge.
 - `build_from` holds the lock 20.6 ms for a 22 MiB capsule (each Lumis spawn).
 
