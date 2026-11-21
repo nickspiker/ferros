@@ -1232,6 +1232,27 @@ mod tests {
         assert!((1_000_000_000..1_001_000_000).contains(&t.frame_ns(&p)), "{}", t.frame_ns(&p));
     }
 
+    /// A frame length SET on a running stream (payloads/camera SET 4, owner 2026-11-20: a rate change without a reopen): the frame planned against is the new one, and the frame is the longer of it and the shutter with the sensor's margin (max(1/fps, shutter)).
+    /// The paced 60 a second (ferros_clip `Pacing::of(60)`: 5293 lines, 16.67 ms), then 24 a second (13232 lines), then the open's own again.
+    #[test]
+    fn a_frame_length_set_keeps_the_shutter() {
+        let open = main_timing();
+        for (fll, fps) in [(5293u16, 60u64), (13232, 24)] {
+            let t = Timing { fll, ..open };
+            // A shutter inside the new frame: the frame is the new one, a frame every 1/fps to within a line (the frame is whole lines).
+            let p = t.plan(4_000_000).unwrap();
+            assert_eq!((p.llp, p.fll, p.shift), (6320, fll, 0));
+            let period = t.frame_ns(&p);
+            assert!(period.abs_diff(1_000_000_000 / fps) < crate::MAIN_LINE_PS / 1000, "{fps}: {period}");
+            // A shutter longer than the new frame (the 67.3 ms of a still): the frame is the shutter's, never cut under it.
+            let p = t.plan(67_265_000).unwrap();
+            assert_eq!(p.fll as u64, p.coarse as u64 + 2, "{fps}: {p:?}");
+            assert!(p.fll > fll && t.ns(&p) <= 67_265_000 && t.frame_ns(&p) >= t.ns(&p), "{fps}: {p:?}");
+        }
+        // Back to the open's own frame: the plan is the open's again.
+        assert_eq!(open.plan(4_000_000).unwrap().fll, 0x5372);
+    }
+
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.
     #[test]
     fn long_exposures_with_a_shift() {

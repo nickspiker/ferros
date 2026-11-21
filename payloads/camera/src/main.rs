@@ -14,7 +14,7 @@
 //! - `0` LIST: the list, a VSF document built here (ferros_cam list): a section per camera that can stream whose inputs and IDT are in the vault, each with its own Absolute IDT and sensitivity read from `cam.<key>.idt`; a camera whose 1:1 init is in the vault (`cam.<key>.init.full`) has a second section, the same `id` and `name`, its `mode` 2 and its own size, `cfa_period`, `frame_ns` and exposure range (ferros_cam list `Readout`).
 //! - `1` OPEN + id (+ `1` for the view): `[0]` open, `[1]` no such camera (or one that cannot stream), `[2]` another holds it, `[3]` it would not start (the console says why). With the view asked for and given, `[0]` then its token and the ring's shape (`VIEW_REPLY`).
 //! - `2` FRAME + bin: waits for the next frame; a 64-byte header, then the mosaic, `bin` x `bin` same-colour samples averaged, 16 bits a sample. bin 2, 4 or 8 (a whole readout is past the largest reply).
-//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 3 (a device test) the vendor shift every later exposure takes (0 the least that fits; a forced shift is not held to the sensor's frame counter, the plain exposure is: refused past the list's `exposure_max`, the longest the counter holds). `[0]` taken, `[1]` outside the range.
+//! - `3` SET + what + value (8 bytes): what 0 exposure (ns), 1 analogue gain (1024 unity), 2 focus, 4 the frame length in lines (0 the open's own; the frame then the longer of it and the shutter, from the next frame: a rate change without a reopen), 3 (a device test) the vendor shift every later exposure takes (0 the least that fits; a forced shift is not held to the sensor's frame counter, the plain exposure is: refused past the list's `exposure_max`, the longest the counter holds). `[0]` taken, `[1]` outside the range.
 //! - `4` CLOSE: the view taken back, the stream stopped, the switch off, `[0]`, and the driver ends; its frames go back to the pool wiped.
 //! - `5` MAP + the buffer to give back (G#FF none), with the view: waits for a frame newer than the last mapped and holds its buffer; the frame's 64-byte header (bin 1, the buffer at +40), the samples read in place thru the view (docs/CAMERA.md "The view").
 //! - `6` RELEASE + buffer: the held buffer given back; `[0]`, `[1]` when it was not held.
@@ -1179,6 +1179,8 @@ struct Open {
     /// The sensor's frame timing (ferros_cam ccs `Timing`: the mode's line and frame, the integration's least and margin as the sensor answered them) and what its exposure now set it to (`Plan`).
     timing: ccs::Timing,
     now: ccs::Plan,
+    /// The frame length the OPEN set (the mode's own, or the OPEN's asked): SET's frame length 0 goes back to it.
+    open_fll: u16,
     /// A device test's forced vendor shift (SET 3; 0: the plan's least): every exposure SET after it at exactly that shift (ferros_cam ccs `Timing::plan_shift`), to find how far the shift field reaches.
     force: u8,
     /// The sensor's settings now (the gain code, the lens's target) and the frame counted at the last FRAME or MAP request.
@@ -1271,6 +1273,51 @@ fn exposure_set(bus: &Bus, c: &Cam, t: &ccs::Timing, now: &ccs::Plan, p: &ccs::P
     })();
     bus.write(c.addr, c.release)?;
     r
+}
+
+/// A new plan written to the running sensor (SET's exposure, SET's frame length): in the hold, or by a cut when the frame in flight would end long after the new one (`cut_due`), the frame period and a held call's deadline moved with it, and the open's state following; `what` names the SET on the console. `[0]` taken, `[1]` when the writes failed.
+fn plan_apply(g: u64, o: &mut Open, bus: &Bus, c: &Cam, p: &ccs::Plan, pending: &mut Option<Pending>, what: &str) -> u8 {
+    let p = *p;
+    let moved = (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift);
+    let new_ns = o.timing.frame_ns(&p);
+    let cut = moved && cut_due(new_ns);
+    match if cut { exposure_cut(bus, c, &o.timing, &o.now, &p) } else { exposure_set(bus, c, &o.timing, &o.now, &p) } {
+        Ok(()) => {
+            if moved {
+                readout_say(g, "before");
+                readout_reset();
+                period_set(new_ns);
+                say!(g, "camera: {what}: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, new_ns / 1_000_000);
+                // A frame that lengthens moves a held call's deadline with it (`late_tick` counts the frame before and this one for two frames); one that shortens leaves it, as the frame in flight may still be the old one.
+                if let Some(h) = pending.as_mut() {
+                    h.until = h.until.max(late_tick());
+                }
+            }
+            if cut {
+                // The frame begun now, at the new timing; the first frame after it is said when it lands.
+                let t = ferros_sys::now();
+                let left_ms = FLIGHT_AT.load(Ordering::Relaxed) as u128 * 1000 / ferros_sys::freq() as u128 + FLIGHT_NS.load(Ordering::Relaxed) as u128 / 1_000_000 - t as u128 * 1000 / ferros_sys::freq() as u128;
+                FLIGHT_AT.store(t, Ordering::Relaxed);
+                FLIGHT_NS.store(new_ns, Ordering::Relaxed);
+                CUT_N.store(FRAMES.load(Ordering::Acquire), Ordering::Relaxed);
+                CUT_AT.store(t, Ordering::Relaxed);
+                say!(g, "camera: the frame in flight cut with about A#{left_ms} ms of it left: frame truncation (CCS G#0106), stream off, the new timing, stream on; the next frame due in A#{} ms\n", new_ns / 1_000_000);
+            }
+            o.now = p;
+            NOW_LINES.store((p.coarse as u64) << p.shift, Ordering::Relaxed);
+            NOW_NS.store(o.timing.ns(&p), Ordering::Relaxed);
+            FLL.store(p.fll as u64, Ordering::Relaxed);
+            LLP.store(p.llp as u64, Ordering::Relaxed);
+            0
+        }
+        Err(e) => {
+            // Some of the hold's writes may have landed: the line and frame are no longer known, so the next exposure writes both.
+            o.now.llp = 0;
+            o.now.fll = 0;
+            say!(g, "camera: a {what}'s writes failed (G#{e:X}){}\n", if cut { " in a cut (the stream on tried last)" } else { "" });
+            1
+        }
+    }
 }
 
 /// CCS fast_standby_ctrl (G#0106, one byte): 1, a stream off truncates the frame in flight at once instead of finishing it (CCS's "frame truncation"); 0 (CCS's default, unread on these sensors) finishes it. None of the four local inits writes G#0106 directly (scanned 2026-11-18; Samsung's indirect window not decoded for it).
@@ -2011,7 +2058,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain, gain_code) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, gain_code, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, open_fll: fll, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, gain_code, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -3129,50 +3176,37 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 let r = match what {
                     // Exposure (ns): the plan the sensor's timing makes of it (ferros_cam ccs `Timing::plan`: inside the mode's frame, else the frame lengthened, else the shift), refused past the longest, never capped. Answered while a frame waits too (docs/CAMERA.md "Serving while a frame waits"): it lands at the next frame's start (the hold), or, when the frame in flight would end more than `CUT_US` after the new one would, that frame is cut (`exposure_cut`).
                     0 => match if o.force != 0 { o.timing.plan_shift(value, o.force) } else { o.timing.plan(value) } {
-                        Some(p) => {
-                            let moved = (p.llp, p.fll, p.shift) != (o.now.llp, o.now.fll, o.now.shift);
-                            let new_ns = o.timing.frame_ns(&p);
-                            let cut = moved && cut_due(new_ns);
-                            match if cut { exposure_cut(&bus, c, &o.timing, &o.now, &p) } else { exposure_set(&bus, c, &o.timing, &o.now, &p) } {
-                                Ok(()) => {
-                                    if moved {
-                                        readout_say(g, "before");
-                                        readout_reset();
-                                        period_set(new_ns);
-                                        say!(g, "camera: exposure A#{} us: frame A#{} lines of A#{} clocks, shift A#{}, integration A#{} lines; a frame every A#{} ms\n", o.timing.ns(&p) / 1000, p.fll, p.llp, p.shift, p.coarse, new_ns / 1_000_000);
-                                        // A frame that lengthens moves a held call's deadline with it (`late_tick` counts the frame before and this one for two frames); one that shortens leaves it, as the frame in flight may still be the old one.
-                                        if let Some(h) = pending.as_mut() {
-                                            h.until = h.until.max(late_tick());
-                                        }
+                        Some(p) => plan_apply(g, o, &bus, c, &p, &mut pending, "exposure"),
+                        None => 1,
+                    },
+                    // Frame length in lines (0: the open's own), for a rate change on a running stream (owner, 2026-11-20: Lumis's still to RAW video "takes like 5 seconds", a close, a power-up and the init's writes, for what is only another frame length on the same readout).
+                    // It becomes the frame every exposure is planned against (`Timing::fll`, the frame `plan` keeps while the integration fits it), and the exposure now in force is planned again against it: the frame is the new length, or longer when the shutter is (the integration plus the sensor's margin), never cut under the shutter.
+                    // Written in the hold as an exposure is (`plan_apply`), so it lands at the next frame's start; refused, the timing left as it was, when the exposure now in force fits no plan against it.
+                    4 => {
+                        let rows = ROWS.load(Ordering::Relaxed);
+                        let fll = if value == 0 { o.open_fll as u64 } else { value };
+                        // WHY the bounds: the value is the caller's eight bytes. Past 16 bits the sensor's frame-length register (CCS G#0340) cannot hold it; under the rows plus the least blanking the driver ever asks (a slit's `BLANK`) the front end has no blanking to run the next frame's program in (LATE_CONFIG). PROOF: a value past 16 bits would be cut by the `as u16` below into a short frame nobody asked for.
+                        if fll > u16::MAX as u64 || fll < rows + BLANK as u64 {
+                            1
+                        } else {
+                            let before = o.timing.fll;
+                            o.timing.fll = fll as u16;
+                            let ns = o.timing.ns(&o.now);
+                            match if o.force != 0 { o.timing.plan_shift(ns, o.force) } else { o.timing.plan(ns) } {
+                                Some(p) => match plan_apply(g, o, &bus, c, &p, &mut pending, "frame length") {
+                                    0 => {
+                                        say!(g, "camera: the frame length A#{fll} lines asked (the open's A#{}): frame A#{} lines, a frame every A#{} us\n", o.open_fll, p.fll, o.timing.frame_ns(&p) / 1000);
+                                        0
                                     }
-                                    if cut {
-                                        // The frame begun now, at the new timing; the first frame after it is said when it lands.
-                                        let t = ferros_sys::now();
-                                        let left_ms = FLIGHT_AT.load(Ordering::Relaxed) as u128 * 1000 / ferros_sys::freq() as u128 + FLIGHT_NS.load(Ordering::Relaxed) as u128 / 1_000_000 - t as u128 * 1000 / ferros_sys::freq() as u128;
-                                        FLIGHT_AT.store(t, Ordering::Relaxed);
-                                        FLIGHT_NS.store(new_ns, Ordering::Relaxed);
-                                        CUT_N.store(FRAMES.load(Ordering::Acquire), Ordering::Relaxed);
-                                        CUT_AT.store(t, Ordering::Relaxed);
-                                        say!(g, "camera: the frame in flight cut with about A#{left_ms} ms of it left: frame truncation (CCS G#0106), stream off, the new timing, stream on; the next frame due in A#{} ms\n", new_ns / 1_000_000);
-                                    }
-                                    o.now = p;
-                                    NOW_LINES.store((p.coarse as u64) << p.shift, Ordering::Relaxed);
-                                    NOW_NS.store(o.timing.ns(&p), Ordering::Relaxed);
-                                    FLL.store(p.fll as u64, Ordering::Relaxed);
-                                    LLP.store(p.llp as u64, Ordering::Relaxed);
-                                    0
-                                }
-                                Err(e) => {
-                                    // Some of the hold's writes may have landed: the line and frame are no longer known, so the next exposure writes both.
-                                    o.now.llp = 0;
-                                    o.now.fll = 0;
-                                    say!(g, "camera: an exposure's writes failed (G#{e:X}){}\n", if cut { " in a cut (the stream on tried last)" } else { "" });
+                                    r => r,
+                                },
+                                None => {
+                                    o.timing.fll = before;
                                     1
                                 }
                             }
                         }
-                        None => 1,
-                    },
+                    }
                     // Gain (1024 one): the analogue code the sensor's own model gives, digital gain written as one (owner, 2026-11-17: digital gain is after the ADC, so analogue only); past the analogue's most refused, never capped; the frame's header then carries the gain the code makes. With no model, the captured gain alone (1024).
                     1 => match o.gain_model.and_then(|m| m.split(value)) {
                         // The gain already set: nothing written (a device test's shape writes it all the same).
