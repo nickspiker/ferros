@@ -115,7 +115,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [FGTW is a DUNA](fgtw_duna_runanga.md) - nobody owns it; service buyers are the runanga; at-cost pricing
 - [Wateo (wateo.net)](wateo_net.md) - data-only member carrier; no dollars; DUNA forming, invite only; site + logo rules
 - [ferros flasher tool](ferros_flasher_tool.md) - planned GPT/partition library + CLI, fluor GUI later
-- [Genesis kist (shelved)](genesis_kist_shelved.md) - jgenesis core; VSF RGB, no CD/32X, VSF saves in the person's vault
+- [Aemulus, the Genesis kist](genesis_kist_shelved.md) - named Aemulus 2026-11-21; cartridges as hold items; jgenesis core; VSF RGB, no CD/32X, VSF saves in the person's vault
 - [USB session auth design](project_usb_auth_design.md) - March 2026 PT-over-USB auth (Ed25519, X25519, ChaCha20); unbuilt
 - [TOKEN recovery = Shamir not OPRF](token_recovery_shamir_not_oprf.md) - hardened Shamir; never re-propose threshold-OPRF
 

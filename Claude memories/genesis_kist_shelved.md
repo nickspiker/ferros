@@ -1,6 +1,6 @@
 ---
 name: genesis-kist-shelved
-description: "Sega Genesis kist (jgenesis core, GPL-3) scoped 2026-11-11 and shelved for night work: VSF RGB primaries, CD/32X dropped, proper VSF save states, saves in the person's vault not the kist's"
+description: "Aemulus, the Sega Genesis kist (jgenesis core, GPL-3) scoped 2026-11-11 and shelved for night work: VSF RGB primaries, CD/32X dropped, proper VSF save states, saves in the person's vault not the kist's"
 metadata:
   type: project
 ---
@@ -18,3 +18,5 @@ Owner, 2026-11-11: "would like an agent to scope out getting a SEGA genesis kist
 **How to apply:** night work, when nothing else is queued: step A (Sonic, touch overlay, no audio, ~1 week) first. Related: [[kist-catalog]], [[permissions-asked-once]].
 
 **Built 2026-11-11 night (step A, then the owner's answers):** A715s stay default ("middle cores is where it's at for now"); colour gamma 2 VSF RGB "good"; "No full screen"; "nah on the six button" (pad keeps A, B, C, Start); H32 "your call on the average" → area-weighted columns, straddles mixed in linear light. Back's Escape opens a pause page (Resume, Save state, Load state, Reset; no Quit, the house has none). Save states = jgenesis `vsf` feature (`#[derive(VsfState)]` beside every bincode derive, runs of structs as columns, ASCII strings: `x` would add 9 MB). Saves: owner "Two permissions, saving under the kist key and saving under the user key ... never in a directory tree" → docs/STORE.md (draft), Genesis its stage 0; until then `store.rs` `Session` keeps one per kind and game in memory, said on the page. Icon: genesis-kist/assets/icon.vsf from the owner's cartridge.jpeg (VSF image, `image`/`data` t_u3 256x256x3). Not yet run on the 8a (it left the bus at 20:45 that night).
+
+**Named Aemulus (owner, 2026-11-21: "Aemulus it is!"):** the emulator kist's name, Latin for one who rivals or strives to equal, the root of "emulate"; it stays right if it later runs other consoles. No "Sega", "Genesis" or "Mega Drive" in the name (trademarks). Cartridges go in the hold as a kind of their own ("Sega Genesis cartridge"), opened by Aemulus from a chooser; the owner's Sonic 2 ROM is at ~/Downloads/Sonic The Hedgehog 2 (World) (Rev B) (Sonic Compilation ~ Sonic Classics).md (his own; never commit a ROM).
