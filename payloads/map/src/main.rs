@@ -32,6 +32,8 @@ mod wifi;
 mod targets;
 /// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
 mod camera;
+/// The deck packed into the screen (Back's swipe on the deck), pure so tools/deck-fit tests it on the host.
+mod jam;
 /// The screenshot's two-finger slide on the helm, pure so tools/chords tests it on the host.
 mod pair;
 
@@ -272,79 +274,10 @@ const ONE: i64 = 1 << 14;
 /// The rate of every motion after a finger lifts or a tap: the halving's, ln 2 a display frame (owner, 2026-11-05: halve what is left each frame), as a critically damped spring (owner, 2026-11-06: "just needs some ease").
 const SPRING: f64 = core::f64::consts::LN_2;
 
-/// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
-/// Circles of radii `r` packed into a cluster, every one touching (owner, 2026-11-18: "cluster best fit all touching"): the largest first at the centre, the next beside it, and each after where it touches two placed ones nearest the cluster's middle without overlapping any (every tangent pair tried, both sides: n ≤ `MAX`, so n³ tries are nothing). Each centre, in the radii's units, the cluster's area-weighted middle at the origin.
-fn pack(r: &[f64]) -> alloc::vec::Vec<(f64, f64)> {
-    let n = r.len();
-    let mut order: alloc::vec::Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| r[b].partial_cmp(&r[a]).unwrap_or(core::cmp::Ordering::Equal));
-    let mut at = alloc::vec![(0f64, 0f64); n];
-    let mut placed: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    for (k, &i) in order.iter().enumerate() {
-        if k == 1 {
-            at[i] = (r[order[0]] + r[i], 0.);
-        } else if k > 1 {
-            // The middle so far, weighted by area, where the cluster pulls toward.
-            let (mut mx, mut my, mut mw) = (0., 0., 0.);
-            for &j in &placed {
-                let w = r[j] * r[j];
-                mx += at[j].0 * w;
-                my += at[j].1 * w;
-                mw += w;
-            }
-            let (mx, my) = (mx / mw, my / mw);
-            let mut best: Option<((f64, f64), f64)> = None;
-            for (pa, &a) in placed.iter().enumerate() {
-                for &b in &placed[pa + 1..] {
-                    // Where circle i touches both a and b: the two crossings of the circles about a and b of radii r_a + r_i and r_b + r_i.
-                    let (ax, ay, bx, by) = (at[a].0, at[a].1, at[b].0, at[b].1);
-                    let (ra, rb) = (r[a] + r[i], r[b] + r[i]);
-                    let (dx, dy) = (bx - ax, by - ay);
-                    let d2 = dx * dx + dy * dy;
-                    let d = libm::sqrt(d2);
-                    if d == 0. || d > ra + rb {
-                        continue;
-                    }
-                    let along = (ra * ra - rb * rb + d2) / (2. * d);
-                    let h2 = ra * ra - along * along;
-                    if h2 < 0. {
-                        continue;
-                    }
-                    let h = libm::sqrt(h2);
-                    let (px, py) = (ax + dx * along / d, ay + dy * along / d);
-                    for s in [-1., 1.] {
-                        let c = (px - s * dy * h / d, py + s * dx * h / d);
-                        // Clear of every circle placed (a millionth of a radius of slack for the tangents themselves).
-                        let clear = placed.iter().all(|&j| { let (ex, ey) = (c.0 - at[j].0, c.1 - at[j].1); ex * ex + ey * ey >= (r[j] + r[i]) * (r[j] + r[i]) * (1. - 1e-6) });
-                        if clear {
-                            let score = (c.0 - mx) * (c.0 - mx) + (c.1 - my) * (c.1 - my);
-                            if best.is_none_or(|(_, s0)| score < s0) {
-                                best = Some((c, score));
-                            }
-                        }
-                    }
-                }
-            }
-            // No pair leaves room (never with these sizes): beside the largest, on its far side from the middle.
-            at[i] = best.map_or((at[order[0]].0 - r[order[0]] - r[i], at[order[0]].1), |(c, _)| c);
-        }
-        placed.push(i);
-    }
-    let (mut mx, mut my, mut mw) = (0., 0., 0.);
-    for i in 0..n {
-        let w = r[i] * r[i];
-        mx += at[i].0 * w;
-        my += at[i].1 * w;
-        mw += w;
-    }
-    if mw > 0. {
-        for p in at.iter_mut() {
-            *p = (p.0 - mx / mw, p.1 - my / mw);
-        }
-    }
-    at
-}
+/// A packed circle this little past another or a wall (pixels) touches it: the pack's own sixteenth (`jam`), finer than the eye tells from touching.
+const TOUCH: f64 = 1. / ((1 << 4) as f64);
 
+/// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
 fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
     spring_at(x0, v0, t, SPRING)
 }
@@ -376,6 +309,25 @@ struct Flight {
     spiral: camera::Spiral,
     fade_to: f64,
     t: i32,
+}
+
+/// The deck's circles on their way to a pack into the screen or back to the scatter they came from (`Map::pack_deck`, `Map::scatter_back`), a shown frame a step (`Map::step_travel`).
+/// On the glass each circle rides the settings strip's spring (`spring`: the halving's rate, ln 2 a shown frame, eased from the speed it had) from where it shows to where it lands, while the camera flies to the camera it lands under on the same spring, so its size eases at the same rate; its world place each frame is whatever the camera then shows at its glass place.
+/// Should another flight or a pan take the camera, the rest of the way is in the world, from where each stands at the speed it has.
+#[derive(Clone, Copy)]
+struct Travel {
+    n: usize,
+    /// Where each lands, world ×256 on whole world units (the display's scene holds whole units), and the camera it lands under.
+    land: [(i64, i64); MAX],
+    cam: Cam,
+    /// Where each lands on the glass under `cam` (pixels from the panel's centre); its offset from there when the travel began and its speed then (a shown frame), in glass pixels while `glass`, in world ×256 after.
+    to: [(f64, f64); MAX],
+    off: [(f64, f64); MAX],
+    vel: [(f64, f64); MAX],
+    t: i32,
+    glass: bool,
+    /// The way back to the scatter.
+    back: bool,
 }
 
 /// A circle's radius in world units: area = share x the map's total, so r = 110 x sqrt(4 x share). Integer square root, no floats.
@@ -994,6 +946,27 @@ impl Cam {
     fn screen(&self, w: i64, h: i64, wx: i64, wy: i64) -> (i64, i64) {
         let (dx, dy) = (wx - self.x, wy - self.y);
         (w / 2 + (((self.c * dx - self.s * dy) / ONE * self.z) >> 24), h / 2 + (((self.s * dx + self.c * dy) / ONE * self.z) >> 24))
+    }
+    /// A world vector (×256) on the glass: pixels, the turn and the zoom alone (`screen`'s linear part, unrounded).
+    fn glass_dir(&self, dx: f64, dy: f64) -> (f64, f64) {
+        let k = self.z as f64 / ((1u64 << 24) as f64 * ONE as f64);
+        let (c, s) = (self.c as f64, self.s as f64);
+        ((c * dx - s * dy) * k, (s * dx + c * dy) * k)
+    }
+    /// A world point (×256, any sub-unit bits) on the glass: pixels from the panel's centre, unrounded (`screen` in f64).
+    fn glass(&self, wx: f64, wy: f64) -> (f64, f64) {
+        self.glass_dir(wx - self.x as f64, wy - self.y as f64)
+    }
+    /// `glass_dir` undone: the world vector (×256) a glass vector shows.
+    fn unglass_dir(&self, gx: f64, gy: f64) -> (f64, f64) {
+        let (c, s) = (self.c as f64, self.s as f64);
+        let k = (1u64 << 24) as f64 * ONE as f64 / (self.z as f64 * (c * c + s * s));
+        ((c * gx + s * gy) * k, (c * gy - s * gx) * k)
+    }
+    /// `glass` undone: the world point (×256) under a glass offset from the panel's centre.
+    fn unglass(&self, gx: f64, gy: f64) -> (f64, f64) {
+        let (dx, dy) = self.unglass_dir(gx, gy);
+        (self.x as f64 + dx, self.y as f64 + dy)
     }
     fn op(&self, keep: bool) -> [u8; 18] {
         let mut m = [0u8; 18];
@@ -1637,12 +1610,12 @@ struct Map {
     front_kist: Option<[u8; 32]>,
     /// The display's frame count as op 5 last gave it (`display_seen`): a smaller one means the display started again.
     display_frames: u32,
-    /// The deck's circles gathered (owner, 2026-11-18: "for swiping back on the deck, would be nice to make all the circles cluster best fit all touching, and tapping on back reverses back to whatever scatter they were in"): each circle's place in the scatter it came from (world ×256) and the camera then; None while scattered.
+    /// The deck's circles packed into the screen (`pack_deck`; owner, 2026-11-18, of the cluster it replaced: "tapping on back reverses back to whatever scatter they were in"): each circle's place in the scatter it came from (world ×256) and the camera then; None while scattered.
     scatter: Option<(alloc::vec::Vec<(i64, i64)>, Cam)>,
     /// The display's count of unused Escapes when Back last sent one to the app in front (`escapes_unused`), for PREF_HELM `BACK_OUT`.
     escape_sent: Option<u8>,
-    /// The circles on their way (`gather`, `scatter_back`): from, to (world ×256), the shown frames so far, and whether this is the way back.
-    gathering: Option<(alloc::vec::Vec<(i64, i64)>, alloc::vec::Vec<(i64, i64)>, i32, bool)>,
+    /// The circles on their way (`pack_deck`, `scatter_back`).
+    travel: Option<Travel>,
     /// The pucks launched since the person attested, by capsule (docs/PUCKS.md: a puck lives while a person is present, launched once, never by a tap).
     pucks_up: alloc::vec::Vec<[u8; 32]>,
     /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
@@ -2599,9 +2572,31 @@ impl Map {
             self.deck.circles[i].r = (self.deck.circles[i].r * z / Z_ONE).max(1);
             self.deck.circles[i].arranged = true;
         }
+        // What else is kept in world units goes with it, so it shows as before: the scatter Back's tap goes to (until 2026-11-21 it kept the old scale, and a Back after a pan put the circles back at the wrong size for their places), and a travel's places and the camera it lands under (its glass offsets are the glass's, unchanged).
+        let rez = |c: Cam| Cam { x: c.x * z / Z_ONE, y: c.y * z / Z_ONE, z: c.z * Z_ONE / z, c: c.c, s: c.s };
+        if let Some((places, cam)) = self.scatter.as_mut() {
+            for q in places.iter_mut() {
+                *q = (q.0 * z / Z_ONE, q.1 * z / Z_ONE);
+            }
+            *cam = rez(*cam);
+        }
+        let was = self.cam;
         self.cam.x = self.cam.x * z / Z_ONE;
         self.cam.y = self.cam.y * z / Z_ONE;
         self.cam.z = Z_ONE;
+        if let Some(t) = self.travel.as_mut() {
+            for q in t.land[..t.n].iter_mut() {
+                *q = (q.0 * z / Z_ONE, q.1 * z / Z_ONE);
+            }
+            t.cam = if t.cam == was { self.cam } else { rez(t.cam) };
+            if !t.glass {
+                let a = z as f64 / Z_ONE as f64;
+                for i in 0..t.n {
+                    t.off[i] = (t.off[i].0 * a, t.off[i].1 * a);
+                    t.vel[i] = (t.vel[i].0 * a, t.vel[i].1 * a);
+                }
+            }
+        }
         self.send_scene();
     }
 
@@ -3605,9 +3600,9 @@ impl Map {
                 let rows: [(Msg, u8, [Msg; 2]); 5] = [
                     (Msg::HelmBackTap, BACK_OUT, [Msg::HelmUpTop, Msg::HelmUpOut]),
                     (Msg::HelmBackSwipe, BACK_SWIPE_FORWARD, [Msg::HelmRecent, Msg::HelmForward]),
-                    (Msg::HelmBackSwipeDeck, BACK_SWIPE_DECK_RECENT, [Msg::HelmCluster, Msg::HelmRecent]),
+                    (Msg::HelmBackSwipeDeck, BACK_SWIPE_DECK_RECENT, [Msg::HelmPack, Msg::HelmRecent]),
                     (Msg::HelmDeckSwipe, DECK_SWIPE_OUT, [Msg::HelmControls, Msg::HelmToDeck]),
-                    (Msg::HelmDeckSwipeDeck, DECK_SWIPE_DECK_CLUSTER, [Msg::HelmFit, Msg::HelmCluster]),
+                    (Msg::HelmDeckSwipeDeck, DECK_SWIPE_DECK_PACK, [Msg::HelmFit, Msg::HelmPack]),
                 ];
                 for (title, bit, choices) in rows {
                     b.text(cx, y, note as u16, dim(), 1, tr(title));
@@ -5128,8 +5123,8 @@ impl Map {
             self.pan = if v == 0. { None } else { Some((ux, uy, v, rx - ix, ry - iy)) };
         }
         let flying = self.step_cam();
-        let gathering = self.step_gather();
-        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying || gathering
+        let travelling = self.step_travel();
+        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying || travelling
     }
 
     /// A screenshot (owner, 2026-11-18: "screenshot is the two finger slide"; WINDOWS.md "Screenshot"): the display takes the screen as it is and keeps it as the offer, the clipboard's one held item (display op 84, the system's alone). Acknowledged on the glass at once: both helm buttons lit full while the fingers stay, and faded by the display from the lift (`helm_draw` halves the light each pass), no timer. Said on the console.
@@ -5225,76 +5220,180 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
-    /// The deck's circles gathered into a cluster, every one touching (`pack`), about the area-weighted middle of where they stand, the scatter kept for Back's tap (`scatter_back`); each goes on the plane's spring, a shown frame a step (`step_gather`), and the camera fits them once they land. Already gathered: the camera fits them again.
-    fn gather(&mut self) -> &'static str {
-        if self.scatter.is_some() && self.gathering.is_none() {
-            self.deck_fly();
-            return "map: deck: the cluster in view";
-        }
+    /// The deck's circles packed into the screen (owner, 2026-11-21: "zoomed in as possible to fit all pieces but do a dense pack, not a cluster, then a fit, like a pack into screen instead of bunch"), from where they stand (`jam::pack`).
+    /// The walls are the deck's fit's (`deck_fit_at`): the screen's left and right edges, and the big circle (ferros_sys::active_circle), whose top arc sits under the camera's knockout and whose bottom arc on the screen's bottom; at the camera's own turn.
+    /// The circles keep their radii: the pack is a camera (the zoom found, the room's centre showing the fit's centre) and a world place for each, on whole world units as the display's scene holds them.
+    /// Each travels there on the glass while the camera flies there (`Travel`), and the scatter is kept for Back's tap (`scatter_back`); a deck packed again, or packed on its way back, keeps the scatter it came from.
+    /// Nothing is marked as arranged by hand, as with the cluster before it (2026-11-18): the places are kept when the plane is next let go, where the world goes back to zoom one and every circle is kept (`renormalise`).
+    fn pack_deck(&mut self) -> &'static str {
         let n = self.deck.n();
-        let r: alloc::vec::Vec<f64> = (0..n).map(|i| self.deck.circles[i].r as f64).collect();
-        let (mut mx, mut my, mut mw) = (0f64, 0f64, 0f64);
+        let (c, s) = (self.cam.c as f64, self.cam.s as f64);
+        let l = libm::sqrt(c * c + s * s);
+        let (uc, us) = (c / l, s / l);
+        let (ax, ay, ar) = ferros_sys::active_circle(self.w as usize, self.h as usize);
+        let room = camera::Room { half_w: self.w as f64 * 0.5, radius: ar as f64 };
+        // The room's centre on the glass, from the panel's centre.
+        let (gx, gy) = (ax as f64 - (self.w / 2) as f64, ay as f64 - (self.h / 2) as f64);
+        let mut discs = [(0f64, 0f64, 0f64); MAX];
         for i in 0..n {
-            let w = r[i] * r[i];
-            mx += self.deck.circles[i].at.x as f64 * w;
-            my += self.deck.circles[i].at.y as f64 * w;
-            mw += w;
+            discs[i] = (self.deck.circles[i].at.x as f64, self.deck.circles[i].at.y as f64, (self.deck.circles[i].r << 8) as f64);
         }
-        // WHY the floor: a deck of circles all of radius 0 has no middle to divide by (never: every circle has a radius of at least 1).
-        let mw = mw.max(1.);
-        let (mx, my) = (mx / mw, my / mw);
-        let from: alloc::vec::Vec<(i64, i64)> = (0..n).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect();
-        // World units to ×256: the positions are kept at 256 to a unit, the radii in units.
-        let to: alloc::vec::Vec<(i64, i64)> = pack(&r).iter().map(|p| (libm::round(mx + p.0 * 256.) as i64, libm::round(my + p.1 * 256.) as i64)).collect();
+        // The start: the fit, every circle inside the walls; each centre in glass pixels from the room's centre, in the turned frame.
+        let (wx, wy, z0) = camera::fit_at(&discs[..n], uc, us, room);
+        let k0 = z0 / (1u64 << 24) as f64;
+        let (cu, cv) = (uc * wx - us * wy, us * wx + uc * wy);
+        let mut r = [0f64; MAX];
+        let mut p = [(0f64, 0f64); MAX];
+        for i in 0..n {
+            let (x, y, rr) = discs[i];
+            r[i] = rr;
+            p[i] = (k0 * (uc * x - us * y - cu), k0 * (us * x + uc * y - cv));
+        }
+        let t0 = now();
+        let got = jam::pack(&r[..n], &mut p[..n], k0, room);
+        // The camera: the zoom found (the turn's Q14 length taken out, as the display turns by it as it is), floored so no circle shows larger than the pack; centred so the room's centre shows the fit's centre.
+        let mut cam = Cam { x: 0, y: 0, z: libm::floor(got.k * ((1u64 << 24) as f64) * ONE as f64 / l) as i64, c: self.cam.c, s: self.cam.s };
+        let (dx, dy) = cam.unglass_dir(gx, gy);
+        cam.x = libm::round(wx - dx) as i64;
+        cam.y = libm::round(wy - dy) as i64;
+        // Each place on whole world units, as the display draws it: of the four whole units round its exact place, the one nearest touching without overlapping anything (the circles before it as they landed, the ones after it where the pack put them, the walls; under `TOUCH` counts as touching), else the one overlapping least, in order. Measured on the 8a's deck (2026-11-21), the nearest unit alone left 13 sixteenths of a pixel of overlap (a unit is 1.4 pixels there).
+        let k = l * cam.z as f64 / ((1u64 << 24) as f64 * ONE as f64);
+        let mut land = [(0i64, 0i64); MAX];
+        let mut q = [(0f64, 0f64); MAX];
+        for i in 0..n {
+            q[i] = p[i];
+        }
+        for i in 0..n {
+            let (x, y) = cam.unglass(p[i].0 + gx, p[i].1 + gy);
+            let (fx, fy) = (libm::floor(x / 256.) as i64, libm::floor(y / 256.) as i64);
+            let mut best = (0f64, (0i64, 0i64), (0f64, 0f64));
+            for (c, (ux, uy)) in [(fx, fy), (fx + 1, fy), (fx, fy + 1), (fx + 1, fy + 1)].into_iter().enumerate() {
+                let g = cam.glass((ux * 256) as f64, (uy * 256) as f64);
+                q[i] = (g.0 - gx, g.1 - gy);
+                let clear = jam::gap(&r[..n], &q[..n], k, room, i);
+                let better = |b: f64| if (clear >= -TOUCH) != (b >= -TOUCH) { clear >= -TOUCH } else if clear >= -TOUCH { clear < b } else { clear > b };
+                if c == 0 || better(best.0) {
+                    best = (clear, (ux * 256, uy * 256), q[i]);
+                }
+            }
+            land[i] = best.1;
+            q[i] = best.2;
+        }
+        let took = ferros_sys::us_since(t0);
         if self.scatter.is_none() {
-            self.scatter = Some((from.clone(), self.cam));
+            self.scatter = Some(match self.travel {
+                Some(t) if t.back => (t.land[..t.n].to_vec(), t.cam),
+                _ => ((0..n).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect(), self.cam),
+            });
         }
-        self.gathering = Some((from, to, 0, false));
-        self.settling = true;
-        "map: back: the circles gathered, touching"
+        self.travel_to(&land[..n], cam, false);
+        self.fly(cam);
+        // The pack as the glass will show it, its places on whole world units: the largest overlap there and the most any circle stands off everything (the display draws a circle at its whole world units).
+        let over = jam::overlap(&r[..n], &q[..n], k, room);
+        let apart = (0..n).map(|i| jam::gap(&r[..n], &q[..n], k, room, i)).fold(0f64, f64::max);
+        let fit_z = z0 * ONE as f64 / l;
+        let said = alloc::format!(
+            "map: deck: packed in A#{took} us: zoom G#{:X} (the fit's G#{:X}, A#{} per mille of it), A#{} zooms tried, A#{} sweeps, pressure at the jam A#{} 1024ths of a pixel, A#{} loose moved; on whole world units the most overlap A#{} and the most apart A#{} 16ths of a pixel\n",
+            cam.z,
+            fit_z as i64,
+            libm::round(cam.z as f64 / fit_z * 1000.) as i64,
+            got.trials,
+            got.sweeps,
+            libm::round(got.pressure * 1024.) as i64,
+            got.loose,
+            libm::round(over * 16.) as i64,
+            libm::round(apart * 16.) as i64
+        );
+        console(self.grants, said.as_bytes());
+        // Development builds: where each lands (world ×256 x and y, the radius) and the camera, so a pack can be replayed on the host (tools/deck-fit).
+        if DEV {
+            let mut s = alloc::format!("map: deck: packed under x A#{} y A#{} zoom G#{:X} turn A#{} A#{}; circles", cam.x, cam.y, cam.z, cam.c, cam.s);
+            for i in 0..n {
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" A#{},A#{},A#{}", land[i].0, land[i].1, self.deck.circles[i].r));
+            }
+            s.push('\n');
+            console(self.grants, s.as_bytes());
+        }
+        self.draw();
+        "map: deck: the circles packed into the screen"
     }
 
-    /// Back's tap on a gathered deck: every circle back to where it stood before (`gather`), the camera with them. Whether there was a scatter to go back to.
+    /// The circles set travelling (`Travel`) to `land` (world ×256) under the camera `cam`: each from where it shows now, at the speed it has on a travel under way (one turned round keeps its speed, so no jolt), else from rest.
+    fn travel_to(&mut self, land: &[(i64, i64)], cam: Cam, back: bool) {
+        // WHY the least: a scatter taken before a circle was stowed or unstowed holds another count; the circles both know travel, the rest stay.
+        let n = land.len().min(self.deck.n());
+        let mut t = Travel { n, land: [(0, 0); MAX], cam, to: [(0., 0.); MAX], off: [(0., 0.); MAX], vel: [(0., 0.); MAX], t: 0, glass: true, back };
+        for i in 0..n {
+            t.land[i] = land[i];
+            t.to[i] = cam.glass(land[i].0 as f64, land[i].1 as f64);
+            let at = self.cam.glass(self.deck.circles[i].at.x as f64, self.deck.circles[i].at.y as f64);
+            t.off[i] = (at.0 - t.to[i].0, at.1 - t.to[i].1);
+            t.vel[i] = self.travel_speed(i);
+        }
+        self.travel = Some(t);
+        self.settling = true;
+    }
+
+    /// Circle `i`'s speed on the glass (pixels a shown frame) on the travel under way; none at rest.
+    fn travel_speed(&self, i: usize) -> (f64, f64) {
+        let Some(t) = self.travel else { return (0., 0.) };
+        // WHY: a circle stowed since the travel began is not on it.
+        if i >= t.n {
+            return (0., 0.);
+        }
+        let (vx, vy) = (spring(t.off[i].0, t.vel[i].0, t.t).1, spring(t.off[i].1, t.vel[i].1, t.t).1);
+        if t.glass { (vx, vy) } else { self.cam.glass_dir(vx, vy) }
+    }
+
+    /// Back's tap on a packed deck: every circle back to where it stood before (`pack_deck`), the camera with them, on the same travel. Whether there was a scatter to go back to.
     fn scatter_back(&mut self) -> bool {
         let Some((to, cam)) = self.scatter.take() else { return false };
-        let from: alloc::vec::Vec<(i64, i64)> = (0..self.deck.n()).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect();
-        // A circle stowed or unstowed since: as many as both know.
-        let k = from.len().min(to.len());
-        self.gathering = Some((from[..k].to_vec(), to[..k].to_vec(), 0, true));
+        self.travel_to(&to, cam, true);
         self.fly(cam);
-        self.settling = true;
         true
     }
 
-    /// One shown frame of the circles on their way: each at its target plus the plane's spring of its offset (C¹ from rest, no timer: `spring`, as a flight's), sent to the display (op 17). Whether any is still a half pixel or more from its place; landed, a gather fits the camera to the cluster.
-    fn step_gather(&mut self) -> bool {
-        let Some((from, to, t, back)) = self.gathering.take() else { return false };
-        let t = t + 1;
-        let z = self.cam.z as f64;
+    /// One shown frame of the circles on their way (`Travel`), each sent to the display (op 17): its glass place on its spring, and its world place what the camera now shows there. Whether any still moves: until every circle is within half a pixel of its place at under half a pixel a frame, and the camera has landed; then each stands exactly on its place.
+    fn step_travel(&mut self) -> bool {
+        let Some(mut tr) = self.travel.take() else { return false };
+        let n = tr.n.min(self.deck.n());
+        let ours = self.target == Some(tr.cam) || (self.target.is_none() && self.cam == tr.cam);
+        if tr.glass && !ours {
+            // The camera taken elsewhere (a tap's flight, a pan): the rest of the way in the world, from where each stands, at the speed it has.
+            for i in 0..n {
+                let v = (spring(tr.off[i].0, tr.vel[i].0, tr.t).1, spring(tr.off[i].1, tr.vel[i].1, tr.t).1);
+                tr.off[i] = ((self.deck.circles[i].at.x - tr.land[i].0) as f64, (self.deck.circles[i].at.y - tr.land[i].1) as f64);
+                tr.vel[i] = self.cam.unglass_dir(v.0, v.1);
+            }
+            tr.glass = false;
+            tr.t = 0;
+        }
+        tr.t += 1;
+        // A unit of the offsets on the glass: a pixel, or on the world's way world ×256 at 16.16 pixels a unit, as `step_cam` measures.
+        let px = if tr.glass { 1. } else { self.cam.z as f64 / (1u64 << 24) as f64 };
         let mut still = false;
-        for i in 0..from.len().min(self.deck.n()) {
-            let (ox, oy) = ((from[i].0 - to[i].0) as f64, (from[i].1 - to[i].1) as f64);
-            let (x, vx) = spring(ox, 0., t);
-            let (y, vy) = spring(oy, 0., t);
-            self.deck.circles[i].at.x = to[i].0 + libm::round(x) as i64;
-            self.deck.circles[i].at.y = to[i].1 + libm::round(y) as i64;
+        for i in 0..n {
+            let (x, vx) = spring(tr.off[i].0, tr.vel[i].0, tr.t);
+            let (y, vy) = spring(tr.off[i].1, tr.vel[i].1, tr.t);
+            let (wx, wy) = if tr.glass { self.cam.unglass(tr.to[i].0 + x, tr.to[i].1 + y) } else { (tr.land[i].0 as f64 + x, tr.land[i].1 as f64 + y) };
+            self.deck.circles[i].at.x = libm::round(wx) as i64;
+            self.deck.circles[i].at.y = libm::round(wy) as i64;
             self.send_move(i);
-            // On the screen: world ×256 at 16.16 pixels a unit, as `step_cam` measures.
-            let px = |v: f64| v.abs() * z / (1u64 << 24) as f64;
-            still |= px(x) >= 0.5 || px(y) >= 0.5 || px(vx) >= 0.5 || px(vy) >= 0.5;
+            still |= [x, y, vx, vy].iter().any(|v| v.abs() * px >= 0.5);
         }
-        if still {
-            self.gathering = Some((from, to, t, back));
-        } else {
-            for i in 0..to.len().min(self.deck.n()) {
-                (self.deck.circles[i].at.x, self.deck.circles[i].at.y) = to[i];
-                self.send_move(i);
-            }
-            if !back {
-                self.deck_fly();
-            }
+        if still || (tr.glass && self.target == Some(tr.cam)) {
+            self.travel = Some(tr);
+            return true;
         }
-        still
+        for i in 0..n {
+            (self.deck.circles[i].at.x, self.deck.circles[i].at.y) = tr.land[i];
+            self.send_move(i);
+        }
+        if DEV {
+            let l = alloc::format!("map: deck: the circles {} after A#{} shown frames{}\n", if tr.back { "back in their scatter" } else { "packed" }, tr.t, if tr.glass { "" } else { ", the last of the way in the world" });
+            console(self.grants, l.as_bytes());
+        }
+        false
     }
 
     /// Deck's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
@@ -5365,7 +5464,7 @@ impl Map {
             self.app_front = false;
             self.front_kist = None;
         }
-        // A gathered deck: the circles back where they stood (`scatter_back`).
+        // A packed deck: the circles back where they stood (`scatter_back`).
         if self.view == View::Map && self.scatter_back() {
             return "map: back: the circles back where they stood";
         }
@@ -6094,7 +6193,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         display_frames: 0,
         scatter: None,
         escape_sent: None,
-        gathering: None,
+        travel: None,
         pucks_up: alloc::vec::Vec::new(),
         kists,
         ask: 0,
@@ -7009,7 +7108,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 "map: deck: full screen, the controls hidden"
                             }
                             Some(false) => "map: deck: full screen off, the controls shown",
-                            None if helm & DECK_SWIPE_DECK_CLUSTER != 0 => map.gather(),
+                            None if helm & DECK_SWIPE_DECK_PACK != 0 => map.pack_deck(),
                             None => {
                                 map.deck_fly();
                                 "map: deck: every circle in view, turned to fit them largest"
@@ -7019,7 +7118,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         // Forward, the redo of the last step back (owner: "like a redo or a forward browser navigation"): the Again key to the app in front.
                         if ferros_sys::window::key(map.display, ferros_sys::window::KEY_AGAIN).is_some() { "map: back: forward to the app in front" } else { map.flip() }
                     } else if !map.app_front && map.view == View::Map && helm & BACK_SWIPE_DECK_RECENT == 0 {
-                        map.gather()
+                        map.pack_deck()
                     } else {
                         map.flip()
                     };
@@ -7268,8 +7367,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.deck.circles[i].at.y += dy;
                     map.send_move(i);
                     map.deck.circles[i].arranged = true;
-                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    // A circle moved by hand: the pack is the arrangement now, the scatter it came from forgotten, and a travel under way ends where it stands (it would move the circle back under the finger's place).
                     map.scatter = None;
+                    map.travel = None;
                     move_us += ferros_sys::us_since(t_m);
                     let t_p = now();
                     map.push_apart(i);
@@ -7311,8 +7411,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                     map.send_move(i);
                     map.deck.circles[i].arranged = true;
-                    // A circle moved by hand: the cluster is the arrangement now, the scatter it came from forgotten.
+                    // A circle moved by hand: the pack is the arrangement now, the scatter it came from forgotten, and a travel under way ends where it stands (it would move the circle back under the finger's place).
                     map.scatter = None;
+                    map.travel = None;
                     map.push_apart(i);
                     scene_moved = true;
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {

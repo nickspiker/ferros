@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "w górę, potem na pokład",
         Msg::HelmRecent => "ostatnio używany kist",
         Msg::HelmForward => "naprzód, jak ponów",
-        Msg::HelmCluster => "zbierz okręgi, stykające się",
+        Msg::HelmPack => "upchnij okręgi na ekranie",
         Msg::HelmControls => "ukryj lub pokaż sterowanie",
         Msg::HelmToDeck => "na pokład",
         Msg::HelmFit => "wszystkie okręgi w widoku",

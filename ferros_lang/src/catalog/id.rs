@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "naik, lalu keluar ke dek",
         Msg::HelmRecent => "kist terakhir",
         Msg::HelmForward => "maju, seperti ulangi",
-        Msg::HelmCluster => "kumpulkan lingkaran, bersentuhan",
+        Msg::HelmPack => "padatkan lingkaran ke layar",
         Msg::HelmControls => "sembunyikan atau tampilkan kontrol",
         Msg::HelmToDeck => "keluar ke dek",
         Msg::HelmFit => "semua lingkaran terlihat",

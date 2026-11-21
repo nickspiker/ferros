@@ -62,8 +62,8 @@ messages! {
     /// Back's swipe in a kist: the kist before (the most recent, the default), or forward: the redo of the last step back, the Again key to the kist (owner: "like a redo or a forward browser navigation").
     HelmRecent,
     HelmForward,
-    /// On the deck: every circle gathered into a cluster, all touching (Back's tap scatters them back).
-    HelmCluster,
+    /// On the deck: every circle packed into the screen, as large as they all fit, touching (Back's tap scatters them back).
+    HelmPack,
     /// Deck's swipe in a kist: the controls hidden or shown (the default), or out to the deck.
     HelmControls,
     HelmToDeck,

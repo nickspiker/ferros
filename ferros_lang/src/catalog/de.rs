@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "nach oben, dann hinaus aufs Deck",
         Msg::HelmRecent => "der zuletzt benutzte Kist",
         Msg::HelmForward => "vorwärts, als Wiederholen",
-        Msg::HelmCluster => "die Kreise sammeln, sich berührend",
+        Msg::HelmPack => "die Kreise in den Bildschirm packen",
         Msg::HelmControls => "die Bedienelemente aus- oder einblenden",
         Msg::HelmToDeck => "hinaus aufs Deck",
         Msg::HelmFit => "alle Kreise ins Bild",

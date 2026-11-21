@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "up, then out to the deck",
         Msg::HelmRecent => "the most recent kist",
         Msg::HelmForward => "forward, as a redo",
-        Msg::HelmCluster => "gather the circles, touching",
+        Msg::HelmPack => "pack the circles into the screen",
         Msg::HelmControls => "hide or show the controls",
         Msg::HelmToDeck => "out to the deck",
         Msg::HelmFit => "fit every circle in view",

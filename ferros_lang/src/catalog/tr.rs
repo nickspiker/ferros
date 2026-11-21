@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "yukarı, sonra güverteye",
         Msg::HelmRecent => "en son kist",
         Msg::HelmForward => "ileri, yinele gibi",
-        Msg::HelmCluster => "daireleri topla, birbirine değerek",
+        Msg::HelmPack => "daireleri ekrana sığdır",
         Msg::HelmControls => "denetimleri gizle veya göster",
         Msg::HelmToDeck => "güverteye",
         Msg::HelmFit => "tüm daireler görünümde",

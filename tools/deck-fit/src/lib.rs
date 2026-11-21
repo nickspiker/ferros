@@ -5,9 +5,14 @@
 #[allow(dead_code)]
 pub mod camera;
 
+#[path = "../../../payloads/map/src/jam.rs"]
+#[allow(dead_code)]
+pub mod jam;
+
 #[cfg(test)]
 mod tests {
     use super::camera::{self, Disc, Room, Spiral};
+    use super::jam;
     use core::f64::consts::{LN_2, PI};
 
     /// The map's turn, Q14.
@@ -509,5 +514,113 @@ mod tests {
             let (lx, ly) = (camera::spring_at(d.0, 0., t, LN_2).0, camera::spring_at(d.1, 0., t, LN_2).0);
             assert!((co.0 - lx).abs() < 1. && (co.1 - ly).abs() < 1., "frame {t}: {co:?} against the line's ({lx}, {ly})");
         }
+    }
+
+    /// The pack's start, as the map makes it (`Map::pack_deck`): the deck's fit at the turn `a` (`camera::fit_at`), each centre in pixels from the room's centre in the turned frame, the radii in world units ×256, the fit's zoom in pixels a world unit ×256.
+    fn pack_start(l: &Layout, s: &Screen, a: f64) -> (Vec<f64>, Vec<(f64, f64)>, f64, Room) {
+        let room = Room { half_w: s.w as f64 * 0.5, radius: s.ar as f64 };
+        let (c, sn) = (a.cos(), a.sin());
+        let discs: Vec<Disc> = (0..l.xs.len()).map(|i| (l.xs[i] as f64, l.ys[i] as f64, (l.rs[i] << 8) as f64)).collect();
+        let (wx, wy, z) = camera::fit_at(&discs, c, sn, room);
+        let k0 = z / (1u64 << 24) as f64;
+        let (cu, cv) = (c * wx - sn * wy, sn * wx + c * wy);
+        let p = discs.iter().map(|&(x, y, _)| (k0 * (c * x - sn * y - cu), k0 * (sn * x + c * y - cv))).collect();
+        (discs.iter().map(|d| d.2).collect(), p, k0, room)
+    }
+
+    /// Which walls a pack touches (within a sixteenth of a pixel): the left edge, the right edge, the big circle's arc above its centre, below it.
+    fn walls_touched(r: &[f64], p: &[(f64, f64)], k: f64, room: Room) -> [bool; 4] {
+        let near = 1. / 16.;
+        let mut w = [false; 4];
+        for i in 0..r.len() {
+            let rho = k * r[i];
+            w[0] |= p[i].0 - rho + room.half_w < near;
+            w[1] |= room.half_w - p[i].0 - rho < near;
+            let d = (p[i].0 * p[i].0 + p[i].1 * p[i].1).sqrt();
+            let on = room.radius - d - rho < near;
+            w[2] |= on && p[i].1 < 0.;
+            w[3] |= on && p[i].1 > 0.;
+        }
+        w
+    }
+
+    /// The pack never overlaps (circle on circle, circle past a wall: a 256th of a pixel at most), every circle touches a neighbour or a wall (a sixteenth of a pixel, `jam::LOOSE`), and it is never smaller than the fit it started from; on random decks of 2 to 9 circles, both screens, three turns.
+    #[test]
+    fn pack_never_overlaps_and_touches() {
+        let (mut gain, mut n, mut most_sweeps, mut most_trials, mut loose) = (0f64, 0, 0, 0, 0);
+        let mut sides = [0u32; 4];
+        let t0 = std::time::Instant::now();
+        for s in &screens() {
+            for l in layouts(256) {
+                for a in [0., 0.7, 2.3] {
+                    let (r, mut p, k0, room) = pack_start(&l, s, a);
+                    let got = jam::pack(&r, &mut p, k0, room);
+                    let over = jam::overlap(&r, &p, got.k, room);
+                    assert!(over <= 1. / 256., "an overlap of {over} pixels ({} circles, {}x{})", r.len(), s.w, s.h);
+                    for i in 0..r.len() {
+                        let g = jam::gap(&r, &p, got.k, room, i);
+                        assert!(g <= 1. / 16. + 1. / 256., "circle {i} of {} is {g} pixels from everything", r.len());
+                    }
+                    assert!(got.k >= k0, "smaller than the fit");
+                    let w = walls_touched(&r, &p, got.k, room);
+                    for k in 0..4 {
+                        sides[k] += w[k] as u32;
+                    }
+                    gain += (got.k / k0).ln();
+                    n += 1;
+                    most_sweeps = most_sweeps.max(got.sweeps);
+                    most_trials = most_trials.max(got.trials);
+                    loose += got.loose;
+                }
+            }
+        }
+        let el = t0.elapsed();
+        println!("pack: A#{n} decks, the zoom A#{:.3}x the fit's on average (geometric), at most A#{most_trials} zooms tried and A#{most_sweeps} sweeps a deck, A#{loose} rattlers moved; walls touched (left, right, top arc, bottom arc) {sides:?} of A#{n}; A#{} us a deck on the host", (gain / n as f64).exp(), el.as_micros() / n as u128);
+    }
+
+    /// The same deck packs the same, bit for bit (a fixed order, no randomness), and a packed deck packed again stays where it is to within a sixteenth of a pixel.
+    #[test]
+    fn pack_is_deterministic() {
+        for s in &screens() {
+            for l in layouts(64) {
+                let (r, p0, k0, room) = pack_start(&l, s, 0.3);
+                let (mut p, mut q) = (p0.clone(), p0.clone());
+                let a = jam::pack(&r, &mut p, k0, room);
+                let b = jam::pack(&r, &mut q, k0, room);
+                assert!(a.k.to_bits() == b.k.to_bits() && p.iter().zip(&q).all(|(x, y)| x.0.to_bits() == y.0.to_bits() && x.1.to_bits() == y.1.to_bits()), "two packs of one deck differ");
+            }
+        }
+    }
+
+    /// The 8a's deck as its map logged it on 2026-11-21 (`map: deck: from ... circles`, x and y world ×256, r world units), at its turn: the pack's zoom against the fit's, the walls it touches, and the host's time.
+    #[test]
+    fn the_8a_deck() {
+        let c: [(i64, i64, i64); 12] = [(765149, -713735, 115), (958280, -685932, 109), (1024100, -783557, 203), (816503, -679874, 122), (840028, -899779, 83), (891443, -856861, 176), (892508, -667400, 154), (756336, -802752, 120), (804478, -851950, 146), (870413, -758901, 210), (969690, -859342, 127), (741217, -755728, 70)];
+        let l = Layout { xs: c.iter().map(|v| v.0).collect(), ys: c.iter().map(|v| v.1).collect(), rs: c.iter().map(|v| v.2).collect() };
+        let s = &screens()[0];
+        let (r, mut p, k0, room) = pack_start(&l, s, (15992f64).atan2(3562.));
+        let t0 = std::time::Instant::now();
+        let got = jam::pack(&r, &mut p, k0, room);
+        let el = t0.elapsed();
+        assert!(jam::overlap(&r, &p, got.k, room) <= 1. / 256.);
+        println!("the 8a's deck: zoom A#{:.4}x the fit's (fit G#{:X}, pack G#{:X} Q16), A#{} zooms tried, A#{} sweeps, pressure at the jam A#{:.4} px, A#{} rattlers; walls {:?}; A#{} us on the host", got.k / k0, (k0 * 65536. * 256.) as i64, (got.k * 65536. * 256.) as i64, got.trials, got.sweeps, got.pressure, got.loose, walls_touched(&r, &p, got.k, room), el.as_micros());
+        for i in 0..r.len() {
+            println!("  circle A#{i}: at ({:.2}, {:.2}) px, radius {:.2} px, gap {:.4} px", p[i].0, p[i].1, got.k * r[i], jam::gap(&r, &p, got.k, room, i));
+        }
+        let arc = |below: bool| (0..r.len()).filter(|&i| (p[i].1 > 0.) == below).map(|i| room.radius - (p[i].0 * p[i].0 + p[i].1 * p[i].1).sqrt() - got.k * r[i]).fold(f64::MAX, f64::min);
+        println!("  the big circle: A#{:.2} px above, A#{:.2} px below", arc(false), arc(true));
+        // The largest empty circle inside the room (a grid of 2 px): the void the pack left.
+        let mut hole = 0f64;
+        for gy in -(room.radius as i64)..(room.radius as i64) {
+            if gy % 2 != 0 { continue; }
+            for gx in -(room.half_w as i64)..(room.half_w as i64) {
+                if gx % 2 != 0 { continue; }
+                let (x, y) = (gx as f64, gy as f64);
+                let mut m = (room.half_w - x.abs()).min(room.radius - (x * x + y * y).sqrt());
+                for i in 0..r.len() { m = m.min(((x - p[i].0).powi(2) + (y - p[i].1).powi(2)).sqrt() - got.k * r[i]); }
+                hole = hole.max(m);
+            }
+        }
+        println!("  the largest hole: radius A#{hole:.1} px (the smallest circle A#{:.1} px)", r.iter().fold(f64::MAX, |a, &b| a.min(b)) * got.k);
     }
 }

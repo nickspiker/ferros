@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "ऊपर, फिर डेक पर",
         Msg::HelmRecent => "सबसे हाल का kist",
         Msg::HelmForward => "आगे, फिर से करने की तरह",
-        Msg::HelmCluster => "घेरों को एक साथ, छूते हुए",
+        Msg::HelmPack => "घेरों को स्क्रीन में भरें",
         Msg::HelmControls => "नियंत्रण छिपाओ या दिखाओ",
         Msg::HelmToDeck => "डेक पर",
         Msg::HelmFit => "सभी घेरे दृश्य में",

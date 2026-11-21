@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "juu, kisha nje kwenye sitaha",
         Msg::HelmRecent => "kist ya hivi karibuni",
         Msg::HelmForward => "mbele, kama kurudia",
-        Msg::HelmCluster => "kusanya miduara, ikigusana",
+        Msg::HelmPack => "panga miduara ijaze skrini",
         Msg::HelmControls => "ficha au onyesha vidhibiti",
         Msg::HelmToDeck => "nje kwenye sitaha",
         Msg::HelmFit => "miduara yote ionekane",

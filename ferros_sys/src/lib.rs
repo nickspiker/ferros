@@ -838,7 +838,7 @@ pub mod gpu {
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"), a device setting set thru the Settings capability: 0 never set (`audio::DEFAULT_LEVEL`), 1-255 dimmest to loudest, each step a 16th of an octave of amplitude (255 is full scale, 239 half, 1 almost 16 octaves down).
 pub const PREF_VOLUME: u64 = 46;
 
-/// Preference 47: what the helm's two buttons do (owner, 2026-11-18: "a settings addition to choose what back and home do"; docs/WINDOWS.md "The helm"), a choice per bit, 0 each default: bit 0 Back's tap goes out to the deck at a kist's top (else it stays in the kist), bit 1 Back's swipe in a kist goes forward, the Again key to the kist, a redo of its last step back (else to the most recent kist), bit 2 Back's swipe on the deck goes to the most recent kist (else it clusters the circles), bit 3 Deck's swipe in a kist goes to the deck (else it hides or shows the controls), bit 4 Deck's swipe on the deck clusters (else it fits every circle in view).
+/// Preference 47: what the helm's two buttons do (owner, 2026-11-18: "a settings addition to choose what back and home do"; docs/WINDOWS.md "The helm"), a choice per bit, 0 each default: bit 0 Back's tap goes out to the deck at a kist's top (else it stays in the kist), bit 1 Back's swipe in a kist goes forward, the Again key to the kist, a redo of its last step back (else to the most recent kist), bit 2 Back's swipe on the deck goes to the most recent kist (else it packs the circles into the screen), bit 3 Deck's swipe in a kist goes to the deck (else it hides or shows the controls), bit 4 Deck's swipe on the deck packs the circles into the screen (else it fits every circle in view).
 pub const PREF_HELM: u64 = 47;
 /// PREF_HELM's bits.
 pub mod helm {
@@ -846,7 +846,7 @@ pub mod helm {
     pub const BACK_SWIPE_FORWARD: u8 = 1 << 1;
     pub const BACK_SWIPE_DECK_RECENT: u8 = 1 << 2;
     pub const DECK_SWIPE_OUT: u8 = 1 << 3;
-    pub const DECK_SWIPE_DECK_CLUSTER: u8 = 1 << 4;
+    pub const DECK_SWIPE_DECK_PACK: u8 = 1 << 4;
 }
 
 /// Sound out (docs/AUDIO.md): the system's audio service, which owns the AoC's playback entry point and the speaker amplifiers and mixes every stream into one. A kist reaches it thru the `audio` right (ferros_kist::RIGHTS), a send right on the `audio` endpoint; the service is started by the kernel at the first call (process.rs `ON_DEMAND`) and ends once every stream has closed and played out, so silence holds no arc and the amplifiers sit in reset.

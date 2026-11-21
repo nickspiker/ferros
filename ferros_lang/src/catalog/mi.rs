@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "ki runga, kātahi ka puta ki te papa",
         Msg::HelmRecent => "te kist o mua tata",
         Msg::HelmForward => "whakamua, pēnei i te mahi anō",
-        Msg::HelmCluster => "kohia ngā porowhita, kia pā",
+        Msg::HelmPack => "whakakīia te mata ki ngā porowhita",
         Msg::HelmControls => "hunaia, whakaaturia rānei ngā mana",
         Msg::HelmToDeck => "ki te papa",
         Msg::HelmFit => "ngā porowhita katoa kia kitea",

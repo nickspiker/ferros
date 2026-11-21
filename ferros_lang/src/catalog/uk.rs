@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "вгору, потім на палубу",
         Msg::HelmRecent => "останній kist",
         Msg::HelmForward => "вперед, як повтор",
-        Msg::HelmCluster => "зібрати кола впритул",
+        Msg::HelmPack => "щільно вкласти кола в екран",
         Msg::HelmControls => "сховати або показати керування",
         Msg::HelmToDeck => "на палубу",
         Msg::HelmFit => "усі кола в полі зору",

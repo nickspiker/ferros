@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "lên, rồi ra boong",
         Msg::HelmRecent => "kist gần nhất",
         Msg::HelmForward => "tiến tới, như làm lại",
-        Msg::HelmCluster => "gom các vòng tròn, chạm nhau",
+        Msg::HelmPack => "xếp chặt các vòng tròn vào màn hình",
         Msg::HelmControls => "ẩn hoặc hiện điều khiển",
         Msg::HelmToDeck => "ra boong",
         Msg::HelmFit => "mọi vòng tròn trong khung",

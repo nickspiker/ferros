@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "pataas, saka lalabas sa kubyerta",
         Msg::HelmRecent => "ang pinakahuling kist",
         Msg::HelmForward => "pasulong, parang ulitin",
-        Msg::HelmCluster => "tipunin ang mga bilog, magkadikit",
+        Msg::HelmPack => "isiksik ang mga bilog sa screen",
         Msg::HelmControls => "itago o ipakita ang mga kontrol",
         Msg::HelmToDeck => "lalabas sa kubyerta",
         Msg::HelmFit => "lahat ng bilog sa tanaw",

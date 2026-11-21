@@ -22,7 +22,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::HelmUpOut => "remonter, puis sortir sur le pont",
         Msg::HelmRecent => "le kist le plus récent",
         Msg::HelmForward => "en avant, comme rétablir",
-        Msg::HelmCluster => "rassembler les cercles, qui se touchent",
+        Msg::HelmPack => "tasser les cercles dans l’écran",
         Msg::HelmControls => "masquer ou afficher les commandes",
         Msg::HelmToDeck => "sortir sur le pont",
         Msg::HelmFit => "tous les cercles en vue",
