@@ -163,7 +163,7 @@ pub fn record(shape: Shape) -> Compiled {
             // `Walk::pixel`: the base added (no lane carries: fluor's proof), the visible value turned to darkness, opaque.
             let noise = W { lo: (c.lo + base.lo) ^ U::splat(u32::MAX), hi: ((c.hi + base.hi) ^ U::splat(0xFFFF)) | U::splat(0xFFFF_0000) };
             let at = row + x;
-            let write = || {
+            let write = |dst: U| {
                 let px = if shape.layers {
                     let none = W { lo: U::splat(0), hi: U::splat(0) };
                     // Front to back: the chrome first (its rows only), the pane under it, then the noise under both.
@@ -176,12 +176,12 @@ pub fn record(shape: Shape) -> Compiled {
                     noise
                 };
                 match shape.out {
-                    Out::G2t => store_px(slot::OUT, at, px),
+                    Out::G2t => store_px(slot::OUT, dst, px),
                     Out::Baked | Out::Phases => {
                         let [cr, cg, cb] = bake(px, &odt);
                         if shape.out == Out::Baked {
                             // The baked pixel: R, G, B in its low three lanes, the fourth its transparency as bake.rs writes an opaque one's (2: Q14 1, shifted past the no-dither bit).
-                            store_px(slot::OUT, at, W { lo: (cg << 16) | cr, hi: U::splat(2 << 16) | cb });
+                            store_px(slot::OUT, dst, W { lo: (cg << 16) | cr, hi: U::splat(2 << 16) | cb });
                         } else {
                             let th = ssa::load8(slot::BLUE, blue_row + (x & U::splat(15)), 0, 0);
                             for (k, turn) in [0u32, 2, 3, 1].into_iter().enumerate() {
@@ -192,17 +192,19 @@ pub fn record(shape: Shape) -> Compiled {
                                     (s >> 8) - (s >> 16)
                                 };
                                 let word = (code(cb) << 24) | (code(cg) << 14) | (code(cr) << 4) | U::splat(3);
-                                ssa::store_at(slot::PHASE + k as u8, at, 2, 0, word);
+                                ssa::store_at(slot::PHASE + k as u8, dst, 2, 0, word);
                             }
                         }
                     }
                 }
             };
             if shape.clip {
+                // Outside the rect every store goes to a scratch line of its own (this row's, in the bench's scratch below the output: the index wraps in the 32-bit address), not a block skipped: no branch in the loop. (The first cut's `when` around the stores looked broken on the device, 15 us a rect, but the queue's stale uniforms were the cause, GPU-KISTS.md section 3; that form was not tried again.)
                 let inside = in_rows & x.ge(x0) & x.lt(x1);
-                ssa::when(inside, (), || write());
+                let spare = U::splat(((crate::layout::SCRATCH_AT as i64 - crate::layout::OUT_AT as i64) / 8) as u32) + (r & U::splat(255));
+                write(U::select(inside, at, spare));
             } else {
-                write();
+                write(at);
             }
             let i1 = i + U::splat(1);
             ((rng.lo, rng.hi, c.lo, c.hi, i1, x + dx), i1.lt(steps))

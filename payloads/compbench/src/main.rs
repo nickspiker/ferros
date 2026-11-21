@@ -5,7 +5,7 @@
 //!
 //! Spawn: `ferros-bridge spawn compbench.bin [mode [seconds]] --name compbench --use gpu --dma layers-32`
 //! Grant slots: 0 console, 1 gpu (use), 2 its GPU block (grown to 2^28 bytes).
-//! Modes: none or 0 every measure (the console has the lines); 1 the frame at 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor).
+//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's stale uniforms against calls (GPU-KISTS.md section 3). The rects and patches run thru calls, not the queue, for that reason.
 #![no_std]
 #![no_main]
 
@@ -359,6 +359,9 @@ impl Gpu {
         };
         let e = self.q.wait(j);
         let wall = ferros_sys::now() - t0;
+        if e.status != S_DONE {
+            say!("compbench: kernel A#{k} over A#{} groups: status A#{}, GPU address G#{:X}, AS_FAULTSTATUS G#{:X}; the queue ended A#{}, opened again {}\n", run.groups(), e.status, e.fault_address, e.fault_status, self.q.ended(), self.q.reopen());
+        }
         (wall, e.gpu_ticks().unwrap_or(0), e.status)
     }
 
@@ -540,6 +543,9 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
     ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 100);
     match mode {
         1..=4 => sustained(&mut gpu, mode, seconds),
+        5 => clip_probe(&mut gpu),
+        6..=9 => clip_sequence(&mut gpu, mode - 6),
+        10 => uniforms_probe(&mut gpu),
         _ => everything(&mut gpu),
     }
 }
@@ -548,11 +554,12 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
 fn sustained(gpu: &mut Gpu, mode: u8, seconds: u64) -> ! {
     let f = ferros_sys::freq();
     let period = f / 120;
-    let frames = seconds * 120;
+    let mut frames = 0u64;
     let (mut late, mut busy) = (0u64, 0u64);
     let start = ferros_sys::now();
     let mut next = start;
-    for _ in 0..frames {
+    while ferros_sys::now() < start + seconds * f {
+        frames += 1;
         let t0 = ferros_sys::now();
         match mode {
             1 => {
@@ -641,7 +648,7 @@ fn everything(gpu: &mut Gpu) -> ! {
             inner(who).0
         }
     };
-    say!("compbench rects: log2 pixels, w x h, where; NEON on the X3 (inline) and one A715 (its own time): least/mean us; the GPU back to back and after 2^6 ms idle: submit to wake mean us (its own); NEON's present of the rect on the X3 after either\n");
+    say!("compbench rects: log2 pixels, w x h, where; NEON on the X3 (inline) and one A715 (its own time): least/mean us; the GPU thru calls back to back and after 2^6 ms idle: call to reply mean us (its own); NEON's present of the rect on the X3 after either\n");
     for lg in 4..=20u32 {
         let (w, h) = (1usize << lg.div_ceil(2), 1usize << (lg / 2));
         for far in [false, true] {
@@ -655,8 +662,18 @@ fn everything(gpu: &mut Gpu) -> ! {
             }
             let (na, nb) = (spread(&a[..reps]), spread(&b[..reps]));
             let run = tables::Run::rect(x0, y0, x1, y1);
-            let (gw, gg) = gpu.runs(K_CLIP, &run, OUT_AT, reps, 0);
-            let (iw, ig) = gpu.runs(K_CLIP, &run, OUT_AT, 4, 1 << 6);
+            for y in y0..y1 {
+                px(OUT_AT, W * H)[y * W + x0..y * W + x1].fill(0x5555_5555_5555_5555);
+            }
+            let (gw, gg) = call_runs(K_CLIP, &run, reps, 0);
+            let mut left = 0usize;
+            for y in y0..y1 {
+                left += px(OUT_AT, W * H)[y * W + x0..y * W + x1].iter().filter(|&&p| p == 0x5555_5555_5555_5555).count();
+            }
+            if left != 0 {
+                say!("compbench rect 2^A#{lg}: A#{left} of its pixels not written by the GPU\n");
+            }
+            let (iw, ig) = call_runs(K_CLIP, &run, 4, 1 << 6);
             let t0 = ferros_sys::now();
             run_rows(&Task { who: 0, stages: PRESENT, y0, rows: h, x0, x1, dest: OUT_AT }, y0, y1);
             let pres = us(ferros_sys::now() - t0);
@@ -673,14 +690,18 @@ fn everything(gpu: &mut Gpu) -> ! {
         }
         let (na, nb) = (spread(&a), spread(&b));
         let run = tables::Run::rect(x0, y0, x1, y1);
-        let (gw, gg) = gpu.runs(K_CLIP, &run, OUT_AT, 8, 0);
-        let (iw, ig) = gpu.runs(K_CLIP, &run, OUT_AT, 4, 1 << 6);
+        let (gw, gg) = call_runs(K_CLIP, &run, 8, 0);
+        let (iw, ig) = call_runs(K_CLIP, &run, 4, 1 << 6);
         say!("compbench {name}: NEON X3 A#{}/A#{}/A#{} us, A715 A#{}/A#{}/A#{} us; GPU warm A#{} us (own A#{}), idle A#{} us (own A#{})\n", na.0, na.1, na.2, nb.0, nb.1, nb.2, gw.1, gg.1, iw.1, ig.1);
     }
     // ---- the handoff ----
     // NEON's patch and the GPU's job of the same pixels: how far apart.
     let (x0, y0, x1, y1) = (200usize, 800usize, 456usize, 896usize);
-    gpu.job(K_CLIP, &tables::Run::rect(x0, y0, x1, y1), OUT_AT);
+    // A mark first, so a GPU job that wrote nothing shows as every pixel differing.
+    for y in y0..y1 {
+        px(OUT_AT, W * H)[y * W + x0..y * W + x1].fill(0x5555_5555_5555_5555);
+    }
+    call_job(K_CLIP, &tables::Run::rect(x0, y0, x1, y1), OUT_AT);
     let keep = px(SCRATCH_AT, (x1 - x0) * (y1 - y0));
     for y in y0..y1 {
         keep[(y - y0) * (x1 - x0)..(y - y0 + 1) * (x1 - x0)].copy_from_slice(&px(OUT_AT, W * H)[y * W + x0..y * W + x1]);
@@ -706,7 +727,7 @@ fn everything(gpu: &mut Gpu) -> ! {
         for y in py0..py1 {
             keep[(y - py0) * 4..(y - py0 + 1) * 4].copy_from_slice(&px(OUT_AT, W * H)[y * W + px0..y * W + px1]);
         }
-        let (w, _, s) = gpu.job(K_CLIP, &tables::Run::rect(1005, py0, 1013, py1), OUT_AT);
+        let (w, _, s) = call_job(K_CLIP, &tables::Run::rect(1005, py0, 1013, py1), OUT_AT);
         let mut clobbered = 0;
         for y in py0..py1 {
             for x in px0..px1 {
@@ -718,6 +739,127 @@ fn everything(gpu: &mut Gpu) -> ! {
         say!("compbench handoff pass A#{pass}: NEON patched A#{} pixels mid-line after the GPU's frame, then a GPU job (status A#{s}, A#{} us) wrote the rest of their lines: A#{clobbered} of the patch's pixels changed under it\n", (px1 - px0) * (py1 - py0), us(w));
     }
     say!("compbench: done\n");
+    exit(0);
+}
+
+/// Mode 5: what the clip kernel writes on the device (its GPU time was 15 us for every rect: too little for the walk). Each rect marked, the kernel run, then the rows and columns it wrote and how its pixels compare with the whole-frame kernel's; then the clip kernel over the whole frame against the whole-frame kernel.
+fn clip_probe(gpu: &mut Gpu) -> ! {
+    let frame = tables::Run::frame();
+    gpu.job(K_BAKED, &frame, BAKED_AT);
+    let reference = px(BAKED_AT, W * H);
+    for (x0, y0, x1, y1) in [(1072usize, 1000usize, 1328usize, 1256usize), (200, 800, 456, 896), (0, 0, W, H), (672, 1000, 688, 1016)] {
+        let out = px(OUT_AT, W * H);
+        for y in y0..y1 {
+            out[y * W + x0..y * W + x1].fill(0x5555_5555_5555_5555);
+        }
+        let run = tables::Run::rect(x0, y0, x1, y1);
+        let (w, g, s) = gpu.job(K_CLIP, &run, OUT_AT);
+        let (mut written, mut rows, mut far, mut near, mut wrong) = (0usize, 0usize, 0usize, W, 0usize);
+        for y in y0..y1 {
+            let mut any = false;
+            for x in x0..x1 {
+                let p = out[y * W + x];
+                if p != 0x5555_5555_5555_5555 {
+                    written += 1;
+                    any = true;
+                    far = far.max(x);
+                    near = near.min(x);
+                    if p != reference[y * W + x] {
+                        wrong += 1;
+                    }
+                }
+            }
+            rows += any as usize;
+        }
+        say!("compbench clip probe {x0},{y0} to {x1},{y1}: A#{} groups, status A#{s}, A#{} us (GPU A#{} us): A#{written} of A#{} written in A#{rows} rows, columns A#{near} to A#{far}; A#{wrong} written differ from the whole-frame kernel\n", run.groups(), us(w), us(g), (x1 - x0) * (y1 - y0));
+    }
+    exit(0);
+}
+
+/// Mode 6: the clip kernel wrote everything in mode 5 and nothing inside mode 0's run. Here it runs 2^6 times over the hover's rect, each time after one of the other kernels' whole frames (none, noise, compose, baked, phases in turn), each run's pixels counted: which neighbour, or which count, leaves it writing nothing.
+fn clip_sequence(gpu: &mut Gpu, how: u8) -> ! {
+    // how: bit 0 the clock held and let go first (op 6, as mode 0 does before its rects), bit 1 a NEON patch of the rect on this thread and one A715 before each GPU job (as mode 0 times them).
+    if how & 1 != 0 {
+        say!("compbench clip sequence: held {}, let go {}\n", gpu.hold(true), gpu.hold(false));
+    }
+    let (x0, y0, x1, y1) = (200usize, 800usize, 456usize, 896usize);
+    let run = tables::Run::rect(x0, y0, x1, y1);
+    let frame = tables::Run::frame();
+    let mut line = [0u8; 64];
+    for i in 0..64 {
+        let before = [usize::MAX, K_NOISE, K_G2T, K_BAKED, K_PHASES][i % 5];
+        if before != usize::MAX {
+            gpu.job(before, &frame, BAKED_AT);
+        }
+        if how & 2 != 0 {
+            let t = Task { who: 0, stages: LAYERS | NOISE | BAKE, y0, rows: y1 - y0, x0, x1, dest: OUT_AT };
+            run_rows(&t, y0, y1);
+            dispatch(Task { who: A715_1, ..t });
+        }
+        let out = px(OUT_AT, W * H);
+        for y in y0..y1 {
+            out[y * W + x0..y * W + x1].fill(0x5555_5555_5555_5555);
+        }
+        let (_, g, s) = gpu.job(K_CLIP, &run, OUT_AT);
+        let mut written = 0usize;
+        for y in y0..y1 {
+            written += out[y * W + x0..y * W + x1].iter().filter(|&&p| p != 0x5555_5555_5555_5555).count();
+        }
+        line[i] = if s != S_DONE { b'F' } else if written == 0 { b'0' } else if written == (x1 - x0) * (y1 - y0) { b'W' } else { b'p' };
+        if i < 10 || written != (x1 - x0) * (y1 - y0) {
+            say!("compbench clip sequence A#{i} (after kernel A#{}): status A#{s}, GPU A#{} us, A#{written} written\n", before as i64, us(g));
+        }
+    }
+    say!("compbench clip sequence: {}\n", core::str::from_utf8(&line).unwrap_or("?"));
+    exit(0);
+}
+
+/// Kernel `k` over `run` thru a call (op 1: its uniforms copied by the service into its own descriptor page, which the GPU maps non-cacheable), not the queue: the caller's call to its reply and the GPU's own time, ticks, and the status.
+fn call_job(k: usize, run: &tables::Run, out_at: usize) -> (u64, u64, u64) {
+    let kk = kernel(k);
+    let mut u = [0u64; 64];
+    let n = tables::uniforms(&mut u, run, ferros_sys::gpu::ARENA_VA, out_at, SCROLL, OFFSET, walk(), &tables::odt_scaled(ferros_sys::akita()), kk.consts);
+    let preload = ferros_sys::gpu::PRELOAD_X | if kk.regs64 { ferros_sys::gpu::PRELOAD_REGS64 } else { 0 };
+    let mut msg = [0u8; 18 + 8 * 64];
+    msg[0] = 1;
+    msg[1..3].copy_from_slice(&preload.to_le_bytes());
+    msg[3..7].copy_from_slice(&((K_AT + k * K_ROOM) as u32).to_le_bytes());
+    msg[7..9].copy_from_slice(&(kk.words.len() as u16).to_le_bytes());
+    msg[9..13].copy_from_slice(&run.groups().to_le_bytes());
+    msg[13..17].copy_from_slice(&1u32.to_le_bytes());
+    msg[17] = n as u8;
+    for i in 0..n {
+        msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&u[i].to_le_bytes());
+    }
+    let mut reply = [0u8; 17];
+    let t0 = ferros_sys::now();
+    let r = ferros_sys::call(unsafe { GRANTS_GPU }, &msg[..18 + 8 * n], &mut reply);
+    let wall = ferros_sys::now() - t0;
+    let gpu = if r >= 9 && reply[0] == 0 { u32::from_le_bytes([reply[5], reply[6], reply[7], reply[8]]) as u64 * ferros_sys::freq() / 1_000_000 } else { 0 };
+    (wall, gpu, reply[0] as u64)
+}
+
+/// Mode 10: two rects in the pattern A, A, B (period 3 against the queue's 4 records, so a record is reused with other uniforms), small jobs only (nothing evicting the GPU's L2 between them), each run's rect counted as written whole (W), partly (p) or not (0); thru the queue, then thru calls.
+fn uniforms_probe(gpu: &mut Gpu) -> ! {
+    let rects = [(200usize, 800usize, 456usize, 896usize), (1072, 1000, 1328, 1064)];
+    for thru_calls in [false, true] {
+        let mut line = [0u8; 48];
+        for (i, c) in line.iter_mut().enumerate() {
+            let (x0, y0, x1, y1) = rects[(i % 3 == 2) as usize];
+            let out = px(OUT_AT, W * H);
+            for y in y0..y1 {
+                out[y * W + x0..y * W + x1].fill(0x5555_5555_5555_5555);
+            }
+            let run = tables::Run::rect(x0, y0, x1, y1);
+            let (_, _, s) = if thru_calls { call_job(K_CLIP, &run, OUT_AT) } else { gpu.job(K_CLIP, &run, OUT_AT) };
+            let mut written = 0usize;
+            for y in y0..y1 {
+                written += out[y * W + x0..y * W + x1].iter().filter(|&&p| p != 0x5555_5555_5555_5555).count();
+            }
+            *c = if s != 0 { b'F' } else if written == 0 { b'0' } else if written == (x1 - x0) * (y1 - y0) { b'W' } else { b'p' };
+        }
+        say!("compbench uniforms probe thru {}: {}\n", if thru_calls { "calls" } else { "the queue" }, core::str::from_utf8(&line).unwrap_or("?"));
+    }
     exit(0);
 }
 
@@ -746,4 +888,25 @@ fn patch_scrolled(x0: usize, y0: usize, x1: usize, y1: usize) {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("compbench: panic: {}\n", info);
     exit(0xDEAD);
+}
+
+/// `call_job` `n` times (after one unmeasured when back to back, or each after `gap_ms` idle): the call to its reply and the GPU's own time, least/mean/most µs. Calls, not the queue: the queue's records reused with other uniforms are read stale by the GPU (mode 10).
+fn call_runs(k: usize, run: &tables::Run, n: usize, gap_ms: u64) -> ((u64, u64, u64), (u64, u64, u64)) {
+    let (mut wall, mut gpu) = ([0u64; 16], [0u64; 16]);
+    if gap_ms == 0 {
+        call_job(k, run, OUT_AT);
+    }
+    for i in 0..n {
+        if gap_ms != 0 {
+            ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000 * gap_ms);
+        }
+        let (w, g, s) = call_job(k, run, OUT_AT);
+        if s != 0 {
+            say!("compbench: call of kernel A#{k} status A#{s}\n");
+            exit(1);
+        }
+        wall[i] = w;
+        gpu[i] = g;
+    }
+    (spread(&wall[..n]), spread(&gpu[..n]))
 }
