@@ -144,6 +144,8 @@ const ICONS_MAX: usize = 1 << 16;
 /// Display ops for the icon cache (payloads/display, ferros_kept::icon `Cache`): whether it holds an icon built, by its `hp`; and a piece of an icon's texels.
 const OP_ICON_HAVE: u8 = 78;
 const OP_ICON_PUT: u8 = 79;
+/// Display op 80 `windows as they stood [surface u8][generation u8]` (generation 0: none): said to a display that started again, and at the map's own start (WINDOWS.md "A display started again").
+const OP_WINDOWS_STOOD: u8 = 80;
 /// The texels in one `OP_ICON_PUT`: a call's message is at most 4 KiB, less the op, the icon and the offset.
 const ICON_PIECE: usize = 4032;
 
@@ -5356,14 +5358,25 @@ impl Map {
         }
         // The kist last brought to the front (home clears it, op 60), while it still runs (one that ended is not started by a restart).
         let front = self.front_kist.filter(|c| self.live.as_ref().is_some_and(|l| l.contains(c)));
-        ferros_sys::console_flash(self.grants, alloc::format!("map: the display started again (frames A#{frames}); the kist in front {}", if front.is_some() { "launched again" } else { "none" }).as_bytes());
+        // Its window by surface and generation, as init knows it: a kist that runs is answered RUNNING with them and nothing is started.
+        let mut at = (0u8, 0u8);
+        if let Some(c) = front {
+            let mut m = [0u8; 33];
+            m[0] = ferros_kist::launch::OP_LAUNCH;
+            m[1..].copy_from_slice(&c);
+            let mut r = [ferros_kist::launch::REFUSED, 0, 0, 0];
+            if call(cap(self.grants, S_LAUNCH), &m, &mut r) == 3 && r[0] == ferros_kist::launch::RUNNING {
+                at = (r[1], r[2]);
+            }
+        }
+        // Said before anything else to the new display: its apps' first watches wait for it (display op 80), so the one in front hears its frame is wanted again, never "behind" (Lumis ends on "behind"), and the rest hear "behind".
+        let mut r = [0u8; 1];
+        call(self.display, &[OP_WINDOWS_STOOD, at.0, at.1], &mut r);
+        ferros_sys::console_flash(self.grants, alloc::format!("map: the display started again (frames A#{frames}); the window in front {}", if at.1 != 0 { alloc::format!("surface A#{} generation A#{}", at.0, at.1) } else { alloc::string::String::from("none") }).as_bytes());
+        // Marked in front again by the eight-a-second look once its window shows (its show comes as it makes its frame again).
         self.app_front = false;
         self.send_scene();
         self.draw();
-        if let Some(i) = front.and_then(|c| self.circle_of(&c)) {
-            self.launch(i);
-            self.app_front = false;
-        }
         true
     }
 
@@ -6061,6 +6074,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         for (c, (x, y)) in map.deck.circles.iter_mut().zip(xs.iter().zip(&ys)) {
             c.at = deck::At { x: x << 8, y: y << 8 };
         }
+    }
+    // A map starting knows no app in front: any app of a display that started with it (the restart of both) hears it is behind, and is brought back by a tap on its circle (display op 80; a display that never restarted has none waiting, and answers nothing).
+    {
+        let mut r = [0u8; 1];
+        call(map.display, &[OP_WINDOWS_STOOD, 0, 0], &mut r);
     }
     // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
     if DEV {

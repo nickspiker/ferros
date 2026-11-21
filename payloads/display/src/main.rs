@@ -3540,10 +3540,10 @@ static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), and the system's own (78 and 79, the icon cache): their caller's holdings are asked of the kernel as they arrive.
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), and the system's own (78 and 79, the icon cache; 80, the windows as they stood): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7621,6 +7621,18 @@ extern "C" fn receive(grants: u64) -> ! {
             }
             continue;
         }
+        // 80 `windows as they stood [surface u8][generation u8]` (2026-11-20, WINDOWS.md "A display started again"): from the deck after this display started again, the window that was in front (generation 0: none). Every app of the display before, held at its first watch until now, hears it: the one in front that the display's bake changed (it makes its frame again and shows it), the others that they are behind (events.rs `restore`). The system's alone: [4] (`NOT_YOURS`) from another caller.
+        if op == 80 && n >= 3 {
+            if system(h) {
+                let front = (msg[2] != 0 && (msg[1] as usize) < SURFACES).then_some((msg[1] as usize, msg[2]));
+                let (told, fronted) = events::restore(front);
+                ferros_sys::reply(&tok, &[0]);
+                ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: the deck says how the windows stood (in front: {}); re-attached apps told G#{told:X}, of them in front G#{fronted:X}", front.map_or(alloc::string::String::from("none"), |(k, g)| alloc::format!("surface A#{k} generation A#{g}"))).as_bytes());
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
+            }
+            continue;
+        }
         // 69 `keyboard watch [seen u32]`: the system keyboard's doorbell (keyboard.rs; WINDOWS.md "The keyboard"), held until whether an app wants the keyboard changed past `seen` → [0][count u32][wanted u8]. The system's alone: [4] (`NOT_YOURS`) from another caller.
         if op == 69 && n >= 5 {
             if system(h) {
@@ -8158,6 +8170,11 @@ fn server(grants: u64) -> ! {
     // A second console writer: `log` is lent to the op handler for the whole pass.
     let mut tlog = Log { grants, buf: [0; 256], n: 0 };
     unsafe { SCREEN_WH = (width as u16, height as u16) };
+    // The surfaces' owners known before the first call is taken (`live_gen`): registered after the receive thread, a display started again took its apps' first watches under generation 0, then dropped them as another owner's when the generation came (2026-11-20, the Pro).
+    let surf_bell = ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE);
+    if surf_bell {
+        SURF_BELL.store(true, Ordering::Release);
+    }
     if ferros_sys::thread_spawn(receive, unsafe { &mut *(&raw mut RECV_STACK) }, grants) != 0 {
         log.s(b"display: no receive thread\n");
         log.flush();
@@ -8201,8 +8218,7 @@ fn server(grants: u64) -> ! {
         log.flush();
     }
     // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
-    if ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE) {
-        SURF_BELL.store(true, Ordering::Release);
+    if surf_bell {
         if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
             log.s(b"display: no reaper thread\n");
             log.flush();
