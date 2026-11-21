@@ -110,3 +110,14 @@ fn weather() {
     assert_eq!(words[0][0], "6\u{B0}C");
     assert!(weather::deadline(&f, f.now.time) > f.now.time);
 }
+
+#[test]
+fn thermo() {
+    let r = thermo::Reading { object: Some(21.25), sensor: Some(28.07) };
+    let words = both("thermo", 0, |w, focus| thermo::face(w, &r, focus));
+    assert_eq!(words[0], ["21.3\u{B0}C", "28.1\u{B0}C"]);
+    assert_eq!(words[1], ["21.25\u{B0}C", "28.07\u{B0}C"]);
+    let none = thermo::Reading::default();
+    let words = both("thermo, no sample yet", 0, |w, focus| thermo::face(w, &none, focus));
+    assert!(words[0].is_empty());
+}

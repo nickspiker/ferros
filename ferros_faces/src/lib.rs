@@ -11,6 +11,7 @@
 pub mod compass;
 pub mod gps;
 pub mod sky;
+pub mod thermo;
 pub mod tide;
 pub mod weather;
 #[cfg(test)]
