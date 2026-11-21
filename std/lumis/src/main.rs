@@ -1855,29 +1855,9 @@ impl FluorApp<G2t16> for Lumis {
         ctx.window.request_redraw();
     }
 
-    /// The person's app scale set from outside (ferros_fluor following preference 14: the Settings page, another kist's pinch): Lumis's words drawn at it, never a pinch of the picture (the default would take it as one about the centre).
+    /// The person's app scale set from outside (ferros_fluor following preference 14: the Settings page, another kist's pinch, or Lumis's own pinch written back at its end): Lumis laid out at it.
     fn on_zoom_set(&mut self, _factor: f32, ctx: &mut Context) {
         self.follow_scale(ctx);
-    }
-
-    /// On the camera screen a pinch is the picture's (lumis_core `touch::pinch`: open past a half octave for 1:1 about the fingers, close past one for the fit view), so the host leaves the app scale alone and ferros_fluor writes none back; on the menu it is the person's app scale, as in any kist.
-    fn owns_zoom_gesture(&self) -> bool {
-        matches!(self.screen, Screen::Camera(_))
-    }
-
-    fn on_zoom(&mut self, factor: f32, anchor_x: f32, anchor_y: f32, ctx: &mut Context) {
-        if let Screen::Camera(ui) = &mut self.screen {
-            if lumis_core::ui::touch::pinch(ui, factor, anchor_x, anchor_y) {
-                self.changed = true;
-                ctx.window.request_redraw();
-            }
-        }
-    }
-
-    fn on_zoom_end(&mut self, _ctx: &mut Context) {
-        if let Screen::Camera(ui) = &mut self.screen {
-            lumis_core::ui::touch::pinch_end(ui);
-        }
     }
 
     fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
@@ -2182,7 +2162,7 @@ fn main() {
     }
     let cameras = list();
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch on the menu is written back as the app scale with the display grant, one on the camera screen is the picture's.
+    // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch anywhere in Lumis is the app scale (the owner, 2026-11-20: "RU everywhere. Should inherit the global RU"), written back with the display grant at its end.
     match ferros_fluor::run_app(Lumis::new(cameras, vault), caps, None, sys::cap(DISPLAY)) {
         Ok(()) => println!("lumis: closed"),
         Err(e) => println!("lumis: {e}"),
