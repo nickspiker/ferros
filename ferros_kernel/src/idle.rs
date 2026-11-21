@@ -1,7 +1,7 @@
 //! The kernel core's idle while dark (POWER.md "Deep idle", 2026-11-13: the owner lost half the battery overnight with the screen off).
 //!
 //! Tickless: with the screen off and no worker up, the service loop sleeps in `wfi` until the next thing due (a thread's deadline, its own quarter-second duties), not on the event stream every 2.7 ms and the 2 ms backstop.
-//! The core's power-down (PSCI c2) and the keeper that holds the keys meanwhile are on the deep-sleep branch until EL3 accepts ferros's CPU_SUSPEND (POWER.md "c2 is refused by EL3").
+//! The core's power-down (PSCI c2) and the keeper that holds the keys meanwhile are on the deep-sleep branch (worktree-agent-ad6164a08c7d8c6e9, tip dc85522c, kept in /mnt/Harbor/Code/ferros-branches-2026-11-20.bundle since the branches were deleted on 2026-11-20) until EL3 accepts ferros's CPU_SUSPEND (POWER.md "c2 is refused by EL3").
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
