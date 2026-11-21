@@ -554,6 +554,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_gpuq"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_mailbox"
 version = "0.1.0"
 
@@ -561,6 +565,7 @@ version = "0.1.0"
 name = "ferros_sys"
 version = "0.1.0"
 dependencies = [
+ "ferros_gpuq",
  "ferros_mailbox",
  "ferros_theme",
  "tatau",
