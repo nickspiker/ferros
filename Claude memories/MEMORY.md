@@ -55,6 +55,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 ## Vocabulary
 - [ferros vocabulary](ferros_vocabulary.md) - photon, beam, kist, stow, puck, the deck (Deck/Back), the hold, pandok, GPS
 - [Pucks draw squares](pucks_draw_squares.md) - on the 8a; deck = settings, kists, pucks only (display widgets deleted); basecalc dial
+- [Deck packs into the screen](deck_pack_into_screen.md) - jammed pack touching all sides by compression + pressure; halve the distance each frame; after the GPU queue fix
 
 ## Owner decisions and design
 - [Owner decisions 2026-11-19](owner_decisions_2026_11_19.md) - approved: RAW video first, heat any method, GPU fence + host Mesa; NOT approved: gnss/fgtw fetch, camera cap, A510s, gain floor, motion right
