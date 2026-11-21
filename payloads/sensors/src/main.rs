@@ -3,9 +3,10 @@
 //! The kernel keeps the AoC's start — its rails, the firmware through GSA and Trusty: secure-world calls it makes on the `sensors` switch's word (decision 2, 2026-11-01: no FF-A door for EL0). This process turns the switch on, waits for the AoC to come online, then holds the whole conversation: the kernel has no USF of its own. Should it end, init's keeper starts another.
 //!
 //! Spawn: ferros-bridge spawn sensors.bin --name sensors --dma aoc-ipc --hw aoc-mbox --store aoc --sensors --power sensors
-//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch, 6 the AoC's a32 mailbox line (`aoc-mbox-a32`: the kernel adds it after the Sensors right's holder's last slot, as it adds pcie1's line), 7 the motion mailbox's writer's region (`motion-mailbox`, added the same way since 2026-11-19).
+//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch, 6 the AoC's a32 mailbox line (`aoc-mbox-a32`: the kernel adds it after the Sensors right's holder's last slot, as it adds pcie1's line), 7 the motion mailbox's writer's region (`motion-mailbox`, added the same way since 2026-11-19), 8 the thermometer's (`thermo-mailbox`, since 2026-11-20).
 //!
 //! The motion mailbox (ferros_sys::mailbox, ferros_mailbox::motion; docs/SENSORS.md "The motion mailbox"; owner, 2026-11-19: "same with accelerometer, mic, etc."): gravity, its last two samples, the field and the accelerometer, published with each sample of any, for any number of readers waiting on it, none of them calling this process.
+//! The thermo mailbox (ferros_mailbox::thermo; docs/SENSORS.md "The thermo mailbox"; owner, 2026-11-20): the IR thermometer's object and sensor temperatures and every float of its samples, both ranges, published with each sample of either.
 //! The block the kernel reads stays as it was (SYS_FACTS, SYS_LIGHT, the wake rule).
 #![no_std]
 #![no_main]
@@ -26,6 +27,8 @@ pub const S_POWER: u64 = 5;
 pub const S_DOORBELL: u64 = 6;
 /// The motion mailbox's writer's region, which the kernel hands with the Sensors right after the line.
 pub const S_MOTION: u64 = 7;
+/// The thermometer's mailbox's writer's region, which the kernel hands with the Sensors right after motion's.
+pub const S_THERMO: u64 = 8;
 
 global_asm!(
     r#"
@@ -72,6 +75,8 @@ const DISPLAY_HZ: u32 = 120;
 const GRAVITY_MS: u64 = 10;
 /// The accelerometer's period for the motion mailbox (2026-11-19): 2^4 ms, about 62 a second, the owner's knob.
 const ACCEL_MS: u64 = 1 << 4;
+/// The IR thermometer's batching (2026-11-20): the AoC samples it at its own fixed rates whatever period is asked (64 a second in the normal range, 20 in the extended: their sensor info's least and most delay are one value) and holds the samples up to 2^9 ms, so each range wakes this process about twice a second (docs/SENSORS.md "The thermo mailbox").
+const THERMO_MS: u64 = 1 << 9;
 
 pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -141,6 +146,18 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         None => out.push_str("sensors: no ICM45631 Accelerometer listed: the motion mailbox carries no acceleration\n"),
     }
+    // The IR thermometer for the thermo mailbox (2026-11-20), both ranges, continuous, batched up to 2^9 ms: no unsubscribe is known in USF, so it streams from here on (docs/SENSORS.md "The thermo mailbox").
+    // Found by their names in husky's registry and the AoC's firmware ("MLX90632 FIR Temperature", "MLX90632 FIR Extended Temperature"); another board has no such part, and the mailbox stays empty.
+    for name in ["MLX90632 FIR Temperature", "MLX90632 FIR Extended Temperature"] {
+        match usf::find(name) {
+            Some(h) => {
+                usf::subscribe_batched(h, THERMO_MS, THERMO_MS, 1, false, &mut out);
+            }
+            None => {
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("sensors: no {name} listed: the thermo mailbox leaves that range empty\n"));
+            }
+        }
+    }
     say(&out);
     out.clear();
     // The block is valid from here: the kernel answers from it once the magic is written.
@@ -156,6 +173,13 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     let mut motion_seen = (0u64, 0u64, 0u64);
     let mut motion_w = [0u64; ferros_sys::mailbox::motion::WORDS];
+    // The thermo mailbox: the thermometer's two ranges, published when either has a new sample. None from a kernel before 2026-11-20 (no such slot).
+    let thermo = ferros_sys::mailbox::Writer::take(cap(grants, S_THERMO));
+    if thermo.is_none() {
+        say("sensors: no thermo mailbox to publish in\n");
+    }
+    let mut thermo_seen = (0u32, 0u32);
+    let mut thermo_w = [0u64; ferros_sys::mailbox::thermo::WORDS];
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -168,6 +192,13 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if counts != motion_seen {
                 motion_seen = counts;
                 w.publish(ferros_sys::mailbox::motion::KIND, &motion_w);
+            }
+        }
+        if let Some(w) = &thermo {
+            let counts = usf::thermo_words(&mut thermo_w);
+            if counts != thermo_seen {
+                thermo_seen = counts;
+                w.publish(ferros_sys::mailbox::thermo::KIND, &thermo_w);
             }
         }
         // The display's state follows the screen (the under-display sensor times its bursts to the panel), and the light scope follows its preference: both the kernel's to watch before the move.

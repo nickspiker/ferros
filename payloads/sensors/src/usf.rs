@@ -493,6 +493,9 @@ fn sample(p: &[u8]) {
             let ticks = ((ts & 0x00FF_FFFF_FFFF_FFFF) as u128 * freq() as u128 / 1_000_000_000) as u64;
             ACCEL = (w(0) | w(1) << 32, w(2) | (n.wrapping_add(1).max(1) as u64) << 32, ticks);
         }
+        if ty == THERMO_TYPES[0] || ty == THERMO_TYPES[1] {
+            thermo(ty, count, size, p);
+        }
         if ty != 22 || size < 12 {
             return;
         }
@@ -513,6 +516,52 @@ fn sample(p: &[u8]) {
             PAIR[2] = ticks;
         }
     }
+}
+
+/// The IR thermometer's USF types (MLX90632, 2026-10-24 by hand, docs/SENSORS.md "Every sensor"): the normal range, then the extended; their index is the thermo mailbox's range (ferros_mailbox::thermo `NORMAL`, `EXTENDED`).
+pub const THERMO_TYPES: [u16; 2] = [56, 67];
+/// Each range's block of the thermo mailbox as the samples come (ferros_mailbox::thermo `Range`).
+static mut THERMO: [ferros_sys::mailbox::thermo::Range; 2] = [ferros_sys::mailbox::thermo::Range { samples: 0, floats: 0, aoc_ns: 0, at: 0, raw: [0.; ferros_sys::mailbox::thermo::FLOATS] }; 2];
+/// How many of each range's first samples are said whole on the console (every float, the AoC's time): the unnamed floats read on the device.
+const THERMO_SAID: u32 = 1 << 2;
+
+/// A thermometer sample event (type 56 or 67): the newest sample kept whole, its time as the AoC stamped it and on ferros's counter, and the first `THERMO_SAID` samples of each range said on the console.
+fn thermo(ty: u16, count: u8, size: u8, p: &[u8]) {
+    use ferros_sys::mailbox::thermo::FLOATS;
+    let k = (ty == THERMO_TYPES[1]) as usize;
+    let floats = size as usize / 4;
+    // WHY the min: the sample's size is the AoC's byte; the block keeps `FLOATS` and says how many there were.
+    let kept = floats.min(FLOATS);
+    let fq = freq() as u128;
+    for s in 0..count as usize {
+        let a = 16 + s * (8 + size as usize);
+        let ns = u32_at(p, a).unwrap_or(0) as u64 | (u32_at(p, a + 4).unwrap_or(0) as u64) << 32;
+        let r = unsafe { &mut (*(&raw mut THERMO))[k] };
+        // WHY the floor of one: the count is a reader's "a sample has come" flag (zero: none yet), so its wrap past 2^32 skips zero.
+        r.samples = r.samples.wrapping_add(1).max(1);
+        r.floats = floats as u32;
+        r.aoc_ns = ns;
+        r.at = ((ns & 0x00FF_FFFF_FFFF_FFFF) as u128 * fq / 1_000_000_000) as u64;
+        r.raw = [0.; FLOATS];
+        for i in 0..kept {
+            r.raw[i] = f32::from_bits(u32_at(p, a + 8 + 4 * i).unwrap_or(0));
+        }
+        if r.samples <= THERMO_SAID {
+            let mut line = alloc::format!("usf: thermometer type A#{ty} sample A#{} (A#{s} of an event of A#{count}) at A#{ns} ns, A#{floats} floats:", r.samples);
+            for i in 0..floats {
+                let _ = write!(line, " {}", f32::from_bits(u32_at(p, a + 8 + 4 * i).unwrap_or(0)));
+            }
+            line.push('\n');
+            crate::say(&line);
+        }
+    }
+}
+
+/// The thermo mailbox's payload (ferros_mailbox::thermo): both ranges. Answers their sample counts, which move with each sample of either.
+pub fn thermo_words(w: &mut [u64; ferros_sys::mailbox::thermo::WORDS]) -> (u32, u32) {
+    let r = unsafe { &*(&raw const THERMO) };
+    ferros_sys::mailbox::thermo::encode(r, w);
+    (r[0].samples, r[1].samples)
 }
 
 /// The light waveform's format (FlickerFormat: f0 rate Hz, f1 code — bytes per sample —, f2 little-endian, f3 low bits to ignore).
@@ -863,11 +912,16 @@ fn strip(text: &[u8], drop: &[&[u8]]) -> Vec<u8> {
 
 /// Subscribe to any sensor: `mode` 1 continuous, 2 on change, 3 one-shot; `period_ms`; no batching. The subscription (0: refused).
 pub fn subscribe(handle: u32, period_ms: u64, mode: u32, wake: bool, out: &mut String) -> u32 {
+    subscribe_batched(handle, period_ms, 0, mode, wake, out)
+}
+
+/// Subscribe with batching: the AoC may hold samples up to `latency_ms` and send them together, one event (one ring of the doorbell) for many (the HAL's max report latency, f2).
+pub fn subscribe_batched(handle: u32, period_ms: u64, latency_ms: u64, mode: u32, wake: bool, out: &mut String) -> u32 {
     let mut m = SUBSCRIBE.to_vec();
     put32(&mut m, 52, handle);
     m[126] = if wake { 0 } else { 1 };
     m[127] = 0;
-    m[128..136].copy_from_slice(&0u64.to_le_bytes());
+    m[128..136].copy_from_slice(&(latency_ms * 1_000_000).to_le_bytes());
     m[136..144].copy_from_slice(&(period_ms * 1_000_000).to_le_bytes());
     put32(&mut m, 148, mode);
     let Some(txn) = send(m, Some(60)) else {
@@ -876,7 +930,7 @@ pub fn subscribe(handle: u32, period_ms: u64, mode: u32, wake: bool, out: &mut S
     };
     let r = reply(txn, 256);
     let id = r.as_ref().and_then(|(_, b)| body_u32(b, 0)).unwrap_or(0);
-    let _ = writeln!(out, "usf: subscribe handle {handle} every {period_ms} ms mode {mode}: status {:?}, subscription {id}", r.as_ref().map(|(s, _)| *s));
+    let _ = writeln!(out, "usf: subscribe handle {handle} every {period_ms} ms, batched up to {latency_ms} ms, mode {mode}: status {:?}, subscription {id}", r.as_ref().map(|(s, _)| *s));
     if id != 0 && unsafe { SUB_ID } == 0 {
         unsafe { SUB_ID = id };
     }
