@@ -25,6 +25,7 @@ members = [
     "tools/ferros-send",
     "tools/handle-guard",
     "tools/python-guard",
+    "tools/oracle-decode",
     "tools/ferros-mask",
     "tools/install",
     "tools/flash",

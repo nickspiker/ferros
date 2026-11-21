@@ -191,7 +191,7 @@ Oracle captures that close them: the MMIO trace of the ch0 PCIe and PMU G#1546_3
 
 ## Boot channel G#F1: captured (2026-10-19)
 
-Captured on Android under the hv with only the IPC control page G#EA40_0000 trapped (`FERROS_HV_MODEM_RING=1 FERROS_HV_ORACLE_STEP=1`, see below), decoded with `tools/oracle-decode-modem-ring.py`; the modem still came up ONLINE under the trap.
+Captured on Android under the hv with only the IPC control page G#EA40_0000 trapped (`FERROS_HV_MODEM_RING=1 FERROS_HV_ORACLE_STEP=1`, see below), decoded with `cargo run -p oracle-decode -- modem-ring < trace` (tools/oracle-decode); the modem still came up ONLINE under the trap.
 The raw trace stays local (`/mnt/Harbor/tmp/modem-capture`): the NV images it carries are per-unit.
 
 Every frame is a 12-byte SIT header {G#ABCD, u16 frame seq, u16 cfg (G#C000 AP->CP, 0 CP->AP), u16 length incl. header, u8 channel G#F1, u8 channel seq, 2 spare}, then a payload whose first u16 is the command.

@@ -6,7 +6,7 @@ Opus 5.5's safety classifier stopped these pieces of work partway. The text it w
 
 Done and committed:
 - `docs/oracle/MODEM-BOOT-RECON.md`: the modem boot from the GPL sources (GPIO power sequence, PCIe ch0 root complex, shared-memory layout, ROM boot handshake) and the captured boot-channel G#F1 protocol (section order and command numbers, `modem.bin` TOC layout, which per-unit files supply the NV sections).
-- `tools/oracle-decode-modem-ring.py`; hv knobs `FERROS_HV_MODEM_RING`, `FERROS_HV_ORACLE_STEP`, `FERROS_HV_ORACLE_SMC`, one-shot oracle marker (afa464a).
+- `oracle-decode modem-ring` (tools/oracle-decode); hv knobs `FERROS_HV_MODEM_RING`, `FERROS_HV_ORACLE_STEP`, `FERROS_HV_ORACLE_SMC`, one-shot oracle marker (afa464a).
 - `ferros_ext4` (host-tested), `ferros_kernel/src/partfs.rs`, `diag modem files` / `diag modem readmain` (not yet run on hardware).
 - `ferros_kernel/src/modem.rs`: `diag modem s0..s5` (survey, GPIO power-on, PHY, link, endpoint, ROM boot) written and building, never run.
 

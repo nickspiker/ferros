@@ -1,6 +1,6 @@
 # husky display oracle — google-hk3 on DSIM0, as Android drives it
 
-Captured 2026-10-16 from the phone running Android (Magisk root), by `tools/sweep.sh` and `tools/sweep-retry.sh` over adb, decoded by `tools/decode.py`. This is the register oracle for ferros's display driver (DISPLAY-DESIGN.md): what the stock driver sends to the panel and what the DPU looks like, in every state. Nothing here is secret.
+Captured 2026-10-16 from the phone running Android (Magisk root), by `tools/sweep.sh` and `tools/sweep-retry.sh` over adb, decoded by `cargo run -p oracle-decode -- dsi oracle/display/husky-hk3` (tools/oracle-decode, from the repository root). This is the register oracle for ferros's display driver (DISPLAY-DESIGN.md): what the stock driver sends to the panel and what the DPU looks like, in every state. Nothing here is secret.
 
 Each state directory holds:
 - `dsi-commands.txt` — every DSI packet of the transition into that state (ftrace `dsi_tx`: payload bytes, packet type when not a long write, the driver's wait after it) with the time in ms from the first packet; `-- pps begin/end`, `-- init_cmd begin/end` and TE2 notes are the driver's own labels.

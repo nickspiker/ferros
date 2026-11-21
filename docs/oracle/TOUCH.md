@@ -10,7 +10,7 @@ Boot-time probe with only the SPI page trapped and the kernel booted at `logleve
 ```bash
 FERROS_HV_NO_PMU_READ=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_ORACLE_PAGES="G#111D_0000" FERROS_HV_ORACLE_CAP=30000 HV_CMDLINE="loglevel=4" tools/husky-hv.sh --flash
 # after boot: marker, sysrq crash to flush, read console-ramoops-0
-python3 tools/oracle-decode-spi.py < raw.log > touch-boot-probe-transfers.txt
+cargo run -q -p oracle-decode -- spi < raw.log > touch-boot-probe-transfers.txt
 ```
 
 `touch-boot-probe-transfers.txt` is the decoded result: 27 SPI transactions, no integrity gaps.

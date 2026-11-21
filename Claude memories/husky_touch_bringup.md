@@ -9,7 +9,7 @@ Contact reporting finger-verified 2026-10-20 (2035 readings in 30 s, pressure to
 
 **Facts that cost time (don't re-derive):**
 - Driver source is public: AOSP kernel/google-modules/touch/fts_touch, cloned at /mnt/Harbor/ferros-ref/touch-fts (branch android-gs-shusky-6.1-android15-qpr2, dir ftm5/).
-- Capture the boot probe, not a rebind: `echo spi20.0 > .../fts/unbind` PANICS Android (of_drm_find_bridge). Boot capture with HV_CMDLINE=loglevel=4 (tools/husky-hv.sh) keeps pstore clean; decode with tools/oracle-decode-spi.py.
+- Capture the boot probe, not a rebind: `echo spi20.0 > .../fts/unbind` PANICS Android (of_drm_find_bridge). Boot capture with HV_CMDLINE=loglevel=4 (tools/husky-hv.sh) keeps pstore clean; decode with `oracle-decode spi` (tools/oracle-decode).
 - Leaving the touch-SPI oracle build running idle in Android ended in a watchdog reset; reflash the clean hv right after a capture.
 - Cold: USI2 clock gates already open (auto), USI_CON=1 must be cleared, rails LDO25M/LDO4M programmed but off (bit 7 enables, via ACPM main PMIC), reset gpp21-2 is an input; SPI pads are fixed-function (no pinmux).
 - System-info block holds a per-die ID at offsets 32-47: identity data, don't read or log it (see [[ira-entropy-sources-husky]]).
