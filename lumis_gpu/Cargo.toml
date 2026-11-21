@@ -1,0 +1,19 @@
+[package]
+name = "lumis_gpu"
+version = "0.1.0"
+edition = "2021"
+description = "Lumis's GPU kernels on ferros (the owner's GPU plan, 2026-11-20: the GPU as \"NEON on steroids\", every pixel of a damaged rectangle computed straight from Lumis's own formulas): recorded with valhall's SSA recorder, run by std/lumis thru the GPU queue (ferros_sys::gpu::queue), checked on the host in valhall's emulator against lumis_core's CPU drawing."
+
+[lib]
+name = "lumis_gpu"
+path = "src/lib.rs"
+
+[dependencies]
+valhall = { path = "../valhall", features = ["ssa"] }
+
+[dev-dependencies]
+valhall = { path = "../valhall", features = ["ssa", "sim"] }
+# The CPU drawing the kernels are checked against (ui::draw).
+lumis_core = { path = "../../lumis/rust", default-features = false }
+
+[workspace]
