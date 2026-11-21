@@ -8,6 +8,7 @@
 //! Its grant slots, as ferros lays out a kist that declares only the camera (ferros_kist `slots`): 1 display, 2 touch, 3 surface, 4 ira, 5 its vault domain, 6 entropy, 7 camera (an empty slot when the person said no), then the GPU's three and sound out, which it does not use.
 
 mod camera;
+mod gpu;
 mod hold;
 mod sys;
 
@@ -1789,6 +1790,12 @@ struct Lumis {
     lut: [u32; 256],
     /// The preview's split on the UI thread (`Probe`).
     probe: Probe,
+    /// The GPU that draws the menu (`gpu::Gpu`), when Lumis holds it; asked for once, with the first menu.
+    gpu: Option<gpu::Gpu>,
+    gpu_asked: bool,
+    /// The menu changed since its last frame on the GPU (its parts written into the block again), and the surface that frame went into, for the show (`own_surface`).
+    menu_fresh: bool,
+    own: Option<u64>,
 }
 
 impl Lumis {
@@ -1798,7 +1805,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new() }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu: None, gpu_asked: false, menu_fresh: true, own: None }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1893,6 +1900,26 @@ impl FluorApp<G2t16> for Lumis {
         self.changed = true;
         self.menu = Some(app::menu_new(width, height, DENSITY_DPI, camera_infos(&self.cameras)));
         self.menu_dirty = true;
+        self.menu_fresh = true;
+        // The menu on the GPU (`gpu::Gpu`): asked for with the first menu; a frame of another size later is the CPU's (the GPU's parts were laid out for the first).
+        match self.gpu.as_mut() {
+            Some(g) if g.fits(w, h) => g.new_menu(),
+            Some(_) => {
+                println!("lumis: a A#{w} x A#{h} frame: the menu on the CPU from now (its GPU parts were laid out for the first frame)");
+                self.gpu = None;
+            }
+            None if !self.gpu_asked => {
+                self.gpu_asked = true;
+                match gpu::Gpu::open(sys::cap(SURFACE), w, h, &self.lut) {
+                    Ok(g) => {
+                        println!("lumis: the menu on the GPU, every pixel a frame (lumis_gpu menu_kernel), into two surfaces of Lumis's own");
+                        self.gpu = Some(g);
+                    }
+                    Err(e) => println!("lumis: the menu on the CPU: {e}"),
+                }
+            }
+            None => {}
+        }
         ctx.window.request_redraw();
     }
 
@@ -2000,7 +2027,11 @@ impl FluorApp<G2t16> for Lumis {
             Screen::Menu => {
                 if self.menu_dirty {
                     self.menu_dirty = false;
-                    if let Some(menu) = self.menu.as_mut() {
+                    // On the GPU the frame is drawn at the show (`render_own`), its parts from the menu as it is then; else here on the CPU.
+                    if self.gpu.is_some() {
+                        self.menu_fresh = true;
+                        self.changed = true;
+                    } else if let Some(menu) = self.menu.as_mut() {
                         app::menu_draw(menu, surface, false);
                     }
                 }
@@ -2104,6 +2135,33 @@ impl FluorApp<G2t16> for Lumis {
         }
     }
 
+    /// The menu (and the menu still shown while a camera opens) drawn whole on the GPU straight into a surface of Lumis's own (`gpu::Gpu::frame`), which the host shows (`own_surface`): no scratch, no conversion, no bake on the CPU. A GPU that fails leaves the menu to the CPU from then, said on the console.
+    fn render_own(&mut self, _ctx: &mut Context) -> bool {
+        self.own = None;
+        if !matches!(self.screen, Screen::Menu | Screen::Opening) {
+            return false;
+        }
+        let (Some(gpu), Some(menu), Some(surface)) = (self.gpu.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
+        match gpu.frame(menu, std::mem::take(&mut self.menu_fresh)) {
+            Ok(base) => {
+                self.own = Some(base);
+                self.changed = false;
+                true
+            }
+            Err(e) => {
+                println!("lumis: {e}: the menu on the CPU from now");
+                app::menu_draw(menu, surface, true);
+                surface.take_posted();
+                self.gpu = None;
+                false
+            }
+        }
+    }
+
+    fn own_surface(&self) -> Option<u64> {
+        self.own
+    }
+
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
         CursorIcon::Default
     }
@@ -2202,6 +2260,8 @@ fn main() {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));
     }
     let cameras = list();
+    // The menu drawn as ink (lumis_core `ui::draw::set_ink`): the CPU draws its words and lines, the GPU (or, without one, the CPU) the splash and the slots under them.
+    lumis_core::ui::draw::set_ink(true);
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
     // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch anywhere in Lumis is the app scale (the owner, 2026-11-20: "RU everywhere. Should inherit the global RU"), written back with the display grant at its end.
     match ferros_fluor::run_app(Lumis::new(cameras, vault), caps, None, sys::cap(DISPLAY)) {

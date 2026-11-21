@@ -1321,6 +1321,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_gpuq"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_items"
 version = "0.1.0"
 dependencies = [
@@ -1353,6 +1357,7 @@ dependencies = [
 name = "ferros_sys"
 version = "0.1.0"
 dependencies = [
+ "ferros_gpuq",
  "ferros_mailbox",
  "ferros_theme",
  "tatau",
@@ -2700,17 +2705,19 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lumis-ferros"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "blake3",
  "ferros_clip",
  "ferros_fluor",
  "ferros_items",
+ "ferros_sys",
  "fluor",
  "getrandom 0.2.17",
  "kete",
  "log",
  "lumis_core",
+ "lumis_gpu",
  "rayon",
  "vsf",
 ]
@@ -2768,6 +2775,13 @@ dependencies = [
  "winres",
  "zune-core",
  "zune-jpegxl",
+]
+
+[[package]]
+name = "lumis_gpu"
+version = "0.1.0"
+dependencies = [
+ "valhall",
 ]
 
 [[package]]

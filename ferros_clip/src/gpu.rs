@@ -33,8 +33,10 @@ pub fn pack_band(info: &[u32], bodies: &[u32], k: usize, width: usize, height: u
 /// Sets of the frame, the bodies and the facts in the block: a frame is copied and run into one while the coders pack the one before from the other.
 pub const SETS: usize = 2;
 
-/// Where things lie in the GPU block: the kernel's words at 0, then each set's frame (the MiB before it is the kernel's slack before the first row), bodies and facts, each on a MiB.
+/// Where things lie in the GPU block: the kernel's words at `base`, then each set's frame (the MiB before it is the kernel's slack before the first row), bodies and facts, each on a MiB.
 pub struct Layout {
+    /// Where the recorder's part of the block starts (`set_base`): the kernel's words.
+    pub base: usize,
     pub frame: [usize; SETS],
     pub codes: [usize; SETS],
     pub info: [usize; SETS],
@@ -43,10 +45,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn of(height: usize, stride: usize) -> Layout {
+    /// The recorder's part of the block from `base` (a multiple of 2^20).
+    pub fn of(base: usize, height: usize, stride: usize) -> Layout {
         let mib = |n: usize| n.div_ceil(1 << 20) << 20;
         let (mut frame, mut codes, mut info) = ([0; SETS], [0; SETS], [0; SETS]);
-        let mut at = 1 << 20;
+        let mut at = base + (1 << 20);
         for s in 0..SETS {
             frame[s] = at;
             // The kernel's slack after the last row: 64 bytes, a MiB's rounding gives at least that only when the frame is not a whole MiB, so one more 2^16 always.
@@ -54,8 +57,20 @@ impl Layout {
             info[s] = codes[s] + mib((height << BLOCKS_LOG2 << BODY_LOG2) * 4);
             at = info[s] + mib((height << BLOCKS_LOG2) * 4);
         }
-        Layout { frame, codes, info, log: at.next_power_of_two().trailing_zeros() }
+        Layout { base, frame, codes, info, log: at.next_power_of_two().trailing_zeros() }
     }
+}
+
+/// Where the recorder's part of the GPU block starts: 0 unless another user of the same block keeps the bytes before it (Lumis's UI, std/lumis `gpu::UI_LOG`, 2026-11-21: its queue, kernel and the menu's parts).
+static BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The recorder's part of the GPU block from byte `base` (a multiple of 2^20) for clips started from now: its kernel's words there, its frames after.
+pub fn set_base(base: usize) {
+    BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn base() -> usize {
+    BASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether `Recorder::start` codes on the GPU when the process holds one (on by default; a bench turns it off to compare).

@@ -234,7 +234,7 @@ impl GpuDevice {
     /// The GPU service in grant `service`, the GPU block in grant `block`, for frames of `width` x `height` samples `stride` bytes a row: the block grown to the layout and the kernel's words written to it.
     pub fn open(service: u64, block: u64, width: usize, height: usize, stride: usize) -> Result<GpuDevice, String> {
         let kernel = crate::gpu::prebuilt(width, stride).ok_or_else(|| format!("no GPU kernel built for A#{width} samples on A#{stride} bytes"))?;
-        let layout = crate::gpu::Layout::of(height, stride);
+        let layout = crate::gpu::Layout::of(crate::gpu::base(), height, stride);
         let size = svc(DMA, cap(block), 2, layout.log as u64, 0, 0);
         // WHY: the kernel answers ERR for a grant that is no GPU block or a frame pool short of the size, and a kernel from before 2026-11-13 answers the base instead (past any block's size).
         if size == ERR || size > GPU_BLOCK_MOST || size < 1 << layout.log {
@@ -245,8 +245,8 @@ impl GpuDevice {
             return Err(format!("grant A#{block} is no DMA region"));
         }
         let d = GpuDevice { service, block: base as *mut u8, layout, kernel, height };
-        // SAFETY: the block is `size` bytes at `base`, the words far under the first frame's MiB.
-        unsafe { core::ptr::copy_nonoverlapping(kernel.words.as_ptr() as *const u8, d.block, kernel.words.len() * 8) };
+        // SAFETY: the block is `size` bytes at `base`, the words at the layout's base, far under the first frame's MiB.
+        unsafe { core::ptr::copy_nonoverlapping(kernel.words.as_ptr() as *const u8, d.block.add(d.layout.base), kernel.words.len() * 8) };
         Ok(d)
     }
 
@@ -270,6 +270,8 @@ impl GpuDevice {
         msg[0] = 1;
         let preload: u16 = 0x1000 | if self.kernel.regs64 { 0x8000 } else { 0 };
         msg[1..3].copy_from_slice(&preload.to_le_bytes());
+        // The code at its offset in the block (the layout's base).
+        msg[3..7].copy_from_slice(&(self.layout.base as u32).to_le_bytes());
         msg[7..9].copy_from_slice(&(self.kernel.words.len() as u16).to_le_bytes());
         msg[9..13].copy_from_slice(&(invocations >> 4).to_le_bytes());
         msg[13..17].copy_from_slice(&1u32.to_le_bytes());
