@@ -5143,29 +5143,44 @@ fn wall_step(grants: u64, width: usize, height: usize) {
             if LOAD_WANTED != 0 {
                 return;
             }
-            WALL_OWN = d & 0xFF == FOUND_OWN;
-            match d & 0xFF {
-                FOUND_OWN => {
-                    console(grants, b"display: wallpaper: the person's own\n");
-                    wall_ready(width, height);
+            // Already in the buffer whole (the same document, `FOUND_HELD`): nothing was read, and a wallpaper on the glass stays as it is.
+            let held = d & FOUND_HELD != 0;
+            match d & FOUND_KIND {
+                k @ (FOUND_OWN | FOUND_MADE) => {
+                    WALL_OWN = k == FOUND_OWN;
+                    console(
+                        grants,
+                        match (k == FOUND_OWN, held) {
+                            (true, false) => b"display: wallpaper: the person's own\n",
+                            (false, false) => b"display: wallpaper: the person's, kept on this device\n",
+                            (true, true) => b"display: wallpaper: the person's own, the document the display already holds: not read again\n",
+                            (false, true) => b"display: wallpaper: the person's, kept on this device, the document the display already holds: not read again\n",
+                        },
+                    );
+                    if !(held && WALL_ON) {
+                        wall_ready(width, height);
+                    }
                     attest_mark(grants, 2, b"wallpaper shown");
                 }
-                FOUND_MADE => {
-                    console(grants, b"display: wallpaper: the person's, kept on this device\n");
-                    wall_ready(width, height);
-                    attest_mark(grants, 2, b"wallpaper shown");
+                // Nothing of theirs to show (their space closed, or nothing kept yet): one shown until now goes. Said, not silent (the Pro, 2026-11-10: the deck without its wallpaper mid-boot, nothing in the log to say why).
+                _ => {
+                    WALL_OWN = false;
+                    if WALL_ON {
+                        WALL_ON = false;
+                        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                        clean_reset_all();
+                    }
+                    console(grants, b"display: wallpaper: none kept yet; none shown until wallgen has made it on the GPU (op 44)\n");
                 }
-                // Said, not silent (the Pro, 2026-11-10: the deck without its wallpaper mid-boot, nothing in the log to say why).
-                _ => console(grants, b"display: wallpaper: none kept yet; none shown until wallgen has made it on the GPU (op 44)\n"),
             }
             return;
         }
         if LOAD_WANTED != 0 {
             LOADING = true;
-            WALL_ON = false;
-            attest_mark(grants, 1, b"wallpaper load started");
+            // A wallpaper on the glass stays there thru the load (2026-11-21, the Pro: the attest read the one already shown again and the screen was black for its 558 ms): the loader keeps it when the document is the same, and otherwise puts the new one in row by row, each row whole (`wall_own`).
+            attest_mark(grants, 1, if WALL_ON { b"wallpaper load started; the one shown stays" } else { b"wallpaper load started" });
             let seq = (LOAD_REQ.load(Ordering::Acquire) >> 8) + 1;
-            LOAD_REQ.store(seq << 8 | LOAD_WANTED, Ordering::Release);
+            LOAD_REQ.store(seq << 8 | (WALL_ON as u64) * LOAD_SHOWN | LOAD_WANTED, Ordering::Release);
             LOAD_WANTED = 0;
             loader_bell();
         }
@@ -5275,10 +5290,106 @@ static LOAD_REQ: AtomicU64 = AtomicU64::new(0);
 static LOAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// What a load tries (`LOAD_REQ`'s low byte): their own, then the one made on this device.
 const LOAD_KEPT: u64 = 1;
-/// What a load found (`LOAD_DONE`'s low byte).
+/// Beside it: a wallpaper was on the glass when the load started (`WALL_ON`), which stays there until another is whole (`wall_own`).
+const LOAD_SHOWN: u64 = 2;
+/// What a load found (`LOAD_DONE`'s low byte): which (`FOUND_KIND`), and whether the buffer already held that document whole, so nothing was read (`FOUND_HELD`).
 const FOUND_OWN: u64 = 1;
 const FOUND_MADE: u64 = 2;
 const FOUND_NONE: u64 = 3;
+const FOUND_KIND: u64 = 3;
+const FOUND_HELD: u64 = 4;
+
+/// What the wallpaper's buffer holds, kept at the end of its half of the `display-sprites` region, past the screen's pixels (husky's 1344 × 2992 × 8 bytes leave 1.3 MiB there): written by the loader once a wallpaper is whole in the buffer, its mark cleared before anything makes the buffer less than one whole wallpaper. A load whose document is the one held reads nothing (`wall_own`); a display started again finds it, since the region is the same memory (`wall_adopt`).
+/// `pages`: BLAKE3 of the buffer's first word in every 4 KiB, made again whenever its pixels change in place (a re-bake, a refresh): the region is ordinary memory before ferros has it (Android's, before a jump), and a page of it reused there changes its first word.
+#[repr(C)]
+struct WallHeld {
+    mark: u64,
+    /// The screen it was made for: width << 32 | height.
+    size: u64,
+    /// The value's length in the person's space when it was read.
+    len: u64,
+    /// 1 the person's own (`map.wallpaper`), 0 the one made on this device.
+    own: u64,
+    /// The document's content identity (its header's `hp`).
+    hp: [u8; 32],
+    pages: [u8; 32],
+}
+/// `WallHeld::mark` when the buffer holds the wallpaper it names.
+const WALL_HELD_MARK: u64 = u64::from_le_bytes(*b"wallheld");
+
+fn wall_held() -> *mut WallHeld {
+    unsafe { (WALL_BUF + (32 << 20) - core::mem::size_of::<WallHeld>()) as *mut WallHeld }
+}
+
+/// The buffer's sampled pages (`WallHeld::pages`).
+fn wall_pages(width: usize, height: usize) -> [u8; 32] {
+    let buf = unsafe { core::slice::from_raw_parts(WALL_BUF as *const u64, width * height) };
+    let mut h = blake3::Hasher::new();
+    for i in (0..width * height).step_by(1 << 9) {
+        h.update(&buf[i].to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// The buffer no longer one whole wallpaper (a load about to write it): the mark goes first.
+fn held_drop() {
+    unsafe { core::ptr::write_volatile(&raw mut (*wall_held()).mark, 0) };
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// The buffer holds the document `hp` whole: said in the record, the mark last. A document with no content identity (no 32-byte `hp`, or a zero one) leaves the record dropped, so it is read again each load. Under `WALL_LOCK`: a re-bake on the render thread changes the pixels the pages are sampled from.
+fn held_keep(hp: Option<[u8; 32]>, own: bool, len: u64, width: usize, height: usize) {
+    let Some(hp) = hp.filter(|h| *h != [0; 32]) else { return };
+    wall_lock();
+    unsafe {
+        let p = wall_held();
+        core::ptr::write_volatile(p, WallHeld { mark: 0, size: (width as u64) << 32 | height as u64, len, own: own as u64, hp, pages: wall_pages(width, height) });
+        core::sync::atomic::fence(Ordering::SeqCst);
+        core::ptr::write_volatile(&raw mut (*p).mark, WALL_HELD_MARK);
+    }
+    wall_unlock();
+}
+
+/// The pixels changed in place, the wallpaper the same (a re-bake, a refresh): its pages sampled again. The caller holds `WALL_LOCK`.
+fn held_pages_again(width: usize, height: usize) {
+    unsafe {
+        if core::ptr::read_volatile(&raw const (*wall_held()).mark) == WALL_HELD_MARK {
+            (*wall_held()).pages = wall_pages(width, height);
+        }
+    }
+}
+
+/// Whether the buffer holds document `hp` from value `key` whole, for this screen.
+fn held_is(hp: &[u8; 32], own: bool, len: u64, width: usize, height: usize) -> bool {
+    unsafe {
+        let p = &*wall_held();
+        core::ptr::read_volatile(&p.mark) == WALL_HELD_MARK && p.size == (width as u64) << 32 | height as u64 && p.len == len && p.own == own as u64 && p.hp == *hp
+    }
+}
+
+/// A display started again (`diag "restart display"`, a crash) while its person is unlocked: the wallpaper its last run left whole in the region shown at once, before the first frame, so the restart puts no black between it and itself. Only when the record is whole for this screen, its pages are as recorded (nothing reused the memory since), and the person's space still holds a value of that length under its key (their space open: a locked device shows nobody's wallpaper). The load that follows checks the document's identity (`wall_own`): the same, it is baked again from its source (`wall_refresh`, its bake was the last run's); another, that one goes in row by row. A record that fails its pages is dropped.
+fn wall_adopt(grants: u64, width: usize, height: usize, log: &mut Log) {
+    unsafe {
+        let p = &*wall_held();
+        if core::ptr::read_volatile(&p.mark) != WALL_HELD_MARK {
+            return;
+        }
+        if p.size != (width as u64) << 32 | height as u64 || p.pages != wall_pages(width, height) {
+            held_drop();
+            log.s(b"display: the wallpaper's record from a run before does not match its buffer; dropped\n");
+            log.flush();
+            return;
+        }
+        let key: &[u8] = if p.own == 1 { b"wallpaper" } else { b"wallpaper.made" };
+        if ferros_sys::store_get(cap(grants, S_MAP_SCOPE), key, &mut []) != Some(p.len as usize) {
+            return;
+        }
+        WALL_OWN = p.own == 1;
+        wall_ready(width, height);
+        log.s(b"display: the wallpaper held from the run before shown at once; checked against the person's space and baked again from its source behind it\n");
+        log.flush();
+    }
+}
 /// The screen's size, for the loader.
 static mut LOAD_SIZE: (usize, usize) = (0, 0);
 /// A load wanted and not started yet (the render loop starts it next pass): its low byte as `LOAD_REQ`'s.
@@ -5357,20 +5468,25 @@ extern "C" fn wall_loader(grants: u64) -> ! {
     let (mut seen, mut bell_seen) = (0, 0);
     // The kept wallpaper the last load found (its key), which a refresh reads again; none before a load found one.
     let mut shown: &'static [u8] = b"";
+    // A load just finished: its wallpaper baked again from its source if it is not exact with the bake in use (one held from a display's run before, or a brightness change during the load).
+    let mut due = false;
     loop {
         let bell = LOADER_BELL.load(Ordering::Acquire);
         let r = LOAD_REQ.load(Ordering::Acquire);
         let (width, height) = unsafe { LOAD_SIZE };
         if r != seen {
             seen = r;
-            let found = if wall_own(grants, width, height, b"wallpaper") {
-                FOUND_OWN
-            } else if wall_own(grants, width, height, b"wallpaper.made") {
-                FOUND_MADE
-            } else {
-                FOUND_NONE
-            };
-            shown = match found {
+            let on_glass = r & LOAD_SHOWN != 0;
+            let mut found = FOUND_NONE;
+            for (key, kind) in [(&b"wallpaper"[..], FOUND_OWN), (&b"wallpaper.made"[..], FOUND_MADE)] {
+                match wall_own(grants, width, height, key, kind == FOUND_OWN, on_glass) {
+                    Got::None => continue,
+                    Got::Held => found = kind | FOUND_HELD,
+                    Got::Read => found = kind,
+                }
+                break;
+            }
+            shown = match found & FOUND_KIND {
                 FOUND_OWN => b"wallpaper",
                 FOUND_MADE => b"wallpaper.made",
                 _ => b"",
@@ -5379,13 +5495,19 @@ extern "C" fn wall_loader(grants: u64) -> ! {
             LOAD_DONE.store(r & !0xFF | found, Ordering::Release);
             // The render thread waits on its doorbell between passes (`BELL`).
             ring_bell();
+            due = true;
             continue;
         }
-        if bell != bell_seen {
-            // The brightness settled (`loader_bell` from the render loop): the wallpaper baked again from its source, unless it already is with this bake.
+        if bell != bell_seen || due {
+            // The brightness settled (`loader_bell` from the render loop), or a load finished: the wallpaper baked again from its source, unless it already is with this bake.
             bell_seen = bell;
+            due = false;
             if !shown.is_empty() && WALL_EXACT.load(Ordering::Acquire) != bake::generation() {
-                wall_refresh(grants, width, height, shown);
+                wall_refresh(grants, width, height, shown, false);
+                // Its rows changed in place, whether it finished or not.
+                wall_lock();
+                held_pages_again(width, height);
+                wall_unlock();
                 LOAD_HEAP.reset();
             }
             continue;
@@ -5401,25 +5523,24 @@ fn loader_bell() {
     ferros_sys::wake(&LOADER_BELL, 1);
 }
 
-/// A load of the kept wallpaper wanted, started by `wall_step` next pass. The wallpaper on the glass goes now: the load writes the buffer it is published from. A read already under way is kept unless `again` (wallgen's op 44: it has just stored what that read may have missed): a display started after the person unlocked reads at once, and the attest's op 42 follows; until 2026-11-09 the second request threw the first read away and read the 24 MB again (shown at +1716 ms where one read takes about 420).
+/// A load of the kept wallpaper wanted, started by `wall_step` next pass. A wallpaper on the glass stays there thru it (2026-11-21): the load reads nothing when its document is the one held (`WallHeld`), and otherwise puts the new one in row by row (`wall_own`). A read already under way is kept unless `again` (wallgen's op 44: it has just stored what that read may have missed): a display started after the person unlocked reads at once, and the attest's op 42 follows; until 2026-11-09 the second request threw the first read away and read the 24 MB again (shown at +1716 ms where one read takes about 420).
 fn wall_load(again: bool) {
     unsafe {
         if LOADING && !again && LOAD_REQ.load(Ordering::Acquire) & LOAD_KEPT != 0 {
             return;
         }
         LOAD_WANTED = LOAD_KEPT;
-        WALL_ON = false;
     }
-    clean_reset_all();
 }
 
-/// The kept wallpaper's plane in its value (`wall_open`): its samples' first byte and the byte past their last; how much of the value's start the first stretch buffer holds (read for the opening) and whether the opening's two stretches were read; their time, µs.
+/// The kept wallpaper's plane in its value (`wall_open`): its samples' first byte and the byte past their last; how much of the value's start the first stretch buffer holds (read for the opening) and whether the opening's two stretches were read; their time, µs; the document's content identity (its header's `hp`), None when it carries no 32-byte one.
 struct WallPlane {
     first: u64,
     end: u64,
     head: usize,
     spans_ok: bool,
     t_spans: u64,
+    hp: Option<[u8; 32]>,
 }
 
 /// The kept wallpaper's document opened over the vault (`VaultSource`) and its plane located and checked against this screen (`wall_own`'s load, `wall_refresh`'s), on the loader's thread: the value's first stretch and its last read whole first, into the loader's two stretch buffers, which the plane's own reads reuse once the document is dropped here. None, with its line, when the value is not such a document.
@@ -5461,22 +5582,54 @@ fn wall_open(c: u64, key: &'static [u8], len: usize, width: usize, height: usize
         l.flush();
         return None;
     };
+    let hp = match &doc.header().provenance_hash {
+        vsf::types::VsfType::hp(h) => <[u8; 32]>::try_from(&h[..]).ok(),
+        _ => None,
+    };
     // The document is done with: its source's spans are the stretch buffers the plane's reads now reuse.
     drop(doc);
-    Some(WallPlane { first: span.data_offset, end: span.data_offset + span.data_len, head, spans_ok, t_spans })
+    Some(WallPlane { first: span.data_offset, end: span.data_offset + span.data_len, head, spans_ok, t_spans, hp })
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`wall_open`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
-fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
+/// What a load of one value did (`wall_own`).
+enum Got {
+    /// No such document of this screen's size (or it could not be read whole).
+    None,
+    /// The buffer already held this document whole (`WallHeld`): nothing read.
+    Held,
+    /// Read into the buffer.
+    Read,
+}
+
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`wall_open`), and the document's content identity (`hp`) is compared with the one the buffer holds whole (`WallHeld`): the same, nothing is read (2026-11-21, the Pro: a boot that unlocked the identity loaded the wallpaper at start, and the attest's op 42 read the same 24 MB again with the screen black for its 558 ms).
+/// Otherwise, with a wallpaper on the glass (`shown`), the new one goes in row by row in place (`wall_refresh` replacing), each row whole and baked before it goes in, so every pixel is the old wallpaper's or the new one's and never none. With none on the glass the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
+fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8], own: bool, shown: bool) -> Got {
     let c = cap(grants, S_MAP_SCOPE);
-    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
+    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return Got::None };
     let t0 = now();
     let (calls0, call_t0) = (VAULT_CALLS.load(Ordering::Relaxed), VAULT_CALL_TICKS.load(Ordering::Relaxed));
     VAULT_CALL_MAX.store(0, Ordering::Relaxed);
     let mut l = Log { grants, buf: [0; 256], n: 0 };
-    let Some(WallPlane { first, end, head, spans_ok, t_spans }) = wall_open(c, key, len, width, height, &mut l) else { return false };
+    let Some(WallPlane { first, end, head, spans_ok, t_spans, hp }) = wall_open(c, key, len, width, height, &mut l) else { return Got::None };
     unsafe { WALL_PLANE = (len as u64, first) };
     let t_open = ferros_sys::us_since(t0);
+    if hp.is_some_and(|h| held_is(&h, own, len as u64, width, height)) {
+        l.s(b"display: the person's ");
+        l.s(key);
+        l.s(b" is the document the display holds (its hp the same): not read again; opened in ");
+        l.dec(t_open / 1000);
+        l.s(b" ms\n");
+        l.flush();
+        return Got::Held;
+    }
+    held_drop();
+    if shown {
+        let ok = wall_refresh(grants, width, height, key, true);
+        if ok {
+            held_keep(hp, own, len as u64, width, height);
+        }
+        return if ok { Got::Read } else { Got::None };
+    }
     let n = width * height;
     let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
     // Each code into its pixel's lane as it comes (the planes one after another, red setting the pixel opaque), and the whole baked in place once the plane is in (`wall_bake_rows`).
@@ -5501,7 +5654,7 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         if !held && !read_wait(seq) {
             l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
             l.flush();
-            return false;
+            return Got::None;
         }
         t_wait += now() - t;
         // The next stretch into the other buffer while this one becomes working values.
@@ -5574,7 +5727,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     l.dec(VAULT_CALL_MAX.load(Ordering::Relaxed) * 1_000_000 / freq());
     l.s(b" us\n");
     l.flush();
-    true
+    held_keep(hp, own, len as u64, width, height);
+    Got::Read
 }
 
 /// The present before and after the bake, measured once at start on the render thread's core (development builds; COMPOSITOR.md "Baked", the owner's "measure"): 64 rows of the screen's width, warm in the caches, each kernel over them eight times and the fastest pass kept, in the core's own cycles (`pmu::cycles`) a pixel:
@@ -5799,12 +5953,15 @@ fn rebake(width: usize, height: usize) {
         if (*(&raw const FLIGHT_FRAME)).is_none() {
             FLIGHT = None;
         }
-        if WALL_ON && !LOADING {
+        // Every shown wallpaper, a replacement going in included (2026-11-21): with one on the glass a load writes only whole rows baked with the bake in use, under `WALL_LOCK` as this is (`wall_refresh` replacing); one read with none on the glass (`WALL_ON` false) is baked by the loader once whole.
+        if WALL_ON {
             // The old bake's unbake tables in this pass's scratch, read by every stripe.
             let (to_p, to_v) = (alloc::vec![0f32; 1 << 16].leak(), alloc::vec![0u16; UNBAKE_V + 1].leak());
             bake::before().unbake_tables(to_p, to_v);
             WALL_UNBAKE = (to_p.as_ptr() as usize, to_v.as_ptr() as usize);
             stripes(5, 0, width, height, draw::Rect::full(width, height));
+            // The caller holds `WALL_LOCK`.
+            held_pages_again(width, height);
         }
     }
     CON_NUDGE.fetch_add(1, Ordering::Release);
@@ -5881,10 +6038,11 @@ static mut WALL_SUPERSEDED: u64 = 0;
 /// A refresh's row, baked before it goes into the wallpaper (husky's 1344, the widest screen, fits).
 static mut WALL_ROW: [u64; 1 << 11] = [0; 1 << 11];
 
-/// The wallpaper baked again from its source, the plane in the vault, with the bake in use (owner, 2026-11-12, on the 8a: "The moment you adjust the brightness on the 8a it bands terribly bad"). On the loader's thread, once the brightness has settled after a change (`loader_bell`).
+/// The wallpaper baked again from its source, the plane in the vault, with the bake in use (owner, 2026-11-12, on the 8a: "The moment you adjust the brightness on the 8a it bands terribly bad"). On the loader's thread, once the brightness has settled after a change (`loader_bell`), or after a load that left it not exact.
 /// Why: a brightness change re-bakes the wallpaper from its own codes (`wall_rebake_rows`) at once, so it changes with everything else, but that is a round trip thru a bake that lost what it lost (a dim bake keeps far fewer steps of a smooth gradient than the source has), and each change starts from the last one's result. Measured on the 8a before this: brightness 0 to 128 and back moved 97 % of a smooth stretch of the wallpaper, 46 g2t codes darker on average, and halved its distinct values. The source is wallgen's (or the person's own), kept in the vault in VSF RGB; no copy of it is held (the arc pool has no 15 to 23 MiB to spare).
 /// How: band by band of rows (as many as three planes' rows fill the loader's two stretch buffers: 323 on akita, 260 on husky), each band's three plane stretches read, each row made from its samples and baked in `WALL_ROW` (`Bake::codes_in_place`), then copied in under `WALL_LOCK` if the bake in use is still the one it was made with. Any brightness change meanwhile, or a load wanted, ends it: the rows done stay (the re-bake carries them), and the next settling starts it again. A whole pass marks the wallpaper exact (`WALL_EXACT`) and has every phase published again (`WALL_FRESH`). Whether it finished.
-fn wall_refresh(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
+/// `replace`: another wallpaper put in place of the one on the glass (`wall_own`, a load with one shown, 2026-11-21), the same way, so every row on the glass stays one wallpaper's or the other's, whole and baked, and none goes black; a brightness change then bakes the row again with the new bake and goes on (the render thread re-bakes the rows already in from their codes, as it does any shown wallpaper's), and only a failed read ends it. The result's `wall_ready` publishes it whole.
+fn wall_refresh(grants: u64, width: usize, height: usize, key: &'static [u8], replace: bool) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let t0 = now();
     let (g, req) = (bake::generation(), LOAD_REQ.load(Ordering::Acquire));
@@ -5903,8 +6061,8 @@ fn wall_refresh(grants: u64, width: usize, height: usize, key: &'static [u8]) ->
     let band = 2 * STRETCH / (6 * width);
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     let row = unsafe { &mut (&mut *(&raw mut WALL_ROW))[..width] };
-    // Superseded: a brightness change since it began (the next settling starts it again with that bake), or a load wanted (it reads the plane whole).
-    let gone = || bake::generation() != g || LOAD_REQ.load(Ordering::Acquire) != req;
+    // Superseded: a brightness change since it began (the next settling starts it again with that bake), or a load wanted (it reads the plane whole). A replacement is never superseded: it runs inside a load, and stopping it would leave two wallpapers on the glass.
+    let gone = || !replace && (bake::generation() != g || LOAD_REQ.load(Ordering::Acquire) != req);
     let mut y = 0;
     while y < height {
         // WHY the min: the last band is what is left of the screen.
@@ -5916,37 +6074,54 @@ fn wall_refresh(grants: u64, width: usize, height: usize, key: &'static [u8]) ->
             }
             let at = first + 2 * (p * n + y * width) as u64;
             if !vault_read(c, key, at, &mut area[2 * p * band * width..2 * (p * band + y1 - y) * width]) {
-                l.s(b"display: the wallpaper could not be read again after a brightness change; it stays baked from its codes\n");
+                l.s(if replace { b"display: the new wallpaper could not be read whole; the one shown goes\n" } else { b"display: the wallpaper could not be read again after a brightness change; it stays baked from its codes\n" });
                 l.flush();
                 return false;
             }
         }
         for yy in y..y1 {
-            let b = bake::now();
             let o = 2 * (yy - y) * width;
-            for (x, px) in row.iter_mut().enumerate() {
-                let s = |p: usize| {
-                    let i = 2 * p * band * width + o + 2 * x;
-                    u16::from_be_bytes([area[i], area[i + 1]]) as u64
-                };
-                *px = 0xFFFF << 48 | s(0) | s(1) << 16 | s(2) << 32;
-            }
-            b.codes_in_place(row);
-            wall_lock();
-            // The bake checked under the lock, which the render thread holds from its `bake::set` to the end of its re-bake: a row made with a bake that was replaced meanwhile never goes in.
-            let same = bake::generation() == g;
-            if same {
-                buf[yy * width..(yy + 1) * width].copy_from_slice(row);
-            }
-            wall_unlock();
-            if !same {
-                unsafe { WALL_SUPERSEDED += 1 };
-                return false;
+            loop {
+                // The bake this row is made with: its generation first, then the bake (`bake::set` publishes the bake before the generation moves, so a generation read is never newer than the bake read after it).
+                let gy = bake::generation();
+                let b = bake::now();
+                for (x, px) in row.iter_mut().enumerate() {
+                    let s = |p: usize| {
+                        let i = 2 * p * band * width + o + 2 * x;
+                        u16::from_be_bytes([area[i], area[i + 1]]) as u64
+                    };
+                    *px = 0xFFFF << 48 | s(0) | s(1) << 16 | s(2) << 32;
+                }
+                b.codes_in_place(row);
+                wall_lock();
+                // The bake checked under the lock, which the render thread holds from its `bake::set` to the end of its re-bake: a row made with a bake that was replaced meanwhile never goes in.
+                let same = bake::generation() == if replace { gy } else { g };
+                if same {
+                    buf[yy * width..(yy + 1) * width].copy_from_slice(row);
+                }
+                wall_unlock();
+                if same {
+                    break;
+                }
+                if !replace {
+                    unsafe { WALL_SUPERSEDED += 1 };
+                    return false;
+                }
             }
         }
         y = y1;
     }
-    WALL_EXACT.store(g, Ordering::Release);
+    // Exact when no brightness change came during it (a replacement's rows in before one were re-baked from their codes: the next settling reads them again).
+    WALL_EXACT.store(if bake::generation() == g { g } else { 0 }, Ordering::Release);
+    if replace {
+        l.s(b"display: the person's ");
+        l.s(key);
+        l.s(b" put in place of the one shown, row by row, in ");
+        l.dec(ferros_sys::us_since(t0) / 1000);
+        l.s(b" ms\n");
+        l.flush();
+        return true;
+    }
     WALL_FRESH.fetch_add(1, Ordering::Release);
     ring_bell();
     l.s(b"display: wallpaper baked again from its source (");
@@ -8043,6 +8218,8 @@ fn server(grants: u64) -> ! {
             ARENA = sprites as usize;
             ARENA_WORDS = (32 << 20) / 8;
             WALL_BUF = sprites as usize + (32 << 20);
+            // The wallpaper's record sits past the screen's pixels in the same 32 MiB (`WallHeld`): a screen too large for both is a bug here, not a case to fall back from.
+            assert!(width * height * 8 + core::mem::size_of::<WallHeld>() <= 32 << 20, "the wallpaper and its record outgrow the region's upper half");
         } else {
             ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
@@ -8321,7 +8498,9 @@ fn server(grants: u64) -> ! {
         ALLOC.reset();
     }
     // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen says when it opens (op 42).
+    // A wallpaper this display's run before left whole in the region shown before the first frame, when the person's space still holds it (`wall_adopt`): a restart puts no black between it and itself.
     if unsafe { WALL_BUF } != 0 {
+        wall_adopt(grants, width, height, &mut log);
         wall_load(false);
     }
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
