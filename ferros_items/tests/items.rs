@@ -249,7 +249,7 @@ fn a_body_whose_card_never_landed_is_swept() {
 
 #[test]
 fn wire_documents_round_trip() {
-    let p = Proposed { kind: kinds::LIST, title: Some("Groceries: milk, bread".into()), of: vec![([6; 32], 1)], attrs: vec![("items".into(), VsfType::u3(2)), ("at".into(), VsfType::e(EtType::e6(T0)))], keeper: 0 };
+    let p = Proposed { kind: kinds::LIST, title: Some("Groceries: milk, bread".into()), of: vec![(ferros_items::Ht::from_bytes([6; 32]), 1)], attrs: vec![("items".into(), VsfType::u3(2)), ("at".into(), VsfType::e(EtType::e6(T0)))], keeper: 0 };
     assert_eq!(wire::parse_propose(&wire::propose(&p, T0).unwrap()).unwrap(), p);
     let f = Find { kinds: vec![kinds::PHOTO, kinds::SCAN], maker: Some([2; 32]), from: Some(1), to: Some(T0), changed: Some(5), words: Some("tax 2026".into()), of: Some([4; 32]), wheres: vec![("lens".into(), IS_AT_LEAST, VsfType::u3(30)), ("place".into(), IS_WORDS, VsfType::x("Ra".into()))], order: 2, skip: 3, count: 4 };
     assert_eq!(wire::parse_find(&wire::find(&f, T0).unwrap()).unwrap(), f);
@@ -307,4 +307,26 @@ fn the_callers_stamp_reads() {
     let (c, call) = Caller::from_stamp(&p).unwrap();
     assert!(c.maker.is_none() && call.is_empty());
     assert!(Caller::from_stamp(&s[..70]).is_none());
+}
+
+/// An item's id is a thing (`ht`) on its card, and a card the hold wrote before (its id an `hp`, 2026-11-19) reads with the same id.
+#[test]
+fn an_item_id_is_a_thing_and_an_older_card_keeps_it() {
+    let mut items = Items::new([1; 32]);
+    let m = items.make(&lumis(), photo("a photo", 30), T0, [7; 32]).unwrap();
+    let card = m.card().clone();
+    let bytes = card.section(None).unwrap();
+    let id = *card.id.as_bytes();
+    let at = (0..bytes.len() - 36).find(|&i| bytes[i..i + 2] == *b"ht" && bytes[i + 4..i + 36] == id).expect("the id written as ht");
+    assert_eq!(ferros_items::Card::parse(&bytes).unwrap().0, card);
+    let mut older = bytes.clone();
+    older[at + 1] = b'p';
+    assert_eq!(ferros_items::Card::parse(&older).unwrap().0.id, card.id, "an hp id reads as the same thing");
+    // To a caller (with its handle) the id rides as the hp a kist built before reads, the same bytes.
+    let handed = card.section(Some(&[3; 32])).unwrap();
+    assert!((0..handed.len() - 36).any(|i| handed[i..i + 2] == *b"hp" && handed[i + 4..i + 36] == id));
+    assert_eq!(ferros_items::Card::parse(&handed).unwrap().0.id, card.id);
+    // Any other marker for the id is refused.
+    older[at + 1] = b'b';
+    assert!(ferros_items::Card::parse(&older).is_err());
 }

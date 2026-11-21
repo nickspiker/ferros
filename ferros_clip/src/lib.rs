@@ -85,7 +85,32 @@ impl Pacing {
         m[16] = 1;
         m
     }
+
+    /// The camera driver's SET of this pacing's frame length on a camera already streaming the binned readout (payloads/camera SET what 4; owner, 2026-11-20: still to RAW video without the 5 s reopen): `[3][4][fll: u64]`.
+    /// Answered `[0]` taken, `[1]` refused (a frame under the readout's rows and blanking, or an exposure no plan holds against it).
+    /// It lands at the next frame's start, in the sensor's hold as an exposure SET does; the frame then is the longer of this frame and the shutter with the sensor's margin (max(1 / fps, shutter)), as at a paced open.
+    /// The frame in flight when it is answered keeps the old length: the frames at this pacing are those counted [`SET_SETTLES`] or more past the count the last frame before the SET carried.
+    pub fn set_msg(&self) -> [u8; 10] {
+        set_fll_msg(self.fll as u64)
+    }
 }
+
+/// The SET that gives a streaming camera back the frame length its OPEN set (`[3][4][0]`): leaving RAW video for stills.
+pub fn set_open_fll_msg() -> [u8; 10] {
+    set_fll_msg(0)
+}
+
+/// The camera driver's SET of frame length `fll` lines (0: the OPEN's own).
+pub fn set_fll_msg(fll: u64) -> [u8; 10] {
+    let mut m = [0u8; 10];
+    m[0] = 3;
+    m[1] = 4;
+    m[2..10].copy_from_slice(&fll.to_le_bytes());
+    m
+}
+
+/// Frames past the last one before a frame length SET until the first at the new length: the frame in flight finishes at the old length (one), the next begins at the new.
+pub const SET_SETTLES: u64 = 2;
 
 /// Where a clip's bytes go: whole 4 KiB blocks, at most [`WRITE_MAX`] a call, from block 0 up.
 pub trait Sink: Send {

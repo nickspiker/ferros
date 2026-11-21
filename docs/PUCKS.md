@@ -29,6 +29,7 @@ The display asks; the puck answers with pixels; nothing is parsed.
 ### Scaling and turning between squares
 
 - **A square costs its own circle.** At each flip, every puck whose newest square the phase about to show does not hold yet is drawn again there, its circle's box alone (the way the display's clock was drawn between frames); the deck is drawn whole only for a binding, a puck gone, or on a display without the temporal flips. Measured on the 8a: 13.4 ms a box (a 656-pixel circle), where a whole redraw was 35 to 46 ms of scene and 34 to 41 ms of publish.
+- **A square is sampled once, by every core** (2026-11-20). A new square is drawn into the canvas once; a later phase that lacks it while the canvas holds it whole only publishes the box from the canvas (puck.rs `canvas_holds`: a whole frame, or a redraw of the puck's own box, records the square it drew; a part of a box drawn from a newer square forgets it). The sampling is an item of the scene's list (`Item::Puck`), drawn by bands of rows across the publish workers and the render thread, each with its own rows. Measured on the Pro (a 188k-pixel box): before, 16 to 18 ms a box, all but 1 ms of it the sampling on the render thread alone, redone for each of the four phases; the display's console says each 64 boxes how many were redrawn and how many only published, and what a pass with boxes took.
 - **Gravity turns the faces alone**: past half a pixel at the largest puck's rim, each puck hears its new turn and its box is owed to every phase, never a whole redraw.
 
 - While a pinch or a turn moves a circle, every scene tells the puck its new view when it has changed by a pixel of diameter or half a pixel of turn at the rim; meanwhile the display draws the newest square scaled and turned from the size and turn it was drawn at. A puck that keeps up is sharp thru a pinch; a slow one is soft until its next square lands. No rate is set and nothing is limited.
@@ -106,13 +107,20 @@ The place-bound pucks (tide, sun, moon, compass, weather) share one: the ~10 km 
 - **tools/tide-station** (host): NOAA's JSON to a station document, the catalog from NOAA's list or from documents, `show`, `predict`. fetch.sh fetches with curl; fixtures.sh writes ferros_tide/stations/ (the four stations and their catalog).
 - **payloads/tidetest**: the data path on the device without drawing and without anyone's place: the bundled catalog and documents parsed, each station found as the nearest to its own place, its face computed, each step timed. Builds (payload-check passes) and passes the sandbox checker masked (48569 words, 0 refused). Not run on a device yet.
 
+## When the display starts again
+
+A display that ends (a restart, a fault) takes its held calls with it: the kernel answers each one it had taken ERR. Nothing is killed by hand to recover (2026-11-20; until then a restart left every puck showing its name until it was killed and the map restarted).
+- **The puck** (ferros_puck::rt `watcher`): its WATCH answered ERR once, it calls again; that call waits for the display that comes after (a call on an endpoint with no server queues until one receives), which answers at once, its count starting again, with the circle hidden. Two failures in a row are no display behind the grant, and the watch stops as before.
+- **The map** hears the restart on the facts' bell (the display's frame count went down) and hands the new display everything again: the scene, the icons, the pucks' bindings (op 73). Each puck then hears its circle shown and draws its square there.
+- A SHOW in flight at the end is answered ERR and taken as refused; the next square goes to the new display.
+- Measured on the Pro (b1068): the seven pucks drew again on their own after `diag "restart display"`.
+
 ## What changes on the device
 
 Stored together with a flash of the matching kernel (Claude memories/stored_capsules_need_flashed_kernel.md): the kernel (the `puck` right and its stamp, init's slot 9 the display's `puck` endpoint, the pucks' window, SYS_DMA x1 = 6, BELL_PUCKS, facts 88-89 for the compass), and the capsules display, map, init, kists (ferros_kist's `puck` right) and sensors (the magnetometers). Then the clock, basecalc and the six pucks are stowed like any kist; the clock's version 1 replaces the clock kist of 2026-11-10 (the same option).
 
 ## Not built
 
-- A puck mid-hand-over when the display restarts waits for an answer that never comes, and needs a restart itself (the development loop only: kill it, restart the map).
 - The display's own clock is not yet deleted: nothing names it any more (the deck no longer gives icon G#80 to a kist named Clock), and it goes once the clock puck is seen on the glass (owner: "make another clock proper, then delete the weird wired in one"). The console's corner clock keeps `clock_state`.
 - Frames for a moving puck come only with the 10 Hz temporal flips; with temporal dithering off, a `FRAMES` puck is drawn only when its view changes.
 - A puck's square sampled bilinear only: a circle much smaller than its square while a pinch outruns the puck aliases until the next square.

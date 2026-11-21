@@ -21,3 +21,5 @@ ferros_kept = { path = "../ferros_kept" }
 ferros_ledger = { path = "../ferros_ledger" }
 # The host test seals and opens the space between two vaults as the devices do (the seal is fgtw's `fanout`, its nonce the OS's with `std`).
 fgtw = { path = "../../fgtw", default-features = false, features = ["std", "fanout"] }
+# The deck document's circles named as the map names them.
+ferros_thing = { path = "../ferros_thing" }

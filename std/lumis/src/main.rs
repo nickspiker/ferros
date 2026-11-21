@@ -298,7 +298,7 @@ fn end_clip(clip: Clip, header: Option<&mut [u64]>, why: &str) {
     let hex: String = info.hash[..8].iter().map(|b| format!("{b:02x}")).collect();
     // The item as its seal left it: its id, which the bench finds it by (`ferros-bridge items find --kind "RAW video"`), and its card's size.
     match &clip.receipt.lock().unwrap().card {
-        Some(c) => println!("lumis: camera {cam}: RAW video: {} is item {} in the hold, {} bytes", clip.name, c.id[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), c.size),
+        Some(c) => println!("lumis: camera {cam}: RAW video: {} is item {} in the hold, {} bytes", clip.name, c.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), c.size),
         None => println!("lumis: camera {cam}: RAW video: {} not sealed into the hold (the vault closes it at its last whole frame)", clip.name),
     }
     println!(
@@ -1536,7 +1536,7 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
         if photo && hold::held() {
             let kept = match hold::keep_still(&bytes) {
                 Ok((write_ms, read_ms, card)) => {
-                    println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", card.id[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len(), card.body[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len(), card.body[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
                     true
                 }
                 Err(e) => {

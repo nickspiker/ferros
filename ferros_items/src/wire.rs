@@ -115,7 +115,7 @@ pub fn propose(p: &Proposed, now: i64) -> Result<Vec<u8>> {
         b = b.set("title", VsfType::x(t.clone())).map_err(fmt)?;
     }
     for (id, how) in &p.of {
-        b = b.append_multi("of", alloc::vec![VsfType::hp(id.to_vec()), VsfType::u(*how as usize, false)]).map_err(fmt)?;
+        b = b.append_multi("of", alloc::vec![VsfType::from(*id), VsfType::u(*how as usize, false)]).map_err(fmt)?;
     }
     for (name, v) in &p.attrs {
         b = b.append_multi("attr", alloc::vec![VsfType::d(Ascii::new(name.clone()).map_err(fmt)?), v.clone()]).map_err(fmt)?;
@@ -130,7 +130,7 @@ pub fn parse_propose(doc: &[u8]) -> Result<Proposed> {
     let one = |name: &str| s.get_fields(name).first().and_then(|f| f.values.first()).cloned();
     let mut of = Vec::new();
     for f in s.get_fields("of") {
-        let id = f.values.iter().find_map(|v| if let VsfType::hp(_) = v { h32(v) } else { None });
+        let id = f.values.iter().find_map(crate::ht_of);
         if let (Some(id), Some(how)) = (id, f.values.iter().find_map(|v| v.as_u64())) {
             of.push((id, how));
         }

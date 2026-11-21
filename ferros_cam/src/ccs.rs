@@ -329,6 +329,11 @@ impl Timing {
         (((p.coarse as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
     }
 
+    /// The exposure a plan gives (ns), rounded up: what `plan` takes to give back the plan's own lines at the mode's line (a frame length SET plans the exposure in force again; from `ns`, rounded down, `lines` came back a line short: 16 lines planned as 15 on the Pro, 2026-11-20).
+    pub fn ns_ceil(&self, p: &Plan) -> u64 {
+        (((p.coarse as u128) << p.shift) * self.line_ps_at(p.llp) as u128).div_ceil(1000) as u64
+    }
+
     /// A plan's frame period (ns), in 128 bits as `ns`.
     pub fn frame_ns(&self, p: &Plan) -> u64 {
         (((p.fll as u128) << p.shift) * self.line_ps_at(p.llp) as u128 / 1000) as u64
@@ -1230,6 +1235,35 @@ mod tests {
         assert_eq!(t.frame_ns(&t.own(16)), 0x5372 * crate::MAIN_LINE_PS / 1000);
         let p = t.plan(most).unwrap();
         assert!((1_000_000_000..1_001_000_000).contains(&t.frame_ns(&p)), "{}", t.frame_ns(&p));
+    }
+
+    /// A frame length SET on a running stream (payloads/camera SET 4, owner 2026-11-20: a rate change without a reopen): the frame planned against is the new one, and the frame is the longer of it and the shutter with the sensor's margin (max(1/fps, shutter)).
+    /// The paced 60 a second (ferros_clip `Pacing::of(60)`: 5293 lines, 16.67 ms), then 24 a second (13232 lines), then the open's own again.
+    #[test]
+    fn a_frame_length_set_keeps_the_shutter() {
+        let open = main_timing();
+        for (fll, fps) in [(5293u16, 60u64), (13232, 24)] {
+            let t = Timing { fll, ..open };
+            // A shutter inside the new frame: the frame is the new one, a frame every 1/fps to within a line (the frame is whole lines).
+            let p = t.plan(4_000_000).unwrap();
+            assert_eq!((p.llp, p.fll, p.shift), (6320, fll, 0));
+            let period = t.frame_ns(&p);
+            assert!(period.abs_diff(1_000_000_000 / fps) < crate::MAIN_LINE_PS / 1000, "{fps}: {period}");
+            // A shutter longer than the new frame (the 67.3 ms of a still): the frame is the shutter's, never cut under it.
+            let p = t.plan(67_265_000).unwrap();
+            assert_eq!(p.fll as u64, p.coarse as u64 + 2, "{fps}: {p:?}");
+            assert!(p.fll > fll && t.ns(&p) <= 67_265_000 && t.frame_ns(&p) >= t.ns(&p), "{fps}: {p:?}");
+        }
+        // Back to the open's own frame: the plan is the open's again.
+        assert_eq!(open.plan(4_000_000).unwrap().fll, 0x5372);
+        // The exposure in force planned again keeps its lines: every integration from the least to past a frame, against a slit's 192 lines and a 384-line SET (the Pro, 2026-11-20: 16 lines came back 15 from `ns`).
+        for fll in [192u16, 384, 5293] {
+            let t = Timing { fll, ..open };
+            for c in [2u16, 15, 16, 17, 190, 1000, 21342] {
+                let now = Plan { llp: 6320, fll: 0x5372, coarse: c, shift: 0 };
+                assert_eq!(t.plan(t.ns_ceil(&now)).unwrap().coarse, c, "{fll} {c}");
+            }
+        }
     }
 
     /// With a shift (an example: the shift in the high byte, to 2^7, as the capture may show), 16 s is the mode's own line with the frame and integration counted in 2^shift lines, the least shift that fits.

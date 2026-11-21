@@ -684,34 +684,58 @@ fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, 
 }
 
 
-/// The bundle's codes to canvas values, 16 bits: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 working values with white at Q14 — so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255) now the canvas has the headroom. ICN2 (gamma 2 codes, white at 255): c × 16384 / 255.
+/// An icon's codes to canvas values, 16 bits: icons hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256; KISTS.md "Icons"), the canvas gamma 2 working values with white at Q14, so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255).
+/// The range: c/256 is 0 to 255/256, so atanh is 0 to 3.12 and the value 0.5 to A#51_1xx, inside a u16.
 fn icon_decode() -> [u16; 256] {
-    let g2t = ICONS.len() >= 4 && &ICONS[..4] == b"ICN3";
     let mut t = [0u16; 256];
     for (c, e) in t.iter_mut().enumerate() {
-        let v = if g2t { libm::atanhf(c as f32 / 256.0) * 16384.0 + 0.5 } else { c as f32 * 16384.0 / 255.0 + 0.5 };
-        *e = if v.is_nan() || v < 0.0 { 0 } else if v > 65535.0 { 65535 } else { v as u16 };
+        *e = (libm::atanhf(c as f32 / 256.) * 16384. + 0.5) as u16;
     }
     t
 }
 
-/// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
-static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
-/// The ferros mark's number, one past the bundle's six (counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`); the bundle carries no raster of it.
+/// The ferros mark's scene icon: drawn from logo.vsf's geometry (`draw::logo`), the one icon the display carries.
 const ICON_FERROS: u8 = 7;
-/// The app icons' mip chains, once built (the server's start): what a page draws a kist's icon from (op 77).
-static mut MIPS: Option<&'static [draw::Mips]> = None;
+/// The scene icon of the cache's first slot; slot k is `ICON_SLOT0 + k` (owner, 2026-11-20: the display keeps the icons it is handed by their `hp`, and carries no kist's icon of its own).
+const ICON_SLOT0: u8 = 0x40;
+/// The cache's slots, one for every circle the deck holds (payloads/map `MAX`, 16; coordinator, 2026-11-20: no thrashing): each holds one icon at its own size, 256 x 256, as the map handed it over (256 KiB of `g2t` RGBA, to bake again at a brightness change), and its chain (`draw::Mips`: the levels from 256 down to 4, A#91_552 texels of 8 bytes, 716 KiB), made at the start, before the heap's mark, and filled in place. Drawn scaled from them (`draw::icon`), never kept at a circle's size. 16 slots are 15.5 MiB.
+const ICON_SLOTS: usize = 1 << 4;
+/// An icon's side in texels (ferros_kept::icon `SIDE`).
+const ICON_SIDE: usize = ferros_kept::icon::SIDE;
 
-/// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
-fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
-    if n == 0 || ICONS.len() < 7 || !(&ICONS[..4] == b"ICN2" || &ICONS[..4] == b"ICN3") || n > ICONS[4] {
-        return None;
-    }
-    let size = u16::from_le_bytes([ICONS[5], ICONS[6]]) as usize;
-    let at = 7 + (n as usize - 1) * size * size * 5;
-    let px = ICONS.get(at..at + size * size * 4)?;
-    let grey = ICONS.get(at + size * size * 4..at + size * size * 5)?;
-    Some((px, grey, size))
+/// One slot of the icon cache: the texels (straight `g2t` RGBA, 256 x 256) and the chain made from them.
+struct IconSlot {
+    texels: &'static mut [u8],
+    mips: draw::Mips,
+}
+
+/// The cache's slots, made at the start; which icon each holds, by `hp` (ferros_kept::icon `Cache`); and the icon arriving in pieces (op 79). Touched on the render thread only, between frames (ops 78 and 79), as the bundle's chains were filled at a brightness change.
+static mut ICON_SLOT: Option<&'static mut [IconSlot]> = None;
+static mut ICON_CACHE: Option<ferros_kept::icon::Cache<()>> = None;
+static mut ICON_PIECES: Option<ferros_kept::icon::Pieces> = None;
+
+/// The slot a scene icon names, when it is a slot that holds an icon.
+fn icon_slot(icon: u8) -> Option<usize> {
+    let k = (icon as usize).wrapping_sub(ICON_SLOT0 as usize);
+    // SAFETY: the render thread's alone (ops 78 and 79 run on it, between frames).
+    (k < ICON_SLOTS && unsafe { (*(&raw const ICON_CACHE)).as_ref() }.is_some_and(|c| c.get(k).is_some())).then_some(k)
+}
+
+/// A scene icon's chain, when it names a slot that holds an icon.
+fn icon_mips(icon: u8) -> Option<&'static draw::Mips> {
+    let k = icon_slot(icon)?;
+    // SAFETY: as `icon_slot`; the slots live for the process.
+    let slots: &'static [IconSlot] = unsafe { (*(&raw const ICON_SLOT)).as_deref()? };
+    Some(&slots[k].mips)
+}
+
+/// A scene icon's texels (straight `g2t` RGBA) and its side, when it names a slot that holds an icon.
+fn icon(icon: u8) -> Option<(&'static [u8], usize)> {
+    let k = icon_slot(icon)?;
+    // SAFETY: as `icon_mips`.
+    let slots: &'static [IconSlot] = unsafe { (*(&raw const ICON_SLOT)).as_deref()? };
+    let t: &'static [u8] = &*slots[k].texels;
+    Some((t, ICON_SIDE))
 }
 /// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
 const WIDGET_CLOCK: u8 = 0x80;
@@ -1357,6 +1381,16 @@ static mut FIRST_SHOWS_N: usize = 0;
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// Inside the scene: icons, discs, labels (µs, the last camera op).
 static mut SCENE_US: [u64; 3] = [1; 3];
+/// Measuring the pucks' redraws between frames (a clipped replay, `CLIP_PHASE`): the last one's scene (the circles reaching the clip and the list drawn), the list's part across the cores, the publish, the clear and the clip's pixels, in µs; summed by the pass that runs them and told every 64 (2026-11-20, the Pro: passes of 31 to 38 ms with no calls, several puck boxes at about 7 ms each).
+static mut BOX_LAST: [u64; 5] = [0; 5];
+/// The sums since the last line: the redraws, their whole µs, then `BOX_LAST`'s five.
+static mut BOX_SUM: [u64; 7] = [0; 7];
+/// The boxes only published from the canvas (it held the square already, `puck::canvas_holds`) since the last line, and their µs; the passes that had boxes, the µs their boxes took in all, and the most one pass took.
+static mut BOX_PUB: [u64; 2] = [0; 2];
+/// The scene loop's µs in the last camera op by what each circle was: 0 a puck by bands (`Item::Puck`), 1 a puck into its sprite, 2 a puck's name, 3 anything else; and their sums over the redraws since the last line.
+static mut SCENE_PART: [u64; 4] = [0; 4];
+static mut BOX_PARTS: [u64; 4] = [0; 4];
+static mut BOX_PASS: [u64; 3] = [0; 3];
 /// The map's colours, the glow's strength: the theme (ferros_sys::theme).
 /// The glow that replaced the ring (owner, 2026-10-23: no stroke, so circles can touch; additive glow, 1/distance): its colour, how bright one pixel out by importance (ring 1, ring 2), the distance it holds that brightness (Q8 px), and the floor where it stops. Tunables, by eye.
 const GLOW_SCALE_Q8: i64 = 256;
@@ -2372,6 +2406,12 @@ fn arena_turn() {
     }
 }
 
+/// Whether circle i's sprite is current for this key and side (`sprite` would blit it, not draw it).
+fn sprite_current(i: usize, key: [i64; 6], d: usize) -> bool {
+    let sp = unsafe { &*(&raw const SPRITES[i]) };
+    sp.valid && sp.key == key && sp.d == d
+}
+
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space; `sprite_room` first says there is room). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
 fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [Px], usize)) -> (&'static [Px], &'static [Px]) {
     unsafe {
@@ -2528,8 +2568,8 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 } else if cir.icon == ICON_FERROS {
                     draw::logo(px, width, height, cx, cy, rr, 1 << 14, 0, true);
                     draw::disc(px, width, height, cx, cy, rr, 0);
-                // WHY `get`: the icon is the map's word (1 to the bundle's count, 0 none); a kist with no bundle icon (0, or one this display does not carry) falls to the plain fill below.
-                } else if let Some(mp) = unsafe { MIPS }.and_then(|v| v.get((cir.icon as usize).wrapping_sub(1))) {
+                // The icon the scene names by a slot of the cache that holds one (`icon_mips`); a kist whose icon the display does not hold (0, or a slot empty) falls to the plain fill below.
+                } else if let Some(mp) = icon_mips(cir.icon) {
                     draw::icon(px, width, height, cx, cy, rr, 1 << 14, 0, mp);
                 } else {
                     draw::disc(px, width, height, cx, cy, rr, th.ring & 0x00FF_FFFF);
@@ -2854,6 +2894,8 @@ enum Item {
     Icon(i64, i64, i64, i64, i64, usize, bool),
     /// A glow: centre, radius, colour, peak, its reach divisor (`GLOW_FRACTION`, a for-you glow's smaller) and its multiply (Q16, 0 none; `state_glow`).
     Glow(i64, i64, i64, u32, u32, i64, u32),
+    /// A puck's square sampled into its circle (`puck::draw_into`): the puck, centre, radius (Q8), the face's turn (Q14). On the list so its rows are drawn by bands across the threads (2026-11-20, the Pro: 14 ms a box on the render thread alone).
+    Puck(usize, i64, i64, i64, i64, i64),
 }
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
@@ -2867,6 +2909,8 @@ impl Item {
         match *self {
             Item::Blit(_, _, d, _, oy) => (oy, oy + d as i64),
             Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
+            // Its edge a row further up than a disc's (`puck::draw_into` starts a row above the circle).
+            Item::Puck(_, _, y, r, _, _) => (((y - r) >> 8) - 1, ((y + r) >> 8) + 3),
             Item::Glow(_, y, r, _, _, frac, _) => {
                 let reach = r + r / frac + 256;
                 ((y - reach) >> 8, ((y + reach) >> 8) + 3)
@@ -2894,6 +2938,11 @@ impl Item {
                 } else {
                     draw::glow(px, width, height, x, y, r, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
                 }
+            }
+            Item::Puck(j, x, y, r, c, s) => {
+                // Inside this thread's band of the frame's clip (`draw::bounds`), as every item draws.
+                let (x0, y0, x1, y1) = draw::bounds(width, height);
+                puck::draw_into(px, width, draw::Rect { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32, y1: y1 as i32 }, j, x, y, r, c, s);
             }
         }
     }
@@ -3491,9 +3540,10 @@ static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), and the system's own (78 and 79, the icon cache; 80, the windows as they stood): their caller's holdings are asked of the kernel as they arrive.
+/// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -5735,11 +5785,11 @@ fn present_bench(width: usize, log: &mut Log) {
 }
 
 /// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers, and from its source once the brightness settles (`wall_refresh`); the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
-fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
+fn rebake(width: usize, height: usize) {
     let decode = icon_decode();
-    for (i, m) in mips.iter().enumerate() {
-        if let Some((px, grey, _)) = icon(i as u8 + 1) {
-            m.fill(px, grey, &decode);
+    for k in 0..ICON_SLOTS {
+        if let (Some((px, _)), Some(m)) = (icon(ICON_SLOT0 + k as u8), icon_mips(ICON_SLOT0 + k as u8)) {
+            m.fill(px, &decode);
         }
     }
     unsafe {
@@ -5947,7 +5997,7 @@ fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, 
     let reach = r / frac as f32;
     // The icon's disc inside the stroke (2 pixels wide on the radius's inside).
     let ri = r - 2.0;
-    let art = icon(icon_n).map(|(px, _, size)| (px, size, icon_decode()));
+    let art = icon(icon_n).map(|(px, size)| (px, size, icon_decode()));
     let (x0, x1, y0, y1) = ((x - r - reach - 2.0) as i64, (x + r + reach + 2.0) as i64, (y - r - reach - 2.0) as i64, (y + r + reach + 2.0) as i64);
     for py in y0..=y1 {
         // WHY the test: the glow's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
@@ -7449,9 +7499,9 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 static mut SCREEN_WH: (u16, u16) = (0, 0);
 static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
-/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
+/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns, an icon's slot): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard; 2026-11-20: ops 78 and 79, so no icon slot ever came back).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71 | 78 | 79)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -7568,6 +7618,18 @@ extern "C" fn receive(grants: u64) -> ! {
                 None => {
                     ferros_sys::reply(&tok, &[3]);
                 }
+            }
+            continue;
+        }
+        // 80 `windows as they stood [surface u8][generation u8]` (2026-11-20, WINDOWS.md "A display started again"): from the deck after this display started again, the window that was in front (generation 0: none). Every app of the display before, held at its first watch until now, hears it: the one in front that the display's bake changed (it makes its frame again and shows it), the others that they are behind (events.rs `restore`). The system's alone: [4] (`NOT_YOURS`) from another caller.
+        if op == 80 && n >= 3 {
+            if system(h) {
+                let front = (msg[2] != 0 && (msg[1] as usize) < SURFACES).then_some((msg[1] as usize, msg[2]));
+                let (told, fronted) = events::restore(front);
+                ferros_sys::reply(&tok, &[0]);
+                ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: the deck says how the windows stood (in front: {}); re-attached apps told G#{told:X}, of them in front G#{fronted:X}", front.map_or(alloc::string::String::from("none"), |(k, g)| alloc::format!("surface A#{k} generation A#{g}"))).as_bytes());
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
             }
             continue;
         }
@@ -7887,17 +7949,17 @@ fn server(grants: u64) -> ! {
     let mut dev_seen = 0u64;
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
-    let mips: &'static [draw::Mips] = {
+    // The icon cache's slots (`IconSlot`), each a chain made from empty texels, kept for the process; filled in place as the map hands icons over (op 79).
+    {
         let decode = icon_decode();
-        let mut v = alloc::vec::Vec::new();
-        let mut n = 1u8;
-        while let Some((px, grey, size)) = icon(n) {
-            v.push(draw::Mips::build(px, grey, size, &decode));
-            n += 1;
+        let blank = alloc::vec![0u8; ferros_kept::icon::TEXELS];
+        let slots: alloc::vec::Vec<IconSlot> = (0..ICON_SLOTS).map(|_| IconSlot { texels: alloc::vec![0u8; ferros_kept::icon::TEXELS].leak(), mips: draw::Mips::build(&blank, ICON_SIDE, &decode) }).collect();
+        unsafe {
+            ICON_SLOT = Some(slots.leak());
+            ICON_CACHE = Some(ferros_kept::icon::Cache::new(ICON_SLOTS));
+            ICON_PIECES = Some(ferros_kept::icon::Pieces::default());
         }
-        v.leak()
-    };
-    unsafe { MIPS = Some(mips) };
+    }
     heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
@@ -8108,6 +8170,11 @@ fn server(grants: u64) -> ! {
     // A second console writer: `log` is lent to the op handler for the whole pass.
     let mut tlog = Log { grants, buf: [0; 256], n: 0 };
     unsafe { SCREEN_WH = (width as u16, height as u16) };
+    // The surfaces' owners known before the first call is taken (`live_gen`): registered after the receive thread, a display started again took its apps' first watches under generation 0, then dropped them as another owner's when the generation came (2026-11-20, the Pro).
+    let surf_bell = ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE);
+    if surf_bell {
+        SURF_BELL.store(true, Ordering::Release);
+    }
     if ferros_sys::thread_spawn(receive, unsafe { &mut *(&raw mut RECV_STACK) }, grants) != 0 {
         log.s(b"display: no receive thread\n");
         log.flush();
@@ -8151,8 +8218,7 @@ fn server(grants: u64) -> ! {
         log.flush();
     }
     // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
-    if ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE) {
-        SURF_BELL.store(true, Ordering::Release);
+    if surf_bell {
         if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
             log.s(b"display: no reaper thread\n");
             log.flush();
@@ -8325,6 +8391,55 @@ fn server(grants: u64) -> ! {
                             SCENE_N += 1;
                         }
                         at += 30;
+                    }
+                }
+                // 78 `icon have [hp 32]`: the cache's slot holding that icon as its scene icon (`ICON_SLOT0` + k), or 0 when it holds none (the map then hands it over, op 79). The system's alone, as op 79.
+                Some(78) if m.len() >= 33 => {
+                    let hp = ferros_thing::Hp::from_bytes(m[1..33].try_into().expect("33 bytes or more, by the arm's guard"));
+                    // SAFETY: the render thread's alone, between frames.
+                    let slot = unsafe { (*(&raw mut ICON_CACHE)).as_mut() }.and_then(|c| c.slot(&hp));
+                    out[0] = if !system(unsafe { HOLDS }) { 0 } else { slot.map_or(0, |k| ICON_SLOT0 + k as u8) };
+                }
+                // 79 `icon put [hp 32][offset u32][texels…]`: a piece of an icon's texels (ferros_kept::icon: straight `g2t` RGBA at the icon's own size, `TEXELS` in all), in order from 0. → [0 more due][1 built, then its slot][2 dropped: out of order, past the size, no room, or not the system's].
+                // Only the system hands icons over (the map, which read it from the vault under that `hp`): a kist's pieces would put its pixels under another kist's icon.
+                Some(79) if m.len() >= 37 => {
+                    let hp = ferros_thing::Hp::from_bytes(m[1..33].try_into().expect("33 bytes or more, by the arm's guard"));
+                    let offset = u32::from_le_bytes([m[33], m[34], m[35], m[36]]) as usize;
+                    len = 2;
+                    // SAFETY: the render thread's alone, between frames (as `rebake` fills the chains).
+                    let done = if system(unsafe { HOLDS }) { unsafe { (*(&raw mut ICON_PIECES)).as_mut() }.map(|p| p.take(&hp, offset, &m[37..])) } else { None };
+                    match done {
+                        Some(None) => out[0] = 0,
+                        None => {
+                            ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: icon put refused: the caller is not the system (holds G#{:X})", unsafe { HOLDS }).as_bytes());
+                            out[0] = 2;
+                        }
+                        Some(Some(texels)) => {
+                            // The slots the scene shows now stay; the new icon takes its own slot, an empty one, or the one used longest ago.
+                            let keep: alloc::vec::Vec<usize> = unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().filter_map(|c| icon_slot(c.icon)).collect() };
+                            match unsafe { (*(&raw mut ICON_CACHE)).as_mut() }.and_then(|c| c.put(hp, (), &keep)) {
+                                None => out[0] = 2,
+                                Some(k) => {
+                                    // SAFETY: as above; the slot's texels are `TEXELS` long, as `take` returns them.
+                                    let slots = unsafe { (*(&raw mut ICON_SLOT)).as_mut() }.expect("the icon slots are made at the start");
+                                    slots[k].texels.copy_from_slice(&texels);
+                                    slots[k].mips.fill(slots[k].texels, &icon_decode());
+                                    // What was drawn from that slot before is another icon's: every sprite made again, the last frame and the plane's images not reused.
+                                    unsafe {
+                                        for s in 0..256 {
+                                            SPRITES[s].valid = false;
+                                            SPRITES[s].cap = 0;
+                                        }
+                                        ARENA_NEXT = 0;
+                                        LAST_FRAME.1 = 0;
+                                        SCENE_GEN = SCENE_GEN.wrapping_add(1);
+                                    }
+                                    ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: icon G#{:02X}{:02X}{:02X}{:02X} built in slot A#{k}", hp.as_bytes()[0], hp.as_bytes()[1], hp.as_bytes()[2], hp.as_bytes()[3]).as_bytes());
+                                    out[0] = 1;
+                                    out[1] = ICON_SLOT0 + k as u8;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(57) if m.len() >= 2 => {
@@ -8527,12 +8642,14 @@ fn server(grants: u64) -> ! {
                     // The clean window is the open circle's ground alone (owner, 2026-11-07: "can we not draw any other circles other than the nav and console?"): no circle of the map, not the open one's own mark, no glow; the bars are their own layer.
                     let scene_n = if skip_scene || remade { 0 } else { unsafe { SCENE_N } };
                     let mut t_phase = now();
-                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
+                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3]; SCENE_PART = [0; 4] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
                     arena_turn();
                     // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
                     // What each puck's circle shows of itself this frame (puck.rs `scene_end`: a held WATCH answered when it changes), gathered in the same pass.
                     if clip_k.is_none() {
+                        // A whole frame: the canvas holds again only what this frame draws of each puck (`canvas_drew` below).
+                        puck::canvas_forget();
                         puck::scene_start();
                         let discs = hit::discs();
                         let mut n = 0;
@@ -8569,7 +8686,11 @@ fn server(grants: u64) -> ! {
                         let mut nglow = 0usize;
                         // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
                         let th = ferros_sys::theme::current();
+                        // Measuring (2026-11-20): each circle's time in this loop by what it was (`SCENE_PART`), the last one's added as the next starts.
+                        let (mut t_part, mut part) = (now(), 3usize);
                         for i in 0..scene_n {
+                            unsafe { SCENE_PART[part] += ferros_sys::us_since(t_part) };
+                            (t_part, part) = (now(), 3);
                             let cir = unsafe { SCENE[i] };
                             // World to screen, Q8 pixels: offset, turn, zoom, centre.
                             let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
@@ -8618,7 +8739,9 @@ fn server(grants: u64) -> ! {
                                 let d = (2 * ((sr >> 8) + 3)) as usize;
                                 let still = unsafe { LAST_KEY[i] == key };
                                 unsafe { LAST_KEY[i] = key };
-                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
+                                // A sprite only where it pays: one current for this drawing is blitted; a new one is made only in a whole frame, where the moves that follow reuse it. A redraw of a box draws the square by bands across the threads instead: made there, a sprite samples the whole square on this thread alone (2026-11-20, the Pro: 10 to 12 ms of each box went into sprites, 2.5 ms by bands).
+                                if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && (clip_k.is_none() || sprite_current(i, key, d)) && sprite_room(i, d) {
+                                    part = 1;
                                     let (spr, ext) = sprite(i, key, d, |px, d| {
                                         let c = ((d as i64 / 2) << 8) | 128;
                                         if !puck::draw_into(px, d, draw::Rect::full(d, d), j, c, c, ri, tc, ts) {
@@ -8627,14 +8750,22 @@ fn server(grants: u64) -> ! {
                                         draw::disc(px, d, d, c, c, ri, plane);
                                     });
                                     scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
+                                } else if puck::has_square(j) {
+                                    // Its square by bands across the threads, with the rest of the list (`Item::Puck`), the plane under it.
+                                    part = 0;
+                                    scene_push(Item::Puck(j, sx, sy, ri, tc, ts), pixels, width, height);
+                                    scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
                                 } else {
-                                    let clip = draw::Rect::full(width, height).intersect(unsafe { draw::CLIP });
-                                    if !puck::draw_into(pixels, width, clip, j, sx, sy, ri, tc, ts) {
-                                        puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
-                                    }
+                                    part = 2;
+                                    puck_name(pixels, width, height, &cir, sx, sy, ri, tc, ts, th.text2);
                                     scene_push(Item::Disc(sx, sy, ri, plane, moving), pixels, width, height);
                                 }
-                                let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+                                let whole = puck::box_of(sx, sy, sr, width, height);
+                                // What the canvas now holds of this puck: its newest square whole when the clip covered its whole box (a whole frame, whose clip is everything, or a redraw of its own box), else a part (a pan's strip, another box; `canvas_drew`). Not for the flight's plane image, which is drawn into a surface of its own.
+                                if pre != 2 {
+                                    let c = unsafe { draw::CLIP };
+                                    puck::canvas_drew(j, c.x0 <= whole.x0 && c.y0 <= whole.y0 && c.x1 >= whole.x1 && c.y1 >= whole.y1);
+                                }
                                 unsafe { CUR_DMG = CUR_DMG.union(whole) };
                                 continue;
                             }
@@ -8729,7 +8860,7 @@ fn server(grants: u64) -> ! {
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
                             let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
                             let fill = if lit { th.lit & 0x00FF_FFFF } else { th.plane & 0x00FF_FFFF };
-                            let mp = mips.get((cir.icon as usize).wrapping_sub(1));
+                            let mp = icon_mips(cir.icon);
                             let d = (2 * ((sr >> 8) + 3)) as usize;
                             let mut r = draw::Rect::EMPTY;
                             let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
@@ -8778,6 +8909,7 @@ fn server(grants: u64) -> ! {
                             let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
                             unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                         }
+                        unsafe { SCENE_PART[part] += ferros_sys::us_since(t_part) };
                         let t_g = now();
                         for &g in &glows[..nglow] {
                             scene_push(g, pixels, width, height);
@@ -8818,7 +8950,13 @@ fn server(grants: u64) -> ! {
                     // A clock refresh (the camera has not moved): only the clock's own rectangle changed.
                     if let Some(k) = clip_k {
                         unsafe {
-                            publish10x4(pixels, width, height, &tabs, if CLIP_MASK != 0 { CLIP_MASK } else { 1 << k }, draw::CLIP.clip(width, height));
+                            let t_pub = now();
+                            let c = draw::CLIP.clip(width, height);
+                            publish10x4(pixels, width, height, &tabs, if CLIP_MASK != 0 { CLIP_MASK } else { 1 << k }, c);
+                            BOX_LAST = [PHASE_US[0], SCENE_US[2], ferros_sys::us_since(t_pub), CLEAR_US, ((c.x1 - c.x0).max(0) * (c.y1 - c.y0).max(0)) as u64];
+                            for q in 0..4 {
+                                BOX_PARTS[q] += SCENE_PART[q];
+                            }
                             (PREV_DMG, CUR_DMG) = saved_dmg;
                         }
                         ferros_sys::dma_barrier();
@@ -9418,8 +9556,14 @@ fn server(grants: u64) -> ! {
                             frames += 1;
                             FRAMES.store(frames, Ordering::Relaxed);
                         }
+                    } else if sk < SURFACES && m[2] != 0 && live_gen(sk) == m[2] {
+                        // No window yet, but the surface lives under that generation: an app from before this display started again (WINDOWS.md "A display started again"), told it was behind when it re-attached (events.rs `watch`). Told it is in front now, it draws whole and shows, and its show makes its window here, in front.
+                        events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        last_interaction = now();
+                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: no window yet, told it is in front", m[2]).as_bytes());
                     } else {
                         out[0] = 3;
+                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: refused (live generation A#{}, a window {})", m[2], if sk < SURFACES { live_gen(sk) } else { 0 }, if sk < SURFACES { unsafe { WINS[sk] }.map_or(alloc::string::String::from("none"), |w| alloc::format!("of generation A#{}", w.generation)) } else { alloc::string::String::from("none") }).as_bytes());
                     }
                 }
                 Some(60) => {
@@ -9965,24 +10109,95 @@ fn server(grants: u64) -> ! {
             }
             if unsafe { LAST_FRAME.1 > 0 } {
                 let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                let mut boxes = [draw::Rect::EMPTY; puck::N];
+                let mut boxes = [(0usize, draw::Rect::EMPTY); puck::N];
                 let nb = puck::phase_due(k, width, height, &mut boxes);
                 let t_box = now();
-                for clip in boxes[..nb].iter().filter(|c| !c.is_empty()) {
+                for &(j, clip) in boxes[..nb].iter().filter(|(_, c)| !c.is_empty()) {
                     puck::count(4);
-                    unsafe {
-                        draw::CLIP = *clip;
-                        CLIP_PHASE = Some(k);
+                    let t_one = now();
+                    // The canvas holds this square whole already (an earlier phase drew it, or the last whole frame did): the box published into this phase from it, nothing drawn again (2026-11-20: each phase sampled the same square again, 16 ms a box).
+                    if puck::canvas_holds(j) {
+                        // SAFETY: `back` is the canvas, a full screen of the display's own, which only this thread writes; the publish only reads it.
+                        let canvas = unsafe { core::slice::from_raw_parts(back as *const Px, width * height) };
+                        publish10x4(canvas, width, height, &tabs, 1 << k, clip);
+                        unsafe {
+                            BOX_PUB[0] += 1;
+                            BOX_PUB[1] += ferros_sys::us_since(t_one);
+                        }
+                    } else {
+                        unsafe {
+                            draw::CLIP = clip;
+                            CLIP_PHASE = Some(k);
+                            BOX_LAST = [0; 5];
+                        }
+                        replay(&mut handle);
+                        unsafe {
+                            CLIP_PHASE = None;
+                            draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                            BOX_SUM[0] += 1;
+                            BOX_SUM[1] += ferros_sys::us_since(t_one);
+                            for q in 0..5 {
+                                BOX_SUM[2 + q] += BOX_LAST[q];
+                            }
+                        }
                     }
-                    replay(&mut handle);
                     unsafe {
-                        CLIP_PHASE = None;
-                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                        // Every 64 boxes, either way: the redraws' parts, the publishes from the canvas, and what the passes with boxes spent on them.
+                        if BOX_SUM[0] + BOX_PUB[0] == 64 {
+                            tlog.s(b"display: puck boxes, 64: A#");
+                            tlog.dec(BOX_SUM[0]);
+                            tlog.s(b" redrawn");
+                            // WHY the test: an average over no redraws has no value to say (and would divide by zero).
+                            if BOX_SUM[0] > 0 {
+                                tlog.s(b", us each: whole ");
+                                for (q, name) in [&b"; scene "[..], b" (of it across the cores ", b"); publish ", b"; clear ", b"; pixels each "].iter().enumerate() {
+                                    tlog.dec(BOX_SUM[1 + q] / BOX_SUM[0]);
+                                    tlog.s(name);
+                                }
+                                tlog.dec(BOX_SUM[6] / BOX_SUM[0]);
+                                tlog.s(b"; the circles' loop by kind, us each: pucks by bands ");
+                                for (q, name) in [&b", pucks into sprites "[..], b", pucks' names ", b", the rest "].iter().enumerate() {
+                                    tlog.dec(BOX_PARTS[q] / BOX_SUM[0]);
+                                    tlog.s(name);
+                                }
+                                tlog.dec(BOX_PARTS[3] / BOX_SUM[0]);
+                            }
+                            tlog.s(b"; A#");
+                            tlog.dec(BOX_PUB[0]);
+                            tlog.s(b" published from the canvas");
+                            // WHY the test: as above, no publishes, no average.
+                            if BOX_PUB[0] > 0 {
+                                tlog.s(b", us each ");
+                                tlog.dec(BOX_PUB[1] / BOX_PUB[0]);
+                            }
+                            tlog.s(b"; A#");
+                            tlog.dec(BOX_PASS[0]);
+                            tlog.s(b" passes with boxes");
+                            // WHY the test: a line can come before any pass with boxes has ended (the 64th box is in this pass).
+                            if BOX_PASS[0] > 0 {
+                                tlog.s(b", their boxes us a pass ");
+                                tlog.dec(BOX_PASS[1] / BOX_PASS[0]);
+                                tlog.s(b", the most ");
+                                tlog.dec(BOX_PASS[2]);
+                            }
+                            tlog.s(b"\n");
+                            tlog.flush();
+                            BOX_SUM = [0; 7];
+                            BOX_PUB = [0; 2];
+                            BOX_PARTS = [0; 4];
+                            BOX_PASS = [0; 3];
+                        }
                     }
                 }
                 if nb > 0 {
                     puck::phase_drew(k, false);
-                    puck::count_us(ferros_sys::us_since(t_box));
+                    let us = ferros_sys::us_since(t_box);
+                    puck::count_us(us);
+                    unsafe {
+                        BOX_PASS[0] += 1;
+                        BOX_PASS[1] += us;
+                        BOX_PASS[2] = BOX_PASS[2].max(us);
+                    }
                 }
             }
         }
@@ -10041,6 +10256,14 @@ fn server(grants: u64) -> ! {
                         l.s(b" dropped: its process ended\n");
                         l.flush();
                     }
+                }
+            }
+            // Apps that re-attached from an earlier display (events.rs `watch`) heard they are behind: a window one already made here by a show goes behind too, so the glass and the app agree until the deck brings it to the front (op 59).
+            let reattached = events::reattached();
+            for sk in (0..SURFACES).filter(|&sk| reattached >> sk & 1 == 1) {
+                if let Some(w) = (*(&raw mut WINS))[sk].as_mut().filter(|w| !w.back) {
+                    w.back = true;
+                    gone = true;
                 }
             }
             if gone {
@@ -10426,7 +10649,7 @@ fn server(grants: u64) -> ! {
             bake::set(white, peak_e);
             bake_consts();
             tabs = bake::now().odt;
-            rebake(mips, width, height);
+            rebake(width, height);
             wall_unlock();
             settle_owed = true;
             // The map's last frame drawn again with the new bake, at the top of the next pass (where the clock's replays run), which the bell starts at once.

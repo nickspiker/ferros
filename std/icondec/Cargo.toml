@@ -1,0 +1,41 @@
+[package]
+name = "icondec"
+version = "0.1.0"
+edition = "2024"
+description = "The icon decoder at stow (docs/KISTS.md \"Icons\"; coordinator, 2026-11-20): a kist's icon, its AV1 picture handed in by the stower, decoded once into what the display draws (ferros_kept::icon `texels`) and handed back. A std process with no right but its own endpoint (`icons`): rav1d is a large decoder fed a stranger's bytes, so it gets nothing to misuse. Started by the kernel when the stower calls and none runs; ends itself once it has handed an icon back."
+
+[[bin]]
+name = "icondec"
+path = "src/main.rs"
+
+[dependencies]
+# The picture's three planes, VSF YCbCr 4:2:0 to R, G, B codes (vsf::visual::av1, rav1d), as every VSF reader decodes an AV1 plane.
+vsf = { path = "../../../vsf", features = ["av1-decode"] }
+# What the display draws from them, one definition with the host's seed (ferros_kept::icon `texels`).
+ferros_kept = { path = "../../ferros_kept" }
+
+# The host's seed: an icon read from a capsule or an icon document and named by the `hp` the device knows it by.
+[target.'cfg(not(target_os = "ferros"))'.dependencies]
+ferros_kist = { path = "../../ferros_kist" }
+ferros_thing = { path = "../../ferros_thing" }
+
+[dev-dependencies]
+# The test makes an icon's AV1 with vsf's own encoder (rav1e), as tools/app-icons does thru Photon's.
+vsf = { path = "../../../vsf", features = ["av1"] }
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+[patch.crates-io]
+# rav1d spells its types through libc, whose ferros arm lives in this fork (as Photon's and camreplay's builds take it).
+libc = { path = "/mnt/Harbor/Code/ferros-libc" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

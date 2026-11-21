@@ -83,6 +83,7 @@ fn usage() {
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  part list | dump <name> <out> | gpt <lu> <primary> <backup>   Partitions block for block, read-only (development kernels; per-unit backups into keys/<device>/)");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
+    eprintln!("  icon seed <decoded.vsf>...   Decoded icons (std/icondec on the host) into kists. by their hp");
     eprintln!("  items find | card <h> | get <h> <out> | put <kind> <file> [--clip] | rm <h> | usage | kinds   The hold, as the person (`items` alone for the flags)");
     eprintln!("  sponsor <address> <port> <out.vsf>  The sponsor document for `store put fgtw.sponsor @out.vsf` (IPv4 or IPv6)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
@@ -135,6 +136,7 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        "icon" => cmd_icon(&args[2..]).await,
         "items" => items::cmd_items(&args[2..]).await,
         // part list | dump <name> <out> | gpt <lu> <primary> <backup>: Android's partitions read block for block thru the development `diag lun`, for the per-unit backups (part.rs).
         "part" => part::cmd(&args[2..]).await,
@@ -1253,6 +1255,50 @@ async fn extent_pull(key: &str, bytes: &str, out: &str, kist: Option<[u8; 64]>) 
 }
 
 /// One STORE command and its reply: the status byte's meaning on failure, the rest on success.
+/// `icon seed <decoded.vsf>…` (coordinator, 2026-11-20: the bench and a first deploy need no fresh stow): each decoded icon (std/icondec on the host: `icondec <capsule or icon> <out.vsf>`) stored in the device's `kists.` under the `hp` its document names, by address, as the stower stores what the decoder hands it (the development store capability, which only the host reaches; a production build answers none). The document is checked first: it must be a decoded icon that says it is that `hp`. The stower's start then puts each stowed kist's icon in the index, finding these decoded already.
+async fn cmd_icon(args: &[String]) {
+    let files = match args.first().map(String::as_str) {
+        Some("seed") if args.len() >= 2 => &args[1..],
+        _ => {
+            eprintln!("Usage: ferros-bridge icon seed <decoded.vsf>...   (make each with std/icondec on the host)");
+            std::process::exit(1);
+        }
+    };
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
+        eprintln!("no device: {e}");
+        std::process::exit(1);
+    });
+    for path in files {
+        let doc = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("{path}: {e}");
+            std::process::exit(1);
+        });
+        // The `hp` it names, read by its type marker, then the whole document held to it (ferros_kept::icon `read_decoded`).
+        let hp = vsf::VsfHeader::decode(&doc).ok().and_then(|(h, _)| h.fields.iter().find(|f| f.name == "decoded").map(|f| f.offset_bytes)).and_then(|at| {
+            let mut p = at;
+            vsf::VsfSection::parse(&doc, &mut p).ok()?.get_field("icon").and_then(|f| f.values.first()).and_then(|v| ferros_thing::Hp::from_vsf(v).ok())
+        });
+        let Some(hp) = hp.filter(|h| ferros_kept::icon::read_decoded(&doc, h).is_some()) else {
+            eprintln!("{path}: not a decoded icon (std/icondec makes them)");
+            std::process::exit(1);
+        };
+        let mut key = b"kists.".to_vec();
+        key.extend_from_slice(hp.as_bytes());
+        let mut p = Vec::with_capacity(2 + key.len() + doc.len());
+        // Bit 14: the key is a scope's prefix and a 32-byte address (service.rs `vault_job_start`).
+        p.extend_from_slice(&((key.len() as u16) | 1 << 14).to_be_bytes());
+        p.extend_from_slice(&key);
+        p.extend_from_slice(&doc);
+        match store_call(&link, ferros_pt::Op::Write, &p).await {
+            Ok(_) => println!("{path}: icon {} stored in kists., {} bytes", hp.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(), doc.len()),
+            Err(e) => {
+                eprintln!("{path}: not stored: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 async fn store_call(link: &usb::UsbLink, op: ferros_pt::Op, params: &[u8]) -> Result<Vec<u8>, String> {
     let cmd = build_cmd(ferros_pt::command::caps::STORE, op, params);
     // A put that commits a large value may outlive one answer: its end read held (ferros_pt::command::held).

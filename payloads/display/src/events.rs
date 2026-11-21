@@ -28,9 +28,19 @@ struct Queue {
     at: [u32; EVENTS],
     /// A watch held: its reply token and the count its caller had seen.
     held: Option<([u8; 32], u32)>,
+    /// The held watch is an app of an earlier display waiting for the deck to say how the windows stood (op 80, `restore`).
+    restore: bool,
 }
 
-const EMPTY: Queue = Queue { generation: 0, n: 0, behind: false, ring: [0; EVENTS], nb: 0, bytes: [0; BYTES], at: [0; EVENTS], held: None };
+/// The surfaces whose app re-attached from an earlier display (`watch`), bit k surface k: the render thread puts their windows behind (`reattached`).
+static REATTACHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The surfaces whose app re-attached since the last call, cleared as read (the render thread's, once a pass).
+pub fn reattached() -> u32 {
+    REATTACHED.swap(0, Ordering::AcqRel)
+}
+
+const EMPTY: Queue = Queue { generation: 0, n: 0, behind: false, ring: [0; EVENTS], nb: 0, bytes: [0; BYTES], at: [0; EVENTS], held: None, restore: false };
 static mut QUEUES: [Queue; SURFACES] = [EMPTY; SURFACES];
 static LOCK: AtomicBool = AtomicBool::new(false);
 
@@ -114,13 +124,81 @@ pub fn watch(k: usize, generation: u8, seen: u32, tok: &[u8; 32]) {
     let qs = lock();
     let q = &mut qs[k];
     own(q, generation);
+    // A count this display never gave, on a surface it has told nothing (2026-11-20, docs/WINDOWS.md "A display started again"): the caller watched an earlier display, which ended. Until the deck has said how the windows stood (op 80, `restore`), the watch is held: what it hears is decided then (`reattach`), so the app in front never hears a false "behind" (Lumis ends on it). No timer: an app whose deck never says keeps the state it had.
+    if q.n == 0 && seen != 0 && !q.restore {
+        if let Some((old, s)) = q.held.take() {
+            answer(q, s, &old);
+        }
+        let said = match unsafe { FRONT } {
+            None => {
+                q.held = Some((*tok, seen));
+                q.restore = true;
+                None
+            }
+            Some(front) => Some(reattach(q, k, seen, tok, front)),
+        };
+        unlock();
+        // A restart's work, so in the flash log; said outside the lock.
+        let what = match said {
+            None => "held until the deck says how the windows stood",
+            Some(true) => "told the display's bake again (it was in front)",
+            Some(false) => "told it is behind",
+        };
+        ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: surface A#{k}'s app re-attached from an earlier display (it had seen A#{seen} events): {what}").as_bytes());
+        return;
+    }
     if let Some((old, s)) = q.held.take() {
         answer(q, s, &old);
     }
+    q.restore = false;
     if seen != q.n {
         answer(q, seen, tok);
     } else {
         q.held = Some((*tok, seen));
     }
     unlock();
+}
+
+/// How the deck said the windows stood (op 80): None until it has; then Some of the window in front (its surface and generation), or Some(None) for none.
+static mut FRONT: Option<Option<(usize, u8)>> = None;
+
+/// What a re-attaching app hears once the deck has said (`watch`, `restore`), answering `tok` (it saw `seen` events). The count goes one past what it saw, so it is answered with that one event whatever it saw (set to 1 instead, an app that had seen one event, the safe area at its first show, was held and never heard it: Kuaha on the Pro).
+/// The window that was in front hears the display's bake changed (`EV_BAKE`): it asks this display's bake and makes its frame again whole, and its show makes its window here, in front; an idle app draws again for it too, where "front" would change nothing for an app that thinks it is in front already. Any other hears it is behind (it draws nothing until brought to the front, op 59), and a window it already made here by a show goes behind with it (`reattached`). Whether it was the one in front. Under the lock.
+fn reattach(q: &mut Queue, k: usize, seen: u32, tok: &[u8; 32], front: Option<(usize, u8)>) -> bool {
+    // By the generation the surface lives under now (`live_gen`), not the queue's, which a watch taken early may have left at 0.
+    let is_front = front.is_some_and(|(sk, g)| sk == k && g != 0 && g == live_gen(k));
+    let ev = if is_front { ferros_sys::window::EV_BAKE } else { ferros_sys::window::EV_BEHIND };
+    q.behind = !is_front;
+    q.n = seen.wrapping_add(1);
+    let i = (q.n.wrapping_sub(1)) as usize % EVENTS;
+    q.ring[i] = (ev as u16) << 8;
+    q.at[i] = q.nb;
+    q.restore = false;
+    if !is_front {
+        REATTACHED.fetch_or(1 << k, Ordering::AcqRel);
+    }
+    answer(q, seen, tok);
+    is_front
+}
+
+/// Op 80 from the deck (the system's alone): how the windows stood before this display started, the window in front by surface and generation, or none. Every re-attaching watch held for it is answered now (`reattach`), and one that comes later is answered at once. The surfaces it answered, bit k surface k, and which of them was the one in front.
+pub fn restore(front: Option<(usize, u8)>) -> (u32, u32) {
+    let qs = lock();
+    unsafe { FRONT = Some(front) };
+    let (mut told, mut fronted) = (0u32, 0u32);
+    for (k, q) in qs.iter_mut().enumerate() {
+        if !q.restore {
+            continue;
+        }
+        let Some((tok, seen)) = q.held.take() else {
+            q.restore = false;
+            continue;
+        };
+        told |= 1 << k;
+        if reattach(q, k, seen, &tok, front) {
+            fronted |= 1 << k;
+        }
+    }
+    unlock();
+    (told, fronted)
 }

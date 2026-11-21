@@ -712,6 +712,32 @@ pub fn icon_of(capsule: &[u8]) -> Result<Option<Icon>, &'static str> {
     section(capsule, ICON)?.as_ref().map(icon_from).transpose()
 }
 
+/// The content identity (`hp`) of the icon a capsule carries: the BLAKE3 of its `icon` section's bytes as the capsule holds them, signed with the rest (ferros_thing `icon`), or None for a capsule without one. What the deck and the display know the icon by: the same icon in two builds of a kist is one icon, decoded once.
+pub fn icon_hp(capsule: &[u8]) -> Result<Option<ferros_thing::Hp>, &'static str> {
+    let Some((at, len)) = icon_span(capsule)? else { return Ok(None) };
+    // WHY `get`: the span is the file's own table of contents; one past its end is no icon.
+    icon_section_hp(capsule.get(at..at.checked_add(len).ok_or("a section past the file's end")?).ok_or("a section past the file's end")?).map(Some)
+}
+
+/// Where a capsule's `icon` section lies (offset and length, by its table of contents), read from its first bytes alone (the header: the stower reads the section itself from the vault, never the whole capsule); None for a capsule without one.
+pub fn icon_span(head: &[u8]) -> Result<Option<(usize, usize)>, &'static str> {
+    let (header, _) = VsfHeader::decode(head).map_err(|_| "not a VSF file")?;
+    Ok(header.fields.iter().find(|f| f.name == ICON).map(|e| (e.offset_bytes, e.size_bytes)))
+}
+
+/// An `icon` section's content identity: the bytes of the section as the capsule holds them, from the start of its span ([`icon_span`]) to where it parses to, once they read as an icon; a section that is no icon has none.
+pub fn icon_section_hp(span: &[u8]) -> Result<ferros_thing::Hp, &'static str> {
+    icon_section_read(span).map(|(hp, _)| hp)
+}
+
+/// An `icon` section read from its span: its content identity ([`icon_section_hp`]) and the icon (its AV1 and encoding), for the decoder at stow.
+pub fn icon_section_read(span: &[u8]) -> Result<(ferros_thing::Hp, Icon), &'static str> {
+    let mut end = 0;
+    // The table of contents names it (`icon_span`); its fields say whether it is an icon.
+    let icon = icon_from(&VsfSection::parse(span, &mut end).map_err(|_| "a section that does not parse")?)?;
+    Ok((ferros_thing::icon(&span[..end]), icon))
+}
+
 /// An icon from its own document (tools/app-icons `icon`: a complete VSF file, vsf's flat image section `image`).
 pub fn icon_document(doc: &[u8]) -> Result<Icon, &'static str> {
     icon_from(&section(doc, "image")?.ok_or("no `image` section")?)
@@ -1122,6 +1148,11 @@ impl Want {
 }
 
 impl Kist {
+    /// The kist as a thing (`ht`): from its developer and option, the same across its versions and whether it is a puck now or not (ferros_thing `kist`).
+    pub fn thing(&self) -> ferros_thing::Ht {
+        ferros_thing::kist(&self.developer, &self.option)
+    }
+
     /// Whether its capsule declares `PUCK`: a puck, a live circle on the deck never opened (docs/PUCKS.md).
     pub fn is_puck(&self) -> bool {
         self.wants.iter().any(|w| w.right == PUCK)
@@ -1896,6 +1927,7 @@ pub mod capsule {
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
             // No icon given, none carried.
             assert_eq!(crate::icon_of(&c).unwrap(), None);
+            assert_eq!(crate::icon_hp(&c).unwrap(), None);
         }
 
         #[test]
@@ -1909,7 +1941,17 @@ pub mod capsule {
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
             let c = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&icon), &key.public(), &code, 9).unwrap(), &key).unwrap();
             fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
-            assert_eq!(crate::icon_of(&c).unwrap(), Some(icon));
+            assert_eq!(crate::icon_of(&c).unwrap(), Some(icon.clone()));
+            // Its content identity is the BLAKE3 of the section as written; another build of the kist with the same icon has the same one, another icon another.
+            let hp = crate::icon_hp(&c).unwrap().unwrap();
+            assert_eq!(hp, ferros_thing::icon(&crate::icon_section(&icon).encode()));
+            let again = fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 2])), None, Some(&icon), &key.public(), &code, 10).unwrap(), &key).unwrap();
+            assert_eq!(crate::icon_hp(&again).unwrap(), Some(hp));
+            let other = crate::Icon { av1: alloc::vec![0x12u8, 0, 0x0A, 0x0B, 8], encoding: vsf::visual::Encoding::Gamma2Tanh };
+            let changed = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&other), &key.public(), &code, 9).unwrap(), &key).unwrap();
+            assert_ne!(crate::icon_hp(&changed).unwrap(), Some(hp));
+            // The kist is the same thing in all three.
+            assert_eq!(identity(&c).unwrap(), identity(&changed).unwrap());
             // The declaration reads as before, and the icon sits after the code, out of the first bytes the stower and the kernel read.
             assert_eq!(declaration(&c).unwrap(), decl());
             let at = |s: &[u8]| (0..c.len() - s.len()).find(|&i| c[i..i + s.len()] == *s).unwrap();

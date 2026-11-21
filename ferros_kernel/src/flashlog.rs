@@ -190,9 +190,54 @@ pub fn personal(text: &str) {
     put(category::PERSON_TEXT, "kernel", text, None)
 }
 
+/// The lines that repeat on a retry loop, kept once and then counted (coordinator, 2026-11-20: b1062's USB retries, three lines every 4 s with nothing plugged in, pushed a crash's lead-up out of `diag log`'s window): per slot, the hash of the last line kept and how many times it came again since.
+pub mod once {
+    /// The USB link's tcpc state, the link readied, the USB process's end after its tries.
+    pub const USB_TCPC: usize = 0;
+    pub const USB_LINK: usize = 1;
+    pub const USB_END: usize = 2;
+    pub const SLOTS: usize = 1 << 2;
+}
+static ONCE_HASH: [AtomicU64; once::SLOTS] = [const { AtomicU64::new(0) }; once::SLOTS];
+static ONCE_AGAIN: [AtomicU64; once::SLOTS] = [const { AtomicU64::new(0) }; once::SLOTS];
+
+/// Whether a line in `slot` is to be kept: the first time, and whenever it differs from the last one kept (then the count of the last one's repeats goes first, as a line of its own). Counted and dropped otherwise.
+fn once_keep(slot: usize, writer: &str, words: &str) -> bool {
+    // FNV-1a over the writer, a zero, the words: a line told from the last one kept, no more (a collision only drops a line the count then names).
+    let h = writer.bytes().chain(core::iter::once(0)).chain(words.bytes()).fold(0xCBF2_9CE4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01B3));
+    if ONCE_HASH[slot].swap(h, Ordering::Relaxed) == h {
+        ONCE_AGAIN[slot].fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let again = ONCE_AGAIN[slot].swap(0, Ordering::Relaxed);
+    if again != 0 {
+        put(category::TEXT, "kernel", &alloc::format!("the line before from {writer}'s retry said A#{again} more times"), None);
+    }
+    true
+}
+
+/// A kernel line that repeats on a retry loop: kept once, then counted (`once`).
+pub fn line_once(slot: usize, text: &str) {
+    if once_keep(slot, "kernel", text) {
+        line(text)
+    }
+}
+
+/// The repeats counted and not yet said, for the heartbeat's line: (slot, count).
+pub fn once_pending() -> Vec<(usize, u64)> {
+    (0..once::SLOTS).filter_map(|s| match ONCE_AGAIN[s].load(Ordering::Relaxed) { 0 => None, n => Some((s, n)) }).collect()
+}
+
 /// A process's end (category `kernel.process`, process.rs `death_line`), its writer the process: the sentence in the words, and the exit value, the last line, and a panic's or a fault's report (message, place, thread, frames) as typed fields (ferros_ledger death).
 pub fn death(writer: &str, words: &str, d: Death) {
     put(category::PROCESS, writer, words, Some(d))
+}
+
+/// A process's end on a retry loop (the USB process giving up after its tries, started again by the kernel): kept once, then counted (`once`).
+pub fn death_once(slot: usize, writer: &str, words: &str, d: Death) {
+    if once_keep(slot, writer, words) {
+        death(writer, words, d)
+    }
 }
 
 /// The kernel's own end in the boot before, found in its record at this boot (category `kernel.panic`, service.rs).

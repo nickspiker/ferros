@@ -53,8 +53,8 @@ fn read(settings: u64) -> Option<Vec<Rec>> {
 impl Map {
     /// Whether circle `i`'s disc meets the deck's resting view (`rest`): the screen's rectangle as the camera stood when the person last settled the deck.
     pub fn in_view(&self, i: usize) -> bool {
-        let (sx, sy) = self.rest.screen(self.w, self.h, self.xs[i], self.ys[i]);
-        let sr = (self.rs[i] * self.rest.z) >> 16;
+        let (sx, sy) = self.rest.screen(self.w, self.h, self.deck.circles[i].at.x, self.deck.circles[i].at.y);
+        let sr = (self.deck.circles[i].r * self.rest.z) >> 16;
         ferros_kist::note::in_view(sx, sy, sr, self.w, self.h)
     }
 

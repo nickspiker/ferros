@@ -385,9 +385,53 @@ pub fn largest_r() -> i64 {
 
 /// `draw_into`'s rows: a circle's box is at most the panel's width plus its edge, inside the clip; the widest panel ferros drives is under 2^11.
 const ROW_MAX: usize = 1 << 11;
-static mut ROW: [u64; ROW_MAX] = [0; ROW_MAX];
-static mut BAKED: [u64; ROW_MAX] = [0; ROW_MAX];
-static mut COV: [f32; ROW_MAX] = [0.; ROW_MAX];
+/// The threads that draw the scene's list (the publish workers and the render thread, `draw::thread_slot`): each its own rows, since a puck's square is drawn by bands across them (`Item::Puck`, 2026-11-20).
+const THREADS: usize = super::PUB_WORKERS + 1;
+static mut ROW: [[u64; ROW_MAX]; THREADS] = [[0; ROW_MAX]; THREADS];
+static mut BAKED: [[u64; ROW_MAX]; THREADS] = [[0; ROW_MAX]; THREADS];
+static mut COV: [[f32; ROW_MAX]; THREADS] = [[0.; ROW_MAX]; THREADS];
+
+/// The square of each puck the canvas holds whole (its `seq`), at the geometry of the last scene; None: not known (never drawn whole since the last whole frame, or drawn in part from a newer square).
+/// A phase that lacks a puck's newest square while the canvas holds it is only published from the canvas, never drawn again (2026-11-20, the Pro: a new square was sampled once for each of the four phases, 16 ms a box).
+/// Only the render thread touches it, between draws.
+static mut CANVAS: [Option<u32>; N] = [None; N];
+
+/// Puck j's newest square's `seq`, while it has one that lives.
+fn seq_of(j: usize) -> Option<u32> {
+    let id = unsafe { &*(&raw const BOUND) }[j];
+    let es = lock();
+    let s = es.iter().find(|e| e.id == id && id != [0; 64]).and_then(|e| e.cur.filter(live).map(|_| e.seq));
+    unlock();
+    s
+}
+
+/// Whether puck j has a square to draw (else its circle shows its name on the plane).
+pub fn has_square(j: usize) -> bool {
+    seq_of(j).is_some()
+}
+
+/// A whole frame is drawn into the canvas: what it held of each puck is forgotten, and the frame's own draws say it again (`canvas_drew`).
+pub fn canvas_forget() {
+    unsafe { CANVAS = [None; N] };
+}
+
+/// Puck j was drawn into the canvas from its newest square: its whole box (`whole`), or a part of it (a clip that cut it), which leaves the canvas mixed unless it held that square already.
+pub fn canvas_drew(j: usize, whole: bool) {
+    let s = seq_of(j);
+    unsafe {
+        if whole {
+            CANVAS[j] = s;
+        } else if CANVAS[j] != s {
+            CANVAS[j] = None;
+        }
+    }
+}
+
+/// Whether the canvas holds puck j's newest square whole: a phase that lacks it needs only the box published.
+pub fn canvas_holds(j: usize) -> bool {
+    let s = seq_of(j);
+    s.is_some() && unsafe { CANVAS[j] } == s
+}
 
 /// Draw puck j's square into `px` (w × h, inside `clip`): the circle at (cx, cy) radius r (Q8 pixels), its face turned (fc, fs) Q14, each pixel sampled from the square (bilinear, the turn between the square's and the face's undone, its size to the circle's), trimmed by the circle's edge and baked, under what is there. False when the puck has handed no square yet (the caller shows its plane).
 #[allow(clippy::too_many_arguments)]
@@ -420,9 +464,11 @@ pub fn draw_into(px: &mut [Px], w: usize, clip: draw::Rect, j: usize, cx: i64, c
         return true;
     }
     let n = (x1 - x0) as usize;
-    // The rows in fixed buffers, nothing on the heap: this process's heap is a bump that only the text draws reset, so a deck with no words on it (no labels) never gave back three rows a puck redraw, and the display ran out of memory 16 minutes into the 8a's first pucks (2026-11-18, "memory allocation of 5272 bytes failed"). Only the render thread draws pucks.
-    // SAFETY: the render thread alone calls `draw_into` (the scene and its sprites), so nothing else holds these.
-    let (row, baked, cov): (&mut [u64; ROW_MAX], &mut [u64; ROW_MAX], &mut [f32; ROW_MAX]) = unsafe { (&mut *(&raw mut ROW), &mut *(&raw mut BAKED), &mut *(&raw mut COV)) };
+    // The rows in fixed buffers, nothing on the heap: this process's heap is a bump that only the text draws reset, so a deck with no words on it (no labels) never gave back three rows a puck redraw, and the display ran out of memory 16 minutes into the 8a's first pucks (2026-11-18, "memory allocation of 5272 bytes failed").
+    // Each drawing thread its own (`THREADS`): the scene's list draws a puck by bands across the publish workers and the render thread.
+    let t = draw::thread_slot();
+    // SAFETY: row set t is this thread's alone (`draw::thread_slot` is unique to each drawing thread), so nothing else holds these.
+    let (row, baked, cov): (&mut [u64; ROW_MAX], &mut [u64; ROW_MAX], &mut [f32; ROW_MAX]) = unsafe { (&mut (*(&raw mut ROW))[t], &mut (*(&raw mut BAKED))[t], &mut (*(&raw mut COV))[t]) };
     let (row, baked, cov) = (&mut row[..n], &mut baked[..n], &mut cov[..n]);
     // WHY the bounds: a pixel at the circle's rim, turned and scaled into the square, lands up to a pixel past its side (and anywhere past it while the circle is turned or sized since the square was drawn); past the side is nothing.
     let at = |x: i32, y: i32| -> u64 { if x >= 0 && y >= 0 && (x as usize) < d && (y as usize) < d { src[y as usize * d + x as usize] } else { 0 } };
@@ -528,8 +574,13 @@ pub fn counts() -> [u64; 6] {
 /// The square each dither phase holds of each puck (its `seq`, 0 nothing known): what a flip still owes a phase.
 static mut PHASE_SEQ: [[u32; N]; 4] = [[0; N]; 4];
 
-/// The boxes phase `k` lacks before it is shown: each bound puck on the glass whose newest square that phase does not hold yet, the circle's box with a margin for its edge (Q8 geometry of the last scene). How many, into `out`.
-pub fn phase_due(k: usize, width: usize, height: usize, out: &mut [draw::Rect; N]) -> usize {
+/// A circle's box at (sx, sy) radius sr (Q8 pixels), with a margin for its edge, on the screen: what a puck's redraw covers, and what a draw must cover to hold its square whole (`canvas_drew`).
+pub fn box_of(sx: i64, sy: i64, sr: i64, width: usize, height: usize) -> draw::Rect {
+    draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height)
+}
+
+/// The boxes phase `k` lacks before it is shown: each bound puck on the glass whose newest square that phase does not hold yet, by the puck (j) and its circle's box with a margin for its edge (Q8 geometry of the last scene; `box_of`). How many, into `out`.
+pub fn phase_due(k: usize, width: usize, height: usize, out: &mut [(usize, draw::Rect); N]) -> usize {
     let bound = unsafe { &*(&raw const BOUND) };
     let seen = unsafe { &*(&raw const SEEN) };
     let geom = unsafe { &*(&raw const GEOM) };
@@ -542,7 +593,7 @@ pub fn phase_due(k: usize, width: usize, height: usize, out: &mut [draw::Rect; N
         let Some(e) = es.iter().find(|e| e.id == bound[j]) else { continue };
         if e.cur.is_some() && unsafe { PHASE_SEQ[k][j] } != e.seq {
             let (sx, sy, sr, _, _) = geom[j];
-            out[n] = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+            out[n] = (j, box_of(sx, sy, sr, width, height));
             n += 1;
         }
     }

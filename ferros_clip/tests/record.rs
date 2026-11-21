@@ -14,6 +14,19 @@ fn a_long_shutter_opens_short_then_sets() {
 }
 
 #[test]
+fn a_rate_change_is_a_frame_length_set() {
+    // Still to RAW video at 60, 60 to 24, and back to the still's frame: SET what 4 with the pacing's frame length, then 0 for the open's own.
+    for fps in [60, 24, 1] {
+        let p = Pacing::of(fps);
+        let m = p.set_msg();
+        assert_eq!((m[0], m[1]), (3, 4));
+        assert_eq!(u64::from_le_bytes(m[2..10].try_into().unwrap()), p.fll as u64);
+        assert!(p.fll as u64 >= ferros_clip::FLL_LEAST && p.fll as u64 <= ferros_clip::FLL_MOST);
+    }
+    assert_eq!(ferros_clip::set_open_fll_msg(), [3, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
 fn space_from_the_vaults_reply() {
     // The vault's EOP_SPACE reply in blocks: a 48 GiB window, 2^20 blocks taken, 2^21 the longest free stretch, 2^18 this app's in 3 clips.
     let mut b = [0u8; 40];

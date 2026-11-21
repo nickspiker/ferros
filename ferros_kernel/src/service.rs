@@ -1283,10 +1283,16 @@ fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"arena"), Serve(b"gpu"), Dma(b"surfaces"), Irq(b"gpu-mmu")]
 }
 
-/// The stower's grants in its slot order (payloads/kists; docs/KISTS.md "The stower"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Stow right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
+/// The stower's grants in its slot order (payloads/kists; docs/KISTS.md "The stower"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Stow right (the kernel checks and seals what it stored), 7 use icons (the icon decoder: a kist's icon decoded once at stow, 2026-11-20). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
 fn kists_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Stow]
+    alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Stow, Use(b"icons")]
+}
+
+/// The icon decoder's grants (std/icondec, docs/KISTS.md "Icons"): 1 serve icons, nothing else: no vault, no network, no device. rav1d is a large decoder fed a stranger's bytes, so it holds nothing to misuse; the stower hands it an icon's AV1 and stores what it hands back. Started on demand (process.rs `ON_DEMAND`) from its capsule, `icons`, as the torch is.
+fn icons_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"icons")]
 }
 
 /// The torch's grants in its slot order (payloads/torch, docs/TORCH.md): 1 serve torch, 2 hsi2c_14 (the LM3644's bus), 3 the `torch` switch. Its own list, as the GPS driver's: init's page is full, and the kernel starts it when a call on `torch` finds no server (process.rs `ON_DEMAND`).
@@ -1320,6 +1326,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }
     if name == b"gpu" {
         return Some(gpu_grants());
+    }
+    if name == b"icons" {
+        return Some(icons_grants());
     }
     if name == b"torch" {
         return Some(torch_grants());
@@ -2772,7 +2781,7 @@ pub(crate) fn tcpc_usb_switch(log: bool) {
         let _ = write_byte(HSI2C_11, TCPC, 0x93, 0x09);
     }
     if log || act {
-        crate::flashlog::line(&alloc::format!("usb: tcpc role G#{role:X} cc G#{cc:X} power G#{pwr:X} usb switch G#{sw:X}{}", if act { " -> closed (G#09)" } else { "" }));
+        crate::flashlog::line_once(crate::flashlog::once::USB_TCPC, &alloc::format!("usb: tcpc role G#{role:X} cc G#{cc:X} power G#{pwr:X} usb switch G#{sw:X}{}", if act { " -> closed (G#09)" } else { "" }));
     }
 }
 
@@ -2837,6 +2846,8 @@ pub fn run(mut b: Boot) -> ! {
     let _ = crate::rtc::sync();
     let freq = cntfrq();
     let mut t_heartbeat = cntpct();
+    // The stalls already in the flash log (`platform::stalls`).
+    let mut stalls_logged = 0u64;
     // The AoC's start, idle until the `sensors` switch asks for it (sensorlink.rs START).
     let mut sensor_boot = SensorBoot::Done;
     let mut st = PtStats::default();
@@ -3469,11 +3480,21 @@ pub fn run(mut b: Boot) -> ! {
 
         // The kernel lock's alarm (a hold of 2^-7 s or more since the last pass) into the flash log: the line that survives a reset (devsched.rs).
         crate::devsched::alarm_lines();
+        // A stall the catcher caught since the last pass, into the flash log at once (2026-11-20: the Pro was power-cycled after a hang and its stall record, kept in DRAM, read back as noise). Written here, by the service loop, never by the catching core: the stalled core may hold the storage lock the flash log takes.
+        let caught = platform::stalls();
+        if caught != stalls_logged {
+            stalls_logged = caught;
+            for l in stall_lines(freq).lines().filter(|l| l.starts_with("stall (this boot") || l.starts_with("lock: held longest")) {
+                crate::flashlog::line(l);
+            }
+        }
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
             t_heartbeat = now;
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
             // The log region (64 MiB) holds months of these.
-            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
+            // With the retry lines counted since they were last kept (flashlog `once`: the USB link's state, the link readied, the USB process's end), so the count is in the log even while nothing new is said.
+            let again: alloc::string::String = crate::flashlog::once_pending().iter().map(|(s, n)| alloc::format!(", retry line {s} again A#{n}")).collect();
+            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}{again}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
         }
         // The GPU's clock follows its service (owner, 2026-11-05: the attest mark within a 120 Hz frame): at its top while a `gpu` process lives, at its floor otherwise; looked at only when the process table changed (process.rs PROCS_GEN), on this core, where every ACPM call is made. The L2 first going up and last going down (GPU.md "The GPU's clock").
         let table = crate::process::PROCS_GEN.load(core::sync::atomic::Ordering::Acquire);

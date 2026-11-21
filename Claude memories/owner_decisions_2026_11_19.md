@@ -36,3 +36,8 @@ Related: [[sensor_mailboxes]], [[gpu_role_layers]], [[feedback_keep_devices_busy
   - It's the one approved foreign encoder, for grading only; nothing on a device writes DNG.
   - A Resolve decode plugin is being researched as the ideal.
 - **Grading belongs in Opsin** (owner: "it should be building that into Opsin"). Opsin (/mnt/Harbor/Code/opsin) opens, plays and grades VSF RAW clips with its view ops as appended generations, and exports a CinemaDNG sequence for other tools. The codec's decoder is proposed for vsf's raw-video branch, so every VSF reader has it.
+
+**2026-11-20, the camera ring and the GPU:**
+- **The rule:** "I think it should always be allowed, unless it's a security issue. if a naughty dev racks up memory, let their kist get rated like shit." The camera ring is mapped read-only into the camera holder's GPU address space whenever it holds the camera open, not only while recording.
+- **Security conditions** (equal to the CPU view it already has): the holder alone; read-only; unmapped with a TLB flush at CLOSE or at the holder's end, before the buffers are reused; a running job stopped first.
+- **Resource abuse is a rating,** not a block: a kist that hogs memory gets rated badly in pandok.

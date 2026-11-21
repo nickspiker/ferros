@@ -1449,7 +1449,14 @@ pub fn threads_report(out: &mut Vec<u8>) {
             State::Running => alloc::format!("running"),
             State::Runnable => alloc::format!("runnable"),
             State::Receiving(ep, ..) => alloc::format!("recv on endpoint A#{ep}"),
-            State::Calling(..) => alloc::format!("calling"),
+            // Who has the call (2026-11-20: Lumis.2 "calling" for good after the camera ended, and nothing said on what): queued on an endpoint, by its name and whether a live process receives there, or taken by the process that holds its reply token.
+            State::Calling(..) => match kk.endpoints.iter().position(|e| e.queue.iter().any(|q| q.0 == i)) {
+                Some(ep) => alloc::format!("calling, queued on `{}` (A#{ep}), {}", alloc::string::String::from_utf8_lossy(&kk.endpoints[ep].name), if has_receiver(ep) { "its server alive" } else { "no server receiving" }),
+                None => match kk.procs.iter().flatten().find(|p| p.cspace.iter().any(|c| matches!(c.object, Object::Reply(r) if r == i))) {
+                    Some(p) => alloc::format!("calling, taken by {}{}", alloc::string::String::from_utf8_lossy(&p.name), if p.dying { " (dying)" } else { "" }),
+                    None => alloc::format!("calling, held by nobody"),
+                },
+            },
             State::Sleeping(d) => alloc::format!("sleeping, A#{} ms left", d.saturating_sub(now) * 1000 / f),
             State::Waiting(a, d) if a < 1024 => alloc::format!("irq_wait on INTID A#{a}{}, pending {}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }, unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) }),
             State::Waiting(a, d) => alloc::format!("wait on word G#{a:X}{}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }),
@@ -1794,7 +1801,8 @@ fn endpoint(name: &[u8]) -> usize {
 }
 
 /// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`. The audio service the same way (docs/AUDIO.md, 2026-11-11): started by a kist's first call on `audio`, ended by itself once every stream has played out.
-pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio", b"camera"];
+/// The icon decoder too (std/icondec, 2026-11-20): started by the stower's first call on `icons` at a stow, ended by itself once it has handed an icon back.
+pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio", b"camera", b"icons"];
 /// The on-demand servers a call found missing since the service loop last looked (`on_demand_take`).
 static ON_DEMAND_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -5224,6 +5232,8 @@ fn drain_dying(cur: usize) -> bool {
             arc_free(p.arc);
             // The slot empty only now: the table changed again (the process count the facts' bell watches, service.rs `bell_facts`).
             PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+            // Its end looked at the endpoints again, now that it is out of the table: a call queued while it was dying asked for an on-demand server the service loop then saw alive (`named_alive_locked` counts a dying process) and did not start, and nothing asked again (the Pro, b1064, 2026-11-20: the camera ended after Lumis's LIST with a thread still on another core, Lumis's OPEN came in between, and it waited for good).
+            fail_orphaned_calls();
         }
     }
     true
@@ -7756,7 +7766,12 @@ fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxe
         }
     } else {
         let line = alloc::format!("{who}: ended, exit G#{value:016X}; its last line: {last_words}");
-        crate::flashlog::death(who, &line, d);
+        // The USB process ends after its tries with nothing plugged in and is started again, every 2^4 s: kept once, then counted.
+        if name == b"usb" {
+            crate::flashlog::death_once(crate::flashlog::once::USB_END, who, &line, d);
+        } else {
+            crate::flashlog::death(who, &line, d);
+        }
         return;
     };
     let kk = k();

@@ -219,6 +219,18 @@ Until then a kist's window was cut to the app's circle (tangent to the camera cu
 - **Opening and closing.** A kist's window has no flight of its own (a tap on its circle launches it or brings its window to the front, a cut; KISTS.md's flight into the circle is not built): it appears whole, to the glass's edge. The deck's flight (COMPOSITOR.md, op 45 and 46: the settings circle, a kist's question or why it stopped) is the map's own region and unchanged.
 - **The system's windows** (the attest screen at level 2, the keyboard at level 1) are not told: they lay themselves out in the circle by `active_circle`, and their corners now show their own pixels (black, but the attest screen's green when bound) under the bars.
 
+## A display started again (2026-11-20)
+
+The display server may end under running apps (a restart in the development loop, a fault). The kernel answers ERR every call it had taken (each app's held op 62, a show in flight); a call made while no display receives waits for the next one. Nothing is killed by hand to recover.
+- **The app** (fluor's ferros host, fluor main a2d24c0): its window watch (op 62) answered ERR once calls again, and waits for the display after. A show answered ERR marks the display lost (`lost`): the window is held behind, nothing drawn or shown, until the watch's next answer, which comes from the new display. The app ends only when the watch itself has ended (`gone`: two failed calls in a row, or a display without op 62), never by counting failed frames.
+- **The new display** (events.rs `watch`): a watch whose count it never gave, on a surface it has told nothing, comes from an app of an earlier display. It is held until the deck says how the windows stood (op 80 `windows as they stood [surface][generation]`, the system's alone; no timer), so the app in front never hears a false "behind" (Lumis ends on it). Then each is answered with one event, the surface's count moved one past what the app saw (set to one instead, an app that had seen exactly one event, the safe area at its first show, was held and never heard it: Kūaha on the Pro):
+  - the window that was in front hears the display's bake changed (`EV_BAKE`): it asks this display's bake, makes its frame again whole and shows it, and its show makes its window here, in front (an idle app draws again for it too; "front" would change nothing for an app that thinks it is in front already);
+  - any other hears it is behind, draws nothing until it is brought to the front, and a window it already made here by a show goes behind with it.
+- **Front** (op 59) for a surface that lives under the generation named but has no window on this display: the app is told it is in front (`EV_FRONT`), draws whole and shows, and its show makes its window, in front (a tap on its circle).
+- **The map** hears the restart on its look at the window or on the facts' bell (the display's frame count went down; `display_seen`), tells the new display which window was in front (the kist it last brought to the front, while it runs, by the surface and generation init answers for it), then hands it its scene, icons and pucks again; it marks the app in front once its window shows. A map that starts says "none", so with a display that started with it every app hears it is behind.
+- **The display** registers for the surfaces' owners before it takes its first call, so an app's first watch is taken under the generation its surface lives under.
+- **Pucks** re-attach by themselves (PUCKS.md "When the display starts again").
+
 ## Order of work
 
 1. Done: map frames kept off the glass under an app; text at op 26; the map stands aside for any app in front.

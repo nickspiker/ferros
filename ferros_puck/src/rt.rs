@@ -101,6 +101,7 @@ static mut WATCH_LINK: Link = Link { grants: 0, slot: 0, square: 0 };
 extern "C" fn watcher(_: u64) -> ! {
     let link = unsafe { WATCH_LINK };
     let mut seen = 0u32;
+    let mut failed = false;
     loop {
         let mut m = [0u8; 6];
         m[0] = call::WATCH;
@@ -108,7 +109,13 @@ extern "C" fn watcher(_: u64) -> ! {
         m[5] = WANTS.load(Ordering::Acquire) as u8;
         let mut r = [0u8; 14 + 4 * call::TAPS];
         let n = ferros_sys::call(cap(link.grants, link.slot), &m, &mut r);
-        // No display, or none that knows this puck: the view stays as it was and the puck runs on its deadlines alone; asking again would only spin.
+        // A display that ended holding the watch fails it once (the kernel answers ERR for a server gone); the next call waits for the display that comes after it, which answers at once (its count starts again), and the deck binds this puck to its circle there again (docs/PUCKS.md "When the display starts again"). Two failures in a row are no display behind the grant: asking again would only spin.
+        if n == ferros_sys::ERR && !failed {
+            failed = true;
+            continue;
+        }
+        failed = false;
+        // No display, or none that knows this puck: the view stays as it was and the puck runs on its deadlines alone.
         if n == ferros_sys::ERR || n < 14 || r[0] != 0 {
             ferros_sys::console(link.grants, b"puck: the display does not answer the view's watch; following deadlines only\n");
             loop {

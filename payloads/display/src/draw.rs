@@ -637,7 +637,6 @@ pub struct Mips {
     /// Level l starts at `offset[l]` texels; its rows are `size >> l` + 4 texels long (the border).
     pub offset: [usize; 8],
     rgba: *mut Px,
-    grey: *mut Px,
     total: usize,
 }
 
@@ -650,9 +649,9 @@ impl Mips {
         unsafe { core::slice::from_raw_parts(self.rgba, self.total) }
     }
 
-    /// From the bundle's straight-alpha RGBA and grey planes.
-    /// `decode`: each bundle code's 16-bit working value (gamma2tanh or gamma 2 codes to working values, white at Q14, highlights above it kept), baked here.
-    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize, decode: &[u16; 256]) -> Mips {
+    /// From the icon's straight-alpha RGBA, at its own size.
+    /// `decode`: each code's 16-bit working value (gamma2tanh codes to working values, white at Q14, highlights above it kept), baked here.
+    pub fn build(rgba_in: &[u8], size: usize, decode: &[u16; 256]) -> Mips {
         let mut total = 0;
         let mut offset = [0usize; 8];
         let mut levels = 0;
@@ -664,36 +663,33 @@ impl Mips {
             s /= 2;
         }
         let rgba = alloc::vec![0u64; total].leak().as_mut_ptr();
-        let grey = alloc::vec![0u64; total].leak().as_mut_ptr();
-        let m = Mips { size, levels, offset, rgba, grey, total };
-        m.fill(rgba_in, grey_in, decode);
+        let m = Mips { size, levels, offset, rgba, total };
+        m.fill(rgba_in, decode);
         m
     }
 
-    /// The chain made (again) from the bundle's planes with the bake in use: level 0 a row at a time, each texel's straight working value baked (`Bake::working_row`) and then premultiplied by its α, and every level below from it.
-    pub fn fill(&self, rgba_in: &[u8], grey_in: &[u8], decode: &[u16; 256]) {
+    /// The chain made (again) from the icon's texels with the bake in use: level 0 a row at a time, each texel's straight working value baked (`Bake::working_row`) and then premultiplied by its α, and every level below from it.
+    /// The photopic grey chain is gone (2026-11-20): nothing has drawn it since a circle stays in its own colours (2026-11-08), and it was half of every chain.
+    pub fn fill(&self, rgba_in: &[u8], decode: &[u16; 256]) {
         let (size, levels, offset) = (self.size, self.levels, self.offset);
-        // SAFETY: as `rgba`; nothing else holds these slices while the chain is made.
-        let (rgba, grey) = unsafe { (core::slice::from_raw_parts_mut(self.rgba, self.total), core::slice::from_raw_parts_mut(self.grey, self.total)) };
+        // SAFETY: as `rgba`; nothing else holds this slice while the chain is made.
+        let rgba = unsafe { core::slice::from_raw_parts_mut(self.rgba, self.total) };
         let dec = |c: u8| decode[c as usize] as u64;
         let at = |l: usize, x: usize, y: usize| offset[l] + (y + PAD) * ((size >> l) + 2 * PAD) + x + PAD;
         let bake = crate::bake::now();
-        let mut row = alloc::vec![0u64; 2 * size];
+        let mut row = alloc::vec![0u64; size];
         for y in 0..size {
-            let (c, g) = row.split_at_mut(size);
             for x in 0..size {
                 let i = y * size + x;
-                c[x] = dec(rgba_in[i * 4]) | dec(rgba_in[i * 4 + 1]) << 16 | dec(rgba_in[i * 4 + 2]) << 32;
-                g[x] = dec(grey_in[i]) * 0x0000_0001_0001_0001;
+                row[x] = dec(rgba_in[i * 4]) | dec(rgba_in[i * 4 + 1]) << 16 | dec(rgba_in[i * 4 + 2]) << 32;
             }
             bake.working_row(&mut row);
             for x in 0..size {
                 let a = rgba_in[(y * size + x) * 4 + 3] as u64;
                 // Premultiplied in 16 bits: the baked code times alpha.
                 let pm = |p: u64, sh: u32| ((p >> sh & 0xFFFF) * a + 127) / 255 << sh;
-                let (c, g) = (row[x], row[size + x]);
+                let c = row[x];
                 rgba[at(0, x, y)] = (a * 257) << 48 | pm(c, 0) | pm(c, 16) | pm(c, 32);
-                grey[at(0, x, y)] = (a * 257) << 48 | pm(g, 0) | pm(g, 16) | pm(g, 32);
             }
         }
         let mut s = size;
@@ -701,16 +697,14 @@ impl Mips {
             let n = s / 2;
             for y in 0..n {
                 for x in 0..n {
-                    for plane in [&mut *rgba, &mut *grey] {
-                        let mut acc = [0u64; 4];
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let t = plane[at(l - 1, 2 * x + dx, 2 * y + dy)];
-                            for c in 0..4 {
-                                acc[c] += t >> (16 * c) & 0xFFFF;
-                            }
+                    let mut acc = [0u64; 4];
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let t = rgba[at(l - 1, 2 * x + dx, 2 * y + dy)];
+                        for c in 0..4 {
+                            acc[c] += t >> (16 * c) & 0xFFFF;
                         }
-                        plane[at(l, x, y)] = (0..4).fold(0u64, |w, c| w | ((acc[c] + 2) / 4) << (16 * c));
                     }
+                    rgba[at(l, x, y)] = (0..4).fold(0u64, |w, c| w | ((acc[c] + 2) / 4) << (16 * c));
                 }
             }
             s = n;
@@ -729,31 +723,86 @@ fn bilerp(p00: Px, p10: Px, p01: Px, p11: Px, fu: u32, fv: u32) -> Px {
     (rb >> 8 & M) | (ga >> 8 & M) << 16
 }
 
-/// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there, always in its own colours: a circle's graphic stays the same for recognisability, and its glow says its state (owner, 2026-11-08; until then a quiet circle drew its grey). The mip level is the smallest at least as wide as the disc, so a texel never shrinks more than 2:1; between texels, bilinear. Returns the rectangle it touched.
+/// One mip level as `icon` samples it: its texels, row stride, the inverse turn's four steps (texels per screen pixel, Q16), the centre's texel coordinate, and the end of the range its bilinear taps stay inside.
+struct Level<'a> {
+    tex: &'a [Px],
+    stride: usize,
+    du_dx: i64,
+    dv_dx: i64,
+    du_dy: i64,
+    dv_dy: i64,
+    half: i64,
+    hi: i64,
+}
+
+impl<'a> Level<'a> {
+    /// Level `l` of `m` for a disc of radius `r` (Q8) turned by (c, s): the art sampled as if its circle were larger than the one drawn, by 2 px or 2 texels of this level if that is more, so the drawn edge always lands on fully opaque art: the icon's own antialiased rim never reaches the screen, and the edge's antialiasing is the disc's coverage alone (owner, 2026-10-23: "come in at least 2 px before you start drawing, so there's a trim").
+    fn new(m: &'a Mips, l: usize, r: i64, c: i64, s: i64) -> Level<'a> {
+        let size = (m.size >> l) as i64;
+        let stride = size as usize + 2 * PAD;
+        let texel = (2 * r) / size.max(1);
+        let r_art = r + (2 * 256i64).max(2 * texel);
+        let k = (size << 24) / (2 * r_art);
+        Level {
+            tex: &m.rgba()[m.offset[l]..m.offset[l] + stride * stride],
+            stride,
+            du_dx: c * k >> 14,
+            dv_dx: -s * k >> 14,
+            du_dy: s * k >> 14,
+            dv_dy: c * k >> 14,
+            // Texel space with the border: centre at size/2 + PAD, bilinear taps at −½.
+            half: ((size << 16) >> 1) + ((PAD as i64) << 16) - (1 << 15),
+            hi: (size + 2 * PAD as i64 - 1) << 16,
+        }
+    }
+
+    /// The texel coordinate (Q16) of the pixel offset (ox, oy) (Q8) from the disc's centre.
+    #[inline(always)]
+    fn start(&self, ox: i64, oy: i64) -> (i64, i64) {
+        (self.half + ((ox * self.du_dx + oy * self.du_dy) >> 8), self.half + ((ox * self.dv_dx + oy * self.dv_dy) >> 8))
+    }
+
+    /// The bilinear sample at (u, v) in Q16 texels; transparent outside the level.
+    #[inline(always)]
+    fn at(&self, u: i64, v: i64) -> Px {
+        // WHY: the coordinates follow the turned disc's pixels, which reach past the level's square at its corners; the taps stay inside its border there.
+        if u < 0 || v < 0 || u >= self.hi || v >= self.hi {
+            return 0;
+        }
+        let (t, s) = (self.tex, self.stride);
+        let i = (v >> 16) as usize * s + (u >> 16) as usize;
+        bilerp(t[i], t[i + 1], t[i + s], t[i + s + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32)
+    }
+}
+
+/// `a` toward `b` by `w` 256ths, every channel, two per multiply (as `bilerp`): a lane is at most 2^16 × 2^8, inside its 32 bits.
+#[inline(always)]
+fn mix(a: Px, b: Px, w: u64) -> Px {
+    const M: u64 = 0x0000_FFFF_0000_FFFF;
+    let rb = (a & M) * (256 - w) + (b & M) * w;
+    let ga = (a >> 16 & M) * (256 - w) + (b >> 16 & M) * w;
+    (rb >> 8 & M) | (ga >> 8 & M) << 16
+}
+
+/// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there, always in its own colours: a circle's graphic stays the same for recognisability, and its glow says its state (owner, 2026-11-08; until then a quiet circle drew its grey). Returns the rectangle it touched.
+/// Scaled as it is drawn from the icon at its own size, never kept at the circle's (2026-11-20), and smooth in the circle's size: the two mip levels about the disc's width, each bilinear, mixed by a C∞ step of where the width sits between them (`bump_step` of the fraction of λ = log2(level 0's side / the disc's width)), so a circle growing or shrinking never steps from one level to the next. Level 0 alone at or above its own width; the last level alone below its width.
 pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips) -> Rect {
     if r < 256 {
         return Rect::EMPTY;
     }
-    // The art is sampled as if its circle were larger than the one drawn — by 2 px, or 2 texels of the chosen level if that is more — so the drawn edge always lands on fully opaque art: the icon's own antialiased rim (the bundle's circle cut, bilinear taps into the transparent border) never reaches the screen, and the edge's antialiasing is this disc's coverage alone (owner, 2026-10-23: "come in at least 2 px before you start drawing, so there's a trim").
-    let diameter = ((2 * r) >> 8) as usize;
-    let mut l = 0;
-    while l + 1 < m.levels && (m.size >> (l + 1)) >= diameter {
-        l += 1;
-    }
-    let size = (m.size >> l) as i64;
-    let stride = size as usize + 2 * PAD;
-    let tex = &m.rgba()[m.offset[l]..m.offset[l] + stride * stride];
-    // One texel in Q8 screen pixels at radius r, and the trim: the larger of 2 px and 2 texels.
-    let texel = (2 * r) / size.max(1);
-    let r_art = r + (2 * 256i64).max(2 * texel);
-    // Texels per screen pixel in Q16, and the four steps of the inverse turn — for the art's larger circle.
-    let k = (size << 24) / (2 * r_art);
-    let (du_dx, dv_dx) = (c * k >> 14, -s * k >> 14);
-    let (du_dy, dv_dy) = (s * k >> 14, c * k >> 14);
+    // Octaves from level 0 down to the disc's width (2r/256 pixels).
+    let lambda = libm::log2f(m.size as f32 * 128. / r as f32);
+    let (l, w) = if lambda <= 0. {
+        (0, 0)
+    } else {
+        // WHY the min: past the last level's octave there is no level below to take; the last level is drawn alone, as the chain's end.
+        let l = (lambda as usize).min(m.levels - 1);
+        // `lambda - l` is in [0, 1) while a next level exists, the step's own domain.
+        (l, if l + 1 < m.levels { (bump_step(lambda - l as f32) * 256. + 0.5) as u64 } else { 0 })
+    };
+    let fine = Level::new(m, l, r, c, s);
+    let coarse = (w > 0).then(|| Level::new(m, l + 1, r, c, s));
     let (bx0, by0, bx1, by1) = bounds(width, height);
-    // Texel space with the border: centre at size/2 + PAD, bilinear taps at −½.
-    let half = ((size << 16) >> 1) + ((PAD as i64) << 16) - (1 << 15);
-    let (lo, hi) = (0i64, (size + 2 * PAD as i64 - 1) << 16);
     // The edge's coverage, as `disc` computes it: 128 − (d² − r²)·k >> 24, with k = 255 / 2r in Q24.
     let r2 = r * r;
     let kc = ((255i64 << 24) / (2 * r)) >> 8;
@@ -769,35 +818,40 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
         }
         let (ox, oy) = ((x0 << 8) + 128 - cx, (y << 8) + 128 - cy);
         let dy2 = oy * oy;
-        let mut u = half + ((ox * du_dx + oy * du_dy) >> 8);
-        let mut v = half + ((ox * dv_dx + oy * dv_dy) >> 8);
+        let (mut u, mut v) = fine.start(ox, oy);
+        let (mut u1, mut v1) = coarse.as_ref().map_or((0, 0), |k| k.start(ox, oy));
         let row = &mut px[rowb + x0 as usize..=rowb + x1 as usize];
         for (n, p) in row.iter_mut().enumerate() {
-            if *p >> 48 != 0xFFFF && u >= lo && v >= lo && u < hi && v < hi {
-                let i = (v >> 16) as usize * stride + (u >> 16) as usize;
-                let mut t = bilerp(tex[i], tex[i + 1], tex[i + stride], tex[i + stride + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32);
+            if *p >> 48 != 0xFFFF {
+                let mut t = fine.at(u, v);
+                if let Some(k) = &coarse {
+                    t = mix(t, k.at(u1, v1), w);
+                }
                 // Outside the inner span: the pixel straddles the edge, so the texel is scaled by the disc's coverage (premultiplied: every channel).
                 let x = x0 + n as i64;
-                if x < xi0 || x > xi1 {
+                let cov = if x < xi0 || x > xi1 {
                     let dx = (x << 8) + 128 - cx;
-                    let cov = 128 - ((dx * dx + dy2 - r2) * kc >> 24);
-                    if cov <= 0 {
-                        u += du_dx;
-                        v += dv_dx;
-                        continue;
-                    }
+                    128 - ((dx * dx + dy2 - r2) * kc >> 24)
+                } else {
+                    255
+                };
+                if cov > 0 {
                     if cov < 255 {
                         let c = cov as u64;
                         let sc = |sh: u32| ((t >> sh & 0xFFFF) * c + 127) / 255 << sh;
                         t = sc(48) | sc(32) | sc(16) | sc(0);
                     }
-                }
-                if t >> 48 != 0 {
-                    *p = if *p == 0 { t } else { under(*p, t) };
+                    if t >> 48 != 0 {
+                        *p = if *p == 0 { t } else { under(*p, t) };
+                    }
                 }
             }
-            u += du_dx;
-            v += dv_dx;
+            u += fine.du_dx;
+            v += fine.dv_dx;
+            if let Some(k) = &coarse {
+                u1 += k.du_dx;
+                v1 += k.dv_dx;
+            }
         }
     });
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
