@@ -28,11 +28,11 @@ device_pin husky || exit 1
 
 HK=/mnt/Harbor/husky-kernel
 DIST=$HK/out/shusky/dist
-MKB=$HK/tools/mkbootimg
 LZ4=$HK/prebuilts/kernel-build-tools/linux-x86/bin/lz4
 W=/mnt/Harbor/tmp/vkb_probe
 REPO=/mnt/Harbor/Code/ferros
 BIN=$REPO/target/aarch64-unknown-none/release/ferros_kernel.bin
+MKIMG=$REPO/target/debug/ferros-mkimg
 # DO NOT strip modules. The canonical kernel-tree repack (husky-kernel/repack-ferros-vkb.sh)
 # injects /ferros.bin into the STOCK ramdisk and strips nothing. An earlier reconstruction of
 # this script stripped the power-domain/PMIC/regulator modules — which breaks Android boot
@@ -50,14 +50,16 @@ if [ "${1:-}" = "--read" ]; then
 fi
 
 echo "== build shim-handoff kernel =="
-( cd "$REPO" && FERROS_SHIM_HANDOFF=1 cargo build -p ferros_kernel --target aarch64-unknown-none --release )
+( cd "$REPO" && FERROS_SHIM_HANDOFF=1 cargo build -p ferros_kernel --target aarch64-unknown-none --release && cargo build -q -p ferros-mkimg )
 if command -v aarch64-linux-gnu-objcopy >/dev/null; then OBJ=aarch64-linux-gnu-objcopy; else OBJ=rust-objcopy; fi
 "$OBJ" -O binary "$REPO/target/aarch64-unknown-none/release/ferros_kernel" "$BIN"
 echo "  bin: $(stat -c%s "$BIN") bytes"
 
 echo "== unpack vendor_kernel_boot + extract ramdisk =="
 rm -rf "$W"; mkdir -p "$W"
-python3 "$MKB/unpack_bootimg.py" --boot_img "$DIST/vendor_kernel_boot.img" --out "$W/unpacked" --format=mkbootimg 2>/dev/null > "$W/mkargs.txt"
+# ferros-mkimg vendor-ramdisk takes the ramdisk out and puts the new one back in its place, the rest of the image byte for byte (what AOSP's unpack_bootimg and mkbootimg did here).
+mkdir -p "$W/unpacked"
+"$MKIMG" vendor-ramdisk "$DIST/vendor_kernel_boot.img" --extract "$W/unpacked/vendor_ramdisk00"
 mkdir -p "$W/rd"; ( cd "$W/rd" && "$LZ4" -dc "$W/unpacked/vendor_ramdisk00" | cpio -id 2>/dev/null )
 
 echo "== inject /ferros.bin (NO module strip — stock ramdisk, matches repack-ferros-vkb.sh) =="
@@ -65,9 +67,8 @@ cp "$BIN" "$W/rd/ferros.bin"
 
 echo "== repack ramdisk + vendor_kernel_boot =="
 ( cd "$W/rd" && find . | cpio -o -H newc 2>/dev/null | "$LZ4" -l -9 > "$W/unpacked/vendor_ramdisk00.new" )
-mv "$W/unpacked/vendor_ramdisk00.new" "$W/unpacked/vendor_ramdisk00"
 # NOTE: the kernel cmdline (incl. log_buf_len) lives in vendor_boot, NOT here — vendor_kernel_boot's cmdline is ignored by the husky bootloader. The stock 1 MB printk ring wraps past the early ferros_ramoops_read report; vendor_boot_a was repacked once with log_buf_len=16M (stock copy: /mnt/Harbor/tmp/vendor_boot/vendor_boot_a.stock.img).
-python3 "$MKB/mkbootimg.py" $(cat "$W/mkargs.txt") --vendor_boot "$W/vendor_kernel_boot.img"
+"$MKIMG" vendor-ramdisk "$DIST/vendor_kernel_boot.img" --replace "$W/unpacked/vendor_ramdisk00.new" -o "$W/vendor_kernel_boot.img"
 echo "  image: $W/vendor_kernel_boot.img ($(stat -c%s "$W/vendor_kernel_boot.img") bytes)"
 
 if [ "${1:-}" = "--flash" ]; then

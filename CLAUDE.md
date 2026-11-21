@@ -25,7 +25,7 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 ```
 
 ## Target Hardware
-- **Pixel 8 Pro** (husky, Tensor G3, serial in memory) — PRIMARY. ARMv9, EL2 via `fastboot oem pkvm disable`. Runs via the husky-kernel handoff (tools/husky-probe-boot.sh). Not "Pixel 8"/shiba/G9BQD — that was the original purchase note.
+- **Pixel 8 Pro** (husky, Tensor G3, serial in memory) — PRIMARY. ARMv9, EL2 via `fastboot oem pkvm disable`. Boots cold from ABL (tools/husky-cold.sh); the Linux handoff (tools/husky-hotload.sh) is for register captures. Not "Pixel 8"/shiba/G9BQD — that was the original purchase note.
 - **M1 MacBook Air** — ACTIVE. EL2 via m1n1. macOS 26.4, Asahi/m1n1 UEFI entry installed (120 GB free). Fedora x86 box is the dev host connected via USB-C.
 - **Fairphone 5** (QCM6490) — DROPPED. Bricked + Qualcomm security restrictions. Do not touch.
 

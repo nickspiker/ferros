@@ -67,6 +67,7 @@ fn main() {
         "avb-footer" => cmd_avb_footer(&args[2..]),
         "gate" => cmd_gate(&args[2..]),
         "unpack-kernel" => cmd_unpack_kernel(&args[2..]),
+        "vendor-ramdisk" => cmd_vendor_ramdisk(&args[2..]),
         "help" | "--help" | "-h" => usage(),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
@@ -91,6 +92,7 @@ fn usage() {
     eprintln!("  ferros-mkimg vbmeta-info <vbmeta.img>");
     eprintln!("  ferros-mkimg gate --hv <hv.bin> --image <Linux Image> [--ferros <ferros.bin>] [--cmdline <s>] -o <boot.img>");
     eprintln!("  ferros-mkimg unpack-kernel --boot <boot.img> -o <Image>");
+    eprintln!("  ferros-mkimg vendor-ramdisk <vendor_boot.img> [--index N] --extract <ramdisk> | --replace <ramdisk> -o <out.img>");
     eprintln!("  ferros-mkimg avb-footer --key <avb.vsf> --google-boot <boot.img> --image <boot.img> -o <partition.img>   (the image with its own footer, for an unlocked device)");
     eprintln!("  ferros-mkimg avb-sign --key <avb.vsf> --google-vbmeta <vbmeta.img> --google-boot <boot.img> --gate <gate.img> --out-vbmeta <vbmeta.img> --out-boot <boot.img>");
 }
@@ -1030,6 +1032,66 @@ fn lz4_legacy_decompress(d: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// `unpack-kernel --boot <boot.img> -o <Image>`: the kernel of a boot image v4, out of its LZ4 legacy frame (what husky-hv.sh used Google's unpack_bootimg.py and Python's lz4 for).
+/// `vendor-ramdisk <vendor_boot.img> [--index N] --extract <ramdisk>` or `... --replace <ramdisk> -o <out.img>`: one ramdisk of a vendor boot image v4 (`vendor_boot`, `vendor_kernel_boot`) taken out, or put back in its place, everything else kept byte for byte: what tools/husky-probe-boot.sh needed of AOSP's unpack_bootimg.py and mkbootimg.py (Python, which ferros does not run).
+/// The layout (the header's fields at the offsets `avb::image_len` reads, each section padded to page_size): the header; the vendor ramdisks back to back (vendor_ramdisk_size bytes); the DTB; the ramdisk table (entry_num entries of entry_size bytes: size at 0, offset into the ramdisk section at 4, then type, name and board id, kept); the bootconfig.
+/// A replaced ramdisk moves the ones after it: the table's offsets and vendor_ramdisk_size are rewritten to match, as mkbootimg lays them.
+fn cmd_vendor_ramdisk(args: &[String]) {
+    let path = args.first().filter(|a| !a.starts_with('-')).unwrap_or_else(|| die("vendor-ramdisk", "<vendor_boot.img> [--index N] --extract <ramdisk> | --replace <ramdisk> -o <out.img>"));
+    let img = fs::read(path).unwrap_or_else(|e| die(path, e));
+    let len = avb::image_len(&img).unwrap_or_else(|e| die(path, e));
+    if &img[0..8] != b"VNDRBOOT" {
+        die(path, "not a vendor boot image");
+    }
+    let le = |at: usize| u32::from_le_bytes(img[at..at + 4].try_into().unwrap()) as usize;
+    let page = le(12);
+    let up = |n: usize| n.div_ceil(page) * page;
+    let (rd_size, header, dtb, table, entries, entry_size) = (le(24), le(2096), le(2100), le(2112), le(2116), le(2120));
+    let rd_at = up(header);
+    let dtb_at = rd_at + up(rd_size);
+    let table_at = dtb_at + up(dtb);
+    // The bootconfig runs from here to `len`; `image_len` has checked every section lies inside the file.
+    let bc_at = table_at + up(table);
+    if entries * entry_size > table || entry_size < 8 {
+        die(path, format!("a ramdisk table of {entries} entries of {entry_size} bytes in {table} bytes"));
+    }
+    // Each entry's (size, offset into the ramdisk section), checked against the section: the image is external input.
+    let ent: Vec<(usize, usize)> = (0..entries).map(|i| (le(table_at + i * entry_size), le(table_at + i * entry_size + 4))).collect();
+    if let Some((s, o)) = ent.iter().find(|(s, o)| o + s > rd_size) {
+        die(path, format!("a ramdisk of {s} bytes at {o} runs past the {rd_size}-byte section"));
+    }
+    let index = if args.iter().any(|a| a == "--index") { arg(args, "--index").parse::<usize>().unwrap_or_else(|e| die("--index", e)) } else { 0 };
+    if index >= entries {
+        die("--index", format!("{index}, but the image holds {entries} ramdisks"));
+    }
+    let piece = |i: usize| &img[rd_at + ent[i].1..rd_at + ent[i].1 + ent[i].0];
+    if args.iter().any(|a| a == "--extract") {
+        let out = arg(args, "--extract");
+        fs::write(&out, piece(index)).unwrap_or_else(|e| die(&out, e));
+        eprintln!("{out}: ramdisk {index} of {entries}, {} bytes", ent[index].0);
+        return;
+    }
+    let new = fs::read(arg(args, "--replace")).unwrap_or_else(|e| die("--replace", e));
+    let out = arg(args, "-o");
+    let mut rd = Vec::new();
+    let mut tab = img[table_at..table_at + up(table)].to_vec();
+    for i in 0..entries {
+        let data = if i == index { &new[..] } else { piece(i) };
+        tab[i * entry_size..i * entry_size + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        tab[i * entry_size + 4..i * entry_size + 8].copy_from_slice(&(rd.len() as u32).to_le_bytes());
+        rd.extend_from_slice(data);
+    }
+    let mut o = img[..rd_at].to_vec();
+    o[24..28].copy_from_slice(&(rd.len() as u32).to_le_bytes());
+    let rd_len = rd.len();
+    o.extend_from_slice(&rd);
+    o.resize(rd_at + up(rd_len), 0);
+    o.extend_from_slice(&img[dtb_at..table_at]);
+    o.extend_from_slice(&tab);
+    o.extend_from_slice(&img[bc_at..len]);
+    fs::write(&out, &o).unwrap_or_else(|e| die(&out, e));
+    eprintln!("{out}: ramdisk {index} of {entries} now {} bytes (was {}), the image {} bytes (was {len})", new.len(), ent[index].0, o.len());
+}
+
 fn cmd_unpack_kernel(args: &[String]) {
     let boot = fs::read(arg(args, "--boot")).unwrap_or_else(|e| die("boot", e));
     let out = arg(args, "-o");
