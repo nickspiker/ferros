@@ -364,7 +364,8 @@ Everything below is built and host-tested; nothing of it has run on a device yet
 
 The owner's decision of 2026-11-11, "the GPU powers up when work is queued and gates when its queue empties, as events, never a timer", built:
 - a power switch, `gpu-clock` (the GPU service's grant 9; process.rs `POWERS`, service.rs `gpu_clock`): on, the GPU at its top (G3D 890, G3DL2 900 MHz) while the screen is lit; off, its floor (150 / 160 MHz). Quiet (no console line a turn); `diag clock` counts the turns and the longest.
-- the service turns it on when its first job is put in flight and off when its last lands (serve.rs `fly`, `land`, `WANT`), from a thread that lives on the kernel's core (every switch runs there), one syscall a turn. It puts the GPU at its floor when it starts.
+- the service turns it on when a job is put in flight with the clock down, and off only at the second display frame in a row (the frame mailbox) that finds nothing in flight and nothing put in flight since the frame before (the coordinator, 2026-11-20, after the 8a's measure below: never at a job's end), from a thread that lives on the kernel's core (every switch runs there), one syscall a turn. It puts the GPU at its floor when it starts. While the display starts no frame the clock stays up until the next frame or the dark profile.
+- while the clock is up, the firmware's shader-core power-off delay (GLB_PWROFF_TIMER, GLB_REQ bit 3) is just over one display frame (the shortest spacing seen since the clock went up, and a quarter more), so a client working once a frame finds the cores on; back to 800 us when the clock goes down.
 - the kernel's old rule (the top while a `gpu` process lives) holds until the switch's first use, for a service from before.
 - The shader cores' own power is the firmware's: it powers them down 800 µs after they idle (global init), as before.
 
@@ -484,6 +485,21 @@ This branch's kernel RAM-reloaded on the 8a (it ran forge fe1783a0 flashed, thro
 
 **Found and fixed on the device: the GPU's caches after a group ended mid-job.** After a camtest run (its long job stopped at CLOSE), the next client's job (0F) left the GPU's fence a latched fault: a write, refused, at G#8_9240_1A40, the line of the camtest queue's record whose job was stopped (its start stamp). Reproduced the same way twice. The stopped job's stamp sat dirty in the GPU's L2 (no end-of-job flush ran), and the next client's end-of-job flush wrote it after camtest's frames had gone back to the pool: refused there because the frames were out of the fence, but frames given to another client and admitted again would have taken it. The service now flushes the GPU's caches (GPU_COMMAND FLUSH_CACHES, L2 and LSC cleaned and invalidated) after every group it ends with a job in it, before the memory may go; the same sequence twice since: no fault. No other run left a fault (0E, 0F, 10, the kills, camtest, checked after each).
 
+**After the coordinator's decisions** (the same day, the 8a, gputest 10, a job a frame, 128 frames at 60 a second):
+
+| | turns up / down in the run | frame start to an empty job's end (least / mean / most, µs) |
+|---|---|---|
+| clock down when the queues empty, cores off 800 us after idle | 114 / 114 | 454 / 482 / 613 |
+| clock held up, cores off 800 us after idle | 0 / 0 | 440 / 474 / 574 |
+| clock down at one quiet frame | 60 / 60 | 450 / 506 / 1483 |
+| clock down at two quiet frames in a row, cores on across a frame (as built) | 1 / 1 (up at the start, down after the run) | 45 / 70 / 607; again 44 / 73 / 598 |
+
+So the turns went from about 0.9 a frame each way to none while work comes every frame, and the shader cores' power-up (about 0.4 ms a frame) is gone.
+
+The camera ring cacheable by default: camtest 11 again, every word of every frame equal to the CPU's view; a whole frame's copy 1386 µs non-cacheable against 949 cacheable (8 frames each); in a shorter run (4 each, beside the second holder's test) 852 against 962.
+
+**A second holder reads none of the first's frames** (camtest 12 then 11, two processes): the first opened the camera, read a frame on its GPU (0 words off its view) and closed; while the second opened the camera (the same view window, its own run) and read its own frames on its GPU (0 words off its view), the first at each of 1024 display frames found its camera unmapped (`refresh`, 0 times mapped) and its job reading where its ring was faulted every time (1024 translation faults in its own space, 0 reads). The GPU's fence clean after both.
+
 **The flashed kernel with the new service** (the 8a rebooted to forge fe1783a0 at the end, the new `gpu` stored): the service starts ("the clock the kernel's (no gpu-clock grant)"), calls work (gputest's Mandelbrot, 0 of 4096 off), a queue's open is refused cleanly (status 1: that kernel has no hold), the fence clean. So the new service stays stored.
 
 ## 4. Open questions for the owner
@@ -497,7 +513,7 @@ This branch's kernel RAM-reloaded on the 8a (it ran forge fe1783a0 flashed, thro
 6. **Bounded loops** required, or any loop with the progress timer alone?
 7. **The clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and idle gating.
 8. **naga** as a dependency, or our own WGSL front end?
-9. **The clock's down turn** (section 3, "Power and clock by events"): at the queue's emptying, as built, or at a display frame with nothing queued since the last, if a turn a frame costs more than it saves. To decide with the device's turn counts and the longest turn. Measured on the 8a: a turn 566 µs of the kernel's core, about 1.1 ms a frame at a job a frame; the job's own latency unchanged (section 3, "Measured on the 8a").
+9. **The clock's down turn**: decided (the coordinator, 2026-11-20): down only at a display frame that finds nothing queued and nothing run since the last; built as two such frames in a row, with the shader cores kept on across a frame while up (section 3, "After the coordinator's decisions"). Open: the Pro's panel starts no frame while its picture holds, so there the clock stays up until the next frame or the dark profile.
 10. **The display reading a layer's tile coverage** (section 3, "Layers"): the form is set (a byte a 64-pixel tile past the pixels); skipping a layer's empty tiles and stopping at its opaque ones is the display's change, not built here.
-11. **The camera on the GPU cacheable** (section 3): non-cacheable by default; measured on the 8a, a whole frame read 1.4 to 1.7 times faster cacheable with an invalidate a job (896 to 1099 µs against 1322 to 1588). Making it the default is the next step's.
+11. **The camera on the GPU cacheable**: decided and built (the coordinator, 2026-11-20): cacheable with the GPU's caches invalidated before each of the holder's jobs.
 12. **A bad kernel ends its kist's GPU work, not its kist** (Lumis's ask 8): decided (the coordinator, 2026-11-20): end the kist's GPU work and report it; the kist decides whether to end itself.
