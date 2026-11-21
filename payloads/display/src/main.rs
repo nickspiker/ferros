@@ -290,52 +290,189 @@ extern "C" fn panel(grants: u64) -> ! {
             dsi_unlock();
         }
         let off = PANEL_SCREEN.load(Ordering::Acquire) == 1;
-        // Every screen change said with the link as found (console and flash log): the Pro's panel stayed asleep after a night's screen off with no line from here at the presses (2026-11-21).
-        if off != screen_off {
-            dsi_lock();
-            let found = link_state(grants, &dsi);
-            dsi_unlock();
-            let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(if off { b"display: screen off asked; " } else { b"display: screen on asked; " });
-            found.say(&mut l);
-            if !found.alive {
-                l.s(b"; the link is down: nothing sent");
-            }
-            l.s(b"\n");
-            l.flush_flash();
+        if off == screen_off {
+            continue;
         }
-        if off != screen_off && dsi.alive() {
-            screen_off = off;
-            dsi_lock();
-            if off && ferros_sys::akita() {
-                let mut l = Log { grants, buf: [0; 256], n: 0 };
-                l.s(b"display: AK3B before its sleep");
-                ak3b_state(&dsi, &mut l);
-                l.flush();
-            }
-            if off {
-                let _ = dsi.dcs(&[0x28]);
-                let _ = dsi.dcs(&[0x10]);
-            } else {
-                panel_wake(&dsi);
-            }
-            let pm = power_mode(&dsi);
-            let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(if off { b"display: screen off; power mode now " } else { b"display: screen on; power mode now " });
-            match pm {
-                Some(p) => l.hex(p as u32),
-                None => l.s(b"unread"),
-            }
-            l.s(b"\n");
-            // akita: the panel's state after it woke (ak3b_state), against the one logged before it slept.
-            if ferros_sys::akita() && !off {
-                l.s(b"display: AK3B after its wake");
-                ak3b_state(&dsi, &mut l);
-            }
-            dsi_unlock();
-            l.flush_flash();
+        // Every screen change taken, whatever the link: until 2026-11-21 it ran only while `dsi.alive()` held and was dropped otherwise, silently and for good (nothing asked again), and the Pro's panel stayed asleep after a night's screen off until the display was restarted.
+        // Each said with the link as found (console and flash log).
+        screen_off = off;
+        dsi_lock();
+        let found = link_state(grants, &dsi);
+        dsi_unlock();
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        l.s(if off { b"display: screen off asked; " } else { b"display: screen on asked; " });
+        found.say(&mut l);
+        l.s(b"\n");
+        l.flush_flash();
+        if off {
+            screen_dark(grants, &dsi, &found);
+        } else {
+            screen_light(grants, &dsi, &found);
         }
     }
+}
+
+/// The panel's display off and sleep in. With the link down nothing can reach the panel: said, and the next screen on brings the link up (`screen_light`).
+fn screen_dark(grants: u64, dsi: &ferros_dsi::Dsim<DsiGrant>, found: &LinkState) {
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    if !found.up() {
+        l.s(b"display: screen off: the link is down, nothing sent; the next screen on brings it up\n");
+        l.flush_flash();
+        return;
+    }
+    dsi_lock();
+    if ferros_sys::akita() {
+        let mut a = Log { grants, buf: [0; 256], n: 0 };
+        a.s(b"display: AK3B before its sleep");
+        ak3b_state(dsi, &mut a);
+        a.flush();
+    }
+    let _ = dsi.dcs(&[0x28]);
+    let _ = dsi.dcs(&[0x10]);
+    let pm = power_mode(dsi);
+    dsi_unlock();
+    l.s(b"display: screen off; power mode now ");
+    say_pm(&mut l, pm);
+    l.s(b"\n");
+    l.flush_flash();
+}
+
+/// The panel showing again, from whatever state the screen's time off left it in. The link up and the panel answering: woken as the power key always woke it (`panel_wake`). The link down (the DPU's domains, DSIM_CONFIG, the TE pin, the panel's rails) or the panel not showing after its wake: the render thread brings the pipe up again as a restart does (`relink`: the modeset from reset, the panel reset and powered up when it is not showing), then display on after its first frame.
+fn screen_light(grants: u64, dsi: &ferros_dsi::Dsim<DsiGrant>, found: &LinkState) {
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    if found.up() {
+        dsi_lock();
+        panel_wake(dsi);
+        let pm = power_mode(dsi);
+        // akita: the panel's state after it woke (ak3b_state), against the one logged before it slept.
+        if ferros_sys::akita() {
+            l.s(b"display: AK3B after its wake");
+            ak3b_state(dsi, &mut l);
+            l.s(b"\n");
+        }
+        dsi_unlock();
+        l.s(b"display: screen on; power mode now ");
+        say_pm(&mut l, pm);
+        if pm.is_some_and(showing) {
+            l.s(b"\n");
+            l.flush_flash();
+            return;
+        }
+        l.s(b": not showing; the pipe brought up again\n");
+        l.flush_flash();
+    } else {
+        l.s(b"display: screen on: the link is down; the pipe brought up again\n");
+        l.flush_flash();
+    }
+    // akita's AK3B has no power-up from reset in ferros (docs/AK3B.md): its pipe is ABL's, never rebuilt.
+    if ferros_sys::akita() {
+        l.s(b"display: akita: the AK3B's power-up from reset is not written; the panel left as it is\n");
+        l.flush_flash();
+        return;
+    }
+    // The render thread owns DECON: it runs the modeset between its passes and says when it is done (RELINK_DONE moves).
+    let done = RELINK_DONE.load(Ordering::Acquire);
+    let frames = FRAME_STARTS.load(Ordering::Acquire);
+    RELINK.store(1, Ordering::Release);
+    ring_bell();
+    while RELINK_DONE.load(Ordering::Acquire) == done {
+        ferros_sys::wait(&RELINK_DONE, done, 0);
+    }
+    // Powered up from reset (the modeset's `panel_on`): display on once a frame has gone out, as at the server's start, so the panel never shows the memory it woke with.
+    let due = PANEL_ON_DUE.swap(0, Ordering::AcqRel) == 1;
+    if due {
+        frame_after(frames);
+    }
+    dsi_lock();
+    if due {
+        let _ = dsi.dcs(&[0x29]);
+        let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+        set_panel(dsi, hbm, dbv);
+    }
+    // Left as it was by the modeset (it answered showing then) but not showing now: woken.
+    let woke = !due && !power_mode(dsi).is_some_and(showing);
+    if woke {
+        panel_wake(dsi);
+    }
+    let after = link_state(grants, dsi);
+    dsi_unlock();
+    l.s(if due { b"display: screen on after the pipe came up again: powered up from reset, display on after a frame; " } else if woke { b"display: screen on after the pipe came up again: woken; " } else { b"display: screen on after the pipe came up again: showing; " });
+    after.say(&mut l);
+    l.s(b"\n");
+    l.flush_flash();
+}
+
+/// Showing: booster, sleep out, normal mode and display on (G#9C, as the modeset's check after a jump asks).
+fn showing(pm: u8) -> bool {
+    pm & 0x9C == 0x9C
+}
+
+fn say_pm(l: &mut Log, pm: Option<u8>) {
+    match pm {
+        Some(p) => l.hex(p as u32),
+        None => l.s(b"unread"),
+    }
+}
+
+/// A frame started after `seen` (the frame-start count), or a quarter second without one, as `first_frame`.
+fn frame_after(seen: u64) {
+    let end = now() + freq() / 4;
+    while FRAME_STARTS.load(Ordering::Acquire) == seen && now() < end {
+        ferros_sys::wait(&FRAME_STARTS, seen, end);
+    }
+}
+
+/// The panel thread's ask (1) for the pipe brought up again by the render thread (`relink`), and the count of those done, which the panel thread waits on.
+static RELINK: AtomicU64 = AtomicU64::new(0);
+static RELINK_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// The pipe brought up again as the server's start brings it up after a restart, for a screen on that found the link down or the panel not waking (`screen_light`): the DPU's domains switched on if down, the panel's rails if off, the modeset from reset (DSIM_CONFIG not running or the DPU down: `modeset::from_off`) or from the cold boot's tables (`modeset::ten_bpc` forced), the panel asked its power mode and reset and powered up when not showing, then what the server's start sets after its modeset: the other windows off, DECON's frame-start interrupt, the panel's idle floor and fixed TE, the brightness. On the render thread (it owns DECON), with the DSI lock held. Returns what it did, for the console.
+fn relink(grants: u64, pipe: &Pipe, win: u32) -> alloc::vec::Vec<u8> {
+    let dsi = ferros_dsi::Dsim(DsiGrant { grants });
+    let mut rep = alloc::vec::Vec::new();
+    let t0 = now();
+    let dpu_down = ferros_sys::facts().0[30] == 1;
+    if dpu_down {
+        if !ferros_sys::power(cap(grants, S_DPU_POWER), true) || ferros_sys::facts().0[30] != 2 {
+            rep.extend_from_slice(b"display: relink: the DPU is down and its switch did not bring it up; its registers are not touched\n");
+            return rep;
+        }
+        rep.extend_from_slice(b"display: relink: the DPU was down: switched on\n");
+    }
+    let panel_cold = ferros_sys::facts().0[81] == 1;
+    if panel_cold {
+        if !ferros_sys::power(cap(grants, S_PANEL_POWER), true) {
+            rep.extend_from_slice(b"display: relink: the panel is off and its switch did not bring it up\n");
+            return rep;
+        }
+        PANEL_ON_DUE.store(1, Ordering::Release);
+        rep.extend_from_slice(b"display: relink: the panel was off: rails on, reset, its init set next\n");
+    }
+    let vddd = || ferros_sys::power(cap(grants, S_PANEL_VDDD), true);
+    let cold: Option<&dyn Fn() -> bool> = if panel_cold { Some(&vddd) } else { None };
+    let reset = || ferros_sys::power(cap(grants, S_PANEL_POWER), true);
+    let awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)> = if panel_cold { None } else { Some((&reset, &vddd)) };
+    let from_off = dpu_down || !dsi.alive();
+    // As the server's start calls it after this boot's kind (SYS_FACTS 31 = 6, the jump from Android: its DQE taken to the cold state too), so a relink leaves the pipe as a restart would.
+    let android = ferros_sys::facts().0[31] == 6;
+    let r = if from_off { modeset::from_off(pipe, &dsi, android, cold, awake) } else { modeset::ten_bpc(pipe, &dsi, true, true, android, cold, awake) };
+    rep.extend_from_slice(&r);
+    for w in 0..8u64 {
+        if w != win as u64 {
+            pipe.wr(S_WINCON, w * 0x1000, 0);
+        }
+    }
+    pipe.wr(S_DECON, SHD_REG_UP_REQ, pipe.rd(S_DECON, SHD_REG_UP_REQ) | SHD_GLOBAL | 0xFF);
+    pipe.wr(S_DECON, INT_EN, 0);
+    pipe.wr(S_DECON, INT_PEND, !0);
+    pipe.wr(S_DECON, INT_PEND_EXTRA, !0);
+    pipe.wr(S_DECON, INT_EN, 1 | INT_EN_FRAME_START);
+    let (_, f1) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
+    let (_, f2) = dsi.sequence(ferros_dsi::hk3::TE_FIXED);
+    let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+    let b = set_panel(&dsi, hbm, dbv);
+    rep.extend_from_slice(alloc::format!("display: relink {} in {} ms; idle floor and TE {}, brightness {}\n", if from_off { "from reset" } else { "from the cold tables" }, ferros_sys::us_since(t0) / 1000, if f1.is_none() && f2.is_none() { "set" } else { "stuck" }, if b { "set" } else { "stuck" }).as_bytes());
+    rep
 }
 
 /// The link and the panel as a screen change finds them: DSIM_CONFIG (and `alive`, its test), the DPU's domains (SYS_FACTS 30: 2 on, 1 down), the panel's VCI (81: 1 off), the TE pin's function (2 is DECON's) and level, the frames started, and the panel's power mode (G#0A) when it answers.
@@ -366,6 +503,13 @@ fn link_state(grants: u64, dsi: &ferros_dsi::Dsim<DsiGrant>) -> LinkState {
 }
 
 impl LinkState {
+    /// The link up and the panel answering: the DPU's domains on, DSIM running, the TE pin DECON's, the panel's rails on, its power mode read. akita as before 2026-11-21 (the DPU on and DSIM running): its pipe is ABL's and never rebuilt (`screen_light`), and its reads may answer the previous read's.
+    fn up(&self) -> bool {
+        if ferros_sys::akita() {
+            return self.dpu != 1 && self.alive;
+        }
+        self.dpu != 1 && self.alive && self.te_fn == 2 && self.vci != 1 && self.pm.is_some()
+    }
     fn say(&self, l: &mut Log) {
         l.s(b"DSIM_CONFIG ");
         l.hex(self.cfg);
@@ -10441,6 +10585,23 @@ fn server(grants: u64) -> ! {
         }
         // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.
         // The power key (kernel preference 2): the panel thread does the DSI work; the frame the layer holds is presented again once it says the screen is back.
+        // The panel thread found the link down, or the panel not waking, at a screen on (`screen_light`): the pipe brought up again here, where DECON is driven, under the DSI lock; then the frame the layer holds presented, which the panel's display on waits for.
+        if RELINK.swap(0, Ordering::AcqRel) == 1 {
+            armed = None;
+            dsi_lock();
+            let rep = relink(grants, &pipe, win);
+            dsi_unlock();
+            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+            let (moved, _) = pipe.present(win);
+            for line in rep.split(|&c| c == b'\n').filter(|t| !t.is_empty()) {
+                let mut t = line.to_vec();
+                t.push(b'\n');
+                ferros_sys::console_flash(grants, &t);
+            }
+            ferros_sys::console_flash(grants, if moved { b"display: relink: a frame went out\n" } else { b"display: relink: no frame went out in a quarter second\n" });
+            RELINK_DONE.fetch_add(1, Ordering::AcqRel);
+            ferros_sys::wake(&RELINK_DONE, 1);
+        }
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         if off != screen_off {
             screen_off = off;
