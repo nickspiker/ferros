@@ -290,6 +290,20 @@ extern "C" fn panel(grants: u64) -> ! {
             dsi_unlock();
         }
         let off = PANEL_SCREEN.load(Ordering::Acquire) == 1;
+        // Every screen change said with the link as found (console and flash log): the Pro's panel stayed asleep after a night's screen off with no line from here at the presses (2026-11-21).
+        if off != screen_off {
+            dsi_lock();
+            let found = link_state(grants, &dsi);
+            dsi_unlock();
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(if off { b"display: screen off asked; " } else { b"display: screen on asked; " });
+            found.say(&mut l);
+            if !found.alive {
+                l.s(b"; the link is down: nothing sent");
+            }
+            l.s(b"\n");
+            l.flush_flash();
+        }
         if off != screen_off && dsi.alive() {
             screen_off = off;
             dsi_lock();
@@ -305,15 +319,71 @@ extern "C" fn panel(grants: u64) -> ! {
             } else {
                 panel_wake(&dsi);
             }
+            let pm = power_mode(&dsi);
             let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
+            l.s(if off { b"display: screen off; power mode now " } else { b"display: screen on; power mode now " });
+            match pm {
+                Some(p) => l.hex(p as u32),
+                None => l.s(b"unread"),
+            }
+            l.s(b"\n");
             // akita: the panel's state after it woke (ak3b_state), against the one logged before it slept.
             if ferros_sys::akita() && !off {
                 l.s(b"display: AK3B after its wake");
                 ak3b_state(&dsi, &mut l);
             }
             dsi_unlock();
-            l.flush();
+            l.flush_flash();
+        }
+    }
+}
+
+/// The link and the panel as a screen change finds them: DSIM_CONFIG (and `alive`, its test), the DPU's domains (SYS_FACTS 30: 2 on, 1 down), the panel's VCI (81: 1 off), the TE pin's function (2 is DECON's) and level, the frames started, and the panel's power mode (G#0A) when it answers.
+struct LinkState {
+    cfg: u32,
+    alive: bool,
+    dpu: u64,
+    vci: u64,
+    te_fn: u32,
+    te: u32,
+    frames: u64,
+    pm: Option<u8>,
+}
+
+/// The DSI lock held by the caller. The DPU's domains are read first: with them down no DSIM or DECON register is touched (the EL3 poison rule).
+fn link_state(grants: u64, dsi: &ferros_dsi::Dsim<DsiGrant>) -> LinkState {
+    let f = ferros_sys::facts().0;
+    let mut s = LinkState { cfg: 0, alive: false, dpu: f[30], vci: f[81], te_fn: 0, te: 0, frames: FRAME_STARTS.load(Ordering::Acquire), pm: None };
+    let gpp = mmio_read(cap(grants, S_GPP0), 0) as u32;
+    s.te_fn = gpp >> 12 & 0xF;
+    s.te = mmio_read(cap(grants, S_GPP0), GPP0_DAT) as u32 >> 3 & 1;
+    if s.dpu != 1 {
+        s.cfg = mmio_read(cap(grants, S_DSIM), ferros_dsi::DSIM_CONFIG as u64) as u32;
+        s.alive = dsi.alive();
+        s.pm = power_mode(dsi);
+    }
+    s
+}
+
+impl LinkState {
+    fn say(&self, l: &mut Log) {
+        l.s(b"DSIM_CONFIG ");
+        l.hex(self.cfg);
+        l.s(if self.alive { b" (alive)" } else { b" (NOT alive)" });
+        l.s(b", DPU fact ");
+        l.dec(self.dpu);
+        l.s(b", panel VCI fact ");
+        l.dec(self.vci);
+        l.s(b", TE pin function ");
+        l.dec(self.te_fn as u64);
+        l.s(b" level ");
+        l.dec(self.te as u64);
+        l.s(b", frames ");
+        l.dec(self.frames);
+        l.s(b", power mode ");
+        match self.pm {
+            Some(p) => l.hex(p as u32),
+            None => l.s(b"unread"),
         }
     }
 }
@@ -955,6 +1025,13 @@ impl Log {
         let n = self.n;
         let buf = self.buf;
         console(self.grants, &buf[..n]);
+        self.n = 0;
+    }
+    /// `flush`, and the line into the flash log too (rare lines only: each is a flash write).
+    fn flush_flash(&mut self) {
+        let n = self.n;
+        let buf = self.buf;
+        ferros_sys::console_flash(self.grants, &buf[..n]);
         self.n = 0;
     }
 }
@@ -10368,8 +10445,9 @@ fn server(grants: u64) -> ! {
         if off != screen_off {
             screen_off = off;
             PANEL_SCREEN.store(off as u64, Ordering::Release);
-            PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
+            let seq = PANEL_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
             ferros_sys::wake(&PANEL_SEQ, 1);
+            ferros_sys::console_flash(grants, alloc::format!("display: the power key's screen {}: the panel thread asked (sequence A#{seq})\n", if off { "off" } else { "on" }).as_bytes());
         }
         if PANEL_REPRESENT.swap(0, Ordering::AcqRel) == 1 {
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
