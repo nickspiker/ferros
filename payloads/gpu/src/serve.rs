@@ -94,7 +94,7 @@ struct Slot {
     nregions: usize,
     frames: [u64; ferros_sys::gpu::FRAMES],
     nframes: usize,
-    /// Its client's camera view is mapped in its space; and mapped cacheable on the GPU, each job invalidating the GPU's caches first (op 5's byte, a development measure: non-cacheable by default).
+    /// Its client's camera view is mapped in its space; and mapped cacheable on the GPU, each job invalidating the GPU's caches first (the default since 2026-11-20; op 5's byte 0 maps it non-cacheable, the measure).
     camera: bool,
     camera_cached: bool,
     /// Its address space's root while a client is bound.
@@ -122,7 +122,7 @@ struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: false, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
 }
 
 struct State {
@@ -145,6 +145,8 @@ static SLOT_BELL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static CALL_BELL: AtomicU64 = AtomicU64::new(0);
 /// The clock's want, 1 while any job is in flight: `clock` turns the switch to it.
 static WANT: AtomicU64 = AtomicU64::new(0);
+/// Jobs put in flight since the service began (`fly`): the clock's look at each display frame tells "nothing since the last frame" by it not moving.
+static ACTIVITY: AtomicU64 = AtomicU64::new(0);
 /// The clock held up whatever the queues hold (op 6, a development measure: the frame's cost of the turns, docs/GPU-KISTS.md "Power and clock by events").
 static CLOCK_HOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -359,6 +361,7 @@ fn fly(st: &mut State, k: usize, f: Flight) {
     sl.flight[(sl.head + sl.len) % FLIGHT] = f;
     sl.len += 1;
     st.inflight += 1;
+    ACTIVITY.fetch_add(1, Ordering::Relaxed);
     if st.inflight == 1 {
         WANT.store(1, Ordering::Release);
         ferros_sys::wake(&WANT, 1);
@@ -543,21 +546,96 @@ extern "C" fn events(_: u64) -> ! {
 }
 
 /// The GPU's clock (the `gpu-clock` switch, grant 9) turned to `WANT` on the kernel's core, where every switch runs: this thread lives there (one move at its start, as ferros_sys `power` makes), so each turn is one syscall.
+/// The coordinator's rule (2026-11-20, after the 8a's measure: a turn up and one down a frame cost about 7 % of the kernel's core):
+/// - up at once when a job is put in flight with the clock down (`WANT`);
+/// - down only at a display frame (the frame mailbox, ferros_mailbox `FRAME`) that finds nothing in flight and nothing put in flight since the frame before (`ACTIVITY`), two such looks in a row (a whole frame quiet), never at a job's end;
+/// - while up, the firmware's shader-core power-off delay (`GLB_PWROFF_TIMER`, panthor_fw.h `poweroff_timer`) just over one display frame (the shortest frame spacing seen since the clock went up, and a quarter more), so a client working once a frame finds the cores on; back to the default 800 us when the clock goes down.
+/// While the display starts no frame (the Pro's panel holds a still picture) the clock stays up until the next frame or the dark profile (the kernel's `gpu_clock` drops it there): no timer brings it down.
+/// Without the frame mailbox (a kernel from before it) the clock goes down when the queues empty, as before.
 extern "C" fn clock(token: u64) -> ! {
     ferros_sys::pin(ferros_sys::CORES_BIG);
     ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
+    let turn = |on: bool| ferros_sys::svc(ferros_sys::nr::POWER, token, on as u64, 0, 0, 0);
     // The service ready with nothing queued: the floor, whatever the kernel's rule from before the switch left (the top while this process lives).
-    ferros_sys::svc(ferros_sys::nr::POWER, token, 0, 0, 0, 0);
-    let mut applied = 0;
-    loop {
-        let w = WANT.load(Ordering::Acquire);
-        if w == applied {
-            ferros_sys::wait(&WANT, applied, 0);
-            continue;
+    turn(false);
+    let s = svc();
+    let mut tok = [0u8; 32];
+    let frames = ferros_sys::mailbox::Reader::open(ferros_sys::mailbox::FRAME, 0, &mut tok);
+    let Some(frames) = frames else {
+        say!(s.grants, "gpu: no frame mailbox: the clock goes down when the queues empty\n");
+        let mut applied = 0;
+        loop {
+            let w = WANT.load(Ordering::Acquire);
+            if w == applied {
+                ferros_sys::wait(&WANT, applied, 0);
+                continue;
+            }
+            turn(w != 0);
+            applied = w;
         }
-        ferros_sys::svc(ferros_sys::nr::POWER, token, w, 0, 0, 0);
-        applied = w;
+    };
+    let mut out = [0u64; ferros_sys::mailbox::frame::WORDS];
+    loop {
+        // Down: asleep until a job is put in flight.
+        while WANT.load(Ordering::Acquire) == 0 && !CLOCK_HOLD.load(Ordering::Relaxed) {
+            ferros_sys::wait(&WANT, 0, 0);
+        }
+        turn(true);
+        let mut seen = frames.seq();
+        let mut last_act = ACTIVITY.load(Ordering::Relaxed);
+        // Quiet looks in a row: down at the second. A job put in flight right after a frame's publish races the look at that frame, so one look may find nothing new while the next finds two; two quiet looks in a row hold a whole frame with nothing put in flight (measured on the 8a: one quiet look turned the clock 60 times in 128 frames at a job a frame).
+        let mut quiet = 0u32;
+        let (mut last_at, mut shortest, mut delay) = (0u64, u64::MAX, PWROFF_DEFAULT);
+        // Up: a look at each display frame.
+        loop {
+            seen = frames.wait(seen, 0);
+            let at = match frames.read(&mut out) {
+                ferros_sys::mailbox::Got::Fresh { at, seq, .. } => {
+                    seen = seq;
+                    at
+                }
+                _ => continue,
+            };
+            let act = ACTIVITY.load(Ordering::Relaxed);
+            let busy = act != last_act || WANT.load(Ordering::Acquire) != 0 || CLOCK_HOLD.load(Ordering::Relaxed);
+            last_act = act;
+            quiet = if busy { 0 } else { quiet + 1 };
+            if quiet == 2 {
+                break;
+            }
+            if last_at != 0 {
+                shortest = shortest.min(at.wrapping_sub(last_at));
+            }
+            last_at = at;
+            // Just over one display frame, from the second frame of the run on (the first has no spacing yet).
+            let want = if shortest == u64::MAX { PWROFF_DEFAULT } else { shortest + shortest / 4 };
+            if want != delay {
+                with(|_| pwroff_set(s, want));
+                delay = want;
+            }
+        }
+        turn(false);
+        if delay != PWROFF_DEFAULT {
+            with(|_| pwroff_set(s, PWROFF_DEFAULT));
+        }
+        CLOCK_FRAMES_DOWN.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The firmware's shader-core power-off delay at global init (main.rs: G#4CCC ticks of the 24.576 MHz system counter, 800 us).
+const PWROFF_DEFAULT: u64 = 0x4CCC;
+/// Times the clock went down at a frame (`clock`).
+static CLOCK_FRAMES_DOWN: AtomicU64 = AtomicU64::new(0);
+
+/// The firmware's shader-core power-off delay set to `ticks` of the system counter (GLB_PWROFF_TIMER at the global input's +G#14, its source bit 31 clear: the system timestamp; then GLB_REQ's CFG_POWEROFF_TIMER, bit 3, toggled against GLB_ACK and doorbell 0, as panthor_fw.c sets it at init); false when the firmware did not acknowledge it in 16 ms. Under the lock (the shared interface).
+fn pwroff_set(s: &Svc, ticks: u64) -> bool {
+    let (gin, gout) = (s.sh.rd(0x0400_0008), s.sh.rd(0x0400_000C));
+    // WHY the mask: the field is 31 bits (GLB_TIMER_VAL); a frame spacing past it (over a minute) is no display frame, and the top bit would pick the GPU's own counter as the source.
+    s.sh.wr(gin + 0x14, (ticks & 0x7FFF_FFFF) as u32);
+    let (req, ack) = (s.sh.rd(gin), s.sh.rd(gout));
+    s.sh.wr(gin, (req & !8) | ((ack ^ 8) & 8));
+    s.g.doorbell(0);
+    s.g.wait(16, |_| (s.sh.rd(gin) ^ s.sh.rd(gout)) & 8 == 0)
 }
 
 /// Slot `k`'s thread: while its slot has a queue, waits on the queue's `SUBMIT` (the client's doorbell, SYS_WAKE on its own block's word) and writes each new job into the client's stream; a `GONE` there is the client's end (the kernel's mark) or the queue's close (the service's).
@@ -652,7 +730,7 @@ fn bind(s: &Svc, sl: &mut Slot, stamp: &Stamp, bbase: u64, bsize: u64) {
     tables(s, sl, true);
 }
 
-/// A slot's client's address space made from what its bind kept, in the slot's other pool of table pages, then installed (`space_install`: the old walks and lines dropped first) when its group runs, else at its next start: the slot's own pages (its stream and descriptors read-only, its sequence page, its code read-only and the only executable pages), its block's frames read-write at `ARENA_VA`, each surface frame by frame at its place from `SURFACES_VA`, and (`camera`) its camera view read-only at `CAMERA_VA`, non-cacheable on the GPU (the front end writes the ring with no snooping, and a line the GPU's L2 kept from a lap before would be the last lap's).
+/// A slot's client's address space made from what its bind kept, in the slot's other pool of table pages, then installed (`space_install`: the old walks and lines dropped first) when its group runs, else at its next start: the slot's own pages (its stream and descriptors read-only, its sequence page, its code read-only and the only executable pages), its block's frames read-write at `ARENA_VA`, each surface frame by frame at its place from `SURFACES_VA`, and (`camera`) its camera view read-only at `CAMERA_VA`, cacheable on the GPU with the GPU's caches invalidated before each of the client's jobs (`Dispatch::invalidate`: the front end writes the ring with no snooping, and a line the GPU's L2 kept from a lap before would be the last lap's), non-cacheable when the client asked (op 5's byte 0).
 /// Two pools a slot, so tables the GPU may be walking are never written: a running group's space moves to the new ones at once (2026-11-20: a block grown or a camera view given while a queue runs). Under the lock.
 fn tables(s: &Svc, sl: &mut Slot, camera: bool) {
     let pool = sl.pools[sl.cur ^ 1];
@@ -938,8 +1016,8 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             }
             // Its memory looked at again (2026-11-20): its address space made from this call's stamp when it changed (a camera view given since: mapped read-only at `CAMERA_VA`), `[0][the camera mapped u8]`.
             5 => {
-                // `[5][1]`: the camera mapped cacheable on the GPU, every job of the client invalidating the GPU's caches before it runs (the measure against non-cacheable); `[5]` or `[5][0]` non-cacheable. A change remakes its tables.
-                let cached = m.len() > 1 && m[1] == 1;
+                // The camera mapped cacheable on the GPU (the coordinator, 2026-11-20, after the 8a's measure: 1.4 to 1.7 times faster), every job of the client invalidating the GPU's L2 and load-store caches before it runs, so a frame landed since the last job is read from DRAM: `[5]` or `[5][1]`; `[5][0]` non-cacheable (the measure). A change remakes its tables.
+                let cached = !(m.len() > 1 && m[1] == 0);
                 let cam = with(|st| {
                     let k = slot_for(st, &stamp, bbase, bsize)?;
                     if st.slots[k].camera_cached != cached {

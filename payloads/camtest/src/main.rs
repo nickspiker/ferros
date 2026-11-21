@@ -115,6 +115,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 11 {
         camera_gpu(g, ep, id, frames, t1);
     }
+    // A fourth byte of 12: the first holder of a second holder's test (its ring gone from its GPU once it closed, whoever holds the camera next).
+    if arg(3) == 12 {
+        first_holder(g, ep, id, t1);
+    }
     if bin == 1 {
         view(g, ep, id, frames, arg(3) == 2, arg(5), arg(6), t1);
     }
@@ -1077,7 +1081,7 @@ fn camera_gpu(g: u64, ep: u64, id: u8, frames: u32, t1: u64) -> ! {
         say!(g, "camtest gpu: a kernel was not loaded\n");
         ferros_sys::exit(1);
     };
-    let mapped = q.refresh();
+    let mapped = q.refresh_mapped(false);
     say!(g, "camtest gpu: the view at G#{base:X}, A#{w} x A#{h}, A#{stride} bytes a line; the block A#{} MiB; the camera mapped on the GPU: {:?}\n", size.unwrap_or(0) >> 20, mapped);
     let words = stride * h / 4;
     let groups = (words / 16) as u32;
@@ -1120,7 +1124,7 @@ fn camera_gpu(g: u64, ep: u64, id: u8, frames: u32, t1: u64) -> ! {
     let job = q.submit(&Job { kernel: kpoke, groups: (1, 1), uniforms: &[CAMERA_VA + place] }).unwrap();
     let d = q.wait(job);
     say!(g, "camtest gpu: a store into the camera: status A#{} at GPU address G#{:X}, AS_FAULTSTATUS G#{:X} (the queue ended A#{}); opened again {}\n", d.status, d.fault_address, d.fault_status, q.ended(), q.reopen());
-    let _ = q.refresh_mapped(false);
+    let _ = q.refresh();
     // A long job in flight at CLOSE: the frame copied 2^5 times over (the second axis repeats the first), the CLOSE at once.
     let long = q.submit(&Job { kernel: kcopy, groups: (groups, 1 << 5), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }).unwrap();
     let t = ferros_sys::now();
@@ -1137,6 +1141,93 @@ fn camera_gpu(g: u64, ep: u64, id: u8, frames: u32, t1: u64) -> ! {
     say!(g, "camtest gpu: after the CLOSE: opened again {reopened}, the camera mapped {:?}; a job reading the ring: status A#{} at G#{:X}, AS_FAULTSTATUS G#{:X}\n", mapped, d.status, d.fault_address, d.fault_status);
     q.close();
     ferros_sys::exit(0)
+}
+
+/// The first holder of a second holder's test (fourth byte 12, G#0C; the coordinator, 2026-11-20: "a second holder's OPEN reads none of the first's frames"): OPEN with the view, the ring mapped on its GPU, one frame copied and checked, CLOSE; then at each of 2^10 display frames (the frame mailbox, about 17 s at 60 a second), while a second holder (camtest 11, spawned from the host once this says "closed") opens the camera and reads its own frames: `refresh` must say unmapped, and a job reading where its ring was must fault.
+/// Spawn: `camtest.bin 0001000C00 --name camtest-a --use camera --use gpu --dma layers-32`.
+fn first_holder(g: u64, ep: u64, id: u8, t1: u64) -> ! {
+    use ferros_sys::gpu::queue::*;
+    use ferros_sys::gpu::{ARENA_VA, CAMERA_VA, PRELOAD_X};
+    use ferros_sys::mailbox::{Reader, FRAME};
+    let (gpu, blk) = (cap(g, 2), cap(g, 3));
+    let mut r = [0u8; 64];
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut r) };
+    if n == ERR || r[0] != 0 || n < 48 {
+        say!(g, "camtest a: OPEN refused\n");
+        ferros_sys::exit(1);
+    }
+    let tok = unsafe { &mut *(&raw mut VIEW_TOKEN) };
+    tok.copy_from_slice(&r[1..33]);
+    let base = ferros_sys::dma(ferros_sys::off(tok.as_ptr())) as usize;
+    let (_w, h) = (u16::from_le_bytes([r[36], r[37]]) as usize, u16::from_le_bytes([r[38], r[39]]) as usize);
+    let stride = u32::from_le_bytes(r[40..44].try_into().unwrap()) as usize;
+    let _ = ferros_sys::gpu_block_ask(blk, 26);
+    let arena = ferros_sys::dma(blk) as usize;
+    const CODE_AT: usize = 1 << 20;
+    const OUT_AT: usize = 2 << 20;
+    let mut kc = valhall::Kernel::<8>::new();
+    kernel_copy(&mut kc);
+    let cw = kc.finish().to_vec_free();
+    for (i, &x) in cw.0[..cw.1].iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + CODE_AT + 8 * i) as *mut u64, x) };
+    }
+    let Ok(mut q) = Queue::open(gpu, blk, 0, 2) else {
+        say!(g, "camtest a: the queue did not open\n");
+        ferros_sys::exit(1);
+    };
+    let Some(kcopy) = q.kernel(CODE_AT, cw.1, PRELOAD_X) else {
+        say!(g, "camtest a: the kernel was not loaded\n");
+        ferros_sys::exit(1);
+    };
+    let mapped = q.refresh();
+    let mut h64 = [0u8; 64];
+    let n = call(ep, &[5, 0xFF], &mut h64);
+    if n == ERR || n < 64 {
+        say!(g, "camtest a: no frame\n");
+        ferros_sys::exit(1);
+    }
+    let place = u64::from_le_bytes(h64[48..56].try_into().unwrap());
+    let words = stride * h / 4;
+    let job = q.submit(&Job { kernel: kcopy, groups: ((words / 16) as u32, 1), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }).unwrap();
+    let d = q.wait(job);
+    let wrong = (0..words).filter(|&i| unsafe { core::ptr::read_volatile((base + place as usize + 4 * i) as *const u32) != core::ptr::read_volatile((arena + OUT_AT + 4 * i) as *const u32) }).count();
+    let mut c = [0u8; 4];
+    call(ep, &[4], &mut c);
+    say!(g, "camtest a: mapped {mapped:?}, a frame read on the GPU: status A#{}, A#{wrong} of A#{words} words off its view; closed in A#{} ms since the open: spawn the second holder now\n", d.status, ferros_sys::us_since(t1) / 1000);
+    let mut ftok = [0u8; 32];
+    let Some(frames) = Reader::open(FRAME, 0, &mut ftok) else {
+        say!(g, "camtest a: no frame mailbox\n");
+        ferros_sys::exit(1);
+    };
+    let (mut seen, mut faulted, mut read, mut mapped_again, mut other) = (frames.seq(), 0u32, 0u32, 0u32, 0u32);
+    let mut first_fault = (0u64, 0u64);
+    for _ in 0..1 << 10 {
+        seen = frames.wait(seen, 0);
+        mapped_again += (q.refresh() == Some(true)) as u32;
+        let Some(n) = q.submit(&Job { kernel: kcopy, groups: (1, 1), uniforms: &[CAMERA_VA + place, ARENA_VA + OUT_AT as u64] }) else {
+            other += 1;
+            q.reopen();
+            continue;
+        };
+        let e = q.wait(n);
+        match e.status {
+            S_OUTSIDE => {
+                faulted += 1;
+                if first_fault.0 == 0 {
+                    first_fault = (e.fault_address, e.fault_status);
+                }
+                q.reopen();
+            }
+            S_DONE => read += 1,
+            _ => {
+                other += 1;
+                q.reopen();
+            }
+        }
+    }
+    say!(g, "camtest a: after its CLOSE, over A#1024 display frames: the camera mapped again A#{mapped_again} times, a job reading where its ring was faulted A#{faulted} times (the first at G#{:X}, AS_FAULTSTATUS G#{:X}), read A#{read} times, else A#{other}\n", first_fault.0, first_fault.1);
+    q.close();
+    ferros_sys::exit(if mapped_again == 0 && read == 0 { 0 } else { 1 })
 }
 
 /// A kernel's words out of its builder into a fixed array (no allocator here): the words and how many.
