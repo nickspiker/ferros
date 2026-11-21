@@ -4,6 +4,8 @@
 //!
 //! The screen: black, a green triangle on the right edge pointing at the power button, and the Google-coloured chevron at volume down. No words: the gate is drawn before the vault opens, so it cannot know the person's language; a symbol reads in every one (owner, 2026-10-27: "wordless"). It was "Ready?" until then; the gate keeps the name. The press — not the release — is the power key's falling-edge interrupt (killswitch.rs `arm_power_key`, `.Lirq_power`).
 //!
+//! A production build (FERROS_PRODUCTION) has no gate screen at all (owner, 2026-11-21): it boots straight to ferros, which attests, then reboots into Android only when the attested identity chose it (service.rs `START_INTO`, `ANDROID_REQ`). The gate below is a development build's.
+//!
 //! Dev builds proceed as if pressed after one second, so unattended loops keep working and every line after the gate is the same code — unless a volume key goes down during that second, which cancels the timer: the gate then waits for the power key like a production build (FERROS_PRODUCTION set at build time), which always waits. There is no remote press: USB does not exist before the press.
 
 /// The gate's two marks from the board's measured keys (board::keys): (centre row, half height, length) of the power triangle, as tall as the power key, centred on the power key and as tall as it, and of the volume-down chevron, its tip on the rocker's bottom edge (owner, 2026-11-06: "the arrow tip touches the bottom of the vol rocker") and a quarter of the rocker tall. The proportions are those of husky's marks first placed by eye (a 90-high half and 140 long; 48 and 80).
@@ -13,7 +15,7 @@ fn marks() -> ((usize, usize, usize), (usize, usize, usize)) {
     let vh = (k.rocker.1 - k.rocker.0) / 8;
     (((k.power.0 + k.power.1) / 2, ph, ph * 14 / 9), (k.rocker.1, vh, vh * 5 / 3))
 }
-/// The gate's answer: power = ferros; volume down = Android (slot a made active, then a reset; BOOT.md "Dual Boot"). Volume up only holds (the dev auto-press is cancelled; a production build waits for power anyway).
+/// The gate's answer (development builds; a production build has no gate): power = ferros; volume down = Android (ANDROID_ONCE left for the hv's gate, slot a made active, then a reset, before the vault opens: main.rs); volume up only holds (the dev auto-press is cancelled). The auto-press's ferros follows the person's "Start into" setting after the attest (service.rs `START_INTO`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Ferros,
@@ -97,6 +99,13 @@ pub fn wait() -> (u64, Choice) {
     let mut rep = alloc::vec::Vec::new();
     crate::checklist::at("gate: adopting panel");
     let panel = crate::display::adopt_once(freq, &mut rep);
+    // A production build shows nothing and waits for nothing: the panel adopted for the boot ring, the wairua's KOHI drawn, ferros (`GATE_HOW` 4).
+    if cfg!(ferros_production) {
+        let _ = crate::wairua::draw();
+        crate::checklist::at("gate: none (production)");
+        GATE_HOW.store(4, core::sync::atomic::Ordering::Relaxed);
+        return (crate::platform::cntpct(), Choice::Ferros);
+    }
     if let Some(panel) = &panel {
         crate::checklist::at("gate: panel adopted");
         draw(panel);
@@ -160,7 +169,7 @@ pub fn wait() -> (u64, Choice) {
     (crate::platform::cntpct(), choice)
 }
 
-/// How this kernel's own gate ended, for `diag boot` (checklist.rs): bits 0-7 what answered it (0 the power key's press interrupt, 1 volume down, 2 the dev timer), bit 8 the power key already down when the gate armed, bit 9 the power key down when it answered. Measuring the owner's report of 2026-11-06 on akita, a gate gone in a third of a second where a boot nobody touched waited the full second.
+/// How this kernel's own gate ended, for `diag boot` (checklist.rs): bits 0-7 what answered it (0 the power key's press interrupt, 1 volume down, 2 the dev timer, 4 no gate: a production build), bit 8 the power key already down when the gate armed, bit 9 the power key down when it answered. Measuring the owner's report of 2026-11-06 on akita, a gate gone in a third of a second where a boot nobody touched waited the full second.
 pub static GATE_HOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The gate's present report (display::Panel::present), and DECON's frame count as the gate answered, for `diag boot`.
 pub static mut GATE_PRESENT: Option<alloc::vec::Vec<u8>> = None;
@@ -169,7 +178,7 @@ pub static GATE_END_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::
 /// The hv's boot gate (ferros_hv/src/gate.rs) leaves this word in its report page when it hands the machine to ferros: the human has already answered "ferros", so the gate is not shown twice. Read once and cleared, so a later boot that did not come through the hv never sees a stale answer.
 const HV_GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
 
-/// The hv gate's telemetry (gate.rs gate_telemetry): how it was answered (1 power, 2 timer, 3 volume down) in bits 0-7, ms from the screen in bits 8-31, ms the power pin read pressed from the start in bits 32-63. Kept for DIAG (GATE_ANSWER, GATE_MS, GATE_POWER_HELD_MS).
+/// The hv gate's telemetry (gate.rs gate_telemetry): how it was answered (1 power, 2 the dev timer, 3 volume down: Android by way of ferros, 4 a recovery boot without its word, 5 the chord's FERROS_ONCE, 6 the jump, 7 a production build: no gate) in bits 0-7, ms from the screen in bits 8-31, ms the power pin read pressed from the start in bits 32-63. Kept for DIAG (GATE_ANSWER, GATE_MS, GATE_POWER_HELD_MS).
 pub static GATE_TELEMETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn answered_by_hv() -> bool {

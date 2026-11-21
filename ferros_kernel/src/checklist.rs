@@ -586,7 +586,7 @@ pub fn boot_times() -> alloc::string::String {
     let p = PRESS.load(Relaxed);
     if p != 0 {
         let h = crate::ready::GATE_HOW.load(Relaxed);
-        let by = ["the power key", "volume down", "the dev timer", "?"][(h & 3) as usize];
+        let by = match h & 0xFF { 0 => "the power key", 1 => "volume down", 2 => "the dev timer", 4 => "nothing: a production build has no gate", _ => "?" };
         s.push_str(&alloc::format!("  gate answered      +A#{} us, by {}{}{}\n", us(p.saturating_sub(e)), by, if h & (1 << 8) != 0 { ", power already down as it armed" } else { "" }, if h & (1 << 9) != 0 { ", power down as it answered" } else { "" }));
         if let Some(r) = unsafe { (*(&raw const crate::ready::GATE_PRESENT)).as_ref() } {
             s.push_str("  gate's present: ");

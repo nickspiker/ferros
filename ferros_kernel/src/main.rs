@@ -2254,8 +2254,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         display::KEEP_PIXELS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     // No USB at the gate: the kernel has none of its own since 2026-11-01 (USB.md); the USB process comes with init, after the press. Dev builds answer the gate themselves after a second.
+    // The hv's gate answers volume down (how 3, development builds) with ferros, which leaves ANDROID_ONCE and resets below: the hv starts Android only on that word (ferros_hv gate.rs `ask`).
+    let hv_how = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF;
     let (pressed_at, gate_choice) = if hv_answered {
-        (platform::cntpct(), ready::Choice::Ferros)
+        (platform::cntpct(), if cfg!(not(ferros_production)) && hv_how == 3 { ready::Choice::Android } else { ready::Choice::Ferros })
     } else if real_boot {
         ready::wait()
     } else {
@@ -2358,35 +2360,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         // The ferros partition by its GPT name: where the flash log and the vault live (ufs_device::locate; on husky only if it is where it always was).
         platform::pstore(if ufs_device::locate() { b"ferros: the ferros partition found\n" as &[u8] } else { b"ferros: NO ferros partition\n" });
     }
-    // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
-    // akita keeps Android on slot b, and since 2026-11-06 the hv there (tools/akita-hv.sh, as husky's slot a): the choice is ANDROID_ONCE for the hv's gate, slot b active (a bare ferros on slot a hands over the slot as well), then the reset. Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
-    if gate_choice == ready::Choice::Android && link_up && board::akita() {
-        // The hv's gate takes this word and goes to Android once, as on husky; a bare ferros on slot a has no gate to read it, and slot b's own does.
-        unsafe {
-            let p = 0xFD60_0FF8usize as *mut u64;
-            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-        }
-        if slot::set_active(1) == slot::MARKED {
+    // The gate chose Android (development builds only: volume down at this gate or at the hv's; a production build has no gate): the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault), ANDROID_ONCE left for the hv's gate, slot a active, then a plain reset. Android lives on slot a on both boards (akita's since 2026-11-18, BOARDS.md), whose hv gate takes the word and goes to Android, once. The way back is a reboot: no word, so the gate gives ferros (owner, 2026-11-21: Android starts only by ferros's hand).
+    // Cleaned to DRAM, since the gate reads it with the caches off.
+    if cfg!(not(ferros_production)) && gate_choice == ready::Choice::Android && link_up {
+        platform::android_once();
+        if slot::set_active(0) == slot::MARKED {
             platform::crumb(0xC7);
             platform::reboot();
         }
         checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
     }
-    if gate_choice == ready::Choice::Android && link_up && !board::akita() {
-        // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
-        unsafe {
-            let p = 0xFD60_0FF8usize as *mut u64;
-            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-        }
-        let r = slot::set_active(0);
-        if r == slot::MARKED {
-            platform::crumb(0xC7);
-            platform::reboot();
-        }
-        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
-    }
+    // The person's standing choice (owner, 2026-11-21: "Start into: ferros / Android") applies only to a boot nobody answered: a production boot (no gate) or a development gate's untouched second. A press of power at the gate, the chord's FERROS_ONCE, a recovery boot refused, the jump and a reload all mean ferros, now. Taken at the first attest (service.rs `START_INTO`).
+    let unattended = real_boot && !platform::jumped() && if hv_answered { matches!(hv_how, 2 | 7) } else { matches!(ready::GATE_HOW.load(core::sync::atomic::Ordering::Relaxed) & 0xFF, 2 | 4) };
+    service::START_INTO.store(unattended, core::sync::atomic::Ordering::Relaxed);
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
     if link_up {

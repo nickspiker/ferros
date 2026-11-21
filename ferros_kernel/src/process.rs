@@ -2362,6 +2362,8 @@ pub const PREF_THEME: usize = 5;
 pub const PREF_PROX_WAKE: usize = 6;
 /// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its 16 kHz trace follows (in the sensor's register order, VD6283 datasheet: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear — provisional for the VD6282) (usf.rs, the display's scope widget).
 pub const PREF_SCOPE: usize = 7;
+/// Preference 8: what this device starts into (owner, 2026-11-21: "Start into: ferros / Android" on the Settings page), 0 ferros (the default) or 1 Android: the attested identity's standing choice for this device. A device setting (settings flow identity to device only), kept in the device document as `start_into`. Set to Android only while a person is present on a device that allows Android (the disclaimer's typed confirmation, SYS_UNLOCK op 14); back to ferros always. Applied after the attest of a boot nobody answered (service.rs `START_INTO`). Byte 8 was the surfaces' first generation until 2026-11-12, zero since.
+pub const PREF_START_INTO: usize = 8;
 /// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 were the surfaces' generations until 2026-11-12 (the windows' bell carries them since, and the kernel leaves them zero), 16-31 the wall clock; the language is in the second block (PREF_LANG).
 pub const PREF_LAYOUT: usize = 12;
 /// How many layouts the honeycomb carries: the valid range of PREF_LAYOUT.
@@ -2554,6 +2556,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SCOPE => value <= 6,
         PREF_LAYOUT => value < LAYOUTS,
         PREF_UNLOCK_AT_BOOT => value <= 1,
+        PREF_START_INTO => value <= 1,
         PREF_SCALE => (value as i8).unsigned_abs() <= SCALE_REACH as u8,
         // Five radios, a bit each.
         PREF_RADIOS_OFF => value < 1 << 5,
@@ -6271,6 +6274,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 0
             }
         },
+        // Android on this device (owner, 2026-11-21; docs/BOOT.md "Android only by the identity's choice"), op 13 for a Settings holder (the Settings page), x2 the request: 0 start Android now, 1 Android off on this device (and the setting back to ferros), 2 Android on again for a person who accepted the disclaimer before, 3 the state (bit 0 this device allows Android, bit 1 the person present accepted the disclaimer). Each but 3 only while a person is present; the vault's half is service.rs `store_unlock` (its ops 13, 15, 16, 17). → 1 done, 0 refused, ERR without the right or a vault.
+        SYS_UNLOCK if f.x[1] == 13 => {
+            let token = p.read(f.x[0], 32);
+            let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
+            f.x[0] = match (held, unsafe { UNLOCK }) {
+                // WHY the bound: x2 is the caller's; only the four requests exist.
+                (true, Some(unlock)) if f.x[2] < 4 => match unlock([13, 15, 16, 17][f.x[2] as usize], None) {
+                    // Android off: what this device starts into goes back to ferros with it.
+                    Ok(1) if f.x[2] == 1 => {
+                        if pref(PREF_START_INTO) != 0 {
+                            set_pref_locked(PREF_START_INTO, 0);
+                            keep_settings();
+                        }
+                        1
+                    }
+                    r => r.unwrap_or(ERR),
+                },
+                _ => ERR,
+            };
+            0
+        }
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
         SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
             f.x[0] = tag_syscall(p, f);
@@ -6333,6 +6357,29 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             Ok(2) => (Reply { error: true, present: true, matched: true, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "the seed could not be kept"),
                             Ok(_) => (Reply { error: true, present: true, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "they do not match"),
                             Err(()) => (Reply { error: true, present: false, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "no seed held: nobody present"),
+                        };
+                        match reply(answer, why, crate::settings::eagle_now()) {
+                            Some(doc) => {
+                                // WHY the min: x4 is the caller's buffer length; only what it holds is written.
+                                p.write(f.x[3], &doc[..doc.len().min(f.x[4] as usize)]);
+                                doc.len() as u64
+                            }
+                            None => ERR,
+                        }
+                    }
+                    // Op 14, the disclaimer's typed confirmation (owner, 2026-11-01 and 2026-11-21; docs/BOOT.md "Android only by the identity's choice"): Android allowed on this device once the person present has read the disclaimer in full and typed their own handle again, 32 bytes of its seed at x2; the reply document (ahau_core::retype, `on` = Android allowed now) into x3, x4 its length. Only the attest screen's keyboard (ahau, by name and never a kist), as op 12.
+                    14 if p.kist || p.name.as_slice() != b"ahau" => ERR,
+                    14 => {
+                        let mut seed = [0u8; 32];
+                        p.read_into(f.x[2], &mut seed);
+                        let r = unlock(14, Some(&seed));
+                        crate::keys::wipe_to_dram(&mut seed);
+                        use ahau_core::retype::{reply, Reply};
+                        let (answer, why) = match r {
+                            Ok(1) => (Reply { error: false, present: true, matched: true, on: true }, "Android allowed on this device"),
+                            Ok(2) => (Reply { error: true, present: true, matched: true, on: false }, "the acceptance could not be kept"),
+                            Ok(_) => (Reply { error: true, present: true, matched: false, on: false }, "they do not match"),
+                            Err(()) => (Reply { error: true, present: false, matched: false, on: false }, "nobody present"),
                         };
                         match reply(answer, why, crate::settings::eagle_now()) {
                             Some(doc) => {
@@ -7027,6 +7074,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = held || (index == PREF_SCALE && matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Endpoint(e), r)) if e == endpoint(b"display") && r & RIGHT_SEND != 0));
             // Attest at boot turns on only thru the retype gate (SYS_UNLOCK op 12: the handle typed again, compared with the person present's in the kernel); off is always safe and stays a plain set (owner, 2026-11-17: "my toddler could do it without me").
             let held = held && !(index == PREF_UNLOCK_AT_BOOT && value != 0);
+            // Android as what this device starts into: only while a person is present and the device allows Android (the disclaimer accepted, SYS_UNLOCK op 14); ferros always (owner, 2026-11-21: Android starts only when the attested identity chose it).
+            let held = held && !(index == PREF_START_INTO && value != 0 && !(crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) && crate::service::ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2));
             // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
             let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
             f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {

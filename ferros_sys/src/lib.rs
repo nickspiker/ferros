@@ -342,6 +342,8 @@ pub const PREF_THEME: u64 = 5;
 pub const PREF_SCOPE: u64 = 7;
 /// Preference 6: the proximity wake, 0 off or 1 on (the kernel refuses a wake press while proximity reads near).
 pub const PREF_PROX_WAKE: u64 = 6;
+/// Preference 8: what this device starts into (owner, 2026-11-21), 0 ferros (the default) or 1 Android: the attested identity's standing choice, applied after the attest of a boot nobody answered. The kernel takes Android only while a person is present on a device that allows Android (`android_accept`); ferros always.
+pub const PREF_START_INTO: u64 = 8;
 /// Preference 12: the honeycomb keyboard's layout, 0 Dvorak (the default) or 1 QWERTY with Q on the bottom row (honeycomb::LAYOUTS).
 pub const PREF_LAYOUT: u64 = 12;
 /// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the device unlocks without typing — a stolen device then holds the identity).
@@ -3080,6 +3082,35 @@ pub fn person_key_held(cap: u64) -> Option<bool> {
 /// Hand the person key to the kernel (SYS_UNLOCK op 10, the Unlock right; docs/FACETS.md D1): it derives each kist's alias from it and wipes it at lock. True when held; false while nobody is present, without the right, or from a kernel before 2026-11-12.
 pub fn give_person_key(cap: u64, key: &[u8; 32]) -> bool {
     svc(nr::UNLOCK, cap, 10, off(key.as_ptr()), 0, 0) == 0
+}
+
+/// Android on this device (SYS_UNLOCK op 13, the Settings right; docs/BOOT.md "Android only by the identity's choice"): what the Settings page asks of the kernel. Each but `State` only while a person is present.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Android {
+    /// Start Android now: ferros leaves the gate its word and resets (the device must allow Android).
+    StartNow = 0,
+    /// Android off on this device; what it starts into goes back to ferros.
+    Off = 1,
+    /// Android on again, for a person who accepted the disclaimer before.
+    OnAgain = 2,
+    /// The state: bit 0 this device allows Android, bit 1 the person present accepted the disclaimer.
+    State = 3,
+}
+
+/// Ask the kernel `what` (`Android`) with the Settings right `cap`: 1 done (or the state's bits), 0 refused, None without the right or a vault.
+pub fn android(cap: u64, what: Android) -> Option<u64> {
+    match svc(nr::UNLOCK, cap, 13, what as u64, 0, 0) {
+        ERR => None,
+        n => Some(n),
+    }
+}
+
+/// The disclaimer's typed confirmation (SYS_UNLOCK op 14, the Unlock right, the attest screen's keyboard only): the seed of the person's own handle typed again after the disclaimer was read in full. The kernel compares it with the seed of the person present; one, their acceptance is kept in their identity class and this device allows Android. The reply, a VSF document (ahau_core::retype, `on` = allowed now), lands in `out`. Its whole length, or None without the right.
+pub fn android_accept(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+    match svc(nr::UNLOCK, cap, 14, off(seed.as_ptr()), off(out.as_mut_ptr()), out.len() as u64) {
+        ERR => None,
+        n => Some(n as usize),
+    }
 }
 
 /// The retype gate (SYS_UNLOCK op 12, the Unlock right; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again. The kernel compares it with the seed of the person present and turns the setting on only when they are one; the reply, a VSF document (ahau_core::retype), lands in `out`. Its whole length, or None without the right or from a kernel before 2026-11-17 (whose SET_PREF still takes the setting, unchecked).

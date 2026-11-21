@@ -823,8 +823,28 @@ fn vault<R>(f: impl FnOnce() -> R) -> R {
 
 /// Android from within ferros, behind an attest (owner, 2026-11-01 and 2026-11-04: "launch Android from within ferros so it's gated behind an attest", from the deck). The device's opt-in, the vault's device-class `android.allowed` (one byte, 1), as the service loop read it at start: 2 allowed, 1 not, 0 not read yet (SYS_FACTS 82, so the map shows the Android circle only on a device that allows it). Written by the opt-in (the disclaimer, next) and for now from the host.
 pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The disclaimer text's number (ferros_lang `Msg::AndroidDisclaimer`; 0 the text of 2026-11-01 as shown from 2026-11-21): kept with the person's acceptance, so a changed text can be asked again.
+const DISCLAIMER_VERSION: u8 = 0;
+
+/// The person's acceptance of the Android disclaimer as kept in their identity class (kvault `ANDROID_DISCLAIMER`): section `android_disclaimer`, `version` (`DISCLAIMER_VERSION`) and `accepted` (Eagle time).
+fn disclaimer_document() -> Option<alloc::vec::Vec<u8>> {
+    use vsf::schema::{SectionSchema, TypeConstraint};
+    let now = crate::settings::eagle_now();
+    let section = SectionSchema::new("android_disclaimer")
+        .field("version", TypeConstraint::AnyUnsigned)
+        .field("accepted", TypeConstraint::AnyEagleTime)
+        .build()
+        .set("version", vsf::VsfType::u(DISCLAIMER_VERSION as usize, false))
+        .and_then(|b| b.set("accepted", vsf::VsfType::e(vsf::EtType::e6(now))))
+        .and_then(|b| b.encode())
+        .ok()?;
+    vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_unboxed("android_disclaimer", section).build().ok()
+}
+
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The person's standing choice is still to be applied this boot (owner, 2026-11-21: "Start into: ferros / Android", PREF_START_INTO): set by main.rs only for a boot nobody answered (a production boot, or a development gate's untouched second; not a press of power, the chord's FERROS_ONCE, a refused recovery boot, the jump or a reload), taken by the service loop at the first attest: with the setting at Android on a device that allows it, the launch (`ANDROID_REQ`).
+pub static START_INTO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A completed departure released the identity (SYS_UNLOCK op 4): the service loop restarts the device, which comes back at the attest screen (AUTH.md's "no way back to the attest screen" gap, closed the plain way).
 static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The drops of the released person's domains in the vault process (process.rs `vault_stamp_drops`), each a stamp carrying that domain's keys, waiting for the service loop to send them before the restart. Under the kernel lock (filled in a syscall, taken by the loop).
@@ -1003,6 +1023,66 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
+        }
+        // Android on this device (process.rs SYS_UNLOCK ops 13 and 14; docs/BOOT.md "Android only by the identity's choice"). Every one but the state needs a person present.
+        // 13: start Android now (the Settings page's action), on a device that allows it: the service loop's launch (`ANDROID_REQ`). 1 accepted, 0 refused.
+        (13, _) => {
+            if !st.unlocked() {
+                return Err(());
+            }
+            let ok = ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
+            crate::flashlog::line(if ok { "android: start now, the person's action on the Settings page" } else { "android: start now refused: this device does not allow Android" });
+            if ok {
+                ANDROID_REQ.store(true, core::sync::atomic::Ordering::Release);
+            }
+            Ok(ok as u64)
+        }
+        // 14: the disclaimer's typed confirmation (ahau's keyboard): the handle typed again is the person present's, so their acceptance is kept in their identity class (once per person) and this device allows Android. 1 done, 0 they do not match, 2 they match but it could not be kept.
+        (14, Some(s)) => match st.retype_matches(s) {
+            Ok(true) => {
+                let accepted = disclaimer_document().map(|d| st.set(crate::kvault::ANDROID_DISCLAIMER, &d).is_ok()).unwrap_or(false);
+                let allowed = st.set("android.allowed", &[1]).is_ok();
+                crate::flashlog::line(&alloc::format!("android: the disclaimer accepted by the person present (handle typed again): acceptance kept {accepted}, allowed on this device {allowed}"));
+                if allowed {
+                    ANDROID_ALLOWED.store(2, core::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(if accepted && allowed { 1 } else { 2 })
+            }
+            Ok(false) => {
+                crate::flashlog::line("android: the disclaimer's handle typed again does not match; nothing changed");
+                Ok(0)
+            }
+            Err(_) => Err(()),
+        },
+        // 15: Android off on this device (the setting goes back to ferros in process.rs). The person's acceptance stays theirs. 1 done.
+        (15, _) => {
+            if !st.unlocked() {
+                return Err(());
+            }
+            let ok = st.set("android.allowed", &[0]).is_ok();
+            crate::flashlog::line(&alloc::format!("android: off on this device (the person's choice), kept {ok}"));
+            if ok {
+                ANDROID_ALLOWED.store(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(ok as u64)
+        }
+        // 16: Android on again for a person who accepted the disclaimer before (on this device: their identity class). 1 done, 0 no acceptance kept.
+        (16, _) => {
+            if !st.unlocked() {
+                return Err(());
+            }
+            let before = matches!(st.get_by_key(crate::kvault::ANDROID_DISCLAIMER), Ok(Some(_)));
+            let ok = before && st.set("android.allowed", &[1]).is_ok();
+            crate::flashlog::line(if ok { "android: on again on this device (the person accepted the disclaimer before)" } else { "android: on again refused: no acceptance of the disclaimer kept for the person present" });
+            if ok {
+                ANDROID_ALLOWED.store(2, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(ok as u64)
+        }
+        // 17: the state, bit 0 this device allows Android, bit 1 the person present accepted the disclaimer.
+        (17, _) => {
+            let accepted = st.unlocked() && matches!(st.get_by_key(crate::kvault::ANDROID_DISCLAIMER), Ok(Some(_)));
+            Ok((ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2) as u64 | (accepted as u64) << 1)
         }
         _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1 | (st.person_held() as u64) << 2),
     }
@@ -3251,16 +3331,25 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
-        // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
+        // The person's standing choice, once, at the first attest of a boot nobody answered (`START_INTO`): Android when they chose it and this device allows it.
+        #[cfg(not(shim_handoff))]
+        if START_INTO.load(core::sync::atomic::Ordering::Relaxed) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+            START_INTO.store(false, core::sync::atomic::Ordering::Relaxed);
+            let android = crate::process::pref(crate::process::PREF_START_INTO) == 1;
+            let allowed = ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
+            if android && allowed {
+                crate::flashlog::line("start into: Android, the person's choice, after the attest");
+                ANDROID_REQ.store(true, core::sync::atomic::Ordering::Release);
+            } else if android {
+                crate::flashlog::line("start into: Android chosen, but this device does not allow Android: ferros");
+            }
+        }
+        // A launch of Android the attested identity chose (the "Start into" setting, "start Android now" on the Settings page, the `android` switch): the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
         if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
             // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
             let r = crate::slot::set_active(0);
-            unsafe {
-                let p = 0xFD60_0FF8usize as *mut u64;
-                core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-                core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-            }
+            crate::platform::android_once();
             crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
             if r == crate::slot::MARKED {
                 platform::crumb(0xC7);
@@ -3920,6 +4009,11 @@ pub fn run(mut b: Boot) -> ! {
                 // The handoff build has no `slot`: marking an A/B slot is a cold-boot job, and a ferros chainloaded out of a running Android must not rewrite devinfo under it.
                 #[cfg(not(shim_handoff))]
                 if cmd.params == b"android" || cmd.params == b"android here" {
+                    // Only with a person present (owner, 2026-11-21: Android starts only when the attested identity chose it). These devices unlock at boot, so the development door still works for whoever holds them; refused before anything is answered or written.
+                    if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+                        queue_pt_response(&mut pt_out_data, b"android: refused: no one has attested\n");
+                        continue;
+                    }
                     // From the USB process: reply first, and reset when it asks again with its reply sent (ptlink.rs).
                     if from_proc && !pt_act {
                         queue_pt_response(&mut pt_out_data, b"android: resetting once this reply is out\n");
@@ -3928,12 +4022,8 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
                     let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
-                    // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
-                    unsafe {
-                        let p = 0xFD60_0FF8usize as *mut u64;
-                        core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-                        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-                    }
+                    // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once.
+                    crate::platform::android_once();
                     resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     if r == crate::slot::MARKED {
@@ -3944,6 +4034,11 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 if cmd.params == b"recovery" {
+                    // Only with a person present: a wipe or a rescue of Android's data needs an attest (owner, 2026-11-02, android_behind_attestation); recovery is Android's, which starts only by the attested identity's hand (2026-11-21).
+                    if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+                        queue_pt_response(&mut pt_out_data, b"recovery: refused: no one has attested\n");
+                        continue;
+                    }
                     // `diag recovery`: Android's recovery, once. The gate refuses a recovery boot unless this word is there (ferros_hv gate.rs RECOVERY_ONCE: no reflash without the handle, owner 2026-11-01); ferros leaves it, cleaned to DRAM, then resets into the bootloader's recovery mode. A development door for now; the attest-gated setting comes with the UI.
                     if from_proc && !pt_act {
                         queue_pt_response(&mut pt_out_data, b"recovery: resetting into recovery once this reply is out\n");
