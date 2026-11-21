@@ -449,6 +449,43 @@ Each needs this branch's kernel (RAM-reloaded) and its GPU service stored (`ferr
 4. A client killed with its queue open (`diag "kill gputest"` mid-run of 1): the service's line "ended with its queue open", the block back in the pool (`diag arcs`).
 5. The camera (needs a camera holder that calls the GPU: Lumis with the queue, or a camtest mode): its view mapped (op 5 answers 1), a kernel reading it, a store into it faulting, CLOSE with a job in flight (its queue ends `E_CAMERA`), the service's settle line, the frames shut out after it, a second OPEN by another holder reading nothing of the first's.
 
+6. The camera on the GPU: `spawn camtest.bin 1001000B00 --name camtest --use camera --use gpu --dma layers-32` (16 frames of the main).
+7. The fence after each: `diag "gpu fence"` (the GPU S2MPU's latched fault, decoded, then cleared).
+
+### Measured on the 8a (2026-11-20)
+
+This branch's kernel RAM-reloaded on the 8a (it ran forge fe1783a0 flashed, through the hv's gate; identity unlocked at boot each time, nothing of it touched), its GPU service stored (the one before in keys/akita/capsules-before-gpu-kists-2026-11-20/gpu.capsule.vsf, blake3 cee7a99c...). The GPU's timestamp is the CPU's counter (24 ticks apart, a read's width), so the job stamps are on.
+
+**Submit to done** (gputest 0E, 2^8 jobs each unless said; least / mean / most, µs; the last of three runs, the others alike):
+
+| | submit to the client's wake | doorbell to the service seeing the end | the GPU's own time | doorbell to the GPU's start |
+|---|---|---|---|---|
+| empty kernel, one at a time, thru the queue | 62 / 88 / 751 | 29 / 50 / 704 | 2 / 5 / 359 | 8 / 16 / 269 |
+| empty kernel thru calls (op 1) | 71 / 126 / 225 (call to reply) | | | |
+| empty kernel, four in flight | 28 µs a job | | | |
+| ferros_clip's band coder, a binned 4080 × 3072 frame, thru the queue (16) | 6203 / 6657 / 6993 | | 5966 / 6384 / 6729 | |
+| the band coder thru calls (16) | 5541 / 6273 / 7056 | | 5280 / 5982 / 6688 | |
+
+- The queue's own cost over the GPU's time is about 90 µs for an empty job (mean) and about 270 µs for the band coder (its stamp at the run's end comes before the L2 clean of the 25 MB it wrote, so that clean is in the difference). Four in flight, 28 µs a job.
+- The Mandelbrot thru the queue: 0 of 4096 pixels off the CPU's. A store outside the block: status 4 with the address and AS_FAULTSTATUS (a translation fault), the job behind it lost, the queue ended and opened again, the next job done.
+- Lumis's ops (0F) on the device: 0 words wrong of each (multiply-add, shifts, the f16 pair, the narrow loads), the histogram's 16 atomic counters and its sum exact, from 2^11 invocations.
+
+**A kernel a display frame** (gputest 10, 2^7 frames; the 8a's panel at 60 a second in ferros): the frames 16.71 ms apart (16.37 to 17.05), none missed; the frame mailbox's reader woken 4 / 10 / 29 µs after the publish; frame start to an empty job's end 454 / 482 / 613 µs with the clock turning, 440 / 474 / 574 with it held up (op 6). Most of that half millisecond is the shader cores' power-up: the firmware powers them down 800 µs after they idle, and a job a frame finds them down every time (back to back, an empty job's round is about 90 µs).
+
+**The clock's turns** (`diag clock`): a turn 566 µs on average (744 the longest), two ACPM requests and their answers on the kernel's core. A job a frame turned it up and down 114 times in 128 frames: about 1.1 ms of the kernel's core a frame, at 60 a second about 7 % of it. The job itself did not notice (8 µs on the mean). The coordinator's to decide with these.
+
+**A client killed with its queue open** (twice, once in the band coder's run): the service's line "slot k's client (epoch e) ended with its queue open: its group ended, its GPU work let go", its 128 MiB block back in the pool (`diag arcs`), the fence clean.
+
+**The camera on the GPU** (camtest 11, the main, 4624 × 3472, 5824 bytes a line), three runs:
+- mapped read-only: `refresh` said mapped; every frame copied whole by the GPU from `CAMERA_VA` (19.7 MiB) equal to the CPU's read of the view, 0 words of 5,055,232 different in 48 frames;
+- non-cacheable against cacheable with the L2 and LSC invalidated before each job: a whole frame's copy 1588, 1582 and 1322 µs non-cacheable, 923, 1099 and 896 cacheable (8 frames each); the invalidate costs less than it saves;
+- a store into the ring: a permission fault in the holder's own space (AS_FAULTSTATUS G#10003CA), the queue ended, opened again;
+- CLOSE with a long job reading the ring in flight (133 to 154 ms, the driver's close): the service's line "the camera view went with a job in flight: its group ended, its queue ended", the job lost, the queue `E_CAMERA`; after it `refresh` said unmapped and a job reading the ring took a translation fault; the run went back to the pool after the service's settle each time.
+
+**Found and fixed on the device: the GPU's caches after a group ended mid-job.** After a camtest run (its long job stopped at CLOSE), the next client's job (0F) left the GPU's fence a latched fault: a write, refused, at G#8_9240_1A40, the line of the camtest queue's record whose job was stopped (its start stamp). Reproduced the same way twice. The stopped job's stamp sat dirty in the GPU's L2 (no end-of-job flush ran), and the next client's end-of-job flush wrote it after camtest's frames had gone back to the pool: refused there because the frames were out of the fence, but frames given to another client and admitted again would have taken it. The service now flushes the GPU's caches (GPU_COMMAND FLUSH_CACHES, L2 and LSC cleaned and invalidated) after every group it ends with a job in it, before the memory may go; the same sequence twice since: no fault. No other run left a fault (0E, 0F, 10, the kills, camtest, checked after each).
+
+**The flashed kernel with the new service** (the 8a rebooted to forge fe1783a0 at the end, the new `gpu` stored): the service starts ("the clock the kernel's (no gpu-clock grant)"), calls work (gputest's Mandelbrot, 0 of 4096 off), a queue's open is refused cleanly (status 1: that kernel has no hold), the fence clean. So the new service stays stored.
+
 ## 4. Open questions for the owner
 
 0. **The kernel's form in a capsule:** WGSL text means a parser for untrusted text on the device (the rule against string parsers); proposal: WGSL parsed on the developer's side, the capsule carrying a typed form (naga's IR as VSF, or SPIR-V), validated on the device.
@@ -460,7 +497,7 @@ Each needs this branch's kernel (RAM-reloaded) and its GPU service stored (`ferr
 6. **Bounded loops** required, or any loop with the progress timer alone?
 7. **The clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and idle gating.
 8. **naga** as a dependency, or our own WGSL front end?
-9. **The clock's down turn** (section 3, "Power and clock by events"): at the queue's emptying, as built, or at a display frame with nothing queued since the last, if a turn a frame costs more than it saves. To decide with the device's turn counts and the longest turn.
+9. **The clock's down turn** (section 3, "Power and clock by events"): at the queue's emptying, as built, or at a display frame with nothing queued since the last, if a turn a frame costs more than it saves. To decide with the device's turn counts and the longest turn. Measured on the 8a: a turn 566 µs of the kernel's core, about 1.1 ms a frame at a job a frame; the job's own latency unchanged (section 3, "Measured on the 8a").
 10. **The display reading a layer's tile coverage** (section 3, "Layers"): the form is set (a byte a 64-pixel tile past the pixels); skipping a layer's empty tiles and stopping at its opaque ones is the display's change, not built here.
-11. **The camera on the GPU cacheable** (section 3): mapped non-cacheable today for correctness (the front end does not snoop; the GPU's L2 is cleaned, not invalidated, at each job's end); cacheable with an L2 invalidate per job may read faster: to measure.
-12. **A bad kernel ends its kist's GPU work, not its kist** (Lumis's ask 8): as built a fault ends the kist's group and its queue and says where; the kist goes on and opens the queue again. Ending the kist's process itself on a GPU fault is a policy the owner may want instead.
+11. **The camera on the GPU cacheable** (section 3): non-cacheable by default; measured on the 8a, a whole frame read 1.4 to 1.7 times faster cacheable with an invalidate a job (896 to 1099 µs against 1322 to 1588). Making it the default is the next step's.
+12. **A bad kernel ends its kist's GPU work, not its kist** (Lumis's ask 8): decided (the coordinator, 2026-11-20): end the kist's GPU work and report it; the kist decides whether to end itself.
