@@ -903,8 +903,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
     };
     let mut turns = Turns::default();
-    // The last frame taken, by the driver's count and Eagle ns: the sensor's rate from one to the next (`set_sensor_rate`).
-    let mut last_frame: Option<(u32, i64)> = None;
+    // The last frame or slit taken (whether a slit, the driver's count, Eagle ns): the sensor's rate from one to the next (`set_sensor_rate`).
+    let mut last_frame: Option<(bool, u64, i64)> = None;
     let first = if dev_slit {
         println!("lumis: camera {}: development: slits from the open, Lumis sized from the list ({} x {})", cam.name, cam.width, cam.height);
         let shutter_ns = match dev_shutter_us() {
@@ -1121,7 +1121,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 if let Some(c) = CLIP.lock().unwrap().take() {
                     end_clip(c, Some(&mut *integrator.header), "the rate changed");
                 }
-                paced_from = last_frame.map_or(0, |(c, _)| c as u64 + ferros_clip::SET_SETTLES);
+                paced_from = last_frame.map_or(0, |(_, c, _)| c + ferros_clip::SET_SETTLES);
                 match want {
                     Some(fps) => {
                         println!("lumis: camera {}: RAW video at {fps} a second, the frame length set in place (no reopen)", cam.name);
@@ -1256,14 +1256,16 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         } else if quiet != Some(heartbeat) {
             quiet = None;
         }
-        // F, the sensor's own rate (the owner, 2026-11-20): the frames the driver counted since the last one taken over the time its clock says passed, at every frame taken (one the preview passes over too), not Lumis's intake.
-        // WHY the order check: the count and the time are the driver's, and both start over when the camera reopens; that frame only starts the next measure.
-        if let Got::Frame(head, _) = &got {
-            if let Some((c0, t0)) = last_frame.filter(|&(c0, t0)| head.count > c0 && head.time > t0) {
-                integrator.set_sensor_rate((head.count - c0) as f64 * 1e9 / (head.time - t0) as f64);
-            }
-            last_frame = Some((head.count, head.time));
+        // F, the sensor's own rate (the owner, 2026-11-20): the frames, or in Slitscan the slits, the driver counted since the last one taken over the time its clock says passed, at every one taken (one the preview passes over too), not Lumis's intake. A slit's count and time are its record's (the owner: "the :Fps number up top is wrong for slitscan. I doubt it's 14": it kept the whole frames' rate).
+        // WHY the order and kind checks: the count and the time are the driver's, both start over when the camera reopens, and a slit's count is not a frame's; such a one only starts the next measure.
+        let stamp = match &got {
+            Got::Frame(head, _) => (false, head.count as u64, head.time),
+            Got::Slit { count, time, .. } => (true, *count, *time),
+        };
+        if let Some((_, c0, t0)) = last_frame.filter(|&(slit, c0, t0)| slit == stamp.0 && stamp.1 > c0 && stamp.2 > t0) {
+            integrator.set_sensor_rate((stamp.1 - c0) as f64 * 1e9 / (stamp.2 - t0) as f64);
         }
+        last_frame = Some(stamp);
         // A continuous save or a calibration integrates on: the integrator never ends Lumis on a quiet UI while either runs (lumis ferros-cal-behind).
         // Otherwise, behind (or in front again before the UI has drawn), nothing is integrated: the save on its way is the image already made, so it is started if asked for and not yet begun, kept when encoded, and Lumis leaves once nothing is left on its way.
         if !kept && quiet.is_some() {
