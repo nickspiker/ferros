@@ -40,6 +40,18 @@ pub fn reattached() -> u32 {
     REATTACHED.swap(0, Ordering::AcqRel)
 }
 
+/// The screen dark (the power key's preference 2 as the render thread last took it, set by it at its start and at each change): a re-attaching app that was in front hears it is behind (`reattach`).
+pub static DARK: AtomicBool = AtomicBool::new(false);
+
+/// A re-attaching app that was in front while the screen was dark, as `1 << 16 | surface << 8 | generation` (0: none), for the render thread to tell it it is in front once the panel is back.
+static DARK_FRONT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// That app's surface and generation, cleared as read (the render thread's, once a pass).
+pub fn dark_front_take() -> Option<(usize, u8)> {
+    let v = DARK_FRONT.swap(0, Ordering::AcqRel);
+    (v != 0).then_some(((v >> 8 & 0xFF) as usize, v as u8))
+}
+
 const EMPTY: Queue = Queue { generation: 0, n: 0, behind: false, ring: [0; EVENTS], nb: 0, bytes: [0; BYTES], at: [0; EVENTS], held: None, restore: false };
 static mut QUEUES: [Queue; SURFACES] = [EMPTY; SURFACES];
 static LOCK: AtomicBool = AtomicBool::new(false);
@@ -141,6 +153,7 @@ pub fn watch(k: usize, generation: u8, seen: u32, tok: &[u8; 32]) {
         // A restart's work, so in the flash log; said outside the lock.
         let what = match said {
             None => "held until the deck says how the windows stood",
+            Some(true) if DARK.load(Ordering::Acquire) => "told it is behind while the screen is dark (it was in front: told it is in front once the panel is back)",
             Some(true) => "told the display's bake again (it was in front)",
             Some(false) => "told it is behind",
         };
@@ -164,11 +177,18 @@ static mut FRONT: Option<Option<(usize, u8)>> = None;
 
 /// What a re-attaching app hears once the deck has said (`watch`, `restore`), answering `tok` (it saw `seen` events). The count goes one past what it saw, so it is answered with that one event whatever it saw (set to 1 instead, an app that had seen one event, the safe area at its first show, was held and never heard it: Kuaha on the Pro).
 /// The window that was in front hears the display's bake changed (`EV_BAKE`): it asks this display's bake and makes its frame again whole, and its show makes its window here, in front; an idle app draws again for it too, where "front" would change nothing for an app that thinks it is in front already. Any other hears it is behind (it draws nothing until brought to the front, op 59), and a window it already made here by a show goes behind with it (`reattached`). Whether it was the one in front. Under the lock.
+/// With the screen dark (`DARK`) the one in front hears it is behind as well, so it draws nothing for a dark panel, and is kept (`DARK_FRONT`) for the render thread, which tells it it is in front once the panel is back (WINDOWS.md "The screen off"); a window it made here is not sent behind.
 fn reattach(q: &mut Queue, k: usize, seen: u32, tok: &[u8; 32], front: Option<(usize, u8)>) -> bool {
     // By the generation the surface lives under now (`live_gen`), not the queue's, which a watch taken early may have left at 0.
-    let is_front = front.is_some_and(|(sk, g)| sk == k && g != 0 && g == live_gen(k));
-    let ev = if is_front { ferros_sys::window::EV_BAKE } else { ferros_sys::window::EV_BEHIND };
-    q.behind = !is_front;
+    let g = live_gen(k);
+    let is_front = front.is_some_and(|(sk, fg)| sk == k && fg != 0 && fg == g);
+    let dark = DARK.load(Ordering::Acquire);
+    let ev = if is_front && !dark { ferros_sys::window::EV_BAKE } else { ferros_sys::window::EV_BEHIND };
+    if is_front && dark {
+        DARK_FRONT.store(1 << 16 | (k as u32) << 8 | g as u32, Ordering::Release);
+        DARK_TOLD.store(true, Ordering::Release);
+    }
+    q.behind = !is_front || dark;
     q.n = seen.wrapping_add(1);
     let i = (q.n.wrapping_sub(1)) as usize % EVENTS;
     q.ring[i] = (ev as u16) << 8;

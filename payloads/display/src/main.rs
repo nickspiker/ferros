@@ -8207,8 +8207,11 @@ fn server(grants: u64) -> ! {
     // The screen as the kernel wants it (preference 2, the power key's), taken before the panel thread is spawned: that thread holds the panel to it from its start (a restarted server finds the panel as the last one left it), and this loop passes it each change after.
     let mut screen_off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
     PANEL_SCREEN.store(screen_off as u64, Ordering::Release);
-    // The app window in front when the screen went off (its surface and generation), told it is behind then (`EV_BEHIND`), so it stops drawing for a dark panel (2026-11-21: apps drew all night on the Pro with the screen off). Told it is in front again (`EV_FRONT`) once the panel thread has the screen back (`PANEL_LIT` reaches `on_seq`, the sequence the screen on was posted under), and only if it is still the one in front. The window itself never leaves the front for this: the deck's order, `FULL` and the kernel's stop word are as they were.
-    let mut dark_front: Option<(usize, u8)> = None;
+    // Before the receive thread starts: an app re-attaching while the screen is dark hears it is behind (events.rs `reattach`).
+    events::DARK.store(screen_off, Ordering::Release);
+    // The app window in front while the screen is dark (its surface and generation), told it is behind (`EV_BEHIND`) so it draws nothing for a dark panel (2026-11-21: apps drew all night on the Pro with the screen off): the one in front at screen off, one brought to the front while dark (op 59, its `EV_FRONT` held), or one that re-attached from an earlier display while dark and was in front (`events::dark_front_take`). Told it is in front (`EV_FRONT`) once the panel thread has the screen back (`PANEL_LIT` reaches `on_seq`, the sequence the screen on was posted under), and only if it is still the one in front. The window itself never leaves the front for this: the deck's order, `FULL` and the kernel's stop word are as they were.
+    // The third field: no window of its own here yet (an app re-attached, or op 59 for a surface with none), whose show makes it once it is told it is in front.
+    let mut dark_front: Option<(usize, u8, bool)> = None;
     let mut on_seq = 0u64;
     // A frame armed and not yet seen to start (Pipe::arm / settle).
     // The modeset re-sent the panel its PPS, raster and rate, and the panel drops what it was showing: black from here to the first client frame (464 to 1033 ms after the press, measured 2026-11-05). The layer is still on the boot ring's surface, so one frame now puts the ring back until the attest screen replaces it. Armed, not waited for (the frame-start count is not running yet; waiting cost a quarter second): the main loop's settle masks the trigger once the frame has started. A cold or jumped panel has shown nothing yet: the same frame is its first.
@@ -9518,7 +9521,14 @@ fn server(grants: u64) -> ! {
                             }
                         }
                         windows_changed(width, height);
-                        events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        // The screen dark: the window in front now, its `EV_FRONT` held until the panel is back (`dark_front`), so it draws nothing for a dark panel meanwhile.
+                        if screen_off {
+                            dark_front = Some((sk, m[2], false));
+                            DARK_TOLD.store(true, Ordering::Release);
+                            ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{} while the screen is dark: in front, told so once the panel is back\n", m[2]).as_bytes());
+                        } else {
+                            events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        }
                         last_interaction = now();
                         if ten && unsafe { TEMPORAL } {
                             pipe.settle(&mut armed, true);
@@ -9536,9 +9546,15 @@ fn server(grants: u64) -> ! {
                         }
                     } else if sk < SURFACES && m[2] != 0 && live_gen(sk) == m[2] {
                         // No window yet, but the surface lives under that generation: an app from before this display started again (WINDOWS.md "A display started again"), told it was behind when it re-attached (events.rs `watch`). Told it is in front now, it draws whole and shows, and its show makes its window here, in front.
-                        events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        // The screen dark: held as the one in front until the panel is back, as above.
+                        if screen_off {
+                            dark_front = Some((sk, m[2], true));
+                            DARK_TOLD.store(true, Ordering::Release);
+                        } else {
+                            events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        }
                         last_interaction = now();
-                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: no window yet, told it is in front", m[2]).as_bytes());
+                        ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: no window yet, {}", m[2], if screen_off { "the screen dark: told it is in front once the panel is back" } else { "told it is in front" }).as_bytes());
                     } else {
                         out[0] = 3;
                         ferros_sys::console_flash(grants, alloc::format!("display: op 59 for surface A#{sk} generation A#{}: refused (live generation A#{}, a window {})", m[2], if sk < SURFACES { live_gen(sk) } else { 0 }, if sk < SURFACES { unsafe { WINS[sk] }.map_or(alloc::string::String::from("none"), |w| alloc::format!("of generation A#{}", w.generation)) } else { alloc::string::String::from("none") }).as_bytes());
@@ -10627,6 +10643,7 @@ fn server(grants: u64) -> ! {
         if off != screen_off {
             screen_off = off;
             PANEL_SCREEN.store(off as u64, Ordering::Release);
+            events::DARK.store(off, Ordering::Release);
             let seq = PANEL_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
             ferros_sys::wake(&PANEL_SEQ, 1);
             ferros_sys::console_flash(grants, alloc::format!("display: the power key's screen {}: the panel thread asked (sequence A#{seq})\n", if off { "off" } else { "on" }).as_bytes());
@@ -10638,7 +10655,7 @@ fn server(grants: u64) -> ! {
                 match front_app() {
                     Some(sk) => {
                         let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
-                        dark_front = Some((sk, g));
+                        dark_front = Some((sk, g, false));
                         DARK_TOLD.store(true, Ordering::Release);
                         events::post(sk, g, (ferros_sys::window::EV_BEHIND as u16) << 8);
                         ferros_sys::console_flash(grants, alloc::format!("display: screen off: surface A#{sk} generation A#{g}, the app in front, told it is behind (EV_BEHIND)\n").as_bytes());
@@ -10647,11 +10664,22 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
-        // The screen back (a pass of the panel thread under the screen on's sequence, or a later one, ended with the screen on): the window put behind at screen off told it is in front, if it still is (same surface, same generation, live, not sent behind or passed by another meanwhile). Dark again before that: nothing told until the next screen on is back.
+        // An app that re-attached from an earlier display while the screen was dark and was the one in front (events.rs `reattach`): held as the window in front unless one was brought to the front since (op 59 while dark, the later word).
+        if let Some((sk, g)) = events::dark_front_take() {
+            if dark_front.is_none() {
+                dark_front = Some((sk, g, true));
+            }
+            ferros_sys::console_flash(grants, alloc::format!("display: surface A#{sk} generation A#{g}, in front, re-attached while the screen was dark: told it is behind, {}\n", if dark_front.is_some_and(|d| d == (sk, g, true)) { "told it is in front once the panel is back" } else { "another brought to the front since" }).as_bytes());
+        }
+        // The screen back (a pass of the panel thread under the screen on's sequence, or a later one, ended with the screen on): the window held while dark told it is in front, if it still is (live under the same generation; its window, if it has one here, still the app in front: not sent behind or passed by another meanwhile; with none yet, one that never had a window here, whose show makes it). Dark again before that: nothing told until the next screen on is back.
         if !screen_off && dark_front.is_some() && PANEL_LIT.load(Ordering::Acquire) >= on_seq {
             DARK_TOLD.store(false, Ordering::Release);
-            if let Some((sk, g)) = dark_front.take() {
-                let still = front_app() == Some(sk) && unsafe { WINS[sk] }.is_some_and(|w| w.generation == g) && live_gen(sk) == g;
+            if let Some((sk, g, fresh)) = dark_front.take() {
+                let still = live_gen(sk) == g
+                    && match unsafe { WINS[sk] } {
+                        Some(w) => w.generation == g && front_app() == Some(sk),
+                        None => fresh,
+                    };
                 if still {
                     events::post(sk, g, (ferros_sys::window::EV_FRONT as u16) << 8);
                     last_interaction = now();
