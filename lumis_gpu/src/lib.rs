@@ -89,3 +89,41 @@ pub fn slot_kernel() -> Compiled {
     ssa::store_at(OUT, at, 2, 0, out);
     ssa::compile()
 }
+
+/// The 8-bit-code pixels' uniforms for `to_g2t16_kernel`.
+pub mod g2t {
+    /// The source pixels (a u32 each, R | G << 8 | B << 16) and the destination's (fluor's G2t16, a u64 each).
+    pub const SRC: u8 = 0;
+    pub const DST: u8 = 1;
+    /// A code's darkness: 256 u32, entry v fluor's 16-bit darkness for 8-bit code v (std/lumis's `lut`, white less its light).
+    pub const LUT: u8 = 2;
+    /// (x0, y0), (run, rise): the rectangle, the same place in both.
+    pub const ORIGIN: u8 = 3;
+    pub const SIZE: u8 = 4;
+    /// (the source's stride, the destination's), pixels.
+    pub const STRIDES: u8 = 5;
+    pub const SLOTS: u8 = 6;
+    /// fluor's G2t16 opaque: α = 2^16 - 1 in the top 16 bits.
+    pub const ALPHA_OPAQUE: u32 = 0xFFFF;
+}
+
+/// A rectangle of 8-bit-code pixels into fluor's G2t16 (`α << 48 | R << 32 | G << 16 | B`, each a 16-bit darkness), opaque, each channel thru the code's table: what the host then bakes and shows (`FluorApp::own_frame`).
+pub fn to_g2t16_kernel() -> Compiled {
+    use g2t::*;
+    ssa::begin();
+    ssa::reserve(SLOTS);
+    let g = ssa::gid();
+    let run_u = ssa::uniform(SIZE, 0);
+    let run = F::from_u32(run_u);
+    // The row and column from the id, as `slot_kernel` takes them.
+    let yu = ((F::from_u32(g) + 0.5) / run).floor().to_u32();
+    let xu = g - yu.wrapping_mul(run_u);
+    let (x, y) = (ssa::uniform(ORIGIN, 0) + xu, ssa::uniform(ORIGIN, 1) + yu);
+    let px = ssa::load(SRC, y.wrapping_mul(ssa::uniform(STRIDES, 0)) + x, 2, 0);
+    let dark = |shift: u32| ssa::load(LUT, (px >> shift) & U::splat(0xFF), 2, 0);
+    let (r, gr, b) = (dark(0), dark(8), dark(16));
+    let at = y.wrapping_mul(ssa::uniform(STRIDES, 1)) + x;
+    ssa::store_at(DST, at, 3, 0, (gr << 16) | b);
+    ssa::store_at(DST, at, 3, 4, U::splat(ALPHA_OPAQUE << 16) | r);
+    ssa::compile()
+}
