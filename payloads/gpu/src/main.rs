@@ -50,6 +50,9 @@ macro_rules! say {
     }};
 }
 
+// The resident service (calls and queues), after `say!` so it may use it.
+mod serve;
+
 // GPU_CONTROL (GPU.md "Registers").
 const GPU_ID: usize = 0x000;
 const GPU_IRQ_RAWSTAT: usize = 0x020;
@@ -60,6 +63,8 @@ const GPU_STATUS: usize = 0x034;
 const GPU_FAULTSTATUS: usize = 0x03C;
 const L2_CONFIG: usize = 0x048;
 const THREAD_MAX_THREADS: usize = 0x0A0;
+/// The GPU's timestamp (panthor_gpu_regs.h GPU_TIMESTAMP): the system counter as the GPU sees it, what a job's STORE_STATE stamps (serve.rs).
+const GPU_TIMESTAMP: usize = 0x098;
 const SHADER_PRESENT: usize = 0x100;
 const TILER_PRESENT: usize = 0x110;
 const L2_PRESENT: usize = 0x120;
@@ -158,6 +163,8 @@ const CODE_PAGES: usize = 32;
 const UNIFORMS: usize = 64;
 /// The GPU MMU's interrupt (slot 8, since 2026-11-12): a client's job that reaches outside its own memory faults in its own address space, and the service ends that job at once (`mmu_watch`).
 const S_MMU: u64 = 8;
+/// The `gpu-clock` switch (slot 9, since 2026-11-20): the GPU's clock up while a job is queued or running, down when none is (serve.rs `clock`).
+const S_CLOCK: u64 = 9;
 
 /// The resident service's clients at once (GPU-KISTS.md plan step 1, 2026-11-12): a command-stream group each, groups 0 to 6, bound to address spaces 1 to 7 (AS0 is the MCU's; the GPU has 8 address spaces and the firmware 8 groups), user doorbells 1 to 7. An eighth client takes the slot used longest ago (`serve`).
 const SLOTS: usize = 7;
@@ -424,7 +431,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     say!(grants, "gpu: global init acknowledged; ping answered in {} us\n", ferros_sys::us_since(t0));
     if serving {
-        serve(&g, &sh, &mut m, slot_mem, cores, grants);
+        serve::serve(&g, &sh, &mut m, slot_mem, cores, grants);
     }
 
     // The group's address space (1): a 4 KiB ring and the word the job writes, both non-cacheable so the CPU and the GPU agree without cache maintenance.
@@ -1160,330 +1167,6 @@ extern "C" fn mmu_watch(irq: u64) -> ! {
         }
         wr32(regs + MMU_IRQ_CLEAR, raw);
         ferros_sys::irq_ack(irq);
-    }
-}
-
-/// A client's slot: its own group, address space, ring, descriptors, done flag, code region and page-table pages, all in gpu-mem; and the client bound to it, by the kernel's stamp.
-struct Slot {
-    mem: SlotMem,
-    ring: usize,
-    desc: usize,
-    flag: usize,
-    code: usize,
-    pool: usize,
-    /// Its address space's root while a client is bound.
-    root: usize,
-    insert: core::cell::Cell<usize>,
-    client: Option<ferros_sys::gpu::Key>,
-    /// When it last ran a job (a count of jobs), for choosing the slot used longest ago.
-    used: u64,
-    /// Its group is running (started, not ended since).
-    running: bool,
-}
-
-/// Slot `k`'s group's blocks in the shared interface: CSG input and output, stream 0's input and output (GPU.md, ferros-csf-spec.md: group n at G#0400_1000 + n · G#A0).
-fn blocks(sh: &Shared, k: usize) -> (u32, u32, u32, u32) {
-    let gctl = 0x0400_1000u32 + 0xA0 * k as u32;
-    (sh.rd(gctl + 4), sh.rd(gctl + 8), sh.rd(gctl + 0x40 + 4), sh.rd(gctl + 0x40 + 8))
-}
-
-/// GLB_DB_REQ's bit `bit` toggled against GLB_DB_ACK, then doorbell 0: the firmware looks at that group's request.
-fn glb_doorbell(g: &Gpu, sh: &Shared, bit: u32) {
-    let (gin, gout) = (sh.rd(0x0400_0008), sh.rd(0x0400_000C));
-    sh.wr(gin + 0x08, (sh.rd(gin + 0x08) & !bit) | ((sh.rd(gout + 0x08) ^ bit) & bit));
-    g.doorbell(0);
-}
-
-/// The command-stream group of slot `k` (group k, address space k + 1, doorbell k + 1), started as kbase starts one (program_cs, program_csg_slot) and as the test suite's group 0 is: its stream's ring and user-IO pages, every ack interrupt, START; the group's cores, endpoints and `priority`, its address space, its suspend buffer, START. False if the firmware did not acknowledge it in 100 ms.
-fn group_start(g: &Gpu, sh: &Shared, k: usize, sl: &Slot, cores: u64, priority: u32) -> bool {
-    let (cin, cout, sin, sout) = blocks(sh, k);
-    let doorbell = k as u32 + 1;
-    // A fresh queue: its user-IO pages zeroed (insert and extract at 0), as kbase gives a new queue.
-    for w in 0..2 * PAGE / 8 {
-        wr64(sl.mem.uio + 8 * w, 0);
-    }
-    sl.insert.set(0);
-    sh.wr(sin + 0x10, RING_VA as u32);
-    sh.wr(sin + 0x14, (RING_VA >> 32) as u32);
-    sh.wr(sin + 0x18, PAGE as u32);
-    sh.wr(sin + 0x30, sl.mem.uio_va as u32);
-    sh.wr(sin + 0x34, (sl.mem.uio_va >> 32) as u32);
-    sh.wr(sin + 0x38, (sl.mem.uio_va + PAGE as u64) as u32);
-    sh.wr(sin + 0x3C, ((sl.mem.uio_va + PAGE as u64) >> 32) as u32);
-    sh.wr(sin + 0x04, doorbell << 8);
-    sh.wr(sin + 0x0C, 0xFFFF_FFFF);
-    let cs_ack = sh.rd(sout);
-    let keep = 1 << 27 | 1 << 30 | 1 << 31;
-    sh.wr(sin, (cs_ack & keep) | 1 << 10 | 1 << 8 | 1 << 12 | 1);
-    unsafe { core::arch::asm!("dmb osh") };
-    sh.wr(cin + 0x08, (sh.rd(cin + 0x08) & !1) | ((sh.rd(cout + 0x08) ^ 1) & 1));
-    sh.wr(cin + 0x20, cores as u32);
-    sh.wr(cin + 0x24, (cores >> 32) as u32);
-    sh.wr(cin + 0x28, cores as u32);
-    sh.wr(cin + 0x2C, (cores >> 32) as u32);
-    sh.wr(cin + 0x30, g.rd64(TILER_PRESENT) as u32);
-    sh.wr(cin + 0x34, cores.count_ones() | cores.count_ones() << 8 | 1 << 16 | priority << 28);
-    sh.wr(cin + 0x38, 0);
-    sh.wr(cin + 0x50, k as u32 + 1);
-    sh.wr(cin + 0x40, sl.mem.susp_va as u32);
-    sh.wr(cin + 0x44, (sl.mem.susp_va >> 32) as u32);
-    sh.wr(cin + 0x48, 0);
-    sh.wr(cin + 0x4C, 0);
-    sh.wr(cin + 0x04, 0xFFFF_FFFF);
-    sh.wr(cin, (sh.rd(cin) & !7) | 1);
-    unsafe { core::arch::asm!("dmb osh") };
-    glb_doorbell(g, sh, 1 << k);
-    g.wait(100, |_| sh.rd(cout) & 7 == 1 && sh.rd(sout) & 7 == 1)
-}
-
-/// Slot `k`'s group ended (CSG_REQ's state TERMINATE, 0): whatever job it runs stops, kbase's way of ending a context's groups. False if the firmware did not acknowledge it in 100 ms.
-fn group_end(g: &Gpu, sh: &Shared, k: usize) -> bool {
-    let (cin, cout, _, _) = blocks(sh, k);
-    sh.wr(cin, sh.rd(cin) & !7);
-    unsafe { core::arch::asm!("dmb osh") };
-    glb_doorbell(g, sh, 1 << k);
-    g.wait(100, |_| sh.rd(cout) & 7 == 0)
-}
-
-/// Address space `n` given `root`: the walks and lines of whatever tables it had dropped first (LOCKADDR over the whole 48-bit space, LOCK, FLUSH_PT, which cleans and invalidates the L2 and the MMU's cached walks with it: kbase's sequence for changed mappings on arch 11, ferros-csf-spec.md), then TRANSCFG, TRANSTAB, MEMATTR and UPDATE (`Gpu::install`).
-fn space_install(g: &Gpu, n: usize, root: usize) -> bool {
-    let idle = |g: &Gpu| g.rd(Gpu::as_reg(n, AS_STATUS)) & 1 == 0;
-    if !g.wait(64, idle) {
-        return false;
-    }
-    // LOCKADDR: base 0, SIZE = log2(2^48) - 1.
-    g.wr64(Gpu::as_reg(n, AS_LOCKADDR), 47);
-    g.wr(Gpu::as_reg(n, AS_COMMAND), 2);
-    if !g.wait(64, idle) {
-        return false;
-    }
-    g.wr(Gpu::as_reg(n, AS_COMMAND), 4);
-    if !g.wait(64, idle) {
-        return false;
-    }
-    g.install(n, root)
-}
-
-/// A group that would not end: its job may still run in its client's address space, and that client may have ended and its memory be another's soon. The service ends, one shot: the GPU's next service soft-resets it before it serves (every job on it stopped), and the kernel holds every block and surface an ended client's job could reach until that service takes its first request (process.rs `gpu_drain`). Clients fall back as they do without a GPU service until it is started again (`diag "restart gpu"`).
-fn stuck(grants: u64, k: usize) -> ! {
-    say!(grants, "gpu: slot {k}'s group did not end in 100 ms: the service ends, so the GPU is reset before it runs anything more\n");
-    exit(1)
-}
-
-/// The resident service (GPU.md "The resident service"; GPU-KISTS.md plan step 1, 2026-11-12): every client's jobs in a group and an address space of its own, which map only the memory the kernel's stamp says the client holds (its block of the layer arena at `ARENA_VA`, its surfaces at their place from `SURFACES_VA`) and the service's few pages for that client (its ring and descriptors read-only, its code region read-only and the only executable pages, its done flag). No address a client names reaches another client's memory or the service's: it is in no table of the client's space, the GPU MMU faults the access there, and the kernel's fence (s2mpu::fence_gpu) holds every space inside gpu-mem, the arena and the surfaces.
-///
-/// A request: the kernel's stamp (ferros_sys::gpu `Stamp`), then [1][preload u16, bit 15 = 64 registers a thread][code at an offset into the client's own block u32][code words u16][groups x u32][groups y u32][uniforms n u8, at most 64][n × u64], then optionally [n u8][the client's name][n u8][the kernel's name] (`label`). The reply: [status][µs u32]: 0 done, 1 a request it cannot take (no stamp, no block of the arena, its code outside its block), 2 the job faulted or did not finish in its guard, 3 its code starts with a zero word, 4 (`OUTSIDE`) it reached outside the client's memory, then [the GPU address u64][AS_FAULTSTATUS u32], 5 (`UNCHECKED`) a kist's job on a production build.
-///
-/// One job at a time, in the order the kernel queues the calls (each caller's thread holds one call), each ended at its guard (`GUARD_SYSTEM_MS`, `GUARD_KIST_MS`) with its group: a failed job's group is ended, and started again at its client's next job, so a fault costs only that client's job. The service takes its next request only when the last job is over, which is what lets the kernel give an ended client's memory to another (process.rs `gpu_drain`).
-fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u64, grants: u64) -> ! {
-    use ferros_sys::gpu::{is_block, Stamp, OUTSIDE, SURFACES_PA, UNCHECKED};
-    let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
-    let arena_bytes = ferros_sys::dma_size(cap(grants, S_ARENA), ARENA_MOST as u64).map_or(ARENA_BEFORE, |n| n as usize);
-    let arena_ok = arena != 0 && arena != usize::MAX;
-    // A client's surfaces are mapped for it only when the kernel fences them in for the GPU (granted here, the whole region, s2mpu::fence_gpu).
-    let surfaces = ferros_sys::dma(cap(grants, S_SURFACES));
-    let surfaces_ok = surfaces == ferros_sys::SURFACES_WINDOW && ferros_sys::dma_size(cap(grants, S_SURFACES), SURFACES_BYTES as u64) == Some(SURFACES_BYTES as u64);
-    let slots: [Slot; SLOTS] = core::array::from_fn(|k| {
-        let ring = m.alloc(1);
-        let desc = m.alloc(1);
-        let flag = m.alloc(1);
-        let code = m.alloc(CODE_PAGES);
-        let pool = m.alloc(TABLE_PAGES);
-        Slot { mem: slot_mem[k], ring, desc, flag, code, pool, root: 0, insert: core::cell::Cell::new(0), client: None, used: 0, running: false }
-    });
-    let mut slots = slots;
-    // Page faults in every client's space, on their own line and thread.
-    let mmu = cap(grants, S_MMU);
-    // The grants page's count (G#200, ferros_sys::cap) says whether slot 8 was given: the kernel that gives it is the one that stamps every call on `gpu` (2026-11-12). A kernel from before stamps nothing, so a request's first bytes would be the client's own, naming any memory: the service then serves nothing, each request answered 1 at once (its clients draw on the CPU, as with no GPU service), until the kernel is the stamping one.
-    let stamped = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64 > S_MMU;
-    if !stamped {
-        say!(grants, "gpu: this kernel does not stamp calls on `gpu` (no slot 8): serving nothing\n");
-        let mut msg = [0u8; 64];
-        let mut token = [0u8; 32];
-        loop {
-            if ferros_sys::recv(cap(grants, S_GPU), &mut msg, &mut token, false) != ferros_sys::NOTHING {
-                ferros_sys::reply(&token, &[1, 0, 0, 0, 0]);
-            }
-        }
-    }
-    g.wr(MMU_IRQ_CLEAR, 0xFFFF_FFFF);
-    g.wr(MMU_IRQ_MASK, 0xFFFF);
-    MMU_REGS.store(g.regs, core::sync::atomic::Ordering::Release);
-    ferros_sys::thread_spawn(mmu_watch, unsafe { &mut *(&raw mut MMU_STACK) }, mmu);
-    say!(grants, "gpu: serving `gpu`, a group and an address space a client ({} at once): the arena {} ({} MiB), the surfaces {}\n", SLOTS, if arena_ok { "granted" } else { "not granted" }, arena_bytes >> 20, if surfaces_ok { "fenced in" } else { "not granted" });
-    let irq = cap(grants, S_IRQ);
-    let max_threads = g.rd(THREAD_MAX_THREADS);
-    let mut jobs = 0u64;
-    let mut msg = [0u8; 1 << 13];
-    let mut token = [0u8; 32];
-    loop {
-        let n = ferros_sys::recv(cap(grants, S_GPU), &mut msg, &mut token, false);
-        if n == ferros_sys::NOTHING || n == 0 {
-            continue;
-        }
-        let whole = &msg[..(n as usize).min(msg.len())];
-        let mut reply = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut reply_len = 5;
-        // The kernel's stamp: who calls and what memory it holds. None only from a kernel before the stamp, whose callers' memory the service cannot know: refused.
-        let Some((stamp, m)) = Stamp::read(whole) else {
-            ferros_sys::reply(&token, &reply[..reply_len]);
-            continue;
-        };
-        if stamp.kist && stamp.production {
-            reply[0] = UNCHECKED;
-            ferros_sys::reply(&token, &reply[..reply_len]);
-            continue;
-        }
-        // The client's block: the first region inside the arena (a client holds one; a holder of the whole arena, a development spawn's `--dma arena`, gets the whole).
-        let block = stamp.regions().iter().copied().find(|&(b, sz)| arena_ok && b as usize >= arena && b as usize + sz as usize <= arena + arena_bytes);
-        // The request's own lengths checked against what was sent, the code against the client's own block: they come from another process.
-        let Some((bbase, bsize)) = block.filter(|_| m.len() >= 18 && m[0] == 1) else {
-            ferros_sys::reply(&token, &reply[..reply_len]);
-            continue;
-        };
-        let u16_at = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]);
-        let u32_at = |i: usize| u32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
-        let (preload, code_off, words) = (u16_at(1) as u32, u32_at(3) as usize, u16_at(7) as usize);
-        let groups = (u32_at(9), u32_at(13));
-        let nu = m[17] as usize;
-        let fits = m.len() >= 18 + 8 * nu && nu <= UNIFORMS && words > 0 && words + 16 <= CODE_PAGES * PAGE / 8 && code_off % 8 == 0 && code_off + 8 * words <= bsize as usize && groups.0 > 0 && groups.1 > 0;
-        if !fits {
-            ferros_sys::reply(&token, &reply[..reply_len]);
-            continue;
-        }
-        let code = unsafe { core::slice::from_raw_parts((bbase as usize + code_off) as *const u64, words) };
-        let (client, rest) = label(&m[18 + 8 * nu..]);
-        let (kernel, _) = label(rest);
-        // WHY: a kernel's first word is an instruction, and the zero word is none a client emits (opcode 0 is NOP, which the valhall builder has no form for, and even Mesa's NOP sets bits 47:46: NOP.end is G#7800_C000_0000_0000, assembler-cases.txt). Zeros there mean the client's words never reached the arena (2026-11-11: masked ahau's pointer stores landed in its own arc).
-        if code[0] == 0 {
-            say!(grants, "gpu: refused {client}'s {kernel} kernel: its code at G#{code_off:X} in its block ({words} words) starts with a zero word, so its words never reached the arena\n");
-            reply[0] = 3;
-            ferros_sys::reply(&token, &reply[..reply_len]);
-            continue;
-        }
-        let mut uniforms = [0u64; UNIFORMS];
-        for (k, u) in uniforms[..nu].iter_mut().enumerate() {
-            *u = u64::from_le_bytes(m[18 + 8 * k..26 + 8 * k].try_into().unwrap());
-        }
-        jobs += 1;
-        // The client's slot: its own if bound, else a free one, else the one used longest ago (its group ended, its space given the new client's tables).
-        let k = match slots.iter().position(|sl| sl.client == Some(stamp.key())) {
-            Some(k) => k,
-            None => {
-                let k = (0..SLOTS).min_by_key(|&k| (slots[k].client.is_some(), slots[k].used)).unwrap();
-                if slots[k].running && !group_end(g, sh, k) {
-                    stuck(grants, k);
-                }
-                let sl = &mut slots[k];
-                sl.running = false;
-                // The client's address space, from the stamp alone.
-                let mut tm = Mem::new(sl.pool);
-                let t = Table::new(&mut tm);
-                t.map(&mut tm, RING_VA, sl.ring, 1, PAGE_RO | NC | NX, TABLE);
-                t.map(&mut tm, DESC_VA, sl.desc, 1, PAGE_RO | NC | NX, TABLE);
-                t.map(&mut tm, OUT_VA, sl.flag, 1, PAGE_RW | NC | NX, TABLE);
-                t.map(&mut tm, CODE_BIG_VA, sl.code, CODE_PAGES, PAGE_RO | NC, TABLE);
-                if is_block(bbase, bsize) {
-                    // The block's frames in 2 MiB blocks from `ARENA_VA` (2026-11-13: frames of the pool, wherever it had them), in the stamp's order, which is the CPU's from the block's base.
-                    let bi = stamp.regions().iter().position(|&r| r == (bbase, bsize)).unwrap();
-                    for (j, pa) in stamp.frames_of(bi).enumerate() {
-                        t.map_block(&mut tm, ARENA_VA + j as u64 * ferros_sys::gpu::FRAME, pa as usize, BLOCK_RW | 6 << 2 | 2 << 8 | NX, TABLE);
-                    }
-                } else {
-                    // A kernel from before 2026-11-13: a block of the fixed arena, at its physical address.
-                    t.map(&mut tm, ARENA_VA, bbase as usize, bsize as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
-                }
-                // Each surface frame by frame (the stamp's frames: wherever the pool had them), at its place in the view; a stamp without frames (a kernel from before) maps none.
-                for (i, &(b, sz)) in stamp.regions().iter().enumerate() {
-                    if is_block(b, sz) {
-                        continue;
-                    }
-                    for (j, pa) in stamp.frames_of(i).enumerate() {
-                        if surfaces_ok {
-                            t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA) + j as u64 * ferros_sys::gpu::FRAME, pa as usize, ferros_sys::gpu::FRAME as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
-                        }
-                    }
-                }
-                // The pool's size is the bound on any stamp the kernel writes (a block of 2 MiB entries in one level-2 table, at most the four surfaces in pages): past it is a bug here, loud.
-                assert!(tm.used() <= TABLE_PAGES * PAGE, "gpu: a client's tables outgrew their slot");
-                sl.root = t.root;
-                sl.client = Some(stamp.key());
-                k
-            }
-        };
-        slots[k].used = jobs;
-        let n_as = k + 1;
-        if !slots[k].running {
-            MMU_FAULTS[n_as].store(0, core::sync::atomic::Ordering::Relaxed);
-            let ok = space_install(g, n_as, slots[k].root) && group_start(g, sh, k, &slots[k], cores, if stamp.kist { PRIORITY_KIST } else { PRIORITY_SYSTEM });
-            if !ok {
-                say!(grants, "gpu: slot {k} (address space {n_as}) did not start for {client}\n");
-                reply[0] = 2;
-                ferros_sys::reply(&token, &reply[..reply_len]);
-                continue;
-            }
-            slots[k].running = true;
-        }
-        let sl = &slots[k];
-        wr32(sl.flag + 0x200, 0);
-        let cx = Compute { code: sl.code, desc: sl.desc, code_va: CODE_BIG_VA, desc_va: DESC_VA, max_threads };
-        let mut job = [0u64; 32];
-        let len = cx.prepare_grid(code, &uniforms[..nu], groups, preload, OUT_VA + 0x200, &mut job);
-        let q = Queue { ring: sl.ring, uio: sl.mem.uio, insert: core::cell::Cell::new(sl.insert.get()), doorbell: n_as };
-        let (_, _, sin, sout) = blocks(sh, k);
-        let t0 = now();
-        q.submit(g, &job[..len]);
-        sl.insert.set(q.insert.get());
-        let guard = if stamp.kist { GUARD_KIST_MS } else { GUARD_SYSTEM_MS };
-        let deadline = t0 + g.f / 1000 * guard;
-        let done = || rd32(sl.flag + 0x200) == 1;
-        let mmu_fault = || MMU_FAULTS[n_as].load(core::sync::atomic::Ordering::Acquire);
-        let cs_fault = || (sh.rd(sin) ^ sh.rd(sout)) & 1 << 31 != 0;
-        while !done() && mmu_fault() == 0 && !cs_fault() && now() < deadline {
-            if ferros_sys::irq_wait(irq, deadline) == 0 {
-                // Each group's events acknowledged as kbase does (CSG_ACK's IDLE, SYNC_UPDATE and progress bits into CSG_REQ, CSG_IRQ_ACK = CSG_IRQ_REQ), every group with its bit set.
-                let raw = g.rd(JOB_IRQ_RAWSTAT);
-                g.wr(JOB_IRQ_CLEAR, raw);
-                for j in 0..SLOTS {
-                    if raw & 1 << j != 0 {
-                        let (ji, jo, _, _) = blocks(sh, j);
-                        let mask = 1 << 28 | 1 << 29 | 1 << 31;
-                        sh.wr(ji, (sh.rd(ji) & !mask) | (sh.rd(jo) & mask));
-                        sh.wr(ji + 0x0C, sh.rd(jo + 0x0C));
-                    }
-                }
-                ferros_sys::irq_ack(irq);
-            }
-        }
-        let us = ferros_sys::us_since(t0) as u32;
-        let fault = MMU_FAULTS[n_as].swap(0, core::sync::atomic::Ordering::AcqRel);
-        let faulted = cs_fault();
-        reply[1..5].copy_from_slice(&us.to_le_bytes());
-        if done() && fault == 0 && !faulted {
-            reply[0] = 0;
-        } else {
-            let (cf, info, ptr) = (sh.rd(sout + 0x80), sh.rd(sout + 0x88) as u64 | (sh.rd(sout + 0x8C) as u64) << 32, sh.rd(sout + 0x40) as u64 | (sh.rd(sout + 0x44) as u64) << 32);
-            let ran = |w: usize| unsafe { core::ptr::read_volatile((sl.code + 8 * w) as *const u64) };
-            let (first, second, last) = (ran(0), ran(1), ran(words - 1));
-            // The job ended with its group, whatever state it is in (past its guard, stalled, faulted): no other client's job waits behind it, and its group starts afresh at its client's next job.
-            if !group_end(g, sh, k) {
-                stuck(grants, k);
-            }
-            slots[k].running = false;
-            if fault != 0 {
-                let addr = MMU_ADDRS[n_as].load(core::sync::atomic::Ordering::Relaxed);
-                reply[0] = OUTSIDE;
-                reply[5..13].copy_from_slice(&addr.to_le_bytes());
-                reply[13..17].copy_from_slice(&(fault as u32).to_le_bytes());
-                reply_len = 17;
-                say!(grants, "gpu: {client}'s {kernel} kernel reached outside its memory: GPU address G#{addr:X}, AS_FAULTSTATUS G#{:X} ({}) in its own address space {n_as}; its job ended\n", fault as u32, exception(fault as u32));
-            } else {
-                reply[0] = 2;
-                say!(grants, "gpu: {client}'s {kernel} kernel {}: {words} words from G#{code_off:X} in its block, first G#{first:X} G#{second:X}, last G#{last:X}; {} x {} groups, preload G#{preload:X}, {nu} uniforms; {us} us\n", if faulted { "faulted" } else { "did not finish in its guard" }, groups.0, groups.1);
-                say!(grants, "gpu: {client}'s {kernel} kernel: CS_FAULT G#{cf:X} ({}), CS_FAULT_INFO G#{info:X}, CS_STATUS_CMD_PTR G#{ptr:X}; its group ended\n", exception(cf));
-            }
-        }
-        ferros_sys::reply(&token, &reply[..reply_len]);
     }
 }
 

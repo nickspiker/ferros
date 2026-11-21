@@ -110,9 +110,9 @@ enum Op {
     /// After the loop's head: an invocation no longer running leaves here, its phis taking the head's outputs (in [`Loop::exits`]), as the CPU's loop returns them; the tail runs only for the ones still going.
     LoopBreak(u32),
     /// value to *(uniform slot's address + (index << shift) + offset).
-    Store { slot: u8, shift: u8, offset: i16, index: u32, value: u32 },
+    Store { slot: u8, shift: u8, offset: i16, index: u32, value: u32, atom: bool },
     /// *(uniform slot's address + (index << shift) + offset), 32 bits.
-    Load { slot: u8, shift: u8, offset: i16, index: u32 },
+    Load { slot: u8, shift: u8, offset: i16, index: u32, size: u8 },
 }
 
 impl Op {
@@ -188,8 +188,8 @@ impl Op {
             FFma(a, b, c) => FFma(f(a), f(b), f(c)),
             HFma(a, b, c) => HFma(f(a), f(b), f(c)),
             Sel(a, b, c) => Sel(f(a), f(b), f(c)),
-            Store { slot, shift, offset, index, value } => Store { slot, shift, offset, index: f(index), value: f(value) },
-            Load { slot, shift, offset, index } => Load { slot, shift, offset, index: f(index) },
+            Store { slot, shift, offset, index, value, atom } => Store { slot, shift, offset, index: f(index), value: f(value), atom },
+            Load { slot, shift, offset, index, size } => Load { slot, shift, offset, index: f(index), size },
         }
     }
     /// The kind's name, for `Compiled::kinds`.
@@ -416,13 +416,31 @@ pub fn store(slot: u8, shift: u8, offset: i16, value: U) {
 /// `value` to the address in uniform `slot` plus `index << shift` plus `offset` bytes. The address is worked out in 32 bits (the slot's high word kept): the layer arena lies below 4 GiB.
 pub fn store_at(slot: u8, index: U, shift: u8, offset: i16, value: U) {
     let (index, offset) = split_index(index.0, shift, offset);
-    push(Op::Store { slot, shift, offset, index, value: value.0 });
+    push(Op::Store { slot, shift, offset, index, value: value.0, atom: false });
 }
 
 /// 32 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes (the same address as `store_at`).
 pub fn load(slot: u8, index: U, shift: u8, offset: i16) -> U {
     let (index, offset) = split_index(index.0, shift, offset);
-    U(push(Op::Load { slot, shift, offset, index }))
+    U(push(Op::Load { slot, shift, offset, index, size: 3 }))
+}
+
+/// 8 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes, zero-extended (LOAD.i8.w0; 2026-11-20, Lumis's glyph atlas: an 8-bit coverage a texel).
+pub fn load8(slot: u8, index: U, shift: u8, offset: i16) -> U {
+    let (index, offset) = split_index(index.0, shift, offset);
+    U(push(Op::Load { slot, shift, offset, index, size: 0 }))
+}
+
+/// 16 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes, zero-extended (LOAD.i16.w0; a sensor sample unpacked to 16 bits, a code table's entry).
+pub fn load16(slot: u8, index: U, shift: u8, offset: i16) -> U {
+    let (index, offset) = split_index(index.0, shift, offset);
+    U(push(Op::Load { slot, shift, offset, index, size: 1 }))
+}
+
+/// `value` added to the 32-bit word at the address in uniform `slot` plus `index << shift` plus `offset` bytes, atomically across every invocation (ATOM.i32.aadd, no value back; 2026-11-20, a layer's tile coverage, a histogram).
+/// The offset is ATOM's unsigned 8-bit immediate, so it is never folded with a constant from the index.
+pub fn atomic_add(slot: u8, index: U, shift: u8, offset: u8, value: U) {
+    push(Op::Store { slot, shift, offset: offset as i16, index: index.0, value: value.0, atom: true });
 }
 
 /// Word `word` (0 low, 1 high) of the caller's uniform slot `slot`, as a value: what a run passes besides addresses (where a band of a grid starts, so one kernel serves every band).
@@ -685,6 +703,10 @@ impl U {
     }
     pub fn wrapping_mul(self, o: U) -> U {
         U(push(Op::IMul(self.0, o.0)))
+    }
+    /// self · b + c, wrapping (2026-11-20, Lumis's "integer multiply-add"): Valhall has no fused integer form (ISA.xml: IMUL alone, the SFU's), so IMUL.i32 then IADD.u32, folded as each folds (a constant operand into a uniform or an immediate).
+    pub fn mul_add(self, b: U, c: U) -> U {
+        self.wrapping_mul(b) + c
     }
     /// Per invocation, `a` where the mask is set and `b` elsewhere.
     pub fn select(m: M, a: U, b: U) -> U {
@@ -1790,7 +1812,7 @@ fn compile_rec(rec: Rec) -> Compiled {
                 at_addr = None;
                 hi_slot = None;
             }
-            Op::Store { slot, shift, offset, index, value } => {
+            Op::Store { slot, shift, offset, index, value, atom } => {
                 if at_addr != Some((slot, index, shift)) {
                     address(&mut k, slot, rr(index), shift, hi_slot == Some(slot));
                     at_addr = Some((slot, index, shift));
@@ -1804,9 +1826,14 @@ fn compile_rec(rec: Rec) -> Compiled {
                         r(CONST_REGS[2])
                     }
                 };
-                k.store_i32(v, pair(ADDR), offset, Slot::S0);
+                if atom {
+                    // WHY the cast: `atomic_add` takes its offset as a u8 (ATOM's unsigned 8-bit immediate, 15:8) and never folds a constant into it.
+                    k.atom_add_i32(v, pair(ADDR), offset as u8, Slot::S0);
+                } else {
+                    k.store_i32(v, pair(ADDR), offset, Slot::S0);
+                }
             }
-            Op::Load { slot, shift, offset, index } => {
+            Op::Load { slot, shift, offset, index, size } => {
                 if at_addr != Some((slot, index, shift)) {
                     address(&mut k, slot, rr(index), shift, hi_slot == Some(slot));
                     at_addr = Some((slot, index, shift));
@@ -1814,7 +1841,11 @@ fn compile_rec(rec: Rec) -> Compiled {
                 }
                 // The wait on the load itself, so the next instruction sees the value (the flow field acts after the instruction carrying it); none where the next is a load of the same address, whose wait covers both.
                 let batched = next_emitted(i).is_some_and(|j| matches!(nodes[j], Op::Load { slot: s2, shift: h2, index: x2, .. } if (s2, x2, h2) == (slot, index, shift)));
-                let pl = k.load_i32(d, pair(ADDR), offset, Slot::S0);
+                let pl = match size {
+                    0 => k.load_i8_w0(d, pair(ADDR), offset, Slot::S0),
+                    1 => k.load_i16_w0(d, pair(ADDR), offset, Slot::S0),
+                    _ => k.load_i32(d, pair(ADDR), offset, Slot::S0),
+                };
                 if !batched {
                     pl.wait(Slot::S0);
                 }

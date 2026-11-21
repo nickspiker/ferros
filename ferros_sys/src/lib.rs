@@ -685,6 +685,130 @@ pub mod gpu {
             bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()))
         }
     }
+
+    /// A kernel's preload word (the run's and the load's): bit 12 r60 = the global id x, bit 13 r61 = the global id y, bit 15 (the service's own) 64 registers a thread.
+    pub const PRELOAD_X: u16 = 1 << 12;
+    pub const PRELOAD_Y: u16 = 1 << 13;
+    pub const PRELOAD_REGS64: u16 = 1 << 15;
+
+    /// The GPU queue (docs/GPU-KISTS.md "The queue", 2026-11-20): jobs submitted from the caller's own thread into a ring in its own GPU block, ended by the GPU service with their GPU time and any fault, waited on by a doorbell; no call a job (ferros_gpuq has the layout).
+    ///
+    /// ```ignore
+    /// let (service, block) = (wants + 1, wants + 2); // a kist's grants (ferros_sys::gpu::kist_slots).
+    /// let mut q = Queue::open(cap(g, service), cap(g, block), 0, 2)?;     // the ring at the block's start, 4 deep
+    /// // the kernel's words written into the block at `code_at` first (valhall's recorder, compiled where the kist chooses)
+    /// let k = q.kernel(code_at, words, PRELOAD_X | PRELOAD_Y)?;
+    /// let n = q.submit(&Job { kernel: k, groups: (w / 16, h), uniforms: &[ARENA_VA + out_at, ...] }).unwrap();
+    /// let e = q.wait(n);                                                   // e.status, e.gpu_ticks(), e.fault_address
+    /// ```
+    pub mod queue {
+        pub use ferros_gpuq::{Ended, Job, DEPTH_MOST_LOG2, E_CLOSED, E_FAULT, E_OVERRUN, E_SERVICE, S_DONE, S_FAILED, S_LOST, S_OUTSIDE, S_REFUSED, UNIFORMS_MOST};
+        use core::sync::atomic::AtomicU64;
+
+        /// A queue open on the GPU service.
+        pub struct Queue {
+            ring: ferros_gpuq::Ring<'static>,
+            service: u64,
+            at: usize,
+            next: u64,
+        }
+
+        impl Queue {
+            /// The queue at byte `at` (a multiple of 4 KiB) of the GPU block granted at `block`, 2^`depth_log2` jobs deep (at most `DEPTH_MOST_LOG2`), on the GPU service granted at `service`: the block must hold it whole, and should already be the size the caller wants (a block grown after the open is another client to the service, `Stamp::key`, whose kernels and queue are not this one's).
+            /// Err: the GPU service's status (1: no room, no slot, a kernel or service from before the queue; 5 a kist's on a production build), or ERR for a grant that is no GPU block.
+            pub fn open(service: u64, block: u64, at: usize, depth_log2: u32) -> Result<Queue, u64> {
+                let base = super::super::dma(block);
+                let size = super::super::dma_size(block, super::super::GPU_BLOCK_MOST as u64).unwrap_or(0) as usize;
+                // WHY: the caller's offset and depth: the ring must lie in its own block, or its words would be another region's.
+                if base == super::super::ERR || depth_log2 > DEPTH_MOST_LOG2 || at % ferros_gpuq::PAGE != 0 || at + ferros_gpuq::bytes(depth_log2) > size {
+                    return Err(super::super::ERR);
+                }
+                // SAFETY: the block is the caller's for its life (the kernel never takes a held block back), mapped at `base`, `size` bytes; the ring's words lie inside it (checked above), 8-aligned; every word an atomic, as the service and the GPU share them.
+                let words = unsafe { core::slice::from_raw_parts((base as usize + at) as *const AtomicU64, ferros_gpuq::bytes(depth_log2) / 8) };
+                let ring = ferros_gpuq::Ring::new(words, depth_log2).ok_or(super::super::ERR)?;
+                let mut msg = [3u8, 0, 0, 0, 0, depth_log2 as u8];
+                msg[1..5].copy_from_slice(&(at as u32).to_le_bytes());
+                let mut reply = [1u8; 1];
+                let r = super::super::call(service, &msg, &mut reply);
+                if r == super::super::ERR || r == 0 || reply[0] != 0 {
+                    return Err(if r == super::super::ERR || r == 0 { super::super::ERR } else { reply[0] as u64 });
+                }
+                Ok(Queue { ring, service, at, next: ring.submitted() })
+            }
+
+            /// A kernel for this queue's jobs: its `words` Valhall words, written by the caller at byte `code_at` of its block, copied by the service into its own executable pages; `preload` as `PRELOAD_X` and the others. Its handle, or None (the service's room: 16 kernels, 2^14 words a client).
+            pub fn kernel(&self, code_at: usize, words: usize, preload: u16) -> Option<u8> {
+                let mut msg = [2u8, 0, 0, 0, 0, 0, 0, 0, 0];
+                msg[1..3].copy_from_slice(&preload.to_le_bytes());
+                msg[3..7].copy_from_slice(&(code_at as u32).to_le_bytes());
+                msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
+                let mut reply = [1u8; 2];
+                let r = super::super::call(self.service, &msg, &mut reply);
+                (r == 2 && reply[0] == 0).then_some(reply[1])
+            }
+
+            /// `job` submitted, and the service's doorbell rung (SYS_WAKE on `SUBMIT`): its number, which `wait` and `result` take. None when 2^depth jobs are not yet ended (wait for the oldest first), it passes more than `UNIFORMS_MOST` uniforms, or the queue has ended (`ended`).
+            /// The uniforms are read by the GPU from the job's record, so a job's own buffers' addresses go here as `ARENA_VA` plus their offsets in the block.
+            pub fn submit(&mut self, job: &Job) -> Option<u64> {
+                let n = self.next;
+                if !self.ring.submit(n, job) {
+                    return None;
+                }
+                self.next = n + 1;
+                super::super::wake(self.ring.submit_word(), 1);
+                Some(n)
+            }
+
+            /// Asleep until job `n` has ended (or the queue has: every job then ends, lost), and its result. Read it before job n + 2^depth is submitted: it lies in that job's record.
+            pub fn wait(&self, n: u64) -> Ended {
+                loop {
+                    if let Some(e) = self.ring.result(n) {
+                        return e;
+                    }
+                    let d = self.ring.done_raw();
+                    // The service gone (the kernel's mark): no result will come.
+                    if self.ring.ended() == E_SERVICE {
+                        return Ended { status: S_LOST, ..Ended::default() };
+                    }
+                    if self.ring.result(n).is_none() {
+                        super::super::wait(self.ring.done_word(), d, 0);
+                    }
+                }
+            }
+
+            /// Job `n`'s result if it has ended, at once.
+            pub fn result(&self, n: u64) -> Option<Ended> {
+                self.ring.result(n)
+            }
+
+            /// Jobs ended so far (every job numbered under it), and why the queue ended (0 while it runs; `E_FAULT` after a job of it failed: `open` it again to go on).
+            pub fn done(&self) -> u64 {
+                self.ring.done()
+            }
+            pub fn ended(&self) -> u64 {
+                self.ring.ended()
+            }
+            /// The number the next `submit` takes.
+            pub fn next(&self) -> u64 {
+                self.next
+            }
+
+            /// The queue opened again after it ended (a fault, a close): the jobs from `next` on are served.
+            pub fn reopen(&mut self) -> bool {
+                let mut msg = [3u8, 0, 0, 0, 0, self.ring.depth_log2() as u8];
+                msg[1..5].copy_from_slice(&(self.at as u32).to_le_bytes());
+                let mut reply = [1u8; 1];
+                let r = super::super::call(self.service, &msg, &mut reply);
+                r == 1 && reply[0] == 0
+            }
+
+            /// The queue closed: a job still running stopped, the rest lost.
+            pub fn close(&mut self) {
+                let mut reply = [1u8; 1];
+                super::super::call(self.service, &[4], &mut reply);
+            }
+        }
+    }
 }
 
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"), a device setting set thru the Settings capability: 0 never set (`audio::DEFAULT_LEVEL`), 1-255 dimmest to loudest, each step a 16th of an octave of amplitude (255 is full scale, 239 half, 1 almost 16 octaves down).

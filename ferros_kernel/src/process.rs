@@ -2725,6 +2725,50 @@ fn mbox_wake(addr: usize, count: u64) -> u64 {
     n
 }
 
+/// A word of a GPU block that a SYS_WAIT or SYS_WAKE names outside the caller's arc (2026-11-20, docs/GPU-KISTS.md "The queue"): its address in the blocks' window, when it lies in the frames of a block that is held and the caller holds that block (its owner) or the whole window (`arena`, the GPU service).
+/// A kist's GPU queue lives in its own block: it waits on the word the service bumps as its jobs end, and the service's thread for it waits on the word the kist bumps as it submits, each woken by the other's wake, with no call either way.
+/// Waiters on one word are kept under its window address whatever process they are in, as a mailbox's are (`mbox_wake`): that address is the same in every holder's view, and no arc word lies in the window.
+fn gpub_word(p: &Process, off: u64) -> Option<usize> {
+    let a = ((p.arc.base as u64).wrapping_add(off) & !DMA_ADDR) as usize;
+    let (lo, hi) = crate::cachemap::GPUB_VA;
+    // WHY: the address is the process's own; outside the window, or not a whole aligned word, it names no block word.
+    if a < lo || a >= hi || a % 8 != 0 {
+        return None;
+    }
+    let j = (a - lo) / crate::cachemap::GPU_BLOCK_MOST;
+    let b = unsafe { &(*(&raw const BLOCKS))[j] };
+    // WHY: only a held block's frames are mapped from the slot's start (`block_grow`); past them the window is unmapped, where the kernel's own read of the word would fault.
+    if !b.held || a - (lo + j * crate::cachemap::GPU_BLOCK_MOST) >= b.n * crate::frames::FRAME {
+        return None;
+    }
+    let holds = p.cspace.iter().any(|c| match c.object {
+        Object::Dma(i) if DMA[i].name == "arena" => true,
+        Object::Dma(i) if DMA[i].name == "gpu-block" => i - gpub0() == j && b.owner == p.epoch,
+        _ => false,
+    });
+    holds.then_some(a)
+}
+
+/// Every thread waiting on a word inside `[lo, hi)` made runnable, whatever process it is in: how many. At a GPU block's owner's end the GPU service's thread for its queue waits on a word of that block (`gpub_word`), and is woken so it finds its client gone and ends its group. Under the lock.
+fn wake_range(lo: usize, hi: usize) -> u64 {
+    let kk = k();
+    let mut n = 0u64;
+    for i in 0..kk.threads.len() {
+        if let Some(x) = th(i).filter(|x| matches!(x.state, State::Waiting(a, _) if a >= lo && a < hi)) {
+            x.state = State::Runnable;
+            if OLD.load(core::sync::atomic::Ordering::Relaxed) {
+                woken(i, WAKE_WORD);
+                enqueue_back(i);
+            } else {
+                enqueue_woken(i, WAKE_WORD);
+            }
+            tr(TR_WAKE, i, 0xFFFF);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// SYS_MAILBOX op 0: mailbox `id`'s view for the caller, proved by the token at arc offset `proof`; the view's token written at arc offset `out` (the one it holds already, or a new one), answered the view's base (`mbox_dma`). ERR: no such mailbox, the proof refused, no frame.
 /// The proof, per mailbox: GPS, what proves a GPS claim (Settings, the `gps` right as its endpoint's send right) or a GPS view; motion, none (gravity and the field are what SYS_FACTS gives anyone today; a `sensors` right is the owner's to decide, rights_implicit_set); the microphones and the test mailbox are granted by name only.
 fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
@@ -3610,12 +3654,152 @@ fn gpu_drain(epoch: u64) {
     let slots = unsafe { &*(&raw const SLOTS) };
     for (j, b) in blocks.iter().enumerate() {
         if b.owner == epoch {
-            unsafe { GPU_DRAINING |= 1 << j };
+            unsafe {
+                GPU_DRAINING |= 1 << j;
+                BLOCK_DRAIN_EPOCH[j] = epoch;
+            }
         }
     }
     for (k, s) in slots.iter().enumerate() {
         if s.owner == epoch {
-            unsafe { SURF_DRAINING |= 1 << k };
+            unsafe {
+                SURF_DRAINING |= 1 << k;
+                SURF_DRAIN_EPOCH[k] = epoch;
+            }
+        }
+    }
+}
+
+/// The epochs whose GPU work the GPU service holds (2026-11-20, docs/GPU-KISTS.md "The queue"; SYS_DMA x1 = 7 on `arena`).
+/// A client with a queue submits jobs without a call, so no held call says a job of its is on the GPU (`gpu_job_in_flight`): the service says so instead, from its queue's open until its group has ended.
+/// A held epoch's blocks and surfaces stay drained past its end until the service lets it go (`gpu_hold`), whatever requests the service takes meanwhile.
+/// The queue word is the client's `SUBMIT` (ferros_gpuq), which the service's thread for that queue waits on: at the client's end the kernel sets its bit 63 and wakes it, so the thread finds its client gone even when the end comes between its look and its wait.
+/// At the service's end the kernel sets bit 63 of every held queue's `DONE`, 64 bytes on, which the client waits on, so no client waits for ever on a service that is gone.
+/// One a slot of the service's seven, and one spare: (epoch, the queue word's window address or 0). Under the kernel lock.
+static mut GPU_HOLDS: [(u64, usize); 8] = [(0, 0); 8];
+/// The epoch each draining block (`GPU_DRAINING`) and surface (`SURF_DRAINING`) was drained for, so a held epoch's are kept while the rest go at the service's next request. Under the kernel lock.
+static mut BLOCK_DRAIN_EPOCH: [u64; GPU_BLOCK_SLOTS] = [0; GPU_BLOCK_SLOTS];
+static mut SURF_DRAIN_EPOCH: [u64; SURFACE_SLOTS] = [0; SURFACE_SLOTS];
+/// Bit 63 of a queue word, set by the kernel at an end (`GPU_HOLDS`): ferros_gpuq `GONE`.
+const GPU_QUEUE_GONE: u64 = 1 << 63;
+/// `DONE`'s distance from `SUBMIT` in a queue's header, in bytes (ferros_gpuq `DONE`, word 8).
+const GPU_QUEUE_DONE: usize = 64;
+
+/// Whether the GPU service holds `epoch`'s GPU work (`GPU_HOLDS`). Under the lock.
+fn gpu_held(epoch: u64) -> bool {
+    epoch != 0 && unsafe { (*(&raw const GPU_HOLDS)).iter().any(|h| h.0 == epoch) }
+}
+
+/// Bit 63 set in the queue word at `a` (a window address `gpu_hold` checked) and its waiters woken, in every process.
+fn gpu_queue_mark(a: usize) {
+    // SAFETY: `a` is an aligned word inside a held block's frames (`gpu_hold` checked it, and a held epoch's block stays held, drained, until the hold is let go), mapped in the kernel's own view of the blocks' window.
+    unsafe { (*(a as *const core::sync::atomic::AtomicU64)).fetch_or(GPU_QUEUE_GONE, core::sync::atomic::Ordering::SeqCst) };
+    mbox_wake(a, u64::MAX);
+}
+
+/// A process ending (`end_process`, `kill_locked`), before its blocks and surfaces are freed: drained when a job of its may be on the GPU (a call the service has taken, `busy`, or work the service holds for it, `gpu_held`).
+/// Its held queue's word is marked and the service's threads waiting on words of its blocks woken, so the one serving its queue finds it gone, ends its group and lets it go. Under the lock.
+fn gpu_ending(epoch: u64, busy: bool) {
+    // The GPU service itself ending (the holder of the whole blocks' window): every held queue's `DONE` marked, so its client stops waiting; the holds go with it, and what they kept stays drained until the next service's first request, which it takes only after its GPU's reset (payloads/gpu), as an ended client's call-held job always was (`gpu_drained`).
+    let service = k().procs.iter().flatten().any(|p| p.epoch == epoch && p.cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "arena")));
+    if service {
+        let holds = unsafe { &mut *(&raw mut GPU_HOLDS) };
+        for h in holds.iter_mut() {
+            if h.1 != 0 {
+                gpu_queue_mark(h.1 + GPU_QUEUE_DONE);
+            }
+            *h = (0, 0);
+        }
+    }
+    let held = gpu_held(epoch);
+    if busy || held {
+        gpu_drain(epoch);
+    }
+    if held {
+        for h in unsafe { (*(&raw const GPU_HOLDS)).iter() } {
+            if h.0 == epoch && h.1 != 0 {
+                gpu_queue_mark(h.1);
+            }
+        }
+        let blocks = unsafe { &*(&raw const BLOCKS) };
+        for (j, b) in blocks.iter().enumerate() {
+            if b.owner == epoch && b.held {
+                let base = DMA[gpub0() + j].base;
+                wake_range(base, base + b.n * crate::frames::FRAME);
+            }
+        }
+    }
+}
+
+/// SYS_DMA x1 = 7 on `arena`, the GPU service's: `epoch`'s GPU work held (`on`), its queue's `SUBMIT` word at window address `word` (0: none), or let go once its group has ended.
+/// The word must be an aligned word of a block that epoch holds, with its `DONE` inside the same frames.
+/// Letting go of an epoch that has ended gives its drained blocks and surfaces back now. 0, or ERR when the holds are full, a hold names epoch 0, or the word is none of that epoch's. Under the lock.
+fn gpu_hold(epoch: u64, on: bool, word: u64) -> u64 {
+    let holds = unsafe { &mut *(&raw mut GPU_HOLDS) };
+    if on {
+        let a = word as usize;
+        let (lo, hi) = crate::cachemap::GPUB_VA;
+        // WHY: the epoch and the word are the service's to name, and the kernel writes the word at that epoch's end: only a held block's own frames, that epoch's, may be written there.
+        let ok = a == 0
+            || (a >= lo && a < hi && a % 8 == 0 && {
+                let j = (a - lo) / crate::cachemap::GPU_BLOCK_MOST;
+                let b = unsafe { &(*(&raw const BLOCKS))[j] };
+                b.held && b.owner == epoch && a + GPU_QUEUE_DONE + 8 <= lo + j * crate::cachemap::GPU_BLOCK_MOST + b.n * crate::frames::FRAME
+            });
+        if epoch == 0 || !ok {
+            return ERR;
+        }
+        if let Some(h) = holds.iter_mut().find(|h| h.0 == epoch) {
+            h.1 = a;
+            return 0;
+        }
+        return match holds.iter().position(|h| h.0 == 0) {
+            Some(i) => {
+                holds[i] = (epoch, a);
+                0
+            }
+            None => ERR,
+        };
+    }
+    for h in holds.iter_mut().filter(|h| h.0 == epoch) {
+        *h = (0, 0);
+    }
+    // An ending process's blocks and surfaces were freed (drained) at its end, its threads elsewhere or not.
+    if gpu_alive(epoch) == 0 {
+        gpu_released(epoch);
+    }
+    0
+}
+
+/// SYS_DMA x1 = 8 on `arena`: whether a process with `epoch` is alive and not ending (1) or not (0), for the GPU service's thread that a client's end woke (`gpu_ending`). Under the lock.
+fn gpu_alive(epoch: u64) -> u64 {
+    k().procs.iter().flatten().any(|p| p.epoch == epoch && !p.dying) as u64
+}
+
+/// Every block and surface drained for `epoch` given back: its owner ended and the service let its GPU work go. Under the lock.
+fn gpu_released(epoch: u64) {
+    for j in 0..GPU_BLOCK_SLOTS {
+        let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
+        if unsafe { GPU_DRAINING } >> j & 1 == 1 && unsafe { BLOCK_DRAIN_EPOCH[j] } == epoch {
+            unsafe {
+                GPU_DRAINING &= !(1 << j);
+                BLOCK_DRAIN_EPOCH[j] = 0;
+            }
+            if owner == 0 && held {
+                block_release(j);
+            }
+        }
+    }
+    let slots = unsafe { &*(&raw const SLOTS) };
+    for k in 0..SURFACE_SLOTS {
+        if unsafe { SURF_DRAINING } >> k & 1 == 1 && unsafe { SURF_DRAIN_EPOCH[k] } == epoch {
+            unsafe {
+                SURF_DRAINING &= !(1 << k);
+                SURF_DRAIN_EPOCH[k] = 0;
+            }
+            if slots[k].owner == 0 && slots[k].held {
+                surface_release(k);
+            }
         }
     }
 }
@@ -3703,8 +3887,15 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
 
 /// The GPU service took a request: whatever waited for its last job to end may be given out again, a drained block's or surface's frames back to the pool. Under the lock.
 fn gpu_drained() {
-    let d = unsafe { GPU_DRAINING };
-    unsafe { GPU_DRAINING = 0 };
+    // A held epoch's drains stay (`GPU_HOLDS`): its queue's jobs run with no call, so a request taken says nothing of them.
+    let kept = |e: u64| gpu_held(e);
+    let mut d = unsafe { GPU_DRAINING };
+    for j in 0..GPU_BLOCK_SLOTS {
+        if d >> j & 1 == 1 && kept(unsafe { BLOCK_DRAIN_EPOCH[j] }) {
+            d &= !(1 << j);
+        }
+    }
+    unsafe { GPU_DRAINING &= !d };
     for j in 0..GPU_BLOCK_SLOTS {
         let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
         if d >> j & 1 == 1 && owner == 0 && held {
@@ -3712,8 +3903,13 @@ fn gpu_drained() {
         }
     }
     let slots = unsafe { &*(&raw const SLOTS) };
-    let d = unsafe { SURF_DRAINING };
-    unsafe { SURF_DRAINING = 0 };
+    let mut d = unsafe { SURF_DRAINING };
+    for k in 0..SURFACE_SLOTS {
+        if d >> k & 1 == 1 && kept(unsafe { SURF_DRAIN_EPOCH[k] }) {
+            d &= !(1 << k);
+        }
+    }
+    unsafe { SURF_DRAINING &= !d };
     for k in 0..SURFACE_SLOTS {
         if d >> k & 1 == 1 && slots[k].owner == 0 && slots[k].held {
             surface_release(k);
@@ -4841,8 +5037,8 @@ pub struct PowerSwitch {
 /// - the camera's (camera_power.rs; 43 ms of the kernel lock at an open, `diag lock`), kept under the lock until now because its region's fence, under the kernel lock on any core (`cam_ask`, `cam_free`), writes the S2MPUs the switch also writes. The fence and the region it follows now have a lock of their own (`FENCE`), which both sides take, so the lock that kept them apart is no longer the kernel's; the S2MPUs sit in the front end's domain, which the switch brings on once and never gates again (`FE_ON`), so a fence from another core never finds it down. The rest of the switch is the camera PMIC's bus (hsi2c_14, shared with the torch, whose switch is refused while this one holds it, both on the kernel's core), ACPM (the kernel's core alone), the domain's EL3 calls (the pd gating pass, the kernel's core alone), and the front end's clocks, sysmmus, engine and receiver, which no path under the kernel lock touches.
 /// - the USB link's (ptlink.rs `power`; 11 ms of the kernel lock at a reload's boot, `diag lock`, the eUSB2 PHY's and the repeater's waits): its link reset, the one piece of the lock's state it touches, is taken under the lock inside it (`with_lock_held_or`); the rest is hsi2c_11 (the TCPC and the repeater, which only the kernel's core reaches: the battery gauge's polls and the diag commands are the service loop's), ACPM (the kernel's core only, as for the camera's), the eUSB2 PHY, the controller's DCTL and HSI0's S2MPU and SYSMMU, which nothing else in the kernel writes after boot.
 /// Not the display's (`dpu`: EL3 calls into the PMU, which a via-EL3 grant's SYS_MMIO on another core also makes), the panel's (its reset line shares GPA6_CON with the volume-up key's pin mode) nor android's: unaudited, they keep the lock.
-const SWITCH_UNLOCKED: [&str; 9] = ["gps", "nfc", "bt", "touch", "amp", "torch", "sensors", "camera", "usb"];
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
+const SWITCH_UNLOCKED: [&str; 10] = ["gps", "nfc", "bt", "touch", "amp", "torch", "sensors", "camera", "usb", "gpu-clock"];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }, PowerSwitch { name: "gpu-clock", set: crate::service::gpu_clock }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
 struct BufFault {
@@ -5433,7 +5629,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
         }
         // A word in the arc, or a mailbox's sequence word thru a region the caller holds (2026-11-19, `mbox_wait_word`): waiters of every process on one mailbox are kept under its view's address, so its writer's wake finds them all.
-        SYS_WAIT => match p.word(f.x[0]).or_else(|| mbox_wait_word(p, f.x[0])) {
+        SYS_WAIT => match p.word(f.x[0]).or_else(|| mbox_wait_word(p, f.x[0])).or_else(|| gpub_word(p, f.x[0])) {
             // A word outside the arc: the syscall resolves or traps (`bad_buf`).
             None => {
                 p.bad_buf(f.x[0], 8, false);
@@ -5476,6 +5672,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
         // A mailbox's writer waking its readers (2026-11-19): its own sequence word, every process's waiters on that mailbox, in the one scan below (`mbox_wake`).
         SYS_WAKE if p.word(f.x[0]).is_none() && mbox_wake_word(p, f.x[0]).is_some() => {
             f.x[0] = mbox_wake(mbox_wake_word(p, f.x[0]).unwrap(), f.x[1]);
+            0
+        }
+        // A word of a GPU block, by its owner or the GPU service (2026-11-20, `gpub_word`): every process's waiters on it, as a mailbox's writer wakes its readers.
+        SYS_WAKE if p.word(f.x[0]).is_none() && gpub_word(p, f.x[0]).is_some() => {
+            f.x[0] = mbox_wake(gpub_word(p, f.x[0]).unwrap(), f.x[1]);
             0
         }
         SYS_WAKE => {
@@ -6920,6 +7121,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     cam_view_drop("the driver closed");
                     0
                 }
+                // x1 = 7 (2026-11-20, docs/GPU-KISTS.md "The queue"): the GPU service holds epoch x2's GPU work (x3 = 1; x4 its queue's `SUBMIT` word, 0 none), or lets it go (x3 = 0) once that client's group has ended (`gpu_hold`). x1 = 8: whether epoch x2 is alive (`gpu_alive`).
+                Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 7 => gpu_hold(f.x[2], f.x[3] == 1, f.x[4]),
+                Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 8 => gpu_alive(f.x[2]),
                 // A mailbox's region (2026-11-19): its frame taken and mapped at the first ask, the writer's region making the caller its writer (`mbox_dma`).
                 Some(Object::Dma(i)) if f.x[1] == 0 && mbox_of(i).is_some() => mbox_dma(p, i),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
@@ -7823,9 +8027,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         let name = p.name.clone();
         // A kist ended by a fault or a panic: kept for the map's circle (`kist_stopped`).
         kist_stopped(p, value);
-        if gpu_busy {
-            gpu_drain(p.epoch);
-        }
+        gpu_ending(p.epoch, gpu_busy);
         surfaces_free(p.epoch);
         regions_free(p.epoch);
         pucks_free(p.epoch);
@@ -8159,9 +8361,7 @@ fn kill_locked(name: &[u8]) -> bool {
     if kk.procs[i].as_ref().unwrap().kist {
         bell_count(BELL_KISTS);
     }
-    if gpu_job_in_flight(i) {
-        gpu_drain(kk.procs[i].as_ref().unwrap().epoch);
-    }
+    gpu_ending(kk.procs[i].as_ref().unwrap().epoch, gpu_job_in_flight(i));
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     regions_free(kk.procs[i].as_ref().unwrap().epoch);
     pucks_free(kk.procs[i].as_ref().unwrap().epoch);

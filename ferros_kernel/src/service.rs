@@ -1277,10 +1277,10 @@ fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
 }
 
-/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena whole (it reads a client's kernel from the client's own block), 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu), 8 the GPU MMU's interrupt (2026-11-12: a client's job that reaches outside its own memory faults in its own address space, and the service ends that job at once). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
+/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena whole (it reads a client's kernel from the client's own block), 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu), 8 the GPU MMU's interrupt (2026-11-12: a client's job that reaches outside its own memory faults in its own address space, and the service ends that job at once), 9 the `gpu-clock` switch (2026-11-20: the GPU's clock up while a job is queued or running, down when the queues empty, `gpu_clock`). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
 fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"arena"), Serve(b"gpu"), Dma(b"surfaces"), Irq(b"gpu-mmu")]
+    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"arena"), Serve(b"gpu"), Dma(b"surfaces"), Irq(b"gpu-mmu"), Power(b"gpu-clock")]
 }
 
 /// The stower's grants in its slot order (payloads/kists; docs/KISTS.md "The stower"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Stow right (the kernel checks and seals what it stored), 7 use icons (the icon decoder: a kist's icon decoded once at stow, 2026-11-20). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
@@ -2536,6 +2536,41 @@ fn gpu_rate(top: bool) {
     crate::process::push_console(alloc::format!("gpu clock: {} ({:?})\n", if top { "G3D 890, G3DL2 900 MHz" } else { "the floor, 150 / 160 MHz" }, r).as_bytes());
 }
 
+/// Whether the GPU's clock follows the GPU service's `gpu-clock` switch (`gpu_clock`) rather than its being alive: set at the switch's first use, for the boot.
+pub static GPU_BY_SWITCH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The switch's turns up and down since boot (`diag clock`), and the longest of either in counter ticks (its two ACPM requests and their answers).
+pub static GPU_CLOCK_UPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static GPU_CLOCK_DOWNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static GPU_CLOCK_LONGEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The `gpu-clock` switch (2026-11-20, docs/GPU-KISTS.md "Power and clock by events"; the owner, 2026-11-11: "the GPU powers up when work is queued and gates when its queue empties, as events, never a timer"): on when the GPU service has a job queued or running, off when its queues are empty, each turn made by the service at that event.
+/// The GPU at its top (G3D 890, G3DL2 900 MHz) while on and the screen lit, at its floor (150 / 160 MHz) while off or dark; the dark profile's own turn follows it (`clock_policy`). On the kernel's core, as every switch, with the lock let go (`SWITCH_UNLOCKED`): its ACPM requests are the clock policy's, made on this same core, never beside them.
+/// Quiet: a turn a frame would be a line a frame; `diag clock` says the counts.
+pub fn gpu_clock(on: bool) -> bool {
+    GPU_BY_SWITCH.store(true, core::sync::atomic::Ordering::Relaxed);
+    if on == unsafe { GPU_CLOCKED } {
+        return true;
+    }
+    unsafe { GPU_CLOCKED = on };
+    if unsafe { CLOCK_STATE } == 3 {
+        return true;
+    }
+    let t0 = cntpct();
+    if on {
+        let _ = crate::acpm::dvfs_set(8, 900_000);
+        let _ = crate::acpm::dvfs_set(7, crate::thermal::capped(7, 890_000));
+        let _ = crate::acpm::dvfs_get(7);
+        GPU_CLOCK_UPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        let _ = crate::acpm::dvfs_set(7, crate::thermal::capped(7, 150_000));
+        let _ = crate::acpm::dvfs_set(8, 160_000);
+        let _ = crate::acpm::dvfs_get(8);
+        GPU_CLOCK_DOWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    GPU_CLOCK_LONGEST.fetch_max(cntpct().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// `diag smp dark on|off`: whether the workers go off with the dark profile (on by default).
 pub static DARK_WORKERS_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -2663,6 +2698,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("lift (THERMAL.md decision 3): the A715s up to A#{} MHz while interacting (A#{} MHz calm), held f>>A#{} after input, while frames come within f>>A#{} of each other, and f>>A#{} after the camera front end's last answered interrupt (0: never; A#{} answers seen); {} now; A#{} windows lifted (A#{} by the camera alone), A#{} lifts begun; memory side (MIF A#3744, DSU A#1800 MHz) {}, A#{} lifts; the camera's switch {} it; armed actions (the camera releases its descriptor by one; diag irqs) {}\n",GOV_LIFT_KHZ.load(Relaxed).max(A715_CALM_KHZ) / 1000, A715_CALM_KHZ / 1000, GOV_HOLD.load(Relaxed), crate::process::ANIM_GAP_LOG2.load(Relaxed), CAM_HOLD.load(Relaxed), unsafe { CAM_ACKS_SEEN }, if causes != 0 { alloc::format!("lifted by {why}") } else { "calm".into() }, unsafe { GOV_LIFTED[0] }, unsafe { GOV_LIFTED[2] }, unsafe { GOV_LIFTED[1] }, if unsafe { SHARED_LIFTED } { "lifted" } else { "at the tier" }, unsafe { SHARED_LIFTS }, if !CAM_MEM.load(Relaxed) { "does not hold (cammem off)" } else if crate::camera_power::held() { "holds" } else { "is off; when on it holds" }, if crate::irqarm::ON.load(Relaxed) { "on" } else { "off" }).as_bytes());
     let a715 = &govs[1];
     out.extend_from_slice(alloc::format!("recording (docs/RAW-VIDEO.md): while a RAW clip is recorded the A715s run up to A#{} MHz (0: as the policy has them){} and the A510s up to their top; {} now\n", CLIPS_KHZ.load(Relaxed) / 1000, if CLIPS_HOLD.load(Relaxed) != 0 { ", held there (clipshold 1)" } else { "" }, if recording() { "recording" } else { "not recording" }).as_bytes());
+    out.extend_from_slice(alloc::format!("GPU clock (docs/GPU-KISTS.md \"Power and clock by events\"): {} by {}; the switch up A#{} times, down A#{}, its longest turn A#{} us\n", if unsafe { GPU_CLOCKED } { "up" } else { "at its floor" }, if GPU_BY_SWITCH.load(Relaxed) { "the service's queue (gpu-clock)" } else { "the service's being alive" }, GPU_CLOCK_UPS.load(Relaxed), GPU_CLOCK_DOWNS.load(Relaxed), GPU_CLOCK_LONGEST.load(Relaxed) * 1_000_000 / f).as_bytes());
     out.extend_from_slice(alloc::format!("busy lift (THERMAL.md \"The busy lift\"): the A715s up to A#{} MHz (0: none) while every core of theirs stays at 7/8 busy or more under A#{} MHz for 2^A#{} windows in a row, until their load asks no more than that as long; {} now (least busy core A#{}/256 averaged; A#{} windows over, A#{} under); A#{} windows busy-lifted with no other lift, A#{} busy lifts begun\n", GOV_BUSY_KHZ.load(Relaxed) / 1000, A715_CALM_KHZ / 1000, GOV_BUSY_HOLD.load(Relaxed), if a715.busy { "on" } else { "off" }, a715.whole, a715.over, a715.under, unsafe { GOV_BUSY_COUNTS[0] }, unsafe { GOV_BUSY_COUNTS[1] }).as_bytes());
     out.extend_from_slice(alloc::format!("the kernel core's doze: 2^-A#{} s (0: none), A#{} wakes back to sleep with no pass, A#{} sleeps since boot\n", DOZE_LOG2.load(Relaxed), X3_DOZES.load(Relaxed), X3_SLEEPS.load(Relaxed)).as_bytes());
     let ms = |t: u64| t * 1000 / f;
@@ -3504,7 +3540,8 @@ pub fn run(mut b: Boot) -> ! {
             ALIVE.store(crate::process::alive() as u64, core::sync::atomic::Ordering::Relaxed);
             bell_facts();
             let live = crate::process::running(b"gpu");
-            if live != unsafe { GPU_CLOCKED } {
+            // A GPU service that drives its clock by its queue (the `gpu-clock` switch, `gpu_clock`) owns it from its first use; this rule is for a service from before.
+            if !GPU_BY_SWITCH.load(core::sync::atomic::Ordering::Relaxed) && live != unsafe { GPU_CLOCKED } {
                 unsafe { GPU_CLOCKED = live };
                 gpu_rate(live && unsafe { CLOCK_STATE } != 3);
             }

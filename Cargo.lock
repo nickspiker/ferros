@@ -1078,6 +1078,7 @@ dependencies = [
 name = "ferros-payload-gpu"
 version = "0.1.0"
 dependencies = [
+ "ferros_gpuq",
  "ferros_sys",
  "libm",
 ]
@@ -1087,6 +1088,8 @@ name = "ferros-payload-gputest"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_gpuq",
+ "ferros_rawcodec",
  "ferros_sys",
  "tapuwae",
  "valhall",
@@ -1615,6 +1618,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_gpuq"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
@@ -1777,6 +1784,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_rawcodec"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_sandbox"
 version = "0.1.0"
 
@@ -1829,6 +1840,7 @@ dependencies = [
 name = "ferros_sys"
 version = "0.1.0"
 dependencies = [
+ "ferros_gpuq",
  "ferros_mailbox",
  "ferros_theme",
  "tatau",

@@ -1061,6 +1061,15 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
         say!(grants, "gputest: no layer arena\n");
         exit(1);
     }
+    // Input 15: Lumis's back-end ops against the CPU.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 15 {
+        lumis_ops_test(grants, arena);
+    }
+    // Input [14, n]: the queue (GPU-KISTS.md "The queue"): n frames of the band coder (0: 16).
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 14 {
+        let frames = if input_len > 1 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } } else { 0 };
+        queue_test(grants, arena, if frames == 0 { 16 } else { frames as u32 });
+    }
     // Input [13, 0] and [13, 1]: the isolation test's keeper and intruder (GPU-KISTS.md plan step 1).
     if input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 13 {
         match unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } {
@@ -1156,6 +1165,278 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     say!(grants, "gputest: {} words; reply {n} bytes, status {}, job {job_us} us, call {call_us} us; {wrong} of {PIXELS} pixels differ from the CPU (the first at gid {})\n", words.len(), reply[0], first.map_or(-1, |g| g as i64));
     exit(if reply[0] == 0 && wrong == 0 { 0 } else { 1 });
+}
+
+mod band {
+    include!(concat!(env!("OUT_DIR"), "/band.rs"));
+}
+
+/// Lumis's back-end needs on the device (input 15; valhall tests/sim.rs `lumis_ops_against_the_cpu`, the same kernel and checks): 8- and 16-bit loads, integer multiply-add, shifts, an atomic add into a histogram from 2^11 invocations at once, a v2f16 multiply-add; every word against the CPU.
+fn lumis_ops_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, F, H, U};
+    const N: u32 = 1 << 11;
+    const IN: usize = 2 << 20;
+    const HIST: usize = 3 << 20;
+    ssa::begin();
+    ssa::reserve(3);
+    let g = ssa::gid();
+    let b = ssa::load8(1, g, 0, 3);
+    let h = ssa::load16(1, g, 1, 1);
+    let w = ssa::load(1, g, 2, 0);
+    let m = g.mul_add(U::splat(2_654_435_761), w);
+    let s = (m >> 7) ^ (b << 9) ^ h.shl_by(g & U::splat(7)) ^ w.shr_by(U::splat(3));
+    let p = H::pack(F::from_u32(b), F::from_u32(h & U::splat(1023)));
+    let q = p.mul_add(H::splat2(0.5, 0.25), H::splat2(1., 2.));
+    ssa::store(0, 4, 0, m);
+    ssa::store(0, 4, 4, s);
+    ssa::store(0, 4, 8, q.to_bits());
+    ssa::store(0, 4, 12, b | h << 8);
+    ssa::atomic_add(2, b & U::splat(15), 2, 0, U::splat(1));
+    ssa::atomic_add(2, U::splat(0), 0, 64, h);
+    let c = ssa::compile();
+    let wr8 = |at: usize, v: u8| unsafe { core::ptr::write_volatile((arena + at) as *mut u8, v) };
+    let r32 = |at: usize| unsafe { core::ptr::read_volatile((arena + at) as *const u32) };
+    for (i, &x) in c.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, x) };
+    }
+    let byte = |i: usize| (i as u32).wrapping_mul(0x9E37_79B9).rotate_left(13) as u8;
+    for i in 0..4 * N as usize + 8 {
+        wr8(IN + i, byte(i));
+    }
+    for j in 0..17 {
+        unsafe { core::ptr::write_volatile((arena + HIST + 4 * j) as *mut u32, 0) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + OUT as u64, ARENA_VA + IN as u64, ARENA_VA + HIST as u64];
+    uniforms.extend_from_slice(&c.consts);
+    let reply = run_with(grants, c.words.len(), N / 16, 0x1000 | if c.regs64 { 0x8000 } else { 0 }, &uniforms);
+    let rd = |o: usize, n: usize| (0..n).rev().fold(0u32, |a, k| a << 8 | byte(o + k) as u32);
+    let f16 = |x: f32| valhall::f32_to_f16(x) as u32;
+    let (mut hist, mut sum, mut wrong) = ([0u32; 16], 0u32, [0u32; 5]);
+    for g in 0..N {
+        let (b, h, w) = (rd(g as usize + 3, 1), rd(2 * g as usize + 1, 2), rd(4 * g as usize, 4));
+        let m = g.wrapping_mul(2_654_435_761).wrapping_add(w);
+        let s = (m >> 7) ^ (b << 9) ^ (h << (g & 7)) ^ (w >> 3);
+        let at = OUT + 16 * g as usize;
+        wrong[0] += (r32(at) != m) as u32;
+        wrong[1] += (r32(at + 4) != s) as u32;
+        wrong[2] += (r32(at + 8) != (f16(b as f32 * 0.5 + 1.) | f16((h & 1023) as f32 * 0.25 + 2.) << 16)) as u32;
+        wrong[3] += (r32(at + 12) != (b | h << 8)) as u32;
+        hist[(b & 15) as usize] += 1;
+        sum = sum.wrapping_add(h);
+    }
+    wrong[4] = (0..16).filter(|&j| r32(HIST + 4 * j) != hist[j]).count() as u32 + (r32(HIST + 64) != sum) as u32;
+    say!(grants, "gputest: Lumis's ops, A#{N} invocations, A#{} words: status A#{}, A#{} us; wrong: multiply-add A#{}, shifts A#{}, f16 pair A#{}, narrow loads A#{}, atomic histogram and sum A#{} (of 17)\n", c.words.len(), reply.0, reply.1, wrong[0], wrong[1], wrong[2], wrong[3], wrong[4]);
+    exit(if reply.0 == 0 && wrong.iter().all(|&x| x == 0) { 0 } else { 1 });
+}
+
+/// Where the queue test keeps things in its block (grown to 2^27 bytes first: the band coder's full frame): the calls' code at 0, the Mandelbrot's output at 1 MiB, the queue at 2 MiB, the kernels' words from 3 MiB (the empty one, the Mandelbrot 4 KiB on, the band coder 64 KiB on), the frame from 4 MiB and 64 KiB (the coder reads 64 bytes before its first row), the bodies from 24 MiB, the facts from 80 MiB.
+const Q_AT: usize = 2 << 20;
+const K_AT: usize = 3 << 20;
+const FRAME_AT: usize = (4 << 20) + (64 << 10);
+const CODES_AT: usize = 24 << 20;
+const INFO_AT: usize = 80 << 20;
+const BAND_ROWS_FRAME: usize = 3072;
+
+/// Microseconds of counter ticks.
+fn us(t: u64) -> u64 {
+    t * 1_000_000 / ferros_sys::freq()
+}
+
+/// The least, the mean and the most of `v`, in microseconds of ticks.
+fn spread(v: &[u64]) -> (u64, u64, u64) {
+    let (mut lo, mut hi, mut sum) = (u64::MAX, 0, 0);
+    for &x in v {
+        lo = lo.min(x);
+        hi = hi.max(x);
+        sum += x;
+    }
+    (us(lo), us(sum / v.len().max(1) as u64), us(hi))
+}
+
+/// The queue's measures (GPU-KISTS.md "The queue", Lumis's asks 3, 7 and 8): an empty kernel and ferros_clip's band coder thru a queue and thru calls, the Mandelbrot thru the queue checked pixel by pixel, a job reaching outside the block (its fault, the queue ended, opened again), each line on the console.
+/// Spawn: `ferros-bridge spawn gputest.bin 0E --name gputest --use gpu --dma layers-32` (a second byte, the band coder's frames, 16 by default).
+fn queue_test(grants: u64, arena: usize, frames: u32) -> ! {
+    use ferros_sys::gpu::queue::*;
+    use ferros_sys::gpu::{PRELOAD_REGS64, PRELOAD_X};
+    let f = ferros_sys::freq();
+    let w64 = |at: usize, v: u64| unsafe { core::ptr::write_volatile((arena + at) as *mut u64, v) };
+    let r32 = |at: usize| unsafe { core::ptr::read_volatile((arena + at) as *const u32) };
+    // The block first grown to hold the band coder's frame: a block grown after the queue opens is another client to the service.
+    match ferros_sys::gpu_block_ask(cap(grants, S_ARENA), 27) {
+        Some(n) => say!(grants, "gputest queue: block A#{} MiB\n", n >> 20),
+        None => {
+            say!(grants, "gputest queue: the block did not grow to 128 MiB\n");
+            exit(1);
+        }
+    }
+    let mut q = match Queue::open(cap(grants, S_GPU), cap(grants, S_ARENA), Q_AT, 2) {
+        Ok(q) => q,
+        Err(e) => {
+            say!(grants, "gputest queue: open refused (G#{e:X}): a service or kernel from before the queue?\n");
+            exit(1);
+        }
+    };
+    // The kernels: an empty one (NOP.end), the Mandelbrot, the band coder.
+    let mut e = Kernel::<32>::new();
+    e.nop().end();
+    let empty_words = e.finish().to_vec();
+    for (i, &w) in empty_words.iter().enumerate() {
+        w64(K_AT + 8 * i, w);
+    }
+    let mut mk = Kernel::<32>::new();
+    mandelbrot(&mut mk);
+    let mandel_words = mk.finish().to_vec();
+    for (i, &w) in mandel_words.iter().enumerate() {
+        w64(K_AT + (4 << 10) + 8 * i, w);
+    }
+    for (i, &w) in band::BAND_WORDS.iter().enumerate() {
+        w64(K_AT + (64 << 10) + 8 * i, w);
+    }
+    let (Some(ke), Some(km), Some(kb)) = (q.kernel(K_AT, empty_words.len(), PRELOAD_X), q.kernel(K_AT + (4 << 10), mandel_words.len(), PRELOAD_X), q.kernel(K_AT + (64 << 10), band::BAND_WORDS.len(), PRELOAD_X | if band::BAND_REGS64 { PRELOAD_REGS64 } else { 0 })) else {
+        say!(grants, "gputest queue: a kernel was not loaded\n");
+        exit(1);
+    };
+    say!(grants, "gputest queue: open at A#{} MiB, 4 deep; kernels {ke} (A#{} words), {km} (A#{}), {kb} (band coder, A#{})\n", Q_AT >> 20, empty_words.len(), mandel_words.len(), band::BAND_WORDS.len());
+    const N: usize = 1 << 8;
+    // 1: the empty kernel one at a time: the caller's submit to its wake, the service's doorbell to its seeing the end, the GPU's own stamps.
+    let (mut wall, mut round, mut gpu, mut start) = ([0u64; N], [0u64; N], [0u64; N], [0u64; N]);
+    let mut stamped = 0;
+    for i in 0..N {
+        let t0 = ferros_sys::now();
+        let Some(n) = q.submit(&Job { kernel: ke, groups: (1, 1), uniforms: &[] }) else {
+            say!(grants, "gputest queue: submit refused at job A#{i}\n");
+            exit(1);
+        };
+        let d = q.wait(n);
+        wall[i] = ferros_sys::now() - t0;
+        if d.status != S_DONE {
+            say!(grants, "gputest queue: empty job A#{i} status A#{}\n", d.status);
+            exit(1);
+        }
+        round[i] = d.round_ticks();
+        if let Some(g) = d.gpu_ticks() {
+            gpu[i] = g;
+            start[i] = d.started.wrapping_sub(d.submitted);
+            stamped += 1;
+        }
+    }
+    let (a, b, c) = (spread(&wall), spread(&round), spread(&gpu));
+    let s = spread(&start);
+    say!(grants, "gputest queue: empty kernel, one at a time, A#{N} jobs: submit to wake A#{}/A#{}/A#{} us (least/mean/most), doorbell to seen A#{}/A#{}/A#{}, GPU A#{}/A#{}/A#{} (A#{stamped} stamped), doorbell to the GPU's start A#{}/A#{}/A#{}\n", a.0, a.1, a.2, b.0, b.1, b.2, c.0, c.1, c.2, s.0, s.1, s.2);
+    // 2: the empty kernel four in flight: jobs a second thru one queue.
+    let t0 = ferros_sys::now();
+    let first = q.next();
+    for i in 0..N as u64 {
+        if i >= 4 {
+            q.wait(first + i - 4);
+        }
+        q.submit(&Job { kernel: ke, groups: (1, 1), uniforms: &[] });
+    }
+    q.wait(first + N as u64 - 1);
+    say!(grants, "gputest queue: empty kernel, four in flight: A#{N} jobs in A#{} us, A#{} us a job\n", us(ferros_sys::now() - t0), us(ferros_sys::now() - t0) / N as u64);
+    // 3: the same thru a call each (op 1): the caller's call to its reply.
+    for (i, &w) in empty_words.iter().enumerate() {
+        w64(8 * i, w);
+    }
+    for slot in wall.iter_mut() {
+        let t0 = ferros_sys::now();
+        let (st, _) = run_with(grants, empty_words.len(), 1, 0x1000, &[]);
+        *slot = ferros_sys::now() - t0;
+        if st != 0 {
+            say!(grants, "gputest queue: an empty call's status A#{st}\n");
+            exit(1);
+        }
+    }
+    let a = spread(&wall);
+    say!(grants, "gputest queue: empty kernel thru calls, A#{N}: call to reply A#{}/A#{}/A#{} us\n", a.0, a.1, a.2);
+    // 4: the Mandelbrot thru the queue, every pixel against the CPU.
+    for i in 0..PIXELS {
+        unsafe { core::ptr::write_volatile((arena + OUT + 4 * i) as *mut u32, u32::MAX) };
+    }
+    let (x0, y0, step) = (-2.0f32, -1.25f32, 0.0390625f32);
+    let u = [ARENA_VA + OUT as u64, SIDE_SHIFT as u64 | (MAX_ITER as u64) << 32, x0.to_bits() as u64 | (y0.to_bits() as u64) << 32, step.to_bits() as u64];
+    let n = q.submit(&Job { kernel: km, groups: ((PIXELS / 16) as u32, 1), uniforms: &u }).unwrap();
+    let d = q.wait(n);
+    let wrong = (0..PIXELS as u32).filter(|&g| r32(OUT + 4 * g as usize) != reference(g, x0, y0, step)).count();
+    say!(grants, "gputest queue: Mandelbrot thru the queue: status A#{}, GPU A#{} us, A#{wrong} of A#{PIXELS} pixels differ from the CPU\n", d.status, d.gpu_ticks().map_or(0, us));
+    // 5: the band coder over a full binned frame (4080 x 3072 RAW10 of a pattern): thru the queue one at a time, then thru calls.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..BAND_ROWS_FRAME * 0x1400 / 8 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        w64(FRAME_AT + 8 * i, x);
+    }
+    let mut ub = [0u64; 24];
+    ub[0] = ARENA_VA + CODES_AT as u64;
+    ub[1] = ARENA_VA + FRAME_AT as u64;
+    ub[2] = ARENA_VA + INFO_AT as u64;
+    let nb = 3 + band::BAND_CONSTS.len();
+    ub[3..nb].copy_from_slice(band::BAND_CONSTS);
+    let groups = ((BAND_ROWS_FRAME << 7) / 16) as u32;
+    let (mut bw, mut bg) = ([0u64; 64], [0u64; 64]);
+    let frames = frames.min(64) as usize;
+    for i in 0..frames {
+        let t0 = ferros_sys::now();
+        let n = q.submit(&Job { kernel: kb, groups: (groups, 1), uniforms: &ub[..nb] }).unwrap();
+        let d = q.wait(n);
+        bw[i] = ferros_sys::now() - t0;
+        bg[i] = d.gpu_ticks().unwrap_or(0);
+        if d.status != S_DONE {
+            say!(grants, "gputest queue: band coder frame A#{i} status A#{}\n", d.status);
+            exit(1);
+        }
+    }
+    let (a, g) = (spread(&bw[..frames]), spread(&bg[..frames]));
+    say!(grants, "gputest queue: band coder thru the queue, A#{frames} frames: submit to wake A#{}/A#{}/A#{} us, GPU A#{}/A#{}/A#{} us; the facts' first words G#{:X} G#{:X}\n", a.0, a.1, a.2, g.0, g.1, g.2, r32(INFO_AT), r32(INFO_AT + 4));
+    for (i, &w) in band::BAND_WORDS.iter().enumerate() {
+        w64(8 * i, w);
+    }
+    let mut cg = [0u64; 64];
+    for i in 0..frames {
+        let t0 = ferros_sys::now();
+        let (st, _, gus) = run_band(grants, band::BAND_WORDS.len(), groups, 0x1000 | if band::BAND_REGS64 { 0x8000 } else { 0 }, &ub[..nb]);
+        bw[i] = ferros_sys::now() - t0;
+        cg[i] = gus as u64 * f / 1_000_000;
+        if st != 0 {
+            say!(grants, "gputest queue: band coder call A#{i} status A#{st}\n");
+            exit(1);
+        }
+    }
+    let (a, g) = (spread(&bw[..frames]), spread(&cg[..frames]));
+    say!(grants, "gputest queue: band coder thru calls, A#{frames} frames: call to reply A#{}/A#{}/A#{} us, GPU A#{}/A#{}/A#{} us\n", a.0, a.1, a.2, g.0, g.1, g.2);
+    // 6: a job reaching outside its block: its fault, its queue ended, the others behind it lost; opened again, the empty kernel runs.
+    let bad = [ARENA_VA + (1 << 30), u[1], u[2], u[3]];
+    let n0 = q.submit(&Job { kernel: km, groups: ((PIXELS / 16) as u32, 1), uniforms: &bad }).unwrap();
+    let n1 = q.submit(&Job { kernel: ke, groups: (1, 1), uniforms: &[] }).unwrap();
+    let (d0, d1) = (q.wait(n0), q.wait(n1));
+    say!(grants, "gputest queue: outside its block: status A#{} at GPU address G#{:X}, AS_FAULTSTATUS G#{:X}; the job behind it A#{}; the queue ended A#{}\n", d0.status, d0.fault_address, d0.fault_status, d1.status, q.ended());
+    let reopened = q.reopen();
+    let n = q.submit(&Job { kernel: ke, groups: (1, 1), uniforms: &[] });
+    let after = n.map(|n| q.wait(n).status);
+    say!(grants, "gputest queue: opened again {reopened}; the empty kernel after it: status {:?}\n", after);
+    let ok = d0.status == S_OUTSIDE && d1.status == S_LOST && after == Some(S_DONE) && wrong == 0;
+    q.close();
+    say!(grants, "gputest queue: {}\n", if ok { "all as expected" } else { "NOT as expected" });
+    exit(if ok { 0 } else { 1 });
+}
+
+/// A call (op 1) with code at 0 in the block: its status, the service's µs, and the GPU's own µs when the reply carries it (a service of 2026-11-20 on).
+fn run_band(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u64]) -> (u8, u32, u32) {
+    let mut msg = [0u8; 18 + 8 * 64];
+    msg[0] = 1;
+    msg[1..3].copy_from_slice(&preload.to_le_bytes());
+    msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
+    msg[9..13].copy_from_slice(&groups.to_le_bytes());
+    msg[13..17].copy_from_slice(&1u32.to_le_bytes());
+    msg[17] = uniforms.len() as u8;
+    for (i, u) in uniforms.iter().enumerate() {
+        msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let mut reply = [0u8; 17];
+    let n = call(cap(grants, S_GPU), &msg[..18 + 8 * uniforms.len()], &mut reply);
+    let gpu = if n >= 9 && reply[0] == 0 { u32::from_le_bytes([reply[5], reply[6], reply[7], reply[8]]) } else { 0 };
+    (reply[0], u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]), gpu)
 }
 
 #[panic_handler]

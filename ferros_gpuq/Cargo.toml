@@ -1,0 +1,9 @@
+[package]
+name = "ferros_gpuq"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The GPU queue (docs/GPU-KISTS.md \"The queue\", 2026-11-20): a client's jobs submitted from its own thread into a ring in its own GPU block, ended by the GPU service with their GPU time and any fault, waited on by a doorbell, with no call a job. The ring's layout, its records, and the command-stream words a job runs as. no_std, no dependencies; host-tested."
+
+[lib]
+path = "src/lib.rs"

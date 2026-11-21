@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["ferros_rt", "ferros_fluor", "std/hello", "std/probe", "std/fluordemo", "std/photon"]
+exclude = ["ferros_rt", "ferros_fluor", "std/hello", "std/probe", "std/fluordemo", "std/photon", "ferros_rawcodec", "tools/raw-codec"]
 members = [
     "ferros_layout",
     "ferros_ext4",
@@ -79,6 +79,7 @@ members = [
     "payloads/pcie1",
     "ferros_sys",
     "ferros_mailbox",
+    "ferros_gpuq",
     "ferros_spi",
     "ferros_cam",
     "payloads/camera",

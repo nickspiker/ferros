@@ -1215,6 +1215,20 @@ impl<const N: usize> Kernel<N> {
         self.push(i)
     }
 
+    /// `ATOM.i32.slotS.aadd @src, [addr], offset` (ISA.xml:3605-3617, `ATOM.i32`; 2026-11-20, Lumis's tile coverage and histograms): `src` added to the 32-bit word at the address, no value back. Opcode G#068 at 56:48, opcode2 3 at 29:27, the operation at 25:22 (valhall.py `atom_opc`, start 22 size 4; `aadd` 2, ISA.xml:745-765), the staging read register at 45:40 with flags 47:46, count 1 at 35:33, the slot at 32:30, an unsigned 8-bit offset at 15:8, the address pair at 7:0.
+    /// Mesa's test vector `32 00 80 18 02 4c 68 08` (assembler-cases.txt) is `ATOM.i32.slot0.aadd.wait0 @r12, [r50:r51], offset:0x0`.
+    pub fn atom_add_i32(&mut self, src: Reg, addr: Pair, offset: u8, slot: Slot) -> Placed<'_> {
+        let mut i = Ins::new(0x068);
+        i.bits(3, 27);
+        i.bits(2, 22);
+        i.bits(src.0 as u64 | SR_READ << 6, DEST);
+        i.bits(1, 33);
+        i.bits(slot as u64, 30);
+        i.bits(offset as u64, 8);
+        i.bits(addr.0 as u64, 0);
+        self.push(i)
+    }
+
     /// `STORE.i32.slotS @src, [addr], offset` (ISA.xml:1603-1608, group 1582-1638): staging read register at 45:40 with flags 47:46, count 1 at 35:33.
     pub fn store_i32(&mut self, src: Reg, addr: Pair, offset: i16, slot: Slot) -> Placed<'_> {
         let mut i = Ins::new(0x061);

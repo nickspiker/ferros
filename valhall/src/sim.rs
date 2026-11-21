@@ -28,6 +28,13 @@ impl Memory {
         let o = self.at(va, 4);
         u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap())
     }
+    pub fn read8(&self, va: u64) -> u8 {
+        self.bytes[self.at(va, 1)]
+    }
+    pub fn read16(&self, va: u64) -> u16 {
+        let o = self.at(va, 2);
+        u16::from_le_bytes([self.bytes[o], self.bytes[o + 1]])
+    }
     pub fn write32(&mut self, va: u64, v: u32) {
         let o = self.at(va, 4);
         self.bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -321,11 +328,23 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
                     next = (pc as i64 + 1 + off) as usize;
                 }
             }
-            // LOAD.i32 (size 3 at 29:27): the staging register 45:40, the signed offset 23:8, the address pair 7:0.
+            // LOAD (size at 29:27, lane at 38:36): i32 (3, lane w0 0), and i8 and i16 zero-extended to 32 bits (0 and 1, lane w0: 6 and 2, ISA.xml:300-320); the staging register 45:40, the signed offset 23:8, the address pair 7:0.
             0x060 => {
-                assert_eq!((w >> 27) & 7, 3, "valhall::sim: a load other than i32 at {pc}");
                 let va = addr(&reg, w);
-                reg[dst] = mem.read32(va);
+                reg[dst] = match ((w >> 27) & 7, (w >> 36) & 7) {
+                    (3, 0) => mem.read32(va),
+                    (0, 6) => mem.read8(va) as u32,
+                    (1, 2) => mem.read16(va) as u32,
+                    (s, l) => panic!("valhall::sim: a load of size {s} lane {l} at {pc}"),
+                };
+            }
+            // ATOM.i32 (opcode2 3 at 29:27): `aadd` (2 at 25:22) of the staging register to the word at the pair plus the unsigned offset 15:8. One invocation at a time here, so the add is whole, as the device's atomic makes it.
+            0x068 => {
+                assert_eq!(((w >> 27) & 7, (w >> 22) & 15), (3, 2), "valhall::sim: an atomic other than ATOM.i32.aadd at {pc}");
+                let p = (w & 63) as usize;
+                let va = (reg[p] as u64 | (reg[p + 1] as u64) << 32).wrapping_add((w >> 8) & 0xFF);
+                let v = mem.read32(va).wrapping_add(reg[dst]);
+                mem.write32(va, v);
             }
             // STORE.i32.
             0x061 => {

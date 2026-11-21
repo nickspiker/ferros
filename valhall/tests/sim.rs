@@ -417,3 +417,77 @@ fn negations_keep_their_modifiers() {
         assert_eq!(f32::from_bits(at(5)), x - hl[0], "row {g}: x - h.lo_f()");
     }
 }
+
+/// Mesa's test vector for the atomic add (assembler-cases.txt: `32 00 80 18 02 4c 68 08    ATOM.i32.slot0.aadd.wait0 @r12, [r50:r51], offset:0x0`), and the narrow loads' lanes and sizes (`80 00 00 00 62 82 60 00    LOAD.i8.w0.slot0 @r2, u0`, `80 00 00 08 22 82 60 00    LOAD.i16.w0.slot0 @r2, u0`; the builder addresses a register pair and sets the unsigned bit, as Mesa's compiler always does).
+#[test]
+fn the_atomic_and_narrow_loads_encode_as_mesa() {
+    let mut k = Kernel::<4>::new();
+    k.atom_add_i32(r(12), pair(50), 0, Slot::S0).wait(Slot::S0);
+    assert_eq!(k.finish()[0], u64::from_le_bytes([0x32, 0x00, 0x80, 0x18, 0x02, 0x4c, 0x68, 0x08]));
+    let lane_size = |w: u64| ((w >> 36) & 7, (w >> 27) & 7, (w >> 48) & 0x1FF);
+    let mut k = Kernel::<4>::new();
+    k.load_i8_w0(r(2), pair(4), 0, Slot::S0);
+    k.load_i16_w0(r(2), pair(4), 0, Slot::S0);
+    let w = k.finish();
+    let (m8, m16) = (u64::from_le_bytes([0x80, 0, 0, 0, 0x62, 0x82, 0x60, 0]), u64::from_le_bytes([0x80, 0, 0, 0x08, 0x22, 0x82, 0x60, 0]));
+    assert_eq!(lane_size(w[0]), lane_size(m8));
+    assert_eq!(lane_size(w[1]), lane_size(m16));
+}
+
+/// Lumis's back-end needs (2026-11-20): 8- and 16-bit loads, integer multiply-add, shifts (by constants and by values), an atomic add, paired f16; each recorded, compiled and run in the emulator against the same steps on the CPU, over invocations whose loads cross word and half-word boundaries.
+#[test]
+fn lumis_ops_against_the_cpu() {
+    use valhall::ssa::{self, F, H, U};
+    let _turn = RECORDING.lock().unwrap();
+    const N: u32 = 1 << 7;
+    // Uniform slots: 0 the output (four words an invocation), 1 the bytes read (an atlas), 2 the histogram (sixteen counters, then a sum).
+    const IN: u64 = OUT + 0x10_0000;
+    const HIST: u64 = OUT + 0x20_0000;
+    ssa::begin();
+    ssa::reserve(3);
+    let g = ssa::gid();
+    let b = ssa::load8(1, g, 0, 3);
+    let h = ssa::load16(1, g, 1, 1);
+    let w = ssa::load(1, g, 2, 0);
+    let m = g.mul_add(U::splat(2_654_435_761), w);
+    let s = (m >> 7) ^ (b << 9) ^ h.shl_by(g & U::splat(7)) ^ w.shr_by(U::splat(3));
+    // A pair of halves from the byte and the half-word, multiplied and added as v2f16, read back as its two f16 lanes' bits.
+    let p = H::pack(F::from_u32(b), F::from_u32(h & U::splat(1023)));
+    let q = p.mul_add(H::splat2(0.5, 0.25), H::splat2(1., 2.));
+    ssa::store(0, 4, 0, m);
+    ssa::store(0, 4, 4, s);
+    ssa::store(0, 4, 8, q.to_bits());
+    ssa::store(0, 4, 12, b | h << 8);
+    ssa::atomic_add(2, b & U::splat(15), 2, 0, U::splat(1));
+    ssa::atomic_add(2, U::splat(0), 0, 64, h);
+    let comp = ssa::compile();
+    let mut uniforms = vec![OUT, IN, HIST];
+    uniforms.extend_from_slice(&comp.consts);
+    // The input bytes: every invocation's three loads, the byte at g + 3, the half-word at 2g + 1 (odd: across a word's halves), the word at 4g.
+    let bytes: Vec<u8> = (0..4 * N as usize + 8).map(|i| (i as u32).wrapping_mul(0x9E37_79B9).rotate_left(13) as u8).collect();
+    let mut mem = Memory { base: OUT, bytes: vec![0; (HIST - OUT) as usize + 128] };
+    mem.bytes[(IN - OUT) as usize..(IN - OUT) as usize + bytes.len()].copy_from_slice(&bytes);
+    for g in 0..N {
+        run(&comp.words, &uniforms, [g, 0], &mut mem);
+    }
+    let (mut hist, mut sum) = ([0u32; 16], 0u32);
+    let rd = |o: usize, n: usize| bytes[o..o + n].iter().rev().fold(0u32, |a, &x| a << 8 | x as u32);
+    for g in 0..N {
+        let (b, h, w) = (rd(g as usize + 3, 1), rd(2 * g as usize + 1, 2), rd(4 * g as usize, 4));
+        let m = g.wrapping_mul(2_654_435_761).wrapping_add(w);
+        let s = (m >> 7) ^ (b << 9) ^ (h << (g & 7)) ^ (w >> 3);
+        let at = OUT + 16 * g as u64;
+        assert_eq!(mem.read32(at), m, "multiply-add at {g}");
+        assert_eq!(mem.read32(at + 4), s, "shifts at {g}");
+        assert_eq!(mem.read32(at + 12), b | h << 8, "the narrow loads at {g}");
+        let q = mem.read32(at + 8);
+        let lanes = [f16_to_f32(q as u16), f16_to_f32((q >> 16) as u16)];
+        assert_eq!(lanes, [h16(b as f64 * 0.5 + 1.), h16((h & 1023) as f64 * 0.25 + 2.)], "the f16 pair at {g}");
+        hist[(b & 15) as usize] += 1;
+        sum = sum.wrapping_add(h);
+    }
+    for (j, &c) in hist.iter().enumerate() {
+        assert_eq!(mem.read32(HIST + 4 * j as u64), c, "histogram bin {j}");
+    }
+    assert_eq!(mem.read32(HIST + 64), sum, "the sum's atomic");
+}
