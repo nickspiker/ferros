@@ -1,6 +1,6 @@
 # GPU kists: one compute path for the system and for kists
 
-Status: study, design and plan, 2026-11-11; plan step 0 built the same day (below), measured on the host, not yet on the device; plan step 1's isolation built 2026-11-12 and run on the 8a the same day (below), not yet on the Pro; plan step 4's fifth pass (the kernel compiled once, f16, branches) run on the 8a the same day.
+Status: study, design and plan, 2026-11-11; plan step 0 built the same day (below), measured on the host, not yet on the device; plan step 1's isolation built 2026-11-12 and run on the 8a the same day (below), not yet on the Pro; plan step 4's fifth pass (the kernel compiled once, f16, branches) run on the 8a the same day; Lumis's asks (section 3: the queue, the clock by events, per-job GPU time, faults to the kist, the camera ring read-only on the GPU, the display's frames, layers, the back end's ops) built 2026-11-20 on branch gpu-kists-lumis, host-tested, not yet run on a device.
 Everything not quoted from the owner is a proposal.
 GPU.md is the driver as built; this is what it grows into.
 
@@ -167,6 +167,8 @@ The MMU, not the compiler, keeps a kernel inside its memory, so the compiler is 
 
 No op polls; op 1 replaces today's.
 
+As built since 2026-11-20 ("The queue" below), the ops are: 1 run (as before, now answering the GPU's own µs too), 2 load a kernel for a queue, 3 open a queue, 4 close it, 5 look at the caller's memory again. Memory is the kernel's (a GPU block asked of the kernel, SYS_DMA x1 = 2; surfaces asked of it, SYS_DMA x1 = 10), never the service's, and a job is submitted without a call at all: the proposal's ops 0, 2 and 3 are the kernel's, and its op 4 is the queue.
+
 ## 2. Plan
 
 Each step is measured on the Pro before the next; sizes are estimates.
@@ -321,7 +323,133 @@ Each step is measured on the Pro before the next; sizes are estimates.
 6. **The kist side:** kernels in the capsule, `gpuc` at stow, sealed objects, the ops for kists; production gives kists the GPU once their kernels are checked (no `gpu` in RIGHTS, no settings rows: 1.6).
    - Proof: a test kist stowed, asked once, running; denied, an empty slot; revoked, respawned without it; Mahere launched as a kist with the right.
 
-## 3. Open questions for the owner
+## 3. Lumis on the GPU (2026-11-20)
+
+The Lumis session's asks, sent at the owner's ask. The owner frames the GPU as "NEON on steroids": compute only, one job kind, a gather over a grid. Lumis's pipe: (a) a camera layer, a kernel gathering each screen pixel's sensor cell straight from the camera ring, the colour matrix applied and encoded (fit, 1:1, PHASE, Slitscan); (b) a UI layer, one kernel over a small shape list and an 8-bit glyph atlas; (c) the display composing them with `under` on NEON.
+
+Its asks in its order, and where each stands:
+
+| | Ask | Built |
+|---|---|---|
+| 1 | the camera ring read-only in the holder's GPU space, no copy | yes ("The camera ring on the GPU"); the owner: "I think it should always be allowed, unless it's a security issue" |
+| 2 | layers as mailboxes, two or more a kist, each with its tile coverage | layers and their mailboxes yes, from windows the display already stacks ("Layers"); the coverage's form yes, the display reading it no |
+| 3 | a submit ring written from the kist's own thread, a completion word and doorbell, no call a job | yes ("The queue") |
+| 4 | a display frame event | yes ("The display's frames") |
+| 5 | the GPU's power and clock up by events, never timers | yes ("Power and clock by events") |
+| 6 | Rust-recorded kernels now, with integer multiply-add, shifts, 8- and 16-bit loads, atomicAdd, paired f16 | yes ("The back end") |
+| 7 | per-job GPU time with the completion | yes (the GPU's own stamps) |
+| 8 | faults to the kist with address and kind; a bad kernel ends its kist's work only | yes |
+
+Everything below is built and host-tested; nothing of it has run on a device yet ("To run on a device").
+
+### The queue (asks 3, 7, 8)
+
+**The ring is the client's own memory.** A queue lies in the client's GPU block at an offset it picks (ferros_gpuq):
+- a header page: `SUBMIT` (the jobs submitted, the client's alone), `DONE` (the jobs ended, the service's alone), `ENDED` (why the queue ended, 0 while it runs);
+- 2^depth records of 1 KiB (depth at most 2^4), job n in record n mod 2^depth: its kernel handle and uniform count, its grid, its uniforms (read by the GPU from the record itself: no copy), and a result line (its status, the GPU's own stamps of its start and end, when the service rang its doorbell and saw it end, a fault's address and status).
+
+**A job, with no call.** The client fills a record, stores `SUBMIT` = n + 1 and wakes that word (SYS_WAKE on a word of its own block, new: below). The service's thread for that client's slot, asleep on the same word, writes the job's command-stream words into the client's own stream (ferros_gpuq `job_words`: the run's words exactly as since 2026-11-04, plus STORE_STATE timestamps before the run and after its wait) and rings the client's doorbell. At the GPU's job interrupt the service's events thread lands every job that ended in order (the stream sets the slot's sequence word as its last act), writes its result, stores `DONE` and wakes that word, where the client sleeps. A call is made only to open a queue, load a kernel, close a queue or look at the client's memory again.
+
+**One path.** Calls (op 1) and queue jobs go into the same stream of the same group in the same address space, end with the same sequence word and are landed by the same thread; the old one-job-at-a-time loop is gone (payloads/gpu serve.rs). Clients' groups now run at once on the GPU, the firmware choosing by priority (a system client's 15, a kist's 8).
+
+**Per-job GPU time (7).** STORE_STATE with the timestamp state (genxml v11 "CS STORE_STATE", opcode 40) at r76:r77 + 8 before RUN_COMPUTE and + 16 after its WAIT, synchronous (wait mask 0). The GPU's timestamp (GPU_TIMESTAMP, G#98, panthor_gpu_regs.h) is the system counter; the service reads its lead on the CPU's counter once at its start and writes the stamps back in the CPU's counter ticks, so `Ended::gpu_ticks` is the GPU's own time and `started - submitted` the doorbell to the GPU's start. The stamps are used only when the stream has the registers (CS_FEATURES' work registers, read at the start) and the timestamp reads nonzero; the service says which on the console. Calls answer the GPU's own µs after the service's.
+
+**Faults (8).** A page fault in the client's own space (the MMU's line, as since 2026-11-12), a command-stream fault, or the job's guard passed (2^8 ms a kist's, 2^10 ms a system client's, counted from when the job became the oldest of its slot: the events thread's one deadline) ends that client's group and its queue: the failing job's status says which (`S_OUTSIDE` with the GPU address and AS_FAULTSTATUS, or `S_FAILED`), every later job `S_LOST`, `ENDED` = `E_FAULT`, and the client opens the queue again to go on (`Queue::reopen`). No other client's work is touched: its own group, its own space.
+
+**A client that ends with jobs on the GPU.** No call is held for a queue's jobs, so the kernel's drain (a call the service has taken: `gpu_job_in_flight`) cannot see them. The service holds the client's epoch instead from the queue's open (SYS_DMA x1 = 7 on `arena`, with the queue's `SUBMIT` word): a held epoch's blocks and surfaces stay drained past its end whatever requests the service takes, until the service lets it go. At the client's end the kernel sets bit 63 (`GONE`) of that word and wakes it, so the slot's thread finds its client gone even when the end falls between its look and its wait, asks whether the epoch lives (x1 = 8), ends its group and lets it go, and only then does the kernel return the memory. At the service's own end the kernel marks every held queue's `DONE` the same way, so no client waits for ever (`ended()` says `E_SERVICE`), and what the holds kept stays drained until the next service's first request (after its GPU's reset), as a call's always did.
+
+**The kernel's words between processes.** SYS_WAIT and SYS_WAKE take a word of a GPU block when the caller holds the block or the whole blocks' window (the GPU service): waiters are kept under the word's window address, the same in every holder's view, as a mailbox's are (process.rs `gpub_word`).
+
+### Power and clock by events (ask 5)
+
+The owner's decision of 2026-11-11, "the GPU powers up when work is queued and gates when its queue empties, as events, never a timer", built:
+- a power switch, `gpu-clock` (the GPU service's grant 9; process.rs `POWERS`, service.rs `gpu_clock`): on, the GPU at its top (G3D 890, G3DL2 900 MHz) while the screen is lit; off, its floor (150 / 160 MHz). Quiet (no console line a turn); `diag clock` counts the turns and the longest.
+- the service turns it on when its first job is put in flight and off when its last lands (serve.rs `fly`, `land`, `WANT`), from a thread that lives on the kernel's core (every switch runs there), one syscall a turn. It puts the GPU at its floor when it starts.
+- the kernel's old rule (the top while a `gpu` process lives) holds until the switch's first use, for a service from before.
+- The shader cores' own power is the firmware's: it powers them down 800 µs after they idle (global init), as before.
+
+What it costs is to measure: a turn is two ACPM requests and their answers on the kernel's core, and a kist working once a frame turns it up and down every frame. If that costs, the down turn can wait for a display frame with nothing queued (the frame mailbox below): the owner's call, with the numbers.
+
+### The camera ring on the GPU (ask 1)
+
+The owner (via the coordinator, 2026-11-20): "I think it should always be allowed, unless it's a security issue", with the conditions that make it the same as the CPU view the holder already has. Each built:
+- **The holder alone.** The kernel puts the camera view in the GPU stamp of its holder's calls only (process.rs `gpu_cam_stamp`: the view's region in its window and its frames), never another's.
+- **Read-only, twice.** The GPU's S2MPU admits the view's frames with the read nibble alone (s2mpu `gpu_admit_ro`, G#4 a page), from the holder's first GPU call carrying the view; the service maps them read-only (a 2 MiB block with AP's read-only bit) at `CAMERA_VA` (G#1_0000_0000), the view's first frame there and the rest after it as the CPU sees them. A store there faults in the client's own space (`S_OUTSIDE`).
+- **Non-cacheable on the GPU.** The front end writes the ring without snooping, and a line the GPU's L2 kept from an earlier lap would be that lap's (each job ends with an L2 clean, not an invalidate). Whether a cacheable mapping with an invalidate per job is faster is to measure.
+- **Gone before the frames serve anyone else.** A view taken back (the camera's CLOSE, its holder's end, a view given anew) whose holder's GPU calls carried it makes that epoch stale and rings the service's bell (SYS_BELL source 15, `BELL_GPU_CAMERA`, the `arena` holder's alone). The service then, under its lock: ends that client's group if a job of it is in flight (stopped before the unmap; its queue ends `E_CAMERA`), makes its tables again without the camera and installs them with LOCK and FLUSH_PT (the GPU's TLB and walk caches dropped), and says so (SYS_DMA x1 = 9). Only then does the kernel shut the frames out of the fence. Meanwhile no stamp carries a camera view, a view given anew shuts the old frames out of the fence before its own frames land in them, and a camera run given back waits out of the pool. Until the service's word the old frames stay admitted, so a job still reading one is stopped by the service, never by a fence closed under it (a bus fault the GPU may not ride out); the one exception is a new OPEN before that word, which shuts them at once.
+- **After the camera's OPEN**, the client calls `Queue::refresh` (op 5) and its space maps the view; its jobs then read a buffer at `CAMERA_VA` plus the buffer's place in the view (the MAP header's +48). Wait for the queue's jobs that read the camera before a CLOSE: one in flight is stopped when the view goes.
+- The service's slots now make a client's tables again in place when its memory changes (two pools of table pages a slot, the running group moved to the new tables at once): a block grown, a surface or a camera view given or taken no longer binds a second slot to the same client.
+
+Not done: ferros_clip still copies each frame into its block (1.7 ms) for the band coder; with the ring mapped it can read the frame in place (its kernel's frame address a uniform: the change is ferros_clip's).
+
+### The display's frames (ask 4)
+
+A mailbox (KERNEL.md "Mailboxes"): `frame` (ferros_mailbox `FRAME`, layout `frame`: the frame starts and the pictures armed since boot, the header's time the start's counter). The kernel is its one writer: at every display frame start it takes for the display (DECON0's frame-start interrupt, process.rs `irq_pending_take`) it publishes and wakes every reader (`frame_mailbox_flush`). Anyone opens it with no proof (`mailbox::Reader::open(mailbox::FRAME, 0, &mut token)`): when a picture starts on the glass is what everyone sees.
+
+On the Pro a frame starts only when the display arms a picture (the panel holds its image between), so at rest nothing is published; on the 8a the controller sends one on every TE, 120 a second at rest. A kist with nothing new does not need a frame; one with something new (a camera frame) shows it and the display's frame follows.
+
+### Layers (ask 2)
+
+The display already composes every window as a layer, front to back, chains cut at the first opaque window (WINDOWS.md "The layer stack"), and takes a window's pixels from another surface of its owner's with each show (op 22's 36-byte form: a mailbox). So a kist's layers are its windows:
+- **Surfaces asked for at run time** (SYS_DMA x1 = 10 on a surface it holds, `ferros_sys::surface_ask`): up to four a process, each its own capability, admitted to the GPU's fence and mapped in its GPU space as every surface is. Two layers of two buffers each.
+- **A layer's mailbox show**: `window::show_buffer(display, window, buffer, ...)`, answered once the display has taken it, so the buffer shown before is the kist's to draw into again.
+- **The stack's order**: a window keeps its place across shows that leave its place, level, format and mode as they were, so a kist shows its camera layer first (behind) and its UI layer second (in front) once, then swaps buffers in each.
+- **Partial α** (the UI's antialiased edges over the camera) is fluor's 16-bit α + darkness (format 1), which the display folds with `under`; working values are opaque or see-through.
+- **Tile coverage** (COMPOSITOR.md rule 2): the form is ferros_gpuq `coverage`, a byte a 64-pixel tile (empty, partial, opaque, and a changed bit) past the pixels in the layer's surface, made by a kernel counting each tile's pixels with an atomic add. The display does not read it yet (it composes a window by its rectangle and the show's changed rectangle): the display's change, its own session's.
+
+### The back end (ask 6)
+
+valhall's recorder (valhall::ssa), each new form checked in the emulator against the CPU (tests/sim.rs `lumis_ops_against_the_cpu`) and its encoding against Mesa's vectors (`the_atomic_and_narrow_loads_encode_as_mesa`):
+- `ssa::load8`, `ssa::load16`: LOAD.i8 and LOAD.i16 with the w0 lane, zero-extended to 32 bits;
+- `ssa::atomic_add(slot, index, shift, offset u8, value)`: ATOM.i32.aadd, no value back (opcode G#068, the operation at 25:22; Mesa's `32 00 80 18 02 4c 68 08`);
+- `U::mul_add`: IMUL.i32 then IADD.u32 (Valhall has no fused integer form);
+- shifts by constants and by values, and paired f16 (`H`), as since 2026-11-12.
+
+On the device: gputest input 15 runs the same kernel over 2^11 invocations (a histogram of atomics from every warp at once) and compares every word with the CPU.
+
+Kernels stay Rust recorded, compiled where the kist chooses (ferros_clip compiles on the host and ships words: the owner's 2026-11-19 decision for the RAW codec); the device runs no Mesa.
+
+### The API Lumis uses
+
+```rust
+use ferros_sys::gpu::{queue::*, ARENA_VA, CAMERA_VA, PRELOAD_X, PRELOAD_Y, kist_slots};
+let (service, block, spare) = kist_slots(wants);                      // the kist's grants
+ferros_sys::gpu_block_ask(cap(g, block), 27);                         // grow the block first: a block grown later is another client
+let mut q = Queue::open(cap(g, service), cap(g, block), QUEUE_AT, 2)?; // the ring at QUEUE_AT in the block, 4 deep
+// the kernels' words written into the block (valhall::ssa::compile()'s `words`), then:
+let cam_k = q.kernel(CAM_CODE_AT, cam_words, PRELOAD_X | PRELOAD_Y).unwrap();
+let ui_k = q.kernel(UI_CODE_AT, ui_words, PRELOAD_X | PRELOAD_Y).unwrap();
+// after the camera's OPEN:
+q.refresh();                                                          // the ring mapped read-only at CAMERA_VA
+// the layers: two windows, each a mailbox of two surfaces
+let mut t = [0u8; 32];
+let cam_b = ferros_sys::surface_ask(cap(g, spare), &mut t).unwrap(); // and two more for the UI layer
+// a frame: wait on the frame mailbox (or a camera frame), then
+let n = q.submit(&Job { kernel: cam_k, groups: (w / 16, h), uniforms: &[CAMERA_VA + place, layer_va, ...] }).unwrap();
+let e = q.wait(n);                                                    // e.status, e.gpu_ticks(), e.fault_address, e.fault_status
+window::show_buffer(display, cam_window, cam_buffer, 0, 0, w, h, window::APP, 1, changed, 0);
+```
+
+A surface's GPU address is `SURFACES_VA` plus its address less `SURFACES_PA` (as Mahere reckons it); a kernel's uniforms are its buffers' GPU addresses and its own constants (`Compiled::consts`).
+
+### Measured on the host
+
+- ferros_gpuq (tests/ring.rs): the job's words without stamps are the old run's word for word over five grids; the stamps decode as genxml's STORE_STATE (offset 8 and 16, timestamp state, r76, synchronous) around the run's WAIT; the protocol thru a ring of depth 2^2 between two host threads, 2^16 jobs in order, none lost, 254 ns a job (spinning, no syscalls: the protocol's own cost, for scale); the `GONE` marks; the coverage's classes and its room on both boards.
+- valhall: all 10 emulator tests and 11 builder tests pass, the two new ones among them; ferros_clip's band coder kernel unchanged (tests/gpu.rs against `encode_band` on a Pro frame).
+- The kernel, the service, gputest and ferros_sys build for the device.
+
+What the host cannot measure is the asked-for number, submit to done on the GPU: that is the device's (below).
+
+### To run on a device
+
+Each needs this branch's kernel (RAM-reloaded) and its GPU service stored (`ferros-bridge capsule gpu.bin gpu.capsule.vsf`, `store put gpu @gpu.capsule.vsf`; the kernel starts it at home). Build from target/agent-gpukists/build.sh (`kernel`, `ferros-payload-gpu`, `ferros-payload-gputest`).
+1. `spawn gputest.bin 0E --name gputest --use gpu --dma layers-32`: the empty kernel thru the queue one at a time (submit to wake, doorbell to seen, the GPU's own time, doorbell to the GPU's start; 2^8 each), four in flight, thru calls; the band coder over a full binned frame thru the queue and thru calls (submit to wake, the GPU's time); the Mandelbrot thru the queue, every pixel against the CPU; a job storing outside its block (its address and status, the job behind it lost, the queue opened again and running). Then `diag clock` for the clock's turns.
+2. `spawn gputest.bin 0F ...`: Lumis's ops on the device against the CPU.
+3. `spawn gputest.bin 10 ...` with the display presenting: a job a frame, the frames' spacing, the wake's lateness, frame start to the job's end.
+4. A client killed with its queue open (`diag "kill gputest"` mid-run of 1): the service's line "ended with its queue open", the block back in the pool (`diag arcs`).
+5. The camera (needs a camera holder that calls the GPU: Lumis with the queue, or a camtest mode): its view mapped (op 5 answers 1), a kernel reading it, a store into it faulting, CLOSE with a job in flight (its queue ends `E_CAMERA`), the service's settle line, the frames shut out after it, a second OPEN by another holder reading nothing of the first's.
+
+## 4. Open questions for the owner
 
 0. **The kernel's form in a capsule:** WGSL text means a parser for untrusted text on the device (the rule against string parsers); proposal: WGSL parsed on the developer's side, the capsule carrying a typed form (naga's IR as VSF, or SPIR-V), validated on the device.
 1. **One source language?** System kernels stay Rust recorded (one source for NEON and GPU), or move to WGSL so every kernel takes the kist path.
@@ -332,3 +460,7 @@ Each step is measured on the Pro before the next; sizes are estimates.
 6. **Bounded loops** required, or any loop with the progress timer alone?
 7. **The clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and idle gating.
 8. **naga** as a dependency, or our own WGSL front end?
+9. **The clock's down turn** (section 3, "Power and clock by events"): at the queue's emptying, as built, or at a display frame with nothing queued since the last, if a turn a frame costs more than it saves. To decide with the device's turn counts and the longest turn.
+10. **The display reading a layer's tile coverage** (section 3, "Layers"): the form is set (a byte a 64-pixel tile past the pixels); skipping a layer's empty tiles and stopping at its opaque ones is the display's change, not built here.
+11. **The camera on the GPU cacheable** (section 3): mapped non-cacheable today for correctness (the front end does not snoop; the GPU's L2 is cleaned, not invalidated, at each job's end); cacheable with an L2 invalidate per job may read faster: to measure.
+12. **A bad kernel ends its kist's GPU work, not its kist** (Lumis's ask 8): as built a fault ends the kist's group and its queue and says where; the kist goes on and opens the queue again. Ending the kist's process itself on a GPU fault is a policy the owner may want instead.

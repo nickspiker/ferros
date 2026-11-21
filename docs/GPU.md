@@ -322,3 +322,13 @@ Mahere's map draws on the GPU (GPU-KISTS.md plan step 4, its first cut), and the
 
 Measured on the Pro: Mahere's kernel 6.6 to 7.7 ms a whole-screen frame at 890 MHz; the display's show of it about 20 ms; about 49 frames a second on the glass at a town's scale (GPU-KISTS.md step 4 has the parts and what 120 Hz still needs).
 
+
+## Calls and queues (2026-11-20, GPU-KISTS.md section 3)
+
+Built on branch gpu-kists-lumis, host-tested, not yet run on a device:
+- **The service in threads** (payloads/gpu serve.rs): the main thread takes calls; an events thread waits on the job line and lands every slot's jobs in order (each job's stream sets the slot's sequence word last); a thread a slot takes its client's queue's new jobs from a ring in the client's own block, with no call a job; a clock thread turns the `gpu-clock` switch on the kernel's core; a camera thread settles a camera view taken back. Clients' groups run at once.
+- **Ops:** 1 run (as before; the reply adds the GPU's own µs), 2 load a kernel for a queue, 3 open a queue, 4 close it, 5 look at the caller's memory again (its camera view mapped after an OPEN).
+- **Grants now:** 1 `gpu-regs`, 2 `gpu-mem`, 3 `gpu.`, 4 `gpu-job`, 5 `arena`, 6 serve `gpu`, 7 `surfaces`, 8 `gpu-mmu`, 9 the `gpu-clock` switch.
+- **Per slot in gpu-mem:** a 4-page stream, a descriptor page (a call's descriptor and uniforms, a shared thread storage descriptor, a loaded kernel's program descriptor 32 bytes each from G#400), a sequence page, 64 code pages (32 a call's, 32 the loaded kernels'), two pools of 160 table pages.
+- **Each job's stream:** ferros_gpuq `job_words`, the words of 2026-11-04 plus STORE_STATE timestamps around the run.
+- **The kernel:** SYS_WAIT and SYS_WAKE on a GPU block's words between its owner and the service; SYS_DMA x1 = 7, 8, 9 on `arena` (hold an epoch's GPU work with its queue word, whether an epoch lives, the camera view settled); the GPU's S2MPU reads the camera view's frames read-only for its holder (`gpu_admit_ro`).

@@ -504,6 +504,8 @@ extern "C" fn events(_: u64) -> ! {
 extern "C" fn clock(token: u64) -> ! {
     ferros_sys::pin(ferros_sys::CORES_BIG);
     ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
+    // The service ready with nothing queued: the floor, whatever the kernel's rule from before the switch left (the top while this process lives).
+    ferros_sys::svc(ferros_sys::nr::POWER, token, 0, 0, 0, 0);
     let mut applied = 0;
     loop {
         let w = WANT.load(Ordering::Acquire);
