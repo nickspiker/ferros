@@ -1245,6 +1245,12 @@ fn focus_set(bus: &Bus, c: &Cam, pos: u64) -> Result<(), u32> {
     bus.write(c.actuator, &[0x00, (pos >> 8) as u8])?;
     bus.write(c.actuator, &[0x01, pos as u8])
 }
+/// The lens's position as its actuator reads it back (G#84, two bytes, high first; docs/oracle/CAMERA.md "Focus"): where the last target landed, read at the next focus SET so the lens has had its frames to settle (docs/CAMERA.md "Focus calibration and the rear mosaics", the travel check).
+fn focus_pos(bus: &Bus, c: &Cam) -> Result<u16, u32> {
+    let mut r = [0u8; 2];
+    bus.write_read(c.actuator, &[0x84], &mut r)?;
+    Ok(u16::from_be_bytes(r))
+}
 
 /// The sensor's exposure as planned (ferros_cam ccs `Timing::plan`), inside its grouped-parameter hold, so the line, the frame and the integration land together at one frame's start (the main's G#0104 is one byte: the hold is 01 04 01 01, its release 01 04 00 01, Linux's per-frame block, camera-main-open-transfers.txt 771-778; the ultrawide's 8-bit registers take 01 04 01 and 01 04 00, the end of its captured init).
 /// The integration (CCS coarse_integration_time, G#0202) always; the vendor's shift words when the camera has them, as Android writes them in every hold; the line length (G#0342) and frame length (G#0340) only when they move, so an exposure inside the mode's frame writes what it wrote before 2026-11-17.
@@ -3263,7 +3269,14 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         o.force = value as u8;
                         0
                     }
-                    2 if c.focus.1 != 0 && (c.focus.0..=c.focus.1).contains(&value) && focus_set(&bus, c, value).is_ok() => {
+                    2 if c.focus.1 != 0 && (c.focus.0..=c.focus.1).contains(&value) && {
+                        // The last target's landing, said beside it (the travel check reads it off the console: within G#64 of the target where the lens reaches it).
+                        match focus_pos(&bus, c) {
+                            Ok(p) => say!(g, "camera: focus: the lens at G#{p:04X} for the target G#{:04X}; next G#{value:04X}\n", o.focus),
+                            Err(e) => say!(g, "camera: focus: no position read (G#{e:X}); next G#{value:04X}\n"),
+                        }
+                        focus_set(&bus, c, value).is_ok()
+                    } => {
                         o.focus = value;
                         NOW_FOCUS.store(value, Ordering::Relaxed);
                         0
