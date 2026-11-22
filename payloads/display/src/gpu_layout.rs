@@ -16,6 +16,14 @@ pub const BLUE_AT: usize = 128 << 10;
 pub const FRONT_AT: usize = 1 << 20;
 /// The check's output (op 86's `4`): one phase's words, a u32 a pixel.
 pub const CHECK_AT: usize = 33 << 20;
+/// The layered kernel's words (gpu_layers.rs, step 4).
+pub const L_AT: usize = 256 << 10;
+/// The bake's tables for the layered kernel's noise (bake.rs `Bake::tables`): 2^16 f16, then 2^12 + 2 f32.
+pub const LIGHT_AT: usize = 49 << 20;
+pub const CODE_AT: usize = (49 << 20) + (128 << 10);
+/// The layered kernel's workgroup storage, 2^`SHARED_ROOM_LOG2` bytes set aside (as compbench's, for every core's workgroups: about 3.2 MiB on the Pro).
+pub const SHARED_AT: usize = 50 << 20;
+pub const SHARED_ROOM_LOG2: u8 = 23;
 /// The block's size, log 2: 64 MiB (GPU-COMPOSE.md knob 20).
 pub const BLOCK_LOG2: u32 = 26;
 

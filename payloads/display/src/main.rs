@@ -61,6 +61,8 @@ mod puck;
 /// The compose on the GPU (docs/GPU-COMPOSE.md step 2, behind op 86).
 mod gpu;
 mod gpu_layout;
+/// The layered show (docs/GPU-COMPOSE.md 3.1, step 4).
+mod layered;
 use odt::{panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -3312,6 +3314,8 @@ fn manages(h: u64, k: usize) -> bool {
 fn not_theirs(m: &[u8], h: u64) -> Option<usize> {
     let at = |i: usize| surface_of(u64::from_le_bytes(m[i..i + 8].try_into().unwrap())).filter(|&k| !holds(h, k));
     match m.first() {
+        // The layered form's pixel layers (layered.rs): each source the caller's too.
+        Some(22) if m.len() > layered::TAIL => at(9).or_else(|| at(28)).or_else(|| layered::sources(m).find_map(|b| surface_of(b).filter(|&k| !holds(h, k)))),
         Some(22) if m.len() >= 36 => at(9).or_else(|| at(28)),
         Some(22) if m.len() >= 18 => at(9),
         Some(23) if m.len() >= 9 => at(1),
@@ -3389,8 +3393,8 @@ fn window_pixels(k: usize, width: usize, height: usize) -> &'static mut [u64] {
     surface(unsafe { PIXELS[k] } as usize, width, height)
 }
 
-/// What this display reads beyond the forms every client may send, op 5's byte 14 (a client of an older display gets 14 bytes and assumes none; byte 13 is the Escapes count, op 76): bit 0, a ring in op 22's 50-byte form (`Ring`).
-const FEATURES: u8 = 1;
+/// What this display reads beyond the forms every client may send, op 5's byte 14 (a client of an older display gets 14 bytes and assumes none; byte 13 is the Escapes count, op 76): bit 0, a ring in op 22's 50-byte form (`Ring`); bit 1 (2026-11-21), the layered form after it (layered.rs, GPU-COMPOSE.md 3.1).
+const FEATURES: u8 = 1 | 2;
 
 /// A window's scrolling pane as a ring of rows (op 22's 50-byte form; DISPLAY-SCROLL.md section 2, option B, 2026-11-17): screen row y inside the rect's rows and columns is read from surface row `y0 + (y − y0 + o) mod H`, H = y1 − y0, and every other pixel where it is.
 /// A scroll then moves the origin, never the pixels (fluor's ferros host, `paint::ring`, writes its damage thru the same map).
@@ -3649,6 +3653,11 @@ fn partial_run(px: &mut [u64], blocks: u128, chain: &[u8], order: &[(u8, u8, u8)
 /// Window layer (surface `k`, its `format`) row `y`, columns `a..b`, into `out[a..b]` as baked pixels with their transparency (bits 49-62; the see-through bit, a see-through pixel's channels nothing whatever the client left under the bit): a baked surface's (`BAKED`) as they are, a working one's (format 0) and fluor's (`G2T16`) baked here, every frame (bake.rs): the work a baked surface spares the display.
 /// `a..b` is one run of `ring_cuts`: its source row is the window's ring's row for `y` (`src_row`).
 fn layer_row(k: usize, format: u8, y: usize, a: usize, b: usize, width: usize, height: usize, out: &mut [u64]) {
+    // A layered window (layered.rs): its layers and its noise composed into the row.
+    if format == layered::FORMAT {
+        layered::row(k, y, a, b, width, height, out);
+        return;
+    }
     let y = src_row(k, y, a);
     let src = &window_pixels(k, width, height)[y * width + a..y * width + b];
     let dst = &mut out[a..b];
@@ -9616,6 +9625,12 @@ fn server(grants: u64) -> ! {
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
                     let rect = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
                     let base = u64::from_le_bytes(m[9..17].try_into().unwrap());
+                    // The layered form (layered.rs, GPU-COMPOSE.md 3.1): the window kept by its layers, under its own format; a tail that does not parse is a plain show.
+                    let stack = layered::parse(m, width, height);
+                    let fmt = if stack.is_some() { layered::FORMAT } else if m.len() > 18 { m[18] } else { 0 };
+                    if stack.is_some() {
+                        layered::scratch_for(width, height);
+                    }
                     // The surface's live generation read once: read twice (once to refuse a dead surface, once to keep), a process ending between the two reads left a window kept under generation 0, which no later byte ever differed from, so it stayed in front for good. 0, its owner gone (a show queued before it ended): refused.
                     match surface_of(base).map(|sk| (sk, live_gen(sk))) {
                         // A window behind (op 60): its place and format kept for when it comes to the front, nothing published (the glass is another's), not raised by its own show.
@@ -9623,10 +9638,11 @@ fn server(grants: u64) -> ! {
                             if let Some(w) = (*(&raw mut WINS))[sk].as_mut() {
                                 w.rect = rect;
                                 w.level = m[17];
-                                w.format = if m.len() > 18 { m[18] } else { 0 };
+                                w.format = fmt;
                                 w.mode = if m.len() > 27 { m[27] } else { 0 };
                             }
                             RINGS[sk] = ring_of(m, width, height);
+                            layered::STACKS[sk] = stack;
                         },
                         // The input level while no app wants the keyboard (WINDOWS.md "The keyboard"): refused, nothing kept or published, so the keyboard never stands over the map or an app that did not ask (the system keyboard shows again when one does).
                         Some(_) if m[17] == ferros_sys::window::INPUT && keyboard::want().is_none() => out[0] = 3,
@@ -9639,8 +9655,11 @@ fn server(grants: u64) -> ! {
                             unsafe { PIXELS[sk] = pixels as u8 };
                             // The window's ring (the 50-byte form, `ring_of`), read by this show's publish and the idle fill after it; none for a shorter form.
                             // A ring's change moves rows of its rect for the reader, which the host names in `changed` (the ring's rect with its damage).
-                            unsafe { RINGS[sk] = ring_of(m, width, height) };
-                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode && w.format == if m.len() > 18 { m[18] } else { 0 }) && unsafe { APP }.is_some();
+                            unsafe {
+                                RINGS[sk] = ring_of(m, width, height);
+                                layered::STACKS[sk] = stack;
+                            }
+                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode && w.format == fmt) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             let t22 = now();
                             let t_chrome = now();
@@ -9649,7 +9668,7 @@ fn server(grants: u64) -> ! {
                                     RAISES += 1;
                                     // Its full screen kept across shows (op 43), a new owner's window starting without.
                                     let full_was = WINS[sk].is_some_and(|w| w.generation == generation && w.full);
-                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode, back: false, full: full_was });
+                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: fmt, mode, back: false, full: full_was });
                                     // The keyboard follows: another app in front takes it from the one that wanted it, an input window shows only while one does, and the keyboard's own show tells that app its place.
                                     keys_follow(width, height);
                                     layout_build(width, height);

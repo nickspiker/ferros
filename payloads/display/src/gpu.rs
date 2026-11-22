@@ -35,7 +35,11 @@ static VIEW_NAMED: AtomicU64 = AtomicU64::new(0);
 struct Ctx {
     q: Queue,
     kernel: u8,
+    /// The layered window's kernel (gpu_layers.rs, step 4), when it loaded.
+    lkernel: Option<u8>,
     block: usize,
+    /// The bake's generation whose tables lie in the block (`tables_update`).
+    tables: u32,
 }
 static mut CTX: Option<Ctx> = None;
 /// Frames composed here and their GPU µs, since the stats line last said them (`stats`).
@@ -177,7 +181,14 @@ fn setup(grants: u64) -> bool {
         l.flush();
         return false;
     };
-    unsafe { *(&raw mut CTX) = Some(Ctx { q, kernel: k, block: base }) };
+    // The layered kernel: its words after the step 2 kernel's, its workgroup's storage in the block (`SHARED_AT`).
+    unsafe { core::slice::from_raw_parts_mut((base + L_AT) as *mut u64, kernel::L_WORDS.len()).copy_from_slice(kernel::L_WORDS) };
+    let lpre = ferros_sys::gpu::PRELOAD_X | if kernel::L_REGS64 { ferros_sys::gpu::PRELOAD_REGS64 } else { 0 };
+    let lk = q.kernel_group(L_AT, kernel::L_WORDS.len(), lpre, kernel::L_WG_LOG2 as u8, kernel::L_SHARED.trailing_zeros() as u8, SHARED_AT, SHARED_ROOM_LOG2).map(|x| x.0);
+    if lk.is_none() {
+        l.s(b"display: GPU compose: the layered kernel was not loaded (layered windows stay on NEON)\n");
+    }
+    unsafe { *(&raw mut CTX) = Some(Ctx { q, kernel: k, lkernel: lk, block: base, tables: u32::MAX }) };
     l.s(b"display: GPU compose ready: block A#");
     l.dec(1 << (BLOCK_LOG2 - 20));
     l.s(b" MiB, kernel A#");
@@ -225,6 +236,15 @@ fn eligible(width: usize, height: usize) -> Option<([Wn; WINDOWS], usize)> {
 /// Rect `r` (clipped to the screen) of the phases `mask` names composed on the GPU, one job a phase, waited for; the hit map's rows with it on the CPU when `hits`. False when step 2 does not compose this frame (`eligible`, the switch, the view, a failed job): the caller publishes it on NEON as before.
 pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool) -> bool {
     if !ON.load(Ordering::Acquire) || STATE.load(Ordering::Acquire) != READY || unsafe { crate::CAPTURE } != 0 || hit::view() {
+        return false;
+    }
+    // A layered window (step 4): the layered kernel when it is the only window up, else NEON's.
+    let (ord, nw) = front_order();
+    if ord[..nw].iter().any(|&(_, w)| w.format == crate::layered::FORMAT) {
+        if nw == 1 && compose_layered(ord[0].0, r, mask, width, height, hits) {
+            return true;
+        }
+        NEON_FRAMES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let Some((wins, n)) = eligible(width, height) else {
@@ -535,7 +555,7 @@ struct Cost {
     b: f32,
 }
 /// NEON's and the GPU's costs (the render thread's alone).
-static mut COSTS: [Cost; 2] = [Cost { a: 64., b: 1. / 1024. }, Cost { a: 512., b: 1. / 2048. }];
+static mut COSTS: [Cost; 3] = [Cost { a: 64., b: 1. / 1024. }, Cost { a: 512., b: 1. / 2048. }, Cost { a: 512., b: 1. / 512. }];
 /// Frames under 2^14 pixels feed `a`, frames over 2^18 feed `b`.
 const SMALL: u32 = 14;
 const LARGE: u32 = 18;
@@ -568,8 +588,13 @@ fn cost_add(p: usize, px: u64, us: u64) {
 
 /// Whether the GPU takes a frame of `px` pixels (summed over its phases): the cheaper path by the costs, the other one frame in 2^5.
 fn gpu_cheaper(px: u64) -> bool {
+    gpu_cheaper_on(1, px)
+}
+
+/// `gpu_cheaper` against GPU path `p` (1 the windows' kernel, 2 the layered one, whose noise costs more a pixel).
+fn gpu_cheaper_on(p: usize, px: u64) -> bool {
     let c = unsafe { *(&raw const COSTS) };
-    let gpu = cost_at(c[1], px) < cost_at(c[0], px);
+    let gpu = cost_at(c[p], px) < cost_at(c[0], px);
     let n = DECISIONS.fetch_add(1, Ordering::Relaxed);
     if n & EXPLORE == EXPLORE { !gpu } else { gpu }
 }
@@ -586,5 +611,147 @@ pub fn costs() -> ([(u64, u64); 2], u64, u64) {
     let c = unsafe { *(&raw const COSTS) };
     // The cast saturates: a crossing below 0 pixels (the GPU cheaper at every size) says 0.
     let line = if c[0].b > c[1].b { ((c[1].a - c[0].a) / (c[0].b - c[1].b)) as u64 } else { u64::MAX };
-    (c.map(|c| (c.a as u64, (c.b * 1000.) as u64)), line, CROSSED.swap(0, Ordering::Relaxed))
+    ([0, 1].map(|p| (c[p].a as u64, (c[p].b * 1000.) as u64)), line, CROSSED.swap(0, Ordering::Relaxed))
+}
+
+// ---- the layered window (step 4) ----
+
+/// The bake's tables in the block when the bake has changed since they were copied (a brightness change, `rebake`): each code's light (f16) and the code table, as bake.rs holds them, for the layered kernel's noise.
+fn tables_update(c: &mut Ctx) {
+    let g = crate::bake::generation();
+    if c.tables == g {
+        return;
+    }
+    let (light, code) = crate::bake::now().tables();
+    // SAFETY: both tables lie in the block (gpu_layout.rs `LIGHT_AT`, `CODE_AT`, room for 2^16 u16 and 2^12 + 2 f32), and no job reads them while the render thread writes (each job is waited for).
+    unsafe {
+        core::slice::from_raw_parts_mut((c.block + LIGHT_AT) as *mut u16, light.len()).copy_from_slice(light);
+        core::slice::from_raw_parts_mut((c.block + CODE_AT) as *mut f32, code.len()).copy_from_slice(code);
+    }
+    c.tables = g;
+}
+
+/// fluor's `widen_mask` and `widen_base` (fluor noise.rs, private there; GPU-COMPOSE.md 3.4 asks fluor to make them public): a byte a channel as the walk's 16-bit lanes, R in bits 32-47.
+fn widen_mask(m8: u32) -> u64 {
+    let lane = |s: u32| ((((m8 >> s) & 0xFF) as u64) << 8) | 0xFF;
+    (lane(16) << 32) | (lane(8) << 16) | lane(0)
+}
+fn widen_base(b8: u32) -> u64 {
+    let lane = |s: u32| (((b8 >> s) & 0xFF) as u64) << 8;
+    (lane(16) << 32) | (lane(8) << 16) | lane(0)
+}
+
+/// Window `k` (a layered one, the only window up) over rect `r` of the phases `mask` names, on the GPU: its pixel layers, the noise under them, the front, the present (gpu_layers.rs), one job a phase, waited for. False when it does not take this frame (the kernel not loaded, the view not yet naming its layers' surfaces, the crossover, a failed job): NEON's then.
+fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool) -> bool {
+    let Some(s) = (unsafe { crate::layered::STACKS[k] }) else { return false };
+    // Every layer's surface named by the view under its generation; else asked for, and this frame on NEON.
+    let named = VIEW_NAMED.load(Ordering::Acquire);
+    let mut need = 0u64;
+    for p in &s.pix[..s.n] {
+        need |= (live_gen(p.slot) as u64) << (4 * p.slot);
+    }
+    if s.pix[..s.n].iter().any(|p| (named >> (4 * p.slot)) & 15 != (need >> (4 * p.slot)) & 15 || (need >> (4 * p.slot)) & 15 == 0) {
+        let want = live_of(named) | need;
+        if want != VIEW_WANT.load(Ordering::Acquire) {
+            VIEW_WANT.store(want, Ordering::Release);
+            ring();
+        }
+        NEON_FRAMES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let px = ((r.x1 - r.x0) * (r.y1 - r.y0)) as u64 * (mask & 15).count_ones() as u64;
+    if !gpu_cheaper_on(2, px) {
+        CROSSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let t0 = ferros_sys::now();
+    front_update(width, height);
+    let Some(c) = (unsafe { (*(&raw mut CTX)).as_mut() }) else { return false };
+    let Some(lk) = c.lkernel else { return false };
+    tables_update(c);
+    use crate::gpu_layout::lslot as ls;
+    let va = ferros_sys::gpu::ARENA_VA;
+    let pair = |a: u64, b: u64| a | b << 32;
+    let xy = |x: i32, y: i32| (x as u64) | (y as u64) << 16;
+    let cm = crate::CHANNELS.load(Ordering::Relaxed);
+    let on = |b: u32| if cm >> b & 1 == 1 { 0xFFu64 } else { 0 };
+    let mut u = [0u64; 64];
+    u[ls::FRONT as usize] = va + FRONT_AT as u64;
+    u[ls::BLUE as usize] = va + BLUE_AT as u64;
+    u[ls::RECT as usize] = pair(xy(r.x0, r.y0), xy(r.x1, r.y1));
+    // The noise's parameters, or none: its clip empty, its axis the screen's middle (the kernel's sides still follow it).
+    let nz = s.noise;
+    let axis = nz.map_or(width / 2, |n| n.axis) as i32;
+    let rows = (r.y1 - r.y0) as u64;
+    // Each side of the axis the owed rect reaches, and how far from it.
+    let (right, left) = (r.x1 > axis, r.x0 < axis);
+    let steps = (if right { (r.x1 - axis) as u64 } else { 0 }, if left { (axis - r.x0) as u64 } else { 0 });
+    let sides = right as u64 + left as u64;
+    u[ls::SIDE as usize] = pair(!right as u64, rows);
+    u[ls::STEPS as usize] = pair(steps.0, steps.1);
+    u[ls::AXIS as usize] = pair(axis as u64, nz.map_or(0, |n| n.scroll) as u64);
+    u[ls::TEX as usize] = pair(height as u64, nz.map_or(0, |n| n.frame) as u64);
+    u[ls::MASK as usize] = widen_mask(fluor::theme::BG_MASK);
+    u[ls::SPECKLE as usize] = widen_mask(fluor::theme::BG_SPECKLE);
+    u[ls::BASE as usize] = widen_base(nz.map_or(fluor::theme::BG_BASE, |n| n.base));
+    u[ls::SHIMMER as usize] = (nz.map_or(0, |n| n.shimmer) as u64) << 8;
+    u[ls::CLIP as usize] = nz.map_or(0, |n| pair(xy(n.clip.x0, n.clip.y0), xy(n.clip.x1, n.clip.y1)));
+    u[ls::LIGHT as usize] = va + LIGHT_AT as u64;
+    u[ls::CODE as usize] = va + CODE_AT as u64;
+    // The ODT over the light table's scale (2^14 at the E peak, odt.rs `F16_SCALE`).
+    let m = crate::bake::now().m;
+    let odt: [f32; 9] = core::array::from_fn(|i| m[i / 3][i % 3] * (1. / (1 << 14) as f32));
+    for i in 0..5 {
+        let w = |j: usize| if j < 9 { odt[j].to_bits() as u64 } else { 0 };
+        u[ls::ODT as usize + i] = pair(w(2 * i), w(2 * i + 1));
+    }
+    for (i, p) in s.pix[..s.n].iter().enumerate() {
+        let b = ls::LAYER as usize + 4 * i;
+        u[b] = ferros_sys::gpu::SURFACES_VA + ferros_sys::SURFACES_WINDOW + (p.slot * ferros_sys::SURFACE_BYTES) as u64 - ferros_sys::gpu::SURFACES_PA + crate::PORCH as u64;
+        u[b + 1] = pair(xy(p.rect.x0, p.rect.y0), xy(p.rect.x1, p.rect.y1));
+        u[b + 2] = pair(p.ring.x0 as u64 | (p.ring.x1 as u64) << 16, p.ring.y0 as u64 | (p.ring.y1 as u64) << 16);
+        u[b + 3] = p.ring.o as u64 | (p.opaque as u64) << 32;
+    }
+    let nu = ls::RESERVED as usize + kernel::L_CONSTS.len();
+    u[ls::RESERVED as usize..nu].copy_from_slice(kernel::L_CONSTS);
+    let mut jobs = [0u64; crate::PHASES];
+    let mut nj = 0;
+    for ph in 0..crate::PHASES {
+        if mask >> ph & 1 == 0 {
+            continue;
+        }
+        u[ls::PHASE as usize] = ferros_sys::gpu::PHASES_VA + (ph << 24) as u64;
+        u[ls::SCREEN as usize] = pair(width as u64, crate::neon::TURN[ph] as u64 | on(0) << 8 | on(1) << 16 | on(2) << 24);
+        match c.q.submit(&Job { kernel: lk, groups: ((rows * sides) as u32, 1), uniforms: &u[..nu] }) {
+            Some(j) => {
+                jobs[nj] = j;
+                nj += 1;
+            }
+            None => break,
+        }
+    }
+    let mut ok = nj == (mask & 15).count_ones() as usize;
+    for &j in &jobs[..nj] {
+        let e = c.q.wait(j);
+        ok &= e.status == S_DONE;
+        JOB_US.fetch_add(e.gpu_ticks().unwrap_or(0) * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);
+        ROUND_US.fetch_add(e.round_ticks() * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);
+    }
+    if !ok {
+        let reopened = c.q.reopen();
+        let mut l = crate::Log { grants: unsafe { GRANTS }, buf: [0; 256], n: 0 };
+        l.s(b"display: a layered GPU compose job failed; the queue opened again: ");
+        l.s(if reopened { &b"yes"[..] } else { &b"no"[..] });
+        l.s(b"\n");
+        l.flush();
+        return false;
+    }
+    JOBS.fetch_add(nj as u64, Ordering::Relaxed);
+    cost_add(2, px, ferros_sys::us_since(t0));
+    if hits {
+        for y in r.y0 as usize..r.y1 as usize {
+            hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
+        }
+    }
+    true
 }

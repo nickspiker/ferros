@@ -157,6 +157,12 @@ impl Bake {
         self.of_lights(l)
     }
 
+    /// The tables a GPU job bakes with (the display's GPU compose, gpu.rs, GPU-COMPOSE.md step 4): each 16-bit g2t code's light (f16 bits, the E peak at 2^14) and √p's code (`CODE_STEPS` + 2 f32), as this bake holds them.
+    pub fn tables(&self) -> (&[u16], &[f32]) {
+        // SAFETY: `set` filled 2^16 and `CODE_STEPS + 2` entries here for the process.
+        unsafe { (core::slice::from_raw_parts(self.light, 1 << 16), core::slice::from_raw_parts(self.code, CODE_STEPS + 2)) }
+    }
+
     /// A baked pixel's channels (R, G, B in bits 0-15, 16-31, 32-47) back to the working values they were baked from, Q14 (white 16384) as f32, unrounded: each code's panel light (`to_p`, linear between its steps), the ODT inverted back to VSF light, its root unrolled (`to_v`, linear between its steps). `unbake_with`'s math with this bake's own tables, for one pixel at a time (main.rs `partial_under`: a window's pixel behind a partly covered one). A premultiplied pixel (codes of its light over black) gives its light over black, the premultiplied working value. Approximate only where the bake lost something for good, as `unbake_with`: past the panel's gamut and in the roll-off's last stops.
     #[inline]
     pub fn unbake_px(&self, c: u64) -> [f32; 3] {
