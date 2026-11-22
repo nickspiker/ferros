@@ -2869,8 +2869,8 @@ impl Ahau {
         let mut o = [0u8; 2 + 32];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
         let mut name = [0u8; 32];
-        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4) the person's own handle again for attest at boot (5) and for the Android disclaimer (6): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 6 {
+        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4), the person's own handle again for attest at boot (5), for the Android disclaimer (6) and to remove this device (7): a departure asked of another device takes no words since 2026-11-10 (owner: Approve or Deny).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 7 {
             return (0, (name, 0));
         }
         if o[0] == 4 {
