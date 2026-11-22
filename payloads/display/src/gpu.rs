@@ -13,6 +13,7 @@ use ferros_sys::gpu::queue::{Job, Queue, S_DONE};
 const S_GPU: u64 = 27;
 const S_BLOCK: u64 = 28;
 
+#[allow(dead_code)]
 mod kernel {
     // The compose kernel's words and constants (build.rs, gpu_kernel.rs).
     include!(concat!(env!("OUT_DIR"), "/compose.rs"));

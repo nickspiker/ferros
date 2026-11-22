@@ -3,6 +3,12 @@
 mod gpu_layout;
 #[path = "src/gpu_kernel.rs"]
 mod gpu_kernel;
+#[path = "src/gpu_layers.rs"]
+mod gpu_layers;
+/// The background noise's parallel form (the Photon session's generator, as compbench copies it; fluor's own constants stay private until the Photon session makes them public, GPU-COMPOSE.md 3.4).
+#[path = "../compbench/src/noise.rs"]
+#[allow(dead_code)]
+mod noise;
 
 fn main() {
     compose_kernel();
@@ -67,6 +73,22 @@ fn compose_kernel() {
     }
     s.push_str("];\npub static CONSTS: &[u64] = &[");
     for x in &k.consts {
+        let _ = write!(s, "{x},");
+    }
+    s.push_str("];\n");
+    // The layered window's kernel (step 4, src/gpu_layers.rs): `L_WORDS`, `L_CONSTS`, `L_REGS64`, its workgroup and storage.
+    println!("cargo:rerun-if-changed=src/gpu_layers.rs");
+    println!("cargo:rerun-if-changed=../compbench/src/noise.rs");
+    let l = gpu_layers::record();
+    assert!(l.words.len() * 8 <= gpu_layout::K_ROOM, "the layered kernel's {} words pass its room", l.words.len());
+    let _ = writeln!(s, "/// The layered kernel: {} words, peak {} registers, workgroup 2^{}, {} bytes of storage.", l.words.len(), l.peak, l.wg_log2, l.shared_bytes);
+    let _ = writeln!(s, "pub const L_REGS64: bool = {};\npub const L_WG_LOG2: u32 = {};\npub const L_SHARED: u32 = {};", l.regs64, l.wg_log2, l.shared_bytes);
+    s.push_str("pub static L_WORDS: &[u64] = &[");
+    for x in &l.words {
+        let _ = write!(s, "{x},");
+    }
+    s.push_str("];\npub static L_CONSTS: &[u64] = &[");
+    for x in &l.consts {
         let _ = write!(s, "{x},");
     }
     s.push_str("];\n");

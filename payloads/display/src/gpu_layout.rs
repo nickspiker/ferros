@@ -43,3 +43,33 @@ pub mod slot {
     pub const WIN: u8 = 6;
     pub const RESERVED: u8 = WIN + 4 * super::WINDOWS as u8;
 }
+
+/// The layered window's kernel's uniform slots (gpu_layers.rs, step 4).
+#[allow(dead_code)]
+pub mod lslot {
+    /// As the step 2 kernel's: the phase, the front layer, the thresholds, the owed rect, [the screen's width][the turn | the channels' masks << 8].
+    pub const PHASE: u8 = 0;
+    pub const FRONT: u8 = 1;
+    pub const BLUE: u8 = 2;
+    pub const RECT: u8 = 3;
+    pub const SCREEN: u8 = 4;
+    /// [first side: 0 right of the axis, 1 left][rows a side]: the grid, a workgroup a row a side.
+    pub const SIDE: u8 = 5;
+    /// [steps right][steps left]: how far each side reaches from the axis (to the owed rect's far edge on that side).
+    pub const STEPS: u8 = 6;
+    /// The noise: [its axis column][its scroll, texture rows], [the texture's height][its frame, the twinkle], the walk's mask, speckle and base (16-bit lanes, fluor's `widen_mask` and `widen_base`), [shimmer, 16-bit blue][0], [x0 | y0 << 16][x1 | y1 << 16] its clip.
+    pub const AXIS: u8 = 7;
+    pub const TEX: u8 = 8;
+    pub const MASK: u8 = 9;
+    pub const SPECKLE: u8 = 10;
+    pub const BASE: u8 = 11;
+    pub const SHIMMER: u8 = 12;
+    pub const CLIP: u8 = 13;
+    /// The bake's tables (bake.rs `Bake::light`, f16 a 16-bit code; `Bake::code`, 2^12 + 2 f32) and its ODT over the light table's scale, nine f32 in slots 16 to 20.
+    pub const LIGHT: u8 = 14;
+    pub const CODE: u8 = 15;
+    pub const ODT: u8 = 16;
+    /// Pixel layer l's four slots from `LAYER + 4 l`, as the step 2 kernel's windows: its pixel 0, its rect, its ring's rect, [origin][bit 0 opaque].
+    pub const LAYER: u8 = 21;
+    pub const RESERVED: u8 = LAYER + 4 * 4;
+}
