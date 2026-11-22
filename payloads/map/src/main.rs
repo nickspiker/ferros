@@ -2052,6 +2052,14 @@ impl Map {
     fn reload_kists(&mut self) -> bool {
         match ferros_kist::store::read_here(cap(self.grants, S_KIST_LIST)) {
             Some(k) => {
+                // Why a kist stopped (`fault`) is kept by its capsule, and an update stows a new capsule for the same kist (its developer and option): the reason moves to the new one, so an open circle goes on saying why that kist stopped.
+                // Until 2026-11-22 it stayed on the old capsule: Lumis's circle, open on why the stored 0.2.53 stopped, matched no fault once 0.2.55 was stowed under it and fell thru to the first-start question with nothing to ask ("asks for, once; change it later in settings" and start, no switch), which read as its answers lost.
+                if let Some(f) = self.fault.as_mut() {
+                    let who = self.kists.kists.iter().find(|x| x.capsule == f.0).map(|x| (x.developer, x.option));
+                    if let Some(now) = who.and_then(|(d, o)| k.kists.iter().find(|x| x.developer == d && x.option == o)) {
+                        f.0 = now.capsule;
+                    }
+                }
                 self.kists = k;
                 self.icons = read_icons(self.grants);
                 true
