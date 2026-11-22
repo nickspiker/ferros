@@ -19,11 +19,13 @@ fn the_menu_as_the_cpu_composes_it() {
     draw::set_ink(false);
     m.set_camera_list(vec![camera()]);
     // The camera's row (the one above Exit, the last), pressed: its middle, found from the bottom margin up as the menu lays its rows.
-    let row_h = (h as f32 - 2. * (h as f32 / 12.)) / 7.;
-    m.handle_touch(0, w as f32 / 2., h as f32 - h as f32 / 12. - 1.5 * row_h);
+    // lumis_core's NUM_SLOTS rows (10) between margins of a twelfth of the height.
+    let row_h = (h as f32 - 2. * (h as f32 / 12.)) / 10.;
+    let (_, pressed) = m.handle_touch(0, w as f32 / 2., h as f32 - h as f32 / 12. - 1.5 * row_h);
+    assert!(pressed, "the camera's row pressed");
     let (mut light, mut cover, mut rows, mut slots) = (vec![0u8; w * h * 3], vec![0u8; w * h], vec![0u32; h], Vec::new());
     m.ink_frame(&mut light, &mut cover, &mut rows, &mut slots);
-    assert!(slots.len() >= 4 && cover.iter().any(|&c| c == 255), "the camera's and Exit's slots, each drawn and pressed, and words");
+    assert!(slots.len() == 3 && cover.iter().any(|&c| c == 255), "the camera's and Exit's slots, the camera's pressed (lumis_core draws the pressed row only), and words");
     let mut want = vec![0u8; w * h * 3];
     draw::compose_cpu(m.background(), &light, &cover, &rows, &slots, w, &mut want);
     // The slots show: without them a good part of the frame differs.

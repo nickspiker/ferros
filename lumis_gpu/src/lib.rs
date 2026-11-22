@@ -213,3 +213,36 @@ pub fn menu_kernel() -> Compiled {
     ssa::store_at(DST, at, 3, 4, U::splat(g2t::ALPHA_OPAQUE << 16) | dark[0]);
     ssa::compile()
 }
+
+/// A frame of Lumis's own drawing (three bytes a pixel, R, G, B: lumis_core's PixelSurface, the camera screen) for `frame_kernel`.
+pub mod frame {
+    /// The window's pixel 0 in the surface (fluor's G2t16), the frame, a code's darkness (as `g2t::LUT`).
+    pub const DST: u8 = 0;
+    pub const SRC: u8 = 1;
+    pub const LUT: u8 = 2;
+    /// (width, width x height), and (the surface's stride in pixels, 0), as `menu`'s.
+    pub const SIZE: u8 = 3;
+    pub const STRIDE: u8 = 4;
+    pub const SLOT_COUNT: u8 = 5;
+}
+
+/// Lumis's frame into fluor's G2t16, opaque, an invocation a pixel (ids 0 to width x height - 1, past it the last pixel again), each channel thru the code table: the whole frame each time, as the menu's.
+pub fn frame_kernel() -> Compiled {
+    use frame::*;
+    ssa::begin();
+    ssa::reserve(SLOT_COUNT);
+    let g = ssa::gid();
+    let n = ssa::uniform(SIZE, 1);
+    // WHY the select: as `menu_kernel`'s, the invocations come in groups of 16.
+    let g = U::select(g.lt(n), g, n - U::splat(1));
+    let w_u = ssa::uniform(SIZE, 0);
+    let yu = ((F::from_u32(g) + 0.5) / F::from_u32(w_u)).floor().to_u32();
+    let xu = g - yu.wrapping_mul(w_u);
+    let p3 = g.wrapping_mul(U::splat(3));
+    let dark = |c: i16| ssa::load(LUT, ssa::load8(SRC, p3, 0, c), 2, 0);
+    let (r, gr, b) = (dark(0), dark(1), dark(2));
+    let at = yu.wrapping_mul(ssa::uniform(STRIDE, 0)) + xu;
+    ssa::store_at(DST, at, 3, 0, (gr << 16) | b);
+    ssa::store_at(DST, at, 3, 4, U::splat(g2t::ALPHA_OPAQUE << 16) | r);
+    ssa::compile()
+}

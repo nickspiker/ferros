@@ -172,10 +172,12 @@ const CLIP_BLOCKS_LEAST: u64 = 1 << 16;
 
 /// The rate RAW video asks of the camera (lumis_core: VIDEO_FPS_IDX, 0 until the UI sets it: the UI's default).
 fn video_fps(header: &[u64]) -> u32 {
-    match header[lumis_core::shared_memory::VIDEO_FPS_IDX] {
+    let f = match header[lumis_core::shared_memory::VIDEO_FPS_IDX] {
         0 => lumis_core::ui::ui::VIDEO_FPS_DEFAULT as u32,
         f => f as u32,
-    }
+    };
+    // WHY the min: a rate set on a faster camera stays in the header; on this one it is this one's fastest, as lumis_core's slider shows it (`UserInterface::fps`).
+    f.min(lumis_core::platform::video_fps_most() as u32)
 }
 
 /// A clip started on the held frame `head`, `rows` its rows in the view: the extent opened (as large as the vault gives, from `CLIP_BLOCKS_MOST` halving), generation 0 written, the coder's workers and the writer started. The clip's facts are the still's (the camera's identity and optics, the black and white levels, the 2 x 2 mosaic from the frame), its orientation the EXIF code of the sensor's mount and the hold (as a still's tag), its time the frame's.
@@ -966,9 +968,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if dev_slit {
         integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
     }
-    // RAW video on the binned main only: the recorder's pacing is that readout's (ferros_clip `Pacing`: its pixel clock and line length, its 3072 rows), and its frames are read in place from the view.
-    let video_ok = cam.id == 0 && cam.mode == 0 && (cam.width, cam.height) == (4080, 3072) && matches!(src, Source::View { .. });
+    // RAW video on any Bayer readout whose line the driver gives (ferros_clip `Line`, forge 117fadb5: each camera paced by its own clock, the GPU coding every binned Bayer readout), its frames read in place from the view; the FPS slider to its fastest whole frame (the Pro: the main 60, the ultrawide 48, the tele 51, the front 33). Quad readouts record none: the GPU codes Bayer only.
+    let line = cam.line.filter(|l| cam.cfa_period == 2 && l.fps_most() != 0 && matches!(src, Source::View { .. }));
+    let video_ok = line.is_some();
+    if let Some(l) = line {
+        lumis_core::platform::set_video_fps_most(l.fps_most() as u64);
+    }
     lumis_core::platform::set_video_offered(video_ok);
+    // A rate's pacing on this readout: every rate `video_fps` gives is one it holds.
+    let pace = |fps: u32| ferros_clip::Pacing::of_line(fps, line.expect("RAW video only where the driver gives a line (video_ok)")).expect("a rate up to the readout's fastest is paced");
     if video_ok && dev_knobs4() & DEV_VIDEO != 0 {
         integrator.header[CURRENT_MODE_IDX] = RawMode::Video as u64;
         integrator.header[lumis_core::shared_memory::VIDEO_FPS_IDX] = dev_video_fps() as u64;
@@ -1113,7 +1121,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         // Into or out of RAW video, or a new rate, on a camera streaming whole frames: the frame length SET in place (ferros_clip `Pacing::set_msg`, payloads/camera SET what 4; the owner, 2026-11-20: "from still to video, why the mode switch? it takes like 5 seconds"), the camera left running; only a refused SET (a driver from before it, a frame it cannot hold) closes and opens it again below. The frames at the new length are those SET_SETTLES or more past the last one taken (`paced_from`): no clip starts before them.
         if want != paced && !src.is_slit() {
             let msg = match want {
-                Some(fps) => ferros_clip::Pacing::of(fps).set_msg(),
+                Some(fps) => pace(fps).set_msg(),
                 None => ferros_clip::set_open_fll_msg(),
             };
             let mut r = [0u8; 4];
@@ -1150,7 +1158,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     if k > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(1 << 8));
                     }
-                    match open(&cam, false, Some((ferros_clip::Pacing::of(fps), 0))) {
+                    match open(&cam, false, Some((pace(fps), 0))) {
                         Err(Refused::Why(why)) if k + 1 < 1 << 2 => {
                             println!("lumis: camera {}: RAW video's open at {fps} a second refused ({why}); asking again", cam.name);
                             None
@@ -1227,16 +1235,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         // Behind, decided at each frame (the frame is what this thread waits on; nothing here polls or times): Lumis leaves, unless a continuous save or a calibration runs (it keeps capturing, and the UI draws nothing) or a save the person asked for is still on its way (it is finished and kept first).
         let behind = BEHIND.load(Ordering::Acquire);
-        // Sent behind: a clip ends here, sealed, before anything else decides whether Lumis stays.
-        if behind {
-            if let Some(c) = CLIP.lock().unwrap().take() {
-                end_clip(c, Some(&mut *integrator.header), "Lumis sent behind");
-            }
-        }
         let flags = integrator.header[FLAGS_IDX];
         let kept = kept(flags);
         let now = match (behind, kept, in_flight(flags)) {
             (false, _, _) => Stay::Front,
+            (true, true, _) if flags & lumis_core::shared_memory::RECORDING_BIT != 0 => Stay::Recording,
             (true, true, _) if flags & CONTINUOUS_SAVE_BIT != 0 => Stay::Continuous,
             (true, true, _) => Stay::Calibrating,
             (true, false, true) => Stay::Finishing,
@@ -1245,6 +1248,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         if now != stay {
             match now {
                 Stay::Front => println!("lumis: in front again: carrying on"),
+                Stay::Recording => println!("lumis: sent behind (or the screen off) while a RAW video clip records: staying for it, recording on, drawing nothing; the clip ends as always (STOP, its room full, a write failing), then Lumis ends if still behind"),
                 Stay::Continuous => println!("lumis: sent behind during a continuous save: staying for the save, capturing and saving, drawing nothing; Lumis ends if the save ends while behind"),
                 Stay::Calibrating => println!("lumis: sent behind during a calibration: staying for it, capturing, drawing nothing; Lumis ends if it ends while behind"),
                 Stay::Finishing => println!("lumis: sent behind with a save on its way: finishing it, then Lumis ends"),
@@ -1340,10 +1344,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) if head.count as u64 >= paced_from => {
                     let h = &integrator.header;
                     let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX], h[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX]);
+                    let pacing = pace(fps);
                     let (c, head, line, digests) = (cam.clone(), *head, rows.line, dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES);
                     let (tx, rx) = std::sync::mpsc::channel();
                     match std::thread::Builder::new().name("lumis-clip-start".into()).spawn(move || {
-                        let _ = tx.send(start_clip(&c, facts, ferros_clip::Pacing::of(fps), head, line, digests));
+                        let _ = tx.send(start_clip(&c, facts, pacing, head, line, digests));
                     }) {
                         Ok(_) => {
                             lumis_core::platform::set_video_note(Some("opening the clip's space".into()));
@@ -1630,6 +1635,8 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
 enum Stay {
     /// In front: Lumis as always.
     Front,
+    /// Behind (the screen off counts: the display sends EV_BEHIND) while a RAW video clip records: recording on, nothing drawn (capture first, the owner 2026-11-21: the screen going off never stops a recording).
+    Recording,
     /// Behind during a continuous save: capturing and saving on, nothing drawn.
     Continuous,
     /// Behind during a calibration: capturing on, nothing drawn.
@@ -1638,10 +1645,10 @@ enum Stay {
     Finishing,
 }
 
-/// Whether Lumis stays behind for as long as it runs: a continuous save or a calibration (owner, 2026-11-17: "Basically if continuous save or cal is on"), the same bits lumis_core's integrator keeps the camera alive on with the UI quiet (lumis ferros-cal-behind).
+/// Whether Lumis stays behind for as long as it runs: a continuous save or a calibration (owner, 2026-11-17: "Basically if continuous save or cal is on"), or a RAW video clip (2026-11-21: capture first), the same bits lumis_core's integrator keeps the camera alive on with the UI quiet (lumis ferros-cal-behind).
 /// A calibration whose finish was tapped holds CALIBRATING_BIT until its maps are written, so it stays thru its own save.
 fn kept(flags: u64) -> bool {
-    flags & (CONTINUOUS_SAVE_BIT | CALIBRATING_BIT) != 0
+    flags & (CONTINUOUS_SAVE_BIT | CALIBRATING_BIT | lumis_core::shared_memory::RECORDING_BIT) != 0
 }
 
 /// Whether a save the person asked for is still on its way, by the integrator's flags: a single save asked for and not yet begun (MANUAL_SAVE_BIT, which try_save starts from the image already made), or one encoding or encoded and not yet kept (CURRENTLY_SAVING, cleared by `keep_saves` once the vault has it).
@@ -1796,6 +1803,11 @@ struct Lumis {
     /// The menu changed since its last frame on the GPU (its parts written into the block again), and the surface that frame went into, for the show (`own_surface`).
     menu_fresh: bool,
     own: Option<u64>,
+    /// The app scale changed since the menu was last laid out (`follow_scale`): it is laid out again at its next frame.
+    relayout: bool,
+    /// Relayouts since the last line, and their time.
+    relaids: u64,
+    relaid_us: u64,
 }
 
 impl Lumis {
@@ -1805,7 +1817,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu: None, gpu_asked: false, menu_fresh: true, own: None }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu: None, gpu_asked: false, menu_fresh: true, own: None, relayout: false, relaids: 0, relaid_us: 0 }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -1831,10 +1843,8 @@ impl Lumis {
         let ru = ctx.viewport.ru;
         if ru != lumis_core::platform::ui_scale() {
             lumis_core::platform::set_ui_scale(ru);
-            println!("lumis: the app scale {ru}: Lumis laid out at it");
-            if let Some(menu) = self.menu.as_mut() {
-                menu.relayout();
-            }
+            // The menu laid out again once, at its next frame, at the scale then: a pinch brings several steps a frame, each a relayout before (the Pro, 2026-11-21: 703 relayouts of 10 to 26 ms for 59 frames shown).
+            self.relayout = true;
             self.changed = true;
             self.menu_dirty = true;
             ctx.window.request_redraw();
@@ -1896,30 +1906,35 @@ impl FluorApp<G2t16> for Lumis {
         }
         // The frame is the panel, set once at start (ferros windows are the whole screen); Lumis is built for that size, as Android builds its menu and UI for the surface's.
         (self.width, self.height) = (w, h);
-        self.surface = Some(PixelSurface::new(w, h));
-        self.changed = true;
-        self.menu = Some(app::menu_new(width, height, DENSITY_DPI, camera_infos(&self.cameras)));
-        self.menu_dirty = true;
-        self.menu_fresh = true;
-        // The menu on the GPU (`gpu::Gpu`): asked for with the first menu; a frame of another size later is the CPU's (the GPU's parts were laid out for the first).
+        // Lumis's frames on the GPU (`gpu::Gpu`): asked for with the first frame; a frame of another size later is the CPU's (the GPU's parts were laid out for the first).
         match self.gpu.as_mut() {
             Some(g) if g.fits(w, h) => g.new_menu(),
             Some(_) => {
-                println!("lumis: a A#{w} x A#{h} frame: the menu on the CPU from now (its GPU parts were laid out for the first frame)");
+                println!("lumis: a A#{w} x A#{h} frame: Lumis drawn on the CPU from now (its GPU parts were laid out for the first frame)");
                 self.gpu = None;
             }
             None if !self.gpu_asked => {
                 self.gpu_asked = true;
                 match gpu::Gpu::open(sys::cap(SURFACE), w, h, &self.lut) {
                     Ok(g) => {
-                        println!("lumis: the menu on the GPU, every pixel a frame (lumis_gpu menu_kernel), into two surfaces of Lumis's own");
+                        println!("lumis: the menu and the camera screen on the GPU, every pixel a frame (lumis_gpu menu_kernel and frame_kernel), into two surfaces of Lumis's own");
                         self.gpu = Some(g);
                     }
-                    Err(e) => println!("lumis: the menu on the CPU: {e}"),
+                    Err(e) => println!("lumis: Lumis drawn on the CPU: {e}"),
                 }
             }
             None => {}
         }
+        // Lumis's own frame where the GPU reads it (in the block) when it has one, else on the heap.
+        self.surface = Some(match self.gpu.as_ref() {
+            // SAFETY: the frame's w h 3 bytes in Lumis's part of the GPU block, which is the process's for its life; only this thread draws them, and the GPU reads them only during `Gpu::camera`, on this thread.
+            Some(g) => unsafe { PixelSurface::at(g.frame_bits(), w, h) },
+            None => PixelSurface::new(w, h),
+        });
+        self.changed = true;
+        self.menu = Some(app::menu_new(width, height, DENSITY_DPI, camera_infos(&self.cameras)));
+        self.menu_dirty = true;
+        self.menu_fresh = true;
         ctx.window.request_redraw();
     }
 
@@ -2025,6 +2040,18 @@ impl FluorApp<G2t16> for Lumis {
                 return true;
             }
             Screen::Menu => {
+                if std::mem::take(&mut self.relayout) {
+                    if let Some(menu) = self.menu.as_mut() {
+                        let t = std::time::Instant::now();
+                        menu.relayout();
+                        self.relaid_us += t.elapsed().as_micros() as u64;
+                        self.relaids += 1;
+                        if self.relaids == 1 << 5 {
+                            println!("lumis: the menu laid out again A#{} times, A#{} us each", self.relaids, self.relaid_us >> 5);
+                            (self.relaids, self.relaid_us) = (0, 0);
+                        }
+                    }
+                }
                 if self.menu_dirty {
                     self.menu_dirty = false;
                     // On the GPU the frame is drawn at the show (`render_own`), its parts from the menu as it is then; else here on the CPU.
@@ -2138,20 +2165,27 @@ impl FluorApp<G2t16> for Lumis {
     /// The menu (and the menu still shown while a camera opens) drawn whole on the GPU straight into a surface of Lumis's own (`gpu::Gpu::frame`), which the host shows (`own_surface`): no scratch, no conversion, no bake on the CPU. A GPU that fails leaves the menu to the CPU from then, said on the console.
     fn render_own(&mut self, _ctx: &mut Context) -> bool {
         self.own = None;
-        if !matches!(self.screen, Screen::Menu | Screen::Opening) {
-            return false;
-        }
         let (Some(gpu), Some(menu), Some(surface)) = (self.gpu.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
-        match gpu.frame(menu, std::mem::take(&mut self.menu_fresh)) {
+        let camera = matches!(self.screen, Screen::Camera(_));
+        let t = std::time::Instant::now();
+        // The camera screen: Lumis's frame as lumis_core drew it (in the block), whole, in place of the CPU's present of its changed rects (the owner, 2026-11-21: the GPU composes full frames).
+        let drawn = if camera { gpu.camera() } else { gpu.menu(menu, std::mem::take(&mut self.menu_fresh)) };
+        match drawn {
             Ok(base) => {
                 self.own = Some(base);
                 self.changed = false;
+                if camera {
+                    self.probe.convert += t.elapsed().as_micros() as u64;
+                    self.probe.converts += 1;
+                }
                 true
             }
             Err(e) => {
-                println!("lumis: {e}: the menu on the CPU from now");
-                app::menu_draw(menu, surface, true);
-                surface.take_posted();
+                println!("lumis: {e}: Lumis drawn on the CPU from now");
+                if !camera {
+                    app::menu_draw(menu, surface, true);
+                    surface.take_posted();
+                }
                 self.gpu = None;
                 false
             }
@@ -2219,6 +2253,10 @@ fn list() -> Vec<camera::Camera> {
         Ok(mut c) => {
             // Each camera's readouts together, the binned one first (Android's order: the menu shows a lens by its first readout and offers the rest on its page).
             c.sort_by_key(|c| (c.id, c.mode));
+            // A driver from before the lines: the binned main paces by ferros_clip's own line; the rest record no video.
+            for r in c.iter_mut().filter(|r| r.line.is_none() && r.id == 0 && r.mode == 0) {
+                r.line = Some(ferros_clip::MAIN_LINE);
+            }
             println!("lumis: {} readouts listed", c.len());
             for (k, r) in c.iter().enumerate() {
                 println!("lumis: readout {k}: {} (camera {}), mode {}, {} x {}, filter period {}, rotation {}, facing {}, exposures {} ns to {} ns", r.name, r.id, r.mode, r.width, r.height, r.cfa_period, r.rotation, r.facing, r.exposure_min, r.exposure_max);

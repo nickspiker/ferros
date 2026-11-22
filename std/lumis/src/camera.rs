@@ -124,6 +124,8 @@ pub struct Camera {
     pub field_mm: (f32, f32),
     pub fov_diagonal_deg: f32,
     pub focal_equiv_mm: f32,
+    /// The readout's line and its shortest frame (the list's `line_ps` and `fll_least`, ferros_clip `Line::of_ps`), which RAW video paces by: none from a driver before them (`list` gives the binned main ferros_clip's own `MAIN_LINE`).
+    pub line: Option<ferros_clip::Line>,
 }
 
 /// The list's document, read. A section that misses a field is not a camera Lumis can show, so it is left out and said (a driver bug, not the person's).
@@ -173,6 +175,7 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 field_mm: (one("field_width_mm"), one("field_height_mm")),
                 fov_diagonal_deg: one("fov_diagonal_deg"),
                 focal_equiv_mm: one("focal_equiv_mm"),
+                line: u("line_ps").zip(u("fll_least")).map(|(ps, least)| ferros_clip::Line::of_ps(ps, least)),
             })
         })();
         match cam {
