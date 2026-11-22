@@ -403,3 +403,14 @@ pub fn record_copy() -> Compiled {
     store_px(slot::OUT, g, p);
     ssa::compile()
 }
+
+/// The probes of GPU-COMPOSE.md step 1 (2026-11-21): one invocation a 32-bit word, 16 a warp. The read copies word g of `slot::PANE` to word g of `slot::OUT`; the store writes g into word g of `slot::OUT`. The job names the addresses, so either reaches whatever its space maps there: the display's view of a window (read-only, so the store must fault), its phases, or nothing (a translation fault).
+pub fn record_probe(store: bool) -> Compiled {
+    ssa::begin();
+    ssa::reserve(slot::RESERVED);
+    ssa::uniform_slots(64);
+    let g = ssa::gid();
+    let v = if store { g } else { ssa::load(slot::PANE, g, 2, 0) };
+    ssa::store_at(slot::OUT, g, 2, 0, v);
+    ssa::compile()
+}

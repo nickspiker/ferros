@@ -594,7 +594,7 @@ pub mod gpu {
     /// A frame: what a surface's and a GPU block's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
     pub const FRAME: u64 = 1 << 21;
 
-    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in a window of frames (`in_window`: a surface, or since 2026-11-13 a GPU block), in order, its frames' physical addresses (u64 each, its size over `FRAME` of them). The kernel writes it for every call, so the service trusts it and nothing after it.
+    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in a window of frames (`in_window`: a surface, or since 2026-11-13 a GPU block), in order, its frames' physical addresses (u64 each, its size over `FRAME` of them), then (bit 3, since 2026-11-21, the display alone) its view (`View`). The kernel writes it for every call, so the service trusts it and nothing after it.
     /// The frames stay in the message's bytes (`frames_of` reads them): a block at the ceiling carries 256, more than a fixed array beside each client is worth.
     #[derive(Clone, Copy)]
     pub struct Stamp<'a> {
@@ -605,15 +605,52 @@ pub mod gpu {
         pub regions: [(u64, u64); REGIONS],
         /// The frames' bytes, 8 a frame, in the order of their regions (`frames_of`).
         frames: &'a [u8],
+        /// The display's view (flags bit 3, GPU-COMPOSE.md 2.1, 2026-11-21): only for the caller that holds the display's phases (the display), whose stamp the kernel writes with them and with the windows it composes, read-only.
+        pub view: Option<View<'a>>,
     }
 
-    /// What names a client's GPU memory (`Stamp::key`): its epoch and its regions. A surface's frames never change while it is held, and a block's only as it grows (the kernel appends frames, its size in its region), so the same key is the same frames.
+    /// The display's GPU view as its stamp names it (flags bit 3): [0 u8, so an older service takes the section for a malformed request and refuses it][seq u64][the phases' base u64][their bytes u64][m u8][m × (surface slot u8, generation u8)][m × 16 frames u64, each surface's in order].
+    /// The phases are mapped read-write at `PHASES_VA` (fixed memory: the base is their physical address, side by side); each named surface read-only at its place from `SURFACES_VA`, as its owner's space has it. Nothing else of any window.
+    /// `seq` numbers the display's stamps (the kernel's count): the service tells the kernel which stamp its installed tables came from (SYS_DMA x1 = 10 on `arena`), and only a surface no stamp since names and no table maps goes back to the pool (GPU-COMPOSE.md 2.2).
+    #[derive(Clone, Copy)]
+    pub struct View<'a> {
+        pub seq: u64,
+        pub phases: (u64, u64),
+        /// Bit k: surface slot k named read-only.
+        pub ro: u32,
+        /// Slot k's generation in bits 4k to 4k + 3.
+        pub ro_gen: u64,
+        /// The named surfaces' frames, 16 a surface, in slot order, 8 bytes a frame.
+        frames: &'a [u8],
+    }
+
+    impl<'a> View<'a> {
+        /// The frames of read-only surface slot `k` (a slot `ro` names): its 16 physical addresses in order; none for any other slot.
+        pub fn frames_of(&self, k: usize) -> impl Iterator<Item = u64> + 'a {
+            let named = k < super::SURFACE_SLOTS && self.ro >> k & 1 == 1;
+            let at = if named { (self.ro & ((1u32 << k) - 1)).count_ones() as usize * SURFACE_FRAMES } else { 0 };
+            let bytes: &'a [u8] = if named { &self.frames[8 * at..8 * (at + SURFACE_FRAMES)] } else { &[] };
+            bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        }
+    }
+
+    /// A surface's frames.
+    pub const SURFACE_FRAMES: usize = super::SURFACE_BYTES / FRAME as usize;
+    /// Where the display's GPU space maps the four phases, read-write (GPU-COMPOSE.md 1.2): phase k at `PHASES_VA` plus k times its bytes, as the CPU sees them from the region's base.
+    pub const PHASES_VA: u64 = 0x2_0000_0000;
+    /// The most bytes of phases the service maps.
+    pub const PHASES_MOST: u64 = 64 << 20;
+
+    /// What names a client's GPU memory (`Stamp::key`): its epoch and its regions, and for the display the windows it views read-only (their slots and generations). A surface's frames never change while it is held, and a block's only as it grows (the kernel appends frames, its size in its region), so the same key is the same frames.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct Key {
         pub epoch: u64,
         pub kist: bool,
         pub n: usize,
         pub regions: [(u64, u64); REGIONS],
+        pub display: bool,
+        pub ro: u32,
+        pub ro_gen: u64,
     }
 
     /// Whether a region lies in a window of frames: a surface (the surfaces' window) or a GPU block (the blocks' window, since 2026-11-13), whose frames the stamp carries.
@@ -649,7 +686,7 @@ pub mod gpu {
             if m.len() < end || n > REGIONS {
                 return None;
             }
-            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], frames: &[] };
+            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], frames: &[], view: None };
             for k in 0..s.n {
                 let at = 10 + 16 * k;
                 s.regions[k] = (u64::from_le_bytes(m[at..at + 8].try_into().unwrap()), u64::from_le_bytes(m[at + 8..at + 16].try_into().unwrap()));
@@ -663,7 +700,35 @@ pub mod gpu {
                 return None;
             }
             s.frames = &m[end..end + 8 * nf];
-            Some((s, &m[end + 8 * nf..]))
+            let end = end + 8 * nf;
+            if m[8] & 8 == 0 {
+                return Some((s, &m[end..]));
+            }
+            // The display's view (bit 3): its fixed part, then its surfaces' slots and frames.
+            // WHY each check: as above, the counts are the kernel's, and a message cut short or naming past the surface slots is refused whole, never mapped in part.
+            const FIXED: usize = 1 + 8 * 3 + 1;
+            if m.len() < end + FIXED || m[end] != 0 {
+                return None;
+            }
+            let word = |i: usize| u64::from_le_bytes(m[end + i..end + i + 8].try_into().unwrap());
+            let (seq, phases) = (word(1), (word(9), word(17)));
+            let n = m[end + 25] as usize;
+            let after = end + FIXED + 2 * n + 8 * SURFACE_FRAMES * n;
+            if n > super::SURFACE_SLOTS || m.len() < after || phases.1 > PHASES_MOST {
+                return None;
+            }
+            let (mut ro, mut ro_gen) = (0u32, 0u64);
+            for j in 0..n {
+                let (k, g) = (m[end + FIXED + 2 * j] as usize, m[end + FIXED + 2 * j + 1] as u64);
+                // In slot order, each once (the kernel's own order): the frames are read by slot (`View::frames_of`).
+                if k >= super::SURFACE_SLOTS || ro >> k != 0 {
+                    return None;
+                }
+                ro |= 1 << k;
+                ro_gen |= (g & 15) << (4 * k);
+            }
+            s.view = Some(View { seq, phases, ro, ro_gen, frames: &m[end + FIXED + 2 * n..after] });
+            Some((s, &m[after..]))
         }
 
         /// The regions it names.
@@ -673,7 +738,8 @@ pub mod gpu {
 
         /// Its client's memory as a key: the same key, the same memory.
         pub fn key(&self) -> Key {
-            Key { epoch: self.epoch, kist: self.kist, n: self.n, regions: self.regions }
+            let (ro, ro_gen) = self.view.map_or((0, 0), |v| (v.ro, v.ro_gen));
+            Key { epoch: self.epoch, kist: self.kist, n: self.n, regions: self.regions, display: self.view.is_some(), ro, ro_gen }
         }
 
         /// The frames of region `i` when it is in a window (a surface, a GPU block), in order: its physical memory, 2 MiB a frame; none for any other region.
@@ -838,6 +904,21 @@ pub mod gpu {
                 let mut reply = [1u8; 2];
                 let r = super::super::call(self.service, &[5, cached as u8], &mut reply);
                 (r == 2 && reply[0] == 0).then_some(reply[1] != 0)
+            }
+
+            /// The display's view named (GPU-COMPOSE.md 2.1, 2026-11-21; op 5 with a list): the windows it composes, each surface slot with the generation its window was shown under, at most `SURFACE_SLOTS`. The kernel stamps each one its owner still holds under that generation, read-only, and the service makes the display's GPU space from it: those surfaces at their places from `SURFACES_VA`, the phases at `PHASES_VA`. A slot left out is unmapped, and its frames go back to the pool only once no table of the display's maps them. Called when the windows change, never a frame; for a caller that is not the display the list is ignored. Whether the service took it.
+            pub fn view(&self, surfaces: &[(u8, u8)]) -> bool {
+                let mut msg = [0u8; 3 + 2 * super::super::SURFACE_SLOTS];
+                // WHY the min: the list is the caller's; past the slots there is nothing to name.
+                let n = surfaces.len().min(super::super::SURFACE_SLOTS);
+                msg[..3].copy_from_slice(&[5, 1, n as u8]);
+                for (j, &(k, g)) in surfaces[..n].iter().enumerate() {
+                    msg[3 + 2 * j] = k;
+                    msg[4 + 2 * j] = g;
+                }
+                let mut reply = [1u8; 2];
+                let r = super::super::call(self.service, &msg[..3 + 2 * n], &mut reply);
+                r == 2 && reply[0] == 0
             }
 
             /// The queue closed: a job still running stopped, the rest lost.

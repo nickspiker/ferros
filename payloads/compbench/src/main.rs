@@ -355,9 +355,12 @@ const K_CLIP_P: usize = 11;
 const K_COPY: usize = 12;
 /// The compose into one phase (GPU-COMPOSE.md step 0, 2026-11-21): its phase and turn the job's (`Gpu::submit_phase`).
 const K_PHASE1_P: usize = 13;
-const KERNELS: usize = 14;
+/// The probes of step 1 (kernel.rs `record_probe`).
+const K_PROBE_READ: usize = 14;
+const K_PROBE_STORE: usize = 15;
+const KERNELS: usize = 16;
 fn kernel(i: usize) -> &'static kernels::Kernel {
-    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP, &kernels::NOISE_P6, &kernels::NOISE_P7, &kernels::NOISE_P8, &kernels::G2T_P, &kernels::BAKED_P, &kernels::PHASES_P, &kernels::CLIP_P, &kernels::COPY, &kernels::PHASE1_P][i]
+    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP, &kernels::NOISE_P6, &kernels::NOISE_P7, &kernels::NOISE_P8, &kernels::G2T_P, &kernels::BAKED_P, &kernels::PHASES_P, &kernels::CLIP_P, &kernels::COPY, &kernels::PHASE1_P, &kernels::PROBE_READ, &kernels::PROBE_STORE][i]
 }
 
 fn walk() -> (u64, u64, u64) {
@@ -584,6 +587,7 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
         1..=4 | 14 | 15 => sustained(&mut gpu, mode, seconds),
         16 | 17 => one_phase(&mut gpu, mode == 17, seconds),
         18 => hostile(&mut gpu, seconds),
+        19..=21 => view_test(&mut gpu, mode, input, input_len),
         5 => clip_probe(&mut gpu),
         6..=9 => clip_sequence(&mut gpu, mode - 6),
         10 => uniforms_probe(&mut gpu),
@@ -752,6 +756,64 @@ fn hostile(gpu: &mut Gpu, seconds: u64) -> ! {
         pending[1] = Some(gpu.submit_phase((jobs & 3) as usize));
     }
     say!("compbench hostile: A#{jobs} whole-frame jobs in A#{} ms, the GPU's own A#{} us each on average\n", us(ferros_sys::now() - start) / 1000, us(ticks) / jobs.max(1));
+    exit(0);
+}
+
+impl Gpu {
+    /// A probe job (kernel.rs `record_probe`): `words` 32-bit words read from GPU address `from` into `to`, or (`store`) written at `to`; waited for. A job that faulted ends the queue, opened again here so the next probe runs.
+    fn probe(&mut self, store: bool, from: u64, to: u64, words: u32) -> ferros_sys::gpu::queue::Ended {
+        let k = if store { K_PROBE_STORE } else { K_PROBE_READ };
+        let mut u = [0u64; 64];
+        u[slot::OUT as usize] = to;
+        u[slot::PANE as usize] = from;
+        let c = kernel(k).consts;
+        let n = slot::RESERVED as usize;
+        u[n..n + c.len()].copy_from_slice(c);
+        let Some(j) = self.q.submit(&Job { kernel: self.handles[k], groups: (words / 16, 1), uniforms: &u[..n + c.len()] }) else {
+            say!("compbench probe: a submit refused (the queue ended A#{})\n", self.q.ended());
+            exit(1);
+        };
+        let e = self.q.wait(j);
+        if e.status != S_DONE {
+            self.q.reopen();
+        }
+        e
+    }
+}
+
+/// The display's view of a window, slot `k` (GPU-COMPOSE.md 2.1), at its place in a GPU space: past the surface's porch.
+fn window_va(k: u64) -> u64 {
+    ferros_sys::gpu::SURFACES_VA + ferros_sys::SURFACES_WINDOW + k * ferros_sys::SURFACE_BYTES as u64 - ferros_sys::gpu::SURFACES_PA + 64
+}
+
+/// Modes 19 to 21 (GPU-COMPOSE.md step 1, the kernel's stamp and the GPU service's view, 2026-11-21), input [mode][surface slot][its generation][seconds]:
+/// - 19, spawned holding `display-phases` (so the kernel stamps it as the display): the window named (`Queue::view`), read on the GPU (done), stored into (refused: a permission fault in its own space), the phases read (done), the window named no more and read again (a translation fault).
+/// - 20, spawned without: the phases and the window's place read (both translation faults: no stamp of its names them).
+/// - 21, holding `display-phases`: the window named and read, then the seconds asleep (the host ends the window's owner meanwhile: its frames stay held, `diag` shows the kernel's line), read again (the held frames, done), the window named no more (the kernel's settle then gives them back), then exit.
+fn view_test(gpu: &mut Gpu, mode: u8, input: u64, len: u64) -> ! {
+    let (k, g, secs) = (byte(input, len, 1).unwrap_or(0) as u64, byte(input, len, 2).unwrap_or(0), byte(input, len, 3).unwrap_or(4) as u64);
+    let out = ferros_sys::gpu::ARENA_VA + OUT_AT as u64;
+    let line = |what: &str, e: &ferros_sys::gpu::queue::Ended| say!("compbench view: {what}: status A#{}, GPU address G#{:X}, fault status G#{:X}\n", e.status, e.fault_address, e.fault_status);
+    if mode == 20 {
+        line("the phases read by a client that is not the display", &gpu.probe(false, ferros_sys::gpu::PHASES_VA, out, 1 << 12));
+        line("a window's place read by a client that is not the display", &gpu.probe(false, window_va(k), out, 1 << 12));
+        exit(0);
+    }
+    say!("compbench view: surface A#{k} generation A#{g} named: {}\n", gpu.q.view(&[(k as u8, g)]));
+    px(OUT_AT, 1 << 11).fill(0);
+    let e = gpu.probe(false, window_va(k), out, 1 << 12);
+    let sum = px(OUT_AT, 1 << 11).iter().fold(0u64, |a, &w| a ^ w);
+    line(&alloc::format!("the window read (its first 2^12 words xor G#{sum:X})"), &e);
+    if mode == 21 {
+        ferros_sys::sleep_until(ferros_sys::now() + secs * ferros_sys::freq());
+        line("the window read again after the sleep", &gpu.probe(false, window_va(k), out, 1 << 12));
+        say!("compbench view: named no more: {}\n", gpu.q.view(&[]));
+        exit(0);
+    }
+    line("the window stored into", &gpu.probe(true, 0, window_va(k), 1 << 4));
+    line("the phases read", &gpu.probe(false, ferros_sys::gpu::PHASES_VA, out, 1 << 12));
+    say!("compbench view: named no more: {}\n", gpu.q.view(&[]));
+    line("the window read after it was named no more", &gpu.probe(false, window_va(k), out, 1 << 12));
     exit(0);
 }
 

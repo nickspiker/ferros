@@ -3138,7 +3138,7 @@ fn surfaces_free(epoch: u64) {
             slots[k].owner = 0;
             surface_pref(k, 0);
             if draining >> k & 1 == 0 {
-                surface_release(k);
+                surface_give_back(k);
             }
         }
     }
@@ -3162,6 +3162,15 @@ pub fn gpu_refence() {
     let (first, n) = unsafe { (*(&raw const GPU_CAM)).admitted };
     for f in first..first + n {
         crate::s2mpu::gpu_admit_ro(crate::frames::pa(f));
+    }
+    // The display's phases while its view holds them (`dv_phases`).
+    if unsafe { (*(&raw const DV)).phases } {
+        let (a, b) = crate::cachemap::DISPLAY_PHASES;
+        let mut pa = a;
+        while pa < b {
+            crate::s2mpu::gpu_admit(pa, true);
+            pa += crate::frames::FRAME;
+        }
     }
 }
 
@@ -3515,6 +3524,162 @@ fn gpu_cam_stamp(p: &Process) -> Option<((usize, usize), Vec<u64>)> {
     }
     g.mapped = p.epoch;
     Some(((crate::cachemap::CAM_VIEW_VA.0, v.n * crate::frames::FRAME), (first..first + v.n).map(|f| crate::frames::pa(f) as u64).collect()))
+}
+
+/// The display's GPU view (GPU-COMPOSE.md 2.1 to 2.3, 2026-11-21; the owner's condition for the compose on the GPU: "not sacrifice security"): what the display's GPU space may map besides its own block, and when what it mapped may go back to the pool.
+/// - The phases (`display-phases`, fixed memory), read-write, for the caller that holds them (the display alone): admitted to the GPU's fence from its first stamp until its view is let go (`dv_drop`), so no other space can reach them (none maps them: the service maps a space from its stamp alone).
+/// - The windows it composes, read-only: the surface slots its last op 5 named with their generations (`named`), stamped while each is still held under that generation by a live owner (`gpu_stamp`). The display reads every surface on the CPU already; its GPU view is less (read-only, only what it composes).
+/// - A surface given back while a stamp named it (`viewed`) keeps its frames held and admitted (`held`) until the GPU service says the display's installed tables, made from a stamp at or after the last that named it, map it no more (SYS_DMA x1 = 10, `dv_settled`): then it is wiped back into the pool. So no compose job reads a frame that is someone else's by then (the proof: GPU-COMPOSE.md 2.2).
+/// Under the kernel lock.
+struct DispView {
+    /// The display whose stamps carry the view (0: none since the last `dv_drop`).
+    epoch: u64,
+    /// Each slot's generation as its last op 5 named it, 0 not named.
+    named: [u8; SURFACE_SLOTS],
+    /// The display's stamps so far, and each slot's last stamp that named it.
+    seq: u64,
+    last: [u64; SURFACE_SLOTS],
+    /// Slots some stamp named and no settle has said gone; and of those, the ones given back meanwhile, held from the pool.
+    viewed: u32,
+    held: u32,
+    /// The phases admitted to the GPU's fence.
+    phases: bool,
+    /// Its display ended (or the GPU service did) with GPU work that may still run: what stamps up to `end_seq` named goes at the service's next request (`gpu_drained`) once `end_epoch` holds no GPU work, or at the service's letting go of `end_epoch` (`gpu_released`; 0 for the service's own end).
+    ending: bool,
+    end_seq: u64,
+    end_epoch: u64,
+}
+static mut DV: DispView = DispView { epoch: 0, named: [0; SURFACE_SLOTS], seq: 0, last: [0; SURFACE_SLOTS], viewed: 0, held: 0, phases: false, ending: false, end_seq: 0, end_epoch: 0 };
+
+/// Surface slot k's frames back to the pool, as its owner and any GPU job of its owner's are done with them: at once (`surface_release`), or, while the display's GPU view may map them (`DV.viewed`), held until its settle (`dv_settled`). Under the lock.
+fn surface_give_back(s: usize) {
+    let dv = unsafe { &mut *(&raw mut DV) };
+    if dv.viewed >> s & 1 == 1 {
+        dv.held |= 1 << s;
+        let line = alloc::format!("surface A#{s}: given back while the display's GPU view names it, held until the GPU service unmaps it\n");
+        k().console.extend_from_slice(line.as_bytes());
+        return;
+    }
+    surface_release(s);
+}
+
+/// The phases' frames (`display-phases`, 2 MiB each) admitted to the GPU's fence (`on`) or shut out of it. Under the lock.
+fn dv_phases(on: bool) {
+    let (a, b) = crate::cachemap::DISPLAY_PHASES;
+    let mut pa = a;
+    while pa < b {
+        crate::s2mpu::gpu_admit(pa, on);
+        pa += crate::frames::FRAME;
+    }
+    crate::s2mpu::gpu_sync();
+}
+
+/// The display's view let go up to its stamp `upto`: no GPU space of the display's maps what those stamps named any more (its group ended and the service let it go, or the service and its GPU are gone and the next service has reset it). Every slot no later stamp named is no longer viewed, a held one wiped back into the pool; with no stamp since, the phases are shut out of the fence and the view is none. Stamps after `upto` (the next display's, or the same display's to the next service) keep what they named. Under the lock.
+fn dv_drop(why: &str, upto: u64) {
+    let dv = unsafe { &mut *(&raw mut DV) };
+    let mut back = 0;
+    for j in 0..SURFACE_SLOTS {
+        if dv.viewed >> j & 1 == 1 && dv.last[j] <= upto {
+            dv.viewed &= !(1 << j);
+            if dv.held >> j & 1 == 1 {
+                dv.held &= !(1 << j);
+                surface_release(j);
+                back += 1;
+            }
+        }
+    }
+    dv.ending = false;
+    let none_since = dv.seq <= upto;
+    if none_since {
+        dv.epoch = 0;
+        dv.named = [0; SURFACE_SLOTS];
+        if dv.phases {
+            dv.phases = false;
+            dv_phases(false);
+        }
+    }
+    let line = alloc::format!("display view: let go to its stamp A#{upto} ({why}), A#{back} held surfaces back to the pool{}\n", if none_since { ", the phases shut out of the GPU's fence" } else { "" });
+    k().console.extend_from_slice(line.as_bytes());
+}
+
+/// The display (`epoch`) or the GPU service (`service`) ending (`gpu_ending`): a display with no GPU work that can still run (no call taken, `busy`, no queue held) has its view let go at once; otherwise it goes once that work cannot run: at the service's next request for a call (`gpu_drained`), at its letting go of the display's epoch for a queue (`gpu_released`), at the next service's first request (after its GPU's reset) when the service itself ends. Under the lock.
+fn dv_ending(epoch: u64, busy: bool, held: bool, service: bool) {
+    let dv = unsafe { &mut *(&raw mut DV) };
+    if !service && (dv.epoch == 0 || dv.epoch != epoch) {
+        return;
+    }
+    if service || busy || held {
+        dv.ending = true;
+        dv.end_seq = dv.seq;
+        dv.end_epoch = if service { 0 } else { epoch };
+    } else {
+        dv_drop("its display ended", dv.seq);
+    }
+}
+
+/// SYS_DMA x1 = 10 on `arena`, the GPU service's: its installed tables for the display came from stamp `seq` and map the surface slots in `mask` (bit k slot k), with the GPU's walks and L2 dropped since any table that mapped more (`space_install`'s LOCK and FLUSH_PT). Every viewed slot outside `mask` that no stamp after `seq` named is no longer viewed, and goes back to the pool now if it was given back meanwhile. → 0. Under the lock.
+fn dv_settled(seq: u64, mask: u64) -> u64 {
+    let dv = unsafe { &mut *(&raw mut DV) };
+    for j in 0..SURFACE_SLOTS {
+        if dv.viewed >> j & 1 == 1 && mask >> j & 1 == 0 && dv.last[j] <= seq {
+            dv.viewed &= !(1 << j);
+            if dv.held >> j & 1 == 1 {
+                dv.held &= !(1 << j);
+                surface_release(j);
+                let line = alloc::format!("surface A#{j}: the display's GPU view settled, wiped back into the pool\n");
+                k().console.extend_from_slice(line.as_bytes());
+            }
+        }
+    }
+    0
+}
+
+/// The display's view for its GPU stamp (`gpu_stamp`), when `p` holds the phases: [0][seq u64][the phases' base u64][bytes u64][m u8][m × (slot, generation)][m × 16 frames] (ferros_sys::gpu `View`). An op 5 with a list (`[5][cached][n][n × (slot u8, generation u8)]`, ferros_sys `Queue::view`) names the windows anew; every other call carries what the last one named, less what has gone since. The phases admitted to the GPU's fence at the first. None for any other caller. Under the lock.
+fn dv_stamp(p: &Process, msg: &[u8]) -> Option<Vec<u8>> {
+    let phases = p.cspace.iter().find_map(|c| match c.object {
+        Object::Dma(i) if DMA[i].name == "display-phases" => Some(region(i)),
+        _ => None,
+    })?;
+    let dv = unsafe { &mut *(&raw mut DV) };
+    if dv.epoch != p.epoch {
+        // A display after one whose view was let go, or the first: nothing named yet. (One whose view is still held, `ending`, keeps its viewed and held slots: they go at its settle or its drop.)
+        dv.epoch = p.epoch;
+        dv.named = [0; SURFACE_SLOTS];
+    }
+    // WHY the checks: the list is the caller's bytes; a slot past the table or a count past what arrived names nothing.
+    if msg.len() >= 3 && msg[0] == 5 && msg.len() >= 3 + 2 * msg[2] as usize {
+        dv.named = [0; SURFACE_SLOTS];
+        for j in 0..msg[2] as usize {
+            let (k, g) = (msg[3 + 2 * j] as usize, msg[4 + 2 * j]);
+            if k < SURFACE_SLOTS {
+                dv.named[k] = g;
+            }
+        }
+    }
+    if !dv.phases {
+        dv_phases(true);
+        dv.phases = true;
+    }
+    dv.seq += 1;
+    let slots = unsafe { &*(&raw const SLOTS) };
+    let shown: Vec<usize> = (0..SURFACE_SLOTS).filter(|&k| dv.named[k] != 0 && slots[k].held && slots[k].owner != 0 && slots[k].generation == dv.named[k]).collect();
+    let mut out = Vec::with_capacity(26 + shown.len() * (2 + 8 * SURFACE_FRAMES));
+    out.push(0);
+    out.extend_from_slice(&dv.seq.to_le_bytes());
+    out.extend_from_slice(&(phases.0 as u64).to_le_bytes());
+    out.extend_from_slice(&(phases.1 as u64).to_le_bytes());
+    out.push(shown.len() as u8);
+    for &k in &shown {
+        out.extend_from_slice(&[k as u8, slots[k].generation]);
+        dv.viewed |= 1 << k;
+        dv.last[k] = dv.seq;
+    }
+    for &k in &shown {
+        for &fr in &slots[k].frames {
+            out.extend_from_slice(&(crate::frames::pa(fr as usize) as u64).to_le_bytes());
+        }
+    }
+    Some(out)
 }
 
 /// The view taken back (the driver's close, SYS_DMA x1 = 5; either end of it ending, `cam_free`; a new view given): every block of it the blank frame (still read-only, so a reader in a frame as it goes reads zeros of nobody's, process.rs `blank_frame`), every TLB told, then the holder's capability gone, so SYS_DMA on its token answers ERR. Under the lock.
@@ -3992,6 +4157,7 @@ fn gpu_ending(epoch: u64, busy: bool) {
     if busy || held {
         gpu_drain(epoch);
     }
+    dv_ending(epoch, busy, held, service);
     if held {
         for h in unsafe { (*(&raw const GPU_HOLDS)).iter() } {
             if h.0 == epoch && h.1 != 0 {
@@ -4055,6 +4221,10 @@ fn gpu_alive(epoch: u64) -> u64 {
 
 /// Every block and surface drained for `epoch` given back: its owner ended and the service let its GPU work go. Under the lock.
 fn gpu_released(epoch: u64) {
+    let (ending, end_epoch, end_seq) = unsafe { ((*(&raw const DV)).ending, (*(&raw const DV)).end_epoch, (*(&raw const DV)).end_seq) };
+    if ending && end_epoch != 0 && end_epoch == epoch {
+        dv_drop("the GPU service let its display go", end_seq);
+    }
     for j in 0..GPU_BLOCK_SLOTS {
         let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
         if unsafe { GPU_DRAINING } >> j & 1 == 1 && unsafe { BLOCK_DRAIN_EPOCH[j] } == epoch {
@@ -4075,7 +4245,7 @@ fn gpu_released(epoch: u64) {
                 SURF_DRAIN_EPOCH[k] = 0;
             }
             if slots[k].owner == 0 && slots[k].held {
-                surface_release(k);
+                surface_give_back(k);
             }
         }
     }
@@ -4123,7 +4293,7 @@ fn puck_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
 /// The stamp's length: identity 64, square 8.
 const PUCK_STAMP: usize = 72;
 
-/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
+/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow, bit 3 the display's view follows (2026-11-21, `dv_stamp`)][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
 /// A block's frames change only as it grows (`block_grow` appends; nothing takes one back while it is held), and a surface's never while it is held, so the regions alone name the frames for a caller: the service keys a client's address space by them.
 fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     let slots = unsafe { &*(&raw const SLOTS) };
@@ -4151,9 +4321,11 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
         regions.push(r);
         frames.extend(f);
     }
+    // The display's view (GPU-COMPOSE.md 2.1, 2026-11-21): the phases and the windows it composes, read-only, after the frames (bit 3; `dv_stamp`).
+    let view = dv_stamp(p, &msg);
     let mut out = Vec::with_capacity(10 + 16 * regions.len() + 8 * frames.len() + msg.len());
     out.extend_from_slice(&p.epoch.to_le_bytes());
-    out.push(p.kist as u8 | (cfg!(ferros_production) as u8) << 1 | 1 << 2);
+    out.push(p.kist as u8 | (cfg!(ferros_production) as u8) << 1 | 1 << 2 | (view.is_some() as u8) << 3);
     // WHY no check: a process holds a handful of DMA grants (init, the most, about a dozen), far under the byte's 255.
     out.push(regions.len() as u8);
     for (b, n) in regions {
@@ -4163,12 +4335,19 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     for f in frames {
         out.extend_from_slice(&f.to_le_bytes());
     }
+    if let Some(v) = view {
+        out.extend_from_slice(&v);
+    }
     out.extend_from_slice(&msg);
     out
 }
 
 /// The GPU service took a request: whatever waited for its last job to end may be given out again, a drained block's or surface's frames back to the pool. Under the lock.
 fn gpu_drained() {
+    let (ending, end_epoch, end_seq) = unsafe { ((*(&raw const DV)).ending, (*(&raw const DV)).end_epoch, (*(&raw const DV)).end_seq) };
+    if ending && !gpu_held(end_epoch) {
+        dv_drop(if end_epoch == 0 { "the GPU service ended, the next one serves" } else { "the GPU service took its next request" }, end_seq);
+    }
     // A held epoch's drains stay (`GPU_HOLDS`): its queue's jobs run with no call, so a request taken says nothing of them.
     let kept = |e: u64| gpu_held(e);
     let mut d = unsafe { GPU_DRAINING };
@@ -4194,7 +4373,7 @@ fn gpu_drained() {
     unsafe { SURF_DRAINING &= !d };
     for k in 0..SURFACE_SLOTS {
         if d >> k & 1 == 1 && slots[k].owner == 0 && slots[k].held {
-            surface_release(k);
+            surface_give_back(k);
         }
     }
 }
@@ -7540,6 +7719,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 8 => gpu_alive(f.x[2]),
                 // x1 = 9 (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"): x2 0, the epoch whose GPU space may still map a camera view taken back; x2 that epoch, the service has stopped its jobs and unmapped the view (`gpu_cam_settled`).
                 Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 9 => gpu_cam_settled(f.x[2]),
+                // x1 = 10 (2026-11-21, GPU-COMPOSE.md 2.2): the service's installed tables for the display came from its stamp x2 and map the surface slots in x3 (`dv_settled`).
+                Some(Object::Dma(i)) if DMA[i].name == "arena" && f.x[1] == 10 => dv_settled(f.x[2], f.x[3]),
                 // A mailbox's region (2026-11-19): its frame taken and mapped at the first ask, the writer's region making the caller its writer (`mbox_dma`).
                 Some(Object::Dma(i)) if f.x[1] == 0 && mbox_of(i).is_some() => mbox_dma(p, i),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
@@ -9940,7 +10121,13 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     }
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
-    for &(object, rights) in objects {
+    // The display server (the receiver of `display`) gets the GPU service's send right and a GPU block of its own after the slots it was given (GPU-COMPOSE.md 1.2, 2026-11-21: the compose on the GPU, a client with its own space), at init's spawn and at a keeper's restart alike: init's grants page is full, so it cannot hold them to pass on. The block is the least (32 MiB); the display grows it when it turns the GPU compose on.
+    // With no GPU service (after a jump it is never started) both slots are empty, so a call of the display's never waits on a server that will not come, and the display composes on NEON alone.
+    let display = objects.iter().any(|o| matches!(o, (Object::Endpoint(e), r) if *e == endpoint(b"display") && r & RIGHT_RECV != 0));
+    let gpu = endpoint(b"gpu");
+    let served = k().procs.iter().flatten().any(|q| !q.dying && q.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == gpu) && c.rights & RIGHT_RECV != 0));
+    let extra = if served { [(Object::Endpoint(gpu), RIGHT_SEND), (Object::NewRegion(BLOCK_LEAST_LOG), RIGHT_SEND | RIGHT_RECV)] } else { [(Object::Empty, 0), (Object::Empty, 0)] };
+    for &(object, rights) in objects.iter().chain(&extra[..if display { 2 } else { 0 }]) {
         let object = match object {
             Object::NewSurface => match surface_take(epoch) {
                 Ok(s) => Object::Dma(surface0() + s),

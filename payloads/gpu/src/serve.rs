@@ -16,6 +16,10 @@
 //! - `[2][preload u16][code at an offset into its block u32][code words u16]`: a kernel loaded for its queue, `[0][handle u8]`, or `[1]` (no room: 16 kernels, 2^14 words a client).
 //! - `[3][queue at an offset into its block u32][depth, log2 u8]`: its queue opened (ferros_gpuq), `[0]`, or `[1]`.
 //! - `[4]`: its queue closed, its jobs still in it stopped and lost, `[0]`.
+//! - `[5]`, `[5][cached u8]`: its memory looked at again (a camera view given or taken), `[0][the camera mapped u8]`; from the display, `[5][1][n][n × (surface slot, generation)]` names the windows it composes, which the kernel stamps read-only (ferros_sys `Queue::view`).
+//! - `[6][on u8]`: the GPU's clock held up or let go (a development measure).
+//!
+//! The display (GPU-COMPOSE.md, 2026-11-21): its stamp carries its view (ferros_sys::gpu `View`), so its space maps its phases read-write at `PHASES_VA` and the windows it composes read-only, and nothing of any other client's. Slot 0 is its alone, at priority 15 alone (other system clients 14, kists 8). Each time its tables are in force it tells the kernel which stamp they came from (`view_settled`), and a window it no longer maps goes back to the pool only then.
 
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +41,10 @@ const SEQ_AT: usize = 0x240;
 const CALL_STAMPS: usize = 0x278;
 /// A level-2 block of 2 MiB, read-only (BLOCK_RW with AP's read-only bit, as PAGE_RO is PAGE_RW's): a camera view's frames (2026-11-20).
 const BLOCK_RO: u64 = 0x4C1;
+/// The display's read-only windows' frames a slot keeps (`Slot::ro_frames`): every surface slot's 16.
+const RO_FRAMES: usize = ferros_sys::SURFACE_SLOTS * ferros_sys::gpu::SURFACE_FRAMES;
+/// The display's slot (GPU-COMPOSE.md 2.4, 2026-11-21): slot 0 (group 0, address space 1, doorbell 1) is the display's alone and never given to another client, so no number of kists can take the compositor's GPU.
+const DISPLAY_SLOT: usize = 0;
 
 /// What the threads share, fixed before they start.
 struct Svc {
@@ -106,6 +114,11 @@ struct Slot {
     /// Its client's block (its window base and bytes when bound).
     block: (u64, u64),
     kist: bool,
+    /// Its client is the display (GPU-COMPOSE.md 1.2, 2026-11-21: its stamp carries the view, `ferros_sys::gpu::View`): slot 0, its alone, at priority 15 alone; its phases at `PHASES_VA` read-write and the windows it composes read-only (`ro`, their frames in `ro_frames`, 16 a slot in slot order).
+    display: bool,
+    phases: (u64, u64),
+    ro: u32,
+    ro_frames: [u64; RO_FRAMES],
     /// When it last took a job (a count of jobs), for choosing the slot used longest ago.
     used: u64,
     /// Its group is running (started, not ended since).
@@ -127,7 +140,7 @@ struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, kern_wg: [4; KERNELS_MOST], kern_wls: [false; KERNELS_MOST], queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, display: false, phases: (0, 0), ro: 0, ro_frames: [0; RO_FRAMES], used: 0, running: false, kernels: 0, code_used: 0, kern_wg: [4; KERNELS_MOST], kern_wls: [false; KERNELS_MOST], queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
 }
 
 struct State {
@@ -335,7 +348,7 @@ fn ensure_running(s: &Svc, sl: &mut Slot, k: usize) -> bool {
         return true;
     }
     MMU_FAULTS[k + 1].store(0, Ordering::Relaxed);
-    let ok = space_install(&s.g, k + 1, sl.root) && group_start(&s.g, &s.sh, k, sl, s.cores, if sl.kist { PRIORITY_KIST } else { PRIORITY_SYSTEM });
+    let ok = space_install(&s.g, k + 1, sl.root) && group_start(&s.g, &s.sh, k, sl, s.cores, if sl.display { PRIORITY_DISPLAY } else if sl.kist { PRIORITY_KIST } else { PRIORITY_SYSTEM });
     sl.running = ok;
     ok
 }
@@ -732,6 +745,20 @@ fn bind(s: &Svc, sl: &mut Slot, stamp: &Stamp, bbase: u64, bsize: u64) {
     sl.client = Some(stamp.key());
     sl.block = (bbase, bsize);
     sl.kist = stamp.kist;
+    // The display's view (GPU-COMPOSE.md 2.1): its phases and the windows it composes, kept to make its tables (`tables`).
+    sl.display = stamp.view.is_some();
+    let v = stamp.view;
+    sl.phases = v.map_or((0, 0), |v| v.phases);
+    sl.ro = v.map_or(0, |v| v.ro);
+    let mut at = 0;
+    for k in 0..ferros_sys::SURFACE_SLOTS {
+        if let Some(v) = v.filter(|v| v.ro >> k & 1 == 1) {
+            for pa in v.frames_of(k) {
+                sl.ro_frames[at] = pa;
+                at += 1;
+            }
+        }
+    }
     tables(s, sl, true);
 }
 
@@ -777,6 +804,25 @@ fn tables(s: &Svc, sl: &mut Slot, camera: bool) {
         }
         at += n;
     }
+    // The display's view (GPU-COMPOSE.md 1.2, 2.0): the phases read-write and never executable at `PHASES_VA`, coherent as its block (each job's end flush cleans them to DRAM before its `DONE`, where the panel's engine reads them), in 2 MiB blocks (fixed memory, side by side, 2 MiB aligned); each window it composes read-only and never executable at its place from `SURFACES_VA`, as its owner's space has it, in 2 MiB blocks. Nothing else of any window, and nothing for any other client (`display` comes from the kernel's stamp alone).
+    if sl.display {
+        let (pb, pn) = sl.phases;
+        for j in 0..(pn / ferros_sys::gpu::FRAME) as usize {
+            let off = j as u64 * ferros_sys::gpu::FRAME;
+            t.map_block(&mut tm, ferros_sys::gpu::PHASES_VA + off, (pb + off) as usize, BLOCK_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+        }
+        let mut at = 0;
+        for k in 0..ferros_sys::SURFACE_SLOTS {
+            if sl.ro >> k & 1 == 0 {
+                continue;
+            }
+            let base = SURFACES_VA + (ferros_sys::SURFACES_WINDOW + (k * ferros_sys::SURFACE_BYTES) as u64 - SURFACES_PA);
+            for j in 0..ferros_sys::gpu::SURFACE_FRAMES {
+                t.map_block(&mut tm, base + j as u64 * ferros_sys::gpu::FRAME, sl.ro_frames[at] as usize, BLOCK_RO | 6 << 2 | 2 << 8 | NX, TABLE);
+                at += 1;
+            }
+        }
+    }
     // The pool's size is the bound on any stamp the kernel writes (a block's and a camera view's 2 MiB entries in level-2 tables, at most the four surfaces in pages): past it is a bug here, loud.
     assert!(tm.used() <= TABLE_PAGES * PAGE, "gpu: a client's tables outgrew their slot");
     sl.root = t.root;
@@ -789,15 +835,22 @@ fn slot_for(st: &mut State, stamp: &Stamp, bbase: u64, bsize: u64) -> Option<usi
     if let Some(k) = st.slots.iter().position(|sl| sl.client.is_some_and(|c| c.epoch == stamp.epoch)) {
         // A camera view in the stamp that its tables lack: taken back and given again since its bind (`camera_watch` made them without it), the same frames, so the same key.
         let camera_back = !st.slots[k].camera && stamp.regions().iter().any(|&(b, sz)| is_camera(b, sz));
+        let mut installed = true;
         if st.slots[k].client != Some(stamp.key()) || camera_back {
             bind(s, &mut st.slots[k], stamp, bbase, bsize);
             if st.slots[k].running && !space_install(&s.g, k + 1, st.slots[k].root) {
                 say!(s.grants, "gpu: slot {k}'s address space did not take its new tables\n");
+                installed = false;
             }
+        }
+        if installed {
+            view_settled(s, stamp, &st.slots[k]);
         }
         return Some(k);
     }
-    let k = (0..SLOTS).filter(|&k| st.slots[k].queue.is_none() && st.slots[k].len == 0).min_by_key(|&k| (st.slots[k].client.is_some(), st.slots[k].used))?;
+    // The display's slot is its alone, and the display takes no other (GPU-COMPOSE.md 2.4); a display whose slot still holds the last display's queue (not yet let go) is refused until it is, as a client finding every slot busy is.
+    let display = stamp.view.is_some();
+    let k = (0..SLOTS).filter(|&k| (k == DISPLAY_SLOT) == display && st.slots[k].queue.is_none() && st.slots[k].len == 0).min_by_key(|&k| (st.slots[k].client.is_some(), st.slots[k].used))?;
     if st.slots[k].running && !group_end(&s.g, &s.sh, k) {
         stuck(s.grants, k);
     }
@@ -809,7 +862,16 @@ fn slot_for(st: &mut State, stamp: &Stamp, bbase: u64, bsize: u64) -> Option<usi
     for j in 0..8 {
         wr32(st.slots[k].desc + 0x40 + 4 * j, if j == 1 { 0x1F } else { 0 });
     }
+    // Its group not running, its new tables are installed at its start (`ensure_running`): nothing runs on the old ones.
+    view_settled(s, stamp, &st.slots[k]);
     Some(k)
+}
+
+/// The display's view settled with the kernel (GPU-COMPOSE.md 2.2, SYS_DMA x1 = 10 on `arena`): the tables of the display's slot now in force (installed with the GPU's walks and L2 dropped, `space_install`, or waiting for its group's start) came from this stamp and map the windows in `ro`, so every window outside them that no later stamp named may go back to the pool. Nothing for any other client. Under the lock.
+fn view_settled(s: &Svc, stamp: &Stamp, sl: &Slot) {
+    if let Some(v) = stamp.view {
+        ferros_sys::svc(ferros_sys::nr::DMA, cap(s.grants, S_ARENA), 10, v.seq, sl.ro as u64, 0);
+    }
 }
 
 /// The camera's bell (the kernel's `BELL_GPU_CAMERA`): a camera view whose holder's GPU calls carried it was taken back (its CLOSE, its holder's end, a view given anew). That client's jobs are stopped (its group ended; its queue ends `E_CAMERA`), the view unmapped from its space with the GPU's TLB and walk caches flushed (`space_install`), and the kernel told (SYS_DMA x1 = 9), which only then shuts the frames out of the fence and lets them serve anyone else.

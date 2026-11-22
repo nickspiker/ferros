@@ -176,8 +176,9 @@ const TABLE_PAGES: usize = 160;
 /// How long a client's job may run before the service ends it (its group terminated): a system process's (wallgen's bands, the mark's fine passes) 2^10 ms, a kist's 2^8 ms, so one kist's job holds the GPU from every other client a quarter second at most. The firmware's progress timer (2.6 G GPU cycles, global init) stops a job that stops progressing on its own.
 const GUARD_SYSTEM_MS: u64 = 1 << 10;
 const GUARD_KIST_MS: u64 = 1 << 8;
-/// CSG_EP_REQ's priority (bits 31:28) of a system client's group and a kist's: the firmware runs the higher first when both have work.
-const PRIORITY_SYSTEM: u32 = 15;
+/// CSG_EP_REQ's priority (bits 31:28) of the display's group, another system client's and a kist's: the firmware runs the higher first when both have work. The display alone at 15 (GPU-COMPOSE.md 2.4, 2026-11-21): measured on the Pro the same day (compbench mode 16 beside mode 18), a client keeping two whole-frame jobs queued at the same priority took the GPU whole and the other's job was ended by its guard, so the compositor must not share its priority with anyone.
+const PRIORITY_DISPLAY: u32 = 15;
+const PRIORITY_SYSTEM: u32 = 14;
 const PRIORITY_KIST: u32 = 8;
 
 /// A slot's memory in the MCU's address space (filled before the MCU starts).

@@ -28,8 +28,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/layout.rs");
     println!("cargo:rerun-if-changed=src/noise.rs");
     let shape = |out, layers, clip| Shape { out, layers, clip };
-    // The serial walk's kernels (one invocation a half-row), then the parallel noise's (a workgroup a half-row, `par` its size log 2): the noise alone at three workgroup sizes, the compose's three outputs and the clip at the size `kernel::PAR` names; the memory floor, a pane copied (`record_copy`, Some(0)); and the compose into one phase (GPU-COMPOSE.md step 0).
-    let kernels: [(&str, Shape, Option<u32>); 14] = [
+    // The serial walk's kernels (one invocation a half-row), then the parallel noise's (a workgroup a half-row, `par` its size log 2): the noise alone at three workgroup sizes, the compose's three outputs and the clip at the size `kernel::PAR` names; the memory floor, a pane copied (`record_copy`, Some(0)); the compose into one phase (GPU-COMPOSE.md step 0); and the two probes of GPU-COMPOSE.md step 1 (`record_probe`: a read and a store at an address the job names).
+    let kernels: [(&str, Shape, Option<u32>); 16] = [
         ("NOISE", shape(Out::G2t, false, false), None),
         ("G2T", shape(Out::G2t, true, false), None),
         ("BAKED", shape(Out::Baked, true, false), None),
@@ -44,6 +44,8 @@ fn main() {
         ("CLIP_P", shape(Out::Baked, true, true), Some(kernel::PAR)),
         ("COPY", shape(Out::G2t, false, false), Some(0)),
         ("PHASE1_P", shape(Out::Phase1, true, false), Some(kernel::PAR)),
+        ("PROBE_READ", shape(Out::G2t, false, false), Some(1)),
+        ("PROBE_STORE", shape(Out::G2t, false, false), Some(2)),
     ];
     let mut s = String::new();
     let mut total = 0;
@@ -51,6 +53,8 @@ fn main() {
         let k = match par {
             None => kernel::record(shape),
             Some(0) => kernel::record_copy(),
+            Some(1) => kernel::record_probe(false),
+            Some(2) => kernel::record_probe(true),
             Some(wg) => kernel::record_par(shape, wg),
         };
         total += k.words.len().next_multiple_of(16) + 16;
