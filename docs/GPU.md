@@ -360,5 +360,8 @@ What a session leaves, measured on the Pro:
 - b1113: Linux's sequence as written (CON1 G#3800_0003, CON0's mux) with CON3 at 0: the core clock muxes stalled the bus.
 - b1115: CON3 written with CON1 still at its reset value: the PLLs never locked (no stall).
 - b1116: CON1 G#3800_0003, then CON3: both locked at once; PLL_G3D's mux switched (CON0 G#1_0010, bit 16 set), and the next CMU access (PLL_G3D_L2's mux) stalled the bus.
-- Built since, not yet run: every PLL word set to ABL's before CON3, and each mux's busy bit (16) waited for (bounded) before the next CMU access, a mux that stays busy ending the power-on there with the GPU left off instead of the watchdog. Open: what Linux has that this lacks (likely ACPM's part in the G3D PLLs at pd_g3d's power-on, or the mux needing the embedded domain on first).
+- Since then each mux's busy bit (16) is waited for, bounded, before the next CMU access: a mux that stays busy ends the power-on there with the GPU left off, instead of the watchdog.
+- **Two real jumps from Android (2026-11-22):** b1119 found pd_g3d on (the deny answered 1); b1121 found pd_g3d and embedded_g3d both off (PMU 0, the deny E4), as b879 had. Android powers the GPU down when idle, so most jumps need the power-on. With f7d2a550 reloaded into b1121's session (b1122) the boot left the GPU down and denied with no service, as designed.
+- b1122, by hand on that jumped session: ABL's PLL words with ABL's CON1 (G#1000_0001), then CON3: neither PLL locked in 1 ms (no stall).
+- b1123, the same session: ABL's words, then Linux's CON1 (G#3800_0003), then CON3: both PLLs locked at once, PLL_G3D's and PLL_G3D_L2's muxes switched and read not busy (CON0 G#10). The first core clock mux (COREGROUP_USER, G#1EE0_0630) then stayed busy (G#1_0010) for 1 ms: stopped there, no stall. Its consumer is the embedded domain, still off. Next to try: EMBEDDED_G3D_OUT and the embedded part's CONFIGURATION first, then the four core clock muxes.
 

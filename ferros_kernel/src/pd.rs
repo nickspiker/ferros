@@ -314,6 +314,10 @@ pub fn g3d_on(out: &mut alloc::vec::Vec<u8>, top_only: bool) -> bool {
             wr(CMU + o, v);
             wr(CMU + 0x80 + o, v);
         }
+        // CON1 as Linux's `embedded_g3d_on` writes it (G#3800_0003), over ABL's: with ABL's G#1000_0001 (b1122) or the reset value 2 (b1115) neither PLL locked; with G#3800_0003 both locked at once (b1116).
+        trail("the PLLs' CON1 as Linux writes it");
+        wr(CMU + 0x0104, 0x3800_0003);
+        wr(CMU + 0x0184, 0x3800_0003);
         trail("the PLLs' PMS and enable (CON3)");
         wr(CMU + 0x010C, G3D_PLL_CON3);
         wr(CMU + 0x018C, G3D_L2_PLL_CON3);
