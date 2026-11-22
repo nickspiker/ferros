@@ -6,7 +6,7 @@
 //! Spawn: `ferros-bridge spawn compbench.bin [mode [seconds]] --name compbench --use gpu --dma layers-32`
 //! Grant slots: 0 console, 1 gpu (use), 2 its GPU block (grown to 2^28 bytes).
 //! Since 2026-11-21 also the noise in its parallel form (noise.rs, kernel.rs `record_par`: a workgroup a half-row, its scan in shared storage), measured and checked on the device in mode 0 beside the serial kernels, and the memory floor (a pane copied).
-//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels; 16 the whole frame into one phase a job (the phases in turn) at up to 120 a second, one job at a time, 17 the same with two in flight, 18 a hostile client beside them (whole-frame jobs back to back, two in flight; GPU-COMPOSE.md step 0); for 16 to 18 a third byte of 1 runs it as a kist (the service's op 7); 19 to 21 probe the display's GPU view (step 1, `view_test`). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
+//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels; 16 the whole frame into one phase a job (the phases in turn) at up to 120 a second, one job at a time, 17 the same with two in flight, 18 a hostile client beside them (whole-frame jobs back to back, two in flight; GPU-COMPOSE.md step 0); for 16 to 18 a third byte of 1 runs it as a kist (the service's op 7); 19 to 21 probe the display's GPU view (step 1, `view_test`); 23 a full-screen BAKED window scrolled on its ring (step 2's bench client, `window`). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
 #![no_std]
 #![no_main]
 
@@ -592,6 +592,7 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
         16 | 17 => one_phase(&mut gpu, mode == 17, seconds),
         18 => hostile(&mut gpu, seconds),
         19..=21 => view_test(&mut gpu, mode, input, input_len),
+        23 => window(grants, seconds),
         5 => clip_probe(&mut gpu),
         6..=9 => clip_sequence(&mut gpu, mode - 6),
         10 => uniforms_probe(&mut gpu),
@@ -1393,4 +1394,66 @@ fn par_check(gpu: &mut Gpu) {
         baked_off += c;
     }
     say!("compbench par check: compose A#{wrong} of A#{} pixels off the CPU's; baked A#{baked_off} differ, the most by A#{most} of 65535\n", 64 * W);
+}
+
+/// Mode 23 (GPU-COMPOSE.md step 2's bench client, 2026-11-21): a full-screen app window of `BAKED` pixels scrolled at up to 120 a second for `seconds`, the way a fluor app on the ring scrolls (op 22's 50-byte form: the surface filled once, each show a new origin of its ring and the whole screen changed), so the display composes a whole frame a show (on NEON, or on the GPU with op 86 on). Grants past the bench's: 3 use display, 4 a surface (`--use display --dma surface`).
+/// Its pattern: each row its own colour (a slow ramp down the surface) with a band every 2^6 rows and a stripe every 2^5 columns, so a frame shifted by a row or a column is plain to see.
+fn window(grants: u64, seconds: u64) -> ! {
+    let (display, surf) = (cap(grants, 3), cap(grants, 4));
+    let base = ferros_sys::dma(surf);
+    if base == ferros_sys::ERR || base == 0 {
+        say!("compbench window: no surface (spawn with --use display --dma surface)\n");
+        exit(1);
+    }
+    let px = unsafe { core::slice::from_raw_parts_mut(base as *mut u64, W * H) };
+    for y in 0..H {
+        for x in 0..W {
+            let band = ((y >> 6) & 1) as u64 * 0x3000;
+            let stripe = ((x >> 5) & 1) as u64 * 0x1800;
+            let r = 0x2000 + (y as u64 * 0x9000 / H as u64) + band;
+            let g = 0x1800 + stripe + band / 2;
+            let b = 0x6000 - (y as u64 * 0x4000 / H as u64) + stripe;
+            px[y * W + x] = r | g << 16 | b << 32 | 2 << 48;
+        }
+    }
+    let f = ferros_sys::freq();
+    let period = f / 120;
+    let start = ferros_sys::now();
+    let mut next = start;
+    let (mut frames, mut late, mut origin) = (0u64, 0u64, 0usize);
+    while ferros_sys::now() < start + seconds * f {
+        let mut m = [0u8; 50];
+        m[0] = 22;
+        let put16 = |m: &mut [u8; 50], at: usize, v: u16| m[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        put16(&mut m, 5, W as u16);
+        put16(&mut m, 7, H as u16);
+        m[9..17].copy_from_slice(&base.to_le_bytes());
+        m[17] = ferros_sys::window::APP;
+        m[18] = ferros_sys::window::BAKED;
+        put16(&mut m, 23, W as u16);
+        put16(&mut m, 25, H as u16);
+        m[27] = ferros_sys::window::OPAQUE;
+        m[28..36].copy_from_slice(&base.to_le_bytes());
+        put16(&mut m, 44, W as u16);
+        put16(&mut m, 46, H as u16);
+        put16(&mut m, 48, origin as u16);
+        let mut r = [0u8; 4];
+        ferros_sys::call(display, &m, &mut r);
+        if r[0] != 0 {
+            say!("compbench window: the display refused the show (status A#{})\n", r[0]);
+            exit(1);
+        }
+        frames += 1;
+        origin = (origin + (1 << 3)) % H;
+        next += period;
+        let t = ferros_sys::now();
+        if t > next {
+            late += 1;
+            next = t;
+        } else {
+            ferros_sys::sleep_until(next);
+        }
+    }
+    say!("compbench window: A#{frames} shows in A#{} ms, A#{late} past their slot\n", us(ferros_sys::now() - start) / 1000);
+    exit(0);
 }
