@@ -67,8 +67,8 @@ pub struct Gpu {
     /// The GPU's time of each kind's frames since its last line, counter ticks, and how many.
     ticks: [u64; 4],
     frames: [u64; 4],
-    /// The camera screen's damage the pass before drew (x0, y0, x1, y1), which the next surface lacks: None, the whole frame (a menu frame, the first pass).
-    drawn: Option<(usize, usize, usize, usize)>,
+    /// The camera screen's damage the pass before drew (rects x0, y0, x1, y1), which the next surface lacks: None, the whole frame (a menu frame, the first pass).
+    drawn: Option<Vec<(usize, usize, usize, usize)>>,
 }
 
 // SAFETY: the block is this process's for its life (the kernel never takes a GPU block back); only the UI thread draws into it.
@@ -176,33 +176,36 @@ impl Gpu {
         self.run(Kind::Menu, &mut u, (w * h) as u32)
     }
 
-    /// The camera screen's frame as Lumis drew it (`frame_bits`) into the next surface on the GPU, whole: that surface's base, for the show. Err: why not (the frame is then the CPU's present).
-    /// `damage` (x0, y0, x1, y1: the frame's changed part this pass; None the whole frame) drawn on the GPU into the next surface, with the part the pass before changed (that surface last showed the frame before it: the two buffers take turns): the rest of it is already this frame. Columns to whole quads of four (the frame kernel's). The surface's base, for the show.
-    pub fn camera(&mut self, damage: Option<(usize, usize, usize, usize)>) -> Result<u64, String> {
-        let (w, h) = (self.w, self.h);
-        let whole = (0, 0, w, h);
-        let d = damage.unwrap_or(whole);
-        let (x0, y0, x1, y1) = match self.drawn {
-            Some(p) => (d.0.min(p.0), d.1.min(p.1), d.2.max(p.2), d.3.max(p.3)),
-            None => whole,
+    /// The camera screen's frame as Lumis drew it (`frame_bits`) into the next surface on the GPU: `damage`, the rects the frame changed this pass (None: the whole frame), and the rects the pass before changed (that surface last showed the frame before it: the two buffers take turns); the rest of it is already this frame. Each rect its own job, not one box around them all (the Pro, 2026-11-22: the counters at the top and the exposure's progress at the bottom tick every frame, and the box around them was most of the screen, 2 to 4 ms of the GPU's every pass beside the camera's stack; capture before display, the owner's rule). A pixel in two of them (this pass's and the last's) is drawn twice, the same both times. Columns to whole quads of four (the frame kernel's). The surface's base, for the show.
+    pub fn camera(&mut self, damage: Option<&[(usize, usize, usize, usize)]>) -> Result<u64, String> {
+        let whole = [(0, 0, self.w, self.h)];
+        let now = damage.unwrap_or(&whole).to_vec();
+        let rects: Vec<_> = match self.drawn.take() {
+            Some(before) => now.iter().chain(&before).map(|&(x0, y0, x1, y1)| (x0 & !3, y0, (x1 + 3) & !3, y1)).filter(|r| r.2 > r.0 && r.3 > r.1).collect(),
+            None => whole.to_vec(),
         };
-        self.drawn = Some(d);
-        let (x0, x1) = (x0 & !3, (x1 + 3) & !3);
-        let quads = (x1 - x0) / 4 * (y1 - y0);
-        let mut u = [0u64; frame::SLOT_COUNT as usize];
-        u[frame::SRC as usize] = ARENA_VA + self.frame_at as u64;
-        u[frame::LUT as usize] = ARENA_VA + LUT_AT as u64;
-        u[frame::SIZE as usize] = ((x1 - x0) / 4) as u64 | (quads as u64) << 32;
-        u[frame::ORIGIN as usize] = x0 as u64 | (y0 as u64) << 32;
-        u[frame::STRIDE as usize] = w as u64 | (w as u64) << 32;
-        self.run(Kind::Camera, &mut u, quads as u32)
+        self.drawn = Some(now);
+        let k = self.next;
+        for (j, &(x0, y0, x1, y1)) in rects.iter().enumerate() {
+            let quads = (x1 - x0) / 4 * (y1 - y0);
+            let mut u = [0u64; frame::SLOT_COUNT as usize];
+            u[frame::DST as usize] = SURFACES_VA + (self.surfaces[k] - SURFACES_PA);
+            u[frame::SRC as usize] = ARENA_VA + self.frame_at as u64;
+            u[frame::LUT as usize] = ARENA_VA + LUT_AT as u64;
+            u[frame::SIZE as usize] = ((x1 - x0) / 4) as u64 | (quads as u64) << 32;
+            u[frame::ORIGIN as usize] = x0 as u64 | (y0 as u64) << 32;
+            u[frame::STRIDE as usize] = self.w as u64 | (self.w as u64) << 32;
+            self.exec(Kind::Camera, &u, quads as u32, j + 1 == rects.len())?;
+        }
+        self.next ^= 1;
+        Ok(self.surfaces[k])
     }
 
     /// A job of `kind`'s kernel with uniforms `u` (its DST, slot 0 in both, set here to the next surface) over `invocations`, waited for: the surface it drew.
     fn run(&mut self, kind: Kind, u: &mut [u64], invocations: u32) -> Result<u64, String> {
         let k = self.next;
         u[0] = SURFACES_VA + (self.surfaces[k] - SURFACES_PA);
-        self.exec(kind, u, invocations)?;
+        self.exec(kind, u, invocations, true)?;
         self.next ^= 1;
         Ok(self.surfaces[k])
     }
@@ -220,11 +223,11 @@ impl Gpu {
         u[stack::PLANE as usize] = ARENA_VA + plane as u64;
         u[stack::SIZE as usize] = (width / stack::CHUNK) as u64 | (chunks as u64) << 32;
         u[stack::LINES as usize] = (line / 4) as u64 | (width as u64) << 32;
-        self.exec(if add { Kind::StackAdd } else { Kind::Stack }, &u, chunks as u32)
+        self.exec(if add { Kind::StackAdd } else { Kind::Stack }, &u, chunks as u32, true)
     }
 
-    /// A job of `kind`'s kernel with uniforms `u` over `invocations`, waited for.
-    fn exec(&mut self, kind: Kind, u: &[u64], invocations: u32) -> Result<(), String> {
+    /// A job of `kind`'s kernel with uniforms `u` over `invocations`, waited for; `ends_frame`: the last of its frame's jobs (the GPU time of all of them counted as one frame's).
+    fn exec(&mut self, kind: Kind, u: &[u64], invocations: u32, ends_frame: bool) -> Result<(), String> {
         // The block grew since (the recorder's part for a clip, the integrator's for a camera): another client to the service, the queue opened again for it.
         let size = ferros_sys::dma_size(self.block, ferros_sys::GPU_BLOCK_MOST as u64).unwrap_or(0);
         if size != self.size {
@@ -246,7 +249,7 @@ impl Gpu {
             return Err(why);
         }
         self.ticks[i] += e.gpu_ticks().unwrap_or(0);
-        self.frames[i] += 1;
+        self.frames[i] += ends_frame as u64;
         if self.frames[i] == 1 << 6 {
             println!("lumis: {name} on the GPU: {} us a frame on the GPU, the last {} frames", self.ticks[i] * 1_000_000 / (self.frames[i] * ferros_sys::freq()), self.frames[i]);
             (self.ticks[i], self.frames[i]) = (0, 0);
