@@ -280,7 +280,7 @@ pub const STAMP_REG: u64 = 76;
 /// The registers `job_words` uses, from 0: the highest is the stamp pair's.
 pub const REGS_USED: u32 = STAMP_REG as u32 + 2;
 
-/// A dispatch as the command stream runs it: the shader program descriptor's and the thread storage descriptor's GPU addresses, the uniforms' (and how many), the grid, the cores' thread limit (THREAD_MAX_THREADS, which sizes a task), where to stamp the start and end (a result line, or none), and the sync word the stream sets to `value` at the end.
+/// A dispatch as the command stream runs it: the shader program descriptor's and the thread storage descriptor's GPU addresses (the second holds the workgroup storage's place and size), the uniforms' (and how many), the grid in workgroups, the cores' thread limit (THREAD_MAX_THREADS, which sizes a task), where to stamp the start and end (a result line, or none), and the sync word the stream sets to `value` at the end.
 #[derive(Clone, Copy, Debug)]
 pub struct Dispatch {
     pub spd: u64,
@@ -292,6 +292,9 @@ pub struct Dispatch {
     pub stamps: Option<u64>,
     pub sync: u64,
     pub value: u32,
+    /// The workgroup: 2^`wg_log2` invocations along x (4, one warp, as since 2026-11-04; up to 8 for a kernel with barriers and shared storage, valhall::ssa `workgroup`), and whether the GPU may merge workgroups into one (only for a kernel with no barrier and no shared storage: genxml "Allow merging workgroups").
+    pub wg_log2: u32,
+    pub merge: bool,
 }
 
 /// The flush every job ends with: FLUSH_CACHE2 (opcode 36, genxml v11 "CS FLUSH_CACHE2") with the L2 and the load-store caches cleaned and invalidated (mode 3 each, bits 0-3 and 4-7), the others invalidated (2, bits 8-11), its flush id in r74.
@@ -304,16 +307,18 @@ pub const END_FLUSH: u64 = 0x2400_4A00_0000_0233;
 pub const JOB_WORDS_MOST: usize = 32;
 
 /// The job's command-stream words into `out`; how many.
-/// - REQ_RESOURCE compute; the scoreboard entries (endpoint 3, other 0); SRT 0, the FAU (address | count << 56), SPD, TSD; workgroup 16 x 1 x 1 with merging; job offsets 0; the grid.
+/// - REQ_RESOURCE compute; the scoreboard entries (endpoint 3, other 0); SRT 0, the FAU (address | count << 56), SPD, TSD; the workgroup 2^wg_log2 x 1 x 1, merged as asked (16 with merging for every job before 2026-11-21); job offsets 0; the grid in workgroups.
 /// - With stamps: r76:r77 = the result line, its timestamp at + 8 before the run.
 /// - RUN_COMPUTE (the task's axis and size as Mesa's gallium chooses them, pan_csf.c: along X while the threads fit the core's limit, a task of every workgroup when they all fit; a row a task for a grid of more than one row); WAIT on its entry.
 /// - With stamps: the timestamp at + 16, after the run's WAIT.
 /// - `END_FLUSH` (clean and invalidate L2 and LSC, invalidate the others) and its WAIT; SYNC_SET32 the sync word = `value`, whose update raises the group's interrupt.
 pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
+    // A task of the core's threads: max_threads over the workgroup's invocations (2^4 to 2^8 against the core's 2^10 or more, so at least one; Mesa's pan_calc_workgroups_per_task sizes it the same way).
+    let threads = 1u32 << d.wg_log2;
     let (axis, inc) = if d.groups.1 > 1 {
         (1u64, 1u64)
-    } else if 16 * d.groups.0 >= d.max_threads {
-        (0, (d.max_threads / 16) as u64)
+    } else if threads * d.groups.0 >= d.max_threads {
+        (0, (d.max_threads >> d.wg_log2) as u64)
     } else {
         (2, 1)
     };
@@ -331,7 +336,7 @@ pub fn job_words(d: &Dispatch, out: &mut [u64; JOB_WORDS_MOST]) -> usize {
     put(mv48(16, d.spd));
     put(mv48(24, d.tsd));
     put(mv32(32, 0));
-    put(mv32(33, 0x8000_000F));
+    put(mv32(33, (d.merge as u32) << 31 | (threads - 1)));
     put(mv32(34, 0));
     put(mv32(35, 0));
     put(mv32(36, 0));

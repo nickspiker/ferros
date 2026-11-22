@@ -753,9 +753,23 @@ pub mod gpu {
                 msg[1..3].copy_from_slice(&preload.to_le_bytes());
                 msg[3..7].copy_from_slice(&(code_at as u32).to_le_bytes());
                 msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
-                let mut reply = [1u8; 2];
+                let mut reply = [1u8; 3];
                 let r = super::super::call(self.service, &msg, &mut reply);
-                (r == 2 && reply[0] == 0).then_some(reply[1])
+                (r >= 2 && reply[0] == 0).then_some(reply[1])
+            }
+
+            /// As `kernel`, for a kernel recorded with a workgroup (valhall::ssa `workgroup`, 2026-11-21): 2^`wg_log2` invocations along x (4 to 8; a job's grid then counts these workgroups), and, when `shared_log2` is not 0, 2^`shared_log2` bytes of workgroup storage each, which the GPU keeps in the caller's own block at byte `shared_at` (a multiple of 4 KiB) in the 2^`room_log2` bytes set aside there.
+            /// The room: the storage of as many workgroups as a core's threads hold, for every core id (2^max(`shared_log2`, 7) bytes × THREAD_MAX_THREADS / 2^`wg_log2` × 25 on the Pro's Mali-G715, whose last core id is 24); with less the service gives fewer a core and the GPU holds workgroups back until one's storage is free. Its handle and the workgroups a core may hold, log 2, or None (the service's room, a field outside its range, or a room too small for one workgroup a core).
+            pub fn kernel_group(&self, code_at: usize, words: usize, preload: u16, wg_log2: u8, shared_log2: u8, shared_at: usize, room_log2: u8) -> Option<(u8, u8)> {
+                let mut msg = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, wg_log2, shared_log2, 0, 0, 0, 0, room_log2];
+                msg[1..3].copy_from_slice(&preload.to_le_bytes());
+                msg[3..7].copy_from_slice(&(code_at as u32).to_le_bytes());
+                msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
+                msg[11..15].copy_from_slice(&(shared_at as u32).to_le_bytes());
+                let mut reply = [1u8; 3];
+                let r = super::super::call(self.service, &msg, &mut reply);
+                // An older service answers 2 bytes and ignores the workgroup: refused here, since its jobs would run 16 wide with no storage.
+                (r == 3 && reply[0] == 0).then_some((reply[1], reply[2]))
             }
 
             /// `job` submitted, and the service's doorbell rung (SYS_WAKE on `SUBMIT`): its number, which `wait` and `result` take. None when 2^depth jobs are not yet ended (wait for the oldest first), it passes more than `UNIFORMS_MOST` uniforms, or the queue has ended (`ended`).

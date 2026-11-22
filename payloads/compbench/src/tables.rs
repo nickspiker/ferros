@@ -91,6 +91,7 @@ pub const BLUE: [[u8; 16]; 16] = [
 pub const TURN: [u8; 4] = [0, 2, 3, 1];
 
 /// A run's uniforms: the caller's slots (`slot`), then the kernel's constants.
+#[derive(Clone, Copy)]
 pub struct Run {
     pub y0: u32,
     pub rows: u32,
@@ -118,6 +119,14 @@ impl Run {
     }
     pub fn groups(&self) -> u32 {
         self.padded * self.sides / 16
+    }
+    /// The same run for the parallel kernels (kernel.rs `record_par`): a workgroup a row a side, so its rows unpadded.
+    pub fn par(&self) -> Run {
+        Run { padded: self.rows, ..*self }
+    }
+    /// Its workgroups for the parallel kernels.
+    pub fn par_groups(&self) -> u32 {
+        self.rows * self.sides
     }
 }
 

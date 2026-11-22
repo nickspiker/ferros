@@ -40,10 +40,13 @@ pub const BAKED_AT: usize = 128 << 20;
 /// The four temporal phases' words (the display's layout: a u32 a pixel, a full screen each).
 pub const PHASES_AT: usize = 160 << 20;
 pub const PHASE_BYTES: usize = W * H * 4;
+/// The parallel kernels' workgroup storage (kernel.rs `record_par`, 2026-11-21): 2^`SHARED_ROOM_LOG2` bytes set aside for the GPU service to hand each workgroup its own (ferros_sys `Queue::kernel_group`).
+pub const SHARED_AT: usize = 240 << 20;
+pub const SHARED_ROOM_LOG2: u8 = 24;
 /// The block's size, log 2.
 pub const BLOCK_LOG2: u32 = 28;
 
-const _: () = assert!(CHROME_AT + W * CHROME_ROWS * 8 <= PANE_AT && PANE_AT + W * PANE_ROWS * 8 <= OUT_AT && OUT_AT + W * H * 8 <= CANVAS_AT && CANVAS_AT + W * H * 8 <= BAKED_AT && BAKED_AT + W * H * 8 <= PHASES_AT && PHASES_AT + 4 * PHASE_BYTES <= 1 << BLOCK_LOG2);
+const _: () = assert!(CHROME_AT + W * CHROME_ROWS * 8 <= PANE_AT && PANE_AT + W * PANE_ROWS * 8 <= OUT_AT && OUT_AT + W * H * 8 <= CANVAS_AT && CANVAS_AT + W * H * 8 <= BAKED_AT && BAKED_AT + W * H * 8 <= PHASES_AT && PHASES_AT + 4 * PHASE_BYTES <= SHARED_AT && SHARED_AT + (1 << SHARED_ROOM_LOG2) <= 1 << BLOCK_LOG2);
 
 /// The kernels' uniform slots (the caller's: the kernel's own constants follow from `RESERVED`).
 pub mod slot {
@@ -73,7 +76,9 @@ pub mod slot {
     pub const STIR_LEFT: u8 = 20;
     /// The ODT over 2^14 (the light table's scale), nine f32 by rows, slots 21-25.
     pub const ODT: u8 = 21;
-    pub const RESERVED: u8 = 26;
+    /// [frame u32][0]: the parallel noise's twinkle (noise.rs `row_twinkle`; 0 here, as fluor's still frame).
+    pub const FRAME: u8 = 26;
+    pub const RESERVED: u8 = 27;
 }
 
 /// fluor noise.rs's walk constants (copied: fluor's are private): the step constant, the step's draw, its down draw's shift.

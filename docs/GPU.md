@@ -334,3 +334,10 @@ Built on branch gpu-kists-lumis, host-tested, not yet run on a device:
 - **Per slot in gpu-mem:** a 4-page stream, a descriptor page (a call's descriptor and uniforms, a shared thread storage descriptor, a loaded kernel's program descriptor 32 bytes each from G#400), a sequence page, 64 code pages (32 a call's, 32 the loaded kernels'), two pools of 160 table pages.
 - **Each job's stream:** ferros_gpuq `job_words`, the words of 2026-11-04 plus STORE_STATE timestamps around the run.
 - **The kernel:** SYS_WAIT and SYS_WAKE on a GPU block's words between its owner and the service; SYS_DMA x1 = 7, 8, 9 on `arena` (hold an epoch's GPU work with its queue word, whether an epoch lives, the camera view settled); the GPU's S2MPU reads the camera view's frames read-only for its holder (`gpu_admit_ro`).
+
+## Workgroups (2026-11-21, GPU-KISTS.md section 3 "Workgroups and the parallel noise")
+
+- **A kernel's workgroup:** op 2's 16-byte form names the workgroup (2^4 to 2^8 invocations along x) and its workgroup storage (the bytes a workgroup, where it goes in the client's block, the room there); its reply's third byte is the workgroups a core, log 2.
+- **Each loaded kernel's thread storage descriptor** at the descriptor page's G#800 + 64 a kernel: the workgroup storage's base (the client's own memory, so a reach past it faults in its own space), its size scale (log 2 of the size, at least 128 bytes, plus 1) and its instances a core (log 2), as Mesa's pan_emit_tls; G#1F (none) for a kernel without. The room the service needs: the size × instances × 25 (the last core id of SHADER_PRESENT G#0111_0055, plus 1).
+- **The job:** the workgroup register (r33) the kernel's size less one, merging only for a warp with no storage (ferros_gpuq `Dispatch`); a task along x of THREAD_MAX_THREADS over the workgroup's invocations.
+- **In the shader:** a workgroup storage address is the WLS pointer (FAU special page 1, index 3) plus an offset, a BARRIER.slot7.wait with the instruction before it waiting on every slot (valhall `barrier`); run on the Pro: a 2^6 to 2^8 workgroup's scan over 672 pixels, every pixel the CPU's.

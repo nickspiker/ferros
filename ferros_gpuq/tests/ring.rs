@@ -41,7 +41,7 @@ fn old_words(spd: u64, tsd: u64, fau: u64, nu: u32, groups: (u32, u32), max_thre
 #[test]
 fn words_without_stamps_are_the_old_ones() {
     for (groups, mt) in [((1u32, 1u32), 1024u32), ((1024, 1), 1024), ((84, 2992), 1024), ((24576, 1), 768), ((3, 1), 1024)] {
-        let d = Dispatch { spd: 0x3100_0000, tsd: 0x3100_0040, fau: 0x3100_0080, uniforms: 7, groups, max_threads: mt, stamps: None, sync: 0x3200_0200, value: 1 };
+        let d = Dispatch { spd: 0x3100_0000, tsd: 0x3100_0040, fau: 0x3100_0080, uniforms: 7, groups, max_threads: mt, stamps: None, sync: 0x3200_0200, value: 1, wg_log2: 4, merge: true };
         let mut out = [0u64; JOB_WORDS_MOST];
         let n = job_words(&d, &mut out);
         assert_eq!(&out[..n], &old_words(d.spd, d.tsd, d.fau, 7, groups, mt, d.sync)[..], "{groups:?}");
@@ -55,7 +55,7 @@ fn field(w: u64, start: u32, size: u32) -> u64 {
 
 #[test]
 fn stamps_are_store_state_timestamps() {
-    let d = Dispatch { spd: 0x3100_0400, tsd: 0x3100_0040, fau: 0x8000_1040, uniforms: 3, groups: (256, 1), max_threads: 1024, stamps: Some(0x8000_1240), sync: 0x3200_0240, value: 0x1234_5678 };
+    let d = Dispatch { spd: 0x3100_0400, tsd: 0x3100_0040, fau: 0x8000_1040, uniforms: 3, groups: (256, 1), max_threads: 1024, stamps: Some(0x8000_1240), sync: 0x3200_0240, value: 0x1234_5678, wg_log2: 4, merge: true };
     let mut out = [0u64; JOB_WORDS_MOST];
     let n = job_words(&d, &mut out);
     let w = &out[..n];
@@ -232,4 +232,19 @@ fn coverage_map() {
         let tiles = tiles_across(w) * tiles_across(h);
         assert!(64 + w * h * 8 <= AT && AT + tiles <= 32 << 20, "{w} x {h}");
     }
+}
+
+/// A workgroup of 2^7 with shared storage (2026-11-21): the workgroup register holds 127 with merging off, and a task holds max_threads / 128 workgroups along x; the rest of the words as a warp's.
+#[test]
+fn a_workgroup_dispatch() {
+    let d = Dispatch { spd: 0x3100_0400, tsd: 0x3100_0800, fau: 0x8000_1040, uniforms: 3, groups: (5984, 1), max_threads: 2048, stamps: None, sync: 0x3200_0240, value: 9, wg_log2: 7, merge: false };
+    let mut w = [0u64; JOB_WORDS_MOST];
+    let n = job_words(&d, &mut w);
+    assert!(w[..n].contains(&mv32(33, 127)), "the workgroup register");
+    assert!(w[..n].contains(&(0x04 << 56 | 2048 / 128)), "the task: 16 workgroups along x");
+    let warp = Dispatch { wg_log2: 4, merge: true, ..d };
+    let mut v = [0u64; JOB_WORDS_MOST];
+    let m = job_words(&warp, &mut v);
+    assert_eq!(m, n);
+    assert!(v[..m].contains(&mv32(33, 0x8000_000F)));
 }

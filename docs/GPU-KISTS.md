@@ -88,7 +88,7 @@ Lacking:
 - Each invocation writes only its own element, its store emitted by the compiler from its position, so outputs never race.
 - It reads anything in its bound buffers, and may update a small atomic buffer (histograms, view ranges, a layer's tile coverage bytes).
 - Inputs are resident buffers written on change, plus a uniform block a run.
-- The workgroup is one warp (16 × 1, or 4 × 4 on a 2D grid), the compiler's choice.
+- The workgroup is one warp (16 × 1, or 4 × 4 on a 2D grid), the compiler's choice; a kernel that shares work across invocations (a scan) asks for 2^6 to 2^8 with workgroup memory (since 2026-11-21).
 - System processes and kists use the same kernel format, buffers, queue and isolation, the system first, so the kist side is proven on our own code.
 
 ### 1.1 The language: a compute subset of WGSL
@@ -100,7 +100,8 @@ Lacking:
 | f32, i32, u32, vectors, matrices, `bitcast`, pack | f64 (no hardware); f16 later if measured worth it |
 | arithmetic, compares, `select`, bit ops, sqrt, exp2, log2, sin, cos, atan2, floor, fma | `dpdx` and the other derivatives: fragment only |
 | `if`, loops, `break`, functions (inlined) | pointers past function scope |
-| `atomicAdd`, Min, Max, And, Or, Xor, Exchange | workgroup variables, barriers, subgroups: a gather needs none |
+| `atomicAdd`, Min, Max, And, Or, Xor, Exchange | subgroups (CLPER and the rest): not needed yet; a scan in workgroup memory does what they would (2026-11-21) |
+| `var<workgroup>`, `workgroupBarrier` (since 2026-11-21: valhall::ssa `workgroup`, `shared_load`, `shared_store`, `barrier`) | a gather needs none, but a scan does: the background noise's segmented prefix sum along a half-row (section 3, "Workgroups and the parallel noise"), later blurs and histograms (a row or tile in workgroup memory, read many times) |
 
 - Every loop carries a bound known at dispatch, as tapuwae's `iterate(max, …)` does, so every kernel ends by construction.
 - No bounds checks are generated: the GPU MMU is the bound, and an access outside the client's memory faults the job, loud (WGSL's own rule clamps).
@@ -529,6 +530,63 @@ A job's uniforms are read by the GPU from its record in the ring, and the record
 
 **The patch "reverted" was the test's own.** The same day's handoff test (NEON patched pixels ending mid-line after a GPU frame, a GPU job writing the rest of those lines; "64 of the 256 patched pixels went back") kept its copy of the patch at `SCRATCH_AT`, where the clip kernel sinks its stores outside the rect (the first 2^8 words, a row's own): the clip overwrote the copy of the patch's first 16 rows, 64 pixels, every pass. With the copy past the sink (`KEEP_AT`), the patch held on the service before the fix and after: mode 11 (2^6 passes thru calls and 2^6 thru the queue) 0 pixels changed; mode 12 (where any changed byte would come from: after a GPU frame, after a CPU mark, after an evicting frame, after the CPU rewrote the lines) every patch pixel the patch's in all four. So the GPU wrote back none of the bytes it had not written, even with the line in its L2 from the frame (before the fix); CPU and GPU may share 64-byte lines between jobs.
 
+### Workgroups and the parallel noise (2026-11-21)
+
+The owner's go ("add the memory and barriers to the GPU compiler and do all the things"), after compbench's first run: the serial noise walk kept the GPU's compose latency-bound (one invocation a half-row, 15.8 ms for the compose alone).
+
+**valhall** (forge 715525d4):
+- The builder: BARRIER.slot7.wait; the special FAU values as sources (the workgroup and thread storage pointers, lane, core and warp ids: G#E0 | index << 1 | word with their FAU page); RSHIFT_AND and RSHIFT_XOR. Each against Mesa's assembler vectors (assembler-cases.txt): BARRIER `00 00 00 c0 01 c0 45 48`, MOV of workgroup_local_pointer.w0, thread_local_pointer.w1, lane_id.w0, core_id.w0, RSHIFT_XOR; a special and a uniform in one instruction refused.
+- The recorder: `workgroup(size_log2, shared_bytes)` (2^4 to 2^8 invocations), `local_id`, `group_id`, `shared_load` and `shared_store` (the WLS pointer's low word plus the offset, its high word kept: Mesa's `bi_handle_segment`), `barrier` (the instruction before it waits on slot 0, va_insert_flow.c's rule for barriers); a shift read only by an and, or or xor fused into one LSHIFT_/RSHIFT_ instruction (a hash's xorshifts), a constant shift amount read as a LUT byte.
+- The emulator: `run_group` runs a workgroup's invocations to each barrier in turn with its own storage; a word one invocation wrote and another read or wrote between two barriers panics naming both.
+- Subgroup operations (CLPER) not added: the scan in workgroup memory does what they would.
+
+**The GPU service** (payloads/gpu, stored on the Pro; the one before in keys/husky/capsules-before-gpu-wg-2026-11-21/): op 2 (a kernel loaded for a queue) takes a 16-byte form, the workgroup's size, its storage a workgroup, where in the client's block the storage goes and the room set aside there (ferros_sys `Queue::kernel_group`). Each kernel has its own thread storage descriptor (genxml "Local Storage", Mesa's pan_emit_tls) from the descriptor page's G#800: instances a core as many as THREAD_MAX_THREADS holds, cut to the room (Mesa's pan_calc_wls_instances; fewer and the GPU holds workgroups back), times every core id up to the last present (25). The job's workgroup register is the kernel's size, merging off for any kernel with a workgroup (ferros_gpuq `Dispatch`). The storage is the client's own memory, so a workgroup reaching past it faults in the client's own space. The 9-byte op 2 and the calls run as before.
+
+**The noise in its parallel form** (the Photon session's generator, its scalar reference copied as payloads/compbench/src/noise.rs): each pixel's bits two lowbias32 of a key of its texture row, side and distance from the axis, its colour a segmented sum of the steps since the last speckle. One workgroup a half-row (kernel.rs `record_par`): each invocation hashes a run of ⌈672 / workgroup⌉ pixels, the runs' sums joined by a Hillis-Steele scan in workgroup memory (two barriers a step), each pixel's noise written to workgroup memory, then the half-row composed and stored with neighbouring invocations on neighbouring pixels.
+- Host (tools/compbench-check, `par`): every pixel of the checked rows the CPU reference's bit for bit at workgroups of 2^6, 2^7 and 2^8, the compose fluor's `under` over that noise bit for bit, the bake within 1 of 65535 (as the serial kernels'), the clip writing nothing outside its rect.
+- Device (compbench mode 0, `par check`): the noise 0 of 86016 pixels off the CPU's at each size (64 rows spread over the frame, both sides), the compose 0 off.
+- Statistics against fluor's `noise_under`, the whole frame (the GPU's noise is the reference's bit for bit): every mean, spread and mean step at 1, 16, 64 and 256 pixels within 0.84 % (the largest, B's step at 64), the vertical and cross-channel correlations within 0.006. A different generator: whether fluor takes it is the Photon session's call.
+
+**Where the time goes** (the Pro, clocks held as compbench's first run: A715 2367, A510 1704, MIF 3744, DSU 1800, X3 2914, GPU 890 MHz; the GPU's own time, mean of 16):
+
+| | serial (one invocation a half-row) | parallel (a workgroup of 2^7 a half-row) |
+|---|---|---|
+| the noise alone, G2t16 out | 7.32 ms (6.00 with the GPU's clock held) | 3.35 ms (2^6: 3.52, 2^8: 4.72) |
+| the compose, G2t16 out | 15.58 ms (10.2 to 23.3) | 3.93 ms |
+| the compose and the bake | 21.45 ms | 7.35 ms |
+| the compose, the bake, the dither and the pack (the four phases) | 33.87 ms | 8.83 ms |
+| the floor: a pane copied, 8 bytes read and 8 written a pixel | | 1.95 ms (64 MB: 33 GB/s) |
+
+- The serial kernels waited on memory: 16 invocations a warp touched 16 rows, and 374 warps walked 672 steps each.
+- The parallel compose (3.93 ms) is the noise (3.35) plus the pane's read: issue-bound, about 160 instructions a pixel (the hashes 12, the run's sum 40, the colour, twinkle and pack 55, the scan's share about 25, the output 15), against 1 ms for its 32 MB of writes. The bake adds 3.4 ms (its light and code tables gathered three times a pixel), the dither and pack 1.5.
+- Not yet: v2i16 lanes for the three channels, keeping the steps rather than the hashes across the scan, and the bake's tables in f16 lanes would each take a share of the instructions.
+
+**The frame, re-measured as compbench did** (the whole frame at up to 120 a second for 16 s; power from `diag power`'s 8 s window, its energy above the bench's idle mode 4 a frame shown):
+
+| clocks held | W | frames a second | busy a frame | mJ a frame above idle | the first run's (a85ef847) |
+|---|---|---|---|---|---|
+| 4 idle | 3.18 | | | | |
+| 1 NEON (four A715s make and bake, X3 + 3 A715s present) | 9.20 | 41.1 | 24.4 ms | 147 | 140 |
+| 2 serial GPU bake, NEON present | 6.15 | 40.2 | 24.9 ms | 74 | 92 |
+| 3 serial GPU phases | 4.77 | 29.9 | 33.5 ms | 53 | 73 |
+| 14 parallel GPU bake, NEON present | 9.07 | 94.0 | 10.6 ms | 63 | |
+| 15 parallel GPU phases | 7.85 | 108.2 | 9.2 ms | 43 | |
+
+| the device's own policy | W | frames a second | busy a frame | mJ a frame above idle |
+|---|---|---|---|---|
+| 4 idle | 2.04 | | | |
+| 1 NEON | 6.23 | 38.5 | 26.0 ms | 109 |
+| 2 serial GPU bake, NEON present | 3.28 | 19.2 | 52.2 ms | 65 |
+| 3 serial GPU phases | 3.61 | 29.6 | 33.8 ms | 53 |
+| 14 parallel GPU bake, NEON present | 5.11 | 63.1 | 15.8 ms | 49 |
+| 15 parallel GPU phases | 5.32 | 91.7 | 10.9 ms | 36 |
+
+- The CPU freed: mode 15 runs no CPU code a frame (the bench's thread waits on the queue's doorbell), mode 14 only the present (2.9 ms on the X3 and three A715s held), where NEON's frame is 16.3 ms of four A715s (22.2 under the policy) and the present.
+- Under the policy the profile stays at rest for most of a GPU mode's samples (the CPU idle), so the NEON present of mode 2 and 14 runs at the rest clocks.
+- Neither GPU mode reaches 120 a second alone yet: the parallel phases take 8.8 ms of GPU, the parallel bake 7.4 ms (it would at 120 with the present overlapped on the last frame).
+
+**Small damage** (a rect walked from the axis: NEON on the X3 inline against the GPU's own time and its submit to wake, warm; held clocks): the serial clip kernel's GPU time was 1.5 to 1.9 ms for any rect far from the axis (the walk), so NEON won up to 2^20 pixels. The parallel clip's GPU time is 56 to 290 µs to 2^15 pixels (each row's whole half-row hashed and scanned, only the rect stored), its submit to wake 0.17 to 1 ms (the queue's round, noisy). NEON on the X3 is cheaper below about 2^12 pixels far from the axis and 2^14 near it; from 2^15 the parallel GPU wins at held clocks, from about 2^11 to 2^12 under the policy (the X3 at its rest clock there).
+
 ## 4. Open questions for the owner
 
 0. **The kernel's form in a capsule:** WGSL text means a parser for untrusted text on the device (the rule against string parsers); proposal: WGSL parsed on the developer's side, the capsule carrying a typed form (naga's IR as VSF, or SPIR-V), validated on the device.
@@ -544,3 +602,4 @@ A job's uniforms are read by the GPU from its record in the ring, and the record
 10. **The display reading a layer's tile coverage** (section 3, "Layers"): the form is set (a byte a 64-pixel tile past the pixels); skipping a layer's empty tiles and stopping at its opaque ones is the display's change, not built here.
 11. **The camera on the GPU cacheable**: decided and built (the coordinator, 2026-11-20): cacheable with the GPU's caches invalidated before each of the holder's jobs; since 2026-11-21 every job ends with that invalidate, the holder's and everyone's (section 3, "The queue's uniforms read stale").
 12. **A bad kernel ends its kist's GPU work, not its kist** (Lumis's ask 8): decided (the coordinator, 2026-11-20): end the kist's GPU work and report it; the kist decides whether to end itself.
+13. **The compose on the GPU, re-measured** (section 3, "Workgroups and the parallel noise"): with the noise parallel the GPU makes the whole frame's phases in 8.8 ms (NEON 16.3 ms of four A715s and 2.9 of the present), 43 mJ a frame above idle against NEON's 147 at held clocks, 36 against 109 under the policy, with no CPU a frame; small damage stays on NEON below about 2^12 to 2^14 pixels. The owner's call (the 2026-11-05 decision kept the compose and the present on NEON); the parallel generator is the Photon session's call for fluor.

@@ -30,6 +30,8 @@ const RING_PAGES: usize = 4;
 const KERNEL_PAGES: usize = 32;
 const KERNELS_MOST: usize = 1 << 4;
 const SPD_AT: usize = 0x400;
+/// Each loaded kernel's thread storage descriptor (genxml v11 "Local Storage", 32 bytes, 64-aligned) in the descriptor page: its workgroup storage's place and size (2026-11-21), or none.
+const TSD_AT: usize = 0x800;
 /// In a slot's sequence page (mapped at `OUT_VA`): the word each job's stream sets to its sequence at its end, and the line a call's stamps land in (its start at + 8, its end at + 16).
 const SEQ_AT: usize = 0x240;
 const CALL_STAMPS: usize = 0x278;
@@ -111,6 +113,9 @@ struct Slot {
     /// Kernels loaded for its client (op 2) and the code words they take.
     kernels: usize,
     code_used: usize,
+    /// Each loaded kernel's workgroup (2^n invocations, 4 a warp) and whether it has workgroup storage (no merging then); its thread storage descriptor at `TSD_AT` + 64 a kernel.
+    kern_wg: [u8; KERNELS_MOST],
+    kern_wls: [bool; KERNELS_MOST],
     queue: Option<Queue>,
     /// The next sequence a job of this slot's ends with, and its jobs in flight, `head` the oldest.
     seq: u32,
@@ -122,7 +127,7 @@ struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, used: 0, running: false, kernels: 0, code_used: 0, kern_wg: [4; KERNELS_MOST], kern_wls: [false; KERNELS_MOST], queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
 }
 
 struct State {
@@ -672,7 +677,7 @@ extern "C" fn slot_thread(k: u64) -> ! {
                 let seq = st.slots[k].seq;
                 if ok {
                     let rec = qu.gpu + r.record_offset(n) as u64;
-                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + 0x40, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
+                    let d = q::Dispatch { spd: DESC_VA + (SPD_AT + 32 * kern as usize) as u64, tsd: DESC_VA + (TSD_AT + 64 * kern as usize) as u64, fau: rec + (q::UNIFORMS * 8) as u64, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(rec + q::RESULT_BYTES as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, wg_log2: st.slots[k].kern_wg[kern as usize] as u32, merge: !st.slots[k].kern_wls[kern as usize] && st.slots[k].kern_wg[kern as usize] == 4 };
                     let mut words = [0u64; q::JOB_WORDS_MOST];
                     let len = q::job_words(&d, &mut words);
                     append(s, &mut st.slots[k], k, &words[..len]);
@@ -950,8 +955,16 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             // A kernel loaded for the client's queue: its words copied from its block after the calls' code, its descriptor written.
             2 if m.len() >= 9 => {
                 let (preload, code_off, words) = (u16_at(1) as u32, u32_at(3) as usize, u16_at(7) as usize);
-                // WHY: the offsets and lengths are the client's; its code must lie in its own block, and fit the slot's kernel pages with the 16 zero words after it the front end may fetch.
-                let fits = words > 0 && code_off % 8 == 0 && code_off + 8 * words <= bsize as usize;
+                // The workgroup (2026-11-21, valhall::ssa `workgroup`), from a request of 16 bytes: [9] 2^n invocations along x (4 to 8), [10] the bytes of workgroup storage each workgroup needs, log 2 (0 none), [11..15] where that storage goes in the client's block, [15] the bytes the client set aside there, log 2. A 9-byte request is a warp with none, as before.
+                let (wg, wls_log2, wls_at, room_log2) = if m.len() >= 16 { (m[9] as u32, m[10] as u32, u32_at(11) as usize, m[15] as u32) } else { (4, 0, 0, 0) };
+                // The storage each workgroup takes: a power of two of at least 128 bytes (Mesa's pan_wls_adjust_size), `instances` of them a core (as many workgroups as a core's threads hold, Mesa's pan_calc_wls_instances; fewer and the GPU holds workgroups back until one is free), for every core id up to the last present (pan_query_core_id_range): as many as the room the client set aside holds.
+                let core_range = 64 - s.cores.leading_zeros();
+                let size_log2 = wls_log2.max(7);
+                let want_log2 = (s.max_threads >> wg.min(8)).max(1).trailing_zeros();
+                let inst_log2 = (0..=want_log2).rev().find(|&i| ((core_range as u64) << (size_log2 + i)) <= 1u64 << room_log2.min(40));
+                // WHY: every field is the client's; its storage must lie in its own block, page aligned (pan_emit_tls's assert), and a kernel asking for storage must have room for at least one workgroup a core. Outside that its own space faults anyway; refused here, it hears why at once.
+                let wls_ok = wls_log2 == 0 || (wls_log2 <= 16 && wls_at % PAGE == 0 && room_log2 <= 30 && wls_at + (1usize << room_log2) <= bsize as usize && inst_log2.is_some());
+                let fits = words > 0 && code_off % 8 == 0 && code_off + 8 * words <= bsize as usize && (4..=8).contains(&wg) && wls_ok;
                 let r = with(|st| {
                     let k = slot_for(st, &stamp, bbase, bsize)?;
                     let sl = &mut st.slots[k];
@@ -978,12 +991,22 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
                     for (j, w) in [spd0, pre, va as u32, (va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
                         wr32(sl.desc + SPD_AT + 32 * h + 4 * j, *w);
                     }
+                    // Its thread storage descriptor (genxml v11 "Local Storage"; Mesa's pan_emit_tls): no thread storage; the workgroup storage's instances a core (log 2, bits 0-4) and its size scale (log 2 of the size plus 1, bits 8-12) with its base, or G#8000_0000 packed as log 2 (G#1F) for none.
+                    let (w1, base) = match inst_log2.filter(|_| wls_log2 != 0) {
+                        Some(i) => (i | (size_log2 + 1) << 8, ARENA_VA + wls_at as u64),
+                        None => (0x1F, 0),
+                    };
+                    for (j, w) in [0, w1, 0, 0, base as u32, (base >> 32) as u32, 0, 0].iter().enumerate() {
+                        wr32(sl.desc + TSD_AT + 64 * h + 4 * j, *w);
+                    }
+                    sl.kern_wg[h] = wg as u8;
+                    sl.kern_wls[h] = wls_log2 != 0;
                     sl.kernels += 1;
                     sl.code_used = at + words + 16;
                     Some(h as u8)
                 });
                 match r {
-                    Some(h) => ferros_sys::reply(&token, &[0, h]),
+                    Some(h) => ferros_sys::reply(&token, &[0, h, if wls_log2 != 0 { inst_log2.unwrap_or(0) as u8 } else { 0 }]),
                     None => ferros_sys::reply(&token, &[1]),
                 };
                 continue;
@@ -1111,7 +1134,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
             wr64(sl.flag + CALL_STAMPS + 8, 0);
             wr64(sl.flag + CALL_STAMPS + 16, 0);
             let seq = sl.seq;
-            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq };
+            let d = q::Dispatch { spd: DESC_VA, tsd: DESC_VA + 0x40, fau: DESC_VA + 0x80, uniforms: nu as u32, groups, max_threads: s.max_threads, stamps: s.stamps.then_some(OUT_VA + CALL_STAMPS as u64), sync: OUT_VA + SEQ_AT as u64, value: seq, wg_log2: 4, merge: true };
             let mut jw = [0u64; q::JOB_WORDS_MOST];
             let len = q::job_words(&d, &mut jw);
             append(s, sl, k, &jw[..len]);

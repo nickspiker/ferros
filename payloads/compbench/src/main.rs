@@ -5,7 +5,8 @@
 //!
 //! Spawn: `ferros-bridge spawn compbench.bin [mode [seconds]] --name compbench --use gpu --dma layers-32`
 //! Grant slots: 0 console, 1 gpu (use), 2 its GPU block (grown to 2^28 bytes).
-//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
+//! Since 2026-11-21 also the noise in its parallel form (noise.rs, kernel.rs `record_par`: a workgroup a half-row, its scan in shared storage), measured and checked on the device in mode 0 beside the serial kernels, and the memory floor (a pane copied).
+//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels. The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
 #![no_std]
 #![no_main]
 
@@ -15,6 +16,8 @@ extern crate alloc;
 mod layout;
 #[allow(dead_code)]
 mod tables;
+#[allow(dead_code)]
+mod noise;
 #[path = "../../display/src/neon.rs"]
 #[allow(dead_code)]
 mod neon;
@@ -29,6 +32,9 @@ mod kernels {
     pub struct Kernel {
         pub regs64: bool,
         pub loop_words: usize,
+        /// Its workgroup, 2^wg_log2 invocations (4: a warp, the serial kernels), and its shared storage a workgroup (0: none).
+        pub wg_log2: u32,
+        pub shared_bytes: u32,
         pub words: &'static [u64],
         pub consts: &'static [u64],
     }
@@ -332,35 +338,56 @@ fn neon_runs(t: Task, n: usize) -> ((u64, u64, u64), (u64, u64, u64), u64) {
 
 struct Gpu {
     q: Queue,
-    handles: [u8; 5],
+    handles: [u8; KERNELS],
 }
 const K_NOISE: usize = 0;
 const K_G2T: usize = 1;
 const K_BAKED: usize = 2;
 const K_PHASES: usize = 3;
 const K_CLIP: usize = 4;
+/// The parallel noise's kernels (kernel.rs `record_par`, 2026-11-21): the noise alone at workgroups of 2^6, 2^7 and 2^8, the compose to G2t16, baked and the phases, the clip; and the memory floor (a pane copied).
+const K_NOISE_P6: usize = 5;
+const K_NOISE_P8: usize = 7;
+const K_G2T_P: usize = 8;
+const K_BAKED_P: usize = 9;
+const K_PHASES_P: usize = 10;
+const K_CLIP_P: usize = 11;
+const K_COPY: usize = 12;
+const KERNELS: usize = 13;
 fn kernel(i: usize) -> &'static kernels::Kernel {
-    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP][i]
+    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP, &kernels::NOISE_P6, &kernels::NOISE_P7, &kernels::NOISE_P8, &kernels::G2T_P, &kernels::BAKED_P, &kernels::PHASES_P, &kernels::CLIP_P, &kernels::COPY][i]
 }
 
 fn walk() -> (u64, u64, u64) {
     (widen_mask(fluor::theme::BG_MASK), widen_mask(fluor::theme::BG_SPECKLE), widen_base(fluor::theme::BG_BASE))
 }
 
+/// Kernel `k`'s run and workgroups for `run`: the serial kernels' as the run says, the parallel ones a workgroup a row a side (`Run::par`), the copy a warp a 16 pixels of the frame.
+fn grid(k: usize, run: &tables::Run) -> (tables::Run, u32) {
+    if k == K_COPY {
+        (*run, (W * H / 16) as u32)
+    } else if kernel(k).wg_log2 > 4 {
+        (run.par(), run.par_groups())
+    } else {
+        (*run, run.groups())
+    }
+}
+
 impl Gpu {
     /// Kernel `k` over `run`, its output at `out_at`: submitted, waited for; the caller's submit to its wake and the GPU's own time, ticks, and the status.
     fn job(&mut self, k: usize, run: &tables::Run, out_at: usize) -> (u64, u64, u64) {
+        let (run, groups) = grid(k, run);
         let mut u = [0u64; 64];
-        let n = tables::uniforms(&mut u, run, ferros_sys::gpu::ARENA_VA, out_at, unsafe { JOB_SCROLL }, OFFSET, walk(), &tables::odt_scaled(ferros_sys::akita()), kernel(k).consts);
+        let n = tables::uniforms(&mut u, &run,ferros_sys::gpu::ARENA_VA, out_at, unsafe { JOB_SCROLL }, OFFSET, walk(), &tables::odt_scaled(ferros_sys::akita()), kernel(k).consts);
         let t0 = ferros_sys::now();
-        let Some(j) = self.q.submit(&Job { kernel: self.handles[k], groups: (run.groups(), 1), uniforms: &u[..n] }) else {
+        let Some(j) = self.q.submit(&Job { kernel: self.handles[k], groups: (groups, 1), uniforms: &u[..n] }) else {
             say!("compbench: a submit refused (the queue ended A#{})\n", self.q.ended());
             exit(1);
         };
         let e = self.q.wait(j);
         let wall = ferros_sys::now() - t0;
         if e.status != S_DONE {
-            say!("compbench: kernel A#{k} over A#{} groups: status A#{}, GPU address G#{:X}, AS_FAULTSTATUS G#{:X}; the queue ended A#{}, opened again {}\n", run.groups(), e.status, e.fault_address, e.fault_status, self.q.ended(), self.q.reopen());
+            say!("compbench: kernel A#{k} over A#{} groups: status A#{}, GPU address G#{:X}, AS_FAULTSTATUS G#{:X}; the queue ended A#{}, opened again {}\n", groups, e.status, e.fault_address, e.fault_status, self.q.ended(), self.q.reopen());
         }
         (wall, e.gpu_ticks().unwrap_or(0), e.status)
     }
@@ -519,13 +546,23 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
             exit(1);
         }
     };
-    let mut handles = [0u8; 5];
+    let mut handles = [0u8; KERNELS];
     for (i, h) in handles.iter_mut().enumerate() {
         let kk = kernel(i);
         let w = px(K_AT + i * K_ROOM, kk.words.len());
         w.copy_from_slice(kk.words);
         let preload = ferros_sys::gpu::PRELOAD_X | if kk.regs64 { ferros_sys::gpu::PRELOAD_REGS64 } else { 0 };
-        match q.kernel(K_AT + i * K_ROOM, kk.words.len(), preload) {
+        let loaded = if kk.wg_log2 > 4 {
+            // A parallel kernel: its workgroup and its shared storage, which the GPU keeps in this block at SHARED_AT (layout.rs).
+            let r = q.kernel_group(K_AT + i * K_ROOM, kk.words.len(), preload, kk.wg_log2 as u8, kk.shared_bytes.trailing_zeros() as u8, SHARED_AT, SHARED_ROOM_LOG2);
+            if let Some((_, inst)) = r {
+                say!("compbench: kernel A#{i} (workgroup 2^A#{}, A#{} B shared) loaded, A#{} workgroups a core\n", kk.wg_log2, kk.shared_bytes, 1u32 << inst);
+            }
+            r.map(|x| x.0)
+        } else {
+            q.kernel(K_AT + i * K_ROOM, kk.words.len(), preload)
+        };
+        match loaded {
             Some(x) => *h = x,
             None => {
                 say!("compbench: kernel A#{i} not loaded\n");
@@ -542,7 +579,7 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
     pin_here(8);
     ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 100);
     match mode {
-        1..=4 => sustained(&mut gpu, mode, seconds),
+        1..=4 | 14 | 15 => sustained(&mut gpu, mode, seconds),
         5 => clip_probe(&mut gpu),
         6..=9 => clip_sequence(&mut gpu, mode - 6),
         10 => uniforms_probe(&mut gpu),
@@ -575,6 +612,14 @@ fn sustained(gpu: &mut Gpu, mode: u8, seconds: u64) -> ! {
             }
             3 => {
                 gpu.job(K_PHASES, &tables::Run::frame(), BAKED_AT);
+            }
+            // The parallel noise's kernels (2026-11-21): 14 as 2, 15 as 3.
+            14 => {
+                gpu.job(K_BAKED_P, &tables::Run::frame(), BAKED_AT);
+                dispatch(Task { who: X3_A715_3, stages: PRESENT, ..FRAME });
+            }
+            15 => {
+                gpu.job(K_PHASES_P, &tables::Run::frame(), BAKED_AT);
             }
             _ => {}
         }
@@ -629,6 +674,20 @@ fn everything(gpu: &mut Gpu) -> ! {
             gpu.hold(false);
         }
     }
+    // ---- GPU, the parallel noise (2026-11-21): a workgroup a half-row, its scan in shared storage; and the memory floor ----
+    for held in [false, true] {
+        if held {
+            say!("compbench GPU parallel: the clock held up (op 6): {}\n", gpu.hold(true));
+        }
+        for (name, k) in [("par noise alone, workgroup 2^6", K_NOISE_P6), ("par noise alone, workgroup 2^7", K_NOISE_P6 + 1), ("par noise alone, workgroup 2^8", K_NOISE_P8), ("par compose, G2t16 out", K_G2T_P), ("par compose + bake, baked out", K_BAKED_P), ("par compose + bake + dither + pack, 4 phases out", K_PHASES_P), ("the floor: the pane copied, 8 B read and 8 B written a pixel", K_COPY)] {
+            let (w, g) = gpu.runs(k, &frame, OUT_AT, n, 0);
+            say!("compbench GPU {name} ({} words, workgroup 2^{}, {} B shared): submit to wake A#{}/A#{}/A#{} us, the GPU's own A#{}/A#{}/A#{} us\n", kernel(k).words.len(), kernel(k).wg_log2, kernel(k).shared_bytes, w.0, w.1, w.2, g.0, g.1, g.2);
+        }
+        if held {
+            gpu.hold(false);
+        }
+    }
+    par_check(gpu);
     // The GPU's pixels against NEON's: the compose bit for bit, the bake and the phases by their largest difference.
     gpu.job(K_G2T, &frame, OUT_AT);
     let (m0, n0) = diff64(px(OUT_AT, W * H), px(CANVAS_AT, W * H));
@@ -677,10 +736,12 @@ fn everything(gpu: &mut Gpu) -> ! {
                 say!("compbench rect 2^A#{lg}: A#{left} of its pixels not written by the GPU\n");
             }
             let (iw, ig) = call_runs(K_CLIP, &run, 4, 1 << 6);
+            // The parallel clip thru the queue, warm (2026-11-21).
+            let (pw, pg) = gpu.runs(K_CLIP_P, &run, OUT_AT, reps, 0);
             let t0 = ferros_sys::now();
             run_rows(&Task { who: 0, stages: PRESENT, y0, rows: h, x0, x1, dest: OUT_AT }, y0, y1);
             let pres = us(ferros_sys::now() - t0);
-            say!("compbench rect 2^A#{lg} ({w}x{h} {}): NEON X3 A#{}/A#{} us, A715 A#{}/A#{} us; GPU warm A#{} us (A#{}), idle A#{} us (A#{}); present A#{pres} us\n", if far { "far" } else { "near" }, na.0, na.1, nb.0, nb.1, gw.1, gg.1, iw.1, ig.1);
+            say!("compbench rect 2^A#{lg} ({w}x{h} {}): NEON X3 A#{}/A#{} us, A715 A#{}/A#{} us; GPU warm A#{} us (A#{}), idle A#{} us (A#{}); GPU par warm A#{} us (A#{}); present A#{pres} us\n", if far { "far" } else { "near" }, na.0, na.1, nb.0, nb.1, gw.1, gg.1, iw.1, ig.1, pw.1, pg.1);
         }
     }
     // A cursor blink (4 × 64, at the text's place) and a hover (a 256 × 96 button), each both ways.
@@ -1083,4 +1144,70 @@ fn call_runs(k: usize, run: &tables::Run, n: usize, gap_ms: u64) -> ((u64, u64, 
         gpu[i] = g;
     }
     (spread(&wall[..n]), spread(&gpu[..n]))
+}
+
+/// The parallel kernels' pixels on the device against the CPU's (2026-11-21): 2^6 rows spread over the frame, both sides; the noise of each workgroup size bit for bit against noise.rs `reference_row`, the compose bit for bit against the layers (fluor's `under`, as NEON's) over that noise, the bake against the display's own bake of it (bake.rs `g2t_row`) by its largest difference. A barrier or the shared storage wrong on the device shows here as rows that differ.
+fn par_check(gpu: &mut Gpu) {
+    let frame = tables::Run::frame();
+    let (mask, speckle, base) = walk();
+    let rows = |i: usize| (i * H / 64 + i * 7) % H;
+    let mut half = [0u64; AXIS];
+    let mut want = [0u64; W];
+    // Row y's parallel noise, the whole row (mirrored about the axis), into `want`.
+    let mut noise_row = |y: usize, want: &mut [u64; W]| {
+        let t = ((y as isize - SCROLL as isize).rem_euclid(H as isize)) as u32;
+        noise::reference_row(t, false, W - AXIS, mask, speckle, base, 0, &mut half);
+        want[AXIS..].copy_from_slice(&half[..W - AXIS]);
+        noise::reference_row(t, true, AXIS, mask, speckle, base, 0, &mut half);
+        for k in 0..AXIS {
+            want[AXIS - 1 - k] = half[k];
+        }
+    };
+    for k in [K_NOISE_P6, K_NOISE_P6 + 1, K_NOISE_P8] {
+        gpu.job(k, &frame, OUT_AT);
+        let (mut wrong, mut rows_off) = (0usize, 0usize);
+        for i in 0..64 {
+            let y = rows(i);
+            noise_row(y, &mut want);
+            let got = &px(OUT_AT, W * H)[y * W..(y + 1) * W];
+            let d = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            wrong += d;
+            rows_off += (d != 0) as usize;
+        }
+        say!("compbench par check: noise at workgroup 2^A#{}: A#{wrong} of A#{} pixels off the CPU's, in A#{rows_off} of 64 rows\n", kernel(k).wg_log2, 64 * W);
+    }
+    // The compose: the layers as NEON makes them, the noise under them.
+    let mut comp = [0u64; W];
+    let mut compose_row = |y: usize, comp: &mut [u64; W]| {
+        noise_row(y, &mut want);
+        if y < CHROME_ROWS {
+            comp.copy_from_slice(&px(CHROME_AT, W * CHROME_ROWS)[y * W..(y + 1) * W]);
+        } else {
+            comp.fill(0);
+        }
+        let p = (y + OFFSET as usize) * W;
+        under_row(comp, &px(PANE_AT, W * PANE_ROWS)[p..p + W]);
+        for x in 0..W {
+            comp[x] = if comp[x] == 0 { want[x] } else { comp[x].under(want[x], BlendMode::Normal) };
+        }
+    };
+    gpu.job(K_G2T_P, &frame, OUT_AT);
+    let mut wrong = 0usize;
+    for i in 0..64 {
+        let y = rows(i);
+        compose_row(y, &mut comp);
+        wrong += px(OUT_AT, W * H)[y * W..(y + 1) * W].iter().zip(comp.iter()).filter(|(a, b)| a != b).count();
+    }
+    gpu.job(K_BAKED_P, &frame, OUT_AT);
+    let (mut most, mut baked_off) = (0u64, 0usize);
+    let mut baked = [0u64; W];
+    for i in 0..64 {
+        let y = rows(i);
+        compose_row(y, &mut comp);
+        bake::now().g2t_row(&comp, &mut baked);
+        let (m, c) = diff64(&px(OUT_AT, W * H)[y * W..(y + 1) * W], &baked);
+        most = most.max(m);
+        baked_off += c;
+    }
+    say!("compbench par check: compose A#{wrong} of A#{} pixels off the CPU's; baked A#{baked_off} differ, the most by A#{most} of 65535\n", 64 * W);
 }

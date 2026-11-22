@@ -3,6 +3,9 @@
 #[path = "src/layout.rs"]
 #[allow(dead_code)]
 mod layout;
+#[path = "src/noise.rs"]
+#[allow(dead_code)]
+mod noise;
 #[path = "src/kernel.rs"]
 #[allow(dead_code)]
 mod kernel;
@@ -23,19 +26,36 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ld.display());
     println!("cargo:rerun-if-changed=src/kernel.rs");
     println!("cargo:rerun-if-changed=src/layout.rs");
-    let shapes = [
-        ("NOISE", Shape { out: Out::G2t, layers: false, clip: false }),
-        ("G2T", Shape { out: Out::G2t, layers: true, clip: false }),
-        ("BAKED", Shape { out: Out::Baked, layers: true, clip: false }),
-        ("PHASES", Shape { out: Out::Phases, layers: true, clip: false }),
-        ("CLIP", Shape { out: Out::Baked, layers: true, clip: true }),
+    println!("cargo:rerun-if-changed=src/noise.rs");
+    let shape = |out, layers, clip| Shape { out, layers, clip };
+    // The serial walk's kernels (one invocation a half-row), then the parallel noise's (a workgroup a half-row, `par` its size log 2): the noise alone at three workgroup sizes, the compose's three outputs and the clip at the size `kernel::PAR` names; and the memory floor, a pane copied (`record_copy`, Some(0)).
+    let kernels: [(&str, Shape, Option<u32>); 13] = [
+        ("NOISE", shape(Out::G2t, false, false), None),
+        ("G2T", shape(Out::G2t, true, false), None),
+        ("BAKED", shape(Out::Baked, true, false), None),
+        ("PHASES", shape(Out::Phases, true, false), None),
+        ("CLIP", shape(Out::Baked, true, true), None),
+        ("NOISE_P6", shape(Out::G2t, false, false), Some(6)),
+        ("NOISE_P7", shape(Out::G2t, false, false), Some(7)),
+        ("NOISE_P8", shape(Out::G2t, false, false), Some(8)),
+        ("G2T_P", shape(Out::G2t, true, false), Some(kernel::PAR)),
+        ("BAKED_P", shape(Out::Baked, true, false), Some(kernel::PAR)),
+        ("PHASES_P", shape(Out::Phases, true, false), Some(kernel::PAR)),
+        ("CLIP_P", shape(Out::Baked, true, true), Some(kernel::PAR)),
+        ("COPY", shape(Out::G2t, false, false), Some(0)),
     ];
     let mut s = String::new();
-    for (name, shape) in shapes {
-        let k = kernel::record(shape);
+    let mut total = 0;
+    for (name, shape, par) in kernels {
+        let k = match par {
+            None => kernel::record(shape),
+            Some(0) => kernel::record_copy(),
+            Some(wg) => kernel::record_par(shape, wg),
+        };
+        total += k.words.len().next_multiple_of(16) + 16;
         assert!(k.words.len() * 8 <= layout::K_ROOM, "{name}: {} words past its room", k.words.len());
-        let _ = writeln!(s, "/// {shape:?}: {} words, {} in the loop, {} nodes kept, peak {} registers.", k.words.len(), k.loop_words, k.kept, k.peak);
-        let _ = write!(s, "pub static {name}: Kernel = Kernel {{ regs64: {}, loop_words: {}, words: &[", k.regs64, k.loop_words);
+        let _ = writeln!(s, "/// {shape:?}, workgroup 2^{}: {} words, {} in the loop, {} nodes kept, peak {} registers, {} bytes of shared storage.", k.wg_log2, k.words.len(), k.loop_words, k.kept, k.peak, k.shared_bytes);
+        let _ = write!(s, "pub static {name}: Kernel = Kernel {{ regs64: {}, loop_words: {}, wg_log2: {}, shared_bytes: {}, words: &[", k.regs64, k.loop_words, k.wg_log2, k.shared_bytes);
         for x in &k.words {
             let _ = write!(s, "{x},");
         }
@@ -45,6 +65,8 @@ fn main() {
         }
         s.push_str("] };\n");
     }
+    // WHY: the GPU service keeps a client's loaded kernels in 32 pages (2^14 words, each kernel's words rounded to 16 and 16 zero words after); past them the last loads are refused on the device.
+    assert!(total <= 1 << 14, "the kernels take {total} of the service's 2^14 words");
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("kernels.rs");
     std::fs::write(out, s).expect("OUT_DIR is writable");
 }
