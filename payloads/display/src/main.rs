@@ -3549,6 +3549,98 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
     ((acc & 1 << 48) | ch(0, 0) | ch(16, 1) | ch(32, 2) | t2 << 49 | if t2 == 16384 { 1 << 63 } else { 0 }, t2)
 }
 
+/// A composed pixel's transparency bits from its second step up (bits 50-62): non-zero, with the see-through bit clear, on a partly covered pixel. A transparency of one step (bit 49 alone) is opaque: fluor marks every opaque pixel so (its α 65535 has no Q14 form, 16384 − 65535 / 4 = 1; fluor host/panel.rs), and what that step lets thru is at most a working step of what is behind (1/16384 of it), so taking it as opaque changes no pixel by more than the field's own rounding while sparing the walk every pixel of a baked window (on the Pro, 2026-11-21: every Photon pixel beside the keyboard carries it).
+const PARTIAL: u64 = 0x1FFF << 50;
+/// The partly covered pixels `partial_run` composed and its ticks, since `show_parts`' last line.
+static APP_PARTIAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A selected run's see-through pixels emptied (their channels nothing: black where every window is see-through, as the select has always left them), and each 16-pixel block holding a partly covered pixel (`PARTIAL`) marked, bit j for the block from 16j: the only blocks `partial_run` visits. A run is at most a row (`px` holds 1344 pixels, 84 blocks), so every block has its bit. Each block is one OR of its pixels and one bit set, branch free, in the pass that has always cleared the see-through pixels.
+#[inline(always)]
+fn clear_mark(run: &mut [u64]) -> u128 {
+    let mut blocks = 0u128;
+    for (j, c) in run.chunks_mut(16).enumerate() {
+        let mut o = 0u64;
+        for p in c.iter_mut() {
+            *p &= ((*p >> 63) ^ 1).wrapping_neg();
+            o |= *p;
+        }
+        blocks |= ((o & PARTIAL != 0) as u128) << j;
+    }
+    blocks
+}
+
+/// A run's partly covered pixels composed whole, in working values (owner, 2026-11-21, the keyboard's antialiased edge over Photon: "Sure on the edge pixels."). The plain and select paths take each pixel from its frontmost window that is not see-through, by the see-through bit alone: exact for an opaque pixel and a clear one, but a partly covered pixel (its transparency in bits 49-62) went out as its own light over black, a dark staircase wherever it stands over a window (the keyboard's surround along its 30° key tops, 0542ee39).
+/// Here each such pixel (`px[x]`, as the select left it) is walked front to back over the chain's windows by fluor's `under` in working values: the layer's premultiplied working value by what is still transparent, the transparency the product with the layer's own, until a layer is opaque; what is still transparent at the end is over black. The sum is then baked as a working surface's row is (`neon::bake16`, 16 pixels at a time), so a pixel the front covers whole comes out as `layer_row` bakes it. Never in the panel's codes: the bake is not linear (the roll-off, the ODT, the panel's 1/2.19), so codes mixed by a share are not the codes of the light mixed by it.
+/// Where the working values come from: a working (format 0) window's are its own pixels, as its client wrote them (ahau's keyboard). A baked window's (Photon's) exist only in its client, which bakes in its own process (fluor's host, op 65): the display holds codes. They are unbaked (`Bake::unbake_px`): the bake is one monotone function a channel (the roll-off, then the panel's 1/2.19 after the ODT, a matrix with an inverse), so the unbake is its inverse up to the rounding of the code, which is finer than the working field's step over most of the range; a premultiplied pixel's codes are its light over black, and their unbake its premultiplied working value. Lost only where the bake lost it: past the panel's gamut and in the roll-off's last stops.
+/// A partly covered pixel over nothing (no window behind it shows) is left as it came, its light over black. The opaque and clear pixels pay one OR each, in the pass that has always cleared the see-through ones (`clear_mark`), which marks the 16-pixel blocks holding a partly covered pixel (`blocks`, bit j for the block from `a` + 16j); this walk visits only those blocks.
+/// GPU-COMPOSE: the same per-pixel rule (front to back, `under` in working values, then the bake) is what a compose kernel does for every pixel of a partly covered window; the baked window behind is unbaked there the same way, or held as working values until the compose's last step.
+#[inline(never)]
+fn partial_run(px: &mut [u64], blocks: u128, chain: &[u8], order: &[(u8, u8, u8)], y: usize, a: usize, b: usize, width: usize, height: usize) {
+    let t0 = now();
+    // Each layer's source row for this run (`ring_cuts`: one source row a window in a run) and its format.
+    let mut srcs: [&[u64]; SURFACES] = [&[]; SURFACES];
+    let mut fmts = [0u8; SURFACES];
+    for (n, &i) in chain.iter().enumerate() {
+        let (k, f, _) = order[i as usize];
+        let sy = src_row(k as usize, y, a);
+        srcs[n] = &window_pixels(k as usize, width, height)[sy * width..(sy + 1) * width];
+        fmts[n] = f;
+    }
+    let bk = bake::now();
+    let (mut blk, mut at, mut m, mut count) = ([0u64; 16], [0usize; 16], 0usize, 0u64);
+    let mut flush = |blk: &mut [u64; 16], at: &[usize; 16], m: usize, px: &mut [u64]| {
+        unsafe { neon::bake16(&bk.odt, blk.as_ptr(), blk.as_mut_ptr()) };
+        for j in 0..m {
+            px[at[j]] = blk[j];
+        }
+    };
+    // The marked blocks' columns, lowest first. WHY the min: the run's last block is short when its length is no multiple of 16; past `b` are the next run's pixels, another chain's, which must not be composed with this chain's windows.
+    let xs = core::iter::successors(Some(blocks), |&s| Some(s & s.wrapping_sub(1))).take_while(|&s| s != 0).flat_map(|s| {
+        let x0 = a + ((s.trailing_zeros() as usize) << 4);
+        x0..(x0 + 16).min(b)
+    });
+    for x in xs {
+        if px[x] & PARTIAL == 0 {
+            continue;
+        }
+        let (mut acc, mut t, mut shown) = ([0f32; 3], 1f32, 0u32);
+        for (s, &f) in srcs[..chain.len()].iter().zip(&fmts) {
+            let p = s[x];
+            if p >> 63 != 0 {
+                continue;
+            }
+            let w = if f == BAKED { bk.unbake_px(p) } else { [(p & 0xFFFF) as f32, (p >> 16 & 0xFFFF) as f32, (p >> 32 & 0xFFFF) as f32] };
+            for c in 0..3 {
+                acc[c] += w[c] * t;
+            }
+            let lt = p >> 49 & 0x3FFF;
+            t *= lt as f32 * (1. / 16384.);
+            shown += 1;
+            if lt == 0 {
+                break;
+            }
+        }
+        if shown < 2 {
+            continue;
+        }
+        // To the working field, rounded (a working surface's own step); the sum is at most the field's top (each layer's value at most its share of it), and the cast holds a rounding past it there.
+        let q = |v: f32| (v + 0.5) as u16 as u64;
+        blk[m] = (px[x] & 1 << 48) | q(acc[0]) | q(acc[1]) << 16 | q(acc[2]) << 32;
+        at[m] = x;
+        m += 1;
+        count += 1;
+        if m == 16 {
+            flush(&mut blk, &at, m, px);
+            m = 0;
+        }
+    }
+    if m > 0 {
+        flush(&mut blk, &at, m, px);
+    }
+    APP_PARTIAL[0].fetch_add(count, Ordering::Relaxed);
+    APP_PARTIAL[1].fetch_add(now() - t0, Ordering::Relaxed);
+}
+
 /// Window layer (surface `k`, its `format`) row `y`, columns `a..b`, into `out[a..b]` as baked pixels with their transparency (bits 49-62; the see-through bit, a see-through pixel's channels nothing whatever the client left under the bit): a baked surface's (`BAKED`) as they are, a working one's (format 0) and fluor's (`G2T16`) baked here, every frame (bake.rs): the work a baked surface spares the display.
 /// `a..b` is one run of `ring_cuts`: its source row is the window's ring's row for `y` (`src_row`).
 fn layer_row(k: usize, format: u8, y: usize, a: usize, b: usize, width: usize, height: usize, out: &mut [u64]) {
@@ -4146,8 +4238,10 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                             px[x] = (p & !m) | (src[x] & m);
                         }
                     }
-                    for p in &mut px[a..b] {
-                        *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                    // The select is exact for opaque and see-through pixels; a partly covered one (`PARTIAL`) is composed whole after (`partial_run`), its 16-pixel block marked in the pass that clears the see-through ones (`clear_mark`).
+                    let blocks = clear_mark(&mut px[a..b]);
+                    if chain.len() > 1 && blocks != 0 {
+                        partial_run(&mut px, blocks, chain, order, y, a, b, width, height);
                     }
                 } else if select {
                     // The same select over the chain's rows baked first (`layer_row`).
@@ -4164,8 +4258,10 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                             px[x] = (p & !m) | (row[x] & m);
                         }
                     }
-                    for p in &mut px[a..b] {
-                        *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                    // As the plain path: a partly covered pixel (the keyboard's antialiased edge over a window) composed whole after the select.
+                    let blocks = clear_mark(&mut px[a..b]);
+                    if chain.len() > 1 && blocks != 0 {
+                        partial_run(&mut px, blocks, chain, order, y, a, b, width, height);
                     }
                 } else {
                     // Each layer's row baked first (`layer_row`: as it is when its surface is baked), then folded front to back pixel by pixel.
@@ -4351,6 +4447,11 @@ fn show_parts(log: &mut Log, t_pub: u64, t_wait: u64) {
         log.s(name);
         log.dec(us(APP_PARTS[k].swap(0, Ordering::Relaxed)));
     }
+    // The partly covered pixels composed whole (`partial_run`, inside the compose above): how many a show and their time, ns a show summed over the threads.
+    log.s(b"; partial px ");
+    log.dec(APP_PARTIAL[0].swap(0, Ordering::Relaxed) / n);
+    log.s(b" ns ");
+    log.dec(APP_PARTIAL[1].swap(0, Ordering::Relaxed) * 1_000_000_000 / freq() / n);
     log.s(b"; threads");
     for k in 0..=PUB_WORKERS {
         log.s(b" ");

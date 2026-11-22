@@ -27,10 +27,22 @@ pub struct Bake {
     light: *mut u16,
     /// White (1, 1, 1) baked, Q16 a channel: the blend modes' unit (main.rs `fold`).
     pub white: [u32; 3],
+    /// A baked code's panel light (`unbake_px`): (4i / TOP)^γ at step i, a step every 4 codes, `UNP_STEPS` + 1 of them.
+    to_p: *const f32,
+    /// The working value (Q14, as f32) of each root of a VSF light (`unbake_px`): atanh(√l) / k at √l = i / `UNV_STEPS`, `UNV_STEPS` + 1 of them, the last held at the working field's top.
+    to_v: *const f32,
+    /// The ODT inverted: panel light back to VSF light.
+    inv: [[f32; 3]; 3],
 }
 
 /// The code table's steps.
 const CODE_STEPS: usize = 1 << 12;
+/// The unbake's light table's steps (`Bake::to_p`): one every 4 codes. Linear between them, x^γ is off by about 10^-9 of the peak's light at most (a step squared over 8, times the curve's second derivative, at most 2.6), which after the root is under a fifth of a working step even next to black.
+const UNP_STEPS: usize = 1 << 14;
+/// The unbake's root table's steps (`Bake::to_v`), as main.rs `UNBAKE_V`.
+const UNV_STEPS: usize = 1 << 12;
+/// Each slot's f32 tables, one allocation: the palette's lights, the codes, the unbake's lights and roots.
+const TABLE_LEN: usize = 256 + CODE_STEPS + 2 + UNP_STEPS + 1 + UNV_STEPS + 1;
 /// The baked code at the panel's peak: the old present's Q4 top (16368, 1023 × 16) times four, so a code means what it did.
 pub const TOP: f32 = 65472.;
 
@@ -72,14 +84,23 @@ pub fn set(white: f32, peak_e: f32) {
     unsafe {
         if LIGHTS[0] == 0 {
             LIGHTS = [alloc::vec![0u16; 1 << 16].leak().as_mut_ptr() as usize, alloc::vec![0u16; 1 << 16].leak().as_mut_ptr() as usize];
-            TABLES = [alloc::vec![0f32; 256 + CODE_STEPS + 2].leak().as_mut_ptr() as usize, alloc::vec![0f32; 256 + CODE_STEPS + 2].leak().as_mut_ptr() as usize];
+            TABLES = [alloc::vec![0f32; TABLE_LEN].leak().as_mut_ptr() as usize, alloc::vec![0f32; TABLE_LEN].leak().as_mut_ptr() as usize];
         }
         let first = (*(&raw const SLOTS))[0].is_none();
         let s = if first { 0 } else { NOW.load(Ordering::Acquire) ^ 1 };
         let k = libm::atanh(libm::sqrt((white / peak_e).min(0.999) as f64)) as f32;
         let m = odt::odt();
         let g = 1. / odt::panel_gamma();
-        let (l8, code) = core::slice::from_raw_parts_mut(TABLES[s] as *mut f32, 256 + CODE_STEPS + 2).split_at_mut(256);
+        let (l8, rest) = core::slice::from_raw_parts_mut(TABLES[s] as *mut f32, TABLE_LEN).split_at_mut(256);
+        let (code, rest) = rest.split_at_mut(CODE_STEPS + 2);
+        let (to_p, to_v) = rest.split_at_mut(UNP_STEPS + 1);
+        for (i, e) in to_p.iter_mut().enumerate() {
+            *e = odt::pow((i << 2) as f32 * (1. / TOP), 1. / g);
+        }
+        for (i, e) in to_v.iter_mut().enumerate() {
+            // WHY the min: atanh runs to infinity at the peak (the last step); the working field's top is 65535 (4.0 less a step), where `unbake_tables`' cast holds it too. An infinite step would make the interpolation's (b − a) · 0 a NaN.
+            *e = (libm::atanhf(i as f32 * (1. / UNV_STEPS as f32)) / k * 16384.).min(65535.);
+        }
         for (c, l) in l8.iter_mut().enumerate() {
             let t = libm::tanhf(k * c as f32 * (1. / 255.));
             *l = t * t;
@@ -94,7 +115,7 @@ pub fn set(white: f32, peak_e: f32) {
         }
         // Made in its slot, not on the stack and moved there.
         let slot = &mut (*(&raw mut SLOTS))[s];
-        *slot = Some(Bake { odt: odt::odt_tables(white, peak_e), k, m, g, l8: l8.as_ptr(), code: code.as_ptr(), light: light.as_mut_ptr(), white: [0; 3] });
+        *slot = Some(Bake { odt: odt::odt_tables(white, peak_e), k, m, g, l8: l8.as_ptr(), code: code.as_ptr(), light: light.as_mut_ptr(), white: [0; 3], to_p: to_p.as_ptr(), to_v: to_v.as_ptr(), inv: invert(&m) });
         let b = slot.as_mut().unwrap_unchecked();
         let w = b.px([1., 1., 1.]);
         b.white = [w as u32 & 0xFFFF, (w >> 16) as u32 & 0xFFFF, (w >> 32) as u32 & 0xFFFF];
@@ -134,6 +155,29 @@ impl Bake {
             t * t
         });
         self.of_lights(l)
+    }
+
+    /// A baked pixel's channels (R, G, B in bits 0-15, 16-31, 32-47) back to the working values they were baked from, Q14 (white 16384) as f32, unrounded: each code's panel light (`to_p`, linear between its steps), the ODT inverted back to VSF light, its root unrolled (`to_v`, linear between its steps). `unbake_with`'s math with this bake's own tables, for one pixel at a time (main.rs `partial_under`: a window's pixel behind a partly covered one). A premultiplied pixel (codes of its light over black) gives its light over black, the premultiplied working value. Approximate only where the bake lost something for good, as `unbake_with`: past the panel's gamut and in the roll-off's last stops.
+    #[inline]
+    pub fn unbake_px(&self, c: u64) -> [f32; 3] {
+        // SAFETY: `set` filled `UNP_STEPS + 1` and `UNV_STEPS + 1` entries here for the process.
+        let (to_p, to_v) = unsafe { (core::slice::from_raw_parts(self.to_p, UNP_STEPS + 1), core::slice::from_raw_parts(self.to_v, UNV_STEPS + 1)) };
+        // A 16-bit code's step is at most 65535 >> 2 = UNP_STEPS − 1, so `i + 1` is in the table.
+        let p = |sh: u32| {
+            let c = (c >> sh & 0xFFFF) as usize;
+            let i = c >> 2;
+            to_p[i] + (to_p[i + 1] - to_p[i]) * ((c & 3) as f32 * 0.25)
+        };
+        let q = [p(0), p(16), p(32)];
+        let inv = &self.inv;
+        core::array::from_fn(|r| {
+            let l = inv[r][0] * q[0] + inv[r][1] * q[1] + inv[r][2] * q[2];
+            // WHY the max: a colour the bake held at a channel's 0 (out of the panel's gamut) inverts to a light a little under 0, which has no root; its NaN would carry thru the compose and wipe the front layer's light on that channel too. 0 is what `unbake_with` makes of it (its cast of the NaN).
+            let x = libm::sqrtf(l.max(0.)) * UNV_STEPS as f32;
+            // WHY the min: the inverse of codes the bake rounded or held at the top can land past the peak's light, its root past the table's last step (an index past the table); the step's share past 1 then runs on to the field's top, as `unbake_with`.
+            let i = (x as usize).min(UNV_STEPS - 1);
+            to_v[i] + (to_v[i + 1] - to_v[i]) * (x - i as f32)
+        })
     }
 
     /// A G#RRGGBB colour (8-bit VSF RGB gamma 2 codes, white at 255: the theme's, the ops') baked: its channels, α 0.
