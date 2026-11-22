@@ -149,11 +149,11 @@ fn seal_at_exit() {
     }
 }
 
-/// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost; at 2^7 (about 7.5 previews a second) a warm 32 s clip lost none of its 871 frames (the coding 30.2 ms on average).
-const PREVIEW_GAP_LOG2: u32 = 7;
+/// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost; at 2^7 (about 7.5 previews a second) a warm 32 s clip lost none of its 871 frames (the coding 30.2 ms on average). Since 2026-11-22 the preview is on its own thread, which the camera never waits for (`PreviewJob`): 2^5 ms, about 20 to 24 previews a second, measured on the Pro with 0 dropped at 60 a second on the main and 48 on the ultrawide (16 s clips, cool), where 2^7 and 2^8 gave about 4.
+const PREVIEW_GAP_LOG2: u32 = 5;
 
-/// Above 30 a second, the preview's gap is one power of two longer (2^8 ms, about 4 previews a second): a minute at 60 a second lost 3 frames, all to previews beside hand-overs in its last warm seconds (2026-11-20; the owner asked for a lock).
-const PREVIEW_GAP_FAST_LOG2: u32 = PREVIEW_GAP_LOG2 + 1;
+/// Above 30 a second the gap was one power of two longer while the preview shared the camera thread (a minute at 60 a second lost 3 frames to previews beside hand-overs, 2026-11-20); off that thread it is the same gap at every rate.
+const PREVIEW_GAP_FAST_LOG2: u32 = PREVIEW_GAP_LOG2;
 
 /// The preview's gap while recording at `fps`: 2^`PREVIEW_GAP_LOG2` ms, or `PREVIEW_GAP_FAST_LOG2` above 30 a second, or the input's 24th byte's power of two (development: `DEV_VIDEO` runs measure where drops begin).
 fn preview_gap(fps: u32) -> std::time::Duration {
@@ -1457,6 +1457,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                         *clip = Some(c);
                         started = true;
                         lumis_core::platform::set_video_note(None);
+                        // The clip takes the next frame; this one is neither handed over nor integrated here, so the camera thread is back for the clip's first (an integration on this turn, 16 ms at 60 a second, cost the clip its frame 1 on the Pro, 2026-11-22).
+                        keep_saves(vault.as_deref(), &mut *integrator.header);
+                        frames += 1;
+                        continue;
                     }
                     Ok(Ok(c)) => end_clip(c, Some(&mut *integrator.header), "STOP before its first frame"),
                     Ok(Err(e)) => {
@@ -1569,8 +1573,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             }
         }
         // RAW video not recording: the preview integrates a frame only every preview gap (2^7 ms at 30 a second or under, 2^8 above), the camera's other frames taken and given back: it integrated every frame, and after a 24 a second clip the A510s reached 88 C with nothing recording (the coordinator, 2026-11-20, for the desert).
-        if let (Some(fps), true) = (paced, CLIP.lock().unwrap().is_none() && starting.is_none()) {
-            if idle_preview.elapsed() < preview_gap(fps) {
+        // While a clip starts (`start_clip` on its thread), no frame is integrated here either: the clip's first frames come right after it answers.
+        if let (Some(fps), true) = (paced, CLIP.lock().unwrap().is_none()) {
+            if starting.is_some() || idle_preview.elapsed() < preview_gap(fps) {
                 keep_saves(vault.as_deref(), &mut *integrator.header);
                 frames += 1;
                 continue;
