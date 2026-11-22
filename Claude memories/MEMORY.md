@@ -23,6 +23,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no polling](feedback_no_polling.md) - push or doorbell; a timer only for a proven real deadline
 - [Feedback: stage agents, keep the bench used](feedback_keep_devices_busy.md) - one staged job per device, few agents, no overlapping edits, no helpers; but never idle a set-up device for hours
 - [Feedback: one straight line](feedback_one_line.md) - ferros = forge only, zero branches, no worktrees; commit straight to forge; one shared farm
+- [Feedback: Python, run not commit](feedback_python_run_not_commit.md) - run Python locally as a tool freely; never commit it (python-guard)
 - [Feedback: stop is immediate](feedback_stop_is_immediate.md) - stopping an app or puck is OP_STOP at once; no close message, no grace, no shutdown
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) - one branchless path; owner picks
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
@@ -192,8 +193,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [PIPE state set](pipe_kore_state.md) - KORE=0 WHARA=1 HARA=2 ORA=3; NGARO has no code; KORE-KOHI-BLAKE3-TAHU-ORA
 - [PIPE NGARO = silent wire](pipe_ngaro_state_silent_wire.md) - <8/16 healthy rings, bad OTP or interrupted burn: no heartbeat
 - [PIPE byzantine threshold + ring health](pipe_byzantine_ring_threshold.md) - 16 rings, 8-of-16, 0.79%/ring; health = RCT+APT+GF(2) diff ([pipe_popcount_alone_insufficient.md](pipe_popcount_alone_insufficient.md))
-- [PIPE: slow is the security property](pipe_slow_is_security.md) - bounded throughput caps attacker sample rate
-- [PIPE TRNG silicon primitives](pipe_trng_silicon_primitives.md) - metastability, TERO, subthreshold inverter, shot noise
+- [PIPE: slow is the security property](pipe_slow_is_security.md) - bounded throughput caps attacker rate; primitives in [pipe_trng_silicon_primitives.md](pipe_trng_silicon_primitives.md)
 - [PIPE ira is meaningless alone](pipe_ira_is_meaningless_alone.md) - boot secret means nothing without TOKEN binding
 - [PIPE keypad topology](pipe_dozenal_keypad_topology.md) - resolved: Multiply to a GND tab, row 4 ad hoc; PIPE/KEYPAD.md
 - [PIPE FPGA wire: two pins, no 5k pulldown](pipe_fpga_dual_pin_wire.md) - TX+RX bridged, GP0 bidirectional; 400 ohm + weak pulldown ([pipe_dev_rig_no_external_pulldown.md](pipe_dev_rig_no_external_pulldown.md))
