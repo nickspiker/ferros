@@ -2041,6 +2041,7 @@ impl Map {
     }
 
     /// The person's list read again (another device of theirs may have answered, or a stow added a kist), less what this device leaves off its deck (an unstow "this device only", `ferros_kist::Hidden`); false when it could not be read (nobody present), the copy kept as it was.
+    /// Called only by `refresh_circles` and `reload_arrangement`, which make the circles match the list it read: kist circle i is `kists.kists[i - 1]` (`spec`), so a list read alone, shorter than the deck, leaves a circle for a kist gone (the Pro, 2026-11-21: the map panicked in `spec`, the list 9 kists and the deck more circles, after the owner unstowed four pucks).
     fn reload_kists(&mut self) -> bool {
         match ferros_kist::store::read_here(cap(self.grants, S_KIST_LIST)) {
             Some(k) => {
@@ -5561,9 +5562,8 @@ impl Map {
                 self.refresh_circles();
                 let hit = self.hit(sx, sy);
                 if let Some(i) = hit {
-                    // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list read again first: another of the person's devices may have answered meanwhile.
+                    // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list is as `refresh_circles` read it with this tap (another of the person's devices may have answered meanwhile): a second read here, of the list alone, could find a kist gone that the deck still has a circle for (the Pro, 2026-11-21: the map panicked in `spec` after the owner unstowed four pucks, the list 9 kists, the deck more circles).
                     if i > 0 {
-                        self.reload_kists();
                         let Some(k) = self.kist(i) else { return };
                         let capsule = k.capsule;
                         // A puck answered (docs/PUCKS.md "What a tap does"; owner, 2026-11-18: "Tap/drag with one finger moves it, with two scales/rotates and a simple tap passes thru so we can make our dozenal calculator work too"): never opened; the tap goes to the puck itself (display op 74, which knows where the circle was drawn and its face's turn), launched first if it is not up.
@@ -5886,13 +5886,16 @@ impl Map {
                         }
                     }
                     // An answer turned over on a kist's card or the Permissions page (never answered reads as off: one tap turns it on): kept in the person's list, and the kist, if running, killed and launched again with it.
+                    // The list read again with its circles (`refresh_circles`, never the list alone, which could leave the deck a circle for a kist gone), and the kist found again by its identity: its place in the list may have moved.
                     Some(Choice::Answer(ki, j)) => {
-                        self.reload_kists();
-                        if let Some(w) = self.kists.kists.get_mut(ki as usize).and_then(|k| k.wants.get_mut(j as usize)) {
+                        let who = self.kists.kists.get(ki as usize).map(|k| (k.developer, k.option));
+                        self.refresh_circles();
+                        let ki = who.and_then(|(d, o)| self.kists.kists.iter().position(|k| k.developer == d && k.option == o));
+                        if let Some((ki, w)) = ki.and_then(|ki| self.kists.kists[ki].wants.get_mut(j as usize).map(|w| (ki, w))) {
                             let on = !w.answer.is_some_and(|a| a.0);
                             w.answer = Some((on, ferros_detail::eagle_now()));
                             if self.save_kists() {
-                                self.relaunch(ki as usize);
+                                self.relaunch(ki);
                             }
                         }
                     }
@@ -6041,7 +6044,8 @@ impl Map {
                         }
                     }
                     Some(Choice::Default(r)) => {
-                        self.reload_kists();
+                        // With its circles, as every read of the list (`refresh_circles`).
+                        self.refresh_circles();
                         self.kists.defaults ^= 1 << r;
                         self.save_kists();
                     }
