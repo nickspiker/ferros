@@ -157,6 +157,18 @@ impl Bake {
         self.of_lights(l)
     }
 
+    /// This bake's NEON tables with the roll-off's gain on a working value times `s` (the screenshot's degauss, degauss.rs): only `light16`'s and `light16h`'s k lanes change, so `neon::bake16` with them gives each pixel the light of its working value times s², rolled off as every light is (tanh in root space: light past white lands in the panel's headroom, the peak only approached).
+    pub fn gained(&self, s: f32) -> neon::Odt {
+        use core::arch::aarch64::*;
+        let mut o = self.odt;
+        // The same lanes `odt::odt_tables` fills: k/2^14 (f32, `light16`) and k/2^11 (f16, `light16h`).
+        unsafe {
+            o.k = vsetq_lane_f32::<0>(self.k * s * (1. / (1 << 14) as f32), o.k);
+            o.hk = vsetq_lane_u16::<0>(odt::f32_to_f16(self.k * s * (1. / (1 << 11) as f32)), o.hk);
+        }
+        o
+    }
+
     /// The tables a GPU job bakes with (the display's GPU compose, gpu.rs, GPU-COMPOSE.md step 4): each 16-bit g2t code's light (f16 bits, the E peak at 2^14) and √p's code (`CODE_STEPS` + 2 f32), as this bake holds them.
     pub fn tables(&self) -> (&[u16], &[f32]) {
         // SAFETY: `set` filled 2^16 and `CODE_STEPS + 2` entries here for the process.

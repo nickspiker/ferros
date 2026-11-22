@@ -47,6 +47,8 @@
 extern crate alloc;
 
 mod bake;
+/// The screenshot's degauss (owner, 2026-11-22): its factors and its end.
+mod degauss;
 mod draw;
 mod events;
 mod front;
@@ -1755,6 +1757,9 @@ fn pub_take(job: u64) {
         } else if unsafe { PUB_KIND } == 5 {
             // The wallpaper baked again (a brightness change, `rebake`): this stripe's rows.
             wall_rebake_rows(w, h, stripe.y0 as usize, stripe.y1 as usize);
+        } else if unsafe { PUB_KIND } == 6 {
+            // A step of the screenshot's degauss (`degauss_publish`): this stripe's rows of the offer into the one phase the mask names.
+            degauss_rows(base, w, unsafe { &*(&raw const PUB_TABS) }, mask.trailing_zeros() as usize, stripe);
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -2638,7 +2643,7 @@ enum Item {
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
 static mut SCENE_NI: usize = 0;
-/// The publish workers' job: 0 a publish, 1 the scene's list (`scene_stripe`), 2 and 3 the hit map (`stripes`), 4 an app's publish (`publish_app_mask`).
+/// The publish workers' job: 0 a publish, 1 the scene's list (`scene_stripe`), 2 and 3 the hit map (`stripes`), 4 an app's publish (`publish_app_mask`), 5 the wallpaper baked again (`rebake`), 6 a step of the screenshot's degauss (`degauss_publish`).
 static mut PUB_KIND: u8 = 0;
 
 impl Item {
@@ -4569,6 +4574,98 @@ fn offer_keep(width: usize, height: usize, grants: u64, from: &[u8]) -> bool {
     l.s(b"\n");
     l.flush();
     true
+}
+
+/// The screenshot's degauss (degauss.rs; owner, 2026-11-22: "a degauss effect, first frame, values *2, then /1.5 then *1.25 then /1.125, etc."), from the helm's slide's screenshot kept as the offer until its last step is shown. The render thread's alone.
+/// Each shown frame k after the capture is the offer (the captured frame, as working values) baked with its light times `degauss::factor(k)` (`Bake::gained`) into the next phase in turn and armed (`degauss_step` in the render loop); frame `end` is the true image again, from the canvas or the windows as the idle fill publishes it. The screenshot is the offer itself, taken before the first step, and no step writes it: the effect is never in a screenshot.
+struct Degauss {
+    /// The frame-start count at the first step (`FRAME_STARTS`): step k is the frame started k frames after it. None until the first step.
+    start: Option<u64>,
+    /// The step the true image comes back at (`degauss::end`, for the bake in use at the capture).
+    end: u32,
+}
+
+impl Degauss {
+    fn new() -> Degauss {
+        Degauss { start: None, end: degauss::end(bake::now().k, panel_gamma(), bake::TOP) }
+    }
+}
+
+/// The widest row a degauss step presents (husky's 1344 columns, akita's 1080): a publish worker's stack holds it (8 KiB of its 32).
+const DEGAUSS_ROW: usize = 1 << 11;
+
+/// The degauss's rows `r` (whole rows) into phase `k`: the offer at `at` (working values, a u64 a pixel, `width` a row) baked with `tabs` (`Bake::gained`: the step's light factor thru the roll-off) and presented with the phase's own thresholds, bit 48 kept as the capture composed it (the glass's flat pixels undithered, `present_app16`).
+fn degauss_rows(at: usize, width: usize, tabs: &neon::Odt, k: usize, r: draw::Rect) {
+    let (y0, y1) = (r.y0 as usize, r.y1 as usize);
+    // SAFETY: `at` is the offer, `width` × the screen's height u64s of this process's arc (`offer_keep`), written only by `offer_keep` on the render thread, which waits until every stripe is done (`degauss_publish`).
+    let src = unsafe { core::slice::from_raw_parts(at as *const u64, width * y1) };
+    let dst = phase_slice(k, width * y1);
+    let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
+    let w16 = width & !15;
+    let mut row = [0u32; DEGAUSS_ROW];
+    let mut baked = [0u64; 16];
+    for y in y0..y1 {
+        let line = &src[y * width..(y + 1) * width];
+        let (t0, t1) = neon::row_thresholds(y, k);
+        unsafe {
+            let mut x = 0;
+            while x < w16 {
+                neon::bake16(tabs, line.as_ptr().add(x), baked.as_mut_ptr());
+                neon::present_app16(baked.as_ptr(), row.as_mut_ptr().add(x), t0, t1, cm);
+                x += 16;
+            }
+            // The row's tail past the whole blocks (akita's last 8 columns), from a padded copy, as `publish10`: nothing read past the row; its 16 words land inside `row`, and only the row's own are copied out.
+            if w16 < width {
+                let mut pad = [0u64; 16];
+                pad[..width - w16].copy_from_slice(&line[w16..]);
+                neon::bake16(tabs, pad.as_ptr(), baked.as_mut_ptr());
+                neon::present_app16(baked.as_ptr(), row.as_mut_ptr().add(w16), t0, t1, cm);
+            }
+        }
+        dst[y * width..(y + 1) * width].copy_from_slice(&row[..width]);
+    }
+}
+
+/// A degauss step's frame into phase `k`: the whole screen of the offer at `at` thru `tabs` (`degauss_rows`), in stripes taken by the publish workers and this thread, as `publish10x4` splits a publish; returns when every stripe is done.
+fn degauss_publish(at: usize, width: usize, height: usize, tabs: &neon::Odt, k: usize) {
+    let r = draw::Rect::full(width, height);
+    let workers = PUB_UP.load(Ordering::Acquire) as usize;
+    if workers == 0 {
+        degauss_rows(at, width, tabs, k, r);
+    } else {
+        let n = ((r.y1 - r.y0 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
+        let job = PUB_JOB.load(Ordering::Acquire) + 1;
+        unsafe {
+            PUB_TABS = *tabs;
+            PUB_KIND = 6;
+            PUB_PARAMS = (at, width, height, 1 << k, r, n);
+        }
+        PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_JOB.store(job, Ordering::Release);
+        ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
+        pub_take(job);
+        // Every stripe taken, finished: no deadline, as `publish10x4` (a stripe in a worker's hands is being written).
+        loop {
+            let f = PUB_FINISHED.load(Ordering::Acquire);
+            if (f & 0xFFFF_FFFF) as usize >= n {
+                break;
+            }
+            ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
+        }
+        unsafe { PUB_KIND = 0 };
+    }
+    fps_dot(1 << k, width, height);
+}
+
+/// Phase `k`'s compose-once bits forgotten (`CLEAN`: its background's and its mode's): a degauss step wrote the whole phase, so it holds neither any more.
+fn clean_forget(k: usize) {
+    unsafe {
+        if CLEAN_W > 0 {
+            let keep = !(1u8 << k | wall_bit(k));
+            core::slice::from_raw_parts_mut(CLEAN as *mut u8, CLEAN_W * SCREEN_WH.1 as usize).iter_mut().for_each(|b| *b &= keep);
+        }
+    }
 }
 
 /// The hit map's rows no longer match the windows' layout (`layout_build` sets it, an app publish of the whole screen with the hit map's rows clears it): an app's show writes them only then.
@@ -8552,6 +8649,8 @@ fn server(grants: u64) -> ! {
     let mut bars_present = false;
     // The quick row's step those bars carry, with their publish in µs: counted into the slide line when armed (`slide_shown`).
     let mut bars_step: Option<(Step, u64)> = None;
+    // The screenshot's degauss while it runs (`Degauss`, degauss.rs).
+    let mut degauss: Option<Degauss> = None;
 
     let mut frames = 0u64;
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
@@ -10541,7 +10640,11 @@ fn server(grants: u64) -> ! {
             }
             let mut out = [0u8; 16];
             handle(&[30], &mut out);
-            offer_keep(width, height, grants, if quick_shot { b"the quick row" } else { b"the helm's slide" });
+            let kept = offer_keep(width, height, grants, if quick_shot { b"the quick row" } else { b"the helm's slide" });
+            // The helm's slide shows it was taken (owner, 2026-11-22): the degauss, its first step at this pass's end. Not the quick row's screencap (the owner named the slide); a screenshot during a degauss starts it again from its first step, on the new offer.
+            if kept && !quick_shot {
+                degauss = Some(Degauss::new());
+            }
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
@@ -11068,6 +11171,73 @@ fn server(grants: u64) -> ! {
         if bars_step.is_some() {
             last_interaction = now();
         }
+        // The screenshot's degauss (`Degauss`, degauss.rs): a step each pass while it runs, each into the next phase in turn with that phase's own thresholds (the temporal dither goes on thru it) and armed, as a camera op's frame is. Step k is the frame that starts k frames after the first step's (`FRAME_STARTS`): shown frames, never time. Every phase owes the whole screen meanwhile, so neither a 10 Hz flip nor the idle fill (held off by `last_interaction`) shows a phase from before or in the middle of it; at `end` the true image goes into the next phase and the idle fill brings the rest up to date once the frames stop.
+        // Whether its step armed this pass's frame: then nothing else arms one.
+        let mut degauss_armed = false;
+        if let Some(d) = degauss.as_mut() {
+            let at = OFFER_AT.load(Ordering::Acquire) as usize;
+            let full = draw::Rect::full(width, height);
+            // Only into the four phases (the temporal dither on, the panel lit, the screen the display's, no development drawing holding the phases): otherwise there is no next phase to step into, and the effect is let go, every phase owing the whole screen in case a step is in one.
+            if !(ten && unsafe { TEMPORAL } && client_owned && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0 && at != 0) {
+                if d.start.is_some() {
+                    unsafe { PHASE_DIRTY = [full; PHASES] };
+                    clean_reset_all();
+                }
+                degauss = None;
+            } else {
+                let t_settle = now();
+                pipe.settle(&mut armed, true);
+                let t_step = now();
+                let starts = FRAME_STARTS.load(Ordering::Acquire);
+                let start = *d.start.get_or_insert(starts);
+                let k = (starts - start) as u32;
+                let kk = unsafe { (CUR_PHASE + 1) % PHASES };
+                let last = k >= d.end;
+                unsafe { PHASE_DIRTY = [full; PHASES] };
+                if !last {
+                    degauss_publish(at, width, height, &bake::now().gained(degauss::scale(k)), kk);
+                    // The phase holds a step, not the screen: none of its compose-once bits hold any more.
+                    clean_forget(kk);
+                } else {
+                    // The true image, from what the screen holds now, as the idle fill publishes a phase.
+                    match unsafe { APP } {
+                        Some(_) => publish_app(full, &tabs, kk, width, height, true),
+                        None => publish10x4(pixels, width, height, &tabs, 1 << kk, full),
+                    }
+                    unsafe { PHASE_DIRTY[kk] = draw::Rect::EMPTY };
+                }
+                let (settle_us, pub_us) = ((t_step - t_settle) * 1_000_000 / freq(), ferros_sys::us_since(t_step));
+                unsafe { CUR_PHASE = kk };
+                ferros_sys::dma_barrier();
+                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                armed = Some(pipe.arm(win));
+                frames += 1;
+                FRAMES.store(frames, Ordering::Relaxed);
+                degauss_armed = true;
+                last_interaction = now();
+                tlog.s(b"display: degauss step A#");
+                tlog.dec(k as u64);
+                if last {
+                    tlog.s(b": the true image");
+                } else {
+                    tlog.s(if k & 1 == 0 { b": light times 1 + 2^-A#" } else { b": light over 1 + 2^-A#" });
+                    tlog.dec(k as u64);
+                }
+                tlog.s(b" (A#");
+                tlog.dec(d.end as u64);
+                tlog.s(b" steps), into phase A#");
+                tlog.dec(kk as u64);
+                tlog.s(b", the last frame's start waited A#");
+                tlog.dec(settle_us);
+                tlog.s(b" us, published in A#");
+                tlog.dec(pub_us);
+                tlog.s(b" us\n");
+                tlog.flush();
+                if last {
+                    degauss = None;
+                }
+            }
+        }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
         let t_idle = now();
         // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
@@ -11088,8 +11258,9 @@ fn server(grants: u64) -> ! {
         let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
         // The flip this pass decided at its top, when the pucks' boxes were drawn into the phase it shows: re-reading the time here would flip, now and then, to a phase they had not been drawn into (the display's old clock showed its edge 400 ms behind, 2026-10-24).
         // Bars that changed this pass go out armed, not on a flip (below): a flip's present holds this thread until its frame starts, and the next step of a slide with it.
-        let bars_arm = bars_present && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0;
-        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due && !bars_arm {
+        // Neither when a degauss step armed this pass's frame: the bars come back in the true image, and arming again would show the step twice.
+        let bars_arm = bars_present && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0 && !degauss_armed;
+        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due && !bars_arm && !degauss_armed {
             // The 10 Hz flips. (akita's flips at the panel's rate, tried 2026-11-08, showed phases before their insides were published: every column the circle's top row repeated down the screen, orange in a dev build. At 10 Hz until the phases are published in step with the flips: the owner's "proper rotating synchronous dither buffer".)
             next_flip = now() + freq() / 10;
             pipe.settle(&mut armed, true);
@@ -11162,6 +11333,10 @@ fn server(grants: u64) -> ! {
         let mut wake = next_tick;
         if flip_possible {
             wake = wake.min(next_flip.max(now()));
+        }
+        // A degauss running: its next step at once (the step itself waits for its last frame's start, `settle`), so no sleep.
+        if degauss.is_some() {
+            wake = now();
         }
         // Only for what the idle fill above can do this pass: the next phase owed. Woken for any owed phase, the loop never slept while one it does not fill was owed and nothing flipped (~15,700 passes a second at rest, 2026-11-05).
         if unsafe { TEMPORAL } && client_owned && unsafe { !PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } {

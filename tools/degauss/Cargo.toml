@@ -1,0 +1,12 @@
+[package]
+name = "degauss"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The screenshot's degauss on the host: payloads/display/src/degauss.rs itself (its factors and its end) and the light the display's bake gives a step, tested."
+
+# Standalone, outside the ferros workspace's lock.
+[workspace]
+
+[dependencies]
+libm = "0.2"
