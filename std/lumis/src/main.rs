@@ -2449,8 +2449,8 @@ fn main() {
         lumis_core::set_save_cores(|| {
             sys::pin(CORES_WORKERS);
         });
-        // A save on all four A715s, a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
-        lumis_core::platform::set_save_threads(4);
+        // A save on three of the four A715s (2026-11-22: on all four, at 60 a second, the owner's first shot ended Lumis, the UI drawing on the same cores; the fourth is the UI's now), a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
+        lumis_core::platform::set_save_threads(3);
         println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     // Whatever the intake's placement: a clip recording is sealed before Lumis ends, and the clips page lists and removes Lumis's clips in the person's hold.
