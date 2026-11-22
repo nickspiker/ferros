@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "boong: đang lấy của bạn từ đội",
         Msg::DeckSame => "boong: giống nhau trên mọi thiết bị của bạn",
         Msg::DeckOwn => "boong: riêng của thiết bị này",
-        Msg::RemoveNote => "xóa khỏi thiết bị này: cách xếp bản đồ,\ncác mạng WiFi, vị trí cuối; không lưu lại",
+        Msg::RemoveNote => "hỏi handle của bạn; đội của bạn được báo,\nrồi dữ liệu của bạn ở đây bị xóa và máy tắt",
+        Msg::RetypeToRemove => "Gõ handle của bạn để gỡ thiết bị này.\nEnter báo cho đội của bạn, xóa dữ liệu của bạn ở đây và tắt máy.",
+        Msg::RemovingDevice => "Đội của bạn đã được báo. Dữ liệu của bạn ở đây đang bị xóa, rồi thiết bị này sẽ tắt.",
+        Msg::RemoveLastDevice => "Đây là thiết bị duy nhất của danh tính bạn, nên không gỡ được.",
+        Msg::RemoveNotMember => "Thiết bị này không thuộc đội nào: không có gì để gỡ.",
+        Msg::RemoveNotStarted => "Việc gỡ chưa bắt đầu. Không có gì bị xóa.",
         // ---- Power ----
         Msg::ProximityWake => "đánh thức theo tiệm cận",
         Msg::ProximityWakeNote => "khi bật, phím nguồn chỉ sáng màn hình\nkhi không có gì che cảm biến",

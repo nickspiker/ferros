@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "kubyerta: kinukuha ang sa iyo mula sa armada mo",
         Msg::DeckSame => "kubyerta: pareho sa lahat ng device mo",
         Msg::DeckOwn => "kubyerta: sarili ng device na ito",
-        Msg::RemoveNote => "binubura sa device na ito: ang ayos ng mapa,\nmga WiFi network, ang huling lokasyon; hindi nase-save",
+        Msg::RemoveNote => "hinihingi ang handle mo; sasabihan ang armada mo,\nsaka buburahin ang data mo rito at mamamatay ito",
+        Msg::RetypeToRemove => "I-type ang handle mo para alisin ang device na ito.\nSasabihan ng Enter ang armada mo, buburahin ang data mo rito at papatayin ito.",
+        Msg::RemovingDevice => "Nasabihan na ang armada mo. Binubura ang data mo rito, saka mamamatay ang device na ito.",
+        Msg::RemoveLastDevice => "Ito lang ang device ng pagkakakilanlan mo, kaya hindi ito maaalis.",
+        Msg::RemoveNotMember => "Wala sa armada ang device na ito: walang aalisin.",
+        Msg::RemoveNotStarted => "Hindi nagsimula ang pag-alis. Walang nabura.",
         // ---- Power ----
         Msg::ProximityWake => "paggising sa lapit",
         Msg::ProximityWakeNote => "kapag bukas, sisindihan lang ng power key ang screen\nkapag walang tumatakip sa sensor",

@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "Deck: deins wird von deiner Flotte geholt",
         Msg::DeckSame => "Deck: gleich auf all deinen Geräten",
         Msg::DeckOwn => "Deck: das eigene dieses Geräts",
-        Msg::RemoveNote => "löscht von diesem Gerät: die Anordnung der Karte,\nWiFi-Netze, den letzten Standort; ohne Sicherung",
+        Msg::RemoveNote => "fragt nach deinem Handle; deine Flotte erfährt es,\ndann werden deine Daten hier gelöscht und es schaltet sich aus",
+        Msg::RetypeToRemove => "Tippe dein Handle, um dieses Gerät zu entfernen.\nEnter sagt es deiner Flotte, löscht deine Daten hier und schaltet aus.",
+        Msg::RemovingDevice => "Deine Flotte weiß Bescheid. Deine Daten hier werden gelöscht, dann schaltet sich dieses Gerät aus.",
+        Msg::RemoveLastDevice => "Das ist das einzige Gerät deiner Identität, darum kann es nicht entfernt werden.",
+        Msg::RemoveNotMember => "Dieses Gerät ist in keiner Flotte: nichts zu entfernen.",
+        Msg::RemoveNotStarted => "Entfernen hat nicht begonnen. Nichts wurde gelöscht.",
         // ---- Power ----
         Msg::ProximityWake => "Wecken per Annäherung",
         Msg::ProximityWakeNote => "an, die Ein/Aus-Taste weckt den Bildschirm\nnur, wenn nichts den Sensor verdeckt",

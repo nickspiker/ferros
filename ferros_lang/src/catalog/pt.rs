@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "convés: buscando o seu na sua frota",
         Msg::DeckSame => "convés: o mesmo em todos os seus dispositivos",
         Msg::DeckOwn => "convés: o próprio deste dispositivo",
-        Msg::RemoveNote => "apaga deste dispositivo: a arrumação do mapa,\nas redes WiFi, a última localização; não é salvo",
+        Msg::RemoveNote => "pede seu handle; sua frota é avisada,\ndepois seus dados aqui são apagados e ele desliga",
+        Msg::RetypeToRemove => "Digite seu handle para remover este dispositivo.\nEnter avisa sua frota, apaga seus dados aqui e o desliga.",
+        Msg::RemovingDevice => "Sua frota foi avisada. Seus dados aqui estão sendo apagados, depois este dispositivo desliga.",
+        Msg::RemoveLastDevice => "Este é o único dispositivo da sua identidade, então não pode ser removido.",
+        Msg::RemoveNotMember => "Este dispositivo não está em uma frota: nada a remover.",
+        Msg::RemoveNotStarted => "A remoção não começou. Nada foi apagado.",
         // ---- Power ----
         Msg::ProximityWake => "despertar por proximidade",
         Msg::ProximityWakeNote => "ligado, a tecla de energia acende a tela\nsó quando nada cobre o sensor",

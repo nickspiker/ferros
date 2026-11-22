@@ -745,14 +745,6 @@ impl Fleet {
         let _ = ferros_sys::call_live(svc, msg, &mut r);
     }
 
-    /// Start this device's departure (fgtw op 5, intent 1: to a new owner, so the approver also frees the device for another fleet).
-    fn leave(&mut self, svc: u64) {
-        let mut r = [0u8; 80];
-        let n = ferros_sys::call_live(svc, &[5, 1], &mut r);
-        self.leave_result = if n == ferros_sys::ERR || n < 1 { None } else { Some(r[0]) };
-        self.confirm = false;
-        self.sent = self.leave_result == Some(0);
-    }
 }
 
 /// A line of text being written, for tatau's formatters.
@@ -3928,10 +3920,8 @@ impl Map {
                     }
                 }
                 if matches!(f.state, Some(2) | Some(3)) {
-                    button(self, b, &mut y, fleet(FleetMsg::RemovePill { armed: f.confirm }).as_str(), f.confirm, Some(Choice::FleetRemove));
-                    if f.confirm {
-                        notes(b, &mut y, tr(Msg::RemoveNote));
-                    }
+                    button(self, b, &mut y, fleet(FleetMsg::RemovePill { armed: false }).as_str(), false, Some(Choice::FleetRemove));
+                    notes(b, &mut y, tr(Msg::RemoveNote));
                     // 4: the identity's last device cannot leave (fgtw's departure machine refuses it); any other refusal, the departure did not start.
                     match f.leave_result {
                         Some(4) => rows(self, b, &mut y, small, white(), fleet(FleetMsg::LastDevice).as_str()),
@@ -5806,17 +5796,8 @@ impl Map {
                         let on = self.fleet.deck.is_some_and(|h| h.0);
                         self.fleet.add_op(cap(self.grants, S_FGTW), &[18, !on as u8]);
                     }
-                    Some(Choice::FleetRemove) => {
-                        if self.fleet.confirm {
-                            // The page says the request is going out at once (owner, 2026-11-10: "Second tap on remove device gives zero visual confirmation it took"), then the service is asked.
-                            self.fleet.confirm = false;
-                            self.fleet.sent = true;
-                            self.draw();
-                            self.fleet.leave(cap(self.grants, S_FGTW));
-                        } else {
-                            self.fleet.confirm = true;
-                        }
-                    }
+                    // Remove this device (owner, 2026-11-22: "press remove, type the handle, press unbind"; docs/AUTH.md "Remove this device"): the attest screen's keyboard asks for the person's own handle (words kind 7), and its enter has the identity service tell the fleet at once, then the kernel erase this identity's data here and power off (payloads/fgtw remove.rs). No second tap: the typed handle is the confirmation.
+                    Some(Choice::FleetRemove) => people_ask(&[15, 7]),
                     Some(Choice::Version) => {
                         // WHY the stop at twelve: the count means nothing past it, and held there an endless run of taps cannot wrap the u8 back under the hint.
                         if self.taps < DEV_TAPS {

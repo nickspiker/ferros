@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "güverte: seninki filondan getiriliyor",
         Msg::DeckSame => "güverte: tüm cihazlarında aynı",
         Msg::DeckOwn => "güverte: bu cihaza özel",
-        Msg::RemoveNote => "bu cihazdan silinir: haritanın düzeni,\nWiFi ağları, son konum; kaydedilmez",
+        Msg::RemoveNote => "handle'ını ister; filona haber verilir,\nsonra buradaki verilerin silinir ve kapanır",
+        Msg::RetypeToRemove => "Bu cihazı kaldırmak için handle'ını yaz.\nEnter filona haber verir, buradaki verilerini siler ve cihazı kapatır.",
+        Msg::RemovingDevice => "Filona haber verildi. Buradaki verilerin siliniyor, sonra bu cihaz kapanacak.",
+        Msg::RemoveLastDevice => "Bu, kimliğinin tek cihazı, bu yüzden kaldırılamaz.",
+        Msg::RemoveNotMember => "Bu cihaz bir filoda değil: kaldırılacak bir şey yok.",
+        Msg::RemoveNotStarted => "Kaldırma başlamadı. Hiçbir şey silinmedi.",
         // ---- Power ----
         Msg::ProximityWake => "yakınlıkla uyanma",
         Msg::ProximityWakeNote => "açıkken güç tuşu ekranı yalnızca\nsensörün üstü açıkken yakar",

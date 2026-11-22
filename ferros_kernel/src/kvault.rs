@@ -42,6 +42,24 @@ pub const SEALED: &str = "sealed";
 const IDENTITY: [&str; 8] = ["map.", "fgtw.", "ahau.", "wifi.cred", "gps.last", "kists.", "\0notes.", "\0android."];
 /// The person accepted the Android disclaimer (SYS_UNLOCK op 14): a VSF document (section `android_disclaimer`: `version`, the disclaimer text's number; `accepted`, Eagle time), in the identity class under a reserved name no process scope reaches.
 pub const ANDROID_DISCLAIMER: &str = "\0android.disclaimer";
+/// What a removal would take from the kernel's vault and registers (`Store::remove_preview`): the dry run's account, counts and marks only.
+pub struct RemovePreview {
+    /// A person is present (their keys held): a real removal needs it.
+    pub unlocked: bool,
+    /// The bound mark (one identity per device).
+    pub bound: bool,
+    /// The identity class's entries in the kernel's vault (`ID_ADDRS`).
+    pub entries: usize,
+    /// Tags kept to attest with (AUTH.md "Attest with a tag").
+    pub tags: usize,
+    /// The seed kept for attest at boot.
+    pub kept_seed: bool,
+    /// The device-only secret every identity key here is made from (renewed by the removal).
+    pub secret: bool,
+    /// The person key held in the kernel.
+    pub person_key: bool,
+}
+
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
 }
@@ -859,6 +877,31 @@ impl KVault {
         }
         self.lock();
         Ok(n)
+    }
+
+    /// What removing this device from its identity would take from the kernel's vault and its registers (SYS_UNLOCK op 15's dry run, AUTH.md "Remove this device"), read only: nothing is written or deleted.
+    /// The kept seed and the device-only secret are read only to say whether they are there; each copy read is overwritten at once.
+    pub fn remove_preview(&mut self) -> Result<RemovePreview, KvError> {
+        let present = |name: &str, kv: &mut Self| -> Result<bool, KvError> {
+            Ok(match kv.raw_get(name)? {
+                Some(mut v) => {
+                    crate::keys::wipe_to_dram(&mut v);
+                    true
+                }
+                None => false,
+            })
+        };
+        let kept_seed = present(ID_UNLOCK, self)?;
+        let secret = present(ID_SECRET, self)?;
+        Ok(RemovePreview {
+            unlocked: self.id.is_some(),
+            bound: self.bound()?,
+            entries: self.id_addrs()?.len() / 32,
+            tags: self.addrs(TAGS)?.len() / 32,
+            kept_seed,
+            secret,
+            person_key: self.person_held(),
+        })
     }
 
     /// Every identity-class entry deleted by its address (`ID_ADDRS`), without needing its key, and every kept tag with them (a tag opens only the identity it was kept for, which goes here: on release, and when another handle unlocks a device not bound yet). Returns how many identity entries.

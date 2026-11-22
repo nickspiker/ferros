@@ -83,6 +83,32 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 
 Built 2026-11-22 on ferros (ahau, payloads/fgtw, ferros_lang); Photon's own join screen is Photon's to follow.
 
+## Remove this device (owner, 2026-11-22)
+
+On the device being removed: press Remove on the Fleet page, type the handle, press enter (unbind).
+No Fleet page needs to be open anywhere and no other device is waited on before the erase.
+
+1. **The check.** The attest screen's keyboard (ahau, words kind 7, asked by the map's Remove thru fgtw op 15 `[15][7]`) makes the typed handle's seed and hands it to the identity service (fgtw op 33 `[33][0][seed]`), which compares it with the identity in hand. The kernel compares it again in registers before it erases anything (`SYS_UNLOCK` op 15, service.rs op 18). A mismatch changes nothing and keeps the text on screen to correct.
+2. **The fleet is told at once.** Today that is the departure machine's signed request (intent 1, to a new owner), handed by Photon Transport to every fleet device heard here and put in the identity space, whose push reaches the fleet and fgtw.org in the same pass.
+   - On today's fgtw the chain drops this device only when a surviving member approves. Its Approve publishes the consented Remove and frees this device's brand on fgtw.org.
+   - Another identity's add needs that brand freed: fgtw-bootstrap refuses a bare self-departure (`consent_required`) and refuses to add a device branded to another identity (`device_owned`, `plate_owned`).
+   - fgtw's shared departure machine (the Photon session's) replaces this step when it lands: payloads/fgtw remove.rs `remove_tell` starts it and `remove_step` decides it has gone out.
+3. **The erase**, about 4 s (2^22 µs) after the request is out:
+   - every kist's own domain of the person's, from their list (`kists.list`: the stowed kists and those kept after an unstow), dropped in the vault process;
+   - the person's domain in every scope that holds their names (`map.`, `gps.`, `wifi.`, `fgtw.`, `ahau.`, `kists.`) and the hold (their items and clips);
+   - the kernel's identity class, kept tags, kept seed and bound mark;
+   - the device-only secret, so whatever was missed can never be opened again;
+   - the person key and the person's keys in registers (the lock).
+
+   Never touched: the device class (drivers, firmware, the stowed capsules, the device's settings), any other identity, the factory data in devinfo.
+4. **The power off.** Once the kernel has sent its drops, PSCI SYSTEM_OFF (the killswitch's), so the next power-on is a fresh attest screen. A completed departure (op 4) still restarts instead.
+
+The identity's last device refuses (an identity must live somewhere).
+
+**Dry run:** fgtw op 33 `[33][1]` runs every check and says on the console what each step would take (`fgtw: remove (dry run): ...`, the kernel's account under `kernel:`), changing nothing and needing no handle.
+From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw` (payloads/removedry), then the console.
+`diag "identity remove"` gives the kernel's half alone.
+
 ## Unlocking and locking
 
 - **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to fgtw (the identity service). On an unbound device the look-up and join run as before. A kept tag held to the device does the same without the handle (op 6, "Attest with a tag" below).

@@ -1149,6 +1149,19 @@ impl Want {
     }
 }
 
+impl Kists {
+    /// Every kist whose own vault domain may hold the person's data on this device, for removing the device from its identity (docs/AUTH.md "Remove this device"): each stowed kist with its name, then each unstowed kist kept with answers (its name empty: an unstow can keep the kist's data), each identity (developer, option) once.
+    pub fn domain_owners(&self) -> Vec<([u8; 32], [u8; 32], String)> {
+        let mut out: Vec<([u8; 32], [u8; 32], String)> = Vec::new();
+        for (d, o, name) in self.kists.iter().map(|k| (k.developer, k.option, k.name.clone())).chain(self.kept.iter().map(|k| (k.developer, k.option, String::new()))) {
+            if !out.iter().any(|e| e.0 == d && e.1 == o) {
+                out.push((d, o, name));
+            }
+        }
+        out
+    }
+}
+
 impl Kist {
     /// The kist as a thing (`ht`): from its developer and option, the same across its versions and whether it is a puck now or not (ferros_thing `kist`).
     pub fn thing(&self) -> ferros_thing::Ht {
@@ -1194,6 +1207,20 @@ mod tests {
         assert!(parse(b"not a document").is_none());
         // The flags beside a state stay apart: auto-stow never reads as native code.
         assert_eq!(offer::NATIVE & offer::AUTO, 0);
+    }
+
+    /// Removing a device names every kist's own domain once: the stowed ones with their names, the kept ones (unstowed, answers kept) after them, a kist both stowed and kept once.
+    #[test]
+    fn domain_owners_names_each_kist_once() {
+        let k = |d: u8, o: u8, name: &str| Kist { capsule: [d ^ o; 32], developer: [d; 32], option: [o; 32], name: String::from(name), wants: Vec::new(), source: None, stowed: 0, version: None, unread: Vec::new() };
+        let kept = |d: u8, o: u8| Kept { developer: [d; 32], option: [o; 32], answers: alloc::vec![(0, true, 1)], unread: Vec::new() };
+        let list = Kists { kists: alloc::vec![k(1, 1, "Photon"), k(2, 1, "Lumis")], kept: alloc::vec![kept(2, 1), kept(3, 4)], ..Kists::default() };
+        let owners = list.domain_owners();
+        assert_eq!(owners.len(), 3);
+        assert_eq!((owners[0].0, owners[0].1, owners[0].2.as_str()), ([1; 32], [1; 32], "Photon"));
+        assert_eq!((owners[1].0, owners[1].1, owners[1].2.as_str()), ([2; 32], [1; 32], "Lumis"));
+        assert_eq!((owners[2].0, owners[2].1, owners[2].2.as_str()), ([3; 32], [4; 32], ""));
+        assert!(Kists::default().domain_owners().is_empty());
     }
 
     #[test]

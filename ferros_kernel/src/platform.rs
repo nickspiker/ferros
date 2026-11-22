@@ -970,6 +970,13 @@ pub fn reboot() -> ! {
     unsafe { core::arch::asm!("smc #0", in("x0") 0x8400_0009u64, options(noreturn)) }
 }
 
+/// PSCI SYSTEM_OFF after the reset path's own steps (`before_reset`: the identity's keys dropped): the PMIC cuts the rails as the killswitch's chord does (KILLSWITCH.md), so the next power-on is a cold boot. A removal's end (service.rs `RELEASE_OFF`; owner, 2026-11-22).
+pub fn power_off() -> ! {
+    before_reset();
+    dss_mark_clean_reboot();
+    unsafe { core::arch::asm!("smc #0", in("x0") 0x8400_0008u64, options(noreturn)) }
+}
+
 pub fn reboot_to_bootloader() -> u64 {
     reboot_to_mode(REBOOT_MODE_BOOTLOADER)
 }

@@ -92,7 +92,7 @@ impl SpaceSync {
 }
 
 /// The device's copy through this process's `map.` and `kists.` grants. A refused read is an error, never absent (ferros_space::Store).
-struct VaultCopy {
+pub(crate) struct VaultCopy {
     map: u64,
     kists: u64,
 }
@@ -152,7 +152,7 @@ impl ferros_space::Store for VaultCopy {
 }
 
 impl Client {
-    fn copy(&self) -> VaultCopy {
+    pub(crate) fn copy(&self) -> VaultCopy {
         VaultCopy { map: cap(self.log.grants, S_MAP), kists: cap(self.log.grants, S_KISTS) }
     }
 

@@ -2405,6 +2405,8 @@ impl Ahau {
             Mode::Words(5) => tx(Msg::RetypeForAttestAtBoot),
             // The Android page's agreement: the person's own handle again, after the disclaimer.
             Mode::Words(6) => tx(Msg::RetypeForAndroid),
+            // The Fleet page's Remove (docs/AUTH.md "Remove this device"): the person's own handle, then enter unbinds.
+            Mode::Words(7) => tx(Msg::RetypeToRemove),
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
@@ -2731,6 +2733,8 @@ impl Ahau {
                         1 => b"ahau: words wanted: a new device's\n".as_slice(),
                         4 => b"ahau: words wanted: a WiFi passphrase (the WiFi page)\n",
                         5 => b"ahau: words wanted: the person's own handle again (attest at boot)\n",
+                        6 => b"ahau: words wanted: the person's own handle again (the Android disclaimer)\n",
+                        7 => b"ahau: words wanted: the person's own handle (remove this device)\n",
                         _ => b"ahau: words wanted: a person's handle (the People page)\n",
                     },
                 );
@@ -2990,6 +2994,40 @@ impl Ahau {
                 self.end_words(true);
             }
         }
+    }
+
+    /// Enter on the Fleet page's Remove (words kind 7; owner, 2026-11-22: "press remove, type the handle, press unbind"; docs/AUTH.md "Remove this device"): the person's own handle, shown as typed (a handle is not a password).
+    /// Its seed goes to the identity service (fgtw op 33), which checks it against the identity in hand, tells the fleet at once, and has the kernel check it again before it erases this identity's data and powers the device off; the seed is wiped once sent.
+    /// Started: the keyboard stays with what happens on its status line, until the power goes. A mismatch: "They don't match.", the text kept to be corrected, nothing changed.
+    fn remove_enter(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
+        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
+            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
+            return;
+        };
+        let mut m = [0u8; 34];
+        m[0] = 33;
+        m[2..].copy_from_slice(&seed);
+        scrub(&mut seed);
+        let mut o = [0u8; 8];
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut o);
+        scrub(&mut m);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 {
+            self.status(tx(ferros_lang::Msg::IdentityServiceNotAnswering).as_str());
+            return;
+        }
+        let (line, msg): (&[u8], ferros_lang::Msg) = match o[0] {
+            0 => (b"ahau: remove: the handle matches; the fleet is told, then this identity's data is erased and the device powers off\n", ferros_lang::Msg::RemovingDevice),
+            6 => (b"ahau: remove: the handle typed does not match; nothing changed\n", ferros_lang::Msg::TheyDontMatch),
+            4 => (b"ahau: remove: the identity's last device; nothing changed\n", ferros_lang::Msg::RemoveLastDevice),
+            1 => (b"ahau: remove: this device is not a member of a fleet; nothing changed\n", ferros_lang::Msg::RemoveNotMember),
+            _ => (b"ahau: remove: not started; nothing changed\n", ferros_lang::Msg::RemoveNotStarted),
+        };
+        console(self.grants, line);
+        self.status(tx(msg).as_str());
     }
 
     /// The words as typed to the identity service: a newcomer's, matched at every stroke (fgtw op 11, the live matcher). The answer on the status line; a match ends the words.
@@ -3254,6 +3292,11 @@ impl Ahau {
             // The person's own handle again (the Android disclaimer's agreement): handed to the kernel to compare.
             Some(Event::Enter) if self.mode == Mode::Words(6) => {
                 self.android_enter();
+                return;
+            }
+            // The person's own handle (remove this device): handed to the identity service, which tells the fleet and has the kernel erase.
+            Some(Event::Enter) if self.mode == Mode::Words(7) => {
+                self.remove_enter();
                 return;
             }
             // Words: enter sends them as typed (they hold no newline).

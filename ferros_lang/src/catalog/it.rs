@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "ponte: recupero del tuo dalla flotta",
         Msg::DeckSame => "ponte: lo stesso su tutti i tuoi dispositivi",
         Msg::DeckOwn => "ponte: quello proprio di questo dispositivo",
-        Msg::RemoveNote => "cancella da questo dispositivo: la disposizione della mappa,\nle reti WiFi, l’ultima posizione; non viene salvato",
+        Msg::RemoveNote => "chiede il tuo handle; la tua flotta viene avvisata,\npoi i tuoi dati qui vengono cancellati e si spegne",
+        Msg::RetypeToRemove => "Scrivi il tuo handle per rimuovere questo dispositivo.\nInvio avvisa la tua flotta, cancella i tuoi dati qui e lo spegne.",
+        Msg::RemovingDevice => "La tua flotta è avvisata. I tuoi dati qui vengono cancellati, poi questo dispositivo si spegne.",
+        Msg::RemoveLastDevice => "È l’unico dispositivo della tua identità, quindi non si può rimuovere.",
+        Msg::RemoveNotMember => "Questo dispositivo non è in una flotta: niente da rimuovere.",
+        Msg::RemoveNotStarted => "La rimozione non è partita. Non è stato cancellato nulla.",
         // ---- Power ----
         Msg::ProximityWake => "risveglio di prossimità",
         Msg::ProximityWakeNote => "attivato, il tasto di accensione illumina lo schermo\nsolo quando nulla copre il sensore",

@@ -851,6 +851,31 @@ pub static START_INTO: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The drops of the released person's domains in the vault process (process.rs `vault_stamp_drops`), each a stamp carrying that domain's keys, waiting for the service loop to send them before the restart. Under the kernel lock (filled in a syscall, taken by the loop).
 static mut RELEASE_DROPS: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+/// The release was a removal (SYS_UNLOCK op 15; AUTH.md "Remove this device"; owner, 2026-11-22: "then the killswitch"): once the drops are sent the service loop powers the device off (PSCI SYSTEM_OFF) instead of restarting it, so the next power-on is a cold boot at the attest screen.
+static RELEASE_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// More drops for the release under way (process.rs op 15: each kist's own domain of the person's, stamped while their keys still existed). Under the kernel lock, as `RELEASE_DROPS` is filled.
+pub(crate) fn release_drops_add(mut drops: alloc::vec::Vec<alloc::vec::Vec<u8>>) {
+    crate::flashlog::line(&alloc::format!("identity removed: A#{} of the kists' own domains of the person's to drop in the vault process too", drops.len()));
+    unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
+}
+
+/// The kernel's half of a removal's dry run (SYS_UNLOCK op 15 with its dry bit, `diag "identity remove"`): what the release would take from the kernel's vault and registers, as lines of text with every number in A#. Read only. None with no vault.
+/// Under the kernel lock, as every caller of `store_unlock` holds it.
+pub(crate) fn remove_preview_text() -> Option<alloc::string::String> {
+    let p = vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).map(|s| s.remove_preview()))?.ok()?;
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    Some(alloc::format!(
+        "person present: {}; bound to an identity: {}\nkernel's vault, the identity class: A#{} entries deleted\ntags kept to attest with: A#{} deleted\nthe seed kept for attest at boot: {}\nthe device-only secret: {}\nthe person key in the kernel: {}\nthe person's keys in registers: dropped (the lock)\n",
+        yn(p.unlocked),
+        yn(p.bound),
+        p.entries,
+        p.tags,
+        if p.kept_seed { "there, deleted" } else { "none" },
+        if p.secret { "there, deleted (a new one at the next attest, so nothing missed opens again)" } else { "none yet" },
+        if p.person_key { "held, wiped" } else { "not held" },
+    ))
+}
 
 /// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person stows, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
@@ -1007,7 +1032,10 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             crate::flashlog::line("identity bound: this device now opens only for it");
             Ok(0)
         }
-        (4, _) => {
+        // 18: whether `seed` (a handle typed again just now) is the person present's (`retype_matches`, compared in registers): 1 it is, 0 it is not; Err while nobody is present. Nothing written. The first step of a removal (process.rs op 15).
+        (18, Some(s)) => st.retype_matches(s).map(|m| m as u64).map_err(|_| ()),
+        // 4 the release (a completed departure, `diag "identity release"`); 19 a removal (process.rs op 15, after op 18 matched): the same release, then the device powers off rather than restarting (`RELEASE_OFF`).
+        (4 | 19, _) => {
             // The person's domains in the vault process, stamped while their keys still exist (release locks them); the service loop sends the drops before its restart.
             let mut drops = crate::process::vault_stamp_drops();
             let n = match st.release() {
@@ -1023,6 +1051,10 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             // The person's zone goes with them (zone.rs): this device's own choice rules again.
             let _ = crate::zone::set_identity(None, || crate::process::settings_snapshot().is_some_and(|(d, g)| settings_write(&d, g)));
             unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
+            if op == 19 {
+                RELEASE_OFF.store(true, core::sync::atomic::Ordering::Release);
+                crate::flashlog::line("identity removed (the person typed their handle on this device): the device powers off once the drops are sent");
+            }
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
         }
@@ -3493,6 +3525,11 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     None => {
                         RELEASE_RESET.store(false, core::sync::atomic::Ordering::Release);
+                        // A removal ends in the killswitch's power off (owner, 2026-11-22); a completed departure restarts.
+                        if RELEASE_OFF.load(core::sync::atomic::Ordering::Acquire) {
+                            crate::flashlog::line("identity removed: powering off; the next power-on comes up at the attest screen");
+                            platform::power_off();
+                        }
                         crate::flashlog::line("identity released: restarting at the attest screen");
                         platform::reboot();
                     }
@@ -5550,6 +5587,13 @@ pub fn run(mut b: Boot) -> ! {
                             (None, None) => resp.extend_from_slice(b"no window yet: diag power start <s>\n"),
                         }
                     }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"identity remove" {
+                    // `diag "identity remove"`: the kernel's half of a removal's dry run (AUTH.md "Remove this device"): what it would take, nothing changed. The kists' own domains are named by the identity service (fgtw op 33's dry run, which asks the kernel for this same account with them).
+                    let t = crate::process::with_lock(|| crate::process::remove_dry_text(&[]));
+                    resp.extend_from_slice(t.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

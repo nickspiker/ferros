@@ -3218,6 +3218,17 @@ pub fn android_accept(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize
     }
 }
 
+/// Remove this device from its identity (SYS_UNLOCK op 15, the identity service alone; docs/AUTH.md "Remove this device"): the first `len` bytes of `buf` hold [flags: bit 0 a dry run][the typed handle's seed 32][each kist of the person's, (developer 32, option 32)].
+/// A removal → Some(1) removed (the device powers off once the kernel's drops are sent), Some(0) the seed is not the person present's (nothing changed).
+/// A dry run → Some(the account's whole length), its text written over `buf`; nothing changed.
+/// None: refused (nobody present, no right, a buffer of another shape, a kernel before 2026-11-22).
+pub fn remove_device(cap: u64, buf: &mut [u8], len: usize) -> Option<u64> {
+    match svc(nr::UNLOCK, cap, 15, off(buf.as_mut_ptr()), len as u64, buf.len() as u64) {
+        ERR => None,
+        n => Some(n),
+    }
+}
+
 /// The retype gate (SYS_UNLOCK op 12, the Unlock right; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again. The kernel compares it with the seed of the person present and turns the setting on only when they are one; the reply, a VSF document (ahau_core::retype), lands in `out`. Its whole length, or None without the right or from a kernel before 2026-11-17 (whose SET_PREF still takes the setting, unchecked).
 pub fn attest_at_boot_on(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize> {
     match svc(nr::UNLOCK, cap, 12, off(seed.as_ptr()), off(out.as_mut_ptr()), out.len() as u64) {

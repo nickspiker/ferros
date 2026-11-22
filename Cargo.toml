@@ -48,6 +48,7 @@ members = [
     "payloads/gpstest",
     "payloads/clock",
     "payloads/aliastest",
+    "payloads/removedry",
     "payloads/tidetest",
     "payloads/pucks",
     "payloads/touchtest",

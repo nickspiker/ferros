@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "sitaha: inaleta yako kutoka kundi lako",
         Msg::DeckSame => "sitaha: ileile kwenye vifaa vyako vyote",
         Msg::DeckOwn => "sitaha: ya kifaa hiki chenyewe",
-        Msg::RemoveNote => "hufuta kwenye kifaa hiki: mpangilio wa ramani,\nmitandao ya WiFi, mahali pa mwisho; havihifadhiwi",
+        Msg::RemoveNote => "huomba handle yako; kundi lako linaarifiwa,\nkisha data yako hapa inafutwa na kinazimika",
+        Msg::RetypeToRemove => "Andika handle yako ili kuondoa kifaa hiki.\nEnter huarifu kundi lako, hufuta data yako hapa na kukizima.",
+        Msg::RemovingDevice => "Kundi lako limearifiwa. Data yako hapa inafutwa, kisha kifaa hiki kitazimika.",
+        Msg::RemoveLastDevice => "Hiki ndicho kifaa pekee cha utambulisho wako, kwa hiyo hakiwezi kuondolewa.",
+        Msg::RemoveNotMember => "Kifaa hiki hakimo kwenye kundi: hakuna cha kuondoa.",
+        Msg::RemoveNotStarted => "Kuondoa hakukuanza. Hakuna kilichofutwa.",
         // ---- Power ----
         Msg::ProximityWake => "kuamsha kwa ukaribu",
         Msg::ProximityWakeNote => "ikiwashwa, kitufe cha kuwasha huwasha skrini\npale tu hakuna kinachofunika kitambuzi",

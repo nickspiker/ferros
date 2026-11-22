@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "deck: fetching yours from your fleet",
         Msg::DeckSame => "deck: the same on all your devices",
         Msg::DeckOwn => "deck: this device's own",
-        Msg::RemoveNote => "wipes from this device: the map's arrangement,\nWiFi networks, the last location; not saved",
+        Msg::RemoveNote => "asks for your handle; your fleet is told,\nthen your data here is erased and it powers off",
+        Msg::RetypeToRemove => "Type your handle to remove this device.\nEnter tells your fleet, erases your data here and powers off.",
+        Msg::RemovingDevice => "Your fleet is told. Your data here is being erased, then this device powers off.",
+        Msg::RemoveLastDevice => "This is your identity's only device, so it cannot be removed.",
+        Msg::RemoveNotMember => "This device is not in a fleet: nothing to remove.",
+        Msg::RemoveNotStarted => "Remove did not start. Nothing was erased.",
         // ---- Power ----
         Msg::ProximityWake => "proximity wake",
         Msg::ProximityWakeNote => "on, the power key lights the screen\nonly when nothing covers the sensor",

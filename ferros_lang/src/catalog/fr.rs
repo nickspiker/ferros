@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "pont : récupération du tien depuis ta flotte",
         Msg::DeckSame => "pont : le même sur tous tes appareils",
         Msg::DeckOwn => "pont : propre à cet appareil",
-        Msg::RemoveNote => "efface de cet appareil : la disposition de la carte,\nles réseaux WiFi, la dernière position ; sans sauvegarde",
+        Msg::RemoveNote => "demande ton handle ; ta flotte est prévenue,\npuis tes données ici sont effacées et il s’éteint",
+        Msg::RetypeToRemove => "Écris ton handle pour retirer cet appareil.\nEntrée prévient ta flotte, efface tes données ici et l’éteint.",
+        Msg::RemovingDevice => "Ta flotte est prévenue. Tes données ici sont effacées, puis cet appareil s’éteint.",
+        Msg::RemoveLastDevice => "C’est le seul appareil de ton identité : il ne peut pas être retiré.",
+        Msg::RemoveNotMember => "Cet appareil n’est dans aucune flotte : rien à retirer.",
+        Msg::RemoveNotStarted => "Le retrait n’a pas commencé. Rien n’a été effacé.",
         // ---- Power ----
         Msg::ProximityWake => "réveil par proximité",
         Msg::ProximityWakeNote => "activé, le bouton d’alimentation allume l’écran\nseulement si rien ne couvre le capteur",

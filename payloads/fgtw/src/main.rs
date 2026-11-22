@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving, 10 selected, 11 joining but not yet confirmed by this device's person) and the words the 23 pairing words while joining once confirmed (none before, none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs), op 32 `[32][1]` the join confirmed on this device (nothing of a join is sent before it: no binding request to the fleet or fgtw.org, no tap secret, no BLE or LAN beacon; owner 2026-11-22), `[32][0]` withdrawn, `[32][2]` the words asked for (fgtw.org's registry is the last rung: it gets the request then, or once no fleet device is heard on this network after the mint, `registry_step`). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving, 10 selected, 11 joining but not yet confirmed by this device's person) and the words the 23 pairing words while joining once confirmed (none before, none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs), op 33 `[33][0][seed]` remove this device (the handle typed on the attest screen's keyboard, words kind 7: the fleet told by the departure request, then every domain of the person's erased and the power off; `[33][1]` its dry run, remove.rs), op 32 `[32][1]` the join confirmed on this device (nothing of a join is sent before it: no binding request to the fleet or fgtw.org, no tap secret, no BLE or LAN beacon; owner 2026-11-22), `[32][0]` withdrawn, `[32][2]` the words asked for (fgtw.org's registry is the last rung: it gets the request then, or once no fleet device is heard on this network after the mint, `registry_step`). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -25,6 +25,7 @@ mod depart;
 /// The facets (docs/FACETS.md): be you and the people on the `facets` endpoint, and the person's people added and listed.
 mod facets;
 mod kept;
+mod remove;
 mod route;
 mod space;
 
@@ -570,6 +571,8 @@ struct Client {
     lock_epoch: u64,
     /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
     members: Vec<[u8; 32]>,
+    /// Remove this device under way (op 33, remove.rs): told the fleet, then the erase and the power off.
+    removing: Option<remove::Removing>,
     /// The chain's ops said on the console so far (`note_members`): its whole history the first time this run adopts one, then each op added after.
     chain_seen: usize,
     pt: Pt,
@@ -1914,6 +1917,22 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 33: remove this device (remove.rs; owner, 2026-11-22: press remove, type the handle, unbind), [33][0][the typed handle's seed 32] from the attest screen's keyboard (words kind 7) → [0 started, 1 not a member of a fleet, 4 the identity's last device, 6 not this identity's handle, 7 the kernel cannot remove (nothing told), else the departure's refusal]; the seed wiped from the message here. [33][1] the dry run (no handle): every check and what each step would take, on the console, nothing changed → [0 said, 1 no identity in hand].
+                if n >= 2 && req[0] == 33 {
+                    let r = if req[1] & 1 == 1 {
+                        self.remove_dry()
+                    } else if got >= 34 {
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&req[2..34]);
+                        wipe(&mut req[2..34]);
+                        self.remove_start(&mut seed)
+                    } else {
+                        2
+                    };
+                    let r = [r];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && req[0] == 19 {
                     let r = self.identity_seed.map(|seed| fgtw::pair::device_name_default(&self.me, &seed).into_bytes()).unwrap_or_default();
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
@@ -1993,6 +2012,11 @@ impl Client {
                         // 5: the person's own handle again, to turn attest at boot on (the Security page; docs/AUTH.md "Unlock at boot"). The keyboard's host compares it thru the kernel (SYS_UNLOCK op 12) and ends it with op 15 [0]; nothing of it comes here. (Kind 4 was the retype gate's on its branch; forge had given 4 to the WiFi passphrase first, so it is 5 since the merge of 2026-11-20.)
                         15 if n >= 2 && req[1] == 5 => {
                             self.entry = 5;
+                            alloc::vec![0]
+                        }
+                        // 7: the person's own handle, to remove this device (the Fleet page's Remove; remove.rs). The keyboard's host makes its seed and hands it here (op 33), never the text.
+                        15 if n >= 2 && req[1] == 7 => {
+                            self.entry = 7;
                             alloc::vec![0]
                         }
                         // 6: the person's own handle again, to agree to the Android disclaimer (the Settings page's Android page; docs/BOOT.md "Android only by the identity's choice"). As 5: the keyboard's host compares it thru the kernel (SYS_UNLOCK op 14) and ends it with op 15 [0]; nothing of it comes here.
@@ -2145,6 +2169,8 @@ impl Client {
             busy |= self.facets_now(&mut lap);
             // The departure machine's slow work: signing a request or a deny, an approval's publish, a chain read (depart.rs), here in the loop and never inside a call another process waits on.
             self.depart_work();
+            // A removal under way (remove.rs): told, then the erase.
+            self.remove_step(t);
             lap.mark(b"depart_work");
             busy |= self.facets_now(&mut lap);
             // Sponsoring (add.rs): the radios listening for newcomers and for a departure's tap, the add machine's deadline, and its slow work (signing, the registry's read, the bind, the grow), here in the loop and never inside a call another process waits on.
@@ -2489,7 +2515,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

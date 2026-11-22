@@ -5407,6 +5407,38 @@ pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'s
     Some((with_lock_held_or(|| stamp(VOP_LIST, sc.prefix.as_bytes(), classes, &[], &rest))?, sc.prefix))
 }
 
+/// Each kist's own domain (`KIST_DOMAIN_CONTEXT` over its ihi, as a process of it gets at spawn) for `ids` ([developer 32][option 32] each), each once: a kist named twice (stowed, and kept with answers after an unstow) is one domain. None for any when no system secret is open.
+fn kist_domains(ids: &[u8]) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    for id in ids.chunks_exact(64) {
+        let developer: [u8; 32] = id[..32].try_into().unwrap();
+        let Some(ihi) = crate::oracle::ihi(&developer, &id[32..]) else { continue };
+        let d = blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi);
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// A removal's dry run as lines of text (SYS_UNLOCK op 15's dry bit, `diag "identity remove"`; AUTH.md "Remove this device"): the kernel's half (service.rs `remove_preview_text`), the person's domain in each scope the release drops in the vault process, and the kists' own domains from `ids` (as the identity service read them from the person's list). Nothing changed. Under the kernel lock.
+pub fn remove_dry_text(ids: &[u8]) -> alloc::string::String {
+    let mut t = alloc::string::String::from("remove this device (dry run): nothing erased\n");
+    match crate::service::remove_preview_text() {
+        Some(k) => t.push_str(&k),
+        None => t.push_str("the kernel's vault: not open\n"),
+    }
+    t.push_str("vault process, the person's domain dropped in each scope:");
+    for sc in STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)) {
+        t.push(' ');
+        t.push_str(sc.prefix);
+    }
+    t.push_str(" and the hold (the person's items and their clips)\n");
+    t.push_str(&alloc::format!("vault process, the kists' own domains of the person's dropped: A#{} (from A#{} kists named)\n", kist_domains(ids).len(), ids.len() >> 6));
+    t.push_str("not touched: the device class (drivers, firmware, the stowed capsules, the device's settings), any other identity, the factory data in devinfo\nthen: the power off\n");
+    t
+}
+
 /// Stamps dropping every one of the person's domains in the vault process (each scope that holds the person's names), for release: made while their keys still exist, sent by the service loop before its restart (service.rs). Empty while they are locked: nothing could be stamped, and what is on the disk is already unopenable once release renews the device-only secret.
 pub fn vault_stamp_drops() -> Vec<Vec<u8>> {
     // The person's items domain goes with them (docs/STORE.md "Removal": release drops their items with their domains), its clips' extents with it (the vault drops a domain's extents by its owner tag).
@@ -6629,6 +6661,62 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 },
                 _ => ERR,
             };
+            0
+        }
+        // Op 15, remove this device from its identity (AUTH.md "Remove this device"; owner, 2026-11-22: press remove, type the handle, unbind; the fleet told at once, then the identity's data erased and the killswitch's power off). Only the identity service (`fgtw` by name, never a kist), which tells the fleet before it asks.
+        // x2 a buffer in the caller's arc: in, [flags u8: bit 0 a dry run][the typed handle's seed 32][each kist the person has, (developer 32, option 32)]; x3 its length; x4 its room. Out, written over it: a dry run's account (lines of text, `remove_dry_text`), else nothing.
+        // A removal: the seed must be the person present's (service.rs op 18, compared in registers); then each kist's own domain is stamped for a drop in the vault process while the person's keys still exist, and op 19 releases (op 4's release: every scope's domain of the person's dropped, the kernel's identity class, tags, bound mark and kept seed deleted, the device-only secret renewed, the lock) and powers the device off once the drops are sent. → 1 removed, 0 the seed is not the person present's (nothing changed), ERR nobody present, no right, or a buffer of another shape. A dry run → the account's whole length (what fits is written); nothing changed, no seed needed.
+        SYS_UNLOCK if f.x[1] == 15 => {
+            let token = p.read(f.x[0], 32);
+            let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0);
+            let (at, len, room) = (f.x[2], f.x[3] as usize, f.x[4] as usize);
+            // WHY the bounds: the lengths are the caller's: the flags and a seed, then whole kist identities, at most 2^8 of them (each costs a derivation here, under the kernel lock), and room for at least what was sent.
+            let fits = len >= 33 && (len - 33) % 64 == 0 && (len - 33) >> 6 <= 1 << 8 && room >= len;
+            f.x[0] = match (held && fits && !p.kist && p.name.as_slice() == b"fgtw", unsafe { UNLOCK }) {
+                (true, Some(unlock)) => {
+                    let mut msg = p.read(at, len);
+                    let r = if msg[0] & 1 == 1 {
+                        let t = remove_dry_text(&msg[33..]);
+                        let b = t.as_bytes();
+                        // WHY the min: `room` is the caller's buffer; only what it holds is written, and the whole length is returned so it can ask again with more.
+                        p.write(at, &b[..b.len().min(room)]);
+                        b.len() as u64
+                    } else {
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&msg[1..33]);
+                        let m = unlock(18, Some(&seed));
+                        crate::keys::wipe_to_dram(&mut seed);
+                        match m {
+                            Ok(1) => {
+                                // Each kist's own domain of the person's, stamped while their keys still exist (the release locks them).
+                                let mut drops: Vec<Vec<u8>> = kist_domains(&msg[33..]).iter().filter_map(|d| stamp(VOP_DROP, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], &[], &[])).collect();
+                                match unlock(19, None) {
+                                    Ok(_) => {
+                                        crate::service::release_drops_add(drops);
+                                        1
+                                    }
+                                    Err(()) => {
+                                        for d in drops.iter_mut() {
+                                            crate::keys::wipe_to_dram(d);
+                                        }
+                                        ERR
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                crate::flashlog::line("identity remove refused: the handle typed is not the person present's; nothing changed");
+                                0
+                            }
+                            Err(()) => ERR,
+                        }
+                    };
+                    crate::keys::wipe_to_dram(&mut msg);
+                    r
+                }
+                _ => ERR,
+            };
+            // A removal locked the identity.
+            identity_bell();
             0
         }
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).

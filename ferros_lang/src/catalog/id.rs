@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "dek: mengambil milikmu dari armadamu",
         Msg::DeckSame => "dek: sama di semua perangkatmu",
         Msg::DeckOwn => "dek: milik perangkat ini sendiri",
-        Msg::RemoveNote => "terhapus dari perangkat ini: susunan peta,\njaringan WiFi, lokasi terakhir; tidak disimpan",
+        Msg::RemoveNote => "meminta handle-mu; armadamu diberi tahu,\nlalu datamu di sini dihapus dan perangkat mati",
+        Msg::RetypeToRemove => "Ketik handle-mu untuk melepas perangkat ini.\nEnter memberi tahu armadamu, menghapus datamu di sini, lalu mematikannya.",
+        Msg::RemovingDevice => "Armadamu sudah diberi tahu. Datamu di sini sedang dihapus, lalu perangkat ini mati.",
+        Msg::RemoveLastDevice => "Ini satu-satunya perangkat identitasmu, jadi tidak bisa dilepas.",
+        Msg::RemoveNotMember => "Perangkat ini tidak ada di armada mana pun: tidak ada yang dilepas.",
+        Msg::RemoveNotStarted => "Pelepasan tidak dimulai. Tidak ada yang terhapus.",
         // ---- Power ----
         Msg::ProximityWake => "bangun dengan kedekatan",
         Msg::ProximityWakeNote => "jika nyala, tombol daya menyalakan layar\nhanya saat tidak ada yang menutupi sensor",

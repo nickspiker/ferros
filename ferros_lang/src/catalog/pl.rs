@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "pokład: pobieranie twojego z floty",
         Msg::DeckSame => "pokład: taki sam na wszystkich twoich urządzeniach",
         Msg::DeckOwn => "pokład: własny tego urządzenia",
-        Msg::RemoveNote => "wymazuje z tego urządzenia: układ mapy,\nsieci WiFi, ostatnią lokalizację; bez kopii",
+        Msg::RemoveNote => "prosi o twój handle; twoja flota dostaje wiadomość,\npotem twoje dane tutaj są wymazane i się wyłącza",
+        Msg::RetypeToRemove => "Wpisz swój handle, by usunąć to urządzenie.\nEnter powiadamia twoją flotę, wymazuje twoje dane tutaj i je wyłącza.",
+        Msg::RemovingDevice => "Twoja flota wie. Twoje dane tutaj są wymazywane, potem to urządzenie się wyłączy.",
+        Msg::RemoveLastDevice => "To jedyne urządzenie twojej tożsamości, więc nie da się go usunąć.",
+        Msg::RemoveNotMember => "To urządzenie nie jest we flocie: nie ma czego usuwać.",
+        Msg::RemoveNotStarted => "Usuwanie się nie zaczęło. Nic nie wymazano.",
         // ---- Power ----
         Msg::ProximityWake => "budzenie zbliżeniowe",
         Msg::ProximityWakeNote => "włączone, przycisk zasilania zapala ekran\ntylko gdy nic nie zasłania czujnika",

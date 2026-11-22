@@ -330,8 +330,18 @@ messages! {
     /// Also the checkbox's label.
     DeckSame,
     DeckOwn,
-    /// Two lines: what removing this device wipes from it.
+    /// Two lines under the Fleet page's Remove: what removing this device does (owner, 2026-11-22; docs/AUTH.md "Remove this device").
     RemoveNote,
+    /// The attest screen keyboard's prompt for Remove (words kind 7): the person's own handle, and what enter does. Two lines.
+    RetypeToRemove,
+    /// The keyboard's status once the removal started: the fleet told, the erase, the power off.
+    RemovingDevice,
+    /// Remove refused: the identity's only device (an identity must live somewhere).
+    RemoveLastDevice,
+    /// Remove refused: this device is in no fleet.
+    RemoveNotMember,
+    /// Remove refused for any other reason; nothing erased.
+    RemoveNotStarted,
 
     // ---- Power ----
     ProximityWake,

@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "papa: e tiki ana i tōu mai i tō kāhui",
         Msg::DeckSame => "papa: he ōrite i ō pūrere katoa",
         Msg::DeckOwn => "papa: mō tēnei pūrere anake",
-        Msg::RemoveNote => "ka ūkuia i tēnei pūrere: te takoto o te mahere,\nngā whatunga WiFi, te wāhi whakamutunga; kāore e tiakina",
+        Msg::RemoveNote => "ka tonoa tō handle; ka whakamōhiotia tō kāhui,\nkātahi ka ūkuia ō raraunga i konei, ka weto",
+        Msg::RetypeToRemove => "Tāurua tō handle kia tangohia tēnei pūrere.\nKa whakamōhio a Enter i tō kāhui, ka ūkui i ō raraunga i konei, ka weto.",
+        Msg::RemovingDevice => "Kua mōhio tō kāhui. Kei te ūkuia ō raraunga i konei, kātahi ka weto tēnei pūrere.",
+        Msg::RemoveLastDevice => "Koinei anake te pūrere o tō tuakiri, nō reira e kore e taea te tango.",
+        Msg::RemoveNotMember => "Kāore tēnei pūrere i tētahi kāhui: kāore he mea hei tango.",
+        Msg::RemoveNotStarted => "Kāore i tīmata te tango. Kāore he mea i ūkuia.",
         // ---- Power ----
         Msg::ProximityWake => "whakaoho ā-tata",
         Msg::ProximityWakeNote => "ki te kā, ka whakamārama te pātene hiko i te mata\nmēnā kāore he mea e hipoki ana i te pūoko",

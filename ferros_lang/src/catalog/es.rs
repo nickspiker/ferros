@@ -194,7 +194,12 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DeckFetching => "cubierta: trayendo la tuya de tu flota",
         Msg::DeckSame => "cubierta: la misma en todos tus dispositivos",
         Msg::DeckOwn => "cubierta: la propia de este dispositivo",
-        Msg::RemoveNote => "borra de este dispositivo: la disposición del mapa,\nlas redes WiFi, la última ubicación; no se guarda",
+        Msg::RemoveNote => "pide tu handle; se avisa a tu flota,\nluego se borran tus datos aquí y se apaga",
+        Msg::RetypeToRemove => "Escribe tu handle para quitar este dispositivo.\nEnter avisa a tu flota, borra tus datos aquí y lo apaga.",
+        Msg::RemovingDevice => "Tu flota ya está avisada. Se borran tus datos aquí y luego este dispositivo se apaga.",
+        Msg::RemoveLastDevice => "Es el único dispositivo de tu identidad, así que no se puede quitar.",
+        Msg::RemoveNotMember => "Este dispositivo no está en una flota: no hay nada que quitar.",
+        Msg::RemoveNotStarted => "Quitar no empezó. No se borró nada.",
         // ---- Power ----
         Msg::ProximityWake => "despertar por proximidad",
         Msg::ProximityWakeNote => "activado, la tecla de encendido ilumina la pantalla\nsolo cuando nada cubre el sensor",
