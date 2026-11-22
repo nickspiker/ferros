@@ -58,6 +58,9 @@ mod neon;
 mod odt;
 mod quick;
 mod puck;
+/// The compose on the GPU (docs/GPU-COMPOSE.md step 2, behind op 86).
+mod gpu;
+mod gpu_layout;
 use odt::{panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -3160,6 +3163,8 @@ fn wins_mirror() {
         }
     }
     WIN_GENS.store(v, Ordering::Release);
+    // The GPU's view of the windows follows (gpu.rs): a window gone is named no more.
+    gpu::windows_changed();
     // Op 75's doorbell: whether an app is in front may have changed with the table (front.rs).
     front::changed();
 }
@@ -4087,6 +4092,12 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
+    // The GPU's compose when it is on and takes this frame (GPU-COMPOSE.md step 2, `gpu::compose`); else NEON's below, as before. A check asked (op 86's 4) takes this one on NEON and then again on the GPU.
+    let check = gpu::check_take(mask);
+    if check.is_none() && gpu::compose(r, mask, width, height, hits) {
+        fps_dot(mask, width, height);
+        return;
+    }
     // The rows by stripes across the publish workers and this thread, as `publish10x4` splits the deck's (2026-11-11: an app's whole-screen frame, Mahere's map from the GPU every frame, took 28 ms of one thread a show on the Pro). Each row is its own: its composition, its codes (`codes_row`, a scratch a thread), its hit map row and its phases' words. A capture (op 30) stays on this thread.
     let workers = PUB_UP.load(Ordering::Acquire) as usize;
     if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 || unsafe { CAPTURE } != 0 {
@@ -4119,6 +4130,9 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
     }
     if unsafe { CAPTURE } != 0 {
         return;
+    }
+    if let Some(k) = check {
+        gpu::check_say(k, width, height);
     }
     fps_dot(mask, width, height);
 }
@@ -7997,6 +8011,18 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &frames_op(msg[1]));
             continue;
         }
+        // 86 `gpu compose [what u8: 0 off, 1 on, 2 toggle, 3 ask, 4 check]` → [0][on u8][state u8: 0 not started, 2 ready, 3 failed] (docs/GPU-COMPOSE.md step 2, 2026-11-21): the windows' frames composed on the GPU (`gpu::compose`), off at every start; 4 asks the render thread to compose the next app frame on NEON and again on the GPU, and to say how many words differ (`gpu::check`). Development builds only (status 1 on a release build), as op 63. Answered here, at once.
+        if op == 86 && n >= 2 {
+            if DEV {
+                if msg[1] == 4 {
+                    gpu::check_next();
+                }
+                ferros_sys::reply(&tok, &gpu::op(if msg[1] == 4 { 3 } else { msg[1] }));
+            } else {
+                ferros_sys::reply(&tok, &[1, 0, 0]);
+            }
+            continue;
+        }
         // 63 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
         if op == 63 && n >= 2 {
             ferros_sys::reply(&tok, &channels_op(msg[1]));
@@ -8569,6 +8595,8 @@ fn server(grants: u64) -> ! {
             log.flush();
         }
     }
+    // The GPU compose's thread (gpu.rs): asleep until op 86 turns it on.
+    gpu::start(grants);
     // The bars' producer (`console_worker`), on the workers with the rest.
     if ferros_sys::thread_spawn(console_worker, unsafe { &mut *(&raw mut CON_STACK) }, (width as u64) << 32 | height as u64) != 0 {
         log.s(b"display: no console worker\n");
@@ -10443,6 +10471,8 @@ fn server(grants: u64) -> ! {
                 BAR_W_BACK = w;
                 BAR_SPAN_BACK = s;
                 let mut r = CON_RECT;
+                // The front layer the GPU composes under (gpu.rs) made again on those rows.
+                gpu::bars_changed(r);
                 // Whether the bars now on the screen hold any of the quick row (a screencap it asked for waits until they hold none).
                 quick::EMPTY_FRONT = quick::EMPTY_BACK.load(Ordering::Acquire);
                 // The hit map's share of the bars with them; the whole map again when the row came or went (everything inside the app's circle changed hands).
@@ -10783,6 +10813,19 @@ fn server(grants: u64) -> ! {
                     tlog.s(b" times, ");
                     tlog.dec(hit::PAINT_US.swap(0, Ordering::Relaxed) / paints);
                     tlog.s(b" us each");
+                }
+                // The compose on the GPU (gpu.rs, op 86): its jobs, the GPU's own and the queue's round each, and the frames it left to NEON while on.
+                let (jobs, gpu_us, round_us, neon) = gpu::stats();
+                if jobs + neon > 0 {
+                    tlog.s(b"; GPU compose A#");
+                    tlog.dec(jobs);
+                    tlog.s(b" jobs, A#");
+                    tlog.dec(gpu_us);
+                    tlog.s(b" us the GPU's own and A#");
+                    tlog.dec(round_us);
+                    tlog.s(b" us the round each, A#");
+                    tlog.dec(neon);
+                    tlog.s(b" frames left to NEON");
                 }
                 tlog.s(b"\n");
                 tlog.flush();

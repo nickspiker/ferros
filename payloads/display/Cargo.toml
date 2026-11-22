@@ -37,3 +37,5 @@ libm = "0.2"
 [build-dependencies]
 # The ferros mark read from logo.vsf on the host into a table (build.rs, draw::logo).
 vsf = { path = "../../../vsf" }
+# The compose kernel (GPU-COMPOSE.md step 2, gpu_kernel.rs) recorded on the host into words, as compbench's are: the device compiles nothing.
+valhall = { path = "../../valhall", features = ["ssa"] }

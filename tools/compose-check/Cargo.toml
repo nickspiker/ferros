@@ -1,0 +1,14 @@
+[package]
+name = "compose-check"
+version = "0.1.0"
+edition = "2021"
+description = "The display's compose kernel (payloads/display/src/gpu_kernel.rs, GPU-COMPOSE.md step 2) run in valhall's emulator against the display's own arithmetic: the front layer under the scene, the windows thru their rings, the present's words, word for word"
+
+[[bin]]
+name = "compose-check"
+path = "src/main.rs"
+
+[dependencies]
+valhall = { path = "../../valhall", features = ["ssa", "sim"] }
+
+[workspace]

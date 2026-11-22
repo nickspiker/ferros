@@ -1,4 +1,11 @@
+#[path = "src/gpu_layout.rs"]
+#[allow(dead_code)]
+mod gpu_layout;
+#[path = "src/gpu_kernel.rs"]
+mod gpu_kernel;
+
 fn main() {
+    compose_kernel();
     let ld = std::path::Path::new("payloads/display/payload.ld");
     println!("cargo:rustc-link-arg=-T{}", ld.display());
     // Position-independent link: absolute addresses in data become .rela.dyn entries that ferros_sys::relocate() applies at entry (the vtables of `dyn` traits, for one — fontdue's outline builder faulted at an unrelocated one on 2026-10-16).
@@ -42,4 +49,26 @@ fn main() {
     }
     table += "];\n";
     std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("logo.rs"), table).unwrap();
+}
+
+/// The compose kernel (GPU-COMPOSE.md step 2, src/gpu_kernel.rs) recorded on the host into words for the display to load: `WORDS`, `CONSTS` (its uniforms past the caller's), `REGS64`.
+fn compose_kernel() {
+    use std::fmt::Write;
+    println!("cargo:rerun-if-changed=src/gpu_kernel.rs");
+    println!("cargo:rerun-if-changed=src/gpu_layout.rs");
+    let k = gpu_kernel::record();
+    assert!(k.words.len() * 8 <= gpu_layout::K_ROOM, "the compose kernel's {} words pass its room", k.words.len());
+    let mut s = String::new();
+    let _ = writeln!(s, "/// {} words, peak {} registers.", k.words.len(), k.peak);
+    let _ = writeln!(s, "pub const REGS64: bool = {};", k.regs64);
+    s.push_str("pub static WORDS: &[u64] = &[");
+    for x in &k.words {
+        let _ = write!(s, "{x},");
+    }
+    s.push_str("];\npub static CONSTS: &[u64] = &[");
+    for x in &k.consts {
+        let _ = write!(s, "{x},");
+    }
+    s.push_str("];\n");
+    std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("compose.rs"), s).unwrap();
 }
