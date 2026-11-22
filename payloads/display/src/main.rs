@@ -10841,7 +10841,10 @@ fn server(grants: u64) -> ! {
                 // The compose on the GPU (gpu.rs, op 86): its jobs, the GPU's own and the queue's round each, and the frames it left to NEON while on.
                 let (jobs, gpu_us, round_us, neon) = gpu::stats();
                 if jobs + neon > 0 {
-                    tlog.s(b"; GPU compose A#");
+                    // A line of its own: the line before it is cut at the log's 256 bytes.
+                    tlog.s(b"\n");
+                    tlog.flush();
+                    tlog.s(b"display: GPU compose A#");
                     tlog.dec(jobs);
                     tlog.s(b" jobs, A#");
                     tlog.dec(gpu_us);
