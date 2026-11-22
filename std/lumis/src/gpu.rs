@@ -67,6 +67,8 @@ pub struct Gpu {
     /// The GPU's time of each kind's frames since its last line, counter ticks, and how many.
     ticks: [u64; 4],
     frames: [u64; 4],
+    /// The camera screen's damage the pass before drew (x0, y0, x1, y1), which the next surface lacks: None, the whole frame (a menu frame, the first pass).
+    drawn: Option<(usize, usize, usize, usize)>,
 }
 
 // SAFETY: the block is this process's for its life (the kernel never takes a GPU block back); only the UI thread draws into it.
@@ -103,7 +105,7 @@ impl Gpu {
         // SAFETY: the table's 2^10 bytes at LUT_AT, under Lumis's 2^UI_LOG of the block.
         unsafe { core::ptr::copy_nonoverlapping(lut.as_ptr() as *const u8, base.add(LUT_AT), 1 << 10) };
         *PLACE.lock().unwrap() = Some((block, base as usize));
-        Ok(Gpu { service, block, base, size, q, kernels, compiled, surfaces, next: 0, w, h, bg_at, ink_at, frame_at, bg_written: false, slots: Vec::new(), ticks: [0; 4], frames: [0; 4] })
+        Ok(Gpu { service, block, base, size, q, kernels, compiled, surfaces, next: 0, w, h, bg_at, ink_at, frame_at, bg_written: false, slots: Vec::new(), ticks: [0; 4], frames: [0; 4], drawn: None })
     }
 
     /// The queue opened on the block as it is now and the kernels' words given to it.
@@ -169,25 +171,38 @@ impl Gpu {
         u[menu::LUT as usize] = at(LUT_AT);
         u[menu::SIZE as usize] = w as u64 | ((w * h) as u64) << 32;
         u[menu::STRIDE as usize] = w as u64;
-        self.run(Kind::Menu, &mut u)
+        // The menu fills both buffers in turn: the camera screen after it draws them whole.
+        self.drawn = None;
+        self.run(Kind::Menu, &mut u, (w * h) as u32)
     }
 
     /// The camera screen's frame as Lumis drew it (`frame_bits`) into the next surface on the GPU, whole: that surface's base, for the show. Err: why not (the frame is then the CPU's present).
-    pub fn camera(&mut self) -> Result<u64, String> {
+    /// `damage` (x0, y0, x1, y1: the frame's changed part this pass; None the whole frame) drawn on the GPU into the next surface, with the part the pass before changed (that surface last showed the frame before it: the two buffers take turns): the rest of it is already this frame. Columns to whole quads of four (the frame kernel's). The surface's base, for the show.
+    pub fn camera(&mut self, damage: Option<(usize, usize, usize, usize)>) -> Result<u64, String> {
         let (w, h) = (self.w, self.h);
+        let whole = (0, 0, w, h);
+        let d = damage.unwrap_or(whole);
+        let (x0, y0, x1, y1) = match self.drawn {
+            Some(p) => (d.0.min(p.0), d.1.min(p.1), d.2.max(p.2), d.3.max(p.3)),
+            None => whole,
+        };
+        self.drawn = Some(d);
+        let (x0, x1) = (x0 & !3, (x1 + 3) & !3);
+        let quads = (x1 - x0) / 4 * (y1 - y0);
         let mut u = [0u64; frame::SLOT_COUNT as usize];
         u[frame::SRC as usize] = ARENA_VA + self.frame_at as u64;
         u[frame::LUT as usize] = ARENA_VA + LUT_AT as u64;
-        u[frame::SIZE as usize] = w as u64 | ((w * h) as u64) << 32;
-        u[frame::STRIDE as usize] = w as u64;
-        self.run(Kind::Camera, &mut u)
+        u[frame::SIZE as usize] = ((x1 - x0) / 4) as u64 | (quads as u64) << 32;
+        u[frame::ORIGIN as usize] = x0 as u64 | (y0 as u64) << 32;
+        u[frame::STRIDE as usize] = w as u64 | (w as u64) << 32;
+        self.run(Kind::Camera, &mut u, quads as u32)
     }
 
-    /// A job of `kind`'s kernel with uniforms `u` (its DST, slot 0 in both, set here to the next surface) over every pixel, waited for: the surface it drew.
-    fn run(&mut self, kind: Kind, u: &mut [u64]) -> Result<u64, String> {
+    /// A job of `kind`'s kernel with uniforms `u` (its DST, slot 0 in both, set here to the next surface) over `invocations`, waited for: the surface it drew.
+    fn run(&mut self, kind: Kind, u: &mut [u64], invocations: u32) -> Result<u64, String> {
         let k = self.next;
         u[0] = SURFACES_VA + (self.surfaces[k] - SURFACES_PA);
-        self.exec(kind, u, (self.w * self.h) as u32)?;
+        self.exec(kind, u, invocations)?;
         self.next ^= 1;
         Ok(self.surfaces[k])
     }
@@ -199,13 +214,13 @@ impl Gpu {
 
     /// A camera frame stacked into the integrator's plane on the GPU (lumis_gpu `stack_kernel`): its RAW10 at `src` (`CAMERA_VA` plus its place in the view), `line` bytes a row, `width` x `height` samples, into the plane at `plane` bytes into the block (`INTEGRATOR_AT` on), written or added (`add`). Waited for.
     pub fn stack(&mut self, src: u64, line: usize, width: usize, height: usize, plane: usize, add: bool) -> Result<(), String> {
-        let groups = width / 4 * height;
+        let chunks = width / stack::CHUNK * height;
         let mut u = [0u64; stack::SLOT_COUNT as usize];
         u[stack::SRC as usize] = src;
         u[stack::PLANE as usize] = ARENA_VA + plane as u64;
-        u[stack::SIZE as usize] = (width / 4) as u64 | (groups as u64) << 32;
-        u[stack::LINES as usize] = line as u64 | (width as u64) << 32;
-        self.exec(if add { Kind::StackAdd } else { Kind::Stack }, &u, groups as u32)
+        u[stack::SIZE as usize] = (width / stack::CHUNK) as u64 | (chunks as u64) << 32;
+        u[stack::LINES as usize] = (line / 4) as u64 | (width as u64) << 32;
+        self.exec(if add { Kind::StackAdd } else { Kind::Stack }, &u, chunks as u32)
     }
 
     /// A job of `kind`'s kernel with uniforms `u` over `invocations`, waited for.

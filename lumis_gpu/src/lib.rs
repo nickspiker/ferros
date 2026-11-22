@@ -216,72 +216,89 @@ pub fn menu_kernel() -> Compiled {
 
 /// A frame of Lumis's own drawing (three bytes a pixel, R, G, B: lumis_core's PixelSurface, the camera screen) for `frame_kernel`.
 pub mod frame {
-    /// The window's pixel 0 in the surface (fluor's G2t16), the frame, a code's darkness (as `g2t::LUT`).
+    /// The window's pixel 0 in the surface (fluor's G2t16), the frame (three bytes a pixel, R, G, B), a code's darkness (as `g2t::LUT`).
     pub const DST: u8 = 0;
     pub const SRC: u8 = 1;
     pub const LUT: u8 = 2;
-    /// (width, width x height), and (the surface's stride in pixels, 0), as `menu`'s.
+    /// (quads of four pixels a row of the rectangle, quads in it), and (the rectangle's left, its top): the part of the frame drawn, its left and width multiples of 4.
     pub const SIZE: u8 = 3;
-    pub const STRIDE: u8 = 4;
-    pub const SLOT_COUNT: u8 = 5;
+    pub const ORIGIN: u8 = 4;
+    /// (the surface's stride in pixels, the frame's width in pixels).
+    pub const STRIDE: u8 = 5;
+    pub const SLOT_COUNT: u8 = 6;
 }
 
-/// Lumis's frame into fluor's G2t16, opaque, an invocation a pixel (ids 0 to width x height - 1, past it the last pixel again), each channel thru the code table: the whole frame each time, as the menu's.
+/// A rectangle of Lumis's frame into fluor's G2t16, opaque, an invocation four pixels side by side (ids 0 to the rectangle's quads - 1, row by row; past them the last quad again), each channel thru the code table: the frame's twelve bytes read as three aligned words (the Pro, 2026-11-22: three byte loads a pixel took the whole frame 7.7 to 10.7 ms), and only the damage drawn (the owner, 2026-11-20: "you render every px all at once thru the gpu when anything within that damage rectangle changes").
 pub fn frame_kernel() -> Compiled {
     use frame::*;
     ssa::begin();
     ssa::reserve(SLOT_COUNT);
     let g = ssa::gid();
     let n = ssa::uniform(SIZE, 1);
-    // WHY the select: as `menu_kernel`'s, the invocations come in groups of 16.
+    // WHY the select: the invocations come in groups of 16, so past a rectangle whose quads are not a multiple of 16 they would draw outside it; those draw its last quad again, the same values.
     let g = U::select(g.lt(n), g, n - U::splat(1));
-    let w_u = ssa::uniform(SIZE, 0);
-    let yu = ((F::from_u32(g) + 0.5) / F::from_u32(w_u)).floor().to_u32();
-    let xu = g - yu.wrapping_mul(w_u);
-    let p3 = g.wrapping_mul(U::splat(3));
-    let dark = |c: i16| ssa::load(LUT, ssa::load8(SRC, p3, 0, c), 2, 0);
-    let (r, gr, b) = (dark(0), dark(1), dark(2));
-    let at = yu.wrapping_mul(ssa::uniform(STRIDE, 0)) + xu;
-    ssa::store_at(DST, at, 3, 0, (gr << 16) | b);
-    ssa::store_at(DST, at, 3, 4, U::splat(g2t::ALPHA_OPAQUE << 16) | r);
+    let run = ssa::uniform(SIZE, 0);
+    let yq = ((F::from_u32(g) + 0.5) / F::from_u32(run)).floor().to_u32();
+    let xq = g - yq.wrapping_mul(run);
+    let (x, y) = (ssa::uniform(ORIGIN, 0) + (xq << 2), ssa::uniform(ORIGIN, 1) + yq);
+    // The quad's four pixels, twelve bytes, from word (y w + x) 3 / 4 of the frame (x and w multiples of 4, so it is whole words).
+    let word = (y.wrapping_mul(ssa::uniform(STRIDE, 1)) + x).wrapping_mul(U::splat(3)) >> 2;
+    let w: Vec<U> = (0..3).map(|k| ssa::load(SRC, word, 2, 4 * k)).collect();
+    let byte = |i: usize| (w[i >> 2] >> (8 * (i & 3) as u32)) & U::splat(0xFF);
+    let at = y.wrapping_mul(ssa::uniform(STRIDE, 0)) + x;
+    for p in 0..4 {
+        let dark = |c: usize| ssa::load(LUT, byte(3 * p + c), 2, 0);
+        let (r, gr, b) = (dark(0), dark(1), dark(2));
+        ssa::store_at(DST, at, 3, 8 * p as i16, (gr << 16) | b);
+        ssa::store_at(DST, at, 3, 8 * p as i16 + 4, U::splat(g2t::ALPHA_OPAQUE << 16) | r);
+    }
     ssa::compile()
 }
 
 /// One camera frame stacked into a plane (lumis_core's integrator: the Average plane of the exposure in progress, `stack_kernel`).
 pub mod stack {
-    /// The frame's row 0 (RAW10: four samples in five bytes, each sample's high 8 bits in bytes 0 to 3 and its low 2 in byte 4, two bits a sample from the bottom) and the plane (a u16 a sample, row by row).
+    /// The frame's row 0 (RAW10: four samples in five bytes, each sample's high 8 bits in bytes 0 to 3 and its low 2 in byte 4, two bits a sample from the bottom; a row 4-byte aligned) and the plane (a u16 a sample, row by row).
     pub const SRC: u8 = 0;
     pub const PLANE: u8 = 1;
-    /// (groups of four samples a row, groups in the frame), and (the frame's line in bytes, the plane's row in samples).
+    /// (chunks of sixteen samples a row, chunks in the frame), and (the frame's line in 4-byte words, the plane's row in samples).
     pub const SIZE: u8 = 2;
     pub const LINES: u8 = 3;
     pub const SLOT_COUNT: u8 = 4;
-    /// Bytes past the plane its kernel may write (the last group of invocations past a frame whose groups are not a multiple of 16).
-    pub const SLACK: usize = 1 << 7;
+    /// Samples an invocation stacks: four RAW10 groups, twenty bytes, five aligned words.
+    pub const CHUNK: usize = 1 << 4;
+    /// Bytes past the plane its kernel may write (invocations past a frame whose chunks are not a multiple of 16, 32 bytes each).
+    pub const SLACK: usize = 1 << 9;
 }
 
-/// A camera frame into the integrator's plane, an invocation a group of four samples (ids 0 to the frame's groups - 1, row by row; past them, into the plane's `SLACK`): its five bytes read straight from the camera's buffer, unpacked as lumis_core's RAW10 rows are (ferros std/lumis `camera::unpack_raw10`), and written (`add` false: an exposure's first frame) or added (`add`: the plane holds at most the integrator's fold of frames, so no half carries into the next) into the plane, two samples a u32.
+/// A camera frame into the integrator's plane, an invocation a chunk of sixteen samples (ids 0 to the frame's chunks - 1, row by row; past them, into the plane's `SLACK`): its twenty bytes read straight from the camera's buffer as five aligned words (the Pro, 2026-11-22: a group's five byte loads took the stack 8 to 10.6 ms a frame), unpacked as lumis_core's RAW10 rows are (ferros std/lumis `camera::unpack_raw10`), and written (`add` false: an exposure's first frame) or added (`add`: the plane holds at most the integrator's fold of frames, so no half carries into the next) into the plane, two samples a u32. A row's width is a multiple of 16 samples (every binned readout of the Pro).
 pub fn stack_kernel(add: bool) -> Compiled {
     use stack::*;
     ssa::begin();
     ssa::reserve(SLOT_COUNT);
     let g0 = ssa::gid();
     let n = ssa::uniform(SIZE, 1);
-    // WHY the selects: the invocations come in groups of 16, so past a frame whose groups are not a multiple of 16 they would read and add outside it; those read the last group (inside the frame) and write their own 8 bytes past the plane (its slack, `SLACK`), never adding twice into a sample. Every binned readout of the Pro is a multiple of 16.
+    // WHY the selects: the invocations come in groups of 16, so past a frame whose chunks are not a multiple of 16 they would read and add outside it; those read the last chunk (inside the frame) and write their own 32 bytes past the plane (its slack, `SLACK`), never adding twice into a sample.
     let past = g0.ge(n);
     let g = U::select(past, n - U::splat(1), g0);
     let run = ssa::uniform(SIZE, 0);
     let yu = ((F::from_u32(g) + 0.5) / F::from_u32(run)).floor().to_u32();
     let xu = g - yu.wrapping_mul(run);
     let at = yu.wrapping_mul(ssa::uniform(LINES, 0)) + xu.wrapping_mul(U::splat(5));
-    let b = |k: i16| ssa::load8(SRC, at, 0, k);
-    let lo = b(4);
-    let s = |k: u32| (b(k as i16) << 2) | ((lo >> (2 * k)) & U::splat(3));
-    let (w0, w1) = (s(0) | (s(1) << 16), s(2) | (s(3) << 16));
-    // The plane's two words for the group: sample y * row + 4 x, two a word.
-    let word = U::select(past, (n << 1) + ((g0 - n) << 1), yu.wrapping_mul(ssa::uniform(LINES, 1) >> 1) + (xu << 1));
-    let (w0, w1) = if add { (ssa::load(PLANE, word, 2, 0) + w0, ssa::load(PLANE, word, 2, 4) + w1) } else { (w0, w1) };
-    ssa::store_at(PLANE, word, 2, 0, w0);
-    ssa::store_at(PLANE, word, 2, 4, w1);
+    let w: Vec<U> = (0..5).map(|k| ssa::load(SRC, at, 2, 4 * k)).collect();
+    let byte = |i: usize| (w[i >> 2] >> (8 * (i & 3) as u32)) & U::splat(0xFF);
+    let mut s = Vec::with_capacity(CHUNK);
+    for k in 0..4 {
+        let lo = byte(5 * k + 4);
+        for j in 0..4 {
+            s.push((byte(5 * k + j) << 2) | ((lo >> (2 * j) as u32) & U::splat(3)));
+        }
+    }
+    // The plane's eight words for the chunk: sample y * row + 16 x, two a word.
+    let word = U::select(past, (n << 3) + ((g0 - n) << 3), yu.wrapping_mul(ssa::uniform(LINES, 1) >> 1) + (xu << 3));
+    for m in 0..CHUNK / 2 {
+        let v = s[2 * m] | (s[2 * m + 1] << 16);
+        let v = if add { ssa::load(PLANE, word, 2, 4 * m as i16) + v } else { v };
+        ssa::store_at(PLANE, word, 2, 4 * m as i16, v);
+    }
     ssa::compile()
 }

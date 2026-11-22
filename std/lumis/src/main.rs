@@ -655,9 +655,9 @@ fn previewing() -> bool {
 }
 
 impl lumis_core::RowSource for ViewRows {
-    /// The frame stacked on the GPU straight from the camera's buffer (lumis_gpu `stack_kernel`, the owner 2026-11-22: "I thought we stacked on the GPU for the memory bandwidth, no?"), when the camera's view is mapped in the GPU (`gpu::CAMERA_MAPPED`), the plane is in the integrator's part of the GPU block (`gpu::plane_in_block`), and the frame's groups of four samples come in whole groups of 16 invocations (every binned readout of the Pro); else the integrator reads the rows itself, as before. A GPU job that fails turns the GPU's stack off for the rest of the process, said once.
+    /// The frame stacked on the GPU straight from the camera's buffer (lumis_gpu `stack_kernel`, the owner 2026-11-22: "I thought we stacked on the GPU for the memory bandwidth, no?"), when the camera's view is mapped in the GPU (`gpu::CAMERA_MAPPED`), the plane is in the integrator's part of the GPU block (`gpu::plane_in_block`), the frame's rows are whole chunks of 16 samples on 4-byte lines, the chunks in whole groups of 16 invocations (every binned readout of the Pro); else the integrator reads the rows itself, as before. A GPU job that fails turns the GPU's stack off for the rest of the process, said once.
     fn stack(&self, plane: &mut [u16], add: bool) -> bool {
-        if self.gpu == 0 || !gpu::CAMERA_MAPPED.load(Ordering::Relaxed) || gpu::STACK_OFF.load(Ordering::Relaxed) || self.width % 4 != 0 || (self.width / 4 * self.height) % (1 << 4) != 0 || plane.len() != self.width * self.height {
+        if self.gpu == 0 || !gpu::CAMERA_MAPPED.load(Ordering::Relaxed) || gpu::STACK_OFF.load(Ordering::Relaxed) || self.width % lumis_gpu::stack::CHUNK != 0 || self.line % 4 != 0 || (self.width / lumis_gpu::stack::CHUNK * self.height) % (1 << 4) != 0 || plane.len() != self.width * self.height {
             return false;
         }
         let Some(at) = gpu::plane_in_block(plane.as_ptr(), plane.len()) else { return false };
@@ -2400,14 +2400,16 @@ impl FluorApp<G2t16> for Lumis {
     }
 
     /// The menu (and the menu still shown while a camera opens) drawn whole on the GPU straight into a surface of Lumis's own (`gpu::Gpu::frame`), which the host shows (`own_surface`): no scratch, no conversion, no bake on the CPU. A GPU that fails leaves the menu to the CPU from then, said on the console.
-    fn render_own(&mut self, _ctx: &mut Context) -> bool {
+    fn render_own(&mut self, ctx: &mut Context) -> bool {
         self.own = None;
+        // The camera screen's damage this pass: the whole frame when Lumis drew it whole, else the box around the parts it repainted (the controls that ticked), which is all the GPU draws (the owner, 2026-11-20: "you render every px all at once thru the gpu when anything within that damage rectangle changes"; the Pro, 2026-11-22: a whole frame every pass, 9 ms on the GPU, held the stack up).
+        let damage = (!self.changed).then(|| ctx.damage_rects().iter().fold((usize::MAX, usize::MAX, 0, 0), |b, r| (b.0.min(r.x0), b.1.min(r.y0), b.2.max(r.x1), b.3.max(r.y1)))).map(|b| if b.0 > b.2 { (0, 0, 0, 0) } else { b });
         let mut shared = gpu::SHARED.lock().unwrap();
         let (Some(gpu), Some(menu), Some(surface)) = (shared.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
         let camera = matches!(self.screen, Screen::Camera(_));
         let t = std::time::Instant::now();
         // The camera screen: Lumis's frame as lumis_core drew it (in the block), whole, in place of the CPU's present of its changed rects (the owner, 2026-11-21: the GPU composes full frames).
-        let drawn = if camera { gpu.camera() } else { gpu.menu(menu, std::mem::take(&mut self.menu_fresh)) };
+        let drawn = if camera { gpu.camera(damage) } else { gpu.menu(menu, std::mem::take(&mut self.menu_fresh)) };
         match drawn {
             Ok(base) => {
                 self.own = Some(base);
