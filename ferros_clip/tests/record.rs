@@ -192,14 +192,14 @@ fn the_gpu_path_writes_the_cpu_path_s_clip() {
     assert!(record(true, false) == record(false, false), "the GPU path's clip, packed behind the hand-over");
 }
 
-/// Every Pro camera's binned readout paced from its list section's line (ferros_cam cams' `line_ps`, the frame at least its rows and the driver's 128 lines of blanking): the fastest whole rate each holds, every rate up to it within half a line, and the main by its picosecond line the same frames as by its exact clock.
+/// Every Pro camera's binned readout paced from its list section's line (ferros_cam cams' `line_ps`, the frame at least its rows and its least blanking: the driver's 128 lines, the tele's own 250): the fastest whole rate each holds, every rate up to it within half a line, and the main by its picosecond line the same frames as by its exact clock.
 #[test]
 fn pacing_for_each_pro_camera() {
     use ferros_clip::{Line, MAIN_LINE};
     // The exact main as before the line: 24/s 13232 lines, 30/s 10586, 60/s 5293 (docs/RAW-VIDEO.md "Pacing").
     assert_eq!([24, 30, 60].map(|f| Pacing::of(f).fll), [13232, 10586, 5293]);
-    for (name, ps, rows, most) in [("main", 3_148_916u64, 3072u64, 60u32), ("ultrawide", 6_561_622, 3000, 48), ("front", 10_437_753, 2736, 33), ("tele", 6_106_805, 3024, 51)] {
-        let line = Line::of_ps(ps, rows + (1 << 7));
+    for (name, ps, rows, blank, most) in [("main", 3_148_916u64, 3072u64, 1u64 << 7, 60u32), ("ultrawide", 6_561_622, 3000, 1 << 7, 48), ("front", 10_437_753, 2736, 1 << 7, 33), ("tele", 6_106_805, 3024, 250, 50)] {
+        let line = Line::of_ps(ps, rows + blank);
         assert_eq!(line.fps_most(), most, "{name}");
         assert!(Pacing::of_line(most + 1, line).is_none() || most == 60, "{name}");
         for fps in 1..=most {

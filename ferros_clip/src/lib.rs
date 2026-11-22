@@ -71,7 +71,7 @@ impl Line {
         Line { num: ps, den: 1_000_000_000_000, fll_least }
     }
 
-    /// The fastest whole rate, 1 to 60, a whole frame of this readout runs at (the Pro, from the list: the main 60, the ultrawide 48, the tele 51, the front 33); 0 none.
+    /// The fastest whole rate, 1 to 60, a whole frame of this readout runs at (the Pro, from the list: the main 60, the ultrawide 48, the tele 50, the front 33); 0 none.
     pub fn fps_most(&self) -> u32 {
         (1..=60).rev().find(|&f| Pacing::of_line(f, *self).is_some()).unwrap_or(0)
     }

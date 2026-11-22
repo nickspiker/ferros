@@ -61,6 +61,8 @@ pub struct Cam {
     pub rotation: u8,
     /// Its other readouts, each replayed whole as Android ran it (`Alt`), opened by the mode block's kind `ALT + k`.
     pub alts: &'static [Alt],
+    /// The least blanking a whole frame of its captured readout takes, lines past its rows (the list's `fll_least`, a client's fastest whole rate): the driver's `BLANK_LEAST`, or more where the sensor pads its frame further (the tele).
+    pub blank_least: u16,
     /// Whether the sensor takes a mode's words only while streaming: written in the hold before stream on, its frame, window and output size are dropped at stream on (the sensor runs its init's mode), so the driver writes the mode after the first frame (payloads/camera `F_MID`).
     /// The tele (2026-11-18, docs/CAMERA.md "Slits on every camera"): frames of 4000 and 8000 lines written before stream on both ran 30 a second, and a 64-row slit sent whole 4032 x 3024 frames (a front end left at the whole frame took them clean); written after the first frame, 4000 lines ran 40 a second, 8000 lines 20, and the slit 559 a second.
     pub mode_live: bool,
@@ -166,6 +168,7 @@ pub const MAIN: Cam = Cam {
     rotation: 1,
     alts: &[],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::ARRAYS[0],
     optics: &crate::optics::OPTICS[0],
 };
@@ -174,7 +177,7 @@ pub const MAIN: Cam = Cam {
 /// Measured: the bus, address and identity (G#0787 at the CCS sensor register G#0016), the stream writes (G#0100 alone, 8-bit), the receiver (link 2), the acknowledgement, the tick, the geometry (stride G#13C0, its front-end program's), the outputs (`job::UW_SLOT_BYTES`).
 /// From the init, not measured: the line time, 9568 pixel clocks (`line_length_pck`) at the PLL's 1458.2 MHz (24.576 MHz / 3 x 178), 6.5616 µs, which makes its 5081-line frame 33.3 ms, the 30 a second seen; the integration, 4124 lines; the longest offered, the frame less 2^6 lines (Sony's margin is not read).
 /// Its mosaic, measured on ferros (2026-11-18 night, a 256 ms frame in the owner's red-lit room, the cell table): rows `261 195` / `195 131`, so R G / G B (its 48 MP readout's 2 x 2 blocks the same), where its calibration capture (cam 3, 4000 x 3000) says B G / G R: the half turn the init's flip (G#0101 = 3, written by both readouts' inits) makes, so that capture's RAW stream ran unflipped and ferros's frames stand a half turn from it (the rotation below, from that capture, is unchecked on a ferros frame). Black 64, white 1023, orientation 6 from that capture. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
-/// Its lens actuator (G#0F) never acknowledged ferros (docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"), so focus is not offered and the lens stays at rest.
+/// Its lens actuator (G#0F, the main's protocol) answers since its power-up raises the LV buck (2026-11-21; before, it never acknowledged ferros, docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"): a sweep over G#0800 to G#7800 moved the lens (the frame's sharpness peaked mid-range, its mean breathing 110, 92, 110), so focus is offered over that span.
 pub const ULTRAWIDE: Cam = Cam {
     id: 1,
     name: "ultrawide",
@@ -188,8 +191,8 @@ pub const ULTRAWIDE: Cam = Cam {
     stream_off: &[0x01, 0x00, 0x00],
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
-    actuator: 0,
-    focus: (0, 0),
+    actuator: 0x0F,
+    focus: (0x0800, 0x7800),
     streams: true,
     rx_start: &crate::rx::RX_START_UW,
     rx_stop: &crate::rx::RX_STOP_UW,
@@ -212,6 +215,7 @@ pub const ULTRAWIDE: Cam = Cam {
     rotation: 1,
     alts: &[UW48],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::ARRAYS[1],
     optics: &crate::optics::OPTICS[1],
 };
@@ -221,7 +225,7 @@ pub const ULTRAWIDE: Cam = Cam {
 /// Its line, measured (2026-11-18, docs/CAMERA.md "The other cameras on the Pro" and "The I2C side without a flash"): 8448 clocks at 24.576 MHz / 3 x 247 (2023.424 MHz) over vt_pix_clk_div 5 (G#0300) at two pixels a clock, 10.437753 us: ferros took frames of its init's 4001 lines 41.66 to 41.85 ms apart (10.44 us), and Android's 1 s hold (47908 lines of 2^1) runs frames 1.0 s apart. The guess before (8.35 us, 30 a second) reported every exposure 20 % short of what the sensor integrated.
 /// From its two captures (cam 7, 3840 x 2736, the size its init sets): cfa G R / B G, black 64, white 1023; orientation 8 (three quarter turns) in the second, none recorded in the first; derived, its init's crop start even and its stream-on's flip 0 the HAL's write.
 /// Its acknowledgement and tick are the ultrawide's, as the harness had them: 64 frames thru the view and 64 at bin 8 ran with them (2026-11-18), no error word.
-/// Its lens actuator (G#0C) is driven as the main's; focus is not offered until its range is measured.
+/// Its lens actuator (G#0C) takes the main's protocol: on the Pro (2026-11-21) its position (G#84) read back each target of a sweep over G#0800 to G#7800 within G#64 (G#0864 for G#0800, G#782C for G#7800), so focus is offered over that span.
 pub const FRONT: Cam = Cam {
     id: 2,
     name: "front",
@@ -236,7 +240,7 @@ pub const FRONT: Cam = Cam {
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x0C,
-    focus: (0, 0),
+    focus: (0x0800, 0x7800),
     streams: true,
     rx_start: &crate::rx::RX_START_FRONT,
     rx_stop: &crate::rx::RX_STOP_FRONT,
@@ -259,6 +263,7 @@ pub const FRONT: Cam = Cam {
     rotation: 3,
     alts: &[FRONT842],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::ARRAYS[2],
     optics: &crate::optics::OPTICS[2],
 };
@@ -306,6 +311,8 @@ pub const TELE: Cam = Cam {
     rotation: 1,
     alts: &[TELE11, TELE48],
     mode_live: true,
+    // Measured on the Pro (2026-11-21): asked 3211 lines (51 a second) its frames came 19.95 ms apart (about 3267 lines), so the sensor pads its frame past the driver's 128; asked 3275 (50 a second) they came 20.0 ms apart. 250 past its 3024 rows makes 50 its fastest whole rate.
+    blank_least: 250,
     array: &crate::ccs::ARRAYS[3],
     optics: &crate::optics::OPTICS[3],
 };
@@ -375,6 +382,7 @@ pub const AKITA_MAIN: Cam = Cam {
     rotation: 1,
     alts: &[],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::AKITA_ARRAYS[0],
     optics: &crate::optics::AKITA_OPTICS[0],
 };
@@ -421,6 +429,7 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     rotation: 1,
     alts: &[],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::AKITA_ARRAYS[1],
     optics: &crate::optics::AKITA_OPTICS[1],
 };
@@ -466,6 +475,7 @@ pub const AKITA_FRONT: Cam = Cam {
     rotation: 3,
     alts: &[],
     mode_live: false,
+    blank_least: crate::BLANK_LEAST,
     array: &crate::ccs::AKITA_ARRAYS[2],
     optics: &crate::optics::AKITA_OPTICS[2],
 };

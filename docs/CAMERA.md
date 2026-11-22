@@ -1609,6 +1609,33 @@ Each link clean (+14 G#0, +1C G#0), no error word.
 
 **Stored** on the Pro: `camera` (capsule 560345 bytes, blake3 32829448fc96da9c; the vault's one before, 555697 bytes, the uw-gain-slit build, kept in target/agent-teleorient/camera-before.capsule.vsf), read back and compared equal; started on demand (camtest alone) it read the 22 degrees R G / G B, the link clean.
 
+## The four cameras for the promo (2026-11-21 night)
+
+The owner: Lumis on the Pro shoots RAW video on all four cameras with no dropped frames, focus and ISO adjustable on each ("function over form").
+Measured on the Pro (flashed 82b908c4, then that kernel with a9bdb503 RAM-reloaded), Photon and Lumis stopped (`diag kill`), the stored driver from 117fadb5 on; tools: rawrec job 8 (the stream alone, +22 the camera), job 0 (a recording on the GPU coder, straight to the flash), job 9 (the list), camtest 3 (gain), 13 (focus), 7 (PROBE), 11 (the ring on the GPU).
+
+| | main | ultrawide | front | tele |
+|---|---|---|---|---|
+| binned readout | 4080 x 3072 | 4000 x 3000 | 3840 x 2736 | 4032 x 3024 |
+| line (list `line_ps`) | 3.149 us | 6.562 us | 10.438 us | 6.107 us |
+| fastest whole rate | 60 | 48 | 33 | 50 (its sensor pads past 128 blank lines) |
+| stream alone, 64 s at 30/s | 1920, 0 skipped | 1921, 0 | 1920, 0 | 1922, 0 |
+| stream alone, 64 s at its fastest | 3838 at 60, 0 | 3073 at 48, 0 | 2112 at 33, 0 | 3210 asked 51 (50.0 a second), 0 |
+| recording, 32 s at 30/s | 960, 0 dropped, 64 C (the screen-off run) | 960, 0 dropped, 72 C | 960, 0, 76 C | 960, 0, 73 C |
+| recording at its fastest | 60: 1741, 0 dropped, the 85 C guard at 29 s | 48: 1105, 0, 85 C at 23 s | 33: 1056, 0, 78 C | 50: 1600, 0, 66 C |
+| GPU coder a frame | 6.2 ms | 7.0 | 6.1 | 6.7 |
+| gain (SET 1, 1024 one) | 1x to 160x, the mean rising each half stop | 1.007x to 64x (1024 refused: the stored least, code 7, not approved by the owner) | 1x to 16x | 1x to 64x |
+| focus (SET 2) | G#0800 to G#7800 (as before) | G#0800 to G#7800 since its LV buck: actuator G#0F and EEPROM G#50 answer, the lens moves | G#0800 to G#7800: its actuator G#0C reads back every target within G#64 | none: the lens is the OIS controller's (humbaba, G#61, 16-bit registers), undecoded |
+
+- **Source digests at 60/s**: rawrec's default hashes every frame as captured; with them the main at 60/s dropped 12 frames a second (the hand-over 20 ms, past 16.7). Without (Lumis's own path), none. A 60/s clip must be recorded without them.
+- **Heat** is what ends a 48 to 60 a second recording: 85 C in 23 to 29 s from 54 C, the charger in. 24 and 30 a second ran their 32 s under 78 C.
+- **The screen off** put the clock policy in its dark tier (the worker cores stopped, the GPU at its 150 MHz floor) under a recording: the 30/s main fell to 5 to 23 frames a second (the stream itself slowed, so none counted as dropped). a9bdb503: no dark tier while the camera's switch is held or a clip's extent is open. RAM-reloaded: the tier stayed active, 960 of 960, 0 dropped thru the screen off and on.
+- **A SET before the first frame** (the front's trap, "The other cameras on the Pro") is now held by the driver until a frame has landed, then served: a client may set its shutter, gain or focus right after its OPEN on any camera. The front with a 262 ms SET before its first frame then streamed, gain 1x to 16x.
+- **The tele's floor**: asked 3211 lines (51 a second) its frames came 19.95 ms apart (about 3267 lines); 3275 (50 a second) ran exact. `Cam::blank_least` 250 makes the list's `fll_least` 3274, so its fastest is 50.
+- **camtest 11 after END_FLUSH** (1786ed7b removed the camera's own per-job invalidate): every word of every frame equal to the CPU's view, non-cacheable and cacheable; a frame's copy 949 us non-cacheable, 1189 us cacheable (849 before); a store into the ring a permission fault; a CLOSE with a job in flight ended its queue; unmapped after; the GPU's fence clean.
+- **The clips window** had 16 GB free of 48 (other domains' clips): a minute at 60/s is about 17 GB coded.
+- **Open**: the tele's focus (a capture of Android's camera focusing the tele, `diag android` and the i2c tracepoints on i2c-4 at every address, as "The I2C side without a flash"); each lens's infinity and nearest targets (the EEPROMs' calibration, undecoded), so a slider in dioptres maps by measure, not by guess.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.

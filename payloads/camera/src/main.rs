@@ -1234,7 +1234,7 @@ fn get<'a>(g: u64, key: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// The lens actuator (the camera's `actuator`) to `pos`: reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 once, then the target into 00/01 (docs/oracle/CAMERA.md "Focus"). The main's protocol; the front camera's actuator takes it untried.
+/// The lens actuator (the camera's `actuator`) to `pos`: reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 once, then the target into 00/01 (docs/oracle/CAMERA.md "Focus"). The main's protocol, which the front's and the ultrawide's actuators take too (2026-11-21).
 fn focus_init(bus: &Bus, c: &Cam) -> Result<(), u32> {
     bus.write(c.actuator, &[0x02, 0x40])?;
     ferros_sys::delay_us(1 << 13);
@@ -2026,7 +2026,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     let refused = REFUSED.load(Ordering::Relaxed);
     say!(g, "camera: engine started (ring G#{ring_pa:X}, count A#{ring_n}, A#{slots} descriptors round which the index goes{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
-    // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered; elsewhere it stays where it rests (the ultrawide's actuator never answered ferros, the front's range is not measured).
+    // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered (the main, the ultrawide and the front since 2026-11-21); elsewhere it stays where it rests (the tele's lens is its OIS controller's, G#61, undecoded).
     let focus = if c.focus.1 != 0 { 0x3800 } else { 0 };
     // The sensor's frame timing, for exposures (ferros_cam ccs `Timing`): the mode's line and frame (the init's own where no mode was asked), and the integration's least and margin as the sensor answers them (CCS G#1004 and G#1006), read here, never assumed.
     let page = ccs::Page::of(init);
@@ -2940,6 +2940,8 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let mut open_cam: Option<Open> = None;
     // The call held while its frame is on its way (`Pending`): at most one; a second call that would wait while one is held is answered empty (one holder, one thread reading frames).
     let mut pending: Option<Pending> = None;
+    // A SET that came before the stream's first frame, held until a frame has landed and then served as if it came then (2026-11-21): the front's sensor takes no setting before its first frame (any write in its hold then, even the integration alone, left it with no frame at all: docs/CAMERA.md "The other cameras on the Pro"), so a client that sets its shutter, gain or rate right after its OPEN would get no stream. Its message, length, reply token and deadline.
+    let mut early: Option<([u8; 64], usize, [u8; 32], u64)> = None;
     // A driver spawned to stay that has closed its one stream (`stay`): it refuses the next open.
     let mut closed_once = false;
     // Binning's measures, for the console every 64 frames served.
@@ -2948,12 +2950,13 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let mut poll = false;
     loop {
         // The doorbell read before anything is looked at: a frame or the holder's end after this read makes the wait below return at once (`DOOR`).
-        WANT.store(pending.is_some() as u64, Ordering::SeqCst);
+        WANT.store((pending.is_some() || early.is_some()) as u64, Ordering::SeqCst);
         let door = DOOR.load(Ordering::SeqCst);
         // The holder's process has ended (the kernel's watch, `CALLER_ENDED`): its stream closed now, whatever it waits for, its held call (whose caller is gone with it) let go.
         if open_cam.is_some() && door & ferros_sys::CALLER_ENDED != 0 {
             say!(g, "camera: its holder's process has ended (the kernel's watch); closing\n");
             close(g);
+            early = None;
             if let Some(p) = pending.take() {
                 reply(&p.token, &[]);
             }
@@ -2989,7 +2992,22 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 Tried::Waiting => {}
             }
         }
-        let got = recv(cap(g, S_SERVE), &mut msg, &mut token, poll);
+        // The SET held for the first frame: served now that a frame has landed, or refused once its deadline passes with none (the stream is then taken for stopped by the call that waits for a frame, as ever).
+        let mut replayed = false;
+        let got = match early {
+            Some((m, n, t, _)) if FRAMES.load(Ordering::Acquire) > 0 => {
+                early = None;
+                (msg, token, replayed) = (m, t, true);
+                n as u64
+            }
+            Some((_, _, t, until)) if ferros_sys::now() >= until => {
+                early = None;
+                say!(g, "camera: a SET held for the first frame: no frame came by its deadline; refused\n");
+                reply(&t, &[1]);
+                continue;
+            }
+            _ => recv(cap(g, S_SERVE), &mut msg, &mut token, poll),
+        };
         poll = true;
         if got == NOTHING {
             match (&open_cam, &pending) {
@@ -3002,6 +3020,11 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 // A call held for its frame: wait for a frame, a call or the holder's end (all three end this wait), until the held call's deadline.
                 (Some(_), Some(p)) => {
                     ferros_sys::wait_or_call(&DOOR, door, p.until);
+                    continue;
+                }
+                // A SET held for the first frame: wait for a frame (frames ring the doorbell while one is held, `WANT`), a call or the holder's end, until its deadline.
+                (Some(_), None) if early.is_some() => {
+                    ferros_sys::wait_or_call(&DOOR, door, early.map_or(0, |e| e.3));
                     continue;
                 }
                 (Some(o), None) => {
@@ -3169,6 +3192,11 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     reply(&token, &[1]);
                     continue;
                 };
+                // Before the stream's first frame: held until one lands (`early`), one at a time (a client sets from one thread).
+                if !replayed && early.is_none() && FRAMES.load(Ordering::Acquire) == 0 {
+                    early = Some((msg, got as usize, token, late_tick()));
+                    continue;
+                }
                 let what = if got >= 2 { msg[1] } else { 0xFF };
                 let value = if got >= 10 { u64::from_le_bytes(msg[2..10].try_into().unwrap()) } else { u64::MAX };
                 let c = cam();
@@ -3247,6 +3275,9 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
             4 => {
                 if open_cam.is_some() {
                     close(g);
+                }
+                if let Some((_, _, t, _)) = early.take() {
+                    reply(&t, &[1]);
                 }
                 if let Some(p) = pending.take() {
                     reply(&p.token, &[]);
