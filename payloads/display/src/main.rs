@@ -10867,8 +10867,11 @@ fn server(grants: u64) -> ! {
                     tlog.s(b" ns, crossing at A#");
                     tlog.dec(line);
                     tlog.s(b" pixels)");
+                    // Its frames' own CPU on a line of its own (the line above fills the log's 256 bytes).
+                    tlog.s(b"\n");
+                    tlog.flush();
                     let (cpu, frames) = gpu::cpu_stats();
-                    tlog.s(b"; A#");
+                    tlog.s(b"display: GPU compose A#");
                     tlog.dec(frames);
                     tlog.s(b" frames, the render thread's own A#");
                     tlog.dec(cpu);
