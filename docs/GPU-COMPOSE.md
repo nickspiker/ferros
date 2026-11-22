@@ -1,6 +1,6 @@
 # GPU-COMPOSE: the compositor on the GPU
 
-Status: design for the owner, 2026-11-21, nothing built. Written against forge 15813c55 (the reversal's commit) with be536647's measurements.
+Status: design for the owner, 2026-11-21, written against forge 15813c55 (the reversal's commit) with be536647's measurements; built the same night, steps 0 to 4 on the host and step 0 measured on the Pro (section 6, "Built").
 The owner's rule for the display: the knobs and the ideal design first, then the build (memory display_driver_design_first).
 Everything not quoted from the owner is a proposal.
 
@@ -328,3 +328,70 @@ Each step leaves the screen working, is testable alone, and is gated by a measur
 11. **The deck on the GPU after apps** (step 6), or never? Recommend after: its frames are mostly small damage (the console, the clock), but flights and pans are whole frames that miss 120 today.
 12. **The mailbox answered when the compose job ends** rather than when it is taken? Recommend yes: it is what keeps an app from drawing into a buffer a job still reads.
 13. **A finger-down as an event that raises the GPU's clock** before the first frame of a pan? Recommend trying it in step 5 and keeping it if the first frame's lateness (the turn's 566 µs and the cores' power-up) shows.
+
+## 6. Built (2026-11-21 night, the gpu-compose agent)
+
+The owner's word that night: "build the GPU path, whilst we are we can tweak and adjust. Once it's built we can profile it and look at hotspots and think about tricks", and "support a full window and a frame". Section 5's questions took the recommendations as defaults (listed again in 6.5); the three the owner answered (after a jump, screen off, both handoffs) as he answered them.
+
+### 6.0 Step 0: measured (compbench, forge 035e46e3)
+
+compbench modes 16 to 18: the whole frame (chrome, pane, the parallel noise, the bake, the dither and the pack) into one phase a job, the phases in turn, paced at 120 a second; the one-phase kernel 1971 words (the four-phase one 2343), checked on the host (0 of 26880 pixels off) and on the device (after a run, the four phases the one-phase jobs left equal the four-phase kernel's word for word, 0 of 8.0 M).
+
+On the Pro under the device's policy (no held clocks; Lumis in front), 8 s each:
+
+| | frames a second | late for their slot | round, median / 99th / most µs | the GPU's own, median / 99th / most µs |
+|---|---|---|---|---|
+| mode 16, one job at a time | 107 | 480 of 860 | 8151 / 11689 / 13020 | 7964 / 9985 / 12763 |
+| mode 17, two in flight | 113 | 309 of 909 | 16915 / 30890 / 32520 (queued behind the one running) | 7964 / 10089 / 12652 |
+
+So one phase a job is 7.96 ms of the GPU at the policy's clocks: under 8.33 at the median, over it at the 99th. Two in flight keeps the GPU busy (113 a second) but cannot pass what the kernel costs. Knob 3 and 4 as recommended; 120 sustained needs the kernel cuts of 1.8 or the bake linearised (knob 7, not measured yet).
+
+**The hostile client at the same priority** (mode 16 beside mode 18 in another process, both system clients at 15, the hostile keeping two whole-frame jobs queued): the hostile ran 1867 jobs in 16 s (8.45 ms each, the GPU whole) and the bench's job was ended by its guard (status 2) a few seconds in. The CSF firmware does not share the GPU between groups of one priority: whichever has work queued keeps it. Two consequences, both built (6.1, 6.2): the display's priority must be its own (knob 14), and kists, which all share 8, must take turns.
+
+### 6.1 Step 1: the kernel's stamp and the GPU service (forge 727a23db)
+
+- **The stamp** (process.rs `dv_stamp`, ferros_sys::gpu `View`): for the caller that holds `display-phases` (the display), flags bit 3 and a section after the frames: [0][seq u64][the phases' base][their bytes][m][m × (surface slot, generation)][m × 16 frames]. The windows are the ones the display's last op 5 named (`Queue::view`: `[5][1][n][n × (slot, generation)]`), each stamped only while its owner still holds it under that generation; every other call of the display's carries the same list less what has gone. An older service finds a 0 where it expects an op and refuses.
+- **The phases in the GPU's fence** while the display's view holds them (admitted at its first stamp, shut when the view is let go), and again at every refence.
+- **Surfaces held from reuse** (GPU-COMPOSE 2.2): a window's surface given back while a display stamp named it stays held and admitted (`surface_give_back`) until the GPU service says the display's tables in force came from a stamp at or after the last one that named it and map it no more (SYS_DMA x1 = 10 on `arena`, `dv_settled`): then it is wiped back into the pool. The display's own end, or the service's, lets the view go once nothing of its can run (`dv_ending`: at once with no GPU work, else at the service's next request or its letting go of the display's queue; the stamps after that point keep what they named).
+- **The display's grants**: the kernel gives the receiver of `display` the GPU service's send right and a GPU block (32 MiB, grown to 64 by the display) as slots 27 and 28, at init's spawn and at a keeper's restart alike (init's page is full); both empty when no GPU service runs (after a jump), so no call of the display's waits on a server that never comes.
+- **The GPU service** (payloads/gpu serve.rs): the view mapped from the stamp alone, the phases read-write at `PHASES_VA` (2 MiB blocks, coherent, never executable), each named window read-only at its own place from `SURFACES_VA` (2 MiB blocks, never executable); slot 0 the display's alone; priorities 15 the display, 14 the other system clients, 8 the kists; after every display call whose tables are in force (installed with LOCK and FLUSH_PT, which clean and invalidate the L2, or waiting for its group's start) it tells the kernel (`view_settled`).
+- **Probes** (compbench modes 19 to 21, `view_test`): a store into a viewed window, the window read after it is named no more, the phases read by a client that is not the display, a window's owner ended while viewed.
+
+### 6.2 The kists take turns (forge e1037e11)
+
+The coordinator's ask after the hostile finding: one kist keeping work queued could starve every other kist (Lumis's RAW encode among them). At each kist job's end, when another kist's group has work in flight, the kists' running groups are ranked by when each was last served: the longest ago at 8, the next 7, and so on down (CSG_EP_REQ's priority, ENDPOINT_CONFIG toggled against its ack, no wait). An event, never a timer; nothing changes while one kist alone has work; the display and the system clients are above every kist and never turned. Op 7 runs a client as a kist (a measure: a client may only give up its standing); compbench modes 16 to 18 take it as a third input byte.
+
+### 6.3 Steps 2 and 3: the display composes on the GPU (forge 8655de24, 22d576cc)
+
+- **Op 86** `gpu compose [0 off, 1 on, 2 toggle, 3 ask, 4 check]` → [0][on][state], development builds, off at every start. A thread of the display's makes the calls (the block grown to 64 MiB, the queue, the kernel, the view), so a call never holds the render thread.
+- **The frame it takes** (`gpu::eligible`): today's windows, op 22, each `BAKED` in Normal, none overlapping, at most four (Photon, Lumis, Mahere, a GPU app full screen). Everything else stays NEON's frame by frame: formats 0 and 1, blend modes, a partly covered pixel over another window (the keyboard over an app: main.rs `partial_run` composes those in working values), the screencap, the hit map's view, a window whose surface the view does not name yet (named for the next frame).
+- **The kernel** (payloads/display/src/gpu_kernel.rs, 304 words, 16 registers, recorded by build.rs): one invocation a pixel, a warp a 16-pixel block; the front layer (the glass's edge, the hole's knockout and the bars, composed front to back once on the CPU whenever they change, `front_row`: `glass_front` and `bars_front` up to the scene), the window thru its ring, the scene under the front (`under_pm`, integer), the present (BLUE ^ the phase's turn, the no-dither bit, the channels' masks, the pack). One job a phase, waited for, so the phases' rules are NEON's. tools/compose-check runs it in valhall's emulator against the display's own arithmetic: 0 words off.
+- **The check** (op 86's 4): the next app frame is published by NEON, composed again by the GPU into the block, and compared word for word; the console says how many differ.
+- **The crossover** (step 3, `gpu_cheaper`): each path's cost a + b pixels from the display's own frames (a from frames under 2^14 pixels, b from those over 2^18, each forgetting 2^-4 a frame), seeded from compbench; the cheaper taken, one frame in 2^5 the other so both stay measured. The once-a-second line says the GPU's jobs and times, both costs and where they cross.
+- **compbench mode 23** is the bench client: a full-screen BAKED window scrolled on its ring at up to 120 a second.
+
+### 6.4 Step 4: the layered window's kernel (forge b2b56f03, host only)
+
+payloads/display/src/gpu_layers.rs (3712 words, 44 registers, a workgroup of 2^7 a half-row, 8 KiB of storage), recorded by build.rs beside the step 2 kernel and not yet used: the window's pixel layers front to back (`BAKED`, the transparency in bits 49-62, see-through bit 63, a layer's ring, opaque by flag), in the panel's codes as 1.4 has it; the parallel noise (compbench's form, a shimmer added to each row's start) baked thru the display's own tables under what is still clear, inside its clip, black past it; the front layer and the present as step 2. tools/compose-check runs it in valhall's emulator against compbench's scalar noise and bake (6.4's numbers there).
+**The display side** (forge 5dc381dd, host-built): the layered show is op 22's 50-byte form plus a tail, `[n]` and n layers frontmost first (layered.rs has the bytes): pixel layers (a surface of the caller's, `BAKED`, its screen rect, opaque by flag, a ring of its own rows), then the background (its clip, axis, scroll, base, shimmer, full, frame). Op 5's feature byte 14 bit 1 says the display reads it. Each source is checked as the caller's in the receive thread (`not_theirs`); a tail that does not parse is a plain show. A layered window is kept under its own format (3) and composed on the GPU by the layered kernel when the compose is on and it is the only window up (the bake's tables copied into the block at each bake generation; its own cost line for the crossover), else on NEON (`layered::row`: its layers front to back in codes, fluor's `noise_under` baked under what they leave clear). compbench mode 24 is its bench client (a chrome, cards on a ring, the noise).
+Differences from 3.1 as written: a new op became op 22's tail (one path for the window's bookkeeping, the mailbox answer and the hit map); a pixel layer's ring is its own rows (the strip taller than the pane, 3.2, is not built); coverage tiles are carried and not read.
+
+### 6.5 The reload that went silent (2026-11-21, 23:43), found and fixed
+
+A RAM reload of forge 8f04f065 on the Pro never came back on USB. The cause was 6.1's grants: the kernel gave "the receiver of `display`" two slots past the ones it was handed, and init holds that receive right too (it hands it to the display), with its grants page already full at 108 slots; the two more made `build_from` refuse init's spawn ("more grants than the grants page holds"), so no init, no USB, no shell. The flashed kernel never had it (a hand reset cold-boots as before), and nothing was stored on the device. Fixed (e4a30393): the two slots go only to a receiver of `display` that does not hold the blocks' window whole (init does; the display never), and only when the page has room for both, the guard every slot added after the given ones has (`LINES_WITH`); and only the display stamps a GPU view (5e97f9a1, init holds the phases only to hand them on). To prove on the device before any flash: a RAM reload with init and every shell process up.
+Not done: a check that fails the build when a change would push init's page past 108 (the kernel has no host tests; the list is built at run time, its partitions chosen by board).
+
+### 6.6 What has run on the Pro, and what has not
+
+Run: step 0 (6.0). Not run: steps 1 to 4 (the reload above ended the night's device time before them). The order for the morning: a RAM reload showing init and the shell up; then compbench 20 and 19 (a client that is not the display reads the phases: a translation fault; the display's store into a viewed window: a permission fault), 21 with a window's owner killed (the kernel's "held until the GPU service unmaps it" then "settled" lines), 16 as the display beside 18 at 14 (the compose's 99th percentile), 16 and 18 both as kists (the turns); the new `gpu` and `display` stored, op 86 on, its check (4) against NEON on compbench 23's scrolled window, compbench 24 for the layered window on both paths, frames a second and `diag power`.
+
+### 6.7 Section 5's questions: what was taken for now
+
+0 one phase a job while moving: yes (step 2 writes the phase a show owes; the rest at the idle fill). 1 the GPU writes the phases (mode 15): yes. 2 the noise's bake: the tables (the linearised form not measured). 3 the noise generated each frame: yes. 4 the twinkle: off (the frame word carried, 0). 5 kist work while the compositor runs: priority alone, plus the kists' turns (6.2); the compose window not built, to decide on the display-15 against system-14 measure. 6 no GPU service: NEON composes everything (the display's GPU slots are empty then and op 86 does nothing). 7 the display's slot pinned at 15 alone: yes. 8 the phases in the fence only while the view is bound: yes. 9 the crossover live: yes (step 3). 10 the hit map stays the CPU's: yes. 11 the deck on the GPU after apps: not started. 12 the mailbox answered when the job ends: today the jobs are waited for before the show is answered, so yes. 13 a finger-down raising the GPU's clock: not built.
+Answered by the owner on 2026-11-21: after a jump the GPU and the hardware come up (not built here; nothing depends on the GPU being absent: the display takes its GPU slots when a service is running at its start); screen off, no UI work on the GPU (the display composes nothing while dark), a Lumis recording's GPU encode untouched; both handoffs, the layered show and the plain op 22 frame (6.3, 6.4).
+
+### 6.8 What fluor's ferros host and Photon still need (the Photon session's)
+
+- The layered show (6.4's bytes; op 5 feature bit 1): `lay_noise` recording the noise's parameters instead of drawing them, `lay_chrome` as its own surface, the content in its own surface on a ring of its own rows (the strip taller than the pane, 3.2, is not in the display yet).
+- fluor's noise constants public (`STIR`, `STEP`, `DOWN`, `SPECKLE_BELOW`, `widen_mask`, `widen_base`, `seed`; 3.4): the display and compbench copy them today.
+- Its frames `BAKED`, Normal, its window alone or not overlapping another (the keyboard over it goes to NEON: format 0 and the partly covered edge).
