@@ -1730,9 +1730,7 @@ fn report(src: &Source, turns: &mut Turns, name: &str) {
     *turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
 }
 
-/// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
-/// Each save goes into the vault as a bulk value (kete `write_device_bulk`: kept out of the read cache, which would otherwise hold a second copy of every still), is read back from the vault itself (`read_device_bulk`, never the cache) and compared with what was written (blake3 of both), so "kept" means the vault gives the file back whole: one console line with its size, its encode's time, the write's, the read's, and the match.
-/// A still (every save but a calibration's maps) goes to the person's hold as an item of kind photo (`hold::keep_still`: kept, read back and compared the same way), so Kūaha shows it; the vault domain keeps it only when the hold is not given, and the calibration maps, which are Lumis's own.
+/// Each save the integrator finished (Android: drainPendingSave, MediaStore) kept (`keep_one`: a still in the person's hold as an item of kind photo, so Kūaha shows it; the calibration maps, and a still when the hold is not given, in the kist's vault under "save/" and its file name), then marked done.
 /// On the keeper's own thread (`KEEPER`), never the camera thread's: a still's write to the hold and its read back took 5 s on the Pro (2026-11-22, 25 MB), and the camera thread asking for no frame for 2^22 us is a holder gone to the driver, which closed the camera, so the owner's first shot ended Lumis. The camera thread hands each save over and takes its next frame; an exit waits for the keeper first (`seal_at_exit`, `saves_settle`), so no save is lost. One save is in flight at a time (CURRENTLY_SAVING), so one keeper keeps them in order.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
     while let Some(save) = lumis_core::get_pending_save() {
@@ -1784,66 +1782,44 @@ fn saves_settle() {
     }
 }
 
+/// One save kept: a still in the person's hold (`hold::keep_still`), a calibration's maps (and a still with no hold given) in Lumis's vault domain under "save/" and its name, as a bulk value (kete `write_device_bulk`: kept out of the read cache, which would otherwise hold a second copy of every still); then marked done. Nothing is read back: the vault's Ok is "written, verified, mirrored and the mirror verified" (the owner, 2026-11-22), and an error is said on the console and the save counts as not kept.
 fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
-    {
-        let lumis_core::PendingSave { bytes, name, encode_ms } = save;
-        let photo = !name.starts_with("cal_");
-        if photo && hold::held() {
-            let kept = match hold::keep_still(&bytes) {
-                Ok((write_ms, read_ms, card)) => {
-                    println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len(), card.body[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
-                    true
-                }
-                Err(e) => {
-                    println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept in the hold: {e}", bytes.len());
-                    false
-                }
-            };
-            app::save_done(header, kept);
-            return;
-        }
-        let key = format!("save/{name}");
-        let t = std::time::Instant::now();
-        let kept = match vault {
-            Some(v) => match v.write_device_bulk(&[(key.clone(), bytes.clone())]) {
-                Ok(()) => {
-                    let write_ms = t.elapsed().as_millis();
-                    let t = std::time::Instant::now();
-                    let back = v.read_device_bulk(&key);
-                    let read_ms = t.elapsed().as_millis();
-                    let want = blake3::hash(&bytes);
-                    match back {
-                        Ok(Some(b)) if blake3::hash(&b) == want => {
-                            println!("lumis: kept {name}: {} bytes, encoded in {encode_ms} ms, written in {write_ms} ms, read back in {read_ms} ms, blake3 {} matches", bytes.len(), &want.to_hex()[..16]);
-                            true
-                        }
-                        Ok(Some(b)) => {
-                            println!("lumis: {name} NOT kept whole: wrote {} bytes (blake3 {}), read back {} bytes (blake3 {}); encoded in {encode_ms} ms, written in {write_ms} ms, read in {read_ms} ms", bytes.len(), &want.to_hex()[..16], b.len(), &blake3::hash(&b).to_hex()[..16]);
-                            false
-                        }
-                        Ok(None) => {
-                            println!("lumis: {name} NOT kept: written ({} bytes in {write_ms} ms), then absent on reading it back", bytes.len());
-                            false
-                        }
-                        Err(e) => {
-                            println!("lumis: {name} NOT kept: written ({} bytes in {write_ms} ms), then the read back failed: {e:?}", bytes.len());
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) not kept: {e:?}", bytes.len());
-                    false
-                }
-            },
-            None => {
-                println!("lumis: {name} ({} bytes) not kept: no vault this launch", bytes.len());
+    let lumis_core::PendingSave { bytes, name, encode_ms } = save;
+    let photo = !name.starts_with("cal_");
+    if photo && hold::held() {
+        let kept = match hold::keep_still(&bytes) {
+            Ok((write_ms, card)) => {
+                println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written and verified in {write_ms} ms", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len());
+                true
+            }
+            Err(e) => {
+                println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept in the hold: {e}", bytes.len());
                 false
             }
         };
-        // A calibration map is not a photo: it never counts (as on Android).
-        app::save_done(header, kept && photo);
+        app::save_done(header, kept);
+        return;
     }
+    let key = format!("save/{name}");
+    let t = std::time::Instant::now();
+    let kept = match vault {
+        Some(v) => match v.write_device_bulk(&[(key, bytes.clone())]) {
+            Ok(()) => {
+                println!("lumis: kept {name}: {} bytes, encoded in {encode_ms} ms, written and verified in {} ms", bytes.len(), t.elapsed().as_millis());
+                true
+            }
+            Err(e) => {
+                println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept: {e:?}", bytes.len());
+                false
+            }
+        },
+        None => {
+            println!("lumis: {name} ({} bytes) not kept: no vault this launch", bytes.len());
+            false
+        }
+    };
+    // A calibration map is not a photo: it never counts (as on Android).
+    app::save_done(header, kept && photo);
 }
 
 /// What the camera thread does with the window behind, said on the console as it changes.

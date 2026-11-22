@@ -66,21 +66,16 @@ pub fn remove_clip(handle: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
-/// A still kept as an item of kind photo, then read back from the hold whole and compared (blake3 of both, and the card's body hash), so "kept" means the hold gives the file back whole. The time each step took, in ms (write, read), or why not.
-pub fn keep_still(bytes: &[u8]) -> Result<(u128, u128, Card), String> {
+/// A still kept as an item of kind photo: the hold's Ok is the vault's word that it is kept and verified on both copies (its put writes, verifies every block, then mirrors and verifies the mirror before it answers; HOLD-API.md), so Lumis reads nothing back (the owner, 2026-11-22: "Drop from lumis, yes"; the read back was about 0.9 s of every 25 MB still). The card's body hash is still compared with the bytes given, a check that costs nothing. The write's time in ms, or why not.
+pub fn keep_still(bytes: &[u8]) -> Result<(u128, Card), String> {
     let mut h = hold();
     let t = std::time::Instant::now();
-    let (handle, card) = h.keep(&Proposed { kind: kinds::PHOTO, ..Default::default() }, bytes).map_err(|e| format!("the hold's keep: {e:?}"))?;
+    let (_, card) = h.keep(&Proposed { kind: kinds::PHOTO, ..Default::default() }, bytes).map_err(|e| format!("the hold's keep: {e:?}"))?;
     let write_ms = t.elapsed().as_millis();
-    let t = std::time::Instant::now();
-    let mut back = vec![0u8; bytes.len()];
-    let (n, size) = h.read(&handle, 0, &mut back).map_err(|e| format!("kept, then the read back failed: {e:?}"))?;
-    let read_ms = t.elapsed().as_millis();
-    let want = *blake3::hash(bytes).as_bytes();
-    if n != bytes.len() || size != bytes.len() as u64 || *blake3::hash(&back).as_bytes() != want || card.body != want {
-        return Err(format!("kept, then read back as {n} of {size} bytes, not the {} written", bytes.len()));
+    if card.body != *blake3::hash(bytes).as_bytes() {
+        return Err(format!("kept, but the card's body hash is not the {} bytes' given", bytes.len()));
     }
-    Ok((write_ms, read_ms, card))
+    Ok((write_ms, card))
 }
 
 /// The recorder's sink with the blocks it was given counted (the room a clip has: the time left under RECORD).
