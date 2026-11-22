@@ -119,7 +119,7 @@ fn main() {
                 let (got, want) = match shape.out {
                     Out::G2t => (get64(&mem, OUT_AT + 8 * i), if shape.layers { frame[i] } else { bare[i] }),
                     Out::Baked => (get64(&mem, OUT_AT + 8 * i), tables::baked(tables::bake_px(frame[i], &light, &code, &odt, f16))),
-                    Out::Phases => {
+                    Out::Phases | Out::Phase1 => {
                         let c = tables::bake_px(frame[i], &light, &code, &odt, f16);
                         let mut far = 0;
                         for p in 0..4 {
@@ -140,7 +140,7 @@ fn main() {
                 let diff = match shape.out {
                     Out::G2t => (got != want) as u32,
                     Out::Baked => (0..3).map(|c| ((got >> (16 * c)) & 0xFFFF).abs_diff((want >> (16 * c)) & 0xFFFF) as u32).max().unwrap().max(((got >> 48) != (want >> 48)) as u32 * 65536),
-                    Out::Phases => got as u32,
+                    Out::Phases | Out::Phase1 => got as u32,
                 };
                 if diff != 0 {
                     wrong += 1;
@@ -298,7 +298,7 @@ fn par(mem: &mut Memory, rows: &[usize], walk: (u64, u64, u64), odt: &[f32; 9], 
         }
         steps
     };
-    let shapes: [(&str, Shape, u32); 7] = [
+    let shapes: [(&str, Shape, u32); 8] = [
         ("noise 2^6", Shape { out: Out::G2t, layers: false, clip: false }, 6),
         ("noise 2^7", Shape { out: Out::G2t, layers: false, clip: false }, 7),
         ("noise 2^8", Shape { out: Out::G2t, layers: false, clip: false }, 8),
@@ -306,6 +306,7 @@ fn par(mem: &mut Memory, rows: &[usize], walk: (u64, u64, u64), odt: &[f32; 9], 
         ("baked", Shape { out: Out::Baked, layers: true, clip: false }, kernel::PAR),
         ("phases", Shape { out: Out::Phases, layers: true, clip: false }, kernel::PAR),
         ("clip", Shape { out: Out::Baked, layers: true, clip: true }, kernel::PAR),
+        ("one phase", Shape { out: Out::Phase1, layers: true, clip: false }, kernel::PAR),
     ];
     for (name, shape, wg) in shapes {
         let k = kernel::record_par(shape, wg);
@@ -313,6 +314,12 @@ fn par(mem: &mut Memory, rows: &[usize], walk: (u64, u64, u64), odt: &[f32; 9], 
         if shape.clip {
             for i in 0..W * H {
                 put64(mem, OUT_AT + 8 * i, 0x5555_5555_5555_5555);
+            }
+        }
+        // The one-phase kernel writes phase 0 with turn 0 (the uniforms' `PHASE` and `FRAME` as `tables::uniforms` leaves them), which the four-phase kernel just wrote too: phase 0's checked rows cleared first, so only its own words pass.
+        if shape.out == Out::Phase1 {
+            for &y in &check {
+                mem.bytes[PHASES_AT + 4 * y * W..PHASES_AT + 4 * (y + 1) * W].fill(0);
             }
         }
         let t0 = std::time::Instant::now();
@@ -333,10 +340,10 @@ fn par(mem: &mut Memory, rows: &[usize], walk: (u64, u64, u64), odt: &[f32; 9], 
                         let (got, want) = (get64(mem, OUT_AT + 8 * i), tables::baked(tables::bake_px(want_px, light, code, odt, f16)));
                         (0..3).map(|c| ((got >> (16 * c)) & 0xFFFF).abs_diff((want >> (16 * c)) & 0xFFFF) as u32).max().unwrap().max(((got >> 48) != (want >> 48)) as u32 * 65536)
                     }
-                    Out::Phases => {
+                    Out::Phases | Out::Phase1 => {
                         let c = tables::bake_px(want_px, light, code, odt, f16);
                         let mut far = 0;
-                        for p in 0..4 {
+                        for p in 0..if shape.out == Out::Phase1 { 1 } else { 4 } {
                             let at = PHASES_AT + p * PHASE_BYTES + 4 * i;
                             let got = u32::from_le_bytes(mem.bytes[at..at + 4].try_into().unwrap());
                             let want = tables::word(c, (tables::BLUE[y & 15][x & 15] ^ tables::TURN[p]) as u32);

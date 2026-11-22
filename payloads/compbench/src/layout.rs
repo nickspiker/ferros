@@ -76,7 +76,7 @@ pub mod slot {
     pub const STIR_LEFT: u8 = 20;
     /// The ODT over 2^14 (the light table's scale), nine f32 by rows, slots 21-25.
     pub const ODT: u8 = 21;
-    /// [frame u32][0]: the parallel noise's twinkle (noise.rs `row_twinkle`; 0 here, as fluor's still frame).
+    /// [frame u32][turn u32]: the parallel noise's twinkle (noise.rs `row_twinkle`; 0 here, as fluor's still frame), then the one-phase kernel's turn of the thresholds (kernel.rs `Out::Phase1`, neon.rs `TURN`).
     pub const FRAME: u8 = 26;
     pub const RESERVED: u8 = 27;
 }

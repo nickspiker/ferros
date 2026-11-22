@@ -6,7 +6,7 @@
 //! Spawn: `ferros-bridge spawn compbench.bin [mode [seconds]] --name compbench --use gpu --dma layers-32`
 //! Grant slots: 0 console, 1 gpu (use), 2 its GPU block (grown to 2^28 bytes).
 //! Since 2026-11-21 also the noise in its parallel form (noise.rs, kernel.rs `record_par`: a workgroup a half-row, its scan in shared storage), measured and checked on the device in mode 0 beside the serial kernels, and the memory floor (a pane copied).
-//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels. The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
+//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels; 16 the whole frame into one phase a job (the phases in turn) at up to 120 a second, one job at a time, 17 the same with two in flight, 18 a hostile client beside them (whole-frame jobs back to back, two in flight; GPU-COMPOSE.md step 0). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
 #![no_std]
 #![no_main]
 
@@ -353,9 +353,11 @@ const K_BAKED_P: usize = 9;
 const K_PHASES_P: usize = 10;
 const K_CLIP_P: usize = 11;
 const K_COPY: usize = 12;
-const KERNELS: usize = 13;
+/// The compose into one phase (GPU-COMPOSE.md step 0, 2026-11-21): its phase and turn the job's (`Gpu::submit_phase`).
+const K_PHASE1_P: usize = 13;
+const KERNELS: usize = 14;
 fn kernel(i: usize) -> &'static kernels::Kernel {
-    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP, &kernels::NOISE_P6, &kernels::NOISE_P7, &kernels::NOISE_P8, &kernels::G2T_P, &kernels::BAKED_P, &kernels::PHASES_P, &kernels::CLIP_P, &kernels::COPY][i]
+    [&kernels::NOISE, &kernels::G2T, &kernels::BAKED, &kernels::PHASES, &kernels::CLIP, &kernels::NOISE_P6, &kernels::NOISE_P7, &kernels::NOISE_P8, &kernels::G2T_P, &kernels::BAKED_P, &kernels::PHASES_P, &kernels::CLIP_P, &kernels::COPY, &kernels::PHASE1_P][i]
 }
 
 fn walk() -> (u64, u64, u64) {
@@ -580,6 +582,8 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
     ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 100);
     match mode {
         1..=4 | 14 | 15 => sustained(&mut gpu, mode, seconds),
+        16 | 17 => one_phase(&mut gpu, mode == 17, seconds),
+        18 => hostile(&mut gpu, seconds),
         5 => clip_probe(&mut gpu),
         6..=9 => clip_sequence(&mut gpu, mode - 6),
         10 => uniforms_probe(&mut gpu),
@@ -635,6 +639,119 @@ fn sustained(gpu: &mut Gpu, mode: u8, seconds: u64) -> ! {
     }
     let wall = ferros_sys::now() - start;
     say!("compbench sustained mode A#{mode}: A#{frames} frames in A#{} ms, A#{} us a frame busy, A#{late} past their slot\n", us(wall) / 1000, us(busy) / frames.max(1));
+    exit(0);
+}
+
+/// Each job's round (doorbell to seen) and the GPU's own time, µs, for the one-phase modes: 2^12 frames, 34 s at 120 a second.
+const RUNS_MOST: usize = 1 << 12;
+static mut ROUNDS: [u32; RUNS_MOST] = [0; RUNS_MOST];
+static mut GPU_US: [u32; RUNS_MOST] = [0; RUNS_MOST];
+
+/// Least, median, 99th percentile and most of the first `n` of `v` (sorted in place).
+fn quantiles(v: &mut [u32], n: usize) -> (u32, u32, u32, u32) {
+    let v = &mut v[..n];
+    v.sort_unstable();
+    if n == 0 {
+        return (0, 0, 0, 0);
+    }
+    (v[0], v[n / 2], v[n - 1 - n / 100], v[n - 1])
+}
+
+impl Gpu {
+    /// The one-phase kernel over the whole frame into `phase` (its own turn of the thresholds, neon.rs `TURN`), submitted and not waited for: its number.
+    fn submit_phase(&mut self, phase: usize) -> u64 {
+        let (run, groups) = grid(K_PHASE1_P, &tables::Run::frame());
+        let mut u = [0u64; 64];
+        let n = tables::uniforms(&mut u, &run, ferros_sys::gpu::ARENA_VA, BAKED_AT, unsafe { JOB_SCROLL }, OFFSET, walk(), &tables::odt_scaled(ferros_sys::akita()), kernel(K_PHASE1_P).consts);
+        u[slot::PHASE as usize] = ferros_sys::gpu::ARENA_VA + (PHASES_AT + phase * PHASE_BYTES) as u64;
+        u[slot::FRAME as usize] = (tables::TURN[phase] as u64) << 32;
+        match self.q.submit(&Job { kernel: self.handles[K_PHASE1_P], groups: (groups, 1), uniforms: &u[..n] }) {
+            Some(j) => j,
+            None => {
+                say!("compbench: a submit refused (the queue ended A#{})\n", self.q.ended());
+                exit(1);
+            }
+        }
+    }
+}
+
+/// Modes 16 and 17 (GPU-COMPOSE.md step 0, knobs 3 and 4): the whole frame composed into one phase a job, the phases in turn, paced at 120 a second for `seconds`; one job at a time (16) or the next submitted while the last runs (17, two in flight). Each job's round (the service's doorbell to its seeing the end) and the GPU's own time, least / median / 99th percentile / most; frames a second; how many missed their slot. Then the phases checked against the four-phase kernel's words. Run beside mode 18 in another process for the compose under a hostile client.
+fn one_phase(gpu: &mut Gpu, two: bool, seconds: u64) -> ! {
+    let f = ferros_sys::freq();
+    let period = f / 120;
+    let (mut frames, mut late, mut n) = (0u64, 0u64, 0usize);
+    let mut pending: [Option<u64>; 2] = [None, None];
+    let take = |e: ferros_sys::gpu::queue::Ended, n: &mut usize| {
+        if e.status != S_DONE {
+            say!("compbench one phase: a job's status A#{}\n", e.status);
+            exit(1);
+        }
+        if *n < RUNS_MOST {
+            unsafe {
+                ROUNDS[*n] = us(e.round_ticks()) as u32;
+                GPU_US[*n] = us(e.gpu_ticks().unwrap_or(0)) as u32;
+            }
+            *n += 1;
+        }
+    };
+    let start = ferros_sys::now();
+    let mut next = start;
+    while ferros_sys::now() < start + seconds * f {
+        let j = gpu.submit_phase((frames & 3) as usize);
+        frames += 1;
+        if two {
+            // The oldest of two in flight waited for only when a third would go in: the GPU always has the next frame queued behind the one it runs.
+            if let Some(o) = pending[0].take() {
+                take(gpu.q.wait(o), &mut n);
+            }
+            pending[0] = pending[1].take();
+            pending[1] = Some(j);
+        } else {
+            take(gpu.q.wait(j), &mut n);
+        }
+        let t1 = ferros_sys::now();
+        next += period;
+        if t1 > next {
+            late += 1;
+            next = t1;
+        } else {
+            ferros_sys::sleep_until(next);
+        }
+    }
+    for o in pending.into_iter().flatten() {
+        take(gpu.q.wait(o), &mut n);
+    }
+    let wall = ferros_sys::now() - start;
+    let r = quantiles(unsafe { &mut *(&raw mut ROUNDS) }, n);
+    let g = quantiles(unsafe { &mut *(&raw mut GPU_US) }, n);
+    say!("compbench one phase a job, {} in flight: A#{frames} frames in A#{} ms (A#{} a second), A#{late} past their slot; round A#{}/A#{}/A#{}/A#{} us, the GPU's own A#{}/A#{}/A#{}/A#{} us (least/median/99th/most of A#{n})\n", if two { 2 } else { 1 }, us(wall) / 1000, frames * f / wall.max(1), r.0, r.1, r.2, r.3, g.0, g.1, g.2, g.3);
+    // The phases the one-phase jobs left (every phase written at least once in a run of four or more) against the four-phase kernel's of the same frame.
+    let keep = px(OUT_AT, 2 * W * H);
+    // SAFETY: the four phases are 4 W H u32 from PHASES_AT, the output room past OUT_AT 2 W H u64 (layout.rs's assert).
+    unsafe { core::ptr::copy_nonoverlapping(at::<u64>(PHASES_AT), keep.as_mut_ptr(), 2 * W * H) };
+    gpu.job(K_PHASES_P, &tables::Run::frame(), BAKED_AT);
+    let both = unsafe { core::slice::from_raw_parts(at::<u64>(PHASES_AT), 2 * W * H) };
+    let off = keep.iter().zip(both).filter(|(a, b)| a != b).count();
+    say!("compbench one phase: the phases against the four-phase kernel's: A#{off} of A#{} word pairs differ\n", 2 * W * H);
+    exit(0);
+}
+
+/// Mode 18 (GPU-COMPOSE.md step 0, the hostile client): whole-frame compose jobs into its own phases back to back, two in flight, no pause, for `seconds`, so the GPU always has its work queued; the jobs and their mean GPU time said at the end. A system client like the bench beside it (the same priority, so a harder test than a kist's 8 against the display's 15).
+fn hostile(gpu: &mut Gpu, seconds: u64) -> ! {
+    let f = ferros_sys::freq();
+    let start = ferros_sys::now();
+    let (mut jobs, mut ticks) = (0u64, 0u64);
+    let mut pending: [Option<u64>; 2] = [None, None];
+    while ferros_sys::now() < start + seconds * f {
+        if let Some(o) = pending[0].take() {
+            let e = gpu.q.wait(o);
+            ticks += e.gpu_ticks().unwrap_or(0);
+            jobs += 1;
+        }
+        pending[0] = pending[1].take();
+        pending[1] = Some(gpu.submit_phase((jobs & 3) as usize));
+    }
+    say!("compbench hostile: A#{jobs} whole-frame jobs in A#{} ms, the GPU's own A#{} us each on average\n", us(ferros_sys::now() - start) / 1000, us(ticks) / jobs.max(1));
     exit(0);
 }
 

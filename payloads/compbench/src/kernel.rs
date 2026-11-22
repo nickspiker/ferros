@@ -18,6 +18,8 @@ pub enum Out {
     Baked,
     /// The baked codes dithered and packed into the four phases' words (the display's present, neon.rs `present_app16`).
     Phases,
+    /// The same into one phase (GPU-COMPOSE.md knob 3, 2026-11-21: one phase a job while moving): its words at `slot::PHASE`, which the caller points at the phase it writes, its turn of the thresholds `slot::FRAME`'s second word.
+    Phase1,
 }
 
 /// A kernel's shape: what it writes, whether it reads the chrome and the pane (false: the noise alone), and whether its stores keep to a rectangle (`slot::COLS`, the rows a side: a damage rect) or cover every column its invocations walk.
@@ -196,11 +198,19 @@ fn put(shape: Shape, noise: W, dst: U, at: U, x: U, chrome: M, pane_row: U, blue
     };
     match shape.out {
         Out::G2t => store_px(slot::OUT, dst, px),
-        Out::Baked | Out::Phases => {
+        Out::Baked | Out::Phases | Out::Phase1 => {
             let [cr, cg, cb] = bake(px, odt);
             if shape.out == Out::Baked {
                 // The baked pixel: R, G, B in its low three lanes, the fourth its transparency as bake.rs writes an opaque one's (2: Q14 1, shifted past the no-dither bit).
                 store_px(slot::OUT, dst, W { lo: (cg << 16) | cr, hi: U::splat(2 << 16) | cb });
+            } else if shape.out == Out::Phase1 {
+                let tk = ssa::load8(slot::BLUE, blue_row + (x & U::splat(15)), 0, 0) ^ ssa::uniform(slot::FRAME, 1);
+                let code = |c: U| {
+                    let s = c + tk;
+                    (s >> 8) - (s >> 16)
+                };
+                let word = (code(cb) << 24) | (code(cg) << 14) | (code(cr) << 4) | U::splat(3);
+                ssa::store_at(slot::PHASE, dst, 2, 0, word);
             } else {
                 let th = ssa::load8(slot::BLUE, blue_row + (x & U::splat(15)), 0, 0);
                 for (k, turn) in [0u32, 2, 3, 1].into_iter().enumerate() {
