@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Nie zgadzają się.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "usługa tożsamości nie działa",
+        Msg::JoinNotConfirmed => "dołącza: jeszcze niepotwierdzone na tym urządzeniu",
         Msg::DeckFetching => "pokład: pobieranie twojego z floty",
         Msg::DeckSame => "pokład: taki sam na wszystkich twoich urządzeniach",
         Msg::DeckOwn => "pokład: własny tego urządzenia",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Zapis tego handle się nie zgadza.\nZacznij od nowa z innym.",
         Msg::Minting => "Powoływanie.",
         Msg::MintingFailed => "Powołanie nie powiodło się. Enter, by spróbować ponownie.",
+        Msg::JoinConfirmPrompt => "Ta tożsamość ma już urządzenia.\nDodać to? Nic do nich nie dotrze, dopóki nie powiesz tak.",
+        Msg::JoinConfirmYes => "Tak, naprawdę chcę dodać to urządzenie, to moja tożsamość, a nie literówka",
+        Msg::JoinTogether => "Zbliż oba urządzenia, ekran drugiego włączony i otwarta jego strona floty, w Photon lub ferros.\nAlbo dotknij nazwy tego urządzenia na tamtej stronie, potem jego zielonego przycisku.",
+        Msg::JoinShowWords => "Poza zasięgiem? Pokaż słowa do skopiowania/wklejenia lub podyktowania",
         Msg::ComputingKeys => "Obliczanie kluczy tożsamości.",
         Msg::IdentityServiceNotAnswering => "Usługa tożsamości nie odpowiada.",
         Msg::NotSeenLastScan => "Nie widziano w ostatnim skanie.",

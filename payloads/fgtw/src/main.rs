@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving, 10 selected, 11 joining but not yet confirmed by this device's person) and the words the 23 pairing words while joining once confirmed (none before, none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs), op 32 `[32][1]` the join confirmed on this device (nothing of a join is sent before it: no binding request to the fleet or fgtw.org, no tap secret, no BLE or LAN beacon; owner 2026-11-22), `[32][0]` withdrawn. Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -468,7 +468,7 @@ impl Udp {
     }
 }
 
-/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out), 9 owned elsewhere (fgtw.org says this device is in another identity's fleet: no words).
+/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out), 9 owned elsewhere (fgtw.org says this device is in another identity's fleet: no words), 10 selected, 11 joining but not confirmed (`V_CONFIRM`).
 const V_NONE: u8 = 0;
 const V_JOIN: u8 = 1;
 const V_LOOKING: u8 = 4;
@@ -481,6 +481,8 @@ const V_LEAVING: u8 = 8;
 const V_OWNED: u8 = 9;
 /// Selected: a member picked this joining device (the Fleet page's button or an NFC tap) and said so (`bind_select`, owner 2026-11-10: "if you tap, it shouldn't become part of the fleet, it should just get notified it was selected"). Nothing is bound: the attest screen turns green with the selecting device's name (op 1's words), and the join completes when the new chain folds this device in and a fan-out wrap opens, as before. Op 1 only; never a verdict.
 const V_SELECTED: u8 = 10;
+/// Joining, not confirmed: the identity has a fleet, and the person on this device has not yet pressed the join's confirmation (op 32 [1], `join_confirmed`; owner, 2026-11-22). Nothing of the join has left the device: the attest screen asks "Yes, I really would like to add this device and this is my identity and not a typo", and only then (state 1) is the request out, the device told to be held to the other one. Op 1 only; the verdict under it is still joining.
+const V_CONFIRM: u8 = 11;
 
 /// One transfer of the vault (the kernel's STORE_MAX): larger values go in pieces.
 const STORE_PIECE: usize = 4096;
@@ -573,6 +575,9 @@ struct Client {
     /// This device's current binding request and its stamp (re-minted every 210 s while unbound, as the app re-posts).
     request_t: i64,
     request_frame: Vec<u8>,
+    /// The person on this device pressed the join's confirmation (op 32 [1]; the attest screen's "Yes, I really would like to add this device and this is my identity and not a typo"; owner, 2026-11-22, after a fleet notification reached his devices before he had confirmed on the new one).
+    /// Until it is set nothing of the join leaves this device: no binding request is minted, so none is handed to a fleet device on the network, none is posted to fgtw.org's registry, no tap secret is served on the NFC tag and no beacon id is advertised over BLE; no LAN beacon goes out under the handle; the pairing words are neither said on the console nor in op 1's reply; and a select is not taken. What runs before it is the look-up alone (a signed question to the person's devices, then fgtw.org), which announces nothing: a handle typed alone rings no device. Forgotten with the roots (`forget_identity`), so a handle typed again (the same or another) asks again.
+    join_confirmed: bool,
     /// Whether the tap secret and the beacon are out (`radios`).
     radios_on: bool,
     /// The secret and beacon id last handed out, a handover that missed a driver, and when it was tried (`radios`).
@@ -828,8 +833,8 @@ impl Client {
 
     fn show_words(&mut self) {
         let (Some(seed), false) = (self.identity_seed, self.bound) else { return };
-        // Leaving (a departure resumed before the chain is adopted again): no pairing words.
-        if self.depart_asking() {
+        // Leaving (a departure resumed before the chain is adopted again), or a join its person has not confirmed: no pairing words.
+        if self.depart_asking() || !self.join_confirmed {
             return;
         }
         let words = join::pair_words(&self.me, &seed);
@@ -1245,6 +1250,7 @@ impl Client {
         self.sponsors.clear();
         self.request_t = 0;
         self.request_frame.clear();
+        self.join_confirmed = false;
         self.verdict = V_NONE;
         // The person key's bytes overwritten before the space state goes (docs/FACETS.md D0: RAM only, as the roots).
         if let Some((k, _)) = self.space.person.as_mut() {
@@ -1424,6 +1430,34 @@ impl Client {
                 5
             }
         }
+    }
+
+    /// Op 32: the join confirmed by this device's person (`on`), or withdrawn. Nothing of a join leaves the device before the confirmation (owner, 2026-11-22: "Nothing is announced on a typed handle alone"); see `join_confirmed`.
+    fn confirm_join(&mut self, on: bool) -> u8 {
+        if !on {
+            if self.join_confirmed && !self.bound {
+                self.join_confirmed = false;
+                self.request_frame.clear();
+                self.request_t = 0;
+                self.select_waiting = None;
+                self.selected_by = None;
+                self.radios(None);
+                self.log.put(b"fgtw: the join withdrawn on this device: the binding request dropped");
+                self.log.line();
+            }
+            return 0;
+        }
+        if self.hp.is_none() || self.bound || self.depart_asking() || self.verdict != V_JOIN {
+            return 1;
+        }
+        if !self.join_confirmed {
+            self.join_confirmed = true;
+            // The words said on the console at once, as at a fresh request.
+            self.last_words_us = 0;
+            self.log.put(b"fgtw: the person confirmed the join on this device: the binding request goes out");
+            self.log.line();
+        }
+        0
     }
 
     /// Mint (or re-mint) this device's binding request.
@@ -1684,7 +1718,8 @@ impl Client {
 
     /// A select's sender checked: a current member of the chain offered for our handle (its genesis this identity's, folded, so a device locked out or removed is not in it), or of the chain this device holds. Until a chain naming it arrives the select waits (the sponsor pushes the chain first, but the frames may cross).
     fn select_from(&mut self, sender: [u8; 32]) {
-        if self.bound {
+        // A select before this device's person confirmed the join is not taken: nothing of this join was sent, so it answers a request from before (one still in fgtw.org's registry from an earlier boot), and the screen must not turn green on it.
+        if self.bound || !self.join_confirmed {
             return;
         }
         if !self.offered.contains(&sender) && !self.members.contains(&sender) {
@@ -1827,6 +1862,13 @@ impl Client {
                 // 20: this device's departure given up (the Fleet page's back, owner 2026-11-09: "pressing back ... should stop me trying to leave"): forgotten here, in the vault and in the space, so no member is asked to approve it. [0] given up, [1] none under way. A member that countersigned it already has published the Remove; nothing here undoes that.
                 if n >= 1 && req[0] == 20 {
                     let r = [self.give_up_depart()];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                // 32 [1]: the person on this device confirmed the join (the attest screen's "Yes, I really would like to add this device and this is my identity and not a typo"; owner, 2026-11-22) → [0 taken, 1 nothing to confirm: no roots, bound, leaving, or the identity not found to have a fleet]. The binding request is minted in this same pass of the loop, and with it the join goes out (`join_confirmed`).
+                // 32 [0]: the join withdrawn (the attest screen's back) → [0]: the request dropped, the tap secret and the BLE beacon stopped, the beacon under the handle silent again. A copy already handed to a fleet device or posted to fgtw.org lapses there on its own (the registry's five minutes).
+                if n >= 2 && req[0] == 32 {
+                    let r = [self.confirm_join(req[1] != 0)];
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
@@ -2035,13 +2077,15 @@ impl Client {
                 let state = if leaving { V_LEAVING } else { state };
                 // Selected by a member and not bound yet: the green screen, the selecting device's name after the state.
                 let state = if !self.bound && !leaving && self.selected_by.is_some() { V_SELECTED } else { state };
+                // Joining and not yet confirmed by this device's person: the attest screen asks first (op 32), and nothing of the join has gone out.
+                let state = if state == V_JOIN && !self.join_confirmed { V_CONFIRM } else { state };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
                 if let (Some(seed), V_SELECTED, Some(by)) = (self.identity_seed, state, self.selected_by) {
                     reply.extend_from_slice(fgtw::pair::device_name_default(&by, &seed).as_bytes());
                 }
-                // Joining's pairing words follow the state, the last resort when a tap and BLE fail; a departure shows none (owner, 2026-11-10), even one resumed before the chain is adopted again.
-                if let (Some(seed), false, V_JOIN, false, None) = (self.identity_seed, self.bound, self.verdict, leaving, self.selected_by) {
+                // Joining's pairing words follow the state once the join is confirmed (state 1), the last resort when NFC and BLE fail: the attest screen keeps them hidden until its person asks ("Not in range?"; owner, 2026-11-22, shoulder surfing). A departure shows none (owner, 2026-11-10), even one resumed before the chain is adopted again; nor does a join not yet confirmed (state 11).
+                if let (Some(seed), V_JOIN) = (self.identity_seed, state) {
                     reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
@@ -2112,8 +2156,8 @@ impl Client {
             }
             lap.mark(b"lookup");
             busy |= self.facets_now(&mut lap);
-            // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
-            if !self.bound && !self.depart_asking() && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
+            // The binding request only once there is a fleet to ask (the verdict says joining) and the person on this device has confirmed the join (op 32, owner 2026-11-22: nothing reaches their devices on a typed handle alone): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
+            if !self.bound && !self.depart_asking() && self.hp.is_some() && self.verdict == V_JOIN && self.join_confirmed && self.request_frame.is_empty() {
                 self.mint_request();
             }
             lap.mark(b"mint_request");
@@ -2128,7 +2172,8 @@ impl Client {
                 }
             }
             lap.mark(b"radios");
-            if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
+            // The beacon under the handle: a member's, and a joining device's once its person has confirmed (`join_confirmed`); a device not yet in the fleet beacons nothing before then, so a handle typed alone announces nothing to the person's devices on this network.
+            if self.hp.is_some() && (self.bound || self.join_confirmed) && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();
             }
@@ -2187,7 +2232,7 @@ impl Client {
         if self.facets_pending() {
             at(t);
         }
-        if self.hp.is_some() {
+        if self.hp.is_some() && (self.bound || self.join_confirmed) {
             at(self.last_beacon_us + 3_000_000);
         }
         if self.bound {
@@ -2205,7 +2250,7 @@ impl Client {
             }
             at(self.last_lookup_us + if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 });
         }
-        if !self.bound && self.hp.is_some() {
+        if !self.bound && self.hp.is_some() && self.join_confirmed {
             at(self.last_words_us + 60_000_000);
         }
         if let Some(d) = self.space_due() {
@@ -2237,7 +2282,7 @@ impl Client {
 
     /// What the Fleet page and the map read, in one piece: the state (op 1's), the members (op 6), a departure waiting (op 13), the add flow (op 9), this device's own departure denied, and the space (op 17).
     fn watch_state(&mut self) -> Vec<u8> {
-        let mut v = alloc::vec![self.hp.is_some() as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart_asking() as u8, self.verdict, self.sponsors.len() as u8];
+        let mut v = alloc::vec![self.hp.is_some() as u8, self.join_confirmed as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart_asking() as u8, self.verdict, self.sponsors.len() as u8];
         // The select too: the attest screen turns green on it.
         v.extend_from_slice(self.selected_by.as_ref().map_or(&[0u8; 32][..], |s| &s[..]));
         v.extend_from_slice(&self.members_reply());
@@ -2396,7 +2441,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

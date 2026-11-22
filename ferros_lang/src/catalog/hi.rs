@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "ये मेल नहीं खाते।",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "पहचान सेवा नहीं चल रही",
+        Msg::JoinNotConfirmed => "जुड़ रहा है: इस डिवाइस पर अभी पुष्टि नहीं हुई",
         Msg::DeckFetching => "डेक: तुम्हारे बेड़े से तुम्हारा लाया जा रहा है",
         Msg::DeckSame => "डेक: तुम्हारे सभी डिवाइस पर एक जैसा",
         Msg::DeckOwn => "डेक: इस डिवाइस का अपना",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "इस हैंडल का रिकॉर्ड मेल नहीं खाता।\nकिसी और से फिर शुरू करो।",
         Msg::Minting => "पहचान बन रही है।",
         Msg::MintingFailed => "पहचान नहीं बन सकी। फिर कोशिश के लिए एंटर दबाओ।",
+        Msg::JoinConfirmPrompt => "इस पहचान के पहले से डिवाइस हैं।\nइसे जोड़ें? जब तक तुम हाँ नहीं कहते, उन तक कुछ नहीं पहुँचता।",
+        Msg::JoinConfirmYes => "हाँ, मैं सच में यह डिवाइस जोड़ना चाहता हूँ, यह मेरी पहचान है और कोई टाइपो नहीं है",
+        Msg::JoinTogether => "दोनों डिवाइस पास लाओ, दूसरे की स्क्रीन चालू और उसका बेड़ा पेज खुला हो, Photon या ferros में।\nया उस पेज पर इस डिवाइस का नाम छुओ, फिर उसका हरा बटन।",
+        Msg::JoinShowWords => "पास नहीं? कॉपी/पेस्ट या बोलकर लिखवाने के लिए शब्द दिखाओ",
         Msg::ComputingKeys => "पहचान की चाबियाँ बनाई जा रही हैं।",
         Msg::IdentityServiceNotAnswering => "पहचान सेवा जवाब नहीं दे रही।",
         Msg::NotSeenLastScan => "पिछली खोज में नहीं दिखा।",

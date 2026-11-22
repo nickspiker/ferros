@@ -2,7 +2,7 @@
 //!
 //! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the identity service (fgtw) in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the device unlocks without the handle being typed — a stolen device then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
 //!
-//! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the identity service (fgtw) in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
+//! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the identity service (fgtw) in RAM, and the client looks the identity up. A member unlocks; a fleet to join asks its person to confirm before anything is sent, then says to hold the two devices together (or touch this one on the other's Fleet page), the words only on asking; a free handle is minted.
 //! - Opt-in (unlock at boot): the seed is stored, the client loads it from the vault at boot, and the screen unlocks as soon as the client reports membership, with no handle typed.
 //! - A kept tag (AUTH.md "Attest with a tag"; owner, 2026-11-05 and 2026-11-11): while the entry is up, a tag kept from settings held to the device attests in place of the handle. The NFC driver hands its UID here (a held call, `tag_thread`), the kernel opens the seed it sealed for that tag and unlocks, and the rest is a typed handle's.
 //!
@@ -14,7 +14,7 @@
 //!
 //! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). There is no switch on this screen (owner, 2026-10-29: the room went to the mark); the layout is set from the identity's settings or `diag pref`, and the keyboard follows it.
 //!
-//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the screen waits while the client keeps looking. There is no way past the screen but a bind or a mint (owner, 2026-11-04, of the "go on" that let a person in mid-join: "I do not see a point. seems like another security nightmare"); `back` returns to the entry.
+//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: once its person confirms on this device (nothing of the join is sent before), this device joins it, by NFC or a touch on a fleet device's Fleet page, its pairing words shown only when asked for (owner, 2026-11-22). No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the screen waits while the client keeps looking. There is no way past the screen but a bind or a mint (owner, 2026-11-04, of the "go on" that let a person in mid-join: "I do not see a point. seems like another security nightmare"); `back` returns to the entry.
 //!
 //! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer), 11 the GPU service (use), 12 its block of the layer arena (32 MiB, its own), 13 use wlan, 14 use nfc (attest with a tag).
 #![no_std]
@@ -273,7 +273,8 @@ extern "C" fn client_thread(grants: u64) -> ! {
         c.words[..k].copy_from_slice(&out[2..2 + k]);
         c.words_len = k;
         c.name_len = 0;
-        if c.state == 1 {
+        // The name while joining, confirmed (1) or not yet (11).
+        if c.state == 1 || c.state == 11 {
             let n = ferros_sys::call_live(svc, &[19], &mut c.name);
             if n != ferros_sys::ERR && (1..=48).contains(&(n as usize)) {
                 c.name_len = n as usize;
@@ -781,7 +782,9 @@ enum Mode {
     /// The roots are with the identity service (fgtw), which is looking the identity up.
     /// No mode holds the seed (2026-11-17): it is the identity service's alone once handed over.
     Looking,
-    /// The identity has a fleet: one of its devices adds this one with the words shown (or the tap); the screen closes when the fleet binds it.
+    /// The identity has a fleet, and nothing of the join has left this device yet (identity service state 11): the screen asks its person to confirm, "Yes, I really would like to add this device and this is my identity and not a typo" (owner, 2026-11-22: nothing reaches their devices on a typed handle alone). The press tells the identity service (fgtw op 32), which only then sends the binding request.
+    Confirm,
+    /// The join confirmed (identity service state 1): the screen says how to finish it, the two devices held together (NFC) with the other's Fleet page open, or this device touched on that page and then its green Add (BLE). The pairing words stay hidden behind "Not in range? Show words to copy/paste or dictate" (`words_open`; owner, 2026-11-22: shoulder surfing). The screen closes when the fleet binds the device.
     Join,
     /// A member selected this device (identity service state 10: its Fleet page's button or an NFC tap, `bind_select`), or the fleet bound it (state 2), and the fleet key has not come yet: the whole screen VSF RGB primary green, the selecting device's name when it is a select, nothing to type. The member's person presses Add once they see it green.
     Bound,
@@ -876,6 +879,10 @@ struct Ahau {
     words_max: core::cell::Cell<i64>,
     words_frame: core::cell::Cell<Option<u32>>,
     dev_name: ([u8; 48], usize),
+    /// While joining: the person asked to see the pairing words ("Not in range?"). Hidden by default (owner, 2026-11-22); forgotten when the screen leaves the join.
+    words_open: bool,
+    /// The join confirmed here and the identity service not yet seen saying so (state 1): a copy still saying 11 was read before the press, and does not take the screen back to the question. The service signs the request in the pass that takes the press, so its echo comes a few seconds late.
+    confirm_echo: bool,
 }
 
 impl Ahau {
@@ -1037,7 +1044,21 @@ impl Ahau {
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
     fn can_go_back(&self) -> bool {
-        matches!(self.mode, Mode::Looking | Mode::Join | Mode::Mint | Mode::Grey | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
+        matches!(self.mode, Mode::Looking | Mode::Confirm | Mode::Join | Mode::Mint | Mode::Grey | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
+    }
+
+    /// Whether the button is the join's wide one: a sentence wrapped over as many lines as it takes (the confirmation, "Not in range?"), not a word.
+    fn wide_button(&self) -> bool {
+        matches!(self.mode, Mode::Confirm) || (matches!(self.mode, Mode::Join) && !self.words_open)
+    }
+
+    /// The button's label broken into its lines (`wrap`), at the label's size: one line for a word, as many as a wide button's sentence takes. Their count.
+    fn button_lines(&self, t: &str, out: &mut [(usize, usize)]) -> usize {
+        if !self.wide_button() {
+            out[0] = (0, t.len());
+            return 1;
+        }
+        self.wrap(self.k(self.w / 24), t.as_bytes(), (self.w * 13 / 16) as i64, out)
     }
 
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
@@ -1045,11 +1066,19 @@ impl Ahau {
         let y0 = self.button_top();
         // The height, the label and the width follow the scale, about the centre (at twice, w/8 to 7w/8). There is no `back` button: the bottom-left corner is back (owner, 2026-11-09: "Never show a back button").
         let hgt = self.k(self.w / 10);
+        // The join's wide button: the screen's width less a sixteenth each side, its foot where every button's is, growing upward a line pitch for each line past the first (the entry line it covers is not shown in these steps).
+        if self.wide_button() {
+            let mut lines = [(0usize, 0usize); 8];
+            // `wrap` gives every text at least one line.
+            let n = self.button_lines(self.button_label().unwrap_or(""), &mut lines);
+            let pitch = self.k(self.w / 24) * 13 / 10;
+            return (self.w / 16, y0 - (n - 1) * pitch, self.w * 15 / 16, y0 + hgt);
+        }
         let half = self.k(self.w * 3 / 16);
         (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
     }
 
-    /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them.
+    /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them. Back from a confirmed join withdraws it (fgtw op 32 [0]): the binding request is dropped and the radios stop.
     fn go_back(&mut self) {
         // On the network page: from the passphrase back to the list, from the list back to the screen under it.
         match self.mode {
@@ -1057,7 +1086,20 @@ impl Ahau {
             Mode::Networks => return self.net_close(),
             _ => {}
         }
+        let whole = matches!(self.mode, Mode::Confirm | Mode::Join);
+        if matches!(self.mode, Mode::Join) {
+            let mut o = [0u8; 4];
+            let _ = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[32, 0], &mut o);
+            console(self.grants, b"ahau: back from the join: withdrawn\n");
+        }
         self.mode = Mode::Fresh;
+        self.words_open = false;
+        self.confirm_echo = false;
+        // From the join's screens, with their tall button: the whole screen again.
+        if whole {
+            self.all();
+            return;
+        }
         self.status(self.prompt().as_str());
         self.words();
         self.entry();
@@ -1073,6 +1115,10 @@ impl Ahau {
             Mode::Mint => Some(t(Msg::Mint)),
             Mode::Wrong | Mode::Owned => Some(t(Msg::StartOver)),
             Mode::Words(_) => Some(t(Msg::Cancel)),
+            // The join's confirmation, in the owner's words (2026-11-22): nothing of the join leaves the device before it.
+            Mode::Confirm => Some(t(Msg::JoinConfirmYes)),
+            // The words only when asked for (owner, 2026-11-22: shoulder surfing); once shown, no button, and the words' band runs on under the keyboard.
+            Mode::Join if !self.words_open => Some(t(Msg::JoinShowWords)),
             Mode::Networks if self.joining => Some(t(Msg::JoiningButton)),
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
             Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some(t(Msg::Join)),
@@ -1082,8 +1128,8 @@ impl Ahau {
     }
 
     fn button(&self) {
-        // While joining there is no button, and its row is the words' band's (`words`): cleared here it cut a black band through them.
-        if matches!(self.mode, Mode::Join) {
+        // While the words show there is no button, and its row is the words' band's (`words`): cleared here it cut a black band thru them.
+        if matches!(self.mode, Mode::Join) && self.words_open {
             return;
         }
         // The whole row first, so a button that moved or went leaves nothing behind.
@@ -1096,12 +1142,19 @@ impl Ahau {
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(0) { PRESSED } else if self.joining { 1800 } else { 2600 }, self.k(self.w / 24));
         }
-        // The labels in front of the pills, the row composed whole before it shows (`compose`).
+        // The labels in front of the pills, the row composed whole before it shows (`compose`): each of its lines centred, the block of them about the pill's middle.
         self.compose(ry0, ry1, || {
         if let Some(t) = self.button_label() {
             let px = self.k(self.w / 24);
-            let x = self.centre_x((x0 + x1) as i64 / 2, px, t.as_bytes());
-            window::text(self.display, self.text_to.get(), x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
+            let pitch = px * 13 / 10;
+            let mut lines = [(0usize, 0usize); 8];
+            let n = self.button_lines(t, &mut lines);
+            let first = (y0 + y1) / 2 + px * 35 / 100 - (n - 1) * pitch / 2;
+            for (k, &(a, b)) in lines[..n].iter().enumerate() {
+                let line = &t.as_bytes()[a..b];
+                let x = self.centre_x((x0 + x1) as i64 / 2, px, line);
+                window::text(self.display, self.text_to.get(), x as i16, (first + k * pitch) as i16, px as u16, TEXT, line);
+            }
         }
         });
     }
@@ -1177,10 +1230,10 @@ impl Ahau {
     fn words_band(&self) -> (usize, usize) {
         let (b, px) = self.status_at();
         let y0 = b + self.status_lines.get().max(1).saturating_sub(1) * px * 13 / 10 + px / 2 + self.w / 32;
-        // Down to the button row when there is a button; the join step has none, and its words run on under the keyboard to its foot (owner, 2026-11-09: "literally let you scroll it under the keyboard"), when its board is kept (`show_board`: one too big is drawn straight onto the glass, with no transparency kept to put them under).
+        // Down to the button's top when there is a button (the join's wide one is taller); once its words show the join step has none, and they run on under the keyboard to its foot (owner, 2026-11-09: "literally let you scroll it under the keyboard"), when its board is kept (`show_board`: one too big is drawn straight onto the glass, with no transparency kept to put them under).
         let (top, bottom) = self.kb_rows();
         let y1 = if self.button_label().is_some() {
-            self.button_top() - self.w / 64
+            self.button_at().1 - self.w / 64
         } else if (bottom - top) * self.w <= BOARD_PIXELS {
             bottom
         } else {
@@ -1217,18 +1270,24 @@ impl Ahau {
             }
         };
         if self.dev_name.1 > 0 {
-            push(b"This device: ", &mut n);
-            // The name comes camelCased (two voca words, as the words do): a space before each capital after the first.
+            // The name comes camelCased (two voca words, as the words do): a space before each capital after the first. Said in the person's language as the Fleet page says it ("<name>  this device", fgtw::text), never English alone.
+            let mut spaced = [0u8; 96];
+            let mut k = 0;
             for (i, &c) in self.dev_name.0[..self.dev_name.1].iter().enumerate() {
                 if c.is_ascii_uppercase() && i > 0 {
-                    push(b" ", &mut n);
+                    spaced[k] = b' ';
+                    k += 1;
                 }
-                push(&[c], &mut n);
+                spaced[k] = c;
+                k += 1;
             }
+            push(fl(ferros_lang::Fleet::MemberThisDevice(core::str::from_utf8(&spaced[..k]).unwrap_or(""))).as_bytes(), &mut n);
             push(b"\n", &mut n);
         }
         let head = n;
-        for (i, &c) in self.word_buf[..self.word_len].iter().enumerate() {
+        // The words only once the person asked for them ("Not in range?"; owner, 2026-11-22: never shown by default, for shoulder surfing).
+        let words = if self.words_open { &self.word_buf[..self.word_len] } else { &[][..] };
+        for (i, &c) in words.iter().enumerate() {
             if c.is_ascii_uppercase() && i > 0 {
                 push(b" ", &mut n);
             }
@@ -1355,7 +1414,7 @@ impl Ahau {
 
     /// While the identity is being looked up or joined: follow the client, from `client_thread`'s copy (nothing here calls fgtw). Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
-        if !matches!(self.mode, Mode::Looking | Mode::Join | Mode::Grey | Mode::Bound) {
+        if !matches!(self.mode, Mode::Looking | Mode::Confirm | Mode::Join | Mode::Grey | Mode::Bound) {
             return false;
         }
         if self.roots_pending {
@@ -1375,7 +1434,14 @@ impl Ahau {
         let same_words = self.word_buf[..self.word_len] == c.words[..c.words_len];
         self.word_buf = c.words;
         self.word_len = c.words_len;
+        if c.state != 11 {
+            self.confirm_echo = false;
+        }
         let next = match c.state {
+            // A copy from before the press: the confirmation not seen yet.
+            11 if self.confirm_echo => return false,
+            // Joining, not yet confirmed here (fgtw V_CONFIRM): nothing of the join has left the device; the screen asks.
+            11 => Mode::Confirm,
             1 => Mode::Join,
             // Bound, the fleet key not here yet: green until it comes (until 2026-11-10 this was taken as attested, and a device picked from the nearby list went on without the key, past the person's confirm).
             2 => {
@@ -1406,14 +1472,18 @@ impl Ahau {
             return false;
         }
         let changed = next != self.mode;
-        let was_bound = matches!(self.mode, Mode::Bound);
+        // The screens drawn whole: the bound one on its own background, the join's two with their tall button.
+        let was_whole = matches!(self.mode, Mode::Bound | Mode::Confirm | Mode::Join);
         self.mode = next;
+        if !matches!(next, Mode::Join) {
+            self.words_open = false;
+        }
         // This device's name in the fleet, for the join step (fgtw op 19: empty until the roots are in).
-        if matches!(next, Mode::Join) && self.dev_name.1 == 0 && c.name_len > 0 {
+        if matches!(next, Mode::Confirm | Mode::Join) && self.dev_name.1 == 0 && c.name_len > 0 {
             self.dev_name = (c.name, c.name_len);
         }
-        // Into the bound screen, or out of it: the whole screen again on its new background.
-        if changed && (matches!(next, Mode::Bound) || was_bound) {
+        // Into the bound screen or one of the join's, or out of one: the whole screen again (a new background, or a button of another height).
+        if changed && (matches!(next, Mode::Bound | Mode::Confirm | Mode::Join) || was_whole) {
             self.all();
             return true;
         }
@@ -1720,6 +1790,10 @@ impl Ahau {
         self.entry();
         self.button();
         self.show_board();
+        // The join's band (this device's name, and the words once asked for): `show_board` draws it only when it was up already.
+        if matches!(self.mode, Mode::Join) && !self.words_shown.get() {
+            self.words();
+        }
     }
 
     /// Whether the network page is up.
@@ -2310,7 +2384,9 @@ impl Ahau {
             // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
             Mode::Looking if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
             Mode::Looking => tx(Msg::FindingIdentity),
-            Mode::Join => fl(Fleet::UseExistingDevice),
+            // The join (owner, 2026-11-22): asked first, then how to finish it, NFC first and the touch to add second; the words only behind the button.
+            Mode::Confirm => tx(Msg::JoinConfirmPrompt),
+            Mode::Join => tx(Msg::JoinTogether),
             Mode::Bound => fl(Fleet::BoundWaitingKeys),
             Mode::Mint => tx(Msg::MintPrompt),
             Mode::Grey if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
@@ -2365,7 +2441,7 @@ impl Ahau {
         publish_fresh_text(&[], true);
     }
 
-    /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a mint confirms; wrong starts over. A join or no answer has no button: the screen closes only when the fleet binds the device.
+    /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a mint confirms; wrong starts over; a join is confirmed (Confirm), then its words shown on asking (Join). No answer has no button, and a confirmed join closes only when the fleet binds the device.
     fn attest(&mut self) {
         match self.mode {
             Mode::Words(_) => {
@@ -2373,6 +2449,28 @@ impl Ahau {
                 return;
             }
             Mode::Hosting | Mode::Keys => return,
+            // The join confirmed (owner, 2026-11-22): only now does the identity service send the binding request (fgtw op 32 [1]); the screen goes on to how to finish it at once, the service's doorbell following.
+            Mode::Confirm => {
+                let mut o = [0u8; 4];
+                let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[32, 1], &mut o);
+                if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] != 0 {
+                    console(self.grants, b"ahau: the join's confirmation was not taken (the identity service no longer has a fleet to join)\n");
+                    return;
+                }
+                console(self.grants, b"ahau: the join confirmed; the binding request goes out\n");
+                self.mode = Mode::Join;
+                self.words_open = false;
+                self.confirm_echo = true;
+                self.all();
+                return;
+            }
+            // "Not in range? Show words to copy/paste or dictate": the words shown, the button gone.
+            Mode::Join if !self.words_open => {
+                console(self.grants, b"ahau: the pairing words shown (not in range)\n");
+                self.words_open = true;
+                self.all();
+                return;
+            }
             Mode::Join | Mode::Grey => return,
             Mode::Wrong | Mode::Owned => {
                 self.mode = Mode::Fresh;
@@ -2450,11 +2548,9 @@ impl Ahau {
                         self.attested();
                     }
                     4 => {
-                        // Another device's genesis won the handle first: it has a fleet now.
-                        self.mode = Mode::Join;
-                        self.status(self.prompt().as_str());
-                        // Its words come with `client_thread`'s next copy (the mint rang the doorbell).
-                        self.words();
+                        // Another device's genesis won the handle first: it has a fleet now, and joining it asks this device's person first (fgtw state 11), as any join does.
+                        self.mode = Mode::Confirm;
+                        self.all();
                     }
                     _ => {
                         let mut l = Line::new();
@@ -3603,7 +3699,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0), words_open: false, confirm_echo: false };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // Unlocked at boot (above): straight to the keyboard, the attest screen never shown.
     if at_boot {

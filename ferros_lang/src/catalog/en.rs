@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "They don't match.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "the identity service is not running",
+        Msg::JoinNotConfirmed => "joining: not yet confirmed on this device",
         Msg::DeckFetching => "deck: fetching yours from your fleet",
         Msg::DeckSame => "deck: the same on all your devices",
         Msg::DeckOwn => "deck: this device's own",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "This handle's record doesn't match.\nStart over with another.",
         Msg::Minting => "Minting.",
         Msg::MintingFailed => "Minting failed. Enter to retry.",
+        Msg::JoinConfirmPrompt => "This identity already has devices.\nAdd this one? Nothing reaches them until you say yes.",
+        Msg::JoinConfirmYes => "Yes, I really would like to add this device and this is my identity and not a typo",
+        Msg::JoinTogether => "Put the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros.\nOr touch this device's name on that page, then its green button.",
+        Msg::JoinShowWords => "Not in range? Show words to copy/paste or dictate",
         Msg::ComputingKeys => "Computing identity keys.",
         Msg::IdentityServiceNotAnswering => "The identity service is not answering.",
         Msg::NotSeenLastScan => "Not seen in the last scan.",

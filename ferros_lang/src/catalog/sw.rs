@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Hazilingani.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "huduma ya utambulisho haifanyi kazi",
+        Msg::JoinNotConfirmed => "kinajiunga: bado hakijathibitishwa kwenye kifaa hiki",
         Msg::DeckFetching => "sitaha: inaleta yako kutoka kundi lako",
         Msg::DeckSame => "sitaha: ileile kwenye vifaa vyako vyote",
         Msg::DeckOwn => "sitaha: ya kifaa hiki chenyewe",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Rekodi ya handle hii hailingani.\nAnza upya na nyingine.",
         Msg::Minting => "Inazalisha.",
         Msg::MintingFailed => "Kuzalisha kumeshindikana. Bonyeza ingiza ili kujaribu tena.",
+        Msg::JoinConfirmPrompt => "Utambulisho huu tayari una vifaa.\nUongeze hiki? Hakuna kinachowafikia hadi useme ndiyo.",
+        Msg::JoinConfirmYes => "Ndiyo, kweli nataka kuongeza kifaa hiki, huu ni utambulisho wangu na si kosa la kuandika",
+        Msg::JoinTogether => "Weka vifaa viwili pamoja, skrini ya kingine ikiwa imewashwa na ukurasa wake wa kundi ukiwa wazi, katika Photon au ferros.\nAu gusa jina la kifaa hiki kwenye ukurasa huo, kisha kitufe chake cha kijani.",
+        Msg::JoinShowWords => "Haupo karibu? Onyesha maneno ya kunakili/kubandika au kuyasoma kwa sauti",
         Msg::ComputingKeys => "Inakokotoa funguo za utambulisho.",
         Msg::IdentityServiceNotAnswering => "Huduma ya utambulisho haijibu.",
         Msg::NotSeenLastScan => "Haikuonekana katika uchanganuzi wa mwisho.",

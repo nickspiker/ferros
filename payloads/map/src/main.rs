@@ -3741,6 +3741,12 @@ impl Map {
                     }
                     Some(0) => fleet(FleetMsg::NoIdentityHere),
                     Some(1) => fleet(FleetMsg::JoiningConfirm),
+                    // Joining, not yet confirmed on this device's attest screen (fgtw V_CONFIRM): nothing of the join has been sent.
+                    Some(11) => {
+                        let mut l = Line::new();
+                        l.s(tr(Msg::JoinNotConfirmed));
+                        l
+                    }
                     Some(2) => fleet(FleetMsg::InFleetWaitingKey),
                     Some(3) => fleet(FleetMsg::InFleet),
                     Some(8) => fleet(FleetMsg::LeavingFleet),

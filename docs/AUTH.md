@@ -71,6 +71,16 @@ The fleet is the person's devices, and they ask each other: fgtw.org (the bootst
 
 Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.org only, nothing notifies, and the join and leave screens still lead with words.
 
+**Nothing is announced before the new device's person confirms** (owner, 2026-11-22, after a fleet notification reached his devices before he had confirmed on the new one): a handle typed alone rings none of the person's devices.
+
+1. **The look-up** is a question, not an announcement: the signed `fleet_req` to this network and the fleet peers known, then fgtw.org. A fleet device answers it and notifies nobody.
+2. **The confirmation.** When the identity has a fleet, the attest screen asks: "Yes, I really would like to add this device and this is my identity and not a typo" (the identity service's state 11, `V_CONFIRM`). Until it is pressed the identity service (payloads/fgtw) mints no binding request, so none is handed to a fleet device on the LAN, none is posted to fgtw.org's registry, no tap secret is served on the NFC tag and no beacon id is advertised over BLE; it sends no LAN beacon under the handle, says no pairing words, and takes no select. The press is fgtw op 32 `[32][1]`; back from the next step withdraws (`[32][0]`: the request dropped, the radios stopped).
+3. **The request falls on deaf ears unless a Fleet page is open** (owner, 2026-11-22, via the Photon session: a stranger typing the person's handle again and again from anywhere must never make their devices light up): it keeps going out, and a fleet device lists it only while its Fleet page is open; no toast, light or notification anywhere else. On ferros the add machine's "asks to join" is a console line only, and the system question (the red Deck button) comes only once the person at that page has selected the device. This supersedes, for joining, the 2026-11-10 bullet above that every fleet device notifies.
+4. **Then the new device advises** NFC first: the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros (ferros's Fleet page opens the add flow, its NFC reader and BLE scan, whenever it shows). Otherwise the click to add over BLE: on that page a touch on this device's name selects it (this screen turns green), and the green button adds it.
+5. **The words are for odd cases only**, never shown by default (shoulder surfing): behind "Not in range? Show words to copy/paste or dictate". On a fleet device the "type its words" choice is the other half.
+
+Built 2026-11-22 on ferros (ahau, payloads/fgtw, ferros_lang); Photon's own join screen is Photon's to follow.
+
 ## Unlocking and locking
 
 - **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to fgtw (the identity service). On an unbound device the look-up and join run as before. A kept tag held to the device does the same without the handle (op 6, "Attest with a tag" below).
@@ -175,7 +185,9 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | A tag refused | Denied. This tag does not open this device. | | proposed (the owner's "Denied." first, as above) |
 | The proof running | Computing identity keys. | | owner |
 | Looking up | Finding this identity. | | owner |
-| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) |  | owner |
+| An identity exists | This identity already has devices. Add this one? Nothing reaches them until you say yes. | Yes, I really would like to add this device and this is my identity and not a typo | the button owner (2026-11-22); the text proposed |
+| Confirmed | Put the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros. Or touch this device's name on that page, then its green button. (this device's name below) | Not in range? Show words to copy/paste or dictate | the button owner (2026-11-22); the text proposed, after the owner's |
+| Words asked for | (as above, the pairing words below the name) |  | owner |
 | None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint | owner |
 | The two differ | They don't match. Try again. | | proposed |
 | Minting | Minting. | | proposed |
@@ -183,7 +195,7 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | No answer | No answer yet. Still looking. |  | proposed |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
 
-No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the words screen and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry.
+No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the join's screens and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry (from a confirmed join it withdraws the request).
 
 If the glossary's proposals are ruled on (GLOSSARY.md, "Proposed: the auth and fleet words"), "bind" in the first and sixth rows may become "join".
 

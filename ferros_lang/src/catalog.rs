@@ -324,6 +324,8 @@ messages! {
 
     // ---- Fleet: ferros's own lines (the fleet's and the identity's words are fgtw's, shared with Photon: fgtw::text) ----
     FleetServiceNotRunning,
+    /// This device's state on the Fleet page while its join waits for its person's confirmation on the attest screen (the identity service's state 11).
+    JoinNotConfirmed,
     DeckFetching,
     /// Also the checkbox's label.
     DeckSame,
@@ -647,6 +649,15 @@ messages! {
     RecordMismatch,
     Minting,
     MintingFailed,
+    // The join (owner, 2026-11-22: nothing reaches the person's devices until they confirm on the new one; then NFC first, the touch to add second, the words only on asking).
+    /// Two lines: the identity has a fleet; nothing is sent before the confirmation.
+    JoinConfirmPrompt,
+    /// The confirmation's button, in the owner's words: a sentence the attest screen wraps.
+    JoinConfirmYes,
+    /// Two lines: how to finish the join, the two devices held together (NFC) with the other's Fleet page open, or this device touched on that page and its green button (BLE).
+    JoinTogether,
+    /// The button behind which the pairing words wait (never shown by default: shoulder surfing), a sentence the attest screen wraps.
+    JoinShowWords,
     /// A tag held to the attest screen that does not open the device: one refusal, no detail (AUTH.md "Attest with a tag").
     TagDenied,
     /// A handle typed again that is not the one it must be (attest at boot's retype): nothing changed, the text kept to correct.

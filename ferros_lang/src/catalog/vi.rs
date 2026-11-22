@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Chúng không khớp.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "dịch vụ danh tính không chạy",
+        Msg::JoinNotConfirmed => "đang gia nhập: chưa xác nhận trên thiết bị này",
         Msg::DeckFetching => "boong: đang lấy của bạn từ đội",
         Msg::DeckSame => "boong: giống nhau trên mọi thiết bị của bạn",
         Msg::DeckOwn => "boong: riêng của thiết bị này",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Hồ sơ của handle này không khớp.\nLàm lại với một handle khác.",
         Msg::Minting => "Đang đúc.",
         Msg::MintingFailed => "Đúc thất bại. Nhấn enter để thử lại.",
+        Msg::JoinConfirmPrompt => "Danh tính này đã có thiết bị.\nThêm thiết bị này? Không gì đến được chúng cho tới khi bạn đồng ý.",
+        Msg::JoinConfirmYes => "Có, tôi thật sự muốn thêm thiết bị này, đây là danh tính của tôi và không phải lỗi gõ",
+        Msg::JoinTogether => "Đặt hai thiết bị sát nhau, màn hình của thiết bị kia bật và trang đội của nó đang mở, trong Photon hoặc ferros.\nHoặc chạm vào tên thiết bị này trên trang đó, rồi chạm nút xanh lá của nó.",
+        Msg::JoinShowWords => "Không ở gần? Hiện các từ để sao chép/dán hoặc đọc",
         Msg::ComputingKeys => "Đang tính các khóa danh tính.",
         Msg::IdentityServiceNotAnswering => "Dịch vụ danh tính không trả lời.",
         Msg::NotSeenLastScan => "Không thấy trong lần quét gần nhất.",

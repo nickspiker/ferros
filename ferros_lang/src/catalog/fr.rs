@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Ils ne correspondent pas.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "le service d’identité ne fonctionne pas",
+        Msg::JoinNotConfirmed => "en train de rejoindre : pas encore confirmé sur cet appareil",
         Msg::DeckFetching => "pont : récupération du tien depuis ta flotte",
         Msg::DeckSame => "pont : le même sur tous tes appareils",
         Msg::DeckOwn => "pont : propre à cet appareil",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "La fiche de ce handle ne correspond pas.\nRecommence avec un autre.",
         Msg::Minting => "Frappe en cours.",
         Msg::MintingFailed => "La frappe a échoué. Entrée pour réessayer.",
+        Msg::JoinConfirmPrompt => "Cette identité a déjà des appareils.\nAjouter celui-ci ? Rien ne leur parvient avant ton oui.",
+        Msg::JoinConfirmYes => "Oui, je veux vraiment ajouter cet appareil, c’est bien mon identité et pas une faute de frappe",
+        Msg::JoinTogether => "Rapproche les deux appareils, l’écran de l’autre allumé et sa page flotte ouverte, dans Photon ou ferros.\nOu touche le nom de cet appareil sur cette page, puis son bouton vert.",
+        Msg::JoinShowWords => "Hors de portée ? Afficher les mots à copier/coller ou dicter",
         Msg::ComputingKeys => "Calcul des clés d’identité.",
         Msg::IdentityServiceNotAnswering => "Le service d’identité ne répond pas.",
         Msg::NotSeenLastScan => "Pas vu lors du dernier balayage.",

@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Sie stimmen nicht überein.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "der Identitätsdienst läuft nicht",
+        Msg::JoinNotConfirmed => "beitreten: auf diesem Gerät noch nicht bestätigt",
         Msg::DeckFetching => "Deck: deins wird von deiner Flotte geholt",
         Msg::DeckSame => "Deck: gleich auf all deinen Geräten",
         Msg::DeckOwn => "Deck: das eigene dieses Geräts",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Der Eintrag dieses Handles passt nicht.\nFang mit einem anderen neu an.",
         Msg::Minting => "Wird geprägt.",
         Msg::MintingFailed => "Prägen fehlgeschlagen. Enter für einen neuen Versuch.",
+        Msg::JoinConfirmPrompt => "Diese Identität hat schon Geräte.\nDieses hinzufügen? Bis zu deinem Ja erfahren sie nichts.",
+        Msg::JoinConfirmYes => "Ja, ich will dieses Gerät wirklich hinzufügen, das ist meine Identität und kein Tippfehler",
+        Msg::JoinTogether => "Halte die beiden Geräte zusammen, beim anderen den Bildschirm an und seine Flotten-Seite offen, in Photon oder ferros.\nOder berühre dort den Namen dieses Geräts, dann seinen grünen Knopf.",
+        Msg::JoinShowWords => "Nicht in Reichweite? Wörter zum Kopieren/Einfügen oder Diktieren zeigen",
         Msg::ComputingKeys => "Berechne die Identitätsschlüssel.",
         Msg::IdentityServiceNotAnswering => "Der Identitätsdienst antwortet nicht.",
         Msg::NotSeenLastScan => "Bei der letzten Suche nicht gesehen.",

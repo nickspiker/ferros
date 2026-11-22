@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Kāore e hāngai.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "kāore te ratonga tuakiri e rere ana",
+        Msg::JoinNotConfirmed => "e hono ana: kāore anō kia whakaūngia i tēnei pūrere",
         Msg::DeckFetching => "papa: e tiki ana i tōu mai i tō kāhui",
         Msg::DeckSame => "papa: he ōrite i ō pūrere katoa",
         Msg::DeckOwn => "papa: mō tēnei pūrere anake",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Kāore te pūkete o tēnei handle e hāngai.\nTīmata anō me tētahi atu.",
         Msg::Minting => "E whakawhānau ana.",
         Msg::MintingFailed => "I rahua te whakawhānau. Pēhia te tāuru kia ngana anō.",
+        Msg::JoinConfirmPrompt => "He pūrere kē tō tēnei tuakiri.\nMe tāpiri tēnei? Kāore he aha e tae atu ki a rātou kia whakaae rā anō koe.",
+        Msg::JoinConfirmYes => "Āe, e tino hiahia ana ahau ki te tāpiri i tēnei pūrere, ko tōku tuakiri tēnei, ehara i te hapa patopato",
+        Msg::JoinTogether => "Whakatataria ngā pūrere e rua, kia ara te mata o tērā atu, kia tuwhera tōna whārangi kāhui, i Photon, i ferros rānei.\nKo te mea kē, pāwhiria te ingoa o tēnei pūrere i taua whārangi, kātahi ko tōna pātene kākāriki.",
+        Msg::JoinShowWords => "Kāore i te tata? Whakaaturia ngā kupu hei tārua/whakapiri, hei whakahua rānei",
         Msg::ComputingKeys => "E tātai ana i ngā kī tuakiri.",
         Msg::IdentityServiceNotAnswering => "Kāore te ratonga tuakiri e whakautu ana.",
         Msg::NotSeenLastScan => "Kāore i kitea i te matawai whakamutunga.",

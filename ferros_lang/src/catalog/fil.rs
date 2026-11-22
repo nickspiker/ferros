@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Hindi sila magkatugma.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "hindi tumatakbo ang serbisyo ng pagkakakilanlan",
+        Msg::JoinNotConfirmed => "sumasali: hindi pa nakumpirma sa device na ito",
         Msg::DeckFetching => "kubyerta: kinukuha ang sa iyo mula sa armada mo",
         Msg::DeckSame => "kubyerta: pareho sa lahat ng device mo",
         Msg::DeckOwn => "kubyerta: sarili ng device na ito",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Hindi tugma ang rekord ng handle na ito.\nMagsimula ulit sa iba.",
         Msg::Minting => "Binubuo.",
         Msg::MintingFailed => "Nabigo ang pagbuo. Pindutin ang enter para subukan ulit.",
+        Msg::JoinConfirmPrompt => "May mga device na ang pagkakakilanlang ito.\nIdagdag ito? Walang aabot sa kanila hangga't hindi ka pumapayag.",
+        Msg::JoinConfirmYes => "Oo, gusto ko talagang idagdag ang device na ito, ito ang aking pagkakakilanlan at hindi typo",
+        Msg::JoinTogether => "Pagdikitin ang dalawang device, nakabukas ang screen ng isa at ang pahina ng armada nito, sa Photon o ferros.\nO pindutin ang pangalan ng device na ito sa pahinang iyon, saka ang berdeng button nito.",
+        Msg::JoinShowWords => "Wala sa abot? Ipakita ang mga salita para kopyahin/i-paste o idikta",
         Msg::ComputingKeys => "Kinukuwenta ang mga susi ng pagkakakilanlan.",
         Msg::IdentityServiceNotAnswering => "Hindi sumasagot ang serbisyo ng pagkakakilanlan.",
         Msg::NotSeenLastScan => "Hindi nakita sa huling scan.",

@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "Keduanya tidak cocok.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "layanan identitas tidak berjalan",
+        Msg::JoinNotConfirmed => "bergabung: belum dikonfirmasi di perangkat ini",
         Msg::DeckFetching => "dek: mengambil milikmu dari armadamu",
         Msg::DeckSame => "dek: sama di semua perangkatmu",
         Msg::DeckOwn => "dek: milik perangkat ini sendiri",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "Catatan handle ini tidak cocok.\nMulai lagi dengan yang lain.",
         Msg::Minting => "Mencetak.",
         Msg::MintingFailed => "Pencetakan gagal. Tekan enter untuk mencoba lagi.",
+        Msg::JoinConfirmPrompt => "Identitas ini sudah punya perangkat.\nTambahkan yang ini? Tidak ada yang sampai ke mereka sebelum kamu bilang ya.",
+        Msg::JoinConfirmYes => "Ya, saya sungguh ingin menambahkan perangkat ini, ini identitas saya dan bukan salah ketik",
+        Msg::JoinTogether => "Dekatkan kedua perangkat, layar perangkat yang lain menyala dan halaman armadanya terbuka, di Photon atau ferros.\nAtau sentuh nama perangkat ini di halaman itu, lalu tombol hijaunya.",
+        Msg::JoinShowWords => "Tidak dalam jangkauan? Tampilkan kata untuk disalin/ditempel atau didiktekan",
         Msg::ComputingKeys => "Menghitung kunci identitas.",
         Msg::IdentityServiceNotAnswering => "Layanan identitas tidak menjawab.",
         Msg::NotSeenLastScan => "Tidak terlihat di pindaian terakhir.",

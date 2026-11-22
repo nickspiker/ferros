@@ -190,6 +190,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TheyDontMatch => "No coinciden.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "el servicio de identidad no está en marcha",
+        Msg::JoinNotConfirmed => "uniéndose: aún sin confirmar en este dispositivo",
         Msg::DeckFetching => "cubierta: trayendo la tuya de tu flota",
         Msg::DeckSame => "cubierta: la misma en todos tus dispositivos",
         Msg::DeckOwn => "cubierta: la propia de este dispositivo",
@@ -384,6 +385,10 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RecordMismatch => "El registro de este handle no coincide.\nEmpieza de nuevo con otro.",
         Msg::Minting => "Acuñando.",
         Msg::MintingFailed => "Falló el acuñado. Intro para reintentar.",
+        Msg::JoinConfirmPrompt => "Esta identidad ya tiene dispositivos.\n¿Añadir este? No les llega nada hasta que digas que sí.",
+        Msg::JoinConfirmYes => "Sí, de verdad quiero añadir este dispositivo, esta es mi identidad y no es un error de tecleo",
+        Msg::JoinTogether => "Junta los dos dispositivos, con la pantalla del otro encendida y su página de flota abierta, en Photon o ferros.\nO toca el nombre de este dispositivo en esa página y luego su botón verde.",
+        Msg::JoinShowWords => "¿Fuera de alcance? Mostrar palabras para copiar y pegar o dictar",
         Msg::ComputingKeys => "Calculando las claves de identidad.",
         Msg::IdentityServiceNotAnswering => "El servicio de identidad no responde.",
         Msg::NotSeenLastScan => "No se vio en el último escaneo.",
