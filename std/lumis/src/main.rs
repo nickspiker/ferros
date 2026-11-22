@@ -147,6 +147,8 @@ fn seal_at_exit() {
     if let Some(c) = CLIP.lock().unwrap().take() {
         end_clip(c, None, "Lumis ending");
     }
+    // A save on the keeper's thread is kept before Lumis ends (`keep_saves`).
+    saves_settle();
 }
 
 /// While a clip records, the preview integrates a frame at most every 2^`PREVIEW_GAP_LOG2` ms, beside that frame's hand-over (camera_service). Measured on the Pro, warm, 30 a second (2026-11-19): together they take 36 to 42 ms of a 33 ms frame (the coding 28 ms alone, 33 beside the integration on the A510s), so each preview frame leaves the camera thread a few ms late, made up over the frames after it; at 2^6 ms (14 previews a second) it never caught up and 28 of 870 frames were lost; at 2^7 (about 7.5 previews a second) a warm 32 s clip lost none of its 871 frames (the coding 30.2 ms on average). Since 2026-11-22 the preview is on its own thread, which the camera never waits for (`PreviewJob`): 2^5 ms, about 20 to 24 previews a second, measured on the Pro with 0 dropped at 60 a second on the main and 48 on the ultrawide (16 s clips, cool), where 2^7 and 2^8 gave about 4.
@@ -1731,8 +1733,60 @@ fn report(src: &Source, turns: &mut Turns, name: &str) {
 /// Each save the integrator finished (Android: drainPendingSave, MediaStore), kept in the kist's vault under "save/" and its file name, then marked done.
 /// Each save goes into the vault as a bulk value (kete `write_device_bulk`: kept out of the read cache, which would otherwise hold a second copy of every still), is read back from the vault itself (`read_device_bulk`, never the cache) and compared with what was written (blake3 of both), so "kept" means the vault gives the file back whole: one console line with its size, its encode's time, the write's, the read's, and the match.
 /// A still (every save but a calibration's maps) goes to the person's hold as an item of kind photo (`hold::keep_still`: kept, read back and compared the same way), so Kūaha shows it; the vault domain keeps it only when the hold is not given, and the calibration maps, which are Lumis's own.
+/// On the keeper's own thread (`KEEPER`), never the camera thread's: a still's write to the hold and its read back took 5 s on the Pro (2026-11-22, 25 MB), and the camera thread asking for no frame for 2^22 us is a holder gone to the driver, which closed the camera, so the owner's first shot ended Lumis. The camera thread hands each save over and takes its next frame; an exit waits for the keeper first (`seal_at_exit`, `saves_settle`), so no save is lost. One save is in flight at a time (CURRENTLY_SAVING), so one keeper keeps them in order.
 fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
-    while let Some(lumis_core::PendingSave { bytes, name, encode_ms }) = lumis_core::get_pending_save() {
+    while let Some(save) = lumis_core::get_pending_save() {
+        match KEEPER.get_or_init(keeper) {
+            Some(keeper) => {
+                *KEEPING.lock().unwrap() += 1;
+                if let Err(e) = keeper.send((save, header.as_mut_ptr() as usize, header.len())) {
+                    *KEEPING.lock().unwrap() -= 1;
+                    let (save, at, len) = e.0;
+                    // SAFETY: the header handed over is this one.
+                    keep_one(save, vault, unsafe { std::slice::from_raw_parts_mut(at as *mut u64, len) });
+                }
+            }
+            None => keep_one(save, vault, header),
+        }
+    }
+}
+
+/// The keeper's thread: saves in, each kept (`keep_one`) in the vault the process opened (`VAULT`), its header marked as the camera thread's would be.
+type Keep = (lumis_core::PendingSave, usize, usize);
+static KEEPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Keep>>> = std::sync::OnceLock::new();
+/// Saves handed to the keeper and not yet kept.
+static KEEPING: Mutex<u64> = Mutex::new(0);
+static KEPT: std::sync::Condvar = std::sync::Condvar::new();
+/// The vault main opened, for the keeper.
+static VAULT: std::sync::OnceLock<Arc<kete::FlatStorage>> = std::sync::OnceLock::new();
+
+fn keeper() -> Option<std::sync::mpsc::Sender<Keep>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Keep>();
+    std::thread::Builder::new()
+        .name("lumis-keep".into())
+        .spawn(move || {
+            for (save, at, len) in rx {
+                // SAFETY: the integrator's header, shared memory for the process's life (the integrator is never dropped), written from the UI and the camera threads as ever.
+                keep_one(save, VAULT.get().map(|v| &**v), unsafe { std::slice::from_raw_parts_mut(at as *mut u64, len) });
+                *KEEPING.lock().unwrap() -= 1;
+                KEPT.notify_all();
+            }
+        })
+        .ok()
+        .map(|_| tx)
+}
+
+/// Wait until the keeper has kept every save handed to it.
+fn saves_settle() {
+    let mut n = KEEPING.lock().unwrap();
+    while *n != 0 {
+        n = KEPT.wait(n).unwrap();
+    }
+}
+
+fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
+    {
+        let lumis_core::PendingSave { bytes, name, encode_ms } = save;
         let photo = !name.starts_with("cal_");
         if photo && hold::held() {
             let kept = match hold::keep_still(&bytes) {
@@ -1746,7 +1800,7 @@ fn keep_saves(vault: Option<&kete::FlatStorage>, header: &mut [u64]) {
                 }
             };
             app::save_done(header, kept);
-            continue;
+            return;
         }
         let key = format!("save/{name}");
         let t = std::time::Instant::now();
@@ -2460,6 +2514,8 @@ fn main() {
     let vault = open_vault();
     if let Some(v) = &vault {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));
+        // The keeper (`keep_saves`) keeps saves in it from its own thread.
+        let _ = VAULT.set(v.clone());
     }
     let cameras = list();
     // The menu drawn as ink (lumis_core `ui::draw::set_ink`): the CPU draws its words and lines, the GPU (or, without one, the CPU) the splash and the slots under them.
