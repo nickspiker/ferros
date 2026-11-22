@@ -183,21 +183,17 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [PIPE comms status](pipe_comms_status.md) - 256/256 Claims 7+12 reliable; late slip = slot tracker; SM2 sampler next
 - [PIPE comms acceptance test](pipe_comms_acceptance_test.md) - done = 1-minute full-duplex PRNG, BLAKE3 match both ends
 - [PIPE load_dev is RAM hotload](pipe_load_dev_is_ram_hotload.md) - needs --features ram-image; no-pong is a host race
-- [PIPE mirror-XOR line code](pipe_mirror_xor_line_code.md) - Claim 12: one-XOR single-wire duplex code, DC balance + clock
-- [PIPE DC-balance worked trace](pipe_dc_balance_worked_trace.md) - 80-slot trace: each tx unbalanced, wire exactly 40/40
+- [PIPE mirror-XOR line code](pipe_mirror_xor_line_code.md) - Claim 12 one-XOR single-wire duplex code; DC trace in [pipe_dc_balance_worked_trace.md](pipe_dc_balance_worked_trace.md): wire exactly 40/40
 - [PIPE pubkey does five jobs](pipe_pubkey_does_five_jobs.md) - Claim 13: the ephemeral pubkey field does five jobs
 - [PIPE handshake = entropy request](pipe_handshake_is_entropy_request.md) - one bit in, 256 fresh entropy bits out
 - [PT unified stack](pipe_pt_unified_stack.md) - Photon Transport L0-L4; PIPE = single-wire L0-L1; USB reuses L2-L4
 - [PIPE host asks, enclave answers](pipe_host_asks_enclave_answers.md) - enclave never volunteers state; heartbeat alive/dead only
 - [PIPE state set](pipe_kore_state.md) - KORE=0 WHARA=1 HARA=2 ORA=3; NGARO has no code; KORE-KOHI-BLAKE3-TAHU-ORA
 - [PIPE NGARO = silent wire](pipe_ngaro_state_silent_wire.md) - <8/16 healthy rings, bad OTP or interrupted burn: no heartbeat
-- [PIPE byzantine ring threshold](pipe_byzantine_ring_threshold.md) - 16 rings, 8-of-16; per-ring budget 0.79%
-- [PIPE ring health](pipe_popcount_alone_insufficient.md) - RCT + APT + iterated GF(2) difference, 689 LUT4 on ECP5-25F
+- [PIPE byzantine threshold + ring health](pipe_byzantine_ring_threshold.md) - 16 rings, 8-of-16, 0.79%/ring; health = RCT+APT+GF(2) diff ([pipe_popcount_alone_insufficient.md](pipe_popcount_alone_insufficient.md))
 - [PIPE: slow is the security property](pipe_slow_is_security.md) - bounded throughput caps attacker sample rate
 - [PIPE TRNG silicon primitives](pipe_trng_silicon_primitives.md) - metastability, TERO, subthreshold inverter, shot noise
 - [PIPE ira is meaningless alone](pipe_ira_is_meaningless_alone.md) - boot secret means nothing without TOKEN binding
 - [PIPE keypad topology](pipe_dozenal_keypad_topology.md) - resolved: Multiply to a GND tab, row 4 ad hoc; PIPE/KEYPAD.md
-- [PIPE FPGA wire uses two pins](pipe_fpga_dual_pin_wire.md) - FPGA TX + RX bridged externally; bridge GP0 bidirectional
-- [PIPE dev rig has no 5k pulldown](pipe_dev_rig_no_external_pulldown.md) - 400 ohm series + FPGA weak pulldown only
-- [PIPE Verilog: two always blocks](pipe_two_always_blocks_dce_trap.md) - two always blocks on one reg: yosys drops one
-- [PIPE OLED fb CE gating](pipe_oled_fb_ce_gating.md) - gate framebuffer reads on the driver's CE pulse
+- [PIPE FPGA wire: two pins, no 5k pulldown](pipe_fpga_dual_pin_wire.md) - TX+RX bridged, GP0 bidirectional; 400 ohm + weak pulldown ([pipe_dev_rig_no_external_pulldown.md](pipe_dev_rig_no_external_pulldown.md))
+- [PIPE Verilog traps](pipe_two_always_blocks_dce_trap.md) - two always blocks on one reg: yosys drops one; OLED fb reads gated on CE ([pipe_oled_fb_ce_gating.md](pipe_oled_fb_ce_gating.md))
