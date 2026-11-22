@@ -135,8 +135,8 @@ A masked process reaches memory through one pair, x28 and x27, so it reaches one
 
 ## Masked std apps (scoped 2026-11-11, not built)
 
-Stowing (KISTS.md "Stowing") takes native code on a development build only, and a production build refuses it, so Mahere, Photon and Genesis stow nowhere a person would run them until they build masked.
-They are native today: tools/std-build.sh, tools/mahere-build.sh, tools/photon-build.sh and tools/genesis-build.sh run a plain `cargo +nightly build -Zbuild-std=core,alloc,std,panic_abort` for `aarch64-unknown-ferros` and flatten the ELF; nothing goes thru ferros-mask or the checker.
+Stowing (KISTS.md "Stowing") takes native code on a development build only, and a production build refuses it, so Mahere, Photon and Aemulus stow nowhere a person would run them until they build masked.
+They are native today: tools/std-build.sh, tools/mahere-build.sh, tools/photon-build.sh and genesis-kist's tools/aemulus-build.sh run a plain `cargo +nightly build -Zbuild-std=core,alloc,std,panic_abort` for `aarch64-unknown-ferros` and flatten the ELF; nothing goes thru ferros-mask or the checker.
 What a masked std build would take:
 
 0. **The pipeline with std in it.** tools/ferros-masked-build.sh builds `core,alloc,compiler_builtins` for `targets/aarch64-ferros.json` and masks the payload's post-LTO module plus compiler_builtins. A std app needs the same with `std,panic_abort` from the ferros-rust fork and its own target (`aarch64-unknown-ferros`, whose reserved registers must match the masked target's), and the post-LTO module of an app as large as Photon (fat LTO over std, fluor, vsf and the post-quantum crates) thru ferros-mask and llvm-mc.
@@ -146,7 +146,7 @@ What a masked std build would take:
 4. **What the checker must take that it has not seen:** thread-local storage (`tpidr_el0` reads in std's thread locals), std's unwinding stubs under `panic_abort`, atomics and the formatting machinery at scale; each a forms question for ferros_sandbox, answered by running the checker over a built image first and reading its refusals.
 5. **Cost at stow.** The checker over tens of MB of text, once, at the stow's code stage (its bar), and the emitter's ~15% more code (+24 to 36% in exact, "Modes"): to measure on the Pro before deciding.
 
-Order: Genesis or Mahere first (smaller, fewer C crates), Photon last.
+Order: Aemulus or Mahere first (smaller, fewer C crates), Photon last.
 
 ## Status
 

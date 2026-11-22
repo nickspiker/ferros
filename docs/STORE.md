@@ -103,7 +103,7 @@ A person still arranges things; an arrangement is just never the place a thing l
   It updates itself: a new save shows up in it without anyone filing it.
 - **A collection** is a hand-made list: "the trip", "tax 2026".
   An item can be in any number of collections at once; putting it in one does not move it out of another, and removing a collection removes no item.
-- **A kist's own view**: Genesis shows its saves by game and slot; Mahere shows its areas on the map.
+- **A kist's own view**: Aemulus (GENESIS.md, the emulator kist) shows its saves by game and slot; Mahere shows its areas on the map.
   Those are finds the kist asks, not places it owns.
 
 Both kinds of arrangement are items themselves (kinds "find" and "collection"), so they sync and can be found like anything else.
@@ -154,10 +154,10 @@ Cropped in an editor kist, the crop is a new version of the same item, the origi
 In a folder world it would be `DCIM/Camera/IMG_20261111_140212.jpg` and every other way of finding it would be a copy.
 
 **A game save.**
-Sonic 2 on the Genesis kist, saved in slot 0.
-Kind "Sega Genesis save state", made by Genesis, attributes the ROM's hash (`rom`), the game's title and the slot, related to the ROM item it was played from.
-Genesis finds it by asking "save states of this ROM", and the person finds it by typing "Sonic".
-Restowing Genesis, a new device, or a different build of Genesis (part 1) all find the same saves, because nothing about them depends on where Genesis put them.
+Sonic 2 on Aemulus (the emulator kist, GENESIS.md), saved in slot 0.
+Kind "Sega Genesis save state", made by Aemulus, attributes the ROM's hash (`rom`), the game's title and the slot, related to the ROM item it was played from.
+Aemulus finds it by asking "save states of this ROM", and the person finds it by typing "Sonic".
+Restowing Aemulus, a new device, or a different build of Aemulus (part 1) all find the same saves, because nothing about them depends on where Aemulus put them.
 
 **A downloaded map area.**
 Mahere downloads the terrain and roads around Raglan for use offline.
@@ -210,7 +210,7 @@ Both already have a home in the vault as VAULT-OUT.md decided it (2026-11-07): e
 | a rebuilt kist under another key | cannot open it, by design | finds it by kind, once allowed |
 | for | caches, downloads it can fetch again, its working state | anything the person would miss: saves, photos, documents, tracks |
 
-The owner's line for Genesis (2026-11-11, GENESIS.md): "Proper VSF all the way. We can also note on saves to use the user vault rather than the kist."
+The owner's line for the emulator kist, Aemulus since 2026-11-21 (2026-11-11, GENESIS.md): "Proper VSF all the way. We can also note on saves to use the user vault rather than the kist."
 That is the rule in general: if losing it would hurt the person, it is kept for the person.
 
 ### Kinds, and the question asked
@@ -222,15 +222,15 @@ A kist that keeps things for the person declares, in its signed capsule, each ki
 
 - **Making** a declared kind, and opening again what it made itself, is the `items` right.
 - **Opening** a kind made by anyone (other kists, other builds, the person's other devices) is asked per kind.
-- **Asked once, ever**, per person, per kist, per kind (owner, 2026-11-07: "1 means 1"), and at the person's first action that needs it, never at stow or launch (owner, 2026-11-10, permissions_asked_once: "maybe I never share my location with anyone so there's no reason for Photon to ever ask me"): Genesis asks to open the person's save states the first time they open its load page.
+- **Asked once, ever**, per person, per kist, per kind (owner, 2026-11-07: "1 means 1"), and at the person's first action that needs it, never at stow or launch (owner, 2026-11-10, permissions_asked_once: "maybe I never share my location with anyone so there's no reason for Photon to ever ask me"): Aemulus asks to open the person's save states the first time they open its load page.
 - **Read and write apart**, as VAULT-OUT.md decision 2 has the common area's names: changing an item made by someone else is its own answer (and implies opening, as write implies read there), and makes a new version (part 3), never an overwrite.
 - The kernel stamps each call with the kist's identity and its granted kinds, as it stamps domain keys today (VAULT-OUT.md "Built"), so the store never takes a kist's word for what it may open.
 
 This turns the common area's named grants (VAULT-OUT.md decision 2: `wallpaper`, `images`, `contacts`, `theme`) into kinds: the "small documented vocabulary" is the project's kinds, and a developer can add theirs (open question 1).
 
-### Genesis rebuilt under another key
+### Aemulus rebuilt under another key
 
-Genesis is GPL-3 (GENESIS.md); anyone may rebuild it and sign it with their own key, and it is then another kist (KISTS.md: a kist's identity is its developer key and option).
+Aemulus is GPL-3 (GENESIS.md); anyone may rebuild it and sign it with their own key, and it is then another kist (KISTS.md: a kist's identity is its developer key and option).
 
 - The owner's build (key A) keeps a save state for the person: kind "Sega Genesis save state", made by A.
 - Someone's rebuild (key B) declares that it makes and opens that kind.
@@ -387,7 +387,7 @@ A complete VSF document, one section `find`, every condition optional, all of th
 | `order` | `u` | 0 newest first, 1 oldest first, 2 by title, 3 largest first |
 | `skip`, `count` | `u` | paging; `count` at most 2^8 |
 
-Genesis's load page: `kind` = Sega Genesis save state, `where` `rom` equal to this ROM's hash, `order` 0.
+Aemulus's load page: `kind` = Sega Genesis save state, `where` `rom` equal to this ROM's hash, `order` 0.
 
 The answer is a section `found`: `total`, `generation` (the domain index's change count), and per item its handle and card.
 A handle is a 32-byte token keyed with a secret drawn for that process's life, so it means nothing to any other process and nothing after the kist ends; the item's id is never handed out.
@@ -395,7 +395,7 @@ A handle is a 32-byte token keyed with a secret drawn for that process's life, s
 ### Watching, not polling
 
 A watch is a held call (feedback_no_polling: push or doorbell, never a question every so often): the store answers it when a keep, change or removal moves that find's answer, with the new `generation`, and the kist asks again.
-The find page holds one; Genesis's load page holds one while it is up; nothing asks on a timer.
+The find page holds one; Aemulus's load page holds one while it is up; nothing asks on a timer.
 
 ---
 
@@ -462,7 +462,7 @@ In words, top to bottom:
 - **Time**, a strip from the oldest thing to now, dense where there are many: drag to zoom from years to days and slide along it, smoothly (no steps between years and months).
 - **Who made it**: kist icons, the person's devices, people from their phonebook.
 - **The things themselves** as circles, as everything on ferros is: a photo's circle is its picture, a save's the game's icon with its slot, a document's its first words; in the order chosen (newest, oldest, by title, largest).
-- A held circle shows its card: its kind, title, who made it on which device and when, its versions, which kists may open it ("Genesis can open this"), and whether it is only on this device.
+- A held circle shows its card: its kind, title, who made it on which device and when, its versions, which kists may open it ("Aemulus can open this"), and whether it is only on this device.
   From there: open in, keep a version, add to a collection, remove.
 
 Any find can be kept with a name, and appears among the kinds as its own circle; a kept find or a collection can also be put on the deck as a circle (it opens on the find page).
@@ -502,7 +502,7 @@ Both are ferros_store values; items add a card and the index.
 | Mahere's cells (downloaded terrain and features, its own cell index) | items kept by Mahere for itself, one per area the person downloaded, its cells inside | the person sees "offline areas" and their sizes and can remove one |
 | Mahere's tracks (`track` chunks) | items for the person, kind "GPS track", attributes start, length, distance; chunks inside the body | the person's walk, outlives Mahere |
 | Mahere's areas and ink (`area`, `user` cells) | items for the person, kind "map drawing" | the person's drawing |
-| Genesis's battery RAM and save states (GENESIS.md, waiting) | items for the person, kinds "Sega Genesis battery RAM" and "Sega Genesis save state" | the first use (part 8) |
+| Aemulus's battery RAM and save states (GENESIS.md; built 2026-11-21, not yet run on a device) | items for the person, kinds "Sega Genesis battery RAM" and "Sega Genesis save state" | the first use (part 8) |
 | Lumis's captures (KISTS.md had them in its own domain) | items for the person, kind "photo" | the person's photos |
 | Photon's messages, contacts, avatars (kete) | Photon's own state; a photo or file the person keeps from a chat becomes an item, made by Photon, `person` the sender | Photon is one app on every platform (feedback_photon_is_the_full_app); its store stays its own |
 
@@ -546,13 +546,13 @@ What this spec would add, and what it would not:
 
 ## 8. Build plan, smallest useful first
 
-0. **Genesis saves kept and found** (the waiting user, GENESIS.md "Saves").
+0. **Aemulus's saves kept and found** (the waiting user, GENESIS.md "Saves").
    - `ferros_items` (no_std, over ferros_store, host-tested): the card, the time pages and root, make, write, finish, read, card, find by kind and attributes, remove, versions; ferros_store's writes without its names list.
    - The vault process serves it in the person's items domain; the kernel stamps the caller's `items` right and kinds.
    - ferros_kist: the `items` right with kinds in the declaration; the Genesis kinds minted as ideas.
-   - Genesis: battery RAM kept per game as it changes; save states (jgenesis's `vsf` feature) per game and slot; its load page finds them by ROM and watches.
+   - Aemulus: battery RAM kept per game as it changes; save states (jgenesis's `vsf` feature) per game and slot; its load page finds them by ROM and watches.
    - The bridge: `items` commands (find, card, get, put) for the bench.
-   - Done when: saves kept, the kist killed and launched again, the same saves found; then a second Genesis signed with another key, allowed once, finds them too.
+   - Done when: saves kept, the kist killed and launched again, the same saves found; then a second Aemulus signed with another key, allowed once, finds them too.
 1. **Pick and keep.** The find page as the picker in a kist's circle and the keep sheet, under the input path's ticket; picks remembered; a kist with no `items` keeps thru the sheet.
 2. **The find page** ("your things"): search, kinds, the time strip, who made it, cards, versions, remove; kept finds and collections.
 3. **Sync**: cards across the fleet by page digests, bodies on demand by kind, "only on this device", and the departure's check.

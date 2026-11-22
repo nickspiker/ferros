@@ -1,7 +1,7 @@
 # The hold's API for kists
 
 What a kist calls to keep things for the person in the hold, find them, read their bodies by range and remove them (docs/STORE.md is the design; this is the interface as built on branch `hold`, 2026-11-19).
-Lumis keeps stills and RAW clips with it; Kūaha (`kuaha` in code), the kist that views the person's items, finds, reads and removes with it.
+Lumis keeps stills and RAW clips with it; Kūaha (`kuaha` in code), the kist that views the person's items, finds, reads and removes with it; Aemulus (GENESIS.md) lists the person's cartridges and keeps its saves with it.
 
 Status: host-tested (ferros_items `tests/serve.rs`: a kist's calls thru the kernel's stamp into the vault's server over a RAM vault and clips area) and run on the Pro (2026-11-20, branch `hold` ddfd6437 flashed to both slots; "On the Pro" below).
 
@@ -18,6 +18,30 @@ From the bench, a capsule declares them with `ferros-bridge capsule <code.bin> <
 A development spawn gets any kind with `ferros-bridge spawn <payload.bin> --items` (grant 18).
 
 The `items` grant's slot is the want's slot (ferros_kist `slots`: a kist that declares no implicit right has slots 1 to 6 for display, touch, surface, ira, domain and entropy, then its wants in order from slot 7).
+
+## The kinds
+
+A kind is an idea (IDEAS.md): 32 bytes, `hi`, pinned by its first phrasing in English, `ferros_idea::id(eng, words)`; ferros_items `kinds::KINDS` holds the project's, each held to its phrasing by the test `kinds_are_their_first_phrasings`.
+The bench and a capsule's `--makes` and `--opens` name a kind by that phrasing (`ferros-bridge items kinds` lists them).
+
+| first phrasing | ferros_items `kinds` | what its body is | made by | opened by |
+|---|---|---|---|---|
+| photo | `PHOTO` | a still's VSF document | Lumis | Kūaha |
+| RAW video | `RAW_VIDEO` | a RAW clip, a single-copy extent | Lumis | Kūaha |
+| video | `VIDEO` | | | Kūaha |
+| document | `DOCUMENT` | | | Kūaha |
+| scan | `SCAN` | | | Kūaha |
+| list | `LIST` | | | Kūaha |
+| contact | `CONTACT` | | | Kūaha |
+| song | `SONG` | | | Kūaha |
+| GPS track | `GPS_TRACK` | | | Kūaha |
+| find | `FIND` | | | Kūaha |
+| collection | `COLLECTION` | | | Kūaha |
+| Sega Genesis save state | `GENESIS_SAVE_STATE` | a state as one complete VSF file (GENESIS.md "Saves") | Aemulus | Aemulus, Kūaha |
+| Sega Genesis battery RAM | `GENESIS_BATTERY_RAM` | a cartridge's battery RAM as one complete VSF file | Aemulus | Aemulus, Kūaha |
+| Sega Genesis cartridge | `GENESIS_CARTRIDGE` (G#E9052E5ACD3CF616..., 2026-11-21) | the ROM exactly as the person's file holds it (an ingest, nothing converted) | the person, from the bench (`items put`) | Aemulus |
+
+A kind made by no kist yet is minted so every kist means the same by it; the person (the bench) may keep any kind.
 
 ## The calls
 
@@ -107,6 +131,16 @@ Kūaha declares no `make` (it views) and `open` for the kinds it shows: photo, R
 - **Hand an item to the kist that opens it** (Opsin for stills, RAW clips and scans; Photon for contacts): not built.
   It is STORE.md's step 1 (pick and offer under the input path's ticket).
   Until then a kist that declares `open` for a kind finds the item itself, by its kind and attributes.
+
+## Aemulus
+
+Aemulus (GENESIS.md) declares `items` with `--makes` "Sega Genesis save state" and "Sega Genesis battery RAM" and `--opens` those two and "Sega Genesis cartridge" (genesis-kist tools/aemulus-kist.sh); its grant is slot 7.
+
+- **The chooser**: `find` with `kinds` the cartridge, `order` newest, `count` 256; each card's title and size; a pick read whole by `read` (a MiB a call).
+- **A save**: `find` the newest of its kind whose `rom` attribute (`IS_EQUAL`, `hp`) is this game's; when there is one, `keep_again` it in place (one a kind and game, no versions), else `keep` a new one: the game's title, `rom` as an attribute, `of` the cartridge's id with `OF_MADE_FROM` when the game came from the hold.
+- **A load**: the same find, then `read` the body whole; the battery RAM so found goes to the core at start.
+
+Host-tested against `serve::Server` over a RAM vault (genesis-kist `hold.rs` tests); not yet run on a device.
 
 ## The bench
 

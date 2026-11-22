@@ -143,7 +143,7 @@ PCM instead goes thru the ring service `audio_playbackN` (S16_LE stereo 48 kHz; 
 - **ferros_sys `audio`**: the protocol's one copy, the format, `gain_q15`, `level`, and `Stream` (open, write, gain, close) for no_std kists; std kists inline the same calls (the Genesis kist).
 - **The kernel**: the `aoc-mbox-f1` interrupt line (SPI 78), `audio` among the on-demand servers with its grants (`audio_grants`: serve audio, aoc-ipc, aoc-mbox, aoc-mbox-f1, usi1-spi, gpio-gpn0, the `amp` switch, entropy), the `audio` right made a send right on the endpoint, preference 46 kept as `volume`, and the amplifiers' port clocked at half (about 3.07 MHz, spi.rs `halved`) for the OTP's 4 MHz limit.
 - **The kists' vocabulary**: `audio` appended (ferros_kist), its words in every language (ferros_lang `Msg::RightAudio`), the map's Permissions page naming it.
-- **The Genesis kist** (secondary): genesis-kist branch `audio` (worktree /mnt/Harbor/tmp/genesis-kist-audio), a cargo feature `audio`, off by default; GENESIS.md "Audio".
+- **Aemulus**, the emulator kist (secondary): genesis-kist branch `audio` (cb986d8, from before the rename; its worktree in /mnt/Harbor/tmp is gone), a cargo feature `audio`, off by default; GENESIS.md "Audio".
 
 ## Verification on the device (husky; the owner present for every step that makes sound)
 
@@ -217,7 +217,7 @@ One speaker silent: the right's channel (DAC_PCM1_SRC G#09, ASPRX2) or its selec
 **3. Android's own settings, to compare** (the register oracle, slot b's Magisk root, a capture as SENSORS.md's): while Android plays a sound, `cat /sys/kernel/debug/regmap/spi19.0/registers` and `spi19.1`: SP_FORMAT (G#4808), SP_RX_WL (G#4840), SP_FRAME_RX_SLOT (G#4820), DAC_PCM1_SRC (G#4C00), PLL_CLK_CTRL (G#2C04), GLOBAL_CLK_CTRL (G#2C0C), PWR_CTRL2 (G#2018), BSTCVRT_PEAK_CUR (G#3808).
 amp.rs's SP_FORMAT (slot widths 32, DSP_A) and RX width 16 are read from the drivers, not measured: this is the check.
 
-**4. A stream and the mixer.** The Genesis kist with `--features audio` (GENESIS.md "Audio"), at the default volume (level 223, two octaves down): its console line every 512 frames gives the frames paced by sound and the ring's lowest point (0 means a gap heard); the service's STATE gives underruns and starved.
+**4. A stream and the mixer.** Aemulus with `--features audio` (GENESIS.md "Audio"), at the default volume (level 223, two octaves down): its console line every 512 frames gives the frames paced by sound and the ring's lowest point (0 means a gap heard); the service's STATE gives underruns and starved.
 Then the volume: `ferros-bridge diag "pref volume 207"` (an octave down from the default) while it plays, the change heard within a period (every period reads the preference).
 
 **5. The end of it.** After the last stream closes or its kist ends, about 1.4 s plus 85 ms later the console says `audio: silent, ending`, `diag arcs` no longer lists `audio`, and the amplifiers' DEVID reads 0 from the `amp` tool (held in reset: the switch went off with the process).

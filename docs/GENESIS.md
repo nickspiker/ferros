@@ -1,6 +1,7 @@
-# The Genesis kist
+# Aemulus
 
-A Sega Genesis (Mega Drive) emulator as a kist: [jgenesis](https://github.com/jsgroth/jgenesis)'s Genesis core (GPL-3) under a ferros shell, a touch pad drawn by fluor, saves as VSF.
+Aemulus is an emulator kist: a Sega Genesis (Mega Drive), [jgenesis](https://github.com/jsgroth/jgenesis)'s Genesis core (GPL-3) under a ferros shell, the person's cartridges chosen from their hold, a touch pad drawn by fluor, saves as VSF kept in the hold.
+Named by the owner, 2026-11-21: "Aemulus it is!" (Latin, one who rivals or strives to equal, the root of "emulate"; still the right name if it later runs other consoles). No "Sega", "Genesis" or "Mega Drive" in the kist's name; they name the console and the kinds of its things.
 Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`); step A built the night of 2026-11-11 on the Pixel 8a (akita).
 
 ## Status
@@ -9,22 +10,23 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
   Played by injected touches: Start out of the demo, the title, a game in Emerald Hill, Sonic run right on a held D-pad (its right nub lit while held).
 - **The pause page** (built the night of 2026-11-11, host-tested; not yet run on the 8a, which was off the USB bus all that night): back's Escape opens it over the game, which stops; Resume, Save state, Load state, Reset; Escape again resumes (below, "The pause page").
 - **Save states** (built, host-tested): VSF all the way, the emulator's every field by name thru a `vsf` feature on jgenesis (below, "Saves"); about 340 KB for Sonic 2 (the VDP's frame buffer left out, redrawn by the next frame); a state saved, the game moved on and the state loaded gives the same frames again.
-  Kept in the kist's memory until it ends: the store they belong in (STORE.md, a draft) does not exist yet, and the page says so.
+  Kept in the person's hold (2026-11-21, below, "Saves"); a development spawn with no `items` grant keeps them until the kist ends, and the page says which.
 - **H32 columns** area-weighted (below, "The picture"); **the icon** made from the owner's picture (below, "The icon").
 - **Sound** (built the night of 2026-11-11 behind the kist's `audio` feature, off by default, host-tested; not yet run: no device was on the bus, and the `audio` service it writes to has not run on one either): below, "Audio".
   Without the feature the kist is silent, as in step A.
 - **Saves:** the battery RAM's VSF schema is built and host-tested and goes the same way as a state; Sonic 2 has none.
-- **Not a catalog kist:** GPL-3 shipping wants a lawyer's read first; nothing is published, no capsule is signed.
+- **The chooser and cartridges in the hold** (2026-11-21, host-tested; not yet run on a device): started from the deck, Aemulus lists the cartridges in the person's hold (kind "Sega Genesis cartridge") and plays the one tapped (below, "The chooser").
+- **Not a catalog kist:** GPL-3 shipping wants a lawyer's read first; nothing is published. A capsule signs with the owner's developer key for stowing on his own devices (genesis-kist tools/aemulus-kist.sh).
 
 ## Where it lives
 
 | what | where |
 |---|---|
-| the kist's crate | `/mnt/Harbor/Code/genesis-kist` (its own git repo, no remote; the owner decides its home); the sound on its branch `audio` (worktree `/mnt/Harbor/tmp/genesis-kist-audio`) until merged |
-| the core | `/mnt/Harbor/tmp/jgenesis`, branch `ferros` (v0.14.1, 386db85, plus the Sega CD and 32X gate, 7ad42bb, and the `vsf` feature, 04362e7 and d6f7413) |
-| the build | `tools/genesis-build.sh` (this repo) |
+| the kist's crate | `/mnt/Harbor/Code/genesis-kist` (crate `aemulus`; its own git repo, no remote; the owner decides its home and its directory's name, still `genesis-kist`); the sound on its branch `audio` (cb986d8, not merged; its worktree in /mnt/Harbor/tmp is gone) |
+| the core | `/mnt/Harbor/Code/jgenesis`, branch `ferros` (386db85, v0.14.1 and after, plus the Sega CD and 32X gate, the `vsf` feature and the frame buffer left out of a state; b495d53b, b07a6cbd, 1b7569aa, ae94e470, 5f4de228). Its remote is jgenesis's own, never pushed to. |
+| the build | genesis-kist `tools/aemulus-build.sh` (the image), `tools/aemulus-kist.sh` (the signed capsule and its stow) |
 | the icon | `genesis-kist/assets/icon.vsf`, made by `genesis-kist/tools/icon` from the owner's picture (the picture is not in the repo) |
-| the ROM | the person's own file; never in a repo, an image or a capsule |
+| the ROM | the person's own file, kept in their hold as a cartridge (below, "Cartridges in the hold"); never in a repo, an image or a capsule |
 
 ## How it fits together
 
@@ -74,6 +76,53 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
   - **No Quit**: the house has none (deck backgrounds a kist, back bottoms out at its main page; WINDOWS.md "The helm"), and quitting would drop a state kept in memory.
   Each action's time is said on the console (`diag console`).
 
+## The chooser
+
+Owner, 2026-11-21: cartridges go in the hold as a kind of their own, opened by Aemulus from a chooser.
+Launched from the deck (no spawn input), Aemulus opens on the chooser (`chooser.rs`), below the window's first owned row as the picture is:
+
+- **What it lists**: the cartridges in the person's hold it may open, newest first, by the title the person gave each ("A cartridge with no title" when none): one find (`hold.rs` `cartridges`: kind "Sega Genesis cartridge", ORDER_NEWEST, at most 256), over the kist's `items` grant.
+  Fewer pills than cartridges: Newer and Older under the list turn the page.
+  A line under the heading says "Newest first", "No cartridges in your hold yet", "Aemulus was not given your things, so it cannot see your cartridges" (no grant: the right refused, an empty slot) or "Your hold did not answer".
+- **A pick**: a pill fires on release (`taps.rs`, shared with the pause page); the cartridge's body is read whole from the hold (`Hold::read`, a MiB a call) and the core tries it before the chooser goes, so a file that is no Genesis cartridge stays on the chooser, said ("That cartridge would not start").
+- **Its look**: fluor front to back (the heading, the line, the house pills, then the theme's ground under them), in the device's theme (`ferros_fluor::look_of(ferros_sys::theme::current())`, fluor's look) and at the person's app scale: its unit a sixteenth of the panel's span times 2^(s/64), s preference 14 (app_scale_theme_global: every kist follows both, an implicit right).
+  Both preferences are read in place once a frame while the chooser shows (the kernel writes the block for every process); a change draws it again, a new scale laid out from the first page.
+  Sizes from the unit: the heading five eighths of one, the line three eighths, pills a unit tall and the area's width less a unit, a quarter between them.
+  The chooser is the kist's own raw shell drawing with fluor's pieces (paint, text, the house pill), as the pad and the pause page are: fluor's ferros host would own the window the game needs.
+- **Behind and in front**: behind, it sleeps on the window's bell; in front again it asks the hold again, so a cartridge put in meanwhile shows.
+  Back's Escape on it does nothing: it is the kist's main page.
+- **After the pick**: the game as before, its saves kept in the hold, each made from that cartridge's item.
+  Another game: Stop on the kist's card and launch it again (no Quit, no way back to the chooser from the game yet).
+
+A development spawn with the ROM as its input (below) skips the chooser.
+
+## Cartridges in the hold
+
+A cartridge is an item of kind "Sega Genesis cartridge" (ferros_items `kinds::GENESIS_CARTRIDGE`, G#E9052E5ACD3CF616..., minted 2026-11-21 as the save kinds were: an idea pinned by its first phrasing), its body the ROM exactly as the person's file holds it (an ingest: no format of ours, nothing converted), its title the person's.
+From the bench, as the person (every kind):
+
+```bash
+B=target/debug/ferros-bridge
+FERROS_BUS=1 $B items put "Sega Genesis cartridge" "<the ROM file>" --title "Sonic the Hedgehog 2"
+FERROS_BUS=1 $B items find --kind "Sega Genesis cartridge"
+```
+
+Aemulus's capsule declares that it opens cartridges and both save kinds and makes the save kinds (genesis-kist tools/aemulus-kist.sh; HOLD-API.md "Declaring it"), all under the one `items` right, asked once, ever, at the first start that needs it.
+Kūaha names Aemulus as the kist that opens a cartridge or a save (kuaha ad76ca8); listing cartridges among the person's things waits on the kind in its `--opens` and its words (a ferros_lang Msg in every language), not done.
+
+## Stowing it
+
+```bash
+cd /mnt/Harbor/Code/genesis-kist
+tools/aemulus-build.sh
+AEMULUS_ICON=<app-icons icon assets/icon.vsf out.vsf --place> tools/aemulus-kist.sh --no-build
+```
+
+The capsule: `--kist Aemulus`, option e8d2aa65... (minted 2026-11-21, never changed), the owner's developer key (keys/developer-nick.key.vsf, as Lumis and Mahere; STORE.md "The owner's build (key A)"), `--want items`, `--makes` the two save kinds, `--opens` those and the cartridge.
+Its grants as a kist: the implicit six (display, touch, surface, ira, its domain, entropy in slots 1 to 6), then `items` in slot 7, where `ferros.rs` looks.
+It is native code (a std kist), stowed only by a development build (KISTS.md "Native code").
+To build against the build farm's ferros rather than the checkout beside the kist: tools/aemulus-build.sh says how (a directory of links to the siblings outside any ferros checkout, the kist copied into it).
+
 ## Running it without an attested person (development)
 
 The 8a sits at the attest screen with nobody attested, and ahau's window (the system level) covers everything.
@@ -82,25 +131,27 @@ The dev escape takes it down, then the kist is spawned over the bridge with the 
 ```bash
 B=target/debug/ferros-bridge     # the debug bridge: the release one ignores FERROS_BUS
 FERROS_BUS=1 $B diag "kill ahau"
-tools/genesis-build.sh
-FERROS_BUS=1 $B spawn /mnt/Harbor/Code/genesis-kist/target/ferros/aarch64-unknown-ferros/release/genesis.bin 00 \
-    --name genesis --use display --use touch --dma surface --input-file <rom>
+/mnt/Harbor/Code/genesis-kist/tools/aemulus-build.sh
+FERROS_BUS=1 $B spawn /mnt/Harbor/Code/genesis-kist/target/ferros/aarch64-unknown-ferros/release/aemulus.bin 00 \
+    --name aemulus --use display --use touch --dma surface --input-file <rom>
 FERROS_BUS=1 $B diag console      # its lines: the title, the picture's row, a timing line every 512 frames, every change of the fingers and buttons
-FERROS_BUS=1 $B diag "kill genesis"
+FERROS_BUS=1 $B diag "kill aemulus"
 FERROS_BUS=1 $B diag "restart ahau"
 ```
 
-With sound (unrun): the kist built with the feature and the `audio` grant fourth, after the surface (the `audio` service up first):
+With sound (unrun, on the kist's branch `audio`, from before the rename): the kist built with the feature and the `audio` grant fourth, after the surface (the `audio` service up first):
 
 ```bash
-tools/genesis-build.sh --features audio
-FERROS_BUS=1 $B spawn /mnt/Harbor/Code/genesis-kist/target/ferros/aarch64-unknown-ferros/release/genesis.bin 00 \
-    --name genesis --use display --use touch --dma surface --use audio --input-file <rom>
+tools/aemulus-build.sh --features audio
+FERROS_BUS=1 $B spawn /mnt/Harbor/Code/genesis-kist/target/ferros/aarch64-unknown-ferros/release/aemulus.bin 00 \
+    --name aemulus --use display --use touch --dma surface --use audio --input-file <rom>
 ```
 
+As a stowed kist the audio grant is not fourth but after the implicit six, `items` and the GPU's three (ferros_kist `slots`): the branch reads it where a development spawn puts it, and moves when it is merged.
+
 The byte after the image picks where the emulation runs: 0 the four A715s, 1 the X3, 3 core 7 alone (its cycle counter then tells its clock), 2 anywhere.
-The ROM is the input file (a u32 length and its bytes after that byte); it never goes into the image.
-The kist needs no right but display, touch and its surface for step A, and `audio` for sound.
+The ROM is the input file (a u32 length and its bytes after that byte); it never goes into the image. With no input (a stowed launch) the byte is 0 and the chooser opens.
+A development spawn holds no `items` grant: saves last until the kist ends, and the page says so.
 `ferros-bridge input hold X Y FRAMES` presses the pad; see "Found on the way" for the injector's fix this needed on the 8a.
 The pause page opens on back's Escape: a tap on the helm's back (bottom left), real or injected (`input tap`), which the map turns into the display's op 61 to the app in front; the map must be up under the kist for that (not yet tried with ahau killed).
 The console then says each step ("back: paused, the page up", "state saved: a VSF document of A#n bytes", "Save took A#n us", "state loaded", "reset").
@@ -175,20 +226,23 @@ Sonic 2 after 128 frames is 339422 bytes of VSF (1155714 with the frame buffer, 
 In the kist (`emu.rs` test `save_move_load`): saved, 41 frames on, loaded, the same first frame and the same 8 after it; a state of another game refused.
 
 **Where saves are kept** (owner, 2026-11-11: "Two permissions, saving under the kist key and saving under the user key. We'll have to work out the filesystem since it won't have a directory structure. Find items by content, date, who created, whatever but never in a directory tree").
-STORE.md (a draft for the owner's review) is that store, and Genesis its stage 0: items kept for the person, kinds "Sega Genesis save state" and "Sega Genesis battery RAM", found by `rom`.
-Until it exists the kist keeps saves behind one boundary (`store.rs`), so the store plugs in there and nothing else changes:
+STORE.md is that store (the hold, HOLD-API.md), and Aemulus its stage 0: items kept for the person, kinds "Sega Genesis save state" and "Sega Genesis battery RAM", found by `rom`.
+The kist keeps saves behind one boundary (`store.rs`), so the game and the page never know which store is behind it:
 
 - `Store::keep(doc)`: a whole document; the store reads what it is from the document itself (`save::what`: its first section, the kind, and its `rom`), checked whole first. STORE.md's make, write and finish, the card from the document.
-- `Store::newest(section, rom)`: the newest of that kind for this game. STORE.md's find (the kind, `where rom` equal, newest first, one).
+- `Store::newest(section, rom)`: the newest of that kind for this game. STORE.md's find (the kind, `where rom` equal, newest first, one), then its body read whole.
 - `Store::lasts()`: how long a kept document lasts, which the page says.
-- `Session`, the one store today: one slot a kind and game in the process's memory (a save replaces the last), gone when the kist ends; the page says "kept until the kist ends".
+- `hold::InHold` (2026-11-21), the store with the `items` right: one item a kind and game, a new save kept again in place over the newest (`keep_again`; no versions, STORE.md), else a new item titled with the game (the header's title), its `rom` an attribute (`hp`), made from the cartridge's item when the game came from the hold (`OF_MADE_FROM`). Found by `rom` whoever made it, so a build of Aemulus under another key finds the same saves. The battery RAM kept for a game is handed to the core at start. The page says "kept in your hold".
+- `Session`, the store without the grant (a development spawn): one slot a kind and game in the process's memory (a save replaces the last), gone when the kist ends; the page says "kept until the kist ends".
+
+Host-tested against the hold's real server (`hold.rs` tests): two saves of a game are one item, the second's body; the battery RAM found by game; another game's not; another build's key finds them.
 
 ## The icon
 
 Owner, 2026-11-11: "For the kist icon, /home/nick/Downloads/cartridge.jpeg is likely good" (a teal cartridge, gold contacts, on dark slate; 1024 square).
-`genesis-kist/assets/icon.vsf` is it, in the form kist icons take today (KISTS.md: a VSF image, as tools/app-icons makes them; the same form as Opsin's orb): a complete VSF file, section `image`, field `data`, a 256 by 256 by 3 `t_u3` of VSF RGB gamma 2 codes, square, the circle inscribed in it the part that shows.
+`genesis-kist/assets/icon.vsf` is Aemulus's, in the form kist icons take today (KISTS.md: a VSF image, as tools/app-icons makes them; the same form as Opsin's orb): a complete VSF file, section `image`, field `data`, a 256 by 256 by 3 `t_u3` of VSF RGB gamma 2 codes, square, the circle inscribed in it the part that shows.
 tools/app-icons takes such a file as an app's source (it cuts the circle with exact coverage and makes the photopic grey), and a directory entry names it with `--icon`.
-Since 2026-11-20 kist icons have one format, a Photon avatar's AV1 picture tagged `g2t` (KISTS.md "Icons"): `app-icons icon genesis-kist/assets/icon.vsf <out>` brings this one into it (a 256-square gamma 2 picture enters Photon's process after its resize), and that file is what a capsule's `icon` carries.
+Since 2026-11-20 kist icons have one format, a Photon avatar's AV1 picture tagged `g2t` (KISTS.md "Icons"): `app-icons icon genesis-kist/assets/icon.vsf <out> --place` brings this one into it (its codes are gamma 2: nothing above white; 16495 bytes) (a 256-square gamma 2 picture enters Photon's process after its resize), and that file is what a capsule's `icon` carries.
 
 `genesis-kist/tools/icon` (a host tool, outside the kist's build) made it: the picture decoded for ingest only (nothing is encoded to JPEG or PNG anywhere), taken as sRGB and brought into VSF RGB by vsf's `SRGB2VSF_RGB` as app-icons brings an app's PNG in; the cartridge found in it (teal or gold against the slate: its box 106 to 906 by 170 to 756, centre (506, 463), its farthest pixel 400 from there); the square centred there with the inscribed circle's radius a sixteenth past that (425), so the cartridge is centred and fills the circle; scaled by the exact area mean in linear light; stored as `√L` of 255.
 The picture itself is not in any repo: whether it is the owner's own (and so may be committed with the tool) is the owner's to say.
@@ -236,9 +290,9 @@ Built the night of 2026-11-11 behind the kist's `audio` cargo feature (off by de
 ## Next
 
 0. The pause page on the 8a: back opens it, save, move on, load, reset; the save's and the load's times on the device (built and host-tested; the 8a was off the bus the night it was built).
-1. Saves kept past the kist's end: STORE.md's stage 0 (items for the person, the `items` right, the Genesis kinds as ideas), then `store.rs`'s `Session` swapped for it; the page's load then holds a watch.
+1. Saves kept past the kist's end: built (2026-11-21, `hold::InHold`), to run on a device: saved, the kist stopped and launched again, the state loaded; the page's load could then hold a watch.
 2. Sound on the device: the `audio` service up, the kist built with `--features audio` and spawned with `--use audio`, the checks under "Audio"; then the feature on by default and the branch merged.
-3. ROMs into the person's vault (over the bridge, a Photon transfer, the clipboard), and a page to pick one; the capsule never carries a ROM.
+3. Cartridges into the person's hold: from the bench, built (`items put`); a Photon transfer or the clipboard next. The chooser built (2026-11-21), to run on a device; then a way back to it from the game (the pause page), if the owner wants one.
 4. Bluetooth pads.
 5. Landscape when the device knows it is turned.
 6. The GPL-3 question before any listing.
