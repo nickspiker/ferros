@@ -260,6 +260,9 @@ pub struct ReadTicks {
     pub copy: u64,
     /// Of `fetch`, the index walks alone (manifestus `locate`: each node read from the index cache, its BLAKE3 guard and decode, to the piece's leaf). Since 2026-11-11 the fetch is the walk and the furrows' unchecked reads; their checks run with the opening (`open_piece`).
     pub walk: u64,
+    /// A write's own (2026-11-22, the 25 MB still that took 4.1 s to keep): sealing its pieces (XChaCha20-Poly1305), and the engine's batches (manifestus `put_batch`: each furrow's BLAKE3 guard, the index, the staged blocks written, read back and compared on each mirror, the spine entry).
+    pub seal: u64,
+    pub engine: u64,
 }
 
 impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
@@ -562,7 +565,9 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     fn seal_piece(&mut self, d: &Domain, w: &mut Writer) -> Result<()> {
         let k = w.written + w.sealed.len() as u64;
         let addr = Self::piece_addr(d, &w.id, k);
+        let t = self.tick();
         let sealed = self.seal(d, &addr, &w.piece)?;
+        self.ticks.seal += self.tick() - t;
         w.sealed.push((addr, sealed));
         w.piece.clear();
         Ok(())
@@ -574,7 +579,9 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             self.edit_list(d, PENDING, pending_schema, "id", |l| l.push(VsfType::hb(w.id.to_vec())))?;
         }
         let items: Vec<(&[u8; 32], &[u8])> = w.sealed.iter().map(|(a, s)| (a, s.as_slice())).collect();
+        let t = self.tick();
         self.vault.put_batch(&items, (self.now)())?;
+        self.ticks.engine += self.tick() - t;
         w.written += w.sealed.len() as u64;
         w.sealed.clear();
         Ok(())
@@ -598,7 +605,9 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let sealed_head = self.seal(d, &w.head_addr, &doc)?;
         let mut items: Vec<(&[u8; 32], &[u8])> = w.sealed.iter().map(|(a, s)| (a, s.as_slice())).collect();
         items.push((&w.head_addr, &sealed_head));
+        let t = self.tick();
         self.vault.put_batch(&items, (self.now)())?;
+        self.ticks.engine += self.tick() - t;
         if let Some(old) = &old {
             self.drop_pieces(d, old)?;
         }

@@ -139,7 +139,10 @@ impl BlockDev for Half {
     fn write(&mut self, lba: u64, buf: &Block) -> manifestus::Result<()> {
         self.io(lba, 1)?;
         ahead_drop();
-        if ferros_sys::block_write(cap(grants(), S_BLOCKS), self.base + lba, buf) != 0 {
+        let t = now();
+        let r = ferros_sys::block_write(cap(grants(), S_BLOCKS), self.base + lba, buf);
+        wrote(t, 1, 1);
+        if r != 0 {
             return Err(manifestus::Error::Corrupt(alloc::format!("block write failed at {lba}")));
         }
         Ok(())
@@ -158,7 +161,8 @@ impl BlockDev for Half {
     fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> manifestus::Result<()> {
         self.io(lba, blocks.len() as u64)?;
         ahead_drop();
-        let mut buf = alloc::vec![0u8; RUN_MAX << 12];
+        // WHY the min: the buffer is the largest call's size, a run shorter than one call (a spine block, an index node) no more than its own blocks; it was 1 MiB zeroed for every run.
+        let mut buf = alloc::vec![0u8; blocks.len().min(RUN_MAX) << 12];
         for (k, chunk) in blocks.chunks(RUN_MAX).enumerate() {
             for (j, b) in chunk.iter().enumerate() {
                 buf[j << 12..(j + 1) << 12].copy_from_slice(&b[..]);
@@ -322,13 +326,28 @@ fn blocks_read(at: u64, buf: &mut [u8], spent: &AtomicU64) -> bool {
     true
 }
 
+/// Block writes, measured for the write report (`WMeter`): the serving thread's time in the kernel's write calls, the calls, the blocks.
+static WR_TICKS: AtomicU64 = AtomicU64::new(0);
+static WR_CALLS: AtomicU64 = AtomicU64::new(0);
+static WR_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// A write call begun at `t`: `calls` calls, `blocks` blocks.
+fn wrote(t: u64, calls: u64, blocks: u64) {
+    WR_TICKS.fetch_add(now() - t, Relaxed);
+    WR_CALLS.fetch_add(calls, Relaxed);
+    WR_BLOCKS.fetch_add(blocks, Relaxed);
+}
+
 /// `blocks_read`'s other half.
 fn blocks_write(at: u64, buf: &[u8]) -> bool {
     let n = buf.len() >> 12;
     let mut k = 0;
     while k < n {
         let m = (n - k).min(RUN_NOW.load(Relaxed));
-        if ferros_sys::block_write(cap(grants(), S_BLOCKS), at + k as u64, &buf[k << 12..(k + m) << 12]) != 0 {
+        let t = now();
+        let r = ferros_sys::block_write(cap(grants(), S_BLOCKS), at + k as u64, &buf[k << 12..(k + m) << 12]);
+        wrote(t, 1, m as u64);
+        if r != 0 {
             match run_down(m) {
                 Some(s) => {
                     RUN_NOW.store(s, Relaxed);
@@ -759,6 +778,84 @@ impl Meter {
     }
 }
 
+/// A value written in requests, measured stage by stage (2026-11-22, the owner: a 25 MB still in the hold "written in 4108 ms" on the Pro): a hold body (`make` or `keep_again`, its `write`s, `finish`) or a value of the store's own write op (offset 0 to the last). One console line at the finish for a value of at least METER_MIN bytes:
+/// `vault: kept …`: the bytes, the requests, first to last; serving split into sealing the pieces (XChaCha20-Poly1305, ferros_store `ReadTicks::seal`), the engine's batches (manifestus `put_batch`) and of those the block writes (the kernel's calls, their blocks) and block reads (the read-back verification, the index walk's misses, the spine's fences), the engine's own work left (each furrow's BLAKE3 guard, the index, staging), and the rest (the hold's BLAKE3 of the body, its card and lists, the copies); and the time between requests (the caller's: Lumis's next MiB, the kernel's stamp and hand-off).
+struct WMeter {
+    on: bool,
+    t0: u64,
+    requests: u64,
+    serving: u64,
+    bytes: u64,
+    /// The counters as they stood at the first request: block write ticks, calls, blocks; block read ticks, calls, blocks; the store's seal and engine ticks.
+    at: [u64; 8],
+}
+
+impl WMeter {
+    fn counters(st: ferros_store::ReadTicks) -> [u64; 8] {
+        let l = |a: &AtomicU64| a.load(Relaxed);
+        [l(&WR_TICKS), l(&WR_CALLS), l(&WR_BLOCKS), l(&IO_TICKS), l(&IO_CALLS), l(&IO_BLOCKS), st.seal, st.engine]
+    }
+
+    /// A value's first request begins at `t` (the counters as they stood before it).
+    fn start(&mut self, t: u64, st: ferros_store::ReadTicks) {
+        *self = WMeter { on: true, t0: t, requests: 0, serving: 0, bytes: 0, at: Self::counters(st) };
+    }
+
+    /// A request of `bytes` begun at `t`, served by now.
+    fn note(&mut self, t: u64, bytes: u64) {
+        self.requests += 1;
+        self.serving += now() - t;
+        self.bytes += bytes;
+    }
+
+    /// The finish served by now (begun at `t`): the line, for a value large enough.
+    fn end(&mut self, t: u64, st: ferros_store::ReadTicks) {
+        if !self.on {
+            return;
+        }
+        self.note(t, 0);
+        self.on = false;
+        if self.bytes < METER_MIN {
+            return;
+        }
+        let c = Self::counters(st);
+        let d: [u64; 8] = core::array::from_fn(|i| c[i] - self.at[i]);
+        let f = freq();
+        let us = |t: u64| t * 1_000_000 / f;
+        let ms = |t: u64| us(t) / 1000;
+        // WHY the max: a stage that took no time would divide by zero, and the report is not worth the process.
+        let rate = |bytes: u64, t: u64| bytes / us(t).max(1);
+        let wall = now() - self.t0;
+        // Signed: the counters are read at different moments.
+        let engine_own = ms(d[7]) as i64 - ms(d[0]) as i64 - ms(d[3]) as i64;
+        let rest = ms(self.serving) as i64 - ms(d[6]) as i64 - ms(d[7]) as i64;
+        say!(
+            "vault: kept {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = sealing {} ({} MB/s) + engine {} [block writes {} ms in {} calls, {} blocks ({} MB/s); block reads {} ms in {} calls, {} blocks ({} MB/s); its own {}] + rest {}; between requests {} ms",
+            self.bytes,
+            self.requests,
+            ms(wall),
+            rate(self.bytes, wall),
+            ms(self.serving),
+            ms(d[6]),
+            rate(self.bytes, d[6]),
+            ms(d[7]),
+            ms(d[0]),
+            d[1],
+            d[2],
+            rate(d[2] << 12, d[0]),
+            ms(d[3]),
+            d[4],
+            d[5],
+            rate(d[5] << 12, d[3]),
+            engine_own,
+            rest,
+            ms(wall - self.serving)
+        );
+    }
+}
+
+static mut WMETER: WMeter = WMeter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, at: [0; 8] };
+
 static mut METER: Meter = Meter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, from: 0, next: 0, whole: 0, pinned: 0, at: Counts::ZERO };
 
 type St = Store<Half, Half, Entropy>;
@@ -1074,12 +1171,17 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                         return reply(out, ERR, 0);
                     }
                 };
+                let t = now();
+                if offset == 0 {
+                    unsafe { (*(&raw mut WMETER)).start(t, store.read_ticks()) };
+                }
                 let i = i.unwrap_or_else(|| {
                     writers.push(Pending { domain: id, person, name: name.to_vec(), next: 0, w: store.begin(&d, name) });
                     writers.len() - 1
                 });
                 // A refused write or finish says why on the console (2026-11-08: every write failed with "vault error" and no word of the cause).
                 let written = store.write(&d, &mut writers[i].w, bytes);
+                unsafe { (*(&raw mut WMETER)).note(t, bytes.len() as u64) };
                 writers[i].next += bytes.len() as u64;
                 if let Err(e) = written {
                     say!("vault: write refused at {}: {:?}", offset, e);
@@ -1088,7 +1190,10 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 } else if !more {
                     let p = writers.swap_remove(i);
                     let whole = p.next;
-                    match store.finish(&d, p.w) {
+                    let t = now();
+                    let finished = store.finish(&d, p.w);
+                    unsafe { (*(&raw mut WMETER)).end(t, store.read_ticks()) };
+                    match finished {
                         Ok(()) => {
                             // A large value's end says what the live set and the heap hold after it (2026-11-13: the live set's growth ended the process twice on the 8a).
                             if whole >= METER_MIN {
@@ -1648,7 +1753,20 @@ fn items(store: &mut St, doms: &[Domain], rest: &[u8], out: &mut [u8], data: &mu
         say!("vault: items: usage with A#{} kists sized in {} ms", doms.len() - 2, (now() - t) * 1000 / freq());
         a
     } else {
-        server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips)
+        let t = now();
+        // A hold body's requests, for the write report (`WMeter`): a make or keep again starts it, each write adds its bytes, the finish says it.
+        let meter = unsafe { &mut *(&raw mut WMETER) };
+        if op == ferros_items::wire::OP_MAKE || op == ferros_items::wire::OP_KEEP_AGAIN {
+            meter.start(t, store.read_ticks());
+        }
+        let a = server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips);
+        match op {
+            ferros_items::wire::OP_MAKE | ferros_items::wire::OP_KEEP_AGAIN => meter.note(t, 0),
+            ferros_items::wire::OP_WRITE => meter.note(t, ferros_items::wire::parse_call(call).map_or(0, |c| c.4.len() as u64)),
+            ferros_items::wire::OP_FINISH => meter.end(t, store.read_ticks()),
+            _ => {}
+        }
+        a
     };
     if let Some(why) = &a.why {
         if !matches!(why, ferros_items::Error::NotFound) {
