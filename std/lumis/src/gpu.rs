@@ -21,6 +21,9 @@ const ROWS_AT: usize = 1 << 18;
 /// The coverage from 2^20, then the splash, the ink and the camera screen's frame, each on a MiB.
 const COVER_AT: usize = 1 << 20;
 
+/// Lumis holds the GPU's grants but no GPU service answers (`Gpu::open`): RAW video does not start (the recorder's GPU runs would wait for the service forever), and says why.
+pub static NO_SERVICE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn mib(n: usize) -> usize {
     n.div_ceil(1 << 20) << 20
 }
@@ -69,6 +72,12 @@ impl Gpu {
     pub fn open(surface: u64, w: usize, h: usize, lut: &[u32; 256]) -> Result<Gpu, String> {
         let (service, block) = ferros_clip::ferros::gpu_grants().ok_or("no GPU grants")?;
         let (service, block) = (crate::sys::cap(service), crate::sys::cap(block));
+        // The GPU service running at all, asked live first: the queue's calls (and the recorder's runs) wait for a server, and after a jump from Android ferros starts none, so Lumis sat at its open (the owner, 2026-11-22). A live call fails at once only when the service's process is gone (a busy one is waited for as ever); op 5, the service told this process's memory now, does nothing else before a queue.
+        let mut r = [1u8; 2];
+        if ferros_sys::call_live(service, &[5, 1], &mut r) == ferros_sys::ERR {
+            NO_SERVICE.store(true, core::sync::atomic::Ordering::Relaxed);
+            return Err("no GPU service running (ferros starts none after a jump from Android): the menu and the camera screen on the CPU, and no RAW video (its coder is the GPU's)".into());
+        }
         let bg_at = COVER_AT + mib(w * h);
         let ink_at = bg_at + mib(w * h * 3);
         let frame_at = ink_at + mib(w * h * 3);

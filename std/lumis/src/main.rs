@@ -1478,6 +1478,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
             }
             match (asked, clip.is_some(), starting.is_some(), paced, &got) {
+                // RECORD with Lumis holding the GPU's grants but no GPU service running (`gpu::NO_SERVICE`, after a jump from Android): the recorder's runs would wait for it forever, so no clip, and the note under RECORD says why.
+                (true, false, false, Some(_), _) if gpu::NO_SERVICE.load(Ordering::Relaxed) => {
+                    lumis_core::platform::set_video_note(Some("RAW video needs the GPU, which is not running".into()));
+                    integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                }
                 (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) if head.count as u64 >= paced_from => {
                     let h = &integrator.header;
                     let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX], h[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX]);
