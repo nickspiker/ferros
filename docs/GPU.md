@@ -224,7 +224,7 @@ The GPU driver maps it coherent (MEMATTR index 6, shareable both ways) at GPU VA
 ## The resident service, and the attest mark's path (2026-11-05)
 
 **The service.**
-- `payloads/gpu` starts at every boot from init. It doesn't start after a jump, because Android ran the GPU and whether the hv cuts it off at the jump is the owner's open decision.
+- `payloads/gpu` is started by the kernel at every boot, before init, once the GPU has come to its reset ("After a jump: the crowbar", below); after a jump too since 2026-11-22.
 - It boots the GPU once and serves `gpu`. A run names:
   - code at an offset in the layer arena (copied into the service's 32-page executable region);
   - a grid and a preload word;
@@ -341,3 +341,24 @@ Built on branch gpu-kists-lumis, host-tested, not yet run on a device:
 - **Each loaded kernel's thread storage descriptor** at the descriptor page's G#800 + 64 a kernel: the workgroup storage's base (the client's own memory, so a reach past it faults in its own space), its size scale (log 2 of the size, at least 128 bytes, plus 1) and its instances a core (log 2), as Mesa's pan_emit_tls; G#1F (none) for a kernel without. The room the service needs: the size × instances × 25 (the last core id of SHADER_PRESENT G#0111_0055, plus 1).
 - **The job:** the workgroup register (r33) the kernel's size less one, merging only for a warp with no storage (ferros_gpuq `Dispatch`); a task along x of THREAD_MAX_THREADS over the workgroup's invocations.
 - **In the shader:** a workgroup storage address is the WLS pointer (FAU special page 1, index 3) plus an offset, a BARRIER.slot7.wait with the instruction before it waiting on every slot (valhall `barrier`); run on the Pro: a 2^6 to 2^8 workgroup's scan over 672 pixels, every pixel the CPU's.
+
+## After a jump: the crowbar (2026-11-22)
+
+The owner, 2026-11-21: "if we can bring up GPU and all hardware after a jump, that would be excellent". Until then the kernel started no GPU service after a jump (and denied G3D's S2MPU when pd_g3d was on), and a client's plain call on `gpu` waited for good: Lumis 0.2.42 sat at its queue's open until the owner stopped it.
+
+**No service, no wait.** A call on `gpu` with no live process holding its receive right and no restart pending is answered ERR at once, plain or live (process.rs `gpu_absent`); calls queued there get ERR when the service ends and is not started again, and when the service loop's restart of it fails (`gpu_restart_tried`). ferros_sys gpu::queue makes every call after `open` live, and ferros_clip's GPU run is live. Measured on the Pro (b1109): with the service killed, gputest's call came back ERR in 4 us.
+
+**The GPU from its reset at every boot** (pd.rs `gpu_fresh`, run in the service loop's setup before init). After a jump G3D's S2MPU is denied first (`deny_gpu`, at once); then on every boot: the S2MPU denied all, a hard reset (GPU_COMMAND G#201, kbase's GPU_COMMAND_HARD_RESET; RESET_COMPLETED waited for, bounded at 2^16 us), the S2MPU fenced to gpu-mem (`fence_gpu`), and only then the service, which loads the MCU's firmware afresh as on a cold boot (`GPU_FRESH`). Nothing of what ran on the GPU is adopted: Android's after a jump, the last session's after a reload or ferros's own restart. Each step is a flash-log line (`gpu fresh: ...`), with the domains' status and the G3D CMU's PLL words.
+
+What a session leaves, measured on the Pro:
+- **b1108, ferros's own restart (answer 7) from a session that ran the service:** g3d and embedded_g3d on, G3D 150 MHz and G3DL2 160 MHz (the floor), MCU_CONTROL 2 (auto) and MCU_STATUS 1 (the last service's firmware still running), AS0 TRANSTAB G#B404_8000 (the last service's table in gpu-mem), AS1-7 unmapped, L2 and tiler ready, shader cores off, GPU_STATUS 0. The hard reset took it to MCU_STATUS 0, AS0 0, L2 not ready; the service then started and gputest matched the CPU on all 4096 pixels (b1109, b1118).
+- **b879, a jump from Android:** g3d off (HV.md "The high bank after a jump"). Not measured since: the next real jump.
+
+**A domain found down stays down** (no service, calls ERR) until its power-on is proven. The power-on as built (`g3d_on`, `diag pd on g3d`, `diag pd on g3d-top` for pd_g3d alone, `diag pd fresh gpu` for the whole crowbar by hand) follows Linux's order (pmucal_local.c: CONFIGURATION on and STATUS, the secure restore of need_smc G#1EE1_0204, then `g3d_save`'s words; then `embedded_g3d_on`). Measured by hand on the Pro after `diag pd off g3d`, each try ending in an APC watchdog reset until the trail named its step:
+- The G3D CMU reads 0 and answers with an error between pd_g3d's power-on and its secure restore (b1111: the trail's read there poisoned the restore's SMC). It is readable after the restore.
+- After the restore both PLLs read their reset values: CON1 2, CON3 (PMS and enable) 0, L2's CON2 G#FF, CON6 G#80_0000, CON7 0; ABL leaves CON1 G#1000_0001, CON2 G#8000_000F, CON6 G#A0C0_0000, CON7 G#F000, CON3 G#807A_0502 (G3D) and G#8082_0502 (L2). Linux's saved words hold only PLL_G3D's CON2, CON4 and CON5.
+- b1113: Linux's sequence as written (CON1 G#3800_0003, CON0's mux) with CON3 at 0: the core clock muxes stalled the bus.
+- b1115: CON3 written with CON1 still at its reset value: the PLLs never locked (no stall).
+- b1116: CON1 G#3800_0003, then CON3: both locked at once; PLL_G3D's mux switched (CON0 G#1_0010, bit 16 set), and the next CMU access (PLL_G3D_L2's mux) stalled the bus.
+- Built since, not yet run: every PLL word set to ABL's before CON3, and each mux's busy bit (16) waited for (bounded) before the next CMU access, a mux that stays busy ending the power-on there with the GPU left off instead of the watchdog. Open: what Linux has that this lacks (likely ACPM's part in the G3D PLLs at pd_g3d's power-on, or the mux needing the embedded domain on first).
+

@@ -153,7 +153,7 @@ Which way a patch goes can change from frame to frame; where it changes over the
 
 - **At rest**: after N = 2^1 panel frames with no show (knob 6), one GPU job writes every owed phase, then the 10 Hz flips resume (`flip_due` waits for the next phase to be current, as now). The GPU's clock goes down after two quiet frames.
 - **Screen off**: no compose job; shows taken and kept as a window behind keeps them (place and format), nothing published; the display's slot and queue kept.
-- **No GPU service** (after a jump the service does not start; before it starts at boot; while it restarts after its own end, `E_SERVICE`): NEON composes everything, the path that exists today (whole frames at 16 ms and up of four A715s). The compositor is the screen itself, so this is its only path then, not a fallback in the wallpaper's sense (section 5, question 6).
+- **No GPU service** (the GPU did not come to its reset at boot, as after a jump that found it powered down; before it starts at boot; while it restarts after its own end, `E_SERVICE`): NEON composes everything, the path that exists today (whole frames at 16 ms and up of four A715s). The compositor is the screen itself, so this is its only path then, not a fallback in the wallpaper's sense (section 5, question 6).
 - **The hit map's development view** (the fourth phase painted from the map, `hit::on_layer`): stays NEON's; the GPU's jobs leave that phase out while the view is on, as `publish_app_rows` does.
 - **The screen capture** (op 30, op 84): stays NEON's, composed on the CPU into the display's own buffer and unbaked, as now.
 

@@ -84,8 +84,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Fact 31 = 7, ferros's own restart (power + volume up, the kernel's restart.rs), meets the state the last session left the same way.
     // The radios start since 2026-11-15: WiFi and the modem take Android's chip and link down first (each driver's `off` at the head of its bring-up, never the controller's ELBI or DBI before), Bluetooth and NFC power-cycle their chips at every start (the kernel's `bt` and `nfc` switches; the NFC bus is brought up fresh after a jump). Measured on the Pro's jump b878: WiFi joined and leased, Bluetooth and NFC up, Android's live CP taken down.
     let jumped = matches!(ferros_sys::facts().0[31], 6 | 7);
-    // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
-    let after_jump = |n: &[u8]| jumped && matches!(n, b"sensors" | b"gpu");
+    // Not the GPU: the kernel starts its service itself, after a jump too since 2026-11-22 (owner, 2026-11-21: "if we can bring up GPU and all hardware after a jump"), once it has crowbarred the GPU to its reset (the kernel's pd.rs `gpu_fresh`).
+    let after_jump = |n: &[u8]| jumped && n == b"sensors";
     // Whether the map was started ahead of fgtw (the device bound already at the attest).
     let mut map_first = false;
     // The identity's doorbell (SYS_UNLOCK op 11): the kernel writes the identity's state into `IDENTITY` now and at every change, and `wait_person` sleeps on it.

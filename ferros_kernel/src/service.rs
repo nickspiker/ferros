@@ -45,6 +45,8 @@ pub struct Boot {
 
 /// What `reboot_to_bootloader` returned when a fastboot request fell through (0 = never tried); reported in r[23].
 static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The GPU came to its reset and was fenced to gpu-mem at this boot (pd.rs `gpu_fresh`, after a jump the crowbar), so the GPU service may start.
+static GPU_FRESH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
@@ -1788,8 +1790,8 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             }
         }
     }
-    // The GPU service, from its capsule in the vault, with its own grants (`gpu_grants`): before init, so it serves before the attest screen asks it. Not after a jump from Android: Android ran the GPU, and the attest screen draws on the CPU without it (init skipped it there too).
-    if !platform::jumped() {
+    // The GPU service, from its capsule in the vault, with its own grants (`gpu_grants`): before init, so it serves before the attest screen asks it. Only once the GPU came to its reset and was fenced (`GPU_FRESH`, every boot, after a jump too); otherwise none, and the attest screen draws on the CPU without it.
+    if GPU_FRESH.load(core::sync::atomic::Ordering::Relaxed) {
         match vault(|| store.as_mut().and_then(|s| s.get_by_key("gpu").ok().flatten())) {
             Some(gc) => match crate::process::spawn_capsule(b"gpu", &gc, b"", &gpu_grants(), &sealed) {
                 Ok(o) => {
@@ -3199,9 +3201,6 @@ pub fn run(mut b: Boot) -> ! {
         // BLK_MISC's bus masters (PDMA1, SPDMA1, DIT), none of them ferros's: denied all, as the hv denies them at the jump.
         let r = crate::s2mpu::deny_all(crate::s2mpu::MISC_S2MPU);
         crate::flashlog::line(&alloc::format!("misc: BLK_MISC's S2MPU denied all: G#{r:X} (1 = done)"));
-        // The GPU held to its own memory (gpu-mem) before any process can program it: its page tables are a process's.
-        let r = crate::s2mpu::fence_gpu();
-        crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU fenced to gpu-mem: G#{r:X} (1 = fenced)"));
     } else {
         // After a jump (HV.md "The high bank after a jump", 2026-11-15): every bus master Android left that the hv's deny-alls and the domains cut leave able to write, stopped before init starts anything.
         // Trace's sinks first (coresight.rs: the ETR would write a buffer Linux allocated, now ferros's memory), the TMCs only. Measured on the jumped Pro (b879, 2026-11-15): every TMC off and the ETR never given a buffer. The kernel of b880 also read every core's trace unit here and stalled the bus (APC watchdog), so those are left alone.
@@ -3212,12 +3211,23 @@ pub fn run(mut b: Boot) -> ! {
         for l in s.lines() {
             crate::flashlog::line(&alloc::format!("trace after the jump: {l}"));
         }
-        // Android's GPU, left powered with Android's page tables: cut off from memory (ferros runs no GPU service after a jump).
+        // Android's GPU (or the last ferros session's, after a restart), perhaps left powered with its page tables and its MCU running: cut off from memory at once.
         let r = crate::s2mpu::deny_gpu();
         crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU denied all after the jump: G#{r:X} (1 = done, E4 = pd_g3d off)"));
         // The AoC, still in Android's session: held to its own carve-out.
         let r = crate::s2mpu::fence_aoc();
         crate::flashlog::line(&alloc::format!("aoc: its S2MPU fenced to its carve-out after the jump: G#{r:X} (1 = fenced)"));
+    }
+    // The GPU at every boot from its reset, then held to its own memory (gpu-mem) before any process can program it (its page tables are a process's): hard reset and fenced (pd.rs `gpu_fresh`; a GPU found with a domain down stays down and denied until its power-on is proven, b879 found g3d off after a jump), the GPU service then starting below and loading the MCU's firmware afresh. After a jump this is the crowbar (owner, 2026-11-21: "if we can bring up GPU and all hardware after a jump, that would be excellent"; the jump is a killswitch: nothing of Android's GPU adopted); after a reload or a restart it ends the last session's MCU and page tables; on a cold boot ABL's GPU is at reset already and the reset costs nothing. A GPU that does not come to reset stays denied and no service starts: a call on `gpu` is then answered ERR (process.rs `gpu_absent`).
+    let mut out = alloc::vec::Vec::new();
+    let fresh = crate::pd::gpu_fresh(&mut out, false);
+    for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        crate::flashlog::line(&alloc::format!("gpu fresh: {}", core::str::from_utf8(l).unwrap_or("?")));
+    }
+    if fresh {
+        let r = crate::s2mpu::fence_gpu();
+        crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU fenced to gpu-mem: G#{r:X} (1 = fenced)"));
+        GPU_FRESH.store(r == 1, core::sync::atomic::Ordering::Relaxed);
     }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {

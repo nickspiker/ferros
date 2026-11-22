@@ -186,7 +186,7 @@ pub fn fence_gpu() -> u32 {
     r
 }
 
-/// After a jump from Android: the GPU cut off from all memory while pd_g3d is on (G#E4 when it is off: left alone, and nothing of Android's runs in a domain that is down). ferros starts no GPU service after a jump (service.rs), and `pd::gate_at_boot` leaves g3d powered (it has no way back on), so Android's Mali stays up with Android's page tables and the S2MPU as ABL left it, open: whatever job it held could still write.
+/// After a jump from Android: the GPU cut off from all memory while pd_g3d is on (G#E4 when it is off: left alone, and nothing of Android's runs in a domain that is down), at once, before the crowbar: Android's Mali may still be up with Android's page tables, its MCU running, and the S2MPU as ABL left it, open. The service loop's setup then takes it to its reset (pd.rs `gpu_fresh`: powered on if down, hard reset) and fences it to gpu-mem (`fence_gpu`) before the GPU service starts, as at every boot.
 pub fn deny_gpu() -> u32 {
     if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         return 0xE4;

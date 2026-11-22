@@ -225,8 +225,212 @@ fn tz_restore(addr: usize) -> i64 {
     r
 }
 
-/// A simple domain back on (not the GPU): CONFIGURATION bit 0 through EL3, a millisecond, the secure world's restore.
+/// STATUS waited for until it reads on, at most `STATUS_WAIT_US` (`wait_off`'s pair): whether it did, and in how many microseconds.
+fn wait_on(pmu_off: u64) -> (bool, u64) {
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    loop {
+        let dt = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / f;
+        if status(pmu_off) & 1 == 1 {
+            return (true, dt);
+        }
+        if dt > STATUS_WAIT_US {
+            return (false, dt);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// A line on the flash log before each step of the GPU's power-on and reset (`g3d_on`, `gpu_fresh`), on every boot: they run once a jump or by hand, and a step that stalls the bus is then the last one named (the first power-on by hand, 2026-11-22 b1109, ended in the APC watchdog with nothing said), with the G3D CMU's PLL words and the domains' status as they stood.
+fn trail(what: &str) {
+    const CMU: usize = 0x1EE0_0000;
+    // Each access first said, then made: an SError left waiting by the last step is taken and named here, before any firmware call can bounce on it (the EL3 poison).
+    let waiting = crate::platform::take_serror();
+    let cmu = if status(0x1A80) & 1 == 1 && CMU_OPEN.load(core::sync::atomic::Ordering::Relaxed) {
+        let v = [rd(CMU + 0x100), rd(CMU + 0x104), rd(CMU + 0x10C), rd(CMU + 0x180), rd(CMU + 0x184), rd(CMU + 0x18C)];
+        let e = crate::platform::take_serror();
+        alloc::format!("PLL_G3D CON0 G#{:X} CON1 G#{:X} CON3 G#{:X}, L2 CON0 G#{:X} CON1 G#{:X} CON3 G#{:X}{}", v[0], v[1], v[2], v[3], v[4], v[5], if e { ", an error answered" } else { "" })
+    } else {
+        alloc::string::String::from("the CMU not read")
+    };
+    crate::flashlog::line(&alloc::format!("gpu fresh: {what} (g3d G#{:X} embedded G#{:X}; {cmu}{})", status(0x1A80), status(0x1C80), if waiting { "; an SError was waiting from the step before" } else { "" }));
+}
+
+/// Whether the G3D CMU may be read by `trail`: not between the domain's power-on and its secure restore (b1111, 2026-11-22: read there, every word 0 and the error left waiting, and the secure restore's SMC never returned).
+static CMU_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// The G3D CMU's words Linux saves before pd_g3d goes down and writes back after it comes up (flexpmu_cal_local_zuma.h `g3d_save`: the two PLLs' lock times, PLL_G3D's CON2, CON4 and CON5, the shortstop, the bus's DRCG and MEMCLK), at the values ABL leaves and a cold ferros runs the GPU with: read on the Pro with g3d on at the 150 MHz floor (b1108, 2026-11-22). (address, value).
+const G3D_RESTORE: [(usize, u32); 10] = [
+    (0x1EE0_0000, 0x2EE),
+    (0x1EE0_0008, 0x2EE),
+    (0x1EE0_0080, 0xFF),
+    (0x1EE0_0084, 0xFF),
+    (0x1EE0_0108, 0x8000_000F),
+    (0x1EE0_0110, 0),
+    (0x1EE0_0114, 0),
+    (0x1EE0_0820, 0x4111),
+    (0x1EE2_0104, 0),
+    (0x1EE2_0108, 0),
+];
+
+/// pd_g3d and its embedded part on, as Linux brings them up (pmucal_local.c `pmucal_local_enable`: the `on` sequence, the secure restore, the saved words; then flexpmu_cal_local_zuma.h `embedded_g3d_on`): CONFIGURATION through EL3 and STATUS waited for, the secure restore of need_smc G#1EE1_0204, `G3D_RESTORE`; then both GPU PLLs' CON1 to G#3800_0003 and their muxes to the PLL, the four core clock muxes to their inputs, EMBEDDED_G3D_OUT bit 1 set thru the PMU's atomic set alias (+G#C000), 280 us, the embedded part's CONFIGURATION and STATUS.
+/// Each part only when it reads off (with `top_only` pd_g3d alone); whether both read on at the end. A step whose STATUS never comes, or a CMU access answered with an error, ends it there, said in `out`.
+pub fn g3d_on(out: &mut alloc::vec::Vec<u8>, top_only: bool) -> bool {
+    const CMU: usize = 0x1EE0_0000;
+    const G3D: u64 = 0x1A80;
+    const EMB: u64 = 0x1C80;
+    serror_before("g3d", "its configuration read", out);
+    if conf(G3D) & 1 == 0 || status(G3D) & 1 == 0 {
+        let before = conf(G3D);
+        CMU_OPEN.store(false, core::sync::atomic::Ordering::Relaxed);
+        trail("configuration on thru EL3");
+        let w = priv_reg(PMU + G3D, true, before | 1);
+        let (done, us) = wait_on(G3D);
+        out.extend_from_slice(alloc::format!("g3d: configuration G#{before:X} -> write {w:X} -> G#{:X}, status G#{:X} after A#{us} us\n", conf(G3D), status(G3D)).as_bytes());
+        if !done {
+            out.extend_from_slice(b"g3d: its status never read on: left as it is\n");
+            return false;
+        }
+        trail("the secure restore");
+        serror_before("g3d", "the secure restore", out);
+        let r = tz_restore(CMU + 0x1_0204);
+        CMU_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
+        trail("the CMU's saved words");
+        for &(a, v) in G3D_RESTORE.iter() {
+            wr(a, v);
+            if crate::platform::take_serror() {
+                trail(&alloc::format!("an error answered the saved word at G#{a:X}"));
+                out.extend_from_slice(alloc::format!("g3d: an error answered its CMU's saved word at G#{a:X}: left there\n").as_bytes());
+                return false;
+            }
+        }
+        out.extend_from_slice(alloc::format!("g3d: secure restore {r}, the CMU's A#{} saved words written\n", G3D_RESTORE.len()).as_bytes());
+    }
+    if !top_only && (conf(EMB) & 1 == 0 || status(EMB) & 1 == 0) {
+        let before = conf(EMB);
+        // Both PLLs' words as ABL leaves them, before anything is muxed to them: after pd_g3d's power-on they read their reset values (CON1 2, CON3 0, L2's CON2 G#FF, CON6 G#80_0000, CON7 0; b1115-b1118, 2026-11-22), and Linux's saved words hold only PLL_G3D's CON2, CON4 and CON5. With CON3 0 the core clock muxes switched to a stopped PLL and the bus stalled (b1113, the APC watchdog); with CON1 at 2 a PLL given its PMS never locked (b1115); with Linux's CON1 (G#3800_0003) and L2's other words at reset, muxing PLL_G3D_L2 stalled (b1116). So: each PLL's words but CON0 and CON3 (`G3D_PLL_WORDS`), then CON3 (the PMS and enable: G3D M 122 P 5 S 2, L2 M 130 P 5 S 2, both about 150 MHz, the floor; the GPU service's clock switch then asks ACPM for the rate it wants), their lock waited for (bit 29, STABLE), then the muxes.
+        trail("the PLLs' words as ABL leaves them (CON1, CON2, CON4-CON7)");
+        for &(o, v) in G3D_PLL_WORDS.iter() {
+            wr(CMU + o, v);
+            wr(CMU + 0x80 + o, v);
+        }
+        trail("the PLLs' PMS and enable (CON3)");
+        wr(CMU + 0x010C, G3D_PLL_CON3);
+        wr(CMU + 0x018C, G3D_L2_PLL_CON3);
+        let (f, t0) = (crate::platform::cntfrq(), crate::platform::cntpct());
+        let mut us = 0;
+        while rd(CMU + 0x010C) & rd(CMU + 0x018C) & 1 << 29 == 0 && us <= PLL_LOCK_US {
+            us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / f;
+            core::hint::spin_loop();
+        }
+        if rd(CMU + 0x010C) & rd(CMU + 0x018C) & 1 << 29 == 0 {
+            trail(&alloc::format!("the PLLs never locked in A#{us} us"));
+            out.extend_from_slice(b"embedded_g3d: the GPU's PLLs never locked: left off\n");
+            return false;
+        }
+        trail(&alloc::format!("the PLLs locked after A#{us} us; PLL_G3D muxed"));
+        // Each mux switched alone, its busy bit (16) waited for before the next access to the CMU: on b1116 PLL_G3D's mux read G#1_0010 (busy) after its switch and the next CMU write stalled the bus. A mux that stays busy ends the power-on there, the GPU left off with no service, instead of the watchdog.
+        for (o, what) in [(0x0100, "PLL_G3D_L2 muxed"), (0x0180, "the core clock muxes"), (0x0630, "STACKS"), (0x0640, "TOP"), (0x0650, "TRACE"), (0x0660, "the muxes switched")] {
+            wr(CMU + o, rd(CMU + o) | 1 << 4);
+            let (f, t0) = (crate::platform::cntfrq(), crate::platform::cntpct());
+            let mut us = 0;
+            while rd(CMU + o) & 1 << 16 != 0 && us <= PLL_LOCK_US {
+                us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / f;
+                core::hint::spin_loop();
+            }
+            if rd(CMU + o) & 1 << 16 != 0 {
+                trail(&alloc::format!("the mux at G#{:X} still busy after A#{us} us (G#{:X}): stopped here", CMU + o, rd(CMU + o)));
+                out.extend_from_slice(alloc::format!("embedded_g3d: the mux at G#{:X} stayed busy: left off\n", CMU + o).as_bytes());
+                return false;
+            }
+            trail(&alloc::format!("not busy after A#{us} us; next {what}"));
+        }
+        if crate::platform::take_serror() {
+            out.extend_from_slice(b"embedded_g3d: an error answered its PLLs or muxes: left off\n");
+            return false;
+        }
+        trail("EMBEDDED_G3D_OUT bit 1, the embedded part's configuration");
+        let o = priv_reg(PMU + (0x1CA0 | 0xC000), true, 2);
+        let t0 = crate::platform::cntpct();
+        while crate::platform::cntpct().wrapping_sub(t0) < crate::platform::cntfrq() * 0x118 / 1_000_000 {
+            core::hint::spin_loop();
+        }
+        trail("EMBEDDED_G3D_OUT set; the embedded configuration on");
+        let w = priv_reg(PMU + EMB, true, before | 1);
+        let (done, us) = wait_on(EMB);
+        trail("the embedded part's status waited for");
+        out.extend_from_slice(alloc::format!("embedded_g3d: out set {o:X}, configuration G#{before:X} -> write {w:X} -> G#{:X}, status G#{:X} after A#{us} us\n", conf(EMB), status(EMB)).as_bytes());
+        if !done {
+            return false;
+        }
+    }
+    true
+}
+
+/// The GPU PLLs' CON3 at the floor ABL leaves them (read on the Pro, b1108 and b1111, 2026-11-22: G#807A_0502 and G#A082_0502 with the lock bit, 29, set): enable (bit 31), M (bits 16-25), P (bits 8-13), S (bits 0-2).
+const G3D_PLL_CON3: u32 = 0x807A_0502;
+const G3D_L2_PLL_CON3: u32 = 0x8082_0502;
+/// Each GPU PLL's words but CON0 (its mux) and CON3 (its PMS and enable), at PLL_G3D's offsets (PLL_G3D_L2's are G#80 on), as ABL leaves them, the same for both PLLs (read on the Pro, b1108, 2026-11-22): CON1 G#1000_0001, CON2 G#8000_000F, CON4 0, CON5 0, CON6 G#A0C0_0000, CON7 G#F000.
+const G3D_PLL_WORDS: [(usize, u32); 6] = [(0x104, 0x1000_0001), (0x108, 0x8000_000F), (0x110, 0), (0x114, 0), (0x118, 0xA0C0_0000), (0x11C, 0xF000)];
+/// The PLLs' lock bound: their lock time is G#2EE cycles of the 24.576 MHz oscillator, about 30 us.
+const PLL_LOCK_US: u64 = 1 << 10;
+
+/// The GPU's registers (GPU.md): GPU_IRQ_RAWSTAT, GPU_IRQ_CLEAR, GPU_COMMAND, MCU_CONTROL, MCU_STATUS, GPU_STATUS.
+const GPU: usize = 0x1F00_0000;
+
+/// The GPU taken from whatever state it is in to its reset, the cold boot's starting point, with nothing of what ran on it adopted (the jump is a killswitch: feedback, "never adopt what Android started"; owner, 2026-11-21: "if we can bring up GPU and all hardware after a jump, that would be excellent"): powered on if a domain is down (`g3d_on`), its S2MPU denied all (the domain's power-on leaves it in an unknown state, and until the reset the MCU and every address space may still hold the last system's page tables), then a hard reset (GPU_COMMAND G#201, kbase's GPU_COMMAND_HARD_RESET: the MCU, the shader cores, the L2 and every address space back to reset; RESET_COMPLETED waited for, bounded). The GPU service then loads the MCU's firmware afresh as on a cold boot.
+/// What it found and did goes into `out`, a line a step. Whether the GPU is at reset and powered: then the caller fences it to gpu-mem (s2mpu.rs `fence_gpu`) and the GPU service may start; else it stays denied and no service starts.
+/// `power_on`: whether a domain found down is powered on (`g3d_on`); the boot passes false until that sequence is proven on the device (2026-11-22: three tries by hand stalled the bus at the PLLs and muxes, each an APC watchdog reset; `diag pd fresh gpu` passes true), and a GPU found down then stays down and denied, with no service.
+pub fn gpu_fresh(out: &mut alloc::vec::Vec<u8>, power_on: bool) -> bool {
+    let found = alloc::format!("found: g3d configuration G#{:X} status G#{:X}, embedded G#{:X} status G#{:X}", conf(0x1A80), status(0x1A80), conf(0x1C80), status(0x1C80));
+    out.extend_from_slice(found.as_bytes());
+    let on_already = status(0x1A80) & 1 == 1 && status(0x1C80) & 1 == 1;
+    if on_already {
+        out.extend_from_slice(alloc::format!("; MCU_CONTROL G#{:X} MCU_STATUS G#{:X} GPU_STATUS G#{:X} AS0 TRANSTAB G#{:X}_{:08X} SHADER_READY G#{:X} L2_READY G#{:X}\n", rd(GPU + 0x700), rd(GPU + 0x704), rd(GPU + 0x34), rd(GPU + 0x2404), rd(GPU + 0x2400), rd(GPU + 0x140), rd(GPU + 0x160)).as_bytes());
+    } else {
+        out.push(b'\n');
+        if !power_on {
+            out.extend_from_slice(b"a domain down: left down and denied, no GPU service (its power-on is not yet proven on the device)\n");
+            return false;
+        }
+        if !g3d_on(out, false) {
+            return false;
+        }
+        trail("powered on; reading the GPU's MCU_STATUS");
+        out.extend_from_slice(alloc::format!("powered on: MCU_STATUS G#{:X}\n", rd(GPU + 0x704)).as_bytes());
+    }
+    trail("denying the GPU's S2MPU");
+    let d = crate::s2mpu::deny_all(crate::s2mpu::GPU_S2MPU);
+    trail("the GPU's hard reset");
+    wr(GPU + 0x24, 1 << 8);
+    wr(GPU + 0x30, 0x201);
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    let (mut done, mut us) = (false, 0);
+    while us <= RESET_WAIT_US {
+        us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / f;
+        if rd(GPU + 0x20) & 1 << 8 != 0 {
+            done = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    wr(GPU + 0x24, 1 << 8);
+    let err = crate::platform::take_serror();
+    out.extend_from_slice(alloc::format!("S2MPU denied all G#{d:X}; hard reset {} after A#{us} us{}: MCU_STATUS G#{:X} GPU_STATUS G#{:X} AS0 TRANSTAB G#{:X} SHADER_READY G#{:X} L2_READY G#{:X}\n", if done { "completed" } else { "NOT completed" }, if err { " (an error answered)" } else { "" }, rd(GPU + 0x704), rd(GPU + 0x34), rd(GPU + 0x2400), rd(GPU + 0x140), rd(GPU + 0x160)).as_bytes());
+    done && !err
+}
+
+/// The hard reset's bound: kbase waits up to 500 ms (`RESET_TIMEOUT`); a soft reset measured 10 us on a cold boot (GPU.md "Online").
+const RESET_WAIT_US: u64 = 1 << 16;
+
+/// A simple domain back on (the GPU: `g3d_on`): CONFIGURATION bit 0 through EL3, a millisecond, the secure world's restore.
 pub fn on(name: &str, out: &mut alloc::vec::Vec<u8>) {
+    // `g3d-top`: pd_g3d alone, its embedded part left off (a measure: what the PLLs read then, and what ACPM's DVFS makes of them).
+    if name == "g3d" || name == "g3d-top" {
+        g3d_on(out, name == "g3d-top");
+        return;
+    }
     let Some(&(_, cmu, pmu_off)) = DOMAINS.iter().find(|d| d.0 == name && d.0 != "g3d") else {
         out.extend_from_slice(alloc::format!("{name}: no on sequence here\n").as_bytes());
         return;
@@ -303,6 +507,7 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
 pub fn diag(args: &str, out: &mut alloc::vec::Vec<u8>) {
     let mut w = args.split_whitespace();
     match (w.next(), w.next()) {
+        (Some("on"), Some("g3d-top")) => on("g3d-top", out),
         (Some("on"), Some(which)) => {
             for &(name, _, _) in DOMAINS.iter().filter(|d| which == "all" || d.0 == which) {
                 on(name, out);
@@ -314,6 +519,16 @@ pub fn diag(args: &str, out: &mut alloc::vec::Vec<u8>) {
                 if off(name, cmu, pmu_off, out) == Off::Pending {
                     break;
                 }
+            }
+        }
+        // `diag pd fresh gpu`: the jump's GPU crowbar by hand (`gpu_fresh`, then the fence to gpu-mem), refused while a GPU service runs; `diag restart gpu` after it starts one as the jump does.
+        (Some("fresh"), Some("gpu")) => {
+            if crate::process::running(b"gpu") {
+                out.extend_from_slice(b"gpu: the GPU service is running: refused (diag kill gpu first)\n");
+                return;
+            }
+            if gpu_fresh(out, true) {
+                out.extend_from_slice(alloc::format!("gpu: fenced to gpu-mem G#{:X} (1 = fenced)\n", crate::s2mpu::fence_gpu()).as_bytes());
             }
         }
         (Some("poison"), Some(which)) => {

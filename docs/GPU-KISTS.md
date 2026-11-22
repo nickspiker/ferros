@@ -48,7 +48,7 @@ The ISA source is Mesa's open Valhall/Bifrost compiler (src/panfrost/compiler, M
 ### 0.1 What exists, and what it lacks
 
 Built:
-- `payloads/gpu`, resident from boot (not after a jump): one group in AS1; op 1 runs code at an arena offset over a 2D grid with up to 16 uniforms.
+- `payloads/gpu`, resident from boot (after a jump too since 2026-11-22, GPU.md "After a jump: the crowbar"): one group in AS1; op 1 runs code at an arena offset over a 2D grid with up to 16 uniforms.
 - `valhall` (2.3k lines): a typed builder from ISA.xml, and `ssa`, which records Rust written over a lane type and compiles it (selection, linear-scan registers, the flow rules, one unnested loop with a real break).
 - tapuwae's mark recorded thru it: ahau's bonded mark at 900 px in a 5.9 ms job after a 1.2 ms compile.
 
@@ -594,7 +594,7 @@ The owner's go ("add the memory and barriers to the GPU compiler and do all the 
 1. **One source language?** System kernels stay Rust recorded (one source for NEON and GPU), or move to WGSL so every kernel takes the kist path.
 2. **The wallpaper's promise:** wallpaper/src/lib.rs promises the same pixels bit for bit everywhere; on the GPU, "looks the same" or still bit for bit (which costs the fast forms)?
 3. **Keep `wallpaper.made`?** If the GPU makes it in well under a second, store it (24 MB, a 2.9 s read) or make it at each boot?
-4. **No GPU service after a jump:** the wallpaper and the mark then have no path; black until the GPU, or the jump brings the service up?
+4. **No GPU service after a jump:** the wallpaper and the mark then have no path; black until the GPU, or the jump brings the service up? Answered 2026-11-21 (the owner: bring the GPU up after a jump); built 2026-11-22 for a GPU found powered (GPU.md "After a jump: the crowbar").
 5. **The `gpu` right:** a right at all (the MMU separates kists; power, heat and timing side channels remain), default off? Closed: no right (2026-11-11, again 2026-11-12).
 6. **Bounded loops** required, or any loop with the progress timer alone?
 7. **The clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and idle gating.
