@@ -1448,7 +1448,16 @@ async fn cmd_kist_answer(args: &[String]) {
         }
     }
     for k in &list.kists {
-        println!("{} (capsule {})", k.name, k.capsule.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        // The version as the device shows it (ferros_kist::write_version, decimal here: its significant parts) and, when they differ, the parts its developer signed.
+        let version = match &k.version {
+            Some(v) => {
+                let shown = v.significant().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(".");
+                let signed = v.0.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(".");
+                if shown == signed { format!("version {shown}") } else { format!("version {shown} (signed {signed})") }
+            }
+            None => "no version".to_string(),
+        };
+        println!("{} ({version}, capsule {})", k.name, k.capsule.iter().map(|b| format!("{b:02X}")).collect::<String>());
         for w in &k.wants {
             println!("  {}: {}", ferros_kist::RIGHTS[w.right as usize], match w.answer { _ if !w.asked() => "always", None => "unanswered", Some((true, _)) => "granted", Some((false, _)) => "not granted" });
         }
