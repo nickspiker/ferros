@@ -85,7 +85,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Kist version stages](kist_version_stages.md) - any number of parts, more parts = later stage, each part in chosen base
 - [Ideas: language-independent meanings](ideas_language_independent.md) - 32-byte id per meaning; UI Msgs + kist reasons are ideas
 - [People vs devices split](people_not_devices_split.md) - a contact is a person with a fleet of device keys
-- [Device add rules](fleet_add_needs_open.md) - Fleet page open; NFC adds at once, touch selects then Add, words add at once
+- [Device add rules](fleet_add_needs_open.md) - confirm first, then notify; NFC with Fleet page open, else BLE Add; words only behind "not in range"
 - [Time zones decided](time_zones_decided.md) - arabic = legal DST wall time; dozenal/hex = standard offset, never DST
 - [Windows](windows_design_pending.md) - full-screen surface per app, frontmost first, inside a circle; WINDOWS.md
 - [Display: global mask, then layers](display_global_mask_then_layers.md) - one per-row shape plan per size, then span layers

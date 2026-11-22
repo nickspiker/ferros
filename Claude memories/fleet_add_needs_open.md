@@ -1,6 +1,6 @@
 ---
 name: fleet-add-needs-open
-description: "Device add rules (owner 2026-11-10): Fleet page open on the old device; NFC proximity adds at once; a touch on a nearby row only selects (green) and Add binds+grows; typed words add at once; passive listening only if proven spam-proof"
+description: "Device add rules (owner 2026-11-10, -22): confirm on the new device before any notification; then NFC (Fleet page open, screen on), else BLE touch-select + Add; words only behind \"not in range\", never shown by default"
 metadata:
   node_type: memory
   type: project
@@ -20,3 +20,8 @@ Owner, 2026-11-10, after a Bluetooth pick 50 ft away stayed bound when Back was 
 - Typed words that match fully bind and grow at once.
 
 **How to apply:** don't add passive listening by default. Use the word "touch" (screen) vs "NFC" (proximity), never "tap". The owner hasn't decided yet on a fleet-key check before the add flow opens (a keyless member could bind and then fail to grow). Related: [[feedback-fgtw-devices-first]], [[feedback-no-polling]].
+
+**Added 2026-11-22 (owner, after a fleet notification reached his devices before he had confirmed on the new one):**
+- No fleet notification reaches the person's devices until the new device's person has pressed the explicit confirmation ("Yes, I really would like to add this device and this is my identity and not a typo"). Nothing is announced on a typed handle alone.
+- After that confirmation, the new device advises: put the two devices together (NFC), the other device's screen on and its Fleet page open, in Photon or ferros. Otherwise the click to add over BLE is the other option.
+- The words are for odd cases only and never shown by default (shoulder surfing): behind a "Not in range? Show words to copy/paste or dictate" choice.
