@@ -48,33 +48,99 @@ pub struct Pacing {
     /// The sensor's frame and the clip's, nanoseconds, as the clock makes them (whole lines).
     pub sensor_ns: u64,
     pub period_ns: u64,
+    /// The readout's line the frame is counted in (the binned main's [`MAIN_LINE`] for [`Pacing::of`]).
+    pub line: Line,
+}
+
+/// A readout's line, for pacing any camera's binned readout (2026-11-21, the promo's four cameras): the line's time as `num` / `den` seconds, and the shortest frame the driver streams whole frames of it at.
+/// The binned main's is exact ([`MAIN_LINE`]: 6320 clocks of 2,007,040,000 Hz); any camera's from its list section ([`Line::of_ps`]: the readout's `line_ps` and `fll_least`, ferros_cam list), the line measured in picoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Line {
+    pub num: u64,
+    pub den: u64,
+    /// The shortest frame in lines: the readout's rows and the least blanking the driver asks (payloads/camera refuses a frame length SET under it).
+    pub fll_least: u64,
+}
+
+/// The binned main's line, exact.
+pub const MAIN_LINE: Line = Line { num: MAIN_LLP, den: MAIN_PIXCLK, fll_least: FLL_LEAST };
+
+impl Line {
+    /// A line of `ps` picoseconds (the list's `line_ps`) whose frames are at least `fll_least` lines (the list's `fll_least`).
+    pub const fn of_ps(ps: u64, fll_least: u64) -> Line {
+        Line { num: ps, den: 1_000_000_000_000, fll_least }
+    }
+
+    /// The fastest whole rate, 1 to 60, a whole frame of this readout runs at (the Pro, from the list: the main 60, the ultrawide 48, the tele 51, the front 33); 0 none.
+    pub fn fps_most(&self) -> u32 {
+        (1..=60).rev().find(|&f| Pacing::of_line(f, *self).is_some()).unwrap_or(0)
+    }
+
+    /// Camera `id`'s readout `mode` (its list section's `mode`, 0 the binned) from the camera driver's LIST reply (a VSF document, docs/CAMERA.md "The endpoint"): its `line_ps` and `fll_least`. None when the list has no such readout or a driver from before 2026-11-21 lists neither.
+    pub fn of_list(list: &[u8], id: u8, mode: u8) -> Option<Line> {
+        let d = vsf::container::Document::open(list).ok()?;
+        for e in d.entries_named("camera") {
+            let Ok(s) = d.section(e) else { continue };
+            if s.uint("id") == Some(id as u64) && s.uint("mode").unwrap_or(0) == mode as u64 {
+                return Some(Line::of_ps(s.uint("line_ps")?, s.uint("fll_least")?));
+            }
+        }
+        None
+    }
+
+    /// Whole lines in `ns`, rounded down (in 128 bits: a picosecond line's 10^12 times a shutter of seconds passes 2^64).
+    pub fn lines_in(&self, ns: u64) -> u64 {
+        (ns as u128 * self.den as u128 / (self.num as u128 * 1_000_000_000)) as u64
+    }
+
+    /// `lines` of this line in nanoseconds, rounded down.
+    pub fn ns_of(&self, lines: u64) -> u64 {
+        (lines as u128 * self.num as u128 * 1_000_000_000 / self.den as u128) as u64
+    }
+
+    /// The nearest whole frame length to one frame at `rate` a second.
+    fn frame_at(&self, rate: u64) -> u64 {
+        let per = self.num as u128 * rate as u128;
+        ((self.den as u128 + (per >> 1)) / per) as u64
+    }
 }
 
 impl Pacing {
     /// The binned main's pacing for a whole rate of 1 to 60 a second (the nearest frame length; the sensor's clock has factors 2, 5 and 7, so a rate with a factor 3 is never exact, and the others only where llp would divide too).
     pub fn of(fps: u32) -> Pacing {
         assert!((1..=60).contains(&fps), "fps {fps} outside 1 to 60");
-        let lines = |rate: u64| (MAIN_PIXCLK + (MAIN_LLP * rate >> 1)) / (MAIN_LLP * rate);
+        Pacing::of_line(fps, MAIN_LINE).expect("the binned main holds every rate 1 to 60")
+    }
+
+    /// Any readout's pacing for a whole rate of 1 to 60 a second, from its line (`Line::of_ps` of its list section's `line_ps` and `fll_least`): the nearest frame length, the sensor running at a multiple below the rate its 16-bit frame holds.
+    /// None: a rate outside 1 to 60, or faster than a whole frame of this readout runs (its nearest frame length under `fll_least`; [`Line::fps_most`] says the fastest).
+    pub fn of_line(fps: u32, line: Line) -> Option<Pacing> {
+        if !(1..=60).contains(&fps) {
+            return None;
+        }
         let mut keep = 1u64;
-        while lines(fps as u64 * keep) > FLL_MOST {
+        while line.frame_at(fps as u64 * keep) > FLL_MOST {
             keep += 1;
         }
-        let fll = lines(fps as u64 * keep);
-        debug_assert!(fll >= FLL_LEAST);
-        let sensor_ns = fll * MAIN_LLP * 1_000_000_000 / MAIN_PIXCLK;
-        Pacing { fps, fll: fll as u16, keep: keep as u32, sensor_ns, period_ns: sensor_ns * keep }
+        let fll = line.frame_at(fps as u64 * keep);
+        // WHY: a frame shorter than the readout's rows and least blanking is one the driver refuses (its SET) or the front end cannot run the next frame's program in (LATE_CONFIG); the rate is refused here, never capped to the fastest.
+        if fll < line.fll_least {
+            return None;
+        }
+        let sensor_ns = line.ns_of(fll);
+        Some(Pacing { fps, fll: fll as u16, keep: keep as u32, sensor_ns, period_ns: sensor_ns * keep, line })
     }
 
     /// The camera driver's open with its view for this pacing (payloads/camera `Spec`): `[1][camera][1 = with the view][kind 1, the binned readout][rows][fll][exposure lines][flags][ring][llp][cols][view flags: bit 0 write-back]`.
     /// `exposure_ns` the opening shutter, at most the frame less the driver's margin (`ccs::Mode::check`: an integration of more refuses the open, "no such mode (Integration(..))"); a shutter longer than the frame is the caller's SET after the first frame, which lengthens the frame (the interval is then the shutter's). [`Pacing::open_needs_set`] says which.
     /// Whether a shutter of `exposure_ns` is longer than the open can carry: then SET it (exposure, what 0) after the first frame.
     pub fn open_needs_set(&self, exposure_ns: u64) -> bool {
-        exposure_ns * MAIN_PIXCLK / (MAIN_LLP * 1_000_000_000) > self.fll as u64 - OPEN_MARGIN
+        self.line.lines_in(exposure_ns) > self.fll as u64 - OPEN_MARGIN
     }
 
     pub fn open_msg(&self, camera: u8, exposure_ns: u64) -> [u8; 17] {
         // WHY the min: the driver refuses an open whose integration does not fit its frame less the margin (`ccs::Mode::check`, coarse + 32 <= fll); the longer shutter goes by SET once the stream runs (`open_needs_set`). PROOF: Lumis's 67.8 ms shutter at 30/s (21342 lines in a 10586-line frame) was refused, 2026-11-19.
-        let lines = (exposure_ns * MAIN_PIXCLK / (MAIN_LLP * 1_000_000_000)).max(1).min(self.fll as u64 - OPEN_MARGIN) as u16;
+        let lines = self.line.lines_in(exposure_ns).max(1).min(self.fll as u64 - OPEN_MARGIN) as u16;
         let mut m = [0u8; 17];
         m[0] = 1;
         m[1] = camera;

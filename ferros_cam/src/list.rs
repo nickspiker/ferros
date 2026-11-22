@@ -103,6 +103,9 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     put("exposure_max", u(t.most_ns()));
     // The mode's own frame period (ns): its frame of lines at its line, the frame rate while the exposure fits it (the binned main 67.3 ms, its 1:1 41.7 ms).
     put("frame_ns", u(r.frame_ns));
+    // The readout's line (ps) at its own line length, and the shortest whole frame the driver streams it at (its rows and `BLANK_LEAST`): what a client paces any rate from (ferros_clip `Line::of_ps`, `Pacing::of_line`; 2026-11-21, RAW video on every camera, whose lines differ: the main 3.149 us, the ultrawide 6.562, the front 10.438, the tele 6.107).
+    put("line_ps", u(t.line_ps_at(t.llp)));
+    put("fll_least", u(r.height as u64 + crate::BLANK_LEAST as u64));
     // The readout at the longest exposure (ns), first row to last, the rolling shutter's skew (owner, 2026-11-17: a camera that ever stretches its line says what its readout costs; the default route never does, so this is the mode's own).
     put("readout", u(t.readout_ps(&t.own(1), r.height as u64) / 1000));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
@@ -163,7 +166,7 @@ mod tests {
             let floats = |name: &str| -> Vec<f32> { s.get_field(name).unwrap().values.iter().map(|v| if let VsfType::f5(x) = v { *x } else { panic!() }).collect() };
             assert_eq!(s.uint("id"), Some(c.id as u64));
             assert_eq!(s.text("name"), Some(c.name));
-            for f in ["facing", "mode", "width", "height", "cfa", "cfa_period", "frame_ns", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
+            for f in ["facing", "mode", "width", "height", "cfa", "cfa_period", "frame_ns", "line_ps", "fll_least", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
             let o = c.optics;

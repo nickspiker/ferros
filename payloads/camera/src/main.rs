@@ -1451,7 +1451,7 @@ const F_LOUD: u8 = 1 << 7;
 /// `fll`'s word for the mode's own frame length.
 const FLL_OWN: u16 = 0xFFFF;
 /// Lines of frame past a mode's rows when `fll` is 0: a 4-row slit ran at 96 lines and stopped at 68 (2026-10-21), so 2^7 past the rows holds the slit with room; a whole frame gets 2^8.
-const BLANK: u16 = 1 << 7;
+const BLANK: u16 = ferros_cam::BLANK_LEAST;
 /// The integration (lines) when `exposure` is 0: short, so the bench measures the readout and not the light.
 const EXPOSURE: u16 = 1 << 4;
 /// A slit ring's buffers: 2^8 by default (a binned 4-row slit's 32 KiB each, 8 MiB), at most 2^12 (the slim copies' 4 MiB).

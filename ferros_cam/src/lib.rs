@@ -54,3 +54,5 @@ pub const MAIN_LINE_PS: u64 = 3_148_916;
 /// The init's frame length in lines (CCS frame_length_lines G#0340 = G#5372) and its longest integration (G#535E, 21342 lines): the exposure cannot pass the frame.
 pub const MAIN_FRAME_LINES: u64 = 0x5372;
 pub const MAIN_EXPOSURE_MAX_LINES: u64 = 0x535E;
+/// The least blanking (lines past a readout's rows) the driver streams a frame with: a slit's default, and the floor of a frame length SET (payloads/camera `BLANK`); the ultrawide's whole frames need about this many (2026-11-16: 32 gave no frame, 128 ran 48 a second). The list's `fll_least` is a readout's rows and this.
+pub const BLANK_LEAST: u16 = 1 << 7;

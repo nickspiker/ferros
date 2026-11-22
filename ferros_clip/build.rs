@@ -7,8 +7,8 @@ mod gpu_kernel;
 
 use std::fmt::Write;
 
-/// The geometries (width, stride) a kernel is built for: the binned main (4080 samples on a G#1400-byte line, payloads/camera `W_MOST`).
-const GEOMETRIES: [(usize, usize); 1] = [(4080, 0x1400)];
+/// The geometries (width, stride) a kernel is built for: each of the Pro's binned Bayer readouts as its job writes it (ferros_cam cams: the main 4080 samples on a G#1400-byte line, the ultrawide 4000 on G#13C0, the front 3840 on G#12C0, the tele 4032 on G#13C0; 2026-11-21, RAW video on all four cameras).
+const GEOMETRIES: [(usize, usize); 4] = [(4080, 0x1400), (4000, 0x13C0), (3840, 0x12C0), (4032, 0x13C0)];
 
 fn main() {
     println!("cargo:rerun-if-changed=src/gpu_kernel.rs");

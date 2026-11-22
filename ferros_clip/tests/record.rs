@@ -191,3 +191,58 @@ fn the_gpu_path_writes_the_cpu_path_s_clip() {
     assert!(record(true, true) == cpu, "the GPU path's clip, source hashes asked");
     assert!(record(true, false) == record(false, false), "the GPU path's clip, packed behind the hand-over");
 }
+
+/// Every Pro camera's binned readout paced from its list section's line (ferros_cam cams' `line_ps`, the frame at least its rows and the driver's 128 lines of blanking): the fastest whole rate each holds, every rate up to it within half a line, and the main by its picosecond line the same frames as by its exact clock.
+#[test]
+fn pacing_for_each_pro_camera() {
+    use ferros_clip::{Line, MAIN_LINE};
+    // The exact main as before the line: 24/s 13232 lines, 30/s 10586, 60/s 5293 (docs/RAW-VIDEO.md "Pacing").
+    assert_eq!([24, 30, 60].map(|f| Pacing::of(f).fll), [13232, 10586, 5293]);
+    for (name, ps, rows, most) in [("main", 3_148_916u64, 3072u64, 60u32), ("ultrawide", 6_561_622, 3000, 48), ("front", 10_437_753, 2736, 33), ("tele", 6_106_805, 3024, 51)] {
+        let line = Line::of_ps(ps, rows + (1 << 7));
+        assert_eq!(line.fps_most(), most, "{name}");
+        assert!(Pacing::of_line(most + 1, line).is_none() || most == 60, "{name}");
+        for fps in 1..=most {
+            let p = Pacing::of_line(fps, line).unwrap();
+            let want = 1_000_000_000f64 / fps as f64;
+            let err_ppm = (p.period_ns as f64 - want) / want * 1e6;
+            // The nearest whole frame: within half a line of the rate (the ultrawide's 6.56 us line is 154 ppm of a 47/s frame), each kept frame of `keep`.
+            assert!((p.period_ns as f64 - want).abs() <= (line.ns_of(1) as f64 / 2. + 1.) * p.keep as f64, "{name} fps {fps}: {} ns ({err_ppm:+.1} ppm)", p.period_ns);
+            assert!(p.fll as u64 >= line.fll_least && p.fll as u64 <= ferros_clip::FLL_MOST);
+            if name == "main" {
+                assert!((p.fll as i64 - Pacing::of(fps).fll as i64).abs() <= 1, "fps {fps}");
+            }
+        }
+        let p = Pacing::of_line(30.min(most), line).unwrap();
+        eprintln!("{name}: the fastest A#{most} a second; at 30 fll A#{}, a frame A#{} ns; an open at 16 ms asks A#{} lines", p.fll, p.sensor_ns, u16::from_le_bytes([p.open_msg(0, 16_000_000)[8], p.open_msg(0, 16_000_000)[9]]));
+    }
+    assert_eq!(MAIN_LINE.fps_most(), 60);
+    assert!(Pacing::of_line(0, MAIN_LINE).is_none() && Pacing::of_line(61, MAIN_LINE).is_none());
+}
+
+/// A readout's line read from a LIST reply as the driver builds it (ferros_cam list: a `camera` section a readout with its `id`, `mode`, `line_ps` and `fll_least`); a list from a driver before them gives none.
+#[test]
+fn a_line_from_the_list() {
+    use ferros_clip::Line;
+    use vsf::VsfType;
+    let section = |id: u64, mode: u64, line: Option<(u64, u64)>| {
+        let mut s = vsf::file_format::VsfSection::new("camera");
+        let mut put = |name: &str, v: u64| {
+            let mut f = vsf::file_format::VsfField::new(name);
+            f.values = vec![VsfType::u(v as usize, false)];
+            s.fields.push(f);
+        };
+        put("id", id);
+        put("mode", mode);
+        if let Some((ps, least)) = line {
+            put("line_ps", ps);
+            put("fll_least", least);
+        }
+        s
+    };
+    let doc = vsf::VsfBuilder::new().add_section_direct(section(0, 0, Some((3_148_916, 3200)))).add_section_direct(section(0, 2, Some((6_586_000, 6272)))).add_section_direct(section(1, 0, Some((6_561_622, 3128)))).add_section_direct(section(2, 0, None)).build().unwrap();
+    assert_eq!(Line::of_list(&doc, 1, 0), Some(Line::of_ps(6_561_622, 3128)));
+    assert_eq!(Line::of_list(&doc, 0, 2), Some(Line::of_ps(6_586_000, 6272)));
+    assert_eq!(Line::of_list(&doc, 0, 0).unwrap().fps_most(), 60);
+    assert_eq!((Line::of_list(&doc, 2, 0), Line::of_list(&doc, 3, 0)), (None, None));
+}

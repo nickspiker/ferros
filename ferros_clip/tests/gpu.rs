@@ -24,8 +24,13 @@ fn frame(h: usize, stride: usize) -> Vec<u8> {
 static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn check(w: usize, bands: usize, what: &str) {
+    check_at(w, 5120, bands, what)
+}
+
+/// As `check`, rows `stride` bytes apart (a real frame's bytes read at that stride: the same bytes go to the GPU and to the CPU).
+fn check_at(w: usize, stride: usize, bands: usize, what: &str) {
     let _one = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
-    let (stride, h) = (5120usize, bands * rc::BAND_ROWS);
+    let h = bands * rc::BAND_ROWS;
     let raw = frame(h, stride);
     let k = gpu::kernel(w, stride);
     // The words the device runs are build.rs's, compiled on the host: the same recording, so the same words.
@@ -103,4 +108,13 @@ fn the_gpu_kernel_is_the_band_coder_on_a_pro_frame() {
 #[test]
 fn rows_of_whole_blocks() {
     check(4096, 1, "4096 wide");
+}
+
+/// The other three Pro cameras' binned readouts as their jobs write them (ferros_cam cams), each kernel the one build.rs ships for its geometry: the ultrawide's 4000 (125 whole blocks), the front's 3840 (120), the tele's 4032 (126).
+#[test]
+fn the_other_cameras_geometries() {
+    for (w, stride, what) in [(4000, 0x13C0, "the ultrawide"), (3840, 0x12C0, "the front"), (4032, 0x13C0, "the tele")] {
+        assert!(gpu::prebuilt(w, stride).is_some(), "{what}: no kernel built");
+        check_at(w, stride, 2, what);
+    }
 }

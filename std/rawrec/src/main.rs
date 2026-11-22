@@ -3,7 +3,7 @@
 //!
 //! The input (hex bytes):
 //! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 6 the per-core profile, 7 the GPU bench, 8 the camera alone (the power baseline), 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
-//! - record (+21 the `items` grant's slot: the clip kept as an item of the hold, ferros_clip `items::ItemSink`, spawned with `--items` after the other grants; 0 the scope's extent) (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip).
+//! - record (+21 the `items` grant's slot: the clip kept as an item of the hold, ferros_clip `items::ItemSink`, spawned with `--items` after the other grants; 0 the scope's extent) (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip); +22 the camera (0 the main, 1 the ultrawide, 2 the front, 3 the tele: its binned readout, paced from its line in the driver's list).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
 
@@ -509,7 +509,27 @@ fn gpu_bench(slot: u64, inp: &[u8]) {
     }
 }
 
-/// Job 8: the camera alone, the baseline a recording's power is measured against: the binned main at +1 frames a second (0: 30) for +4 seconds (u16 LE, 0: 64), every frame taken (MAP) and given back, nothing coded or written; the hottest zone every 2^4 s.
+/// Camera `id`'s binned readout paced at `fps` (ferros_clip `Pacing::of_line`, its line from the driver's LIST, 2026-11-21): the main by its exact clock when the list carries no line (a driver from before); None when the list has no line for another camera, or the rate is past the fastest its whole frame runs (said with that rate).
+fn pacing_for(id: u8, fps: u32) -> Option<Pacing> {
+    let mut list = vec![0u8; 1 << 16];
+    let n = call(S_CAMERA, &[0], &mut list);
+    let line = if n == ERR { None } else { ferros_clip::Line::of_list(&list[..n as usize], id, 0) };
+    let line = match (line, id) {
+        (Some(l), _) => l,
+        (None, 0) => ferros_clip::MAIN_LINE,
+        (None, _) => {
+            println!("rawrec: camera A#{id}: no line in the driver's list (a driver from before 2026-11-21)");
+            return None;
+        }
+    };
+    let p = Pacing::of_line(fps, line);
+    if p.is_none() {
+        println!("rawrec: camera A#{id}: A#{fps} a second is past its fastest whole frame, A#{} a second", line.fps_most());
+    }
+    p
+}
+
+/// Job 8: the camera alone, the baseline a recording's power is measured against: camera +22 (0 the main) binned at +1 frames a second (0: 30) for +4 seconds (u16 LE, 0: 64), every frame taken (MAP) and given back, nothing coded or written; the frames the camera counted past one between two MAPs said as skipped; the hottest zone every 2^4 s.
 fn camera_only(inp: &[u8]) {
     let arg = |k: usize| inp.get(k).copied().unwrap_or(0) as u64;
     let fps = if arg(1) == 0 { 30 } else { arg(1).min(60) } as u32;
@@ -517,16 +537,19 @@ fn camera_only(inp: &[u8]) {
         0 => 64,
         s => s,
     };
+    let id = arg(22) as u8;
+    let Some(pacing) = pacing_for(id, fps) else { return };
     let mut r = [0u8; 64];
-    let n = call(S_CAMERA, &Pacing::of(fps).open_msg(0, 0), &mut r);
+    let n = call(S_CAMERA, &pacing.open_msg(id, 0), &mut r);
     if n == ERR || r[0] != 0 || n < 48 {
         println!("rawrec: camera only: OPEN refused");
         return;
     }
+    println!("rawrec: camera only: camera A#{id} at A#{fps} a second, fll A#{}, a frame A#{} ns", pacing.fll, pacing.sensor_ns);
     let mut hd = [0u8; 64];
     let mut held = 0xFFu8;
     let t0 = Instant::now();
-    let (mut frames, mut next) = (0u64, 0u64);
+    let (mut frames, mut next, mut skipped, mut last) = (0u64, 0u64, 0u64, None::<u32>);
     while t0.elapsed().as_secs() < secs {
         if call(S_CAMERA, &[5, held], &mut hd) == ERR {
             println!("rawrec: camera only: MAP failed");
@@ -534,15 +557,20 @@ fn camera_only(inp: &[u8]) {
         }
         held = hd[40];
         frames += 1;
+        let count = u32::from_le_bytes(hd[0..4].try_into().unwrap());
+        if let Some(l) = last {
+            skipped += count.wrapping_sub(l).wrapping_sub(1) as u64;
+        }
+        last = Some(count);
         let el = t0.elapsed().as_secs();
         if el >= next {
             next = el + (1 << 4);
-            println!("rawrec: camera only: A#{el} s: A#{frames} frames, hottest A#{} C", hottest());
+            println!("rawrec: camera only: A#{el} s: A#{frames} frames, A#{skipped} skipped, hottest A#{} C", hottest());
         }
     }
     let _ = call(S_CAMERA, &[6, held], &mut r);
     let _ = call(S_CAMERA, &[4], &mut r);
-    println!("rawrec: camera only: A#{frames} frames in A#{} ms at A#{fps} a second, hottest A#{} C", t0.elapsed().as_millis(), hottest());
+    println!("rawrec: camera only: camera A#{id}: A#{frames} frames, A#{skipped} skipped, in A#{} ms at A#{fps} a second, hottest A#{} C", t0.elapsed().as_millis(), hottest());
 }
 
 /// Job 4: this build's band coder (NEON with `--features neon`) against the scalar one, byte for byte, on frames of the binned main at four gains (+1 the frames at each, 0: 4), then each band decoded and compared with the frame; the times on four A715s.
@@ -671,7 +699,9 @@ fn main() {
         _ => {}
     }
     let fps = if arg(1) == 0 { 30 } else { arg(1).min(60) } as u32;
-    let pacing = Pacing::of(fps);
+    // +22: the camera (0 the main), paced from its line in the driver's list.
+    let id = arg(22);
+    let Some(pacing) = pacing_for(id, fps) else { return };
     let (frames_want, secs) = (le16(2), le16(4));
     let frames_want = if frames_want == 0 && secs == 0 { 64 } else { frames_want };
     let a715 = match arg(6) {
@@ -690,9 +720,9 @@ fn main() {
     ferros_clip::ferros::pin(if arg(18) == 1 { 0x000F } else { 0x00F0 });
     println!("rawrec: A#{fps} a second (fll A#{}, the sensor's frame A#{} ns, every A#{}-th kept: the clip's frame A#{} ns), A#{} frames or A#{secs} s, workers A#{a715} A715 + A#{a510} A510, shutter A#{shutter_us} us, gain byte A#{}, every A#{}-th frame hashed, A#{slots} slots, stop at A#{stop_c} C", pacing.fll, pacing.sensor_ns, pacing.keep, pacing.period_ns, frames_want, arg(12), 1u64 << hash_log2);
 
-    // The camera: the binned main at this pacing, with its view.
+    // The camera: its binned readout at this pacing, with its view.
     let mut r = [0u8; 64];
-    let open = pacing.open_msg(0, shutter_us * 1000);
+    let open = pacing.open_msg(id, shutter_us * 1000);
     let n = call(S_CAMERA, &open, &mut r);
     if n == ERR || r[0] != 0 || n < 48 {
         println!("rawrec: OPEN refused (G#{:X}, A#{} bytes)", if n == ERR { 0xEEE } else { r[0] as u64 }, if n == ERR { 0 } else { n });
@@ -734,7 +764,7 @@ fn main() {
         white: u16::from_le_bytes([hd[12], hd[13]]),
         make: "Google".into(),
         model: "Pixel 8 Pro".into(),
-        sensor_module: "main".into(),
+        sensor_module: format!("camera {id}"),
         lens: String::new(),
         f_number: None,
         focal_mm: None,
