@@ -6,6 +6,8 @@
 //! The v2f16 forms (FADD, FMA, FMIN, FMAX), an f32 operand widened from an f16 half, FADD.f32 narrowing into a half register, and the destination clamps are emulated from ISA.xml and Mesa's test vectors, each lane rounded to f16 once (an FMA from its exact f64 product and sum); not yet checked against the device, whose f16 denormals and NaNs it does not claim.
 //!
 //! An invocation runs alone, so a divergent branch is a plain jump: the per-thread result is the warp's, since nothing here reads another lane.
+//! A workgroup (`run_group`, 2026-11-21) runs its invocations one after another up to each BARRIER in turn, with its own workgroup-local storage at `WLS_VA` (what the WLS pointer reads); a word one invocation wrote and another read or wrote between two barriers panics naming both, since on the device that order is the warps', not the kernel's.
+//! A workgroup (`run_group`, 2026-11-21) runs its invocations one after another to each BARRIER in turn, with its own workgroup-local storage at `WLS_VA` (what the WLS pointer reads); a word one invocation wrote and another read or wrote between two barriers is a panic naming both, since on the device that order is the warps' and not the kernel's.
 
 extern crate std;
 
@@ -51,11 +53,117 @@ pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> 
 
 /// As [`run`], marking in `ran` (one flag an instruction, or empty for none) every instruction the invocation ran: the union over a warp's sixteen invocations is what the warp issues, a branch over a block skipped only where all sixteen skip it.
 pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory, ran: &mut [bool]) -> u64 {
-    let mut reg = [0u32; 64];
-    reg[60] = gid[0];
-    reg[61] = gid[1];
-    let mut pc = 0usize;
-    let mut steps = 0u64;
+    let mut inv = Inv::new(gid, 0);
+    match exec(words, uniforms, &mut inv, mem, None, ran) {
+        Stop::End => inv.steps,
+        // WHY: a barrier waits for the rest of a workgroup, which a lone invocation does not have; `run_group` runs one.
+        Stop::Barrier => panic!("valhall::sim: a BARRIER in a kernel run one invocation at a time (run_group runs a workgroup)"),
+    }
+}
+
+/// Where a workgroup's local storage (shared memory) lies in the emulator's addresses: what the WLS pointer special reads (Mesa adds an offset to its low word and keeps its high word, so its low word is 0 here and nothing carries).
+pub const WLS_VA: u64 = 0x7F_0000_0000;
+
+/// A workgroup's local storage, with the order of its accesses checked: a word one invocation wrote and another read or wrote between the same two barriers is a race on the device (the warps run in no order the kernel may count on), so here a panic naming it, though the emulator runs the invocations one after another and would read a value.
+pub struct Wls {
+    bytes: std::vec::Vec<u8>,
+    /// Per 32-bit word: the last writer (invocation + 1, 0 none) and the barrier epoch of that write; the last reader (invocation + 1, `MANY` for several) and its epoch.
+    write: std::vec::Vec<(u32, u32)>,
+    read: std::vec::Vec<(u32, u32)>,
+    epoch: u32,
+}
+
+const MANY: u32 = u32::MAX;
+
+impl Wls {
+    pub fn new(bytes: usize) -> Wls {
+        Wls { bytes: std::vec![0; bytes], write: std::vec![(0, 0); bytes.div_ceil(4)], read: std::vec![(0, 0); bytes.div_ceil(4)], epoch: 1 }
+    }
+    fn holds(&self, va: u64) -> bool {
+        va >= WLS_VA && va < WLS_VA + self.bytes.len() as u64
+    }
+    fn at(&self, va: u64, n: usize) -> usize {
+        // WHY: as `Memory::at`: an access past the workgroup's storage is the kernel's bug (on the device another workgroup's storage, or a fault).
+        assert!(va + n as u64 <= WLS_VA + self.bytes.len() as u64, "valhall::sim: a workgroup storage access at G#{va:X} past its G#{:X} bytes", self.bytes.len());
+        (va - WLS_VA) as usize
+    }
+    fn read(&mut self, va: u64, n: usize, who: u32) -> u32 {
+        let o = self.at(va, n);
+        let wd = o / 4;
+        let (w, e) = self.write[wd];
+        assert!(!(e == self.epoch && w != 0 && w != who + 1), "valhall::sim: invocation {who} read workgroup storage +G#{o:X} that invocation {} wrote with no barrier between", w - 1);
+        let (r, re) = self.read[wd];
+        self.read[wd] = (if re == self.epoch && r != 0 && r != who + 1 { MANY } else { who + 1 }, self.epoch);
+        let mut b = [0u8; 4];
+        b[..n].copy_from_slice(&self.bytes[o..o + n]);
+        u32::from_le_bytes(b)
+    }
+    fn write(&mut self, va: u64, v: u32, who: u32) {
+        let o = self.at(va, 4);
+        let wd = o / 4;
+        let (w, e) = self.write[wd];
+        assert!(!(e == self.epoch && w != 0 && w != who + 1), "valhall::sim: invocations {} and {who} both wrote workgroup storage +G#{o:X} with no barrier between", w - 1);
+        let (r, re) = self.read[wd];
+        assert!(!(re == self.epoch && r != 0 && r != who + 1), "valhall::sim: invocation {who} wrote workgroup storage +G#{o:X} that {} read with no barrier between", if r == MANY { std::string::String::from("several") } else { std::format!("invocation {}", r - 1) });
+        self.write[wd] = (who + 1, self.epoch);
+        self.bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// One invocation's state between its runs (a barrier stops it).
+struct Inv {
+    reg: [u32; 64],
+    pc: usize,
+    steps: u64,
+    /// Its index in its workgroup.
+    index: u32,
+}
+
+impl Inv {
+    fn new(gid: [u32; 2], index: u32) -> Inv {
+        let mut reg = [0u32; 64];
+        reg[60] = gid[0];
+        reg[61] = gid[1];
+        Inv { reg, pc: 0, steps: 0, index }
+    }
+}
+
+/// Why an invocation's run stopped.
+enum Stop {
+    End,
+    Barrier,
+}
+
+/// Runs one workgroup of `size` invocations, global ids x `first` to `first + size - 1` (y `y`), with `wls_bytes` of workgroup-local storage, zeroed (the device leaves it as it was; a kernel reads only what its workgroup wrote): each invocation runs to its next BARRIER or its end, and every one must reach each barrier before any goes past it. Returns the instructions run in all.
+/// The barrier's memory rule is checked as it is the device's: a word of the workgroup's storage written by one invocation and read or written by another between two barriers panics (`Wls`).
+pub fn run_group(words: &[u64], uniforms: &[u64], first: u32, y: u32, size: u32, wls_bytes: usize, mem: &mut Memory) -> u64 {
+    let mut wls = Wls::new(wls_bytes);
+    let mut invs: std::vec::Vec<Inv> = (0..size).map(|i| Inv::new([first + i, y], i)).collect();
+    loop {
+        let (mut ended, mut waiting) = (0u32, 0u32);
+        for inv in invs.iter_mut() {
+            match exec(words, uniforms, inv, mem, Some(&mut wls), &mut []) {
+                Stop::End => ended += 1,
+                Stop::Barrier => waiting += 1,
+            }
+        }
+        // WHY: a barrier some invocations of the workgroup never reach holds the rest for ever on the device (or worse); the kernel must reach every barrier in uniform control flow.
+        assert!(waiting == 0 || ended == 0, "valhall::sim: {ended} of {size} invocations ended while {waiting} wait at a barrier");
+        if waiting == 0 {
+            return invs.iter().map(|v| v.steps).sum();
+        }
+        wls.epoch += 1;
+    }
+}
+
+/// Runs `inv` from where it stopped to its next BARRIER (past it, so the next run goes on after it) or its end.
+fn exec(words: &[u64], uniforms: &[u64], inv: &mut Inv, mem: &mut Memory, mut wls: Option<&mut Wls>, ran: &mut [bool]) -> Stop {
+    let mut reg = inv.reg;
+    let mut pc = inv.pc;
+    let mut steps = inv.steps;
+    let lane = inv.index & 15;
+    let who = inv.index;
+    let has_wls = wls.is_some();
     loop {
         let w = words[pc];
         if !ran.is_empty() {
@@ -73,7 +181,21 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
                     let slot = (page << 5 | (b >> 1) & 31) as usize;
                     (uniforms[slot] >> (32 * (b & 1))) as u32
                 }
-                3 => LUT[(b & 31) as usize],
+                3 if b & 32 == 0 => LUT[(b & 31) as usize],
+                // A special FAU value (G#E0 | index << 1 | word, its page in 58:57): the workgroup's storage pointer (page 1, 3: `WLS_VA`), the lane (page 3, 1), the core (page 3, 3: 0 here).
+                3 => {
+                    let v: u64 = match (page, (b >> 1) & 15) {
+                        (1, 3) => {
+                            // WHY: a workgroup storage address read where none was given (`run` runs a lone invocation) would send its accesses to the global memory's addresses.
+                            assert!(has_wls, "valhall::sim: the WLS pointer read in a run with no workgroup storage (run_group gives one) at {pc}");
+                            WLS_VA
+                        }
+                        (3, 1) => lane as u64,
+                        (3, 3) => 0,
+                        (p, i) => panic!("valhall::sim: special FAU value page {p} index {i} at {pc}"),
+                    };
+                    (v >> (32 * (b & 1))) as u32
+                }
                 _ => panic!("valhall::sim: source byte G#{b:X} at {pc}"),
             }
         };
@@ -331,12 +453,29 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
             // LOAD (size at 29:27, lane at 38:36): i32 (3, lane w0 0), and i8 and i16 zero-extended to 32 bits (0 and 1, lane w0: 6 and 2, ISA.xml:300-320); the staging register 45:40, the signed offset 23:8, the address pair 7:0.
             0x060 => {
                 let va = addr(&reg, w);
-                reg[dst] = match ((w >> 27) & 7, (w >> 36) & 7) {
-                    (3, 0) => mem.read32(va),
-                    (0, 6) => mem.read8(va) as u32,
-                    (1, 2) => mem.read16(va) as u32,
+                let n = match ((w >> 27) & 7, (w >> 36) & 7) {
+                    (3, 0) => 4,
+                    (0, 6) => 1,
+                    (1, 2) => 2,
                     (s, l) => panic!("valhall::sim: a load of size {s} lane {l} at {pc}"),
                 };
+                reg[dst] = match wls.as_deref_mut() {
+                    // The workgroup's storage: the same LOAD at the WLS pointer's address (Valhall has no segment of its own for it, bifrost_compile.c `bi_handle_segment`).
+                    Some(l) if l.holds(va) => l.read(va, n, who),
+                    _ => match n {
+                        4 => mem.read32(va),
+                        1 => mem.read8(va) as u32,
+                        _ => mem.read16(va) as u32,
+                    },
+                };
+            }
+            // BARRIER.slot7.wait: this invocation stops past it until its whole workgroup has reached it (`run_group`).
+            0x045 => {
+                assert!((w >> 30) & 7 == 7 && (w >> 59) & 15 == 9, "valhall::sim: a BARRIER without slot 7 and the wait flow at {pc}");
+                inv.reg = reg;
+                inv.pc = next;
+                inv.steps = steps;
+                return Stop::Barrier;
             }
             // ATOM.i32 (opcode2 3 at 29:27): `aadd` (2 at 25:22) of the staging register to the word at the pair plus the unsigned offset 15:8. One invocation at a time here, so the add is whole, as the device's atomic makes it.
             0x068 => {
@@ -350,12 +489,18 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
             0x061 => {
                 assert_eq!((w >> 27) & 7, 3, "valhall::sim: a store other than i32 at {pc}");
                 let va = addr(&reg, w);
-                mem.write32(va, reg[dst]);
+                match wls.as_deref_mut() {
+                    Some(l) if l.holds(va) => l.write(va, reg[dst], who),
+                    _ => mem.write32(va, reg[dst]),
+                }
             }
             _ => panic!("valhall::sim: opcode G#{op:X} at {pc} (G#{w:016X})"),
         }
         if (w >> 59) & 15 == 15 {
-            return steps;
+            inv.reg = reg;
+            inv.pc = pc;
+            inv.steps = steps;
+            return Stop::End;
         }
         pc = next;
     }

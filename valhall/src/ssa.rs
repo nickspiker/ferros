@@ -113,13 +113,17 @@ enum Op {
     Store { slot: u8, shift: u8, offset: i16, index: u32, value: u32, atom: bool },
     /// *(uniform slot's address + (index << shift) + offset), 32 bits.
     Load { slot: u8, shift: u8, offset: i16, index: u32, size: u8 },
+    /// Every invocation of the workgroup waits here for the rest, and the workgroup storage written before it is seen after it ([`barrier`]).
+    Barrier,
+    /// A shift fused with the logic operation that reads it: `a` shifted left or right by `s`, then and, or or xor `b` (kind 0, 1, 2). Made by the compiler from a shift that operation alone reads (LSHIFT_OR, RSHIFT_XOR and the rest: one instruction for two).
+    ShiftOp { left: bool, kind: u8, a: u32, s: u32, b: u32 },
 }
 
 impl Op {
     fn sources(&self, mut f: impl FnMut(u32)) {
         use Op::*;
         match *self {
-            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) => {}
+            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) | Barrier => {}
             BlockBegin(a) | HNeg(a) | HNarrow(a) | HBroadcast(a, _) | HWiden(a, _) | FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) | LoopBreak(a) => f(a),
             FAddLscale(a, b) | FExp(a, b) | HAdd(a, b) | HMul(a, b) | HMin(a, b) | HMax(a, b) | HPack(a, b) => {
                 f(a);
@@ -139,13 +143,18 @@ impl Op {
                 f(value)
             }
             Load { index, .. } => f(index),
+            ShiftOp { a, s, b, .. } => {
+                f(a);
+                f(s);
+                f(b)
+            }
         }
     }
     /// The same operation with each source mapped through `f`.
     fn map_sources(self, f: impl Fn(u32) -> u32) -> Op {
         use Op::*;
         match self {
-            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) => self,
+            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) | Barrier => self,
             BlockBegin(a) => BlockBegin(f(a)),
             HNeg(a) => HNeg(f(a)),
             HNarrow(a) => HNarrow(f(a)),
@@ -190,6 +199,7 @@ impl Op {
             Sel(a, b, c) => Sel(f(a), f(b), f(c)),
             Store { slot, shift, offset, index, value, atom } => Store { slot, shift, offset, index: f(index), value: f(value), atom },
             Load { slot, shift, offset, index, size } => Load { slot, shift, offset, index: f(index), size },
+            ShiftOp { left, kind, a, s, b } => ShiftOp { left, kind, a: f(a), s: f(s), b: f(b) },
         }
     }
     /// The kind's name, for `Compiled::kinds`.
@@ -246,10 +256,12 @@ impl Op {
             LoopBreak(_) => "loopbreak",
             Store { .. } => "store",
             Load { .. } => "load",
+            Barrier => "barrier",
+            ShiftOp { .. } => "shiftop",
         }
     }
     fn has_value(&self) -> bool {
-        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Store { .. } | Op::BlockBegin(_) | Op::BlockEnd)
+        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Store { .. } | Op::BlockBegin(_) | Op::BlockEnd | Op::Barrier)
     }
 }
 
@@ -271,6 +283,9 @@ struct Rec {
     slots: u8,
     /// The values of the [`param`]s, by index.
     params: Vec<u32>,
+    /// The workgroup: 2^`wg_log2` invocations along x ([`workgroup`]; 16 by default, one warp), and the bytes of workgroup-local storage it uses (0: none).
+    wg_log2: u32,
+    wls: u32,
     /// Blocks open now ([`when`]).
     open: u32,
 }
@@ -352,7 +367,7 @@ fn const_of(x: u32) -> Option<u32> {
 
 /// Start recording a kernel.
 pub fn begin() {
-    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false, slots: 16, params: Vec::new(), open: 0 }) };
+    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false, slots: 16, params: Vec::new(), open: 0, wg_log2: 4, wls: 0 }) };
 }
 
 /// A value the kernel takes from its run rather than from its words: recorded as a constant would be, placed as one (a uniform word, or an immediate the run patches), but never folded into the code, so the kernel's words and [`Recording::key`] do not depend on it. A frame's light, camera or inks: one compiled kernel serves every frame ([`Compiled::bind`]), where a constant would make a new kernel each time it changed.
@@ -441,6 +456,50 @@ pub fn load16(slot: u8, index: U, shift: u8, offset: i16) -> U {
 /// The offset is ATOM's unsigned 8-bit immediate, so it is never folded with a constant from the index.
 pub fn atomic_add(slot: u8, index: U, shift: u8, offset: u8, value: U) {
     push(Op::Store { slot, shift, offset: offset as i16, index: index.0, value: value.0, atom: true });
+}
+
+/// The slot number a load or store names for the workgroup's own storage (its address the WLS pointer's, not a uniform's).
+pub const SHARED: u8 = 0xFF;
+
+/// The workgroup this kernel runs in: 2^`size_log2` invocations along x (from one warp, 2^4, to 2^8; its index in the workgroup is [`local_id`]), with `shared_bytes` of workgroup-local storage ([`shared_load`], [`shared_store`]). Without it a kernel runs in workgroups of one warp with no storage, which the GPU may merge (the service's default since 2026-11-04).
+/// The run must be asked in workgroups of this size (`Compiled::wg_log2`) with the storage given (`Compiled::shared_bytes`: the GPU service's kernel load, 2026-11-21).
+pub fn workgroup(size_log2: u32, shared_bytes: u32) {
+    // WHY: a workgroup is at least a warp here (the lane id and `local_id` take it so) and the compiler's choice of 2^8 at most keeps a workgroup's barriers inside one core's threads at 64 registers (the core's 1024 a thread mode halves).
+    assert!((4..=8).contains(&size_log2), "valhall::ssa::workgroup: 2^{size_log2} invocations (2^4 to 2^8)");
+    let r = rec();
+    r.wg_log2 = size_log2;
+    r.wls = shared_bytes;
+}
+
+/// The invocation's index in its workgroup (x only: the grid's workgroups lie along x and y, each 2^size_log2 by 1).
+pub fn local_id() -> U {
+    let mask = (1u32 << rec().wg_log2) - 1;
+    gid() & U::splat(mask)
+}
+
+/// The invocation's workgroup along x.
+pub fn group_id() -> U {
+    let s = rec().wg_log2;
+    gid() >> s
+}
+
+/// `value` to byte `(index << shift) + offset` of the workgroup's storage. Read by the workgroup's other invocations only after a [`barrier`] (the emulator checks it).
+pub fn shared_store(index: U, shift: u8, offset: i16, value: U) {
+    let (index, offset) = split_index(index.0, shift, offset);
+    push(Op::Store { slot: SHARED, shift, offset, index, value: value.0, atom: false });
+}
+
+/// 32 bits from byte `(index << shift) + offset` of the workgroup's storage.
+pub fn shared_load(index: U, shift: u8, offset: i16) -> U {
+    let (index, offset) = split_index(index.0, shift, offset);
+    U(push(Op::Load { slot: SHARED, shift, offset, index, size: 3 }))
+}
+
+/// Every invocation of the workgroup waits here until all have come, and what any wrote to the workgroup's storage before it is what all read after it (BARRIER.slot7.wait). Every invocation must reach it: never inside a [`when`] block or after a loop's break that only some take.
+pub fn barrier() {
+    // WHY: a barrier only some invocations reach waits for ever on the device; a block is exactly that.
+    assert!(rec().open == 0, "valhall::ssa::barrier inside a `when` block");
+    push(Op::Barrier);
 }
 
 /// Word `word` (0 low, 1 high) of the caller's uniform slot `slot`, as a value: what a run passes besides addresses (where a band of a grid starts, so one kernel serves every band).
@@ -927,6 +986,9 @@ pub struct Compiled {
     pub kinds: Vec<(&'static str, usize)>,
     /// Where each [`param`] went, by index: its uniform word, and the immediates that carry it.
     pub params: Vec<ParamPlace>,
+    /// The workgroup the run must ask for: 2^`wg_log2` invocations along x, and the bytes of workgroup-local storage each needs (0: none; [`workgroup`]).
+    pub wg_log2: u32,
+    pub shared_bytes: u32,
     reserved: u8,
 }
 
@@ -1018,7 +1080,7 @@ impl Recording {
             l.carried.hash(&mut h);
             l.exits.hash(&mut h);
         }
-        (r.reserved, r.exact, r.slots, r.params.len()).hash(&mut h);
+        (r.reserved, r.exact, r.slots, r.params.len(), r.wg_log2, r.wls).hash(&mut h);
         core::hash::Hasher::finish(&h)
     }
 
@@ -1263,6 +1325,46 @@ fn compile_rec(rec: Rec) -> Compiled {
             }
         }
     }
+    // Shifts fused into the and, or or xor that alone reads them (2026-11-21): Valhall's shift group shifts one operand and then combines it with another in one instruction (LSHIFT_OR, RSHIFT_XOR and the rest), so `x ^ (x >> 16)` is one instruction, not two (a hash's xorshifts, a packing's or of a shifted field). Only where nothing changes control between the two (a loop's or a block's edge): the shift's sources are then read where they were.
+    {
+        users.iter_mut().for_each(|u| *u = 0);
+        for op in &work {
+            op.sources(|s| users[s as usize] += 1);
+        }
+        for l in &rec.loops {
+            for &(phi, upd) in l.carried.iter().chain(&l.exits) {
+                users[phi as usize] += 1;
+                users[upd as usize] += 1;
+            }
+        }
+        // Control edges up to each node, to see whether one lies between a shift and its reader.
+        let mut edges = alloc::vec![0u32; n + 1];
+        for (i, op) in work.iter().enumerate() {
+            let e = matches!(op, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::BlockBegin(_) | Op::BlockEnd | Op::Phi(_) | Op::Barrier) as u32;
+            edges[i + 1] = edges[i] + e;
+        }
+        for i in 0..n {
+            let (x, y, kind) = match work[i] {
+                Op::And(x, y) => (x, y, 0u8),
+                Op::Or(x, y) => (x, y, 1),
+                Op::Xor(x, y) => (x, y, 2),
+                _ => continue,
+            };
+            for (sh, other) in [(y, x), (x, y)] {
+                let (a, s, left) = match work[sh as usize] {
+                    Op::Shl(a, s) => (a, s, true),
+                    Op::Shr(a, s) => (a, s, false),
+                    _ => continue,
+                };
+                if users[sh as usize] != 1 || edges[sh as usize + 1] != edges[i] {
+                    continue;
+                }
+                work[i] = Op::ShiftOp { left, kind, a, s, b: other };
+                users[sh as usize] = 0;
+                break;
+            }
+        }
+    }
     let nodes = &work;
     let imm_bits = |i: u32| -> Option<u32> {
         match nodes[i as usize] {
@@ -1280,7 +1382,7 @@ fn compile_rec(rec: Rec) -> Compiled {
     let mut keep = alloc::vec![false; n];
     let seed = |keep: &mut Vec<bool>| {
         for (i, op) in nodes.iter().enumerate() {
-            if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_)) {
+            if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Barrier) {
                 keep[i] = true;
             }
         }
@@ -1574,6 +1676,13 @@ fn compile_rec(rec: Rec) -> Compiled {
         let mut place: [(u32, Src); 3] = [(u32::MAX, Src::Lut(Lut::ZERO)); 3];
         let mut np = 0;
         let mut loads = 0;
+        // A constant shift amount below 32 is a byte of the LUT's byte-index entries (8 to 15 hold bytes 0 to 31), read by the shift group's lane select: no uniform word or register for it, as `address` does. Not when the same constant is another operand of the instruction (that one reads the whole entry).
+        let shift_amount = match *op {
+            Op::Shl(a, x) | Op::Shr(a, x) if a != x => Some(x),
+            Op::ShiftOp { a, s: x, b, .. } if a != x && b != x => Some(x),
+            _ => None,
+        };
+        let mut shift_byte = Byte::B0;
         op.sources(|s| {
             if !is_imm(s) || hoisted_at(s, i) || place[..np].iter().any(|p| p.0 == s) {
                 return;
@@ -1598,6 +1707,15 @@ fn compile_rec(rec: Rec) -> Compiled {
                     false
                 }
             };
+            if shift_amount == Some(s) && param_of(s).is_none() && bits < 32 {
+                let li = 8 + (bits >> 2) as u8;
+                if take(0x100 | li as u16, None) {
+                    shift_byte = [Byte::B0, Byte::B1, Byte::B2, Byte::B3][(bits & 3) as usize];
+                    place[np] = (s, Src::Lut(Lut::index(li)));
+                    np += 1;
+                    return;
+                }
+            }
             let lut = if param_of(s).is_none() { LUT.iter().position(|&v| v == bits) } else { None };
             let src = if let Some(li) = lut {
                 if take(0x100 | li as u16, None) { Some(Src::Lut(Lut::index(li as u8))) } else { None }
@@ -1723,10 +1841,33 @@ fn compile_rec(rec: Rec) -> Compiled {
                 k.lshift_xor_i32(d, rr(a), Lut::ZERO, Byte::B0, rr(b));
             }
             Op::Shl(a, s) => {
-                k.lshift_or_i32(d, rr(a), rr(s), Byte::B0, Lut::ZERO);
+                k.lshift_or_i32(d, rr(a), rr(s), shift_byte, Lut::ZERO);
             }
             Op::Shr(a, s) => {
-                k.rshift_or_i32(d, rr(a), rr(s), Byte::B0, Lut::ZERO);
+                k.rshift_or_i32(d, rr(a), rr(s), shift_byte, Lut::ZERO);
+            }
+            Op::ShiftOp { left, kind, a, s, b } => {
+                let (a, s, b) = (rr(a), rr(s), rr(b));
+                match (left, kind) {
+                    (true, 0) => k.lshift_and_i32(d, a, s, shift_byte, b),
+                    (true, 1) => k.lshift_or_i32(d, a, s, shift_byte, b),
+                    (true, _) => k.lshift_xor_i32(d, a, s, shift_byte, b),
+                    (false, 0) => k.rshift_and_i32(d, a, s, shift_byte, b),
+                    (false, 1) => k.rshift_or_i32(d, a, s, shift_byte, b),
+                    (false, _) => k.rshift_xor_i32(d, a, s, shift_byte, b),
+                };
+            }
+            Op::Barrier => {
+                // Every slot with memory work outstanding waited for first (va_insert_flow.c: the DDK and Mesa both put `.wait` on the instruction before a BARRIER): on the last instruction when its flow is free or a wait already, else a NOP; this compiler issues all its memory work on slot 0.
+                match if k.is_empty() { Flow::Wait as u64 } else { k.last_flow() } {
+                    0..=7 => {
+                        k.last().wait(Slot::S0);
+                    }
+                    _ => {
+                        k.nop().wait(Slot::S0);
+                    }
+                }
+                k.barrier();
             }
             Op::F2U(a) => {
                 k.f32_to_u32(d, rr(a), Round::Rtz);
@@ -1873,7 +2014,7 @@ fn compile_rec(rec: Rec) -> Compiled {
         }
     }
     kinds.sort_by(|a, b| b.1.cmp(&a.1));
-    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds, params, reserved }
+    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds, params, wg_log2: rec.wg_log2, shared_bytes: rec.wls, reserved }
 }
 
 /// Registers taking new values all at once (a parallel copy): each (destination, source) pair, then each (destination, constant, the param it is if one). A copy waits until no other pending copy still reads its destination, and a ring of them goes through the scratch register; constants last, as nothing reads them from a register. Used where a loop's phis take their values: a value can be another field's phi (a fold handing back a node already recorded).
@@ -1928,8 +2069,10 @@ fn address(k: &mut Kernel<16384>, slot: u8, index: Src, shift: u8, hi_set: bool)
         _ => (Lut::BYTES_4_7, Byte::B3),
     };
     k.lshift_or_i32(r(ADDR), index, lut, byte, Lut::ZERO);
-    k.iadd_u32(r(ADDR), r(ADDR), u(slot).w0());
+    // The workgroup's storage: the WLS pointer's low word plus the offset, its high word kept (Mesa's `bi_handle_segment` on Valhall: the region never crosses 4 GiB, pan_desc.c `pan_emit_tls`).
+    let (lo, hi): (Src, Src) = if slot == SHARED { (Special::WlsPointer.w0().into(), Special::WlsPointer.w1().into()) } else { (u(slot).w0().into(), u(slot).w1().into()) };
+    k.iadd_u32(r(ADDR), r(ADDR), lo);
     if !hi_set {
-        k.mov_i32(r(ADDR + 1), u(slot).w1());
+        k.mov_i32(r(ADDR + 1), hi);
     }
 }

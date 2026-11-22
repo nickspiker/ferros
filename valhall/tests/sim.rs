@@ -85,7 +85,7 @@ static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn the_ssa_mandelbrot() {
     use valhall::ssa::{self, F, U};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     ssa::begin();
     let g = ssa::gid();
     let py = g >> SIDE_SHIFT;
@@ -121,7 +121,7 @@ fn the_ssa_mandelbrot() {
 #[test]
 fn two_loops_a_uniform_and_an_add() {
     use valhall::ssa::{self, F, M};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     let escape = |c: (F, F), z0: (F, F)| {
         let (_, _, k, x, y) = ssa::iterate(
             48,
@@ -190,7 +190,7 @@ fn h16(x: f64) -> f32 {
 #[test]
 fn f16_lanes_and_clamps() {
     use valhall::ssa::{self, F, H};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     ssa::begin();
     let g = ssa::gid();
     let x = F::from_u32(g) * (1. / 64.) - 2.;
@@ -229,7 +229,7 @@ fn f16_lanes_and_clamps() {
 #[test]
 fn a_block_runs_only_where_its_mask_is() {
     use valhall::ssa::{self, F, U};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     ssa::begin();
     let g = ssa::gid();
     // Odd invocations (within each warp), and whole warps (16 invocations) of every other one.
@@ -272,7 +272,7 @@ fn a_block_runs_only_where_its_mask_is() {
 #[test]
 fn params_bind_into_one_kernel() {
     use valhall::ssa::{self, U};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     const TABLE: u64 = OUT + (1 << 12);
     let record = |base: u32| {
         ssa::begin();
@@ -324,7 +324,7 @@ fn params_bind_into_one_kernel() {
 #[test]
 fn abs_of_a_widened_half() {
     use valhall::ssa::{self, H};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     const TABLE: u64 = OUT + (1 << 12);
     // Each word two f16s, lane 0 low; the subnormals are 2^-20 (G#10) and the smallest, 2^-24 (G#1).
     let halves: [(u16, u16); 8] = [
@@ -374,7 +374,7 @@ fn abs_of_a_widened_half() {
 #[test]
 fn negations_keep_their_modifiers() {
     use valhall::ssa::{self, F, H};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     const TABLE: u64 = OUT + (1 << 12);
     // Each row: two f32s, then two words of f16 pairs (lane 0 low).
     let rows: [(f32, f32, [f32; 2], [f32; 2]); 4] = [(1.5, 0.25, [0.5, -3.], [2., 0.125]), (-7., 2., [-0.75, 1.25], [-1., 4.]), (0.03, -0.03, [8., 0.0625], [0.5, -0.5]), (100., 1e-3, [-2., -6.], [3., 1.])];
@@ -438,7 +438,7 @@ fn the_atomic_and_narrow_loads_encode_as_mesa() {
 #[test]
 fn lumis_ops_against_the_cpu() {
     use valhall::ssa::{self, F, H, U};
-    let _turn = RECORDING.lock().unwrap();
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     const N: u32 = 1 << 7;
     // Uniform slots: 0 the output (four words an invocation), 1 the bytes read (an atlas), 2 the histogram (sixteen counters, then a sum).
     const IN: u64 = OUT + 0x10_0000;
@@ -490,4 +490,87 @@ fn lumis_ops_against_the_cpu() {
         assert_eq!(mem.read32(HIST + 4 * j as u64), c, "histogram bin {j}");
     }
     assert_eq!(mem.read32(HIST + 64), sum, "the sum's atomic");
+}
+
+/// A workgroup's inclusive prefix sum in its shared storage (2026-11-21, the parallel noise's scan): 2^7 invocations, Hillis-Steele over log2 rounds, each round a barrier to read the last round's values and a barrier before writing this one's; every word against the CPU's running sum, over four workgroups of a 2^9 grid.
+fn scan_kernel() -> valhall::ssa::Compiled {
+    use valhall::ssa::{self, U};
+    const WG: u32 = 7;
+    ssa::begin();
+    ssa::reserve(2);
+    ssa::workgroup(WG, 4 << WG);
+    let g = ssa::gid();
+    let i = ssa::local_id();
+    let x = ssa::load(1, g, 2, 0);
+    ssa::shared_store(i, 2, 0, x);
+    let mut acc = x;
+    for k in 0..WG {
+        let off = 1u32 << k;
+        ssa::barrier();
+        let has = i.ge(U::splat(off));
+        // An invocation below `off` reads its own word (no neighbour that far back) and adds nothing.
+        let from = U::select(has, i - U::splat(off), i);
+        let y = ssa::shared_load(from, 2, 0);
+        acc = acc + (y & U::from_mask(has));
+        ssa::barrier();
+        ssa::shared_store(i, 2, 0, acc);
+    }
+    ssa::store(0, 2, 0, acc);
+    ssa::compile()
+}
+
+#[test]
+fn a_workgroup_scan_in_shared_storage() {
+    use valhall::sim::run_group;
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+    let c = scan_kernel();
+    assert_eq!((c.wg_log2, c.shared_bytes), (7, 512));
+    // Every barrier's slot-0 wait in place: the instruction before each BARRIER waits.
+    for (j, &w) in c.words.iter().enumerate() {
+        if (w >> 48) & 0x1FF == 0x045 {
+            assert_eq!(w, 0x4845_C001_C000_0000, "the BARRIER at {j}");
+            let f = (c.words[j - 1] >> 59) & 15;
+            assert!(f >= 1 && f <= 7 && f & 1 == 1, "the instruction before the BARRIER at {j} waits on slot 0 (flow {f})");
+        }
+    }
+    const N: usize = 1 << 9;
+    const IN: u64 = 0x8000_0000 + 4 * N as u64;
+    let mut mem = Memory { base: 0x8000_0000, bytes: vec![0; 8 * N] };
+    let input: Vec<u32> = (0..N as u32).map(|k| k.wrapping_mul(0x9E37_79B9) >> 7).collect();
+    for (k, &v) in input.iter().enumerate() {
+        mem.write32(IN + 4 * k as u64, v);
+    }
+    let mut uniforms = vec![0x8000_0000u64, IN];
+    uniforms.extend_from_slice(&c.consts);
+    for grp in 0..(N >> 7) as u32 {
+        run_group(&c.words, &uniforms, grp << 7, 0, 1 << 7, 512, &mut mem);
+    }
+    for k in 0..N {
+        let start = k & !127;
+        let want = input[start..=k].iter().fold(0u32, |a, &b| a.wrapping_add(b));
+        assert_eq!(mem.read32(0x8000_0000 + 4 * k as u64), want, "invocation {k}");
+    }
+}
+
+/// The same scan without the barrier before each round's write: an invocation overwrites a word its neighbour has yet to read, which the emulator names (the device would give a wrong sum now and then).
+#[test]
+#[should_panic(expected = "with no barrier between")]
+fn a_race_in_shared_storage_is_named() {
+    use valhall::sim::run_group;
+    use valhall::ssa::{self, U};
+    let _turn = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+    ssa::begin();
+    ssa::workgroup(4, 64);
+    let i = ssa::local_id();
+    ssa::shared_store(i, 2, 0, i);
+    ssa::barrier();
+    let has = i.ge(U::splat(1));
+    let y = ssa::shared_load(U::select(has, i - U::splat(1), i), 2, 0);
+    ssa::shared_store(i, 2, 0, y + i);
+    ssa::store(0, 2, 0, y);
+    let c = ssa::compile();
+    let mut mem = Memory { base: 0x8000_0000, bytes: vec![0; 64] };
+    let mut uniforms = vec![0x8000_0000u64];
+    uniforms.extend_from_slice(&c.consts);
+    run_group(&c.words, &uniforms, 0, 0, 16, 64, &mut mem);
 }

@@ -231,12 +231,62 @@ impl Lut {
     }
 }
 
-/// A 32-bit source: a register, a uniform word, or a LUT immediate.
+/// A special FAU value (ISA.xml "FAU special page 0/1/3"): a 64-bit entry the hardware fills per invocation or per workgroup, encoded as if it were LUT entry 32 + its index, its page in the FAU page field (va_pack.c `va_pack_fau_64`: G#E0 | index << 1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Special {
+    /// Page 0, 2: the warp's id and the warps a core less one.
+    WarpId,
+    /// Page 1, 1: thread-local storage's base.
+    TlsPointer,
+    /// Page 1, 3: this workgroup's own workgroup-local storage (shared memory) base, a 64-bit GPU address; Mesa adds a 32-bit offset to its low word and keeps its high word (bifrost_compile.c `bi_handle_segment`).
+    WlsPointer,
+    /// Page 3, 1: the invocation's lane in its warp (0 to 15).
+    LaneId,
+    /// Page 3, 3: the shader core's id.
+    CoreId,
+}
+
+impl Special {
+    /// (page, index in the page).
+    const fn place(self) -> (u8, u8) {
+        match self {
+            Special::WarpId => (0, 2),
+            Special::TlsPointer => (1, 1),
+            Special::WlsPointer => (1, 3),
+            Special::LaneId => (3, 1),
+            Special::CoreId => (3, 3),
+        }
+    }
+    /// The low 32-bit word.
+    pub const fn w0(self) -> SpecialWord {
+        SpecialWord { which: self, word: Word::W0 }
+    }
+    /// The high 32-bit word.
+    pub const fn w1(self) -> SpecialWord {
+        SpecialWord { which: self, word: Word::W1 }
+    }
+}
+
+/// One 32-bit word of a special FAU value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpecialWord {
+    which: Special,
+    word: Word,
+}
+
+/// A 32-bit source: a register, a uniform word, a LUT immediate, or a word of a special FAU value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Src {
     Reg(Reg),
     Uniform(Uniform),
     Lut(Lut),
+    Special(SpecialWord),
+}
+
+impl From<SpecialWord> for Src {
+    fn from(x: SpecialWord) -> Src {
+        Src::Special(x)
+    }
 }
 
 impl From<Reg> for Src {
@@ -424,7 +474,7 @@ macro_rules! operand {
         }
     )*};
 }
-operand!(Reg, Uniform, Lut, Src);
+operand!(Reg, Uniform, Lut, Src, SpecialWord);
 
 // ---------------------------------------------------------------------------
 // Instruction fields
@@ -563,8 +613,8 @@ const SR_WRITE: u64 = 2;
 /// One instruction word plus the FAU it has claimed so far.
 struct Ins {
     word: u64,
-    /// The one 64-bit uniform slot this instruction reads, if any.
-    slot: Option<u8>,
+    /// The one 64-bit FAU entry this instruction reads, if any: a uniform slot (0 to 127), or a special value (G#200 | page << 4 | index).
+    slot: Option<u16>,
     /// The distinct 32-bit FAU words read: G#0xx = uniform (slot << 1 | word), G#1xx = LUT index.
     words: [u16; 2],
     used: usize,
@@ -592,13 +642,18 @@ impl Ins {
 
     /// Claims a uniform slot, enforcing the one-slot rule, and sets its FAU page.
     fn fau_slot(&mut self, slot: u8) {
+        self.fau_entry(slot as u16, slot >> 5);
+    }
+
+    /// Claims a 64-bit FAU entry (keyed as `slot` holds it) on FAU page `page`, enforcing the one-entry rule.
+    fn fau_entry(&mut self, key: u16, page: u8) {
         match self.slot {
             None => {
-                self.slot = Some(slot);
-                self.bits((slot >> 5) as u64, PAGE);
+                self.slot = Some(key);
+                self.bits(page as u64, PAGE);
             }
-            // WHY: the hardware fetches one 64-bit FAU slot per instruction (va_validate.c:10-11); a second slot would read whatever the first slot's port carries.
-            Some(s) => assert!(s == slot, "valhall: an instruction may read only one 64-bit uniform slot"),
+            // WHY: the hardware fetches one 64-bit FAU entry per instruction from one page (va_validate.c:10-11); a second entry would read whatever the first one's port carries.
+            Some(s) => assert!(s == key, "valhall: an instruction may read only one 64-bit uniform slot or special value"),
         }
     }
 
@@ -615,6 +670,14 @@ impl Ins {
             Src::Lut(x) => {
                 self.fau_word(0x100 | x.0 as u16);
                 0xC0 | x.0 as u64
+            }
+            Src::Special(x) => {
+                let (page, idx) = x.which.place();
+                let key = 0x200 | (page as u16) << 4 | idx as u16;
+                self.fau_entry(key, page);
+                self.fau_word(0x400 | (page as u16) << 4 | (idx as u16) << 1 | x.word as u16);
+                // As LUT entry 32 + its index, the word in bit 0 (va_pack.c `va_pack_fau_64`: (0x7 << 5) | special << 1).
+                0xE0 | (idx as u64) << 1 | x.word as u64
             }
         };
         self.bits(byte, at);
@@ -908,6 +971,29 @@ impl<const N: usize> Kernel<N> {
     /// `LSHIFT_XOR.i32 dst, a, shift.bN, b`: (a << byte N of shift) ^ b (ISA.xml:3043-3048, opcode2 G#102).
     pub fn lshift_xor_i32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, shift: impl Into<Src>, byte: Byte, b: impl Into<Src>) -> Placed<'_> {
         self.shift(1 << 32 | 2 << 24, dst, a, shift, byte, b)
+    }
+
+    /// `RSHIFT_AND.i32 dst, a, shift.bN, b`: (a >> byte N of shift, logical) & b (ISA.xml:2883-2889, opcode2 G#000).
+    pub fn rshift_and_i32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, shift: impl Into<Src>, byte: Byte, b: impl Into<Src>) -> Placed<'_> {
+        self.shift(0, dst, a, shift, byte, b)
+    }
+
+    /// `RSHIFT_XOR.i32 dst, a, shift.bN, b`: (a >> byte N of shift, logical) ^ b (ISA.xml:3077-3083, opcode2 G#002); Mesa's vector `82 4c c0 52 00 cc b4 00` is the same form with not_result set (assembler-cases.txt:193).
+    pub fn rshift_xor_i32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, shift: impl Into<Src>, byte: Byte, b: impl Into<Src>) -> Placed<'_> {
+        self.shift(2 << 24, dst, a, shift, byte, b)
+    }
+
+    // --- Workgroups ----------------------------------------------------------
+
+    /// `BARRIER.slot7.wait` (ISA.xml:857-865): every invocation of the workgroup waits here until all have arrived, and the workgroup's memory written before it is seen by all after it. Slot 7 and the `wait` flow are required (the ISA's own words); Mesa's vector is `00 00 00 c0 01 c0 45 48` (assembler-cases.txt:60).
+    /// The instruction before it must wait on every slot with memory work outstanding (va_insert_flow.c: "We need to wait for all general slots before a barrier ... The DDK is observed to use the same workaround"): the caller's (the SSA compiler puts `.wait0` there).
+    pub fn barrier(&mut self) -> Placed<'_> {
+        let mut i = Ins::new(0x045);
+        // No destination: the G#C0 placeholder, as Mesa's vector.
+        i.bits(0xC0, DEST);
+        i.bits(7, 30);
+        i.bits(Flow::Wait as u64, FLOW);
+        self.push(i)
     }
 
     /// `MUX.i32.mode dst, a, b, mask` (ISA.xml:3139-3154): [`Mux::Bit`] takes a's bits where the mask's are set and b's elsewhere, so a compare's all-ones/zero result selects whole words: `select(mask, a, b)`.

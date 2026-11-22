@@ -235,3 +235,29 @@ fn mesa_vectors_f16_clamp_nop() {
     k.nop().end();
     same(k.finish(), &[0x00A4_C000_0800_0001, 0x00A4_C000_0400_0001, 0x00A5_C000_0C00_0001, 0x00A4_C032_0000_0201, 0x7800_C000_0000_0000]);
 }
+
+/// Workgroups (2026-11-21, the parallel noise's scan): the barrier, the workgroup-local storage pointer and the other special FAU values, and the right shifts with a second operand, against Mesa's assembler test vectors (assembler-cases.txt).
+#[test]
+fn mesa_vectors_workgroup() {
+    let mut k = Kernel::<8>::new();
+    // 00 00 00 c0 01 c0 45 48: BARRIER.slot7.wait
+    k.barrier();
+    // e6 00 00 00 00 c1 91 02: MOV.i32 r1, workgroup_local_pointer.w0
+    k.mov_i32(r(1), Special::WlsPointer.w0());
+    // e3 00 00 00 00 c1 91 02: MOV.i32 r1, thread_local_pointer.w1
+    k.mov_i32(r(1), Special::TlsPointer.w1());
+    // e2 00 00 00 00 c1 91 06: MOV.i32 r1, lane_id.w0
+    k.mov_i32(r(1), Special::LaneId.w0());
+    // e6 00 00 00 00 c1 91 06: MOV.i32 r1, core_id.w0
+    k.mov_i32(r(1), Special::CoreId.w0());
+    // 82 4c c0 52 00 cc b4 00: RSHIFT_XOR.i32.not_result r12, u1.w0, r12^.b00, 0x0, here without not_result (bit 30) and the discard (bit 6 of r12's byte): the shift group's form as LSHIFT_XOR's, its direction bit 32 clear.
+    k.rshift_xor_i32(r(12), u(1).w0(), r(12), Byte::B0, Lut::ZERO);
+    same(k.finish(), &[0x4845_C001_C000_0000, 0x0291_C100_0000_00E6, 0x0291_C100_0000_00E3, 0x0691_C100_0000_00E2, 0x0691_C100_0000_00E6, 0x00B4_CC00_12C0_0C82]);
+}
+
+#[test]
+#[should_panic(expected = "only one 64-bit uniform slot or special value")]
+fn special_and_uniform_refused() {
+    let mut k = Kernel::<4>::new();
+    k.iadd_u32(r(0), Special::WlsPointer.w0(), u(1).w0());
+}
