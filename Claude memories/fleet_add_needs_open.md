@@ -25,3 +25,8 @@ Owner, 2026-11-10, after a Bluetooth pick 50 ft away stayed bound when Back was 
 - No fleet notification reaches the person's devices until the new device's person has pressed the explicit confirmation ("Yes, I really would like to add this device and this is my identity and not a typo"). Nothing is announced on a typed handle alone.
 - After that confirmation, the new device advises: put the two devices together (NFC), the other device's screen on and its Fleet page open, in Photon or ferros. Otherwise the click to add over BLE is the other option.
 - The words are for odd cases only and never shown by default (shoulder surfing): behind a "Not in range? Show words to copy/paste or dictate" choice.
+
+**Refined the same day (via the Photon session; Photon memory feedback_add_device_confirm_first.md):**
+- ADD: the joiner types the handle once and taps attest, then waits; only when it sees the handle is taken and this device unbound does it ask "are you sure?"; only on yes does the request go out, as a persistent broadcast that "falls on deaf ears unless my fleet page is open on my other devices". No toast or light-up anywhere else ("don't want someone typing Nick in in Germany a bunch of times and making my device light up"). Then NFC, or BLE touch-select + green Add; words only behind "Not in range?".
+- REMOVE, on the device being removed: press remove, type the handle, press unbind; the fleet is told at once (no Fleet page needed); the device then wipes its vault and keys (Photon on Android just closes; on ferros the killswitch).
+- Both flows go into fgtw as one shared Join machine and departure; ferros's join (mint_request, the beacon) adopts it.
