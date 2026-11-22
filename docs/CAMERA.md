@@ -1635,6 +1635,16 @@ Measured on the Pro (flashed 82b908c4, then that kernel with a9bdb503 RAM-reload
 - **camtest 11 after END_FLUSH** (1786ed7b removed the camera's own per-job invalidate): every word of every frame equal to the CPU's view, non-cacheable and cacheable; a frame's copy 949 us non-cacheable, 1189 us cacheable (849 before); a store into the ring a permission fault; a CLOSE with a job in flight ended its queue; unmapped after; the GPU's fence clean.
 - **The clips window** had 16 GB free of 48 (other domains' clips): a minute at 60/s is about 17 GB coded.
 - **Open**: the tele's focus (a capture of Android's camera focusing the tele, `diag android` and the i2c tracepoints on i2c-4 at every address, as "The I2C side without a flash"); each lens's infinity and nearest targets (the EEPROMs' calibration, undecoded), so a slider in dioptres maps by measure, not by guess.
+- **The Pro went silent** after a RAM reload of forge 8f04f065 (23:43:56: no USB, no fastboot, not back on its own); the same night's reload of 82b908c4 with a9bdb503 alone came back in a second and ran every test above. Between the two, the kernel's changes were GPU-COMPOSE step 1 (727a23db; e4a30393 since). Both slots still hold the flashed boot_restarts_82b908c4, and the stored `camera` (65348f7a, blake3 2e34495d...) runs on it, so a power-button reset brings back a healthy Pro, but without a9bdb503: a RAW recording with the screen off still falls to the dark tier until a kernel with it is flashed.
+
+### For the owner (the morning of 2026-11-22)
+
+- **Promo-ready on the ferros side**: all four cameras stream and record RAW on the GPU coder with no dropped frame at 24 and 30 a second; gain (ISO) works on all four; focus on the main, the ultrawide and the front.
+- **Shoot settings**: 30 a second on all four (the front's fastest whole frame is 33, the ultrawide's 48, the tele's 50, the main's 60); the top rates for short takes only, from a cool start (85 C in 23 to 29 s at 48 to 60 a second with the charger in).
+- **Needs your hand**: a power-button reset of the Pro, then the flash of the night's kernel (a9bdb503's screen-off fix) once GPU-COMPOSE step 1 is fixed or left out.
+- **Needs your call**: the ultrawide's least gain at code 7 (1031, 1024 refused): a floor stored since uw-gain-slit that you never approved (left as it is tonight).
+- **Not done**: the tele's focus (its lens is driven by its OIS controller, humbaba at G#61; a capture of Android's camera focusing the tele is the way in); each lens's infinity and nearest targets, so Lumis's dioptre slider maps by measure.
+- **Front focus**: confirmed by the actuator's own position readback (every target G#0800 to G#7800 read back within G#64); the frames of the night's scene were too featureless to show the sharpness move.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
