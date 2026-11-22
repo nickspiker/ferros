@@ -246,3 +246,42 @@ pub fn frame_kernel() -> Compiled {
     ssa::store_at(DST, at, 3, 4, U::splat(g2t::ALPHA_OPAQUE << 16) | r);
     ssa::compile()
 }
+
+/// One camera frame stacked into a plane (lumis_core's integrator: the Average plane of the exposure in progress, `stack_kernel`).
+pub mod stack {
+    /// The frame's row 0 (RAW10: four samples in five bytes, each sample's high 8 bits in bytes 0 to 3 and its low 2 in byte 4, two bits a sample from the bottom) and the plane (a u16 a sample, row by row).
+    pub const SRC: u8 = 0;
+    pub const PLANE: u8 = 1;
+    /// (groups of four samples a row, groups in the frame), and (the frame's line in bytes, the plane's row in samples).
+    pub const SIZE: u8 = 2;
+    pub const LINES: u8 = 3;
+    pub const SLOT_COUNT: u8 = 4;
+    /// Bytes past the plane its kernel may write (the last group of invocations past a frame whose groups are not a multiple of 16).
+    pub const SLACK: usize = 1 << 7;
+}
+
+/// A camera frame into the integrator's plane, an invocation a group of four samples (ids 0 to the frame's groups - 1, row by row; past them, into the plane's `SLACK`): its five bytes read straight from the camera's buffer, unpacked as lumis_core's RAW10 rows are (ferros std/lumis `camera::unpack_raw10`), and written (`add` false: an exposure's first frame) or added (`add`: the plane holds at most the integrator's fold of frames, so no half carries into the next) into the plane, two samples a u32.
+pub fn stack_kernel(add: bool) -> Compiled {
+    use stack::*;
+    ssa::begin();
+    ssa::reserve(SLOT_COUNT);
+    let g0 = ssa::gid();
+    let n = ssa::uniform(SIZE, 1);
+    // WHY the selects: the invocations come in groups of 16, so past a frame whose groups are not a multiple of 16 they would read and add outside it; those read the last group (inside the frame) and write their own 8 bytes past the plane (its slack, `SLACK`), never adding twice into a sample. Every binned readout of the Pro is a multiple of 16.
+    let past = g0.ge(n);
+    let g = U::select(past, n - U::splat(1), g0);
+    let run = ssa::uniform(SIZE, 0);
+    let yu = ((F::from_u32(g) + 0.5) / F::from_u32(run)).floor().to_u32();
+    let xu = g - yu.wrapping_mul(run);
+    let at = yu.wrapping_mul(ssa::uniform(LINES, 0)) + xu.wrapping_mul(U::splat(5));
+    let b = |k: i16| ssa::load8(SRC, at, 0, k);
+    let lo = b(4);
+    let s = |k: u32| (b(k as i16) << 2) | ((lo >> (2 * k)) & U::splat(3));
+    let (w0, w1) = (s(0) | (s(1) << 16), s(2) | (s(3) << 16));
+    // The plane's two words for the group: sample y * row + 4 x, two a word.
+    let word = U::select(past, (n << 1) + ((g0 - n) << 1), yu.wrapping_mul(ssa::uniform(LINES, 1) >> 1) + (xu << 1));
+    let (w0, w1) = if add { (ssa::load(PLANE, word, 2, 0) + w0, ssa::load(PLANE, word, 2, 4) + w1) } else { (w0, w1) };
+    ssa::store_at(PLANE, word, 2, 0, w0);
+    ssa::store_at(PLANE, word, 2, 4, w1);
+    ssa::compile()
+}

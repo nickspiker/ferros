@@ -4,16 +4,19 @@
 
 use ferros_sys::gpu::queue::{Job, Queue, S_DONE};
 use ferros_sys::gpu::{ARENA_VA, PRELOAD_REGS64, PRELOAD_X, SURFACES_PA, SURFACES_VA};
-use lumis_gpu::{frame, menu, Compiled};
+use lumis_gpu::{frame, menu, stack, Compiled};
 
 /// Lumis's part of the GPU block, 2^26 bytes (64 MiB): the Pro's menu's parts take 29 MiB of it, the camera screen's frame 12 more.
 pub const UI_LOG: u32 = 26;
 /// The queue at the block's start, 2^1 jobs deep (a frame's job at a time, and the next).
 const QUEUE_AT: usize = 0;
 const DEPTH_LOG2: u32 = 1;
-/// The kernels' words (the menu's, then the frame's 2^15 bytes on), the code table, the slots' records (2^10 - 2^6 bytes after the table: two drawings of NUM_SLOTS rows and the empty one fit many times over), each pixel row's slot.
+/// The kernels' words (kernel k at CODE_AT + k 2^CODE_SLOT_LOG: the menu's, the frame's, the stack written and added), the code table, the slots' records (2^10 - 2^6 bytes after the table: two drawings of NUM_SLOTS rows and the empty one fit many times over), each pixel row's slot.
 const CODE_AT: usize = 1 << 16;
-const FRAME_CODE_AT: usize = CODE_AT + (1 << 15);
+const CODE_SLOT_LOG: u32 = 13;
+/// The camera's integrator's shared memory (lumis_core `platform::set_shared_place`: its header, its image slots, the slitscan ring) from 2^28, the block grown to 2^29 for it: past the recorder's part (from 2^UI_LOG, the main's 137 MB), so a RAW clip and the stack never meet. The GPU stacks each frame into the plane in progress there (`Gpu::stack`).
+pub const INTEGRATOR_AT: usize = 1 << 28;
+const CAMERA_LOG: u32 = 29;
 const LUT_AT: usize = 1 << 17;
 const SLOTS_AT: usize = LUT_AT + (1 << 10);
 const SLOTS_MOST: usize = ((1 << 18) - SLOTS_AT) / (menu::RECORD_WORDS * 4);
@@ -33,6 +36,8 @@ fn mib(n: usize) -> usize {
 enum Kind {
     Menu = 0,
     Camera = 1,
+    Stack = 2,
+    StackAdd = 3,
 }
 
 /// Lumis's GPU: the queue on its part of the block, the two kernels, the two surfaces of Lumis's layer.
@@ -43,9 +48,9 @@ pub struct Gpu {
     base: *mut u8,
     size: u64,
     q: Queue,
-    /// Each kernel's handle in the queue and its recording: the menu's, the frame's.
-    kernels: [u8; 2],
-    compiled: [Compiled; 2],
+    /// Each kernel's handle in the queue and its recording: the menu's, the frame's, the stack written, the stack added.
+    kernels: [u8; 4],
+    compiled: [Compiled; 4],
     /// The two surfaces, each its base as Lumis's own `dma` of it (what the show names), and the one the next frame goes into.
     surfaces: [u64; 2],
     next: usize,
@@ -60,8 +65,8 @@ pub struct Gpu {
     /// The slots as lumis_core gave them (`MainMenu::ink_frame`).
     slots: Vec<lumis_core::ui::draw::Slot>,
     /// The GPU's time of each kind's frames since its last line, counter ticks, and how many.
-    ticks: [u64; 2],
-    frames: [u64; 2],
+    ticks: [u64; 4],
+    frames: [u64; 4],
 }
 
 // SAFETY: the block is this process's for its life (the kernel never takes a GPU block back); only the UI thread draws into it.
@@ -93,20 +98,22 @@ impl Gpu {
             surfaces[k] = ferros_sys::surface_ask(surface, &mut t[k]).ok_or("no surface of Lumis's own (at most four a process)")?;
         }
         let base = ferros_sys::dma(block) as *mut u8;
-        let compiled = [lumis_gpu::menu_kernel(), lumis_gpu::frame_kernel()];
+        let compiled = [lumis_gpu::menu_kernel(), lumis_gpu::frame_kernel(), lumis_gpu::stack_kernel(false), lumis_gpu::stack_kernel(true)];
         let (q, kernels) = Self::queue(service, block, base, &compiled)?;
         // SAFETY: the table's 2^10 bytes at LUT_AT, under Lumis's 2^UI_LOG of the block.
         unsafe { core::ptr::copy_nonoverlapping(lut.as_ptr() as *const u8, base.add(LUT_AT), 1 << 10) };
-        Ok(Gpu { service, block, base, size, q, kernels, compiled, surfaces, next: 0, w, h, bg_at, ink_at, frame_at, bg_written: false, slots: Vec::new(), ticks: [0; 2], frames: [0; 2] })
+        *PLACE.lock().unwrap() = Some((block, base as usize));
+        Ok(Gpu { service, block, base, size, q, kernels, compiled, surfaces, next: 0, w, h, bg_at, ink_at, frame_at, bg_written: false, slots: Vec::new(), ticks: [0; 4], frames: [0; 4] })
     }
 
-    /// The queue opened on the block as it is now and both kernels' words given to it.
-    fn queue(service: u64, block: u64, base: *mut u8, compiled: &[Compiled; 2]) -> Result<(Queue, [u8; 2]), String> {
+    /// The queue opened on the block as it is now and the kernels' words given to it.
+    fn queue(service: u64, block: u64, base: *mut u8, compiled: &[Compiled; 4]) -> Result<(Queue, [u8; 4]), String> {
         let q = Queue::open(service, block, QUEUE_AT, DEPTH_LOG2).map_err(|s| format!("the GPU queue did not open (status G#{s:X})"))?;
-        let mut kernels = [0u8; 2];
-        for (k, (c, at)) in compiled.iter().zip([CODE_AT, FRAME_CODE_AT]).enumerate() {
-            // A kernel of a few hundred words (8 bytes each) in its 2^15 bytes.
-            assert!(c.words.len() * 8 <= 1 << 15, "a kernel's words pass their room");
+        let mut kernels = [0u8; 4];
+        for (k, c) in compiled.iter().enumerate() {
+            let at = CODE_AT + (k << CODE_SLOT_LOG);
+            // A kernel of a few hundred words (8 bytes each) in its 2^CODE_SLOT_LOG bytes.
+            assert!(c.words.len() * 8 <= 1 << CODE_SLOT_LOG, "a kernel's words pass their room");
             // SAFETY: the words at their place, under LUT_AT.
             unsafe { core::ptr::copy_nonoverlapping(c.words.as_ptr() as *const u8, base.add(at), c.words.len() * 8) };
             let preload = PRELOAD_X | if c.regs64 { PRELOAD_REGS64 } else { 0 };
@@ -178,21 +185,45 @@ impl Gpu {
 
     /// A job of `kind`'s kernel with uniforms `u` (its DST, slot 0 in both, set here to the next surface) over every pixel, waited for: the surface it drew.
     fn run(&mut self, kind: Kind, u: &mut [u64]) -> Result<u64, String> {
-        // The recorder grew the block since (ferros_clip, a clip on the GPU): another client to the service, the queue opened again for it.
+        let k = self.next;
+        u[0] = SURFACES_VA + (self.surfaces[k] - SURFACES_PA);
+        self.exec(kind, u, (self.w * self.h) as u32)?;
+        self.next ^= 1;
+        Ok(self.surfaces[k])
+    }
+
+    /// The camera's view mapped in this process's GPU space now (the GPU service's op 5): after each OPEN, at `CAMERA_VA` (a frame at its place in the view, the MAP header's +48); after a CLOSE, gone. None: the service did not answer.
+    pub fn camera_mapped(&self) -> Option<bool> {
+        self.q.refresh()
+    }
+
+    /// A camera frame stacked into the integrator's plane on the GPU (lumis_gpu `stack_kernel`): its RAW10 at `src` (`CAMERA_VA` plus its place in the view), `line` bytes a row, `width` x `height` samples, into the plane at `plane` bytes into the block (`INTEGRATOR_AT` on), written or added (`add`). Waited for.
+    pub fn stack(&mut self, src: u64, line: usize, width: usize, height: usize, plane: usize, add: bool) -> Result<(), String> {
+        let groups = width / 4 * height;
+        let mut u = [0u64; stack::SLOT_COUNT as usize];
+        u[stack::SRC as usize] = src;
+        u[stack::PLANE as usize] = ARENA_VA + plane as u64;
+        u[stack::SIZE as usize] = (width / 4) as u64 | (groups as u64) << 32;
+        u[stack::LINES as usize] = line as u64 | (width as u64) << 32;
+        self.exec(if add { Kind::StackAdd } else { Kind::Stack }, &u, groups as u32)
+    }
+
+    /// A job of `kind`'s kernel with uniforms `u` over `invocations`, waited for.
+    fn exec(&mut self, kind: Kind, u: &[u64], invocations: u32) -> Result<(), String> {
+        // The block grew since (the recorder's part for a clip, the integrator's for a camera): another client to the service, the queue opened again for it.
         let size = ferros_sys::dma_size(self.block, ferros_sys::GPU_BLOCK_MOST as u64).unwrap_or(0);
         if size != self.size {
             println!("lumis: the GPU block is G#{size:X} bytes now (G#{:X} at the queue's open): the queue opened again", self.size);
             (self.q, self.kernels) = Self::queue(self.service, self.block, self.base, &self.compiled)?;
             self.size = size;
         }
-        let (k, i) = (self.next, kind as usize);
-        u[0] = SURFACES_VA + (self.surfaces[k] - SURFACES_PA);
+        let i = kind as usize;
         let mut uniforms = u.to_vec();
         uniforms.extend_from_slice(&self.compiled[i].consts);
-        let groups = ((self.w * self.h).div_ceil(1 << 4) as u32, 1);
+        let groups = (invocations.div_ceil(1 << 4), 1);
         let n = self.q.submit(&Job { kernel: self.kernels[i], groups, uniforms: &uniforms }).ok_or("the GPU queue took no job")?;
         let e = self.q.wait(n);
-        let name = ["the menu", "the camera screen"][i];
+        let name = ["the menu", "the camera screen", "the stack (a frame written)", "the stack (a frame added)"][i];
         if e.status != S_DONE {
             // The queue ended with it (a fault ends a queue): opened again for the next frame.
             let why = format!("{name}'s GPU job ended with status A#{} (the GPU address G#{:X}, fault G#{:X})", e.status, e.fault_address, e.fault_status);
@@ -205,7 +236,49 @@ impl Gpu {
             println!("lumis: {name} on the GPU: {} us a frame on the GPU, the last {} frames", self.ticks[i] * 1_000_000 / (self.frames[i] * ferros_sys::freq()), self.frames[i]);
             (self.ticks[i], self.frames[i]) = (0, 0);
         }
-        self.next ^= 1;
-        Ok(self.surfaces[k])
+        Ok(())
+    }
+}
+
+/// Lumis's GPU, shared by the UI thread (the menu, the camera screen's frame) and the camera thread (the stack, the camera's view): None until `Gpu::open` (on the UI thread, with the first frame), and when there is none.
+pub static SHARED: std::sync::Mutex<Option<Gpu>> = std::sync::Mutex::new(None);
+
+/// The GPU block's grant and its CPU address, once the GPU is open: where the integrator's shared memory goes (`shared_place`).
+static PLACE: std::sync::Mutex<Option<(u64, usize)>> = std::sync::Mutex::new(None);
+
+/// lumis_core's `platform::set_shared_place`: the camera's integrator's `bytes` of shared memory at `INTEGRATOR_AT` in the GPU block (grown to 2^CAMERA_LOG for it) and zeroed, when the GPU is open and they fit under 2^CAMERA_LOG with the stack kernel's slack; None (the heap) otherwise: a readout too large (the 1:1 ones) is stacked on the CPU.
+pub fn shared_place(bytes: usize) -> Option<*mut u64> {
+    let (block, base) = (*PLACE.lock().unwrap())?;
+    if INTEGRATOR_AT + bytes + stack::SLACK > 1 << CAMERA_LOG {
+        return None;
+    }
+    let size = ferros_sys::gpu_block_ask(block, CAMERA_LOG)?;
+    if size < 1 << CAMERA_LOG {
+        return None;
+    }
+    let at = (base + INTEGRATOR_AT) as *mut u8;
+    // SAFETY: the block is 2^CAMERA_LOG bytes at `base` (just grown), the process's for its life; the bytes from INTEGRATOR_AT are no one else's (the recorder's part ends under it, `INTEGRATOR_AT`), and the integrator they are for is the camera's only one (the one before it, of a camera since closed, never used again).
+    unsafe { core::ptr::write_bytes(at, 0, bytes) };
+    Some(at as *mut u64)
+}
+
+/// Where the integrator's plane at `plane` (`len` samples) lies in the block, in bytes from its start: Some when it is in the integrator's part (`shared_place` put it there) with the stack kernel's slack after it.
+pub fn plane_in_block(plane: *const u16, len: usize) -> Option<usize> {
+    let (_, base) = (*PLACE.lock().unwrap())?;
+    let at = (plane as usize).checked_sub(base)?;
+    (at >= INTEGRATOR_AT && at + len * 2 + stack::SLACK <= 1 << CAMERA_LOG).then_some(at)
+}
+
+/// The camera's view is mapped in Lumis's GPU space (`camera_changed` after an OPEN said so), so a frame can be stacked on the GPU from it.
+pub static CAMERA_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A stack job failed: the stack is the CPU's for the rest of the process.
+pub static STACK_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The camera opened (`open`) or closed: the GPU service told (op 5), which maps the camera's view in Lumis's GPU space after an OPEN and takes it away after a CLOSE, and whether frames can be stacked from it now.
+pub fn camera_changed(open: bool) {
+    let mapped = SHARED.lock().unwrap().as_ref().and_then(|g| g.camera_mapped()) == Some(true);
+    CAMERA_MAPPED.store(open && mapped, core::sync::atomic::Ordering::Relaxed);
+    if open {
+        println!("lumis: the camera's view {} in the GPU", if mapped { "mapped: frames stacked there" } else { "not mapped: frames stacked on the CPU" });
     }
 }

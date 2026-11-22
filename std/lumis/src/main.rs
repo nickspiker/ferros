@@ -569,12 +569,16 @@ struct ViewRows {
     cached: bool,
     /// The frame's phase-detect rows in the same buffer, where the driver gives them (MAP +56 and +60: docs/CAMERA.md "Phase detect as data"): where they start in this process and how many, at the image's line.
     pd: Option<(usize, usize)>,
+    /// The frame in the GPU's view of the camera (`CAMERA_VA` plus its place in the view; 0: none, as for its phase-detect rows) and its size in samples, for the GPU's stack (`RowSource::stack`).
+    gpu: u64,
+    width: usize,
+    height: usize,
 }
 
 impl ViewRows {
     /// The phase-detect rows as rows of their own (the same line and caching as the image's) and their count.
     fn pd(&self) -> Option<(ViewRows, usize)> {
-        self.pd.map(|(src, rows)| (ViewRows { src, line: self.line, cached: self.cached, pd: None }, rows))
+        self.pd.map(|(src, rows)| (ViewRows { src, line: self.line, cached: self.cached, pd: None, gpu: 0, width: 0, height: 0 }, rows))
     }
 }
 
@@ -651,6 +655,24 @@ fn previewing() -> bool {
 }
 
 impl lumis_core::RowSource for ViewRows {
+    /// The frame stacked on the GPU straight from the camera's buffer (lumis_gpu `stack_kernel`, the owner 2026-11-22: "I thought we stacked on the GPU for the memory bandwidth, no?"), when the camera's view is mapped in the GPU (`gpu::CAMERA_MAPPED`), the plane is in the integrator's part of the GPU block (`gpu::plane_in_block`), and the frame's groups of four samples come in whole groups of 16 invocations (every binned readout of the Pro); else the integrator reads the rows itself, as before. A GPU job that fails turns the GPU's stack off for the rest of the process, said once.
+    fn stack(&self, plane: &mut [u16], add: bool) -> bool {
+        if self.gpu == 0 || !gpu::CAMERA_MAPPED.load(Ordering::Relaxed) || gpu::STACK_OFF.load(Ordering::Relaxed) || self.width % 4 != 0 || (self.width / 4 * self.height) % (1 << 4) != 0 || plane.len() != self.width * self.height {
+            return false;
+        }
+        let Some(at) = gpu::plane_in_block(plane.as_ptr(), plane.len()) else { return false };
+        let mut shared = gpu::SHARED.lock().unwrap();
+        let Some(g) = shared.as_mut() else { return false };
+        match g.stack(self.gpu, self.line, self.width, self.height, at, add) {
+            Ok(()) => true,
+            Err(e) => {
+                gpu::STACK_OFF.store(true, Ordering::Relaxed);
+                println!("lumis: {e}: the stack on the CPU from now");
+                false
+            }
+        }
+    }
+
     fn read_row(&self, y: usize, out: &mut [u16]) {
         let at = self.src + y * self.line;
         if self.cached {
@@ -686,7 +708,7 @@ impl Source {
                     println!("lumis: the phase view {}", if pd { format!("offered: {} phase-detect rows a frame, G#{:X} past the image", m.pd_rows, m.pd_offset) } else { "not offered: the frames carry no phase-detect rows".into() });
                 }
                 let src = *base + m.offset;
-                Some(Got::Frame(m.frame, Taken::View(ViewRows { src, line: view.line, cached: view.cached, pd: pd.then_some((src + m.pd_offset, m.pd_rows)) })))
+                Some(Got::Frame(m.frame, Taken::View(ViewRows { src, line: view.line, cached: view.cached, pd: pd.then_some((src + m.pd_offset, m.pd_rows)), gpu: ferros_sys::gpu::CAMERA_VA + m.offset as u64, width: m.frame.width, height: m.frame.height })))
             }
             Source::Copy { buf } => {
                 let n = sys::call_live(CAMERA, &[camera::OP_FRAME, BIN as u8], buf);
@@ -960,6 +982,8 @@ fn open(cam: &camera::Camera, slit: bool, video: Option<(ferros_clip::Pacing, u6
                 return Ok(Source::Slit { base: base as usize, slits, after: 0, take: 1..=0, band: Vec::new(), lost: 0, skipped: 0 });
             }
             println!("lumis: camera {}: the view, {} buffers of {} x {} RAW10 at G#{base:X}, {}", cam.name, v.buffers, v.width, v.height, if v.cached { "write-back" } else { "non-cacheable" });
+            // The GPU told: the view mapped in Lumis's GPU space, where the stack reads each frame (`ViewRows::stack`).
+            gpu::camera_changed(true);
             Ok(Source::View { base: base as usize, view: v, held: camera::NONE })
         }
         Some(v) => Err(Refused::Why(format!("the view's format {} is not one Lumis reads", v.format))),
@@ -1554,7 +1578,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 if let (true, Some((jobs, _))) = (preview_now && !behind && ring >= 4 && !previewing(), preview.as_ref()) {
                     c.preview = std::time::Instant::now();
                     *PREVIEWING.lock().unwrap() = true;
-                    let job = PreviewJob { rows: ViewRows { src: rows.src, line: rows.line, cached: rows.cached, pd: None }, last: head.count as u64 + ring - 3, iso: iso(head.gain) as i32, exposure_ns: head.exposure_ns as i64, quad: head.quad() };
+                    let job = PreviewJob { rows: ViewRows { src: rows.src, line: rows.line, cached: rows.cached, pd: None, gpu: rows.gpu, width: rows.width, height: rows.height }, last: head.count as u64 + ring - 3, iso: iso(head.gain) as i32, exposure_ns: head.exposure_ns as i64, quad: head.quad() };
                     if jobs.send(job).is_err() {
                         *PREVIEWING.lock().unwrap() = false;
                     }
@@ -1868,14 +1892,16 @@ fn in_flight(flags: u64) -> bool {
 /// The driver's CLOSE (docs/CAMERA.md, op 4): the view taken back, the stream stopped, the module powered down, and the driver ends.
 /// Said by the camera thread (or before it reads any frame), so nothing reads the view after the driver takes it back.
 fn close_camera(name: &str) {
-    // A preview still reading a buffer the CLOSE takes back ends first.
+    // A preview still reading a buffer the CLOSE takes back ends first, and no stack starts on the GPU from a view going away; after it the GPU is told the view is gone.
     preview_settle();
+    gpu::CAMERA_MAPPED.store(false, Ordering::Relaxed);
     let mut r = [0u8; 4];
     if sys::call_live(CAMERA, &[camera::OP_CLOSE], &mut r) == sys::ERR {
         println!("lumis: camera {name}: the CLOSE was not answered; the driver closes when Lumis ends");
     } else {
         println!("lumis: camera {name}: closed");
     }
+    gpu::camera_changed(false);
 }
 
 /// The camera closed for Lumis's leaving, once whoever asks first (`LEAVING`); the caller holds `VIEW` (the camera thread in its turn, or `close_from_behind`).
@@ -2007,8 +2033,7 @@ struct Lumis {
     lut: [u32; 256],
     /// The preview's split on the UI thread (`Probe`).
     probe: Probe,
-    /// The GPU that draws the menu (`gpu::Gpu`), when Lumis holds it; asked for once, with the first menu.
-    gpu: Option<gpu::Gpu>,
+    /// The GPU (`gpu::SHARED`, the camera thread's too) asked for: once, with the first menu.
     gpu_asked: bool,
     /// The menu changed since its last frame on the GPU (its parts written into the block again), and the surface that frame went into, for the show (`own_surface`).
     menu_fresh: bool,
@@ -2027,7 +2052,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu: None, gpu_asked: false, menu_fresh: true, own: None, relayout: false, relaids: 0, relaid_us: 0 }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu_asked: false, menu_fresh: true, own: None, relayout: false, relaids: 0, relaid_us: 0 }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -2117,18 +2142,20 @@ impl FluorApp<G2t16> for Lumis {
         // The frame is the panel, set once at start (ferros windows are the whole screen); Lumis is built for that size, as Android builds its menu and UI for the surface's.
         (self.width, self.height) = (w, h);
         // Lumis's frames on the GPU (`gpu::Gpu`): asked for with the first frame; a frame of another size later is the CPU's (the GPU's parts were laid out for the first).
-        match self.gpu.as_mut() {
-            Some(g) if g.fits(w, h) => g.new_menu(),
-            Some(_) => {
+        let mut shared = gpu::SHARED.lock().unwrap();
+        let fits = shared.as_ref().map(|g| g.fits(w, h));
+        match fits {
+            Some(true) => shared.as_mut().unwrap().new_menu(),
+            Some(false) => {
                 println!("lumis: a A#{w} x A#{h} frame: Lumis drawn on the CPU from now (its GPU parts were laid out for the first frame)");
-                self.gpu = None;
+                *shared = None;
             }
             None if !self.gpu_asked => {
                 self.gpu_asked = true;
                 match gpu::Gpu::open(sys::cap(SURFACE), w, h, &self.lut) {
                     Ok(g) => {
-                        println!("lumis: the menu and the camera screen on the GPU, every pixel a frame (lumis_gpu menu_kernel and frame_kernel), into two surfaces of Lumis's own");
-                        self.gpu = Some(g);
+                        println!("lumis: the menu and the camera screen on the GPU, every pixel a frame (lumis_gpu menu_kernel and frame_kernel), into two surfaces of Lumis's own; the stack on it too (stack_kernel)");
+                        *shared = Some(g);
                     }
                     Err(e) => println!("lumis: Lumis drawn on the CPU: {e}"),
                 }
@@ -2136,7 +2163,7 @@ impl FluorApp<G2t16> for Lumis {
             None => {}
         }
         // Lumis's own frame where the GPU reads it (in the block) when it has one, else on the heap.
-        self.surface = Some(match self.gpu.as_ref() {
+        self.surface = Some(match shared.as_ref() {
             // SAFETY: the frame's w h 3 bytes in Lumis's part of the GPU block, which is the process's for its life; only this thread draws them, and the GPU reads them only during `Gpu::camera`, on this thread.
             Some(g) => unsafe { PixelSurface::at(g.frame_bits(), w, h) },
             None => PixelSurface::new(w, h),
@@ -2265,7 +2292,7 @@ impl FluorApp<G2t16> for Lumis {
                 if self.menu_dirty {
                     self.menu_dirty = false;
                     // On the GPU the frame is drawn at the show (`render_own`), its parts from the menu as it is then; else here on the CPU.
-                    if self.gpu.is_some() {
+                    if gpu::SHARED.lock().unwrap().is_some() {
                         self.menu_fresh = true;
                         self.changed = true;
                     } else if let Some(menu) = self.menu.as_mut() {
@@ -2375,7 +2402,8 @@ impl FluorApp<G2t16> for Lumis {
     /// The menu (and the menu still shown while a camera opens) drawn whole on the GPU straight into a surface of Lumis's own (`gpu::Gpu::frame`), which the host shows (`own_surface`): no scratch, no conversion, no bake on the CPU. A GPU that fails leaves the menu to the CPU from then, said on the console.
     fn render_own(&mut self, _ctx: &mut Context) -> bool {
         self.own = None;
-        let (Some(gpu), Some(menu), Some(surface)) = (self.gpu.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
+        let mut shared = gpu::SHARED.lock().unwrap();
+        let (Some(gpu), Some(menu), Some(surface)) = (shared.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
         let camera = matches!(self.screen, Screen::Camera(_));
         let t = std::time::Instant::now();
         // The camera screen: Lumis's frame as lumis_core drew it (in the block), whole, in place of the CPU's present of its changed rects (the owner, 2026-11-21: the GPU composes full frames).
@@ -2396,7 +2424,7 @@ impl FluorApp<G2t16> for Lumis {
                     app::menu_draw(menu, surface, true);
                     surface.take_posted();
                 }
-                self.gpu = None;
+                *shared = None;
                 false
             }
         }
@@ -2512,6 +2540,8 @@ fn main() {
     let cameras = list();
     // The menu drawn as ink (lumis_core `ui::draw::set_ink`): the CPU draws its words and lines, the GPU (or, without one, the CPU) the splash and the slots under them.
     lumis_core::ui::draw::set_ink(true);
+    // The camera's integrator keeps its shared memory in the GPU block when the GPU is open (lumis_core `platform::set_shared_place`, `gpu::shared_place`), where the GPU stacks each frame.
+    lumis_core::platform::set_shared_place(gpu::shared_place);
     let caps = fluor::host::ferros::Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
     // In the person's app scale and the device's theme, following both (ferros_fluor); a pinch anywhere in Lumis is the app scale (the owner, 2026-11-20: "RU everywhere. Should inherit the global RU"), written back with the display grant at its end.
     match ferros_fluor::run_app(Lumis::new(cameras, vault), caps, None, sys::cap(DISPLAY)) {
