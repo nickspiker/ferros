@@ -16,6 +16,7 @@ pub const KINDS: &[(&str, [u8; 32])] = &[
     ("collection", COLLECTION),
     ("Sega Genesis save state", GENESIS_SAVE_STATE),
     ("Sega Genesis battery RAM", GENESIS_BATTERY_RAM),
+    ("Sega Genesis cartridge", GENESIS_CARTRIDGE),
 ];
 
 pub const PHOTO: [u8; 32] = [120, 231, 226, 216, 3, 15, 249, 204, 92, 249, 221, 138, 187, 28, 21, 71, 191, 2, 222, 64, 2, 5, 75, 244, 127, 53, 247, 80, 67, 133, 138, 81];
@@ -31,6 +32,7 @@ pub const FIND: [u8; 32] = [109, 119, 169, 82, 158, 100, 153, 214, 82, 11, 212, 
 pub const COLLECTION: [u8; 32] = [55, 37, 163, 136, 32, 31, 148, 0, 129, 191, 83, 161, 228, 192, 232, 185, 213, 39, 3, 37, 79, 107, 209, 195, 40, 227, 5, 233, 6, 21, 255, 181];
 pub const GENESIS_SAVE_STATE: [u8; 32] = [185, 51, 235, 74, 73, 115, 233, 253, 83, 242, 127, 49, 199, 15, 71, 31, 157, 96, 133, 90, 74, 42, 56, 168, 113, 99, 41, 243, 144, 183, 56, 28];
 pub const GENESIS_BATTERY_RAM: [u8; 32] = [197, 171, 9, 230, 54, 152, 168, 156, 51, 173, 95, 43, 227, 254, 233, 226, 117, 94, 100, 122, 21, 62, 178, 102, 76, 18, 92, 113, 52, 175, 14, 236];
+pub const GENESIS_CARTRIDGE: [u8; 32] = [233, 5, 46, 90, 205, 60, 246, 22, 233, 167, 175, 152, 126, 11, 205, 144, 189, 105, 49, 60, 178, 23, 148, 147, 83, 64, 95, 77, 158, 75, 193, 145];
 
 /// A kind's first phrasing, for a bench tool to name it (a person reads the idea's phrasing in their language once sheets carry them).
 pub fn phrasing(kind: &[u8; 32]) -> Option<&'static str> {
