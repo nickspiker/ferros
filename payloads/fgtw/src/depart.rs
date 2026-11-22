@@ -541,7 +541,7 @@ impl Client {
         }
     }
 
-    /// Op 5: leave the fleet. A fresh salt from the kernel's entropy names the request; the machine refuses on the last device and asks for the frame to be signed, which the loop does (`depart_work`). `intent` is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk). Returns 0 started, 1 not a member of a fleet, 2 an intent that is neither, 4 the identity's last device (or its fleet not known yet).
+    /// Op 5: leave the fleet. A fresh salt from the kernel's entropy names the request; the machine refuses on the last device and asks for the frame to be signed, which the loop does (`depart_work`). `intent` is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk). Returns 0 started, 1 not a member of a fleet, 2 an intent that is neither, 4 the identity's last device (or its fleet not known yet), 5 refused by fgtw's removal gate (no removal confirmed with the handle held: Remove this device goes by `remove_unbind`).
     pub fn leave(&mut self, intent: u8) -> u8 {
         if self.hp.is_none() || !self.bound || self.dep.m.is_none() {
             return 1;
@@ -560,9 +560,47 @@ impl Client {
         if last {
             return 4;
         }
+        // fgtw's removal gate (e5766f4): a bare Leave sends nothing unless a removal confirmed with the handle is held; removing goes by `remove_unbind`.
+        if !self.depart_asking() {
+            return 5;
+        }
         self.log.put(if intent == join::DEPART_NEW_OWNER { b"fgtw: leaving the fleet (to a new owner): signing the request".as_slice() } else { b"fgtw: leaving the fleet: signing the request" });
         self.log.line();
         0
+    }
+
+    /// Remove this device (remove.rs), on fgtw's removal gate (fgtw e5766f4, owner 2026-11-22: nothing goes out until Remove is pressed, the handle typed and Unbind pressed): `UserOp::Remove`, then `Event::Unbind` with the typed handle's memory-hard proof, to a new owner (the approval frees this device's brand), sent at once. A fresh salt from the kernel's entropy names the request.
+    /// Returns 0 the request is being signed (or one of ours already stands), 1 not a member of a fleet, 4 the identity's last device (or its fleet not known yet), 6 the proof is not this identity's (nothing out), 3 the machine sent nothing for another reason.
+    pub fn remove_unbind(&mut self, proof: [u8; 32]) -> u8 {
+        if self.hp.is_none() || !self.bound || self.dep.m.is_none() {
+            return 1;
+        }
+        if self.depart_asking() {
+            return 0;
+        }
+        let mut salt = [0u8; 32];
+        kernel_entropy(&mut salt);
+        self.dep.denied_by = None;
+        let Some(m) = self.dep.m.as_mut() else { return 1 };
+        let step = m.step(Flow::User(UserOp::Remove), eagle());
+        let last = step.actions.iter().any(|a| matches!(a, Action::Note(Note::LastDevice)));
+        self.depart_carry(step.actions);
+        if last {
+            return 4;
+        }
+        let Some(m) = self.dep.m.as_mut() else { return 1 };
+        let step = m.step(Flow::Unbind { proof, intent: join::DEPART_NEW_OWNER, salt, hold: false }, eagle());
+        self.depart_carry(step.actions);
+        self.depart_unsent();
+        if self.depart_asking() {
+            self.log.put(b"fgtw: removing this device: the handle's proof is this identity's; signing the request (to a new owner)");
+            self.log.line();
+            return 0;
+        }
+        match self.dep.m.as_ref().map(|m| m.removal()) {
+            Some(fgtw::flow::depart::Removal::TypeHandle { wrong: true }) => 6,
+            _ => 3,
+        }
     }
 
     /// Op 20: our request given up: forgotten here, in the vault and in the space, so no member is asked to approve it. 0, or 1 when there is none.

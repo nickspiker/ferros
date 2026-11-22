@@ -2997,7 +2997,7 @@ impl Ahau {
     }
 
     /// Enter on the Fleet page's Remove (words kind 7; owner, 2026-11-22: "press remove, type the handle, press unbind"; docs/AUTH.md "Remove this device"): the person's own handle, shown as typed (a handle is not a password).
-    /// Its seed goes to the identity service (fgtw op 33), which checks it against the identity in hand, tells the fleet at once, and has the kernel check it again before it erases this identity's data and powers the device off; the seed is wiped once sent.
+    /// Its seed and memory-hard proof go to the identity service (fgtw op 33), which checks them against the identity in hand, tells the fleet at once, and has the kernel check it again before it erases this identity's data and powers the device off; the seed is wiped once sent.
     /// Started: the keyboard stays with what happens on its status line, until the power goes. A mismatch: "They don't match.", the text kept to be corrected, nothing changed.
     fn remove_enter(&mut self) {
         if self.len == 0 {
@@ -3008,10 +3008,26 @@ impl Ahau {
             self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
             return;
         };
-        let mut m = [0u8; 34];
+        // Its memory-hard proof too, for fgtw's removal gate (the departure goes out only when it is this identity's handle proof, as attest checks it): seconds on the X3, the status saying so, the text kept on screen for a mismatch.
+        self.status(tx(ferros_lang::Msg::ComputingKeys).as_str());
+        self.show();
+        // Let the display put the status up before the proof holds the core.
+        sleep_until(now() + freq() / 30);
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        sleep_until(now() + freq() / 1000);
+        // The heap is the proof's while it runs, as at attest (HEAP_USE).
+        while HEAP_USE.compare_exchange(0, 2, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        let mut proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
+        HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
+        ferros_sys::pin(0);
+        let mut m = [0u8; 66];
         m[0] = 33;
-        m[2..].copy_from_slice(&seed);
+        m[2..34].copy_from_slice(&seed);
+        m[34..].copy_from_slice(&proof);
         scrub(&mut seed);
+        scrub(&mut proof);
         let mut o = [0u8; 8];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut o);
         scrub(&mut m);

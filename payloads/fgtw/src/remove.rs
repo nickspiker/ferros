@@ -1,7 +1,7 @@
 //! Remove this device from its identity (owner, 2026-11-22; docs/AUTH.md "Remove this device"), on the device being removed: Remove on the Fleet page, the person's handle typed on the attest screen's keyboard (ahau, words kind 7), enter.
 //! No Fleet page needs to be open anywhere and nothing waits on another device before the erase.
 //!
-//! 0. **The check.** The typed handle's seed against the roots in hand here (op 33), and again in the kernel at the erase (SYS_UNLOCK op 15, compared in registers).
+//! 0. **The check.** The typed handle's seed against the roots in hand here (op 33), its memory-hard proof against this identity's by fgtw's removal gate (`UserOp::Remove`, then `Event::Unbind`), and the seed again in the kernel at the erase (SYS_UNLOCK op 15, compared in registers).
 //! 1. **The fleet told at once**, with what fgtw has today: the departure machine's signed request (depart.rs), intent 1 (to a new owner), handed by Photon Transport to every fleet device heard here and put in the identity space, whose push goes to the fleet and to fgtw.org in the same pass (space.rs `space_put_depart`).
 //!    On today's fgtw the chain still drops this device only when a surviving member approves (its Approve publishes the consented Remove and frees this device's brand on fgtw.org, which another identity's add needs: fgtw-bootstrap refuses a bare self-departure and a device branded to another identity).
 //!    fgtw's shared departure machine (the Photon session's) takes this step over when it lands: `remove_tell` is the one place that starts it, and `remove_step` the one place that decides it has gone out.
@@ -24,9 +24,9 @@ pub struct Removing {
 }
 
 impl Client {
-    /// Op 33 [0][seed 32]: the person typed their handle to remove this device. → 0 started (or already under way), 1 not a member of a fleet, 4 the identity's last device (an identity must live somewhere: nothing to tell, nothing done), 6 the handle is not this identity's (nothing done), 7 the kernel cannot remove (nothing told), else the departure's own refusal (depart.rs `leave`).
+    /// Op 33 [0][seed 32][proof 32]: the person typed their handle to remove this device (its seed, and its memory-hard proof for fgtw's removal gate, both made by the attest screen's keyboard). → 0 started (or already under way), 1 not a member of a fleet, 4 the identity's last device (an identity must live somewhere: nothing to tell, nothing done), 6 the handle is not this identity's (nothing done), 7 the kernel cannot remove (nothing told), else the departure's own refusal (depart.rs `leave`).
     /// `typed` is wiped here whatever the answer.
-    pub fn remove_start(&mut self, typed: &mut [u8; 32]) -> u8 {
+    pub fn remove_start(&mut self, typed: &mut [u8; 32], proof: &[u8; 32]) -> u8 {
         let same = self.identity_seed.as_ref().is_some_and(|s| s.iter().zip(typed.iter()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0);
         if !same {
             wipe(typed);
@@ -48,7 +48,7 @@ impl Client {
             self.log.line();
             return 7;
         }
-        let r = self.remove_tell();
+        let r = self.remove_tell(proof);
         if r != 0 {
             wipe(typed);
             self.log.put(b"fgtw: remove: not started (");
@@ -64,12 +64,9 @@ impl Client {
         0
     }
 
-    /// Step 1's start: the departure request, intent 1 (to a new owner, so the approval frees this device's brand), on the departure machine; one of ours already standing is used as it is. 0 started, else `leave`'s refusal.
-    fn remove_tell(&mut self) -> u8 {
-        if self.depart_asking() {
-            return 0;
-        }
-        self.leave(join::DEPART_NEW_OWNER)
+    /// Step 1's start: on fgtw's removal gate (Remove, then Unbind with the typed handle's memory-hard proof), the departure request, intent 1 (to a new owner, so the approval frees this device's brand); one of ours already standing is used as it is. 0 started, else `remove_unbind`'s refusal.
+    fn remove_tell(&mut self, proof: &[u8; 32]) -> u8 {
+        self.remove_unbind(*proof)
     }
 
     /// Once a pass of the loop: the request out (the machine holds our signed frame, which `depart_work` handed to the fleet's devices heard here and pushed into the space as it built it), then `TELL_US` for them to take it, then the erase.
@@ -182,7 +179,7 @@ impl Client {
         if self.depart_asking() {
             self.log.put(b"fgtw: remove (dry run): a departure request of ours already stands: it would be the one told");
         } else {
-            self.log.put(b"fgtw: remove (dry run): the request, to a new owner, signed with every egg (seconds on the X3), then A#4 s for the fleet to take it");
+            self.log.put(b"fgtw: remove (dry run): fgtw's removal gate checks the typed handle's memory-hard proof, then the request, to a new owner, signed with every egg (seconds on the X3), then A#4 s for the fleet to take it");
         }
         self.log.line();
         self.log.put(b"fgtw: remove (dry run): on today's fgtw a surviving member's Approve then publishes the Remove and frees this device's brand on fgtw.org (another identity's add needs it)");
