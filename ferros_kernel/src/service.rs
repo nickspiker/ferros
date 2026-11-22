@@ -5650,6 +5650,9 @@ pub fn run(mut b: Boot) -> ! {
                 // CPU0's state as PSCI sees it (AFFINITY_INFO: 0 on, 1 off, 2 on pending): whether the park's CPU_OFF took (x3.rs).
                 {
                     let r: i64;
+                    // The full report's steps that touch hardware or the firmware say themselves as crumbs first (G#D9 plus the step above bit 8: 1 this PSCI call, 2 the thermal lines, 3 the USB controller's words, 4 the S2MPUs, 5 the reboot word thru EL3), so a stall inside it names its step (b1119, 2026-11-22: a plain `diag` on the jumped Pro froze the kernel's core here, its last crumb only G#D5, the DIAG read).
+                    platform::crumb(0xD9 | 1 << 8);
+                    let _ = platform::take_serror();
                     unsafe { core::arch::asm!("smc #0", inout("x0") 0x8400_0004u64 => r, in("x1") 0u64, in("x2") 0u64) };
                     append_hex(&mut resp, b"CPU0_AFFINITY=", r as u32);
                 }
@@ -5672,6 +5675,7 @@ pub fn run(mut b: Boot) -> ! {
                 // The commands the USB process has handed over (ptlink.rs).
                 append_hex(&mut resp, b"PT_PROC_CMDS=", st.proc_cmds);
                 // The heat (thermal.rs `diag`): the hottest zone, °C, and which; the X3's uncapped rate in MHz while the policy caps it (0 = not); the kernel's core's clock measured, the firmware's rate for the X3, the slow and firmware-capped seconds, the X3's divider bits seen.
+                platform::crumb(0xD9 | 2 << 8);
                 crate::thermal::diag(&mut resp);
                 for k in 0..9 {
                     append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
@@ -5730,6 +5734,7 @@ pub fn run(mut b: Boot) -> ! {
                     append_hex(&mut resp, b"STACK_SIZE=", size);
                     append_hex(&mut resp, b"STACK_USED_MAX=", used);
                 }
+                platform::crumb(0xD9 | 3 << 8);
                 append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
                 append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
                 append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
@@ -5756,6 +5761,7 @@ pub fn run(mut b: Boot) -> ! {
                     append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
                     append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
                     #[cfg(all(feature = "pixel8", not(shim_handoff)))]
+                    platform::crumb(0xD9 | 4 << 8);
                     crate::s2mpu::report(&mut resp);
                     append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
                     let daif: u64;
@@ -5819,6 +5825,9 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"FERROS_PART_FIRST=", pf);
                 append_hex(&mut resp, b"FERROS_PART_BLOCKS=", pb);
                 // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
+                platform::crumb(0xD9 | 5 << 8);
+                // An SError left waiting by any read above would bounce this firmware call until EL3 panics (the EL3 poison, platform.rs `take_serror`): taken first.
+                let _ = platform::take_serror();
                 append_hex(&mut resp, b"PMU_REBOOT_CMD=", platform::priv_reg(platform::PMU_REBOOT_CMD, false, 0) as u32);
                 append_hex(&mut resp, b"DSS_REASON=", r(platform::DSS_HEADER + platform::DSS_OFFSET_EMERGENCY_REASON));
                 append_hex(&mut resp, b"DSS_SCRATCH=", r(platform::DSS_HEADER + platform::DSS_OFFSET_SCRATCH));

@@ -459,23 +459,32 @@ fn install(base: usize, gbs: &[(usize, *mut Smpt)], vids: u8) -> u32 {
 pub fn report(out: &mut alloc::vec::Vec<u8>) {
     use crate::platform::append_hex;
     append_hex(out, b"S2MPU_FENCE=", result());
+    crate::platform::crumb(0xDA | (BASE as u64) << 8);
     faults(out, BASE);
+    // After a jump (or ferros's own restart) the S2MPUs in front of bus masters the last system left running (HSI1's PCIe, BLK_MISC's DMA, the GPU) are not read here: the jump's sessions keep those blocks in whatever clock state Android left, and a plain `diag` on the jumped Pro (b1119, 2026-11-22) froze the kernel's core inside this report (its last crumb G#D5, the DIAG read) until the watchdog reset it. The fences' results above and below still say what was set at boot. Each read that remains says itself as a crumb first (G#DA plus its base above bit 8), so a stall here names its block.
+    let jumped = crate::platform::jumped();
     append_hex(out, b"S2MPU_MODEM_FENCE=", MODEM_RESULT.load(core::sync::atomic::Ordering::Relaxed));
-    if unsafe { read_volatile(PD_HSI1_STATUS as *const u32) } & 1 == 1 {
+    if !jumped && unsafe { read_volatile(PD_HSI1_STATUS as *const u32) } & 1 == 1 {
+        crate::platform::crumb(0xDA | (MODEM_S2MPU as u64) << 8);
         faults(out, MODEM_S2MPU);
     }
-    append_hex(out, b"S2MPU_MISC_PROT=", rd(MISC_S2MPU, 0x58));
-    faults(out, MISC_S2MPU);
+    if !jumped {
+        crate::platform::crumb(0xDA | (MISC_S2MPU as u64) << 8);
+        append_hex(out, b"S2MPU_MISC_PROT=", rd(MISC_S2MPU, 0x58));
+        faults(out, MISC_S2MPU);
+    }
     append_hex(out, b"S2MPU_GPU_FENCE=", GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed));
     append_hex(out, b"S2MPU_GPU_GIBS=", 1 + unsafe { GPU_GBS_N } as u32);
     append_hex(out, b"S2MPU_GPU_SYNC_LATE=", GPU_SYNC_LATE.load(core::sync::atomic::Ordering::Relaxed));
-    if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 1 {
+    if !jumped && unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 1 {
+        crate::platform::crumb(0xDA | (GPU_S2MPU as u64) << 8);
         faults(out, GPU_S2MPU);
     }
     // The camera's three, only while the camera switch has brought pd_ispfe on (an access with the domain down poisons EL3): one fault status line each.
     append_hex(out, b"S2MPU_CAM_FENCE=", CAM_RESULT.load(core::sync::atomic::Ordering::Relaxed));
     if crate::camera_power::fe_on() {
         for s in ISPFE_S2MPUS {
+            crate::platform::crumb(0xDA | (s as u64) << 8);
             faults(out, s);
         }
     }
@@ -483,6 +492,7 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).
     if crate::dpu_power::all_on() {
         for s in DPU_S2MPUS {
+            crate::platform::crumb(0xDA | (s as u64) << 8);
             faults(out, s);
         }
     }
