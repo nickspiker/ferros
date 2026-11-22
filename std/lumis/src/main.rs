@@ -1788,8 +1788,14 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
     let photo = !name.starts_with("cal_");
     if photo && hold::held() {
         let kept = match hold::keep_still(&bytes) {
-            Ok((write_ms, card)) => {
-                println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written and verified in {write_ms} ms", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len());
+            Ok((write_ms, card, copies)) => {
+                // The copies the vault verified: both, or one while it runs on one (still kept).
+                let on = match copies {
+                    Some(2) => ", on both copies".to_string(),
+                    Some(n) => format!(", on A#{n} copy only: the vault runs on one"),
+                    None => String::new(),
+                };
+                println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written and verified in {write_ms} ms{on}", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len());
                 true
             }
             Err(e) => {
@@ -1797,6 +1803,10 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
                 false
             }
         };
+        // Not kept: the camera screen says so until the next touch (lumis_core `platform::save_failed`).
+        if !kept {
+            lumis_core::platform::set_save_failed(true);
+        }
         app::save_done(header, kept);
         return;
     }
@@ -1818,6 +1828,9 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
             false
         }
     };
+    if !kept {
+        lumis_core::platform::set_save_failed(true);
+    }
     // A calibration map is not a photo: it never counts (as on Android).
     app::save_done(header, kept && photo);
 }
