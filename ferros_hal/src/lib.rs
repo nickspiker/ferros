@@ -23,6 +23,8 @@
 // ring.rs ── the spine (vault root ring) and stem (kernel ring) entries as VSF documents, portable (ferros-install writes them on the host), plus the aarch64 UFS scan and write (spec in RING.md) struct RingEntry ::schema(), to_block(), from_block(blk), genesis(now), next(now) struct KernelRingEntry ::new(.., now), schema(), to_block(), from_block(blk)
 //
 // hsi2c.rs ── Exynos HSI2C (USI-I2C) master, polling/auto-mode (port of i2c-exynos5.c, hardware-proven on Pixel 8 hsi2c_11) struct Hsi2c { base } ::new(base), init() — MASTER+AUTO_MODE, reuses ABL timing (no SW_RST) ::xfer(addr, buf, is_read, stop) → Result<(), trans_status> ::read_reg(addr, reg) → Result<u8, u32>, write_reg(addr, reg, val) PIXEL8_HSI2C11_BASE (G#10CB0000), PIXEL8_EUSB_REPEATER_ADDR (G#3E)
+//
+// bcb.rs ── Android's bootloader control block at misc's start (portable, host-tested): what recovery Android asked for, classed by the proof it needs ask(block) → ASK_NONE / ASK_WIPE / ASK_RESCUE / ASK_REMOTE / ASK_CHANGES, args(block) → the arguments as text
 
 //! Ferros Hardware Abstraction Layer
 //!
@@ -67,5 +69,7 @@ pub mod console;
 // The DWC3 driver needs no allocator: the kernel and the USB driver process (payloads/usb, no heap) both link it.
 #[cfg(target_arch = "aarch64")]
 pub mod usb;
+// Android's recovery request in misc (docs/BOOT.md "Recovery requests from Android"): portable, so its tests run on the host.
+pub mod bcb;
 #[cfg(feature = "alloc")]
 pub mod hamt;

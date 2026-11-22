@@ -847,6 +847,103 @@ fn disclaimer_document() -> Option<alloc::vec::Vec<u8>> {
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The person's standing choice is still to be applied this boot (owner, 2026-11-21: "Start into: ferros / Android", settings.rs `START_ANDROID`): set by main.rs only for a boot nobody answered (a production boot, or a development gate's untouched second; not a press of power, the chord's FERROS_ONCE, a refused recovery boot, the jump or a reload), taken by the service loop at the first attest: with the setting at Android on a device that allows it, the launch (`ANDROID_REQ`).
 pub static START_INTO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Android's recovery request in misc (ferros_hal::bcb `ASK_*`, 0 none; docs/BOOT.md "Recovery requests from Android"; owner, 2026-11-22: "boot into ferros and then have the user attest, then grant the one time boot wipe"): read at boot (`recovery_ask_read`) and left in misc untouched until the person answers it on the Android page (SYS_UNLOCK op 13, requests 6 to 8). A launch of Android waits for that answer (`ANDROID_REQ`), so no request is cleared on the way past it.
+pub static RECOVERY_ASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The person's answer, for the service loop: 1 yes (RECOVERY_ONCE and a reset into recovery, the arguments still in misc, so recovery does what Android asked without the person choosing it again), 2 no (the command and arguments cleared, nothing else in misc). Set only by op 13 with a person present.
+pub static RECOVERY_ANSWER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// A launch of Android held for that answer has been said in the flash log (once a hold).
+static ANDROID_HELD_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A request's words for the flash log and the diag.
+fn recovery_ask_words(ask: u8) -> &'static str {
+    match ask {
+        ferros_hal::bcb::ASK_NONE => "none",
+        ferros_hal::bcb::ASK_WIPE => "a factory reset (erase Android's data)",
+        ferros_hal::bcb::ASK_RESCUE => "a rescue (Android could not start; recovery offers to erase its data)",
+        ferros_hal::bcb::ASK_REMOTE => "a remote wipe (refused: no one chose it at the device)",
+        _ => "something that can change what boots (an update, a sideload, fastbootd, the recovery menu: needs a second fleet device, not built)",
+    }
+}
+
+/// Whether the person may allow `ask` with their attest alone (owner, 2026-11-02: a wipe or a crash rescue touches Android's data only; anything that changes what boots needs a second fleet device too; a remote wipe is refused).
+pub(crate) fn recovery_allowable(ask: u8) -> bool {
+    ask == ferros_hal::bcb::ASK_WIPE || ask == ferros_hal::bcb::ASK_RESCUE
+}
+
+/// The held request changed (`RECOVERY_ASK`): kept, and the facts' bell rung (process.rs `BELL_FACTS`), which wakes the map, so the Android page and the Deck button's question follow at once, not at the next touch. On the service loop.
+fn recovery_ask_set(ask: u8) {
+    if RECOVERY_ASK.swap(ask, core::sync::atomic::Ordering::AcqRel) != ask {
+        crate::process::with_lock(|| crate::process::bell_count(crate::process::BELL_FACTS));
+    }
+}
+
+/// Android's recovery request as this boot finds it in misc (main.rs, once the disk answers and the flash log is up): kept in `RECOVERY_ASK` and said with its arguments; never cleared here.
+pub fn recovery_ask_read() {
+    let line = match crate::slot::misc_request() {
+        Ok((ask, args)) => {
+            RECOVERY_ASK.store(ask, core::sync::atomic::Ordering::Release);
+            if ask == ferros_hal::bcb::ASK_NONE {
+                return;
+            }
+            // Android's text, one line: each byte outside printable ASCII (the newlines between its arguments among them) as '|'.
+            let args: alloc::string::String = args.iter().map(|&c| if (0x20..0x7F).contains(&c) { c as char } else { '|' }).collect();
+            alloc::format!("recovery: Android asks for {}, its arguments \"{args}\"; kept in misc until the person answers after the attest", recovery_ask_words(ask))
+        }
+        Err(e) => alloc::format!("recovery: misc not read (G#{e:X}): no question this boot, and a launch of Android reads it again"),
+    };
+    crate::flashlog::line(&line);
+}
+
+/// RECOVERY_ONCE for the hv's gate (ferros_hv gate.rs: the gate refuses a recovery boot without it; no reflash without the handle, owner 2026-11-01), cleaned to DRAM, then the reset into the bootloader's recovery mode. Returns only when the EL3 monitor refused the reboot mode (its answer).
+fn recovery_once_reset() -> u64 {
+    unsafe {
+        let p = 0xFD60_0FF0usize as *mut u64;
+        core::ptr::write_volatile(p, 0x5245_434F_5645_5231);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+    }
+    platform::crumb(0xC7);
+    platform::reboot_to_mode(platform::REBOOT_MODE_RECOVERY)
+}
+
+/// The person said yes to Android's request (the service loop, a person present): misc read again, and only while it still asks what the person was shown and that is theirs to allow, RECOVERY_ONCE and the reset into recovery. misc is not touched: recovery reads the arguments Android left and does what it asked.
+fn recovery_yes() {
+    let ask = RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire);
+    if !recovery_allowable(ask) {
+        crate::flashlog::line(&alloc::format!("recovery: yes refused: {} is not the person's alone to allow", recovery_ask_words(ask)));
+        return;
+    }
+    // From a jumped session every reset ferros orders is a power cycle, which loses the gate's word in DRAM (husky_cold_slot_b, 2026-11-15): the gate would refuse the recovery boot and the person would see the question again.
+    if platform::jumped() {
+        crate::flashlog::line("recovery: yes not taken in a jumped session (the reset loses the gate's word): restart ferros, then answer again");
+        return;
+    }
+    match crate::slot::misc_request() {
+        Ok((now, _)) if now == ask => {}
+        Ok((now, _)) => {
+            recovery_ask_set(now);
+            crate::flashlog::line(&alloc::format!("recovery: yes not taken: misc now asks for {}, not what the person was shown", recovery_ask_words(now)));
+            return;
+        }
+        Err(e) => {
+            crate::flashlog::line(&alloc::format!("recovery: yes not taken: misc not read (G#{e:X})"));
+            return;
+        }
+    }
+    crate::flashlog::line(&alloc::format!("recovery: the person allowed {} once: RECOVERY_ONCE, resetting into recovery", recovery_ask_words(ask)));
+    let r = recovery_once_reset();
+    crate::flashlog::line(&alloc::format!("recovery: the EL3 monitor refused the reboot mode ({r})"));
+}
+
+/// The person said no (the service loop, a person present): the command and arguments cleared in misc, nothing else there (slot.rs `misc_clear_recovery`), and ferros stays. A launch of Android held for the answer goes on after it (`ANDROID_REQ`).
+fn recovery_no() {
+    let m = crate::slot::misc_clear_recovery();
+    if m == crate::slot::MARKED || m == crate::slot::ALREADY {
+        recovery_ask_set(ferros_hal::bcb::ASK_NONE);
+        crate::flashlog::line(if m == crate::slot::MARKED { "recovery: the person said no: Android's request cleared in misc" } else { "recovery: the person said no: misc held no request" });
+    } else {
+        crate::flashlog::line(&alloc::format!("recovery: the person said no, but misc was not cleared (G#{m:X}): the question stays"));
+    }
+}
 /// A completed departure released the identity (SYS_UNLOCK op 4): the service loop restarts the device, which comes back at the attest screen (AUTH.md's "no way back to the attest screen" gap, closed the plain way).
 static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The drops of the released person's domains in the vault process (process.rs `vault_stamp_drops`), each a stamp carrying that domain's keys, waiting for the service loop to send them before the restart. Under the kernel lock (filled in a syscall, taken by the loop).
@@ -3536,6 +3633,14 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        // The person's answer to Android's recovery request (the Android page, SYS_UNLOCK op 13 requests 7 and 8; docs/BOOT.md "Recovery requests from Android"), taken here where a reset may be ordered and UFS written. Checked again: only with a person present.
+        #[cfg(not(shim_handoff))]
+        match RECOVERY_ANSWER.swap(0, core::sync::atomic::Ordering::AcqRel) {
+            0 => {}
+            _ if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) => crate::flashlog::line("recovery: an answer with no one present: not taken"),
+            1 => recovery_yes(),
+            _ => recovery_no(),
+        }
         // The person's standing choice, once, at the first attest of a boot nobody answered (`START_INTO`): Android when they chose it and this device allows it.
         #[cfg(not(shim_handoff))]
         if START_INTO.load(core::sync::atomic::Ordering::Relaxed) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
@@ -3550,24 +3655,43 @@ pub fn run(mut b: Boot) -> ! {
             }
         }
         // A launch of Android the attested identity chose (the "Start into" setting, "start Android now" on the Settings page, the `android` switch): the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
+        // Android's own recovery request first (a factory reset, RescueParty, an update left in misc; owner, 2026-11-22): the launch waits until the person has answered it on the Android page, and is never the answer itself, so a wipe they asked for in Android is never cleared on the way past. Their no clears it and the launch goes on; their yes resets into recovery instead.
         #[cfg(not(shim_handoff))]
-        if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
-            // Android's own recovery request first (a `reboot recovery`, RescueParty, an update left in misc): the person chose Android, not recovery, which is the "no" that clears its command and arguments (slot.rs `misc_clear_recovery`). Left there, the bootloader starts recovery, the hv's gate refuses it without RECOVERY_ONCE, and the launch lands in ferros again (the 8a, 2026-11-21). Not cleared: no reset, the log says why.
-            let m = crate::slot::misc_clear_recovery();
-            if m == crate::slot::MARKED {
-                crate::flashlog::line("android: Android's recovery request in misc cleared (the person chose Android)");
-            }
-            if m != crate::slot::MARKED && m != crate::slot::ALREADY {
-                crate::flashlog::line(&alloc::format!("android: not launching: misc's recovery request could not be cleared (G#{m:X})"));
+        if ANDROID_REQ.load(core::sync::atomic::Ordering::Acquire) {
+            let held = || {
+                if !ANDROID_HELD_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    crate::flashlog::line("android: launch held: Android's recovery request waits on the person's answer (the Android page)");
+                }
+            };
+            if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+                ANDROID_REQ.store(false, core::sync::atomic::Ordering::Release);
+            } else if RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire) != ferros_hal::bcb::ASK_NONE {
+                held();
             } else {
-                // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
-                let r = crate::slot::set_active(0);
-                crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
-                // The word only with the reset, so none waits for a later boot.
-                if r == crate::slot::MARKED {
-                    crate::platform::android_once();
-                    platform::crumb(0xC7);
-                    platform::reboot();
+                // misc read again at the launch: a request the boot's read missed (misc unreadable then) is asked, not cleared.
+                match crate::slot::misc_request() {
+                    Ok((ferros_hal::bcb::ASK_NONE, _)) => {
+                        ANDROID_REQ.store(false, core::sync::atomic::Ordering::Release);
+                        ANDROID_HELD_SAID.store(false, core::sync::atomic::Ordering::Relaxed);
+                        // Under the UFS lock (slot.rs takes it), as every UFS command: devinfo is written while processes still run.
+                        let r = crate::slot::set_active(0);
+                        crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
+                        // The word only with the reset, so none waits for a later boot.
+                        if r == crate::slot::MARKED {
+                            crate::platform::android_once();
+                            platform::crumb(0xC7);
+                            platform::reboot();
+                        }
+                    }
+                    Ok((ask, _)) => {
+                        recovery_ask_set(ask);
+                        crate::flashlog::line(&alloc::format!("android: misc asks for {} after all", recovery_ask_words(ask)));
+                        held();
+                    }
+                    Err(e) => {
+                        ANDROID_REQ.store(false, core::sync::atomic::Ordering::Release);
+                        crate::flashlog::line(&alloc::format!("android: not launching: misc not read (G#{e:X}), so whether Android asks for recovery is unknown"));
+                    }
                 }
             }
         }
@@ -4236,10 +4360,17 @@ pub fn run(mut b: Boot) -> ! {
                         continue;
                     }
                     // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
-                    // Android's own recovery request in misc cleared first, as the service loop's launch does (slot.rs `misc_clear_recovery`): a person present chose Android. Not cleared: no reset.
-                    let m = crate::slot::misc_clear_recovery();
-                    resp.extend_from_slice(alloc::format!("misc's recovery request: {}\n", match m { crate::slot::MARKED => "cleared", crate::slot::ALREADY => "none", _ => "NOT cleared" }).as_bytes());
-                    let r = if m != crate::slot::MARKED && m != crate::slot::ALREADY { m } else if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
+                    // Android's own recovery request in misc is the person's to answer first, as the service loop's launch waits for it (owner, 2026-11-22): never cleared on the way past. A request there: no reset, the reply says how to answer.
+                    let m = match crate::slot::misc_request() {
+                        Ok((ferros_hal::bcb::ASK_NONE, _)) => crate::slot::ALREADY,
+                        Ok((ask, _)) => {
+                            recovery_ask_set(ask);
+                            resp.extend_from_slice(alloc::format!("misc asks for {}: answer it first (the Android page, or `diag recovery clear` for no)\n", recovery_ask_words(ask)).as_bytes());
+                            crate::slot::NOT_ACTIVE
+                        }
+                        Err(e) => e,
+                    };
+                    let r = if m != crate::slot::ALREADY { m } else if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
                     // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once: only when resetting, so no word waits for a later boot.
                     if r == crate::slot::MARKED {
                         crate::platform::android_once();
@@ -4270,6 +4401,9 @@ pub fn run(mut b: Boot) -> ! {
                 #[cfg(not(shim_handoff))]
                 if cmd.params == b"recovery clear" {
                     let r = if crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) { Some(crate::slot::misc_clear_recovery()) } else { None };
+                    if matches!(r, Some(crate::slot::MARKED | crate::slot::ALREADY)) {
+                        recovery_ask_set(ferros_hal::bcb::ASK_NONE);
+                    }
                     crate::flashlog::line(&match r {
                         Some(crate::slot::MARKED) => alloc::string::String::from("recovery clear: Android's recovery request in misc cleared (the person present said no)"),
                         Some(crate::slot::ALREADY) => alloc::string::String::from("recovery clear: misc held no recovery request"),
@@ -4285,6 +4419,57 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, say.as_bytes());
                     continue;
                 }
+                // `diag recovery ask`: Android's recovery request as the kernel holds it (the question the Android page shows) and as misc holds it now, its arguments as text. Read only.
+                #[cfg(not(shim_handoff))]
+                if cmd.params == b"recovery ask" {
+                    let held = RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire);
+                    resp.extend_from_slice(alloc::format!("held: {} (A#{held}), the person may allow it alone: {}\n", recovery_ask_words(held), if recovery_allowable(held) { "yes" } else { "no" }).as_bytes());
+                    match crate::slot::misc_request() {
+                        Ok((ask, args)) => {
+                            let args: alloc::string::String = args.iter().map(|&c| if (0x20..0x7F).contains(&c) { c as char } else { '|' }).collect();
+                            resp.extend_from_slice(alloc::format!("misc now: {} (A#{ask}), arguments \"{args}\"\n", recovery_ask_words(ask)).as_bytes());
+                        }
+                        Err(e) => resp.extend_from_slice(alloc::format!("misc not read (G#{e:X})\n").as_bytes()),
+                    }
+                    resp.extend_from_slice(alloc::format!("pKVM signs from the bootloader this boot: {}\n", unsafe { core::str::from_utf8(&*(&raw const crate::modem::KVM_SIGNS)).unwrap_or("(not text)") }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag recovery test`: a harmless recovery request written into misc from ferros's side, for testing the question on a device (development builds, a person present): the command "boot-recovery" with the arguments "recovery\n--just_exit\n", which asks recovery to do nothing and is classed as one the person cannot allow alone (only no). Never a wipe. Held at once, as a boot would find it.
+                // `diag recovery pretend <A#1..4>`: the kernel's held request set to that class in RAM alone (misc untouched), to see the Android page's question for a wipe or a rescue without one in misc: a yes then reads misc again, finds nothing like it, and resets nothing.
+                #[cfg(all(not(shim_handoff), not(ferros_production)))]
+                if cmd.params == b"recovery test" || cmd.params.starts_with(b"recovery pretend ") {
+                    let say = if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
+                        alloc::string::String::from("refused: no one has attested")
+                    } else if cmd.params == b"recovery test" {
+                        match crate::slot::misc_write_request(b"recovery\n--just_exit\n") {
+                            crate::slot::MARKED => {
+                                if let Ok((ask, _)) = crate::slot::misc_request() {
+                                    recovery_ask_set(ask);
+                                }
+                                alloc::format!("written; held: {}", recovery_ask_words(RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire)))
+                            }
+                            e => alloc::format!("not written (G#{e:X})"),
+                        }
+                    } else if !matches!(crate::slot::misc_request(), Ok((ferros_hal::bcb::ASK_NONE, _))) {
+                        // Pretend only over an empty misc: over a real request a pretended wipe's yes would find misc asking it and really wipe.
+                        alloc::string::String::from("refused: misc holds a request (or was not read); pretend is for an empty misc")
+                    } else {
+                        match &cmd.params[17..] {
+                            b"1" | b"2" | b"3" | b"4" => {
+                                let ask = cmd.params[17] - b'0';
+                                recovery_ask_set(ask);
+                                alloc::format!("held (RAM only, misc untouched): {}", recovery_ask_words(ask))
+                            }
+                            _ => alloc::string::String::from("pretend takes A#1 (wipe), 2 (rescue), 3 (remote), 4 (changes what boots)"),
+                        }
+                    };
+                    crate::flashlog::line(&alloc::format!("diag {}: {say}", core::str::from_utf8(cmd.params).unwrap_or("recovery")));
+                    resp.extend_from_slice(say.as_bytes());
+                    resp.push(b'\n');
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"recovery" {
                     // Only with a person present: a wipe or a rescue of Android's data needs an attest (owner, 2026-11-02, android_behind_attestation); recovery is Android's, which starts only by the attested identity's hand (2026-11-21).
                     if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
@@ -4297,13 +4482,7 @@ pub fn run(mut b: Boot) -> ! {
                         proc_act = true;
                         continue;
                     }
-                    unsafe {
-                        let p = 0xFD60_0FF0usize as *mut u64;
-                        core::ptr::write_volatile(p, 0x5245_434F_5645_5231);
-                        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-                    }
-                    platform::crumb(0xC7);
-                    let r = platform::reboot_to_mode(platform::REBOOT_MODE_RECOVERY);
+                    let r = recovery_once_reset();
                     resp.extend_from_slice(alloc::format!("recovery: the EL3 monitor refused the reboot mode ({r})\n").as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

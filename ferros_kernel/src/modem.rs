@@ -120,12 +120,27 @@ pub fn hwcfg(rep: &mut Vec<u8>) {
 /// ABL's bootconfig as it was at this boot (`keep_bootconfig`), for `diag bootconfig`: what the gate will key on to tell a recovery boot from a normal one (2026-11-01: AOSP passes androidboot.force_normal_boot=1 on a normal boot and leaves it out for recovery; checked on husky before the gate relies on it).
 pub static mut BOOTCONFIG: Option<Vec<u8>> = None;
 
-/// Keep a copy of ABL's bootconfig (a real boot only, while ABL's initrd is still in place).
+/// What ABL handed this boot about pKVM: each word of /chosen/bootargs and each bootconfig line that names kvm, " | " between them (empty when none). For the flash log at every boot (main.rs) and `diag bootconfig`, so a boot after a wipe can be set beside one before it (the owner's question, 2026-11-22: does Android's recovery wipe put pKVM back on, as `fastboot -w` does? docs/BOOT.md "Recovery requests from Android").
+pub static mut KVM_SIGNS: Vec<u8> = Vec::new();
+
+/// Keep a copy of ABL's bootconfig (a real boot only, while ABL's initrd is still in place), and the pKVM signs (`KVM_SIGNS`).
 pub fn keep_bootconfig(dtb_addr: u64) {
     let Some(dtb) = (unsafe { ferros_hal::dtb::Dtb::from_ptr(dtb_addr as *const u8) }) else {
         return;
     };
-    if let Some(t) = bootconfig(&dtb) {
+    let t = bootconfig(&dtb);
+    let mut signs = Vec::new();
+    let args = dtb.find_node_prop(b"chosen", b"bootargs").map(|p| p.data);
+    let words = args.into_iter().flat_map(|a| a.split(|&c| c == b' ' || c == 0));
+    let lines = t.into_iter().flat_map(|t| t.split(|&c| c == b'\n'));
+    for w in words.chain(lines).filter(|w| w.windows(3).any(|k| k.eq_ignore_ascii_case(b"kvm"))) {
+        if !signs.is_empty() {
+            signs.extend_from_slice(b" | ");
+        }
+        signs.extend_from_slice(w);
+    }
+    unsafe { KVM_SIGNS = signs };
+    if let Some(t) = t {
         crate::bootlock::read(t);
         unsafe { BOOTCONFIG = Some(Vec::from(t)) };
     }

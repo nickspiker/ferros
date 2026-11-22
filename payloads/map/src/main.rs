@@ -1038,6 +1038,9 @@ enum Choice {
     AndroidOff,
     AndroidOn,
     AndroidAgree,
+    /// Android's recovery request on the Android page (docs/BOOT.md "Recovery requests from Android"): allow once (two taps; SYS_UNLOCK op 13 request 7), and no (request 8).
+    RecoveryAllow,
+    RecoveryRefuse,
     /// About's version line: twelve taps in a row and Developer is a page.
     Version,
     /// A neighbour page's title: one page that way.
@@ -1627,6 +1630,8 @@ struct Map {
     person_armed: Option<u8>,
     /// The Android page's "start Android now", its first tap taken (the second restarts into Android).
     android_armed: bool,
+    /// The Android page's "allow once" for Android's recovery request, its first tap taken (the second answers yes).
+    recovery_armed: bool,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
     card: Option<[u8; 32]>,
     /// The unstow sheet open on a kist's card, in the card's place (docs/KISTS.md "The unstow sheet"): what is kept and from where, as the person has it so far. Gone with the card.
@@ -3668,6 +3673,25 @@ impl Map {
             "Android" => {
                 let st = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0);
                 let (allowed, accepted) = (st & 1 == 1, st & 2 == 2);
+                // Android's recovery request first, whatever else the page shows (owner, 2026-11-22: "boot into ferros and then have the user attest, then grant the one time boot wipe"): the gate refused the recovery boot, the kernel kept the request in misc, and the person answers it here, after the attest. A wipe or a rescue: allow once (two taps: a stray tap must not erase Android's data) or no. A remote wipe, or anything that changes what boots: only no (owner, 2026-11-02: proof scales with the stakes).
+                let ask = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::RecoveryAsk).unwrap_or(ferros_sys::RECOVERY_NONE);
+                if ask != ferros_sys::RECOVERY_NONE {
+                    let words = match ask {
+                        ferros_sys::RECOVERY_WIPE => Msg::RecoveryWipe,
+                        ferros_sys::RECOVERY_RESCUE => Msg::RecoveryRescue,
+                        ferros_sys::RECOVERY_REMOTE => Msg::RecoveryRemote,
+                        _ => Msg::RecoveryChanges,
+                    };
+                    row(self, b, &mut y, small, white(), tr(words), None);
+                    if ask == ferros_sys::RECOVERY_WIPE || ask == ferros_sys::RECOVERY_RESCUE {
+                        let armed = self.recovery_armed;
+                        button(self, b, &mut y, tr(if armed { Msg::TapAgainAllowOnce } else { Msg::AllowOnce }), armed, Some(Choice::RecoveryAllow));
+                    }
+                    button(self, b, &mut y, tr(Msg::RecoveryNo), false, Some(Choice::RecoveryRefuse));
+                    y += uu(1, 1);
+                    notes(b, &mut y, tr(Msg::RecoveryNote));
+                    y += uu(2, 1);
+                }
                 if allowed {
                     b.text(cx, y, note as u16, dim(), 1, tr(Msg::StartInto));
                     y += uu(2, 1);
@@ -5689,6 +5713,9 @@ impl Map {
                 if row != Some(Choice::AndroidNow) {
                     self.android_armed = false;
                 }
+                if row != Some(Choice::RecoveryAllow) {
+                    self.recovery_armed = false;
+                }
                 // The clock's (or the language's) word on a choice that did not take stays until the next tap.
                 self.zone_note = None;
                 let set = |m: &Map, pref: u64, v: u8| {
@@ -5764,6 +5791,18 @@ impl Map {
                     }
                     Some(Choice::AndroidOn) => {
                         let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::OnAgain);
+                    }
+                    // Android's recovery request: allow once on the second tap (the kernel checks the person and misc again, then resets into recovery with Android's own arguments), no in one (the kernel clears the command and arguments in misc; ferros stays).
+                    Some(Choice::RecoveryAllow) => {
+                        if self.recovery_armed {
+                            self.recovery_armed = false;
+                            let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::RecoveryYes);
+                        } else {
+                            self.recovery_armed = true;
+                        }
+                    }
+                    Some(Choice::RecoveryRefuse) => {
+                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::RecoveryNo);
                     }
                     // The disclaimer's agreement: the keyboard asks for the person's own handle again (kind 6 on the attest screen's keyboard), which the kernel compares with the person present's and keeps their acceptance itself (SYS_UNLOCK op 14).
                     Some(Choice::AndroidAgree) => people_ask(&[15, 6]),
@@ -6258,6 +6297,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         unstow_armed: None,
         person_armed: None,
         android_armed: false,
+        recovery_armed: false,
         card: None,
         sheet: None,
         sheet_size: None,
@@ -6461,7 +6501,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut theme_seen = ferros_sys::pref(ferros_sys::PREF_THEME);
     let mut scale_seen = ferros_sys::pref(ferros_sys::PREF_SCALE);
     let mut unlock_boot_seen = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT);
-    // The Android page's state as last drawn (allowed, accepted, and what the device starts into): it changes under the keyboard (the disclaimer's agreement) and from the bridge.
+    // The Android page's state as last drawn (allowed, accepted, what the device starts into, and Android's recovery request waiting): it changes under the keyboard (the disclaimer's agreement) and from the bridge.
     let mut android_seen = u64::MAX;
 
     // The previous frame's held contacts, by contact id: present, x, y.
@@ -6632,7 +6672,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The Android page follows the kernel's state while it shows: read at a wake, never on a timer.
         if matches!(map.view, View::Open(_)) && PAGES[map.page] == "Android" && !map.settling {
-            let a = ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0);
+            let a = ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::State).unwrap_or(0) | ferros_sys::android(cap(map.grants, S_SETTINGS), ferros_sys::Android::RecoveryAsk).unwrap_or(0) << 8;
             if a != android_seen {
                 android_seen = a;
                 map.draw();

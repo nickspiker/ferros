@@ -305,6 +305,21 @@ messages! {
     RetypeForAndroid,
     /// The disclaimer in full (owner, 2026-11-01, android_behind_attestation; the one place "phone" is right, it names what is lost). Three paragraphs. Its number is kernel service.rs `DISCLAIMER_VERSION`: a changed text gets the next one.
     AndroidDisclaimer,
+    /// Android's recovery request, asked after the attest (owner, 2026-11-22; docs/BOOT.md "Recovery requests from Android"): one question for each class, each a paragraph the page wraps. A factory reset Android asked for.
+    RecoveryWipe,
+    /// RescueParty: Android could not start, and its recovery would offer to erase its data.
+    RecoveryRescue,
+    /// A wipe asked from afar (a device admin, Find My Device): refused, only no.
+    RecoveryRemote,
+    /// An update, a sideload, fastbootd or the recovery menu: needs a second device of the person's, not built, so only no.
+    RecoveryChanges,
+    /// The yes button (its first tap; the second is `TapAgainAllowOnce`).
+    AllowOnce,
+    TapAgainAllowOnce,
+    /// The no button: the request is cleared.
+    RecoveryNo,
+    /// Two lines under the buttons: what each answer does.
+    RecoveryNote,
 
     // ---- the NFC page: attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-11) ----
     /// The heading over the tags kept to attest with.

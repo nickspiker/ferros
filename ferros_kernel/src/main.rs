@@ -2384,6 +2384,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         if once != [0; 3] {
             flashlog::line(&alloc::format!("gate words still set at ferros's start: G#{:X} G#{:X} G#{:X}", once[0], once[1], once[2]));
         }
+        // Android's recovery request in misc (a factory reset, a rescue, an update), which the gate refused to boot: kept for the person to answer after the attest (service.rs `RECOVERY_ASK`; owner, 2026-11-22), never cleared here.
+        #[cfg(not(shim_handoff))]
+        service::recovery_ask_read();
+        // What ABL said about pKVM this boot (modem.rs `KVM_SIGNS`): after a wipe, set beside a boot before it (docs/BOOT.md "Recovery requests from Android").
+        if real_boot {
+            let s = unsafe { &*(&raw const modem::KVM_SIGNS) };
+            flashlog::line(&alloc::format!("pKVM signs from the bootloader: {}", if s.is_empty() { "none" } else { core::str::from_utf8(s).unwrap_or("(not text)") }));
+        }
         // How ABL saw the reset that started this boot, kept where the next bootloader run cannot overwrite it (platform::abl_reset_lines). Only when ABL booted this ferros on husky: a reload has no ABL run of its own, a jump's log is Android's boot's, and akita's log place is not measured.
         if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() && !board::akita() {
             flashlog::line(&alloc::format!("bootloader saw: {}", platform::abl_reset_lines()));

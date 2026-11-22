@@ -143,6 +143,7 @@ Its notes show again as soon as the last question is answered.
   | a first start's permissions (KISTS.md, the first-launch question) | the kist's circle is open on them | the circle | Start, or a tap outside it |
   | a device asking to leave the fleet | fgtw's departure asking here (status 0) | the Fleet page | Approve or Deny |
   | a device asking to join | the add flow's phase 3 (selected, Yes waiting) | the Fleet page | Yes or No |
+  | Android's recovery request (BOOT.md "Recovery requests from Android") | the kernel holds it from the boot's read of misc (SYS_UNLOCK op 13 request 6) | the Android page | Allow once (a wipe or a rescue) or No |
 
   A kist's own ask at first need (KISTS.md: "a kist can put a question only while holding the one-shot ticket") is not built; it joins the list when it is.
 - **The note:** a new question is posted (SYS_NOTIFY op 0, Settings, source `ferros_kist::note::SYSTEM`, all zeros: no capsule hashes to it), kind personal, its `key` naming it (the question's kind, then what it is about), its words a line in ASCII ("a kist offered over USB: Stow or Cancel"), never what it names.

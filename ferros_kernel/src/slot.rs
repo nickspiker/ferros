@@ -254,30 +254,40 @@ fn set_active_held(slot: usize) -> u32 {
     MARKED
 }
 
-/// misc's bootloader message (AOSP bootloader_message.h, at the partition's start): `command`, 32 bytes at 0 ("boot-recovery" makes the bootloader start recovery at every boot until recovery clears it), `status` 32 at 32, `recovery`, the arguments, 768 at 64.
-const BCB_COMMAND: core::ops::Range<usize> = 0..32;
-const BCB_RECOVERY: core::ops::Range<usize> = 64..64 + 768;
+/// misc's bootloader message (ferros_hal::bcb: AOSP bootloader_message.h, at the partition's start): `command`, 32 bytes at 0 ("boot-recovery" makes the bootloader start recovery at every boot until recovery clears it), `status` 32 at 32, `recovery`, the arguments, 768 at 64.
+use ferros_hal::bcb::{COMMAND as BCB_COMMAND, RECOVERY as BCB_RECOVERY};
 /// No partition named `misc` was found.
 pub const NO_MISC: u32 = 0x25;
 
-/// Clear Android's recovery request in misc: the bootloader message's command and its arguments, nothing else in the partition (owner, 2026-11-02: a "no" to a recovery request clears the command and arguments; 2026-11-21: an attested launch of Android is that "no", the person chose Android and not recovery; docs/BOOT.md "Android only by the identity's choice").
-/// Without it a recovery request Android left (a `reboot recovery`, RescueParty, an update) makes every boot a recovery boot, which the hv's gate refuses without RECOVERY_ONCE: Android unreachable, every start bounced to ferros (the 8a, 2026-11-21).
+/// misc's first block, which holds the whole bootloader message. Under the UFS lock (the caller's).
+fn misc_read(ufs: &UfsController, p: crate::partfs::Part) -> Option<alloc::vec::Vec<u8>> {
+    // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
+    for _ in 0..4 {
+        if ufs.read_block_lun(p.lun, p.first as u32) == 0 && ufs.last_response_status() == 0 {
+            return Some(ufs.data_buffer().to_vec());
+        }
+    }
+    None
+}
+
+/// Android's recovery request in misc as it stands (docs/BOOT.md "Recovery requests from Android"): what it asks (ferros_hal::bcb `ASK_*`) and its arguments as text, for the flash log; or why misc could not be read (NO_MISC, READ_FAILED). Read only.
+pub fn misc_request() -> Result<(u8, alloc::vec::Vec<u8>), u32> {
+    let Some(p) = crate::partfs::find("misc") else { return Err(NO_MISC) };
+    crate::process::UFS.with(|| {
+        let ufs = UfsController::new(UFS_BASE);
+        let block = misc_read(&ufs, p).ok_or(READ_FAILED)?;
+        Ok((ferros_hal::bcb::ask(&block), ferros_hal::bcb::args(&block).to_vec()))
+    })
+}
+
+/// Clear Android's recovery request in misc: the bootloader message's command and its arguments, nothing else in the partition (owner, 2026-11-02: a "no" to a recovery request clears the command and arguments; 2026-11-22: only the person's own "no" on ferros's screen, never a launch of Android on the way past it; docs/BOOT.md "Recovery requests from Android").
+/// Without it a recovery request Android left (a `reboot recovery`, RescueParty, a factory reset) makes every boot a recovery boot, which the hv's gate refuses without RECOVERY_ONCE: Android unreachable, every start bounced to ferros (the 8a, 2026-11-21).
 /// MARKED when cleared (read back), ALREADY when there was nothing to clear, else why not (READ_FAILED, WRITE_FAILED, VERIFY_FAILED, NO_MISC).
 pub fn misc_clear_recovery() -> u32 {
     let Some(p) = crate::partfs::find("misc") else { return NO_MISC };
     crate::process::UFS.with(|| {
         let ufs = UfsController::new(UFS_BASE);
-        let lba = p.first as u32;
-        let read = |ufs: &UfsController| -> Option<alloc::vec::Vec<u8>> {
-            // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
-            for _ in 0..4 {
-                if ufs.read_block_lun(p.lun, lba) == 0 && ufs.last_response_status() == 0 {
-                    return Some(ufs.data_buffer().to_vec());
-                }
-            }
-            None
-        };
-        let Some(block) = read(&ufs) else { return READ_FAILED };
+        let Some(block) = misc_read(&ufs, p) else { return READ_FAILED };
         if block[BCB_COMMAND].iter().all(|&b| b == 0) && block[BCB_RECOVERY].iter().all(|&b| b == 0) {
             return ALREADY;
         }
@@ -285,10 +295,34 @@ pub fn misc_clear_recovery() -> u32 {
         want[BCB_COMMAND].fill(0);
         want[BCB_RECOVERY].fill(0);
         ufs.data_buffer_mut().copy_from_slice(&want);
-        if ufs.write_block_lun(p.lun, lba) != 0 || ufs.last_response_status() != 0 {
+        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 {
             return WRITE_FAILED;
         }
-        if !matches!(read(&ufs), Some(back) if back == want) {
+        if !matches!(misc_read(&ufs, p), Some(back) if back == want) {
+            return VERIFY_FAILED;
+        }
+        MARKED
+    })
+}
+
+/// Write a recovery request into misc: the command "boot-recovery" and `args` as the arguments, nothing else in the partition touched (`diag recovery test`, development builds: a harmless request for testing the question on a device). MARKED when written and read back, else why not.
+#[cfg(not(ferros_production))]
+pub fn misc_write_request(args: &[u8]) -> u32 {
+    let Some(p) = crate::partfs::find("misc") else { return NO_MISC };
+    crate::process::UFS.with(|| {
+        let ufs = UfsController::new(UFS_BASE);
+        let Some(block) = misc_read(&ufs, p) else { return READ_FAILED };
+        let mut want = block.clone();
+        want[BCB_COMMAND].fill(0);
+        want[BCB_COMMAND][..13].copy_from_slice(b"boot-recovery");
+        want[BCB_RECOVERY].fill(0);
+        // The caller's text, the harmless test's own: it must leave the field's last byte as its NUL.
+        want[BCB_RECOVERY][..args.len()].copy_from_slice(args);
+        ufs.data_buffer_mut().copy_from_slice(&want);
+        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 {
+            return WRITE_FAILED;
+        }
+        if !matches!(misc_read(&ufs, p), Some(back) if back == want) {
             return VERIFY_FAILED;
         }
         MARKED

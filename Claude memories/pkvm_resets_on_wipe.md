@@ -19,3 +19,5 @@ After `fastboot oem pkvm disable` and a fresh wipe, Android booted through the g
 - After any wipe (`fastboot -w`, recovery's format, a factory reset), run `fastboot oem pkvm disable` and confirm with `status` before booting Android through the gate.
 - When gate-Android fails while stock boots, check pKVM first.
 - Don't trust a disable read back in the same session as a wipe.
+
+**Recovery wipes (2026-11-22, for the recovery question):** the record says a recovery wipe does NOT re-arm pKVM: husky's 2026-11-02 Settings factory reset (let thru by `diag recovery`) ran its wipe and pKVM stayed disabled. `fastboot=` is the bootloader's own setting, reset by its fastboot erase handler, out of Linux's reach; misc's vendor space (G#800, where `theme-dark` sits) has no pKVM flag on either device (`misc=auto`). Unchecked on the 8a after its 2026-11-22 factory reset: run `fastboot oem pkvm status` next time it is in fastboot. ferros logs "pKVM signs from the bootloader" (KVM words in /chosen/bootargs and bootconfig) at every boot, to find whether the two states differ there.

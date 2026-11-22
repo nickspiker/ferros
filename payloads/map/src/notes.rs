@@ -326,6 +326,8 @@ pub enum Question {
     Departure(u8),
     /// A device being added to the fleet, selected and asking Yes or No (the Fleet page, the add flow's phase 3).
     Pairing,
+    /// Android's recovery request (a factory reset, a rescue, an update), which the gate refused to boot and the kernel kept for the person: Allow once or No (the Android page; docs/BOOT.md "Recovery requests from Android"), by its class (ferros_sys `RECOVERY_*`).
+    Recovery(u8),
 }
 
 impl Question {
@@ -341,6 +343,10 @@ impl Question {
                 (3, None)
             }
             Question::Pairing => (4, None),
+            Question::Recovery(class) => {
+                k[1] = *class;
+                (5, None)
+            }
         };
         k[0] = tag;
         if let Some(c) = about {
@@ -357,12 +363,13 @@ impl Question {
             Question::FirstStart(_) => "a first start: its permissions",
             Question::Departure(_) => "a device asks to leave the fleet: Approve or Deny",
             Question::Pairing => "a device asks to join the fleet: Yes or No",
+            Question::Recovery(_) => "Android asks for its recovery: Allow once or No",
         }
     }
 
     /// Whether it comes unasked (from a host, from another device), so it taps the motor once as it arrives, as a personal note does; the rest the person opened themselves, looking at it.
     fn unasked(&self) -> bool {
-        matches!(self, Question::Offer(_) | Question::Departure(_))
+        matches!(self, Question::Offer(_) | Question::Departure(_) | Question::Recovery(_))
     }
 
     /// The settings page it is answered on, if it is on one.
@@ -370,13 +377,14 @@ impl Question {
         match self {
             Question::Offer(_) | Question::Unstow(_) => Some("deck"),
             Question::Departure(_) | Question::Pairing => Some("fleet"),
+            Question::Recovery(_) => Some("Android"),
             Question::FirstStart(_) => None,
         }
     }
 }
 
 impl Map {
-    /// The questions waiting on the person now, read from what the map holds: the stower's offer, the unstow sheet, an open first-start question, the fleet's departure asking and its add flow's Yes.
+    /// The questions waiting on the person now, read from what the map holds: the stower's offer, the unstow sheet, an open first-start question, the fleet's departure asking and its add flow's Yes; and from the kernel, Android's recovery request.
     fn questions_now(&self) -> Vec<Question> {
         let mut q = Vec::new();
         if let Some(o) = self.stower.offer.as_ref() {
@@ -397,6 +405,11 @@ impl Map {
         }
         if self.fleet.add == 3 {
             q.push(Question::Pairing);
+        }
+        // Asked of the kernel, which holds it from the boot's read of misc until the person answers (a trap, no vault; 0 while nobody is present).
+        let class = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::RecoveryAsk).unwrap_or(ferros_sys::RECOVERY_NONE);
+        if class != ferros_sys::RECOVERY_NONE {
+            q.push(Question::Recovery(class as u8));
         }
         q
     }

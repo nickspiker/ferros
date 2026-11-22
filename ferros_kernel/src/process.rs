@@ -6626,7 +6626,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 0
             }
         },
-        // Android on this device (owner, 2026-11-21; docs/BOOT.md "Android only by the identity's choice"), op 13 for a Settings holder (the Settings page), x2 the request: 0 start Android now, 1 Android off on this device (and the setting back to ferros), 2 Android on again for a person who accepted the disclaimer before, 3 the state (bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android), 4 start into ferros, 5 start into Android (only while a person is present on a device that allows Android). 0 to 2 only while a person is present; the vault's half of 0 to 3 is service.rs `store_unlock` (its ops 13, 15, 16, 17); 4 and 5 are the kernel's own setting (settings.rs `START_ANDROID`), kept in the device document. → 1 done, 0 refused, ERR without the right or a vault.
+        // Android on this device (owner, 2026-11-21; docs/BOOT.md "Android only by the identity's choice"), op 13 for a Settings holder (the Settings page), x2 the request: 0 start Android now, 1 Android off on this device (and the setting back to ferros), 2 Android on again for a person who accepted the disclaimer before, 3 the state (bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android), 4 start into ferros, 5 start into Android (only while a person is present on a device that allows Android), 6 Android's recovery request waiting on the person, 7 yes to it, 8 no to it (docs/BOOT.md "Recovery requests from Android"). 0 to 2 only while a person is present; the vault's half of 0 to 3 is service.rs `store_unlock` (its ops 13, 15, 16, 17); 4 and 5 are the kernel's own setting (settings.rs `START_ANDROID`), kept in the device document. → 1 done, 0 refused, ERR without the right or a vault.
         SYS_UNLOCK if f.x[1] == 13 => {
             let token = p.read(f.x[0], 32);
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
@@ -6647,6 +6647,22 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     if ok {
                         start_into(true);
                     }
+                    ok as u64
+                }
+                // 6: Android's recovery request waiting on the person (service.rs `RECOVERY_ASK`, ferros_hal::bcb `ASK_*`), 0 while nobody is present: the question the Android page shows.
+                (true, Some(_)) if f.x[2] == 6 => {
+                    let ask = crate::service::RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire);
+                    if crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) { ask as u64 } else { 0 }
+                }
+                // 7 yes, allow it once (only a wipe or a rescue, the person's alone to allow; owner, 2026-11-02), 8 no (any request): taken by the service loop, which checks the person again and misc again (service.rs `recovery_yes`, `recovery_no`).
+                (true, Some(_)) if f.x[2] == 7 || f.x[2] == 8 => {
+                    let ask = crate::service::RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire);
+                    let yes = f.x[2] == 7;
+                    let ok = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) && ask != ferros_hal::bcb::ASK_NONE && (!yes || crate::service::recovery_allowable(ask));
+                    if ok {
+                        crate::service::RECOVERY_ANSWER.store(if yes { 1 } else { 2 }, core::sync::atomic::Ordering::Release);
+                    }
+                    crate::flashlog::line(&alloc::format!("recovery: the Android page answered {} ({})", if yes { "yes" } else { "no" }, if ok { "taken" } else { "refused" }));
                     ok as u64
                 }
                 // WHY the bound: x2 is the caller's; only the four requests below exist.

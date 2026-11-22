@@ -3200,7 +3200,25 @@ pub enum Android {
     StartIntoFerros = 4,
     /// Android: only while a person is present on a device that allows Android.
     StartIntoAndroid = 5,
+    /// Android's recovery request waiting on the person (docs/BOOT.md "Recovery requests from Android"): one of the `RECOVERY_*` classes, `RECOVERY_NONE` while there is none or nobody is present.
+    RecoveryAsk = 6,
+    /// Yes to it, once: the device restarts into Android's recovery with what Android asked (only `RECOVERY_WIPE` and `RECOVERY_RESCUE`, the person's alone to allow).
+    RecoveryYes = 7,
+    /// No to it: the request is cleared, and ferros stays.
+    RecoveryNo = 8,
 }
+
+/// Android's recovery request classes (`Android::RecoveryAsk`), the kernel's (ferros_hal::bcb `ASK_*`), by the proof each needs (owner, 2026-11-02).
+/// None waiting.
+pub const RECOVERY_NONE: u64 = 0;
+/// A factory reset: erase Android's data. The attest allows it.
+pub const RECOVERY_WIPE: u64 = 1;
+/// Android could not start: its rescue screen, which offers to erase its data. The attest allows it.
+pub const RECOVERY_RESCUE: u64 = 2;
+/// A wipe asked from afar (a device admin, Find My Device): refused, only no.
+pub const RECOVERY_REMOTE: u64 = 3;
+/// Something that can change what boots (an update, a sideload, fastbootd, the recovery menu): needs a second fleet device as well, not built, so only no.
+pub const RECOVERY_CHANGES: u64 = 4;
 
 /// Ask the kernel `what` (`Android`) with the Settings right `cap`: 1 done (or the state's bits), 0 refused, None without the right or a vault.
 pub fn android(cap: u64, what: Android) -> Option<u64> {
