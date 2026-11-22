@@ -20,7 +20,7 @@ Working since 2026-10-19 on slot b, no Linux: `bridge diag "cam bus"`, `"cam up"
 
 ## 2026-10-20: the sensor is ours, the ISP front end is not
 
-**The ISP's register map is in the Pixel tree, in the open.** `zuma-isp-event-info.dtsi` (7847 lines) + `dt-bindings/lwis/platform/zuma/*.h` name every interrupt source, mask, overflow and reset register of every ISP block and every bit in them. LWIS's *logic* is a passthrough, which is why it got written off, but its device tree carries the semantics the closed HAL otherwise keeps. `tools/gen-isp-events.py` generates `ferros_kernel/src/camera_events.rs` (203 named sources); `diag cam events` prints the ones reporting, counting an armed mask as interesting too. **Use this before diffing any ISP register by hand.**
+**The ISP's register map is in the Pixel tree, in the open.** `zuma-isp-event-info.dtsi` (7847 lines) + `dt-bindings/lwis/platform/zuma/*.h` name every interrupt source, mask, overflow and reset register of every ISP block and every bit in them. LWIS's *logic* is a passthrough, which is why it got written off, but its device tree carries the semantics the closed HAL otherwise keeps. The bring-up harness generated `camera_events.rs` from them (203 named sources) and `diag cam events` printed the ones reporting, counting an armed mask as interesting too; both left with the harness (c5f24d02), the generator with them. **Use this before diffing any ISP register by hand.**
 
 It immediately re-read words the driver had printed for days: `CSIS_LINK1 + G#14 = G#100` is **ERR_DESKEW_OVER** (a D-PHY lane deskew overflow), not an "interrupt latch"; `+G#1C` LINE_END, `+G#24` FRAME_START ch0-2, `+G#2C` FRAME_END ch0-2.
 
@@ -39,7 +39,7 @@ Full detail: ferros/docs/oracle/CAMERA.md.
 
 ## 2026-10-21: the clock no capture could show
 
-**The hv snapshots Linux's live registers.** `FERROS_HV_SNAPSHOT=1` + `FERROS_HV_SNAP_LIST` reads 2914 known-to-exist registers sixteen frames into a Linux stream (`tools/camera-snap-list.py` builds the list and turns the log into `camera_snap.rs`); `diag cam pdma` reads the same list cold and prints every difference. This is the tool for "everything we capture matches, it still fails": it sees state set by firmware, which no trap does. Recipe in CAMERA.md.
+**The hv snapshots Linux's live registers.** `FERROS_HV_SNAPSHOT=1` + `FERROS_HV_SNAP_LIST` reads 2914 known-to-exist registers sixteen frames into a Linux stream (the list, built once, is local at target/hv/snap-list.txt); the harness's `diag cam pdma` read the same list cold and printed every difference (gone with the harness, c5f24d02, and the list's generator with it). This is the tool for "everything we capture matches, it still fails": it sees state set by firmware, which no trap does. Recipe in CAMERA.md.
 
 **Found with it:** CMU_TOP `ISPFE_NOC` (mux G#2604_10BC, div G#2604_18B4) is 465 MHz under Linux (PLL_SHARED1_D4 ÷1) and 111 MHz cold (SHARED3_D1 ÷6). Linux sets it through ACPM DVFS (INT domain), never a CPU write. `fe_up` now sets it, mux first, and the link's deskew overflow vanished. **Not sufficient:** the core still sees no frame start. The front-end diffs left over (G#8F where Linux has G#10, `+G#1C`/`+G#20` = 1 where Linux has 0) are pending requests the hardware consumes at frame start: symptoms.
 
@@ -63,7 +63,7 @@ Full detail: ferros/docs/oracle/CAMERA.md.
 - **A second `cam pdma` needs a cold boot.** `scratchpad coldflash.sh` / `bridge reboot` + fastboot flash boot_b.
 - **`diag android`** leaves a ramoops marker so slot a's gate picks Android unattended.
 
-**Tools:** `tools/camera-pull.sh`, `tools/camera-raw10.py`, `tools/camera-raw2vsf`; `cam pdma af= exp= gain= sweep=<a>:<step> view=<s> snap fast`.
+**Tools:** `tools/camera-pull.sh` (prints the frame's figures with `cam-oracle raw10`), `tools/camera-raw2vsf`; `cam pdma af= exp= gain= sweep=<a>:<step> view=<s> snap fast`.
 
 **Next:** the other three cameras; a re-runnable capture without a cold boot; the exact exposure time (pixel clock) for absolute-IDT comparison with the Android captures; screen calibration with the owner.
 
