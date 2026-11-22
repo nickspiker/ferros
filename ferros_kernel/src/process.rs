@@ -3640,6 +3640,10 @@ fn dv_stamp(p: &Process, msg: &[u8]) -> Option<Vec<u8>> {
         Object::Dma(i) if DMA[i].name == "display-phases" => Some(region(i)),
         _ => None,
     })?;
+    // Not init, which holds the phases (and the blocks' window whole) only to hand them on: only the display stamps a view.
+    if p.cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "arena")) {
+        return None;
+    }
     let dv = unsafe { &mut *(&raw mut DV) };
     if dv.epoch != p.epoch {
         // A display after one whose view was let go, or the first: nothing named yet. (One whose view is still held, `ending`, keeps its viewed and held slots: they go at its settle or its drop.)
