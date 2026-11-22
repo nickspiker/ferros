@@ -14,10 +14,15 @@ fi
 pkg=${PHOTON_FERROS_PKG:-$here/std/photon}
 version=${PHOTON_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$pkg/../../../photon/Cargo.toml" | head -n 1)}
 [ -n "$version" ] || { echo "no version: set PHOTON_VERSION or check $pkg/../../../photon/Cargo.toml" >&2; exit 1; }
-# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/photon.vsf); $PHOTON_ICON wins.
+# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration; $PHOTON_ICON wins, else target/icons/photon.vsf (app-icons bundle writes it), made here from Photon's logo when it is not there (app-icons icon, the codes assigned VSF RGB g2t as app-icons' APPS has Photon: owner, 2026-11-20).
+# Never signed without it: until 2026-11-21 a missing file was passed over in silence, and every Photon capsule stowed on the Pro (from the farm and from exports, where target/icons was never made) carried no icon, so its circle had none.
 icon=${PHOTON_ICON:-$here/target/icons/photon.vsf}
-icon_arg=()
-[ -f "$icon" ] && icon_arg=(--icon "$icon")
+if [ ! -f "$icon" ]; then
+    logo="$pkg/../../../photon/assets/logo original.jpeg"
+    mkdir -p "$(dirname "$icon")"
+    OPUS_NO_PKG=1 OPUS_STATIC=1 cargo run --manifest-path "$here/tools/app-icons/Cargo.toml" -- icon "$logo" "$icon" >&2 || { echo "no icon: app-icons could not make $icon from $logo (set PHOTON_ICON to one made already)" >&2; exit 1; }
+fi
+icon_arg=(--icon "$icon")
 FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}" "$here/target/debug/ferros-bridge" capsule "$1" "$2" --kist Photon --option 8c2411c6bf1c10a45d8021340b2dae4a7c69774235069eddd85abbdc6959eb74 --version "$version" "${icon_arg[@]}" \
     --want display "to show your conversations on the screen" \
     --want touch "to read your taps and typing" \
