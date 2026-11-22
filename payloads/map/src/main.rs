@@ -1686,6 +1686,8 @@ struct Map {
     /// A live note on the screen (its source and number) and its words; the note a tap opens its kist at (`notes_front`), and one waiting for its kist's window to show.
     live_note: Option<([u8; 32], u8)>,
     live_words: Option<alloc::string::String>,
+    /// The restart notes last seen on the about page, their words (notes.rs `notices_take`; docs/KERNEL.md "Restarts"): listed there until the next are seen or the map starts again.
+    notices_shown: Vec<alloc::string::String>,
     opening: Option<u8>,
     open_pending: Option<([u8; 32], u8)>,
 }
@@ -4359,6 +4361,12 @@ impl Map {
                 let facts = ferros_sys::facts();
                 b.text(cx, y, (uu(2, 1)) as u16, white(), 1, "ferros");
                 y += uu(3, 1);
+                // The system processes the kernel started again (or stopped starting), as their notes said: seen here (notes.rs `notices_take`), each a line under the name.
+                self.notices_take();
+                for w in self.notices_shown.clone() {
+                    b.text(cx, y, note as u16, white(), 1, &w);
+                    y += uu(2, 1);
+                }
                 row(self, b, &mut y, small, grey(), tr(if DEV { Msg::VersionDev } else { Msg::Version }), Some(Choice::Version));
                 // The hint from the fourth tap on, counting down to Developer; it stays until the next tap changes it (no timers).
                 if self.taps >= DEV_HINT {
@@ -5436,6 +5444,10 @@ impl Map {
             if self.question_open() {
                 return "map: deck: the question waiting opened";
             }
+            // A system process restarted (its note waiting, docs/KERNEL.md "Restarts"): the about page, which lists it.
+            if self.notice_open() {
+                return "map: deck: the restart notes opened (the about page)";
+            }
             if self.send_behind(true) {
                 return "map: deck: the app in front behind";
             }
@@ -6236,6 +6248,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         questions: Vec::new(),
         live_note: None,
         live_words: None,
+        notices_shown: Vec::new(),
         opening: None,
         open_pending: None,
     };

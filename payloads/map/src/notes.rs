@@ -89,6 +89,7 @@ impl Map {
             let mut l = Line::new();
             let _ = write!(l, "map: notes: a {} note from G#{:02X}{:02X}{:02X}{:02X} (note {}, count {}), {}\n", kind_word(n.kind), n.source[0], n.source[1], n.source[2], n.source[3], n.number, n.count, match circle {
                 None if n.source == ferros_kist::note::SYSTEM => "the system's question: the Deck button red",
+                None if n.source == ferros_kist::note::RESTARTS => "a system process restarted: the Deck button and the about page",
                 None => "no circle on the deck",
                 Some(i) if self.in_view(i) => "in view",
                 Some(_) => "out of view: silent",
@@ -135,10 +136,9 @@ impl Map {
         let mut count = 0u64;
         let mut latest: Option<(u64, usize)> = None;
         for n in &self.notes {
-            let Some(i) = self.circle_of(&n.source) else { continue };
-            if !self.in_view(i) {
-                continue;
-            }
+            // A restart note (docs/KERNEL.md "Restarts") is the system's, whatever the view: the settings circle's (circle 0), as a question is, but in for you's violet: nothing waits on the person's answer.
+            let circle = if n.source == ferros_kist::note::RESTARTS { Some(0) } else { self.circle_of(&n.source).filter(|&i| self.in_view(i)) };
+            let Some(i) = circle else { continue };
             count += n.count as u64;
             if latest.is_none_or(|l| n.seq > l.0) {
                 latest = Some((n.seq, i));
@@ -470,5 +470,42 @@ impl Map {
             None => self.draw(),
         }
         true
+    }
+
+    /// Whether a restart note waits (docs/KERNEL.md "Restarts": the kernel started a system process again at its death, or stopped starting it).
+    fn notices_waiting(&self) -> bool {
+        self.notes.iter().any(|n| n.source == ferros_kist::note::RESTARTS)
+    }
+
+    /// Deck tapped with a restart note waiting and no question: the about page, where the notes are listed (`notices_take`), the app in front sent behind first. False when none waits or the about page is on the glass already, for Deck's own tap.
+    pub fn notice_open(&mut self) -> bool {
+        if !self.notices_waiting() {
+            return false;
+        }
+        if !self.app_front && self.view == View::Open(0) && !self.leaving && !self.picker && PAGES[self.page] == "about" {
+            return false;
+        }
+        if self.app_front {
+            self.send_behind(false);
+        }
+        self.show_page("about");
+        true
+    }
+
+    /// The about page is showing: the restart notes waiting read (their words, as the kernel kept them) into the page's list, which replaces the last one, and marked seen, so the Deck button goes back to what else waits (owner, 2026-11-12: a note clears when it is seen, never on a timer). Gone from `notes` here too, so the next draw before the kernel's bell does not read them again.
+    pub fn notices_take(&mut self) {
+        if !self.notices_waiting() {
+            return;
+        }
+        let mut shown = Vec::new();
+        for n in self.notes.iter().filter(|n| n.source == ferros_kist::note::RESTARTS) {
+            if let Some(w) = self.note_words(&n.source, n.number) {
+                shown.push(w);
+            }
+        }
+        self.notes.retain(|n| n.source != ferros_kist::note::RESTARTS);
+        ferros_sys::notify::seen(cap(self.grants, S_SETTINGS), &ferros_kist::note::RESTARTS, ferros_sys::notify::ALL, false);
+        self.notices_shown = shown;
+        self.notes_view();
     }
 }
