@@ -420,7 +420,7 @@ const GPP8: usize = 0x100;
 /// The front camera and the tele list LDO8 as a supply and no enable of their own; under Android the main is powered at boot (`lwis,power-up-to-suspend`) and this line stays high, so it is high whenever they run there.
 /// Every ferros reading of it from a cold boot was G#40 (output, low), and nothing in the front camera's or the tele's power-up ever raised it: the one supply of theirs no register comparison could have covered, since their power-up never touches it (docs/CAMERA.md "The other cameras").
 /// So their sequences raise it where the main's does (after LDO1, 10 µs before LDO8): a guess from the device tree, to be measured.
-/// The ultrawide's does not: it answered and streamed from a cold boot with the line low (2026-10-22), and its LDO8 is not its sensor's core (its 1.1 V core is LDO6).
+/// The ultrawide's sensor streamed with the line low (2026-10-22: its LDO8 is not its sensor's core, LDO6 is), but its lens actuator (G#0F) and EEPROM (G#50) never answered ferros until it was raised (the Pro, 2026-11-21: PROBE found both, and a focus sweep moved its lens): its sequence raises it as the front's and the tele's do.
 pub const LV_BUCK_EN: u32 = 2;
 
 /// The ultrawide (oksoko, Sony IMX787): hsi2c_3 (G#108A_0000, gpp6-0/1, USI offset 8), reset gpp6-3, master clock gpp3-0 (CIS_CLK0, `sensor_mclk1`, drive X4).
@@ -433,8 +433,8 @@ pub const ULTRAWIDE: Module = Module {
     usi_mux: CMU_PERIC0 + 0x670,
     reset: (GPP6, 3),
     mclk: (GPP3, 3),
-    up: &[(Step::Ldo(0), 500), (Step::Ldo(7), 750), (Step::SubLdo(0x3A), 0), (Step::Ldo(5), 0), (Step::Ldo(1), 0), (Step::Ldo(3), 1000), (Step::Switch(0x1711), 1000), (Step::Mclk, 1000), (Step::Reset, 10_000)],
-    down: &[(Step::Reset, 1000), (Step::Mclk, 1000), (Step::Switch(0x1711), 0), (Step::Ldo(3), 0), (Step::Ldo(1), 0), (Step::Ldo(5), 0), (Step::SubLdo(0x3A), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0)],
+    up: &[(Step::Ldo(0), 500), (Step::SubGpio(LV_BUCK_EN), 10), (Step::Ldo(7), 750), (Step::SubLdo(0x3A), 0), (Step::Ldo(5), 0), (Step::Ldo(1), 0), (Step::Ldo(3), 1000), (Step::Switch(0x1711), 1000), (Step::Mclk, 1000), (Step::Reset, 10_000)],
+    down: &[(Step::Reset, 1000), (Step::Mclk, 1000), (Step::Switch(0x1711), 0), (Step::Ldo(3), 0), (Step::Ldo(1), 0), (Step::Ldo(5), 0), (Step::SubLdo(0x3A), 500), (Step::Ldo(7), 500), (Step::Ldo(0), 0), (Step::SubGpio(LV_BUCK_EN), 0)],
 };
 
 /// The front camera (dokkaebi): hsi2c_2 (G#1089_0000, gpp4-0/1, USI offset 4), reset gpp4-2, master clock gpp5-0 (CIS_CLK1, `sensor_mclk2`, drive X3), its lens actuator powered by the shared enable (sub GPIO4).

@@ -2560,7 +2560,10 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     unsafe { GOV_INPUT = input };
     // The camera's switch on: the memory side stays where it is put for the whole open, below (`CAM_MEM`).
     let cam = CAM_MEM.load(core::sync::atomic::Ordering::Relaxed) && crate::camera_power::held();
-    let dark = !pt_hold && !cam && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
+    // Never dark while a camera streams or a clip records (owner, 2026-11-21: "if the screen is off, that should not affect video recording"): the dark tier stops the worker cores, floors the X3 and MIF and drops the GPU to its floor.
+    // The screen off still stops the UI's drawing (the display tells the app in front it is behind).
+    let capturing = crate::camera_power::held() || crate::process::EXTENTS_OPEN.load(core::sync::atomic::Ordering::Relaxed);
+    let dark = !pt_hold && !cam && !capturing && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
     let was = unsafe { CLOCK_STATE };
     let gov = GOV_ON.load(core::sync::atomic::Ordering::Relaxed);
     // The governor runs in every tier once the policy has applied one; in the dark the workers are down and only the X3 moves.
