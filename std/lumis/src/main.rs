@@ -36,6 +36,11 @@ static LEAVING: AtomicBool = AtomicBool::new(false);
 
 /// Held by the camera thread whenever it may read the view (all of its turn but the driver's wait, `Source::next`), and by a thread that closes the camera for Lumis's leaving: the driver takes the view back at CLOSE, so a CLOSE sent from another thread must never land while a frame's rows are being read.
 static VIEW: Mutex<()> = Mutex::new(());
+/// The newest frame the camera thread has taken (the driver's count): a preview read after its buffer went back is whole while this is at most its frame's count plus the ring less 3 (`Preview`).
+static NEWEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A preview is reading the view on its own thread (`Preview`): nothing closes the camera or touches the integrator until it ends (`preview_settle`).
+static PREVIEWING: Mutex<bool> = Mutex::new(false);
+static PREVIEW_IDLE: std::sync::Condvar = std::sync::Condvar::new();
 
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
@@ -571,6 +576,78 @@ impl ViewRows {
     }
 }
 
+/// RAW video's preview while a clip records, on a thread of its own (capture first, the owner 2026-11-21): the camera thread hands it the held frame as the hand-over starts and takes the camera's next frame as soon as the hand-over is done, never waiting for the preview (on the Pro a preview beside the hand-over took 14 to 48 ms, past a 60 or 48 a second frame, and the frame after it was lost). The preview reads on after the buffer went back; the view's ring gives it the frames until the engine comes round to that buffer, and one that outran them is dropped unpublished (lumis_core `RowSource::whole`), the last whole preview staying on screen (the owner: only whole frames shown).
+struct PreviewJob {
+    rows: ViewRows,
+    /// The last frame the camera may have taken for the read still to be whole: the frame's count plus the view's ring less 3 (its buffer is written again by the frame a ring after it, which starts as the one before that lands; one frame more for the camera thread's taking it).
+    last: u64,
+    iso: i32,
+    exposure_ns: i64,
+    quad: bool,
+}
+
+/// A preview's end: the settings the integrator gave back, its time, whether it was whole (published).
+struct PreviewDone {
+    settings: (i32, i64, f32),
+    us: u64,
+    whole: bool,
+}
+
+/// The frame a preview reads, whole while the camera has not taken past `last` (`NEWEST`), asked by the integrator before it publishes.
+struct FreshRows {
+    rows: ViewRows,
+    last: u64,
+    whole: AtomicBool,
+}
+
+impl lumis_core::RowSource for FreshRows {
+    fn read_row(&self, y: usize, out: &mut [u16]) {
+        self.rows.read_row(y, out)
+    }
+
+    fn whole(&self) -> bool {
+        let w = NEWEST.load(Ordering::Acquire) <= self.last;
+        self.whole.store(w, Ordering::Relaxed);
+        w
+    }
+}
+
+/// The preview thread for the integrator at `integrator`: jobs in, their ends out.
+fn preview_thread(integrator: usize) -> Option<(std::sync::mpsc::Sender<PreviewJob>, std::sync::mpsc::Receiver<PreviewDone>)> {
+    let (tx, jobs) = std::sync::mpsc::channel::<PreviewJob>();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("lumis-preview".into())
+        .spawn(move || {
+            for j in jobs {
+                let f = FreshRows { rows: j.rows, last: j.last, whole: AtomicBool::new(true) };
+                let t = std::time::Instant::now();
+                // SAFETY: the integrator is leaked for the process's life; while PREVIEWING is set (from the job's hand-over until here) the camera thread calls none of its methods and reads and writes only its header, the shared memory the UI thread writes too (`preview_settle` before anything else), and the view stays mapped (`close_camera` waits for this).
+                let settings = unsafe { &mut *(integrator as *mut lumis_core::CameraIntegrator) }.process_rows(&f, j.iso, j.exposure_ns, 0., j.quad);
+                let d = PreviewDone { settings, us: t.elapsed().as_micros() as u64, whole: f.whole.load(Ordering::Relaxed) };
+                *PREVIEWING.lock().unwrap() = false;
+                PREVIEW_IDLE.notify_all();
+                if done_tx.send(d).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok()
+        .map(|_| (tx, done))
+}
+
+/// Wait until no preview reads the view or uses the integrator.
+fn preview_settle() {
+    let mut busy = PREVIEWING.lock().unwrap();
+    while *busy {
+        busy = PREVIEW_IDLE.wait(busy).unwrap();
+    }
+}
+
+fn previewing() -> bool {
+    *PREVIEWING.lock().unwrap()
+}
+
 impl lumis_core::RowSource for ViewRows {
     fn read_row(&self, y: usize, out: &mut [u16]) {
         let at = self.src + y * self.line;
@@ -1042,6 +1119,14 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut idle_preview = std::time::Instant::now();
     // The last frame's integration, us: said with a RAW video drop that may follow it.
     let mut last_preview_us = 0u64;
+    // RAW video's preview while a clip records (`PreviewJob`), its thread started once a camera; previews it dropped as not whole, said on the console.
+    let preview = preview_thread(&mut *integrator as *mut lumis_core::CameraIntegrator as usize);
+    if preview.is_none() {
+        println!("lumis: camera {}: no thread for RAW video's preview: no preview while a clip records", cam.name);
+    }
+    let mut previews_dropped = 0u64;
+    // The settings came from a preview on its thread this turn (its time is `last_preview_us` already).
+    let mut preview_async = false;
     // The GPU block grown to the recorder's size for this open's RAW video (`video_block`), once.
     let mut video_grown = false;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
@@ -1205,6 +1290,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         let slit_now = src.is_slit();
         drop(reading);
+        // The view's ring (its buffers), read before the frame borrows the source: RAW video's preview off the camera thread needs four or more (`PreviewJob`).
+        let ring = match &src {
+            Source::View { view, .. } => view.buffers as u64,
+            _ => 0,
+        };
         let got = src.next(&mut turns);
         reading = VIEW.lock().unwrap();
         // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
@@ -1279,8 +1369,34 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             Got::Frame(head, _) => (false, head.count as u64, head.time),
             Got::Slit { count, time, .. } => (true, *count, *time),
         };
+        if !stamp.0 {
+            NEWEST.store(stamp.1, Ordering::Release);
+        }
+        // No clip recording: a preview still on its thread ends before the integrator is used here (during a clip only its header is, `PreviewJob`).
+        if CLIP.lock().unwrap().is_none() {
+            preview_settle();
+        }
+        // A preview's end on its thread: its settings sent as an integration's are (below), its time said with a drop, a preview that was not whole counted.
+        preview_async = false;
+        if let Some(d) = preview.as_ref().and_then(|(_, done)| done.try_recv().ok()) {
+            last_preview_us = d.us;
+            if !d.whole {
+                previews_dropped += 1;
+                if previews_dropped.is_power_of_two() {
+                    println!("lumis: camera {}: RAW video: A#{previews_dropped} previews dropped so far, read past the view's ring (the last whole one stayed on screen)", cam.name);
+                }
+            }
+            preview_done = Some(d.settings);
+            preview_async = true;
+        }
         if let Some((_, c0, t0)) = last_frame.filter(|&(slit, c0, t0)| slit == stamp.0 && stamp.1 > c0 && stamp.2 > t0) {
-            integrator.set_sensor_rate((stamp.1 - c0) as f64 * 1e9 / (stamp.2 - t0) as f64);
+            let fps = (stamp.1 - c0) as f64 * 1e9 / (stamp.2 - t0) as f64;
+            // While a preview uses the integrator on its thread, the rate goes straight into the header (what set_sensor_rate writes once it has been called, as it has by any clip).
+            if previewing() {
+                integrator.header[lumis_core::shared_memory::FPS_IDX] = fps.to_bits();
+            } else {
+                integrator.set_sensor_rate(fps);
+            }
         }
         last_frame = Some(stamp);
         // A continuous save or a calibration integrates on: the integrator never ends Lumis on a quiet UI while either runs (lumis ferros-cal-behind).
@@ -1395,33 +1511,23 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     focus: head.focus,
                 };
                 let index = c.rec.stats().frames;
-                // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"): the hand-over on a scoped thread of its own, the integration here, both done before the next MAP gives the buffer back; the preview then costs the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
+                // A preview frame is integrated while the recorder codes the same held buffer (owner, 2026-11-19: "a faster preview"), now on the preview's own thread, which the camera thread never waits for (`PreviewJob`, 2026-11-21: a preview past the frame cost the frame after it); before, both were done before the next MAP gave the buffer back, and the preview cost the coding's own time, not its own after it (at 2^9 ms apart, one after the other, the camera thread had to make an integration up over five frames). Between preview frames the hand-over is all.
                 // No preview in a clip's first 2^10 ms: its first hand-overs run slow while the coder's workers start (40 to 64 ms on the Pro, 2026-11-20), and a preview beside them lost 8 of the first 9 frames.
                 // Nor in the 2^10 ms after a drop: a warm minute at 60 a second lost its only frames (22, its last 5 s) to previews beside hand-overs as the device heated (2026-11-20); the preview gives the camera thread its time back while it falls behind, and comes back by itself.
                 // Nor after a hand-over that took over half the sensor's period: the recorder is running late, and a preview beside the next would make it later (a minute at 60 a second lost its last frame so, 2026-11-20; the owner asked for a lock).
                 let preview_now = c.preview.elapsed() >= preview_gap(c.fps) && c.began.elapsed() >= std::time::Duration::from_millis(1 << 10) && c.dropped_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1 << 10)) && c.last_code_us <= c.period_us >> 1;
-                let (taken, code_us) = if preview_now {
+                // The preview on its thread (`PreviewJob`), started as the hand-over starts and never waited for: none behind or with the screen off (nothing shows it, and heat is the recording's limit at 48 to 60 a second), only with a ring of four or more (the read then has two frames past its own before the engine comes round), and only when the last one has ended.
+                if let (true, Some((jobs, _))) = (preview_now && !behind && ring >= 4 && !previewing(), preview.as_ref()) {
                     c.preview = std::time::Instant::now();
-                    let rec = &mut c.rec;
-                    let (taken, code_us, pre) = std::thread::scope(|s| {
-                        let coder = s.spawn(|| {
-                            let t = std::time::Instant::now();
-                            let taken = rec.frame(&f);
-                            (taken, t.elapsed().as_micros() as u64)
-                        });
-                        let t = std::time::Instant::now();
-                        let r = integrator.process_rows(rows, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad());
-                        last_preview_us = t.elapsed().as_micros() as u64;
-                        let (taken, code_us) = coder.join().expect("the hand-over thread does not panic");
-                        (taken, code_us, r)
-                    });
-                    preview_done = Some(pre);
-                    (taken, code_us)
-                } else {
-                    let t_code = std::time::Instant::now();
-                    let taken = c.rec.frame(&f);
-                    (taken, t_code.elapsed().as_micros() as u64)
-                };
+                    *PREVIEWING.lock().unwrap() = true;
+                    let job = PreviewJob { rows: ViewRows { src: rows.src, line: rows.line, cached: rows.cached, pd: None }, last: head.count as u64 + ring - 3, iso: iso(head.gain) as i32, exposure_ns: head.exposure_ns as i64, quad: head.quad() };
+                    if jobs.send(job).is_err() {
+                        *PREVIEWING.lock().unwrap() = false;
+                    }
+                }
+                let t_code = std::time::Instant::now();
+                let taken = c.rec.frame(&f);
+                let code_us = t_code.elapsed().as_micros() as u64;
                 if taken == ferros_clip::Taken::Recorded && dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES && index & ((1 << 3) - 1) == 0 {
                     let h: String = c.rec.source_hash().iter().map(|b| format!("{b:02x}")).collect();
                     println!("lumis: RAW video: frame {index} source {h}");
@@ -1454,8 +1560,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 };
                 if taken == ferros_clip::Taken::Ended {
                     end_clip(clip.take().unwrap(), Some(&mut *integrator.header), "the clip's space is full, or a write failed");
-                } else if !preview_now {
-                    // Not this frame for the preview: the camera's next frame comes first.
+                } else if preview_done.is_none() {
+                    // The preview is its thread's (`PreviewJob`): the camera's next frame comes first, unless a preview ended with settings to send (below).
                     keep_saves(vault.as_deref(), &mut *integrator.header);
                     frames += 1;
                     continue;
@@ -1481,6 +1587,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             integrator.header[FLAGS_IDX] |= MANUAL_SAVE_BIT;
         }
         // A RAW video clip's preview frame was integrated beside its hand-over (above); any other frame is integrated here.
+        // A clip that ended this turn may have left a preview on its thread: it ends before the integrator is used here.
+        if preview_done.is_none() {
+            preview_settle();
+        }
         let (iso, shutter_ns, focus) = if let Some(r) = preview_done.take() { r } else { match got {
             // With its phase-detect rows where it has them (the phase view renders them; every other mode passes them over).
             Got::Frame(head, Taken::View(rows)) => {
@@ -1495,7 +1605,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         } };
         let t_after = std::time::Instant::now();
         turns.integrate += (t_after - t_integrate).as_micros() as u64;
-        last_preview_us = (t_after - t_integrate).as_micros() as u64;
+        if !preview_async {
+            last_preview_us = (t_after - t_integrate).as_micros() as u64;
+        }
         if dev_knobs2() & DEV_NO_SET != 0 {
             sent = (iso, shutter_ns, focus);
         }
@@ -1677,6 +1789,8 @@ fn in_flight(flags: u64) -> bool {
 /// The driver's CLOSE (docs/CAMERA.md, op 4): the view taken back, the stream stopped, the module powered down, and the driver ends.
 /// Said by the camera thread (or before it reads any frame), so nothing reads the view after the driver takes it back.
 fn close_camera(name: &str) {
+    // A preview still reading a buffer the CLOSE takes back ends first.
+    preview_settle();
     let mut r = [0u8; 4];
     if sys::call_live(CAMERA, &[camera::OP_CLOSE], &mut r) == sys::ERR {
         println!("lumis: camera {name}: the CLOSE was not answered; the driver closes when Lumis ends");
