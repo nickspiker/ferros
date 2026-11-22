@@ -2,7 +2,7 @@
 //! Spawned with the camera and a vault scope, in that order: `ferros-bridge spawn rawrec.bin <hex> --name rawrec --use camera --store test`; with `--use gpu --dma layers` after them a Bayer clip is coded on the GPU (ferros_clip `gpu`, +20 bit 3 turns it off).
 //!
 //! The input (hex bytes):
-//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 6 the per-core profile, 7 the GPU bench, 8 the camera alone (the power baseline), 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
+//! - +0 the job: 0 record, 1 the clip's record (info), 2 delete it, 6 the per-core profile, 7 the GPU bench, 8 the camera alone (the power baseline), 9 the camera list said readout by readout, 5 read it back as sealed (a recovered one too) by its index, every 2^(+1)-th frame decoded against its hash, 3 the seal bench (XChaCha20-Poly1305 on one and four cores of each cluster: what sealing a clip would cost), 4 the NEON check (+1 frames a gain, 0: 4): this build's band coder against the scalar, byte for byte, on the binned main at gains 1x to 64x, each band decoded against the frame, both timed on four A715s; build with `--features neon` for it to mean anything.
 //! - record (+21 the `items` grant's slot: the clip kept as an item of the hold, ferros_clip `items::ItemSink`, spawned with `--items` after the other grants; 0 the scope's extent) (+17 the writer's cores: 0 the A510s, 1 the A715s, 2 the X3): +1 frames a second (1 to 60, 0: 30); +2 frames to record, u16 LE (0: by seconds); +4 seconds, u16 LE (0: 64 frames); +6 A715 workers (0 to 4, G#FF none; 0: 4); +7 A510 workers (0 to 4); +8 the shutter in microseconds, u32 LE (0: the driver's); +12 the gain as 2^(n-1) times unity (0: the driver's); +13 every 2^n-th frame hashed as captured (0: 3, every 8th); +14 coded frames waiting for the flash (0: 4); +15 the hottest zone that ends the run, C (0: 85); +16 1: decode the clip on the device after, every hashed frame against its hash (0: yes, 2: no); +18 1: the main loop on the A510s; +19 the clip's name, rawrec<n>.clip (0: rawrec.clip); +22 the camera (0 the main, 1 the ultrawide, 2 the front, 3 the tele: its binned readout, paced from its line in the driver's list).
 //!
 //! Every second it says the frames, the dropped ones, the bytes written and their rate, the longest frame's coding and the hottest zone; at the end the clip's length and seal, its first block in the clips area (for a pull), and each hashed frame's index and BLAKE3 (of its packed rows as the camera wrote them, each row's 5/4 bytes a sample, the stride's tail left out), which a host decode of the pulled clip repacks and compares.
@@ -529,6 +529,29 @@ fn pacing_for(id: u8, fps: u32) -> Option<Pacing> {
     p
 }
 
+/// Job 9: the camera driver's LIST, each readout's line: its camera and mode, size, line (ps), shortest frame, the fastest whole rate (ferros_clip `Line::fps_most`), its gain and focus ranges.
+fn list_say() {
+    let mut list = vec![0u8; 1 << 16];
+    let n = call(S_CAMERA, &[0], &mut list);
+    if n == ERR {
+        println!("rawrec: LIST refused");
+        return;
+    }
+    let Ok(d) = vsf::container::Document::open(&list[..n as usize]) else {
+        println!("rawrec: LIST: A#{n} bytes, not a VSF document");
+        return;
+    };
+    for e in d.entries_named("camera") {
+        let Ok(s) = d.section(e) else { continue };
+        let u = |f: &str| s.uint(f).map_or("none".to_string(), |v| format!("A#{v}"));
+        let most = match (s.uint("line_ps"), s.uint("fll_least")) {
+            (Some(ps), Some(least)) => format!("A#{}", ferros_clip::Line::of_ps(ps, least).fps_most()),
+            _ => "none".into(),
+        };
+        println!("rawrec: LIST: camera {} {} mode {}: {} x {}, line_ps {}, fll_least {}, fastest {most} a second, gain {} to {}, focus {} to {}, exposure {} to {} ns", u("id"), s.text("name").unwrap_or("?"), u("mode"), u("width"), u("height"), u("line_ps"), u("fll_least"), u("gain_min"), u("gain_max"), u("focus_min"), u("focus_max"), u("exposure_min"), u("exposure_max"));
+    }
+}
+
 /// Job 8: the camera alone, the baseline a recording's power is measured against: camera +22 (0 the main) binned at +1 frames a second (0: 30) for +4 seconds (u16 LE, 0: 64), every frame taken (MAP) and given back, nothing coded or written; the frames the camera counted past one between two MAPs said as skipped; the hottest zone every 2^4 s.
 fn camera_only(inp: &[u8]) {
     let arg = |k: usize| inp.get(k).copied().unwrap_or(0) as u64;
@@ -694,6 +717,10 @@ fn main() {
         }
         8 => {
             camera_only(&inp);
+            return;
+        }
+        9 => {
+            list_say();
             return;
         }
         _ => {}

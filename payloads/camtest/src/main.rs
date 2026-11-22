@@ -12,6 +12,7 @@
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 //! A fourth byte of 9 drives the driver while a long frame's MAP waits (2026-11-18, docs/CAMERA.md "Serving while a frame waits"): OPEN with the view, the exposure to 2^n s (the sixth byte; 10 if 0), a second thread MAPping, then LIST, STATS and a SET back to 67 ms timed (the frame in flight cut), the exposure long again, and the end by the seventh byte: 0 CLOSE, 1 this process ends with the MAP held, 2 it holds until killed from the host (`00000009` the main, 2^10 s, CLOSE; `00000009001C01` the main, 2^28 s, about 8.5 years, its end; `00000009001C02` the same, killed from the host).
 //! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut), the third byte 1 the driver's plain plan instead of a forced shift (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
+//! A fourth byte of 13 (G#0D) sweeps the lens: the sixth and seventh bytes the first and last target's high byte (G#08 and G#78 if 0), the first byte the steps (8 if 0), each a SET, three frames let pass and one at bin 2 whose middle half's sharpness is said (`0800000D0208` the front from G#0800 to G#7800 in 8 steps).
 //! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s); the ninth byte the exposure as 2^n ms and the tenth the gain as 2^n times unity, set first (`02000008000006000E06`: 16 s at 64x, two frames to settle).
 #![no_std]
 #![no_main]
@@ -111,6 +112,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 5 && bin == 1 {
         long_ladder(g, ep, id, bin, arg(0), arg(5), arg(6), t1);
     }
+    // A fourth byte of 13: a focus sweep, the frame's sharpness at each target (2026-11-21, focus on every camera).
+    if arg(3) == 13 {
+        focus_sweep(g, ep, id, arg(0), arg(5), arg(6), t1);
+    }
     // A fourth byte of 11: the camera ring read in place by this process's GPU queue (docs/GPU-KISTS.md "The camera ring on the GPU").
     if arg(3) == 11 {
         camera_gpu(g, ep, id, frames, t1);
@@ -187,6 +192,54 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// A focus sweep (the fourth byte 13, 2026-11-21: focus on every camera for the promo): OPEN camera `id`, then the lens's target from `lo` to `hi` (the sixth and seventh bytes as the target's high byte; G#08 and G#78 if 0) in `steps` steps (the first byte; 8 if 0), each a SET then three frames let pass and one taken by copy at bin 2, with:
+/// - the SET's answer (0 taken, 1 refused: focus not offered by this camera, or outside its range) and the header's focus;
+/// - the frame's sharpness: over the middle half of the frame, the sum of every sample's difference from the same colour's sample two along the row, in 2^-8 of the mean sample (so a brighter frame reads no sharper), the mean beside it.
+/// Whatever the camera is aimed at, the sharpness peaks where the lens brings it to focus, and a lens that does not move gives the same number at every step.
+fn focus_sweep(g: u64, ep: u64, id: u8, steps: u8, lo: u8, hi: u8, t1: u64) -> ! {
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    let mut r = [0u8; 4];
+    let n = { let (m, l) = open_msg(id, false); call(ep, &m[..l], &mut r) };
+    say!(g, "camtest: focus: OPEN of camera A#{id} answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { r[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    if n == ERR || r[0] != 0 {
+        ferros_sys::exit(1);
+    }
+    let steps = if steps == 0 { 8 } else { steps } as u64;
+    let (lo, hi) = (if lo == 0 { 0x08 } else { lo } as u64 * 256, if hi == 0 { 0x78 } else { hi } as u64 * 256);
+    for k in 0..steps {
+        let target = lo + (hi - lo) * k / if steps > 1 { steps - 1 } else { 1 };
+        let mut m = [3u8, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&target.to_le_bytes());
+        let mut a = [0xEEu8; 1];
+        let answer = if call(ep, &m, &mut a) == ERR { 0xEE } else { a[0] };
+        let mut n = 0;
+        for _ in 0..4 {
+            n = call(ep, &[2, 2], buf);
+            if n == ERR || n < 64 {
+                say!(g, "camtest: focus: no frame (G#{:X})\n", n);
+                let _ = call(ep, &[4], &mut r);
+                ferros_sys::exit(1);
+            }
+        }
+        let h = &buf[..64];
+        let (w, hh) = (u16::from_le_bytes([h[4], h[5]]) as usize, u16::from_le_bytes([h[6], h[7]]) as usize);
+        let s = |x: usize, y: usize| u16::from_le_bytes([buf[64 + 2 * (y * w + x)], buf[64 + 2 * (y * w + x) + 1]]) as u64;
+        let (mut diff, mut sum, mut count) = (0u64, 0u64, 0u64);
+        for y in hh / 4..hh * 3 / 4 {
+            for x in w / 4..w * 3 / 4 {
+                let (a, b) = (s(x, y), s(x + 2, y));
+                diff += if a > b { a - b } else { b - a };
+                sum += a;
+                count += 1;
+            }
+        }
+        say!(g, "camtest: focus: target G#{target:04X}: SET answered A#{answer}, header focus G#{:X}, sharpness A#{} (2^-8 of the mean), mean A#{}\n", u32::from_le_bytes(h[28..32].try_into().unwrap()), (diff << 8) / sum, sum / count);
+    }
+    let n = call(ep, &[4], &mut r);
+    say!(g, "camtest: focus: CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { r[0] as u64 });
     ferros_sys::exit(0)
 }
 
