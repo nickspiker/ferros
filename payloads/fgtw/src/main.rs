@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving, 10 selected, 11 joining but not yet confirmed by this device's person) and the words the 23 pairing words while joining once confirmed (none before, none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs), op 32 `[32][1]` the join confirmed on this device (nothing of a join is sent before it: no binding request to the fleet or fgtw.org, no tap secret, no BLE or LAN beacon; owner 2026-11-22), `[32][0]` withdrawn. Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same sponsor for the boot-started service, as a VSF document (ferros_kept::sponsor: `ferros-bridge sponsor <address> <port> <out.vsf>`, then `ferros-bridge store put fgtw.sponsor @<out.vsf>`)] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving, 10 selected, 11 joining but not yet confirmed by this device's person) and the words the 23 pairing words while joining once confirmed (none before, none while leaving); op 1 the state alone, op 2 `[2][seed]` mint, the handle typed again (a result byte first: 6 when it is not the one handed over), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs), op 32 `[32][1]` the join confirmed on this device (nothing of a join is sent before it: no binding request to the fleet or fgtw.org, no tap secret, no BLE or LAN beacon; owner 2026-11-22), `[32][0]` withdrawn, `[32][2]` the words asked for (fgtw.org's registry is the last rung: it gets the request then, or once no fleet device is heard on this network after the mint, `registry_step`). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their deck and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -483,6 +483,8 @@ const V_OWNED: u8 = 9;
 const V_SELECTED: u8 = 10;
 /// Joining, not confirmed: the identity has a fleet, and the person on this device has not yet pressed the join's confirmation (op 32 [1], `join_confirmed`; owner, 2026-11-22). Nothing of the join has left the device: the attest screen asks "Yes, I really would like to add this device and this is my identity and not a typo", and only then (state 1) is the request out, the device told to be held to the other one. Op 1 only; the verdict under it is still joining.
 const V_CONFIRM: u8 = 11;
+/// How long after a binding request is minted it waits for a fleet device to be heard on this network before fgtw.org's registry gets it (`registry_step`): 2^22 µs, about 4.2 s, past the 3 s every device beacons at, so a fleet device on this network has been heard by then.
+const REGISTRY_WAIT_US: u64 = 1 << 22;
 
 /// One transfer of the vault (the kernel's STORE_MAX): larger values go in pieces.
 const STORE_PIECE: usize = 4096;
@@ -578,6 +580,11 @@ struct Client {
     /// The person on this device pressed the join's confirmation (op 32 [1]; the attest screen's "Yes, I really would like to add this device and this is my identity and not a typo"; owner, 2026-11-22, after a fleet notification reached his devices before he had confirmed on the new one).
     /// Until it is set nothing of the join leaves this device: no binding request is minted, so none is handed to a fleet device on the network, none is posted to fgtw.org's registry, no tap secret is served on the NFC tag and no beacon id is advertised over BLE; no LAN beacon goes out under the handle; the pairing words are neither said on the console nor in op 1's reply; and a select is not taken. What runs before it is the look-up alone (a signed question to the person's devices, then fgtw.org), which announces nothing: a handle typed alone rings no device. Forgotten with the roots (`forget_identity`), so a handle typed again (the same or another) asks again.
     join_confirmed: bool,
+    /// The binding request as minted (`request_frame` is its framed copy), kept for fgtw.org's registry, which is the last rung only (owner's HARD rule, 2026-11-18, restated 2026-11-22: peers first, fgtw.org only when no LAN broadcast is heard and no WAN peer answers). Posted (`registry_step`) when no fleet device has been heard on this network for `REGISTRY_WAIT_US` after the mint (ferros has no WAN peer path yet, so that is the whole test), or at once when the person asked for the words ("Not in range?", op 32 [2]: a fleet device not in range finds the request there by them). `request_posted` is the stamp of the request last posted, 0 none.
+    request: Option<fgtw::fleet::BindRequest>,
+    request_posted: i64,
+    registry_asked: bool,
+    registry_due_us: u64,
     /// Whether the tap secret and the beacon are out (`radios`).
     radios_on: bool,
     /// The secret and beacon id last handed out, a handover that missed a driver, and when it was tried (`radios`).
@@ -1251,6 +1258,9 @@ impl Client {
         self.request_t = 0;
         self.request_frame.clear();
         self.join_confirmed = false;
+        self.request = None;
+        self.request_posted = 0;
+        self.registry_asked = false;
         self.verdict = V_NONE;
         // The person key's bytes overwritten before the space state goes (docs/FACETS.md D0: RAM only, as the roots).
         if let Some((k, _)) = self.space.person.as_mut() {
@@ -1439,6 +1449,8 @@ impl Client {
                 self.join_confirmed = false;
                 self.request_frame.clear();
                 self.request_t = 0;
+                self.request = None;
+                self.registry_asked = false;
                 self.select_waiting = None;
                 self.selected_by = None;
                 self.radios(None);
@@ -1457,6 +1469,48 @@ impl Client {
             self.log.put(b"fgtw: the person confirmed the join on this device: the binding request goes out");
             self.log.line();
         }
+        0
+    }
+
+    /// fgtw.org's registry, the last rung (owner's HARD rule, 2026-11-18: peers first, fgtw.org only when no LAN broadcast is heard and no WAN peer answers): the request in hand posted once its stamp is not yet posted and either the person asked for the words (op 32 [2]) or the wait after the mint is over with no fleet device heard on this network in the last two minutes (as the pings count them). ferros has no WAN peer path yet, so no peer can answer there.
+    fn registry_step(&mut self) {
+        if self.bound || self.request_t == 0 || self.request_posted == self.request_t {
+            return;
+        }
+        let t = now_us();
+        let heard = self.sponsors.iter().any(|s| t - s.heard_us < 120_000_000);
+        if !self.registry_asked && (t < self.registry_due_us || heard) {
+            return;
+        }
+        let (Some(req), Some(hp)) = (self.request.clone(), self.hp) else { return };
+        self.request_posted = self.request_t;
+        self.log.put(if self.registry_asked { b"fgtw: the words asked for: the binding request to fgtw.org too" } else { b"fgtw: no fleet device heard on this network: the binding request to fgtw.org, the last rung" });
+        self.log.line();
+        match self.post_request(&req, &hp) {
+            Ok(()) => self.log.put(b"fgtw: binding request posted to fgtw.org"),
+            // fgtw.org's registry has this device's key in another identity's fleet (its device → owner index): a final answer, not a failed post (owner, 2026-11-09, "Ira is bound": a released 8a showed join words for a second handle). The request is dropped, so no words, no LAN copy and no tap; the device stays its owner's until that fleet lets it go (a departure to a new owner releases the claim).
+            Err(e) if e.starts_with("device_owned") => {
+                self.log.put(b"fgtw: binding request refused by fgtw.org: this device belongs to another identity's fleet");
+                self.request_frame.clear();
+                self.request_t = 0;
+                self.request = None;
+                self.radios(None);
+                self.verdict = V_OWNED;
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: binding request not posted to fgtw.org: ");
+                self.log.put(e.as_bytes());
+            }
+        }
+        self.log.line();
+    }
+
+    /// Op 32 [2]: the person on this device asked for the words ("Not in range? Show words to copy/paste or dictate"), the explicit edge on which fgtw.org's registry gets the request at once (`registry_step`), for a fleet device not in range to find it by them. [0] taken, [1] no confirmed join here.
+    fn registry_ask(&mut self) -> u8 {
+        if !self.join_confirmed || self.bound {
+            return 1;
+        }
+        self.registry_asked = true;
         0
     }
 
@@ -1491,23 +1545,10 @@ impl Client {
                 self.log.put(b" KiB of ");
                 self.log.dec(STACK_BYTES as u64 / 1024);
                 self.log.line();
-                // The same request to fgtw.org's registry, as the app posts it: a sponsor lists its candidates from the registry and from requests handed to it on the LAN, and matches the typed words and the heard BLE beacon only against those. Handed over the LAN alone, a request never reached a sponsor this device could not hear (a WiFi that passes no multicast between its clients), and the sponsor had nothing to match (2026-11-04, owner: "does not register").
-                match self.post_request(&req, &hp) {
-                    Ok(()) => self.log.put(b"fgtw: binding request posted to fgtw.org"),
-                    // fgtw.org's registry has this device's key in another identity's fleet (its device → owner index): a final answer, not a failed post (owner, 2026-11-09, "Ira is bound": a released 8a showed join words for a second handle). The request is dropped, so no words, no LAN copy and no tap; the device stays its owner's until that fleet lets it go (a departure to a new owner releases the claim).
-                    Err(e) if e.starts_with("device_owned") => {
-                        self.log.put(b"fgtw: binding request refused by fgtw.org: this device belongs to another identity's fleet");
-                        self.request_frame.clear();
-                        self.request_t = 0;
-                        self.radios(None);
-                        self.verdict = V_OWNED;
-                    }
-                    Err(e) => {
-                        self.log.put(b"fgtw: binding request not posted to fgtw.org: ");
-                        self.log.put(e.as_bytes());
-                    }
-                }
-                self.log.line();
+                // fgtw.org's registry is the last rung (owner's HARD rule: peers first): not posted here. The request goes to the fleet's devices on this network (each heard beaconing is handed it, `on_beacon`) and out over NFC and BLE; `registry_step` posts it only when no fleet device has been heard here by `registry_due_us`, or when the person asks for the words.
+                // Until 2026-11-22 every request was posted at once, so a sponsor this device could not hear on the LAN could still match it by BLE or words (2026-11-04, owner: "does not register"); a BLE-only add now needs the request carried over BLE or NFC itself, not built yet.
+                self.request = Some(req);
+                self.registry_due_us = now_us() + REGISTRY_WAIT_US;
             }
             Err(e) => {
                 self.log.put(b"fgtw: binding request failed: ");
@@ -1867,8 +1908,9 @@ impl Client {
                 }
                 // 32 [1]: the person on this device confirmed the join (the attest screen's "Yes, I really would like to add this device and this is my identity and not a typo"; owner, 2026-11-22) → [0 taken, 1 nothing to confirm: no roots, bound, leaving, or the identity not found to have a fleet]. The binding request is minted in this same pass of the loop, and with it the join goes out (`join_confirmed`).
                 // 32 [0]: the join withdrawn (the attest screen's back) → [0]: the request dropped, the tap secret and the BLE beacon stopped, the beacon under the handle silent again. A copy already handed to a fleet device or posted to fgtw.org lapses there on its own (the registry's five minutes).
+                // 32 [2]: the person asked for the words ("Not in range?") → [0 taken, 1 no confirmed join]: the explicit edge on which fgtw.org's registry gets the request at once (`registry_ask`, `registry_step`).
                 if n >= 2 && req[0] == 32 {
-                    let r = [self.confirm_join(req[1] != 0)];
+                    let r = [if req[1] == 2 { self.registry_ask() } else { self.confirm_join(req[1] != 0) }];
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
@@ -2160,6 +2202,8 @@ impl Client {
             if !self.bound && !self.depart_asking() && self.hp.is_some() && self.verdict == V_JOIN && self.join_confirmed && self.request_frame.is_empty() {
                 self.mint_request();
             }
+            // fgtw.org's registry, the last rung: only once no fleet device has been heard here since the mint, or the person asked for the words.
+            self.registry_step();
             lap.mark(b"mint_request");
             // Bound: nothing left to prove proximity for.
             if self.bound && self.radios_on {
@@ -2268,6 +2312,10 @@ impl Client {
         }
         if !self.bound && self.hp.is_some() && self.verdict == V_JOIN && self.request_t != 0 {
             eagle_at(self.request_t + 210 * vsf::OSCILLATIONS_PER_SECOND as i64 + 1);
+        }
+        // The registry's last-rung check, while a request waits unposted.
+        if !self.bound && self.request_t != 0 && self.request_posted != self.request_t {
+            at(self.registry_due_us);
         }
         let f = ferros_sys::freq();
         let mut ticks = if due == u64::MAX { 0 } else { due * (f / 1_000_000).max(1) };
@@ -2441,7 +2489,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

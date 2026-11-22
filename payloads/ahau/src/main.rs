@@ -2466,7 +2466,10 @@ impl Ahau {
             }
             // "Not in range? Show words to copy/paste or dictate": the words shown, the button gone.
             Mode::Join if !self.words_open => {
-                console(self.grants, b"ahau: the pairing words shown (not in range)\n");
+                // The explicit edge on which the identity service also puts the request in fgtw.org's registry, the last rung (fgtw op 32 [2]): a fleet device not in range finds it there by the words.
+                let mut o = [0u8; 4];
+                let _ = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[32, 2], &mut o);
+                console(self.grants, b"ahau: the pairing words shown (not in range); the request to fgtw.org too\n");
                 self.words_open = true;
                 self.all();
                 return;
