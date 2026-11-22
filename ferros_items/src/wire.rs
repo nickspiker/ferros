@@ -254,6 +254,39 @@ pub fn card_doc(c: &Card, handle: &[u8; 32], now: i64) -> Result<Vec<u8>> {
     document(now, "card", alloc::vec![c.section(Some(handle))?], None)
 }
 
+/// A body kept (OP_FINISH): the item's handle and card, and how many copies of it the vault wrote and read back equal before it answered.
+/// The vault keeps two (manifestus's mirror, write-verify-then-mirror): `copies` 2 is the body, its card and the commit naming them each written and read back equal on both, before the answer was sent; 1 is the vault running on one copy (the other failed, at this write or earlier, and was dropped until the vault opens again), everything verified on that one. None: a vault from before 2026-11-22, which does not say.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kept {
+    pub handle: [u8; 32],
+    pub card: Card,
+    pub copies: Option<u8>,
+}
+
+fn kept_schema() -> SectionSchema {
+    SectionSchema::new("kept").field("copies", TypeConstraint::AnyUnsigned)
+}
+
+/// OP_FINISH's answer: the card document with a `kept` head saying the copies.
+pub fn kept_doc(c: &Card, handle: &[u8; 32], now: i64, copies: u8) -> Result<Vec<u8>> {
+    let head = kept_schema().build().set("copies", VsfType::u(copies as usize, false)).map_err(fmt)?.encode().map_err(fmt)?;
+    document(now, "card", alloc::vec![c.section(Some(handle))?], Some(("kept", head)))
+}
+
+pub fn parse_kept_doc(doc: &[u8]) -> Result<Kept> {
+    let (handle, card) = parse_card_doc(doc)?;
+    let copies = match sections(doc, "kept")?.first() {
+        Some(s) => {
+            let h = SectionBuilder::parse(kept_schema(), s).map_err(fmt)?;
+            let n = h.get_fields("copies").first().and_then(|f| f.values.first()).and_then(|v| v.as_u64()).ok_or(Error::Format)?;
+            // WHY: the count is the vault's; a value past a byte is a bad answer, not a count to truncate.
+            Some(u8::try_from(n).map_err(|_| Error::Format)?)
+        }
+        None => None,
+    };
+    Ok(Kept { handle, card, copies })
+}
+
 pub fn parse_card_doc(doc: &[u8]) -> Result<([u8; 32], Card)> {
     let s = sections(doc, "card")?;
     let (c, h) = Card::parse(s.first().ok_or(Error::Format)?)?;

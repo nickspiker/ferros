@@ -232,7 +232,18 @@ impl Server {
                 let Some(i) = self.makings.iter().position(|o| o.token == handle && o.caller == tag) else { return refused(Error::Refused) };
                 let o = self.makings.swap_remove(i);
                 match self.items.finish(store, d, &caller, o.m, now) {
-                    Ok((h, c)) => card_answer(&c, &h, now, out, room),
+                    Ok((h, c)) => {
+                        // Every commit of the keep returned only after its blocks were written and read back equal on each copy the vault holds (manifestus `write_each`, the spine by `write_verified`): two, or one once the other failed and was dropped.
+                        let copies = if store.engine().degraded() { 1 } else { 2 };
+                        match wire::kept_doc(&c, &h, now, copies) {
+                            Ok(doc) => {
+                                let n = doc.len().min(room);
+                                out[..n].copy_from_slice(&doc[..n]);
+                                ok(doc.len() as u64, n)
+                            }
+                            Err(e) => refused(e),
+                        }
+                    }
                     Err(e) => refused(e),
                 }
             }

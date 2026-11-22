@@ -93,14 +93,27 @@ impl<T: Transport> Hold<T> {
 
     /// The body committed and the card placed: the item's handle and its card.
     pub fn finish(&mut self, b: Body) -> Result<([u8; 32], Card)> {
-        self.card_call(wire::OP_FINISH, &b.token, &[])
+        self.finish_verified(b).map(|k| (k.handle, k.card))
+    }
+
+    /// `finish`, saying how many copies the vault wrote and read back equal before it answered (`wire::Kept`): 2 is kept and verified on both, 1 on one only (the vault runs on one copy). Ok is sent only after that verification; an app needs no read-back of its own.
+    pub fn finish_verified(&mut self, b: Body) -> Result<wire::Kept> {
+        let mut room = alloc::vec![0u8; wire::CARD_DOC_MAX];
+        let n = self.call(wire::OP_FINISH, &b.token, 0, &[], &mut room)? as usize;
+        // WHY: the value is the vault's; an answer past its room is not one this build reads.
+        wire::parse_kept_doc(room.get(..n).ok_or(Error::TooLarge)?)
     }
 
     /// `make`, `write` and `finish` for a body in hand (a still, a list, a contact).
     pub fn keep(&mut self, p: &Proposed, body: &[u8]) -> Result<([u8; 32], Card)> {
+        self.keep_verified(p, body).map(|k| (k.handle, k.card))
+    }
+
+    /// `keep` with the copies the vault verified (`finish_verified`).
+    pub fn keep_verified(&mut self, p: &Proposed, body: &[u8]) -> Result<wire::Kept> {
         let b = self.make(p)?;
         self.write(&b, body)?;
-        self.finish(b)
+        self.finish_verified(b)
     }
 
     /// Keep an item again in place (no versions: the new body replaces the old at `finish`).

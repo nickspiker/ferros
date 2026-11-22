@@ -208,7 +208,10 @@ fn lumis_keeps_a_still_and_kuaha_finds_reads_and_removes_it() {
     let (mut l, mut k) = (hold(&b, &lumis()), hold(&b, &kuaha()));
     let still = bytes(3 << 20, 5);
     let p = Proposed { kind: kinds::PHOTO, title: Some("Kids in the river".into()), attrs: vec![("lens".into(), VsfType::u3(24))], ..Default::default() };
-    let (lh, card) = l.keep(&p, &still).unwrap();
+    // Kept and verified on both copies before the answer (the vault's two mirrors): no read-back of Lumis's own needed.
+    let kept = l.keep_verified(&p, &still).unwrap();
+    assert_eq!(kept.copies, Some(2));
+    let (lh, card) = (kept.handle, kept.card);
     assert_eq!((card.size, card.body, card.kist.name.as_str()), (still.len() as u64, *blake3::hash(&still).as_bytes(), "Lumis"));
     // Kūaha finds it by kind and attribute, with its own handle.
     let f = Find { kinds: vec![kinds::PHOTO], wheres: vec![("lens".into(), IS_EQUAL, VsfType::u3(24))], ..Default::default() };

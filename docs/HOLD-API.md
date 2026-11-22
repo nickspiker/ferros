@@ -73,6 +73,19 @@ A handle is the vault's token for one item to one caller: another kist's handle 
 
 Every error is `ferros_items::Error`: `Refused` (no right to that kind, a handle not the kist's, a clip still recording when removed), `NotFound` (gone), `Format`, `TooLarge` (no room in the clips area, a card past 4 KiB).
 
+### What Ok means (2026-11-22)
+
+A keep's Ok (`finish`, `keep`, and `finish_verified` / `keep_verified`) is sent only after the body, its card and the commit naming them were each written and read back equal on every copy the vault holds; anything less is an Err, and an Err leaves the item as it was (a new item absent, a kept-again item its old body).
+The vault holds two copies (manifestus's mirror: the first copy's whole batch written and read back before the second's first block, then each commit's spine entry the same way), so an app needs no read-back of its own (the owner, 2026-11-22: Lumis drops its read-back of each still).
+`finish_verified` and `keep_verified` say it as a field, `wire::Kept { handle, card, copies }`:
+- `copies` 2: kept and verified on both copies.
+- `copies` 1: kept and verified on one; the vault runs on one copy, the other having failed at this write or earlier (dropped until the vault opens again, manifestus's degraded mirror). The item is kept; an app that wants two can say so to the person.
+- `copies` None: a vault from before 2026-11-22, which does not say.
+In the answer it is a `kept` head (`copies`, unsigned) beside the `card` section of OP_FINISH's document; `finish` and `keep` read the same answer and leave it out.
+The store's own write op (a process's own values, `store put`) answers on the same terms: its last write is answered after the value's commit is verified on each copy.
+A RAW clip's body is the exception by design: a single-copy extent, written once at the flash's rate with no mirror and no read-back (its card is kept as above).
+The limit, stated plainly: "read back equal" is equal as the flash device returns it. ferros does not yet flush the device's own write cache (no SYNCHRONIZE CACHE or FUA; the vault's flush is a no-op, each command polled to completion), so a power cut in the moment after an Ok rests on the device's own power-loss handling.
+
 ### Bounds
 
 - A transfer is a MiB (`wire::TRANSFER`): `write`, `read` and `write_clip` split larger buffers themselves.
