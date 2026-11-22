@@ -170,6 +170,16 @@ const CLIP_BLOCKS_MOST: u64 = 1 << 22;
 /// The least worth recording into, 2^28 bytes (about 30 s at 30 a second at 2 times).
 const CLIP_BLOCKS_LEAST: u64 = 1 << 16;
 
+/// The GPU block grown to what the recorder's layout needs for frames of `height` rows `line` bytes apart (ferros_clip `gpu::Layout`, from its base past Lumis's part), when Lumis holds the GPU: the recorder's own grow at its start then finds it so.
+fn video_block(name: &str, height: usize, line: usize) {
+    let Some((_, block)) = ferros_clip::ferros::gpu_grants() else { return };
+    let log = ferros_clip::gpu::Layout::of(ferros_clip::gpu::base(), height, line).log;
+    match ferros_sys::gpu_block_ask(sys::cap(block), log) {
+        Some(size) => println!("lumis: camera {name}: RAW video: the GPU block at G#{size:X} bytes for the recorder, before RECORD"),
+        None => println!("lumis: camera {name}: RAW video: the GPU block did not grow to 2^A#{log} bytes (the recorder tries again at RECORD)"),
+    }
+}
+
 /// The rate RAW video asks of the camera (lumis_core: VIDEO_FPS_IDX, 0 until the UI sets it: the UI's default).
 fn video_fps(header: &[u64]) -> u32 {
     let f = match header[lumis_core::shared_memory::VIDEO_FPS_IDX] {
@@ -968,8 +978,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     if dev_slit {
         integrator.header[CURRENT_MODE_IDX] = RawMode::Slitscan as u64;
     }
-    // RAW video on any Bayer readout whose line the driver gives (ferros_clip `Line`, forge 117fadb5: each camera paced by its own clock, the GPU coding every binned Bayer readout), its frames read in place from the view; the FPS slider to its fastest whole frame (the Pro: the main 60, the ultrawide 48, the tele 51, the front 33). Quad readouts record none: the GPU codes Bayer only.
-    let line = cam.line.filter(|l| cam.cfa_period == 2 && l.fps_most() != 0 && matches!(src, Source::View { .. }));
+    // RAW video on any binned Bayer readout (mode 0: the pacing's open is the binned kind's) whose line the driver gives (ferros_clip `Line`, forge 117fadb5: each camera paced by its own clock, the GPU coding every binned Bayer readout), its frames read in place from the view; the FPS slider to its fastest whole frame (the Pro: the main 60, the ultrawide 48, the tele 51, the front 33). Quad readouts record none: the GPU codes Bayer only.
+    let line = cam.line.filter(|l| cam.mode == 0 && cam.cfa_period == 2 && l.fps_most() != 0 && matches!(src, Source::View { .. }));
     let video_ok = line.is_some();
     if let Some(l) = line {
         lumis_core::platform::set_video_fps_most(l.fps_most() as u64);
@@ -1032,6 +1042,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut idle_preview = std::time::Instant::now();
     // The last frame's integration, us: said with a RAW video drop that may follow it.
     let mut last_preview_us = 0u64;
+    // The GPU block grown to the recorder's size for this open's RAW video (`video_block`), once.
+    let mut video_grown = false;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
@@ -1307,6 +1319,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             }
             sweep_last = now;
             sweep_frames += 1;
+        }
+        // In RAW video, the GPU block grown to the recorder's size at its first paced frame, not at RECORD: the grow makes Lumis's UI queue another client to the GPU service, which the UI opens again at its next frame, and that reopen beside a clip's first frames cost each clip its first frame at 48 to 60 a second (the Pro, 2026-11-21: one dropped at clip frame 1 on the main, the ultrawide and the tele, none at the front's 33). Capture first: the reopen lands here, before RECORD.
+        if let (false, Some(_), Got::Frame(head, Taken::View(rows))) = (video_grown, paced, &got) {
+            video_grown = true;
+            video_block(&cam.name, head.height, rows.line);
         }
         {
             use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
