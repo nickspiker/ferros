@@ -59,6 +59,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 
 ## Owner decisions and design
 - [Owner decisions 2026-11-19](owner_decisions_2026_11_19.md) - approved: RAW video first, heat any method, GPU fence + host Mesa; NOT approved: gnss/fgtw fetch, camera cap, A510s, gain floor, motion right
+- [Owner decisions 2026-11-21 night](owner_decisions_2026_11_21_night.md) - GPU + hardware after a jump; build GPU compose now; promo Photon (Opsin in) + Lumis (RAW, 4 cams)
 - [Owner directions 2026-10-27](owner_directions_2026_10_27.md) - windows, arcs, drivers out, attest at boot, HashMap rule
 - [No baked apps](no_baked_apps.md) - one built-in circle (settings); no identity = no way past attest
 - [ferros attest is OS-level](ferros_attest_os_level.md) - payloads/ahau at boot; ira unlocks drivers, identity the rest
