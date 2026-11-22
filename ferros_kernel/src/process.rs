@@ -1902,8 +1902,34 @@ fn crash_answer(name: &[u8], value: u64) {
     if let Some(i) = KEPT.iter().position(|n| *n == name) {
         KEPT_END[i].store(end as u8, core::sync::atomic::Ordering::Release);
         KEPT_WANT.fetch_or(1 << i, core::sync::atomic::Ordering::AcqRel);
+        if name == GPU_EP {
+            GPU_RESTART.store(true, core::sync::atomic::Ordering::Release);
+        }
         unsafe { core::arch::asm!("sev") };
     }
+}
+
+/// The GPU service's endpoint.
+const GPU_EP: &[u8] = b"gpu";
+/// The GPU service died by a panic or a fault and the service loop is to start it again (`crash_answer`): calls on `gpu` wait for the new one meanwhile. Cleared by the service loop once its restart has been tried (`gpu_restart_tried`).
+static GPU_RESTART: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `ep` is the GPU service's endpoint and no GPU service is running or coming: no live process holds its receive right (the kernel spawns the service before init and nobody else is given that right, so one that holds it is the service, perhaps still booting the GPU before its first receive) and no restart of it is pending (`GPU_RESTART`).
+/// A call there is answered ERR at once, a plain one too (2026-11-22: after a jump from Android no GPU service was started, and Lumis 0.2.42's queue open, a plain call, waited for one until the owner stopped it). Under the kernel lock.
+fn gpu_absent(ep: usize) -> bool {
+    let kk = k();
+    kk.endpoints[ep].name == GPU_EP && !has_receiver(ep) && !GPU_RESTART.load(core::sync::atomic::Ordering::Acquire) && !kk.procs.iter().flatten().any(|q| !q.dying && q.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0))
+}
+
+/// The service loop has tried the GPU service's restart (`GPU_RESTART`): when it is not running after it (refused, no capsule, a crash loop), every call waiting on `gpu` gets ERR now rather than waiting for a service that is not coming. How many were answered. Takes the kernel lock.
+pub fn gpu_restart_tried() -> usize {
+    with_lock(|| {
+        GPU_RESTART.store(false, core::sync::atomic::Ordering::Release);
+        match k().endpoints.iter().position(|e| e.name == GPU_EP) {
+            Some(ep) if gpu_absent(ep) => on_demand_refuse_locked(GPU_EP),
+            _ => 0,
+        }
+    })
 }
 
 /// Which kept processes died and are to be started again (bits by `KEPT` index), cleared as read: the service loop's, once a pass.
@@ -7598,6 +7624,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     f.x[0] = ERR;
                     0
                 }
+                // The GPU service neither running nor coming (`gpu_absent`): ERR now, a plain call too, never a wait for a service nobody will start.
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && gpu_absent(ep) => {
+                    f.x[0] = ERR;
+                    0
+                }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
                     // A caller cannot ask for a store reply's decoding (bit 62): only `store_forward` sets it.
@@ -7934,6 +7965,11 @@ fn fail_orphaned_calls() {
         // No server left: one started again must receive before CALL_LIVE counts it.
         kk.endpoints[ep].server = 0;
         if kk.endpoints[ep].queue.is_empty() {
+            continue;
+        }
+        // The GPU service ended and is not started again (killed, or its restarts stopped: `crash_answer` marks one it restarts before this runs): every call queued on it, plain ones too, gets ERR (`gpu_absent`).
+        if gpu_absent(ep) {
+            on_demand_refuse_locked(GPU_EP);
             continue;
         }
         // An on-demand server that ended with calls still queued (one came between its last look and its end): another is started for them.

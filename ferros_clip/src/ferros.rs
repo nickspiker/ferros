@@ -202,6 +202,8 @@ impl vsf::container::ByteSource for ExtentSource {
 }
 
 const CALL: u64 = 1;
+/// Bit 63 of a call's reply length: ERR at once when no server is receiving on the endpoint (ferros_sys `call_live`).
+const CALL_LIVE: u64 = 1 << 63;
 const DMA: u64 = 7;
 /// The client's GPU block in the GPU's own view (ferros_sys `gpu::ARENA_VA`).
 const ARENA_VA: u64 = 0x8000_0000;
@@ -284,9 +286,9 @@ impl GpuDevice {
         }
         let mut reply = [0u8; 17];
         let len = 18 + 8 * u.len();
-        let r = svc(CALL, cap(self.service), off(msg.as_ptr()), len as u64, off(reply.as_mut_ptr()), reply.len() as u64);
+        let r = svc(CALL, cap(self.service), off(msg.as_ptr()), len as u64, off(reply.as_mut_ptr()), reply.len() as u64 | CALL_LIVE);
         if r == ERR {
-            return Err("the GPU service refused the call".into());
+            return Err("the GPU service refused the call, or is not running".into());
         }
         let us = u32::from_le_bytes(reply[1..5].try_into().unwrap());
         match reply[0] {

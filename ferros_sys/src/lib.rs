@@ -783,6 +783,7 @@ pub mod gpu {
         use core::sync::atomic::AtomicU64;
 
         /// A queue open on the GPU service.
+        /// `open` is a plain call: it waits for a service that is still booting the GPU, and the kernel answers it ERR at once when no GPU service runs or is coming (2026-11-22, after a jump; process.rs `gpu_absent`). Every call after it is live (`call_live`): the service it opened on has received, so a service gone since, whose new one would not know this queue, answers ERR at once instead of a wait.
         pub struct Queue {
             ring: ferros_gpuq::Ring<'static>,
             service: u64,
@@ -820,7 +821,7 @@ pub mod gpu {
                 msg[3..7].copy_from_slice(&(code_at as u32).to_le_bytes());
                 msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
                 let mut reply = [1u8; 3];
-                let r = super::super::call(self.service, &msg, &mut reply);
+                let r = super::super::call_live(self.service, &msg, &mut reply);
                 (r >= 2 && reply[0] == 0).then_some(reply[1])
             }
 
@@ -833,7 +834,7 @@ pub mod gpu {
                 msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
                 msg[11..15].copy_from_slice(&(shared_at as u32).to_le_bytes());
                 let mut reply = [1u8; 3];
-                let r = super::super::call(self.service, &msg, &mut reply);
+                let r = super::super::call_live(self.service, &msg, &mut reply);
                 // An older service answers 2 bytes and ignores the workgroup: refused here, since its jobs would run 16 wide with no storage.
                 (r == 3 && reply[0] == 0).then_some((reply[1], reply[2]))
             }
@@ -889,7 +890,7 @@ pub mod gpu {
                 let mut msg = [3u8, 0, 0, 0, 0, self.ring.depth_log2() as u8];
                 msg[1..5].copy_from_slice(&(self.at as u32).to_le_bytes());
                 let mut reply = [1u8; 1];
-                let r = super::super::call(self.service, &msg, &mut reply);
+                let r = super::super::call_live(self.service, &msg, &mut reply);
                 r == 1 && reply[0] == 0
             }
 
@@ -902,7 +903,7 @@ pub mod gpu {
             /// `refresh`, the camera mapped cacheable on the GPU when `cached` (the default since 2026-11-20: each job of this process then invalidates the GPU's caches before it runs, so a frame landed since is read from DRAM), non-cacheable when not (a measure; docs/GPU-KISTS.md "The camera ring on the GPU").
             pub fn refresh_mapped(&self, cached: bool) -> Option<bool> {
                 let mut reply = [1u8; 2];
-                let r = super::super::call(self.service, &[5, cached as u8], &mut reply);
+                let r = super::super::call_live(self.service, &[5, cached as u8], &mut reply);
                 (r == 2 && reply[0] == 0).then_some(reply[1] != 0)
             }
 
@@ -917,21 +918,21 @@ pub mod gpu {
                     msg[4 + 2 * j] = g;
                 }
                 let mut reply = [1u8; 2];
-                let r = super::super::call(self.service, &msg[..3 + 2 * n], &mut reply);
+                let r = super::super::call_live(self.service, &msg[..3 + 2 * n], &mut reply);
                 r == 2 && reply[0] == 0
             }
 
             /// This client's GPU work run as a kist's from now (op 7, a measure: priority 8 and the kists' turns): a client may only give up its standing. Whether the service took it (an older one refuses it).
             pub fn as_kist(&self) -> bool {
                 let mut reply = [1u8; 1];
-                let r = super::super::call(self.service, &[7], &mut reply);
+                let r = super::super::call_live(self.service, &[7], &mut reply);
                 r == 1 && reply[0] == 0
             }
 
             /// The queue closed: a job still running stopped, the rest lost.
             pub fn close(&mut self) {
                 let mut reply = [1u8; 1];
-                super::super::call(self.service, &[4], &mut reply);
+                super::super::call_live(self.service, &[4], &mut reply);
             }
         }
     }

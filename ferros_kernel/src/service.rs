@@ -3372,6 +3372,15 @@ pub fn run(mut b: Boot) -> ! {
                     crate::flashlog::line(&alloc::format!("restarts: {nm} died by {} and was not started again: {said}", end.word()));
                 }
             }
+            // The GPU service's restart tried (not one put off for room, which is still coming): calls waiting on `gpu` get ERR if it is not running now (process.rs `gpu_absent`).
+            if let Some(g) = crate::process::KEPT.iter().position(|n| *n == b"gpu") {
+                if want >> g & 1 == 1 && kept_room >> g & 1 == 0 {
+                    let n = crate::process::gpu_restart_tried();
+                    if n != 0 {
+                        crate::flashlog::line(&alloc::format!("restarts: gpu not running: A#{n} calls waiting on it answered ERR"));
+                    }
+                }
+            }
         }
         // The restart notes, posted once a person is present (a note is theirs; nobody present, they wait here): the Deck button glows and the about page lists them (payloads/map notes.rs).
         notices.extend(crate::process::notices_take());
