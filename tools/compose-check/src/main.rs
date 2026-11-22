@@ -6,6 +6,17 @@
 mod gpu_layout;
 #[path = "../../../payloads/display/src/gpu_kernel.rs"]
 mod gpu_kernel;
+#[path = "../../../payloads/display/src/gpu_layers.rs"]
+mod gpu_layers;
+#[path = "../../../payloads/compbench/src/noise.rs"]
+#[allow(dead_code)]
+mod noise;
+#[path = "../../../payloads/compbench/src/layout.rs"]
+#[allow(dead_code)]
+mod layout;
+#[path = "../../../payloads/compbench/src/tables.rs"]
+#[allow(dead_code)]
+mod tables;
 
 use gpu_layout::{slot, PASS, WINDOWS};
 use valhall::sim::{run, Memory};
@@ -156,5 +167,184 @@ fn main() {
         }
     }
     println!("{wrong} words of the owed rects differ, {outside} written outside them");
-    std::process::exit((wrong + outside != 0) as i32);
+    let (_, lfar, lout) = layered();
+    std::process::exit((wrong + outside + lout != 0 || lfar > 1) as i32);
+}
+
+/// The layered kernel (gpu_layers.rs, step 4) in the emulator, a workgroup a half-row with its storage and barriers, against the same frame worked out on the CPU: the parallel noise by its scalar reference (compbench noise.rs `reference_row`), baked by compbench's scalar bake (tables.rs `bake_px`, the display's bake in the kernel's order), the pixel layers front to back in codes, the front layer and the present. → (words that differ, the most by in 8-bit codes, words written outside the owed rect).
+fn layered() -> (usize, u32, usize) {
+    use gpu_layout::lslot as ls;
+    use valhall::sim::run_group;
+    const LW: usize = 300;
+    const LH: usize = 24;
+    let k = gpu_layers::record();
+    println!("the layered kernel: {} words, peak {} registers, workgroup 2^{}, {} B of storage", k.words.len(), k.peak, k.wg_log2, k.shared_bytes);
+    let (front_at, blue_at, light_at, code_at, lay_at, phase_at) = (0usize, 1 << 20, 2 << 20, 3 << 20, 4 << 20, 6 << 20);
+    let mut mem = Memory { base: VA, bytes: vec![0; 8 << 20] };
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let put64 = |m: &mut Memory, at: usize, v: u64| m.bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    // The bake: compbench's tables for white two stops under the E peak (as its bench), the Pro's ODT.
+    let odt = tables::odt_scaled(false);
+    let kg = tables::gain(0.25);
+    let light: Vec<u16> = (0..1 << 16).map(|c| tables::light_entry(kg, c, valhall::f32_to_f16)).collect();
+    let code: Vec<f32> = (0..layout::CODE_STEPS + 2).map(|i| tables::code_entry(i, false)).collect();
+    for (c, &l) in light.iter().enumerate() {
+        mem.bytes[light_at + 2 * c..light_at + 2 * c + 2].copy_from_slice(&l.to_le_bytes());
+    }
+    for (i, &c) in code.iter().enumerate() {
+        mem.bytes[code_at + 4 * i..code_at + 4 * i + 4].copy_from_slice(&c.to_bits().to_le_bytes());
+    }
+    for y in 0..16 {
+        mem.bytes[blue_at + 16 * y..blue_at + 16 * y + 16].copy_from_slice(&BLUE_T[y]);
+    }
+    // The front: nothing in front but the first and last two columns (the mask, an edge), and a bar over the top three rows.
+    let mut front = vec![PASS; LW * LH];
+    for y in 0..LH {
+        for x in 0..LW {
+            let f = &mut front[y * LW + x];
+            if x < 2 || x >= LW - 2 {
+                *f = 0x1000 | 0x0800 << 16 | 1 << 48;
+            } else if y < 3 && x > 40 && x < 90 {
+                let t = (rng(&mut s) % 16385) as u64;
+                let most = ((16384 - t) * 65535 >> 14) + 1;
+                *f = (0..3).fold(t << 49, |a, c| a | (rng(&mut s) % most) << (16 * c));
+            }
+        }
+    }
+    for (i, &f) in front.iter().enumerate() {
+        put64(&mut mem, front_at + 8 * i, f);
+    }
+    // Two layers: the chrome over the top 6 rows (opaque, partly covered and see-through pixels), the content under it with a ring and see-through gaps.
+    let mut lay = vec![vec![0u64; LW * LH]; 2];
+    for y in 0..LH {
+        for x in 0..LW {
+            let r = rng(&mut s);
+            let lt = match r >> 62 {
+                0 => 0,
+                1 => (r >> 30) & 0x3FFF,
+                _ => 0,
+            };
+            let see = r >> 60 == 0xF;
+            // Premultiplied: a channel no more than what the pixel covers.
+            let most = ((16384 - lt) * 65535 >> 14) + 1;
+            let ch = (0..3).fold(0u64, |a, c| a | (rng(&mut s) % most) << (16 * c));
+            lay[0][y * LW + x] = if see { 1 << 63 | ch } else { ch | lt << 49 };
+            let r2 = rng(&mut s);
+            lay[1][y * LW + x] = if r2 >> 61 == 0 { 1 << 63 } else { (r2 & 0xFFFF_FFFF_FFFF) | 1 << 49 };
+        }
+    }
+    for (l, px) in lay.iter().enumerate() {
+        for (i, &p) in px.iter().enumerate() {
+            put64(&mut mem, lay_at + l * LW * LH * 8 + 8 * i, p);
+        }
+    }
+    let layers = [((0usize, 0usize, LW, 6usize), (0usize, 0usize, 0usize, 0usize, 0usize)), ((0, 0, LW, LH), (10, 290, 2, 22, 5))];
+    let walk = (0x0FFF_0FFF_1FFFu64, 0x3FFF_3FFF_3FFFu64, 0x1000_1800_2000u64);
+    let (axis, scroll, texh, frame) = (LW / 2, 5u32, LH as u32, 0u32);
+    let clip = (2usize, 1usize, LW - 2, LH - 1);
+    let (x0, y0, x1, y1) = (1usize, 0usize, 297usize, 23usize);
+    let marker = 0xA5A5_A5A5u32;
+    let mut far = 0u32;
+    let (mut wrong, mut outside) = (0usize, 0usize);
+    for (phase, cm) in [(1usize, 0b111u32), (3, 0b011)] {
+        for i in 0..LW * LH {
+            mem.bytes[phase_at + 4 * i..phase_at + 4 * i + 4].copy_from_slice(&marker.to_le_bytes());
+        }
+        let on = |b: u32| if cm >> b & 1 == 1 { 0xFFu64 } else { 0 };
+        let mut u = [0u64; 64];
+        let pair = |a: u64, b: u64| a | b << 32;
+        let xy = |x: usize, y: usize| (x | y << 16) as u64;
+        u[ls::PHASE as usize] = VA + phase_at as u64;
+        u[ls::FRONT as usize] = VA + front_at as u64;
+        u[ls::BLUE as usize] = VA + blue_at as u64;
+        u[ls::RECT as usize] = pair(xy(x0, y0), xy(x1, y1));
+        u[ls::SCREEN as usize] = pair(LW as u64, TURN[phase] as u64 | on(0) << 8 | on(1) << 16 | on(2) << 24);
+        let rows = (y1 - y0) as u32;
+        // Both sides: right first; each reaches from the axis to the rect's far edge on its side.
+        u[ls::SIDE as usize] = pair(0, rows as u64);
+        u[ls::STEPS as usize] = pair((x1 - axis) as u64, (axis - x0) as u64);
+        u[ls::AXIS as usize] = pair(axis as u64, scroll as u64);
+        u[ls::TEX as usize] = pair(texh as u64, frame as u64);
+        u[ls::MASK as usize] = walk.0;
+        u[ls::SPECKLE as usize] = walk.1;
+        u[ls::BASE as usize] = walk.2;
+        u[ls::SHIMMER as usize] = 0;
+        u[ls::CLIP as usize] = pair(xy(clip.0, clip.1), xy(clip.2, clip.3));
+        u[ls::LIGHT as usize] = VA + light_at as u64;
+        u[ls::CODE as usize] = VA + code_at as u64;
+        for i in 0..5 {
+            let w = |j: usize| if j < 9 { odt[j].to_bits() as u64 } else { 0 };
+            u[ls::ODT as usize + i] = pair(w(2 * i), w(2 * i + 1));
+        }
+        for (l, &(r, ring)) in layers.iter().enumerate() {
+            let b = ls::LAYER as usize + 4 * l;
+            u[b] = VA + (lay_at + l * LW * LH * 8) as u64;
+            u[b + 1] = pair(xy(r.0, r.1), xy(r.2, r.3));
+            u[b + 2] = pair(xy(ring.0, ring.1), xy(ring.2, ring.3));
+            u[b + 3] = ring.4 as u64;
+        }
+        let n = ls::RESERVED as usize + k.consts.len();
+        u[ls::RESERVED as usize..n].copy_from_slice(&k.consts);
+        for g in 0..2 * rows {
+            run_group(&k.words, &u[..n], g << k.wg_log2, 0, 1 << k.wg_log2, k.shared_bytes as usize, &mut mem);
+        }
+        // The reference.
+        let mut half = vec![0u64; LW];
+        for y in 0..LH {
+            let t = ((y as i64 - scroll as i64).rem_euclid(texh as i64)) as u32;
+            let mut nzr = vec![0u64; LW];
+            noise::reference_row(t, false, LW - axis, walk.0, walk.1, walk.2, frame, &mut half);
+            nzr[axis..].copy_from_slice(&half[..LW - axis]);
+            noise::reference_row(t, true, axis, walk.0, walk.1, walk.2, frame, &mut half);
+            for j in 0..axis {
+                nzr[axis - 1 - j] = half[j];
+            }
+            for x in 0..LW {
+                let i = y * LW + x;
+                let got = u32::from_le_bytes(mem.bytes[phase_at + 4 * i..phase_at + 4 * i + 4].try_into().unwrap());
+                if !(x >= x0 && x < x1 && y >= y0 && y < y1) {
+                    outside += (got != marker) as usize;
+                    continue;
+                }
+                let (mut acc, mut clear) = ([0u64; 3], 16384u64);
+                for (l, &(r, ring)) in layers.iter().enumerate() {
+                    if !(x >= r.0 && x < r.2 && y >= r.1 && y < r.3) || clear == 0 {
+                        continue;
+                    }
+                    let (rx0, rx1, ry0, ry1, o) = ring;
+                    let sy = if x >= rx0 && x < rx1 && y >= ry0 && y < ry1 { let (rr, h) = (y - ry0 + o, ry1 - ry0); ry0 + if rr >= h { rr - h } else { rr } } else { y };
+                    let v = lay[l][sy * LW + x];
+                    let see = v >> 63 != 0;
+                    let lt = if see { 16384 } else { v >> 49 & 0x3FFF };
+                    for c in 0..3 {
+                        let ch = if see { 0 } else { (v >> (16 * c)) & 0xFFFF };
+                        acc[c] += ch * clear >> 14;
+                    }
+                    clear = clear * lt >> 14;
+                }
+                if x >= clip.0 && x < clip.2 && y >= clip.1 && y < clip.3 && clear != 0 {
+                    let nb = tables::bake_px(nzr[x], &light, &code, &odt, valhall::f16_to_f32);
+                    for c in 0..3 {
+                        acc[c] += nb[c] as u64 * clear >> 14;
+                    }
+                }
+                let f = front[i];
+                let ft = f >> 49;
+                let px = if ft == 0x7FFF { acc[0] | acc[1] << 16 | acc[2] << 32 } else { (0..3).fold(f & 1 << 48, |a, c| a | (((f >> (16 * c)) & 0xFFFF) + (acc[c] * ft >> 14)) << (16 * c)) };
+                let th = if px >> 48 & 1 == 1 { 0 } else { (BLUE_T[y & 15][x & 15] ^ TURN[phase]) as u64 };
+                let code8 = |c: usize| (((((px >> (16 * c)) & 0xFFFF) + th).min(0xFFFF) >> 8) as u32) & on(c as u32) as u32;
+                let want = code8(2) << 24 | code8(1) << 14 | code8(0) << 4 | 3;
+                if got != want {
+                    let d = [4u32, 14, 24].iter().map(|&sh| ((got >> sh) & 0xFF).abs_diff((want >> sh) & 0xFF)).max().unwrap();
+                    far = far.max(d);
+                    if wrong < 3 && d > 1 {
+                        println!("layered, phase {phase} at {x},{y}: the kernel G#{got:08X}, the reference G#{want:08X}");
+                    }
+                    wrong += 1;
+                }
+            }
+        }
+    }
+    println!("layered: {wrong} words of the owed rects differ (the most by {far} 8-bit codes: the bake's f32 rounding), {outside} written outside them");
+    (wrong, far, outside)
 }
