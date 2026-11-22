@@ -25,10 +25,10 @@ version=${LUMIS_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$lumis/ru
 [ -n "$version" ] || { echo "no version: set LUMIS_VERSION or check $lumis/rust/Cargo.toml" >&2; exit 1; }
 out=target/lumis.capsule.vsf
 B=target/debug/ferros-bridge
-# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/lumis.vsf); $LUMIS_ICON wins.
-icon=${LUMIS_ICON:-target/icons/lumis.vsf}
-icon_arg=()
-[ -f "$icon" ] && icon_arg=(--icon "$icon")
+# Its icon in the one icon format (tools/app-icons `icon`, ferros_kist::Icon), in the signed declaration: kept in the Lumis tree (rust/assets/icon.vsf, Lumis 82aec3e), as Photon keeps its own; $LUMIS_ICON wins. No icon, no capsule: a stow without one shows Lumis with no lens on the deck (2026-11-22: the icon lived only in a build directory, and a stow from a fresh tree lost it).
+icon=${LUMIS_ICON:-$lumis/rust/assets/icon.vsf}
+[ -f "$icon" ] || { echo "no icon at $icon: make it with tools/app-icons icon <the launcher icon> $icon, or set LUMIS_ICON" >&2; exit 1; }
+icon_arg=(--icon "$icon")
 FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Lumis --option 0b94129b0c3896fa4663993540f730cb623d26de226823b11bb4037c97066556 --version "$version" "${icon_arg[@]}" \
     --want camera "to show you what each camera sees and take its raw frames, kept on this device" \
     --want items "to keep your photos and RAW videos as your own things" \
