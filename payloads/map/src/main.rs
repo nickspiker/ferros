@@ -1566,6 +1566,8 @@ struct Map {
     frame_seen: Option<u32>,
     /// A flight's trace (development builds): each step's zoom and turn left, as per mille of where they began, `|` between the frames drawn; said on the console as it lands.
     flight_trace: alloc::string::String,
+    /// The camera last said on the console at rest (development builds, `draw`): the deck coming to rest somewhere new says where, so a deck that lands wrong is measured.
+    cam_said: Option<Cam>,
     /// Taps in a row on About's version line.
     taps: u8,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
@@ -2093,8 +2095,16 @@ impl Map {
         // WHY: the scene holds MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         self.place_circles(n, &was);
-        if self.load_view() {
+        let viewed = self.load_view();
+        if viewed {
             self.send_scene();
+        }
+        // The camera to the display too: until 2026-11-22 only the scene went, and the display went on showing the old camera over the new places (and hit-tested taps the map read under the new one) until something else drew.
+        if !self.app_front {
+            self.draw();
+        }
+        if DEV {
+            ferros_sys::console_flash(self.grants, alloc::format!("map: the arrangement read again from the identity space: A#{n} circles, the view {}", if viewed { "kept" } else { "none" }).as_bytes());
         }
     }
 
@@ -2601,6 +2611,27 @@ impl Map {
             }
         }
         self.send_scene();
+    }
+
+    /// The deck's view into the vault once it has moved since it was last kept (`saved`), with its resting view and what is in it (notes.rs): on the plane only, with no flight under way, and at zoom one, the world rescaled first and every circle kept (`renormalise`), since the view document holds the centre and the turn but no zoom (`save_view`).
+    /// Until 2026-11-22 the view was kept wherever the camera came to rest: arrived at an open circle (its zoom the circle's, its centre the circle's), and landed on a fit or a pack before any lift.
+    /// A map started again (the jump back from Android, a restart, a reboot) then put that centre at zoom one: the owner opened the settings circle, started Android from it, jumped back, and the deck came up centred on the settings circle, half a screen high on the Pro, where that circle sits at the bottom of his packed deck.
+    fn keep_view(&mut self, saved: &mut Cam) {
+        if self.view != View::Map || self.target.is_some() || self.cam == *saved {
+            return;
+        }
+        if self.cam.z != Z_ONE {
+            self.renormalise();
+            self.draw();
+            self.save_arranged();
+        }
+        self.rest = self.cam;
+        self.notes_view();
+        if self.save_view() {
+            *saved = self.cam;
+        } else {
+            console(self.grants, b"map: the vault did not take the view\n");
+        }
     }
 
     /// The view, where the camera is and how the plane is turned, into the vault (`map.view`, its document: x, y, cos, sin), so a restart shows the plane as it was left. The zoom is always one at a release (`renormalise`), so the scale is already in the radii.
@@ -3160,6 +3191,19 @@ impl Map {
         cam[13] |= ((self.touching || self.settling) as u8) << 1;
         b.op(&cam);
         b.send(self.display);
+        // Development builds: the deck at rest under a camera not said before, said with the screen it is for and the circles' extent on it, so a deck that comes back in the wrong place says where it is (2026-11-22, the Pro's deck half a screen high after a jump).
+        if DEV && self.view == View::Map && !self.touching && !self.settling && self.cam_said != Some(self.cam) {
+            self.cam_said = Some(self.cam);
+            let (mut y0, mut y1) = (i64::MAX, i64::MIN);
+            for i in 0..self.deck.n() {
+                let (_, sy) = self.cam.screen(self.w, self.h, self.deck.circles[i].at.x, self.deck.circles[i].at.y);
+                let sr = self.deck.circles[i].r * self.cam.z >> 16;
+                y0 = y0.min(sy - sr);
+                y1 = y1.max(sy + sr);
+            }
+            let l = alloc::format!("map: deck at rest: camera x A#{} y A#{} zoom G#{:X} turn A#{} A#{}; screen A#{}x A#{}; the circles from row A#{} to A#{}\n", self.cam.x, self.cam.y, self.cam.z, self.cam.c, self.cam.s, self.w, self.h, y0, y1);
+            console(self.grants, l.as_bytes());
+        }
     }
 
     /// How many settings pages there are now: Developer the last of them on development builds, or once the twelve taps made it one.
@@ -6187,6 +6231,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         settling: false,
         frame_seen: None,
         flight_trace: alloc::string::String::new(),
+        cam_said: None,
         taps: 0,
         dev: false,
         hit_view: false,
@@ -7286,18 +7331,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             map.draw();
             map.save_arranged();
-            if map.cam != saved_view {
-                // Settled on the deck: its resting view, and what is in it (notes.rs).
-                if map.view == View::Map {
-                    map.rest = map.cam;
-                    map.notes_view();
-                }
-                if map.save_view() {
-                    saved_view = map.cam;
-                } else {
-                    console(grants, b"map: the vault did not take the view\n");
-                }
-            }
+            map.keep_view(&mut saved_view);
             if !moved && most <= 2 {
                 // Where the fingers landed, on average.
                 let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
@@ -7531,15 +7565,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
             // Come to rest after the lift (a fling, a flight): the view into the vault if it moved, as the lift does for what the fingers left.
-            if !moving && map.cam != saved_view {
-                // Settled on the deck: its resting view, and what is in it (notes.rs).
-                if map.view == View::Map {
-                    map.rest = map.cam;
-                    map.notes_view();
-                }
-                if map.save_view() {
-                    saved_view = map.cam;
-                }
+            if !moving {
+                map.keep_view(&mut saved_view);
             }
         }
     }
