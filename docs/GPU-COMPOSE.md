@@ -405,3 +405,31 @@ The `gpu` and `display` built from forge e5f4da21 stored (native, read back equa
 - **Step 2, op 86 on**, compbench 23 (a full-screen BAKED window scrolled on its ring): the check against NEON 0 of 4,021,248 words differ, twice (phases 3 and 0); 2364 and 2388 shows in 20 s (118 a second) composed on the GPU, against 2400 with op 86 off.
 - **Step 4**, compbench 24 (the layered window): 1522 shows in 20 s, no failed job, no panic (which path took each frame is in the stats line from the next display: the line was cut at 256 bytes before the GPU's part, now a line of its own).
 - Not measured yet: `diag power` either way, the GPU compose's own times a frame, the layered window's check (op 86's 4 covers step 2's windows only).
+
+### 6.10 Real-path numbers (the Pro, 2026-11-22, flashed e5f4da21; display b4f97c16 stored)
+
+Each row an 8 s `diag power` window (the device's own clock policy) while the bridge's `input` drove it; the display's own lines for the rest. Photon in a conversation, flung up and down for 20 s at a time (two runs each way); the deck idle, panned (drag), zoomed (pinch) and packed (Back's swipe).
+
+**Photon, a fling in a conversation** (Photon renders a frame in 22 to 28 ms, so about 23 shows a second either way: the app, not the compose, sets the rate):
+
+| | NEON (op 86 off) | GPU (op 86 on) |
+|---|---|---|
+| power, two runs | 4112, 4808 mW | 3962, 4199 mW |
+| the display's CPU a show | 21.1 ms of thread time (four threads, 5.0 to 5.8 ms each, the X3 at 499 MHz) | 0.57 to 0.85 ms of the render thread (the front layer's rows and the submit) |
+| a show's publish, wall | 4.38 ms | 3.8 to 3.95 ms (the GPU's own 3.47 to 3.74, the round 3.62 to 3.89) |
+| shows a second | 22 to 24 | 18 to 25 |
+| idle in the conversation | 1813 mW | 1723 mW |
+
+An earlier pair (the X3 at 879 MHz then): NEON 3449 mW with 35 ms of thread time a show, the GPU 3664 mW. The CPU freed is plain (about 20 to 35 ms of thread time a frame to under 1 ms); the power is inside the windows' spread (a few hundred mW either way), so it needs longer windows or the rails (`diag odpm`) to settle.
+**The 118 a second** of compbench 23 is the panel's 120: the display arms one frame a panel frame, the newest show wins, and the bench's own pacing lost 2 of 120 slots a second; NEON and the GPU both made it.
+
+**The deck today (NEON)**:
+
+| | power | frames a second | a frame |
+|---|---|---|---|
+| idle, the pucks ticking | 2163 mW | 9 | a puck batch: 6.0 ms whole, its scene 4.4 ms (CPU, the circles drawn), its publish 1.1 ms |
+| panning (drag) | 2864 mW | up to 90 | a camera frame: the scene 1.9 ms, the publish 1.9 ms |
+| zooming (pinch) | 3289 mW | 26 | a camera frame: the scene 9.6 ms (the glow 9.5 of it), the publish 5.4 ms |
+| the pack (Back's swipe) | 2548 mW | the flight's 13 steps over about 24 panel frames (about 60 a second) | |
+
+**What the deck on the GPU would take, and save** (not built): the deck's frame is mostly the scene, drawn on the CPU into the canvas (the circles, the pucks, the glows: 1.9 to 9.6 ms), and its publish (0.7 to 5.4 ms) composes the canvas, a region's text layer, the wallpaper under them and the flights' sampled planes. The step 2 kernel takes the publish's place only once the GPU can read those buffers: the canvas (`display-canvas`) and the sprites stamped read-only and admitted to the fence (2.3: a kernel change), the wallpaper moved out of the display's heap into its block, and the flights' sampling as a kernel of its own. That saves the publish (up to 5.4 ms a frame when zooming, about 1 ms at rest), not the scene; moving the scene (the glow is most of a zoom's frame) is the larger win and a larger job.
