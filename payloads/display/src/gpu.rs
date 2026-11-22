@@ -47,6 +47,9 @@ static JOBS: AtomicU64 = AtomicU64::new(0);
 static JOB_US: AtomicU64 = AtomicU64::new(0);
 static ROUND_US: AtomicU64 = AtomicU64::new(0);
 static NEON_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// The render thread's own time a GPU-composed frame (from the frame's start to its last submit, the front layer's making in it, then the hit map's rows: everything but the sleep on the jobs), µs summed, and the frames.
+static CPU_US: AtomicU64 = AtomicU64::new(0);
+static GPU_FRAMES: AtomicU64 = AtomicU64::new(0);
 static mut STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut GRANTS: u64 = 0;
 
@@ -312,6 +315,7 @@ pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool
             None => break,
         }
     }
+    let t_sub = ferros_sys::now();
     let mut ok = nj == (mask & 15).count_ones() as usize;
     for &j in &jobs[..nj] {
         let e = c.q.wait(j);
@@ -331,11 +335,14 @@ pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool
     }
     JOBS.fetch_add(nj as u64, Ordering::Relaxed);
     cost_add(1, px, ferros_sys::us_since(t0));
+    let t_hits = ferros_sys::now();
     if hits {
         for y in r.y0 as usize..r.y1 as usize {
             hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
         }
     }
+    CPU_US.fetch_add((t_sub - t0 + ferros_sys::now() - t_hits) * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);
+    GPU_FRAMES.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -730,6 +737,7 @@ fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usi
             None => break,
         }
     }
+    let t_sub = ferros_sys::now();
     let mut ok = nj == (mask & 15).count_ones() as usize;
     for &j in &jobs[..nj] {
         let e = c.q.wait(j);
@@ -748,10 +756,19 @@ fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usi
     }
     JOBS.fetch_add(nj as u64, Ordering::Relaxed);
     cost_add(2, px, ferros_sys::us_since(t0));
+    let t_hits = ferros_sys::now();
     if hits {
         for y in r.y0 as usize..r.y1 as usize {
             hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
         }
     }
+    CPU_US.fetch_add((t_sub - t0 + ferros_sys::now() - t_hits) * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);
+    GPU_FRAMES.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// The render thread's own time a GPU-composed frame, µs, and the frames, since the last ask (the stats line).
+pub fn cpu_stats() -> (u64, u64) {
+    let f = GPU_FRAMES.swap(0, Ordering::Relaxed);
+    (CPU_US.swap(0, Ordering::Relaxed) / f.max(1), f)
 }

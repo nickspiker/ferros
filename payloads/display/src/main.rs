@@ -10867,6 +10867,12 @@ fn server(grants: u64) -> ! {
                     tlog.s(b" ns, crossing at A#");
                     tlog.dec(line);
                     tlog.s(b" pixels)");
+                    let (cpu, frames) = gpu::cpu_stats();
+                    tlog.s(b"; A#");
+                    tlog.dec(frames);
+                    tlog.s(b" frames, the render thread's own A#");
+                    tlog.dec(cpu);
+                    tlog.s(b" us each");
                 }
                 tlog.s(b"\n");
                 tlog.flush();
