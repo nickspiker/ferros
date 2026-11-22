@@ -406,22 +406,75 @@ unsafe fn stage2_protect() {
     pstore::log(&[b"\nferros hv: stage 2 keeps Linux off (bit 0 the ONCE page read-only, bit 1 the hv unmapped): ", pstore::hex(done, &mut h), b"\n"]);
 }
 
+/// The first stage-2 faults outside the UFS page, logged whole (the Pro's reset under the always-on stage 2, 2026-11-21): ESR, FAR, HPFAR, the address stage 1 gives FAR (AT S1E1R, PAR_EL1), ELR and the instruction there, SPSR, the guest's LR and Rt; then, after the handling, ISR_EL1 (a pending SError shows as bit 8).
+static mut S2_RECORDED: u64 = 0;
+const S2_RECORD_MAX: u64 = 16;
+
+/// Stage 1's answer for an EL1 virtual address (PAR_EL1 after AT S1E1R), the guest's PAR_EL1 kept.
+fn s1_par(va: u64) -> u64 {
+    let (keep, par): (u64, u64);
+    unsafe { asm!("mrs {k}, par_el1", "at s1e1r, {va}", "isb", "mrs {p}, par_el1", "msr par_el1, {k}", k = out(reg) keep, p = out(reg) par, va = in(reg) va) };
+    par
+}
+
+/// Whether this fault gets a record (`S2_RECORDED`), logging its first half.
+fn s2_record(esr: u64, frame: &[u64; 32]) -> bool {
+    let (far, hpfar, elr, spsr): (u64, u64, u64, u64);
+    unsafe { asm!("mrs {a}, far_el2", "mrs {b}, hpfar_el2", "mrs {c}, elr_el2", "mrs {d}, spsr_el2", a = out(reg) far, b = out(reg) hpfar, c = out(reg) elr, d = out(reg) spsr) };
+    if (hpfar >> 4) << 12 == UFS_HCI {
+        return false;
+    }
+    let n = unsafe { read_volatile(&raw const S2_RECORDED) };
+    if n >= S2_RECORD_MAX {
+        return false;
+    }
+    unsafe { write_volatile(&raw mut S2_RECORDED, n + 1) };
+    let par = s1_par(far);
+    let ipar = s1_par(elr);
+    // The instruction itself, from where stage 1 puts ELR (DRAM: the kernel's text); 0 when stage 1 does not map it.
+    let insn = if ipar & 1 == 0 { (unsafe { read_volatile((((ipar & 0xF_FFFF_FFFF_F000) | (elr & 0xFFF)) & !3) as *const u32) }) as u64 } else { 0 };
+    let srt = ((esr >> 16) & 0x1F) as usize;
+    let rt = if srt == 31 { 0 } else { frame[srt] };
+    let mut h = [[0u8; 16]; 10];
+    let [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9] = &mut h;
+    pstore::log(&[b"\nferros hv: S2 fault ESR ", pstore::hex(esr, h0), b" FAR ", pstore::hex(far, h1), b" HPFAR ", pstore::hex(hpfar, h2), b" PAR ", pstore::hex(par, h3), b" ELR ", pstore::hex(elr, h4), b" insn ", pstore::hex(insn, h5), b" SPSR ", pstore::hex(spsr, h6), b" LR ", pstore::hex(frame[30], h7), b" Rt ", pstore::hex(rt, h8), b" core ", pstore::hex(me_core(), h9), b"\n"]);
+    true
+}
+
+/// The record's second half: ISR_EL1 once the access was handled.
+fn s2_record_after() {
+    let isr: u64;
+    unsafe { asm!("dsb sy", "isb", "mrs {v}, isr_el1", v = out(reg) isr) };
+    let mut h = [0u8; 16];
+    pstore::log(&[b"\nferros hv: S2 fault handled, ISR_EL1 ", pstore::hex(isr, &mut h), b"\n"]);
+}
+
 /// Whether a stage-2 fault at `pa` is one of `stage2_protect`'s.
 fn protected(pa: u64) -> bool {
     pa & !0xFFF == ONCE_PAGE || (HV_BASE..HV_BASE + HV_SIZE).contains(&pa)
 }
 
-/// The faulting access's physical address (identity map: IPA == PA).
-fn fault_pa() -> u64 {
+/// The faulting access's physical address (identity map: IPA == PA), or None when it cannot be known (the guest then retries the instruction).
+/// HPFAR_EL2 holds the IPA for a stage-2 translation or access flag fault, and for any fault on a stage-1 table walk (S1PTW), but it is UNKNOWN for a stage-2 permission fault (ARM ARM, HPFAR_EL2; KVM's `__populate_fault_info` resolves those with AT the same way). Measured on the Pro, 2026-11-21: Linux's write to the read-only ONCE page came with HPFAR G#8000_0000_0000_0000 (NS only, no address), so the address read as 0, the write missed `protected`, and the oracle path wrote 8 zero bytes to PA 0 from EL2; the SError that left (ISR_EL1 G#100) reset the device in Linux's early boot.
+/// A permission fault is resolved thru stage 1 instead (AT S1E1R of FAR_EL2, the guest's PAR_EL1 kept): stage 2 is identity, so stage 1's output is the physical address. When stage 1 no longer maps FAR (another core changed it since the fault), None: the instruction faults again and is resolved then.
+fn fault_pa(esr: u64) -> Option<u64> {
     let (far, hpfar): (u64, u64);
     unsafe { asm!("mrs {a}, far_el2", "mrs {b}, hpfar_el2", a = out(reg) far, b = out(reg) hpfar) };
-    ((hpfar >> 4) << 12) | (far & 0xFFF)
+    // DFSC G#C-G#F: a permission fault at level 0-3; S1PTW (bit 7): the fault was on a stage-1 table walk, where HPFAR is valid.
+    let permission = (esr & 0x3C) == 0x0C && (esr >> 7) & 1 == 0;
+    if !permission {
+        return Some(((hpfar >> 4) << 12) | (far & 0xFFF));
+    }
+    let par = s1_par(far);
+    if par & 1 == 1 {
+        return None;
+    }
+    Some((par & 0xF_FFFF_FFFF_F000) | (far & 0xFFF))
 }
 
 /// An EL1&0 access `stage2_protect` refused: a write is dropped, a read answers 0, and the instruction is stepped past. Counted at report +G#C8 (writes) and +G#D0 (reads), the last address at +G#E0, the first eight in pstore.
 /// A load or store without a syndrome (a pair, or one with writeback) is stepped past too, its registers untouched: Linux's own pmsg writes are single-register stores (memcpy_toio, ISV = 1), so only code that is not Linux's ring lands here.
-fn refuse(esr: u64, frame: &mut [u64; 32]) {
-    let pa = fault_pa();
+fn refuse(esr: u64, pa: u64, frame: &mut [u64; 32]) {
     let (isv, wnr, srt) = ((esr >> 24) & 1, (esr >> 6) & 1, ((esr >> 16) & 0x1F) as usize);
     if isv == 1 && wnr == 0 && srt != 31 {
         frame[srt] = 0;
@@ -1340,8 +1393,20 @@ const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 const PSCI_DENIED: u64 = -3i64 as u64;
 
 /// The trapped synchronous exception from EL1. `frame` holds x0..x17 (then x18, x30) as the guest left them; results go back through it.
+/// The first stage-2 faults outside the UFS page are recorded whole around the handling (`s2_record`, `s2_record_after`).
 #[unsafe(no_mangle)]
 extern "C" fn hv_sync(frame: &mut [u64; 32]) {
+    let esr: u64;
+    unsafe { asm!("mrs {v}, esr_el2", v = out(reg) esr) };
+    // Not while the jump freezes Linux: every core then faults on its next instruction and goes off.
+    let rec = (esr >> 26) & 0x3F == 0x24 && !(cfg!(hv_core) && hvcore::freezing()) && s2_record(esr, frame);
+    trap(frame);
+    if rec {
+        s2_record_after();
+    }
+}
+
+fn trap(frame: &mut [u64; 32]) {
     // The jump to ferros has taken stage 2 away: whatever brought this core here (the fault on its next instruction, or an SMC already in flight), it goes off.
     if cfg!(hv_core) && hvcore::freezing() {
         hvcore::park();
@@ -1463,13 +1528,18 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
             }
         }
-        // A write to the ONCE page, or any access to the hv's own memory (`stage2_protect`): refused, never emulated or handed back.
-        0x24 if protected(fault_pa()) => refuse(esr, frame),
         0x24 => {
+            // The address, resolved thru stage 1 for a permission fault (`fault_pa`); unknown: the instruction runs again, ELR untouched.
+            let Some(pa) = fault_pa(esr) else {
+                bump(0xE8);
+                return;
+            };
+            // A write to the ONCE page, or any access to the hv's own memory (`stage2_protect`): refused, never emulated or handed back.
+            if protected(pa) {
+                refuse(esr, pa, frame);
+                return;
+            }
             // Stage-2 data abort from EL1&0: an access to a page the oracle unmapped. The hv runs at EL2, which is not under stage 2, so it performs the real access against the device register, hands the guest the result, logs it, and steps past the instruction. Only the single-register syndrome form (ISV = 1, what readl/writel compile to) is emulated; a pair or other ISV = 0 access is logged and skipped (the driver may miss it, but the hv does not guess).
-            let (far, hpfar): (u64, u64);
-            unsafe { asm!("mrs {a}, far_el2", "mrs {b}, hpfar_el2", a = out(reg) far, b = out(reg) hpfar) };
-            let pa = ((hpfar >> 4) << 12) | (far & 0xFFF); // identity map: IPA == PA
             let isv = (esr >> 24) & 1;
             let wnr = (esr >> 6) & 1;
             let sas = ((esr >> 22) & 3) as u32;
