@@ -482,6 +482,10 @@ impl Map {
             Some(p) => self.show_page(p),
             None => self.draw(),
         }
+        // A departure answered on the Fleet page opens no add flow (`fleet_hold`; the security review of 2026-11-22): Deck went to the question, not to adding a device.
+        if matches!(q, Question::Departure(_)) {
+            self.fleet_hold = true;
+        }
         true
     }
 

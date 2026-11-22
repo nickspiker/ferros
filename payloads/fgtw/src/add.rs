@@ -3,7 +3,7 @@
 //!
 //! - **Made** once the roots are in hand (`add_start`), from its state in the vault when there is one, then told the fold of every chain adopted (`add_fold`: members, locked devices, locked plates) and whether this device holds the fleet key when it arrives or goes (`add_key`). An add under way when the device stopped is resumed as soon as the machine is made: before any fold the machine waits, and the first fold carries the resume out, so a grow names the whole fleet.
 //! - **Kept** in the `fgtw.` scope as `add` (`ADD_KEY`), whatever unlock-at-boot says: the machine's state as one VSF document (`Add::to_vsf`), the newcomer's key and how far its add got; no root is in it, the roots in hand give it back when it is read (kept.rs).
-//! - **Fed**: the Fleet page shown or gone (op 8), a `bind_req` from the LAN with its source address, a beacon under our handle from a device not in the fold (`LanHeard`), the BLE beacon ids the Bluetooth driver lists (op 5: a new id at once, every id still listed again at the machine's wake, then the wake itself), a failed read of fgtw.org's registry, a tag's secret the NFC reader read (op 6), the person's touch (op 10), Yes (op 12), No (op 8 [1] while a device is selected, the map's No), words typed (op 11), "type its words" (op 15 [1], the edge that reads fgtw.org's registry), PT's word on each send, a member reachable, a network up, and each job's answer.
+//! - **Fed**: the Fleet page shown or gone (op 8 [1] the add flow on the glass, anything else not: the map tells 1 only while the person has the page in front of them, `fleet_page`), a `bind_req` from the LAN with its source address, a beacon under our handle from a device not in the fold (`LanHeard`), the BLE beacon ids the Bluetooth driver lists (op 5: a new id at once, every id still listed again at the machine's wake, then the wake itself), a failed read of fgtw.org's registry, a tag's secret the NFC reader read (op 6), the person's touch (op 10), Yes (op 12), No (op 8 [1] while a device is selected, the map's No), words typed (op 11), "type its words" (op 15 [1], the edge that reads fgtw.org's registry), PT's word on each send, a member reachable, a network up, and each job's answer.
 //! - **Slow work** (signing a frame, the registry's read, the bind, the grow, our chain to a device or the fleet) is queued and run by the loop (`add_work`), pinned to the X3 where it signs or publishes, never inside a call another process waits on.
 //! - **Sends** go by Photon Transport to the address the device was last heard at: a member's from the fleet devices heard (`sponsors`), a newcomer's from its `bind_req` (`Seen`). PT's answer names the frame by its hash, mapped back to the device (route.rs). A device with no address here is reported given up at once (ferros has no relay): a selected device so reached is `PickUnreachable`, and a fan-out member is handed the key when it is next heard.
 //! - **The Fleet page** (payloads/map) reads op 9, built from the machine's view (addview.rs), and the doorbell; each `Note` sets what op 9's note says and puts a line on the console.
@@ -240,7 +240,13 @@ impl Client {
         self.add_event(Flow::Wake { reason });
     }
 
-    /// Op 8: the Fleet page shown (1) or gone (0). The map's No on a selected device is also [8][1] (No does what Back does): it drops the pick. Answers 0.
+    /// Op 8: what of the Fleet page is on the glass (payloads/map `FLEET_PAGE`): 0 nothing (the page or the circle left, the screen off, an app in front, the flow held closed by a departure, Close or Back), 1 the add flow, 2 a departure asked about here alone. The add machine is open (its NFC reader and BLE scan on) only at 1, closed at anything else, which also drops a pick and the words typed (fgtw::flow::add `page`); at 2 the NFC reader reads for the leaving device's tap instead (`sponsor_step`). Answers 0.
+    pub fn fleet_page(&mut self, what: u8) -> u8 {
+        self.depart_shown = what == 2;
+        self.add_page(what == 1)
+    }
+
+    /// The add flow on the glass (op 8 [1]) or not (anything else). The map's No on a selected device is also [8][1] (No does what Back does): it drops the pick. Answers 0.
     pub fn add_page(&mut self, on: bool) -> u8 {
         if on && self.add_phase() == Phase::Selected {
             self.add_event(Flow::User(UserOp::No));

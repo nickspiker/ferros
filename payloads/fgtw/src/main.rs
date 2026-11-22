@@ -623,8 +623,10 @@ struct Client {
     held_fan: core::cell::RefCell<fgtw::held::HeldFanouts>,
     /// Adding a device, the sponsor's side, on fgtw's machine (add.rs).
     add: add::Sponsoring,
-    /// Whether the radios are listening (`sponsor_radios`): the NFC reader while the add machine wants it or a fleet device's departure waits here (a tap of the leaving device approves it), the BLE scan while the add machine wants it.
+    /// Whether the radios are listening (`sponsor_radios`): the NFC reader while the add machine wants it or a fleet device's departure waits here with its question on the glass (`depart_shown`: a tap of the leaving device approves it), the BLE scan while the add machine wants it.
     listening: (bool, bool),
+    /// The Fleet page on the glass showing a departure asked about here (op 8 [2], payloads/map): the NFC reader reads for the leaving device's tap only then (the security review of 2026-11-22: no radio listens unless the person has the page in front of them). False at the start, as the map tells it.
+    depart_shown: bool,
     /// Loop passes since the radios were last told to listen: told again every 64 while either listens, so a driver restarted meanwhile listens again (both answer a repeat with nothing changed). And what they last answered, so only a change is said.
     listen_pass: u32,
     listen_said: (u8, u8),
@@ -1883,7 +1885,7 @@ impl Client {
                 busy = true;
                 // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
                 let got = (n as usize).min(req.len());
-                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, on fgtw's machines, add.rs and depart.rs): each answers alone, nothing of the state after it. 8 [on] the Fleet page shown or gone, and [8][1] on a selected device is No → [0]; 9 → the add flow (`add_reply`, addview.rs); 10 [key 8] a row touched → [result]; 11 [words] the words typed so far → the match (`add_words`); 12 Yes on a selected device → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's, which also reads fgtw.org's registry once) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
+                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, on fgtw's machines, add.rs and depart.rs): each answers alone, nothing of the state after it. 8 [what] what of the Fleet page is on the glass (0 nothing, 1 the add flow, 2 a departure asked about here alone; `fleet_page`), and [8][1] on a selected device is No → [0]; 9 → the add flow (`add_reply`, addview.rs); 10 [key 8] a row touched → [result]; 11 [words] the words typed so far → the match (`add_words`); 12 Yes on a selected device → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's, which also reads fgtw.org's registry once) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
                 // The identity space (space.rs): 17 → its state for the map (`space_reply`: the generation the map reloads its circles on, this device's deck sync, the first pull done, the facts); 18 [on] this device's deck follows the fleet's or keeps its own → [0 done, 1 not yet: before the first pull].
                 if n >= 1 && req[0] == 17 {
                     let r = self.space_reply();
@@ -1993,7 +1995,7 @@ impl Client {
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {
-                        8 if n >= 2 => alloc::vec![self.add_page(req[1] != 0)],
+                        8 if n >= 2 => alloc::vec![self.fleet_page(req[1])],
                         9 => self.add_reply(),
                         10 if n >= 9 => alloc::vec![self.add_pick(&req[1..9])],
                         11 => self.add_words(text),
@@ -2406,7 +2408,7 @@ impl Client {
         self.entry
     }
 
-    /// The radios listening: the NFC driver reading a tapped device's tag (op 4 on, op 5 off) while the add machine wants it or a fleet device's departure waits here, the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) while the add machine wants it. CALL_LIVE: a driver that is down fails at once.
+    /// The radios listening: the NFC driver reading a tapped device's tag (op 4 on, op 5 off) while the add machine wants it or a fleet device's departure waits here with its question on the glass, the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) while the add machine wants it. CALL_LIVE: a driver that is down fails at once.
     fn sponsor_radios(&mut self, on: (bool, bool)) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
@@ -2466,8 +2468,8 @@ impl Client {
 
     /// The sponsor's turn, once a pass of the loop: the radios as the add machine and a departure asked about here want them, what they heard, the add machine's deadline, and its slow work.
     fn sponsor_step(&mut self) {
-        // The NFC reader also while a departure is asked about here, so a tap of the leaving device (its tag serves the request's salt) approves it.
-        let asked = self.bound && self.depart_asked().is_some();
+        // The NFC reader also while a departure is asked about here and the Fleet page shows it (op 8 [2]), so a tap of the leaving device (its tag serves the request's salt) approves it; never with the page away, the screen off or an app in front.
+        let asked = self.bound && self.depart_shown && self.depart_asked().is_some();
         let on = (self.add.radios.0 || asked, self.add.radios.1);
         self.listen_pass += 1;
         if on != self.listening || (on != (false, false) && self.listen_pass >= 64) {
@@ -2518,7 +2520,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

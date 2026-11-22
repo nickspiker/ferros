@@ -1388,14 +1388,16 @@ extern "C" fn fgtw_poller(grants: u64) -> ! {
 }
 
 
-/// Whether the Fleet page is on screen, as the main loop last saw it (bit 0), counted in the bits above so each change is a new word: `fleet_page_thread` opens fgtw's add flow while it shows and closes it when it goes (owner, 2026-11-10: adding a device, by a touch on its row or by NFC, needs "the fleet page open").
+/// What of the Fleet page is on the glass, as the main loop last saw it (bits 0-1: 0 nothing, 1 the add flow, 2 a departure asked about here alone), counted in the bits above so each change is a new word: `fleet_page_thread` tells fgtw (op 8), whose add flow and its radios are open only while it is 1 (owner, 2026-11-10: adding a device, by a touch on its row or by NFC, needs "the fleet page open"; the security review of 2026-11-22: only while the person chose the page and it is on the glass), and whose NFC reader reads for a leaving device's tap only while it is 2.
 static FLEET_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The add flow following the Fleet page (fgtw op 8 [1] or [0]), on a thread of its own: a call waits as long as fgtw's pass, and the main loop never waits on fgtw (`fgtw_poller`). Asleep on FLEET_PAGE between changes; a refused call (fgtw not serving yet) is made again after the doubling wait `fgtw_poller` uses.
+/// The add flow following the Fleet page (fgtw op 8 [state], `FLEET_PAGE`), on a thread of its own: a call waits as long as fgtw's pass, and the main loop never waits on fgtw (`fgtw_poller`). Asleep on FLEET_PAGE between changes; a refused call (fgtw not serving yet) is made again after the doubling wait `fgtw_poller` uses.
+/// Its first call tells fgtw the state at this map's start (0 until the main loop's first pass says otherwise): a map started again while fgtw's flow was open (the last map died on the Fleet page) closes it, as a fgtw started again starts closed.
 extern "C" fn fleet_page_thread(grants: u64) -> ! {
     use core::sync::atomic::Ordering;
     let svc = cap(grants, S_FGTW);
-    let mut done = 0u64;
+    // No word FLEET_PAGE ever holds (its count starts at 0 and moves one a change), so the state at the start is told.
+    let mut done = u64::MAX;
     let mut absent = freq() >> 6;
     loop {
         let v = FLEET_PAGE.load(Ordering::Acquire);
@@ -1404,7 +1406,7 @@ extern "C" fn fleet_page_thread(grants: u64) -> ! {
             continue;
         }
         let mut r = [0u8; 4];
-        if ferros_sys::call_live(svc, &[8, (v & 1) as u8], &mut r) == ferros_sys::ERR {
+        if ferros_sys::call_live(svc, &[8, (v & 3) as u8], &mut r) == ferros_sys::ERR {
             sleep_until(now() + absent);
             if absent < freq() {
                 absent <<= 1;
@@ -1591,6 +1593,10 @@ struct Map {
     /// The page picker is up (a tap on the title), and how far its list is scrolled, pixels.
     picker: bool,
     pick_scroll: i64,
+    /// The add flow held closed on this visit to the Fleet page (the security review of 2026-11-22: the flow and its radios open only while the person has chosen the Fleet page and it is on the glass): set as a departure opens the page (the person did not choose it, and approving one must not open the add flow), and by Close, Done or Back on the page; cleared by the page's Add, and as the visit ends (the page or the circle left).
+    fleet_hold: bool,
+    /// The page's Add tapped: what of the page is on the glass told to fgtw again even when it is what was told last (fgtw may have closed the flow itself: started again, or refused it for want of the fleet key).
+    fleet_retell: bool,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
     scale_live: Option<f32>,
@@ -5271,8 +5277,9 @@ impl Map {
                 self.draw();
                 return "map: back: the remove row disarmed";
             }
-            if self.fleet.add != 0 {
-                self.fleet.add_op(svc, &[8, 0]);
+            // Held closed for the visit; the main loop tells fgtw (`FLEET_PAGE`).
+            if self.fleet.add != 0 && !self.fleet_hold {
+                self.fleet_hold = true;
                 self.draw();
                 return "map: back: the add flow closed";
             }
@@ -5808,8 +5815,13 @@ impl Map {
                     Some(Choice::AndroidAgree) => people_ask(&[15, 6]),
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
                     // Adding a device (payloads/fgtw ops 8, 10, 12, 15): the flow opened and closed, a nearby device picked, a pick confirmed, the keyboard asked for the newcomer's words (1) or a leaver's (2), which the attest screen (ahau) hosts.
-                    Some(Choice::FleetAdd) => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 1]),
-                    Some(Choice::FleetClose) => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 0]),
+                    // The flow opened and closed thru the one state the main loop tells fgtw (`FLEET_PAGE`, op 8 from `fleet_page_thread` alone), so it is open only while the page is on the glass: Add lifts the visit's hold and tells the state again, Close (Done) holds it closed. No on a selected device is op 8 [1] itself (fgtw drops the pick; the flow, open, stays open).
+                    Some(Choice::FleetAdd) if self.fleet.add == 3 => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 1]),
+                    Some(Choice::FleetAdd) => {
+                        self.fleet_hold = false;
+                        self.fleet_retell = true;
+                    }
+                    Some(Choice::FleetClose) => self.fleet_hold = true,
                     Some(Choice::FleetPick(i)) => {
                         let mut m = [0u8; 9];
                         m[0] = 10;
@@ -6268,6 +6280,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         touching: false,
         picker: false,
         pick_scroll: 0,
+        fleet_hold: false,
+        fleet_retell: false,
         pinch: None,
         scale_live: None,
         pressed: None,
@@ -6548,8 +6562,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut offer_held_said = false;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
-    // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
-    let mut fleet_shown = false;
+    // What of the Fleet page was on the glass at the last pass (`FLEET_PAGE`): 0 nothing, as `fleet_page_thread` tells fgtw at the start.
+    let mut fleet_shown = 0u64;
     // The stower's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Deck page showed at the last pass (opening it reads the directory again).
     let (mut stower_seen, mut stower_done, mut kists_shown) = (0u32, 0u64, false);
     // The sizer's answer last taken (stower.rs `size_take`).
@@ -6687,12 +6701,25 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
         }
-        // The Fleet page shown or gone: the add flow follows it (`fleet_page_thread`), so a device can be added by a touch on its row or by NFC whenever the page is open.
-        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "fleet";
-        if shown != fleet_shown {
-            fleet_shown = shown;
+        // What of the Fleet page is on the glass: fgtw's add flow and its radios follow it (`fleet_page_thread`), so a device can be added by a touch on its row or by NFC while the person has the page open, and at no other time (the security review of 2026-11-22: until then any open circle counted, so the Settings ring left on the Fleet page kept the flow and the NFC reader on under a kist's circle, and a departure opened the page, and with it the flow, with no touch).
+        // The page: the Settings circle open and staying (not flying closed), the page itself (not the picker over it) and Fleet. On the glass: no app in front and the screen on. A visit's end (the page, the picker or the circle left) ends its hold (`fleet_hold`).
+        let on_page = map.view == View::Open(0) && !map.leaving && !map.picker && PAGES[map.page] == "fleet";
+        if !on_page {
+            map.fleet_hold = false;
+        }
+        let glass = on_page && !map.app_front && ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) != 1;
+        // 2: a departure asked of this device, which the page shows alone (its Approve and Deny, nothing of the add flow); 0: this device leaving (that alone), the flow held closed, or the page not on the glass; 1: the add flow.
+        let state = match (map.fleet.state, map.fleet.depart) {
+            _ if !glass => 0,
+            (Some(3), Some(_)) => 2,
+            (Some(8), _) => 0,
+            _ if map.fleet.sent || map.fleet_hold => 0,
+            _ => 1,
+        };
+        if state != fleet_shown || core::mem::take(&mut map.fleet_retell) {
+            fleet_shown = state;
             let v = FLEET_PAGE.load(core::sync::atomic::Ordering::Acquire);
-            FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
+            FLEET_PAGE.store(((v >> 2) + 1) << 2 | state, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&FLEET_PAGE, 1);
         }
         // The stower's copy, when its doorbell has rung (stower.rs): taken in, the Deck page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
@@ -6865,10 +6892,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.live_note = None;
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
+        // The add flow stays closed on that visit (`fleet_hold`): the person did not choose the page, and answering the departure leads to no add flow (the security review of 2026-11-22). The page's Add opens it, as does the page chosen again.
         if !map.app_front && !down && !map.settling {
             let ask = map.fleet.depart.filter(|d| d.1 == 0).map(|d| (d.0, map.fleet.depart_name, map.fleet.depart_name_n));
             if ask.is_some() && ask != ask_seen {
                 map.show_page("fleet");
+                map.fleet_hold = true;
                 map.draw();
             }
             ask_seen = ask;
