@@ -642,6 +642,14 @@ impl Opener for Helpers {
 /// Whether the serving thread is on the X3 for a large value's bulk read (the get request).
 static mut ON_BIG: bool = false;
 
+/// A large value's write served on the X3 as a bulk read is (2026-11-22, the Pro: a 25 MB still's write spent 1.2 s of 2.1 s serving in sealing, the furrows' BLAKE3 and the copies on a worker): pinned at a transfer of at least 2^16 bytes, back on the workers at the value's finish or a refused write (a bulk read's end unpins too). A writer that dies between the two leaves it pinned until the next finish or bulk read.
+fn write_pin(on: bool) {
+    if on != unsafe { ON_BIG } {
+        ferros_sys::pin(if on { ferros_sys::CORES_BIG } else { 0 });
+        unsafe { ON_BIG = on };
+    }
+}
+
 /// Opening, measured for the read report: the wall time of each request's opening, and the sealed bytes opened.
 static OPEN_TICKS: AtomicU64 = AtomicU64::new(0);
 static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -931,9 +939,29 @@ extern "C" fn work(_: u64) -> ! {
     // Clips the last boot's writers left open (the power went, a reset): to the recoverer at once, so they are closed before anyone records again.
     recover_kick(&mut store);
 
+    // The reap ahead of the plow, at the idle edge (manifestus `reclaim_ahead`; the owner and the coordinator, 2026-11-22): after every request, while no other waits, one bounded window at a time until the engine says comfortable, so a save meets dead space already reaped instead of reaping a window in each of its commits (a 25 MB still kept in that state took 17 s on the Pro). Driven by the requests themselves, never a timer: a request that arrives waits one window at most.
+    let mut reaping = false;
+    let (mut reaped, mut reap_ticks) = (0u64, 0u64);
     loop {
-        let n = if walking {
+        let n = if walking || reaping {
             let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, true);
+            if n == NOTHING && !walking {
+                let t = now();
+                let r = store.engine().reclaim_ahead(eagle());
+                reap_ticks += now() - t;
+                match r {
+                    Ok(manifestus::Reclaim::Reaped) => reaped += 1,
+                    other => {
+                        reaping = false;
+                        if reaped > 0 || other.is_err() {
+                            let st = store.engine().engine_stats();
+                            say!("vault: reaped ahead {} windows in {} ms between requests, then {:?}; tract {} blocks, plow {} reap {}, {} live", reaped, reap_ticks * 1000 / freq(), other, st.tract_blocks, st.plow, st.reap, st.live_blocks);
+                        }
+                        (reaped, reap_ticks) = (0, 0);
+                    }
+                }
+                continue;
+            }
             if n == NOTHING {
                 match store.engine().settle_step() {
                     Ok(false) => {}
@@ -981,6 +1009,8 @@ extern "C" fn work(_: u64) -> ! {
         }
         let len = serve(&mut store, &mut writers, &mut export, m, &mut out, &token);
         live_note(store.engine());
+        // Any request may have left dead space (a write, a remove, the hold's index): the idle edge looks once it is answered.
+        reaping = true;
         // The stamp's keys and the name wiped; an extent's bytes past them are the clip's own, not a secret of the vault's, and zeroing a MiB a write cost the clip's write path (2026-11-19).
         let wipe_to = if m[0] == OP_EXTENT { m.len().min(1 << 9) } else { m.len() };
         m[..wipe_to].fill(0);
@@ -1175,6 +1205,9 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 if offset == 0 {
                     unsafe { (*(&raw mut WMETER)).start(t, store.read_ticks()) };
                 }
+                if bytes.len() >= 1 << 16 {
+                    write_pin(true);
+                }
                 let i = i.unwrap_or_else(|| {
                     writers.push(Pending { domain: id, person, name: name.to_vec(), next: 0, w: store.begin(&d, name) });
                     writers.len() - 1
@@ -1186,12 +1219,14 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 if let Err(e) = written {
                     say!("vault: write refused at {}: {:?}", offset, e);
                     writers.swap_remove(i);
+                    write_pin(false);
                     ERR
                 } else if !more {
                     let p = writers.swap_remove(i);
                     let whole = p.next;
                     let t = now();
                     let finished = store.finish(&d, p.w);
+                    write_pin(false);
                     unsafe { (*(&raw mut WMETER)).end(t, store.read_ticks()) };
                     match finished {
                         Ok(()) => {
@@ -1759,11 +1794,23 @@ fn items(store: &mut St, doms: &[Domain], rest: &[u8], out: &mut [u8], data: &mu
         if op == ferros_items::wire::OP_MAKE || op == ferros_items::wire::OP_KEEP_AGAIN {
             meter.start(t, store.read_ticks());
         }
+        let wrote = if op == ferros_items::wire::OP_WRITE { ferros_items::wire::parse_call(call).map_or(0, |c| c.4.len() as u64) } else { 0 };
+        if wrote >= 1 << 16 {
+            write_pin(true);
+        }
         let a = server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips);
         match op {
             ferros_items::wire::OP_MAKE | ferros_items::wire::OP_KEEP_AGAIN => meter.note(t, 0),
-            ferros_items::wire::OP_WRITE => meter.note(t, ferros_items::wire::parse_call(call).map_or(0, |c| c.4.len() as u64)),
-            ferros_items::wire::OP_FINISH => meter.end(t, store.read_ticks()),
+            ferros_items::wire::OP_WRITE => {
+                meter.note(t, wrote);
+                if a.why.is_some() {
+                    write_pin(false);
+                }
+            }
+            ferros_items::wire::OP_FINISH => {
+                write_pin(false);
+                meter.end(t, store.read_ticks());
+            }
             _ => {}
         }
         a
