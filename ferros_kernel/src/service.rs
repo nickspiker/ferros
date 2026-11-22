@@ -1449,6 +1449,10 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     if name == b"camera" {
         return Some(camera_grants());
     }
+    // init itself, started again at its death (process.rs `KEPT`) with the grants `start_home` gives it: it starts only what of the shell is missing (payloads/init `spawn_unique`).
+    if name == b"init" {
+        return Some(home_grants());
+    }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
@@ -3102,6 +3106,13 @@ pub fn run(mut b: Boot) -> ! {
     let mut kists_started = false;
     // ARC_FREES when the stower's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no stower for the rest of the boot): tried again once an arc has come back since.
     let mut kists_refused_at: Option<u64> = None;
+    // The kept processes (process.rs `KEPT`) whose restart was refused for want of an arc, and ARC_FREES then: tried again once an arc has come back, as the stower is.
+    let mut kept_room: u32 = 0;
+    let mut kept_room_at: u64 = 0;
+    // Restart notes waiting for a person to post them to (a note is the person's): what process.rs queued (`notices_take`) and the restarts this loop made.
+    let mut notices: alloc::vec::Vec<(&'static [u8], ferros_kist::restart::End, bool)> = alloc::vec::Vec::new();
+    // The on-demand servers whose start was refused for a crash loop, said once each until a restart by hand clears it (bits by `ON_DEMAND` index).
+    let mut on_demand_looped: u32 = 0;
     // Whether the flash log has had the background wipe's line (frames.rs `wipe_report`).
     let mut wipe_logged = false;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
@@ -3208,6 +3219,10 @@ pub fn run(mut b: Boot) -> ! {
             let said = core::str::from_utf8(&rep).unwrap_or("").trim_end();
             if rep.ends_with(b" started\n") {
                 crate::flashlog::line(&alloc::format!("vault process started again: {said}"));
+                // Its death (not a kill) noted for the person (docs/KERNEL.md "Restarts").
+                if let Some(end) = crate::process::vault_end_take() {
+                    notices.push((b"vault", end, false));
+                }
             } else {
                 let n = crate::process::with_lock(crate::process::vault_refuse_locked);
                 crate::flashlog::line(&alloc::format!("vault process not started again ({said}): gone, A#{n} waiting calls refused"));
@@ -3238,10 +3253,68 @@ pub fn run(mut b: Boot) -> ! {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"kists", &mut rep);
                 crate::flashlog::line(&alloc::format!("kists after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
-                // Refused for room, and only that (an stower that started and died is not tried again): the next arc back (a process ending) brings another try.
+                // Refused for room, and only that (a stower that died by a panic or a fault is started again as a kept process, below): the next arc back (a process ending) brings another try.
                 if rep.windows(18).any(|w| w == b"arc pool exhausted") {
                     kists_started = false;
                     kists_refused_at = Some(frees);
+                }
+            }
+        }
+        // The kept processes that died by a panic or a fault (process.rs `KEPT`, `crash_answer`; owner, 2026-11-21, after the deck panicked on the Pro and nothing answered a touch until the bridge restarted it): each started again at once from its capsule, as `diag restart` does, in `KEPT`'s order (the display before the deck). The death woke this loop (`sev`), never a timer; one that died again too soon was not asked for (a crash loop, said and noted where it was counted).
+        // One alive already (started meanwhile by hand, or by init's keeper) is left alone. What reads the person's space is refused as `restart` refuses it (the deck until the device is bound, the identity service and the stower until a person attests), which one that was running had passed already. One refused for room is tried again once an arc has come back.
+        let mut want = crate::process::kept_take();
+        if kept_room != 0 && frees != kept_room_at {
+            want |= kept_room;
+            kept_room = 0;
+        }
+        if want != 0 {
+            for (i, name) in crate::process::KEPT.iter().enumerate() {
+                if want >> i & 1 == 0 {
+                    continue;
+                }
+                let nm = core::str::from_utf8(name).unwrap_or("?");
+                // `running`, not `named_alive_locked`: the one that died may still be ending (a thread of it on another core until its next trap), and that is no successor.
+                if crate::process::running(name) {
+                    crate::flashlog::line(&alloc::format!("restarts: {nm} is running again already"));
+                    continue;
+                }
+                // NFC is a radio: switched off by its status circle, it stays off.
+                if *name == b"nfc" && radios_off >> 3 & 1 == 1 {
+                    crate::flashlog::line("restarts: nfc not started again: switched off");
+                    continue;
+                }
+                let end = crate::process::kept_end(i);
+                let mut rep = alloc::vec::Vec::new();
+                restart(&mut store, name, &mut rep);
+                let said = alloc::string::String::from_utf8_lossy(&rep);
+                let said = said.trim_end();
+                if rep.starts_with(name) && rep.ends_with(b" started\n") {
+                    crate::flashlog::line(&alloc::format!("restarts: {nm} died by {} and was started again", end.word()));
+                    crate::process::push_console(alloc::format!("restarts: {nm} started again after {}\n", end.word()).as_bytes());
+                    notices.push((name, end, false));
+                    // The identity service holds the person's roots in RAM alone unless unlock at boot is on (payloads/fgtw), so a new one may hold none: the attest screen started again after it asks the service's state and, finding no roots, comes up over whatever runs so the handle typed hands them over (AUTH.md "Never stuck"; ahau_core `attest_screen`). With roots kept it shows nothing and stays as the keyboard.
+                    if *name == b"fgtw" {
+                        let mut rep = alloc::vec::Vec::new();
+                        restart(&mut store, b"ahau", &mut rep);
+                        crate::flashlog::line(&alloc::format!("restarts: ahau started again after fgtw, to ask for the roots if it holds none: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                    }
+                } else if rep.windows(18).any(|w| w == b"arc pool exhausted") {
+                    kept_room |= 1 << i;
+                    kept_room_at = frees;
+                    crate::flashlog::line(&alloc::format!("restarts: {nm} not started again yet, no arc free: tried again once one comes back"));
+                } else {
+                    crate::flashlog::line(&alloc::format!("restarts: {nm} died by {} and was not started again: {said}", end.word()));
+                }
+            }
+        }
+        // The restart notes, posted once a person is present (a note is theirs; nobody present, they wait here): the Deck button glows and the about page lists them (payloads/map notes.rs).
+        notices.extend(crate::process::notices_take());
+        if person && !notices.is_empty() {
+            for (name, end, stopped) in notices.drain(..) {
+                let words = ferros_kist::restart::notice_words(name, end, stopped);
+                let r = crate::process::note_post_notice(name, &words);
+                if r == crate::process::ERR || r == crate::process::NOTHING {
+                    crate::flashlog::line(&alloc::format!("restarts: the note \"{words}\" was not kept (G#{r:X})"));
                 }
             }
         }
@@ -3288,9 +3361,19 @@ pub fn run(mut b: Boot) -> ! {
             if wanted >> i & 1 == 0 || crate::process::with_lock(|| crate::process::named_alive_locked(&[name])) != 0 {
                 continue;
             }
+            let nm = core::str::from_utf8(name).unwrap_or("?");
+            // In a crash loop (process.rs `death_counted`; docs/KERNEL.md "Restarts"): not started until a restart by hand, its waiting calls answered ERR; said once.
+            if crate::process::restart_stopped(name) {
+                let n = crate::process::with_lock(|| crate::process::on_demand_refuse_locked(name));
+                if on_demand_looped >> i & 1 == 0 {
+                    on_demand_looped |= 1 << i;
+                    crate::flashlog::line(&alloc::format!("{nm} on demand: not started, it kept crashing (until `diag restart {nm}`); A#{n} waiting calls answered ERR"));
+                }
+                continue;
+            }
+            on_demand_looped &= !(1 << i);
             let mut rep = alloc::vec::Vec::new();
             restart(&mut store, name, &mut rep);
-            let nm = core::str::from_utf8(name).unwrap_or("?");
             if rep.starts_with(name) && rep.ends_with(b" started\n") {
                 crate::flashlog::line(&alloc::format!("{nm} started on demand"));
             } else {
@@ -5025,6 +5108,14 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
+                    // A restart by hand clears each name's count of deaths, and with it a crash loop's stop (docs/KERNEL.md "Restarts").
+                    for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                        if crate::process::restart_clear(name) {
+                            resp.extend_from_slice(b"restarts: the crash loop's stop cleared for ");
+                            resp.extend_from_slice(name);
+                            resp.push(b'\n');
+                        }
+                    }
                     restart(&mut store, names, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

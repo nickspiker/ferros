@@ -1836,6 +1836,111 @@ pub fn on_demand_refuse_locked(name: &[u8]) -> usize {
     queued.len()
 }
 
+/// The system processes the kernel starts again at their death by a panic or a fault (owner, 2026-11-21, after the deck panicked on the Pro and the device sat frozen with nothing to answer a touch: "keyboard, speaker, whatever you think needs to be on the restart list"; docs/KERNEL.md "Restarts"). Each a name service.rs `shell_grants` knows; its index is its bit in `KEPT_WANT`, and the order is the order the service loop starts them when several died at once: the display before the deck (the deck hands a fresh display its scene), the identity service before the deck, init last (it starts only what is missing).
+/// A plain exit is the process's own choice (usb with no cable ends after its tries, and init's keeper starts it again) and a kill from outside is the kernel's, the bridge's or the person's: neither is answered here.
+/// The vault (`vault_ended`) and the on-demand servers (`ON_DEMAND`: the speaker, the torch, the camera, the icon decoder) have restarts of their own; their deaths count toward the same crash-loop rule (`crash_answer`).
+pub static KEPT: [&[u8]; 11] = [b"display", b"touch", b"ahau", b"usb", b"ip", b"nfc", b"gpu", b"fgtw", b"map", b"kists", b"init"];
+/// The kept processes that died and are to be started again (bits by `KEPT` index), cleared as read (`kept_take`): the service loop's, woken by `sev` at the death.
+static KEPT_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// How each kept process last died (`ferros_kist::restart::End` as a byte, by `KEPT` index), for the note the service loop posts once it is started again.
+static KEPT_END: [core::sync::atomic::AtomicU8; 11] = [const { core::sync::atomic::AtomicU8::new(0) }; 11];
+/// How the vault process last ended having served (an `End` byte, 0 none since the service loop last took it), for its restart's note.
+static VAULT_END: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Each restarted process's last deaths and whether its restarts stopped (ferros_kist::restart `Deaths`), by name: the kept, the on-demand servers and the vault, entered at their first death. Under the kernel lock.
+static mut DEATHS: Vec<(&'static [u8], ferros_kist::restart::Deaths)> = Vec::new();
+/// Restart notes waiting for the service loop to post them (it posts once a person is present: a note is the person's): the process, how it ended, whether its restarts stopped. Under the kernel lock.
+static mut NOTICES: Vec<(&'static [u8], ferros_kist::restart::End, bool)> = Vec::new();
+
+/// The `'static` name of a process the kernel restarts (`KEPT`, `ON_DEMAND`, the vault), or None for any other.
+fn restarted_name(name: &[u8]) -> Option<&'static [u8]> {
+    KEPT.iter().chain(ON_DEMAND.iter()).copied().chain(core::iter::once(VAULT_EP)).find(|n| *n == name)
+}
+
+/// How a process ended as a restart reads it (death_line's reading of the exit value): a fault (`FAULT` in the top byte), a panic (G#DEAD, a payload's handler; 101, std's main panicking), or None for a plain exit.
+fn crash_end(value: u64) -> Option<ferros_kist::restart::End> {
+    use ferros_kist::restart::End;
+    if value >> 56 == FAULT >> 56 {
+        Some(End::Fault)
+    } else if value == 0xDEAD || value == 101 {
+        Some(End::Panic)
+    } else {
+        None
+    }
+}
+
+/// A death of `name` counted (ferros_kist::restart `Deaths::died`, timestamps compared now, never a timer): true when it makes a crash loop, which stops its restarts; said then on the console and in the flash log, and noted for the person. Under the kernel lock.
+fn death_counted(name: &'static [u8], end: ferros_kist::restart::End) -> bool {
+    use ferros_kist::restart::{Deaths, LOOP_DEATHS, WINDOW_S};
+    let d = unsafe { &mut *(&raw mut DEATHS) };
+    let i = match d.iter().position(|e| e.0 == name) {
+        Some(i) => i,
+        None => {
+            d.push((name, Deaths::new()));
+            d.len() - 1
+        }
+    };
+    let was = d[i].1.stopped;
+    let looped = d[i].1.died(crate::platform::cntpct(), crate::platform::cntfrq());
+    if looped && !was {
+        let nm = core::str::from_utf8(name).unwrap_or("?");
+        let line = alloc::format!("restarts: {nm} died A#{LOOP_DEATHS} times within A#{WINDOW_S} s (the last by {}): not started again until `diag restart {nm}`", end.word());
+        k().console.extend_from_slice(line.as_bytes());
+        k().console.push(b'\n');
+        crate::flashlog::line(&line);
+        unsafe { (*(&raw mut NOTICES)).push((name, end, true)) };
+    }
+    looped
+}
+
+/// A process ended by itself (`end_process`, never a kill): a kept one (`KEPT`) dead by a panic or a fault is started again by the service loop, woken now, unless this death makes a crash loop (`death_counted`); an on-demand server's crash is counted the same way, and its next start refused once it loops (`restart_stopped`). The vault counts in `vault_ended`. Under the kernel lock.
+fn crash_answer(name: &[u8], value: u64) {
+    let Some(end) = crash_end(value) else { return };
+    let Some(name) = restarted_name(name).filter(|n| *n != VAULT_EP) else { return };
+    if death_counted(name, end) {
+        return;
+    }
+    if let Some(i) = KEPT.iter().position(|n| *n == name) {
+        KEPT_END[i].store(end as u8, core::sync::atomic::Ordering::Release);
+        KEPT_WANT.fetch_or(1 << i, core::sync::atomic::Ordering::AcqRel);
+        unsafe { core::arch::asm!("sev") };
+    }
+}
+
+/// Which kept processes died and are to be started again (bits by `KEPT` index), cleared as read: the service loop's, once a pass.
+pub fn kept_take() -> u32 {
+    KEPT_WANT.swap(0, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// How kept process `i` last died.
+pub fn kept_end(i: usize) -> ferros_kist::restart::End {
+    ferros_kist::restart::End::from_u8(KEPT_END[i].load(core::sync::atomic::Ordering::Acquire)).unwrap_or(ferros_kist::restart::End::Panic)
+}
+
+/// How the vault process last ended having served, taken (None when it has not since the last take: a kill, or nothing).
+pub fn vault_end_take() -> Option<ferros_kist::restart::End> {
+    ferros_kist::restart::End::from_u8(VAULT_END.swap(0, core::sync::atomic::Ordering::AcqRel))
+}
+
+/// Whether `name`'s restarts stopped (a crash loop). Takes the kernel lock.
+pub fn restart_stopped(name: &[u8]) -> bool {
+    with_lock(|| unsafe { (*(&raw const DEATHS)).iter().any(|e| e.0 == name && e.1.stopped) })
+}
+
+/// A restart by hand (`diag restart`): `name`'s count of deaths and its stop cleared, so it is kept again. Whether it had stopped. Takes the kernel lock.
+pub fn restart_clear(name: &[u8]) -> bool {
+    with_lock(|| {
+        let d = unsafe { &mut *(&raw mut DEATHS) };
+        let was = d.iter().any(|e| e.0 == name && e.1.stopped);
+        d.retain(|e| e.0 != name);
+        was
+    })
+}
+
+/// The restart notes waiting, taken. Takes the kernel lock.
+pub fn notices_take() -> Vec<(&'static [u8], ferros_kist::restart::End, bool)> {
+    with_lock(|| core::mem::take(unsafe { &mut *(&raw mut NOTICES) }))
+}
+
 const SYS_EXIT: u64 = 0;
 const SYS_CALL: u64 = 1;
 const SYS_RECV: u64 = 2;
@@ -1935,7 +2040,7 @@ const SYS_PANIC: u64 = 46;
 const SYS_MAILBOX: u64 = 47;
 #[path = "notify.rs"]
 mod notify;
-pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
+pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_notice as note_post_notice, post_system as note_post_system, report as notes_report};
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 pub const CALLER_KIST: u64 = 1 << 9;
 /// SYS_CALLER's answer when its x1 word now watches the caller's end (`end_watch`).
@@ -4294,6 +4399,15 @@ fn vault_ended(p: &Process, value: u64) {
         return;
     }
     if kk.endpoints[ep].server == p.epoch {
+        // Every end of a vault that served is answered with a restart, so every one counts toward the crash-loop rule (docs/KERNEL.md "Restarts"): looping, the vault is gone as one that will not start is, its waiting calls refused.
+        let end = crash_end(value).unwrap_or(ferros_kist::restart::End::Exit);
+        if death_counted(VAULT_EP, end) {
+            VAULT_STATE.store(VAULT_GONE, core::sync::atomic::Ordering::Release);
+            let n = vault_refuse_locked();
+            crate::flashlog::line(&alloc::format!("vault process ended (exit G#{value:016X}) after it served, in a crash loop: not started again, A#{n} waiting calls refused"));
+            return;
+        }
+        VAULT_END.store(end as u8, core::sync::atomic::Ordering::Release);
         crate::flashlog::line(&alloc::format!("vault process ended (exit G#{value:016X}) after it served: started again, the store calls waiting for it meanwhile"));
         VAULT_WANTED.store(true, core::sync::atomic::Ordering::Release);
         unsafe { core::arch::asm!("sev") };
@@ -8414,6 +8528,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         let panicked = p.panicked.take();
         vault_ended(p, value);
         death_line(&name, value, &last, panicked);
+        // A kept process dead by a panic or a fault: started again (`crash_answer`), after its death is said above.
+        crash_answer(&name, value);
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {

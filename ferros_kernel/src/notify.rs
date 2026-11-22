@@ -423,6 +423,21 @@ pub fn post_system(source: [u8; 32], kind: u8, person: bool, words: &str) -> u64
     r
 }
 
+/// A restart's note (docs/KERNEL.md "Restarts"): from the system's restarts source (`note::RESTARTS`), status (the Deck button's glow and the about page, never a sound or the screen), one a process (ferros_kist::restart `notice_key`), revised by its next restart. Kept in the person's vault as any note that is not a question, so one waiting survives a reboot until it is seen. The number | kind << 8, or NOTHING (nobody present, or the source at its count) / ERR as op 0. Takes the kernel lock.
+pub fn post_notice(process: &[u8], words: &str) -> u64 {
+    preload();
+    let r = with_lock(|| {
+        ensure();
+        let n = Note { kind: STATUS, words: Some(alloc::string::String::from(words)), key: Some(ferros_kist::restart::notice_key(process)), count: 1, ..Default::default() };
+        match note::build(&n, crate::settings::eagle_now()) {
+            Some(doc) => post(note::RESTARTS, &doc, None),
+            None => ERR,
+        }
+    });
+    flush();
+    r
+}
+
 /// `diag "notify"`: the notes waiting and the kists alive (by name and capsule's first bytes, to name one in a post). Takes the kernel lock.
 pub fn report() -> alloc::string::String {
     preload();

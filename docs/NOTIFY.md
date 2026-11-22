@@ -157,6 +157,13 @@ Its notes show again as soon as the last question is answered.
   With the question already showing, Deck does what it always does (closes the circle; the question still waits, the button still red).
 - **`ferros send` lets the link go** (KISTS.md "Stowing", USB.md "Offering a kist"): it ends at "waiting on the person" (exit 3) and `ferros sent <capsule>` asks how it ended.
 
+## Restart notes
+
+**Built** (2026-11-21, docs/KERNEL.md "Restarts"): when the kernel starts a system process again at its death (the deck, the display, the keyboard …), or stops starting one in a crash loop, it posts a note from the restarts source (ferros_kist::note `RESTARTS`, all ones, as the questions' `SYSTEM` is all zeros), kind status, one a process (its `key`, ferros_kist::restart `notice_key`), its words a short line ("The deck restarted after a panic", "The deck kept crashing: not restarted").
+- It is the system's, so it shows whatever the view: the Deck button shows the settings circle's ring in for you's violet (never the questions' red: nothing waits on an answer), counted with the notes in view.
+- Deck's tap, with no question waiting, opens the about page, which lists the lines under the name and marks them seen (op 5 for the source, all of them); the list stays on the page until the next are seen or the map starts again.
+- Kept in the person's vault like a kist's note, so one waiting survives a reboot; made while nobody is present, it waits in the kernel's service loop until someone attests.
+
 ## Personal: one tap
 
 **Built:** a personal note new since the deck last looked, whose source is in view, taps the motor once (ROM waveform 1 on the NFC driver's op 8, docs/NFC.md), in sound and vibrate modes and never in silent (preference 39), and not under do not disturb (preference 40), once a kist until the person has looked at it.

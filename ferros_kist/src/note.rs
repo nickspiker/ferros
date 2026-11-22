@@ -27,6 +27,9 @@ pub const LIVE: u8 = 2;
 /// The source of the system's questions (`Note::source` all zeros, the system's own): anything the system waits on the person to answer, a kist offered to stow, the unstow sheet, a first start's permissions, a device asking to join or leave the fleet (docs/NOTIFY.md "System questions"). No capsule's blake3 is all zeros, so no kist is ever this source.
 pub const SYSTEM: [u8; 32] = [0; 32];
 
+/// The source of the system's restart notes (docs/KERNEL.md "Restarts", `crate::restart`): a system process died and the kernel started it again, or stopped starting it. All ones, as `SYSTEM` is all zeros: no capsule's blake3 is either, so no kist is ever this source. Status, never a question: nothing waits on the person's answer.
+pub const RESTARTS: [u8; 32] = [0xFF; 32];
+
 /// A note's fields.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Note {

@@ -1,5 +1,7 @@
 //! init: the first process of a cold boot, started by the kernel once the boot ring completes (the USB link up, or 1 s after the press without a cable). It holds exactly the capabilities the shell needs and starts every process of the home from vault capsules, each with its share (SYS_SPAWN: copies of init's own capabilities, never more), then ends. Policy lives here, in a signed and replaceable capsule; the kernel only starts init (owner, 2026-10-22).
 //!
+//! Started again by the kernel at its death by a panic or a fault (docs/KERNEL.md "Restarts", process.rs `KEPT`): every shell process is started with `spawn_unique`, so an init started again starts only what is missing.
+//!
 //! The shell (SHELL.md): `display` owns the panel and keeps the map's scene, `touch` serves contacts, `ahau` is the attest screen, `map` places the circles and turns touch into the camera. Started in that order; a spawn only queues, so init waits for the attest screen's window before the drivers (`wait_front`, a doorbell from the display), and for a person before the identity service and the map (`wait_person`, the kernel's identity doorbell).
 //!
 //! Then the network (WIFI.md), after the shell so the screen never waits for it: `pcie1`, the WiFi driver, brings up PCIe channel 1, loads the chip's firmware from the vault and joins the network it holds the credential for, then serves Ethernet frames on `wlan`; `ip` (ARP, IPv4 + DHCP, IPv6, UDP) serves `udp` over it. Both are processes with only their own grants; the kernel only hands them out.
@@ -19,7 +21,7 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use ferros_sys::{cap, console, freq, now, sleep_until, spawn, ERR};
+use ferros_sys::{cap, console, freq, now, sleep_until, spawn_unique, ERR, NOTHING};
 
 /// Grant slot 104: the Kists right (KISTS.md); 105: serve launch; 107: the vault scope `kists.`.
 const S_KISTS: u64 = 104;
@@ -116,7 +118,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             // A device already bound to the person who just attested (every attest but its first): the deck first, then the identity service. Each spawn holds the kernel lock while it reads its capsule (fgtw 47 ms, the map 70 ms on the 8a, 2026-11-12), and the map waited behind fgtw's; nothing of the map's start needs fgtw, which answers its Fleet page once it serves.
             if IDENTITY.load(Ordering::Acquire) & ferros_sys::ID_BOUND != 0 {
                 if let Some((n, k, s)) = SHELL.iter().find(|s| s.0 == b"map") {
-                    map_first = spawn(grants, n, k, s) == 0;
+                    map_first = matches!(spawn_unique(grants, n, k, s), 0 | NOTHING);
                 }
             }
         }
@@ -129,7 +131,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // fgtw again until it starts (2026-11-10, the Pro after a release: the attest screen holds one of the big pool's two arcs and wallgen, remaking a wiped person's wallpaper, the other for about 20 s; fgtw's one try found the pool full and the device sat with no identity service, so nothing of the fleet came back). Each try a second apart, said once.
         if *name == b"fgtw" {
             let mut said = false;
-            while spawn(grants, name, key, slots) != 0 {
+            while !matches!(spawn_unique(grants, name, key, slots), 0 | NOTHING) {
                 if !said {
                     said = true;
                     console(grants, b"init: fgtw could not start yet (no arc free); trying again each second\n");
@@ -141,7 +143,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             continue;
         }
-        if spawn(grants, name, key, slots) != 0 {
+        let r = spawn_unique(grants, name, key, slots);
+        if r == NOTHING {
+            // Running already: this init was started again (the kernel's restart at its death, process.rs `KEPT`), and starts only what of the shell is missing.
+            console(grants, b"init: ");
+            console(grants, name);
+            console(grants, b" running already\n");
+        } else if r != 0 {
             console(grants, b"init: could not start ");
             console(grants, name);
             console(grants, b"\n");

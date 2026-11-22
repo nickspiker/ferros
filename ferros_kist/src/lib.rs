@@ -21,6 +21,8 @@ pub mod secret;
 pub mod twin;
 /// An installed image's seal, by its image (until 2026-11-17) or by its address, and the move from one to the other (the kernel's spawns and launches).
 pub mod seal;
+/// The kernel starting a system process again at its death: the crash-loop rule and the person's note (docs/KERNEL.md "Restarts").
+pub mod restart;
 
 use alloc::string::String;
 use alloc::vec::Vec;
