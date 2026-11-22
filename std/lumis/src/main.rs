@@ -451,6 +451,13 @@ fn dev_shutter_us() -> u32 {
     let at = 4 + camera::MODE_BLOCK;
     if n >= at + 4 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) } else { 0 }
 }
+/// Development, the input's 26th to 29th bytes: the exposure Lumis opens at, in ms (u32 LE; 0 or absent, the integrator's own, 0): a long stack measured with no tap (the owner, 2026-11-22: 2 s an output frame of 1/60 s frames, none skipped).
+fn dev_exposure_ms() -> u32 {
+    let mut b = [0u8; 1 << 5];
+    let n = sys::input(0, &mut b) as usize;
+    let at = 12 + camera::MODE_BLOCK;
+    if n >= at + 4 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) } else { 0 }
+}
 fn dev_sets() -> u8 {
     let mut b = [0u8; 1 << 5];
     let n = sys::input(0, &mut b) as usize;
@@ -1085,6 +1092,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     lumis_core::set_camera_identity(identity(&cam));
     // The integrator's memory is the UI's too, for the life of the process (the UI reads it every frame), so the integrator is never dropped.
     let integrator = Box::leak(app::camera_new(&setup));
+    if dev_exposure_ms() != 0 {
+        integrator.header[lumis_core::shared_memory::EXPOSURE_TIME_MS_IDX] = (dev_exposure_ms() as f64).to_bits();
+        println!("lumis: development: an exposure of {} ms", dev_exposure_ms());
+    }
     if let Some(dark) = calibration {
         app::calibration_start(integrator, dark);
     }
