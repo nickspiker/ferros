@@ -1129,6 +1129,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut preview_async = false;
     // The GPU block grown to the recorder's size for this open's RAW video (`video_block`), once.
     let mut video_grown = false;
+    // The view (its token) whose frame length was set to the readout's fastest for stills (`still_fast`): each open, and each return from RAW video, sets it again.
+    let mut still_fast: Option<[u8; 32]> = None;
     // When the last reopen began (its CLOSE) and when its OPEN was answered, until its first frame or slit: the console says the three apart (a stored driver ends at CLOSE and the next OPEN starts it again on demand, a path first run here).
     let mut reopened: Option<(std::time::Instant, std::time::Instant)> = None;
     let slit_later = (dev_knobs2() & DEV_SLIT_LATER != 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(1 << 12));
@@ -1239,6 +1241,27 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             } else {
                 println!("lumis: camera {}: the frame length SET was refused ({}): the camera is opened again", cam.name, if n == sys::ERR { "no answer".to_string() } else { format!("answer {}", r[0]) });
             }
+        }
+        // Stills (every mode but RAW video) at the readout's fastest whole frame (Line::fps_most: the Pro's main 60, ultrawide 48, tele 50, front 33): the open's own frame length is the init's, 15 a second on the main, so integrations topped out at about 14 a second at any exposure (the owner, 2026-11-22: "it's topped out at 14 integrations per second on the pro, doesn't matter if it's a year long image or ten seconds"). The driver lengthens a frame when the shutter needs it, so a long shutter is as before.
+        if let (None, None, Some(l), Source::View { view, .. }) = (want, paced, line, &src) {
+            if still_fast != Some(view.token) {
+                still_fast = Some(view.token);
+                match ferros_clip::Pacing::of_line(l.fps_most(), l) {
+                    Some(p) => {
+                        let mut r = [0u8; 4];
+                        let n = sys::call_live(CAMERA, &p.set_msg(), &mut r);
+                        if n != sys::ERR && n >= 1 && r[0] == 0 {
+                            println!("lumis: camera {}: stills at the readout's fastest frame, {} a second (its shutter lengthens it as it needs)", cam.name, l.fps_most());
+                        } else {
+                            println!("lumis: camera {}: the stills' frame length SET was refused ({}): the open's own frame length stays", cam.name, if n == sys::ERR { "no answer".to_string() } else { format!("answer {}", r[0]) });
+                        }
+                    }
+                    None => println!("lumis: camera {}: no pacing for the readout's fastest frame: the open's own frame length stays", cam.name),
+                }
+            }
+        }
+        if paced.is_some() {
+            still_fast = None;
         }
         if want != paced && !src.is_slit() {
             if let Some(c) = CLIP.lock().unwrap().take() {
