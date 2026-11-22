@@ -27,8 +27,11 @@ pub struct Cam {
     pub release: &'static [u8],
     /// Its lens actuator's address on the same bus (0: none to drive), the main's protocol (02 <- G#40, 5 ms, 02 <- 0, F1 <- 0, the target in 00/01).
     pub actuator: u8,
-    /// The focus targets offered (0 and 0: focus not offered).
+    /// The focus targets offered, the actuator's whole travel (0 and 0: focus not offered).
     pub focus: (u64, u64),
+    /// The lens's calibration: the actuator's target at infinity and at the module's near point, and that point's distance in mm (all 0: not known; the distance alone 0: not known).
+    /// The direction follows from which target is larger; the travel past infinity is the span from the infinity target to the travel's end on the far side.
+    pub focus_cal: FocusCal,
     /// Whether its receiver and job are known, so it can stream (the tele's are not captured).
     pub streams: bool,
     pub rx_start: &'static [(usize, u32)],
@@ -70,6 +73,32 @@ pub struct Cam {
     pub array: &'static crate::ccs::Array,
     /// Its lens and sensor size (ferros_cam optics `Optics`: the list's sizes, focal length, f-number and each readout's field), by board: the Pro's `OPTICS`, the 8a's `AKITA_OPTICS`.
     pub optics: &'static crate::optics::Optics,
+}
+
+/// A lens's focus calibration (`Cam::focus_cal`): the actuator's targets at infinity and at the near point, and the near point's distance in mm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FocusCal {
+    pub infinity: u64,
+    pub near: u64,
+    pub near_mm: u64,
+}
+
+/// No calibration known.
+pub const FOCUS_UNKNOWN: FocusCal = FocusCal { infinity: 0, near: 0, near_mm: 0 };
+
+/// The Pro's three cornerfolk actuators (the main's G#0C, the ultrawide's G#0F, the front's G#0C) take a 12-bit code left-aligned in their 16-bit target (00/01): the target is the code times 2^4.
+/// Measured two ways: the main's sharpest over a floor about a metre away was G#3800 (docs/oracle/CAMERA.md), code 896, a seventh of the way from its infinity code 509 to its near code 3274 (about 1.4 dioptres if the near point is 10 cm); and the owner found the front's slider over G#0800 to G#7800 (codes 128 to 1920) going from about infinity to far past it with nothing near in focus, its infinity code 1642 (G#66A0) near that span's top.
+/// At 2^3 the front's infinity would sit at G#3350 and its near point at G#6000, both inside that span, which the owner's slider refutes; Android's two captured targets (G#5D10 and G#5120, docs/oracle/CAMERA.md) end in a zero nibble, as the code times 2^4 does.
+pub const CORNERFOLK_SHIFT: u32 = 4;
+
+/// The whole 12-bit code's travel as targets (G#0000 to G#FFF0): offered so a client reaches the near point (every one of the three past G#C000) and the lens's span past infinity.
+/// Unmeasured past G#7800: the position (G#84) read back every target of G#0800 to G#7800 within G#64 on the front (2026-11-21) and within 30 ms on the main (2026-10-21); its two ends are for a device check (the position read back at G#0000 and G#FFF0).
+pub const CORNERFOLK_TRAVEL: (u64, u64) = (0, 0xFFF << CORNERFOLK_SHIFT);
+
+/// The module's factory AF calibration as this Pro's persist partition holds it (`/camera/AF_calibration.cal`, written at manufacture, read from the 2026-11-18 partition dump in keys/husky; one unit, as the IDTs are): its infinity and near ("macro") codes, the HAL's 12-bit codes for the cornerfolk actuators.
+/// The near point's distance is not in that file: the HAL's LENS_INFO_MINIMUM_FOCUS_DISTANCE for the Pro was never recorded (the 8a's main reports 10.204 dioptres, 98 mm), so `near_mm` stays 0 until measured.
+const fn cornerfolk_cal(infinity: u64, near: u64) -> FocusCal {
+    FocusCal { infinity: infinity << CORNERFOLK_SHIFT, near: near << CORNERFOLK_SHIFT, near_mm: 0 }
 }
 
 /// The mode block's kind that opens a camera's readout `alts[k]`: `ALT + k`.
@@ -145,7 +174,9 @@ pub const MAIN: Cam = Cam {
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x0C,
-    focus: (0x0800, 0x7800),
+    focus: CORNERFOLK_TRAVEL,
+    // Factory: infinity 509, near 3274 ("rear wide"): G#1FD0 and G#CCA0, 509 codes (G#1FD0 of target) past infinity to the travel's end.
+    focus_cal: cornerfolk_cal(509, 3274),
     streams: true,
     rx_start: &crate::rx::RX_START,
     rx_stop: &crate::rx::RX_STOP,
@@ -176,8 +207,11 @@ pub const MAIN: Cam = Cam {
 /// The ultrawide (oksoko, Sony IMX787), as the bring-up harness streamed it on 2026-10-22 (4000 x 3000 RAW10, about 30 frames a second, every frame landing).
 /// Measured: the bus, address and identity (G#0787 at the CCS sensor register G#0016), the stream writes (G#0100 alone, 8-bit), the receiver (link 2), the acknowledgement, the tick, the geometry (stride G#13C0, its front-end program's), the outputs (`job::UW_SLOT_BYTES`).
 /// From the init, not measured: the line time, 9568 pixel clocks (`line_length_pck`) at the PLL's 1458.2 MHz (24.576 MHz / 3 x 178), 6.5616 µs, which makes its 5081-line frame 33.3 ms, the 30 a second seen; the integration, 4124 lines; the longest offered, the frame less 2^6 lines (Sony's margin is not read).
-/// Its mosaic, measured on ferros (2026-11-18 night, a 256 ms frame in the owner's red-lit room, the cell table): rows `261 195` / `195 131`, so R G / G B (its 48 MP readout's 2 x 2 blocks the same), where its calibration capture (cam 3, 4000 x 3000) says B G / G R: the half turn the init's flip (G#0101 = 3, written by both readouts' inits) makes, so that capture's RAW stream ran unflipped and ferros's frames stand a half turn from it (the rotation below, from that capture, is unchecked on a ferros frame). Black 64, white 1023, orientation 6 from that capture. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
-/// Its lens actuator (G#0F, the main's protocol) answers since its power-up raises the LV buck (2026-11-21; before, it never acknowledged ferros, docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"): a sweep over G#0800 to G#7800 moved the lens (the frame's sharpness peaked mid-range, its mean breathing 110, 92, 110), so focus is offered over that span.
+/// Its mosaic B G / G R (its 48 MP readout's 2 x 2 blocks the same), as its calibration capture says (cam 3, 4000 x 3000), whose channel labelled red peaks at 604 nm in the response solved from it: the IMX787's own R G / G B (Camera2's RGGB on the 8a, whose init writes no flip) turned a half turn by the init's G#0101 = 3, which both readouts' inits write, on Android as on ferros.
+/// The owner saw red and blue swapped in Lumis with R G / G B (2026-11-22, the list of 2026-11-18 to then), and ferros's own frame of 2026-10-22 (target/cam/uw1.raw10, the same init and job) develops a wooden floor tan with B G / G R and blue-grey with R G / G B.
+/// The R G / G B before came from a cell table that took the brightest place for red in the owner's room (2026-11-18 night, rows `261 195` / `195 131`); the rear cameras looked at that room's blue light (the main, whose G B / R G is measured in true colour, read its blue place brightest there the same day, `162 181` / `104 162`), so the brightest place was blue.
+/// Black 64, white 1023, orientation 6 from that capture. (Lumis's 2026-10-18 captures of it, 8000 x 6000 quad Bayer at orientation 3, were the full-resolution mode with the phone held sideways.)
+/// Its lens actuator (G#0F, the main's protocol) answers since its power-up raises the LV buck (2026-11-21; before, it never acknowledged ferros, docs/oracle/CAMERA.md "Open: the ultrawide's lens actuator"): a sweep over G#0800 to G#7800 moved the lens (the frame's sharpness peaked mid-range, its mean breathing 110, 92, 110).
 pub const ULTRAWIDE: Cam = Cam {
     id: 1,
     name: "ultrawide",
@@ -192,7 +226,9 @@ pub const ULTRAWIDE: Cam = Cam {
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
     actuator: 0x0F,
-    focus: (0x0800, 0x7800),
+    focus: CORNERFOLK_TRAVEL,
+    // Factory: infinity 883, near 3224 ("rear uw"): G#3730 and G#C980, 883 codes past infinity.
+    focus_cal: cornerfolk_cal(883, 3224),
     streams: true,
     rx_start: &crate::rx::RX_START_UW,
     rx_stop: &crate::rx::RX_STOP_UW,
@@ -209,7 +245,7 @@ pub const ULTRAWIDE: Cam = Cam {
     fll: 5081,
     exposure_lines: 4124,
     exposure_max_lines: 5081 - (1 << 6),
-    cfa: cfa(0, 1, 1, 2),
+    cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,
     rotation: 1,
@@ -225,7 +261,8 @@ pub const ULTRAWIDE: Cam = Cam {
 /// Its line, measured (2026-11-18, docs/CAMERA.md "The other cameras on the Pro" and "The I2C side without a flash"): 8448 clocks at 24.576 MHz / 3 x 247 (2023.424 MHz) over vt_pix_clk_div 5 (G#0300) at two pixels a clock, 10.437753 us: ferros took frames of its init's 4001 lines 41.66 to 41.85 ms apart (10.44 us), and Android's 1 s hold (47908 lines of 2^1) runs frames 1.0 s apart. The guess before (8.35 us, 30 a second) reported every exposure 20 % short of what the sensor integrated.
 /// From its two captures (cam 7, 3840 x 2736, the size its init sets): cfa G R / B G, black 64, white 1023; orientation 8 (three quarter turns) in the second, none recorded in the first; derived, its init's crop start even and its stream-on's flip 0 the HAL's write.
 /// Its acknowledgement and tick are the ultrawide's, as the harness had them: 64 frames thru the view and 64 at bin 8 ran with them (2026-11-18), no error word.
-/// Its lens actuator (G#0C) takes the main's protocol: on the Pro (2026-11-21) its position (G#84) read back each target of a sweep over G#0800 to G#7800 within G#64 (G#0864 for G#0800, G#782C for G#7800), so focus is offered over that span.
+/// Its lens actuator (G#0C) takes the main's protocol: on the Pro (2026-11-21) its position (G#84) read back each target of a sweep over G#0800 to G#7800 within G#64 (G#0864 for G#0800, G#782C for G#7800).
+/// That span was the main's, never the front's: its infinity is G#66A0 and its near point G#C000 (`focus_cal`), so the owner's slider over it ran from about infinity to far past it (2026-11-22).
 pub const FRONT: Cam = Cam {
     id: 2,
     name: "front",
@@ -240,7 +277,9 @@ pub const FRONT: Cam = Cam {
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x0C,
-    focus: (0x0800, 0x7800),
+    focus: CORNERFOLK_TRAVEL,
+    // Factory: infinity 1642, near 3072 ("front normal"): G#66A0 and G#C000, 1642 codes past infinity.
+    focus_cal: cornerfolk_cal(1642, 3072),
     streams: true,
     rx_start: &crate::rx::RX_START_FRONT,
     rx_stop: &crate::rx::RX_STOP_FRONT,
@@ -273,7 +312,10 @@ pub const FRONT: Cam = Cam {
 /// Android's job writes the image as 16-bit samples (loch0's format G#1C32_0550 = 2, stride G#1F80); the job ferros stores is made RAW10 packed as every other camera's (format 4, stride G#13C0, tools/oracle-isp image `--set`).
 /// Its line, measured (the Pro, 2026-11-18 night): 5568 clocks at 24.576 MHz / 4 x 371 over vt_pix_clk_div 5 at two pixels a clock (911.7 MHz), 6.1068 us: ferros took its 5457-line frames 33.24 to 33.40 ms apart (30 a second; Lumis on Android showed 15, its own pace), and Android's 16 s hold (40960 lines of 2^6) is 16.0 s at it. Lumis's integration at its open 5332 lines; Android's 16 s is the main's shift words with the frame the integration plus 24.
 /// Its stream on writes the image orientation G#0101 = 2 (the vertical flip), as Android's HAL writes it at all three of its readouts (`01 00 01 02`, keys/husky/captures/ftrace-2026-11-18; no tele init writes G#0101): with 0 every tele readout stood mirrored left to right against the main in Lumis (NCC 0.935 mirrored, 0.40 straight), with 2 all three match the main straight (22 degrees NCC 0.947, 48.8 MP 0.947, 11 degrees against 22 degrees 0.997; the Lumis session, 2026-11-19, docs/CAMERA.md "The tele's orientation"). The tele's quarter turn puts the sensor's rows across the screen, so its vertical flip is the screen's mirror.
-/// Its mosaic with that flip, measured on ferros (2026-11-19, the cell table): R G / G B, the rows of the G B / R G it read unflipped (2026-11-18 night, a 2 s frame in the owner's red-lit room: rows `104 79 104 80` / `164 104 164 104`) turned over; the 48.8 MP quad's 2 x 2 blocks the same. Its calibration capture (cam 4, 4032 x 3024) says B G / G R: a column from the unflipped G B / R G, so Android's RAW stream for that capture ran another window or flip than Lumis's 22-degree session the init came from; ferros reads as the init and the stream on set it. Black 64, white 1023, orientation 6 (a quarter turn) from that capture.
+/// Its mosaic with that flip B G / G R (the 48.8 MP quad's 2 x 2 blocks the same), as the sensor itself reports it: CCS pixel_order (G#0006) read back on ferros after the first frame says BGGR with G#0101 = 2 and GRBG with 0 (2026-11-19, `regs_say`), and the calibration capture (cam 4, 4032 x 3024, Android writing the same G#0101 = 2) says B G / G R, its channel labelled red peaking at 604 nm in the response solved from it.
+/// The owner saw red and blue swapped in Lumis with R G / G B (2026-11-22).
+/// The R G / G B before came from cell tables that took the brightest place for red (2026-11-18 night, unflipped rows `104 79` / `164 104`; 2026-11-19 flipped `257 94` / `93 79`): the rear cameras saw the room's blue light (the main the same day read its blue place brightest), so that place was blue, and every reading agreed with the sensor's own pixel_order once read as blue.
+/// Black 64, white 1023, orientation 6 (a quarter turn) from that capture.
 pub const TELE: Cam = Cam {
     id: 3,
     name: "tele",
@@ -289,6 +331,8 @@ pub const TELE: Cam = Cam {
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0,
     focus: (0, 0),
+    // Its lens is the OIS controller's (humbaba, G#61, 16-bit registers), undecoded; the factory's AF calibration ("rear tele", persist /camera/AF_calibration.cal) is infinity 7050 and near 13538 in the HAL's units for it, larger nearer, which become targets once a capture of Android focusing the tele shows its protocol.
+    focus_cal: FOCUS_UNKNOWN,
     streams: true,
     rx_start: &crate::rx::RX_START_TELE,
     rx_stop: &crate::rx::RX_STOP_TELE,
@@ -305,7 +349,7 @@ pub const TELE: Cam = Cam {
     fll: 5457,
     exposure_lines: 5332,
     exposure_max_lines: 5457 - 4,
-    cfa: cfa(0, 1, 1, 2),
+    cfa: cfa(2, 1, 1, 0),
     black: 64,
     white: 1023,
     rotation: 1,
@@ -318,10 +362,10 @@ pub const TELE: Cam = Cam {
 };
 
 /// The tele's 12.2 MP 11-degree readout: the 48.8 MP array's middle 4032 x 3024 at 0.7 um (its init the 22-degree one but G#0B30 = G#0101 and its own frame, 3377 lines), its PD rows 248 x 1488; written 16-bit by Android's job, packed here as the 22-degree's.
-/// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; the cell table of a 2 s frame G B / R G as the 22-degree's unflipped, R G / G B with the stream on's G#0101 = 2, 2026-11-19), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
+/// Measured on the Pro (2026-11-18 night): a Bayer mosaic (the sensor remosaics; its cell tables, read with blue as their brightest place, the 22-degree's: G R / B G unflipped, B G / G R with the stream on's G#0101 = 2), frames 33.3 ms apart, its line 9.8712 us (a 2 s exposure planned as 335392 lines landed 3.3107 s apart, its 3377-line frame 33.3 ms).
 pub const TELE11: Alt = Alt { tag: "t11", width: 4032, height: 3024, stride: 0x13C0, period: 2, pd: true, rx_start: &crate::rx::RX_START_TELE11, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE11_SLOT_BYTES, line_ps: 9_871_200, detach: 0, gather: 1 };
 /// The tele's 48.8 MP readout, 8064 x 6048 RAW10 at G#2760 a line (its job's own, packed), no PD rows; its frame 6309 lines.
-/// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G B / R G unflipped, R G / G B with the stream on's G#0101 = 2, 2026-11-19: the 4 x 4 cell R R G G / R R G G / G G B B / G G B B), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
+/// Measured on the Pro (2026-11-18 night): the quad array as it is (2 x 2 blocks G R / B G unflipped, B G / G R with the stream on's G#0101 = 2: the 4 x 4 cell B B G G / B B G G / G G R R / G G R R, its cell tables read with blue as their brightest place), its line 13.2008 us (a 2 s exposure planned as 335392 lines landed 4.4274 s apart; its 6309-line frame 83.3 ms, 12 a second).
 pub const TELE48: Alt = Alt { tag: "t48", width: 8064, height: 6048, stride: 0x2760, period: 4, pd: false, rx_start: &crate::rx::RX_START_TELE48, rx_stop: &crate::rx::RX_STOP_TELE, sizes: job::TELE48_SLOT_BYTES, line_ps: 13_200_800, detach: 0, gather: 1 };
 /// The ultrawide's 48 MP readout, 8000 x 6000 RAW10 at G#2720 a line, its PD rows 4000 x 1500; its link at the slower op PLL (`RX_START_UW48`).
 pub const UW48: Alt = Alt { tag: "w48", width: 8000, height: 6000, stride: 0x2720, period: 4, pd: true, rx_start: &crate::rx::RX_START_UW48, rx_stop: &crate::rx::RX_STOP_UW, sizes: job::UW48_SLOT_BYTES, line_ps: 5_406_700, detach: 0, gather: 1 };
@@ -360,6 +404,7 @@ pub const AKITA_MAIN: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
+    focus_cal: FOCUS_UNKNOWN,
     streams: true,
     rx_start: &crate::rx::RX_START_AKITA_MAIN,
     rx_stop: &crate::rx::RX_STOP,
@@ -407,6 +452,7 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
+    focus_cal: FOCUS_UNKNOWN,
     streams: true,
     rx_start: &crate::rx::RX_START_AKITA_UW,
     rx_stop: &crate::rx::RX_STOP_FRONT,
@@ -453,6 +499,7 @@ pub const AKITA_FRONT: Cam = Cam {
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
     focus: (0, 0),
+    focus_cal: FOCUS_UNKNOWN,
     streams: true,
     rx_start: &crate::rx::RX_START_AKITA_FRONT,
     rx_stop: &crate::rx::RX_STOP_AKITA_FRONT,
@@ -557,10 +604,10 @@ mod tests {
             }
             assert!(c.exposure_lines <= c.exposure_max_lines);
         }
-        // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout; the ultrawide's and the tele's mosaics as ferros reads them (cell tables: the ultrawide's init flips, the tele's stream on flips its rows).
+        // The captures' facts (2026-10-21, local): their 2 x 2 cfa tensors as cells, every level 64 / 1023, EXIF 6 a quarter turn and 8 three quarters, and each capture's size the readout; ferros reads every camera as Android did (the ultrawide's init flips both ways on both, the tele's stream on flips its rows on both).
         // The tele's stream on carries Android's G#0101 = 2 (its frames mirrored against the main without it).
         assert_eq!(TELE.stream_on, &[0x01, 0x00, 0x01, 0x02]);
-        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [0, 1, 1, 2], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [0, 1, 1, 2], 1, (4032, 3024))] {
+        for (c, cell, turns, size) in [(&MAIN, [1, 2, 0, 1], 1, (4080, 3072)), (&ULTRAWIDE, [2, 1, 1, 0], 1, (4000, 3000)), (&FRONT, [1, 0, 2, 1], 3, (3840, 2736)), (&TELE, [2, 1, 1, 0], 1, (4032, 3024))] {
             assert_eq!(c.cfa, cfa(cell[0], cell[1], cell[2], cell[3]), "{}", c.name);
             assert_eq!((c.rotation, c.black, c.white, (c.width, c.height)), (turns, 64, 1023, size), "{}", c.name);
         }

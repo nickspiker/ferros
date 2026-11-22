@@ -112,9 +112,19 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     let (gmin, gmax) = c.array.gain;
     put("gain_min", u(gmin));
     put("gain_max", u(gmax));
-    // Focus: the lens actuator's targets over the span measured (the main's G#0800 to G#7800); 0 and 0 where focus is not offered.
+    // Focus: the lens actuator's targets over its whole travel; 0 and 0 where focus is not offered.
     put("focus_min", u(c.focus.0));
     put("focus_max", u(c.focus.1));
+    // The lens's calibration where known (ferros_cam cams `FocusCal`, the module's factory AF calibration; agreed with the Lumis session 2026-11-22): the target at infinity, at the near point, and that point's distance in mm; the direction follows from which target is larger, and the travel past infinity runs from `focus_infinity` to the end of `focus_min..focus_max` on the far side.
+    // Absent where not known, so a client falls back to the whole travel.
+    let cal = c.focus_cal;
+    if cal.infinity != cal.near {
+        put("focus_infinity", u(cal.infinity));
+        put("focus_near", u(cal.near));
+        if cal.near_mm != 0 {
+            put("focus_near_mm", u(cal.near_mm));
+        }
+    }
     // The optics (ferros_cam optics, the camera's `Cam::optics`: Android's Camera2 values, on the Pro as Lumis recorded them, on the 8a its dumpsys): the sensor's size in mm, the focal length in mm, the f-number.
     let o = c.optics;
     put("sensor_width_mm", alloc::vec![VsfType::f5(o.sensor_mm.0)]);
@@ -169,6 +179,17 @@ mod tests {
             for f in ["facing", "mode", "width", "height", "cfa", "cfa_period", "frame_ns", "line_ps", "fll_least", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
+            // The focus calibration: on the three cornerfolk lenses, infinity and the near point inside the travel, nearer larger, the travel reaching past infinity; none on the tele; no distance yet.
+            let (inf, near) = (s.uint("focus_infinity"), s.uint("focus_near"));
+            if c.id == 3 {
+                assert_eq!((inf, near), (None, None));
+            } else {
+                let (inf, near) = (inf.unwrap(), near.unwrap());
+                let (lo, hi) = (s.uint("focus_min").unwrap(), s.uint("focus_max").unwrap());
+                assert!(lo < inf && inf < near && near <= hi, "{}", c.name);
+                println!("{}: focus infinity G#{inf:04X}, near G#{near:04X}, travel G#{lo:04X} to G#{hi:04X}, past infinity G#{:04X}", c.name, inf - lo);
+            }
+            assert_eq!(s.uint("focus_near_mm"), None);
             let o = c.optics;
             assert_eq!((floats("sensor_width_mm"), floats("sensor_height_mm"), floats("focal_mm"), floats("f_number")), (vec![o.sensor_mm.0], vec![o.sensor_mm.1], vec![o.focal_mm], vec![o.f_number]), "{}", c.name);
             let (m, sens) = (floats("idt"), floats("sensitivity"));

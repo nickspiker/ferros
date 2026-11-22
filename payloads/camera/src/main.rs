@@ -2026,8 +2026,9 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     let refused = REFUSED.load(Ordering::Relaxed);
     say!(g, "camera: engine started (ring G#{ring_pa:X}, count A#{ring_n}, A#{slots} descriptors round which the index goes{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
-    // The lens to about a metre (the main's measured sharpest over a floor) where focus is offered (the main, the ultrawide and the front since 2026-11-21); elsewhere it stays where it rests (the tele's lens is its OIS controller's, G#61, undecoded).
-    let focus = if c.focus.1 != 0 { 0x3800 } else { 0 };
+    // The lens at infinity where its calibration is known (ferros_cam cams `FocusCal`: the main, the ultrawide and the front, from the factory's AF calibration; docs/CAMERA.md "Focus calibration and the rear mosaics"), else about a metre on the main's measure (G#3800) where focus is offered; elsewhere it stays where it rests (the tele's lens is its OIS controller's, G#61, undecoded).
+    // Until 2026-11-22 every lens opened at G#3800, about 750 codes past the front's infinity.
+    let focus = if c.focus_cal.infinity != 0 { c.focus_cal.infinity } else if c.focus.1 != 0 { 0x3800 } else { 0 };
     // The sensor's frame timing, for exposures (ferros_cam ccs `Timing`): the mode's line and frame (the init's own where no mode was asked), and the integration's least and margin as the sensor answers them (CCS G#1004 and G#1006), read here, never assumed.
     let page = ccs::Page::of(init);
     let (llp, fll) = match mode {

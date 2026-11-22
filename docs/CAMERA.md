@@ -1440,6 +1440,7 @@ Every pulled zone's sha256 equalled the device's. Traps: the script took the fir
 | ultrawide 48 MP (kind 8), 8000 x 6000 | 66 thru the view, link clean | 24 a second (41.55 to 41.74 ms) | 5.4067 us | the quad array, blocks R G / G B |
 | front 8.42 MP (kind 8), 3440 x 2448 | 64 thru the view, clean | 30 a second | the 10.5 MP's, 10.4378 us | G R / B G |
 - The ultrawide's 12 MP read R G / G B too (`261 195` / `195 131` at 256 ms): the half turn of its calibration capture's B G / G R, which the init's flip (G#0101 = 3) makes; and the tele's G B / R G is a column from its capture's B G / G R. ferros_cam cams now carries the mosaics measured; the rotations (from the captures) are unchecked on a ferros frame.
+- **Corrected 2026-11-22** ("Focus calibration and the rear mosaics"): this table's mosaics took each scene's brightest place for red, and the rear cameras saw the room's blue light; the ultrawide's and the tele's are B G / G R as their calibration captures and the tele's own pixel_order say (the tele G R / B G unflipped), the front's G R / B G stands.
 - **The front's 8.42 MP needs FC ctx3 off**: with the processing blocks as captured the engine took the first frame, then stalled inside the second program (its place G#14 against the index G#20), no SHADOW_UPDATE, LATE_CONFIG on both paths; neither the packing (Android's own 16-bit job did the same), nor loch0's timing words (G#1C32_0478, 047C), nor the slim program changed it; detach 1 alone did (`Alt::detach`).
 - Regressions on the same driver: the main (`4008`, 67.2 ms frames) and the front's 10.5 MP (`4001000002`, 41.7 ms) clean; LIST 4560 bytes, eight readouts.
 
@@ -1602,6 +1603,8 @@ The cell tables with the stream on as built (the driver `01`, camtest `080100000
 | 22 degrees (the stored driver, on demand) | `257 94 257 93` / `93 79 93 79` / `257 93 257 93` / `93 79 93 79` | R G / G B |
 | 11 degrees (kind 8) | `309 103 308 102` / `102 83 102 85` / `306 102 309 102` / `102 84 103 82` | R G / G B (remosaiced Bayer) |
 | 48.8 MP (kind 9) | `258 255 95 93` / `254 253 93 94` / `92 93 80 78` / `93 94 79 78` | the quad, blocks R G / G B |
+
+**Corrected 2026-11-22** ("Focus calibration and the rear mosaics"): read with blue as each table's brightest place, all three are B G / G R (the quad's blocks too), as the sensor's own pixel_order (G#0006 = 2, BGGR) said here; the list carried R G / G B until then.
 Each link clean (+14 G#0, +1C G#0), no error word.
 - An aside, not chased: at the same header exposure and gain the 48.8 MP reads about 2.8 times the 22 degrees' signal over black (whole-cell means 257 and 133 at 16 ms 8x). Two readouts with their own inits, so their own analogue settings; Lumis's NCC does not see it.
 
@@ -1645,6 +1648,60 @@ Measured on the Pro (flashed 82b908c4, then that kernel with a9bdb503 RAM-reload
 - **Needs your call**: the ultrawide's least gain at code 7 (1031, 1024 refused): a floor stored since uw-gain-slit that you never approved (left as it is tonight).
 - **Not done**: the tele's focus (its lens is driven by its OIS controller, humbaba at G#61; a capture of Android's camera focusing the tele is the way in); each lens's infinity and nearest targets, so Lumis's dioptre slider maps by measure.
 - **Front focus**: confirmed by the actuator's own position readback (every target G#0800 to G#7800 read back within G#64); the frames of the night's scene were too featureless to show the sharpness move.
+
+## Focus calibration and the rear mosaics (2026-11-22, no device)
+
+The owner, shooting Lumis on the Pro: the front's focus slider ran from about infinity to "way past infinity" with nothing near in focus, real infinity at its far end; the ultrawide's colour looked like "a Bayer pattern whoopsie, b-r maybe" and the tele "def appears to be an r-b swap".
+Settled at the desk from what already existed; the device checks below confirm it.
+
+### The factory's focus calibration
+
+The Pro's persist partition holds each module's factory AF calibration, written at manufacture: `/camera/AF_calibration.cal` (read from the 2026-11-18 partition dump in keys/husky with tools/f2fs-cat; one unit, as the IDTs are).
+Its infinity and near ("macro") codes, the HAL's own, and as targets for the actuator (ferros_cam cams `FocusCal`, the list's `focus_infinity` and `focus_near`):
+
+| camera | infinity | near | target at infinity | target at the near point | past infinity (to G#0000) |
+|---|---|---|---|---|---|
+| main ("rear wide") | 509 | 3274 | G#1FD0 | G#CCA0 | 509 codes, 0.18 times the near point's dioptres |
+| ultrawide ("rear uw") | 883 | 3224 | G#3730 | G#C980 | 883 codes, 0.38 times |
+| front ("front normal") | 1642 | 3072 | G#66A0 | G#C000 | 1642 codes, 1.15 times |
+| tele ("rear tele") | 7050 | 13538 | (humbaba's units) | | not offered: its lens is the OIS controller's (G#61), undecoded |
+
+Larger is nearer on all four.
+The near point's distance is not in the file and the Pro's LENS_INFO_MINIMUM_FOCUS_DISTANCE was never recorded (the 8a's main reports 10.204 dioptres, 98 mm), so the list carries no `focus_near_mm` yet; at 10 dioptres the main runs 1.8 dioptres past infinity, the ultrawide 3.8, the front 11.5.
+
+**The target is the code times 2^4** on the three cornerfolk actuators (the main's G#0C, the ultrawide's G#0F, the front's G#0C): a 12-bit code left-aligned in the 16-bit target (00/01).
+Two observations say so, and none says otherwise:
+- The main's sharpest over a floor about a metre away was G#3800 (docs/oracle/CAMERA.md, 2026-10-21): code 896, a seventh of the way from 509 to 3274, about 1.4 dioptres at a 10 cm near point. At 2^3 it would be code 1792, about 4.7 dioptres (21 cm).
+- The owner's front slider covered G#0800 to G#7800, codes 128 to 1920 at 2^4: from far past the front's infinity (1642) to just past it, nothing near. At 2^3 the front's infinity (G#3350) and near point (G#6000) would both lie inside that span and the slider would have focused near.
+- Android's two captured main targets (G#5D10 at the open, G#5120 at the boot probe) both end in a zero nibble.
+
+**The list now offers each lens's whole code range** (`focus_min` G#0000 to `focus_max` G#FFF0, ferros_cam cams `CORNERFOLK_TRAVEL`): the old G#0800 to G#7800 (the main's sweep span, copied to the others) held no camera's near point, and SET refuses a target outside the list's range.
+Past G#7800 is unmeasured: the front's position (G#84) read back every target of G#0800 to G#7800 within G#64 (2026-11-21) and the main's within 30 ms (2026-10-21).
+**Each open now starts at the infinity target** where the calibration is known (payloads/camera; it was G#3800 on every camera, about 750 codes past the front's infinity, so the front's first frames were blurred until a client set its focus).
+
+### The ultrawide and the tele are B G / G R
+
+The list said R G / G B for both since 2026-11-18 ("Every readout, captured", "The tele flipped, stored"), from cell tables that took a scene's brightest place for red in "the owner's red-lit room".
+The rear cameras saw that room's blue light, so the brightest place was blue:
+- The main, whose G B / R G is measured in true colour, read its blue place brightest there the same day (`162 181` / `104 162`, the main's cell table of "The shift's ceiling"); the front, facing the other way, read its red place brightest in the same session as the ultrawide's and tele's tables (`72 83` / `69 72`, G R / B G as its list).
+- The tele's own CCS pixel_order (G#0006), read back on ferros after the first frame (`regs_say`, "The tele flipped, stored"), says BGGR with G#0101 = 2 and GRBG with 0: the red-blue swap of each cell table as it was read, in both flips.
+- Both calibration captures say B G / G R (the tele's with Android writing the same G#0101 = 2), and in each the channel labelled red peaks at 604 nm in the response solved from it (ultrawide 604, 544, 468 nm; tele 604, 556, 464 nm): Android's frames were B G / G R as labelled.
+- The ultrawide's IMX787 is R G / G B itself (Camera2's RGGB on the 8a, whose init writes no flip); the Pro's init flips it both ways (G#0101 = 3) on Android and on ferros alike: B G / G R.
+- ferros's own ultrawide frames of 2026-10-22 (target/cam/uw1.raw10, uw4.raw10, the same init and job) develop the wooden floor tan with B G / G R and blue-grey with R G / G B.
+- The owner saw red and blue swapped on exactly these two cameras.
+
+Every cell table above reads consistently once its brightest place is blue: the tele's 22 degrees G R / B G unflipped and B G / G R flipped, its 11 degrees the same, its 48.8 MP quad's blocks the same; the ultrawide's 12 MP and 48 MP B G / G R.
+**Changed:** ferros_cam cams `ULTRAWIDE.cfa` and `TELE.cfa` B G / G R (every readout of each takes its camera's).
+The IDTs are each camera's own (their matrices differ, their channels peak in order).
+**Lesson for the method:** a cell table names a colour only under light of a known colour and with a control camera beside it; the brightest place in a room is whatever its lights are.
+
+### Device checks (the Pro, for the next slot)
+
+- **Travel** (headless): on the main, the ultrawide and the front, SET 2 to G#0000, G#7800, the near target, G#FFF0, then G#0000 again; the position (G#84) read back 30 ms after each should be within G#64 of the target.
+- **Infinity** (the owner aiming at a target 50 m or more away): sweep the infinity target plus and minus G#800 in G#80 steps, the camtest focus job's sharpness (byte 13); its peak should sit within about G#100 of the factory's infinity.
+- **Near** (a high-contrast target at a measured 100 mm from the lens): sweep the near target plus and minus G#1000 in G#100 steps for the sharpest target P; the near point is then 10 (near - infinity) / (P - infinity) dioptres, which gives `focus_near_mm`.
+- **The mosaics** (Lumis DEV_CELLS, knobs4 bit 0, a saturated red card under white light, all four cameras, the main and the front as the controls): red brightest at (1, 0) on the main, (0, 1) on the front, (1, 1) on the ultrawide and the tele; a blue card at (0, 1), (1, 0), (0, 0) and (0, 0).
+- **The tele's focus**: an Android i2c trace on its bus with G#61 in the address filter (the 2026-11-18 trace kept the sensors' addresses alone), tapping focus near and far; its writes should run between the factory's 7050 and 13538 in some scale.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
