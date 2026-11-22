@@ -2062,6 +2062,8 @@ struct Lumis {
     video_drawn: std::time::Instant,
     /// When the camera screen last made a pass (while recording, a pass is made only when something on it changes, `tick`).
     ui_pass: std::time::Instant,
+    /// The integrator's frame counter at the last pass on the camera screen: a new frame is a pass (out of RAW video).
+    frame_seen: u64,
     /// The development knobs from the spawn input (`DEV_WHOLE`, `DEV_COPY`, `DEV_SCRATCH`).
     knobs: u8,
     /// A display byte (Lumis's gamma-2 encoded light, 255 its white) as a 16-bit g2t darkness: the code VSF's encoder gives (atanh(code / 2^16)^2 = the light), Lumis's white at g2t's diffuse white.
@@ -2073,6 +2075,8 @@ struct Lumis {
     /// The menu changed since its last frame on the GPU (its parts written into the block again), and the surface that frame went into, for the show (`own_surface`).
     menu_fresh: bool,
     own: Option<u64>,
+    /// What that frame changed against the one shown before it (`own_changed`): the box around the camera screen's damage this pass, empty when nothing changed; None, the whole frame (the menu, a frame Lumis drew whole).
+    own_changed: Option<fluor::canvas::PixelRect>,
     /// The app scale changed since the menu was last laid out (`follow_scale`): it is laid out again at its next frame.
     relayout: bool,
     /// Relayouts since the last line, and their time.
@@ -2087,7 +2091,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), knobs: dev_input().0, lut, probe: Probe::new(), gpu_asked: false, menu_fresh: true, own: None, relayout: false, relaids: 0, relaid_us: 0 }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), frame_seen: 0, knobs: dev_input().0, lut, probe: Probe::new(), gpu_asked: false, menu_fresh: true, own: None, own_changed: None, relayout: false, relaids: 0, relaid_us: 0 }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -2344,6 +2348,12 @@ impl FluorApp<G2t16> for Lumis {
                 if video && self.finger.is_none() && !self.pending_up && ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] == ui.previous_image_counter && self.ui_pass.elapsed() < std::time::Duration::from_millis(1 << 9) {
                     return false;
                 }
+                // Out of RAW video, a pass for a new frame (the counters tick at the sensor's rate), a new image, a finger, or 2^5 ms since the last (the exposure's progress between slow frames), not every display frame: a long exposure at 60 a second made about 120 passes a second, each a show the display composed, and its render thread held the X3 at 100 % until the X3 throttled to 364 MHz and the camera thread fell behind (the coordinator, 2026-11-22).
+                let frame = ui.header[lumis_core::shared_memory::FRAME_COUNTER_IDX];
+                if !video && self.finger.is_none() && !self.pending_up && frame == self.frame_seen && ui.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] == ui.previous_image_counter && self.ui_pass.elapsed() < std::time::Duration::from_millis(1 << 5) {
+                    return false;
+                }
+                self.frame_seen = frame;
                 self.ui_pass = std::time::Instant::now();
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
                 let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
@@ -2448,6 +2458,15 @@ impl FluorApp<G2t16> for Lumis {
         match drawn {
             Ok(base) => {
                 self.own = Some(base);
+                // The show names the box around this pass's damage (an empty box: nothing changed), so the display composes that alone; the menu, or a frame drawn whole, the whole frame.
+                self.own_changed = if camera {
+                    damage.as_ref().map(|d| {
+                        let b = d.iter().fold((usize::MAX, usize::MAX, 0, 0), |b, r| (b.0.min(r.0), b.1.min(r.1), b.2.max(r.2), b.3.max(r.3)));
+                        if b.0 >= b.2 { fluor::canvas::PixelRect::new(0, 0, 0, 0) } else { fluor::canvas::PixelRect::new(b.0, b.1, b.2, b.3) }
+                    })
+                } else {
+                    None
+                };
                 self.changed = false;
                 if camera {
                     self.probe.convert += t.elapsed().as_micros() as u64;
@@ -2469,6 +2488,10 @@ impl FluorApp<G2t16> for Lumis {
 
     fn own_surface(&self) -> Option<u64> {
         self.own
+    }
+
+    fn own_changed(&self) -> Option<fluor::canvas::PixelRect> {
+        self.own_changed
     }
 
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
