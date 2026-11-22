@@ -1789,10 +1789,13 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
     if photo && hold::held() {
         let kept = match hold::keep_still(&bytes) {
             Ok((write_ms, card, copies)) => {
-                // The copies the vault verified: both, or one while it runs on one (still kept).
+                // The copies the vault verified: both (fully kept), or one while it runs on one: kept, and the camera screen warns (1 COPY) until the next touch (the coordinator, 2026-11-22; HOLD-API.md "What Ok means"). A RAW clip's body is single-copy by design and never warns (it is not kept here).
                 let on = match copies {
                     Some(2) => ", on both copies".to_string(),
-                    Some(n) => format!(", on A#{n} copy only: the vault runs on one"),
+                    Some(n) => {
+                        lumis_core::platform::set_save_note(lumis_core::platform::SAVE_NOTE_ONE_COPY);
+                        format!(", on A#{n} copy only: the vault runs on one")
+                    }
                     None => String::new(),
                 };
                 println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written and verified in {write_ms} ms{on}", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len());
@@ -1805,7 +1808,7 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
         };
         // Not kept: the camera screen says so until the next touch (lumis_core `platform::save_failed`).
         if !kept {
-            lumis_core::platform::set_save_failed(true);
+            lumis_core::platform::set_save_note(lumis_core::platform::SAVE_NOTE_NOT_SAVED);
         }
         app::save_done(header, kept);
         return;
@@ -1829,7 +1832,7 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
         }
     };
     if !kept {
-        lumis_core::platform::set_save_failed(true);
+        lumis_core::platform::set_save_note(lumis_core::platform::SAVE_NOTE_NOT_SAVED);
     }
     // A calibration map is not a photo: it never counts (as on Android).
     app::save_done(header, kept && photo);
