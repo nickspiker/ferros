@@ -3,7 +3,7 @@
 # Then stowed, unless --no-stow (docs/KISTS.md "Stowing"): `ferros send` offers it to the device over USB, the device's stower checks it (native code, as Mahere's is, only on a development build), and the person attested there says Stow or Cancel on its screen. Stow it only on a device whose kernel, stower and map know the camera right (code 9, ferros commit "The camera right"): one from before refuses `camera` as a right outside its vocabulary.
 # The option is Lumis's identity across versions (ORACLE.md §5: minted once, kept), so an update keeps the person's answers and its vault domain. Minted 2026-11-12; never change it.
 # The key: the owner's developer key (Lumis is his own app, KISTS.md "Whose key signs a kist"), keys/developer-nick.key.vsf, handed to the bridge as $FERROS_DEV_KEY (one already set wins); the path is passed, the key never leaves the bridge's process.
-# The version is Lumis's own (lumis_core's, rust/Cargo.toml in the Lumis tree beside this one: the same as its Android build), in the signed declaration; $LUMIS_VERSION wins.
+# The version is Lumis's own (lumis_core's, rust/Cargo.toml in the Lumis tree beside this one: the same as its Android build), in the signed declaration; $LUMIS_VERSION wins. Since 2026-11-22 it is std/lumis's number too (the owner: "Yup, bump core to match"): lumis_core, the ferros kist and the Android build share one, bumped together.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"

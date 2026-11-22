@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "lumis_core"
-version = "0.2.8"
+version = "0.2.42"
 dependencies = [
  "anyhow",
  "arc-swap",
