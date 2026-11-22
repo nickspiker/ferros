@@ -160,7 +160,7 @@ impl Client {
             self.log.line();
             return 1;
         };
-        self.log.put(b"fgtw: remove (dry run): this device, ");
+        self.log.put(b"fgtw: remove (dry run): ");
         let me = self.me;
         self.say_device(&me, Some(seed));
         self.log.put(if self.bound { b", a member of its identity's fleet of A#".as_slice() } else { b", NOT a member of a fleet (Remove refuses: nothing to tell) of A#" });
