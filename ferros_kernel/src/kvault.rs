@@ -173,6 +173,9 @@ pub fn alias_known_answer() -> bool {
 static READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The most blocks one UFS command of the kernel's vault moves (128 KiB, 2026-11-22): a run holds the UFS lock, and the kernel lock where the vault's caller holds it, for one command, about as long as SYS_BLOCK's runs held it before they left the kernel lock (2026-11-18, `diag lock`: up to 1.2 ms); a block a command was four commands a block across the two mirrors (a 92 MB capsule about 94,000).
+const KV_RUN: usize = 1 << 5;
+
 /// One mirror region: `blocks` 4 KiB blocks of LU 0 from `base`.
 pub struct Region {
     base: u64,
@@ -237,6 +240,47 @@ impl BlockDev for Region {
         });
         if !ok {
             return Err(manifestus::Error::Corrupt(alloc::format!("UFS write failed at region block {lba}")));
+        }
+        Ok(())
+    }
+    /// Consecutive blocks as UFS commands of up to KV_RUN blocks thru the run bounce (process.rs `ufs_read_run`): manifestus reads a value's furrows and its write's read-back verification in runs, and a block a command was a round trip each (2026-11-22).
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> manifestus::Result<()> {
+        // WHY: the run's blocks are manifestus's positions, checked against the region as `read` checks one.
+        if lba + out.len() as u64 > self.blocks {
+            return Err(manifestus::Error::Bounds(lba));
+        }
+        vault_held();
+        for (k, chunk) in out.chunks_mut(KV_RUN).enumerate() {
+            feed();
+            READS.fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            let at = self.base + lba + (k * KV_RUN) as u64;
+            // SAFETY: a Block is 4096 bytes with no padding, so the chunk is chunk.len() × 4096 contiguous bytes.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(chunk.as_mut_ptr() as *mut u8, chunk.len() << 12) };
+            if !crate::process::ufs_read_run(0, at as u32, bytes) {
+                return Err(manifestus::Error::Corrupt(alloc::format!("UFS read failed at region block {}", lba + (k * KV_RUN) as u64)));
+            }
+        }
+        Ok(())
+    }
+    /// `read_run`'s other half: a batch's appends, then verified by `read_run` (manifestus `write_each`).
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> manifestus::Result<()> {
+        // WHY: as `read_run`.
+        if lba + blocks.len() as u64 > self.blocks {
+            return Err(manifestus::Error::Bounds(lba));
+        }
+        vault_held();
+        // WHY the min: the buffer is one command's, a run shorter than KV_RUN (a spine block, an index node) no more than its own blocks.
+        let mut buf = alloc::vec![0u8; blocks.len().min(KV_RUN) << 12];
+        for (k, chunk) in blocks.chunks(KV_RUN).enumerate() {
+            feed();
+            WRITES.fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            for (j, b) in chunk.iter().enumerate() {
+                buf[j << 12..(j + 1) << 12].copy_from_slice(&b[..]);
+            }
+            let at = self.base + lba + (k * KV_RUN) as u64;
+            if !crate::process::ufs_write_run(0, at as u32, &buf[..chunk.len() << 12]) {
+                return Err(manifestus::Error::Corrupt(alloc::format!("UFS write failed at region block {}", lba + (k * KV_RUN) as u64)));
+            }
         }
         Ok(())
     }

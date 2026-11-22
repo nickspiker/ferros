@@ -2162,6 +2162,21 @@ fn ufs_read_run_held(lun: u8, lba: u32, out: &mut [u8]) -> bool {
     }
     ok
 }
+/// `ufs_read_run`'s other half: `src.len() / 4096` consecutive blocks (1 to RUN_MAX) written to `lun` from `lba` thru the run bounce, one UFS command once the PRDT stride is known (learned first, by reads, as `ufs_read_run` learns it), else a block a command. Under the UFS lock, the copy into the bounce with it: kvault.rs `Region::write_run` (the kernel's own vault, 2026-11-22: it wrote a block a command).
+pub fn ufs_write_run(lun: u8, lba: u32, src: &[u8]) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    UFS.with(|| {
+        let n = src.len() >> 12;
+        let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+        let run = (&raw mut UFS_RUN) as usize;
+        if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+            u.probe_prdt_stride(lun, lba, run);
+        }
+        // SAFETY: the bounce holds RUN_MAX blocks and the caller moves at most that many (kvault.rs KV_RUN); it is touched only under the UFS lock, held here.
+        unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) }.copy_from_slice(src);
+        u.write_run_lun(lun, lba, n, run)
+    })
+}
 /// Whether a run moves as one UFS command (the stride known, runs not turned off by `diag "ufs runs off"`): partfs.rs sizes its reads by it.
 pub fn ufs_runs_on() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
