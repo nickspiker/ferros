@@ -5685,6 +5685,12 @@ impl Map {
                         }
                     }
                     let to = self.at(i);
+                    // The Settings circle opens at its root, the list of every page (owner, 2026-11-22: "the settings page should open to the root, not the first screen"), its top first, never straight onto a page: not the first, not the one left open (the Fleet page among them, whose add flow then opens only as the person picks it). A page picked, the swipe goes round them as before, and Back comes back here.
+                    if i == 0 {
+                        self.picker = true;
+                        self.pick_scroll = 0;
+                        self.fling = 0.;
+                    }
                     // The view to come back to when it closes.
                     self.back = Some(self.cam);
                     self.view = View::Open(i);
