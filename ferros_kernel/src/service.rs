@@ -1554,7 +1554,7 @@ fn seal_add(s: &mut ShimStore, seal: &[u8; 32]) -> Result<(), &'static str> {
     seals_write(s, &list)
 }
 
-fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
+fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8], once: bool) -> Option<Result<crate::process::Outcome, &'static str>> {
     let key = core::str::from_utf8(name).ok()?;
     // Three holds, none of the kernel lock across a read (2026-11-18; one hold of the kernel lock from the length to the last piece before, 24 ms for pcie1's 633 KB and 148 ms at the most, `diag lock`): the length under the vault's lock, the staging arc under the kernel lock, the pieces into it under the vault's lock again.
     let total = vault(|| store.as_mut()?.pieces_len(key).ok().flatten())?;
@@ -1589,27 +1589,32 @@ fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], g
     crate::flashlog::line(&alloc::format!("restart {key}: capsule {total} bytes from its pieces; spawning"));
     // SAFETY: the staging arc's [CODE, CODE + total) holds the capsule just read; nothing else holds the arc until it is freed below.
     let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + crate::process::CODE) as *mut u8, total) };
-    let r = crate::process::spawn_capsule_in_place(name, capsule, input, grants, sealed);
+    let r = crate::process::spawn_capsule_in_place(name, capsule, input, grants, sealed, once);
     crate::process::with_lock(|| crate::process::arc_free(arc));
     Some(r)
 }
 
 /// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
 fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Vec<u8>) {
-    restart_with(store, names, b"", rep)
+    restart_with(store, names, b"", rep, false)
+}
+
+/// A kept process started again at its death (docs/KERNEL.md "Restarts"): `restart` with nothing killed and the spawn made only while no process of that name is alive, checked under the kernel lock as it is made, so it never starts a second beside one init's keeper or a restart by hand made meanwhile (answered "<name>: running already").
+fn restart_once(store: &mut Option<ShimStore>, name: &[u8], rep: &mut alloc::vec::Vec<u8>) {
+    restart_with(store, name, b"", rep, true)
 }
 
 /// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. After a jump from Android too (2026-11-15): neither power-down touches the controller's ELBI or DBI, which stalled the bus when Android left its link suspended (the PHY powered down, its isolation released); both crowbar Android's chip into the cold state (the Pro, b878: WiFi's `off`, then the WiFi driver joined and leased; the modem's `off` took Android's live CP down).
 fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
     let (name, input): (&[u8], &[u8]) = if i == 0 { (b"modem", b"off") } else { (b"pcie1", &[0xF0]) };
     let mut rep = alloc::vec::Vec::new();
-    restart_with(store, name, input, &mut rep);
+    restart_with(store, name, input, &mut rep, false);
     crate::flashlog::line(&alloc::format!("radio {} power-down: {}", core::str::from_utf8(name).unwrap_or("?"), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
     rep.ends_with(b" started\n") || rep.ends_with(b" restarted\n")
 }
 
 /// `restart` with an input for each process started (its spawn input, as `bridge spawn` gives one): the radio switches start the modem and WiFi drivers once with their power-down input (`off`, G#F0) to take their chips down.
-fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: &mut alloc::vec::Vec<u8>) {
+fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: &mut alloc::vec::Vec<u8>, once: bool) {
     // Vault reads under the vault's lock (`vault`: the vault's one owner at a time, the kernel lock free meanwhile); the spawns below take the kernel lock themselves.
     let sealed = seals_for_launch(store);
     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
@@ -1640,13 +1645,14 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
         let nm = core::str::from_utf8(name).unwrap_or("?");
         crate::flashlog::line(&alloc::format!("restart {nm}: killing"));
         platform::crumb(0x51);
-        let killed = crate::process::kill(name);
+        // `once` (a kept process's restart at its death, `restart_once`): nothing killed, and the spawn refused if one of that name is alive by the time it is made.
+        let killed = !once && crate::process::kill(name);
         // What it left switched on goes off before its successor starts, so the new process finds it off rather than switched off under it.
         crate::process::power_offs_apply();
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
         platform::crumb(0x52);
         // A capsule kept in pieces never enters the heap whole (`spawn_from_pieces`).
-        if let Some(r) = spawn_from_pieces(store, name, input, &grants, &sealed) {
+        if let Some(r) = spawn_from_pieces(store, name, input, &grants, &sealed, once) {
             platform::crumb(0x53);
             match r {
                 Ok(o) => {
@@ -1672,7 +1678,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
         };
         crate::flashlog::line(&alloc::format!("restart {nm}: capsule {} bytes; spawning", capsule.len()));
         platform::crumb(0x53);
-        match crate::process::spawn_capsule(name, &capsule, input, &grants, &sealed) {
+        match crate::process::spawn_capsule_as(name, &capsule, input, &grants, &sealed, once) {
             Ok(o) => {
                 crate::process::console_flashlog(&o.console);
                 rep.extend_from_slice(alloc::format!("{} {}\n", core::str::from_utf8(name).unwrap_or("?"), if killed { "restarted" } else { "started" }).as_bytes());
@@ -3285,7 +3291,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 let end = crate::process::kept_end(i);
                 let mut rep = alloc::vec::Vec::new();
-                restart(&mut store, name, &mut rep);
+                restart_once(&mut store, name, &mut rep);
                 let said = alloc::string::String::from_utf8_lossy(&rep);
                 let said = said.trim_end();
                 if rep.starts_with(name) && rep.ends_with(b" started\n") {
@@ -3298,6 +3304,8 @@ pub fn run(mut b: Boot) -> ! {
                         restart(&mut store, b"ahau", &mut rep);
                         crate::flashlog::line(&alloc::format!("restarts: ahau started again after fgtw, to ask for the roots if it holds none: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
                     }
+                } else if rep.ends_with(b"running already\n") {
+                    crate::flashlog::line(&alloc::format!("restarts: {nm} is running again already (started meanwhile)"));
                 } else if rep.windows(18).any(|w| w == b"arc pool exhausted") {
                     kept_room |= 1 << i;
                     kept_room_at = frees;
@@ -3335,7 +3343,7 @@ pub fn run(mut b: Boot) -> ! {
             if !running {
                 let mut rep = alloc::vec::Vec::new();
                 // Input 01, the on-chip replay (GPS.md "No fix, 2026-11-18": the stored `gps.replay` is a host-mode session that can never give a fix); the driver takes no input the same way since that day, so either side alone is enough.
-                restart_with(&mut store, b"gps", &[1], &mut rep);
+                restart_with(&mut store, b"gps", &[1], &mut rep, false);
                 crate::flashlog::line(&alloc::format!("gps claimed (A#{} claims): {}", crate::process::gps_claims(), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
                 // Not started: the GPS mailbox's readers woken to a dead mailbox (`mailbox_ring_dead`), as a driver's end would wake them, so none waits on a publish that will not come.
                 if !(rep.starts_with(b"gps") && rep.ends_with(b" started\n")) {

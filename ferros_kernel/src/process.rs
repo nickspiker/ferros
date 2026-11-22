@@ -9046,6 +9046,11 @@ pub fn seal_moves() -> Vec<([u8; 32], [u8; 32])> {
 
 /// Spawn a signed capsule: it must pass the gate (oracle.rs); the oracle's ihi is written into the process's arc at `IHI` and the kernel keeps no copy. Then as `spawn`.
 pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant], sealed: &[u8]) -> Result<Outcome, &'static str> {
+    spawn_capsule_as(name, capsule, input, grants, sealed, false)
+}
+
+/// `spawn_capsule`, and with `once` only while no live process has that name, checked under the kernel lock as the process is made (`spawn_as`): the service loop's restart of a kept process at its death (docs/KERNEL.md "Restarts"), so it never starts a second beside one init's keeper started meanwhile.
+pub fn spawn_capsule_as(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant], sealed: &[u8], once: bool) -> Result<Outcome, &'static str> {
     let g = crate::oracle::gate(capsule)?;
     // Masked (sandboxed) code runs only if it was installed — its seal is in the vault's `sealed` list (`sealed`: 32-byte entries) — and then without re-checking: the checker ran once at install (SANDBOX.md, run and gun). Native dev code spawns unchecked here; a production build refuses it entirely.
     if g.masked {
@@ -9055,11 +9060,11 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
+    spawn_as(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9, once)
 }
 
 /// `spawn_capsule` over a capsule held outside the kernel heap (service.rs `restart`: a staging arc the vault's pieces were read into), its code never copied into the heap: the gate where it lies (`gate_located`: the signature over the whole file, the code found by its section's entry, `locate_code`, and held to be framed exactly so), masked code's modes read in place (`masked_modes`) and its seal found in `sealed`, then the process built from the code where it lies (`spawn` copies it into the process's own arc). The same checks as `spawn_capsule`'s gate, whose parse copied the code out of the capsule and then copied it again (2026-11-12: with the capsule itself, three blocks of 3 MB in the heap at once for the display's).
-pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], grants: &[Grant], sealed: &[u8]) -> Result<Outcome, &'static str> {
+pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], grants: &[Grant], sealed: &[u8], once: bool) -> Result<Outcome, &'static str> {
     let (co, cl, masked) = locate_code(capsule, capsule.len())?;
     let g = crate::oracle::gate_located(capsule, co, cl)?;
     let (exec_len, mode) = if masked {
@@ -9075,7 +9080,7 @@ pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], gra
         (cl, 0)
     };
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &capsule[co..co + cl], input, grants, Some(ihi), masked, exec_len, mode)
+    spawn_as(name, &capsule[co..co + cl], input, grants, Some(ihi), masked, exec_len, mode, once)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -9092,6 +9097,11 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
 pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32) -> Result<Outcome, &'static str> {
+    spawn_as(name, code, input, grants, ihi, masked, exec_len, fixed, false)
+}
+
+/// `spawn`, and with `once` refused ("running already") when a live process has that name as the process is made, under the kernel lock, so no second starts beside one made meanwhile (as `spawn_build`'s `once`).
+pub fn spawn_as(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32, once: bool) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
@@ -9120,6 +9130,12 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
     spawn_step(9);
     lock();
+    // A process of that name made meanwhile (init's keeper, a restart by hand): nothing made here, the arc back to the pool.
+    if once && named_live(name) {
+        arc_free(arc);
+        unlock();
+        return Err("running already");
+    }
     // A refused build made nothing that holds the arc: it goes back to the pool.
     let built = build_from(name, arc, code.len(), input, &objects, ihi, masked, exec_len, fixed >> 8 & 1 == 1).inspect_err(|_| arc_free(arc));
     launch(built, input.len())
