@@ -500,6 +500,8 @@ static mut BUF: [u64; (32 << 20) / 8] = [0; (32 << 20) / 8];
 /// A recorded label: x, baseline, size, value, the text and its length.
 static mut LABELS: [(i64, i64, u16, u16, [u8; 32], usize); 256] = [(0, 0, 0, 0, [0; 32], 0); 256];
 static mut NLABELS: usize = 0;
+/// The system keyboard's surround tops (`Ahau::surround`): the (layout, view) they were worked out for, and four a column, for a panel up to 2¹¹ pixels wide (husky 1344, akita 1080; a wider one panics at the index, a bug to see).
+static mut SURROUND: (Option<(usize, usize)>, [[i64; 4]; 1 << 11]) = (None, [[0; 4]; 1 << 11]);
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// The entry's buffer, in bytes: a handle (MAX_CHARS characters of up to four bytes) or a newcomer's 23 pairing words (WORD_CHARS).
@@ -888,14 +890,34 @@ impl Ahau {
 
     /// Rows y0..y1 of the buffer onto the shown surface.
     fn present(&self, y0: usize, y1: usize) {
-        let rows = &mut self.surf()[y0 * self.w..y1 * self.w];
-        // The system keyboard is opaque over the app (WINDOWS.md "The keyboard"): the see-through gaps and edges the attest screen's words show thru would hand a finger between two keys to the app under them (the hit map gives a see-through pixel to what is behind it). The bits dropped, every pixel stands over black: the premultiplied channels are its light over black already, and a clear one's are nothing.
+        let rows = &self.surf()[y0 * self.w..y1 * self.w];
+        // The system keyboard stands on its black surround (WINDOWS.md "The keyboard"): the keys grown by one gutter, composed under every pixel (`honeycomb::surround_under`), so the gaps and the keys' edges are opaque, as a finger between two keys must stay the keyboard's (the hit map gives a see-through pixel to what is behind it), and above the top row's outline the app shows, its edge antialiased. Until 2026-11-21 every pixel was made opaque, and the rows from the keyboard's top down to the arc of its top row were a black band cutting the app's content (owner: "The black around the keyboard is fine except for the top section").
+        // Composed on the way out, the buffer left as drawn: a present of the same rows again (a key lit, then the board) composes the surround once, not twice.
         if self.mode == Mode::Keys {
-            for p in rows.iter_mut() {
-                *p &= (1 << 49) - 1;
+            let tops = self.surround();
+            let mut off = window::PORCH + (y0 * self.w * 8) as u64;
+            for (y, row) in (y0..y1).zip(rows.chunks_exact(self.w)) {
+                for (p, t) in row.iter().zip(tops) {
+                    Front::write64(off, honeycomb::surround_under(*p, y, t));
+                    off += 8;
+                }
             }
+            return;
         }
         Front::write_words(window::PORCH + (y0 * self.w * 8) as u64, rows);
+    }
+
+    /// The surround's tops of every column (`Keyboard::surround_tops`) for the keyboard's layout and view, worked out again only when they change (a board's rows are presented at every stroke; the tops are some 2¹⁷ hex tests).
+    fn surround(&self) -> &'static [[i64; 4]] {
+        let s = unsafe { &mut *(&raw mut SURROUND) };
+        let key = (self.kb.layout, self.kb.view);
+        if s.0 != Some(key) {
+            for (x, t) in s.1[..self.w].iter_mut().enumerate() {
+                *t = self.kb.surround_tops(x);
+            }
+            s.0 = Some(key);
+        }
+        &s.1[..self.w]
     }
 
     /// Rows y0..y1 of the buffer onto surface `tb` (the second surface or the shown one), for the display to draw text into.

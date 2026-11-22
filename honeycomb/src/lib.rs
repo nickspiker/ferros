@@ -336,6 +336,42 @@ impl Keyboard {
         }
     }
 
+    /// The top at column `fx` (Q8) of hex (`cx`, `cy`) grown by one gutter (`gap`, the black between two keys), unmoved by the sag; i64::MAX past its reach.
+    /// The hex grown by a disc of radius g (its Minkowski sum): over the top vertex an arc of radius g about it, then each cap moved out by g (2g/√3 straight up, the cap being 30° from level), then an arc of radius g about the cap's corner down to the corner's height, where the grown vertical side starts. The pieces meet with one tangent (the arcs end where their normal is the cap's), so the grown outline is C1 everywhere but between two keys.
+    fn grown_top(&self, cx: i64, cy: i64, fx: i64) -> i64 {
+        let (g, a, r) = (self.gap, self.a, self.r);
+        let dx = (fx - cx).abs();
+        let cap = |d: i64| cy - r + (d * INV_SQRT3 >> 16);
+        if dx <= g / 2 {
+            cy - r - ((g * g - dx * dx) as u64).isqrt() as i64
+        } else if dx <= a + g / 2 {
+            cap(dx) - (g * TWO_OVER_SQRT3 >> 16)
+        } else if dx < a + g {
+            let e = dx - a;
+            cap(a) - ((g * g - e * e) as u64).isqrt() as i64
+        } else {
+            i64::MAX
+        }
+    }
+
+    /// The keyboard's black surround's top at column `fx` (Q8): the keys on show, each grown by one gutter, their outline's highest point in that column, moved down by the column's sag as the keys are (owner, 2026-11-21: "The black around the keyboard is fine except for the top section"). Above it the app shows; below it, black under the keys. Every column meets a ten-key row (they alternate with the nine-key ones), whose end keys stand half a gutter from the screen's edges, so every column has a top.
+    /// The min picks the highest of the grown keys' tops in the column (their union's outline); it constrains nothing.
+    pub fn surround_top(&self, fx: i64) -> i64 {
+        let mut t = i64::MAX;
+        for row in 0..VIS {
+            for col in 0..self.extent_row(row).len() {
+                let (cx, cy) = self.centre(row, col);
+                t = t.min(self.grown_top(cx, cy, fx));
+            }
+        }
+        t + self.sag(fx)
+    }
+
+    /// Pixel column `x`'s surround tops at four sub-columns (its eighths 1, 3, 5, 7, Q8): `surround_under` takes the pixel's share below them, so a steep or vertical stretch of the outline (a nine-key row's end, where the row under it reaches higher) is shaded across the column too.
+    pub fn surround_tops(&self, x: usize) -> [i64; 4] {
+        core::array::from_fn(|k| self.surround_top(((x as i64) << 8) + 32 + ((k as i64) << 6)))
+    }
+
     /// A key's slot in `tint`: the hexes by index, the bar's keys from 48.
     pub fn tint_index(key: Key) -> usize {
         match key {
@@ -605,6 +641,17 @@ fn see_through(area: u64) -> u64 {
 /// The display's clear working pixel: see-through whatever its channels hold.
 pub const CLEAR: u64 = 1 << 63;
 
+/// Working pixel `p` on row `y` of a column whose surround tops are `tops` (`Keyboard::surround_tops`), with the keyboard's black surround under it, front to back: the pixel is the front layer as it stands, the surround goes under it through what the pixel leaves, black at α = the pixel's share below the tops. Black adds no light, so the channels stay; the transparency is the pixel's times what the surround leaves. A clear pixel's channels are nothing, whatever it held under the bit.
+/// The share: each sub-column's overlap of the pixel's rows with the surround below its top (Q8, an interval's length, the coverage itself as `hex` takes it, not a bound), the four summed (Q10). The transparency keeps Q14: a whole one (2¹⁴) lands on bit 63 at bit 49, the clear bit, as `CLEAR` is.
+pub fn surround_under(p: u64, y: usize, tops: &[i64; 4]) -> u64 {
+    let (y0, y1) = ((y as i64) << 8, (y as i64 + 1) << 8);
+    let cover: i64 = tops.iter().map(|&t| (y1 - t.max(y0)).max(0)).sum();
+    let clear = p >> 63;
+    let t = if clear != 0 { 16384 } else { p >> 49 & 0x3FFF };
+    let light = if clear != 0 { 0 } else { p & ((1 << 49) - 1) };
+    light | (t * (1024 - cover) as u64 >> 10) << 49
+}
+
 /// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g`, composed front to back with the key's face `key` behind it: the ▲ first into an empty accumulator at α = its coverage (4 × 4 samples, in sixteenths), then the face under it through what the ▲ leaves, in linear light. The ▲ stands well inside the face's flat span (3/8 of its height, centred), so the face behind it is `key` and the surface is not read: each pixel is written whole, after `shape` has drawn the face. Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black.
 fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64, key: [u64; 3]) {
     // Half the base: h/√3 (37/64).
@@ -750,6 +797,37 @@ mod tests {
         }
         assert_eq!(kb.bottom, h);
         assert_eq!(kb.sag(cx), cy + r - kb.bar1);
+    }
+
+    /// The black surround (`surround_top`, `surround_under`), at every view: it stays inside the keyboard's rows (its window starts at `top`), every key pixel and everything below the keys' outline is opaque over it, and above the outline it reaches no farther than a gutter from a key (owner, 2026-11-21: the black above the top row's arc cut the app's content).
+    #[test]
+    fn surround_follows_the_keys() {
+        let (w, h) = (1344usize, 2992usize);
+        let mut kb = Keyboard::new(w, HUSKY);
+        let mut none = |_: i64, _: i64, _: u16, _: u16, _: &str| {};
+        let reach = (kb.gap >> 8) + 2;
+        for view in 0..=MAX_VIEW {
+            kb.view = view;
+            let mut s = std::vec![0u64; w * h];
+            kb.draw(&mut s, &mut none);
+            for x in 0..w {
+                let tops = kb.surround_tops(x);
+                assert!(tops.iter().all(|&t| t >= (kb.top as i64) << 8), "view {view} column {x}: the surround above the keyboard's top");
+                let mut first = None;
+                for y in kb.top..kb.bottom {
+                    let p = s[y * w + x];
+                    let q = surround_under(p, y, &tops);
+                    if p >> 63 == 0 {
+                        first.get_or_insert(y);
+                        assert_eq!(q >> 49, 0, "view {view} ({x}, {y}): a key or the slab under it not opaque");
+                    } else if first.is_none() && q >> 63 == 0 {
+                        // WHY the saturating start and the min: the square around a pixel at the screen's edge reaches past it, and those pixels do not exist.
+                        let near = (y.saturating_sub(reach as usize)..y + reach as usize + 1).any(|yy| (x.saturating_sub(reach as usize)..(x + reach as usize + 1).min(w)).any(|xx| s[yy * w + xx] >> 63 == 0));
+                        assert!(near, "view {view} ({x}, {y}): the surround more than a gutter from any key");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
