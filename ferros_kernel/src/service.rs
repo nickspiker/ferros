@@ -1714,7 +1714,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     if bare {
         #[cfg(ferros_usb_capsule)]
         // Without a vault there is no ira and so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
-        match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g)) {
+        match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", USB_CARRIED, b"", &g)) {
             Some(Ok(o)) => {
                 mark_ran(&o);
                 crate::process::push_console(b"home: no init in the vault: the usb process from the kernel's capsule\n");
@@ -1754,10 +1754,13 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     // Under the vault's lock, as every vault read once it is shared (nothing else runs yet, but the rule has no exceptions).
     if vault(|| store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten())).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");
+        // Without init nothing else starts usb (the kernel's own USB went 2026-11-01), and a measurement session needs the bridge. Not on the glass: an instrument may be reading it.
+        usb_rescue("off (vault home.off), no init this boot", false);
         return false;
     }
     let Some(capsule) = vault(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
+        usb_rescue("no init capsule in the vault", true);
         return true;
     };
     let sealed = seals_for_launch(store);
@@ -1800,7 +1803,17 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     }
     // The pipe stays at ABL's 8 bpc here: the display server takes it to the 10 bpc blend at its start (payloads/display modeset.rs; KERNEL-OUT.md decision 6, 2026-11-01).
     // The touch controller is the touch process's to bring up (its `touch` power switch, then the ready event and scan mode: payloads/touch; KERNEL-OUT.md move 1).
-    match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
+    #[cfg(not(ferros_init_refuse))]
+    let grants = home_grants();
+    // FERROS_INIT_REFUSE=1 (a development build, never flashed): init's spawn refused the way it was on 2026-11-21, by more grants than its page holds, to prove `usb_rescue` on the device (docs/KERNEL.md "When init does not start").
+    // 2^7 more always overflow: the page holds 108 slots in all.
+    #[cfg(ferros_init_refuse)]
+    let grants = {
+        let mut g = home_grants();
+        g.extend((0..1 << 7).map(|_| crate::process::Grant::Entropy));
+        g
+    };
+    match crate::process::spawn_capsule(b"init", &capsule, b"", &grants, &sealed) {
         Ok(o) => {
             mark_ran(&o);
             // From here the vault, usb and display have `glass::BOOT_DEADLINE_SHIFT` to come up (`glass::boot_watch`).
@@ -1816,10 +1829,49 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             crate::process::push_console(b"home: init refused: ");
             crate::process::push_console(e.as_bytes());
             crate::process::push_console(b"\n");
+            usb_rescue(&alloc::format!("init refused ({e})"), true);
         }
     }
     crate::checklist::at("home: init ran");
     true
+}
+
+/// The usb process's native capsule the kernel image carries (target/akita-usb.capsule.vsf beside the tree at build, `ferros_usb_capsule`), empty when the build carried none. One copy in the image for both its starts: a vault with no init (`start_home`) and init not running (`usb_rescue`).
+#[cfg(ferros_usb_capsule)]
+static USB_CARRIED: &[u8] = include_bytes!("../../target/akita-usb.capsule.vsf");
+#[cfg(not(ferros_usb_capsule))]
+static USB_CARRIED: &[u8] = &[];
+
+/// init is not running, so nothing will start usb, and the kernel has had no USB of its own since 2026-11-01: the usb process from the capsule the kernel image carries, as a vault with no init gets it, so the bridge still reaches the device and `diag console` and the flash log say why.
+/// Called when init's spawn is refused at home, when the vault has no init, under `home.off`, and at the boot's deadline when init is not running and no usb is up (it died, or crash-looped, before it started usb: `glass::boot_watch`).
+/// Why (2026-11-21): a kernel change made init's spawn refused ("more grants than the grants page holds"), and the Pro came up with no init, no USB, no display and no shell; nothing could reach it from the bridge until a hand held its power button.
+/// Native, checked by its signature, without an ihi (the usb process reads none, and a refused init may be a missing ira); nothing started when a usb process runs already.
+/// `glass`: the line drawn on the panel by the kernel too (not under `home.off`, whose panel an instrument may be reading).
+fn usb_rescue(why: &str, glass: bool) {
+    let say = |s: &str| {
+        crate::process::push_console(alloc::format!("{s}\n").as_bytes());
+        crate::flashlog::line(s);
+        if glass {
+            crate::process::with_lock(|| crate::glass::notice(s.as_bytes(), true));
+        }
+    };
+    if crate::process::running(b"usb") {
+        say(&alloc::format!("usb rescue: {why}; a usb process runs already"));
+        return;
+    }
+    if USB_CARRIED.is_empty() {
+        say(&alloc::format!("usb rescue: {why}, and this kernel carries no usb capsule (target/akita-usb.capsule.vsf at build): no USB until a reset"));
+        return;
+    }
+    match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", USB_CARRIED, b"", &g)) {
+        Some(Ok(o)) => {
+            mark_ran(&o);
+            crate::process::console_flashlog(&o.console);
+            say(&alloc::format!("usb rescue: {why}: the usb process started from the kernel's capsule, so the bridge can reach this device"));
+        }
+        Some(Err(e)) => say(&alloc::format!("usb rescue: {why}, and the kernel's usb capsule refused: {e}: no USB until a reset")),
+        None => say(&alloc::format!("usb rescue: {why}, and no usb grants: no USB until a reset")),
+    }
 }
 
 /// The USB link as of the service loop's last pass, for the facts.
@@ -3220,7 +3272,10 @@ pub fn run(mut b: Boot) -> ! {
             radios_applied = radios_off;
         }
         // The vault, usb and display up once init has run 16 s, or said on the glass (glass.rs): two loads and a compare a pass until then.
-        crate::glass::boot_watch();
+        // No usb up then and no init running (it died, or crash-looped, before it started usb): the kernel's own usb (`usb_rescue`), once, at that deadline.
+        if crate::glass::boot_watch() && !crate::process::running(b"init") {
+            usb_rescue(&alloc::format!("init is not running and no usb is up A#{} s after init started", 1u32 << crate::glass::BOOT_DEADLINE_SHIFT), true);
+        }
         // The vault process ended having served, or was killed with no successor (process.rs `vault_ended`, `VAULT_ON`): started again from its capsule at once, the store calls queued for it waiting meanwhile, never answered by the kernel's vault, which no longer holds what it keeps. One that will not start leaves the vault gone, its waiting calls refused.
         if crate::process::vault_wanted() && crate::process::with_lock(|| crate::process::named_alive_locked(&[b"vault"])) == 0 {
             let mut rep = alloc::vec::Vec::new();

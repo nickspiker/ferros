@@ -2,7 +2,7 @@
 //!
 //! - **Which buffer:** the DPU's own registers say (`display::scanned`): the full-screen window's layer, its DMA base, stride and format.
 //!   Before the display server runs that is ABL's splash (the kernel's painter switched it to G#00RRGGBB); after, the phase of the four temporal dither frames on the layer, and then all four are written (the server flips between them) in the panel's baked codes.
-//! - **Three uses:** a kernel panic (`panic_screen`, then `hold`, then the existing report and reset, platform.rs); a process that died by a fault or a panic while no display serves (`notice` from process.rs `end_process`); a boot whose vault, usb or display is not up 16 s after init started (`boot_watch`).
+//! - **Four uses:** a kernel panic (`panic_screen`, then `hold`, then the existing report and reset, platform.rs); a process that died by a fault or a panic while no display serves (`notice` from process.rs `end_process`); a boot whose vault, usb or display is not up 16 s after init started (`boot_watch`); the kernel starting its own usb because init is not running (service.rs `usb_rescue`).
 //! - **Notices** are kept, newest last, in a fixed 2 KiB buffer under the kernel lock and drawn whole each time, the latest lines kept when they run past the bottom (`Keep::Latest`).
 //! - **The panic's** text keeps its earliest lines (the headline and the message) when it runs past the bottom (`Keep::Earliest`).
 
@@ -178,16 +178,17 @@ pub const BOOT_DEADLINE_SHIFT: u32 = 4;
 
 /// Once a service loop pass (it passes at least four times a second): when init has run `BOOT_DEADLINE_SHIFT` seconds, whether the vault, usb and display are up (each serving its endpoint, process.rs `up_locked`); those that are not are named on the console, in the flash log and on the glass, even over a serving display (whose own screen then is not working: the stall is the thing to see, and the display redraws over it as soon as what it shows changes).
 /// Two loads and a compare until then, nothing after.
-pub fn boot_watch() {
+/// True once, at the deadline, when usb was not up then (service.rs `usb_rescue`, when init is not running either).
+pub fn boot_watch() -> bool {
     let at = INIT_AT.load(Relaxed);
     if at == 0 || WATCHED.load(Relaxed) || crate::platform::cntpct().wrapping_sub(at) < crate::platform::cntfrq() << BOOT_DEADLINE_SHIFT {
-        return;
+        return false;
     }
     WATCHED.store(true, Relaxed);
     let names: [&[u8]; 3] = [b"vault", b"usb", b"display"];
     let up = crate::process::with_lock(|| names.map(crate::process::up_locked));
     if up.iter().all(|&u| u) {
-        return;
+        return false;
     }
     let mut line = alloc::string::String::from("boot stalled:");
     for (name, _) in names.iter().zip(up).filter(|(_, u)| !u) {
@@ -198,6 +199,7 @@ pub fn boot_watch() {
     crate::process::push_console(alloc::format!("{line}\n").as_bytes());
     crate::flashlog::line(&line);
     crate::process::with_lock(|| notice(line.as_bytes(), true));
+    !up[1]
 }
 
 /// Which core is drawing a terminal screen (a panic's), plus one; 0 none. `report_panic` claims it; the fault vector (main.rs `.Lexc_recover`) resets at once while it is set.

@@ -35,6 +35,12 @@ fn main() {
     if std::env::var("FERROS_RESCUE").is_ok() {
         println!("cargo:rustc-cfg=ferros_rescue");
     }
+    // FERROS_INIT_REFUSE=1: init's spawn refused at home by too many grants, to prove the kernel's usb rescue on the device (service.rs `usb_rescue`, docs/KERNEL.md "When init does not start"). A RAM reload only, never flashed.
+    println!("cargo:rustc-check-cfg=cfg(ferros_init_refuse)");
+    println!("cargo:rerun-if-env-changed=FERROS_INIT_REFUSE");
+    if std::env::var("FERROS_INIT_REFUSE").map(|v| v == "1").unwrap_or(false) {
+        println!("cargo:rustc-cfg=ferros_init_refuse");
+    }
     // akita's USB process (board.rs: no vault there yet, so no init and no stored capsule): the kernel carries a native usb capsule when target/akita-usb.capsule.vsf exists (tools/akita-boot.sh makes it from the current usb build), and starts it at home.
     println!("cargo:rustc-check-cfg=cfg(ferros_usb_capsule)");
     let usb_capsule = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../target/akita-usb.capsule.vsf");
