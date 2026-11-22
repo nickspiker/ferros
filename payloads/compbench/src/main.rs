@@ -6,7 +6,7 @@
 //! Spawn: `ferros-bridge spawn compbench.bin [mode [seconds]] --name compbench --use gpu --dma layers-32`
 //! Grant slots: 0 console, 1 gpu (use), 2 its GPU block (grown to 2^28 bytes).
 //! Since 2026-11-21 also the noise in its parallel form (noise.rs, kernel.rs `record_par`: a workgroup a half-row, its scan in shared storage), measured and checked on the device in mode 0 beside the serial kernels, and the memory floor (a pane copied).
-//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels; 16 the whole frame into one phase a job (the phases in turn) at up to 120 a second, one job at a time, 17 the same with two in flight, 18 a hostile client beside them (whole-frame jobs back to back, two in flight; GPU-COMPOSE.md step 0). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
+//! Modes: none or 0 every measure (the console has the lines); 1 the frame as fast as it goes up to 120 a second on NEON for the seconds given (default 2^4); 2 the same with the GPU making the baked frame and NEON presenting it; 3 the GPU making the phases' words itself; 4 nothing at all for the seconds (the power's floor); 5 and 6 to 9 the clip kernel checked on the device; 10 the queue's uniforms against calls over 2^10 jobs, 11 a NEON patch ending mid-line then a GPU job writing the rest of its lines, 2^6 times each way, 12 where any byte changed under such a patch would come from, 13 data the CPU writes between jobs (a pane, the same uniforms every job) over 2^10 jobs each way (GPU-KISTS.md section 3, "The queue's uniforms read stale"); 14 as 2 and 15 as 3 with the parallel kernels; 16 the whole frame into one phase a job (the phases in turn) at up to 120 a second, one job at a time, 17 the same with two in flight, 18 a hostile client beside them (whole-frame jobs back to back, two in flight; GPU-COMPOSE.md step 0); for 16 to 18 a third byte of 1 runs it as a kist (the service's op 7); 19 to 21 probe the display's GPU view (step 1, `view_test`). The rects and patches of mode 0 run thru calls, chosen while the queue read stale uniforms (fixed 2026-11-21 by `ferros_gpuq::END_FLUSH`).
 #![no_std]
 #![no_main]
 
@@ -576,6 +576,10 @@ extern "C" fn compbench_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
     }
     let mut gpu = Gpu { q, handles };
+    // Modes 16 to 18 with a third byte of 1: run as a kist runs (the GPU service's op 7), for the kists' turns measured kist against kist (GPU-COMPOSE.md, 2026-11-21).
+    if (16..=18).contains(&mode) && byte(input, input_len, 2) == Some(1) {
+        say!("compbench: as a kist: {}\n", gpu.q.as_kist());
+    }
     for j in 0..THREADS {
         let stack = unsafe { &mut *(&raw mut STACKS[j]) };
         ferros_sys::thread_spawn(worker, stack, j as u64);

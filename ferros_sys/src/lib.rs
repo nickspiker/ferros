@@ -921,6 +921,13 @@ pub mod gpu {
                 r == 2 && reply[0] == 0
             }
 
+            /// This client's GPU work run as a kist's from now (op 7, a measure: priority 8 and the kists' turns): a client may only give up its standing. Whether the service took it (an older one refuses it).
+            pub fn as_kist(&self) -> bool {
+                let mut reply = [1u8; 1];
+                let r = super::super::call(self.service, &[7], &mut reply);
+                r == 1 && reply[0] == 0
+            }
+
             /// The queue closed: a job still running stopped, the rest lost.
             pub fn close(&mut self) {
                 let mut reply = [1u8; 1];

@@ -18,6 +18,9 @@
 //! - `[4]`: its queue closed, its jobs still in it stopped and lost, `[0]`.
 //! - `[5]`, `[5][cached u8]`: its memory looked at again (a camera view given or taken), `[0][the camera mapped u8]`; from the display, `[5][1][n][n × (surface slot, generation)]` names the windows it composes, which the kernel stamps read-only (ferros_sys `Queue::view`).
 //! - `[6][on u8]`: the GPU's clock held up or let go (a development measure).
+//! - `[7]`: the client runs as a kist from now (a measure; `rotate`).
+//!
+//! The kists take turns (`rotate`): at each kist job's end, with another kist's work in flight, the kists' groups are ranked by when each was last served, 8 down; the firmware runs the highest with work first.
 //!
 //! The display (GPU-COMPOSE.md, 2026-11-21): its stamp carries its view (ferros_sys::gpu `View`), so its space maps its phases read-write at `PHASES_VA` and the windows it composes read-only, and nothing of any other client's. Slot 0 is its alone, at priority 15 alone (other system clients 14, kists 8). Each time its tables are in force it tells the kernel which stamp they came from (`view_settled`), and a window it no longer maps goes back to the pool only then.
 
@@ -119,6 +122,11 @@ struct Slot {
     phases: (u64, u64),
     ro: u32,
     ro_frames: [u64; RO_FRAMES],
+    /// Its client asked to run as a kist runs (op 7, a measure: a client may only give up its standing), until the slot is given to another client.
+    demoted: bool,
+    /// Its group's priority now, and when its client was last served among the kists (`rotate`).
+    prio: u32,
+    turn: u64,
     /// When it last took a job (a count of jobs), for choosing the slot used longest ago.
     used: u64,
     /// Its group is running (started, not ended since).
@@ -140,7 +148,7 @@ struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, display: false, phases: (0, 0), ro: 0, ro_frames: [0; RO_FRAMES], used: 0, running: false, kernels: 0, code_used: 0, kern_wg: [4; KERNELS_MOST], kern_wls: [false; KERNELS_MOST], queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
+    const EMPTY: Slot = Slot { mem: SlotMem { susp_va: 0, uio_va: 0, uio: 0 }, ring: 0, desc: 0, flag: 0, code: 0, pools: [0; 2], cur: 0, regions: [(0, 0); ferros_sys::gpu::REGIONS], nregions: 0, frames: [0; ferros_sys::gpu::FRAMES], nframes: 0, camera: false, camera_cached: true, root: 0, insert: 0, client: None, block: (0, 0), kist: false, display: false, phases: (0, 0), ro: 0, ro_frames: [0; RO_FRAMES], demoted: false, prio: 0, turn: 0, used: 0, running: false, kernels: 0, code_used: 0, kern_wg: [4; KERNELS_MOST], kern_wls: [false; KERNELS_MOST], queue: None, seq: 1, flight: [Flight { seq: 0, job: 0, refused: false, submitted: 0 }; FLIGHT], head: 0, len: 0, head_since: 0 };
 }
 
 struct State {
@@ -148,13 +156,15 @@ struct State {
     jobs: u64,
     /// Jobs in flight in every slot: the clock's want (`WANT`).
     inflight: usize,
+    /// The kists' turns so far (`rotate`).
+    turns: u64,
     /// A call's job ended (`events` to the main thread): its status, the service's µs, the GPU's µs, the fault's address and status.
     call: (u8, u32, u32, u64, u32),
 }
 
 static mut SVC: Option<Svc> = None;
 /// Filled in place by `serve` before any thread starts (a slot is about 6 KiB: seven built on the main thread's stack and moved would be 40 KiB of it).
-static mut ST: State = State { slots: [const { Slot::EMPTY }; SLOTS], jobs: 0, inflight: 0, call: (0, 0, 0, 0, 0) };
+static mut ST: State = State { slots: [const { Slot::EMPTY }; SLOTS], jobs: 0, inflight: 0, turns: 0, call: (0, 0, 0, 0, 0) };
 /// The lock over `ST` and the firmware's shared interface: three states, Drepper's futex mutex (0 free, 1 held, 2 held with waiters).
 static LOCK: AtomicU64 = AtomicU64::new(0);
 /// Each slot thread's doorbell while its slot has no queue: moved when one opens there.
@@ -348,9 +358,69 @@ fn ensure_running(s: &Svc, sl: &mut Slot, k: usize) -> bool {
         return true;
     }
     MMU_FAULTS[k + 1].store(0, Ordering::Relaxed);
-    let ok = space_install(&s.g, k + 1, sl.root) && group_start(&s.g, &s.sh, k, sl, s.cores, if sl.display { PRIORITY_DISPLAY } else if sl.kist { PRIORITY_KIST } else { PRIORITY_SYSTEM });
+    sl.prio = base_priority(sl);
+    let ok = space_install(&s.g, k + 1, sl.root) && group_start(&s.g, &s.sh, k, sl, s.cores, sl.prio);
     sl.running = ok;
     ok
+}
+
+/// A slot's group's priority when it starts: the display's 15 alone, another system client's 14, a kist's 8 (and a client that asked to run as one, op 7).
+fn base_priority(sl: &Slot) -> u32 {
+    if sl.display {
+        PRIORITY_DISPLAY
+    } else if as_kist(sl) {
+        PRIORITY_KIST
+    } else {
+        PRIORITY_SYSTEM
+    }
+}
+
+/// Whether a slot's client runs as a kist: one, or one that asked to (op 7).
+fn as_kist(sl: &Slot) -> bool {
+    sl.kist || sl.demoted
+}
+
+/// A running group's priority changed (CSG_EP_REQ's bits 31:28 with the rest as `group_start` wrote them, then CSG_REQ's ENDPOINT_CONFIG, bit 4, toggled against its ack and the group's doorbell rung: panthor's CSG_ENDPOINT_CONFIG). No wait for the ack: a change still unacknowledged is not toggled again (that would take it back), its request word rewritten, which the firmware reads when it takes it. Under the lock.
+fn group_priority(s: &Svc, k: usize, priority: u32) {
+    let (cin, cout, _, _) = blocks(&s.sh, k);
+    let n = s.cores.count_ones();
+    s.sh.wr(cin + 0x34, n | n << 8 | 1 << 16 | priority << 28);
+    const EP_CFG: u32 = 1 << 4;
+    if (s.sh.rd(cin) ^ s.sh.rd(cout)) & EP_CFG == 0 {
+        s.sh.wr(cin, s.sh.rd(cin) ^ EP_CFG);
+        unsafe { core::arch::asm!("dmb osh") };
+        glb_doorbell(&s.g, &s.sh, 1 << k);
+    }
+}
+
+/// The kists take turns (the coordinator, 2026-11-21, after compbench beside a hostile client at the same priority: the firmware ran the hostile's group whole and the other's job ended at its guard, so one kist keeping work queued could starve every other kist, Lumis's RAW encode among them).
+/// At each kist job's end (`reap`), when another kist's group has work in flight, the kists' running groups are ranked by when each was last served: the one served longest ago at 8, the next at 7, and so on down, the one whose job just ended last. The firmware runs the highest with work first, so each kist with work gets the GPU in turn, a job at a time. An event (a job's end), never a timer; nothing changes while one kist alone has work. The display (15) and the other system clients (14) are above every kist and never turned.
+fn rotate(st: &mut State, k: usize) {
+    if !as_kist(&st.slots[k]) || !(0..SLOTS).any(|j| j != k && as_kist(&st.slots[j]) && st.slots[j].running && st.slots[j].len > 0) {
+        return;
+    }
+    st.turns += 1;
+    st.slots[k].turn = st.turns;
+    let s = svc();
+    let mut ranked = [0usize; SLOTS];
+    let mut n = 0;
+    for j in (0..SLOTS).filter(|&j| as_kist(&st.slots[j]) && st.slots[j].running) {
+        // In order of their turns, oldest first (insertion: seven slots at most).
+        let mut at = n;
+        while at > 0 && st.slots[ranked[at - 1]].turn > st.slots[j].turn {
+            ranked[at] = ranked[at - 1];
+            at -= 1;
+        }
+        ranked[at] = j;
+        n += 1;
+    }
+    for (rank, &j) in ranked[..n].iter().enumerate() {
+        let p = PRIORITY_KIST - rank as u32;
+        if st.slots[j].prio != p {
+            st.slots[j].prio = p;
+            group_priority(s, j, p);
+        }
+    }
 }
 
 /// `words` appended to slot `k`'s stream (padded with NOPs to the next 64 bytes: the front end fetches the ring a line at a time and keeps the line, 2026-11-04), its insert offset published, its doorbell rung. The ring is `RING_PAGES` and the stream reads it at the insert offset modulo that: a slot holds at most `FLIGHT` jobs of at most `JOB_WORDS_MOST` words, less than the ring, so no word the stream has not read is written over. Under the lock.
@@ -476,6 +546,7 @@ fn reap(st: &mut State, k: usize, now: u64, wake: &mut Option<usize>) -> bool {
             qu.ring().finish(queue_done(&st.slots[k]), 0);
             *wake = Some(qu.cpu + q::DONE * 8);
         }
+        rotate(st, k);
     }
     if st.slots[k].len == 0 {
         return call;
@@ -857,6 +928,8 @@ fn slot_for(st: &mut State, stamp: &Stamp, bbase: u64, bsize: u64) -> Option<usi
     st.slots[k].running = false;
     st.slots[k].kernels = 0;
     st.slots[k].code_used = 0;
+    st.slots[k].demoted = false;
+    st.slots[k].turn = 0;
     bind(s, &mut st.slots[k], stamp, bbase, bsize);
     // The thread storage descriptor every job of the slot names: no local storage (G#8000_0000 packed as log2), as since 2026-11-04.
     for j in 0..8 {
@@ -1007,7 +1080,7 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
         }
         // The client's block: the first region inside the arena (a client holds one; a holder of the whole arena, a development spawn's `--dma arena`, gets the whole).
         let block = stamp.regions().iter().copied().find(|&(b, sz)| arena_ok && b as usize >= arena && b as usize + sz as usize <= arena + arena_bytes);
-        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=6).contains(&m[0])) else {
+        let Some((bbase, bsize)) = block.filter(|_| !m.is_empty() && (1..=7).contains(&m[0])) else {
             ferros_sys::reply(&token, &reply[..reply_len]);
             continue;
         };
@@ -1118,6 +1191,23 @@ pub fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], core
                     Some(c) => ferros_sys::reply(&token, &[0, c as u8]),
                     None => ferros_sys::reply(&token, &[1, 0]),
                 };
+                continue;
+            }
+            // `[7]`: the client's group runs as a kist's from now (priority 8 and the kists' turns, `rotate`), a measure (compbench beside a hostile client, both as kists): a client may only give up its standing, never take one. `[0]`.
+            7 => {
+                with(|st| {
+                    let k = slot_for(st, &stamp, bbase, bsize)?;
+                    let sl = &mut st.slots[k];
+                    if !sl.display {
+                        sl.demoted = true;
+                        if sl.running && sl.prio > PRIORITY_KIST {
+                            sl.prio = PRIORITY_KIST;
+                            group_priority(s, k, PRIORITY_KIST);
+                        }
+                    }
+                    Some(())
+                });
+                ferros_sys::reply(&token, &[0]);
                 continue;
             }
             // `[6][1]` the GPU's clock held up whatever is queued, `[6][0]` let go (a development measure: what the turns cost a frame), `[0]`.
