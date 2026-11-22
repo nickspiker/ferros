@@ -759,6 +759,16 @@ impl Source {
 /// Unmeasured on the Pro: Lumis's range is taken as 0 to 2^3 diopters (12.5 cm), mapped straight onto the actuator's range, infinity at `focus_min`.
 const NEAREST_DIOPTERS: f64 = (1 << 3) as f64;
 
+/// A camera's focus as Lumis drives it: the actuator's code at infinity (0 diopters), its code at the nearest focus, and that nearest focus in diopters. From the list's calibration where the driver gives it (`focus_infinity`, `focus_near`, `focus_near_mm`: either direction; the owner, 2026-11-22: the front's slider went from infinity to "way past infinity", its listed range being the main's, unmeasured), else the actuator's whole travel at `NEAREST_DIOPTERS` as before; None for a camera without focus.
+fn focus_span(cam: &camera::Camera) -> Option<(u32, u32, f64)> {
+    // WHY the filter on the mm: a driver that knows the codes but not the distance says 0, and the nearest in diopters (1000 over it) would be infinite.
+    match (cam.focus_infinity, cam.focus_near) {
+        (Some(inf), Some(near)) if inf != near => Some((inf, near, cam.focus_near_mm.filter(|&mm| mm > 0).map_or(NEAREST_DIOPTERS, |mm| 1000. / mm as f64))),
+        _ if cam.focus_max > cam.focus_min => Some((cam.focus_min, cam.focus_max, NEAREST_DIOPTERS)),
+        _ => None,
+    }
+}
+
 /// ISO for the driver's analogue gain: unity (1024) as ISO 100, the convention Camera2 HALs report a sensor's base gain as.
 const ISO_AT_UNITY: f64 = 100.;
 
@@ -856,7 +866,7 @@ fn camera_infos(cameras: &[camera::Camera]) -> Vec<CameraInfo> {
                 sensor_height: c.sensor_mm.1,
                 focal_lengths: if c.focal_mm > 0. { vec![c.focal_mm] } else { Vec::new() },
                 apertures: if c.f_number > 0. { vec![c.f_number] } else { Vec::new() },
-                min_focus_distance: if c.focus_max > c.focus_min { NEAREST_DIOPTERS as f32 } else { 0. },
+                min_focus_distance: focus_span(c).map_or(0., |s| s.2 as f32),
                 has_ois: false,
                 // Shown as "RAW": full manual control of a raw stream.
                 hardware_level: 1,
@@ -1064,7 +1074,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         max_iso,
         min_exposure_ns: cam.exposure_min as f64,
         max_exposure_ns: cam.exposure_max as f64,
-        min_focus: if cam.focus_max > cam.focus_min { NEAREST_DIOPTERS } else { 0. },
+        min_focus: focus_span(&cam).map_or(0., |s| s.2),
         initial_iso: seed_iso,
         initial_shutter_ns: seed_shutter,
         focal_length_mm: 0.,
@@ -1097,7 +1107,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     }
     *opened.lock().unwrap() = Some(Opened::Memory { ptr: integrator.get_shared_memory_ptr() as usize, bytes: app::shared_memory_bytes(first.width, first.height) });
     let gain_of = |iso: i32| (iso as f64 * camera::GAIN_UNITY as f64 / ISO_AT_UNITY) as u64;
-    let focus_of = |diopters: f32| cam.focus_min as u64 + ((diopters as f64 / NEAREST_DIOPTERS) * (cam.focus_max - cam.focus_min) as f64) as u64;
+    // Diopters onto the actuator, from its code at infinity to its code at the nearest (`focus_span`), either direction.
+    let span = focus_span(&cam);
+    let focus_of = |diopters: f32| span.map_or(0, |(inf, near, nearest)| (inf as f64 + (near as f64 - inf as f64) * (diopters as f64 / nearest)).round() as u64);
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     let mut frames = 0u64;
@@ -1689,7 +1701,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         if shutter_ns != sent.1 && !set(camera::SET_EXPOSURE, shutter_ns as u64) {
             println!("lumis: the camera did not take exposure {shutter_ns} ns");
         }
-        if focus != sent.2 && cam.focus_max > cam.focus_min && !set(camera::SET_FOCUS, focus_of(focus)) {
+        if focus != sent.2 && span.is_some() && !set(camera::SET_FOCUS, focus_of(focus)) {
             println!("lumis: the camera did not take focus G#{:X}", focus_of(focus));
         }
         sent = (iso, shutter_ns, focus);

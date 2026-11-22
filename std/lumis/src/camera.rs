@@ -112,6 +112,10 @@ pub struct Camera {
     pub gain_max: u32,
     pub focus_min: u32,
     pub focus_max: u32,
+    /// The actuator's code at infinity and at its nearest focus, and that distance in mm, where the driver knows them (from the module's calibration or a sweep; the list's `focus_infinity`, `focus_near`, `focus_near_mm`): either order, the direction the larger. None from a driver before them; focus_min and focus_max stay the full travel.
+    pub focus_infinity: Option<u32>,
+    pub focus_near: Option<u32>,
+    pub focus_near_mm: Option<u32>,
     /// The optics (the driver's list since 2026-11-17, Android's Camera2 values; 0 from a driver before, which Lumis's page shows as unknown): the sensor's size and the focal length in mm, the f-number.
     pub sensor_mm: (f32, f32),
     pub focal_mm: f32,
@@ -165,6 +169,9 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 gain_max: u("gain_max")? as u32,
                 focus_min: u("focus_min")? as u32,
                 focus_max: u("focus_max")? as u32,
+                focus_infinity: u("focus_infinity").map(|v| v as u32),
+                focus_near: u("focus_near").map(|v| v as u32),
+                focus_near_mm: u("focus_near_mm").map(|v| v as u32),
                 // Optional: a driver from before has none, and the page then shows the optics as unknown.
                 sensor_mm: (one("sensor_width_mm"), one("sensor_height_mm")),
                 focal_mm: one("focal_mm"),
