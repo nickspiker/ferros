@@ -4098,6 +4098,7 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
         fps_dot(mask, width, height);
         return;
     }
+    let t_neon = now();
     // The rows by stripes across the publish workers and this thread, as `publish10x4` splits the deck's (2026-11-11: an app's whole-screen frame, Mahere's map from the GPU every frame, took 28 ms of one thread a show on the Pro). Each row is its own: its composition, its codes (`codes_row`, a scratch a thread), its hit map row and its phases' words. A capture (op 30) stays on this thread.
     let workers = PUB_UP.load(Ordering::Acquire) as usize;
     if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 || unsafe { CAPTURE } != 0 {
@@ -4127,6 +4128,10 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
         }
         APP_TAIL.fetch_add(now() - t_tail, Ordering::Relaxed);
         unsafe { PUB_KIND = 0 };
+    }
+    // NEON's cost for the crossover while the GPU compose is on (gpu.rs `cost_add`).
+    if check.is_none() {
+        gpu::neon_took(r, mask, ferros_sys::us_since(t_neon));
     }
     if unsafe { CAPTURE } != 0 {
         return;
@@ -10826,6 +10831,20 @@ fn server(grants: u64) -> ! {
                     tlog.s(b" us the round each, A#");
                     tlog.dec(neon);
                     tlog.s(b" frames left to NEON");
+                    let (c, line, crossed) = gpu::costs();
+                    tlog.s(b" (A#");
+                    tlog.dec(crossed);
+                    tlog.s(b" by the crossover; NEON A#");
+                    tlog.dec(c[0].0);
+                    tlog.s(b" us + A#");
+                    tlog.dec(c[0].1);
+                    tlog.s(b" ns a pixel, the GPU A#");
+                    tlog.dec(c[1].0);
+                    tlog.s(b" us + A#");
+                    tlog.dec(c[1].1);
+                    tlog.s(b" ns, crossing at A#");
+                    tlog.dec(line);
+                    tlog.s(b" pixels)");
                 }
                 tlog.s(b"\n");
                 tlog.flush();

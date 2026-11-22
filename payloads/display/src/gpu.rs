@@ -245,6 +245,13 @@ pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool
         NEON_FRAMES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    // The crossover (step 3): the cheaper path by the display's own measured costs.
+    let px = ((r.x1 - r.x0) * (r.y1 - r.y0)) as u64 * (mask & 15).count_ones() as u64;
+    if !gpu_cheaper(px) {
+        CROSSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let t0 = ferros_sys::now();
     front_update(width, height);
     // SAFETY: `READY` was read above (Acquire), and only this thread uses the context after it.
     let Some(c) = (unsafe { (*(&raw mut CTX)).as_mut() }) else { return false };
@@ -302,6 +309,7 @@ pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool
         return false;
     }
     JOBS.fetch_add(nj as u64, Ordering::Relaxed);
+    cost_add(1, px, ferros_sys::us_since(t0));
     if hits {
         for y in r.y0 as usize..r.y1 as usize {
             hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
@@ -515,4 +523,67 @@ pub fn check_say(k: usize, width: usize, height: usize) {
         None => l.s(b"display: GPU compose check: the GPU does not compose this frame (step 2's windows, the view, or a failed job)\n"),
     }
     l.flush();
+}
+
+// ---- the crossover (GPU-COMPOSE.md knob 0, section 1.6, step 3) ----
+
+/// A path's cost as the render thread measures it, a + b · pixels (µs): `a` what a frame costs before its first pixel (on the GPU the queue's round and the cores' wake; on NEON the workers' wake), followed by the small frames' wall times; `b` each pixel's share, followed by the large frames' (`a` taken off first). Each an average that halves an old frame's weight every 2^4 frames, so the line follows the clocks, the heat and the contention by itself, and nobody picks it. Seeded from compbench (GPU-KISTS.md section 3, "Small damage") until the display's own frames replace it.
+#[derive(Clone, Copy)]
+struct Cost {
+    a: f32,
+    b: f32,
+}
+/// NEON's and the GPU's costs (the render thread's alone).
+static mut COSTS: [Cost; 2] = [Cost { a: 64., b: 1. / 1024. }, Cost { a: 512., b: 1. / 2048. }];
+/// Frames under 2^14 pixels feed `a`, frames over 2^18 feed `b`.
+const SMALL: u32 = 14;
+const LARGE: u32 = 18;
+/// How fast the averages forget: 2^-4 of a new frame each.
+const FORGET: f32 = 1. / (1 << 4) as f32;
+/// One frame in 2^5 goes the other way, so the path not taken keeps being measured.
+const EXPLORE: u64 = (1 << 5) - 1;
+static DECISIONS: AtomicU64 = AtomicU64::new(0);
+/// Frames the crossover sent to NEON (since the stats line).
+static CROSSED: AtomicU64 = AtomicU64::new(0);
+
+fn cost_at(c: Cost, px: u64) -> f32 {
+    c.a + c.b * px as f32
+}
+
+/// A frame's wall time on path `p` (0 NEON, 1 the GPU) taken into its cost.
+fn cost_add(p: usize, px: u64, us: u64) {
+    let c = unsafe { &mut (*(&raw mut COSTS))[p] };
+    let us = us as f32;
+    if px < 1 << SMALL {
+        c.a += (us - c.a) * FORGET;
+    } else if px > 1 << LARGE {
+        let b = (us - c.a) / px as f32;
+        // A large frame faster than the fixed part says nothing of the pixels' share (a fluke of the clocks): left out, so `b` stays positive.
+        if b > 0. {
+            c.b += (b - c.b) * FORGET;
+        }
+    }
+}
+
+/// Whether the GPU takes a frame of `px` pixels (summed over its phases): the cheaper path by the costs, the other one frame in 2^5.
+fn gpu_cheaper(px: u64) -> bool {
+    let c = unsafe { *(&raw const COSTS) };
+    let gpu = cost_at(c[1], px) < cost_at(c[0], px);
+    let n = DECISIONS.fetch_add(1, Ordering::Relaxed);
+    if n & EXPLORE == EXPLORE { !gpu } else { gpu }
+}
+
+/// A NEON publish's wall time while the GPU compose is on (main.rs `publish_app_mask`): into NEON's cost.
+pub fn neon_took(r: draw::Rect, mask: u32, us: u64) {
+    if ON.load(Ordering::Acquire) && STATE.load(Ordering::Acquire) == READY {
+        cost_add(0, ((r.x1 - r.x0) * (r.y1 - r.y0)) as u64 * (mask & 15).count_ones() as u64, us);
+    }
+}
+
+/// The costs now, for the stats line: NEON's and the GPU's (a µs, b ns a pixel), the pixels where they cross, the frames the crossover sent to NEON.
+pub fn costs() -> ([(u64, u64); 2], u64, u64) {
+    let c = unsafe { *(&raw const COSTS) };
+    // The cast saturates: a crossing below 0 pixels (the GPU cheaper at every size) says 0.
+    let line = if c[0].b > c[1].b { ((c[1].a - c[0].a) / (c[0].b - c[1].b)) as u64 } else { u64::MAX };
+    (c.map(|c| (c.a as u64, (c.b * 1000.) as u64)), line, CROSSED.swap(0, Ordering::Relaxed))
 }
