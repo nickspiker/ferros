@@ -19,7 +19,7 @@ fn ink(gamma2: u32) -> u32 {
     dark(fmt(vsf(from_gamma2(gamma2 & 0x00FF_FFFF))))
 }
 
-/// A device theme as fluor's look: the words in its text colours, the controls in its button row (fill, held, the two edges), a field on its plane, and the app's ground, accent and ring.
+/// A device theme as fluor's look: the words in its text colours, the controls in its button row (fill, held, the two edges), a field on its plane, black while it is being typed in (as fluor's TEXTBOX_ACTIVE on every other platform; owner, 2026-11-21), and the app's ground, accent and ring.
 pub fn look_of(t: &ferros_theme::Theme) -> Look {
     let [fill, held, light, shadow] = t.button;
     Look {
@@ -27,7 +27,7 @@ pub fn look_of(t: &ferros_theme::Theme) -> Look {
         label: ink(t.text2),
         field: ink(t.plane),
         field_hover: ink(t.plane),
-        field_active: ink(t.plane),
+        field_active: ink(0),
         light_edge: ink(light),
         shadow_edge: ink(shadow),
         selection: ink(held),
