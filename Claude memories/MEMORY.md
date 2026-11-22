@@ -109,7 +109,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [TTL 63 everywhere](cellular_ttl_63.md) - TTL/hop limit 63 for all ferros traffic (`HOP` in payloads/ip)
 - [APK support is required to ship](apk_support_required.md) - compiled on device at stow, sealed; never translated at runtime
 - [toka pipeline + trust model A](toka_pipeline_trust_model_a.md) - device compiles everything; toka = WASM fork
-- [GPU role: layers](gpu_role_layers.md) - GPU makes compute-dense layers in a shared arena; under + present stay NEON
+- [GPU role: compose reversed](gpu_role_layers.md) - since 2026-11-21 the GPU composites full frames + damage above the measured crossover; NEON small damage
 - [tapuwae: NEON then GPU](tapuwae_neon_then_gpu.md) - attest mark on NEON now; convert to the Mali GPU later
 - [Photon on ferros: no bootstrap](photon_on_ferros_no_bootstrap.md) - peers from pairing + LAN; UDP 4383; device key from ira
 - [fgtw.org serves plain HTTP](fgtw_plain_http_for_ferros.md) - port 80, no redirect; never enable Always Use HTTPS
