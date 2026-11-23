@@ -774,8 +774,10 @@ fn advance(g: u64, s: &mut State, link_only: bool) -> bool {
 }
 
 /// The heap the documents are built and read in (as payloads/gps).
-/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
-const HEAP_CEILING: usize = 1 << 19;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md steps 1 and 2): the interim ceiling every growing payload declares until step 3 (ferros_heap::INTERIM_CEILING), addresses only.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
+/// The heap the kernel maps at spawn, as a log2 (the header's start-size word, process.rs `image_start`): 1 << 19, what the static array held until step 1, so the arc starts as it did and grows from there as the heap runs out. A kernel from before step 2 maps its 4 MiB instead.
+const HEAP_START_LOG2: usize = 19;
 unsafe extern "C" {
     /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
     static __bss_end: u8;
@@ -1238,4 +1240,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
-ferros_sys::entry!(payload_main, grows HEAP_CEILING);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING, starts HEAP_START_LOG2);

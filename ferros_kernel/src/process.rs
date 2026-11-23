@@ -31,8 +31,8 @@ const ARC_MIN_LOG2: u32 = 16;
 
 /// The windows' address space (cachemap ARC_VA) as a buddy allocator: a window is a power of two at an address aligned to it, so a masked arc's base is aligned to any size it can grow to.
 struct Arcs {
-    /// Free blocks per size class (log2 size → block bases): up to 2^39, past the 64 GiB of windows.
-    free: [Vec<usize>; 40],
+    /// Free blocks per size class (log2 size → block bases): up to 2^47, the largest aligned block of the 48-bit windows' space (cachemap ARC_VA, docs/NO-CEILINGS.md step 2).
+    free: [Vec<usize>; 48],
     init: bool,
 }
 
@@ -807,12 +807,12 @@ fn wake_count(kind: usize, ticks: u64) {
 
 
 /// The windows' free address space (cachemap ARC_VA).
-static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 40], init: false }));
+static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 48], init: false }));
 
 fn arcs() -> &'static mut Arcs {
     let a = unsafe { &mut *ARCS.0.get() };
     if !a.init {
-        // The windows' space as aligned power-of-two chunks, largest first (64 GiB: one chunk).
+        // The windows' space as aligned power-of-two chunks (512 GiB to 256 TiB: one of each size from 2^39 to 2^47).
         let (p0, p1) = crate::cachemap::ARC_VA;
         let mut at = p0;
         while at < p1 {
@@ -843,17 +843,22 @@ fn buddy_take(a: &mut Arcs, block: usize) -> Option<usize> {
 }
 
 /// A free window of `block` bytes at `base` back to the windows' space, merged with its buddies while they are free.
+/// Buddies by absolute address (`base ^ block`): the space no longer starts on a multiple of its own size (512 GiB to 256 TiB, docs/NO-CEILINGS.md step 2), so a buddy taken relative to its start would not be aligned to the pair's size; the chunks `arcs` starts with are aligned absolutely, and so is every block split from them.
 fn buddy_give(base: usize, block: usize) {
     let a = arcs();
     let (p0, p1) = crate::cachemap::ARC_VA;
     let mut base = base;
     let mut k = block.trailing_zeros() as usize;
-    while (1usize << k) < p1 - p0 {
-        let buddy = p0 + ((base - p0) ^ (1 << k));
-        match a.free[k].iter().position(|&b| b == buddy) {
+    loop {
+        let parent = base & !(1usize << k);
+        // WHY: a merge stops where the pair would reach past the windows' space (the chunk of 2^39 at 512 GiB has its buddy at 0, outside), so no block outside it is ever made.
+        if parent < p0 || parent + (2usize << k) > p1 {
+            break;
+        }
+        match a.free[k].iter().position(|&b| b == base ^ (1 << k)) {
             Some(i) => {
                 a.free[k].swap_remove(i);
-                base = base.min(buddy);
+                base = parent;
                 k += 1;
             }
             None => break,
@@ -922,7 +927,9 @@ pub fn arc_alloc_room(bytes: usize, ceiling: usize, masked: bool) -> Option<Arc>
     let ceiling = arc_shape(ceiling, masked).max(size);
     let guard = if masked { GUARD } else { 0 };
     // The window: a power of two that holds the ceiling and the guard, so a masked arc's base is aligned to any size it grows to and every address past its guard is unmapped.
-    let window = (ceiling + guard).next_power_of_two().max(crate::frames::FRAME);
+    // An arc that may grow takes twice what the device holds (docs/NO-CEILINGS.md 0.1, step 2: the lower half its image and heap, the upper half its stacks once they grow on their own, step 6), so a ceiling raised to the device's memory (step 3) never needs a larger window; addresses only, as the windows' space is 255.5 TiB (8176 such windows on the Pro, 16352 on the 8a).
+    let room = if ceiling > size { crate::frames::map_bytes().next_power_of_two() << 1 } else { 0 };
+    let window = (ceiling + guard).next_power_of_two().max(crate::frames::FRAME).max(room);
     if crate::frames::free() < size.div_ceil(crate::frames::FRAME) {
         return None;
     }
@@ -940,6 +947,10 @@ pub fn arc_alloc_room(bytes: usize, ceiling: usize, masked: bool) -> Option<Arc>
 fn arc_resize(arc: &mut Arc, size: usize) -> Result<(), u64> {
     use crate::frames::FRAME;
     let mapped = size.next_multiple_of(FRAME);
+    // The window's tables over the slots about to be mapped, before the frames are counted: a table frame taken here is one the count below no longer sees.
+    if mapped > arc.mapped && !crate::cachemap::tables_ready(arc.base + arc.mapped, arc.base + mapped) {
+        return Err(ARC_WHY_MEMORY);
+    }
     if mapped > arc.mapped && crate::frames::free() < (mapped - arc.mapped) / FRAME {
         return Err(ARC_WHY_MEMORY);
     }
@@ -8374,8 +8385,8 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
         return Err(ARC_WHY_OP);
     }
     let n = n as usize;
-    // WHY the bound: n is the process's; a grow past the 64 GiB no window reaches is refused before the sum could wrap.
-    if op == ARC_GROW && n > 1 << 36 {
+    // WHY the bound: n is the process's; a grow past its own window can never be mapped, and is refused before `old + n` could wrap (the window is at most 2^47, so the sum of two values under it cannot).
+    if op == ARC_GROW && n > p.arc.window {
         return Err(ARC_WHY_CEILING);
     }
     let want = if op == ARC_GROW { old + n } else { n };
@@ -10332,22 +10343,30 @@ fn image_grows(code: &[u8]) -> bool {
     has_image_header(code) && code[4] & 1 == 1
 }
 
-/// The zeroed tail the kernel maps after an image at spawn: .bss plus 16 and the heap, or, for a growing image, the heap it starts with (`HEAP_START`, or less when it declared less).
+/// The zeroed tail the kernel maps after an image at spawn: .bss plus 16 and the heap, or, for a growing image, the heap it starts with (`image_heap_start`).
 fn image_tail(code: &[u8]) -> usize {
     if !has_image_header(code) {
         return 0;
     }
-    let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
+    let w = u64::from_le_bytes(code[16..24].try_into().unwrap()) as u128;
     // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
-    // WHY the min: both words are the image's, a gigabyte is past any arc the pool would give (an image declaring more is refused for room, not sized past the windows).
-    (w(16) + image_heap_start(code)).min(1 << 30)
+    // WHY the min: both words are the image's; taken in 128 bits the sum cannot wrap, and past the pool's bytes no arc could hold it (the spawn is then refused for its frames). Until docs/NO-CEILINGS.md step 2 the bound was a gigabyte, a guess.
+    (w + image_heap_start(code) as u128).min(crate::frames::map_bytes() as u128) as usize
 }
 
-/// The heap an image starts with: its whole declared heap (header word 48), or for a growing image `HEAP_START` when it declared more. Never more than it declared, so the declared heap less this cannot wrap.
+/// The heap an image starts with: its whole declared heap (header word 48), or for a growing image the start its header names (`image_start`) when it declared more. Never more than it declared, so the declared heap less this cannot wrap.
 fn image_heap_start(code: &[u8]) -> usize {
     let declared = u64::from_le_bytes(code[48..56].try_into().unwrap()) as usize;
-    // WHY the choice: a growing image starts with HEAP_START, never with more than its build declared.
-    if image_grows(code) && declared > HEAP_START { HEAP_START } else { declared }
+    let start = image_start(code);
+    // WHY the choice: a growing image starts with its start, never with more than its build declared.
+    if image_grows(code) && declared > start { start } else { declared }
+}
+
+/// The heap a growing image asks to be mapped at spawn (docs/NO-CEILINGS.md step 2, the start-size word): bits 8 to 13 of its header's word at offset 4, the start's log2, 0 for the kernel's `HEAP_START`. A ceiling and a start apart, so a small process starts small and still grows (init's 256 KiB, pcie1's 128 KiB); a kernel from before reads bit 0 alone and maps `HEAP_START`.
+fn image_start(code: &[u8]) -> usize {
+    // WHY the mask: the field is six bits of the image's word, so the shift is under 64 and 1 << k is a usize; `image_heap_start` holds the start to the heap declared.
+    let k = code[5] & 63;
+    if k == 0 { HEAP_START } else { 1 << k }
 }
 
 /// The zeroed tail at its most: .bss plus 16 and the whole declared heap (the arc's ceiling), up to the board's whole pool.
@@ -10358,7 +10377,7 @@ fn image_tail_ceiling(code: &[u8]) -> usize {
         return 0;
     }
     let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as u128;
-    // WHY the min: both words are the image's; past the pool's bytes no arc could hold it, and the window it sizes (a power of two of the 64 GiB arc space) would only spend addresses other arcs need. PROOF it is needed: without it an image declaring a heap near 2^64 makes `arc_alloc_room`'s `(ceiling + guard).next_power_of_two()` overflow, which the release kernel (no overflow checks) wraps to 0, so the window is one frame while the ceiling lets SYS_ARC grow the arc over the windows of the arcs after it; and one declaring a few hundred GiB takes a window no power of two of the arc space holds, so it is refused for room though the pool could run it.
+    // WHY the min: both words are the image's; past the pool's bytes no arc could hold it, and the window it sizes (a power of two of the arcs' space) would only spend addresses other arcs need. PROOF it is needed: without it an image declaring a heap near 2^64 makes `arc_alloc_room`'s `(ceiling + guard).next_power_of_two()` overflow, which the release kernel (no overflow checks) wraps to 0, so the window is one frame while the ceiling lets SYS_ARC grow the arc over the windows of the arcs after it; and one declaring a few hundred GiB takes a window no power of two of the arc space holds, so it is refused for room though the pool could run it.
     (w(16) + w(48)).min(crate::frames::map_bytes() as u128) as usize
 }
 

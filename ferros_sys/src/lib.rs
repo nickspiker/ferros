@@ -3565,6 +3565,29 @@ _entry:
             ceiling = const $ceiling
         );
     };
+    // A growing heap that starts smaller than the kernel's 4 MiB (docs/NO-CEILINGS.md step 2, the start-size word): bits 8 to 13 of the pad word the log2 of the heap the kernel maps at spawn (process.rs `image_start`), the rest asked for as it runs out. A kernel from before reads bit 0 alone and maps its 4 MiB.
+    ($main:path, grows $ceiling:expr, starts $log2:expr) => {
+        core::arch::global_asm!(
+            r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte {flags}
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad {ceiling}
+    .size _entry, . - _entry
+"#,
+            main = sym $main,
+            flags = const 1 | (($log2 & 63) << 8),
+            ceiling = const $ceiling
+        );
+    };
 }
 
 /// Whether a data link is up: cellular or WiFi in state 2, connected (facts 33-48, `measure::STATE`; links 0 cellular, 1 WiFi). For a screen that waits on the network to say so (ahau, owner 2026-11-09: "should say something like 'waiting for connectivity'").

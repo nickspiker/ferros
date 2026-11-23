@@ -5324,6 +5324,8 @@ pub fn run(mut b: Boot) -> ! {
                     resp.extend_from_slice(crate::frames::map_report().as_bytes());
                     resp.extend_from_slice(crate::process::with_lock(crate::frames::pool_report).as_bytes());
                     resp.extend_from_slice(crate::frames::wipe_report().as_bytes());
+                    // The windows' tables (docs/NO-CEILINGS.md step 2): frames taken for the level-1 and level-2 tables of the 48-bit windows' space.
+                    resp.extend_from_slice(alloc::format!("window tables: A#{} frames\n", crate::process::with_lock(crate::cachemap::table_frames)).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

@@ -2,7 +2,7 @@
 //!
 //! It translates nothing (virtual = physical) and isolates nothing — isolation is compiled masking plus EL0. It exists because on ARM, with the MMU off, every data access is Device memory: no data cache, exclusives (atomics) not guaranteed, unaligned accesses fault. Measured on husky with the MMU off: a 4 MiB copy in 157 ms, BLAKE3 at 1.6 MB/s.
 //!
-//! Layout (4 KiB granule, 39-bit VA, walk starts at level 1):
+//! Layout (4 KiB granule, 48-bit VA since docs/NO-CEILINGS.md step 2, walk starts at level 0; level 0's first entry is the level-1 table that was the whole table under the 39-bit VA, so everything below 512 GiB kept its address):
 //! - Every 1 GiB block is Device-nGnRnE, exactly what the MMU-off world was, so nothing outside the window changes and nothing there is ever speculatively touched (secure carveouts stay safe).
 //! - The GiB holding the window gets a level-2 table: the window's 2 MiB blocks are Normal write-back; the rest stay Device.
 //! - The 2 MiB blocks holding the device DMA buffers (`.bss.dma`) get level-3 tables: those 4 KiB pages are Normal non-cacheable, so DMA never needs cache maintenance. The one exception is UFS's 1 MiB run bounce (process.rs `UFS_RUN`, 2026-11-11): Normal write-back, kept right by the cache upkeep every UFS command already does around its data.
@@ -18,6 +18,8 @@ use core::arch::asm;
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
 
+/// Level 0 (docs/NO-CEILINGS.md step 2): entry 0 is `L1`, the first 512 GiB, every address ferros had before; entries 1 to 511 the arcs' windows (`ARC_VA`), each a level-1 table taken from the pool when the first window maps a frame under it (`tables_ready`).
+static mut L0: Table = Table([0; 512]);
 static mut L1: Table = Table([0; 512]);
 static mut L2: Table = Table([0; 512]);
 /// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except the surfaces, sprites and canvas.
@@ -28,11 +30,77 @@ static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
 /// Level 3 for the IPC window's first 2 MiB: its pages Device, as the block was, except the TX ring's (`MODEM_TX_NC`), Normal non-cacheable.
 static mut L3_MODEM: Table = Table([0; 512]);
 
-/// The arcs' virtual windows (ARCS.md, 2026-11-11): every process's arc is a window of addresses here, its 2 MiB slots mapped to frames of the pool wherever they lie (frames.rs), so an arc grows by mapping more and moves by remapping, and no process ever sees an address change. 64 GiB from G#40_0000_0000: above every address the SoC decodes on either board (DRAM ends at G#B_0000_0000), inside the 39-bit space TTBR0 walks. Until 2026-11-11 arcs were the physical pools themselves, identity-mapped (POOL's and POOL_BIG's own level-3 tables, which this replaces).
+/// The arcs' virtual windows (ARCS.md, 2026-11-11): every process's arc is a window of addresses here, its 2 MiB slots mapped to frames of the pool wherever they lie (frames.rs), so an arc grows by mapping more and moves by remapping, and no process ever sees an address change. From 512 GiB to 256 TiB since docs/NO-CEILINGS.md step 2 (owner, 2026-11-23: "all yes"), level 0's entries past its first: above every address the SoC decodes on either board (DRAM ends at G#B_0000_0000). Until then 64 GiB from G#40_0000_0000 inside the 39-bit space, which every growing image's window would have spent a few at a time once windows hold what the device holds. Its tables (a level-1 table each 512 GiB, a level-2 table each GiB) are taken from the pool as a frame is first mapped under them (`tables_ready`) and kept for the boot, so addresses cost nothing until they hold a frame. Until 2026-11-11 arcs were the physical pools themselves, identity-mapped (POOL's and POOL_BIG's own level-3 tables, which this replaces).
 /// Why windows and not a base register for every mode (ARCS.md proposed fixed and ring move by x28 alone): masked code keeps only the low bits of a data pointer, but its code pointers are whole addresses (return addresses on its stack, the vtables its relocations filled, function pointers), and a branch is not masked, so after a copy to a new base the first `ret` would jump into the old frames.
-pub const ARC_VA: (usize, usize) = (0x40_0000_0000, 0x50_0000_0000);
-/// Level 2 for each GiB of the windows: an entry per 2 MiB slot, pointing at the level-3 table of the frame mapped there (frames.rs `table`), or invalid.
-static mut L2_ARCS: [Table; 64] = [const { Table([0; 512]) }; 64];
+pub const ARC_VA: (usize, usize) = (1 << 39, 1 << 48);
+
+/// The windows' tables: 4 KiB each, cut from a frame of the pool taken when the last one is used up, zeroed as they are given, kept for the boot (a window freed leaves its tables for the next window over the same addresses). Under the kernel lock, as every arc's making and growth is.
+struct Tables {
+    /// The frame tables are cut from now (its physical address, the kernel's own mapping of it), 0 before the first.
+    frame: usize,
+    /// Tables given from it.
+    used: usize,
+    /// Frames taken for tables (diagnostics).
+    frames: usize,
+}
+static mut TABLES: Tables = Tables { frame: 0, used: 0, frames: 0 };
+
+/// A zeroed 4 KiB table from `TABLES`, None when the pool has no frame left for a new run of them.
+fn table_take() -> Option<usize> {
+    let t = unsafe { &mut *(&raw mut TABLES) };
+    if t.frame == 0 || t.used == MIB2 / PAGE {
+        let f = crate::frames::take()?;
+        t.frame = crate::frames::pa(f);
+        t.used = 0;
+        t.frames += 1;
+    }
+    let a = t.frame + t.used * PAGE;
+    t.used += 1;
+    unsafe { core::ptr::write_bytes(a as *mut u8, 0, PAGE) };
+    Some(a)
+}
+
+/// Frames the windows' tables hold (diagnostics).
+pub fn table_frames() -> usize {
+    unsafe { (*(&raw const TABLES)).frames }
+}
+
+/// The table an entry points at, None while it is invalid.
+fn next_table(e: u64) -> Option<usize> {
+    (e & 3 == TABLE_OR_PAGE).then_some((e & OA) as usize)
+}
+
+/// Every level-1 and level-2 table the window slots in `[lo, hi)` (inside `ARC_VA`) walk thru, made where missing. False when the pool has no frame for one: nothing is mapped then, and the tables made so far stay for the next try. Before `map_slot` over a range it has not mapped before.
+pub fn tables_ready(lo: usize, hi: usize) -> bool {
+    let l0 = unsafe { &mut (*(&raw mut L0)).0 };
+    let mut g = lo & !(GIB - 1);
+    while g < hi {
+        let e0 = &mut l0[g >> 39];
+        let l1 = match next_table(*e0) {
+            Some(t) => t,
+            None => {
+                let Some(t) = table_take() else { return false };
+                *e0 = t as u64 | TABLE_OR_PAGE;
+                t
+            }
+        };
+        let e1 = unsafe { &mut (*(l1 as *mut [u64; 512]))[(g >> 30) & 511] };
+        if next_table(*e1).is_none() {
+            let Some(t) = table_take() else { return false };
+            *e1 = t as u64 | TABLE_OR_PAGE;
+        }
+        g += GIB;
+    }
+    // The new tables written before any core walks them (an entry going from invalid to valid needs no invalidation).
+    mapped();
+    true
+}
+
+/// The level-2 table window slot `va` walks thru, None while its level-1 or level-2 table has not been made.
+fn slot_l2(va: usize) -> Option<usize> {
+    let l1 = next_table(unsafe { (*(&raw const L0)).0[va >> 39] })?;
+    next_table(unsafe { (*(l1 as *const [u64; 512]))[(va >> 30) & 511] })
+}
 /// Level 2 for the GiBs from G#8_0000_0000 (husky's high bank) that hold frames: the frames Normal and the kernel's alone (it zeroes, copies and scrubs them by their own addresses), every other 2 MiB block Device, as the 1 GiB block was.
 static mut L2_DRAM: [Table; 16] = [const { Table([0; 512]) }; 16];
 /// The first GiB `L2_DRAM` covers.
@@ -263,6 +331,8 @@ const HCR_TGE: u64 = 1 << 27;
 const HCR_E2H: u64 = 1 << 34;
 
 const GIB: usize = 1 << 30;
+/// TCR's T0SZ: 64 less the VA's bits (48 since docs/NO-CEILINGS.md step 2).
+const T0SZ: u64 = 16;
 const MIB2: usize = 1 << 21;
 const PAGE: usize = 1 << 12;
 
@@ -455,10 +525,8 @@ pub fn enable() -> bool {
             }
             l1.0[DRAM_GIB0 + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;
         }
-        // The arcs' windows: every GiB's level-2 table in place, every slot invalid until an arc maps a frame there.
-        for (g, t) in (*(&raw const L2_ARCS)).iter().enumerate() {
-            l1.0[ARC_VA.0 / GIB + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;
-        }
+        // Level 0: the first 512 GiB are `L1`; the arcs' windows above are invalid until an arc maps a frame there (`tables_ready`).
+        (*(&raw mut L0)).0[0] = &raw const L1 as u64 | TABLE_OR_PAGE;
         // The surfaces' window: its level-2 table in place, every block invalid until the first surface is given out (`surface_map`).
         l1.0[SURF_VA.0 / GIB] = &raw const L2_SURF as u64 | TABLE_OR_PAGE;
         // The pucks' window: its level-2 table in place, every block invalid until the first square is given out (`puck_map`).
@@ -498,11 +566,11 @@ pub fn enable() -> bool {
             asm!("mrs {t}, cnthctl_el2", "orr {t}, {t}, #3", "msr cnthctl_el2, {t}", "isb", t = out(reg) _);
             crate::pmu::el0_on();
         }
-        // TCR_EL2. Non-VHE: T0SZ 25, inner/outer write-back walks, inner shareable, 4 KiB granule, 40-bit PA, RES1 bits 23 and 31. VHE (TCR_EL1 layout): the same for TTBR0, TTBR1 walks disabled (EPD1, TG1 = 4 KiB), IPS 40-bit.
+        // TCR_EL2. Non-VHE: T0SZ 16 (48-bit VA, the walk from level 0; T0SZ 25 and 39 bits until docs/NO-CEILINGS.md step 2), inner/outer write-back walks, inner shareable, 4 KiB granule, 40-bit PA, RES1 bits 23 and 31. VHE (TCR_EL1 layout): the same for TTBR0, TTBR1 walks disabled (EPD1, TG1 = 4 KiB), IPS 40-bit.
         let tcr: u64 = if vhe {
-            25 | (1 << 8) | (1 << 10) | (3 << 12) | (25 << 16) | (1 << 23) | (2 << 30) | (2 << 32)
+            T0SZ | (1 << 8) | (1 << 10) | (3 << 12) | (25 << 16) | (1 << 23) | (2 << 30) | (2 << 32)
         } else {
-            25 | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16) | (1 << 23) | (1 << 31)
+            T0SZ | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16) | (1 << 23) | (1 << 31)
         };
         asm!(
             "dsb sy",
@@ -533,7 +601,7 @@ pub fn enable() -> bool {
             "isb",
             mair = in(reg) MAIR,
             tcr = in(reg) tcr,
-            ttbr = in(reg) &raw const L1 as u64,
+            ttbr = in(reg) &raw const L0 as u64,
             t = out(reg) _,
         );
         // BTI for EL0 (SCTLR_EL2.BT0 under VHE): enforced only on guarded pages, which only BTI capsules' code gets (set_arc_wx), so nothing else changes.
@@ -775,16 +843,16 @@ pub fn sync_exec(va: usize, len: usize) {
     unsafe { asm!("dsb ish", "isb") };
 }
 
-/// The level-2 entry of window slot `va`. An address outside the windows is a bug in the caller: the index panics.
+/// The level-2 entry of window slot `va`. A slot whose tables were never made (`tables_ready`) is a bug in the caller: fail loud.
 fn slot_entry(va: usize) -> &'static mut u64 {
-    let g = (va - ARC_VA.0) / GIB;
-    unsafe { &mut (*(&raw mut L2_ARCS))[g].0[(va / MIB2) % 512] }
+    let l2 = slot_l2(va).expect("a window slot mapped without its tables (cachemap::tables_ready)");
+    unsafe { &mut (*(l2 as *mut [u64; 512]))[(va >> 21) & 511] }
 }
 
-/// The level-3 table mapped at window slot `va`, None while the slot is unmapped.
+/// The level-3 table mapped at window slot `va`, None while the slot is unmapped (or no table above it was ever made).
 pub fn slot_table(va: usize) -> Option<usize> {
-    let e = *slot_entry(va);
-    (e & 3 == 3).then_some((e & OA) as usize)
+    let l2 = slot_l2(va)?;
+    next_table(unsafe { (*(l2 as *const [u64; 512]))[(va >> 21) & 511] })
 }
 
 /// Point window slot `va` at another level-3 table (a frame's, frames.rs `table`), or unmap it (0). Call `unmapped` for the slot before its old frame is used again.

@@ -11,6 +11,8 @@ unsafe extern "C" {
     /// The end of .bss (payload.ld): the heap starts there.
     static __bss_end: u8;
 }
+/// The heap the kernel maps at spawn, as a log2 (each puck's `entry!(…, starts HEAP_START_LOG2)`, docs/NO-CEILINGS.md step 2): 2 MiB, what the static array held, the rest asked for as it runs out.
+pub const HEAP_START_LOG2: usize = 21;
 #[global_allocator]
 static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
