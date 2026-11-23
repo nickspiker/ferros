@@ -58,10 +58,10 @@ const AID: [u8; 8] = [0xF0, 0x50, 0x48, 0x4F, 0x54, 0x4F, 0x4E, 0x01];
 // The HS-I2C controller (kernel hsi2c.rs, i2c-exynos5.c auto mode).
 const CTL: u64 = 0x00;
 const FIFO_CTL: u64 = 0x04;
-const TRAILING_CTL: u64 = 0x08;
 const CONF: u64 = 0x40;
-/// The bus's timing words (HS1-HS3, FS1-FS3, SLA: i2c-exynos5.c G#54-G#6C), set by the kernel's `nfc` switch and kept across a controller reset (`reset`).
-const TIMINGS: [u64; 7] = [0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C];
+/// The controller's configuration words, kept across its software reset (`reset`): TRAILING_CTL, CLK_CTL, CLK_SLOT, TIMEOUT, then the timings HS1-HS3, FS1-FS3 and SLA (i2c-exynos5.c G#08-G#10, G#48, G#54-G#6C), as the kernel's `nfc` switch left them (hsi2c.rs `bring_up`). CONF is written last, apart.
+/// TIMEOUT above all: it comes out of reset enabled (bit 31, G#800000FF), and with it on no auto-mode transfer completes; `bring_up` clears it. Measured on the Pro (2026-11-22, b1141): a reset that kept only the timings, TRAILING_CTL and CONF left it G#800000FF and every transfer after failed, the stored nfc too once restarted, since the switch's `ready` does not look at it.
+const KEPT: [u64; 11] = [0x08, 0x0C, 0x10, 0x48, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C];
 const INT_ENABLE: u64 = 0x20;
 const INT_STATUS: u64 = 0x24;
 const FIFO_STATUS: u64 = 0x30;
@@ -308,19 +308,17 @@ impl Nfc {
         }
     }
 
-    /// The controller's software reset with its configuration kept, `exynos5_i2c_reset`'s order: SW_RST set and cleared in CTL, the timing words back, then `exynos5_i2c_init`'s CTL (master), TRAILING_CTL and CONF (auto mode). Whatever reset does to the configuration words, they come back as the kernel's `nfc` switch left them. Every transfer writes its own FIFO_CTL, INT_ENABLE, ADDR and AUTO_CONF.
+    /// The controller's software reset with its configuration kept, `exynos5_i2c_reset`'s order: SW_RST set and cleared in CTL, every word of `KEPT` back (the timeout's among them, off as `bring_up` left it), CTL master, then CONF (auto mode). Whatever reset does to them, they come back as the kernel's `nfc` switch left them. Every transfer writes its own FIFO_CTL, INT_ENABLE, ADDR and AUTO_CONF.
     fn reset(&self) {
         let conf = self.rd(CONF);
-        let trailing = self.rd(TRAILING_CTL);
-        let timings = TIMINGS.map(|o| self.rd(o));
+        let kept = KEPT.map(|o| self.rd(o));
         let c = self.rd(CTL);
         self.wr(CTL, c | CTL_SW_RST);
         self.wr(CTL, c & !CTL_SW_RST);
-        for (&o, v) in TIMINGS.iter().zip(timings) {
+        for (&o, v) in KEPT.iter().zip(kept) {
             self.wr(o, v);
         }
         self.wr(CTL, CTL_MASTER);
-        self.wr(TRAILING_CTL, trailing);
         self.wr(CONF, conf);
     }
 

@@ -34,6 +34,8 @@ const INT_NODEV: u32 = 1 << 10;
 const FIFO_TX_EMPTY: u32 = 1 << 8;
 const FIFO_RX_EMPTY: u32 = 1 << 24;
 const CONF_AUTO_MODE: u32 = 1 << 31;
+/// TIMEOUT's enable (bit 31): on out of reset, off for auto mode to complete a transfer (`bring_up`).
+const TIMEOUT_EN: u32 = 1 << 31;
 const AUTO_READ: u32 = 1 << 16;
 const AUTO_STOP_AFTER_TRANS: u32 = 1 << 17;
 const AUTO_MASTER_RUN: u32 = 1 << 31;
@@ -286,16 +288,18 @@ pub fn bring_up(base: usize, usi_mode: usize, fs_div: u32, trailing: u32) {
     wr(base + CTL, CTL_MASTER);
     wr(base + TRAILING_CTL, trailing);
     // The transfer timeout comes out of reset enabled (TIMEOUT G#48 bit 31; reads G#800000FF cold); with it on, auto-mode transfers never complete. The kernel clears it before every message (`exynos5_i2c_xfer_msg`); hsi2c_11 worked in ferros only because the bootloader had already cleared it there (measured 2026-10-19 by diffing the two controllers' register files).
-    wr(base + TIMEOUT, rd(base + TIMEOUT) & !(1 << 31));
+    wr(base + TIMEOUT, rd(base + TIMEOUT) & !TIMEOUT_EN);
     wr(base + CONF, rd(base + CONF) | CONF_AUTO_MODE);
 }
 
-/// `up` for any instance: the same signs, with the instance's own USI mode word.
+/// `up` for any instance: the same signs, with the instance's own USI mode word, and the transfer timeout off.
+/// The timeout too, since 2026-11-22: a controller's software reset turns it back on (G#800000FF), and with it on no auto-mode transfer completes; the nfc process's reset did that on the Pro (b1141) and every other sign still read ready, so the `nfc` switch skipped `bring_up` and the restarted driver failed every transfer until the bit was cleared by hand.
 pub fn ready(base: usize, usi_mode: usize) -> bool {
     rd(usi_mode) & 7 == 4
         && rd(base + USI_CON) & 1 == 0
         && rd(base + CONF) & CONF_AUTO_MODE != 0
         && (rd(base + TIMING_FS3) >> 16) & 0xFF != 0
+        && rd(base + TIMEOUT) & TIMEOUT_EN == 0
         && rd(base + TRANS_STATUS) & TRANS_MASTER_BUSY == 0
 }
 
