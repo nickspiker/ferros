@@ -251,8 +251,6 @@ pub struct Store<A: BlockDev, B: BlockDev, N: Nonces> {
     /// A counter for `read_with`'s stages (`set_clock`), and what it has counted (`ReadTicks`); none until set.
     clock: Option<fn() -> u64>,
     ticks: ReadTicks,
-    /// Inside `removing`: the put reserve is waived until the outermost removal ends.
-    waived: bool,
 }
 
 /// Where `read_with`'s own time goes, in the clock's ticks (`Store::set_clock`), summed over reads (owner, 2026-11-11: the 24 MB read measured before it is fixed): fetching the sealed pieces (the engine's index walk to each piece, its furrows' reads, each block's BLAKE3 guard and decode, the furrows joined), and copying the opened pieces into the caller's buffer with the wipe of what was opened. The opening is the opener's to time.
@@ -269,7 +267,7 @@ pub struct ReadTicks {
 
 impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     pub fn new(vault: Vault<A, B>, nonces: N, now: fn() -> i64) -> Self {
-        Store { vault, nonces, now, last_head: None, last_piece: None, clock: None, ticks: ReadTicks::default(), waived: false }
+        Store { vault, nonces, now, last_head: None, last_piece: None, clock: None, ticks: ReadTicks::default() }
     }
 
     /// Time `read_with`'s stages with `clock` (any monotonic counter: the vault process gives the generic timer).
@@ -633,18 +631,9 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         self.finish(d, w)
     }
 
-    /// `f` with the engine's put reserve waived (manifestus `Vault::set_put_reserve`), held again after: a removal's own writes (the head's removal, its pieces' drop, the domain's lists, a caller's index pages) may use the room a full vault keeps for removals (2026-11-23, the Pro: the hold's remove could not rewrite a card's page in the full vault).
-    /// Removals nest (the hold's remove deletes the body's value, itself a removal): only the outermost holds the reserve again, so the hold's page write after the body's delete still has the room (the Pro, 2026-11-23: the inner one held it again and the page write was refused).
+    /// `f` with the engine's put reserve waived (manifestus `Vault::with_reserve_waived`): a removal's own writes (the head's removal, its pieces' drop, the domain's lists, a caller's index pages) may use the room a full vault keeps for removals (2026-11-23, the Pro: the hold's remove could not rewrite a card's page in the full vault). The engine puts the reserve back as it was however `f` ends, and removals nest (the hold's remove deletes the body's value, itself a removal) with the reserve waived until the outermost ends.
     pub fn removing<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let outer = !self.waived;
-        self.waived = true;
-        self.vault.set_put_reserve(false);
-        let r = f(self);
-        if outer {
-            self.vault.set_put_reserve(true);
-            self.waived = false;
-        }
-        r
+        Vault::with_reserve_waived(self, |s| &mut s.vault, f)
     }
 
     /// The value's pieces removed, DROP_BATCH to an engine commit: one commit a piece was 1,400 commits for a 91 MB kist capsule (2026-11-12, the 8a: its old Photon dropped at a re-stow), each a spine entry and a rewritten index path, the garbage of each feeding the reaps that ran inside the next.
