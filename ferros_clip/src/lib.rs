@@ -13,6 +13,8 @@ pub mod ferros;
 pub mod gpu;
 /// The recorder's sink as an item of the hold (`items::ItemSink`, docs/HOLD-API.md): the clip a card in the person's hold, found while it records.
 pub mod items;
+/// Stacked clips: frames of exact sums, packed at the width each needs (vsf ClipCodec::Packed).
+pub mod packed;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -1114,6 +1116,11 @@ fn write_clip(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, bloc
         }
         let _ = give_back.send(slot);
     }
+    seal_clip(cw, st, &mut *sink, failed, full, &written)
+}
+
+/// A clip's end, for both writers (`write_clip`, a coded clip's; `packed::write_packed`, a stacked one's): after a write that failed, nothing more (the clip reads to its last whole frame and can be repaired); else the closing generation written, flushed and the clip sealed, `full` said as why it ended early.
+fn seal_clip(cw: clip::Writer, mut st: Stage, sink: &mut dyn Sink, failed: Option<String>, full: bool, written: &std::sync::atomic::AtomicU64) -> ClipInfo {
     if let Some(e) = failed {
         return ClipInfo { stats: Stats::default(), len: 0, hash: [0; 32], write_us: st.us, error: Some(format!("{e}: the clip is not closed; it reads to its last whole frame (vsf clip::Reader) and can be repaired and sealed")) };
     }
@@ -1121,7 +1128,7 @@ fn write_clip(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, bloc
     let r = cw.close("ferros_clip", "clip close").map_err(|e| e.to_string()).and_then(|closing| {
         let hash = *blake3::hash(&closing).as_bytes();
         let len = end + closing.len() as u64;
-        st.put(&mut *sink, &closing).and_then(|()| st.flush(&mut *sink)).and_then(|()| sink.seal(len, hash)).map(|()| (len, hash))
+        st.put(sink, &closing).and_then(|()| st.flush(sink)).and_then(|()| sink.seal(len, hash)).map(|()| (len, hash))
     });
     let (len, hash, error) = match r {
         Ok((len, hash)) => (len, hash, full.then(|| "the extent is full: the clip ends at its last frame that fit".to_string())),
