@@ -183,6 +183,14 @@ pub mod arc {
         (a as usize, b as usize)
     }
 
+    /// (the bytes the device's frame pool has free now, the pool's bytes), kernel ARC_FREE (docs/NO-CEILINGS.md 0.5): read once when sizing a large ask or saying why one was refused, never on a timer. None from a kernel before it.
+    pub fn free() -> Option<(usize, usize)> {
+        match call(6, 0) {
+            (ERR, _) => None,
+            (a, b) => Some((a as usize, b as usize)),
+        }
+    }
+
     /// Give back the 2 MiB frames wholly inside `len` bytes from arc offset `off` while the arc keeps its size (kernel ARC_RELEASE, docs/ARCS.md step 4): what a process no longer needs in the middle of its arc (ahau's attest mark after attest). Those bytes must never be touched again (a fault ends the process) until a grow over them; no syscall buffer may lie there. Never the arc's first frame. Ok(the bytes given back), Err(the reason).
     pub fn release(off: u64, len: usize) -> Result<usize, u64> {
         let (a, b): (u64, u64);

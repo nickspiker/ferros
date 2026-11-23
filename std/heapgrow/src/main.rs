@@ -5,6 +5,7 @@
 //! 1. 4 GiB asked for with `try_reserve_exact` and every byte written (the video): its time, or the refusal as the device gave it.
 //! 2. That freed, then 256 MiB at a time until the device says no: how much it gave, then the refusal, said, with the process still running.
 //! 3. All freed, and 4 GiB asked for once more: the memory given back is the process's to ask for again.
+//! 4. 64 TiB asked for plainly (no try): the out-of-memory line (what was asked, what the device has free), then the process ends.
 //! On the 8a (a pool of 5.3 GiB, the system's own processes in it) step 1 may be refused: the line says so, and that is the clear refusal the rule asks for.
 
 use std::time::Instant;
@@ -57,4 +58,8 @@ fn main() {
     }
     assert!(note.iter().all(|&b| b == 1), "the notepad's megabyte changed");
     println!("heapgrow: done in {} ms, the notepad's megabyte as written", t0.elapsed().as_millis());
+    // 4. A plain allocation past the device, as most code allocates (no try): the process ends, and the line before its end says what was asked and what the device had free (the fork's out-of-memory hook, ferros_rt `out_of_memory`, the kernel's ARC_FREE).
+    println!("heapgrow: 4. 64 TiB asked plainly; the next line is the out-of-memory report and the process ends");
+    let past: Vec<u8> = Vec::with_capacity(1 << 46);
+    println!("heapgrow: 4. given?! {}", past.capacity());
 }

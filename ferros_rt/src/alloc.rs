@@ -23,10 +23,70 @@ struct Arc {
     tried: usize,
 }
 
-/// SYS_ARC's ops (kernel process.rs `ARC_GROW`, `ARC_SHRINK`, `ARC_SIZE`).
+/// SYS_ARC's ops (kernel process.rs `ARC_GROW`, `ARC_SHRINK`, `ARC_SIZE`, `ARC_FREE`).
 const ARC_GROW: u64 = 0;
 const ARC_SHRINK: u64 = 1;
 const ARC_SIZE: u64 = 2;
+const ARC_FREE: u64 = 6;
+
+/// (the bytes the device's frame pool has free now, the pool's bytes), the kernel's ARC_FREE (docs/NO-CEILINGS.md 0.5); None from a kernel before it.
+pub fn device_free() -> Option<(usize, usize)> {
+    let (a, b) = sys::svc2(nr::ARC, ARC_FREE, 0);
+    if a == ERR { None } else { Some((a as usize, b as usize)) }
+}
+
+/// The line an allocation of `size` bytes that failed is reported with (the fork's `default_alloc_error_hook`, docs/NO-CEILINGS.md 0.5), written into `out` with no allocation (the heap is what just ran out); its length. The console names the process on every line it writes, and the death record the abort leaves carries this line with the name (SYS_PANIC).
+/// "out of memory: asked A#<size> bytes, the device has A#<free> of A#<pool> free", or "... the device's free memory unknown" from a kernel before ARC_FREE.
+pub fn out_of_memory(size: usize, out: &mut [u8]) -> usize {
+    let mut w = Line { out, at: 0 };
+    w.put(b"out of memory: asked A#");
+    w.dec(size);
+    match device_free() {
+        Some((free, pool)) => {
+            w.put(b" bytes, the device has A#");
+            w.dec(free);
+            w.put(b" of A#");
+            w.dec(pool);
+            w.put(b" free");
+        }
+        None => w.put(b" bytes, the device's free memory unknown (a kernel before ARC_FREE)"),
+    }
+    w.at
+}
+
+/// Bytes into a fixed buffer, the rest dropped where it is full (a report must never allocate).
+struct Line<'a> {
+    out: &'a mut [u8],
+    at: usize,
+}
+
+impl Line<'_> {
+    fn put(&mut self, b: &[u8]) {
+        for &c in b {
+            // WHY the check: the buffer is the caller's fixed array and the report's length depends on its numbers; a full buffer drops the rest rather than index past it.
+            if self.at < self.out.len() {
+                self.out[self.at] = c;
+                self.at += 1;
+            }
+        }
+    }
+    fn dec(&mut self, mut v: usize) {
+        let mut d = [0u8; 20];
+        let mut n = 0;
+        loop {
+            d[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            self.put(&d[n..n + 1]);
+        }
+    }
+}
 
 /// Add a region `[start, start + size)` of the arc to the heap (trimmed to the grain; a sliver is dropped).
 ///
