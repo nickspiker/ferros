@@ -10,7 +10,7 @@
 //!
 //! **Stowing** a kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it", "the proper term for installing a kist is stow"): the host (tools/ferros-send) carries the capsule into `capsules.` thru the kernel (PT `ferros.kist.offer`) and offers it; the offers' watcher takes it (SYS_OFFER) as a job, which runs stages 1 to 3 exactly as above (the capsule read back from the vault and hashed as it passes, in place of the fetch; native code taken unchecked on a development build only, `ferros_sys::stow_check`), then waits at `STAGE_ASKING` for the person: the map shows the offer (op 6) with Stow and Cancel (op 5). Stow is stage 4; Cancel drops its bytes. Each state goes to the kernel, which answers the host's held read. Nothing is in the person's list before Stow.
 //!
-//! An unstow takes the kist out of the person's list, its answers kept (ferros_kist `Kists::remove`: asked once, ever), and drops its capsule; the identity service carries the removal to the person's other devices. A restore (the person's list came back from their fleet after a reset, payloads/fgtw space.rs) fetches each capsule the list names that this device lacks, from its recorded source then the directory, through the same stages; the fleet's own devices first is the owner's order, and a seam (`fleet_fetch`) until that protocol exists.
+//! An unstow takes the kist out of the person's list, its answers kept (ferros_kist `Kists::remove`: asked once, ever), and drops its capsule; the identity service carries the removal to the person's other devices. A restore (the person's list came back from their fleet after a reset, payloads/fgtw space.rs) fetches each capsule the list names that this device lacks, from the fleet's own devices first (the owner's order; `fleet_get`, fgtw op 38), then its recorded source, then the directory, through the same stages. The stower answers the fleet's asks of this device too (`fleet_answer`, fgtw ops 39 and 40).
 //!
 //! Nothing here asks on a timer (owner, 2026-11-10: "No polling!"): the page holds a doorbell (op 0) answered when anything it shows changes; the worker sleeps on a word until a job comes; a restore follows the identity service's own doorbell (fgtw op 21); the kernel tells each stage of its check on a word (`wait_world`). The one timer is net.rs's: ip has no held receive yet.
 //!
@@ -70,6 +70,10 @@ static WORKER_STACK: Region<WORK_STACK> = Region(UnsafeCell::new([0; WORK_STACK]
 static WATCHER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
 /// The offers' watcher's stack: two small calls and a job pushed.
 static OFFER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
+/// The fleet answerer's stack (`fleet_answer`): its buffer is on the heap.
+static ANSWER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
+/// A capsule's piece over the fleet (fgtw ops 38 and 40, payloads/fgtw `CAPSULE_PIECE`, the same): one `capsule_piece` frame over Photon Transport, which carries it in its own BLAKE3-checked pieces.
+const FLEET_PIECE: usize = 1 << 16;
 /// The piece being filled: in the arc (.bss), where a syscall's bytes land (never the heap's start, a DMA region in some processes; here the heap is in the arc too).
 static PIECE_BUF: Region<PIECE> = Region(UnsafeCell::new([0; PIECE]));
 
@@ -358,6 +362,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ferros_sys::thread_spawn(worker, unsafe { &mut *WORKER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(space_watch, unsafe { &mut *WATCHER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(offer_watch, unsafe { &mut *OFFER_STACK.0.get() }, grants);
+    ferros_sys::thread_spawn(fleet_answer, unsafe { &mut *ANSWER_STACK.0.get() }, grants);
     say(b"kists: serving the stower (kists); a restore follows the identity service\n");
     serve(grants)
 }
@@ -702,7 +707,7 @@ fn entry_url(e: &Entry) -> Result<String, u8> {
 fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let e = with(|s| s.dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == job.capsule)).cloned()).ok_or(WHY_NOT_LISTED)?;
     let url = entry_url(&e)?;
-    let (taken, admitted) = bring(grants, i, &url, &e.capsule, Some(e.size), &e.developer, &e.option)?;
+    let (taken, admitted) = bring(grants, i, Origin::Url(&url), &e.capsule, Some(e.size), &e.developer, &e.option)?;
     stage(i, STAGE_STORING, e.size, e.size);
     let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
     // Its version as its signed declaration gives it (what the page compares a listed one against); a capsule without one (a manifest's artefact) takes the entry's, which its developer's signed manifest gave. A version field that does not read is no kist's.
@@ -856,11 +861,8 @@ fn capsules_here(grants: u64) -> Option<Vec<[u8; 32]>> {
     }
 }
 
-/// A restore of one capsule: the fleet's devices first (not built: `fleet_fetch`), then where it was stowed from, then the directory by its blake3.
+/// A restore of one capsule: the fleet's devices first (`fleet_get`), then where it was stowed from, then the directory's entry, then the directory's host by its blake3.
 fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
-    if fleet_fetch(&job.capsule) {
-        return Ok(());
-    }
     let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
     let k = list.by_capsule(&job.capsule).cloned().ok_or(WHY_NOT_LISTED)?;
     let dir = directory(grants);
@@ -881,8 +883,10 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     }
     let size = entry.map(|e| e.size);
     let mut why = WHY_NOT_LISTED;
-    for u in &sources {
-        match bring(grants, i, u, &job.capsule, size, &k.developer, &k.option) {
+    // The person's own devices before any server (owner, 2026-11-10: "BLE, then LAN, then WAN, then hopefully we shouldn't need to but fgtw.org").
+    let origins = core::iter::once(Origin::Fleet).chain(sources.iter().map(|u| Origin::Url(u)));
+    for o in origins {
+        match bring(grants, i, o, &job.capsule, size, &k.developer, &k.option) {
             Ok((_, admitted)) => {
                 // A list from before pins (or one whose pin has not arrived from the space yet): the restored kist's bundle pinned now, as at a first stow.
                 let list_cap = cap(grants, S_KISTS);
@@ -913,9 +917,98 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     Err(why)
 }
 
-/// The fleet's own devices first (owner, 2026-11-10: "BLE, then LAN, then WAN, then hopefully we shouldn't need to but fgtw.org"; docs/IDENTITY-SPACE.md "Capsules", source 2): a `capsule_want` over Photon Transport to the person's devices heard, answered in pieces from their `capsules.`, each piece into this device's vault as the HTTP path does, then the same checks. Not built: it is new protocol (the frame, fgtw's routing to a sibling that holds the capsule, the sibling's answer). TODO(fleet capsules): build it in payloads/fgtw beside `space_want`, and return true here once the capsule is stored and checked.
-fn fleet_fetch(_capsule: &[u8; 32]) -> bool {
-    false
+/// Where `bring` takes a capsule's bytes from.
+#[derive(Clone, Copy)]
+enum Origin<'a> {
+    /// The person's other devices (docs/IDENTITY-SPACE.md "Capsules", source 2): `fleet_get`.
+    Fleet,
+    /// Plain HTTP (net.rs).
+    Url(&'a str),
+}
+
+/// A capsule from the person's own devices (docs/IDENTITY-SPACE.md "Capsules", source 2): fgtw op 38 a piece at a time, each a `capsule_want` over Photon Transport to the fleet's devices heard (the one that served the piece before it alone, after the first), answered from that device's `capsules.` by its stower (`fleet_answer`). Each piece goes to `body` as an HTTP body's bytes do, so the same Intake, vault pieces and checks follow; the bytes are trusted no more than a server's.
+/// Missing when no device has it (none heard, each said none or was given up on, or none answered in time: fgtw's `capsule::ASK_US`), Network when the identity service is not serving.
+fn fleet_get(grants: u64, capsule: &[u8; 32], size: Option<u64>, length: &core::cell::Cell<u64>, mut body: impl FnMut(&[u8]) -> Result<(), &'static str>) -> Result<(), net::Fail> {
+    let svc = cap(grants, S_FGTW);
+    let mut ask = [0u8; 41];
+    ask[0] = 38;
+    ask[1..33].copy_from_slice(capsule);
+    // On the heap, in the arc: [0][the whole length u64 LE][the bytes].
+    let mut reply = alloc::vec![0u8; 9 + FLEET_PIECE];
+    let mut at = 0u64;
+    loop {
+        ask[33..41].copy_from_slice(&at.to_le_bytes());
+        let n = ferros_sys::call_live(svc, &ask, &mut reply);
+        if n == ERR {
+            return Err(net::Fail::Network);
+        }
+        if n < 10 || reply[0] != 0 {
+            return Err(net::Fail::Missing(0));
+        }
+        let total = u64::from_le_bytes(reply[1..9].try_into().unwrap());
+        if at == 0 {
+            if size.is_some_and(|s| s != total) {
+                return Err(net::Fail::Broken("its length is not the directory's"));
+            }
+            length.set(total);
+            say(b"kists: a capsule from a fleet device\n");
+        } else if total != length.get() {
+            return Err(net::Fail::Broken("its length changed between pieces"));
+        }
+        // WHY the min: `n` is what fgtw sent, which may be more than the buffer took; the piece is what landed.
+        let got = (n as usize).min(reply.len()) - 9;
+        body(&reply[9..9 + got]).map_err(net::Fail::Broken)?;
+        at += got as u64;
+        if at >= total {
+            return Ok(());
+        }
+    }
+}
+
+/// The fleet's asks of this device (fgtw op 39, held until a sibling's `capsule_want` comes): each answered with the piece of `capsules.<blake3>` from its offset, or with none when the capsule is not here (fgtw op 40). While fgtw is not serving it is asked again after a wait that doubles to a second, as `space_watch` does: no doorbell exists for a server coming up.
+extern "C" fn fleet_answer(grants: u64) -> ! {
+    let svc = cap(grants, S_FGTW);
+    let capsules = cap(grants, S_CAPSULES);
+    // On the heap, in the arc: [40][id u32 LE][0][the whole length u64 LE][the bytes], or [40][id][1].
+    let mut msg = alloc::vec![0u8; 14 + FLEET_PIECE];
+    msg[0] = 40;
+    let mut absent = freq() >> 6;
+    loop {
+        let mut w = [0u8; 44];
+        let n = ferros_sys::call_live(svc, &[39], &mut w);
+        if n == ERR {
+            sleep_until(now() + absent);
+            if absent < freq() {
+                absent <<= 1;
+            }
+            continue;
+        }
+        absent = freq() >> 6;
+        // Empty: another call took this one's place.
+        if n != 44 {
+            continue;
+        }
+        let mut capsule = [0u8; 32];
+        capsule.copy_from_slice(&w[4..36]);
+        let offset = u64::from_le_bytes(w[36..44].try_into().unwrap());
+        msg[1..5].copy_from_slice(&w[..4]);
+        // WHY the bound on the offset: SYS_STORE carries a read's offset in 32 bits (ferros_sys::store_get_addr_at), so a sibling's offset past them would read from the wrong place; no capsule here is that long.
+        let read = if offset < 1 << 32 { ferros_sys::store_get_addr_at(capsules, &capsule, offset as usize, &mut msg[14..]) } else { None };
+        let len = match read {
+            Some(whole) if (offset as usize) < whole => {
+                msg[5] = 0;
+                msg[6..14].copy_from_slice(&(whole as u64).to_le_bytes());
+                // WHY the min: the last piece is what the capsule holds past the offset, shorter than the buffer.
+                14 + (whole - offset as usize).min(FLEET_PIECE)
+            }
+            _ => {
+                msg[5] = 1;
+                6
+            }
+        };
+        let mut r = [0u8; 1];
+        let _ = ferros_sys::call_live(svc, &msg[..len], &mut r);
+    }
 }
 
 /// The offers' watcher (docs/KISTS.md "Stowing"): the kernel's offers' doorbell held on this thread; each time it rings, the offer not yet ended taken (SYS_OFFER op 1) and queued as a job for the worker. Taken again at start, so a stower that started again takes up an offer its predecessor left.
@@ -1286,7 +1379,7 @@ fn decode_icon(grants: u64, hp: &ferros_thing::Hp, icon: &ferros_kist::Icon) -> 
 }
 
 /// Stages 0 to 3 for one capsule from one URL: fetched into the vault as it streams, its signature checked (its blake3, its size, its identity, every egg against the developer bundle it carries, and that bundle the one the person pinned for its developer), committed, then checked and sealed by the kernel. On any failure its bytes are dropped. Returns what was taken in (its first bytes carry its declaration) and what to pin.
-fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32]) -> Result<(Taken, ferros_kist::capsule::Admitted), u8> {
+fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32]) -> Result<(Taken, ferros_kist::capsule::Admitted), u8> {
     let total = size.unwrap_or(0);
     stage(i, STAGE_FETCHING, 0, total);
     let capsules = cap(grants, S_CAPSULES);
@@ -1296,46 +1389,50 @@ fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>,
     let mut intake = Intake::new();
     let mut told = 0u64;
     let length = core::cell::Cell::new(total);
-    let r = net::get(
-        cap(grants, S_UDP),
-        url,
-        |resp| match (resp.body, size) {
-            (Some(Body::Length(n)), Some(s)) if n != s => Err("its length is not the directory's"),
-            (Some(Body::Length(n)), None) => {
-                length.set(n);
-                Ok(())
-            }
-            _ => Ok(()),
-        },
-        |mut bytes| {
-            intake.update(bytes).map_err(|_| "not a signed capsule")?;
-            // WHY: the directory's size, when it gave one, is the most that is taken.
-            if size.is_some_and(|s| intake.len() > s) {
-                return Err("longer than the directory's size");
-            }
-            while !bytes.is_empty() {
-                // A full piece goes out only once more bytes come, so the last piece is never empty and is held back for the commit.
-                if fill == PIECE {
-                    if !ferros_sys::store_set_addr_at(capsules, expect, written, piece, true) {
-                        return Err("the vault did not take a piece");
-                    }
-                    written += PIECE;
-                    fill = 0;
+    let body = |mut bytes: &[u8]| {
+        intake.update(bytes).map_err(|_| "not a signed capsule")?;
+        // WHY: the directory's size, when it gave one, is the most that is taken.
+        if size.is_some_and(|s| intake.len() > s) {
+            return Err("longer than the directory's size");
+        }
+        while !bytes.is_empty() {
+            // A full piece goes out only once more bytes come, so the last piece is never empty and is held back for the commit.
+            if fill == PIECE {
+                if !ferros_sys::store_set_addr_at(capsules, expect, written, piece, true) {
+                    return Err("the vault did not take a piece");
                 }
-                // WHY: what fits the piece now.
-                let n = (PIECE - fill).min(bytes.len());
-                piece[fill..fill + n].copy_from_slice(&bytes[..n]);
-                fill += n;
-                bytes = &bytes[n..];
+                written += PIECE;
+                fill = 0;
             }
-            // The page's bar moves at each mebibyte.
-            if intake.len() >> 20 != told >> 20 {
-                told = intake.len();
-                stage(i, STAGE_FETCHING, told, length.get());
-            }
-            Ok(())
-        },
-    );
+            // WHY: what fits the piece now.
+            let n = (PIECE - fill).min(bytes.len());
+            piece[fill..fill + n].copy_from_slice(&bytes[..n]);
+            fill += n;
+            bytes = &bytes[n..];
+        }
+        // The page's bar moves at each mebibyte.
+        if intake.len() >> 20 != told >> 20 {
+            told = intake.len();
+            stage(i, STAGE_FETCHING, told, length.get());
+        }
+        Ok(())
+    };
+    let r = match origin {
+        Origin::Fleet => fleet_get(grants, expect, size, &length, body),
+        Origin::Url(url) => net::get(
+            cap(grants, S_UDP),
+            url,
+            |resp| match (resp.body, size) {
+                (Some(Body::Length(n)), Some(s)) if n != s => Err("its length is not the directory's"),
+                (Some(Body::Length(n)), None) => {
+                    length.set(n);
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
+            body,
+        ),
+    };
     let failed = |why: u8| {
         drop_capsule(grants, expect);
         Err(why)

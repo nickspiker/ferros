@@ -21,7 +21,7 @@ use photon_core::wire::{self, Frame};
 
 mod add;
 mod addview;
-/// The fleet's capsule source's bookkeeping (ops 36, 37, 38; `capsule_want`).
+/// The fleet's capsule source's bookkeeping (ops 38, 39, 40; `capsule_want`).
 mod capsule;
 mod depart;
 /// The facets (docs/FACETS.md): be you and the people on the `facets` endpoint, and the person's people added and listed.
@@ -37,7 +37,7 @@ mod space;
 const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The most one peer's transfer may ask of this heap, and the most all of them in flight may hold together (`Pt::bound_inbound`).
 const IN_MOST: usize = 1 << 21;
-/// The largest piece of a capsule the stower hands back in one op 38 (payloads/kists `FLEET_PIECE`, the same): the serve loop's request buffer holds it and its header. A longer one is taken short, and the asker asks the rest from where it ends.
+/// The largest piece of a capsule the stower hands back in one op 40 (payloads/kists `FLEET_PIECE`, the same): the serve loop's request buffer holds it and its header. A longer one is taken short, and the asker asks the rest from where it ends.
 const CAPSULE_PIECE: usize = 1 << 16;
 /// WHY 4 MiB: half the 8 MiB static heap this was until docs/NO-CEILINGS.md step 1, kept as it was; the heap grows now, and this becomes a share of the device's free memory with the kernel's ARC_FREE (NO-CEILINGS.md, section 4, row N5).
 const IN_BUDGET: usize = 1 << 22;
@@ -929,7 +929,7 @@ impl Client {
         Some(*hp) == self.hp && *sender != self.me && self.members.contains(sender) && !self.fleet_locked().contains(sender)
     }
 
-    /// Op 36: a piece of `capsule` from `offset` asked of the person's devices heard (in the last two minutes, as the pings go: on this network, and any heard from beyond it), the call held (`capsule::Capsules::ask`); NOBODY at once with no handle proof or none heard.
+    /// Op 38: a piece of `capsule` from `offset` asked of the person's devices heard (in the last two minutes, as the pings go: on this network, and any heard from beyond it), the call held (`capsule::Capsules::ask`); NOBODY at once with no handle proof or none heard.
     fn capsule_ask(&mut self, tok: [u8; 32], capsule: [u8; 32], offset: u64) {
         let nobody = [capsule::NOBODY];
         let Some(hp) = self.hp else { return self.reply(&tok, &nobody) };
@@ -959,7 +959,7 @@ impl Client {
         self.capsules.ask(tok, capsule, offset, hash, &to, t);
     }
 
-    /// The asks that ended with no piece: each held op 36 answered NOBODY.
+    /// The asks that ended with no piece: each held op 38 answered NOBODY.
     fn capsule_nobody(&mut self, toks: Vec<[u8; 32]>) {
         if toks.is_empty() {
             return;
@@ -972,7 +972,7 @@ impl Client {
         self.log.line();
     }
 
-    /// A sibling's `capsule_want`: handed to this device's stower (op 37), or a `capsule_none` at once when no stower answers here.
+    /// A sibling's `capsule_want`: handed to this device's stower (op 39), or a `capsule_none` at once when no stower answers here.
     pub fn on_capsule_want(&mut self, from: Addr, bytes: &[u8]) {
         let Ok((hp, capsule, offset, sender)) = fgtw::protocol::parse_capsule_want(bytes) else { return };
         if !self.capsule_member(&hp, &sender) {
@@ -987,7 +987,7 @@ impl Client {
         }
     }
 
-    /// A sibling's piece: the held op 36 it answers given it.
+    /// A sibling's piece: the held op 38 it answers given it.
     pub fn on_capsule_piece(&mut self, bytes: &[u8]) {
         let Ok((hp, capsule, offset, total, piece, sender)) = fgtw::protocol::parse_capsule_piece(bytes) else { return };
         if !self.capsule_member(&hp, &sender) {
@@ -1016,7 +1016,7 @@ impl Client {
         self.capsule_nobody(ended);
     }
 
-    /// Op 38: the stower's answer to want `id`, a piece (the whole length and the bytes) or none, signed and sent to the sibling that asked. 0 sent, 1 no such want, 2 not sent.
+    /// Op 40: the stower's answer to want `id`, a piece (the whole length and the bytes) or none, signed and sent to the sibling that asked. 0 sent, 1 no such want, 2 not sent.
     fn capsule_answer(&mut self, id: u32, piece: Option<(u64, &[u8])>) -> u8 {
         let Some(w) = self.capsules.take(id) else { return 1 };
         let Some(hp) = self.hp else { return 2 };
@@ -2396,7 +2396,7 @@ impl Client {
             // The facets first (a kist's wait for be you, its be you, its people): answered before anything slow in this pass, and again between the slow steps below (`facets_now`), never held behind them.
             busy |= self.facets_now(&mut lap);
             // The attest screen: the state, or its roots (op 4, 65 bytes).
-            // In the arc (the heap is), allocated once before the loop: op 38 carries a capsule's piece (`CAPSULE_PIECE` and its header); 512 bytes held every other call (the longest words entry, 23 voca words of at most 18 letters with spaces).
+            // In the arc (the heap is), allocated once before the loop: op 40 carries a capsule's piece (`CAPSULE_PIECE` and its header); 512 bytes held every other call (the longest words entry, 23 voca words of at most 18 letters with spaces).
             let req = &mut req_buf[..];
             let mut tok = [0u8; 32];
             let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), req, &mut tok, true);
@@ -2413,19 +2413,19 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
-                // The fleet's capsule source (capsule.rs; docs/IDENTITY-SPACE.md "Capsules", source 2), the stower's three calls:
-                // 36 [capsule 32][offset u64 LE]: a piece of a kist's capsule from the person's devices heard. Held until one answers → [0][the whole length u64 LE][the bytes], or → [1] when none is heard, every one said none or was given up on, or their time ran out (`capsule::ASK_US`).
-                // 37: held until a member asks this device for a capsule → [id u32 LE][capsule 32][offset u64 LE]; a held call answered empty when another takes its place.
-                // 38 [id u32 LE][0][the whole length u64 LE][the bytes] the piece for want `id`, or [id u32 LE][1] this device has no such capsule → [0] sent, [1] no such want, [2] not sent (no handle proof, or the frame did not build).
+                // The fleet's capsule source (capsule.rs; docs/IDENTITY-SPACE.md "Capsules", source 2), the stower's three calls (36 and 37 are the People page's, facets.rs):
+                // 38 [capsule 32][offset u64 LE]: a piece of a kist's capsule from the person's devices heard. Held until one answers → [0][the whole length u64 LE][the bytes], or → [1] when none is heard, every one said none or was given up on, or their time ran out (`capsule::ASK_US`).
+                // 39: held until a member asks this device for a capsule → [id u32 LE][capsule 32][offset u64 LE]; a held call answered empty when another takes its place.
+                // 40 [id u32 LE][0][the whole length u64 LE][the bytes] the piece for want `id`, or [id u32 LE][1] this device has no such capsule → [0] sent, [1] no such want, [2] not sent (no handle proof, or the frame did not build).
                 // WHY the lengths: another process's message, sliced below by fixed offsets.
-                if got >= 41 && req[0] == 36 {
+                if got >= 41 && req[0] == 38 {
                     let mut capsule = [0u8; 32];
                     capsule.copy_from_slice(&req[1..33]);
                     let offset = u64::from_le_bytes(req[33..41].try_into().unwrap());
                     self.capsule_ask(tok, capsule, offset);
                     continue;
                 }
-                if got >= 1 && req[0] == 37 {
+                if got >= 1 && req[0] == 39 {
                     let (now, old) = self.capsules.hold(tok);
                     if let Some(r) = now {
                         self.reply(&tok, &r);
@@ -2437,7 +2437,7 @@ impl Client {
                     }
                     continue;
                 }
-                if got >= 6 && req[0] == 38 {
+                if got >= 6 && req[0] == 40 {
                     let id = u32::from_le_bytes(req[1..5].try_into().unwrap());
                     let piece = if req[5] == 0 && got >= 14 { Some((u64::from_le_bytes(req[6..14].try_into().unwrap()), &req[14..got])) } else { None };
                     let r = [self.capsule_answer(id, piece)];
