@@ -5439,6 +5439,19 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"vault fresh process yes" {
+                    // `diag "vault fresh process yes"` (development builds; the owner, 2026-11-23: "you can nuke all. I do not care about data on this device"): the vault process alone starts over, its own fresh start (its spawn input bit 0: it zeroes the start of each of its two mirrors and opens them blank, payloads/vault `FRESH`).
+                    // What goes is everything the vault process keeps: the person's data, the identity service's space copy, the stowed kists and their list, the device's firmware and calibration scopes (export them first: `store get`). What stays is the kernel's own vault (every shell capsule, init, the seals, the device settings) and the ledger, so the device comes back with its whole shell, unlike `vault fresh yes`.
+                    #[cfg(not(ferros_production))]
+                    {
+                        crate::flashlog::line("vault fresh process: the owner's fresh start of the vault process alone");
+                        restart_with(&mut store, b"vault", &[1], &mut resp, false);
+                    }
+                    #[cfg(ferros_production)]
+                    resp.extend_from_slice(b"vault fresh process: not on a production build\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                     // A restart by hand clears each name's count of deaths, and with it a crash loop's stop (docs/KERNEL.md "Restarts").
                     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {

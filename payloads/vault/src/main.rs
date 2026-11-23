@@ -107,10 +107,11 @@ fn grants() -> u64 {
     unsafe { GRANTS }
 }
 
-/// One mirror: `blocks` blocks of the window from `base`.
+/// One mirror: `blocks` blocks of the window from `base` in use, growing to `max` (its half of the window).
 struct Half {
     base: u64,
     blocks: u64,
+    max: u64,
 }
 
 impl Half {
@@ -126,9 +127,9 @@ impl BlockDev for Half {
     fn block_count(&self) -> u64 {
         self.blocks
     }
-    /// A mirror's half of the window is all it will ever have: the tract grows into it and then the vault says full (2026-11-23: it asked to double past the window and every write failed as Corrupt).
+    /// A mirror's half of the window is all it will ever have: the tract grows into it and then the vault says full (2026-11-23: it asked to double past the window and every write failed as Corrupt). A blank vault opens bounded at MIRROR but may still grow to the half in the same session.
     fn max_blocks(&self) -> u64 {
-        self.blocks
+        self.max
     }
     fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         self.io(lba, 1)?;
@@ -201,8 +202,8 @@ impl BlockDev for Half {
     /// The tract grown from `old_blocks` to `new_blocks` (the device's whole extent before and after, manifestus's space-first rule): exactly the new blocks zeroed, nothing below. 2026-11-08: this zeroed from a mark of its own that a grow during the vault's open found still unset, and wiped both mirrors from block 0 (the vault had filled at its first 512 MiB, where the default refused to grow).
     fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> manifestus::Result<()> {
         // WHY: a half of the window is all one mirror has; past it the vault is full, and a write must fail rather than reach the other mirror.
-        if new_blocks > self.blocks {
-            return Err(manifestus::Error::Corrupt(alloc::format!("the vault's window is full: {new_blocks} blocks wanted, {} in a mirror", self.blocks)));
+        if new_blocks > self.max {
+            return Err(manifestus::Error::Corrupt(alloc::format!("the vault's window is full: {new_blocks} blocks wanted, {} in a mirror", self.max)));
         }
         ahead_drop();
         let zero = alloc::vec![0u8; RUN << 12];
@@ -214,6 +215,10 @@ impl BlockDev for Half {
                 return Err(manifestus::Error::Corrupt(alloc::format!("zeroing the grown tract failed at {at}")));
             }
             at += n as u64;
+        }
+        // The grown blocks are this mirror's to read and write from now on (a vault opened blank, bounded at MIRROR, grows in the same session). WHY the compare: the engine's grow never asks for less than it has, and the bound never shrinks.
+        if new_blocks > self.blocks {
+            self.blocks = new_blocks;
         }
         Ok(())
     }
@@ -921,7 +926,7 @@ extern "C" fn work(_: u64) -> ! {
     let blank = ferros_sys::block_read(cap(grants(), S_BLOCKS), 0, &mut probe) == 0 && probe.iter().all(|&b| b == 0);
     let bound = if blank { MIRROR } else { HALF };
     say!("vault: block 0 blank {}, opening bounded at {} blocks a mirror", blank, bound);
-    let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound }).with_events(alloc::boxed::Box::new(EngineEvents));
+    let mirror = Mirror::new(Half { base: 0, blocks: bound, max: HALF }, Half { base: HALF, blocks: bound, max: HALF }).with_events(alloc::boxed::Box::new(EngineEvents));
     // Lazily (manifestus `open_lazy`): reads are served from the head's index at once, and the walk that finds what is live is stepped between requests (`settle_step`, below); every write finishes it first, so writes are as after an eager open. The eager open walked the whole index before serving anything: 10.7 s on the 8a with 462,713 live blocks (2026-11-12), and every reader waited behind it, the person's space at attest among them (the deck's kists list 4.9 s, the GPU's firmware, the wallpaper), which an attest in a boot's first seconds met as "four seconds to the deck".
     let vault = match Vault::open_lazy(mirror, RING_LOG2, eagle(), DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
