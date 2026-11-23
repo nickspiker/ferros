@@ -130,6 +130,23 @@ husky has three built-in microphones, ids 0, 1 and 2 (mixer_paths.xml:750-753; t
 
 The protocol (ferros_sys `audio`): `MIC_LEVELS`, held until the next 80 ms of samples (eight periods) have come in, then each microphone's peak; `RECORD` + microphone + level, held while 2^17 frames (2.7 s) of that microphone are captured into the service's memory, then played back once on both speakers, scaled so the recording's loudest sample comes out at the level (never louder than the speaker test can be). The recording is never written anywhere and is gone with the process. A capture nobody asks for again within 64 periods (640 ms) is stopped, and the process ends once nothing else holds it.
 
+## The rings' windows (measured on the Pro 2026-11-22; approved that night by the coordinator for the owner)
+
+The first PROBE on the Pro (forge 516d7559, kernel 07f922ca) found both audio rings past the 2 MiB `aoc-ipc` window the kernel grants (G#95C0_0000 to G#95E0_0000), as "Verification" below foresaw. The service's dump of their headers, offsets from the IPC block's start:
+
+| Service | Type, channel | Region | Offset | Size | Physical |
+|---|---|---|---|---|---|
+| `audio_output_control` | queue, 16 | UP / DOWN | G#12B000 / G#12A000 | 64 slots of 64 | inside `aoc-ipc` |
+| `audio_input_control` | queue, 16 | UP / DOWN | G#12F000 / G#12E000 | 4 slots of 1024 | inside `aoc-ipc` |
+| `audio_playback5` | ring, 20 | DOWN | G#17C000 | 4 MiB | G#9613_C000 to G#9657_C000 |
+| `audio_capture0` | ring, 20 | UP | G#EA0000 | 92160 | G#96AA_0000 to G#96AB_6800 |
+
+Both rings ring channel 20 (block f1, bit 4), the line the service holds, so playback and capture are both interrupt-driven; the control queues answer on channel 16 (block f1 too). Both rings lie inside the AoC's carve-out (G#9400_0000 to G#9700_0000).
+
+**The fix (kernel cachemap.rs `AOC_PLAY`, `AOC_CAPTURE`):** two more grants, to the audio service alone (service.rs `audio_grants` slots 9 and 10): `aoc-play`, 8 MiB at G#9600_0000, and `aoc-capture`, 1 MiB at G#96A0_0000, EL0 Device memory. The service finds the window that holds each ring (aoc.rs `Win`) and refuses a ring no window holds whole.
+
+**The tradeoff, for the owner:** a process reaches a granted region thru its handle, a base plus an offset masked to the region's size, which needs a power of two aligned to itself (SANDBOX.md "Handles"). Growing `aoc-ipc` to cover both rings would take 16 MiB, and G#95C0_0000 is not 16 MiB aligned, so the masked sensors process's handle would go to nothing. Two windows, each the smallest aligned power of two that holds its ring, are the smallest overreach the handles allow: the rest of those 9 MiB is the AoC's heap (its own buffers, the other audio rings), which the audio service can now read and write as well as its two rings. The audio service is ferros's own OS process, the same trust class as the sensors process, which already holds `aoc-ipc`. The AoC's firmware image (the carve-out's first G#1C0_0000) stays the kernel's.
+
 ## The Developer page's tests (2026-11-22; owner: "Just throw a mic and speaker test in the ferros settings and I can test it", and earlier "sound and buzz, why not")
 
 Settings → Developer, after the light scope (payloads/map devtest.rs). Nothing on it is stored; every control starts at its default when the map starts.

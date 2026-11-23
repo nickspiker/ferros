@@ -2766,6 +2766,9 @@ pub static DMA: &[Dma] = &[
     gpu_block_slot(8), gpu_block_slot(9), gpu_block_slot(10), gpu_block_slot(11), gpu_block_slot(12), gpu_block_slot(13), gpu_block_slot(14), gpu_block_slot(15),
     // The AoC's IPC control block and its services' rings (aoc.rs IPC, cachemap.rs AOC_IPC), EL0 Device memory for the sensors process: com.google.usf's rings lie in its first G#85000 bytes.
     Dma { name: "aoc-ipc", base: crate::cachemap::AOC_IPC.0, size: crate::cachemap::AOC_IPC.1 - crate::cachemap::AOC_IPC.0 },
+    // The AoC's playback and capture rings, which lie past `aoc-ipc` (cachemap.rs AOC_PLAY and AOC_CAPTURE: the sizes' WHY, and what else of the AoC's heap they reach): the audio service's alone (service.rs `audio_grants`).
+    Dma { name: "aoc-play", base: crate::cachemap::AOC_PLAY.0, size: crate::cachemap::AOC_PLAY.1 - crate::cachemap::AOC_PLAY.0 },
+    Dma { name: "aoc-capture", base: crate::cachemap::AOC_CAPTURE.0, size: crate::cachemap::AOC_CAPTURE.1 - crate::cachemap::AOC_CAPTURE.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },

@@ -92,6 +92,10 @@ pub const USB_DMA: (usize, usize) = (0x8B80_0000, 0x8C00_0000);
 pub const USB_DMA_NC: usize = 2 << 20;
 /// The AoC's IPC control block and its services' rings (aoc.rs IPC: the carve-out at G#9400_0000 plus G#1C0_0000), EL0 Device memory for the sensors process (KERNEL-OUT.md move 4): com.google.usf's rings lie in its first G#85000 bytes. The rest of the carve-out (the firmware, its heap) stays the kernel's. Granted as `aoc-ipc`.
 pub const AOC_IPC: (usize, usize) = (0x95C0_0000, 0x95E0_0000);
+/// The AoC's audio rings, outside `AOC_IPC` (measured on the Pro 2026-11-22 by the audio service's PROBE: `audio_playback5` 4 MiB at IPC + G#17C000, so G#9613_C000 to G#9657_C000; `audio_capture0` 92160 bytes at IPC + G#EA0000, so G#96AA_0000 to G#96AB_6800; both inside the carve-out, which ends at G#9700_0000). EL0 Device memory, granted to the audio service alone as `aoc-play` and `aoc-capture` (docs/AUDIO.md "The rings' windows").
+/// WHY these sizes (approved by the coordinator for the owner, 2026-11-22): a process reaches a granted region thru its handle, base plus an offset masked to the size, which needs a power of two aligned to itself (SANDBOX.md "Handles"). Growing `AOC_IPC` to cover both rings would take 16 MiB, and G#95C0_0000 is not 16 MiB aligned, so the masked sensors process's handle would go to nothing. So two windows, each the smallest power of two that is aligned and holds its ring: 8 MiB at G#9600_0000 for the playback ring, 1 MiB at G#96A0_0000 for the capture ring. The tradeoff: the rest of those 9 MiB is the AoC's heap (the firmware's own buffers, the other audio rings), which the audio service can now read and write as well as its rings. The audio service is ferros's own OS process, the same trust class as the sensors process, which already holds `aoc-ipc`; this is the smallest overreach the power-of-two handles allow. The AoC's firmware image (the carve-out's first G#1C0_0000) stays the kernel's.
+pub const AOC_PLAY: (usize, usize) = (0x9600_0000, 0x9680_0000);
+pub const AOC_CAPTURE: (usize, usize) = (0x96A0_0000, 0x96B0_0000);
 #[cfg(shim_handoff)]
 pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
@@ -381,7 +385,8 @@ pub fn enable() -> bool {
             let a = gib + j * MIB2;
             *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) || (GPU_MEM.0 != GPU_MEM.1 && a >= GPU_MEM.0 && a + MIB2 <= GPU_SNOOP) {
                 dma_pool(vhe, a, BLOCK)
-            } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
+            } else if (a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1) || (a >= AOC_PLAY.0 && a + MIB2 <= AOC_PLAY.1) || (a <= AOC_CAPTURE.0 && AOC_CAPTURE.1 <= a + MIB2) {
+                // The capture window is 1 MiB inside one 2 MiB block: the block is mapped EL0, and the grant (its handle) reaches only the window.
                 device_el0(vhe, a, BLOCK)
             } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) {
                 pool(vhe, a, BLOCK) | UXN

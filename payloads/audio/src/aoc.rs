@@ -8,7 +8,7 @@
 //!
 //! The IPC block is Device memory, reached thru the `aoc-ipc` grant's handle: every access an aligned word or a byte (payloads/sensors usf.rs does the same).
 
-use crate::{say, S_IPC, S_MBOX};
+use crate::{say, S_CAPTURE, S_IPC, S_MBOX, S_PLAY};
 use ferros_sys::{cap, mmio_read, mmio_write, now, sleep_until, freq, Handle};
 
 type Ipc = Handle<S_IPC>;
@@ -24,6 +24,69 @@ fn rd8(off: u64) -> u8 {
 }
 fn wr8(off: u64, v: u8) {
     Ipc::write8(off, v)
+}
+
+/// Where the IPC block lies (kernel cachemap.rs AOC_IPC), and the two ring windows past it (AOC_PLAY, AOC_CAPTURE): the AoC gives every offset from the IPC block's start, and a ring past the `aoc-ipc` window is reached thru the window that holds it.
+const IPC_BASE: u64 = 0x95C0_0000;
+const PLAY_BASE: u64 = 0x9600_0000;
+const CAPTURE_BASE: u64 = 0x96A0_0000;
+
+/// A granted window a ring's bytes are reached thru.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Win {
+    Ipc,
+    Play,
+    Capture,
+}
+
+impl Win {
+    /// Its start as an offset from the IPC block's, and its length (0 for a grant this process was not given: a kernel from before 2026-11-22 has neither ring window).
+    fn span(self) -> (u64, u64) {
+        match self {
+            Win::Ipc => (0, Ipc::len()),
+            Win::Play => (PLAY_BASE - IPC_BASE, Handle::<S_PLAY>::len()),
+            Win::Capture => (CAPTURE_BASE - IPC_BASE, Handle::<S_CAPTURE>::len()),
+        }
+    }
+    /// The window holding `len` bytes from IPC offset `off`, if one does.
+    fn holding(off: u64, len: u64) -> Option<Win> {
+        [Win::Ipc, Win::Play, Win::Capture].into_iter().find(|w| {
+            let (b, l) = w.span();
+            len != 0 && off >= b && off + len <= b + l
+        })
+    }
+    /// A word or a byte at IPC offset `off`, which `holding` has put inside this window.
+    fn rd32(self, off: u64) -> u32 {
+        let o = off - self.span().0;
+        match self {
+            Win::Ipc => Ipc::read32(o),
+            Win::Play => Handle::<S_PLAY>::read32(o),
+            Win::Capture => Handle::<S_CAPTURE>::read32(o),
+        }
+    }
+    fn rd8(self, off: u64) -> u8 {
+        let o = off - self.span().0;
+        match self {
+            Win::Ipc => Ipc::read8(o),
+            Win::Play => Handle::<S_PLAY>::read8(o),
+            Win::Capture => Handle::<S_CAPTURE>::read8(o),
+        }
+    }
+    fn wr32(self, off: u64, v: u32) {
+        let o = off - self.span().0;
+        match self {
+            Win::Ipc => Ipc::write32(o, v),
+            Win::Play => Handle::<S_PLAY>::write32(o, v),
+            Win::Capture => Handle::<S_CAPTURE>::write32(o, v),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Win::Ipc => "aoc-ipc",
+            Win::Play => "aoc-play",
+            Win::Capture => "aoc-capture",
+        }
+    }
 }
 
 /// The control block (ipc_internal.h:61-74): the magic at 0 once the firmware is up, the service count at 24, each header's size at 28, the table's offset at 32.
@@ -105,6 +168,11 @@ impl Svc {
         let (off, len) = self.span(dir);
         len != 0 && off + len <= Ipc::len()
     }
+    /// The granted window that holds a ring's direction whole (the same WHY as `fits`: an offset past a handle's region would wrap inside it, onto another service's memory).
+    fn ring_win(&self, dir: u64) -> Option<Win> {
+        let (off, len) = self.span(dir);
+        Win::holding(off, len)
+    }
     /// The AoC rung on this service's channel (ipc_core.c via aoc_service_core.c:194-195 and :560-563).
     fn signal(&self) {
         signal(self.irq())
@@ -153,10 +221,11 @@ pub fn find(name: &[u8]) -> Option<Svc> {
     None
 }
 
-/// The control queue and the playback ring, found and checked.
+/// The control queue and the playback ring, found and checked, and the window the ring's bytes are reached thru.
 pub struct Services {
     pub control: Svc,
     pub playback: Svc,
+    play: Win,
 }
 
 /// The two services this process speaks, by the names Linux allocates them by (alsa.h:42 `CMD_OUTPUT_CHANNEL`; aoc_alsa_drv.c:34-74, the playback ring of entry point 5 is `audio_playback5`, Android's low-latency path on husky: dmesg:7426-7430).
@@ -166,15 +235,15 @@ pub fn services() -> Result<Services, &'static str> {
     if control.ring() || !control.fits(DOWN) || !control.fits(UP) {
         return Err("audio_output_control is not a queue inside the aoc-ipc window");
     }
-    if !playback.ring() || !playback.fits(DOWN) {
-        return Err("audio_playback5 is not a ring inside the aoc-ipc window");
-    }
+    let Some(play) = playback.ring_win(DOWN).filter(|_| playback.ring()) else {
+        return Err("audio_playback5 is not a ring inside a granted window (aoc-ipc, aoc-play: a kernel from before 2026-11-22 grants neither ring window)");
+    };
     // WHY: this process writes the ring a 32-bit word at a time (Device memory takes no unaligned access), so its start and its length must both be whole words; the AoC sets them, so it is checked, not assumed.
     let (off, len) = playback.span(DOWN);
     if off & 3 != 0 || len & 3 != 0 {
         return Err("audio_playback5's ring is not word-aligned");
     }
-    Ok(Services { control, playback })
+    Ok(Services { control, playback, play })
 }
 
 // ── The control queue (ipc_core.c:654-689 write, :613-652 read; aoc_service_core.c:104-202) ──
@@ -362,6 +431,22 @@ pub fn samples(s: &Services) -> Result<u64, &'static str> {
     Ok(u64::from_le_bytes(w))
 }
 
+/// GET_EP_TOT_SAMPLES on the output control queue alone (the probe's round trip, needing no ring).
+pub fn control_samples() -> Result<u64, &'static str> {
+    let control = find(b"audio_output_control").ok_or("no audio_output_control service")?;
+    let mut c = [0u8; 17];
+    header(&mut c, CMD_GET_EP_TOT_SAMPLES);
+    c[8] = EP;
+    let mut r = [0u8; 64];
+    let n = command_on(control, &mut c, &mut r)?;
+    if n < 17 {
+        return Err("a short GET_EP_TOT_SAMPLES reply");
+    }
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&r[9..17]);
+    Ok(u64::from_le_bytes(w))
+}
+
 // ── The playback ring (ipc_core.c:185-210 write, :53-65 advance, :332-365 room, :578-600 reset) ──
 
 impl Services {
@@ -391,7 +476,7 @@ impl Services {
         let size = p.get(DOWN, R_SIZE) as u64;
         let mut wp = p.get(DOWN, R_WP) as u64;
         for &f in frames {
-            wr32(off + wp, f);
+            self.play.wr32(off + wp, f);
             wp += 4;
             if wp == size {
                 wp = 0;
@@ -463,6 +548,7 @@ pub const CAPTURE_FRAME_BYTES: usize = MICS * 2;
 pub struct Capture {
     pub control: Svc,
     pub ring: Svc,
+    win: Win,
 }
 
 /// The capture's two services by the names Linux allocates them by.
@@ -472,15 +558,15 @@ pub fn capture_services() -> Result<Capture, &'static str> {
     if control.ring() || !control.fits(DOWN) || !control.fits(UP) {
         return Err("audio_input_control is not a queue inside the aoc-ipc window");
     }
-    if !ring.ring() || !ring.fits(UP) {
-        return Err("audio_capture0 is not a ring inside the aoc-ipc window");
-    }
+    let Some(win) = ring.ring_win(UP).filter(|_| ring.ring()) else {
+        return Err("audio_capture0 is not a ring inside a granted window (aoc-ipc, aoc-capture: a kernel from before 2026-11-22 grants neither ring window)");
+    };
     // WHY: samples are read two bytes at a time at the ring's byte positions; an odd start or length would split one across the wrap. The AoC sets both, so they are checked.
     let (off, len) = ring.span(UP);
     if off & 1 != 0 || len & 1 != 0 {
         return Err("audio_capture0's ring is not sample-aligned");
     }
-    Ok(Capture { control, ring })
+    Ok(Capture { control, ring, win })
 }
 
 /// A capture command's reply checked only for arriving: the AoC's answer, or its error said with the command's name.
@@ -595,13 +681,13 @@ impl Capture {
         let mut done = 0u64;
         while done < n {
             if rp & 3 == 0 && n - done >= 4 && rp + 4 <= size {
-                let w = rd32(off + rp);
+                let w = self.win.rd32(off + rp);
                 f(w as u16 as i16);
                 f((w >> 16) as u16 as i16);
                 rp += 4;
                 done += 4;
             } else {
-                f((rd8(off + rp) as u16 | (rd8(off + rp + 1) as u16) << 8) as i16);
+                f((self.win.rd8(off + rp) as u16 | (self.win.rd8(off + rp + 1) as u16) << 8) as i16);
                 rp += 2;
                 done += 2;
             }
@@ -616,6 +702,21 @@ impl Capture {
     /// The capture ring's mailbox channel.
     pub fn irq(&self) -> u32 {
         self.ring.irq()
+    }
+}
+
+/// A service's header as the AoC wrote it, raw, for the probe (measure before fixing): its flags (type, channel), and each direction's offset, size, slots, tx, rx, wp and rp, with the `aoc-ipc` window's size beside them. None found: said.
+pub fn dump(name: &[u8]) {
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    let Some(s) = find(name) else {
+        say!("audio: {shown}: not in the AoC's service table");
+        return;
+    };
+    let f = s.flags();
+    say!("audio: {shown}: header at G#{:X}, flags G#{f:X} (type A#{}, channel A#{}, push {}), the window A#{} bytes", s.0, (f & TYPE_MASK) >> 16, (f >> IRQ_SHIFT) & IRQ_MASK, (f & RING_PUSH != 0) as u8, Ipc::len());
+    for (d, dn) in [(UP, "UP"), (DOWN, "DOWN")] {
+        let w = s.ring_win(d).map_or("no granted window", |w| w.name());
+        say!("audio: {shown} {dn}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}; as a ring, in {w}", s.get(d, R_OFFSET), s.get(d, R_SIZE), s.get(d, R_SLOTS), s.get(d, R_TX), s.get(d, R_RX), s.get(d, R_WP), s.get(d, R_RP));
     }
 }
 
