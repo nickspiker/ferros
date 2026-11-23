@@ -303,6 +303,24 @@ struct Ferros {
     app: PhotonApp,
     /// The waiter is started once the host hands over the wake sender: every launch since 2026-11-16, as the person is never asked before the first frame.
     waiting: bool,
+    /// The device's base and language as last handed to Photon (`numerals`).
+    numerals: (u8, Option<[u8; 3]>),
+}
+
+/// The device's number base (preference 0, tatau's code) and language in effect (ISO 639-3; None, English), read from this process's own grants page: no call, so every frame looks, as ferros_fluor reads the app scale.
+fn numerals_now() -> (u8, Option<[u8; 3]>) {
+    (ferros_sys::device_base(), ferros_sys::lang::effective())
+}
+
+/// The device's base and language handed to Photon, where they win over Photon's own fleet settings (photon c7935249 `set_host_numerals`; owner, 2026-11-22: "That's an identity preference, not Photon. Same with language."): the person's identity preference reaches the device, and Photon follows the device. Photon has one dozenal form, so DMS (12) and DLS (G#8C) are both its dozenal; a language Photon's list lacks, or none, is English, as the shell's.
+fn numerals_to_photon((base, lang): (u8, Option<[u8; 3]>)) {
+    let b = match base {
+        10 => photon_messenger::NumBase::Arabic,
+        16 => photon_messenger::NumBase::Hex,
+        _ => photon_messenger::NumBase::Dozenal,
+    };
+    let l = lang.and_then(fgtw::text::Lang::from_iso).unwrap_or(fgtw::text::Lang::En);
+    photon_messenger::set_host_numerals(Some(b), Some(l));
 }
 
 impl FluorApp<Px> for Ferros {
@@ -420,7 +438,14 @@ impl FluorApp<Px> for Ferros {
         self.app.take_window_geometry_request()
     }
     fn tick(&mut self, ctx: &mut Context) -> bool {
-        self.app.tick(ctx)
+        // The device's base or language changed (the settings page, or the person's identity preference arriving): Photon follows, and the frame is drawn again.
+        let now = numerals_now();
+        let moved = now != self.numerals;
+        if moved {
+            self.numerals = now;
+            numerals_to_photon(now);
+        }
+        self.app.tick(ctx) || moved
     }
     fn on_user_event(&mut self, event: Ev, ctx: &mut Context) -> EventResponse {
         match event {
@@ -537,12 +562,15 @@ fn main() {
         made.elapsed().as_millis()
     );
     let waiting = true;
+    // The device's base and language before the first frame, then followed every frame (`tick`).
+    let numerals = numerals_now();
+    numerals_to_photon(numerals);
     // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
     fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };
     // The person's app scale and the device's theme, followed live, and a pinch's end written back as the app scale with the display's grant (ferros_fluor; owner 2026-11-20: every kist follows the global scale and theme).
     let scale_token = sys::cap(caps.display);
-    match ferros_fluor::run_app(Ferros { app, waiting }, caps, None, scale_token) {
+    match ferros_fluor::run_app(Ferros { app, waiting, numerals }, caps, None, scale_token) {
         Ok(()) => println!("photon: closed"),
         Err(e) => println!("photon: {e}"),
     }

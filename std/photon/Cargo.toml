@@ -13,6 +13,8 @@ photon-messenger = { path = "../../../photon" }
 fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd", "emoji"] }
 # fluor's ferros host in the person's app scale and the device's theme, following both (owner 2026-11-20).
 ferros_fluor = { path = "../../ferros_fluor" }
+# The device's number base and language (preference 0 and the language block), which Photon follows on ferros (`numerals`): the person's identity preference reaches the device (settings flow identity to device only), and apps follow the device (owner, 2026-11-22).
+ferros_sys = { path = "../../ferros_sys" }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 # The alias's bundle kept sealed in Photon's domain (main.rs `alias_cache`): the AEAD Photon's at-rest layer uses and the VSF document it is kept in, the same versions Photon builds against.
 chacha20poly1305 = "0.11.0-rc.2"
