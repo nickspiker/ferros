@@ -128,6 +128,14 @@ fn wrap() {
     // The newest few, as `diag log 5` asks.
     let five = entries(&r2.newest(&mut m, 5)).iter().map(|s| s.place.seq).collect::<Vec<_>>();
     assert_eq!(five, vec![495, 496, 497, 498, 499]);
+    // Asked for every entry with room for one document: only the head block is read back, its entries the newest, in order.
+    let within = r2.newest_within(&mut m, usize::MAX, 1);
+    let one = entries(&within);
+    assert!(!one.is_empty() && one.len() < e.len(), "{} of {}", one.len(), e.len());
+    assert_eq!(one.last().unwrap().place.seq, 499);
+    for k in 1..one.len() {
+        assert_eq!(one[k].place.seq, one[k - 1].place.seq + 1);
+    }
 }
 
 #[test]

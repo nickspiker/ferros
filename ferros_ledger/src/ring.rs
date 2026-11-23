@@ -398,12 +398,19 @@ impl Ring {
 
     /// Up to `max` of the newest entries, oldest first, with what was found wrong among them (the chain checked between every two).
     pub fn newest<D: Blocks>(&self, dev: &mut D, max: usize) -> Vec<Item> {
+        self.newest_within(dev, max, usize::MAX)
+    }
+
+    /// `newest`, its blocks read back from the head only until their entries hold `bytes` of documents: a reader whose answer holds at most `bytes` (each entry it keeps carries at least its document) never holds more of the ring in memory than that and a block.
+    /// Why (the Pro, 2026-11-22, b1131): `diag "log 131072"` read back blocks for 131072 entries, every one in memory at once, and the kernel's 22 MiB heap ran out (a panic at a 512-byte allocation) for an answer of at most 256 KiB.
+    pub fn newest_within<D: Blocks>(&self, dev: &mut D, max: usize, bytes: usize) -> Vec<Item> {
         if self.empty {
             return Vec::new();
         }
         // Back from the head block, a block at a time, until enough entries or the ring has been gone round.
         let mut blocks: Vec<(u32, Block)> = Vec::new();
         let mut count = 0usize;
+        let mut docs = 0usize;
         let mut k = self.block;
         loop {
             let b = load(dev, self.half, k, usize::MAX);
@@ -411,8 +418,9 @@ impl Ring {
                 break;
             }
             count += b.entries.len();
+            docs += b.entries.iter().map(|e| e.1.len()).sum::<usize>();
             blocks.push((k, b));
-            if count >= max {
+            if count >= max || docs >= bytes {
                 break;
             }
             k = (k + self.half - 1) % self.half;

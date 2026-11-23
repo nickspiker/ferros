@@ -360,7 +360,8 @@ fn answer_locked(n: usize, room: usize) -> Vec<u8> {
     let (sys, per) = (system_key(), personal_key());
     // Each item's documents, newest kept first when the room runs out.
     let mut chunks: Vec<Vec<u8>> = Vec::new();
-    for item in s.ring.newest(&mut s.dev, n) {
+    // The ring read back only as far as the room could hold (`newest_within`): each entry kept carries at least its document, so documents past `room` bytes could never be in the answer, and reading them held them all in the kernel heap at once (b1131: `diag "log 131072"`, the heap out at 22 MiB, a panic).
+    for item in s.ring.newest_within(&mut s.dev, n, room) {
         let mut c = Vec::new();
         match item {
             Item::Entry { block, at, doc, stored } => {

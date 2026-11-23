@@ -3196,6 +3196,8 @@ pub fn run(mut b: Boot) -> ! {
     let _ = crate::rtc::sync();
     let freq = cntfrq();
     let mut t_heartbeat = cntpct();
+    // The kernel heap's next mark for the flash log (`ferros_heap::PEAK` past it: a line from five eighths up).
+    let mut heap_mark = 0usize;
     // The stalls already in the flash log (`platform::stalls`).
     let mut stalls_logged = 0u64;
     // The AoC's start, idle until the `sensors` switch asks for it (sensorlink.rs START).
@@ -4010,7 +4012,19 @@ pub fn run(mut b: Boot) -> ! {
             // The log region (64 MiB) holds months of these.
             // With the retry lines counted since they were last kept (flashlog `once`: the USB link's state, the link readied, the USB process's end), so the count is in the log even while nothing new is said.
             let again: alloc::string::String = crate::flashlog::once_pending().iter().map(|(s, n)| alloc::format!(", retry line {s} again A#{n}")).collect();
-            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}{again}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
+            let heap = crate::heap_report().map(|r| alloc::format!(", kernel heap A#{} of A#{} bytes in use (peak A#{})", r.in_use, r.size, r.peak)).unwrap_or_default();
+            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}{again}{heap}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
+        }
+        // The kernel heap's peak said in the flash log as it passes each eighth of the heap from five eighths up (2026-11-22, b1131: the first sign of a heap running out was the panic itself): an atomic read a pass, the heap's report only when the peak has moved past the last mark.
+        let peak = ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed);
+        if peak > heap_mark {
+            if let Some(r) = crate::heap_report() {
+                let eighth = r.size >> 3;
+                if peak >= eighth * 5 {
+                    crate::flashlog::line(&alloc::format!("kernel heap: peak A#{peak} of A#{} bytes (past A#{}/8), A#{} in use now, the largest free block A#{}; `diag heap` has the rest", r.size, peak / eighth, r.in_use, r.largest));
+                }
+                heap_mark = (peak / eighth + 1) * eighth;
+            }
         }
         // The GPU's clock follows its service (owner, 2026-11-05: the attest mark within a 120 Hz frame): at its top while a `gpu` process lives, at its floor otherwise; looked at only when the process table changed (process.rs PROCS_GEN), on this core, where every ACPM call is made. The L2 first going up and last going down (GPU.md "The GPU's clock").
         let table = crate::process::PROCS_GEN.load(core::sync::atomic::Ordering::Acquire);
