@@ -1,8 +1,6 @@
 //! The dry run of removing this device from its identity (docs/AUTH.md "Remove this device"; payloads/fgtw remove.rs): asks the identity service for it (op 33 [1]) and says its answer. The identity service puts every check and what each step would take on the console (`fgtw: remove (dry run): ...`), the kernel's half included; nothing is changed, no handle is typed, nothing of the identity is printed but device names and kist names.
 //!
-//! cargo el0 -p ferros-payload-removedry (spelled out in the farm), then:
-//! ferros-bridge spawn target/el0/aarch64-unknown-none/release/removedry.bin --name removedry --use fgtw
-//! ferros-bridge diag console | grep -a "remove (dry run)"
+//! Build it with `cargo el0 -p ferros-payload-removedry` (spelled out in the farm), run it with `ferros-bridge spawn target/el0/aarch64-unknown-none/release/removedry.bin --name removedry --use fgtw`, and read its answer with `ferros-bridge diag console | grep -a "remove (dry run)"`.
 #![no_std]
 #![no_main]
 

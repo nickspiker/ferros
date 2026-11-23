@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Put the phone's own AoC firmware into ferros's vault, for `diag aoc boot` (SENSORS.md "Starting the AoC through GSA's mailbox").
+# Put the device's own AoC firmware into ferros's vault, for the AoC's start on the `sensors` switch (service.rs SensorBoot; SENSORS.md "Starting the AoC through GSA's mailbox").
 # The file is /vendor/firmware/aoc.bin from the owner's phone (pulled once to /mnt/Harbor/firmware/husky-aoc/ through Android with root); it is Google's signed binary and never enters the repo. It goes in 2 MiB pieces `aoc.fw.0`, `aoc.fw.1`, ... (a PT transfer over 1 MiB lands in the kernel's 6 MiB big-transfer region; a 4 MiB piece reset the phone on 2026-10-23, the lock holder the X3 inside the store, cause not yet measured), and any stale higher piece is removed.
 # Usage: tools/husky-aoc-fw.sh [aoc.bin]
 set -euo pipefail
