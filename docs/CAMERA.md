@@ -1703,6 +1703,78 @@ The IDTs are each camera's own (their matrices differ, their channels peak in or
 - **The mosaics** (Lumis DEV_CELLS, knobs4 bit 0, a saturated red card under white light, all four cameras, the main and the front as the controls): red brightest at (1, 0) on the main, (0, 1) on the front, (1, 1) on the ultrawide and the tele; a blue card at (0, 1), (1, 0), (0, 0) and (0, 0).
 - **The tele's focus**: an Android i2c trace on its bus with G#61 in the address filter (the 2026-11-18 trace kept the sensors' addresses alone), tapping focus near and far; its writes should run between the factory's 7050 and 13538 in some scale.
 
+## Two-row slits, 2:1 and 1:1 (2026-11-22, desk)
+
+The owner, via the Lumis session: "We should be able to pull 10k lines per second, if we can do 4k full frame video at 60fps"; "ideally we read out those two rows only, in 1:1 and 2:1 mode"; at 1:1, of the quad's R R G G / R R G G / G G B B / G G B B "we only pull" the second and the third rows; "So if the sensor can let us do 2 rows, that's ideal. SSPPEEDD".
+Measured the same day with Lumis 0.2.57 on the flashed kernel: the tele's slit about 63 a second, the main's about 745; Lumis keeps 2 rows a slit.
+
+### The tele's 63 a second was Lumis's shutter
+
+The driver's console of that run (target/farm/lumis-target/slit1.txt):
+- `mode A#3: A#4032 x A#64 (... y G#BA0 to G#C1F ...), frame A#192 lines ... written after the first frame`, then `the mode written mid-stream after A#1 frames`: the slit's window and 192-line frame reach the tele after its first frame (`Cam::mode_live`), as on 2026-11-18 night when the same slit ran 557 a second.
+- Then `exposure: exposure A#15621 us: frame A#2562 lines`: Lumis carried its stills' 15.6 ms shutter into the slit, and the exposure's plan (ferros_cam ccs `Timing::plan`) lengthened every slit to hold it: 2562 lines of 6.1068 us, 64 a second.
+- A slit runs at its own frame only while the integration fits it, the frame less the margin (tele 4 lines, main 2, ultrawide 64). The main's 745 a second (1.34 ms) reads the same way, unconfirmed (its log was not kept).
+- For Lumis: open a slit at an integration inside its frame (a few hundred microseconds), or show that the shutter sets the slit rate.
+
+### What caps a slit: the sensor's least frame
+
+- **The main runs no frame shorter than about 262 lines (825 us), whatever the rows**: 4 rows asked 260, 132, 68 and 36 lines all ran 1199 a second; 64 rows asked 192 ran 1218, drained 1230 ("The slit for real", "The slit runs").
+- **The tele's least frame is about 294 lines (1.79 ms)**: 192 and 256 asked both ran 558 ("Slits on every camera").
+- In vt clocks the two are nearly equal (main 262 x 6320 = 1.656 million, tele 294 x 5568 = 1.637 million, both Samsung): a line count or a clock count, the device check below says which. Nothing captured names it: Android never runs such short frames, and the main's CCS limit block (G#1100) aliases.
+- **The ultrawide and the front ran the 192 lines asked** (794 and 499 a second): their floors are under 192 lines, unmeasured.
+- **The front end and the PDMA are not the cap.** Every slit the sensor sent landed: 261120 drained at 1230 a second, none lost or read over, every DMA_DONE released by the kernel's armed action at the interrupt, the frame thread 82 us an answer. A descriptor must be released inside the blanking: at 2 rows the main's blanking is about 260 lines, 819 us, where the slim program fits the 403 us of a 64-row slit at 1230 a second. A buffer of 2 rows is 12 KiB (`job::slit_bytes`, 2 lines of G#1400 and the 64-byte record on a page); the PDMA takes it as any other.
+- **So packing several slits into one DMA frame would buy nothing**: each slit is one sensor frame, and the sensor's frame is the floor, not the per-frame cost. It would matter only if the floor were lifted below about 100 us.
+
+### Two rows at 2:1
+
+- A binned slit of 2 rows is one Bayer pair, period-aligned, the readout's own colours (ferros_cam ccs `Mode::slit`, host-tested).
+- **The main refused 8 and 4 rows** (loch0 G#404, SENSOR_RESOL_MISMATCH and STREAM_ERROR: the sensor sent other than asked); 16 to 56 streamed with ERR_CRC_PH on the link, 64 clean. So its least window is between 9 and 16 rows, and 2 is expected to fail; the other three are unmeasured.
+- **If a sensor will not send 2 rows, the fastest way to deliver exactly the 2** is its least window with the 2 in it: the frame floor is the same, so the rate is the same (16 rows of the main's 3.149 us lines are 50 us of its 825), and the client keeps 2 rows of each slit.
+
+### Two rows at 1:1
+
+- **The 1:1 readouts are quad on the main, the ultrawide (48 MP) and the tele (48.8 MP)**; the front's own readout is plain Bayer at 1:1, so 2 rows there are a Bayer pair.
+- **The owner's slit straddles the quad's halves**: rows 1 and 2 of each 4-row period, one row of the top half's colours over one of the bottom half's, all three colours in 2 rows, the mosaic 4 across and 2 down. Rows 1 and 2 of a period read back as rows 2 and 1 under a vertical flip, and each captured window holds whole periods, so the same window gives the period's rows 1 and 2 in the frame as read, flipped or not (the ultrawide's G#0101 = 3, the tele's 2, the main's 3).
+- **Its colours as read** (`Cam::cfa`'s blocks, each one row tall): the main `G G B B` over `R R G G`; the ultrawide and the tele `B B G G` over `G G R R`. The list carries them as `cfa` (the blocks, as now) with `slit_cfa_period` 4 across and `slit_cfa_period_y` 2 down; each frame's header says its periods at +14 (across) and +15 (down).
+- **Remosaic** (plain Bayer at 1:1): the tele has one, its 11-degree readout (the array's middle 4032 x 3024 at 1:1, a Bayer mosaic, its line 9.8712 us against the 22 degrees' 6.1068 for the same 4032 columns); a remosaic of the tele's whole width is not captured (its 48.8 MP readout is quad). The main's 1:1 init is quad and no remosaic word is known; the ultrawide's IMX787 likely has Sony's on-chip remosaic, but no captured readout uses it. So a full-width 1:1 slit is the straddle on all three.
+- **The 1:1 row comes as one line**: the main's 8160 RAW10 a line, 24 a second clean thru loch0 with the link at 1.49 GB/s (2026-11-18 evening). Its line (11600 clocks at 1761 MHz, 6.586 us) is the link's at full width; a slit's few rows do not load the link, but each line still crosses it at the lane rate, so the line stays near 6.5 us.
+- The straddle needs the sensor to start its window one row into a quad: on the main that is 2 addresses (its addresses run 2 a pixel), on the tele and the ultrawide 1, an odd address, which a sensor may refuse or round. The device check below reads the window back.
+
+### What each camera reaches with 2-row slits
+
+Lines a second is 2 times slits a second. Measured where marked; the rest from each line time and the floor as noted.
+
+| camera, mode | line | frame of the slit | slits a second | lines a second |
+|---|---|---|---|---|
+| main 2:1 | 3.1489 us | its floor, about 262 lines | 1212 to 1230, measured | 2.4k to 2.5k |
+| main 2:1, line at 5888 clocks (the least the link takes at full width) | 2.934 us | 262 lines, if the floor is lines | 1301 | 2.6k |
+| main 1:1, straddle | 6.586 us | 262 lines (lines), or 1.656 million clocks at 1761 MHz (clocks) | 579 (lines), 1064 (clocks) | 1.2k to 2.1k |
+| ultrawide 2:1 | 6.5616 us | 192 asked, measured; its floor under it | 794 measured; 1588 at 96 lines | 1.6k (3.2k at 96) |
+| ultrawide 1:1, straddle | 5.4067 us | 192 lines, if its floor in lines holds | 963 | 1.9k |
+| front (its readout is its 1:1) | 10.4378 us | 192 asked, measured; its floor under it | 499 measured; 998 at 96 lines | 1.0k (2.0k at 96) |
+| tele 2:1 | 6.1068 us | its floor, about 294 lines | 557, measured | 1.1k |
+| tele 1:1, 48.8 MP straddle | 13.2008 us | 294 lines (lines) | 258 | 0.5k |
+| tele 1:1, 11 degrees (remosaiced Bayer pair) | 9.8712 us | 294 lines (lines) | 344 | 0.7k |
+
+- **10k lines a second from 2 rows needs 5000 frames a second, 200 us a frame**: four times shorter than the main's 825 us floor, the shortest measured. Not reachable on any of the four unless the floor is a register that can be set.
+- 4k at 60 a second is 130k rows a second, but each row is read once a frame; the sensors' readout (the main's 383k rows a second binned, "The line, toward a million") is not their frame rate, and a slit is one frame a sample.
+- Rows kept from each slit raise the lines a second at the same frame rate: the main's 1230 slits of 10 rows are 12.3k lines a second, neighbouring lines of the scene read a few microseconds apart (a strip stitched at the subject's speed, Lumis's to do).
+
+### Staged (not committed; needs the device): target/farm/camera-work/slit-2row.diff
+
+- ferros_cam ccs: `Mode::slit` takes 2 rows at 1:1 on a quad array, one row into its period (`Mode::straddles`), and `Mode::periods` gives (2, 2) binned, (4, 4) quad, (4, 2) the straddle; host tests on the main's binned and 1:1 inits.
+- ferros_cam cams: `Cam::slit_least`, the measured floors (main 262, tele 294; the ultrawide and the front 0, unmeasured).
+- ferros_cam list: every section's `cfa_period_y`; the binned and 1:1 sections' `slit_kind` (3, 4), `slit_rows_least` 2, `slit_cfa_period` and `slit_cfa_period_y`; `slit_lines_least` where measured.
+- payloads/camera: the header's +15, the period down.
+
+### Device checks (no owner needed; hand-spawned driver and cambench, nothing stored)
+
+- **Least rows, each camera**: binned slits of 2, 4, 8, 12 and 16 rows; at each, the link's last packet header (PHY lane +B4 to +D0: data type and word count) and its line-end word, so a refused height says what the sensor sent.
+- **Least frame, each camera**: at its least rows, the frame asked 192, 160, 128, 96, 64 lines and down to rows plus 2^4; the sensor's counter against the front end's rate (cambench's frame sweep). Each floor goes into `Cam::slit_least`.
+- **Lines or clocks**: the main's slit with its line at 5888 clocks, the frame 192 asked: about 769 us (1301 a second) if the floor is 262 lines, 825 us (1212) if it is about 1.65 million clocks.
+- **The 1:1 straddle**: kind 4, 2 rows, on the main, the ultrawide and the tele; CAPS reads the window back (y start one row into a period), and Lumis's DEV_CELLS on the red card names the two rows' colours (expected above).
+- **The front end at the floor**: every run above says its DMA_DONEs released by the kernel and its error words; any LATE_CONFIG at 2 rows would name the per-frame cost.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
