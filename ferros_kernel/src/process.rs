@@ -10281,14 +10281,16 @@ fn image_heap_start(code: &[u8]) -> usize {
     if image_grows(code) && declared > HEAP_START { HEAP_START } else { declared }
 }
 
-/// The zeroed tail at its most: .bss plus 16 and the whole declared heap (the arc's ceiling).
+/// The zeroed tail at its most: .bss plus 16 and the whole declared heap (the arc's ceiling), up to the board's whole pool.
+/// Until 2026-11-22 it was capped at 1 GiB, a cap carried over from `image_tail` (d2f14c2e, 2026-10-27, when an arc was one contiguous block of a boot-time pool and the whole tail was mapped at spawn) into the ceiling (50963897, 2026-11-11, ARCS step 2). For a growing image the ceiling maps nothing: it sizes the arc's window of addresses (`arc_alloc_room`) and bounds SYS_ARC's grows, every frame still asked for and refused when the pool has none. So the cap kept Lumis (a 4 GiB heap declared, std/lumis/build.rs) at about 1 GiB from the vault while a dev run had 4 GiB: its full-resolution integrator's 1.07 GB allocation failed on the Pro (2026-11-22, 15:14:43).
+/// What the cap protected is kept: the sum of the image's two words cannot wrap (taken in 128 bits), and no window is sized past what the pool could ever give (`frames::map_bytes`), so an image declaring more is given a window it can never fill no larger than the pool, and its grows past the free frames are refused as they come (ARC_WHY_MEMORY).
 fn image_tail_ceiling(code: &[u8]) -> usize {
     if !has_image_header(code) {
         return 0;
     }
-    let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
-    // WHY the min: as `image_tail`'s.
-    (w(16) + w(48)).min(1 << 30)
+    let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as u128;
+    // WHY the min: both words are the image's; past the pool's bytes no arc could hold it, and the window it sizes (a power of two of the 64 GiB arc space) would only spend addresses other arcs need. PROOF it is needed: without it an image declaring a heap near 2^64 makes `arc_alloc_room`'s `(ceiling + guard).next_power_of_two()` overflow, which the release kernel (no overflow checks) wraps to 0, so the window is one frame while the ceiling lets SYS_ARC grow the arc over the windows of the arcs after it; and one declaring a few hundred GiB takes a window no power of two of the arc space holds, so it is refused for room though the pool could run it.
+    (w(16) + w(48)).min(crate::frames::map_bytes() as u128) as usize
 }
 
 /// A process's arc (its making is `arc_for`, the code's copy, then `build_from`; the copy with the kernel lock let go since 2026-11-18, `spawn`, `spawn_build`): the image's header read, the arc sized for its code, its zeroed tail, `inline` bytes of input, the stack's guard and the stack, taken from the pool (fixed mode's exact 2^K, exact mode's limit set). Under the kernel lock (the arc pool). The caller copies the code in at CODE.

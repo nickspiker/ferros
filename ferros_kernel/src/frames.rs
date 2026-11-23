@@ -525,6 +525,11 @@ pub fn test_frame(f: usize) -> Option<(usize, usize)> {
     Some((wrong, first))
 }
 
+/// The bytes the map holds, from the map alone (no lock: a sum over constants): the most any arc could ever be given on this board, for a ceiling that only sizes a window of addresses (process.rs `image_tail_ceiling`).
+pub fn map_bytes() -> usize {
+    map().iter().map(|&(lo, hi)| hi - lo).sum()
+}
+
 /// Every frame the map holds, the tables' too (`test_frame`'s range).
 pub fn total() -> usize {
     pool().total
