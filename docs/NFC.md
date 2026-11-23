@@ -116,6 +116,8 @@ The CS40L26A at G#43 (zuma-shusky-haptics.dtsi: reset gph2-3 active low, trigger
 
 The `nfc` switch takes the motor's reset low with the NFC chip's first pulse and high at its end: 20 ms low, then 46 ms for its ROM (it needs 10) inside the NFC chip's waits; off holds both chips in reset. Nothing else drives gph2 (the modem drives gph0 and gph1).
 
+A failed transfer resets the bus controller (2026-11-22, `recover`, as Linux's i2c-exynos5 does): a NACK left the unsent bytes in the transmit FIFO, and the next write sent them ahead of its own, so after the motor NACKed its wake-up every register read returned the register before it, one more behind with each NACK. STATE counts the resets; the first 16 are said with how many bytes each found stranded.
+
 While NFC is switched off (its status circle) the process does not run and the motor has no driver. Nothing buzzes yet; when something does (a key's feedback), either the status circle's off becomes the radio's off inside this process (discovery stopped, the controller in reset, the bus still served) or the bus gets a server of its own.
 
 ```

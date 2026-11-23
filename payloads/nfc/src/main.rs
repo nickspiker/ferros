@@ -58,6 +58,10 @@ const AID: [u8; 8] = [0xF0, 0x50, 0x48, 0x4F, 0x54, 0x4F, 0x4E, 0x01];
 // The HS-I2C controller (kernel hsi2c.rs, i2c-exynos5.c auto mode).
 const CTL: u64 = 0x00;
 const FIFO_CTL: u64 = 0x04;
+const TRAILING_CTL: u64 = 0x08;
+const CONF: u64 = 0x40;
+/// The bus's timing words (HS1-HS3, FS1-FS3, SLA: i2c-exynos5.c G#54-G#6C), set by the kernel's `nfc` switch and kept across a controller reset (`reset`).
+const TIMINGS: [u64; 7] = [0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C];
 const INT_ENABLE: u64 = 0x20;
 const INT_STATUS: u64 = 0x24;
 const FIFO_STATUS: u64 = 0x30;
@@ -67,12 +71,16 @@ const AUTO_CONF: u64 = 0x44;
 const TRANS_STATUS: u64 = 0x50;
 const ADDR: u64 = 0x70;
 const CTL_MASTER: u32 = 1 << 3;
+const CTL_SW_RST: u32 = 1 << 31;
 const CTL_RXCHON: u32 = 1 << 6;
 const CTL_TXCHON: u32 = 1 << 7;
 const INT_TRANSFER_DONE: u32 = 1 << 7;
 const INT_ERRORS: u32 = 0xF << 8;
 const INT_NODEV: u32 = 1 << 10;
 const FIFO_TX_EMPTY: u32 = 1 << 8;
+/// FIFO_STATUS's levels: the transmit FIFO's in bits 6-0, the receive FIFO's in bits 22-16 (i2c-exynos5.c HSI2C_TX_FIFO_LVL_MASK, HSI2C_RX_FIFO_LVL).
+const FIFO_LVL: u32 = 0x7F;
+const FIFO_RX_LVL_SHIFT: u32 = 16;
 const FIFO_RX_EMPTY: u32 = 1 << 24;
 const AUTO_READ: u32 = 1 << 16;
 const AUTO_STOP_AFTER_TRANS: u32 = 1 << 17;
@@ -137,6 +145,9 @@ const GPA7_ECON: u64 = 0x700 + 0x18;
 const GPA7_EMASK: u64 = 0x900 + 0x18;
 const GPA7_EPEND: u64 = 0xA00 + 0x18;
 /// The serving loop's doorbell: counted up by `irq_thread` at each interrupt it takes. The loop's idle wait is on it, ended also by a call (`wait_world_or_call`), a preference changing (the screen: the kernel wakes every word waiter), or discovery's retry. Until 2026-11-13 the loop read the pin every millisecond (every 16 in the dark): ~950 wakes a second on the 8a with the screen on.
+/// Controller resets after a failed transfer (`recover`), for STATE; the first `RESET_SAY` are said on the console.
+static RESETS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const RESET_SAY: u32 = 1 << 4;
 static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// 1 while `irq_thread` waits on the line; 0 once it took an interrupt and left the line masked until the loop has read the chip (as payloads/pcie1).
 static ARMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -274,6 +285,47 @@ impl Nfc {
 
     /// One auto-mode transfer to `target` on the bus: `tx` written, or `rx` filled, with STOP after it unless `hold` keeps the bus for the read that follows (the motor's register reads: a 32-bit address, then the value). The RX FIFO (64 deep) is drained as the bytes come, so a read of any NCI packet's length works.
     fn xfer(&self, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Result<(), u32> {
+        let r = self.xfer_once(target, tx, rx, hold);
+        if let Err(e) = r {
+            self.recover(target, e);
+        }
+        r
+    }
+
+    /// A transfer that failed (a NACK, a bus error, a timeout), cleaned up as Linux does (i2c-exynos5.c: `exynos5_i2c_reset` on "ack was not received" at a write or a read, and on a timeout): the controller let finish what it is clocking, then reset, which empties both FIFOs.
+    /// WHY: a NACK leaves the unsent bytes in the transmit FIFO, and nothing here took them out (i2c-exynos5.c knows no FIFO flush but the reset; drain_rx empties only the receive side). The next write then sends them ahead of its own, its own stay for the one after, and so on. On the Pro (2026-11-22) the motor NACKed its wake-up once and every later register read returned the register before it, exactly: REVID read DEVID's G#40A260, IRQ1 status REVID's G#A1, EINT1 IRQ1's G#1, the mailbox EINT1's G#80004100, the ROM state the mailbox's G#0; the next op 7 NACKed again and ran two behind (DEVID read the ROM state's G#2), with no receive bytes ever reported dropped. Each NACK added one register of lag, which only a queued 4-byte address explains. The NFC chip's own NACKs while it wakes (`send`'s retries) go thru the same path, so a NACKed packet would have stayed queued too (inferred, not seen).
+    fn recover(&self, target: u8, e: u32) {
+        for _ in 0..WAIT_POLLS {
+            if self.rd(TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
+                break;
+            }
+        }
+        let st = self.rd(FIFO_STATUS);
+        self.reset();
+        let n = RESETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < RESET_SAY {
+            say!(self.grants, "nfc: a transfer to G#{target:02X} failed (G#{e:X}), A#{} bytes unsent in the transmit FIFO and A#{} in the receive FIFO: the controller reset, both emptied\n", st & FIFO_LVL, st >> FIFO_RX_LVL_SHIFT & FIFO_LVL);
+        }
+    }
+
+    /// The controller's software reset with its configuration kept, `exynos5_i2c_reset`'s order: SW_RST set and cleared in CTL, the timing words back, then `exynos5_i2c_init`'s CTL (master), TRAILING_CTL and CONF (auto mode). Whatever reset does to the configuration words, they come back as the kernel's `nfc` switch left them. Every transfer writes its own FIFO_CTL, INT_ENABLE, ADDR and AUTO_CONF.
+    fn reset(&self) {
+        let conf = self.rd(CONF);
+        let trailing = self.rd(TRAILING_CTL);
+        let timings = TIMINGS.map(|o| self.rd(o));
+        let c = self.rd(CTL);
+        self.wr(CTL, c | CTL_SW_RST);
+        self.wr(CTL, c & !CTL_SW_RST);
+        for (&o, v) in TIMINGS.iter().zip(timings) {
+            self.wr(o, v);
+        }
+        self.wr(CTL, CTL_MASTER);
+        self.wr(TRAILING_CTL, trailing);
+        self.wr(CONF, conf);
+    }
+
+    /// One try of `xfer`: on an error it returns at once, the controller left as the error found it (`xfer` resets it).
+    fn xfer_once(&self, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Result<(), u32> {
         let mut idle = false;
         for _ in 0..WAIT_POLLS {
             if self.rd(TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
@@ -284,7 +336,12 @@ impl Nfc {
         if !idle {
             return Err(E_BUSY);
         }
-        // Every transfer starts from an empty receive FIFO. The read below takes the first bytes the FIFO holds, so bytes left by an earlier transfer would be its answer and its own bytes the next read's: on the Pro (2026-11-10) every motor read returned the read three before's value, twelve bytes behind. Said when it happens, so where they come from is seen.
+        // Every transfer starts from empty FIFOs. A failed transfer resets the controller (`xfer`, `recover`), which empties both; this is the check that nothing got past it. The read below takes the first bytes the receive FIFO holds, and a write sends the transmit FIFO's first bytes, so either would answer or address the wrong register: on the Pro every motor read returned the value of a read before it (2026-11-10 three behind, 2026-11-22 one, then two).
+        let tx_left = self.rd(FIFO_STATUS) & FIFO_LVL;
+        if tx_left != 0 {
+            say!(self.grants, "nfc: A#{tx_left} bytes were waiting in the transmit FIFO before a transfer to G#{target:02X}: the controller reset\n");
+            self.reset();
+        }
         let stale = self.drain_rx();
         if stale != 0 {
             say!(self.grants, "nfc: A#{stale} bytes were waiting in the receive FIFO before a transfer to G#{target:02X}: dropped\n");
@@ -300,20 +357,7 @@ impl Nfc {
         self.wr(AUTO_CONF, auto);
         self.wr(AUTO_CONF, auto | AUTO_MASTER_RUN);
         if read {
-            let r = self.read_run(rx);
-            // A read that failed once it was running may still be clocking its bytes in: let it finish, then drop what came, so none of it answers the next read.
-            if let Err(e) = r {
-                for _ in 0..WAIT_POLLS {
-                    if self.rd(TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
-                        break;
-                    }
-                }
-                let late = self.drain_rx();
-                if late != 0 {
-                    say!(self.grants, "nfc: a read from G#{target:02X} failed (G#{e:X}); A#{late} bytes came after it: dropped\n");
-                }
-            }
-            r
+            self.read_run(rx)
         } else {
             for &b in tx {
                 let mut room = false;
@@ -852,7 +896,7 @@ impl Nfc {
     }
 
     fn state(&self, out: &mut Line) {
-        let _ = write!(out, "firmware {}, RF config {}; {}{}; S {}; activations {}, S served {}, fields {}, tags {}; TAG held A#{}; discovery failures A#{}, reset pulses A#{}, probes A#{} (A#{} found discovery stopped); ST notifications A#{} (last {}); chip last heard A#{} ms ago", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.needs_init { ", to be brought up again" } else { "" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags, self.nheld, self.discover_failures, self.pulses, self.probes, self.found_stopped, self.st_notes, Hex(&self.st_last), (now() - self.heard_at) * 1000 / freq());
+        let _ = write!(out, "firmware {}, RF config {}; {}{}; S {}; activations {}, S served {}, fields {}, tags {}; TAG held A#{}; discovery failures A#{}, reset pulses A#{}, probes A#{} (A#{} found discovery stopped); ST notifications A#{} (last {}); chip last heard A#{} ms ago; bus resets after a failed transfer A#{}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.needs_init { ", to be brought up again" } else { "" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags, self.nheld, self.discover_failures, self.pulses, self.probes, self.found_stopped, self.st_notes, Hex(&self.st_last), (now() - self.heard_at) * 1000 / freq(), RESETS.load(core::sync::atomic::Ordering::Relaxed));
     }
 
     /// One of the motor's registers: its address written without STOP, then the value read.
