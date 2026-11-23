@@ -590,6 +590,8 @@ fn kist_call(job: &KistJob) -> bool {
 fn kist_arc(job: &mut KistJob) -> Result<bool, KistFault> {
     let (need, ceiling) = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
     let masked = crate::process::kist_masked(&job.head, job.total);
+    // Its frames made clean first with the kernel lock let go (frames.rs `prepare`), so the take under it zeroes none.
+    crate::frames::prepare(crate::process::arc_frames(need, masked));
     let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(need, ceiling, masked)) else {
         return if crate::process::any_dying() { Ok(false) } else { Err((why::ROOM, "the arc pool has no room for the kist")) };
     };
@@ -1690,6 +1692,7 @@ fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], g
     // Three holds, none of the kernel lock across a read (2026-11-18; one hold of the kernel lock from the length to the last piece before, 24 ms for pcie1's 633 KB and 148 ms at the most, `diag lock`): the length under the vault's lock, the staging arc under the kernel lock, the pieces into it under the vault's lock again.
     let total = vault(|| store.as_mut()?.pieces_len(key).ok().flatten())?;
     let need = crate::process::CODE + total;
+    crate::frames::prepare(crate::process::arc_frames(need, false));
     let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(need, need, false)) else {
         return Some(Err("the arc pool has no room to stage the capsule"));
     };
@@ -6441,6 +6444,8 @@ pub fn run(mut b: Boot) -> ! {
                         // The arc starts with the image's first heap and grows to the rest (`stream_room`), and holds the whole capsule while it is staged. WHY the bound: the code offset is the host's; an image header past the first piece is not read (the arc is then the host's sum).
                         let (size, ceiling) = if co <= piece.len() && piece.len() - co >= 56 { crate::process::stream_room(need, &piece[co..co + 56]) } else { (need, need) };
                         let size = size.max(crate::process::CODE + total + crate::process::STACK);
+                        // Its frames made clean first with the kernel lock let go (frames.rs `prepare`), so the take under it zeroes none.
+                        crate::frames::prepare(crate::process::arc_frames(size, false));
                         if let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(size, ceiling, false)) {
                             spawn_stage = Some((arc, total, 0, co, cl));
                         }

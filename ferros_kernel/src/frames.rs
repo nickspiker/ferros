@@ -272,19 +272,11 @@ pub fn clean_step() -> bool {
     }
     let f = crate::process::with_lock(|| {
         let p = pool();
-        let clean: u32 = p.used.iter().zip(p.clean.iter()).map(|(&u, &c)| (!u & c).count_ones()).sum();
-        // The first free frame neither clean nor armed, below the pool's end.
-        let w = (0..WORDS).find(|&w| !(p.used[w] | p.clean[w] | p.armed[w]) != 0);
-        let f = w.map(|w| w * 64 + (!(p.used[w] | p.clean[w] | p.armed[w])).trailing_zeros() as usize);
-        let Some(f) = f.filter(|&f| f < p.total && clean < CLEAN_AHEAD) else {
+        let f = unclean_free(p).filter(|_| clean_free_of(p) < CLEAN_AHEAD as usize);
+        if f.is_none() {
             CLEAN_LOW.store(false, Relaxed);
-            return None;
-        };
-        let w = f / 64;
-        // Out of the pool while it is zeroed: marked used, so no take finds it and a reset's scrub zeroes it with the rest.
-        p.used[w] |= 1 << (f % 64);
-        p.free -= 1;
-        Some(f)
+        }
+        f.map(|f| hold_for_zeroing(p, f))
     });
     let Some(f) = f else { return false };
     zero(pa(f));
@@ -293,6 +285,53 @@ pub fn clean_step() -> bool {
         reclaimed(p, f, false);
     });
     true
+}
+
+/// Free frames known clean now (a take of one zeroes nothing). Under the kernel lock.
+fn clean_free_of(p: &Pool) -> usize {
+    p.used.iter().zip(p.clean.iter()).map(|(&u, &c)| (!u & c).count_ones() as usize).sum()
+}
+
+/// `clean_free_of` the pool, for a caller deciding whether a growth would zero frames under the kernel lock (`prepare`). Under the kernel lock.
+pub fn clean_free() -> usize {
+    clean_free_of(pool())
+}
+
+/// The first free frame neither clean nor armed (the tripwire's), below the pool's end; None when there is none.
+fn unclean_free(p: &Pool) -> Option<usize> {
+    let w = (0..WORDS).find(|&w| !(p.used[w] | p.clean[w] | p.armed[w]) != 0)?;
+    Some(w * 64 + (!(p.used[w] | p.clean[w] | p.armed[w])).trailing_zeros() as usize).filter(|&f| f < p.total)
+}
+
+/// Free frame `f` out of the pool while it is zeroed with the kernel lock let go: marked used, so no take finds it and a reset's scrub zeroes it with the rest. `reclaimed` puts it back clean. Under the kernel lock.
+fn hold_for_zeroing(p: &mut Pool, f: usize) -> usize {
+    p.used[f / 64] |= 1 << (f % 64);
+    p.free -= 1;
+    f
+}
+
+/// Frames made ready for a take of `n` with the kernel lock let go (2026-11-22, kernlock): until `n` free frames are known clean, the frames given back are wiped (`reclaim_step`) and then free frames never taken are zeroed (as `clean_step`, past `CLEAN_AHEAD`), one at a time, each in two short holds of the lock with its 2 MiB zeroed between them.
+/// Why: a take zeroes every frame not known clean under the lock, about 90 us a frame (the Pro, b1129: 138 ms for a 3 GiB staging arc, `diag lock`, while a camera streamed; a stream dies on a hold past its frame). Called first, the take that follows finds clean frames and zeroes none, its hold the bookkeeping and the mapping alone (about 1.2 us a frame: a GPU block's 224 frames in 277 us, clean).
+/// Best effort, never a refusal: it stops when no frame is left to wipe or zero, and a take on another core meanwhile may use some of these frames, so the take that follows zeroes at most what was used meanwhile (as before, under the lock).
+/// At most `n` frames wiped or zeroed here, so it ends even while other cores take and give back frames without a pause.
+/// Call it without the kernel lock: the service loop as is, a syscall thru process.rs `unlocked`.
+pub fn prepare(n: usize) {
+    for _ in 0..n {
+        let ready = crate::process::with_lock(|| clean_free_of(pool()) >= n);
+        if ready {
+            return;
+        }
+        if reclaim_step() {
+            continue;
+        }
+        let f = crate::process::with_lock(|| {
+            let p = pool();
+            unclean_free(p).map(|f| hold_for_zeroing(p, f))
+        });
+        let Some(f) = f else { return };
+        zero(pa(f));
+        crate::process::with_lock(|| reclaimed(pool(), f, false));
+    }
 }
 
 /// A free frame, zeroed, now taken; None when every frame is taken. The first free in the map's order, so the ranges ferros has used longest fill first.

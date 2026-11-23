@@ -905,6 +905,11 @@ fn arc_shape(bytes: usize, masked: bool) -> usize {
     if masked { bytes.max(1 << ARC_MIN_LOG2).next_power_of_two() } else { bytes.max(1).next_multiple_of(crate::frames::FRAME) }
 }
 
+/// The frames an arc of `bytes` in its mode takes at its making (`arc_alloc_room`): what a caller without the kernel lock has made clean first (frames.rs `prepare`), so the take under it zeroes none.
+pub fn arc_frames(bytes: usize, masked: bool) -> usize {
+    arc_shape(bytes, masked).div_ceil(crate::frames::FRAME)
+}
+
 /// An arc of at least `bytes` that never grows (`arc_alloc_room`).
 pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
     arc_alloc_room(bytes, bytes, masked)
@@ -3912,13 +3917,27 @@ fn regions_free(epoch: u64) {
 }
 
 /// SYS_DMA x1 = 2: the caller's own GPU block (DMA region `i`) grown to 2^`log` bytes (2026-11-13, the coordinator's call: a kist asks for the GPU memory it wants, in powers of two, up to `GPU_BLOCK_MOST`). Its size after, or ERR with why said on the console beside the pool's state. Under the lock.
-fn block_ask(p: &Process, i: usize, log: u64) -> u64 {
+/// Called under the kernel lock (a syscall's), which it lets go while the growth's frames are made clean when the pool has fewer known clean than it asks (`frames::prepare`, 2026-11-22, kernlock: a camera opening grows Lumis's block from 64 to 512 MiB, 224 frames, about 20 ms of zeroing under the lock when none is clean); `p` is not used after.
+fn block_ask(p: &Process, cur: usize, i: usize, log: u64) -> u64 {
     let j = i - gpub0();
+    let (epoch, name) = (p.epoch, p.name.clone());
+    let had_n = unsafe { (*(&raw const BLOCKS))[j].n };
+    // WHY the bounds: `log` is the caller's word; a shift past the word's width or past the ceiling is refused below (`block_grow`), so nothing is made ready for it.
+    if log < usize::BITS as u64 && 1usize << log <= crate::cachemap::GPU_BLOCK_MOST {
+        let want = (1usize << log) / crate::frames::FRAME;
+        if want > had_n && want - had_n > crate::frames::clean_free() {
+            unlocked(|| crate::frames::prepare(want - had_n));
+            // Ended on another core meanwhile (its `regions_free` passed the block by or freed it): nothing to grow.
+            if !proc_of(cur).is_some_and(|q| q.epoch == epoch && !q.dying) {
+                return ERR;
+            }
+        }
+    }
     let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
     // WHY: `log` is the caller's word, and a shift past the word's width is no size; past the ceiling (or under a frame) `block_grow` says why.
     let had = unsafe { (*(&raw const BLOCKS))[j].n } * crate::frames::FRAME;
     let t0 = crate::platform::cntpct();
-    let r = if owner != p.epoch || !held {
+    let r = if owner != epoch || !held {
         Err("not the caller's GPU block")
     } else if log >= usize::BITS as u64 {
         Err("a GPU block is a power of two from 2 MiB to the ceiling")
@@ -3931,13 +3950,13 @@ fn block_ask(p: &Process, i: usize, log: u64) -> u64 {
             // The growth's cost under the lock (its frames zeroed where the pool had not wiped them already), once a block.
             if have != had {
                 let us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / crate::platform::cntfrq();
-                let line = alloc::format!("gpu block: {} grew from A#{} to A#{} MiB in A#{us} us, A#{} MiB of the pool free\n", core::str::from_utf8(&p.name).unwrap_or("?"), had >> 20, have >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
+                let line = alloc::format!("gpu block: {} grew from A#{} to A#{} MiB in A#{us} us, A#{} MiB of the pool free\n", core::str::from_utf8(&name).unwrap_or("?"), had >> 20, have >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
                 k().console.extend_from_slice(line.as_bytes());
             }
             have as u64
         }
         Err(why) => {
-            let line = alloc::format!("gpu block: {} asked for 2^A#{log} bytes (holding A#{} MiB, the most A#{} MiB): {why}, A#{} MiB of the pool free: refused\n", core::str::from_utf8(&p.name).unwrap_or("?"), have >> 20, crate::cachemap::GPU_BLOCK_MOST >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
+            let line = alloc::format!("gpu block: {} asked for 2^A#{log} bytes (holding A#{} MiB, the most A#{} MiB): {why}, A#{} MiB of the pool free: refused\n", core::str::from_utf8(&name).unwrap_or("?"), have >> 20, crate::cachemap::GPU_BLOCK_MOST >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
             k().console.extend_from_slice(line.as_bytes());
             ERR
         }
@@ -7852,7 +7871,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // x1 = 1: the region's size in bytes instead (2026-11-11: the GPU service maps the layer arena by it, which grew from 64 to 128 MiB; a kernel from before answers the base to every call, which a caller tells by its being far past any size).
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // x1 = 2 (2026-11-13): the caller's GPU block grown to 2^x2 bytes, answered its size after (`block_ask`); ERR, said on the console, when it is not the caller's block, past the ceiling, or more than the pool can give.
-                Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
+                Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, cur, i, f.x[2]),
                 // x1 = 10 (2026-11-20, docs/GPU-KISTS.md "Layers"): on a surface the caller holds, another surface of its own, its token written at arc offset x2 (`surface_ask`).
                 Some(Object::Dma(i)) if DMA[i].name == "surface" && f.x[1] == 10 => surface_ask(p, f.x[2]),
                 // x1 = 6 (2026-11-18, docs/PUCKS.md): the caller's puck square resized to hold x2 bytes past its porch (`puck_ask`), answered the bytes it holds after; ERR, said on the console, when it is not the caller's, past the slot, or more than the pool can give.
@@ -8181,6 +8200,20 @@ static mut BELL_WORDS: Vec<(usize, u64, usize, usize)> = Vec::new();
 
 /// SYS_ARC (ARCS.md step 2): the caller's arc grown, shrunk or read; x0 and x1 as the call's doc says, the reason in x1 and on the console when refused. Under the kernel lock, in the caller's trap: `f` is its live frame. Returns the trap's result: a masked arc's grow or shrink with another of its threads at EL0 elsewhere holds the process (`hold`, step 3) and the caller waits for it (`State::Held`).
 fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
+    // A grow's frames made clean first with the kernel lock let go (`frames::prepare`, 2026-11-22, kernlock), when the pool has fewer known clean than it asks: the grow under the lock then zeroes none (about 90 us a frame, a 448 MiB growth 20 ms), and a camera streaming meanwhile never waits behind it.
+    if f.x[0] == ARC_GROW {
+        let Some(p) = k().procs.get(pi).and_then(|x| x.as_ref()) else { return 0 };
+        // WHY the min: n is the process's; a grow past its ceiling is refused (`arc_op`), so frames made clean past it would be zeroed for nothing. The ceiling is never under the size (`arc_alloc_room`, `arc_op`), so the subtraction cannot wrap.
+        let want = (f.x[1].min((p.arc.ceiling - p.arc.size) as u64) as usize).div_ceil(crate::frames::FRAME);
+        let epoch = p.epoch;
+        if want > crate::frames::clean_free() {
+            unlocked(|| crate::frames::prepare(want));
+            // Ended on another core meanwhile: its threads are drained at their traps, nothing to grow.
+            if !proc_of(cur).is_some_and(|q| q.epoch == epoch && !q.dying) {
+                return 0;
+            }
+        }
+    }
     let kk = k();
     let Some(p) = kk.procs.get(pi).and_then(|x| x.as_ref()) else { return 0 };
     let (op, n) = (f.x[0], f.x[1]);
@@ -9705,10 +9738,13 @@ pub fn stream_room(need: usize, code: &[u8]) -> (usize, usize) {
     if !has_image_header(code) {
         return (need, need);
     }
-    let grow = image_tail_ceiling(code) - image_tail(code);
+    // The host counts the declared heap as the image states it (ferros-bridge: header words 16 and 48, unclamped), so the heap the arc does not start with is taken off as the image states it too.
+    // Until 2026-11-22 this took off `image_tail_ceiling - image_tail`, where both are clamped at 1 GiB: Lumis declares a 4 GiB heap (std/lumis/build.rs), so 3 GiB of it stayed in the arc at spawn, about 1550 frames taken, zeroed and mapped under the kernel lock (the Pro, b1129: 138 ms at service.rs's staging, then 64 ms in `build_from`'s W^X pass over the same 3 GiB), and the ultrawide's stream, open in the stored Lumis, died at that moment.
+    let grow = u64::from_le_bytes(code[48..56].try_into().unwrap()) as usize - image_heap_start(code);
     // WHY the check: `need` is the host's; one that leaves the heap out (a bridge from before the header) has nothing to give back, and keeps its sum as it is.
+    // The stack's guard page on top (`build_from` wants it above the image; the host's sum leaves it out, which only the arc's rounding to a frame covered, and the 3 GiB above for Lumis).
     match need.checked_sub(grow) {
-        Some(size) => (size, need),
+        Some(size) => (size + STACK_GUARD, need),
         None => (need, need),
     }
 }
@@ -10223,10 +10259,15 @@ fn image_tail(code: &[u8]) -> usize {
     }
     let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
     // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
-    // WHY the choice: a growing image starts with HEAP_START, never with more than its build declared.
-    let heap = if image_grows(code) && w(48) > HEAP_START { HEAP_START } else { w(48) };
     // WHY the min: both words are the image's, a gigabyte is past any arc the pool would give (an image declaring more is refused for room, not sized past the windows).
-    (w(16) + heap).min(1 << 30)
+    (w(16) + image_heap_start(code)).min(1 << 30)
+}
+
+/// The heap an image starts with: its whole declared heap (header word 48), or for a growing image `HEAP_START` when it declared more. Never more than it declared, so the declared heap less this cannot wrap.
+fn image_heap_start(code: &[u8]) -> usize {
+    let declared = u64::from_le_bytes(code[48..56].try_into().unwrap()) as usize;
+    // WHY the choice: a growing image starts with HEAP_START, never with more than its build declared.
+    if image_grows(code) && declared > HEAP_START { HEAP_START } else { declared }
 }
 
 /// The zeroed tail at its most: .bss plus 16 and the whole declared heap (the arc's ceiling).

@@ -591,24 +591,24 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
         return;
     }
     unsafe {
+        // A slot's level-3 table looked up once for its 512 pages (`page_entry` per page walked the level 2 entry for each).
         let mut a = base;
         while a < base + size {
-            let exec = native || (a >= exec_start && a < exec_end);
-            let writable = native || !exec;
-            let e = page_entry(a).unwrap();
-            // A BTI capsule's code on guarded pages (GP, bit 50): every indirect branch into them must land on a `bti` instruction (SCTLR_EL2.BT0, set at boot), so no jump enters a multi-instruction check midway.
-            *e = pool_page(true, (*e & OA) as usize, writable, exec) | if guarded && exec && !native { 1 << 50 } else { 0 };
-            a += PAGE;
+            let t = &mut *(slot_table(a).unwrap() as *mut [u64; 512]);
+            let end = (a & !(MIB2 - 1)) + MIB2;
+            while a < base + size && a < end {
+                let exec = native || (a >= exec_start && a < exec_end);
+                let writable = native || !exec;
+                let e = &mut t[(a / PAGE) % 512];
+                // A BTI capsule's code on guarded pages (GP, bit 50): every indirect branch into them must land on a `bti` instruction (SCTLR_EL2.BT0, set at boot), so no jump enters a multi-instruction check midway.
+                *e = pool_page(true, (*e & OA) as usize, writable, exec) | if guarded && exec && !native { 1 << 50 } else { 0 };
+                a += PAGE;
+            }
         }
-        asm!("dsb ish");
-        let mut a = base;
-        while a < base + size {
-            // Inner shareable: every core's TLB, not this one's — the workers run processes too (smp.rs).
-            asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
-            a += PAGE;
-        }
-        tlbi_done();
     }
+    // Every core's TLB told, as `unmapped` tells it: page by page up to 8 MiB, past that the whole TLB at once.
+    // Why (the Pro, 2026-11-22, b1129): one broadcast invalidation a page is about 70 ns, and with the PTE writes it held the kernel lock 60 to 64 ms in `build_from` for a dev run's 3 GiB native arc (786,432 pages), against 4.5 ms for the stored Lumis's 28 MiB (`diag log`: the build of a kist's launch).
+    unmapped(base, size);
 }
 
 /// The end of every broadcast TLB invalidation: the DSB that waits for every core, then the invalidation and its DSB once more, then the ISB.
@@ -627,13 +627,17 @@ pub fn ctr_note() -> u64 {
     CTR_ALL.fetch_and(ctr, core::sync::atomic::Ordering::AcqRel) & ctr
 }
 
-/// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
+/// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification unless every core's data cache is coherent there already (CTR_EL0.IDC, as `sync_exec`), then invalidate the I-cache.
+/// Why the skip (2026-11-22): `build_from` runs this under the kernel lock, one `dc cvau` a line, 360,000 of them for Lumis's 23 MB of code; the Pro reads IDC on every core (`CTR_ALL` G#9444_C004, KERNEL.md), so the clean did nothing there.
 pub fn sync_code(addr: usize, len: usize) {
+    let ctr = ctr_note();
     unsafe {
-        let mut a = addr & !63;
-        while a < addr + len {
-            asm!("dc cvau, {}", in(reg) a);
-            a += 64;
+        if ctr & (1 << 28) == 0 {
+            let mut a = addr & !63;
+            while a < addr + len {
+                asm!("dc cvau, {}", in(reg) a);
+                a += 64;
+            }
         }
         asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
     }
