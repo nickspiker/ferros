@@ -874,6 +874,11 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
             sources.push(u);
         }
     }
+    // The capsule by its own blake3 on the directory's host, listed or not (2026-11-23, the Pro after its vault's reset: nine kists in the person's list came back and not one capsule, those stowed over USB having no source and the directory listing none of them). The checks below are the trust, whoever served the bytes.
+    let by_hash = alloc::format!("http://{}{}", ferros_kist::directory::HOST, ferros_kist::directory::capsule_path(&job.capsule));
+    if !sources.contains(&by_hash) {
+        sources.push(by_hash);
+    }
     let size = entry.map(|e| e.size);
     let mut why = WHY_NOT_LISTED;
     for u in &sources {

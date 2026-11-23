@@ -2163,6 +2163,32 @@ pub mod directory {
     pub const HOST: &str = "kists.fgtw.org";
     pub const PATH: &str = "/kists.vsf";
 
+    /// A capsule's own path on [`HOST`], by its blake3 (lowercase hex): `/capsules/<blake3>.vsf`. What tools/kistcat publishes a listed capsule at, and where a restore asks for any capsule the person's list names, listed or not (docs/IDENTITY-SPACE.md "Capsules", source 3: the bytes are kept by their own hash, and the stower checks the hash and the developer's signature whoever served them).
+    pub fn capsule_path(blake3: &[u8; 32]) -> String {
+        let mut p = String::from("/capsules/");
+        for b in blake3 {
+            let d = |n: u8| (if n < 10 { b'0' + n } else { b'a' + n - 10 }) as char;
+            p.push(d(b >> 4));
+            p.push(d(b & 15));
+        }
+        p.push_str(".vsf");
+        p
+    }
+
+    #[cfg(test)]
+    mod path {
+        /// A capsule's path on the directory's host is the one tools/kistcat has published at since 2026-11-10: `/capsules/` and its blake3 in lowercase hex.
+        #[test]
+        fn capsule_path_is_its_blake3() {
+            let mut b = [0u8; 32];
+            for (k, x) in b.iter_mut().enumerate() {
+                *x = (k as u8).wrapping_mul(37) ^ 0xA5;
+            }
+            let want: alloc::string::String = b.iter().map(|x| alloc::format!("{x:02x}")).collect();
+            assert_eq!(super::capsule_path(&b), alloc::format!("/capsules/{want}.vsf"));
+        }
+    }
+
     /// Where the device gets the capsule.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Source {

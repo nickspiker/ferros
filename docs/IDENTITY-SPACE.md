@@ -81,6 +81,30 @@ A kist in the person's list whose capsule this device lacks is fetched by its bl
 
 Whatever arrives goes thru the stower's stages (payloads/kists): its blake3 and size, every egg against the developer bundle it carries and that bundle the one the person's list pins for its developer (KISTS.md "Trust on first stow"), then the kernel's checker over its masked code and the seal, which is all a launch checks. The stower holds `capsules.` (write); the map and the identity service never do. It follows the identity service's doorbell: when the space's generation moves, it fetches what the list names and this device lacks, from the kist's recorded source (`source`, carried in its KIST fact) then the directory by blake3; the fleet source (2) is a seam, not built. Until a capsule is back its circle is on the map and a tap is refused by the kernel (no capsule); `ferros-bridge kist stow <capsule>` still restores a development capsule with its answers.
 
+### A reset, observed (the Pro, 2026-11-23)
+
+The vault process started afresh (`diag "vault fresh process yes"`; the kernel's vault, the shell and the device settings kept), the device's firmware and calibration scopes put back from an export, the kept seed gone, and the owner typed his handle and attested. What came back by itself:
+- **The person's list of kists** (`kists.list`): all nine (Kūaha, Tide, Compass, Thermometer, Lumis, Mahere, Clock, Aemulus, Photon) with their versions, capsules' blake3 and every answer (`granted`, `always`); no right was asked again.
+- **The deck's layout** (`map.deck`, `map.view`, the made wallpaper), the owner: "Layout after reset works."
+- **The identity service's space** (`fgtw.space`, `fgtw.space_base`) and ahau's proof and wallpaper.
+
+What did not:
+- **Every kist's capsule.** `capsules.` stayed empty, so no kist and no puck ran. The restore (payloads/kists/src/main.rs `restore`) had no source to fetch from:
+  - the fleet source is a stub returning false (payloads/kists/src/main.rs `fleet_fetch`);
+  - every one of the nine was stowed over USB (`ferros send`), which records no `source` URL (main.rs, the offer's stow: "Carried in over USB: no URL to fetch it again from");
+  - the directory (kists.fgtw.org/kists.vsf) lists only an older Clock, and the restore tried only a listed entry's path;
+  - kists.fgtw.org serves none of the nine capsules by their blake3: each `/capsules/<blake3>.vsf` answered 404.
+- **Each kist's own domain** (Photon's people and messages, Mahere's tiles, Lumis's own settings): empty. A kist's own domain is the device's and nothing carries it to another device or back after a reset. Whether Photon's people come back from the space once its capsule runs (its `people` and `be_you` rights) is not yet seen.
+- The device settings (base, language, theme, scale) were in the kernel's vault, which the reset kept, so this reset did not test their restore from the space.
+
+Since (forge, after this): a restore also asks for any capsule the list names by its blake3 at `http://kists.fgtw.org/capsules/<blake3>.vsf` (`ferros_kist::directory::capsule_path`, the path tools/kistcat publishes at), listed in the directory or not; the stower's checks are the trust whoever served it.
+
+### What is left
+
+- **fgtw.org (R2) must hold the capsules.** The bucket `kists` serves `/capsules/<blake3>.vsf` by exact key (plain HTTP, no redirect, tools/kistcat/worker); today only the directory's own entries are put there, by the wrangler commands tools/kistcat/kists.sh prints. Each kist the person stows needs its capsule there by blake3 (unlisted is enough: the restore no longer needs a directory entry), within R2's single-object limit (Photon's 106 MB capsule fits). Publishing the owner's own-key capsules (Lumis, Mahere, the pucks, Aemulus) is his decision and not yet approved; a stow over USB could also put its capsule there, which would make every stowed kist restorable without the directory.
+- **The fleet source** (`fleet_fetch`), designed, not built: payloads/fgtw answers a `capsule_want(blake3)` beside `space_want`, over Photon Transport to the person's devices heard (LAN first, then WAN): a sibling that holds `capsules.<blake3>` answers its size, then streams it in pieces with PT's per-piece BLAKE3, and the asking device's fgtw writes them into its vault as the HTTP fetch does (`ferros_kist::fetch::Intake`, hashed as they pass), then the stower runs the same checks (the blake3, the eggs against the bundle the list pins, the checker, the seal). It needs a new fgtw op the stower calls, the frames, and a read grant on `capsules.` for fgtw on the answering side (a kernel grant change). Two devices are needed to test it.
+- **The restore's own report**: no `kists: restoring` line reached the console after the attest; whether the restore was queued at all, and what each job ended with, is to be read on the device (the Kists page's states) once it is back.
+
 ## Device firmware (designed, not built)
 
 Never synced: it is the device's, and it is on the device's own partitions. Each driver refills its own vault entries on a miss, through the read-only partition grants that exist (process.rs `Object::Part`, `PARTS`; BT already reads its patch from `vendor_a:/firmware/brcm/BCM.hcd` every start):
