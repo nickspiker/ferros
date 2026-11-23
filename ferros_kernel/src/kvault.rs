@@ -204,6 +204,10 @@ impl BlockDev for Region {
     fn block_count(&self) -> u64 {
         self.blocks
     }
+    /// The region is fixed: full is full (manifestus TractFull), never a grow past it.
+    fn max_blocks(&self) -> u64 {
+        self.blocks
+    }
     fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         if lba >= self.blocks {
             return Err(manifestus::Error::Bounds(lba));

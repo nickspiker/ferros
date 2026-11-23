@@ -65,6 +65,15 @@ pub enum Error {
     TooLarge,
     /// The body is an extent: the caller reads its blocks (`Read::Extent`), or the call wants a stored body.
     Extent,
+    /// The vault is full: nothing more fits until something is removed (manifestus TractFull; 2026-11-23, the Pro's vault filled by an overnight time-lapse). Nothing was kept; what was there before is as it was.
+    Full,
+}
+
+impl Error {
+    /// Whether this is the vault being full, however it came (the engine's TractFull thru the store, or `Full` from the wire).
+    pub fn is_full(&self) -> bool {
+        matches!(self, Error::Full | Error::Store(ferros_store::Error::Engine(manifestus::Error::TractFull)))
+    }
 }
 
 impl From<ferros_store::Error> for Error {

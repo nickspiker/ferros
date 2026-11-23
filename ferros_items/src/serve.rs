@@ -15,6 +15,8 @@ use crate::{wire, Caller, Card, Error, Extent, Ht, Items, Making, Read};
 /// The syscall's answers for a refusal and an absence (ferros_sys `ERR`, `NOTHING`).
 pub const ERR: u64 = u64::MAX;
 pub const NOTHING: u64 = u64::MAX - 1;
+/// A refusal because the vault is full (`Error::is_full`): the caller is told so, apart from every other refusal. A kist from before reads it as an answer too large for its room (TooLarge).
+pub const FULL: u64 = u64::MAX - 2;
 
 /// Bodies one caller may have in the making at once.
 /// WHY: a making holds a ferros_store writer in this process until it is finished or the person locks; a kist that starts makings and never finishes them must not fill the vault's heap. A caller past it is refused a new one, never another caller.
@@ -75,7 +77,13 @@ pub struct Answer {
 }
 
 fn refused(e: Error) -> Answer {
-    let value = if matches!(e, Error::NotFound) { NOTHING } else { ERR };
+    let value = if matches!(e, Error::NotFound) {
+        NOTHING
+    } else if e.is_full() {
+        FULL
+    } else {
+        ERR
+    };
     Answer { value, data: 0, why: Some(e) }
 }
 
@@ -398,5 +406,21 @@ fn card_answer(c: &Card, h: &[u8; 32], now: i64, out: &mut [u8], room: usize) ->
             ok(doc.len() as u64, n)
         }
         Err(e) => refused(e),
+    }
+}
+
+#[cfg(test)]
+mod full_tests {
+    use super::*;
+
+    /// A full vault (the engine's TractFull thru the store) is refused as FULL on the wire, apart from every other refusal, and a kist reads it as `Error::Full`.
+    #[test]
+    fn full_is_its_own_refusal() {
+        let full = Error::Store(ferros_store::Error::Engine(manifestus::Error::TractFull));
+        assert!(full.is_full());
+        assert_eq!(refused(full).value, FULL);
+        assert_eq!(refused(Error::Refused).value, ERR);
+        assert_eq!(refused(Error::NotFound).value, NOTHING);
+        assert_eq!(FULL, crate::kist::FULL);
     }
 }

@@ -126,6 +126,10 @@ impl BlockDev for Half {
     fn block_count(&self) -> u64 {
         self.blocks
     }
+    /// A mirror's half of the window is all it will ever have: the tract grows into it and then the vault says full (2026-11-23: it asked to double past the window and every write failed as Corrupt).
+    fn max_blocks(&self) -> u64 {
+        self.blocks
+    }
     fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         self.io(lba, 1)?;
         // A block the read-ahead holds (a piece's leaf, just past its furrows) is a copy, from the window or the next one read beside it (which then becomes the window); any other is one block, never a fill: the index walk's nodes lie anywhere.

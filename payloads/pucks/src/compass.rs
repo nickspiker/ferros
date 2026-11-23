@@ -58,6 +58,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let kept = load(domain);
     let mut iron = HardIron::new();
     let mut last_kept = kept.unwrap_or(Calibration::NONE);
+    // The calibration last offered to the vault, kept or refused: a refused one is offered again only once the fit has moved as far from it (2026-11-23: with the Pro's vault full, the puck asked again every pass, twelve refusals a second).
+    let mut last_tried = last_kept;
     let mut last_n = 0u32;
     let mut shown_heading: Option<f64> = None;
     loop {
@@ -73,8 +75,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The running fit once it has seen more than the kept one; until then the kept one (a restart keeps its calibration).
         let cal = if iron.samples() > last_kept.samples { iron.calibration() } else { last_kept };
-        if iron.samples() > last_kept.samples && (0..3).any(|k| (cal.offset[k] - last_kept.offset[k]).abs() >= 1. / 16.) && keep(domain, &cal) {
-            last_kept = cal;
+        let moved_from = |c: &Calibration| (0..3).any(|k| (cal.offset[k] - c.offset[k]).abs() >= 1. / 16.);
+        if iron.samples() > last_kept.samples && moved_from(&last_kept) && moved_from(&last_tried) {
+            if keep(domain, &cal) {
+                last_kept = cal;
+            }
+            last_tried = cal;
         }
         let place = common::place();
         let declination = match (place, now) {

@@ -12,6 +12,8 @@ use crate::{wire, Card, Error, Find, Found, Proposed, Result};
 /// The syscall's answers for a refusal and an absence (ferros_sys `ERR`, `NOTHING`).
 pub const ERR: u64 = u64::MAX;
 pub const NOTHING: u64 = u64::MAX - 1;
+/// The vault is full (serve::FULL).
+pub const FULL: u64 = u64::MAX - 2;
 
 /// Where a call goes.
 pub trait Transport {
@@ -53,6 +55,7 @@ fn answer(v: u64) -> Result<u64> {
     match v {
         ERR => Err(Error::Refused),
         NOTHING => Err(Error::NotFound),
+        FULL => Err(Error::Full),
         v => Ok(v),
     }
 }
