@@ -1851,6 +1851,17 @@ The tele's init writes G#0D00 = G#0101 and G#0D02 = G#0101 and nothing else PD-s
 
 At 12 rows and under the link takes frame starts on channels 0 and 2 and never a frame end, with ERR_CRC_PH; its PD is off and channel 1 silent; its side channels on or off change nothing (F_LOUD, 2026-11-22). Channel 2 (data type G#12, embedded) stays on whatever G#0118 is: its 4 lines and the image's few may be what the link reads wrong. Device check: F_KEEP_FE (the front end left at the whole frame) at 8 rows, to see in memory how many lines and of what a short frame carries, and the link's PHY header words at the stop.
 
+### The floors' shape, the tele's PD off, the main's short frame (the Pro, 2026-11-22 night, the flashed 07f922ca kernel)
+
+Hand-spawned from forge (7acde33f's driver, and tele-pd-off.diff for the tele), headless, every stream closed by the driver; logs in target/farm/camera-work/kit/runs/shape.
+- **The ultrawide's floor is a whole frame, not a blanking**: 64 rows at frames of 164, 150, 132 and 120 lines ran 929, 1015, 1154 and 1269 a second (drained 1021 to 1278), each the frame asked; 120 lines is 56 past the rows. With 104 at 4 rows (and 96 refused) its least frame is about 104 lines whatever the rows up to 64.
+- **The front's floor is its sensor's frame**: 2 rows asked 122, 110 and 96 lines ran 784, 791 and 791 a second (797 to 803 drained): about 121 lines of 10.4378 us, however short the frame asked.
+- **The tele's slits land down to 2 rows with its phase detect off** (G#0D00 = 0 in the hold): 64, 16, 8, 4 and 2 rows, none lost, the link's ERR_CRC_PH gone (+1C G#40 remains from the first whole frame before the mode lands mid-stream). 2 rows 713 a second drained, 16 rows 670, 64 rows 559: its frame the rows plus about 229 lines of 6.1068 us. Committed in deca6b4f.
+- **The main at 8 rows takes no frame end even with the front end left at the whole frame** (`F_KEEP_FE`: loch0 and the link at 3072 rows): +24 G#5, +2C G#0, ERR_CRC_PH; the PHY's last header a RAW10 line of 5100 bytes (G#13EC, G#2B). So neither loch0's nor the link's geometry stops it: the short frame's packets fail at the link itself, and its least stays 16 rows.
+- **Stored**: `camera` from deca6b4f (566689 bytes, blake3 b4efb01b...), read back equal; started on demand it ran the tele's 2-row slit at 715 a second, none lost. The one before (7acde33f, blake3 663d5577...) kept in target/farm/camera-work/out/camera-before-deca6b4f.capsule.vsf.
+
+Exactly 2 rows to memory today: the front (791 a second, 1.6k lines a second) and the tele (713, 1.4k); the ultrawide keeps 2 of 4 (1465, 2.9k lines a second of the 2 kept), the main 2 of 16 (1231, 2.5k).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
