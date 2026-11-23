@@ -2,8 +2,8 @@
 //!
 //! The kernel starts it at the first call on `audio` (process.rs `ON_DEMAND`, service.rs `audio_grants`), and it ends itself once every stream has closed and played out: silence holds no arc, and the amplifiers go back to reset (the `amp` switch is off when the process that held it ends). The next call starts another.
 //!
-//! Spawn by hand (development; the kernel's own start is the same grants): ferros-bridge spawn audio.bin --name audio --serve audio --dma aoc-ipc --hw aoc-mbox --irq aoc-mbox-f1 --hw usi1-spi --hw gpio-gpn0 --power amp --entropy --dma aoc-play --dma aoc-capture
-//! Grant slots, in that order: 0 console, 1 the `audio` endpoint (serve), 2 the AoC's IPC block, 3 its mailboxes, 4 mailbox block f1's AoC-to-AP line, 5 the amplifiers' SPI port, 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch, 8 entropy (the streams' handles), 9 the playback ring's window (`aoc-play`), 10 the capture ring's (`aoc-capture`).
+//! Spawn by hand (development; the kernel's own start is the same grants): ferros-bridge spawn audio.bin --name audio --serve audio --dma aoc-ipc --hw aoc-mbox --irq aoc-mbox-f1 --hw usi1-spi --hw gpio-gpn0 --power amp --entropy --dma aoc-play-lo --dma aoc-capture --dma aoc-play-hi
+//! Grant slots, in that order: 0 console, 1 the `audio` endpoint (serve), 2 the AoC's IPC block, 3 its mailboxes, 4 mailbox block f1's AoC-to-AP line, 5 the amplifiers' SPI port, 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch, 8 entropy (the streams' handles), 9 and 11 the playback ring's windows (`aoc-play-lo`, `aoc-play-hi`), 10 the capture ring's (`aoc-capture`).
 //!
 //! The endpoint's protocol is ferros_sys `audio` (its ops, the format, the ring). The AoC must be up (the sensors process asks the kernel to start it at every boot); without it an open is refused.
 //!
@@ -31,9 +31,10 @@ pub const S_SPI: u64 = 5;
 pub const S_GPN: u64 = 6;
 pub const S_POWER: u64 = 7;
 pub const S_ENTROPY: u64 = 8;
-/// The playback and capture rings' windows past `aoc-ipc` (kernel cachemap.rs AOC_PLAY, AOC_CAPTURE; since 2026-11-22).
-pub const S_PLAY: u64 = 9;
+/// The playback and capture rings' windows past `aoc-ipc` (kernel cachemap.rs AOC_PLAY_LO, AOC_CAPTURE, AOC_PLAY_HI; since 2026-11-22): the playback ring straddles G#9600_0000 and takes two.
+pub const S_PLAY_LO: u64 = 9;
 pub const S_CAPTURE: u64 = 10;
+pub const S_PLAY_HI: u64 = 11;
 
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 pub fn grants() -> u64 {

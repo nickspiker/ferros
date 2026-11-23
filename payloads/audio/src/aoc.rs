@@ -8,7 +8,7 @@
 //!
 //! The IPC block is Device memory, reached thru the `aoc-ipc` grant's handle: every access an aligned word or a byte (payloads/sensors usf.rs does the same).
 
-use crate::{say, S_CAPTURE, S_IPC, S_MBOX, S_PLAY};
+use crate::{say, S_CAPTURE, S_IPC, S_MBOX, S_PLAY_HI, S_PLAY_LO};
 use ferros_sys::{cap, mmio_read, mmio_write, now, sleep_until, freq, Handle};
 
 type Ipc = Handle<S_IPC>;
@@ -26,41 +26,51 @@ fn wr8(off: u64, v: u8) {
     Ipc::write8(off, v)
 }
 
-/// Where the IPC block lies (kernel cachemap.rs AOC_IPC), and the two ring windows past it (AOC_PLAY, AOC_CAPTURE): the AoC gives every offset from the IPC block's start, and a ring past the `aoc-ipc` window is reached thru the window that holds it.
+/// Where the IPC block lies (kernel cachemap.rs AOC_IPC), and the ring windows past it (AOC_PLAY_LO, AOC_PLAY_HI, AOC_CAPTURE): the AoC gives every offset from the IPC block's start, and a ring past the `aoc-ipc` window is reached thru the windows that hold it, each byte thru one that holds it (the playback ring straddles G#9600_0000, so it takes two: docs/AUDIO.md "The rings' windows").
 const IPC_BASE: u64 = 0x95C0_0000;
-const PLAY_BASE: u64 = 0x9600_0000;
+const PLAY_LO_BASE: u64 = 0x95C0_0000;
+const PLAY_HI_BASE: u64 = 0x9600_0000;
 const CAPTURE_BASE: u64 = 0x96A0_0000;
 
 /// A granted window a ring's bytes are reached thru.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Win {
     Ipc,
-    Play,
+    PlayLo,
+    PlayHi,
     Capture,
 }
 
+const WINS: [Win; 4] = [Win::Ipc, Win::PlayLo, Win::PlayHi, Win::Capture];
+
 impl Win {
-    /// Its start as an offset from the IPC block's, and its length (0 for a grant this process was not given: a kernel from before 2026-11-22 has neither ring window).
+    /// Its start as an offset from the IPC block's, and its length (0 for a grant this process was not given: a kernel from before has no ring window).
     fn span(self) -> (u64, u64) {
         match self {
             Win::Ipc => (0, Ipc::len()),
-            Win::Play => (PLAY_BASE - IPC_BASE, Handle::<S_PLAY>::len()),
+            Win::PlayLo => (PLAY_LO_BASE - IPC_BASE, Handle::<S_PLAY_LO>::len()),
+            Win::PlayHi => (PLAY_HI_BASE - IPC_BASE, Handle::<S_PLAY_HI>::len()),
             Win::Capture => (CAPTURE_BASE - IPC_BASE, Handle::<S_CAPTURE>::len()),
         }
     }
-    /// The window holding `len` bytes from IPC offset `off`, if one does.
-    fn holding(off: u64, len: u64) -> Option<Win> {
-        [Win::Ipc, Win::Play, Win::Capture].into_iter().find(|w| {
-            let (b, l) = w.span();
-            len != 0 && off >= b && off + len <= b + l
-        })
+    fn end(self) -> u64 {
+        let (b, l) = self.span();
+        b + l
     }
-    /// A word or a byte at IPC offset `off`, which `holding` has put inside this window.
+    /// Of the windows holding IPC offset `off`, the one reaching furthest past it (None: no window holds it).
+    fn at(off: u64) -> Option<Win> {
+        WINS.into_iter().filter(|w| {
+            let (b, l) = w.span();
+            l != 0 && off >= b && off < b + l
+        }).max_by_key(|w| w.end())
+    }
+    /// A word or a byte at IPC offset `off`, which the ring's map has put inside this window. A word never crosses a window's edge: words sit at multiples of four, edges at multiples of a MiB.
     fn rd32(self, off: u64) -> u32 {
         let o = off - self.span().0;
         match self {
             Win::Ipc => Ipc::read32(o),
-            Win::Play => Handle::<S_PLAY>::read32(o),
+            Win::PlayLo => Handle::<S_PLAY_LO>::read32(o),
+            Win::PlayHi => Handle::<S_PLAY_HI>::read32(o),
             Win::Capture => Handle::<S_CAPTURE>::read32(o),
         }
     }
@@ -68,7 +78,8 @@ impl Win {
         let o = off - self.span().0;
         match self {
             Win::Ipc => Ipc::read8(o),
-            Win::Play => Handle::<S_PLAY>::read8(o),
+            Win::PlayLo => Handle::<S_PLAY_LO>::read8(o),
+            Win::PlayHi => Handle::<S_PLAY_HI>::read8(o),
             Win::Capture => Handle::<S_CAPTURE>::read8(o),
         }
     }
@@ -76,16 +87,59 @@ impl Win {
         let o = off - self.span().0;
         match self {
             Win::Ipc => Ipc::write32(o, v),
-            Win::Play => Handle::<S_PLAY>::write32(o, v),
+            Win::PlayLo => Handle::<S_PLAY_LO>::write32(o, v),
+            Win::PlayHi => Handle::<S_PLAY_HI>::write32(o, v),
             Win::Capture => Handle::<S_CAPTURE>::write32(o, v),
         }
     }
     fn name(self) -> &'static str {
         match self {
             Win::Ipc => "aoc-ipc",
-            Win::Play => "aoc-play",
+            Win::PlayLo => "aoc-play-lo",
+            Win::PlayHi => "aoc-play-hi",
             Win::Capture => "aoc-capture",
         }
+    }
+}
+
+/// A ring's bytes as the windows hold them: one window from its start, and a second from `split` on when the first ends inside it.
+#[derive(Clone, Copy)]
+pub struct RingMap {
+    first: Win,
+    split: u64,
+    second: Win,
+}
+
+impl RingMap {
+    /// The windows that hold `len` bytes from IPC offset `off` between them, at most two; None when no two do (a byte no window holds).
+    fn of(off: u64, len: u64) -> Option<RingMap> {
+        if len == 0 {
+            return None;
+        }
+        let first = Win::at(off)?;
+        let split = first.end();
+        if split >= off + len {
+            return Some(RingMap { first, split, second: first });
+        }
+        let second = Win::at(split)?;
+        (second.end() >= off + len).then_some(RingMap { first, split, second })
+    }
+    /// The window for IPC offset `off`, inside the ring.
+    fn win(&self, off: u64) -> Win {
+        if off < self.split { self.first } else { self.second }
+    }
+    fn rd32(&self, off: u64) -> u32 {
+        self.win(off).rd32(off)
+    }
+    fn rd8(&self, off: u64) -> u8 {
+        self.win(off).rd8(off)
+    }
+    fn wr32(&self, off: u64, v: u32) {
+        self.win(off).wr32(off, v)
+    }
+    /// Its windows' names, for the console.
+    fn names(&self) -> (&'static str, &'static str) {
+        (self.first.name(), if self.second == self.first { "" } else { self.second.name() })
     }
 }
 
@@ -168,10 +222,10 @@ impl Svc {
         let (off, len) = self.span(dir);
         len != 0 && off + len <= Ipc::len()
     }
-    /// The granted window that holds a ring's direction whole (the same WHY as `fits`: an offset past a handle's region would wrap inside it, onto another service's memory).
-    fn ring_win(&self, dir: u64) -> Option<Win> {
+    /// The granted windows that hold a ring's direction whole between them (the same WHY as `fits`: an offset past a handle's region would wrap inside it, onto another service's memory).
+    fn ring_win(&self, dir: u64) -> Option<RingMap> {
         let (off, len) = self.span(dir);
-        Win::holding(off, len)
+        RingMap::of(off, len)
     }
     /// The AoC rung on this service's channel (ipc_core.c via aoc_service_core.c:194-195 and :560-563).
     fn signal(&self) {
@@ -225,7 +279,7 @@ pub fn find(name: &[u8]) -> Option<Svc> {
 pub struct Services {
     pub control: Svc,
     pub playback: Svc,
-    play: Win,
+    play: RingMap,
 }
 
 /// The two services this process speaks, by the names Linux allocates them by (alsa.h:42 `CMD_OUTPUT_CHANNEL`; aoc_alsa_drv.c:34-74, the playback ring of entry point 5 is `audio_playback5`, Android's low-latency path on husky: dmesg:7426-7430).
@@ -236,7 +290,7 @@ pub fn services() -> Result<Services, &'static str> {
         return Err("audio_output_control is not a queue inside the aoc-ipc window");
     }
     let Some(play) = playback.ring_win(DOWN).filter(|_| playback.ring()) else {
-        return Err("audio_playback5 is not a ring inside a granted window (aoc-ipc, aoc-play: a kernel from before 2026-11-22 grants neither ring window)");
+        return Err("audio_playback5 is not a ring inside the granted windows (aoc-ipc, aoc-play-lo, aoc-play-hi: a kernel from before has no ring window)");
     };
     // WHY: this process writes the ring a 32-bit word at a time (Device memory takes no unaligned access), so its start and its length must both be whole words; the AoC sets them, so it is checked, not assumed.
     let (off, len) = playback.span(DOWN);
@@ -315,11 +369,18 @@ fn command_on(q: Svc, cmd: &mut [u8], reply: &mut [u8]) -> Result<usize, &'stati
             if n == 4 {
                 return Err("the AoC answered with an error code");
             }
-            // A reply carries the command's own header (hw.c:278-302): type 0 and the same id.
-            if n >= 8 && reply[0] == 0 && reply[4..6] == cmd[4..6] {
+            // The first message of type 0 (DATA_TYPE_CMD) back is the reply, as Linux takes it (hw.c:278-302); a notification (type 1, zuma.h:340-342) is passed over. Measured on the Pro 2026-11-22: MIC_RECORD_AP_SET_PARAMS (224) came back as 22 bytes of type 0 with id 103 in the id's place, and nothing else came, so the id is not checked; a reply whose id differs is said with its bytes, for the record.
+            if reply[0] == 0 {
+                if n < 8 || reply[4..6] != cmd[4..6] {
+                    let mut l = crate::Line { b: [0; 256], n: 0 };
+                    for b in &reply[..n.min(32)] {
+                        let _ = core::fmt::Write::write_fmt(&mut l, format_args!(" {b:02X}"));
+                    }
+                    say!("audio: command A#{} answered with A#{n} bytes of another id, taken as its reply:{}", u16::from_le_bytes([cmd[4], cmd[5]]), core::str::from_utf8(&l.b[..l.n]).unwrap_or(""));
+                }
                 return Ok(n);
             }
-            say!("audio: passed over a message on a control queue: type A#{}, id A#{}, A#{n} bytes", reply[0], u16::from_le_bytes([reply[4], reply[5]]));
+            say!("audio: passed over a message on a control queue: type A#{}, A#{n} bytes", reply[0]);
         }
         sleep_until(now() + f / 1024);
     }
@@ -548,7 +609,7 @@ pub const CAPTURE_FRAME_BYTES: usize = MICS * 2;
 pub struct Capture {
     pub control: Svc,
     pub ring: Svc,
-    win: Win,
+    win: RingMap,
 }
 
 /// The capture's two services by the names Linux allocates them by.
@@ -559,7 +620,7 @@ pub fn capture_services() -> Result<Capture, &'static str> {
         return Err("audio_input_control is not a queue inside the aoc-ipc window");
     }
     let Some(win) = ring.ring_win(UP).filter(|_| ring.ring()) else {
-        return Err("audio_capture0 is not a ring inside a granted window (aoc-ipc, aoc-capture: a kernel from before 2026-11-22 grants neither ring window)");
+        return Err("audio_capture0 is not a ring inside the granted windows (aoc-ipc, aoc-capture: a kernel from before has no ring window)");
     };
     // WHY: samples are read two bytes at a time at the ring's byte positions; an odd start or length would split one across the wrap. The AoC sets both, so they are checked.
     let (off, len) = ring.span(UP);
@@ -580,6 +641,15 @@ fn mic_command(c: &Capture, name: &str, cmd: &mut [u8]) -> Result<(), &'static s
 
 /// The capture started: the microphones powered (as the factory test does, mixer_paths_factory.xml:56-66; Linux's own capture leaves it to the firmware, uncertain on a cold AoC, so sent and its refusal only said), the DC blocker on (the HAL's boot setting, mixer_paths.xml:238), then SET_PARAMS (before AP_INPUT_START: the firmware refuses them while the input runs, its string "SET_MIC_RECORD_AP_PARAMS called while APInputProcessor is started"), SET_PARAMS2, the microphone list, AP_INPUT_START, the ring flushed (hw.c:1979-1983), START_DATA (hw.c:1497-1520).
 pub fn capture_start(c: &Capture) -> Result<(), &'static str> {
+    let r = capture_steps(c);
+    // A start that failed part way leaves nothing on: the input stopped (refused harmlessly if it never started) and the microphones' power taken back.
+    if r.is_err() {
+        capture_stop(c);
+    }
+    r
+}
+
+fn capture_steps(c: &Capture) -> Result<(), &'static str> {
     for mic in 0..MICS as u8 {
         let mut m = [0u8; 9];
         header(&mut m, CMD_MIC_POWER_ON);
@@ -715,8 +785,8 @@ pub fn dump(name: &[u8]) {
     let f = s.flags();
     say!("audio: {shown}: header at G#{:X}, flags G#{f:X} (type A#{}, channel A#{}, push {}), the window A#{} bytes", s.0, (f & TYPE_MASK) >> 16, (f >> IRQ_SHIFT) & IRQ_MASK, (f & RING_PUSH != 0) as u8, Ipc::len());
     for (d, dn) in [(UP, "UP"), (DOWN, "DOWN")] {
-        let w = s.ring_win(d).map_or("no granted window", |w| w.name());
-        say!("audio: {shown} {dn}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}; as a ring, in {w}", s.get(d, R_OFFSET), s.get(d, R_SIZE), s.get(d, R_SLOTS), s.get(d, R_TX), s.get(d, R_RX), s.get(d, R_WP), s.get(d, R_RP));
+        let (w0, w1) = s.ring_win(d).map_or(("no granted window", ""), |m| m.names());
+        say!("audio: {shown} {dn}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}; as a ring, in {w0} {w1}", s.get(d, R_OFFSET), s.get(d, R_SIZE), s.get(d, R_SLOTS), s.get(d, R_TX), s.get(d, R_RX), s.get(d, R_WP), s.get(d, R_RP));
     }
 }
 

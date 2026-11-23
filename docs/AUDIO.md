@@ -132,20 +132,24 @@ The protocol (ferros_sys `audio`): `MIC_LEVELS`, held until the next 80 ms of sa
 
 ## The rings' windows (measured on the Pro 2026-11-22; approved that night by the coordinator for the owner)
 
-The first PROBE on the Pro (forge 516d7559, kernel 07f922ca) found both audio rings past the 2 MiB `aoc-ipc` window the kernel grants (G#95C0_0000 to G#95E0_0000), as "Verification" below foresaw. The service's dump of their headers, offsets from the IPC block's start:
+The first PROBE on the Pro (forge 516d7559, kernel 07f922ca) found both audio rings past the 2 MiB `aoc-ipc` window the kernel grants (G#95C0_0000 to G#95E0_0000), as "Verification" below foresaw. The service's dump of their headers, offsets from the IPC block's start (G#95C0_0000):
 
 | Service | Type, channel | Region | Offset | Size | Physical |
 |---|---|---|---|---|---|
 | `audio_output_control` | queue, 16 | UP / DOWN | G#12B000 / G#12A000 | 64 slots of 64 | inside `aoc-ipc` |
 | `audio_input_control` | queue, 16 | UP / DOWN | G#12F000 / G#12E000 | 4 slots of 1024 | inside `aoc-ipc` |
-| `audio_playback5` | ring, 20 | DOWN | G#17C000 | 4 MiB | G#9613_C000 to G#9657_C000 |
+| `audio_playback5` | ring, 20 | DOWN | G#17C000 | 4 MiB | G#95D7_C000 to G#9617_C000 |
 | `audio_capture0` | ring, 20 | UP | G#EA0000 | 92160 | G#96AA_0000 to G#96AB_6800 |
 
-Both rings ring channel 20 (block f1, bit 4), the line the service holds, so playback and capture are both interrupt-driven; the control queues answer on channel 16 (block f1 too). Both rings lie inside the AoC's carve-out (G#9400_0000 to G#9700_0000).
+Both rings ring channel 20 (block f1, bit 4), the line the service holds, so playback and capture are both interrupt-driven; the control queues answer on channel 16 (block f1 too). Both rings lie inside the AoC's carve-out (G#9400_0000 to G#9700_0000). The playback ring runs across the end of `aoc-ipc` and across G#9600_0000.
 
-**The fix (kernel cachemap.rs `AOC_PLAY`, `AOC_CAPTURE`):** two more grants, to the audio service alone (service.rs `audio_grants` slots 9 and 10): `aoc-play`, 8 MiB at G#9600_0000, and `aoc-capture`, 1 MiB at G#96A0_0000, EL0 Device memory. The service finds the window that holds each ring (aoc.rs `Win`) and refuses a ring no window holds whole.
+**The fix (kernel cachemap.rs `AOC_PLAY_LO`, `AOC_PLAY_HI`, `AOC_CAPTURE`):** three more grants, to the audio service alone (service.rs `audio_grants` slots 9 to 11), EL0 Device memory: `aoc-play-lo`, 4 MiB at G#95C0_0000 (a superset of `aoc-ipc`), and `aoc-play-hi`, 2 MiB at G#9600_0000, for the playback ring; `aoc-capture`, 1 MiB at G#96A0_0000, for the capture ring. The service maps each ring onto the windows that hold it (aoc.rs `RingMap`: at most two, each byte thru the one that holds it; a word never crosses an edge, words at multiples of four and edges at multiples of a MiB) and refuses a ring they do not hold whole.
 
-**The tradeoff, for the owner:** a process reaches a granted region thru its handle, a base plus an offset masked to the region's size, which needs a power of two aligned to itself (SANDBOX.md "Handles"). Growing `aoc-ipc` to cover both rings would take 16 MiB, and G#95C0_0000 is not 16 MiB aligned, so the masked sensors process's handle would go to nothing. Two windows, each the smallest aligned power of two that holds its ring, are the smallest overreach the handles allow: the rest of those 9 MiB is the AoC's heap (its own buffers, the other audio rings), which the audio service can now read and write as well as its two rings. The audio service is ferros's own OS process, the same trust class as the sensors process, which already holds `aoc-ipc`. The AoC's firmware image (the carve-out's first G#1C0_0000) stays the kernel's.
+**The tradeoff, for the owner:** a process reaches a granted region thru its handle, a base plus an offset masked to the region's size, which needs a power of two aligned to itself (SANDBOX.md "Handles"). The playback ring straddles G#9600_0000, a 32 MiB boundary, so one window holding it whole would be 64 MiB (G#9400_0000 to G#9800_0000, the whole carve-out and past it), and growing `aoc-ipc` instead would take the masked sensors process's handle with it. Two playback windows and one capture window, each the smallest aligned power of two for its part, are the smallest overreach the handles allow: the rest of those 7 MiB is the AoC's heap (its own buffers, the other services' queues and rings), which the audio service can now read and write as well as its two rings. The audio service is ferros's own OS process, the same trust class as the sensors process, which already holds `aoc-ipc`. The AoC's firmware image (the carve-out's first G#1C0_0000) stays the kernel's.
+
+(The first cut, forge ef883736, put the playback window at G#9600_0000 to G#9680_0000 from a wrong sum of the ring's address; the second PROBE, on that kernel, showed the capture ring reached and the playback ring still refused.)
+
+**The control queues' replies:** on the same night MIC_RECORD_AP_SET_PARAMS (224) came back as 22 bytes of type 0 with 103 in the id's place, and nothing else came. The service now takes the first type-0 message as the reply, as Linux does (hw.c:278-302), and says one whose id differs with its bytes; a type-1 notification is passed over. A capture whose start fails part way is stopped and its microphones powered off.
 
 ## The Developer page's tests (2026-11-22; owner: "Just throw a mic and speaker test in the ferros settings and I can test it", and earlier "sound and buzz, why not")
 
