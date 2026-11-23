@@ -15,6 +15,11 @@ Android on the same device, a SIM moved to another device, or a device nobody at
 **Decided** (owner, 2026-11-17): "We definitely do not want any physical SIMs ever, that defeats the entire purpose of the device being the key."
 So every Wāteo line is a profile downloaded into the device's own embedded eUICC; no card, no removable part, ever.
 
+**Decided** (owner, 2026-11-17): "there should be no way for me to connect the alias usage and billing with the customer, that's the whole point."
+So nobody running Wāteo, the owner included, can join what a line used or what was paid to the person behind it: not by policy, by construction.
+Three things carry it: the gateways see keys made for Wāteo alone; paying buys credit signed blind; membership is proven blind.
+Each is below, and wateo.net's Privacy page states it as the requirement the build must meet.
+
 ## The SIM opens the door; the identity is the key
 
 **Destination.** Keeping Android away from the eUICC cannot be the lock.
@@ -23,12 +28,12 @@ So the lock is on the network side, where nothing on the device can lift it:
 
 - **A Wāteo profile reaches one place only.** The sponsor carrier's APN for Wāteo profiles is private: it routes to Wāteo's gateways and nowhere else, with no internet, no DNS, no carrier services. Attaching with the profile gets a device an address that can reach the gateways, and nothing else.
 - **Data flows only in a tunnel to a gateway.** ferros opens it after attest ("The connection" below). Its credential is **the person's Wāteo key**: derived by the kernel from the person key (FACETS.md "The alias"), as a kist's alias is but for the system's own use, so no kist ever holds it: `derive_key("ferros 2026-11-13 wateo v0", person key)`.
-- **The device's key names the device; it proves nothing.** The tunnel also carries the device's ira key, for accounting (which device used what). The ira is the device's one ID on ferros, a plate with no papers (owner, 2026-11-13: "on android, linux, mac and windows it's plate AND papers. ferros needs no papers as long as you keep android non rooted or hypervisored. ideally both"): its sources are chip identifiers that only the person's own rooted Android could scrape, which is the person harming themself. Against a stranger it holds while the bootloader is re-locked to the ferros key (the flasher's lock-prep, the person's own lock); unlocked, anyone holding the device boots their own image outside the hv and derives it. So nothing at the gateway rests on it.
+- **The device's key names the device; it proves nothing, and it is Wāteo's alone.** The tunnel also carries a **Wāteo device key**, for accounting (which device used what) and for cutting off a device reported taken: `derive_key("ferros 2026-11-17 wateo device v0", ira ‖ Wāteo key)`. Never the ira's own key: the ira is the device's one ID everywhere on ferros, so a gateway that saw it could match the line to that device wherever else the device shows it. Derived over the Wāteo key too, two people attesting on one device get two unrelated device keys, so the device cannot join them either. The ira is the device's one ID on ferros, a plate with no papers (owner, 2026-11-13: "on android, linux, mac and windows it's plate AND papers. ferros needs no papers as long as you keep android non rooted or hypervisored. ideally both"): its sources are chip identifiers that only the person's own rooted Android could scrape, which is the person harming themself. Against a stranger it holds while the bootloader is re-locked to the ferros key (the flasher's lock-prep, the person's own lock); unlocked, anyone holding the device boots their own image outside the hv and derives it. So nothing at the gateway rests on it.
 - **What Android sees**: it can enable the profile and attach; without the person's Wāteo key no gateway opens a tunnel; no data passes and nothing is billed.
 - **What a moved profile sees**: the same. A Wāteo profile on any device without the person's Wāteo key is a dead line.
 - **What the person can do, deliberately** (owner, 2026-11-13: "I don't think we should restrict. If they want to hackjob android to get access to their own service, plus we can't really stop them without fucking up our open model"): a rooted Android of theirs that joins their fleet (approved on a fleet device) can open the person key and derive the Wāteo key, and use their service. That is the person's choice, paid by them; Wāteo does not try to tell ferros from anything else, which would need a vendor's hardware attestation.
 
-The gateways see the Wāteo key and the device key, never the handle, the identity key, or any kist's alias.
+The gateways see the Wāteo key and the Wāteo device key, never the handle, the handle proof, the identity key, the ira, or any kist's alias.
 
 ## The profile is a pool's; the service is the person's
 
@@ -48,7 +53,7 @@ The hui of 2026-11-11 settled that members pick their carrier (AT&T, Verizon or 
 - The switch happens on the device, with no server at switch time, in one of two ways, by what the supplier's profiles are (W5):
   - one profile that attaches to all three networks: the switch is the modem's network selection pinned to that carrier's PLMNs, seconds, nothing downloaded;
   - one profile per carrier: all three downloaded once at join, and the switch is enabling one (SGP.22 ES10c), the modem refreshing the SIM and attaching again in tens of seconds, offline.
-- The tunnel does not change with the carrier: it is keyed by the person, so the gateways see the same member over any carrier; only the network under it changes.
+- The tunnel does not change with the carrier: it is keyed by the person, so the gateways see the same Wāteo key over any carrier; only the network under it changes.
 - The cellular circle shows each carrier's live measures (signal, rate, loss: "Claude memories/link_measures_no_bars.md"), so the person sees what they switch to; "auto" may later choose by those same measures, from the modem's own reports, never polling.
 
 ## The connection
@@ -58,8 +63,9 @@ No gateway asks a central server anything to forward a packet.
 
 ### The account
 
-- Wāteo is bound to the identity the way a kist is: the Wāteo key above is its alias, and the fleet signs a binding for it as for a kist (FACETS.md "be you").
-- **The account is the Wāteo key's public half.** Wāteo's ledger knows that key and its standing (paid up, credit, limits), never the handle or the identity key; it is unlinkable to every kist the person uses.
+- Wāteo hangs off the identity the way a kist does: the Wāteo key above is its alias, derived from the person key, so every device of the person derives the same one.
+- **No binding.** A kist's binding names the handle proof (FACETS.md "be you"), so a binding shown to Wāteo would hand it the person. The Wāteo key needs none: the ledger takes it because credit is spent under it, not because the fleet vouched for it.
+- **The account is the Wāteo key's public half.** Wāteo's ledger knows that key and its standing (credit, limits), never the handle, the identity key, or any payment; it is unlinkable to every kist the person uses and to the person's membership.
 
 ### Standing travels as a ticket
 
@@ -75,7 +81,7 @@ No gateway asks a central server anything to forward a packet.
 3. Both derive the session's keys from a hybrid exchange: X25519 and a post-quantum KEM.
 4. Packets flow sealed with XChaCha20-Poly1305.
 
-The gateway learns the Wāteo key and the device key, and nothing else.
+The gateway learns the Wāteo key and the Wāteo device key, and nothing else.
 
 ### Many gateways, always connected
 
@@ -89,6 +95,7 @@ The gateway learns the Wāteo key and the device key, and nothing else.
 - Each gateway counts bytes per Wāteo key.
 - The device and the gateway co-sign a **usage receipt** from time to time, so neither can inflate or hide traffic.
 - The ledger collects receipts and debits credit: credit in, receipts out.
+- **A gateway keeps no record of where packets went or when**, per key or at all: the receipts' byte counts are everything metering keeps.
 
 ### The frames
 
@@ -109,22 +116,39 @@ So:
 
 **Decided** (owner, 2026-11-09): no dollars; payment in crypto; fiat holders swap thru an onboarding provider.
 
-**Destination.**
-- **Membership** is a record in the person's identity space (IDENTITY-SPACE.md), signed by Wāteo's association (the DUNA, once formed: "Claude memories/fgtw_duna_runanga.md"), naming the person's Wāteo public key and the device keys allowed to use it (Open: one device at a time or several, W1).
-- **Paying** credits the membership; the ledger renews tickets while credit holds, and receipts debit it at cost.
-- **Joining**, invite only for now: an existing member's sponsorship and a first payment, done in a ferros settings page (the system's, never a kist's), never on a website.
-- The association signs memberships; it never learns the handle. A member's Wāteo key unlinks them from every kist they use.
-- At cost includes paying the people who build and run it (the hui of 2026-11-11), and the supplier bills Wāteo in fiat while members pay in crypto: who converts, and how pay is set and approved, are open (W7, with the legal work).
+**Destination.** Two sides that never touch: the **line** (the Wāteo key, its credit, its use) and the **member** (a person on the roll, vouched by name, one vote).
+Every crossing between them is a blind signature (Chaum, 1982): the signer signs what it cannot see, the holder unblinds it, and when it comes back the signer can check its own signature but cannot tell which signing it came from.
+
+**Paying buys credit blind.**
+- The person pays from any wallet. In the ferros settings page the device makes a batch of credit notes of fixed sizes, each a fresh random serial, and blinds them; the ledger signs the blinded notes against the payment; the device unblinds them.
+- The notes are kept sealed in the identity space (IDENTITY-SPACE.md), so any of the person's devices can spend them and a lost device loses none.
+- The device spends notes under the Wāteo key when its credit runs low: the ledger checks its own signature, checks the serial against the spent list, adds it there, and credits the Wāteo key. Tickets renew while credit holds, and receipts debit it at cost.
+- So the ledger sees a payment, and separately a spend, and cannot join them. Fixed sizes keep an amount from joining them; spending when credit runs low, not when the payment lands, keeps the time from joining them.
+
+**Membership is proven blind.**
+- **The member key**: `derive_key("ferros 2026-11-17 wateo member v0", person key)`, another alias of the person key, unrelated to the Wāteo key.
+- **Membership** is a record in the person's identity space, signed by Wāteo's association (the DUNA, once formed: "Claude memories/fgtw_duna_runanga.md"), naming the member key and the two members who vouched. It never names a Wāteo key, a Wāteo device key, or a device.
+- **Served 30 days** (the patron rule): each period a Wāteo key's credit was debited, the ledger signs one blinded **served** note for it. The person unblinds it and shows it to the roll under the member key: the roll learns that this member paid for service, not which line is theirs.
+- **Ballots**: for each vote the roll signs one blinded ballot per member; ballots are cast unblinded over any path, and counted in public. Who cast which ballot is not knowable.
+- The roll holds the member key and who vouched; it never learns the handle. Vouchers know the person (that is what vouching is), but nothing they sign names a line.
+
+**Joining**, invite only for now: an existing member's sponsorship and a first payment, done in a ferros settings page (the system's, never a kist's), never on a website.
+The invite is blind too: the roll signs a blinded invite for the sponsoring member (counting them against that member), the sponsor hands it over by Photon, and the newcomer spends it under their new Wāteo key with their first credit. The ledger learns that a good invite was spent, not whose.
+
+**What is left outside**: the supplier sees the eUICC's EID when a profile downloads, and the network sees where that chip is; an exchange that knows the payer knows they paid Wāteo. wateo.net's Privacy page lists these as the gaps Wāteo cannot close.
+
+At cost includes paying the people who build and run it (the hui of 2026-11-11), and the supplier bills Wāteo in fiat while members pay in crypto: who converts, and how pay is set and approved, are open (W7, with the legal work).
 
 ## While locked
 
 **Decided** (2026-11-04, "Claude memories/radios_at_attest_gps_locked.md"): radios come up at attest; while locked only the signed locate may act on radio input, and LTE carries the locate's answer.
 
 **Destination.** A locked device has no person key in the kernel, so it cannot open a person's tunnel.
-The gateways take a second, narrow kind: a **device tunnel**, which reaches only fgtw.org's locate responder and nothing else, metered to the membership that names that device.
+The gateways take a second, narrow kind: a **device tunnel**, which reaches only fgtw.org's locate responder and nothing else, debited to the Wāteo key that signed its locate key (below). Nothing names the device to the roll, and no membership pays for a line.
 It cannot be opened with the ira key: anything that regenerates the ira could then open it and answer a locate with a false place.
 Instead, at each attest ferros derives a **locate key** from the wairua (fresh each power-on, in registers only) and has the person's Wāteo key sign it, valid until the device next loses power; the ledger issues a narrow ticket for it (the locate responder only), and while locked the device tunnel opens with that key and ticket alone.
 The trade: a device power-cycled while locked cannot answer a locate until its person attests again; a false place is worse than none.
+The one join left is time: the gateway knows when a Wāteo key's device tunnel spoke, and the locate responder knows which device answered when. The gateway keeps no times (Metering above), and the two must never pool what they see live.
 That keeps locate working on Wāteo without letting a locked device, or Android, use the line.
 
 ## Getting the community onto ferros
@@ -142,27 +166,29 @@ These are what today's code must not break, so real service slots in:
 - **No physical SIM in any Wāteo path.**
 - **No data path that bypasses the tunnel once a Wāteo profile is active.** The modem driver and `ip` may use a carrier's open APN for a person's own SIM (bring your own SIM stays: README "Connectivity"), but a Wāteo profile's traffic goes only to the gateways.
 - **Nothing keys service to the SIM, the ICCID, the IMEI or the EID.** Service is the person's keys; the profile is a pool's.
+- **Nothing joins the line to the person.** Nothing ferros sends Wāteo's gateways or ledger carries the handle, the handle proof, a binding, the identity key, the ira, the member key or any kist's alias; every crossing between the line and the member is blind.
 - **The modem stays ferros's.** Android runs only after a ferros attest (the gate's rule); nothing on ferros hands Android a Wāteo credential or the Wāteo key.
 - **Nothing of a Hologram account (logins, ICCIDs, IMEIs, EIDs, the organisation) goes in the repo.**
 - **No dollars anywhere**, in code, docs or pages.
 
 ## What to build, in order
 
-0. The person key and the kernel's derivation (FACETS.md; built, on the Pro since 2026-11-16); the Wāteo key beside the kist alias, for the system only, and its binding.
+0. The person key and the kernel's derivation (FACETS.md; built, on the Pro since 2026-11-16); the Wāteo key, the Wāteo device key and the member key beside the kist alias, for the system only, with no binding.
 1. **Reaching the eUICC**: the SGP.22 client speaks to the eSIM chip thru the modem's SIM interface (logical channels, APDUs), over the Samsung modem's closed protocol. This is ferros's own biggest unknown in the whole path, and it comes first.
 2. The SGP.22 client: profile download, enable, disable, delete; profiles kept per device (rustls in one std process, trusting only the GSMA CI root).
 3. The modem driver taking its APN and network selection from the active profile and the person's carrier setting (today: Verizon's table, RADIO-CONTROLS.md).
 4. The tunnel in `ip`: the handshake, the ticket, the standby and resumption, receipts, lean data frames, the person tunnel and the device tunnel, and the rule that a Wāteo profile's traffic goes nowhere else.
-5. The membership record (IDENTITY-SPACE.md) and the Wāteo page in settings, with the carrier choice.
-6. Wāteo's side, not ferros's: the gateways, the ledger (tickets, receipts, the revocation push), the private APN with each sponsor, the association's signing.
+5. The Wāteo page in settings, with the carrier choice; credit notes made, blinded, unblinded, kept in the identity space and spent; the membership record (IDENTITY-SPACE.md), served notes, invites and ballots on the person's side.
+6. Wāteo's side, not ferros's: the gateways, the ledger (blind signing of credit and served notes, the spent list, tickets, receipts, the revocation push), the roll (memberships, blind invites and ballots), the private APN with each sponsor, the association's signing.
 
 ## Open
 
 - **W0. The tunnel's protocol**: proposed above, Wāteo's own small one (ticket-based, a hybrid post-quantum handshake, lean frames), rather than Photon Transport or WireGuard as they are.
-- **W1. One device or several**: whether a member's service runs on one device at a time or on every device they attest on at once.
+- **W1. One device or several**: whether a person's service runs on one device at a time or on every device they attest on at once; either way it is the ticket's limit on Wāteo device keys per Wāteo key, never a list on the membership.
 - **W2. The gateways**: run by Wāteo as its own service, or riding FGTW's network (FGTW's peers, "Claude memories/fgtw_duna_runanga.md"); either way placed beside the supplier's breakout points.
 - **W3. Bring your own SIM**: kept as today (any carrier, the person's business) beside Wāteo, or Wāteo only on ferros devices.
 - **W4. The supplier and SGP.22** (blocks build step 2): does Hologram issue SGP.22 downloadable profiles to a phone's eUICC, or only to its own cards and servers? If not, another supplier (an eSIM wholesaler issuing consumer profiles on the same carriers).
 - **W5. The profiles' shape**: one profile reaching all three networks with the device choosing the network, or one profile per carrier; and whether a profile downloaded but disabled costs anything.
 - **W6. Hosting**: where the supplier's packet gateways are, whether it offers cloud interconnect or only IPsec, and cloud against colocation by egress cost.
 - **W7. Money's edges**: who turns members' crypto into the supplier's fiat, and how pay for the people who build and run it is set and approved.
+- **W8. The blind signature**: Chaum's RSA blind signature has perfect blinding, so no computer, quantum included, ever joins a payment to a spend; but a quantum computer could forge its signatures, so the ledger would need to move to a post-quantum blind scheme before one exists, and those are young. Which scheme, and the credit notes' sizes.
