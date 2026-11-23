@@ -50,9 +50,6 @@ pub fn parse(doc: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 /// A field's values are told apart by their type markers, never their places: the name `nw`, the passphrase `a`, and when this device last joined it `e` (Eagle time, `e6`; absent for one handed in and not joined yet).
 const LIST: &str = "networks";
 
-/// Networks one entry keeps at most: sixteen (2^4). A seventeenth kept lets the one joined longest ago go (`keep`).
-pub const MOST: usize = 1 << 4;
-
 /// One network remembered: its SSID's octets, its passphrase (never printed), and when this device last joined it in Eagle oscillations (None: handed in, not joined yet).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Kept {
@@ -65,11 +62,8 @@ fn list_schema() -> SectionSchema {
     SectionSchema::new(LIST).field("network", TypeConstraint::OneOf(alloc::vec![TypeConstraint::Ssid, TypeConstraint::AsciiText, TypeConstraint::AnyEagleTime]))
 }
 
-/// The document for these networks, made at `eagle`: None if one of them is not usable (`usable`), its passphrase is not ASCII, or there are more than `MOST`.
+/// The document for these networks, made at `eagle`, as many as the person keeps (docs/NO-CEILINGS.md step 7; sixteen until then, the oldest let go silently): None if one of them is not usable (`usable`) or its passphrase is not ASCII.
 pub fn build_list(nets: &[Kept], eagle: i64) -> Option<Vec<u8>> {
-    if nets.len() > MOST {
-        return None;
-    }
     let mut b = list_schema().build();
     for k in nets {
         if !usable(&k.name, &k.pass) {
@@ -101,7 +95,7 @@ pub fn parse_list(doc: &[u8]) -> Option<(Vec<Kept>, bool)> {
                 }
             }
             let (name, pass) = (name?, pass?);
-            if !usable(&name, &pass) || out.len() == MOST {
+            if !usable(&name, &pass) {
                 return None;
             }
             out.push(Kept { name, pass, joined });
@@ -112,17 +106,11 @@ pub fn parse_list(doc: &[u8]) -> Option<(Vec<Kept>, bool)> {
     Some((alloc::vec![Kept { name, pass, joined: Some(0) }], true))
 }
 
-/// `nets` with `name` kept with `pass` (handed in: not joined yet), replacing what that name kept; returns what it kept before under the name (None: nothing).
-/// When `nets` is full the network joined longest ago goes to make room (one never joined counts as joined before any that was); the second value is then that one's name.
-pub fn keep(nets: &mut Vec<Kept>, name: &[u8], pass: &[u8]) -> (Option<Kept>, Option<Vec<u8>>) {
+/// `nets` with `name` kept with `pass` (handed in: not joined yet), replacing what that name kept; returns what it kept before under the name (None: nothing). Nothing else is let go: the list is as long as the person keeps it (docs/NO-CEILINGS.md step 7).
+pub fn keep(nets: &mut Vec<Kept>, name: &[u8], pass: &[u8]) -> Option<Kept> {
     let before = nets.iter().position(|k| k.name == name).map(|i| nets.remove(i));
-    let mut gone = None;
-    if nets.len() >= MOST {
-        let (i, _) = nets.iter().enumerate().min_by_key(|(_, k)| k.joined.unwrap_or(i64::MIN)).expect("a full list is not empty");
-        gone = Some(nets.remove(i).name);
-    }
     nets.push(Kept { name: name.to_vec(), pass: pass.to_vec(), joined: None });
-    (before, gone)
+    before
 }
 
 #[cfg(test)]
@@ -159,8 +147,6 @@ mod tests {
         assert!(build_list(&[net("", "12345678", None)], 0).is_none());
         assert!(build_list(&[net("n", "short", None)], 0).is_none());
         assert!(build_list(&[net("n", "not ascii é passphrase", None)], 0).is_none());
-        let many: Vec<Kept> = (0..MOST + 1).map(|_| net("n", "12345678", None)).collect();
-        assert!(build_list(&many, 0).is_none());
         assert!(parse_list(b"not a document").is_none());
         let mut doc = build_list(&[net("pangolin", "a passphrase", None)], 0).unwrap();
         let k = doc.len() - 3;
@@ -171,12 +157,20 @@ mod tests {
     #[test]
     fn keeping() {
         let mut nets = alloc::vec![net("a", "12345678", Some(3)), net("b", "12345678", Some(1))];
-        assert_eq!(keep(&mut nets, b"a", b"new pass phrase"), (Some(net("a", "12345678", Some(3))), None));
+        assert_eq!(keep(&mut nets, b"a", b"new pass phrase"), Some(net("a", "12345678", Some(3))));
         assert_eq!(nets, alloc::vec![net("b", "12345678", Some(1)), net("a", "new pass phrase", None)]);
-        let mut full: Vec<Kept> = (0..MOST as i64).map(|k| Kept { name: alloc::vec![b'n', k as u8], pass: b"12345678".to_vec(), joined: Some(k + 10) }).collect();
-        full[5].joined = Some(2);
-        assert_eq!(keep(&mut full, b"new", b"12345678"), (None, Some(alloc::vec![b'n', 5])));
-        assert_eq!(full.len(), MOST);
-        assert_eq!(full.last(), Some(&net("new", "12345678", None)));
+    }
+
+    #[test]
+    fn as_many_as_the_person_keeps() {
+        // Past the sixteen that were the most until docs/NO-CEILINGS.md step 7: none let go, and the document round-trips whole.
+        let mut nets: Vec<Kept> = Vec::new();
+        for k in 0..300u32 {
+            let name = alloc::format!("net {k}");
+            assert_eq!(keep(&mut nets, name.as_bytes(), b"12345678"), None);
+        }
+        assert_eq!(nets.len(), 300);
+        let doc = build_list(&nets, 1 << 50).unwrap();
+        assert_eq!(parse_list(&doc), Some((nets, false)));
     }
 }

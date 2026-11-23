@@ -2010,9 +2010,15 @@ impl Msgbuf {
             at += 10;
         }
         let joined = self.serving && !self.gone && self.keyed && self.linked;
-        out[at] = self.kept.len() as u8;
+        let count_at = at;
         at += 1;
+        let mut count = 0u8;
         for (name, class, when) in &self.kept {
+            // WHY the bounds: the list is as long as the person keeps (docs/NO-CEILINGS.md step 7) and this reply is one NETS_MAX buffer with a byte for the count; a network that would write past the buffer, or a 256th, would panic the driver on the index or wrap the count. The page shows sixteen; the rest stay kept and joinable, and a reply that grows with the list comes with the page that scrolls (NO-CEILINGS.md, section 2.1).
+            if count == u8::MAX || at + 3 + name.len() + 8 > out.len() {
+                break;
+            }
+            count += 1;
             out[at] = *class;
             out[at + 1] = (joined && name[..] == self.want[..self.want_len]) as u8;
             out[at + 2] = name.len() as u8;
@@ -2021,6 +2027,7 @@ impl Msgbuf {
             out[at..at + 8].copy_from_slice(&when.unwrap_or(i64::MIN).to_le_bytes());
             at += 8;
         }
+        out[count_at] = count;
         at
     }
     /// STATUS's reply: [state: 0 waiting for a network, 1 scanning, 2 joined; the last join's outcome (`outcome`); the name length; the name being joined or kept].
@@ -3344,8 +3351,6 @@ struct Try {
     before: Option<Option<Kept>>,
 }
 
-/// The FILES slot the lists are read into, one at a time (1 MiB + 128 KiB in the DMA region's old layout, the credential's place until 2026-11-18).
-const LIST_SLOT: usize = 2;
 
 /// The networks list `k` keeps: Ok with them (none when the entry is absent), Err when the vault refused (the person's while nobody is attested, AUTH.md), or a read failed part way: nothing is written over a list that could not be read.
 /// A value that is not a list is dropped, never parsed further; the one-network document of before 2026-11-18 is written again as a list of one.
@@ -3360,33 +3365,26 @@ fn list_read(d: &mut Drv, k: usize) -> Result<Vec<Kept>, ()> {
         return Ok(Vec::new());
     }
     let len = r as usize;
-    // WHY the bound: the length is the vault's word and the scratch is one 64 KiB slot (`FILES`); a list of `MOST` networks is under 2 KiB, so a value past the slot is no list (dropped below).
-    let doc: Option<&[u8]> = if len <= 0x1_0000 {
-        // SAFETY: slot LIST_SLOT of FILES is this function's alone (the lists are read one at a time, on the driver's one thread that reads the vault), and `len` is inside it.
-        let buf = unsafe { core::slice::from_raw_parts_mut((&raw mut FILES as *mut u8).add(LIST_SLOT << 16), len) };
-        let mut piece = [0u8; 4096];
-        let mut off = 0;
-        while off < len {
-            // WHY the min: a piece is what is left of the value or a whole piece, whichever is less (the last piece is short).
-            let n = (len - off).min(piece.len());
-            let r = ferros_sys::store_read_at(cap, key, off, &mut piece[..n]);
-            if r == ERR || r == ferros_sys::NOTHING {
-                return Err(());
-            }
-            buf[off..off + n].copy_from_slice(&piece[..n]);
-            off += n;
-        }
-        piece.fill(0);
-        Some(buf)
-    } else {
-        None
-    };
-    let parsed = doc.and_then(ferros_detail::network::parse_list);
-    // The document's bytes (passphrases among them) gone from the scratch once parsed.
-    if len <= 0x1_0000 {
-        // SAFETY: as above, the slot is this function's, and `len` is inside it.
-        unsafe { core::slice::from_raw_parts_mut((&raw mut FILES as *mut u8).add(LIST_SLOT << 16), len) }.fill(0);
+    // The value read whole into the heap at its length (docs/NO-CEILINGS.md step 7: until then one 64 KiB slot of FILES, past which a list was dropped). The length is the vault's word: a heap that cannot hold it is a read that failed, said as one, never a list dropped.
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return Err(());
     }
+    buf.resize(len, 0);
+    let mut off = 0;
+    while off < len {
+        // WHY the min: a piece is what is left of the value or a whole piece, whichever is less (the last piece is short).
+        let n = (len - off).min(1 << 12);
+        let r = ferros_sys::store_read_at(cap, key, off, &mut buf[off..off + n]);
+        if r == ERR || r == ferros_sys::NOTHING {
+            buf.fill(0);
+            return Err(());
+        }
+        off += n;
+    }
+    let parsed = ferros_detail::network::parse_list(&buf);
+    // The document's bytes (passphrases among them) gone from the heap once parsed.
+    buf.fill(0);
     match parsed {
         Some((nets, old)) => {
             if old {
@@ -3466,11 +3464,8 @@ fn hand_in(d: &mut Drv, m: &mut Msgbuf, name: &[u8], pass: &[u8]) -> Result<Try,
     }
     for k in 0..LISTS.len() {
         let Ok(mut nets) = list_read(d, k) else { continue };
-        let (before, gone) = ferros_detail::network::keep(&mut nets, name, pass);
+        let before = ferros_detail::network::keep(&mut nets, name, pass);
         if list_write(d, k, &nets) {
-            if gone.is_some() {
-                d.put(b"sixteen networks kept already: the one joined longest ago let go\n");
-            }
             let _ = kept_all(d, m);
             return Ok(Try { name: name.to_vec(), pass: pass.to_vec(), list: k, before: Some(before) });
         }
@@ -3641,7 +3636,7 @@ fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8], first: bool, mut next: Optio
 /// The network page's list as last answered to a WATCH or NETS (ops 7 and 12), counted: moved on each time the list, its scanning flag or the networks remembered change, kept across a join that failed so a page waiting from before it is answered at once after.
 static PAGE_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// NETS's reply at most (`nets_reply`): 32 networks of at most 43 bytes, 2 bytes before them, and 32 remembered of at most 43 bytes with their count, 2755 bytes in all, under 4 KiB.
+/// NETS's reply at most (`nets_reply`): 32 networks of at most 43 bytes, 2 bytes before them, then the networks remembered, as many as fit after them (`nets_reply`: the list itself has no count since docs/NO-CEILINGS.md step 7).
 const NETS_MAX: usize = 1 << 12;
 
 /// The page's held calls (WATCH op 7, the attest screen's; NETS op 12, the settings page's): each answered when the list changes (a network found, a scan begun or ended, a network kept or forgotten), and once more before the loop leaves for a join (a held call nobody answers keeps its caller waiting for good; it calls again, and that call waits in the endpoint while the join runs).
