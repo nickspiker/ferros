@@ -790,6 +790,17 @@ fn focus_past(cam: &camera::Camera) -> f64 {
     }
 }
 
+/// How much nearer than its rated nearest a camera focuses, in diopters, at `focus_span`'s diopters a code: from its code at the nearest to the end of the actuator's travel beyond it (`focus_max` when nearer is larger, else `focus_min`), the travel tracked on every camera (the coordinator, 2026-11-22: the position followed every target over the listed travel, nothing pinned at a stop; the owner: "I'd just enable full range both ways and I'll inspect it"). 0 without the calibration. The focus slider runs on to there (lumis_core `platform::set_focus_beyond`), and `focus_of` carries its diopters past the nearest's code, as far as that end.
+fn focus_beyond(cam: &camera::Camera) -> f64 {
+    match (focus_span(cam), cam.focus_infinity, cam.focus_near) {
+        (Some((inf, near, nearest)), Some(_), Some(_)) => {
+            let end = if near > inf { cam.focus_max } else { cam.focus_min };
+            near.abs_diff(end) as f64 * nearest / inf.abs_diff(near) as f64
+        }
+        _ => 0.,
+    }
+}
+
 /// ISO for the driver's analogue gain: unity (1024) as ISO 100, the convention Camera2 HALs report a sensor's base gain as.
 const ISO_AT_UNITY: f64 = 100.;
 
@@ -1126,6 +1137,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     }
     lumis_core::platform::set_video_offered(video_ok);
     lumis_core::platform::set_focus_past(focus_past(&cam));
+    lumis_core::platform::set_focus_beyond(focus_beyond(&cam));
     // A rate's pacing on this readout: every rate `video_fps` gives is one it holds.
     let pace = |fps: u32| ferros_clip::Pacing::of_line(fps, line.expect("RAW video only where the driver gives a line (video_ok)")).expect("a rate up to the readout's fastest is paced");
     if video_ok && dev_knobs4() & DEV_VIDEO != 0 {
