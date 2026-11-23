@@ -126,6 +126,7 @@ fn report(b: &Boot, exit: u8) {
 
 /// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open, 5 a value over STORE_VALUE_MAX.
 /// Write [keylen:2 BE][key][value] -> [0][object hash:32]. Read [key] -> [0][value]; an empty key lists every key, '\n'-separated. Exec [key] -> remove -> [0] or [1].
+/// Under the vault's lock alone (2026-11-22, kernlock): the kernel lock was held across the whole transfer, 126 ms for a 1.6 MB `store get` on the Pro (`diag lock`, service.rs `store_command` under `with_lock` and `vault`), and a camera stream died behind it. Nothing here is the kernel lock's: the vault's blocks and its in-memory identity are the vault lock's to read (kvault `id` and `bound` are written under both locks, read under either, and a set, get or remove writes neither), `note_old_put` and `zone::table_stale` are atomics. The one piece of kernel state, a settings document applied to the preferences, is applied by the caller once the vault's lock is let go (`store_host`), as the kernel lock ranks above it.
 fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
     let store = match store {
         Some(s) => s,
@@ -155,10 +156,6 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             crate::process::note_old_put(&key);
             match store.set(&key, &params[2 + klen..]) {
                 Ok(h) => {
-                    // The settings document set from the bridge applies at once, as a change on the device does (SYS_SET_PREF): every live process sees it on its next frame.
-                    if key == crate::settings::KEY {
-                        let _ = crate::settings::apply(&params[2 + klen..], true);
-                    }
                     // A new zones document (tools/tzvsf): read again at the service loop's next pass.
                     if key == "zones" {
                         crate::zone::table_stale();
@@ -221,6 +218,20 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             _ => alloc::vec![3],
         },
     }
+}
+
+/// A host store command on the kernel's own vault (`store_command`) with the kernel lock let go across the vault's transfer, then a settings document it set applied to the preferences at once, as a change on the device does (SYS_SET_PREF): every live process sees it on its next frame. The apply takes the kernel lock itself (`settings::apply` with `held` false).
+/// Between the store and the apply a process's own preference change may land (its document written at its trap's end, `keep_settings`); the apply then puts the stored document's values over it in memory, as a later change would. A development door's race, said here.
+fn store_host(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
+    let resp = vault(|| store_command(store.as_mut(), op, params));
+    // A status 0 on a write means `store_command` found its key inside the parameters (status 3 otherwise), so the key's length and the slices below are in range.
+    if op == ferros_pt::Op::Write && resp.first() == Some(&0) {
+        let klen = u16::from_be_bytes([params[0], params[1]]) as usize;
+        if &params[2..2 + klen] == crate::settings::KEY.as_bytes() {
+            let _ = crate::settings::apply(&params[2 + klen..], false);
+        }
+    }
+    resp
 }
 
 /// A bridge `store` command the vault process answers (VAULT-OUT.md: the names it holds), through the kernel's own channel (process.rs `vault_call`), a transfer a call. Its PT reply waits until the last call is answered: the USB process polls for a reply that is not ready yet (ptlink.rs).
@@ -438,7 +449,7 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
     };
     match job {
         VaultJob::Get { full, got } => match value {
-            NOTHING => return Some(crate::process::with_lock(|| vault(|| store_command(store.as_mut(), ferros_pt::Op::Read, full.as_bytes())))),
+            NOTHING => return Some(store_host(store, ferros_pt::Op::Read, full.as_bytes())),
             ERR => return Some(alloc::vec![2]),
             // The reply is built whole in the kernel's heap, and copied once more as it goes out: held to the limit the kernel's vault keeps for the same reason (STORE_VALUE_MAX).
             whole if whole as usize > STORE_VALUE_MAX => return Some(alloc::vec![5]),
@@ -499,7 +510,7 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
         VaultJob::Remove { full } => {
             return Some(match value {
                 0 => alloc::vec![0],
-                NOTHING => crate::process::with_lock(|| vault(|| store_command(store.as_mut(), ferros_pt::Op::Exec, full.as_bytes()))),
+                NOTHING => store_host(store, ferros_pt::Op::Exec, full.as_bytes()),
                 _ => alloc::vec![2],
             });
         }
@@ -6111,9 +6122,9 @@ pub fn run(mut b: Boot) -> ! {
                         job_due = cntpct() + lease;
                     }
                     Some(Err(resp)) => queue_pt_response(&mut pt_out_data, &resp),
-                    // Under the kernel lock and the vault's (one owner at a time): a stored settings document is applied to the preferences at once, the kernel's state.
+                    // Under the vault's lock alone, the kernel lock taken only to apply a settings document (`store_host`).
                     None => {
-                        let resp = crate::process::with_lock(|| vault(|| store_command(store.as_mut(), cmd.op, cmd.params)));
+                        let resp = store_host(&mut store, cmd.op, cmd.params);
                         // Absent from the kernel's vault, a name of a scope this kernel does not know may be in the vault process (`foreign_job`).
                         match if resp == [1] { foreign_job(cmd.op, cmd.params) } else { None } {
                             Some(job) => {
