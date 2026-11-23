@@ -609,6 +609,8 @@ struct Client {
     fleet_key: Option<[u8; 32]>,
     /// The fan-out revision the fleet key in hand came with (a fan-out from a sibling or from fgtw.org, this device's mint, a recovery), 0 unknown: a key kept on disk and loaded at start carries none until a fan-out holding it is seen (`fanout_check`). The floor a new key must pass, so an older fan-out never takes the key back (`key_floor`).
     fleet_rev: u64,
+    /// The frame names this service does not handle that it has said already (`on_frame`): the Photon app's frames on the shared port, said once a name.
+    unhandled_said: Vec<alloc::string::String>,
     /// The kernel's lock epoch (`ID_BELL`) when the roots in hand were taken (op 4, op 3, the vault at start): once the bell moves past it the identity was locked, and what is held of it goes (`locked_out`).
     lock_epoch: u64,
     /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
@@ -2020,13 +2022,20 @@ impl Client {
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
+            // A frame of the Photon app's own (history pages, avatars, the chain sync...): ip hands every datagram on 4383 to both readers, fgtw and Photon, so this service sees a copy of Photon's traffic and Photon answers it. Said once a name a run, not once a frame (2026-11-22: the Pro's console filled with "frame hist_page from 469e79b8 (not handled)", six a second while the desktop paged history to the Photon kist).
             Ok((Inbound::Other(name), signer)) => {
-                self.log.put(b"fgtw: frame ");
-                self.log.put(name.as_bytes());
-                self.log.put(b" from ");
-                self.log.fp(&signer);
-                self.log.put(b" (not handled)");
-                self.log.line();
+                if !self.unhandled_said.iter().any(|n| *n == name) {
+                    // WHY the bound: the names are a peer's, and a peer could send any number of them; past 2^4 a name is said again rather than remembered.
+                    if self.unhandled_said.len() < 1 << 4 {
+                        self.unhandled_said.push(name.clone());
+                    }
+                    self.log.put(b"fgtw: frame ");
+                    self.log.put(name.as_bytes());
+                    self.log.put(b" from ");
+                    self.log.fp(&signer);
+                    self.log.put(b" (not handled here: the Photon app's, which reads the same port; said once)");
+                    self.log.line();
+                }
             }
             Err(_) => {}
         }
@@ -2185,6 +2194,13 @@ impl Client {
                 let got = (n as usize).min(req.len());
                 // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, on fgtw's machines, add.rs and depart.rs): each answers alone, nothing of the state after it. 8 [what] what of the Fleet page is on the glass (0 nothing, 1 the add flow, 2 a departure asked about here alone; `fleet_page`), and [8][1] on a selected device is No → [0]; 9 → the add flow (`add_reply`, addview.rs); 10 [key 8] a row touched → [result]; 11 [words] the words typed so far → the match (`add_words`); 12 Yes on a selected device → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's, which also reads fgtw.org's registry once) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
                 // The identity space (space.rs): 17 → its state for the map (`space_reply`: the generation the map reloads its circles on, this device's deck sync, the first pull done, the facts); 18 [on] this device's deck follows the fleet's or keeps its own → [0 done, 1 not yet: before the first pull].
+                // 34: the device's copy of the space changed (the map wrote the deck, the view or the person's list; the stower wrote the list) → [0]. The copy is joined to the space at once, and only then: the doorbell that replaced the join every 4 s (owner, 2026-11-10: "No polling!").
+                if n >= 1 && req[0] == 34 {
+                    self.space.copy_rang = true;
+                    let r = [0u8];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && req[0] == 17 {
                     let r = self.space_reply();
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
@@ -2821,7 +2837,7 @@ extern "C" fn work(_: u64) -> ! {
     // What peers' transfers may hold here (photon_core `bound_inbound`): a SPEC asks up to 4 MiB and its buffer is made whole at once, a sender has 26 letters, and this heap is 8 MiB. The largest frame this service takes is a fleet chain (A#225840 bytes at 30 ops on the Pro, 2026-11-22, about 7.5 KB an op), so 2 MiB for one leaves room for about 270 ops, and half the heap for all in flight together.
     pt.bound_inbound(IN_MOST, IN_BUDGET);
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, unhandled_said: Vec::new(), lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

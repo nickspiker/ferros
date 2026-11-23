@@ -1388,6 +1388,40 @@ extern "C" fn fgtw_poller(grants: u64) -> ! {
 }
 
 
+/// The person's copy written here (the deck, the view, the person's list), counted: `copy_bell_thread` tells the identity service (fgtw op 34), which joins the copy to the person's space then and only then (it read the copy every 4 s until 2026-11-22; owner, 2026-11-10: "No polling!").
+static COPY_BELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A write to the person's copy made: the identity service is told, from its own thread (`copy_bell_thread`), so the main loop never waits on it.
+fn ring_copy() {
+    COPY_BELL.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    ferros_sys::wake(&COPY_BELL, 1);
+}
+
+/// fgtw op 34 once for every run of writes to the person's copy (`COPY_BELL`), asleep on the word between them. A call fgtw refuses (not serving yet) is made again after the doubling wait `fgtw_poller` uses; one it takes stands for every write counted before it.
+extern "C" fn copy_bell_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_FGTW);
+    let mut done = 0u64;
+    let mut absent = freq() >> 6;
+    loop {
+        let v = COPY_BELL.load(Ordering::Acquire);
+        if v == done {
+            ferros_sys::wait_world(&COPY_BELL, v, 0);
+            continue;
+        }
+        let mut r = [0u8; 4];
+        if ferros_sys::call_live(svc, &[34], &mut r) == ferros_sys::ERR {
+            sleep_until(now() + absent);
+            if absent < freq() {
+                absent <<= 1;
+            }
+            continue;
+        }
+        absent = freq() >> 6;
+        done = v;
+    }
+}
+
 /// What of the Fleet page is on the glass, as the main loop last saw it (bits 0-1: 0 nothing, 1 the add flow, 2 a departure asked about here alone), counted in the bits above so each change is a new word: `fleet_page_thread` tells fgtw (op 8), whose add flow and its radios are open only while it is 1 (owner, 2026-11-10: adding a device, by a touch on its row or by NFC, needs "the fleet page open"; the security review of 2026-11-22: only while the person chose the page and it is on the glass), and whose NFC reader reads for a leaving device's tap only while it is 2.
 static FLEET_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2189,6 +2223,8 @@ impl Map {
         };
         if !ok {
             console(self.grants, b"map: the vault did not take the person's kists\n");
+        } else {
+            ring_copy();
         }
         ok
     }
@@ -2475,7 +2511,11 @@ impl Map {
         if !changed {
             return true;
         }
-        deck::document(&self.kept, ferros_sys::eagle_now()).is_some_and(|d| ferros_sys::store_set(cap(self.grants, S_STORE), deck::KEY, &d))
+        let kept = deck::document(&self.kept, ferros_sys::eagle_now()).is_some_and(|d| ferros_sys::store_set(cap(self.grants, S_STORE), deck::KEY, &d));
+        if kept {
+            ring_copy();
+        }
+        kept
     }
 
     /// No two circles overlap: after circle `held` moved or grew, every overlapping pair is pushed apart along the line between their centres until they touch (with a hair of air), the held one never moving — so a push carries on through the neighbours (owner, 2026-10-22). A few rounds settle it; every circle that moved is redrawn and kept when the fingers lift.
@@ -2650,7 +2690,11 @@ impl Map {
     /// The view, where the camera is and how the plane is turned, into the vault (`map.view`, its document: x, y, cos, sin), so a restart shows the plane as it was left. The zoom is always one at a release (`renormalise`), so the scale is already in the radii.
     fn save_view(&self) -> bool {
         let Some(doc) = ferros_kept::map::view(&[self.cam.x, self.cam.y, self.cam.c, self.cam.s], ferros_sys::eagle_now()) else { return false };
-        ferros_sys::store_set(cap(self.grants, S_STORE), b"view", &doc)
+        let kept = ferros_sys::store_set(cap(self.grants, S_STORE), b"view", &doc);
+        if kept {
+            ring_copy();
+        }
+        kept
     }
     fn load_view(&mut self) -> bool {
         let Some(vals) = self.read_small(b"view").ok().flatten().and_then(|d| ferros_kept::map::read_view(&d)) else { return false };
@@ -6612,6 +6656,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
+    // The person's copy written here, told to the identity service (`copy_bell_thread`).
+    static mut COPY_STACK: [u8; 1 << 13] = [0; 1 << 13];
+    ferros_sys::thread_spawn(copy_bell_thread, unsafe { &mut *(&raw mut COPY_STACK) }, grants);
     // The People page's and the cards' requests to the identity service (`people_thread`).
     static mut PEOPLE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(people_thread, unsafe { &mut *(&raw mut PEOPLE_STACK) }, grants);

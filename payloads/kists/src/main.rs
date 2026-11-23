@@ -529,6 +529,12 @@ fn directory_reply(s: &State, from: u8) -> Vec<u8> {
     r
 }
 
+/// The person's list written here: the identity service told (fgtw op 34), which joins it to the person's space then and only then (it read the list every 4 s until 2026-11-22; owner, 2026-11-10: "No polling!"). From the worker, which may wait out fgtw's pass; a service not serving yet learns of it at its first join after the attest.
+fn copy_changed(grants: u64) {
+    let mut r = [0u8; 4];
+    let _ = ferros_sys::call_live(cap(grants, S_FGTW), &[34], &mut r);
+}
+
 /// The identity service's doorbell (fgtw op 21), held on this thread: each time it rings and the person's space generation (op 17) moved, or its first pull has just settled, a restore pass is due. While fgtw is not serving (it starts after attest and may restart) it is asked again after a wait that doubles to a second, as the map's `fgtw_poller` does: no doorbell exists for a server coming up.
 extern "C" fn space_watch(grants: u64) -> ! {
     let svc = cap(grants, S_FGTW);
@@ -716,6 +722,7 @@ fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         drop_capsule(grants, &e.capsule);
         return Err(WHY_VAULT);
     }
+    copy_changed(grants);
     unhide(grants, &e.developer, &e.option);
     index_icon(grants, Some(&e.capsule), &e.developer, &e.option);
     // An update: the version it replaced is named by no kist of the person's any more.
@@ -753,6 +760,7 @@ fn unstow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         if !ferros_kist::store::write(list_cap, &list, now) {
             return Err(WHY_VAULT);
         }
+        copy_changed(grants);
         if list.by_capsule(&k.capsule).is_none() {
             drop_capsule(grants, &k.capsule);
         }
@@ -1081,6 +1089,7 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
     if !ferros_kist::store::write(list_cap, &list, at) {
         return Err(WHY_VAULT);
     }
+    copy_changed(grants);
     unhide(grants, &job.developer, &job.option);
     index_icon(grants, Some(&job.capsule), &job.developer, &job.option);
     if let Some(old) = old.filter(|c| *c != job.capsule && list.by_capsule(c).is_none()) {

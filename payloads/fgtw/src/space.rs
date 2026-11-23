@@ -51,7 +51,6 @@ pub struct SpaceSync {
     /// The digest fgtw.org was last seen or made to hold, and the one last handed to the fleet.
     seed_digest: [u8; 32],
     fleet_digest: [u8; 32],
-    last_local_us: u64,
     last_seed_us: u64,
     /// Bumped whenever the device's copy was written from the space: the map reloads its circles when it moves (op 17).
     generation: u32,
@@ -87,13 +86,15 @@ pub struct SpaceSync {
     held: Option<[u8; 32]>,
     /// The key fingerprint of a copy the published fan-out was read for (`space_rekey`) and held nothing to adopt (none newer, or no wrap for this device), and the fingerprint of the key held here then. While both still stand the first pull is not asked again on a timer: an event asks again (`space_wake`; the key changing lifts it by itself).
     checked: Option<([u8; 32], [u8; 32])>,
+    /// The device's copy changed (fgtw op 34: the map or the stower wrote it): joined at the next pass. Also set by a copy merged in and by the first settle: the join runs on these, never on a timer.
+    pub copy_rang: bool,
     /// fgtw.org's failures in a row (a pull or a fan-out read), since it last answered: the first pull's wait doubles with each (`retry_us`).
     misses: u8,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, misses: 0 }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, copy_rang: false, misses: 0 }
     }
 }
 
@@ -242,7 +243,7 @@ impl Client {
             self.log.line();
             self.space_keep();
             // Joined at once, not at the next tick: a reset device puts the person's deck back as soon as it has it.
-            self.space.last_local_us = 0;
+            self.space.copy_rang = true;
         }
         Some(digest)
     }
@@ -320,6 +321,7 @@ impl Client {
                 self.space.seed_digest = digest;
                 if !self.space.settled {
                     self.space.settled = true;
+                    self.space.copy_rang = true;
                     self.log.put(b"fgtw: space: fgtw.org's copy in hand; joining this device's copy to it");
                     self.log.line();
                 }
@@ -329,6 +331,7 @@ impl Client {
                 self.space.misses = 0;
                 if !self.space.settled {
                     self.space.settled = true;
+                    self.space.copy_rang = true;
                     self.log.put(b"fgtw: space: fgtw.org keeps none for this identity yet");
                     self.log.line();
                 }
@@ -343,6 +346,7 @@ impl Client {
                     self.log.line();
                 }
                 self.space.settled = true;
+                self.space.copy_rang = true;
                 return;
             }
             Err(e) => {
@@ -520,6 +524,7 @@ impl Client {
         self.space_release(b"a fleet device's copy opens");
         if !self.space.settled {
             self.space.settled = true;
+            self.space.copy_rang = true;
             self.log.put(b"fgtw: space: a fleet device's copy in hand; joining this device's copy to it");
             self.log.line();
         }
@@ -568,6 +573,8 @@ impl Client {
         self.space_zone_to_kernel();
         self.space_lang_to_kernel();
         self.space_dnd_to_kernel();
+        // The facts as they stood, to say which kinds a change made here touched.
+        let before: Vec<(u8, Vec<vsf::VsfType>, i64, bool)> = self.space.space.entries().iter().map(|e| (e.kind, e.id.clone(), e.updated, e.gone)).collect();
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
@@ -600,7 +607,23 @@ impl Client {
                     self.space_keep();
                 }
                 if o.space_changed {
-                    self.log.put(b"fgtw: space: a change made here, to the fleet");
+                    // Which kinds of fact moved, and how many facts (a fact new, or written again, or removed).
+                    let (mut kinds, mut n) = (0u16, 0u64);
+                    for e in self.space.space.entries() {
+                        if !before.iter().any(|b| b.0 == e.kind && b.1 == e.id && b.2 == e.updated && b.3 == e.gone) {
+                            kinds |= 1 << (e.kind & 15);
+                            n += 1;
+                        }
+                    }
+                    self.log.put(b"fgtw: space: a change made here, to the fleet: A#");
+                    self.log.dec(n);
+                    self.log.put(b" fact(s):");
+                    for (k, name) in [b"kist".as_slice(), b"answer", b"default", b"place", b"view", b"deck sync", b"departure", b"zone", b"language", b"pin", b"do not disturb", b"person key", b"people"].iter().enumerate() {
+                        if kinds >> k & 1 == 1 {
+                            self.log.put(b" ");
+                            self.log.put(name);
+                        }
+                    }
                     self.log.line();
                     self.space_to_fleet();
                     self.space_seed(true);
@@ -699,8 +722,11 @@ impl Client {
             }
             return Some(self.space.last_seed_us + self.retry_us());
         }
-        // WHY the min: the earlier of its two timers, not a bound on a value.
-        Some((self.space.last_local_us + LOCAL_US).min(self.space.last_seed_us + SEED_US))
+        // A join due (the copy rang, or a copy merged in): at once; else fgtw.org's pull (`SEED_US`).
+        if self.space.copy_rang {
+            return Some(0);
+        }
+        Some(self.space.last_seed_us + SEED_US)
     }
 
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
@@ -742,8 +768,9 @@ impl Client {
             }
             return;
         }
-        if t - self.space.last_local_us >= LOCAL_US {
-            self.space.last_local_us = t;
+        // The join on an event (the copy rang, a copy merged in, the first settle), never every 4 s: the device's copy changes only when the map or the stower writes it, and each rings (op 34).
+        if self.space.copy_rang {
+            self.space.copy_rang = false;
             self.space_join();
             self.space_departures();
             self.space_person();
