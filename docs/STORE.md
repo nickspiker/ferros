@@ -369,7 +369,7 @@ Messages are op bytes as the vault's are, the find and the card as complete VSF 
 | 10 offer | a handle offered to the clipboard or the keep sheet | the input path's ticket |
 | 11 versions | the kept versions of an item | a handle |
 
-A finish answers Ok only after the body, its card and their commit are written and read back equal on every copy the vault holds, two normally; the answer says how many (`copies`, HOLD-API.md "What Ok means"), so a kist never reads back what it kept to be sure.
+A finish answers Ok only after the body, its card and their commit are written, flushed to the medium past the device's write cache, and read back equal on every copy the vault holds, two normally; the answer says how many (`copies`, HOLD-API.md "What Ok means"), so a kist never reads back what it kept to be sure.
 
 A kist keeping things for itself uses the same calls with `keeper` 1; its cards are in its own index under its key, and their titles and sizes in the person's (open question 4).
 

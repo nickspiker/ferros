@@ -1831,6 +1831,16 @@ pub fn block_read_timed(cap: u64, at: u64, buf: &mut [u8]) -> (u64, Option<(u64,
     (r, (r == 0 && (cmd, copy) != (op, at)).then_some((cmd, copy)))
 }
 
+/// The device's write cache to the medium (SYS_BLOCK op bit 6, 2026-11-22: SYNCHRONIZE CACHE of the unit the window lies on): Some((0 or ERR, the ticks it took)), or None from a kernel that does not know the op (it leaves x1 as it went in).
+pub fn block_flush(cap: u64) -> Option<(u64, u64)> {
+    let op = 64u64;
+    let (r, ticks): (u64, u64);
+    compiler_fence(Ordering::SeqCst);
+    unsafe { asm!("svc #0", inlateout("x0") cap => r, inlateout("x1") op => ticks, in("x2") 0u64, in("x3") 0u64, in("x4") 0u64, in("x8") nr::BLOCK, options(nostack)) };
+    compiler_fence(Ordering::SeqCst);
+    (ticks != op).then_some((r, ticks))
+}
+
 /// `block_read`'s other half: `buf.len() / 4096` blocks written from `buf` at block `at` of the window.
 pub fn block_write(cap: u64, at: u64, buf: &[u8]) -> u64 {
     svc(nr::BLOCK, cap, 1 | ((buf.len() as u64 >> 12) & 0xFFFF) << 8, at, off(buf.as_ptr()), 0)

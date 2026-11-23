@@ -165,8 +165,11 @@ impl Device for UfsDevice {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
-        // write_block completes synchronously (OCS polled), so writes are on the device.
-        // A SCSI SYNCHRONIZE CACHE (10) to flush the device-side write cache is not yet wired; the vault's write-verify-then-mirror protocol is the durability guard.
+        // The device's write cache to the medium (SYNCHRONIZE CACHE, 2026-11-22): write_block's completion is the device's acceptance, not the medium's.
+        self.scsi_nexus();
+        if !self.ufs.sync_cache_lun(0) {
+            return Err(DeviceError::IoError(DeviceIoKind::WriteFailed));
+        }
         Ok(())
     }
 

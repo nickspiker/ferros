@@ -2182,6 +2182,10 @@ pub fn ufs_write_run(lun: u8, lba: u32, src: &[u8]) -> bool {
         u.write_run_lun(lun, lba, n, run)
     })
 }
+/// `lun`'s write cache to the medium (ferros_hal `sync_cache_lun`, under `DURABLE`), under the UFS lock: kvault's flush and SYS_BLOCK's (op bit 6).
+pub fn ufs_sync(lun: u8) -> bool {
+    UFS.with(|| ferros_hal::ufs::UfsController::new(0x1320_0000).sync_cache_lun(lun))
+}
 /// Whether a run moves as one UFS command (the stride known, runs not turned off by `diag "ufs runs off"`): partfs.rs sizes its reads by it.
 pub fn ufs_runs_on() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
@@ -6298,6 +6302,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 _ if give.is_some() => give.unwrap_or(ERR),
                 // The owner's fresh start is zeroing the flash (service.rs `vault fresh`): nothing more is read or written before its reset.
                 _ if BLOCKS_SHUT.load(core::sync::atomic::Ordering::SeqCst) => ERR,
+                // Op bit 6: the device's write cache to the medium (SYNCHRONIZE CACHE of LU 0, the whole unit, so any window's writes; the owner, 2026-11-22: a flush per commit). The vault process's manifestus flush after each copy's batch and spine block. x1: the ticks it took. With the kernel lock let go, under the UFS lock.
+                (Some(_), Some(_)) if f.x[1] & 64 != 0 => {
+                    let t0 = crate::platform::cntpct();
+                    let ok = unlocked(|| ufs_sync(0));
+                    f.x[1] = crate::platform::cntpct() - t0;
+                    if ok { 0 } else { ERR }
+                }
                 // Op bit 2 (development, docs/RAW-VIDEO.md): the flash at a queue deeper than one, on the `rawbench` window only (it writes the same bytes everywhere, so never where anything is kept): x4's low 32 bits commands of `count` blocks at consecutive places from `at`, its bits 32-39 the depth (1 to QUEUE_MOST); every command's data the caller's `count` blocks (a write) or the bounce (a read, nothing copied back).
                 // The answer: x1 the ticks from the first doorbell to the last completion, x2 the commands that completed well.
                 // WHY the bounds: the commands, depth and place are the process's; all of them inside the window, the depth inside the slots the HAL keeps.

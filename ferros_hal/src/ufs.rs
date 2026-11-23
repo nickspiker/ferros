@@ -80,6 +80,8 @@ pub mod upiu {
 mod scsi {
     pub const READ_10: u8 = 0x28;
     pub const WRITE_10: u8 = 0x2A;
+    pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const MODE_SENSE_10: u8 = 0x5A;
 #[allow(dead_code)] pub const TEST_UNIT_READY: u8 = 0x00;
 }
 
@@ -182,6 +184,16 @@ pub static PRDT_STRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// Every command's time split (2026-11-11, measuring the vault's 24 MB read before fixing it), in counter ticks: [0] the cache upkeep around it (the descriptors' and the data's clean before the doorbell and clean-and-invalidate after: ferros runs UFS non-coherent, kernel cold_ufs.rs, so the upkeep is per line of every byte moved), [1] the doorbell to completion (the link and the device). Read by the kernel's `diag "ufs runs"`, zeroed by its reset.
 pub static CMD_TICKS: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 /// Runs off by hand (`diag "ufs runs off"`): every run a block a command, to measure the difference on the same boot.
+/// How a persistent write reaches the medium past the device's own write cache (the owner, 2026-11-22: a cache flush per commit, the true on-disk guarantee): 0 SYNCHRONIZE CACHE at each `sync_cache_lun` (the default), 1 FUA on every write and `sync_cache_lun` a no-op, 2 neither (as before 2026-11-22; development, to measure what the guarantee costs). `diag "ufs durable sync|fua|off"`.
+pub static DURABLE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// SYNCHRONIZE CACHE commands sent and their ticks, for `diag "ufs durable"`.
+pub static SYNC_STATS: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// WRITE(10)'s byte 1 under `DURABLE`: FUA (bit 3) in mode 1, else none.
+fn write_flags() -> u8 {
+    if DURABLE.load(core::sync::atomic::Ordering::Relaxed) == 1 { 0x08 } else { 0 }
+}
+
 pub static RUNS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Physical Region Description Table entry (16 bytes).
@@ -855,7 +867,7 @@ impl UfsController {
         // SCSI WRITE(10) CDB
         let cdb = [
             scsi::WRITE_10,
-            0x00,                        // flags
+            write_flags(),               // FUA under DURABLE 1
             (lba >> 24) as u8,
             (lba >> 16) as u8,
             (lba >> 8) as u8,
@@ -872,6 +884,39 @@ impl UfsController {
         self.send_command(0, 1, 1)
     }
 
+    /// Everything `lun` holds in its volatile write cache written to the medium (SYNCHRONIZE CACHE(10), LBA 0 and no count: the whole unit), under `DURABLE` 0; a no-op under 1 (every write was FUA) and 2. Whether it completed with OCS 0 and SCSI status 0. The completion wait is the HAL's (4 s), a flush of a full cache being far below it.
+    pub fn sync_cache_lun(&self, lun: u8) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        if DURABLE.load(Relaxed) != 0 {
+            return true;
+        }
+        let t = ticks();
+        let cdb = [scsi::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        self.build_scsi_upiu(lun, 0, 0, 0, &cdb);
+        // No data: no PRDT entry, direction none.
+        let ok = self.send_command(0, 0, 0) == 0 && self.last_response_status() == 0;
+        SYNC_STATS[0].fetch_add(1, Relaxed);
+        SYNC_STATS[1].fetch_add(ticks() - t, Relaxed);
+        ok
+    }
+
+    /// The caching mode page's write cache bits of `lun` (MODE SENSE(10), page G#08, current values): Some((WCE, RCD)), WCE 1 a volatile write cache on, RCD 1 the read cache off; None when the command failed.
+    pub fn caching_page(&self, lun: u8) -> Option<(bool, bool)> {
+        // DBD (byte 1 bit 3): no block descriptors, so the page follows the 8-byte header; 32 bytes take the header and the page's first bytes.
+        let cdb = [scsi::MODE_SENSE_10, 0x08, 0x08, 0, 0, 0, 0, 0, 32, 0];
+        self.build_scsi_upiu(lun, 0, upiu::FLAG_READ, 32, &cdb);
+        self.setup_prdt(32);
+        if self.send_command(0, 2, 1) != 0 || self.last_response_status() != 0 {
+            return None;
+        }
+        let d = self.data_buffer();
+        // The page: byte 0 its code (G#08, the PS bit masked), byte 2 WCE (bit 2) and RCD (bit 0).
+        if d[8] & 0x3F != 0x08 {
+            return None;
+        }
+        Some((d[10] & 4 != 0, d[10] & 1 != 0))
+    }
+
     /// `n` consecutive blocks (1 to RUN_MAX) of `lun` from `lba` into `dst`, n × 4 KiB of device-DMA memory (the UFS's own pages, which its S2MPU lets it reach), identity-mapped: one READ(10) of n blocks once the PRDT stride is known (`PRDT_STRIDE`), else a block a command through the one-block buffer. Whether every command completed with OCS 0 and SCSI status 0.
     pub fn read_run_lun(&self, lun: u8, lba: u32, n: usize, dst: usize) -> bool {
         self.run(lun, lba, n, dst, false)
@@ -886,7 +931,10 @@ impl UfsController {
         use core::sync::atomic::Ordering::Relaxed;
         let stride = PRDT_STRIDE.load(Relaxed) as usize;
         if n > 1 && RUNS_ON.load(Relaxed) && (stride == 16 || stride == 128) {
-            let cdb = rw10(if write { scsi::WRITE_10 } else { scsi::READ_10 }, lba, n as u16);
+            let mut cdb = rw10(if write { scsi::WRITE_10 } else { scsi::READ_10 }, lba, n as u16);
+            if write {
+                cdb[1] = write_flags();
+            }
             self.build_scsi_upiu(lun, 0, if write { upiu::FLAG_WRITE } else { upiu::FLAG_READ }, (n << 12) as u32, &cdb);
             unsafe {
                 let p = &raw mut UFS_BUF.ucd.prdt as *mut u8;

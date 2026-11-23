@@ -75,8 +75,8 @@ Every error is `ferros_items::Error`: `Refused` (no right to that kind, a handle
 
 ### What Ok means (2026-11-22)
 
-A keep's Ok (`finish`, `keep`, and `finish_verified` / `keep_verified`) is sent only after the body, its card and the commit naming them were each written and read back equal on every copy the vault holds; anything less is an Err, and an Err leaves the item as it was (a new item absent, a kept-again item its old body).
-The vault holds two copies (manifestus's mirror: the first copy's whole batch written and read back before the second's first block, then each commit's spine entry the same way), so an app needs no read-back of its own (the owner, 2026-11-22: Lumis drops its read-back of each still).
+A keep's Ok (`finish`, `keep`, and `finish_verified` / `keep_verified`) is sent only after the body, its card and the commit naming them were each written, flushed from the flash device's own write cache to the medium, and read back equal, on every copy the vault holds; anything less is an Err, and an Err leaves the item as it was (a new item absent, a kept-again item its old body).
+The vault holds two copies (manifestus's mirror: the first copy's whole batch written, flushed and read back before the second's first block, then each commit's spine entry the same way), so an app needs no read-back of its own (the owner, 2026-11-22: Lumis drops its read-back of each still).
 `finish_verified` and `keep_verified` say it as a field, `wire::Kept { handle, card, copies }`:
 - `copies` 2: kept and verified on both copies.
 - `copies` 1: kept and verified on one; the vault runs on one copy, the other having failed at this write or earlier (dropped until the vault opens again, manifestus's degraded mirror). The item is kept; an app that wants two can say so to the person.
@@ -84,7 +84,9 @@ The vault holds two copies (manifestus's mirror: the first copy's whole batch wr
 In the answer it is a `kept` head (`copies`, unsigned) beside the `card` section of OP_FINISH's document; `finish` and `keep` read the same answer and leave it out.
 The store's own write op (a process's own values, `store put`) answers on the same terms: its last write is answered after the value's commit is verified on each copy.
 A RAW clip's body is the exception by design: a single-copy extent, written once at the flash's rate with no mirror and no read-back (its card is kept as above).
-The limit, stated plainly: "read back equal" is equal as the flash device returns it. ferros does not yet flush the device's own write cache (no SYNCHRONIZE CACHE or FUA; the vault's flush is a no-op, each command polled to completion), so a power cut in the moment after an Ok rests on the device's own power-loss handling.
+On the medium, not only in the device (the owner, 2026-11-22: a cache flush per commit, the true on-disk guarantee): a write's completion is only the flash device's acceptance into its volatile write cache, so after each copy's batch and each spine block the vault asks for SYNCHRONIZE CACHE (SYS_BLOCK op bit 6, ferros_hal `sync_cache_lun`) before it reads back, writes the next copy or answers; a power cut after an Ok loses nothing kept.
+The same flush follows the kernel's own vault's commits (kvault), each flash log line, the slot record, the devinfo records and misc; a RAW clip's frames stream unflushed and its seal's commit flushes the whole unit, its frames with it, before the table names it sealed.
+`diag "ufs durable"` shows the flushes and their time and LU 0's caching mode page (WCE); `diag "ufs durable fua"` and `"off"` are development switches for measuring (FUA on every write, or no flush at all, as before).
 
 ### Bounds
 

@@ -99,7 +99,8 @@ impl Blocks for Ufs {
         crate::process::UFS.with(|| {
             let u = UfsController::new(UFS_BASE);
             u.data_buffer_mut().copy_from_slice(data);
-            u.write_block_lun(self.lun, self.base + block) == 0 && u.last_response_status() == 0
+            // On the medium before the line counts as written (the device's write cache flushed; the owner, 2026-11-22).
+            u.write_block_lun(self.lun, self.base + block) == 0 && u.last_response_status() == 0 && u.sync_cache_lun(self.lun)
         })
     }
 }

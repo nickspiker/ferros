@@ -127,7 +127,8 @@ fn mark_booted_slot_held(dtb_addr: u64) -> SlotMark {
         want[SLOT_WORDS + 4 * (1 - slot) + 1] &= !FLAG_DEACTIVATED;
     }
     ufs.data_buffer_mut().copy_from_slice(&want);
-    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
+    // Every record written here is on the medium before it is read back (the device's write cache flushed, SYNCHRONIZE CACHE; the owner, 2026-11-22).
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(DEVINFO_LUN) {
         m.result = WRITE_FAILED;
         return m;
     }
@@ -157,7 +158,7 @@ fn set_word_held(slot: usize, retries: u8, flags: u8) -> u32 {
     want[SLOT_WORDS + 4 * slot] = retries;
     want[SLOT_WORDS + 4 * slot + 1] = flags;
     ufs.data_buffer_mut().copy_from_slice(&want);
-    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(DEVINFO_LUN) {
         return WRITE_FAILED;
     }
     if !matches!(read_devinfo(&ufs), Some(back) if back == want) {
@@ -198,7 +199,7 @@ fn set_kv_block_held(now: &[u8; 32], want: &[u8]) -> u32 {
         return CHANGED;
     }
     ufs.data_buffer_mut().copy_from_slice(want);
-    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_KV_LBA) != 0 || ufs.last_response_status() != 0 {
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_KV_LBA) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(DEVINFO_LUN) {
         return WRITE_FAILED;
     }
     if !matches!(read(&ufs), Some(back) if back == want) {
@@ -240,7 +241,7 @@ fn set_active_held(slot: usize) -> u32 {
     want[SLOT_WORDS + 4 * slot + 1] = (want[SLOT_WORDS + 4 * slot + 1] | FLAG_ACTIVE) & !FLAG_DEACTIVATED;
     want[SLOT_WORDS + 4 * (1 - slot) + 1] = (want[SLOT_WORDS + 4 * (1 - slot) + 1] & !FLAG_ACTIVE) | FLAG_DEACTIVATED;
     ufs.data_buffer_mut().copy_from_slice(&want);
-    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(DEVINFO_LUN) {
         return WRITE_FAILED;
     }
     if !matches!(read_devinfo(&ufs), Some(back) if back == want) {
@@ -295,7 +296,7 @@ pub fn misc_clear_recovery() -> u32 {
         want[BCB_COMMAND].fill(0);
         want[BCB_RECOVERY].fill(0);
         ufs.data_buffer_mut().copy_from_slice(&want);
-        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 {
+        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(p.lun) {
             return WRITE_FAILED;
         }
         if !matches!(misc_read(&ufs, p), Some(back) if back == want) {
@@ -319,7 +320,7 @@ pub fn misc_write_request(args: &[u8]) -> u32 {
         // The caller's text, the harmless test's own: it must leave the field's last byte as its NUL.
         want[BCB_RECOVERY][..args.len()].copy_from_slice(args);
         ufs.data_buffer_mut().copy_from_slice(&want);
-        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 {
+        if ufs.write_block_lun(p.lun, p.first as u32) != 0 || ufs.last_response_status() != 0 || !ufs.sync_cache_lun(p.lun) {
             return WRITE_FAILED;
         }
         if !matches!(misc_read(&ufs, p), Some(back) if back == want) {

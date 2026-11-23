@@ -173,9 +173,22 @@ impl BlockDev for Half {
         }
         Ok(())
     }
-    /// Each block is on the flash when the kernel's call returns (the HAL polls the command to completion).
+    /// The device's write cache to the medium (SYS_BLOCK op bit 6; the owner, 2026-11-22: a flush per commit, the true on-disk guarantee): manifestus calls it after each copy's batch is written, before the read-back and before the next copy, and for each spine block, so a commit is on the medium before the answer. A write's completion is only the device's acceptance into its cache. A kernel from before has no flush: said once, and writes go on as before.
     fn flush(&mut self) -> manifestus::Result<()> {
-        Ok(())
+        let t = now();
+        let r = ferros_sys::block_flush(cap(grants(), S_BLOCKS));
+        FLUSH_TICKS.fetch_add(now() - t, Relaxed);
+        FLUSHES.fetch_add(1, Relaxed);
+        match r {
+            Some((0, _)) => Ok(()),
+            Some(_) => Err(manifestus::Error::Corrupt(alloc::string::String::from("the device's cache flush failed"))),
+            None => {
+                if !NO_FLUSH.swap(true, Relaxed) {
+                    console(grants(), b"vault: this kernel has no cache flush (SYS_BLOCK op 6); commits are read back equal, not flushed to the medium\n");
+                }
+                Ok(())
+            }
+        }
     }
     /// A grow without the old extent: refused. This device is a window larger than the vault's extent, so only the engine knows where the old blocks end; manifestus's tract grows call `grow_from` with it.
     fn grow(&mut self, new_blocks: u64) -> manifestus::Result<()> {
@@ -328,6 +341,10 @@ fn blocks_read(at: u64, buf: &mut [u8], spent: &AtomicU64) -> bool {
 
 /// Block writes, measured for the write report (`WMeter`): the serving thread's time in the kernel's write calls, the calls, the blocks.
 static WR_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Cache flushes (`Half::flush`) and their ticks, for the write report; whether the kernel lacks the op (said once).
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FLUSH_TICKS: AtomicU64 = AtomicU64::new(0);
+static NO_FLUSH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static WR_CALLS: AtomicU64 = AtomicU64::new(0);
 static WR_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
@@ -795,13 +812,13 @@ struct WMeter {
     serving: u64,
     bytes: u64,
     /// The counters as they stood at the first request: block write ticks, calls, blocks; block read ticks, calls, blocks; the store's seal and engine ticks.
-    at: [u64; 8],
+    at: [u64; 10],
 }
 
 impl WMeter {
-    fn counters(st: ferros_store::ReadTicks) -> [u64; 8] {
+    fn counters(st: ferros_store::ReadTicks) -> [u64; 10] {
         let l = |a: &AtomicU64| a.load(Relaxed);
-        [l(&WR_TICKS), l(&WR_CALLS), l(&WR_BLOCKS), l(&IO_TICKS), l(&IO_CALLS), l(&IO_BLOCKS), st.seal, st.engine]
+        [l(&WR_TICKS), l(&WR_CALLS), l(&WR_BLOCKS), l(&IO_TICKS), l(&IO_CALLS), l(&IO_BLOCKS), st.seal, st.engine, l(&FLUSHES), l(&FLUSH_TICKS)]
     }
 
     /// A value's first request begins at `t` (the counters as they stood before it).
@@ -827,7 +844,7 @@ impl WMeter {
             return;
         }
         let c = Self::counters(st);
-        let d: [u64; 8] = core::array::from_fn(|i| c[i] - self.at[i]);
+        let d: [u64; 10] = core::array::from_fn(|i| c[i] - self.at[i]);
         let f = freq();
         let us = |t: u64| t * 1_000_000 / f;
         let ms = |t: u64| us(t) / 1000;
@@ -835,10 +852,10 @@ impl WMeter {
         let rate = |bytes: u64, t: u64| bytes / us(t).max(1);
         let wall = now() - self.t0;
         // Signed: the counters are read at different moments.
-        let engine_own = ms(d[7]) as i64 - ms(d[0]) as i64 - ms(d[3]) as i64;
+        let engine_own = ms(d[7]) as i64 - ms(d[0]) as i64 - ms(d[3]) as i64 - ms(d[9]) as i64;
         let rest = ms(self.serving) as i64 - ms(d[6]) as i64 - ms(d[7]) as i64;
         say!(
-            "vault: kept {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = sealing {} ({} MB/s) + engine {} [block writes {} ms in {} calls, {} blocks ({} MB/s); block reads {} ms in {} calls, {} blocks ({} MB/s); its own {}] + rest {}; between requests {} ms",
+            "vault: kept {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = sealing {} ({} MB/s) + engine {} [block writes {} ms in {} calls, {} blocks ({} MB/s); block reads {} ms in {} calls, {} blocks ({} MB/s); cache flushes {} ms in {}; its own {}] + rest {}; between requests {} ms",
             self.bytes,
             self.requests,
             ms(wall),
@@ -855,6 +872,8 @@ impl WMeter {
             d[4],
             d[5],
             rate(d[5] << 12, d[3]),
+            ms(d[9]),
+            d[8],
             engine_own,
             rest,
             ms(wall - self.serving)
@@ -862,7 +881,7 @@ impl WMeter {
     }
 }
 
-static mut WMETER: WMeter = WMeter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, at: [0; 8] };
+static mut WMETER: WMeter = WMeter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, at: [0; 10] };
 
 static mut METER: Meter = Meter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, from: 0, next: 0, whole: 0, pinned: 0, at: Counts::ZERO };
 

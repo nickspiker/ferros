@@ -284,8 +284,12 @@ impl BlockDev for Region {
         }
         Ok(())
     }
-    /// Each write is polled to completion by the HAL (OCS), as the old UfsDevice relied on.
+    /// The device's write cache to the medium (SYNCHRONIZE CACHE; the owner, 2026-11-22: a flush per commit, the true on-disk guarantee): manifestus calls it after each copy's batch is written and before its read-back, and for each spine block, so a commit is on the medium of each copy before the next copy and before its caller hears Ok. A write's completion (OCS) is only the device's acceptance into its cache.
     fn flush(&mut self) -> manifestus::Result<()> {
+        vault_held();
+        if !crate::process::ufs_sync(0) {
+            return Err(manifestus::Error::Corrupt(alloc::string::String::from("UFS cache flush failed")));
+        }
         Ok(())
     }
 }

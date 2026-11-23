@@ -5680,6 +5680,27 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params.starts_with(b"ufs durable") {
+                    // `diag "ufs durable [sync|fua|off|reset]"` (the owner, 2026-11-22: a cache flush per commit, measured): how persistent writes pass the flash's own write cache (ferros_hal `DURABLE`), the SYNCHRONIZE CACHE commands sent and their time, and LU 0's caching mode page (WCE 1: the device has a volatile write cache).
+                    use core::sync::atomic::Ordering::Relaxed;
+                    match &cmd.params[..] {
+                        b"ufs durable sync" => ferros_hal::ufs::DURABLE.store(0, Relaxed),
+                        b"ufs durable fua" => ferros_hal::ufs::DURABLE.store(1, Relaxed),
+                        b"ufs durable off" => ferros_hal::ufs::DURABLE.store(2, Relaxed),
+                        b"ufs durable reset" => ferros_hal::ufs::SYNC_STATS.iter().for_each(|s| s.store(0, Relaxed)),
+                        _ => {}
+                    }
+                    let page = crate::process::UFS.with(|| ferros_hal::ufs::UfsController::new(0x1320_0000).caching_page(0));
+                    let mode = ["sync (SYNCHRONIZE CACHE at each flush)", "fua (every write FUA, flushes skipped)", "off (no flush: development)"];
+                    let (n, t) = (ferros_hal::ufs::SYNC_STATS[0].load(Relaxed), ferros_hal::ufs::SYNC_STATS[1].load(Relaxed) * 1_000_000 / cntfrq());
+                    // WHY the max: no flush yet is no time, and the mean would divide by zero.
+                    resp.extend_from_slice(alloc::format!("ufs durable: {}
+  flushes A#{n}, A#{} ms in all, A#{} us each
+  LU 0 caching page: {}
+", mode[(ferros_hal::ufs::DURABLE.load(Relaxed) as usize).min(2)], t / 1000, t / n.max(1), match page { Some((wce, rcd)) => alloc::format!("WCE {} RCD {}", wce as u8, rcd as u8), None => alloc::string::String::from("did not read") }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params.starts_with(b"ufs runs") {
                     // `diag "ufs runs [on|off|reset]"`: SYS_BLOCK's multi-block commands (a run a command, ferros_hal `read_run_lun`) and what the vault process's block calls cost: calls, blocks, time inside them, MB/s, reads and writes. `off` sends every run a block a command again, to measure both on one boot; `reset` zeroes the counts.
                     use core::sync::atomic::Ordering::Relaxed;
