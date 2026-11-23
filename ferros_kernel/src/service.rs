@@ -1986,7 +1986,7 @@ fn usb_rescue(why: &str, glass: bool) {
         crate::process::push_console(alloc::format!("{s}\n").as_bytes());
         crate::flashlog::line(s);
         if glass {
-            crate::process::with_lock(|| crate::glass::notice(s.as_bytes(), true));
+            crate::process::with_lock(|| crate::glass::notice(crate::glass::Note::words(s), true));
         }
     };
     if crate::process::running(b"usb") {
@@ -5531,7 +5531,7 @@ pub fn run(mut b: Boot) -> ! {
                         }
                     }
                     let shown = crate::process::with_lock(|| {
-                        crate::glass::notice(&t, true);
+                        crate::glass::notice(crate::glass::Note::words(&alloc::string::String::from_utf8_lossy(&t)), true);
                         crate::display::scanned().map(|s| (s.width, s.height, s.stride, s.iova, s.translates()))
                     });
                     resp.extend_from_slice(match shown {

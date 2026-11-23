@@ -3,13 +3,17 @@
 //! - **Which buffer:** the DPU's own registers say (`display::scanned`): the full-screen window's layer, its DMA base, stride and format.
 //!   Before the display server runs that is ABL's splash (the kernel's painter switched it to G#00RRGGBB); after, the phase of the four temporal dither frames on the layer, and then all four are written (the server flips between them) in the panel's baked codes.
 //! - **Four uses:** a kernel panic (`panic_screen`, then `hold`, then the existing report and reset, platform.rs); a process that died by a fault or a panic while no display serves (`notice` from process.rs `end_process`); a boot whose vault, usb or display is not up 16 s after init started (`boot_watch`); the kernel starting its own usb because init is not running (service.rs `usb_rescue`).
-//! - **Notices** are kept, newest last, in a fixed 2 KiB buffer under the kernel lock and drawn whole each time, the latest lines kept when they run past the bottom (`Keep::Latest`).
+//! - **Notices** are kept, newest last, under the kernel lock, about 2 KiB of their words, and drawn whole each time, the latest lines kept when they run past the bottom (`Keep::Latest`).
+//! - **Numbers** read in the device's base (2026-11-22, owner: "So the debug printies really bug me. I'd like those to honor the base too."): a notice is kept as its words and typed numbers (`Note`, ferros_glass `Num`), written in tatau's base, as glyphs, each time the notices are drawn, so a base changed since reads in the new one; the console and the flash log get the same line in the developer's `A#`/`G#` (`Note::dev`). The panic's screen is written in the base the same way.
 //! - **The panic's** text keeps its earliest lines (the headline and the message) when it runs past the bottom (`Keep::Earliest`).
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 
-use ferros_glass::{Buf, Glass, Keep, Paint, Surface};
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use ferros_glass::{Buf, Glass, Keep, Num, Paint, Person, Say, Surface};
 
 use crate::display::{Pixels, Scanned};
 
@@ -109,16 +113,44 @@ pub const HOLD_SHIFT: u32 = 5;
 pub fn panic_screen(info: &core::panic::PanicInfo, core: u64, crumb: u64) -> bool {
     use core::fmt::Write;
     let mut t = Buf::<{ 1 << 11 }>::new();
+    // The message is the panic's own text (core::fmt wrote its numbers); everything the kernel adds is typed, in the device's base.
     let _ = write!(t, "ferros panic\n{}\n", info.message());
+    let mut p = Person(&mut t, tatau::Fmt::current(tatau::Style::Glyphs));
     if let Some(l) = info.location() {
-        let _ = write!(t, "at {}:A#{}:A#{}\n", l.file(), l.line(), l.column());
+        p.s("at ");
+        p.s(l.file());
+        p.s(":");
+        p.n(Num::Line(l.line() as u64));
+        p.s(":");
+        p.n(Num::Line(l.column() as u64));
+        p.s("\n");
     }
-    let _ = write!(t, "core A#{core}, last crumb G#{crumb:X}\n");
+    p.s("core ");
+    p.n(Num::Index(core));
+    p.s(", last crumb ");
+    p.n(Num::Bits(crumb));
+    p.s("\n");
     let fail = ferros_heap::kernel::LockedTlsf::last_fail();
     if fail.size != 0 {
-        let _ = write!(t, "kernel heap refused A#{} bytes at alignment A#{} for G#{:X}; then A#{} in use, A#{} free in A#{} blocks, the largest A#{}\n", fail.size, fail.align, fail.caller, fail.in_use, fail.free, fail.free_blocks, fail.largest);
+        p.s("kernel heap refused ");
+        p.n(Num::Bytes(fail.size as u64));
+        p.s(" at alignment ");
+        p.n(Num::Bytes(fail.align as u64));
+        p.s(" for ");
+        p.n(Num::Bits(fail.caller as u64));
+        p.s("; then ");
+        p.n(Num::Bytes(fail.in_use as u64));
+        p.s(" in use, ");
+        p.n(Num::Bytes(fail.free as u64));
+        p.s(" free in ");
+        p.n(Num::Count(fail.free_blocks as u64));
+        p.s(" blocks, the largest ");
+        p.n(Num::Bytes(fail.largest as u64));
+        p.s("\n");
     }
-    let _ = write!(t, "\nThe report is kept for the next boot's diag. Press power to restart now; it restarts by itself in A#{} s.\n", 1u32 << HOLD_SHIFT);
+    p.s("\nThe report is kept for the next boot's diag. Press power to restart now; it restarts by itself in ");
+    p.n(Num::Ns(1_000_000_000 << HOLD_SHIFT));
+    p.s(".\n");
     show(t.bytes(), Keep::Earliest, &PANIC)
 }
 
@@ -142,29 +174,84 @@ pub fn hold() {
     }
 }
 
-/// The kernel's notices since boot, newest last, one a line (2 KiB; the oldest lines dropped when a new one needs the room).
-/// Under the kernel lock.
-static mut NOTES: Buf<{ 1 << 11 }> = Buf::new();
+/// A line for the glass, said once as its words and typed numbers (ferros_glass `Say`), kept that way so each drawing writes the numbers in the base of the moment.
+#[derive(Default)]
+pub struct Note {
+    parts: Vec<Part>,
+}
 
-/// A line for the glass: kept with the others, and all of them drawn when `glass` (the display not serving, or a boot stall), the latest kept when they run past the bottom.
+enum Part {
+    Words(String),
+    Num(Num),
+}
+
+impl Say for Note {
+    fn s(&mut self, words: &str) {
+        match self.parts.last_mut() {
+            Some(Part::Words(w)) => w.push_str(words),
+            _ => self.parts.push(Part::Words(String::from(words))),
+        }
+    }
+    fn n(&mut self, n: Num) {
+        self.parts.push(Part::Num(n));
+    }
+}
+
+impl Note {
+    pub fn new() -> Note {
+        Note::default()
+    }
+    /// A line of words alone.
+    pub fn words(s: &str) -> Note {
+        let mut n = Note::new();
+        n.s(s);
+        n
+    }
+    /// The line for every other reader (the console, the flash log, the host): its numbers as `A#`/`G#`, whatever the base.
+    pub fn dev(&self) -> String {
+        let mut t = String::new();
+        self.say(&mut ferros_glass::Dev(&mut t));
+        t
+    }
+    /// The line said again to `out`.
+    pub fn say(&self, out: &mut impl Say) {
+        for p in &self.parts {
+            match p {
+                Part::Words(w) => out.s(w),
+                Part::Num(n) => out.n(*n),
+            }
+        }
+    }
+    fn word_bytes(&self) -> usize {
+        self.parts.iter().map(|p| if let Part::Words(w) = p { w.len() } else { 0 }).sum()
+    }
+}
+
+/// The kernel's notices since boot, newest last, one a line; the oldest dropped while their words pass 2 KiB.
+/// Under the kernel lock.
+static mut NOTES: Vec<Note> = Vec::new();
+/// How many bytes of words the notices keep (2 KiB, the fixed buffer's length until 2026-11-22): more than a screen of the glass holds.
+const NOTES_WORDS: usize = 1 << 11;
+
+/// A line for the glass: kept with the others, and all of them drawn when `glass` (the display not serving, or a boot stall), in the device's base, the latest kept when they run past the bottom.
 /// Never over a panic's screen.
 /// Under the kernel lock (process.rs `end_process`, `boot_watch`).
-pub fn notice(line: &[u8], glass: bool) {
-    let n = unsafe { &mut *(&raw mut NOTES) };
-    let cap = n.buf.len();
-    let need = n.n + line.len() + 1;
-    if need > cap {
-        // The oldest whole lines out: up to the first line end at or past the bytes needed.
-        // WHY the smaller: a line longer than the whole buffer needs more than is kept; then everything kept goes (and `push` drops the line's tail past the end).
-        let over = if need - cap < n.n { need - cap } else { n.n };
-        let cut = n.bytes()[over..].iter().position(|&b| b == b'\n').map(|i| over + i + 1).unwrap_or(n.n);
-        n.buf.copy_within(cut..n.n, 0);
-        n.n -= cut;
+pub fn notice(note: Note, glass: bool) {
+    let notes = unsafe { &mut *(&raw mut NOTES) };
+    notes.push(note);
+    let mut words: usize = notes.iter().map(Note::word_bytes).sum();
+    // The newest stays, however long.
+    while words > NOTES_WORDS && notes.len() > 1 {
+        words -= notes.remove(0).word_bytes();
     }
-    n.push(line);
-    n.push(b"\n");
     if glass && crate::GLASS_CORE.load(Acquire) == 0 {
-        show(n.bytes(), Keep::Latest, &NOTICE);
+        let mut t = String::new();
+        let f = tatau::Fmt::current(tatau::Style::Glyphs);
+        for n in notes.iter() {
+            n.say(&mut Person(&mut t, f));
+            t.push('\n');
+        }
+        show(t.as_bytes(), Keep::Latest, &NOTICE);
     }
 }
 
@@ -190,15 +277,18 @@ pub fn boot_watch() -> bool {
     if up.iter().all(|&u| u) {
         return false;
     }
-    let mut line = alloc::string::String::from("boot stalled:");
+    let mut note = Note::words("boot stalled:");
     for (name, _) in names.iter().zip(up).filter(|(_, u)| !u) {
-        line.push(' ');
-        line.push_str(core::str::from_utf8(name).unwrap_or("?"));
+        note.s(" ");
+        note.s(core::str::from_utf8(name).unwrap_or("?"));
     }
-    line.push_str(&alloc::format!(" not up A#{} s after init started", 1u32 << BOOT_DEADLINE_SHIFT));
+    note.s(" not up ");
+    note.n(Num::Ns(1_000_000_000 << BOOT_DEADLINE_SHIFT));
+    note.s(" after init started");
+    let line = note.dev();
     crate::process::push_console(alloc::format!("{line}\n").as_bytes());
     crate::flashlog::line(&line);
-    crate::process::with_lock(|| notice(line.as_bytes(), true));
+    crate::process::with_lock(|| notice(note, true));
     !up[1]
 }
 

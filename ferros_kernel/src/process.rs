@@ -8801,30 +8801,61 @@ fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxe
     let last_words: alloc::string::String = text(last);
     let fault = unsafe { (*(&raw mut LAST_FAULT)).take() };
     let mut d = Death { end: END_EXIT, exit: Some(value), code: Some(CODE as u64), last_words: (!last_words.is_empty()).then(|| last_words.clone()), ..Death::default() };
-    let (line, chain) = if value >> 56 == FAULT >> 56 {
+    // The line said once, its numbers typed (glass.rs `Note`): the console and the flash log get it in `A#`/`G#`, the glass in the device's base.
+    use ferros_glass::{Num, Say};
+    let mut note = crate::glass::Note::words(who);
+    let chain = if value >> 56 == FAULT >> 56 {
         d.end = END_FAULT;
         match fault {
             Some(fa) => {
                 let t: alloc::string::String = text(&fa.thread);
-                let line = alloc::format!("{who}: fault, ESR G#{:X}, FAR G#{:X}, PC +G#{:X} LR +G#{:X} in its arc, thread {t}", fa.esr, fa.far, fa.pc, fa.lr);
+                note.s(": fault, ESR ");
+                note.n(Num::Bits(fa.esr));
+                note.s(", FAR ");
+                note.n(Num::Bits(fa.far));
+                note.s(", PC +");
+                note.n(Num::Bits(fa.pc));
+                note.s(" LR +");
+                note.n(Num::Bits(fa.lr));
+                note.s(" in its arc, thread ");
+                note.s(&t);
                 (d.esr, d.far, d.pc, d.lr, d.thread) = (Some(fa.esr), Some(fa.far), Some(fa.pc), Some(fa.lr), Some(t));
                 d.frames = fa.frames;
-                (line, true)
+                true
             }
-            None => (alloc::format!("{who}: fault, exit G#{value:016X}"), false),
+            None => {
+                note.s(": fault, exit ");
+                note.n(Num::Word(value));
+                false
+            }
         }
     } else if value == 0xDEAD || value == 101 {
         d.end = END_PANIC;
         match panicked {
             Some(p) => {
                 let (m, file, t): (alloc::string::String, alloc::string::String, alloc::string::String) = (text(&p.message), text(&p.file), text(&p.thread));
-                let line = alloc::format!("{who}: panicked at {file}:{}:{}: {m} (thread {t})", p.line, p.column);
+                // The message is the process's own words (its numbers written by its own formatting); where it is, the kernel's, typed.
+                note.s(": panicked at ");
+                note.s(&file);
+                note.s(":");
+                note.n(Num::Line(p.line as u64));
+                note.s(":");
+                note.n(Num::Line(p.column as u64));
+                note.s(": ");
+                note.s(&m);
+                note.s(" (thread ");
+                note.s(&t);
+                note.s(")");
                 (d.message, d.file, d.line, d.column, d.thread) = (Some(m), Some(file), Some(p.line as u64), Some(p.column as u64), Some(t));
                 d.frames = p.frames;
-                (line, true)
+                true
             }
             // A panic handler from before SYS_PANIC (or a kernel's exit with no report): its last line is all there is.
-            None => (alloc::format!("{who}: panicked, its last line: {last_words}"), false),
+            None => {
+                note.s(": panicked, its last line: ");
+                note.s(&last_words);
+                false
+            }
         }
     } else {
         let line = alloc::format!("{who}: ended, exit G#{value:016X}; its last line: {last_words}");
@@ -8836,6 +8867,7 @@ fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxe
         }
         return;
     };
+    let line = note.dev();
     let kk = k();
     let at = kk.console.pos();
     kk.console.extend_from_slice(line.as_bytes());
@@ -8846,7 +8878,7 @@ fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxe
     pstore_since(at);
     crate::flashlog::death(who, &line, d);
     let display_serving = name != b"display" && up_locked(b"display");
-    crate::glass::notice(line.as_bytes(), !display_serving);
+    crate::glass::notice(note, !display_serving);
 }
 
 fn end_process(pi: usize, cur: usize, value: u64) {
