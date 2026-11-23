@@ -548,6 +548,19 @@ fn now_us() -> u64 {
     now() / (ferros_sys::freq() / 1_000_000).max(1)
 }
 
+/// What a read of the published fan-out found for a copy sealed under another fleet key (`fanout_check`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FanCheck {
+    /// A newer key wrapped to this device, adopted: the copy is opened again.
+    Adopted,
+    /// fgtw.org did not answer, or answered with an error of its own: nothing learnt.
+    Unreachable,
+    /// Read, and nothing to adopt (the published key is the one held, not newer, refused): waits for an event.
+    Nothing,
+    /// Read, and no wrap opens for this device: locked out or removed. Waits for an event, never a timer.
+    NoWrap,
+}
+
 struct Sponsor {
     key: [u8; 32],
     addr: Addr,
@@ -567,6 +580,8 @@ struct Client {
     hp: Option<[u8; 32]>,
     bound: bool,
     fleet_key: Option<[u8; 32]>,
+    /// The fan-out revision the fleet key in hand came with (a fan-out from a sibling or from fgtw.org, this device's mint, a recovery), 0 unknown: a key kept on disk and loaded at start carries none until a fan-out holding it is seen (`fanout_check`). The floor a new key must pass, so an older fan-out never takes the key back (`key_floor`).
+    fleet_rev: u64,
     /// The kernel's lock epoch (`ID_BELL`) when the roots in hand were taken (op 4, op 3, the vault at start): once the bell moves past it the identity was locked, and what is held of it goes (`locked_out`).
     lock_epoch: u64,
     /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
@@ -986,6 +1001,8 @@ impl Client {
                 self.log.addr(&addr);
                 self.log.line();
                 self.sponsors.push(Sponsor { key, addr, asked_t: 0, heard_us: t, online: false });
+                // A fleet device newly heard may hold the fleet's current key and its copy of the space: a space pull waiting on an event asks again (the fleet first).
+                self.space_wake(b"a fleet device is heard on this network");
                 // Not bound: that device is asked for the chain at once, unicast (a member is answered with it, `on_fleet_req` on its side), so a member of the fleet binds from its own devices.
                 // The Pro, b913 (2026-11-17): the lookup's broadcast went before the MacBook beaconed and fgtw.org did not answer, so the verdict went GREY; the MacBook's beacon 57 s later made it "joining", the lookup is not run again while joining, and a member of the fleet sat minting a binding request with no person key, so Photon got no alias.
                 if !self.bound {
@@ -1041,20 +1058,198 @@ impl Client {
         let kp = self.keys.keypair();
         let (recovered, ip) = {
             let t2 = self.seed();
-            let r = fgtw::client::recover_fleet_key(&t2, &hp, kp, &seed).ok().flatten();
+            // With its revision: the floor a later key must pass (`key_floor`).
+            let r = fgtw::client::recover_fleet_key_with_epoch(&t2, &hp, kp, &seed).ok().flatten();
             (r, t2.ip.get())
         };
         self.seed_ip = ip;
         if recovered.is_some() {
             self.seed_heard_us = now_us();
         }
-        if let Some(k) = recovered {
+        if let Some((rev, k)) = recovered {
             self.fleet_key = Some(k);
+            self.fleet_rev = rev;
             self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &k);
             self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
             self.log.line();
             self.add_key();
         }
+    }
+
+    /// The fleet's members as the chain held here folds them: the last chain adopted (`chain_held`, kept by every adoption, a sibling's included), else the members noted (`members`).
+    pub(crate) fn fleet_members(&self) -> Vec<[u8; 32]> {
+        match fgtw::fleet::MembershipBlob::from_vsf_bytes(&self.chain_held).ok().and_then(|b| b.fold().ok()) {
+            Some(m) => m,
+            None => self.members.clone(),
+        }
+    }
+
+    /// The revision a new fleet key must pass: the higher of the revision the key in hand came with and the fan-out this device last grew or was handed (`held_fan`). 0 when neither is known (a kept key loaded at start, no fan-out seen since).
+    fn key_floor(&self, hp: &[u8; 32]) -> u64 {
+        // WHY the max: two records of revisions this device has seen for its key, kept by different paths (the add machine's grow keeps `held_fan`); the floor is the later of the two, not a bound on a value.
+        self.fleet_rev.max(self.held_fan.borrow().revision(hp))
+    }
+
+    /// fgtw.org's chain for this identity adopted when it still names this device and folds against our roots (`join::adopt_chain`; `fgtw::held::fetch` keeps the held copy where the seed's is not preferred): for a fan-out whose rotator joined after the chain held here. Whether a chain was adopted.
+    fn refresh_chain(&mut self) -> bool {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
+        fgtw::set_clock(eagle());
+        let fetched = {
+            let s = self.seed();
+            fgtw::held::fetch(&s, &self.held, &hp)
+        };
+        let Ok(Some(b)) = fetched else { return false };
+        let Ok(bytes) = b.to_vsf_bytes() else { return false };
+        match join::adopt_chain(&hp, &seed, &self.me, &bytes) {
+            Ok((blob, true)) => {
+                self.note_members(&blob);
+                self.keep_chain(&bytes);
+                true
+            }
+            Ok((_, false)) => {
+                self.log.put(b"fgtw: fan-out: fgtw.org's chain no longer names this device");
+                self.log.line();
+                false
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: fan-out: fgtw.org's chain was refused: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+                false
+            }
+        }
+    }
+
+    /// A copy of the person's space sealed under a fleet key this device does not hold (fingerprint `slot_kfp`): the published fan-out read from fgtw.org and checked as the key's own path checks it, and its key adopted when it is newer and wrapped to this device.
+    /// The checks, in order: the served document's envelope signature, its signer the blob's rotator, the rotator a member of the chain held here (`fetch_fanout_verified`; fgtw.org's chain read once when it is not, for a rotator added since); the revision newer than the key held (`key_floor`; with no floor known, the fan-out's key must be the one the copy is sealed under); a wrap that opens with this device's own key under the identity seed, whose key the fingerprint names (`fanout_open`); the header's epoch bundle the one that key derives.
+    /// Only fingerprints are said, never a key.
+    pub(crate) fn fanout_check(&mut self, slot_kfp: &[u8; 32]) -> FanCheck {
+        // The key held is read where it lies, for its fingerprint only: no copy of it on this stack.
+        let (Some(hp), Some(seed), Some(ours)) = (self.hp, self.identity_seed, self.fleet_key.as_ref().map(fgtw::fanout::fleet_key_fingerprint)) else { return FanCheck::Nothing };
+        if !self.bound {
+            return FanCheck::Nothing;
+        }
+        if ours == *slot_kfp {
+            return FanCheck::Nothing;
+        }
+        self.log.put(b"fgtw: fan-out: a copy is sealed under key fingerprint ");
+        self.log.fp(slot_kfp);
+        self.log.put(b", the key here is ");
+        self.log.fp(&ours);
+        self.log.put(b": reading the published fan-out");
+        self.log.line();
+        fgtw::set_clock(eagle());
+        let mut members = self.fleet_members();
+        let mut chain_read = false;
+        let f = loop {
+            let (got, ip) = {
+                let s = self.seed();
+                let r = fgtw::client::fetch_fanout_verified(&s, &hp, &members);
+                (r, s.ip.get())
+            };
+            self.seed_ip = ip;
+            match got {
+                Ok(Some((f, _))) => {
+                    self.seed_heard_us = now_us();
+                    break f;
+                }
+                Ok(None) => {
+                    self.seed_heard_us = now_us();
+                    self.log.put(b"fgtw: fan-out: fgtw.org holds none for this identity");
+                    self.log.line();
+                    return FanCheck::Nothing;
+                }
+                // A rotator added after the chain held here: fgtw.org's chain read once, and the fan-out checked against it.
+                Err(e) if e.starts_with("fanout: rotator is not a current fleet member") && !chain_read => {
+                    self.seed_heard_us = now_us();
+                    chain_read = true;
+                    if !self.refresh_chain() {
+                        self.log.put(b"fgtw: fan-out: REFUSED: its rotator is not a member of the chain held here");
+                        self.log.line();
+                        return FanCheck::Nothing;
+                    }
+                    members = self.fleet_members();
+                }
+                // Read but refused: the envelope, the signer, the rotator or the blob does not check out.
+                Err(e) if e.starts_with("fanout:") => {
+                    self.seed_heard_us = now_us();
+                    self.log.put(b"fgtw: fan-out: REFUSED: ");
+                    self.log.put(e.as_bytes());
+                    self.log.line();
+                    return FanCheck::Nothing;
+                }
+                Err(e) => {
+                    self.log.put(b"fgtw: fan-out: fgtw.org: ");
+                    self.log.put(e.as_bytes());
+                    self.log.line();
+                    return FanCheck::Unreachable;
+                }
+            }
+        };
+        let floor = self.key_floor(&hp);
+        self.log.put(b"fgtw: fan-out: revision A#");
+        self.log.dec(f.revision);
+        self.log.put(b", key fingerprint ");
+        self.log.fp(&f.kfp);
+        self.log.put(b", A#");
+        self.log.dec(f.wraps.len() as u64);
+        self.log.put(b" wrap(s), published by ");
+        self.log.fp(&f.rotator_ed);
+        self.log.put(b" (a member); the key here came with revision ");
+        if floor == 0 {
+            self.log.put(b"unknown");
+        } else {
+            self.log.put(b"A#");
+            self.log.dec(floor);
+        }
+        self.log.line();
+        if f.kfp == ours {
+            // The key in hand is the published one: its revision is the floor from now on, and the copy is sealed under a key the fan-out does not carry (an older one, or a rotation not yet published).
+            if f.revision > self.fleet_rev {
+                self.fleet_rev = f.revision;
+            }
+            self.log.put(b"fgtw: fan-out: the published key is the one held here; the copy waits for the fleet");
+            self.log.line();
+            return FanCheck::Nothing;
+        }
+        if f.revision <= floor {
+            self.log.put(b"fgtw: fan-out: REFUSED: not newer than the key held here (never back to an older fan-out)");
+            self.log.line();
+            return FanCheck::Nothing;
+        }
+        // No floor known (a key kept on disk, loaded at start, no fan-out seen since): the published key is taken only when it is the one the fleet sealed the copy under, so a fan-out older than the key in hand, served again, is not.
+        if floor == 0 && f.kfp != *slot_kfp {
+            self.log.put(b"fgtw: fan-out: REFUSED: the revision held here is unknown and the published key is not the one the copy is sealed under");
+            self.log.line();
+            return FanCheck::Nothing;
+        }
+        let Some(mut key) = fgtw::fanout::fanout_open(&hp, &f.kfp, &f.wraps, self.keys.keypair(), &seed) else {
+            self.log.put(b"fgtw: fan-out: NO WRAP FOR THIS DEVICE in revision A#");
+            self.log.dec(f.revision);
+            self.log.put(b": it was locked out or removed from the fleet's key. Not asked again until the fleet's chain or key changes");
+            self.log.line();
+            return FanCheck::NoWrap;
+        };
+        if fgtw::pq::epoch_bundle(&key).public() != f.epoch_pub {
+            wipe(&mut key);
+            self.log.put(b"fgtw: fan-out: REFUSED: its header's epoch bundle is not the one the key derives (a tampered header)");
+            self.log.line();
+            return FanCheck::Nothing;
+        }
+        self.fleet_key = Some(key);
+        self.fleet_rev = f.revision;
+        self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &key);
+        wipe(&mut key);
+        self.log.put(b"fgtw: fan-out: THE FLEET KEY MOVES to fingerprint ");
+        self.log.fp(&f.kfp);
+        self.log.put(b" (revision A#");
+        self.log.dec(f.revision);
+        self.log.put(b"), from ");
+        self.log.fp(&ours);
+        self.log.line();
+        // A key that arrives while the Fleet page shows opens the add flow there.
+        self.add_key();
+        FanCheck::Adopted
     }
 
     /// Joining: fgtw.org's chain for this identity, read quietly; once it holds this device (a sponsor's Add, by the words or the tap), the chain is adopted, the device bound, the tap secret and the beacon stopped, and the fleet key recovered from the published fan-out. The LAN hand-over does the same when the sponsor knows this device's address.
@@ -1099,11 +1294,16 @@ impl Client {
     /// Keep the members a chain folds to (the Fleet page's list), and tell the add machine its fold.
     fn note_members(&mut self, blob: &fgtw::fleet::MembershipBlob) {
         if let Ok(m) = blob.fold() {
+            let changed = m != self.members;
             self.members = m;
             self.say_chain(blob);
             // The held copy too (fgtw::held): what a sponsor's Add extends when the seed does not answer.
             fgtw::held::ChainHold::hold(&self.held, blob);
             self.add_fold(blob);
+            // A change of the fleet may come with a new fan-out: a space pull waiting on an event asks again.
+            if changed {
+                self.space_wake(b"the fleet's members changed");
+            }
         }
     }
 
@@ -1254,6 +1454,7 @@ impl Client {
         wipe_key(&mut self.hp);
         self.bound = false;
         wipe_key(&mut self.fleet_key);
+        self.fleet_rev = 0;
         self.members.clear();
         self.chain_held.clear();
         self.offered.clear();
@@ -1415,8 +1616,9 @@ impl Client {
                 self.log.put(b"fgtw: MINTED: this device is the identity's first member");
                 self.log.line();
                 match key {
-                    Ok((_, k)) => {
+                    Ok((rev, k)) => {
                         self.fleet_key = Some(k);
+                        self.fleet_rev = rev;
                         self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &k);
                         self.log.put(b"fgtw: the fleet key is founded and ours");
                     }
@@ -1622,6 +1824,7 @@ impl Client {
                         self.log.fp(&key);
                         self.log.put(b" answers our pings");
                         self.log.line();
+                        self.space_wake(b"a fleet device answers our pings");
                     }
                     // A departure frame or fan-out it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
                     self.reachable(key);
@@ -1705,19 +1908,41 @@ impl Client {
                     return;
                 }
                 match join::open_fanout(&hp, &blob, &self.keys, &seed) {
-                    Ok(Some((revision, key))) => {
+                    Ok(Some((revision, mut key))) => {
+                        let new = self.fleet_key != Some(key);
+                        // A new key is taken only from a member of the chain held here, and only newer than the key held: a device locked out still has the identity seed, so it could wrap a key of its own to this device and hand it over, or hand back the fan-out from before the lock (the shrink of 2026-11-22). A device joining holds no chain yet and takes its sponsor's.
+                        let refused: Option<&[u8]> = if !new {
+                            None
+                        } else if self.bound && !self.fleet_members().contains(&signer) {
+                            Some(b" - REFUSED: its sender is not a member of the chain held here")
+                        } else if self.fleet_key.is_some() && revision <= self.key_floor(&hp) {
+                            Some(b" - REFUSED: not newer than the key held here (never back to an older fan-out)")
+                        } else {
+                            None
+                        };
                         self.log.put(b"fgtw: fan-out revision ");
                         self.log.dec(revision);
                         self.log.put(b" from ");
                         self.log.fp(&signer);
-                        self.log.put(if self.fleet_key == Some(key) { b" - the key we hold" } else { b" - THE FLEET KEY IS OURS" });
+                        self.log.put(b", key fingerprint ");
+                        self.log.fp(&fgtw::fanout::fleet_key_fingerprint(&key));
+                        self.log.put(match refused {
+                            Some(why) => why,
+                            None if new => b" - THE FLEET KEY IS OURS",
+                            None => b" - the key we hold",
+                        });
                         self.log.line();
-                        if self.fleet_key != Some(key) {
+                        if !new && revision > self.fleet_rev {
+                            self.fleet_rev = revision;
+                        }
+                        if new && refused.is_none() {
                             self.fleet_key = Some(key);
+                            self.fleet_rev = revision;
                             self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &key);
                             // A key that arrives while the Fleet page shows opens the add flow there.
                             self.add_key();
                         }
+                        wipe(&mut key);
                     }
                     Ok(None) => {
                         self.log.put(b"fgtw: a fan-out from ");
@@ -2205,7 +2430,8 @@ impl Client {
                     _ => b"fgtw: the network is up (IPv4 and IPv6)",
                 });
                 self.log.line();
-                // A departure frame or a fan-out given up on is handed again on the new network.
+                // A departure frame or a fan-out given up on is handed again on the new network, and a space pull waiting asks again.
+                self.space_wake(b"the network is up");
                 self.depart_event(fgtw::flow::Event::LinkUp);
                 self.add_event(fgtw::flow::Event::LinkUp);
             }
@@ -2520,7 +2746,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

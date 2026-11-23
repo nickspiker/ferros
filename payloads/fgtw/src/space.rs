@@ -24,6 +24,8 @@ const BASE_KEY: &[u8] = b"space_base";
 /// How often the device's copy is joined to the space, and fgtw.org asked again (µs).
 const LOCAL_US: u64 = 4_000_000;
 const SEED_US: u64 = 64_000_000;
+/// The most times the first pull's wait doubles while fgtw.org does not answer (`retry_us`): 16 s up to 2^6 times that, about 17 minutes.
+const MISS_SHIFT_MAX: u8 = 6;
 
 /// What was last said of the person key: nothing yet, opened (or minted) and held, sealed under a fleet key this device does not hold, a mint refused for want of an egg, the kernel refused it.
 const P_NONE: u8 = 0;
@@ -83,11 +85,15 @@ pub struct SpaceSync {
     said_no_net: bool,
     /// The key fingerprint of a copy (fgtw.org's or a sibling's) that did not open here: while Some, nothing of ours is pushed to fgtw.org (G2, docs/IDENTITY-SPACE.md).
     held: Option<[u8; 32]>,
+    /// The key fingerprint of a copy the published fan-out was read for (`space_rekey`) and held nothing to adopt (none newer, or no wrap for this device), and the fingerprint of the key held here then. While both still stand the first pull is not asked again on a timer: an event asks again (`space_wake`; the key changing lifts it by itself).
+    checked: Option<([u8; 32], [u8; 32])>,
+    /// fgtw.org's failures in a row (a pull or a fan-out read), since it last answered: the first pull's wait doubles with each (`retry_us`).
+    misses: u8,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, misses: 0 }
     }
 }
 
@@ -300,7 +306,13 @@ impl Client {
                 self.seed_heard_us = now_us();
                 // What the seed holds, as it came: what ours is compared with before a put.
                 // A copy that does not open (sealed under a key this device does not hold, or unreadable) neither settles the first pull nor is pushed over: this device's pushes wait until it holds that key or a copy that opens comes (docs/IDENTITY-SPACE.md, G2; 2026-11-17, b925: the Pro pushed its copy over fgtw.org's, sealed under the key before a rotation).
-                let Some(digest) = self.space_take(&sealed, b"fgtw.org") else {
+                self.space.misses = 0;
+                // Sealed under another fleet key: the published fan-out read for it, and the copy opened again once a newer key wrapped to this device is adopted (a rotation made elsewhere: the Pro, 2026-11-22, held the key from before a shrink and tried this pull every 16 s).
+                let mut digest = self.space_take(&sealed, b"fgtw.org");
+                if digest.is_none() && self.space_rekey(&sealed.kfp) {
+                    digest = self.space_take(&sealed, b"fgtw.org");
+                }
+                let Some(digest) = digest else {
                     self.space_hold(&sealed.kfp, b"fgtw.org");
                     return;
                 };
@@ -314,6 +326,7 @@ impl Client {
             }
             Ok(None) => {
                 self.seed_heard_us = now_us();
+                self.space.misses = 0;
                 if !self.space.settled {
                     self.space.settled = true;
                     self.log.put(b"fgtw: space: fgtw.org keeps none for this identity yet");
@@ -323,6 +336,7 @@ impl Client {
             }
             Err(e) if e.contains("unknown_op") => {
                 self.seed_heard_us = now_us();
+                self.space.misses = 0;
                 if !self.space.said_slot {
                     self.space.said_slot = true;
                     self.log.put(b"fgtw: space: fgtw.org has no space slot yet (fgtw-bootstrap space_put/space_get not deployed): the space stays on this device and its fleet");
@@ -335,6 +349,7 @@ impl Client {
                 self.log.put(b"fgtw: space: fgtw.org: ");
                 self.log.put(e.as_bytes());
                 self.log.line();
+                self.space_missed();
                 return;
             }
         }
@@ -387,6 +402,66 @@ impl Client {
         }
     }
 
+    /// A copy that did not open, sealed under the key `kfp` names: when that is not the key held here, the published fan-out read for it (`fanout_check`), once for each pair of the copy's key and the key held. Whether a newer key was adopted, so the copy is opened again.
+    /// Never a write: a copy that still does not open stays held (`space_hold`), and nothing of ours goes over it.
+    fn space_rekey(&mut self, kfp: &[u8; 32]) -> bool {
+        let Some((_, fk)) = self.space_ready() else { return false };
+        let ours = fgtw::fanout::fleet_key_fingerprint(&fk);
+        if *kfp == ours || self.space.checked.is_some_and(|(c, k)| c == *kfp && k == ours) {
+            return false;
+        }
+        match self.fanout_check(kfp) {
+            FanCheck::Adopted => true,
+            FanCheck::Unreachable => {
+                self.space_missed();
+                false
+            }
+            FanCheck::Nothing => {
+                self.space.checked = Some((*kfp, ours));
+                self.log.put(b"fgtw: space: no newer key for this device: the pull waits for the fleet (a fan-out from a sibling, a change of the chain, a fleet device heard, the network coming up), not a timer");
+                self.log.line();
+                false
+            }
+            FanCheck::NoWrap => {
+                self.space.checked = Some((*kfp, ours));
+                self.log.put(b"fgtw: space: this device is locked out of the fleet's key: the pull stops until the fleet's chain or key changes");
+                self.log.line();
+                false
+            }
+        }
+    }
+
+    /// fgtw.org did not answer: the first pull's wait doubles (`retry_us`).
+    fn space_missed(&mut self) {
+        // WHY the bound: the wait is `LOCAL_US * 4 << misses`; past a shift of about 40 the product overflows u64, and a release build masks a shift of 64 or more to its low six bits, so an unbounded count would wrap the wait back to a short one. The bound holds it at its ceiling instead.
+        if self.space.misses < MISS_SHIFT_MAX {
+            self.space.misses += 1;
+        }
+    }
+
+    /// The first pull's wait (µs): 16 s, doubled for each of fgtw.org's failures in a row. A timer only because fgtw.org has no way to tell this device it answers again; every other reason to ask again comes as an event (`space_wake`).
+    fn retry_us(&self) -> u64 {
+        (LOCAL_US * 4) << self.space.misses
+    }
+
+    /// The pull waits on an event: the copy fgtw.org holds is sealed under the key a fan-out read found nothing newer for (`checked`), and the key held here is still the one it was read with.
+    fn space_parked(&self) -> bool {
+        let Some((_, fk)) = self.space_ready() else { return false };
+        self.space.checked.is_some_and(|(c, k)| self.space.held == Some(c) && k == fgtw::fanout::fleet_key_fingerprint(&fk))
+    }
+
+    /// An event that may change what fgtw.org's copy or the fan-out says for this device (`why`): the pull asked again at once, the fan-out read again for a copy that does not open, the back-off reset. Nothing when the pull was not waiting.
+    pub(crate) fn space_wake(&mut self, why: &[u8]) {
+        if self.space.checked.take().is_none() && self.space.misses == 0 {
+            return;
+        }
+        self.space.misses = 0;
+        self.space.last_seed_us = 0;
+        self.log.put(b"fgtw: space: asking again: ");
+        self.log.put(why);
+        self.log.line();
+    }
+
     /// Ours to every fleet device heard, when it moved since they last had it.
     pub(crate) fn space_to_fleet(&mut self) {
         let digest = self.space.space.digest();
@@ -430,7 +505,12 @@ impl Client {
             name[2 * k] = h[(c >> 4) as usize];
             name[2 * k + 1] = h[(c & 15) as usize];
         }
-        let Some(theirs) = self.space_take(&sealed, &name) else {
+        // A sibling's copy sealed under a key this device does not hold: a rotation this device missed, so the published fan-out is read for it.
+        let mut theirs = self.space_take(&sealed, &name);
+        if theirs.is_none() && self.space_rekey(&sealed.kfp) {
+            theirs = self.space_take(&sealed, &name);
+        }
+        let Some(theirs) = theirs else {
             // A sibling's copy this device cannot open holds its pushes too (G2): that sibling holds a key this one does not.
             self.space_hold(&sealed.kfp, &name);
             return;
@@ -611,7 +691,11 @@ impl Client {
             return Some(0);
         }
         if !self.space.settled {
-            return Some(self.space.last_seed_us + LOCAL_US * 4);
+            // Waiting on an event: no deadline of its own.
+            if self.space_parked() {
+                return None;
+            }
+            return Some(self.space.last_seed_us + self.retry_us());
         }
         // WHY the min: the earlier of its two timers, not a bound on a value.
         Some((self.space.last_local_us + LOCAL_US).min(self.space.last_seed_us + SEED_US))
@@ -648,8 +732,8 @@ impl Client {
             self.space.last_seed_us = t;
         }
         if !self.space.settled {
-            // The first pull again until fgtw.org answers or a sibling's copy arrives.
-            if t - self.space.last_seed_us >= LOCAL_US * 4 {
+            // The first pull again until fgtw.org answers with a copy that opens or a sibling's copy arrives: on the back-off while fgtw.org does not answer, not at all while the pull waits on an event (`space_parked`).
+            if !self.space_parked() && t - self.space.last_seed_us >= self.retry_us() {
                 self.space.last_seed_us = t;
                 self.space_ask_fleet();
                 self.space_seed(false);
