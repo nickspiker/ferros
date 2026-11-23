@@ -965,7 +965,8 @@ fn open(cam: &camera::Camera, slit: bool, video: Option<(ferros_clip::Pacing, u6
         ask = pacing.open_msg(cam.id, shutter_ns).to_vec();
         println!("lumis: camera {}: RAW video: the open at {} a second (frame length {} lines, every {} kept)", cam.name, pacing.fps, pacing.fll, pacing.keep);
     } else if slit {
-        ask.extend_from_slice(&camera::slit_block());
+        // The readout's least slit that streams (the list's `slit_rows_least`; the integrator keeps its centre pair), else the 64 rows of before.
+        ask.extend_from_slice(&camera::slit_block(cam.slit_rows.unwrap_or(camera::SLIT_ROWS)));
         // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
         ask.push(0);
     } else if knobs & DEV_COPY != 0 && cam.mode == 0 {
@@ -1705,6 +1706,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         if !preview_async {
             last_preview_us = (t_after - t_integrate).as_micros() as u64;
         }
+        // While slits run, the shutter fits a slit's least frame (`Camera::slit_exposure_most_ns`): the UI's shutter slider tops out there (lumis_core `platform::set_shutter_most`), and until its next pass rewrites the shutter, the shorter of the two is sent (the camera agent, 2026-11-22: the stills' 15.6 ms made the driver lengthen every tele slit from 293 lines to 2562, 63 slits a second against 559). Whole frames: the camera's own longest.
+        let ceiling = if src.is_slit() { cam.slit_exposure_most_ns.unwrap_or(0) } else { 0 };
+        lumis_core::platform::set_shutter_most(ceiling);
+        // WHY the min: the shutter is the UI's, written before this ceiling reached it; a longer one stretches every slit's frame.
+        let shutter_ns = if ceiling > 0 { shutter_ns.min(ceiling as i64) } else { shutter_ns };
         if dev_knobs2() & DEV_NO_SET != 0 {
             sent = (iso, shutter_ns, focus);
         }

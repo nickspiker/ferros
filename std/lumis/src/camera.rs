@@ -31,11 +31,11 @@ pub const KIND_SLIT: u8 = 3;
 pub const KIND_FULL: u8 = 2;
 /// A slit's rows: 64, the fewest that keep the main's link clean (56 and fewer set ERR_CRC_PH while frames still land; 2026-11-18), at the sensor's floor of about 1218 a second.
 pub const SLIT_ROWS: u16 = 1 << 6;
-/// The mode block of a binned slit of [`SLIT_ROWS`], every other field the driver's default (its frame the rows and 2^7 lines more, its integration set by SET, a ring of 2^8 buffers).
-pub fn slit_block() -> [u8; MODE_BLOCK] {
+/// The mode block of a binned slit of `rows` rows (the readout's least that streams, `Camera::slit_rows`, else [`SLIT_ROWS`]), every other field the driver's default (its frame the rows and 2^7 lines more, its integration set by SET, a ring of 2^8 buffers).
+pub fn slit_block(rows: u16) -> [u8; MODE_BLOCK] {
     let mut b = [0u8; MODE_BLOCK];
     b[0] = KIND_SLIT;
-    b[1..3].copy_from_slice(&SLIT_ROWS.to_le_bytes());
+    b[1..3].copy_from_slice(&rows.to_le_bytes());
     b
 }
 
@@ -130,6 +130,9 @@ pub struct Camera {
     pub focal_equiv_mm: f32,
     /// The readout's line and its shortest frame (the list's `line_ps` and `fll_least`, ferros_clip `Line::of_ps`), which RAW video paces by: none from a driver before them (`list` gives the binned main ferros_clip's own `MAIN_LINE`).
     pub line: Option<ferros_clip::Line>,
+    /// The readout's least slit that streams whole, in rows, and the longest exposure that keeps a slit at its least frame, in ns (the list's `slit_rows_least` and `slit_exposure_most_ns`, ferros 8d090b54: the main 16 rows and 806 us, the ultrawide 4 and 420 us, the front 4 and 1221 us, the tele 64 and 1765 us): the slit Lumis asks for and the shutter slider's top while slits run. None from a driver before them: [`SLIT_ROWS`], and the camera's own longest.
+    pub slit_rows: Option<u16>,
+    pub slit_exposure_most_ns: Option<u64>,
 }
 
 /// The list's document, read. A section that misses a field is not a camera Lumis can show, so it is left out and said (a driver bug, not the person's).
@@ -183,6 +186,8 @@ pub fn parse_list(doc: &[u8]) -> Result<Vec<Camera>, String> {
                 fov_diagonal_deg: one("fov_diagonal_deg"),
                 focal_equiv_mm: one("focal_equiv_mm"),
                 line: u("line_ps").zip(u("fll_least")).map(|(ps, least)| ferros_clip::Line::of_ps(ps, least)),
+                slit_rows: u("slit_rows_least").map(|v| v as u16),
+                slit_exposure_most_ns: u("slit_exposure_most_ns"),
             })
         })();
         match cam {
