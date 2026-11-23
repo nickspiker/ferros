@@ -1,6 +1,6 @@
 # No ceilings: memory, the kernel and the slot tables
 
-Status: design for the owner, 2026-11-23, on forge 17ea0da6. Nothing here is built. Building starts after the owner's read of it.
+Status: design, approved by the owner 2026-11-23 ("all yes": every decision at the end, as recorded there). Written on forge 17ea0da6; building in the order of section 3, step 0 first.
 
 The owner, 2026-11-23: "The whole design premise is unlimited and compact." And: "if I open notepad and it requests 1mb of memory and it's happy, then I go and open a video ... and it malloc's 4GB of RAM, it better work." On the order: "Yes, mem, kernel, slot tables, all the things."
 
@@ -51,7 +51,7 @@ So the order is forced: the address space first, then the ceilings can go.
 ### 0.3 no_std payloads: ferros_heap grows
 
 - **The allocator:** ferros_heap's `LockedHeap` (the first-fit list) is replaced for processes by the TLSF the kernel and ferros_rt already run (ferros_heap/src/lib.rs includes ferros_rt/src/tlsf.rs by path), with ferros_rt's grow and give-back: on a failed allocation, SYS_ARC `ARC_GROW` by `grow_bytes`, the new bytes joined to the top region; a large free top given back with `ARC_SHRINK`. One copy of that logic, shared, not a second one written for no_std.
-- **The payloads:** every static heap goes (CAPS-AUDIT M3: vault 56 MiB, modem 16, fgtw 8, kists 4, pucks 2, sensors 2, camera 1, gps 1, gnss_kepler, inject, init, pcie1, wallgen 248 MiB) and each declares `entry!(main, grows)` with no number (the pool). The payloads that grow with their own code (display's `Bump::more`, payloads/display/src/main.rs:733; ip, payloads/ip/src/main.rs:845; map) keep it, their ceilings dropped (M2: display 2^28, map 2^22, ip 2^25, pucks and clock 2^26).
+- **The payloads:** every static heap goes (CAPS-AUDIT M3: vault 56 MiB, modem 16, fgtw 8, kists 4, pucks 2, sensors 2, camera 1, gps 1, gnss_kepler, inject, init, pcie1, wallgen 248 MiB) and each declares a growing heap in its image header. Until step 2 widens the address space, that header names an interim ceiling, `ferros_heap::INTERIM_CEILING` (2^28), so no window grows past what the 64 GiB space holds beside Lumis's and Photon's; step 3 deletes it and the header names the pool. The payloads that grow with their own code (display's `Bump::more`, payloads/display/src/main.rs:733; ip, payloads/ip/src/main.rs:845; map) keep it, their ceilings dropped (M2: display 2^28, map 2^22, ip 2^25, pucks and clock 2^26).
 - **ahau's bump** (25 MiB) stays as it is until its give-back after attest (ARCS.md step 4, its own change).
 - **Cost:** memory goes down. wallgen's 248 MiB and the vault's 56 MiB stop being held while idle: every payload starts at 4 MiB of heap and holds what it uses.
 
@@ -61,7 +61,8 @@ Today: a no_std payload's stack is 64 KiB at the arc's top (process.rs:9419 `STA
 
 - **A stack is a reach of addresses mapped as it is touched.** Both targets probe the stack page by page (targets/aarch64-unknown-ferros.json:45, targets/aarch64-ferros.json:29, `stack-probes: inline`), so a stack that deepens faults first in the page just under its mapped bottom. The kernel maps that page and returns to the faulting instruction. A fault anywhere else is a fault, as today.
 - **4 KiB pages, not 2 MiB frames:** a stack per frame would cost Photon 158 MiB. So the kernel gains a page pool: a frame cut into 512 pages, a stack's 2 MiB slot given its own level-3 table whose entries point at pages as they are touched. A thread then costs the pages it used and one table.
-- **Reaches:** the window's upper half (P) is the stacks'. The entry thread's reach is all of it at first; each new thread takes the untouched lower half of the largest reach (whose own stack lives at its top), and a thread that ends gives its reach back to its buddy. No thread count is fixed: every stack reaches at least P divided by the next power of two of the threads alive at its birth (Photon's 79: 128 MiB each on the Pro, 64 MiB on the 8a). A stack that runs to its reach's bottom faults with its thread named.
+- **Each thread its own window** (the owner's choice, decision 4): the entry thread's stack lies at the top of the process window's upper half; every other thread's stack is a window of P of its own from the windows' space, mapped from its top down as it is touched, and given back when the thread ends. No thread count is fixed and no stack reaches less than the device holds; the cost is a window of addresses a thread (Photon's 79 threads: 79 windows). A masked process's threads must keep sp inside its arc (SANDBOX.md "The stack"), so a masked process's thread stacks take reaches of its own window's upper half instead, halved as threads arrive.
+- **Thread windows and the count:** process and thread windows share the 48-bit space: 8176 windows of 2P on the Pro, twice that of P alone. Past it the refusal names the address space.
 - **Syscall buffers on an untouched stack:** the kernel's buffer resolution (process.rs:1653 `span`) maps the missing stack pages before it writes, as the process's own touch would have.
 - **Masked processes** follow the same rule inside the same window: x27 covers it (0.1), sp is masked into it as now (SANDBOX.md "The stack").
 - **ferros_rt:** the main thread runs on the entry stack (no 1 MiB from the heap), threads ask the kernel for a reach (a new SYS_ARC op) instead of a heap block, and the guard page under each (`ARC_GUARD`, ferros_rt/src/thread.rs:28) becomes the reach's end. std's `stack_size` is then a hint the kernel ignores.
@@ -153,7 +154,7 @@ Each step on the 8a first, then the Pro: the 8a's smaller pool (5.3 GiB) reaches
 5. **IPC at its length, the grants area** (1.0). Kernel, ferros_sys, the servers that take a fixed receive buffer (ip's `MSG_MAX`, payloads/ip/src/main.rs:639). Checked: a 1 MiB call to an echo server; a TCP send of 64 KiB in one call; "too long" to a short buffer, never a cut; init spawned with more grants than a page holds. Flash.
 6. **Stacks** (0.4). Kernel (the page pool, the fault that grows, reaches) and ferros_rt. Checked: payloads/stacktest recursing 256 MiB deep; 1024 threads in one process; Photon's stacks' frames before and after; a syscall into an untouched stack buffer. Flash.
 7. **The processes' tables** (2.1). Payloads only, after step 1. Checked by counting past each old number: 17 kists on the deck, 17 TCP connections, a ninth UDP port, 17 remembered networks, 33 people.
-8. **The kernel's tables** (2.0), one at a time, each measured first: surfaces and pucks, then GPU blocks and the GPU's memory, then the camera, then mailboxes, then the display's and drivers' carve-outs. Checked: 17 surfaces and a 64 MiB surface; 17 pucks; a block past 512 MiB (Mahere at full detail) and 17 clients holding blocks; a run of 16 full RAW10 frames (about 1 GiB); a seventh mailbox registered by name. Flash each.
+8. **The kernel's tables** (2.0), one at a time, each measured first: GPU blocks and the GPU's memory, then the camera, then mailboxes, then the display's and drivers' carve-outs, then surfaces and pucks last (decision 6). Checked: 17 surfaces and a 64 MiB surface; 17 pucks; a block past 512 MiB (Mahere at full detail) and 17 clients holding blocks; a run of 16 full RAW10 frames (about 1 GiB); a seventh mailbox registered by name. Flash each.
 
 The owner's order holds (memory, the kernel, slot tables). Stacks come after the kernel's heap because they are the largest kernel change in the memory part (a page pool and a fault that grows) and nothing but deep recursion meets the stack's cap today. Step 7 can run beside steps 2 to 6: it touches no kernel.
 
@@ -198,6 +199,21 @@ The owner's order holds (memory, the kernel, slot tables). Stacks come after the
 | U11 | a process's last line, a death record, a detail block | a process's own words into the kernel; right |
 
 ## Decisions for the owner
+
+The owner, 2026-11-23, relayed by the coordinator: "all yes". As recorded:
+- 0: 48-bit addresses, measured at step 2 before they are kept.
+- 1: the headroom measured from the system processes' peaks.
+- 2: faults over wraps in ring mode; exact mode for odd-sized handles.
+- 3: fixed mode only for drivers whose needs are known.
+- 4: each thread its own growing stack window (the alternative below, not the halved reaches); 0.4 says it so.
+- 5: "too long", never a silent cut.
+- 6: the display's and the GPU's surface-slot change last of the slot tables.
+- 7: grants across as many pages as they need.
+- 8: the kernel-heap DMA check first, before step 4 changes anything.
+- 9: under pressure the caches shrink in this order: Mahere's map cells, then thumbnails (the owner may refine it).
+
+As written for the owner:
+
 
 0. **48-bit addresses** (0.0): one more level in each page walk on a TLB miss, measured at step 2 before it is kept. The alternative, per-process tables with ASIDs, is larger work and also brings native isolation; it can come later on top.
 1. **Who is refused first when the device runs out.** (a) First come, no reserve: the notepad's 4 GiB can leave the display without its next frame of memory. (b) Recommended: kists' grows are refused while the pool's free bytes are under the system processes' headroom, the sum of each system process's measured peak above its present size (the kernel tracks each arc's peak), a number the device measures, not a constant. It replaces `CAM_RESERVE` and `BLOCK_RESERVE`.
