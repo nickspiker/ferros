@@ -1628,6 +1628,10 @@ dependencies = [
 [[package]]
 name = "ferros_glass"
 version = "0.1.0"
+dependencies = [
+ "fontdue",
+ "tatau",
+]
 
 [[package]]
 name = "ferros_glow"

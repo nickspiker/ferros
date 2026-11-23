@@ -2,13 +2,15 @@
 //! The kernel's panic screen draws with it, so does a process that died while no display served, and a boot that stalled (ferros_kernel glass.rs).
 //!
 //! - **Font:** the 8x16 bitmap font (`font.rs`), each font pixel a square of `scale` panel pixels, where `scale` is the span (2wh/(w+h)) over 2^9: 3 on the Pro (24x48 cells, 51 columns), 2 on the 8a (16x32, 61 columns).
+//! - **Numbers:** tatau's twelve dozenal digits (U+0010-U+001B), its radix point and sign arrows, rasterised from Oxanium +glyphs at build time into the same grid (build.rs); a dozenal digit takes two cells.
+//!   A line's numbers are typed (`Num`, `Say`), so the glass writes them in the device's base while the developer's copy of the same line (the console, the flash log) keeps `A#`/`G#`.
 //!   Never a fixed pixel size (AGENT.md "Dimensional Units").
 //! - **Wrap:** words wrap at the grid's width; a word that does not fit the rest of a line starts the next one; a word longer than a whole line is cut at every line's end.
 //! - **Line returns:** a `\n` ends the line where it stands; a line exactly full followed by a `\n` makes one line, not a line and an empty one.
 //! - **Spaces:** a space at a line's end is dropped (it would start the next line indented); spaces after a manual return are kept (indentation).
 //! - **Down to the bottom:** lines fill the grid row by row to its last row, the bottom margin above the rounded corners.
 //! - **Overrun:** when the text needs more rows than the grid has, one row says `...` and the caller picks which end stays (`Keep`): the earliest lines (a panic: its headline and message come first) or the latest (the kernel's notices, appended as they happen).
-//! - **Bytes:** printable ASCII is drawn as is; a tab is a space; a carriage return is nothing; each other character (a UTF-8 sequence counts once, by its lead byte) is a `?` cell.
+//! - **Bytes:** printable ASCII is drawn as is; tatau's digits, point and arrows as their cells; a tab is a space; a carriage return is nothing; each other character (a UTF-8 sequence counts once, by its lead byte) is a `?` cell.
 //!
 //! No allocation, no locks, and no input makes it panic or reach outside the grid: a panic path draws with it.
 
@@ -20,21 +22,54 @@ pub use font::FONT;
 pub const GLYPH_W: usize = 8;
 pub const GLYPH_H: usize = 16;
 
-/// What one byte of text puts in a cell: printable ASCII itself, a tab a space, nothing for a carriage return or a UTF-8 continuation byte (its character already counted at its lead byte), `?` for anything else.
-pub fn cell_byte(b: u8) -> Option<u8> {
+mod num;
+pub use num::{Dev, Num, Person, Say};
+
+// The dozenal digits' halves, the radix point and the sign arrows (build.rs).
+include!(concat!(env!("OUT_DIR"), "/dozenal.rs"));
+
+/// The cells past ASCII, by id: dozenal digit d's left half `DOZENAL + 2d` and its right half the next, then the point, the up arrow and the down arrow (`EXTRA`'s order).
+/// Cell ids are what `lay` hands its callback, never text.
+pub const DOZENAL: u8 = 0x80;
+pub const POINT: u8 = DOZENAL + 24;
+pub const UP: u8 = DOZENAL + 25;
+pub const DOWN: u8 = DOZENAL + 26;
+
+/// The cells the character at `text[i]` puts on the grid, how many (0, 1 or 2), and how many bytes it takes: printable ASCII itself; tatau's dozenal digits (U+0010-U+001B, one byte each in UTF-8) two cells, their halves; the radix point and the sign arrows one; a tab a space; nothing for a carriage return or a UTF-8 continuation byte (its character already counted at its lead byte); `?` for anything else.
+/// `i` must be inside `text`.
+pub fn cells_at(text: &[u8], i: usize) -> ([u8; 2], usize, usize) {
+    let b = text[i];
     match b {
-        0x20..=0x7E => Some(b),
-        b'\t' => Some(b' '),
-        b'\r' | 0x80..=0xBF => None,
-        _ => Some(b'?'),
+        0x20..=0x7E => ([b, 0], 1, 1),
+        0x10..=0x1B => {
+            let left = DOZENAL + 2 * (b - 0x10);
+            ([left, left + 1], 2, 1)
+        }
+        b'\t' => ([b' ', 0], 1, 1),
+        b'\r' | 0x80..=0xBF => ([0, 0], 0, 1),
+        _ => {
+            let rest = &text[i..];
+            if rest.starts_with("\u{B7}".as_bytes()) {
+                ([POINT, 0], 1, 2)
+            } else if rest.starts_with("\u{2191}".as_bytes()) {
+                ([UP, 0], 1, 3)
+            } else if rest.starts_with("\u{2193}".as_bytes()) {
+                ([DOWN, 0], 1, 3)
+            } else {
+                ([b'?', 0], 1, 1)
+            }
+        }
     }
 }
 
-/// The glyph a cell byte (from `cell_byte`) draws.
+/// The glyph a cell id (from `cells_at`) draws.
 pub fn glyph(c: u8) -> &'static [u8; GLYPH_H] {
-    // `cell_byte` gives only G#20-G#7E, so the index is in the table; any other byte draws `?` rather than reading past it.
-    let i = if (0x20..=0x7E).contains(&c) { c - 0x20 } else { b'?' - 0x20 };
-    &FONT[i as usize]
+    match c {
+        0x20..=0x7E => &FONT[(c - 0x20) as usize],
+        DOZENAL..=DOWN => &EXTRA[(c - DOZENAL) as usize],
+        // `cells_at` gives no other id; any other draws `?` rather than reading past a table.
+        _ => &FONT[(b'?' - 0x20) as usize],
+    }
 }
 
 /// Which end of a text that needs more rows than the grid has stays on the glass.
@@ -70,28 +105,37 @@ fn walk(text: &[u8], cols: usize, mut emit: impl FnMut(usize, usize, u8, bool)) 
             }
             _ => {
                 // The word: up to the next space or return, its width in cells.
+                // A multi-byte character's bytes are all G#80 or above, so none is a space or a return and `j` never stops inside one.
                 let mut j = i;
                 let mut w = 0;
                 while j < text.len() && !matches!(text[j], b'\n' | b' ' | b'\t') {
-                    w += cell_byte(text[j]).is_some() as usize;
-                    j += 1;
+                    let (_, n, len) = cells_at(text, j);
+                    w += n;
+                    j += len;
                 }
                 // Not fitting the rest of the line: the next line, whether or not it fits a whole one.
                 if col > 0 && col + w > cols {
                     line += 1;
                     col = 0;
                 }
-                for &b in &text[i..j] {
-                    let Some(c) = cell_byte(b) else { continue };
-                    // Longer than a line: cut at each line's end.
-                    if col == cols {
+                while i < j {
+                    let (c, n, len) = cells_at(text, i);
+                    i += len;
+                    // WHY: a wide character (a dozenal digit, two cells) in a grid one column wide has room for its left half only; `lay` promises no cell at or past `cols`.
+                    let n = if n > cols { cols } else { n };
+                    if n == 0 {
+                        continue;
+                    }
+                    // Longer than a line: cut at each line's end, a wide character never split across two.
+                    if col + n > cols {
                         line += 1;
                         col = 0;
                     }
-                    emit(line, col, c, head);
-                    col += 1;
+                    for &cell in &c[..n] {
+                        emit(line, col, cell, head);
+                        col += 1;
+                    }
                 }
-                i = j;
             }
         }
     }

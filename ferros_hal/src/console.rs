@@ -1,11 +1,9 @@
 //! Framebuffer console — text rendering on a linear XRGB8888 framebuffer.
 //!
-//! Uses an embedded 8x16 bitmap font (printable ASCII 0x20-0x7E). All output is hex — no decimal formatting, no `core::fmt` bloat.
+//! Uses the glass console's 8x16 bitmap font: printable ASCII, and tatau's dozenal digits (two cells each), radix point and sign arrows (ferros_glass `cells_at`). All output is hex: no decimal formatting, no `core::fmt` bloat.
 
-/// The 8x16 bitmap font for printable ASCII lives in ferros_glass (one copy for this console and the glass console).
-use ferros_glass::{FONT, GLYPH_H, GLYPH_W};
-const FONT_FIRST: u8 = 0x20;
-const FONT_LAST: u8 = 0x7E;
+/// The 8x16 bitmap font lives in ferros_glass (one copy for this console and the glass console).
+use ferros_glass::{GLYPH_H, GLYPH_W};
 
 /// Framebuffer console state.
 pub struct Console {
@@ -95,12 +93,8 @@ impl Console {
 
     /// Draw a single character at text position (col, row) within the margin area.
 
-    fn draw_char(&self, ch: u8, col: usize, row: usize) {
-        let glyph = if ch >= FONT_FIRST && ch <= FONT_LAST {
-            &FONT[(ch - FONT_FIRST) as usize]
-        } else {
-            &FONT[0]
-        };
+    fn draw_char(&self, cell: u8, col: usize, row: usize) {
+        let glyph = ferros_glass::glyph(cell);
 
         let s = self.scale;
         let px = self.x_off + col * GLYPH_W * s;
@@ -167,24 +161,44 @@ impl Console {
                 self.col = 0;
             }
             _ => {
-                if self.col >= self.cols {
-                    self.col = 0;
-                    self.row += 1;
-                    if self.row >= self.rows {
-                        self.row = self.rows - 1;
-                        self.scroll_up();
-                    }
-                }
-                self.draw_char(ch, self.col, self.row);
-                self.col += 1;
+                let (c, n, _) = ferros_glass::cells_at(&[ch], 0);
+                self.cells(&c[..n]);
             }
         }
     }
 
-    /// Write a string to the console.
+    /// One character's cells (one, or two for a dozenal digit), on the next line when they do not fit the rest of this one.
+    fn cells(&mut self, c: &[u8]) {
+        if c.is_empty() {
+            return;
+        }
+        if self.col + c.len() > self.cols {
+            self.col = 0;
+            self.row += 1;
+            if self.row >= self.rows {
+                self.row = self.rows - 1;
+                self.scroll_up();
+            }
+        }
+        for &cell in c {
+            self.draw_char(cell, self.col, self.row);
+            self.col += 1;
+        }
+    }
+
+    /// Write a string to the console: each character its cells, so tatau's point and arrows (two and three bytes in UTF-8) draw as one cell each.
     pub fn puts(&mut self, s: &str) {
-        for b in s.bytes() {
-            self.putc(b);
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if matches!(b[i], b'\n' | b'\r') {
+                self.putc(b[i]);
+                i += 1;
+                continue;
+            }
+            let (c, n, len) = ferros_glass::cells_at(b, i);
+            self.cells(&c[..n]);
+            i += len;
         }
     }
 

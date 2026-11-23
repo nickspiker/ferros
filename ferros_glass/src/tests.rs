@@ -87,6 +87,95 @@ fn other_characters_are_one_question_mark_each() {
     assert_eq!(rows_of("caf\u{e9} \u{2192}\tx\r\n\u{1}", 20, 4, Keep::Earliest), s(&["caf? ? x", "?"]));
 }
 
+/// The cells laid out as ids, one row a vector, for text with tatau's cells (not ASCII, so not a `String`).
+fn cells_of(text: &str, cols: usize, rows: usize) -> Vec<Vec<u8>> {
+    let mut g = vec![vec![b' '; cols]; rows];
+    let used = lay(text.as_bytes(), cols, rows, Keep::Earliest, |r, c, b, _| g[r][c] = b);
+    g.truncate(used);
+    g
+}
+
+#[test]
+fn a_dozenal_digit_takes_two_cells_and_the_point_and_arrows_one() {
+    // ↑ 1 · 6 B : the up arrow, digit one, the point, digit six, digit eleven.
+    let d = |k: u8| [DOZENAL + 2 * k, DOZENAL + 2 * k + 1];
+    let g = cells_of("\u{2191}\u{11}\u{B7}\u{16}\u{1B} s", 12, 2);
+    let mut want = vec![UP];
+    want.extend(d(1));
+    want.push(POINT);
+    want.extend(d(6));
+    want.extend(d(11));
+    want.extend(b" s  ");
+    assert_eq!(g, vec![want]);
+    assert_eq!(cells_of("\u{2193}", 4, 1), vec![vec![DOWN, b' ', b' ', b' ']]);
+}
+
+#[test]
+fn a_dozenal_digit_is_never_split_across_lines() {
+    // Five cells a line: "ab" and two digits (2 + 4 cells) is a word too long for a line, cut so the second digit starts the next line whole.
+    let g = cells_of("ab\u{10}\u{11}", 5, 4);
+    assert_eq!(g, vec![vec![b'a', b'b', DOZENAL, DOZENAL + 1, b' '], vec![DOZENAL + 2, DOZENAL + 3, b' ', b' ', b' ']]);
+    // One column: the left half alone, never a cell past the grid.
+    assert_eq!(cells_of("\u{10}", 1, 2), vec![vec![DOZENAL]]);
+}
+
+#[test]
+fn the_dozenal_cells_are_drawn_and_sit_on_the_baseline() {
+    // Every digit (its two halves together), the point and the arrows light something; none reaches the bitmap font's bottom row (the glyphs end above it, as the ASCII does).
+    for id in DOZENAL..=DOWN {
+        assert_eq!(glyph(id)[GLYPH_H - 1], 0, "cell G#{id:X} reaches the last row");
+    }
+    for id in [POINT, UP, DOWN] {
+        assert!(glyph(id).iter().any(|&r| r != 0), "cell G#{id:X} is empty");
+    }
+    for k in 0..12 {
+        let (l, r) = (glyph(DOZENAL + 2 * k), glyph(DOZENAL + 2 * k + 1));
+        assert!(l.iter().zip(r.iter()).any(|(&a, &b)| a | b != 0), "digit {k} is empty");
+    }
+}
+
+#[test]
+fn numbers_read_in_the_base_for_the_person_and_a_hash_for_the_developer() {
+    use tatau::{Base, Fmt, Style};
+    let dev = |n: Num| {
+        let mut t = String::new();
+        n.dev(&mut t).unwrap();
+        t
+    };
+    let person = |n: Num, b: Base| {
+        let mut t = String::new();
+        n.person(&mut t, Fmt::new(b, Style::Words)).unwrap();
+        t
+    };
+    assert_eq!(dev(Num::Count(12)), "A#12");
+    assert_eq!(dev(Num::Bits(0x96000045)), "G#96000045");
+    assert_eq!(dev(Num::Word(0xDEAD)), "G#000000000000DEAD");
+    assert_eq!(dev(Num::Line(42)), "42");
+    assert_eq!(dev(Num::Ns(16_000_000_000)), "A#16 s");
+    assert_eq!(dev(Num::Bytes(4096)), "A#4096 bytes");
+    // A position is its digits in the base, never doublings: 144 is one gross.
+    assert_eq!(person(Num::Index(144), Base::Dms), "Zila Zil Zil");
+    assert_eq!(person(Num::Bits(0x1F), Base::Hex), "1F");
+    assert_eq!(person(Num::Line(144), Base::Arabic), "144");
+    // An amount in DMS is its doublings: 4096 is twelve (Zila Zil) with a zero digit after the point; zero has none and reads 0.
+    assert_eq!(person(Num::Count(4096), Base::Dms), "Zila Zil\u{B7}Zil");
+    assert_eq!(person(Num::Count(0), Base::Dms), "0");
+    assert_eq!(person(Num::Count(4096), Base::Arabic), "4096");
+    // The same line said to both.
+    let line = |out: &mut dyn Say| {
+        out.s("core ");
+        out.n(Num::Index(3));
+        out.s(", crumb ");
+        out.n(Num::Bits(0xEE12));
+    };
+    let (mut d, mut p) = (String::new(), String::new());
+    line(&mut Dev(&mut d));
+    line(&mut Person(&mut p, Fmt::new(Base::Dms, Style::Glyphs)));
+    assert_eq!(d, "core A#3, crumb G#EE12");
+    // G#EE12 is 60946, dozenal 2 11 3 2 10: glyphs U+0012 U+001B U+0013 U+0012 U+001A.
+    assert_eq!(p, "core \u{13}, crumb \u{12}\u{1B}\u{13}\u{12}\u{1A}");
+}
+
 #[test]
 fn the_headline_is_up_to_the_first_return() {
     let mut heads = Vec::new();
@@ -113,7 +202,7 @@ fn every_byte_lays_out_inside_the_grid() {
     for cols in 1..9 {
         for rows in 1..9 {
             for keep in [Keep::Earliest, Keep::Latest] {
-                lay(&all, cols, rows, keep, |r, c, b, _| assert!(r < rows && c < cols && (0x20..=0x7E).contains(&b)));
+                lay(&all, cols, rows, keep, |r, c, b, _| assert!(r < rows && c < cols && ((0x20..=0x7E).contains(&b) || (DOZENAL..=DOWN).contains(&b))));
             }
         }
     }
