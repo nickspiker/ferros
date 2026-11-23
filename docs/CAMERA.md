@@ -1903,6 +1903,29 @@ What separates them from 8 rows and up: at a doubled line 8 and 12 rows land wit
 - If neither does: the sensor's own least output height (the main's binning G#3244 may need 8 output rows), read by its frame counter against a window of 8 rows with its output size 2, if its digital crop takes it.
 - **Tested on the Pro (2026-11-22 night, kit/emb.sh, slit-knobs.diff hand-spawned): the embedded-data channel is not it.** With the link's channel 2 config word written 0 (+G#60 G#B048 to 0) or its height 0 (+G#64 G#40FF0 to G#0FF0), read back as written, the main's 4 and 2-row slits at the doubled line and the 1:1 straddle at 11600 and 23200 clocks fail exactly as before (frame starts on +24 bits 0 and 2, no frame end, ERR_CRC_PH); 8 rows lands as before (1042 a second). The link still reports channel 2's frame starts with its config cleared, so +24's bit 2 is not what the link's channel 2 word gates. Next: the sensor's own least output height (its binning G#3244), not the receiver.
 
+### The tele's focus from Android, and every lens's nearest focus (the Pro, 2026-11-22 night)
+
+One Android boot (`diag android`, no flash), the kernel's i2c tracepoints under root filtered to humbaba (G#61) and the tele's sensor (G#2D) on i2c-4, Lumis on Android racking the tele's 22-degree readout by taps: its focus slider from its far end (infinity) to its near end (80 cm), back, then eight even steps; `adb reboot` back to ferros (b1137, the identity unlocked at boot). The capture: target/farm/camera-work/kit/runs/tele-af (local; B3SUMS), every CPU's overrun and dropped events 0, tools/oracle-i2c `--ftrace`: 0 writes whose bytes are not their length, 0 reads short, 0 transfers not whole; 165385 humbaba transfers, 25499 the sensor's.
+
+**Humbaba's focus, decoded** (16-bit register addresses, 8-bit values):
+- At each open: G#0201 read (01, ready), G#0200 = 01, G#0B00 = 01, G#0200 = 00, G#0200 = 01 (servo on); later G#0278 = G#3B00, G#0B00 = 01, G#0000 = 01, and reads of G#085C/085E and G#0414/0416 (calibration words, read only).
+- **The target: a 16-bit little-endian value, its low byte at G#0204 and its high byte at G#0205**, each written as its own one-byte write (`02 04 lo`, `02 05 hi`).
+- **The position: G#0208 (low) and G#0209 (high)**, polled between targets (G#1A0A for a target of G#1A0C: within 2). G#0B10/G#0B12 are polled as well (the OIS's, not chased).
+- **Android's targets**: the slider's far end (0 dioptres) **6668 (G#1A0C)**, its near end (1.25 dioptres, 80 cm) **13155 (G#3363)**, the eight steps 7456, 8270, 8983, 9848, 10662, 11400, 12316, 13130, about 810 apart: linear in dioptres, larger nearer.
+- Against the factory's codes (persist AF_calibration.cal, "rear tele"): infinity 7050 and near 13538, 6488 apart; Android's span is 6487 and both ends lie 382 lower. So the factory's codes are humbaba's own units, its near point is the HAL's minimum focus distance (80 cm), and the HAL drives them less 382 (an offset applied to both ends, likely its temperature or posture compensation; the factory's were measured at 33 C).
+- So for the tele: `focus_infinity` 6668 and `focus_near` 13155 as Android drives it (or the factory's 7050 and 13538), `focus_near_mm` 800. Its whole travel is unmeasured; Android drove nothing outside 6668 to 13155.
+
+**Every camera's nearest focus, from the HAL** (`dumpsys media.camera`, read only; each camera's LENS_INFO_MINIMUM_FOCUS_DISTANCE, its calibration APPROXIMATE):
+| camera (Camera2 physical id) | minimum focus distance | so `focus_near_mm` | hyperfocal |
+|---|---|---|---|
+| main (2) | 9.5238 dioptres | 105 | 0.169 dioptres |
+| ultrawide (3) | 50 dioptres | 20 | 1.255 dioptres |
+| front (7) | 10 dioptres | 100 | (none listed) |
+| tele (4) | 1.25 dioptres | 800 | 0.0242 dioptres |
+The tele's capture puts the factory's near code at the HAL's minimum focus distance; the three cornerfolk lenses' near codes are taken the same way, unmeasured.
+
+**Next** (built on the owner's go): the tele's focus in the driver, humbaba's protocol beside the cornerfolk's (servo on, the target at G#0204/G#0205, the position at G#0208/G#0209), the list's `focus_infinity` 6668 and `focus_near` 13155; `focus_near_mm` on all four (105, 20, 100, 800). A device check: the tele's target written and its position read back across 6668 to 13155, and a sharpness rack on the owner's near and far targets.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
