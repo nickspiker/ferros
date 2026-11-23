@@ -25,8 +25,9 @@ pub struct Cam {
     pub stream_off: &'static [u8],
     pub hold: &'static [u8],
     pub release: &'static [u8],
-    /// Its lens actuator's address on the same bus (0: none to drive), the main's protocol (02 <- G#40, 5 ms, 02 <- 0, F1 <- 0, the target in 00/01).
+    /// Its lens actuator's address on the same bus (0: none to drive), and the protocol it takes (`Lens`).
     pub actuator: u8,
+    pub lens: Lens,
     /// The focus targets offered, the actuator's whole travel (0 and 0: focus not offered).
     pub focus: (u64, u64),
     /// The lens's calibration: the actuator's target at infinity and at the module's near point, and that point's distance in mm (all 0: not known; the distance alone 0: not known).
@@ -91,6 +92,21 @@ pub struct FocusCal {
 /// No calibration known.
 pub const FOCUS_UNKNOWN: FocusCal = FocusCal { infinity: 0, near: 0, near_mm: 0 };
 
+/// A lens actuator's protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lens {
+    /// No lens to drive.
+    None,
+    /// The Pro's cornerfolk actuators (the main's, the ultrawide's, the front's: 8-bit registers): reset 02 <- G#40, 5 ms, 02 <- 0, F1 <- 0; the target big-endian in 00/01; the position at 84 (docs/oracle/CAMERA.md "Focus").
+    Cornerfolk,
+    /// The tele's humbaba (its OIS controller, G#61: 16-bit register addresses, 8-bit values), decoded from Android focusing it (2026-11-22, docs/CAMERA.md "The tele's focus from Android"): G#0201 reads 1 when ready, then G#0200 <- 1, G#0B00 <- 1, G#0200 <- 0, G#0200 <- 1; the target little-endian in G#0204 (low) and G#0205 (high), each its own write; the position in G#0208 (low) and G#0209 (high).
+    Humbaba,
+}
+
+/// The Pro's nearest focus of each lens, from its HAL (Camera2 LENS_INFO_MINIMUM_FOCUS_DISTANCE, `dumpsys media.camera` on the Pro, 2026-11-22, its calibration APPROXIMATE): the main 9.5238 dioptres, the ultrawide 50, the front 10, the tele 1.25.
+/// The tele's capture put its factory near code at exactly that distance (Android drove its slider's near end, 1.25 dioptres, to the factory's code less the same 382 as its infinity); the cornerfolk lenses' near codes are taken at theirs the same way, unmeasured.
+pub const NEAR_MM: [u64; 4] = [105, 20, 100, 800];
+
 /// The Pro's three cornerfolk actuators (the main's G#0C, the ultrawide's G#0F, the front's G#0C) take a 12-bit code left-aligned in their 16-bit target (00/01): the target is the code times 2^4.
 /// Measured two ways: the main's sharpest over a floor about a metre away was G#3800 (docs/oracle/CAMERA.md), code 896, a seventh of the way from its infinity code 509 to its near code 3274 (about 1.4 dioptres if the near point is 10 cm); and the owner found the front's slider over G#0800 to G#7800 (codes 128 to 1920) going from about infinity to far past it with nothing near in focus, its infinity code 1642 (G#66A0) near that span's top.
 /// At 2^3 the front's infinity would sit at G#3350 and its near point at G#6000, both inside that span, which the owner's slider refutes; Android's two captured targets (G#5D10 and G#5120, docs/oracle/CAMERA.md) end in a zero nibble, as the code times 2^4 does.
@@ -101,9 +117,9 @@ pub const CORNERFOLK_SHIFT: u32 = 4;
 pub const CORNERFOLK_TRAVEL: (u64, u64) = (0, 0xFFF << CORNERFOLK_SHIFT);
 
 /// The module's factory AF calibration as this Pro's persist partition holds it (`/camera/AF_calibration.cal`, written at manufacture, read from the 2026-11-18 partition dump in keys/husky; one unit, as the IDTs are): its infinity and near ("macro") codes, the HAL's 12-bit codes for the cornerfolk actuators.
-/// The near point's distance is not in that file: the HAL's LENS_INFO_MINIMUM_FOCUS_DISTANCE for the Pro was never recorded (the 8a's main reports 10.204 dioptres, 98 mm), so `near_mm` stays 0 until measured.
-const fn cornerfolk_cal(infinity: u64, near: u64) -> FocusCal {
-    FocusCal { infinity: infinity << CORNERFOLK_SHIFT, near: near << CORNERFOLK_SHIFT, near_mm: 0 }
+/// The near point's distance is not in that file: it is the lens's HAL minimum focus distance (`NEAR_MM`).
+const fn cornerfolk_cal(infinity: u64, near: u64, near_mm: u64) -> FocusCal {
+    FocusCal { infinity: infinity << CORNERFOLK_SHIFT, near: near << CORNERFOLK_SHIFT, near_mm }
 }
 
 /// The mode block's kind that opens a camera's readout `alts[k]`: `ALT + k`.
@@ -179,9 +195,10 @@ pub const MAIN: Cam = Cam {
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x0C,
+    lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
     // Factory: infinity 509, near 3274 ("rear wide"): G#1FD0 and G#CCA0, 509 codes (G#1FD0 of target) past infinity to the travel's end.
-    focus_cal: cornerfolk_cal(509, 3274),
+    focus_cal: cornerfolk_cal(509, 3274, NEAR_MM[0]),
     streams: true,
     rx_start: &crate::rx::RX_START,
     rx_stop: &crate::rx::RX_STOP,
@@ -233,9 +250,10 @@ pub const ULTRAWIDE: Cam = Cam {
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
     actuator: 0x0F,
+    lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
     // Factory: infinity 883, near 3224 ("rear uw"): G#3730 and G#C980, 883 codes past infinity.
-    focus_cal: cornerfolk_cal(883, 3224),
+    focus_cal: cornerfolk_cal(883, 3224, NEAR_MM[1]),
     streams: true,
     rx_start: &crate::rx::RX_START_UW,
     rx_stop: &crate::rx::RX_STOP_UW,
@@ -286,9 +304,10 @@ pub const FRONT: Cam = Cam {
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x0C,
+    lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
     // Factory: infinity 1642, near 3072 ("front normal"): G#66A0 and G#C000, 1642 codes past infinity.
-    focus_cal: cornerfolk_cal(1642, 3072),
+    focus_cal: cornerfolk_cal(1642, 3072, NEAR_MM[2]),
     streams: true,
     rx_start: &crate::rx::RX_START_FRONT,
     rx_stop: &crate::rx::RX_STOP_FRONT,
@@ -340,10 +359,12 @@ pub const TELE: Cam = Cam {
     stream_off: &[0x01, 0x00, 0x00, 0x00],
     hold: &[0x01, 0x04, 0x01, 0x01],
     release: &[0x01, 0x04, 0x00, 0x01],
-    actuator: 0,
-    focus: (0, 0),
-    // Its lens is the OIS controller's (humbaba, G#61, 16-bit registers), undecoded; the factory's AF calibration ("rear tele", persist /camera/AF_calibration.cal) is infinity 7050 and near 13538 in the HAL's units for it, larger nearer, which become targets once a capture of Android focusing the tele shows its protocol.
-    focus_cal: FOCUS_UNKNOWN,
+    actuator: 0x61,
+    lens: Lens::Humbaba,
+    // The span Android drove (2026-11-22): its slider's far end 6668 to its near end 13155 (80 cm), eight steps between linear in dioptres; the lens's travel past them unmeasured, so the span offered is that one.
+    focus: (6668, 13155),
+    // The factory's AF calibration ("rear tele", persist /camera/AF_calibration.cal) is infinity 7050 and near 13538 in humbaba's own units; Android drives both 382 lower, so these are Android's.
+    focus_cal: FocusCal { infinity: 6668, near: 13155, near_mm: NEAR_MM[3] },
     streams: true,
     rx_start: &crate::rx::RX_START_TELE,
     rx_stop: &crate::rx::RX_STOP_TELE,
@@ -416,6 +437,7 @@ pub const AKITA_MAIN: Cam = Cam {
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
+    lens: Lens::None,
     focus: (0, 0),
     focus_cal: FOCUS_UNKNOWN,
     streams: true,
@@ -466,6 +488,7 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
+    lens: Lens::None,
     focus: (0, 0),
     focus_cal: FOCUS_UNKNOWN,
     streams: true,
@@ -515,6 +538,7 @@ pub const AKITA_FRONT: Cam = Cam {
     hold: &[0x01, 0x04, 0x01],
     release: &[0x01, 0x04, 0x00],
     actuator: 0,
+    lens: Lens::None,
     focus: (0, 0),
     focus_cal: FOCUS_UNKNOWN,
     streams: true,

@@ -1236,22 +1236,69 @@ fn get<'a>(g: u64, key: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// The lens actuator (the camera's `actuator`) to `pos`: reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 once, then the target into 00/01 (docs/oracle/CAMERA.md "Focus"). The main's protocol, which the front's and the ultrawide's actuators take too (2026-11-21).
+/// The lens actuator (the camera's `actuator`) ready to take targets, by its protocol (ferros_cam cams `Lens`).
+/// Cornerfolk (the main's, the front's, the ultrawide's): reset (02 <- G#40), at least 5 ms quiet (straight after it every write NACKs), 02 <- 0, F1 <- 0 (docs/oracle/CAMERA.md "Focus").
+/// Humbaba (the tele's, 2026-11-22, Android's own open: docs/CAMERA.md "The tele's focus from Android"): G#0201 read until it says 1 (ready), then G#0200 <- 1, G#0B00 <- 1, G#0200 <- 0, G#0200 <- 1.
 fn focus_init(bus: &Bus, c: &Cam) -> Result<(), u32> {
-    bus.write(c.actuator, &[0x02, 0x40])?;
-    ferros_sys::delay_us(1 << 13);
-    bus.write(c.actuator, &[0x02, 0x00])?;
-    bus.write(c.actuator, &[0xF1, 0x00])
+    match c.lens {
+        cams::Lens::Cornerfolk => {
+            bus.write(c.actuator, &[0x02, 0x40])?;
+            ferros_sys::delay_us(1 << 13);
+            bus.write(c.actuator, &[0x02, 0x00])?;
+            bus.write(c.actuator, &[0xF1, 0x00])
+        }
+        cams::Lens::Humbaba => {
+            // Its ready flag, read up to 2^5 times 2^10 us apart (Android read 1 at the first try): not ready by then is no lens to drive.
+            let mut r = [0u8; 1];
+            let mut ready = false;
+            for _ in 0..1 << 5 {
+                bus.write_read(c.actuator, &[0x02, 0x01], &mut r)?;
+                if r[0] == 1 {
+                    ready = true;
+                    break;
+                }
+                ferros_sys::delay_us(1 << 10);
+            }
+            if !ready {
+                return Err(r[0] as u32 | 1 << 16);
+            }
+            for w in [[0x02, 0x00, 0x01], [0x0B, 0x00, 0x01], [0x02, 0x00, 0x00], [0x02, 0x00, 0x01]] {
+                bus.write(c.actuator, &w)?;
+            }
+            Ok(())
+        }
+        cams::Lens::None => Ok(()),
+    }
 }
+/// The lens to `pos`: cornerfolk's target big-endian in 00/01; humbaba's little-endian, its low byte at G#0204 and its high at G#0205, each its own write as Android writes them.
 fn focus_set(bus: &Bus, c: &Cam, pos: u64) -> Result<(), u32> {
-    bus.write(c.actuator, &[0x00, (pos >> 8) as u8])?;
-    bus.write(c.actuator, &[0x01, pos as u8])
+    match c.lens {
+        cams::Lens::Cornerfolk => {
+            bus.write(c.actuator, &[0x00, (pos >> 8) as u8])?;
+            bus.write(c.actuator, &[0x01, pos as u8])
+        }
+        cams::Lens::Humbaba => {
+            bus.write(c.actuator, &[0x02, 0x04, pos as u8])?;
+            bus.write(c.actuator, &[0x02, 0x05, (pos >> 8) as u8])
+        }
+        cams::Lens::None => Ok(()),
+    }
 }
-/// The lens's position as its actuator reads it back (G#84, two bytes, high first; docs/oracle/CAMERA.md "Focus"): where the last target landed, read at the next focus SET so the lens has had its frames to settle (docs/CAMERA.md "Focus calibration and the rear mosaics", the travel check).
+/// The lens's position as its actuator reads it back: cornerfolk's G#84, two bytes, high first (docs/oracle/CAMERA.md "Focus"); humbaba's G#0208 (low) and G#0209 (high), a byte each as Android reads them. Read at the next focus SET, so the lens has had its frames to settle (docs/CAMERA.md "Focus calibration and the rear mosaics", the travel check).
 fn focus_pos(bus: &Bus, c: &Cam) -> Result<u16, u32> {
-    let mut r = [0u8; 2];
-    bus.write_read(c.actuator, &[0x84], &mut r)?;
-    Ok(u16::from_be_bytes(r))
+    match c.lens {
+        cams::Lens::Humbaba => {
+            let (mut lo, mut hi) = ([0u8; 1], [0u8; 1]);
+            bus.write_read(c.actuator, &[0x02, 0x08], &mut lo)?;
+            bus.write_read(c.actuator, &[0x02, 0x09], &mut hi)?;
+            Ok(u16::from_le_bytes([lo[0], hi[0]]))
+        }
+        _ => {
+            let mut r = [0u8; 2];
+            bus.write_read(c.actuator, &[0x84], &mut r)?;
+            Ok(u16::from_be_bytes(r))
+        }
+    }
 }
 
 /// The sensor's exposure as planned (ferros_cam ccs `Timing::plan`), inside its grouped-parameter hold, so the line, the frame and the integration land together at one frame's start (the main's G#0104 is one byte: the hold is 01 04 01 01, its release 01 04 00 01, Linux's per-frame block, camera-main-open-transfers.txt 771-778; the ultrawide's 8-bit registers take 01 04 01 and 01 04 00, the end of its captured init).
@@ -2036,7 +2083,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     }
     let refused = REFUSED.load(Ordering::Relaxed);
     say!(g, "camera: engine started (ring G#{ring_pa:X}, count A#{ring_n}, A#{slots} descriptors round which the index goes{}), receiver on (A#{rx_geom} of its words' geometry rewritten), A#{n} CPU writes (A#{cpu_geom} rewritten), A#{refused} refused\n", if ring_n == want { "" } else { ": the count did not hold the long ring asked for" });
-    // The lens at infinity where its calibration is known (ferros_cam cams `FocusCal`: the main, the ultrawide and the front, from the factory's AF calibration; docs/CAMERA.md "Focus calibration and the rear mosaics"), else about a metre on the main's measure (G#3800) where focus is offered; elsewhere it stays where it rests (the tele's lens is its OIS controller's, G#61, undecoded).
+    // The lens at infinity where its calibration is known (ferros_cam cams `FocusCal`: the main, the ultrawide and the front from the factory's AF calibration, the tele from Android's own; docs/CAMERA.md "Focus calibration and the rear mosaics", "The tele's focus from Android"), else about a metre on the main's measure (G#3800) where focus is offered; elsewhere it stays where it rests.
     // Until 2026-11-22 every lens opened at G#3800, about 750 codes past the front's infinity.
     let focus = if c.focus_cal.infinity != 0 { c.focus_cal.infinity } else if c.focus.1 != 0 { 0x3800 } else { 0 };
     // The sensor's frame timing, for exposures (ferros_cam ccs `Timing`): the mode's line and frame (the init's own where no mode was asked), and the integration's least and margin as the sensor answers them (CCS G#1004 and G#1006), read here, never assumed.

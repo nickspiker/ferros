@@ -196,17 +196,12 @@ mod tests {
             for f in ["facing", "mode", "width", "height", "cfa", "cfa_period", "frame_ns", "line_ps", "fll_least", "black", "white", "rotation", "exposure_min", "exposure_max", "readout", "gain_min", "gain_max", "focus_min", "focus_max"] {
                 assert!(s.uint(f).is_some(), "{} {f}", c.name);
             }
-            // The focus calibration: on the three cornerfolk lenses, infinity and the near point inside the travel, nearer larger, the travel reaching past infinity; none on the tele; no distance yet.
-            let (inf, near) = (s.uint("focus_infinity"), s.uint("focus_near"));
-            if c.id == 3 {
-                assert_eq!((inf, near), (None, None));
-            } else {
-                let (inf, near) = (inf.unwrap(), near.unwrap());
-                let (lo, hi) = (s.uint("focus_min").unwrap(), s.uint("focus_max").unwrap());
-                assert!(lo < inf && inf < near && near <= hi, "{}", c.name);
-                println!("{}: focus infinity G#{inf:04X}, near G#{near:04X}, travel G#{lo:04X} to G#{hi:04X}, past infinity G#{:04X}", c.name, inf - lo);
-            }
-            assert_eq!(s.uint("focus_near_mm"), None);
+            // The focus calibration on all four: infinity and the near point inside the travel, nearer larger, the cornerfolk lenses' travel reaching past infinity (the tele's offered span is Android's, infinity at its end); the near point's distance the HAL's (`cams::NEAR_MM`).
+            let (inf, near) = (s.uint("focus_infinity").unwrap(), s.uint("focus_near").unwrap());
+            let (lo, hi) = (s.uint("focus_min").unwrap(), s.uint("focus_max").unwrap());
+            assert!(lo <= inf && inf < near && near <= hi && (c.id == 3 || lo < inf), "{}", c.name);
+            assert_eq!(s.uint("focus_near_mm"), Some(cams::NEAR_MM[c.id as usize]), "{}", c.name);
+            println!("{}: focus infinity {inf}, near {near} at {} mm, travel {lo} to {hi}", c.name, cams::NEAR_MM[c.id as usize]);
             // The binned slit's measured shape on every Pro camera: its least rows, its least frame in ns and in lines, the longest integration that keeps it.
             let (rows, frame, lines, most) = (s.uint("slit_rows_least").unwrap(), s.uint("slit_frame_least_ns").unwrap(), s.uint("slit_lines_least").unwrap(), s.uint("slit_exposure_most_ns").unwrap());
             assert!(rows == c.slit_rows as u64 && frame == c.slit_frame_ns && most < frame && lines >= rows, "{}", c.name);
