@@ -15,9 +15,9 @@
 // arc.rs ── a payload's heap that grows (docs/NO-CEILINGS.md 0.3): trait Arc { base, size, grow, shrink } (SYS_ARC; `Kernel` with feature `process`)  struct ArcHeap<A> ::new(arc) (const) ::init(bss_end, input, input_len) ::add_region ::free_bytes ::free_blocks ::largest_free ::try_stats ::held ::grow_counts ::arc_size  impl GlobalAlloc (TLSF; grows the arc on a miss, gives its top back past a cushion)
 // layout.rs ── ferros_rt/src/layout.rs by path: heap_regions, grow_bytes, shrink_to (the one policy)
 //
-// kernel.rs ── the kernel's heap: struct LockedTlsf(SpinLock<State>) ::empty() (const) ::add(start, size) per region ::report() → Option<Report> ::last_fail() → Fail ::try_lock()/lock() → guard  impl GlobalAlloc (realloc in place first; a refused allocation recorded as a Fail, then null)
+// kernel.rs ── the kernel's heap: struct LockedTlsf { lock, grow } ::empty() (const) ::add(start, size) per region ::set_grow(fn(bytes) -> bool) the window's grower ::extend(start, end) at the window's top ::fits(layout) ::trim_begin(cushion, grain) / ::trim_end(block, cut) the window's free top given back ::top_free_bytes() ::report() → Option<Report> ::last_fail() → Fail ::try_lock()/lock() → guard  impl GlobalAlloc (realloc in place first; a miss asks the grower with the lock let go, then again; a refused allocation recorded as a Fail, then null)
 //   struct State ::levels(each(floor, blocks, bytes)) free space by size ::verify() the host tests' walk
-//   struct Report { region, regions, size, in_use, peak, free, free_blocks, largest, fails, last_fail }  struct Fail { size, align, caller, in_use, free, free_blocks, largest }
+//   struct Report { region, regions, window, size, grows, trimmed, in_use, peak, free, free_blocks, largest, fails, last_fail }  struct Fail { size, align, caller, in_use, free, free_blocks, largest }
 
 //! # ferros heap
 //!

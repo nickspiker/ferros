@@ -161,6 +161,9 @@ mod devsched;
 // The frame pool: the DRAM every arc is made of, in 2 MiB frames (frames.rs, ARCS.md).
 #[cfg(feature = "pixel8")]
 mod frames;
+// The kernel heap's window, grown from the frame pool (kheap.rs, docs/NO-CEILINGS.md step 4).
+#[cfg(feature = "pixel8")]
+mod kheap;
 // The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md). Compiled into the handoff build too, for the gate telemetry and marks the shared service reads.
 #[cfg(feature = "pixel8")]
 mod ready;
@@ -233,7 +236,7 @@ static ALLOC: BumpAlloc = BumpAlloc;
 // Both Pixel boot paths run the long-lived PT service (and the handoff the vault, whose commits do many alloc/free cycles); a leak-forever bump would exhaust the 4 MiB heap, so they get a freeing allocator: TLSF since 2026-11-12 (ferros_heap kernel.rs, ferros_rt's tlsf.rs), the first-fit free list before. The free list walked every free block under the lock at each alloc, and grew a Vec only by a new block and a copy; TLSF is a few bit operations whatever the free blocks, grows in place, and records a refused allocation for the panic report (`diag heap`).
 #[cfg(feature = "pixel8")]
 #[global_allocator]
-static KERNEL_HEAP: ferros_heap::kernel::LockedTlsf = ferros_heap::kernel::LockedTlsf::empty();
+pub(crate) static KERNEL_HEAP: ferros_heap::kernel::LockedTlsf = ferros_heap::kernel::LockedTlsf::empty();
 /// Whether the cache map is on, so the heap's second region can join (it must be normal memory: an allocation's unaligned copies fault on Device memory).
 static HEAP2_CACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HEAP2_JOINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -246,6 +249,8 @@ pub fn heap2_join() {
     }
     cachemap::heap2_prepare();
     unsafe { KERNEL_HEAP.add(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
+    // The window after it (docs/NO-CEILINGS.md 1, step 4), so the window is the heap's last region and grows as one.
+    kheap::open();
 }
 
 /// The kernel heap now (its regions, in use and peak, free bytes and blocks, the largest free block, refusals), for DIAG; None if the heap is busy.
@@ -263,13 +268,16 @@ pub fn heap_text() -> alloc::string::String {
     let Some(r) = KERNEL_HEAP.report() else {
         return alloc::string::String::from("kernel heap: busy, ask again\n");
     };
-    let mut s = alloc::format!("kernel heap: A#{} bytes in A#{} regions:", r.size, r.regions);
+    let mut s = alloc::format!("kernel heap: A#{} bytes in A#{} regions and the window:", r.size, r.regions);
     for &(a, b) in &r.region[..r.regions] {
         s.push_str(&alloc::format!(" G#{a:X}-G#{b:X} (A#{} KiB)", (b - a) >> 10));
     }
+    s.push('\n');
+    s.push_str(&kheap::report());
+    s.push_str(&alloc::format!("window growths A#{}, A#{} KiB given back since boot", r.grows, r.trimmed >> 10));
     s.push_str(&alloc::format!("\nin use A#{} bytes, peak A#{} since boot or `diag heap peak reset`\nfree A#{} bytes in A#{} blocks, the largest A#{}\n", r.in_use, r.peak, r.free, r.free_blocks, r.largest));
-    // Gathered on the stack under the heap's lock, written out after it: text allocates, and the lock is the allocator's own. One entry a first level of the lists (tlsf.rs: 28 of them).
-    let mut levels = [(0usize, 0usize, 0usize); 1 << 5];
+    // Gathered on the stack under the heap's lock, written out after it: text allocates, and the lock is the allocator's own. One entry a first level of the lists (tlsf.rs: 39 of them since docs/NO-CEILINGS.md step 3, so 2^6 entries).
+    let mut levels = [(0usize, 0usize, 0usize); 1 << 6];
     let mut n = 0;
     if let Some(h) = KERNEL_HEAP.try_lock() {
         h.levels(|floor, blocks, bytes| {

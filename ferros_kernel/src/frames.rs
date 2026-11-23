@@ -173,6 +173,18 @@ pub fn pa(f: usize) -> usize {
     panic!("frames: no frame G#{f:X}");
 }
 
+/// The frame at address `a` (its range's frames before it plus its place in it): `pa`'s inverse, for a mapping that kept only the address (kheap.rs). An address in no range is a bug in the caller: fail loud.
+pub fn of_pa(a: usize) -> usize {
+    let mut k = 0;
+    for &(lo, hi) in map() {
+        if a >= lo && a < hi {
+            return k + (a - lo) / FRAME;
+        }
+        k += (hi - lo) / FRAME;
+    }
+    panic!("frames: G#{a:X} is no frame");
+}
+
 /// Frame `f`'s level-3 table (the one `cachemap::map_slot` fills when the frame joins an arc).
 pub fn table(f: usize) -> usize {
     if pool().table_frames == 0 {

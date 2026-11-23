@@ -32,8 +32,8 @@ const RESOLVE: u8 = 10;
 const WATCH: u8 = 11;
 const ROOM: u8 = 14;
 
-/// The most of a write one SEND carries: a call carries 4096 bytes (process.rs SYS_CALL), less the op and the handle.
-pub const SEND_MAX: usize = (1 << 12) - 2;
+/// The most of a write one SEND carries: ip's request buffer (payloads/ip `MSG_MAX`, 2^16 since docs/NO-CEILINGS.md step 5, when a call came to carry its whole message), less the op and the handle. It was 4094, all of the 4096 bytes a call carried.
+pub const SEND_MAX: usize = (1 << 16) - 2;
 /// The most data one RECV reply carries: 2^18 bytes (ip's `RECV_MAX`, the kernel's largest reply), the state byte ahead of it.
 pub const RECV_MAX: usize = 1 << 18;
 /// The longest host name RESOLVE takes: 253 bytes (RFC 1035's 255 on the wire, less the first length byte and the root).
@@ -394,6 +394,7 @@ impl Conn {
         let _one = self.writing.lock();
         // WHY the min: a call carries SEND_MAX bytes of data; the caller writes the rest after.
         let n = buf.len().min(SEND_MAX);
+        // On the stack (this crate has no allocator of its own): 64 KiB of a std thread's 1 MiB (ferros_rt thread.rs `DEFAULT_STACK`).
         let mut req = [0u8; 2 + SEND_MAX];
         req[0] = SEND;
         req[1] = self.handle;

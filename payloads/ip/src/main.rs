@@ -195,7 +195,7 @@ struct Ip {
     kicks_at: usize,
     /// The WiFi driver exchanges frames in batches (`wlan` op 8; `wifi_up` asks): frames to it wait in `txb` (the op's header, then each frame's u16 BE length and bytes; `txn` bytes used) until the next exchange. False: a driver without op 8, one frame a call (ops 1 and 2).
     batch: bool,
-    txb: &'static mut [u8; MSG_MAX],
+    txb: &'static mut [u8; TX_MAX],
     txn: usize,
     /// The WiFi path's measures since the last connection report.
     path: Path,
@@ -635,8 +635,10 @@ const NO_WS_WIN: u32 = 65535;
 const MSS_MAX: usize = 1460;
 /// The data a TCP RECV reply carries at most: 2^18, the kernel's largest reply (process.rs SYS_REPLY: `STORE_MAX`, 256 KiB, plus 8 for a store's value), the state byte in front.
 const RECV_MAX: usize = 1 << 18;
-/// The largest request: 4096 bytes, all a call carries (process.rs SYS_CALL reads at most 4096).
-const MSG_MAX: usize = 1 << 12;
+/// The largest request: 64 KiB, a TCP SEND's data and its op and handle (ferros_rt tcp `SEND_MAX`). A call carries its whole message since docs/NO-CEILINGS.md step 5 (4096 bytes until then); a longer one is refused by the kernel, never cut, its caller answered ERR.
+const MSG_MAX: usize = 1 << 16;
+/// The frames batched for the WiFi driver's next exchange (`Ip::txb`): 4096 bytes, the driver's own request buffer (payloads/pcie1).
+const TX_MAX: usize = 1 << 12;
 /// The heap's ceiling in the image header (`ferros_sys::entry!(…, grows HEAP_CEILING)`): what the device holds (ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3; 32 MiB until then), in either mode (masked arcs grow by doubling). The connections' table (`TCPN`) is what bounds the blocks today.
 const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The heap the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`): 4 MiB, three blocks.
@@ -3650,8 +3652,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     static mut RD: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
     static mut WR: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
     static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
-    // The frames batched for the WiFi driver's next exchange (`Ip::txb`): a call carries 4096 bytes.
-    static mut TXB: [u8; MSG_MAX] = [0; MSG_MAX];
+    // The frames batched for the WiFi driver's next exchange (`Ip::txb`): the driver's request buffer, 4096 bytes.
+    static mut TXB: [u8; TX_MAX] = [0; TX_MAX];
     static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
     // The resolver's cache, lookups and held calls (`Dns`).
     static mut DNS: Dns = Dns { cache: ferros_dns::Cache::new(), asks: [ASK_FREE; RECN], rq: [RQ_FREE; RQN], rq_seq: 0, port: 0 };

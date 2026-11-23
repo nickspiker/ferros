@@ -130,6 +130,12 @@ pub fn heap2_prepare() {
 /// The kernel heap's second region (cold only): the window's top above the staging slot (STAGE G#8208_0000 + its 4 MiB, to the next 2 MiB) up to the display framebuffer. The first 12 MiB heap sits between the image and the arc pool and cannot grow; storing a 2.78 MB value needs a vault working set several times its size, and ran the heap out (2026-10-26).
 #[cfg(not(shim_handoff))]
 pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8300_0000);
+/// The end of the RELOAD/RUN staging slot (service.rs `Boot::stage`, the link base plus 32 MiB): the memory up to the heap's second region, where a kernel is staged for RELOAD's MMU-off copy and a RUN payload executes at EL2. A REAL bound of that memory (docs/NO-CEILINGS.md step 4): every other staged image lies in the kernel heap at its own length.
+#[cfg(not(shim_handoff))]
+pub const STAGE_END: usize = HEAP2.0;
+/// The handoff's slot (G#92A0_0000) ends where its frame pool begins.
+#[cfg(shim_handoff)]
+pub const STAGE_END: usize = POOL.0;
 #[cfg(shim_handoff)]
 const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
 /// The first range of the frame pool (frames.rs; until 2026-11-11 the page pool of arcs, EL0-accessible): kernel-only Normal memory now, reached by processes only through their windows (ARC_VA). A power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 16 MiB at G#8300_0000, the top of the window, taken from the heap's second region (2026-10-26: the 8 MiB at G#8100_0000 held four guarded 1 MiB arcs — display, map, WiFi, IP — and refused the fifth process; G#8100_0000-G#8180_0000 is free now). Was: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
@@ -847,6 +853,19 @@ pub fn sync_exec(va: usize, len: usize) {
 fn slot_entry(va: usize) -> &'static mut u64 {
     let l2 = slot_l2(va).expect("a window slot mapped without its tables (cachemap::tables_ready)");
     unsafe { &mut (*(l2 as *mut [u64; 512]))[(va >> 21) & 511] }
+}
+
+/// The kernel heap's window (kheap.rs): the 2 MiB block at `va` maps frame `pa` (Normal write-back, the kernel's alone, never executable: a frame's own mapping, `frame_block`), or nothing. Its tables were made at the window's opening (`tables_ready`). Call `mapped` after a growth, `surface_unmapped` after an unmapping.
+pub fn kheap_map(va: usize, pa: Option<usize>) {
+    *slot_entry(va) = match pa {
+        Some(pa) => frame_block(vhe(), pa),
+        None => 0,
+    };
+}
+
+/// The frame the kernel heap's window maps at `va` (`kheap_map`), by its address.
+pub fn kheap_pa(va: usize) -> usize {
+    (*slot_entry(va) & OA) as usize
 }
 
 /// The level-3 table mapped at window slot `va`, None while the slot is unmapped (or no table above it was ever made).

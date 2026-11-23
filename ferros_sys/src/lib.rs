@@ -17,6 +17,18 @@ pub const NOTHING: u64 = u64::MAX - 1;
 pub const RUNNING_ON: u64 = 1 << 62;
 /// OR'd into a `call`'s reply length: fail with ERR instead of waiting when no server is receiving on the endpoint (none alive, or one still bringing its device up and not yet receiving; now, or once its last server ends). Without it a call waits for a server, as across a restart (process.rs CALL_LIVE).
 pub const CALL_LIVE: u64 = 1 << 63;
+/// A message too long for the buffer it would land in (`recv_long`), or a reply too long for the caller's (`call_long`): this bit and the whole length (docs/NO-CEILINGS.md 1.0, owner decision 5: "too long", never a silent cut). Its top two bits are 01, so it is never ERR, NOTHING or a fault; `too_long` reads it.
+pub const TOO_LONG: u64 = 1 << 62;
+/// A call's reply length flag (x4 bit 61): tell this caller a reply longer than its buffer (`call_long`).
+pub const CALL_LONG: u64 = 1 << 61;
+/// A receive's flag (x4 bit 1): tell this server a message longer than its buffer (`recv_long`).
+pub const RECV_LONG: u64 = 1 << 1;
+
+/// The whole length when `r` (a `recv_long` or `call_long` answer) says "too long".
+#[inline(always)]
+pub const fn too_long(r: u64) -> Option<usize> {
+    if r >> 62 == 1 { Some((r & !TOO_LONG) as usize) } else { None }
+}
 
 /// Syscall numbers (x8).
 pub mod nr {
@@ -2289,6 +2301,7 @@ pub fn off<T: ?Sized>(p: *const T) -> u64 {
 }
 
 /// The token for grant `slot`, given the grants offset the kernel passed at entry (x0): the handle table in the page's first 512 bytes, then at 0x200 a u32 count, then 32-byte tokens; slot 0 is the console.
+/// A process with more grants than the first page holds (108 and the console) has its count and tokens on the pages after it, and the kernel passes the grants offset 0x200 short of them (docs/NO-CEILINGS.md step 5), so this is the same sum.
 #[inline(always)]
 pub fn cap(grants: u64, slot: u64) -> u64 {
     grants + 0x204 + 32 * slot
@@ -2304,14 +2317,28 @@ pub fn spawn_unique(grants: u64, name: &[u8], key: &[u8], slots: &[u64]) -> u64 
     spawn_with(grants, name, key, slots, 1)
 }
 
-/// The most slots a child can be handed in one spawn: the request, at 64 tokens of 32 bytes, stays inside the 4096 bytes the kernel reads of it.
-pub const SPAWN_SLOTS: usize = 64;
+/// The slots a spawn copies into its request (each slot's 32-byte token, as every kernel reads it); past this many the kernel reads the slot numbers where the caller holds them (x2 bit 6) and finds the tokens in the caller's own grants, so a spawn hands any number (docs/NO-CEILINGS.md step 5: the request was cut at 4096 bytes until then, which held 64).
+const SPAWN_COPIED: usize = 64;
 
 fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -> u64 {
-    let mut req = [0u8; 2 + 64 + 64 + 1 + SPAWN_SLOTS * 32];
-    // More slots than fit is the caller's bug, so it panics rather than dropping the rest: until 2026-11-04 this took the first 24 without a word, and the display server (25) lost its last, `panel-vddd`, whenever init started it; after a jump from a screen-off Android the panel then came up without VDDD and stayed black.
-    assert!(slots.len() <= SPAWN_SLOTS, "spawn: more slots than a request holds");
     let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len());
+    if n > SPAWN_COPIED {
+        // [name length][name][key length][key][the count, two bytes little-endian]; the slots themselves (u64 each) at x3, their count at x4.
+        let mut req = [0u8; 2 + 64 + 64 + 2];
+        let mut at = 0;
+        req[at] = nl as u8;
+        req[at + 1..at + 1 + nl].copy_from_slice(&name[..nl]);
+        at += 1 + nl;
+        req[at] = kl as u8;
+        req[at + 1..at + 1 + kl].copy_from_slice(&key[..kl]);
+        at += 1 + kl;
+        req[at..at + 2].copy_from_slice(&(n as u16).to_le_bytes());
+        at += 2;
+        // A count past two bytes is more grants than any page set the kernel builds: the caller's bug, loud.
+        assert!(n <= u16::MAX as usize, "spawn: more slots than a request counts");
+        return svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags | 64, off(slots.as_ptr()), n as u64);
+    }
+    let mut req = [0u8; 2 + 64 + 64 + 1 + SPAWN_COPIED * 32];
     let mut at = 0;
     req[at] = nl as u8;
     req[at + 1..at + 1 + nl].copy_from_slice(&name[..nl]);
@@ -2467,9 +2494,14 @@ pub fn exit(code: u64) -> ! {
     loop {}
 }
 
-/// Call an endpoint (or the console): `msg` goes to the server, its reply lands in `reply`; returns the reply length (ERR on a bad token).
+/// Call an endpoint (or the console): `msg` goes to the server whole, at any length (a kernel since docs/NO-CEILINGS.md step 5; before, its first 4096 bytes), its reply lands in `reply`; returns the reply length, ERR on a bad token, when the server's buffer is shorter than `msg` (the server never sees it cut; the console says so) or when the kernel cannot hold `msg`. A reply longer than `reply` is cut to it, as always: `call_long` says when.
 pub fn call(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
     svc(nr::CALL, cap, off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
+}
+
+/// `call` that says when the reply was longer than `reply`: `TOO_LONG` | its whole length (`too_long`), its first `reply.len()` bytes in `reply`. A kernel before docs/NO-CEILINGS.md step 5 ignores the flag and cuts it.
+pub fn call_long(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
+    svc(nr::CALL, cap, off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64 | CALL_LONG)
 }
 
 /// `call` that fails with ERR at once when no server is receiving on the endpoint (`CALL_LIVE`), instead of waiting for one: for a caller that must not hang on a driver that is down or still bringing its device up.
@@ -2478,8 +2510,14 @@ pub fn call_live(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
 }
 
 /// Receive on an endpoint: the message lands in `buf`, a single-use reply token in `token`; returns the message length. With `poll`, returns NOTHING at once when no message waits.
+/// A message longer than `buf` is refused by the kernel, never cut (docs/NO-CEILINGS.md step 5): its caller answered ERR, the console saying who sent how many bytes. For a server whose requests are all shorter than its buffer; one that takes longer ones receives with `recv_long`.
 pub fn recv(cap: u64, buf: &mut [u8], token: &mut [u8; 32], poll: bool) -> u64 {
     svc(nr::RECV, cap, off(buf.as_mut_ptr()), buf.len() as u64, off(token.as_mut_ptr()), poll as u64)
+}
+
+/// `recv` that is told a message longer than `buf`: `TOO_LONG` | its length (`too_long`), nothing received and no token; the message stays first in the queue for a receive with a buffer that holds it (a kernel since docs/NO-CEILINGS.md step 5; one before cut it to `buf`).
+pub fn recv_long(cap: u64, buf: &mut [u8], token: &mut [u8; 32], poll: bool) -> u64 {
+    svc(nr::RECV, cap, off(buf.as_mut_ptr()), buf.len() as u64, off(token.as_mut_ptr()), poll as u64 | RECV_LONG)
 }
 
 /// A new thread of this process: `entry(arg)` on `stack` (its top is the thread's SP; give it 16 KiB or more), runnable at once while the caller carries on. Threads share the arc and every capability; they are not addressable (KERNEL.md "Threads, interrupts and cores"). Returns 0 or ERR.

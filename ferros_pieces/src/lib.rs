@@ -47,6 +47,8 @@ pub enum Error<E> {
     Store(E),
     /// The manifest or a piece is not what it should be: unreadable, missing, the wrong length, or the whole not its hash.
     Corrupt(&'static str),
+    /// No memory for the whole value (`read_whole`): its length in bytes. The value is untouched; a refusal, never read as absent or corrupt (docs/NO-CEILINGS.md 1: the kernel answers "out of memory" where it panicked).
+    Memory(u64),
 }
 
 /// Where one name's manifest and pieces live.
@@ -252,7 +254,9 @@ pub fn read<S: Store>(s: &mut S, place: &Place, mut sink: impl FnMut(usize, &[u8
 /// The value read whole into one buffer of its length (one block of the heap, never two); None when `place` holds no value in pieces.
 pub fn read_whole<S: Store>(s: &mut S, place: &Place) -> Result<Option<Vec<u8>>, Error<S::Error>> {
     let Some(n) = len(s, place)? else { return Ok(None) };
-    let mut out = Vec::with_capacity(n as usize);
+    let mut out = Vec::new();
+    // The length is the stored value's, any size: a heap that cannot hold it answers that, rather than the allocation's panic.
+    out.try_reserve_exact(n as usize).map_err(|_| Error::Memory(n))?;
     match read(s, place, |_, b| out.extend_from_slice(b)) {
         Ok(_) => Ok(Some(out)),
         Err(e) => {

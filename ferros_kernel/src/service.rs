@@ -48,11 +48,6 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// The GPU came to its reset and was fenced to gpu-mem at this boot (pd.rs `gpu_fresh`, after a jump the crowbar), so the GPU service may start.
 static GPU_FRESH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Largest RELOAD/RUN image the staging slot takes.
-const STAGE_MAX: usize = 4 << 20;
-/// The largest value the vault takes (3 MiB). Until 2026-11-12 sealing a value and reading it back each needed about twice its size in one block of the kernel heap; since then a value over `ferros_pieces::PIECE` is sealed and stored a piece at a time and a restart streams it into a staging arc (`spawn_from_pieces`), but the readers that take a capsule whole (init's spawn through `read_capsule`, `store get`) still hold it in one block, and the gate's parse a second, so the bound stays. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault.
-pub const STORE_VALUE_MAX: usize = 3 << 20;
-
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
 const EXIT_REBOOT: u8 = 0xB0;
 const EXIT_FASTBOOT: u8 = 0xB3;
@@ -124,7 +119,7 @@ fn report(b: &Boot, exit: u8) {
     }
 }
 
-/// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open, 5 a value over STORE_VALUE_MAX.
+/// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open, 5 the kernel out of memory for the value (said on the console; until docs/NO-CEILINGS.md step 4 a value over 3 MiB, `STORE_VALUE_MAX`).
 /// Write [keylen:2 BE][key][value] -> [0][object hash:32]. Read [key] -> [0][value]; an empty key lists every key, '\n'-separated. Exec [key] -> remove -> [0] or [1].
 /// Under the vault's lock alone (2026-11-22, kernlock): the kernel lock was held across the whole transfer, 126 ms for a 1.6 MB `store get` on the Pro (`diag lock`, service.rs `store_command` under `with_lock` and `vault`), and a camera stream died behind it. Nothing here is the kernel lock's: the vault's blocks and its in-memory identity are the vault lock's to read (kvault `id` and `bound` are written under both locks, read under either, and a set, get or remove writes neither), `note_old_put` and `zone::table_stale` are atomics. The one piece of kernel state, a settings document applied to the preferences, is applied by the caller once the vault's lock is let go (`store_host`), as the kernel lock ranks above it.
 fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
@@ -147,11 +142,7 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 _ => return alloc::vec![3],
             };
             let len = params.len() - 2 - klen;
-            // A value larger than STORE_VALUE_MAX is refused (status 5): 4 and 5 MiB values ran the 22 MiB kernel heap out and panicked the kernel (2026-10-31), when a value was sealed and read whole (`STORE_VALUE_MAX` says what still holds it whole).
-            if len > STORE_VALUE_MAX {
-                crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes refused: over {STORE_VALUE_MAX}"));
-                return alloc::vec![5];
-            }
+            // Any size (docs/NO-CEILINGS.md step 4; 3 MiB until then, `STORE_VALUE_MAX`): a value past `ferros_pieces::PIECE` is sealed and written a piece at a time, so the heap holds a piece's work beside the value the command already carries.
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
             crate::process::note_old_put(&key);
             match store.set(&key, &params[2 + klen..]) {
@@ -193,10 +184,15 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 };
             }
             // The value read straight into the reply after its status byte: a value in pieces goes in a piece at a time, never whole in the heap twice.
+            // The reply sized to the value first (`pieces_len`), with this vault's lock let go: the heap's window grows only on a core holding no lock (kheap.rs), and the read itself runs under it.
             let mut r = alloc::vec![0u8];
             match store.get_into(&key, &mut r) {
                 Ok(true) => r,
                 Ok(false) => alloc::vec![1],
+                Err(crate::kvault::KvError::Memory(n)) => {
+                    crate::kheap::refused("a bridge store get", n as usize);
+                    alloc::vec![5]
+                }
                 Err(e) => {
                     crate::flashlog::line(&alloc::format!("store get {key:?} FAILED: {e:?}"));
                     let mut r = alloc::vec![2u8];
@@ -223,6 +219,14 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
 /// A host store command on the kernel's own vault (`store_command`) with the kernel lock let go across the vault's transfer, then a settings document it set applied to the preferences at once, as a change on the device does (SYS_SET_PREF): every live process sees it on its next frame. The apply takes the kernel lock itself (`settings::apply` with `held` false).
 /// Between the store and the apply a process's own preference change may land (its document written at its trap's end, `keep_settings`); the apply then puts the stored document's values over it in memory, as a later change would. A development door's race, said here.
 fn store_host(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
+    // A get of a value in pieces: room for it in the kernel heap before the vault's lock is taken (the window cannot grow under it, kheap.rs); a value kept whole is at most a piece.
+    if op == ferros_pt::Op::Read && !params.is_empty() {
+        if let (Some(s), Ok(key)) = (store.as_mut(), core::str::from_utf8(params)) {
+            if let Ok(Some(n)) = vault(|| s.pieces_len(key)) {
+                crate::kheap::room(n + 1);
+            }
+        }
+    }
     let resp = vault(|| store_command(store.as_mut(), op, params));
     // A status 0 on a write means `store_command` found its key inside the parameters (status 3 otherwise), so the key's length and the slices below are in range.
     if op == ferros_pt::Op::Write && resp.first() == Some(&0) {
@@ -252,7 +256,8 @@ enum VaultJob {
 }
 
 /// A bridge `store extent` read: params [G#FF][block u64 LE][blocks u32 LE][name], at most `EXTENT_PULL` blocks; [G#FE][name] its record. A name in a kist's own domain (a clip Lumis recorded): [G#FD][developer 32][option 32][block u64 LE][blocks u32 LE][name] and [G#FC][developer 32][option 32][name].
-const EXTENT_PULL: u64 = (STORE_VALUE_MAX >> 12) as u64;
+/// A piece, not a bound on the extent (docs/NO-CEILINGS.md step 4): one command's reply is built whole in the kernel's heap and goes out as one PT reply, and the bridge reads an extent of any length 768 blocks (3 MiB) a command.
+const EXTENT_PULL: u64 = 768;
 
 /// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
 const VAULT_PIECE: usize = crate::process::STORE_MAX;
@@ -302,7 +307,7 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
         ferros_pt::Op::Read if params.first() == Some(&0xFF) && params.len() > 13 => {
             let block = u64::from_le_bytes(params[1..9].try_into().ok()?);
             let n = u32::from_le_bytes(params[9..13].try_into().ok()?) as u64;
-            // WHY: the count is the host's; the reply is built whole in the kernel's heap, as a get's is (STORE_VALUE_MAX).
+            // WHY: the count is the host's, and one command's reply is built whole in the kernel's heap: a piece of the extent a command (`EXTENT_PULL`).
             if n == 0 || n > EXTENT_PULL {
                 return Some(Err(alloc::vec![5]));
             }
@@ -314,7 +319,7 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
             let info = params[0] == 0xFC;
             let (block, n, at) = if info { (0, 0, 65) } else { (u64::from_le_bytes(params.get(65..73)?.try_into().ok()?), u32::from_le_bytes(params.get(73..77)?.try_into().ok()?) as u64, 77) };
             let rel = params.get(at..)?;
-            // WHY: the count and the name are the host's: the reply is built whole in the kernel's heap (STORE_VALUE_MAX), and a name is a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
+            // WHY: the count and the name are the host's: one command's reply is built whole in the kernel's heap (a piece, `EXTENT_PULL`), and a name is a value's (printable ASCII up to 96 bytes), as a process's own call takes it.
             if (!info && (n == 0 || n > EXTENT_PULL)) || rel.is_empty() || rel.len() > 96 || !rel.iter().all(|&b| (0x21..0x7F).contains(&b)) {
                 return Some(Err(alloc::vec![5]));
             }
@@ -451,23 +456,22 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
         VaultJob::Get { full, got } => match value {
             NOTHING => return Some(store_host(store, ferros_pt::Op::Read, full.as_bytes())),
             ERR => return Some(alloc::vec![2]),
-            // The reply is built whole in the kernel's heap, and copied once more as it goes out: held to the limit the kernel's vault keeps for the same reason (STORE_VALUE_MAX).
-            whole if whole as usize > STORE_VALUE_MAX => return Some(alloc::vec![5]),
             whole => {
+                // The reply is built whole in the kernel's heap behind its status byte, the value's length the vault's (any size since docs/NO-CEILINGS.md step 4, where it was held to 3 MiB): room for it at the first piece (the service loop holds no lock, so the heap's window grows), or the refusal said and status 5.
                 if got.is_empty() {
-                    got.reserve_exact(whole as usize);
+                    match crate::kheap::vec_for("a bridge store get", whole as usize + 1) {
+                        Some(v) => *got = v,
+                        None => return Some(alloc::vec![5]),
+                    }
+                    got.push(0);
                 }
                 // A piece that brings nothing while the value is not whole would ask for the same piece for ever: the vault's error.
-                if bytes.is_empty() && (got.len() as u64) < whole {
+                if bytes.is_empty() && ((got.len() - 1) as u64) < whole {
                     return Some(alloc::vec![2]);
                 }
                 got.extend_from_slice(&bytes);
-                if got.len() as u64 >= whole {
-                    let mut r = alloc::vec::Vec::with_capacity(1 + got.len());
-                    r.push(0);
-                    r.extend_from_slice(got);
-                    got.fill(0);
-                    return Some(r);
+                if (got.len() - 1) as u64 >= whole {
+                    return Some(core::mem::take(got));
                 }
             }
         },
@@ -1036,8 +1040,17 @@ fn store_scoped_held(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::ve
             crate::process::note_old_put(key);
             st.set(key, v).map(|_| None).map_err(|_| ())
         }
-        None => st.get_by_key(key).map_err(|_| ()),
+        None => st.get_by_key(key).map_err(|e| {
+            if let crate::kvault::KvError::Memory(n) = e {
+                crate::kheap::refused("a store get", n as usize);
+            }
+        }),
     }
+}
+
+/// The length of the value under `key` when it is kept in pieces (process.rs `STORE_LEN`): what a whole read of it will take in the kernel heap, asked for before the read (kheap.rs `room`).
+fn store_len(key: &str) -> Option<usize> {
+    vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).and_then(|s| s.pieces_len(key).ok().flatten()))
 }
 
 /// The base of the device's vault domains (process.rs `domain_keys`, VAULT-OUT.md), from the ira, derived once.
@@ -1337,8 +1350,16 @@ fn store_addr_held(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) ->
 /// Holding the vault's lock; since 2026-11-18 SYS_SPAWN calls it with the kernel lock let go (process.rs `spawn_queued`).
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
+    // A capsule of any size (docs/NO-CEILINGS.md step 4): room for its whole read in the kernel heap first, where the window can grow (kheap.rs `room`: not under the vault's lock).
+    if let Some(n) = store_len(k) {
+        crate::kheap::room(n);
+    }
     match vault(|| unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut() }.map(|s| s.get_by_key(k)))? {
         Ok(v) => v,
+        Err(crate::kvault::KvError::Memory(n)) => {
+            crate::kheap::refused(&alloc::format!("reading the capsule {k:?}"), n as usize);
+            None
+        }
         // A read that failed is not an absent key: say which (2026-10-24, touch "not in the vault" at boot, found by a restart minutes later).
         Err(e) => {
             crate::flashlog::line(&alloc::format!("spawn: reading {k:?} failed: {e:?}"));
@@ -3159,6 +3180,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::SETTINGS_WRITE = Some(settings_write);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
+        crate::process::STORE_LEN = Some(store_len);
         // The last boot's end, if the panic reporter or the fault sink left a whole record of it (platform.rs `PANIC_RECORD`, `FAULT_RECORD`), into the flash log as a `kernel.panic` entry with typed fields: a reboot should never be silent, and a clean one says nothing.
         if let Some(p) = crate::platform::previous_panic() {
             let mut line = alloc::format!("the kernel panicked in b{} on core A#{} at {}:{}:{}: {} (last crumb G#{:X})", p.boot, p.core, p.file, p.line, p.column, p.message, p.crumb);
@@ -3259,6 +3281,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut reload_size = 0usize;
     let mut run_ok = false;
     let mut run_size = 0usize;
+    // RUN's staged image (SPAWN's and SEAL's too), in the kernel heap at its length.
+    let mut run_image: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     // A capsule streamed straight into its arc (the spawn Write pieces): the arc, the capsule's length, the bytes received, the code's offset and length inside it.
     let mut spawn_stage: Option<(crate::process::Arc, usize, usize, usize, usize)> = None;
     // `diag frames test`'s run so far: the next frame, frames tested, words wrong, frames with one wrong, the first wrong word's address.
@@ -3972,6 +3996,8 @@ pub fn run(mut b: Boot) -> ! {
         if now.wrapping_sub(t_boot) > 2 * cntfrq() {
             crate::heap2_join();
         }
+        // The kernel heap's window gives its free top back past its cushion (kheap.rs), holding no lock here.
+        crate::kheap::tend();
         platform::crumb(0xF4);
         crate::odpm::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs). After a jump at once, on the first pass: the jump is a killswitch, and a domain Android left on may hold a bus master still running Android's work (the GPU, a codec, the camera's chain, the TPU); its power cut stops it dead, through EL3 as every domain switch goes, where its S2MPU could not be touched safely (owner, 2026-11-04: "kill the rails").
@@ -6336,23 +6362,32 @@ pub fn run(mut b: Boot) -> ! {
                 // A development door: compiled out of a production build (its `open` check refuses it there anyway).
                 #[cfg(not(ferros_production))]
                 {
-                // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
+                // A kernel (RELOAD) is staged in the slot, write-verified against the source: the copy stub reads it there with the MMU off, so it must be physical memory outside the image it overwrites, and it must carry the ARM64 MZ header and fit below the heap of the image it replaces.
+                // Any other image (RUN's, which SPAWN and SEAL take too) is staged in the kernel heap at its length (docs/NO-CEILINGS.md step 4: `STAGE_MAX`'s 4 MiB went), refused with "kernel out of memory" when the heap cannot hold it; a RUN copies it into the slot only to execute it at EL2.
                 let params = cmd.params;
                 let is_kernel = params.len() > 0x1000 && params[..4] == [0x4D, 0x5A, 0x00, 0x91];
-                let fits = !params.is_empty() && params.len() <= STAGE_MAX && heap_end <= b.stage;
-                let ok_shape = if cmd.cap == cap_reload { is_kernel && fits } else { fits };
                 let mut ok = false;
-                if ok_shape {
-                    let src_hash = blake3::hash(params);
-                    unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), b.stage as *mut u8, params.len()) };
-                    let staged = unsafe { core::slice::from_raw_parts(b.stage as *const u8, params.len()) };
-                    ok = blake3::hash(staged) == src_hash;
+                if cmd.cap == cap_reload {
+                    // REAL: the slot is the physical memory from the stage up to the heap's second region (cachemap `STAGE_END`), all a MMU-off copy can read.
+                    if is_kernel && params.len() <= crate::cachemap::STAGE_END - b.stage && heap_end <= b.stage {
+                        let src_hash = blake3::hash(params);
+                        unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), b.stage as *mut u8, params.len()) };
+                        let staged = unsafe { core::slice::from_raw_parts(b.stage as *const u8, params.len()) };
+                        ok = blake3::hash(staged) == src_hash;
+                    }
+                } else if !params.is_empty() {
+                    if let Some(mut v) = crate::kheap::vec_for("a staged image", params.len()) {
+                        v.extend_from_slice(params);
+                        run_image = v;
+                        ok = true;
+                    }
                 }
                 let size = if ok { params.len() } else { 0 };
                 if cmd.cap == cap_reload {
                     reload_ok = ok;
                     reload_size = size;
                     run_ok = false;
+                    run_image = alloc::vec::Vec::new();
                 } else {
                     run_ok = ok;
                     run_size = size;
@@ -6452,7 +6487,7 @@ pub fn run(mut b: Boot) -> ! {
                 // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
                 let staged = spawn_stage.take();
                 if (run_ok && run_size > 0) || staged.is_some() {
-                    let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                    let code = &run_image[..run_size];
                     let pr = cmd.params;
                     let mut at = 0usize;
                     let mut take = |n: usize| { let s = &pr[at.min(pr.len())..(at + n).min(pr.len())]; at += n; s };
@@ -6521,7 +6556,7 @@ pub fn run(mut b: Boot) -> ! {
                 {
                 // Install the staged masked capsule: gate + checker once, then its seal joins the vault's `sealed` list (idempotent). Reply [0][seal] or ERR.
                 if run_ok && run_size > 0 {
-                    let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                    let capsule = &run_image[..run_size];
                     let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
                         (Ok(seal), Some(store)) => match vault(|| seal_add(store, &seal)) {
                             Ok(()) => {
@@ -6552,7 +6587,11 @@ pub fn run(mut b: Boot) -> ! {
                 #[cfg(not(ferros_production))]
                 {
                 // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.
-                if run_ok && run_size > 0 {
+                // REAL: the payload runs at EL2 from the slot, the one staging memory the kernel may execute (cachemap), so it must fit there (`STAGE_END`).
+                if run_ok && run_size > 0 && run_size > crate::cachemap::STAGE_END - b.stage {
+                    queue_pt_response(&mut pt_out_data, b"ERR:LARGER_THAN_THE_SLOT");
+                } else if run_ok && run_size > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(run_image.as_ptr(), b.stage as *mut u8, run_size) };
                     crate::cachemap::sync_code(b.stage, run_size);
                     let mut out = alloc::vec![0u8; 4096];
                     let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(b.stage) };

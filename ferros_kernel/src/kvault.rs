@@ -331,6 +331,8 @@ pub enum KvError {
     Pieces(&'static str),
     /// One of the vault's own values is not its document (`ferros_pieces::kv`): which. Never read as absent, so nothing is written over it.
     Document(&'static str),
+    /// No room in the kernel heap for a value of this many bytes (docs/NO-CEILINGS.md 1): a refusal, the value untouched.
+    Memory(u64),
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
@@ -342,6 +344,7 @@ impl From<ferros_pieces::Error<KvError>> for KvError {
         match e {
             ferros_pieces::Error::Store(e) => e,
             ferros_pieces::Error::Corrupt(why) => KvError::Pieces(why),
+            ferros_pieces::Error::Memory(n) => KvError::Memory(n),
         }
     }
 }
@@ -556,7 +559,11 @@ impl KVault {
             place.wipe();
             return n.map(|_| false).map_err(KvError::from);
         };
-        out.reserve_exact(n as usize);
+        // The length is the stored value's, any size: a heap that cannot hold it is answered, not a panic (docs/NO-CEILINGS.md 1).
+        if out.try_reserve_exact(n as usize).is_err() {
+            place.wipe();
+            return Err(KvError::Memory(n));
+        }
         let from = out.len();
         let r = ferros_pieces::read(&mut ps, &place, |_, b| out.extend_from_slice(b));
         place.wipe();

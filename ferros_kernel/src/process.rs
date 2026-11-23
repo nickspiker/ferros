@@ -4,8 +4,8 @@
 //!
 //! The syscall boundary is `svc #0` with the call number in x8 (all offsets are arc offsets, masked by the kernel; ERR = all ones):
 //! - 0 `exit(code)` — the process ends; its arc and capabilities cease to exist.
-//! - 1 `call(cap, msg, msg_len, reply, reply_cap)` — present a 32-byte token (at arc offset `cap`) holding the send right and send `msg`; the caller blocks until the reply is written at `reply` (at most `reply_cap` bytes); x0 = its length.
-//! - 2 `recv(cap, buf, buf_cap, reply_token, flags)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes). Flags bit 0 = poll: if nothing is queued, x0 = NOTHING (all ones but one) at once — for a server that also polls hardware.
+//! - 1 `call(cap, msg, msg_len, reply, reply_cap)`: present a 32-byte token (at arc offset `cap`) holding the send right and send `msg`, whole at any length (docs/NO-CEILINGS.md step 5; 4096 bytes until then), ERR when the kernel cannot hold it or the server's buffer is shorter and it did not ask to be told (`RECV_LONG`); the caller blocks until the reply is written at `reply` (at most `reply_cap` bytes); x0 = its length, or with `CALL_LONG` in `reply_cap` `TOO_LONG` | the reply's whole length when it was longer.
+//! - 2 `recv(cap, buf, buf_cap, reply_token, flags)`: wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes). Flags bit 1 = `RECV_LONG`: a message longer than `buf_cap` answers `TOO_LONG` | its length and stays queued for a receive that holds it (without it such a message is refused, its caller answered ERR, never cut). Flags bit 0 = poll: if nothing is queued, x0 = NOTHING (all ones but one) at once: for a server that also polls hardware.
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
 //! - 6 `entropy(cap, buf, len)` — present a token holding the entropy right; `len` bytes (at most 4096) of fresh randomness are written at `buf`, x0 = `len`. The stream is BLAKE3 keyed from this session's wairua (KOHI) over a kernel counter, so no two calls in a power session see the same bytes and nothing from a previous session repeats. ERR without a wairua: a driver that needs randomness (the WiFi firmware's RNG seed) gets none rather than a predictable one.
@@ -419,7 +419,7 @@ fn cur_set(t: Option<usize>) {
 }
 /// The profiler's view of what this core runs (prof.rs): the thread, its process's epoch, its image base and its arc, which the tick reads without the lock; and, while a run is on, the thread's names, kept once for the host.
 fn prof_note(c: usize, t: Option<usize>) {
-    let ctx = t.and_then(|t| proc_of(t).map(|p| crate::prof::Ctx { thread: t, epoch: p.epoch, base: p.arc.base + CODE, lo: p.arc.base, hi: p.arc.base + p.arc.size }));
+    let ctx = t.and_then(|t| proc_of(t).map(|p| crate::prof::Ctx { thread: t, epoch: p.epoch, base: p.arc.base + p.code_at, lo: p.arc.base, hi: p.arc.base + p.arc.size }));
     crate::prof::running(c, ctx);
     if let Some(x) = ctx {
         if crate::prof::on() && crate::prof::unseen(x.thread, x.epoch) {
@@ -429,7 +429,7 @@ fn prof_note(c: usize, t: Option<usize>) {
 }
 fn prof_keep(t: usize) {
     if let Some(p) = proc_of(t) {
-        crate::prof::seen(t, p.epoch, p.arc.base + CODE, &p.name, thread_name(t));
+        crate::prof::seen(t, p.epoch, p.arc.base + p.code_at, &p.name, thread_name(t));
     }
 }
 /// A profiler run starts (prof.rs, lock held): every thread alive now, named.
@@ -840,6 +840,21 @@ fn buddy_take(a: &mut Arcs, block: usize) -> Option<usize> {
         a.free[j].push(base + (1 << j));
     }
     Some(base)
+}
+
+/// A window of `block` bytes (a power of two) from the windows' space for the kernel's own use (kheap.rs: the kernel heap's window), None when no block that large is free. Under the kernel lock.
+pub fn window_take(block: usize) -> Option<usize> {
+    buddy_take(arcs(), block)
+}
+
+/// `window_take`'s window back. Under the kernel lock.
+pub fn window_give(base: usize, block: usize) {
+    buddy_give(base, block)
+}
+
+/// Whether this core holds the kernel lock now.
+pub fn lock_mine() -> bool {
+    HOLDER.load(core::sync::atomic::Ordering::Relaxed) == core() + 1
 }
 
 /// A free window of `block` bytes at `base` back to the windows' space, merged with its buddies while they are free.
@@ -1315,6 +1330,8 @@ struct Process {
     fast: alloc::boxed::Box<Grants>,
     /// The end of its image's code, an arc offset (CODE plus the checked text of a masked image, the whole image of a native one): a return address past it ends a frame walk (`frames`).
     text_end: usize,
+    /// Where its code starts in the arc: `CODE`, or past the pages its tokens took (`build_from`, docs/NO-CEILINGS.md step 5); everything below it is the kernel's, read-only.
+    code_at: usize,
     /// The panic it told the kernel of (SYS_PANIC), for its end (`death_line`); None until then.
     panicked: Option<alloc::boxed::Box<Panicked>>,
 }
@@ -1340,7 +1357,7 @@ const FRAMES: usize = ferros_ledger::death::FRAMES_MAX;
 /// - A return address outside the image's code (`text_end`) ends it: past it the records are not frame records, and what they hold is noise.
 fn frames(p: &Process, pc: u64, fp: u64) -> Vec<u64> {
     let base = p.arc.base as u64;
-    let code = CODE as u64..p.text_end as u64;
+    let code = p.code_at as u64..p.text_end as u64;
     let mut out = Vec::with_capacity(FRAMES);
     out.push(pc.wrapping_sub(base));
     let mut fp = fp;
@@ -1379,6 +1396,8 @@ fn thread_called(t: usize) -> Vec<u8> {
 struct Grants {
     /// Per grant slot (the cspace index, the token at `TOKENS + 4 + 32 * slot` in its grants page): the HARDWARE index plus one, 0 for a grant that is not a register block.
     hw: Vec<u8>,
+    /// Where its token count lies (an arc offset; the tokens follow it): `TOKENS` in the grants page, or the first page after it when they do not fit there (`build_from`).
+    tokens: usize,
     /// Set (SeqCst) when the process ends, before the kernel waits for any core still in a register access of it (`mmio_quiesce`).
     ended: core::sync::atomic::AtomicBool,
 }
@@ -1650,9 +1669,20 @@ fn thread_name(t: usize) -> Vec<u8> {
     n
 }
 
+/// A message this short is read as before, from the fixed part of the kernel heap with no room asked (`Process::message`): what every message was cut to until docs/NO-CEILINGS.md step 5.
+const MESSAGE_SMALL: usize = 1 << 12;
+/// A message (or a reply, for a caller that asked with `CALL_LONG`) longer than the buffer it would land in: x0 is this bit and the length (docs/NO-CEILINGS.md 1.0, owner decision 5: "too long", never a silent cut). The top two bits 01, so it is never ERR, NOTHING, PARKED or FAULT; lengths are under 2^47.
+pub const TOO_LONG: u64 = 1 << 62;
+/// Bit 1 of a receive's x4: tell this server a message too long for its buffer (x0 `TOO_LONG` | its length; it stays at the queue's head for a receive with a buffer that holds it). Without it (every server before docs/NO-CEILINGS.md step 5, and ferros_sys `recv`) such a message is refused: its caller answered ERR, the console told who and how long.
+const RECV_LONG: u64 = 1 << 1;
+/// Where a receiving thread's state keeps `RECV_LONG`: the buffer length's top bit (lengths are under 2^47).
+const RECEIVING_LONG: u64 = 1 << 63;
+/// Bit 61 of a call's reply length (x4): a reply longer than the caller's buffer is answered `TOO_LONG` | its length, its first bytes in the buffer (ferros_sys `call_long`); without it the reply is cut to the buffer as before.
+pub const CALL_LONG: u64 = 1 << 61;
+
 /// Whether `len` bytes at arc offset `off` touch the grants page ([0, CODE)): the kernel's, read-only to the process and to the kernel alike but while the kernel opens it for its own write.
-fn in_grants(off: u64, len: usize) -> bool {
-    len != 0 && off < CODE as u64
+fn in_grants(off: u64, len: usize, code_at: usize) -> bool {
+    len != 0 && off < code_at as u64
 }
 
 impl Process {
@@ -1696,7 +1726,7 @@ impl Process {
     }
     /// A buffer the kernel will touch later (a receive buffer, a reply buffer): resolved now, at the syscall that names it, so a bad one traps there and not inside another process's call.
     fn check(&self, off: u64, len: usize) {
-        if len != 0 && (self.span(off, len).is_none() || in_grants(off, len)) {
+        if len != 0 && (self.span(off, len).is_none() || in_grants(off, len, self.code_at)) {
             self.bad_buf(off, len, true);
         }
     }
@@ -1706,6 +1736,20 @@ impl Process {
         if b.is_none() {
             *b = Some(BufFault { epoch: self.epoch, off, len, write });
         }
+    }
+    /// A message the process sends (a call's, a spawn's or a stow's request): read at its full length (docs/NO-CEILINGS.md 1.0, step 5; until then at most 4096 bytes, the rest cut without a word), room for it in the kernel heap asked first (kheap.rs `room`; at a syscall's start, where no frames work is under way). None, said on the console as "kernel out of memory", when the heap cannot hold it; the caller answers ERR.
+    fn message(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        if len <= MESSAGE_SMALL {
+            return Some(self.read(off, len));
+        }
+        let mut v = crate::kheap::vec_for("a message", len)?;
+        v.resize(len, 0);
+        match self.span(off, len) {
+            // SAFETY: `span` resolved all `len` bytes inside this process's arc or one of its DMA regions; `v` holds `len`.
+            Some(a) => unsafe { core::ptr::copy_nonoverlapping(a as *const u8, v.as_mut_ptr(), len) },
+            None => self.bad_buf(off, len, false),
+        }
+        Some(v)
     }
     fn read(&self, off: u64, len: usize) -> Vec<u8> {
         if len == 0 {
@@ -1750,7 +1794,7 @@ impl Process {
             return;
         }
         // Never into the grants page (owner rule: a syscall buffer resolves or traps, 2026-11-08): it is read-only at every level, the kernel's write there faulted under its lock and reset the device (pcie1's console reply at G#A00, the 8a, 2026-11-09). The kernel's own writes there go by `write_grants`.
-        if in_grants(off, bytes.len()) {
+        if in_grants(off, bytes.len(), self.code_at) {
             self.bad_buf(off, bytes.len(), true);
             return;
         }
@@ -3010,7 +3054,7 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
             // At the first free pair past the slots the build wrote (the page's token count): for a process that opens one view, its grant count, which it knows from its own layout. Not the capability's place in `cspace`, which a server's reply capabilities move.
             // WHY the bound: the table holds `(TOKENS - HANDLES) / 16` pairs; a view opened with none free still serves native readers and the waits, and has no handle.
             // SAFETY: the grants page is the arc's first page, the kernel's to read at its own address; the count and the pairs are words the kernel wrote.
-            let built = unsafe { core::ptr::read_volatile((p.arc.base + TOKENS) as *const u32) } as usize;
+            let built = unsafe { core::ptr::read_volatile((p.arc.base + p.fast.tokens) as *const u32) } as usize;
             let free = (built..(TOKENS - HANDLES) / 16).find(|&s| unsafe { core::ptr::read_volatile((p.arc.base + HANDLES + 16 * s) as *const u64) } == 0);
             if let Some(slot) = free {
                 let (b, m) = handle_of(Object::Dma(vi));
@@ -4568,6 +4612,8 @@ const SESSION_ROOT_CONTEXT: &str = "ferros 2026-11-14 process session root";
 const KIST_DOMAIN_PREFIX: &[u8] = b"kist\0";
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
+/// The length of a value the kernel's vault keeps in pieces, by name (service.rs `store_len`): room for its whole read asked first (kheap.rs `room`, docs/NO-CEILINGS.md step 4).
+pub static mut STORE_LEN: Option<fn(&str) -> Option<usize>> = None;
 /// Delete a key (true when it was there) and list every key of the vault (full names): what a std process's vault needs beyond get and set (kete on ferros, STD-TARGET.md).
 pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
 pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
@@ -4768,7 +4814,7 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
         f.x[0] = ERR;
         return 0;
     };
-    p.check(roff, (rcap & !(CALL_LIVE | STORE_REPLY)) as usize);
+    p.check(roff, (rcap & !(CALL_LIVE | STORE_REPLY | CALL_LONG)) as usize);
     // Blocked on another process: the watchdog's clock paused for the thread that pets (that process answers for its own hang).
     if cur == p.pet_thread {
         p.paused_at = crate::platform::cntpct();
@@ -5677,7 +5723,7 @@ fn buf_trap(f: &mut Frame, cur: usize, pi: usize, r: u64, b: BufFault, nr: u64, 
         nr,
         op,
         if b.write { "was to be written into" } else { "named to be read" },
-        if b.write && in_grants(b.off, b.len) { "in its grants page, read-only (the kernel's: tokens, preferences)" } else { "that is neither in its arc nor in a region it holds" },
+        if b.write && in_grants(b.off, b.len, p.code_at) { "in its grants page, read-only (the kernel's: tokens, preferences)" } else { "that is neither in its arc nor in a region it holds" },
         b.off,
         base.wrapping_add(b.off),
         b.len,
@@ -5794,18 +5840,29 @@ pub const PARKED: u64 = 0xB10C << 48;
 /// Copy the head of an endpoint's queue into a server waiting in recv: message into its buffer, a fresh single-use reply token into its arc and cspace, x0 = message length. The server becomes runnable.
 fn deliver(server: usize, ep: usize, handoff: bool) {
     let kk = k();
-    let Some((caller, mut msg)) = kk.endpoints[ep].queue.pop_front() else { return };
     let Some(st) = th(server) else { return };
     let Some(sp) = proc_of(server) else { return };
     let State::Receiving(_, buf, cap, tok_off) = st.state else { return };
-    let n = msg.len().min(cap as usize);
-    sp.write(buf, &msg[..n]);
-    // Wiped once delivered: a forwarded store call carries domain keys (`store_forward`), which must not outlive it in the kernel's heap.
-    msg.fill(0);
-    let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
-    sp.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
-    sp.write(tok_off, &token);
-    st.frame.x[0] = n as u64;
+    let (long, cap) = (cap & RECEIVING_LONG != 0, (cap & !RECEIVING_LONG) as usize);
+    // A message longer than the server's buffer is never cut (docs/NO-CEILINGS.md 1.0, owner decision 5): a server that asked (`RECV_LONG`) is told its length and receives it again with a buffer that holds it; any other refuses it, its caller answered ERR and the console told.
+    while kk.endpoints[ep].queue.front().is_some_and(|q| q.1.len() > cap) && !long {
+        let (caller, mut msg) = kk.endpoints[ep].queue.pop_front().unwrap();
+        refuse_long(caller, &sp.name, msg.len(), cap);
+        crate::keys::wipe_to_dram(&mut msg);
+    }
+    let Some(len) = kk.endpoints[ep].queue.front().map(|q| q.1.len()) else { return };
+    if len > cap {
+        st.frame.x[0] = TOO_LONG | len as u64;
+    } else {
+        let (caller, mut msg) = kk.endpoints[ep].queue.pop_front().unwrap();
+        sp.write(buf, &msg);
+        // Wiped once delivered: a forwarded store call carries domain keys (`store_forward`), which must not outlive it in the kernel's heap.
+        msg.fill(0);
+        let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
+        sp.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
+        sp.write(tok_off, &token);
+        st.frame.x[0] = len as u64;
+    }
     st.state = State::Runnable;
     // The caller is about to block, and the server it woke is the thread to run now (a direct hand-off, on this core); the kernel's own call wakes it to the front. A server taking its own queue's head in recv is already this core's: not a wake to measure.
     if server == cur_get().unwrap_or(usize::MAX) {
@@ -5818,6 +5875,28 @@ fn deliver(server: usize, ep: usize, handoff: bool) {
         enqueue_woken(server, WAKE_CALL);
     }
     tr(TR_DELIVER, server, ep as u64);
+}
+
+/// A message too long for a server's buffer, refused (`deliver`): its caller answered ERR (the kernel's own call, its answer an error), and the console says who sent how much to whom.
+fn refuse_long(caller: usize, server: &[u8], len: usize, cap: usize) {
+    let who = if caller == KERNEL_CALLER {
+        kernel_answered(Err(()));
+        alloc::string::String::from("the kernel")
+    } else {
+        let name = proc_of(caller).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned()).unwrap_or_default();
+        if let Some(ct) = th(caller) {
+            if matches!(ct.state, State::Calling(..)) {
+                ct.frame.x[0] = ERR;
+                ct.state = State::Runnable;
+                enqueue_back(caller);
+            }
+        }
+        name
+    };
+    let line = alloc::format!("kernel: {who} called {} with A#{len} bytes, past its A#{cap}-byte receive buffer: refused, never cut\n", alloc::string::String::from_utf8_lossy(server));
+    k().console.extend_from_slice(line.as_bytes());
+    crate::platform::pstore(line.as_bytes());
+    crate::flashlog::line(line.trim_end());
 }
 
 /// Take the next runnable process (if any) and make it the one the trap returns into.
@@ -5875,7 +5954,7 @@ fn mmio_fast(f: &Frame) -> Option<u64> {
     // SAFETY: see above: P's box, alive while T is current on this core.
     let g = unsafe { &*g };
     // The slot the token was presented from. WHY the checks: the offset is the process's; one not on a slot of its grants page (below it, between two tokens, past its grants) is the locked path's to answer. Below the slots wraps to a huge number and fails the length test with the rest.
-    let at = f.x[0].wrapping_sub((TOKENS + 4) as u64);
+    let at = f.x[0].wrapping_sub((g.tokens + 4) as u64);
     let slot = (at >> 5) as usize;
     if at & 31 != 0 || slot >= g.hw.len() || g.hw[slot] == 0 {
         return None;
@@ -6537,7 +6616,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     key.extend_from_slice(&rel);
                     let addr: [u8; 32] = if raw && rel.len() == 32 { rel[..].try_into().unwrap() } else { [0; 32] };
                     let name = alloc::string::String::from_utf8(key.clone()).unwrap_or_default();
-                    let fetch = |op: AddrOp| -> Result<Option<Vec<u8>>, ()> { if raw { store_addr(sc.prefix, &addr, op) } else { match op { AddrOp::Get => store(&name, None), AddrOp::Set(v) => store(&name, Some(v)), _ => Err(()) } } };
+                    // A whole read of a named value in pieces: room for it in the kernel heap first, here at the syscall's start (kheap.rs `room`); the read itself runs under the vault's lock, where the heap cannot grow.
+                    let fetch = |op: AddrOp| -> Result<Option<Vec<u8>>, ()> {
+                        if raw {
+                            store_addr(sc.prefix, &addr, op)
+                        } else {
+                            match op {
+                                AddrOp::Get => {
+                                    if let Some(n) = unsafe { STORE_LEN }.and_then(|l| l(&name)) {
+                                        crate::kheap::room(n);
+                                    }
+                                    store(&name, None)
+                                }
+                                AddrOp::Set(v) => store(&name, Some(v)),
+                                _ => Err(()),
+                            }
+                        }
+                    };
                     let cache = unsafe { &mut *(&raw mut STORE_CACHE) };
                     // A listing or a large value is served piecewise from here: fetched once, kept until its last piece is read.
                     let serve = |cache: &mut Option<(Vec<u8>, Vec<u8>)>, p: &Process, at: usize, absent: u64| -> u64 {
@@ -6586,15 +6681,25 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else if set {
                         *cache = None;
                         let piece = p.read(f.x[4], len);
-                        // A value past the vault's limit (service.rs STORE_VALUE_MAX: the seal and the read-back each need about twice it in one piece of the kernel heap) is refused, its stage dropped, before it grows the heap.
-                        if at.unwrap_or(0) + piece.len() > crate::service::STORE_VALUE_MAX {
-                            unsafe { *(&raw mut STORE_STAGE) = None };
+                        // The staged value grows to its length, any size since docs/NO-CEILINGS.md step 4 (3 MiB until then, service.rs `STORE_VALUE_MAX`): the stage grows in the kernel heap's window (room asked here, at the syscall's start, kheap.rs), and a stage the heap cannot hold is refused, said on the console, and dropped. The value is sealed a piece at a time (kvault `set`), so storing it needs a piece's work beside the stage.
+                        let stage = unsafe { &mut *(&raw mut STORE_STAGE) };
+                        let fits = match at {
+                            Some(at) => {
+                                if stage.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                                    *stage = Some((key.clone(), Vec::new()));
+                                }
+                                let buf = &mut stage.as_mut().unwrap().1;
+                                // PROOF of no overflow: `at` is bits 32-63 of x1 and the piece at most STORE_MAX, so the sum is under 2^33.
+                                let need = at + piece.len();
+                                need <= buf.len() || (crate::kheap::room(need) && buf.try_reserve_exact(need - buf.len()).is_ok())
+                            }
+                            None => true,
+                        };
+                        if !fits {
+                            crate::kheap::refused("a store set's stage", at.unwrap_or(0) + piece.len());
+                            *stage = None;
                             ERR
                         } else if let Some(at) = at {
-                            let stage = unsafe { &mut *(&raw mut STORE_STAGE) };
-                            if stage.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-                                *stage = Some((key.clone(), Vec::new()));
-                            }
                             let buf = &mut stage.as_mut().unwrap().1;
                             if buf.len() < at + piece.len() {
                                 buf.resize(at + piece.len(), 0);
@@ -7622,23 +7727,49 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         // Stow mode (x2 bit 3): a kist the stower stored, read, checked and sealed by the service loop (`stow_request`).
         SYS_SPAWN if f.x[2] & 8 != 0 => {
-            f.x[0] = stow_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 16 != 0);
+            let Some(req) = p.message(f.x[0], f.x[1] as usize) else {
+                f.x[0] = ERR;
+                return 0;
+            };
+            f.x[0] = stow_request(p, pi, &req, f.x[2] & 16 != 0);
             0
         }
         SYS_SPAWN if f.x[2] & 2 != 0 => {
-            f.x[0] = kist_request(p, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 4 != 0, f.x[2] & 32 != 0);
+            let Some(req) = p.message(f.x[0], f.x[1] as usize) else {
+                f.x[0] = ERR;
+                return 0;
+            };
+            f.x[0] = kist_request(p, &req, f.x[2] & 4 != 0, f.x[2] & 32 != 0);
             0
         }
         SYS_SPAWN => {
             // Parse [name len][name][key len][key][n][n tokens] from the caller's arc and resolve each token in the caller's own table: a child gets only what its parent holds, at the same rights, and never a reply.
-            let req = p.read(f.x[0], (f.x[1] as usize).min(4096));
+            // At its full length (docs/NO-CEILINGS.md step 5: 64 slots of 32 bytes fit the 4096 bytes read until then, ferros_sys `SPAWN_SLOTS`).
+            let Some(req) = p.message(f.x[0], f.x[1] as usize) else {
+                f.x[0] = ERR;
+                return 0;
+            };
             let mut at = 0usize;
             let mut take = |n: usize| -> Vec<u8> { let s = req[at.min(req.len())..(at + n).min(req.len())].to_vec(); at += n; s };
             let nl = take(1).first().copied().unwrap_or(0) as usize;
             let name = take(nl);
             let kl = take(1).first().copied().unwrap_or(0) as usize;
             let key = take(kl);
-            let n = take(1).first().copied().unwrap_or(0) as usize;
+            // The slots: n tokens copied into the request after a byte's count (every caller before docs/NO-CEILINGS.md step 5, and ferros_sys for up to 64); or with x2 bit 6 a count of two bytes (little-endian) and the slot numbers themselves where the caller holds them (x3, u64 each, x4 of them), each slot's token then the one the kernel wrote into the caller's own grants: the same proof (a process names only its own slots), any number of them.
+            let wide = f.x[2] & 64 != 0;
+            let n = if wide { take(2).iter().rev().fold(0usize, |a, &b| a << 8 | b as usize) } else { take(1).first().copied().unwrap_or(0) as usize };
+            let slots = if wide {
+                // WHY the check: the count and x4 are the caller's; they must agree, or the slots list is not the one the request counts.
+                let Some(list) = (f.x[4] as usize == n).then(|| p.message(f.x[3], 8 * n)).flatten() else {
+                    f.x[0] = ERR;
+                    return 0;
+                };
+                list
+            } else {
+                Vec::new()
+            };
+            // A slot's place in the caller's table: its grants are the first entries of its cspace, in slot order, for good (only reply tokens enter and leave after them, `mmio_fast` reads them the same way).
+            let grants_n = p.fast.hw.len();
             let mut objects = Vec::new();
             // Where the whole surfaces region was passed: (place in `objects`, its index in `DMA`).
             let mut whole: Vec<(usize, usize)> = Vec::new();
@@ -7646,8 +7777,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
             // Which of the request's tokens was refused first, for the console line (2026-11-05: init's 104th slot onward).
             let mut bad_at = usize::MAX;
             for j in 0..n {
-                let tok = take(32);
-                match p.lookup(&tok).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                let found = if wide {
+                    let slot = u64::from_le_bytes(slots[8 * j..8 * j + 8].try_into().unwrap()) as usize;
+                    // WHY the bound: the slot is the caller's word; past its grants it names nothing it was given. An empty slot (a want said no to, its token zeros) is no grant, as its zeros look up to nothing.
+                    (slot < grants_n && p.cspace[slot].object != Object::Empty).then_some(slot)
+                } else {
+                    p.lookup(&take(32))
+                };
+                match found.map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                     Some((Object::Reply(_), _)) | Some((Object::Console, _)) | None => {
                         bad = true;
                         bad_at = bad_at.min(j);
@@ -7758,8 +7895,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
-                    // The text read where it lies in the process's memory, with no copy on the heap: a console write never allocates, never fails and never waits (2026-11-14).
-                    let len = (f.x[2] as usize).min(4096);
+                    // The text read where it lies in the process's memory, with no copy on the heap: a console write never allocates, never fails and never waits (2026-11-14). At its length (docs/NO-CEILINGS.md step 5; 4096 bytes until then, the rest cut without a word): the ring keeps what it holds.
+                    let len = f.x[2] as usize;
+                    // A line for the flash log is copied there: room for it first, here at the syscall's start (kheap.rs).
+                    if f.x[4] & CONSOLE_FLASH != 0 && len > MESSAGE_SMALL {
+                        crate::kheap::room(len);
+                    }
                     let msg: &[u8] = match p.view(f.x[1], len) {
                         // SAFETY: `view` resolved all `len` bytes inside this process's arc or one of its DMA regions, identity-mapped and the kernel's to read; the slice lives only for this write, under the kernel lock, while the process's record (its line state) is updated beside it.
                         Some(m) => unsafe { core::slice::from_raw_parts(m.as_ptr(), m.len()) },
@@ -7806,7 +7947,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // Read with the kernel lock let go (2026-11-18): a 1 MiB chunk of the modem's firmware is UFS commands and an ext4 walk, milliseconds every other core waited out while the modem driver read its 98 MB.
                 // The open file is the partition reader's own lock's (`PART`); the request was copied out before and the reply goes into the caller's memory only once the kernel lock is back (`unlocked`).
                 Some((Object::Part(i), r)) if r & RIGHT_SEND != 0 => {
-                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    let Some(msg) = p.message(f.x[1], f.x[2] as usize) else {
+                        f.x[0] = ERR;
+                        return 0;
+                    };
                     let cap = (f.x[4] & !CALL_LIVE) as usize;
                     let reply = unlocked(|| PART.with(|| crate::partfs::part_call(PARTS[i], &msg, cap)));
                     let n = reply.len().min(cap);
@@ -7829,7 +7973,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
-                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    // At its full length (docs/NO-CEILINGS.md step 5), or ERR when the kernel heap cannot hold it.
+                    let Some(msg) = p.message(f.x[1], f.x[2] as usize) else {
+                        f.x[0] = ERR;
+                        return 0;
+                    };
                     // A caller cannot ask for a store reply's decoding (bit 62): only `store_forward` sets it.
                     call_endpoint(f, cur, ep, msg, f.x[3], f.x[4] & !(CALL_LIVE | STORE_REPLY))
                 }
@@ -7861,11 +8009,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 => {
-                    t.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
+                    t.state = State::Receiving(ep, f.x[1], f.x[2] | if f.x[4] & RECV_LONG != 0 { RECEIVING_LONG } else { 0 }, f.x[3]);
                     t.frame = *f;
                     tr(TR_RECV_BLOCK, cur, ep as u64);
                     if !kk.endpoints[ep].queue.is_empty() {
                         deliver(cur, ep, true);
+                    }
+                    // A poll whose queue held only messages refused as too long (`deliver`): nothing waits now, so NOTHING at once, as for an empty queue.
+                    if f.x[4] & 1 != 0 && matches!(t.state, State::Receiving(..)) {
+                        t.state = State::Running;
+                        kk.endpoints[ep].poller = Some(cur);
+                        f.x[0] = NOTHING;
+                        return 0;
                     }
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
@@ -7919,11 +8074,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_INPUT => {
+            // As much as the caller's buffer holds of what is left, written from the input where it lies (docs/NO-CEILINGS.md step 5: 4096 bytes a call until then). WHY the min: both lengths are the caller's and the input's.
             let off = f.x[0] as usize;
-            let len = (f.x[2] as usize).min(4096);
-            let slice: Vec<u8> = p.input.get(off..).map(|t| t[..len.min(t.len())].to_vec()).unwrap_or_default();
-            p.write(f.x[1], &slice);
-            f.x[0] = slice.len() as u64;
+            let rest: &[u8] = p.input.get(off..).unwrap_or(&[]);
+            let n = (f.x[2] as usize).min(rest.len());
+            p.write(f.x[1], &rest[..n]);
+            f.x[0] = n as u64;
             0
         }
         SYS_DMA => {
@@ -7997,6 +8153,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         kernel_answered(Ok(p.read(f.x[1], (f.x[2] as usize).min(STORE_GET_MAX + 8))));
                     } else if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
                         if let State::Calling(roff, rcap) = ct.state {
+                            // A caller that asked (`CALL_LONG`) is told a reply longer than its buffer, its length with `TOO_LONG`; any other gets what fits, as before.
+                            let (long, rcap) = (rcap & CALL_LONG != 0, rcap & !CALL_LONG);
+                            let told = |n: usize, whole: usize| if long && n < whole { TOO_LONG | whole as u64 } else { n as u64 };
                             if rcap & STORE_REPLY != 0 {
                                 // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for (a get up to STORE_GET_MAX), copied from the vault process's buffer straight into the caller's: until 2026-11-11 each quarter MiB went thru a zeroed heap vector first, three passes over every byte of a 24 MB read under the kernel lock. WHY the checks: the reply is the vault process's, its length its own; shorter than the value it carries nothing, and the caller is refused.
                                 let len = (f.x[2] as usize).min(STORE_GET_MAX + 8);
@@ -8027,7 +8186,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 match p.view(f.x[1], n) {
                                     Some(msg) => {
                                         cp.write(roff, msg);
-                                        ct.frame.x[0] = n as u64;
+                                        ct.frame.x[0] = told(n, f.x[2] as usize);
                                     }
                                     None => ct.frame.x[0] = ERR,
                                 }
@@ -8035,7 +8194,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 let msg = p.read(f.x[1], len);
                                 let n = msg.len().min(rcap as usize);
                                 cp.write(roff, &msg[..n]);
-                                ct.frame.x[0] = n as u64;
+                                ct.frame.x[0] = told(n, msg.len());
                             }
                             ct.state = State::Runnable;
                             kk.ipc_round_trips += 1;
@@ -8847,13 +9006,13 @@ fn frames_text(frames: &[u64]) -> alloc::string::String {
 /// A death by a fault or a panic is also one line on the console, and on the glass when no display serves to show anything else (the display itself the one that died, or never up), written there straight (glass.rs `notice`; owner, 2026-11-17: when things go south, say so on the glass): the message and where for a panic, ESR, FAR and the PC for a fault; the frames on a second console line, for `ferros-bridge deaths` to name.
 /// While a display serves, the glass is its own: a line written under it would stay in the phases its compose-once marks say hold only the background.
 /// Under the kernel lock (the flash log's entry is written once this core lets it go, flashlog.rs `deferred`); a death is rare, never the hot path.
-fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxed::Box<Panicked>>) {
+fn death_line(name: &[u8], value: u64, last: &[u8], panicked: Option<alloc::boxed::Box<Panicked>>, code_at: usize) {
     use ferros_ledger::death::{Death, END_EXIT, END_FAULT, END_PANIC};
     let who = core::str::from_utf8(name).unwrap_or("?");
     let text = |b: &[u8]| alloc::string::String::from_utf8_lossy(b).trim_end().into();
     let last_words: alloc::string::String = text(last);
     let fault = unsafe { (*(&raw mut LAST_FAULT)).take() };
-    let mut d = Death { end: END_EXIT, exit: Some(value), code: Some(CODE as u64), last_words: (!last_words.is_empty()).then(|| last_words.clone()), ..Death::default() };
+    let mut d = Death { end: END_EXIT, exit: Some(value), code: Some(code_at as u64), last_words: (!last_words.is_empty()).then(|| last_words.clone()), ..Death::default() };
     // The line said once, its numbers typed (glass.rs `Note`): the console and the flash log get it in `A#`/`G#`, the glass in the device's base.
     use ferros_glass::{Num, Say};
     let mut note = crate::glass::Note::words(who);
@@ -8995,8 +9154,9 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         // The end in the flash log, whole (`death_line`): its exit value and last line, and a panic's or a fault's report as typed fields. Said under the kernel lock, written once this core lets it go (flashlog.rs `deferred`).
         let last = p.words.clone();
         let panicked = p.panicked.take();
+        let code_at = p.code_at;
         vault_ended(p, value);
-        death_line(&name, value, &last, panicked);
+        death_line(&name, value, &last, panicked, code_at);
         // A kept process dead by a panic or a fault: started again (`crash_answer`), after its death is said above.
         crash_answer(&name, value);
         if elsewhere {
@@ -9242,6 +9402,17 @@ pub fn push_console(bytes: &[u8]) {
     crate::platform::pstore(bytes);
     unlock();
     console_flashlog(bytes);
+}
+
+/// `push_console` whether or not this core holds the kernel lock (a refusal said from inside a syscall or from the service loop).
+pub fn push_console_any(bytes: &[u8]) {
+    if lock_mine() {
+        k().console.extend_from_slice(bytes);
+        crate::platform::pstore(bytes);
+        console_flashlog(bytes);
+    } else {
+        push_console(bytes);
+    }
 }
 
 /// akita: the RAM log does not survive its resets, so the kernel's console lines and a boot-time spawn's first slice go to the flash log too (in the ferros partition, board.rs).
@@ -10414,7 +10585,7 @@ fn arc_for(code: &[u8], inline: usize, masked: bool, fixed: u32) -> Result<Arc, 
 }
 
 /// The process in an arc that already holds its code at the code offset (`spawn` and `spawn_build` copied it, with the kernel lock let go; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
-fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, bti: bool) -> Result<(usize, Arc, usize), &'static str> {
+fn build_from(name: &[u8], mut arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, bti: bool) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     if !has_image_header(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len.min(56)) }) {
         return Err("spawn: the image has no header (ferros_sys::entry!), so its .bss is unknown");
@@ -10425,6 +10596,13 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     if floor < arc.base + CODE + code_len + tail + input.len() {
         return Err("spawn: no room for the stack's guard page above the image");
     }
+    // The process keeps its input for `SYS_INPUT` (any length since docs/NO-CEILINGS.md step 5): room for it asked here, before anything is made, and a refusal said rather than the allocator's panic.
+    let mut kept_input = Vec::new();
+    if !input.is_empty() && !(crate::kheap::room(input.len()) && kept_input.try_reserve_exact(input.len()).is_ok()) {
+        crate::kheap::refused("a spawn's input", input.len());
+        return Err("spawn: the kernel heap cannot hold its input");
+    }
+    kept_input.extend_from_slice(input);
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     // The display server (the receiver of `display`) gets the GPU service's send right and a GPU block of its own after the slots it was given (GPU-COMPOSE.md 1.2, 2026-11-21: the compose on the GPU, a client with its own space), at init's spawn and at a keeper's restart alike: init's grants page is full, so it cannot hold them to pass on. The block is the least (32 MiB); the display grows it when it turns the GPU compose on.
@@ -10522,13 +10700,38 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         let object = Object::Dma(thermo);
         cspace.push(CapEntry { token: mint(object, RIGHT_SEND | RIGHT_RECV, epoch), object, rights: RIGHT_SEND | RIGHT_RECV });
     }
-    // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
-    if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
+    // The tokens (owner decision 7, docs/NO-CEILINGS.md 1.0, step 5): in the grants page while they fit there (108 slots and the console, every process before), on pages of their own after it past that, as many as they need, the code moved up past them.
+    // In the grants page they end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences (2026-11-05), so one more goes to the pages, never over them.
+    // The process finds its tokens by the grants offset it is entered with (x0): every reader adds 0x200 for the count and 0x204 + 32 * slot for a token (ferros_sys `cap`, ferros_rt `grants`), so the offset is the pages' start less 0x200, and no image changes. The handles and the preferences stay where they are, in the first page.
+    let (tokens, code_at) = if TOKENS + 4 + 32 * cspace.len() <= PREFS_HI { (TOKENS, CODE) } else { (CODE, CODE + (4 + 32 * cspace.len()).next_multiple_of(1 << 12)) };
+    // The code moves with no change to it: every image is position-independent (ferros_rt `relocate`, ferros_sys `relocate`), and masked code reaches its arc by base and mask, not by the code's place. An arc that cannot grow keeps the first page's limit: fixed mode's sealed 2^K (every `bfi` assumes it), exact mode's limit, an image that declared no growing heap.
+    if code_at != CODE && masked && (arc.limit != 0 || arc.ceiling <= arc.size) {
         surfaces_free(epoch);
         regions_free(epoch);
         pucks_free(epoch);
-        return Err("spawn: more grants than the grants page holds (108 slots and the console)");
+        return Err("spawn: more grants than the grants page holds (108 slots and the console), in an arc that cannot grow for their pages");
     }
+    if code_at != CODE {
+        // Room past the image for the pages: the arc grows by them (whole frames for a native arc, the next power of two for a masked one) when the stack's guard would be reached, inside its window.
+        let need = code_at + code_len + tail + input.len() + STACK_GUARD + STACK;
+        if arc.top() - arc.base < need {
+            let size = arc_shape(arc.size + need - (arc.top() - arc.base), masked);
+            if size > arc.window || arc_resize(&mut arc, size).is_err() {
+                surfaces_free(epoch);
+                regions_free(epoch);
+                pucks_free(epoch);
+                return Err("spawn: no room in the arc for its grants' pages");
+            }
+            arc.ceiling = arc.ceiling.max(size);
+        }
+        // SAFETY: [base + CODE, base + code_at + code_len + tail) lies inside the arc (above), which is no process's yet; the copy may overlap, so `copy`; the pages it leaves and the tail past the moved code are zeroed.
+        unsafe {
+            core::ptr::copy((arc.base + CODE) as *const u8, (arc.base + code_at) as *mut u8, code_len);
+            core::ptr::write_bytes((arc.base + CODE) as *mut u8, 0, code_at - CODE);
+            core::ptr::write_bytes((arc.base + code_at + code_len) as *mut u8, 0, tail);
+        }
+    }
+    let floor = arc.top() - STACK - STACK_GUARD;
     // A line that stormed under the process before is this one's to arm again (`irq_ack_guarded`).
     for c in cspace.iter() {
         if let Object::Irq(i) = c.object {
@@ -10543,16 +10746,16 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
-    let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
+    let fast = alloc::boxed::Box::new(Grants { hw, tokens, ended: core::sync::atomic::AtomicBool::new(false) });
     // The hold's right as a development spawn has it (`--items`: any kind); a kist's is set from its capsule's declaration once it is built (`spawn_kist`).
     let items = cspace.iter().any(|c| c.object == Object::Items).then(|| alloc::boxed::Box::new(ItemRight { any: true, makes: Vec::new(), opens: Vec::new() }));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, items, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: CODE + exec_len, panicked: None };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: kept_input, born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, items, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: code_at + exec_len, code_at, panicked: None };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
-    // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
-    p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
+    // Grants page: the handle table, the count, then the tokens in slot order (or the count and the tokens on the pages after it, `tokens`). Then the code, then the input.
+    p.write_grants(tokens as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
-        p.write_grants((TOKENS + 4 + 32 * i) as u64, &c.token);
+        p.write_grants((tokens + 4 + 32 * i) as u64, &c.token);
         // The table holds the first 32 slots, the pair load's reach (init holds a hundred grants and uses no handle; its tokens begin where the table ends).
         if i < 32 {
             let (base, mask) = handle_of(c.object);
@@ -10566,25 +10769,27 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let prefs = unsafe { &*(&raw const PREFS_NOW) };
     p.write_grants(PREFS as u64, &prefs[..32]);
     p.write_grants(PREFS_HI as u64, &prefs[32..]);
-    let in_off = CODE + code_len + tail;
+    let in_off = code_at + code_len + tail;
     p.write(in_off as u64, input);
-    crate::cachemap::sync_code(arc.base + CODE, code_len);
+    crate::cachemap::sync_code(arc.base + code_at, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
-    crate::cachemap::set_arc_wx(arc.base, arc.size, arc.base + CODE, arc.base + CODE + exec_len, !masked, bti);
-    // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
-    crate::cachemap::grants_page(arc.base, false);
+    crate::cachemap::set_arc_wx(arc.base, arc.size, arc.base + code_at, arc.base + code_at + exec_len, !masked, bti);
+    // The grants page read-only (the handle table, the tokens, the preferences, the ihi), and the tokens' pages after it: nothing in them is the process's to write.
+    for page in (0..code_at).step_by(1 << 12) {
+        crate::cachemap::grants_page(arc.base + page, false);
+    }
     // The stack's guard: the page under it (`floor`, checked above to lie past the image, its tail and the input).
     crate::cachemap::guard_pages(floor, STACK_GUARD);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
     let mut frame = zero;
-    frame.elr = (arc.base + CODE) as u64;
+    frame.elr = (arc.base + code_at) as u64;
     frame.sp_el0 = (arc.top() - 16) as u64;
     frame.spsr = 0;
     frame.x[28] = arc.base as u64;
     frame.x[27] = arc.x27() as u64;
     // Fixed mode's address register starts at the base: its bits above K are the base's for good, since only `bfi x26, xN, #0, #K` writes it.
     frame.x[26] = arc.base as u64;
-    frame.x[0] = GRANTS as u64;
+    frame.x[0] = (GRANTS + tokens - TOKENS) as u64;
     frame.x[1] = in_off as u64;
     frame.x[2] = input.len() as u64;
     let kk = k();
