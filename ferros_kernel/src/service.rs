@@ -1838,7 +1838,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
     }
 }
 
-/// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
+/// The ring has completed: start the vault's `init`, which starts the shell (the touch controller is the touch process's to bring up, thru its `touch` switch: KERNEL-OUT.md move 1). Its console goes to `diag console`.
 /// Returns false when the shell is off this boot (`home.off`).
 fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
