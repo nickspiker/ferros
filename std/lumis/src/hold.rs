@@ -66,14 +66,14 @@ pub fn remove_clip(handle: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
-/// A still kept as an item of kind photo: the hold's Ok is the vault's word that it is kept and verified on both copies (its put writes, verifies every block, then mirrors and verifies the mirror before it answers; HOLD-API.md), so Lumis reads nothing back (the owner, 2026-11-22: "Drop from lumis, yes"; the read back was about 0.9 s of every 25 MB still). The card's body hash is still compared with the bytes given, a check that costs nothing. The write's time in ms, the card, and the copies the vault verified (`keep_verified`: 2, or 1 while the vault runs on one copy; None from a vault before it), or why not.
-pub fn keep_still(bytes: &[u8]) -> Result<(u128, Card, Option<u8>), String> {
+/// A still kept as an item of kind photo: the hold's Ok is the vault's word that it is kept and verified on both copies (its put writes, verifies every block, then mirrors and verifies the mirror before it answers; HOLD-API.md), so Lumis reads nothing back (the owner, 2026-11-22: "Drop from lumis, yes"; the read back was about 0.9 s of every 25 MB still). The card's body hash is still compared with the bytes given, a check that costs nothing. The write's time in ms, the card, and the copies the vault verified (`keep_verified`: 2, or 1 while the vault runs on one copy; None from a vault before it), or why not and whether it was the vault being full (ferros_items `Error::is_full`: the camera screen says VAULT FULL then, not NOT SAVED; the owner's time-lapse, 2026-11-23).
+pub fn keep_still(bytes: &[u8]) -> Result<(u128, Card, Option<u8>), (String, bool)> {
     let mut h = hold();
     let t = std::time::Instant::now();
-    let kept = h.keep_verified(&Proposed { kind: kinds::PHOTO, ..Default::default() }, bytes).map_err(|e| format!("the hold's keep: {e:?}"))?;
+    let kept = h.keep_verified(&Proposed { kind: kinds::PHOTO, ..Default::default() }, bytes).map_err(|e| (format!("the hold's keep: {e:?}"), e.is_full()))?;
     let write_ms = t.elapsed().as_millis();
     if kept.card.body != *blake3::hash(bytes).as_bytes() {
-        return Err(format!("kept, but the card's body hash is not the {} bytes' given", bytes.len()));
+        return Err((format!("kept, but the card's body hash is not the {} bytes' given", bytes.len()), false));
     }
     Ok((write_ms, kept.card, kept.copies))
 }

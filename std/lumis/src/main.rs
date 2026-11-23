@@ -1884,15 +1884,13 @@ fn keep_one(save: lumis_core::PendingSave, vault: Option<&kete::FlatStorage>, he
                 println!("lumis: kept {name} in the hold as item {}: {} bytes, encoded in {encode_ms} ms, written and verified in {write_ms} ms{on}", card.id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len());
                 true
             }
-            Err(e) => {
-                println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept in the hold: {e}", bytes.len());
+            Err((e, full)) => {
+                println!("lumis: {name} ({} bytes, encoded in {encode_ms} ms) NOT kept in the hold{}: {e}", bytes.len(), if full { ", the vault full" } else { "" });
+                // Not kept: the camera screen says so until the next touch, VAULT FULL when the vault is (the owner's time-lapse, 2026-11-23: every keep refused past 205 stills, the counter still, and nothing said it was the room), else NOT SAVED.
+                lumis_core::platform::set_save_note(if full { lumis_core::platform::SAVE_NOTE_FULL } else { lumis_core::platform::SAVE_NOTE_NOT_SAVED });
                 false
             }
         };
-        // Not kept: the camera screen says so until the next touch (lumis_core `platform::save_failed`).
-        if !kept {
-            lumis_core::platform::set_save_note(lumis_core::platform::SAVE_NOTE_NOT_SAVED);
-        }
         app::save_done(header, kept);
         return;
     }
