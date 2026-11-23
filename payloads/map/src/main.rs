@@ -1690,6 +1690,8 @@ struct Map {
     questions: Vec<(notes::Question, Option<u8>)>,
     /// A live note on the screen (its source and number) and its words; the note a tap opens its kist at (`notes_front`), and one waiting for its kist's window to show.
     live_note: Option<([u8; 32], u8)>,
+    /// The kist the live note came from, by its identity (developer, option): its circle is the one the live page is on, through an update that stows a new capsule for it while the note's source stays the capsule that posted it (`notes::live_circle`).
+    live_kist: Option<([u8; 32], [u8; 32])>,
     live_words: Option<alloc::string::String>,
     /// The restart notes last seen on the about page, their words (notes.rs `notices_take`; docs/KERNEL.md "Restarts"): listed there until the next are seen or the map starts again.
     notices_shown: Vec<alloc::string::String>,
@@ -3366,6 +3368,13 @@ impl Map {
             return;
         }
         let open: alloc::vec::Vec<usize> = (0..k.wants.len()).filter(|&j| k.wants[j].asked() && k.wants[j].answer.is_none()).collect();
+        // Nothing left to ask (the question just answered, its circle flying back to the deck; or a page that went while the circle stayed open): its name alone, never the question with no switch and a start button, which reads as the person's answers lost.
+        if open.is_empty() {
+            if !region {
+                b.disc(cx, cy, r, fill());
+            }
+            return;
+        }
         // The rows' height, centred in the band: a line saying what this is, each want two lines, then start.
         let pitch = uu(7, 2);
         let h = uu(3, 1) + open.len() as i64 * pitch + uu(4, 1);
@@ -6347,6 +6356,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         helm_sent: (0, 0, 0),
         questions: Vec::new(),
         live_note: None,
+        live_kist: None,
         live_words: None,
         notices_shown: Vec::new(),
         opening: None,

@@ -206,6 +206,7 @@ impl Map {
             return;
         };
         self.live_note = Some((source, number));
+        self.live_kist = self.kist(i).map(|k| (k.developer, k.option));
         self.live_words = self.note_words(&source, number);
         if self.app_front {
             self.send_behind(false);
@@ -238,7 +239,7 @@ impl Map {
     pub fn live_answer(&mut self, answer: bool) {
         let Some((source, number)) = self.live_note.take() else { return };
         if answer {
-            if let Some(i) = self.circle_of(&source) {
+            if let Some(i) = self.live_circle_of(self.live_kist) {
                 // The deck as it was before the takeover, behind the kist.
                 self.view = View::Map;
                 if let Some(b) = self.back.take() {
@@ -270,7 +271,7 @@ impl Map {
     /// The live page on its kist's open circle: its name, the note's words (or "for you, now"), Answer and Decline. Whether it drew (the circle is the live note's).
     pub fn live_page(&mut self, b: &mut Batch, i: usize, region: bool) -> bool {
         let Some(k) = self.kist(i).cloned() else { return false };
-        if self.live_note.is_none_or(|l| l.0 != k.capsule) {
+        if self.live_note.is_none() || self.live_circle_of(self.live_kist) != Some(i) {
             return false;
         }
         let (cx, cy, r, uq) = self.page_frame();
@@ -297,7 +298,14 @@ impl Map {
 
     /// Whether the live page is what the open circle shows (a tap outside it does not close it).
     pub fn live_showing(&self) -> bool {
-        matches!((self.view, self.live_note), (View::Open(i), Some((src, _))) if self.kist(i).is_some_and(|k| k.capsule == src))
+        matches!(self.view, View::Open(i) if self.live_note.is_some() && self.live_circle_of(self.live_kist) == Some(i))
+    }
+
+    /// The kist circle of the kist with this identity (developer, option), the live note's (`live_kist`).
+    /// By identity, not by the note's source: an update stows a new capsule for the kist while its live note stays the capsule that posted it, and until 2026-11-22 its open circle then matched no live note and fell thru to the first-start question with nothing to ask.
+    fn live_circle_of(&self, who: Option<([u8; 32], [u8; 32])>) -> Option<usize> {
+        let (d, o) = who?;
+        (1..self.deck.n()).find(|&i| self.kist(i).is_some_and(|k| k.developer == d && k.option == o))
     }
 }
 
