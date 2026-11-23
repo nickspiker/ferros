@@ -67,6 +67,9 @@ pub struct SpaceSync {
     /// The person's language as last written to the kernel (SYS_LANG op 2): None not yet, Some(None) the person has none.
     lang_told: Option<Option<[u8; 3]>>,
     said_lang: bool,
+    /// The person's number base as last written to the kernel (SYS_BASE op 2): None not yet, Some(None) the person has none.
+    base_told: Option<Option<u8>>,
+    said_base: bool,
     /// Do not disturb as last written to the kernel (preference 40): None not yet, Some(None) the person has never switched it.
     dnd_told: Option<Option<bool>>,
     said_dnd: bool,
@@ -94,7 +97,7 @@ pub struct SpaceSync {
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, copy_rang: false, misses: 0 }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, base_told: None, said_base: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, copy_rang: false, misses: 0 }
     }
 }
 
@@ -572,6 +575,7 @@ impl Client {
         // The person's zone and language, which no copy on this device mirrors: to the kernel as they change (from a sibling, fgtw.org, or a choice made here).
         self.space_zone_to_kernel();
         self.space_lang_to_kernel();
+        self.space_base_to_kernel();
         self.space_dnd_to_kernel();
         // The facts as they stood, to say which kinds a change made here touched.
         let before: Vec<(u8, Vec<vsf::VsfType>, i64, bool)> = self.space.space.entries().iter().map(|e| (e.kind, e.id.clone(), e.updated, e.gone)).collect();
@@ -1021,6 +1025,51 @@ impl Client {
             self.space_seed(true);
         }
         self.space_lang_to_kernel();
+        0
+    }
+
+    /// The person's number base written to the kernel when it differs from what was last written (settings flow identity to device only: the kernel never hands one back). The kernel keeps it in the device settings, and the device follows it unless its settings say otherwise (kernel base.rs).
+    fn space_base_to_kernel(&mut self) {
+        let b = ferros_space::base(&self.space.space);
+        if self.space.base_told == Some(b) {
+            return;
+        }
+        if ferros_sys::base::set_identity(b) {
+            self.log.put(b"fgtw: space: the person's number base to this device: ");
+            match b {
+                None => self.log.put(b"none chosen"),
+                Some(c) => {
+                    self.log.put(b"tatau code A#");
+                    self.log.dec(c as u64);
+                }
+            }
+            self.log.line();
+            self.space.base_told = Some(b);
+        } else if !self.space.said_base {
+            // Said once: an older kernel without SYS_BASE, or the vault refused it; tried again at the next join.
+            self.space.said_base = true;
+            self.log.put(b"fgtw: space: the kernel did not take the person's number base");
+            self.log.line();
+        }
+    }
+
+    /// Op 35 [tatau's code]: the person chose their number base on this device (the settings page, following them): into the space, out to the fleet and fgtw.org, and to the kernel. → [0 done, 1 not yet: before the first pull, as op 18; 2 not a base].
+    pub fn space_base(&mut self, code: u8) -> u8 {
+        if self.space_ready().is_none() || !self.space.settled {
+            return 1;
+        }
+        let me = self.me;
+        if ferros_space::base(&self.space.space) != Some(code) {
+            if !ferros_space::set_base(&mut self.space.space, &me, code, eagle()) {
+                return 2;
+            }
+            self.log.put(b"fgtw: space: the person's number base chosen here, to the fleet");
+            self.log.line();
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+        self.space_base_to_kernel();
         0
     }
 

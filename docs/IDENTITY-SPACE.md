@@ -18,6 +18,7 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | DECK_SYNC | a device key | on or off | none: set from the Fleet page |
 | ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
 | LANG | the fleet | the language (`wl`, its ISO 639-3 code) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md); chosen on the language page |
+| BASE | the fleet | the number base (`u`, tatau's code: 10, 12, 16, G#8C) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md "The number base"); chosen on the units page. Its codec, and the language's, is fgtw::prefs, which Photon reads too |
 | DND | the fleet | do not disturb, on or off (`u`) | none: the identity service writes it to the kernel of every device (preference 40, SETTINGS.md); switched on the quick row (QUICK.md) |
 | PIN | developer key | the commitment of the key bundle that developer's first kist carried (`hp`), and their name when it gave one | a `pin` section of `kists.list` (KISTS.md "Trust on first stow") |
 | PERSON | handle proof | one of the person's people (fgtw::people::Person): the pinned identity key, the genesis, the fleet it folded to, the name the person gave them | none: the identity service serves it (the People page, a kist granted people; docs/FACETS.md "People") |

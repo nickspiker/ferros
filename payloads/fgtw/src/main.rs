@@ -2274,6 +2274,12 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 35 [tatau's code]: the person's number base chosen on this device's settings page while it follows them (space.rs `space_base`) → [0 done, 1 before the first pull, 2 not a base]. The kernel holds what the page shows (SYS_BASE op 3, preference 0).
+                if n >= 2 && req[0] == 35 {
+                    let r = [self.space_base(req[1])];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 // 24 [on]: the person's do not disturb switched on this device's quick row (space.rs `space_dnd`) → [0 done, 1 before the first pull]. The kernel holds what the row shows (preference 40).
                 if n >= 2 && req[0] == 24 {
                     let r = [self.space_dnd(req[1] != 0)];

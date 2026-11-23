@@ -14,6 +14,7 @@
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
+//! | `BASE` | the fleet's scope `ke` | the number base `u` (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS) | none: the identity service writes it to the kernel (SYS_BASE op 2) on each device, which follows it unless its settings say otherwise |
 //! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first stow) |
 //! | `PERSON` | the handle proof `hP` | the person (fgtw::people::Person) wrapped `v'W'`: the pinned identity key, the genesis, the fleet it folded to, the name the person gave them | none: the identity service's own (payloads/fgtw), written by the system's add-a-person sheet, served to a kist granted `people` (docs/FACETS.md "People") |
 //! | `PEOPLE` | developer `ke`, option `hp` | all `u` (1) or chosen (0); all while unset | none: the kist's card |
@@ -51,7 +52,7 @@ pub mod kind {
     /// The person's time zone (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): automatic (each device finds its own from its network, then GPS) or a zone by hand; written to each device that follows it, never read back from one (settings flow identity to device only).
     pub const ZONE: u8 = 7;
     /// The person's language (SETTINGS.md, as the zone: "per identity, you can uncheck and set per device"): chosen on the language page of a device that follows it, written to each device that follows it, never read back from one.
-    pub const LANG: u8 = 8;
+    pub const LANG: u8 = fgtw::prefs::LANG;
     /// A developer the person trusted on first stow (owner, 2026-11-10): the commitment of the key bundle that developer's first kist carried, so every device of theirs refuses a kist from that key with another bundle. An unstow keeps it.
     pub const PIN: u8 = 9;
     /// Do not disturb (owner, 2026-11-11: "a fleet/identity preference so it follows the person"): the person's one switch, set from the quick row of any of their devices, written to each device (the kernel's preference 40), never read back from one.
@@ -62,6 +63,8 @@ pub mod kind {
     pub const PEOPLE: u8 = 12;
     /// A person the person picked for a kist whose people are the chosen ones, by kist identity and the person's handle proof; a tombstone once unpicked.
     pub const CHOSEN: u8 = 13;
+    /// The person's number base (SETTINGS.md "The number base", 2026-11-22: settings flow identity to device only, as the language): chosen on the settings page of a device that follows it, written to each device that follows it, never read back from one.
+    pub const BASE: u8 = fgtw::prefs::BASE;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -236,28 +239,34 @@ pub fn set_zone(space: &mut Space, by: &[u8; 32], auto: bool, id: &str, now: i64
     space.put(Entry { kind: kind::ZONE, id: zone_id(), value, updated, by: *by, gone: false })
 }
 
-/// The language's id: the fleet's scope, one choice for the person.
+/// The language's id: the fleet's scope, one choice for the person (fgtw::prefs, the one codec Photon reads too).
 pub fn language_id() -> Vec<VsfType> {
-    vec![VsfType::ke(FLEET.to_vec())]
+    fgtw::prefs::fleet_id()
 }
 
-/// The person's language, its ISO 639-3 code; None until they have chosen one.
+/// The person's language, its ISO 639-3 code; None until they have chosen one (fgtw::prefs).
 pub fn language(space: &Space) -> Option<[u8; 3]> {
-    let e = space.get(kind::LANG, &language_id()).filter(|e| !e.gone)?;
-    e.value.iter().find_map(|v| match v {
-        VsfType::wl(l) => Some(l.code()),
-        _ => None,
-    })
+    fgtw::prefs::language(space)
 }
 
-/// The person chose their language on one of their devices (its settings, following them): written straight into the space as a vsf `wl`, stamped past its last write so it wins the merge whatever the clocks say. `code` is three lowercase letters (an ISO 639-3 code: fgtw::text::Lang::iso); anything else is refused (false). True when the space changed.
+/// The person chose their language on one of their devices (its settings, following them): fgtw::prefs's writer, a vsf `wl` stamped past its last write so it wins the merge whatever the clocks say. `code` is three lowercase letters (an ISO 639-3 code: fgtw::text::Lang::iso); anything else is refused (false). True when the space changed.
 pub fn set_language(space: &mut Space, by: &[u8; 32], code: [u8; 3], now: i64) -> bool {
-    // WHY: vsf::Language::new panics on anything but a-z, and the code reaches here from a process's request.
-    if !code.iter().all(u8::is_ascii_lowercase) || language(space) == Some(code) {
-        return false;
-    }
-    let updated = space.get(kind::LANG, &language_id()).map_or(now, |e| now.max(e.updated + 1));
-    space.put(Entry { kind: kind::LANG, id: language_id(), value: vec![VsfType::wl(vsf::Language::new(code))], updated, by: *by, gone: false })
+    fgtw::prefs::set_language(space, by, code, now)
+}
+
+/// The number base's id: the fleet's scope, one choice for the person (fgtw::prefs).
+pub fn base_id() -> Vec<VsfType> {
+    fgtw::prefs::fleet_id()
+}
+
+/// The person's number base, tatau's code; None until they have chosen one, or one this build does not know (fgtw::prefs, the one codec Photon reads too).
+pub fn base(space: &Space) -> Option<u8> {
+    fgtw::prefs::base(space)
+}
+
+/// The person chose their number base on one of their devices (its settings page, following them): fgtw::prefs's writer, a vsf `u` stamped past its last write. `code` is tatau's (10, 12, 16, G#8C); anything else is refused (false). True when the space changed.
+pub fn set_base(space: &mut Space, by: &[u8; 32], code: u8, now: i64) -> bool {
+    fgtw::prefs::set_base(space, by, code, now)
 }
 
 /// Do not disturb's id: the fleet's scope, one switch for the person.
@@ -1543,6 +1552,26 @@ mod tests {
         let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
         assert_eq!(o.kinds >> kind::LANG & 1, 0);
         assert_eq!(language(&sa), Some(*b"spa"));
+    }
+
+    /// The person's number base, as the language: none until chosen; chosen on one device, it crosses the fleet sealed; the later choice wins even from a device whose clock runs behind; a code tatau does not know is refused; the device's own copy is never touched by the sync.
+    #[test]
+    fn the_persons_base_follows_them() {
+        let mut sa = Space::new();
+        assert_eq!(base(&sa), None);
+        assert!(set_base(&mut sa, &PRO, 0x8C, 2000));
+        assert!(!set_base(&mut sa, &PRO, 0x8C, 2001), "the same choice changes nothing");
+        assert!(!set_base(&mut sa, &PRO, 8, 2002), "not a base");
+        let mut sb = hand_over(&sa);
+        assert_eq!(base(&sb), Some(0x8C));
+        assert!(set_base(&mut sb, &OTHER, 16, 1500));
+        sa.merge(hand_over(&sb));
+        assert_eq!(base(&sa), Some(16));
+        let mut v = arranged_pro();
+        let mut b = Baseline::default();
+        let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
+        assert_eq!(o.kinds >> kind::BASE & 1, 0);
+        assert_eq!(base(&sa), Some(16));
     }
 
     /// Do not disturb, as the language: never switched until it is; switched on one device, it crosses the fleet sealed; the later switch wins even from a device whose clock runs behind; the device's own copy is never touched by the sync.
