@@ -1205,6 +1205,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         // A development run ends at its time whatever the turn did (a RAW video turn that hands a frame over and skips the preview reaches no check further down).
         if let Some(r) = run {
             if run_start.elapsed() >= r {
+                // A slit run says its slits since the last line as it ends, so its last line carries the count and the rate (the coordinator, 2026-11-22: the tele's 2-row run's every-4096 line was lost from the console, and its rate had to be estimated from the totals).
+                report(&src, &mut turns, &cam.name);
                 println!("lumis: development run of {} s ended after {frames} frames", r.as_secs());
                 if let Some(c) = CLIP.lock().unwrap().take() {
                     end_clip(c, Some(&mut *integrator.header), "the development run ended");
