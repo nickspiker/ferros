@@ -369,6 +369,8 @@ impl Client {
                     self.log.put(b"fgtw: space: fgtw.org holds ours (");
                     self.log.dec(self.space.space.entries().len() as u64);
                     self.log.put(b" fact(s))");
+                    // The heap after each push (a pull, a seal, a signature, a put): a time series of what the service holds, on an event it already says.
+                    self.heap_said();
                     self.log.line();
                 }
                 Err(e) => {

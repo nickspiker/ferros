@@ -32,6 +32,9 @@ mod space;
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
 /// 8 MiB since 2026-11-17: at 2 MiB the Pro's service ended on "memory allocation of 67075 bytes failed" (b916) as the desktop's Photon, reloaded, began its sibling ceremony with this device's member key (baf3dec7 is a fleet member, so every Photon of the fleet takes it for a sibling until the alias cutover, PHOTON.md M4): its 573806-byte ClutchOffer arrives as a transfer this service takes in whole (photon_core pt, MAX_TRANSFER 4 MiB), beside the held chain (about 207 KB) and the bindings. A transfer as large as MAX_TRANSFER now fits beside the rest.
 const HEAP_BYTES: usize = 8 << 20;
+/// The most one peer's transfer may ask of this heap, and the most all of them in flight may hold together (`Pt::bound_inbound`).
+const IN_MOST: usize = 1 << 21;
+const IN_BUDGET: usize = HEAP_BYTES >> 1;
 /// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
 const STACK_BYTES: usize = 1 << 20;
 /// What an untouched stack byte holds.
@@ -178,7 +181,31 @@ _entry:
 );
 
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: Heap = Heap(ferros_heap::LockedHeap::empty());
+
+/// The heap, saying what it held when an allocation fails: the panic's message (which the kernel keeps in the flash log's deaths) carries the bytes in use, the peak, the free bytes, how many free blocks they lie in and the largest of them, so a failure tells a heap too small from one too fragmented (2026-11-22, the Pro b1136: "memory allocation of 573806 bytes failed", and nothing else to go on).
+struct Heap(ferros_heap::LockedHeap);
+
+unsafe impl core::alloc::GlobalAlloc for Heap {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let p = unsafe { self.0.alloc(layout) };
+        if p.is_null() {
+            heap_failed(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+}
+
+/// An allocation of `size` bytes failed: a panic that says the heap's state (nothing allocated to say it; the payloads panic without unwinding, so no allocator unwinds). The allocator's lock is free again once its `alloc` returned; `try_lock` all the same, so a failure inside it says zeros rather than spin.
+#[inline(never)]
+fn heap_failed(size: usize) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (free, blocks, largest) = ALLOC.0.try_lock().map_or((0, 0, 0), |h| (h.free_bytes(), h.free_blocks(), h.largest_free()));
+    panic!("memory allocation of A#{size} bytes failed; the heap of A#{HEAP_BYTES}: in use A#{}, peak A#{}, free A#{free} in A#{blocks} blocks, the largest A#{largest}", ferros_heap::IN_USE.load(Relaxed), ferros_heap::PEAK.load(Relaxed));
+}
 
 const S_UDP: u64 = 1;
 const S_STORE: u64 = 2;
@@ -1088,6 +1115,24 @@ impl Client {
     fn key_floor(&self, hp: &[u8; 32]) -> u64 {
         // WHY the max: two records of revisions this device has seen for its key, kept by different paths (the add machine's grow keeps `held_fan`); the floor is the later of the two, not a bound on a value.
         self.fleet_rev.max(self.held_fan.borrow().revision(hp))
+    }
+
+    /// The heap's state on the line being said: in use, the peak, and the largest free block with the number of free blocks (a heap that runs short, too small or fragmented).
+    fn heap_said(&mut self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (blocks, largest) = {
+            let h = ALLOC.0.lock();
+            (h.free_blocks(), h.largest_free())
+        };
+        self.log.put(b"; heap: in use A#");
+        self.log.dec(ferros_heap::IN_USE.load(Relaxed) as u64);
+        self.log.put(b", peak A#");
+        self.log.dec(ferros_heap::PEAK.load(Relaxed) as u64);
+        self.log.put(b", the largest free A#");
+        self.log.dec(largest as u64);
+        self.log.put(b" of A#");
+        self.log.dec(blocks as u64);
+        self.log.put(b" free blocks");
     }
 
     /// fgtw.org's chain for this identity adopted when it still names this device and folds against our roots (`join::adopt_chain`; `fgtw::held::fetch` keeps the held copy where the seed's is not preferred): for a fan-out whose rotator joined after the chain held here. Whether a chain was adopted.
@@ -2075,7 +2120,35 @@ impl Client {
                 self.send_all(out);
                 for e in self.pt.take_events() {
                     match e {
-                        Event::Frame { from, bytes, signer } => self.on_frame(from, &bytes, signer.is_some()),
+                        Event::Frame { from, bytes, signer } => {
+                            // A large frame by transfer, said with its size, its sender and the heap after it arrived: what a heap that ran short was holding (2026-11-22, b1136).
+                            if let (Some(k), true) = (signer, bytes.len() >= 1 << 16) {
+                                self.log.put(b"fgtw: a frame of A#");
+                                self.log.dec(bytes.len() as u64);
+                                self.log.put(b" bytes by transfer from ");
+                                self.log.fp(&k);
+                                self.heap_said();
+                                self.log.line();
+                            }
+                            self.on_frame(from, &bytes, signer.is_some())
+                        }
+                        Event::Refused { from, signer, total, held } => {
+                            self.log.put(b"fgtw: a transfer of A#");
+                            self.log.dec(total as u64);
+                            self.log.put(b" bytes from ");
+                            self.log.fp(&signer);
+                            self.log.put(b" at ");
+                            self.log.addr(&from);
+                            self.log.put(b" refused, A#");
+                            self.log.dec(held as u64);
+                            self.log.put(b" bytes of transfers in flight (A#");
+                            self.log.dec(IN_MOST as u64);
+                            self.log.put(b" for one, A#");
+                            self.log.dec(IN_BUDGET as u64);
+                            self.log.put(b" for all)");
+                            self.heap_said();
+                            self.log.line();
+                        }
                         Event::Sent { to, hash, ok } => {
                             if !ok {
                                 self.log.put(b"fgtw: a frame to ");
@@ -2744,7 +2817,9 @@ extern "C" fn work(_: u64) -> ! {
     log.put(b" ms");
     log.line();
     let me = keys.device_pubkey();
-    let pt = Pt::new(keys.signing_key());
+    let mut pt = Pt::new(keys.signing_key());
+    // What peers' transfers may hold here (photon_core `bound_inbound`): a SPEC asks up to 4 MiB and its buffer is made whole at once, a sender has 26 letters, and this heap is 8 MiB. The largest frame this service takes is a fleet chain (A#225840 bytes at 30 ops on the Pro, 2026-11-22, about 7.5 KB an op), so 2 MiB for one leaves room for about 270 ops, and half the heap for all in flight together.
+    pt.bound_inbound(IN_MOST, IN_BUDGET);
     let given = unsafe { GIVEN };
     let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
@@ -2755,7 +2830,7 @@ static mut GIVEN: Option<Addr> = None;
 #[unsafe(no_mangle)]
 pub extern "C" fn fgtw_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.0.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
     fgtw::set_entropy(kernel_entropy);
     fgtw::set_log(crate_log);

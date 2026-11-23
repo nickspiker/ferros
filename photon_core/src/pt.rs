@@ -211,6 +211,8 @@ pub enum Event {
     Frame { from: Addr, bytes: Vec<u8>, signer: Option<[u8; 32]> },
     /// An outbound frame (by BLAKE3 of its bytes) was delivered, or given up on.
     Sent { to: Addr, hash: [u8; 32], ok: bool },
+    /// A transfer refused at its SPEC, before any of it was held (`bound_inbound`): `total` bytes asked, `held` bytes of other transfers in flight then. Not acknowledged, so the sender tries the SPEC again and gives up as for a lost one.
+    Refused { from: Addr, signer: [u8; 32], total: u32, held: usize },
 }
 
 struct Out {
@@ -274,13 +276,22 @@ pub struct Pt {
     small: Vec<Small>,
     next_sid: Vec<(Addr, u8)>,
     events: Vec<Event>,
+    /// The most one inbound transfer may ask, and the most all inbound transfers in flight may hold together (`bound_inbound`): `MAX_TRANSFER` and no budget unless the socket's owner sets them.
+    in_most: usize,
+    in_budget: usize,
 }
 
 type Sends = Vec<(Addr, Vec<u8>)>;
 
 impl Pt {
     pub fn new(key: SigningKey) -> Self {
-        Pt { key, out: Vec::new(), inn: Vec::new(), answered: Vec::new(), small: Vec::new(), next_sid: Vec::new(), events: Vec::new() }
+        Pt { key, out: Vec::new(), inn: Vec::new(), answered: Vec::new(), small: Vec::new(), next_sid: Vec::new(), events: Vec::new(), in_most: MAX_TRANSFER, in_budget: usize::MAX }
+    }
+
+    /// Bound what inbound transfers may hold: `most` bytes for one, `budget` bytes for all in flight together. A SPEC past either is refused before its buffer is made (`Event::Refused`). For a process whose heap is smaller than what peers may announce (the identity service: 8 MiB, while one SPEC may ask 4 MiB and a sender has 26 letters).
+    pub fn bound_inbound(&mut self, most: usize, budget: usize) {
+        self.in_most = most;
+        self.in_budget = budget;
     }
 
     pub fn take_events(&mut self) -> Vec<Event> {
@@ -361,6 +372,13 @@ impl Pt {
         // A new SPEC on a letter this sender holds retires its earlier unfinished transfer there.
         self.inn.retain(|t| !(t.signer == signer && t.sid == spec.sid));
         self.answered.retain(|a| !(a.from == from && a.sid == spec.sid));
+        // WHY: `total` is the peer's number, and the buffer below is made whole at the SPEC. Without these two checks any device on the network can make the owner of this socket allocate up to MAX_TRANSFER per letter, 26 letters per sender, and a process with a smaller heap dies of it (the identity service, 8 MiB, panicked on a failed 573806-byte allocation on the Pro, b1136, 2026-11-22).
+        // PROOF: the sum of `data` lengths in `inn` is exactly what the inbound transfers hold; a SPEC is taken only when its `total` fits under `in_most` and that sum plus `total` fits under `in_budget`.
+        let held: usize = self.inn.iter().map(|t| t.data.len()).sum();
+        if spec.total as usize > self.in_most || held + spec.total as usize > self.in_budget {
+            self.events.push(Event::Refused { from, signer, total: spec.total, held });
+            return Vec::new();
+        }
         let n = spec.count as usize;
         self.inn.push(In { from, sid: spec.sid, signer, data: vec![0u8; spec.total as usize], got: vec![false; n], have: 0, spec, last: now_us });
         vec![(from, ack)]
@@ -674,5 +692,30 @@ mod tests {
         assert!(matches!(classify(&ack), Some(Kind::Control(Control::Ack { sid: b'c', seq: u32::MAX, .. }))));
         let done = done_vsf(99, spec.hash, true);
         assert!(matches!(classify(&done), Some(Kind::Control(Control::Done { ok: true, .. }))));
+    }
+
+    /// A bounded socket refuses a SPEC past either bound before holding any of it, and takes one that fits.
+    #[test]
+    fn bounded_inbound_refuses_before_holding() {
+        let (a, b) = (addr(1), addr(2));
+        let k = SigningKey::from_bytes(&[5u8; 32]);
+        let signer = k.verifying_key().to_bytes();
+        let mut pb = Pt::new(SigningKey::from_bytes(&[2u8; 32]));
+        pb.bound_inbound(1 << 16, 1 << 17);
+        let big = Spec::for_data(&[1u8; (1 << 16) + 1], b'a').to_vsf(&k, 9);
+        assert!(pb.receive(a, &big, 10, 9).is_empty(), "past one transfer's bound: no ack");
+        assert_eq!(pb.take_events(), vec![Event::Refused { from: a, signer, total: (1 << 16) + 1, held: 0 }]);
+        assert!(!pb.busy(), "nothing held");
+        let one = Spec::for_data(&[1u8; 1 << 16], b'b').to_vsf(&k, 9);
+        assert_eq!(pb.receive(a, &one, 11, 9).len(), 1, "a SPEC that fits is acknowledged");
+        let two = Spec::for_data(&[2u8; 1 << 16], b'c').to_vsf(&k, 9);
+        assert_eq!(pb.receive(a, &two, 12, 9).len(), 1, "two together fill the budget exactly");
+        let three = Spec::for_data(&[3u8; 1 << 10], b'd').to_vsf(&k, 9);
+        assert!(pb.receive(a, &three, 13, 9).is_empty(), "past the budget: no ack");
+        assert_eq!(pb.take_events(), vec![Event::Refused { from: a, signer, total: 1 << 10, held: 1 << 17 }]);
+        // Unbounded (the default), the same SPEC is taken.
+        let mut pc = Pt::new(SigningKey::from_bytes(&[3u8; 32]));
+        assert_eq!(pc.receive(a, &big, 10, 9).len(), 1);
+        let _ = b;
     }
 }
