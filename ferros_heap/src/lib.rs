@@ -14,7 +14,6 @@
 //
 // arc.rs ── a payload's heap that grows (docs/NO-CEILINGS.md 0.3): trait Arc { base, size, grow, shrink } (SYS_ARC; `Kernel` with feature `process`)  struct ArcHeap<A> ::new(arc) (const) ::init(bss_end, input, input_len) ::add_region ::free_bytes ::free_blocks ::largest_free ::try_stats ::held ::grow_counts ::arc_size  impl GlobalAlloc (TLSF; grows the arc on a miss, gives its top back past a cushion)
 // layout.rs ── ferros_rt/src/layout.rs by path: heap_regions, grow_bytes, shrink_to (the one policy)
-// INTERIM_CEILING ── the ceiling a growing payload declares until step 3 names the pool (docs/NO-CEILINGS.md)
 //
 // kernel.rs ── the kernel's heap: struct LockedTlsf(SpinLock<State>) ::empty() (const) ::add(start, size) per region ::report() → Option<Report> ::last_fail() → Fail ::try_lock()/lock() → guard  impl GlobalAlloc (realloc in place first; a refused allocation recorded as a Fail, then null)
 //   struct State ::levels(each(floor, blocks, bytes)) free space by size ::verify() the host tests' walk
@@ -39,9 +38,6 @@ pub use arc::{Arc, ArcHeap};
 #[cfg(feature = "process")]
 pub use arc::Kernel;
 
-/// The heap ceiling a growing payload declares in its image header until docs/NO-CEILINGS.md step 3 names the pool instead. Step 1 needed it because every window came from 64 GiB then (cachemap ARC_VA) and a ceiling of the whole pool would have spent it four windows at a time; step 2 widened the space to 48 bits and gives a growing arc a window of twice the pool whatever its ceiling, so step 3 is this constant's deletion and nothing in the kernel.
-/// WHY 2^28: above every payload's heap before step 1 (wallgen's 248 MiB the largest). Addresses only: the kernel maps the start the header names and the rest only as the heap grows.
-pub const INTERIM_CEILING: usize = 1 << 28;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};

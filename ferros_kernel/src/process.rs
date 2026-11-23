@@ -923,8 +923,9 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
 /// An arc of at least `bytes`, zeroed, in a window of its own with room to grow to `ceiling` (SYS_ARC): masked arcs a power of two with the guard above, native arcs whole frames. None when the pool has too few free frames, which need not lie together anywhere.
 pub fn arc_alloc_room(bytes: usize, ceiling: usize, masked: bool) -> Option<Arc> {
     let size = arc_shape(bytes, masked);
+    // WHY the min: a ceiling past the pool can never be filled, and one near 2^47 (an image declaring what the device holds, ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3, summed by the bridge for a streamed spawn) would size a window past the arcs' space and be refused for addresses; the pool is what the device holds, so nothing a process could use is taken away.
     // WHY the max: a ceiling under the size asked for is a caller's sum that left something out (a staged capsule bigger than its image); the arc never starts above its own ceiling.
-    let ceiling = arc_shape(ceiling, masked).max(size);
+    let ceiling = arc_shape(ceiling.min(crate::frames::map_bytes()), masked).max(size);
     let guard = if masked { GUARD } else { 0 };
     // The window: a power of two that holds the ceiling and the guard, so a masked arc's base is aligned to any size it grows to and every address past its guard is unmapped.
     // An arc that may grow takes twice what the device holds (docs/NO-CEILINGS.md 0.1, step 2: the lower half its image and heap, the upper half its stacks once they grow on their own, step 6), so a ceiling raised to the device's memory (step 3) never needs a larger window; addresses only, as the windows' space is 255.5 TiB (8176 such windows on the Pro, 16352 on the 8a).

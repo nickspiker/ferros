@@ -58,8 +58,8 @@ _entry:
 );
 
 /// The heap: the UE-capability files (half a megabyte, and their replies), the carrier configs, the DL queue and each pass's frames, freed as they go (ferros_heap, the kernel's own allocator).
-/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 16 MiB, held whole from spawn to end.
-const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
+/// The heap's ceiling in the image header: what the device holds (ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3; the kernel takes the least of it and its pool), refused only when the device is out. Addresses only: the kernel maps the start at spawn and the rest as the heap grows (SYS_ARC, ferros_heap::ArcHeap). Until docs/NO-CEILINGS.md step 1 the heap was a static array of 16 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 
 unsafe extern "C" {
     /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.

@@ -506,4 +506,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
-ferros_sys::entry!(payload_main, grows 1 << 30);
+ferros_sys::entry!(payload_main, grows ferros_sys::HEAP_DEVICE);

@@ -27,8 +27,8 @@ SECTIONS {
     }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
-/* The default heap ceiling, 32 MiB (2 MiB until 2026-11-14): a ceiling the arc grows to on demand, never a reservation (ARCS.md step 2), and each thread now takes a 2 MiB stack from it by default (ferros_rt thread::DEFAULT_STACK). */
-__ferros_heap = DEFINED(__ferros_heap) ? __ferros_heap : 32M;
+/* The heap's ceiling: what the device holds (docs/NO-CEILINGS.md step 3, owner 2026-11-23: no declared caps on memory), 2^47 as ferros_sys::HEAP_DEVICE is: the kernel takes the least of it and its pool and refuses a grow only when the device is out. Never a reservation: the kernel maps 4 MiB at spawn and the rest as the heap asks (ARCS.md step 2). It was 32 MiB (2 MiB until 2026-11-14), and each app's build declared its own (Photon 512 MiB, Lumis 4 GiB). --defsym __ferros_heap=<bytes> still sets one, for a build that wants a bound of its own. */
+__ferros_heap = DEFINED(__ferros_heap) ? __ferros_heap : 1 << 47;
 __ferros_tdata_size = SIZEOF(.tdata);
 __ferros_tls_size = SIZEOF(.tdata) + SIZEOF(.tbss);
 __ferros_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));

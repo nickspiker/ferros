@@ -1,5 +1,5 @@
 //! The process heap's allocator: TLSF, two-level segregated fit (Masmano, Ripoll, Crespo and Real, 2004).
-//! Every free block sits on one of 28 × 32 lists by its size: the first level is its power of two, the second splits that power into 32 equal steps.
+//! Every free block sits on one of 39 × 32 lists by its size: the first level is its power of two, the second splits that power into 32 equal steps.
 //! Two bitmaps say which lists hold a block, so finding one that fits is two count-trailing-zeros, never a walk: an alloc or a free costs the same with ten free blocks or fifty thousand.
 //! The first-fit free list it replaced (2026-11-11) walked every free block once a free and twice an alloc, and Mahere's loader, label and vault threads left 20-50 thousand of them.
 //!
@@ -26,8 +26,8 @@ const SL_LOG2: u32 = 5;
 const SL: usize = 1 << SL_LOG2;
 /// Blocks under 1 << FL_SHIFT bytes (512) share first level 0, its 32 classes one grain apart; above, level f + 1 − FL_SHIFT holds [2^f, 2^(f+1)).
 const FL_SHIFT: u32 = SL_LOG2 + GRAIN_LOG2;
-/// Blocks are under 1 << FL_MAX_LOG2 bytes (64 GiB, the whole window space ARCS gives out).
-const FL_MAX_LOG2: u32 = 36;
+/// Blocks are under 1 << FL_MAX_LOG2 bytes: 2^47, the largest block of the arcs' 48-bit space (docs/NO-CEILINGS.md steps 2 and 3; 2^36, the 64 GiB window space, until then), so no allocation the device could hold is refused for want of a class. Each class more costs a bitmap word and 32 list heads.
+const FL_MAX_LOG2: u32 = 47;
 const FL: usize = (FL_MAX_LOG2 - FL_SHIFT) as usize + 1;
 pub const MAX_BLOCK: usize = 1 << FL_MAX_LOG2;
 /// The free bit, in the size word's low bits (sizes are whole grains).

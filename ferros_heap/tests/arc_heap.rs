@@ -61,9 +61,10 @@ struct Lay {
 }
 
 fn spawn(top: usize, ceiling: usize, ring: bool, input_len: usize) -> Lay {
-    // The window: the ceiling, aligned to itself as the kernel's buddy gives it.
-    let arena = Box::leak(vec![0u8; ceiling * 2].into_boxed_slice());
-    let base = (arena.as_ptr() as usize + ceiling - 1) & !(ceiling - 1);
+    // The window aligned as the kernel's buddy gives it: to the ceiling in ring mode (the mask doubles toward it), to a frame natively. The arena is the host's lazily zeroed memory, so a pool of gigabytes costs only the pages a test touches.
+    let align = if ring { ceiling } else { FRAME };
+    let arena = Box::leak(vec![0u8; ceiling + align].into_boxed_slice());
+    let base = (arena.as_ptr() as usize + align - 1) & !(align - 1);
     let mock = Mock { base, top: AtomicUsize::new(top), ceiling, ring, floor: top };
     let heap = Box::leak(Box::new(ArcHeap::new(mock)));
     let bss_end = base + MIB;
@@ -159,6 +160,45 @@ fn gives_the_top_back_when_it_is_free() {
     assert!(!q.is_null());
     assert_eq!(l.heap.grow_counts().0, grows, "the cushion did not hold the largest grow");
     unsafe { l.heap.dealloc(q, piece) };
+}
+
+/// The owner's test (2026-11-23): "if I open notepad and it requests 1mb of memory and it's happy, then I go and open a video because I want to search thru the frame metadata and it malloc's 4GB of RAM, it better work." A process whose ceiling is the device (a 6 GiB pool here, ferros_sys::HEAP_DEVICE as the kernel clamps it), holding 1 MiB, then asking 4 GiB: given, every part of it the process's; then asking past the device: refused, null, and the notepad's megabyte untouched.
+#[test]
+fn notepad_then_a_video() {
+    let pool = 6 << 30;
+    let l = spawn(8 * MIB, pool, false, 0);
+    let note = lay(MIB, 16);
+    let n = unsafe { l.heap.alloc(note) };
+    assert!(!n.is_null());
+    unsafe { core::ptr::write_bytes(n, 0x5A, MIB) };
+    let video = lay(4 << 30, 16);
+    let v = unsafe { l.heap.alloc(video) };
+    assert!(!v.is_null(), "4 GiB refused with a 6 GiB pool");
+    assert!(l.heap.arc_size().0 >= 4 << 30);
+    let mut at = 0;
+    while at < video.size() {
+        unsafe { *v.add(at) = (at >> 26) as u8 };
+        at += 64 * MIB;
+    }
+    unsafe { *v.add(video.size() - 1) = 7 };
+    at = 0;
+    while at < video.size() {
+        assert_eq!(unsafe { *v.add(at) }, (at >> 26) as u8);
+        at += 64 * MIB;
+    }
+    // Past what the device holds: refused as the kernel refuses (ARC_WHY_MEMORY), the allocation null, nothing else changed.
+    let refused = l.heap.grow_counts().1;
+    assert!(unsafe { l.heap.alloc(lay(4 << 30, 16)) }.is_null());
+    assert_eq!(l.heap.grow_counts().1, refused + 1);
+    assert!(unsafe { core::slice::from_raw_parts(n, MIB) }.iter().all(|&b| b == 0x5A), "the notepad's megabyte changed");
+    unsafe {
+        l.heap.dealloc(v, video);
+        l.heap.dealloc(n, note);
+    }
+    // The video closed: its 4 GiB is the notepad's to ask for again.
+    let again = unsafe { l.heap.alloc(video) };
+    assert!(!again.is_null());
+    unsafe { l.heap.dealloc(again, video) };
 }
 
 #[test]

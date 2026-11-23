@@ -656,7 +656,8 @@ const GPP0_DAT: u64 = 0x0004;
 /// Until 2026-11-11 the heap was a fixed 32 MiB region the kernel granted (cachemap DISPLAY_HEAP, `display-heap`), and on the Pro that night the display panicked at start, "memory allocation of 2097152 bytes failed": the quick row's band (+4.2 MiB) and the night's other additions had taken it past 32 MiB. Nothing in the heap is DMA (the back buffer is the canvas region, the framebuffers and the phases their own), so it may lie in any frames of the pool, and move.
 /// A power of two, four times the start as estimated that night (about 27 MiB in this heap on husky, COMPOSITOR.md "Memory"): room for the hit map and what comes after without a rebuild, while the window (the next power of two above it) costs addresses only.
 /// 2^28 since 2026-11-18: the screenshot's offer (`offer_keep`) grows the arc by a screen's frame at the first screenshot (30.7 MiB on the Pro), on top of a heap past 64 MiB by then (the flight's plane image alone is another 30.7); under 2^27 that left the render heap's own growth a few MiB. Addresses only, as before: nothing is mapped until asked.
-const HEAP_CEILING: usize = 1 << 28;
+/// Since docs/NO-CEILINGS.md step 3 what the device holds (ferros_sys::HEAP_DEVICE; the kernel takes the least of it and its pool), refused only when the device is out.
+const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The least one grow asks for: four frames, so a heap that keeps growing asks a few times rather than once an allocation (ferros_rt asks the same way).
 const HEAP_GROW_MIN: usize = 8 << 20;
 /// What the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`, 4 MiB): the console worker's and the wallpaper loader's fixed arenas live there (`heap_init`), the rest of the heap above the first stack, where the arc grows.
@@ -793,7 +794,8 @@ fn heap_init() -> (usize, usize) {
     let used = (1 << 20) + LOAD_HEAP_BYTES;
     let (top, ceiling) = ferros_sys::arc::size();
     if top as u64 == ferros_sys::ERR {
-        ALLOC.init_at(spare + used, HEAP_CEILING - used - 64);
+        // A kernel without SYS_ARC (before 2026-11-11) mapped the whole declared heap here, which is the device's since docs/NO-CEILINGS.md step 3: no such kernel runs this, and one that did is said at once.
+        panic!("display: the kernel answered no arc size (SYS_ARC): the display needs a kernel from 2026-11-11 or later");
     } else {
         ALLOC.init_at(ferros_sys::arc_base() as usize + top, 0);
         unsafe { *ALLOC.grows.get() = true };
@@ -853,7 +855,7 @@ fn heap_water(log: &mut Log) {
     log.s(b", mapped ");
     log.dec(ALLOC.mapped() as u64 >> 10);
     log.s(b" of ");
-    log.dec(HEAP_CEILING as u64 >> 10);
+    log.dec(ferros_sys::arc::size().1 as u64 >> 10);
     log.s(b"), console arena ");
     log.dec(now[1]);
     log.s(b" of ");

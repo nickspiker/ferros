@@ -6,7 +6,7 @@ pub use ferros_puck::rt::{self, Link};
 use ferros_puck::{call, Full, Writer, LIST_MAX};
 use ferros_glyphs::Glyphs;
 
-// The heap (docs/NO-CEILINGS.md step 1): the zeroed tail the kernel maps past .bss for a growing image (each puck's `entry!(…, grows 1 << 26)`, 4 MiB of it at spawn) and what the arc grows by after it. Until then a static 2 MiB array (the typeface's cache, 64 KiB of table and 64 KiB of coverage, and swash's scaling beside the engines' own), and the 4 MiB the kernel mapped beside it went unused.
+// The heap (docs/NO-CEILINGS.md step 1): the zeroed tail the kernel maps past .bss for a growing image (each puck's `entry!(…, grows ferros_sys::HEAP_DEVICE, starts HEAP_START_LOG2)`: what the device holds since step 3, 2 MiB of it at spawn since step 2) and what the arc grows by after it. Until then a static 2 MiB array (the typeface's cache, 64 KiB of table and 64 KiB of coverage, and swash's scaling beside the engines' own), and the 4 MiB the kernel mapped beside it went unused.
 unsafe extern "C" {
     /// The end of .bss (payload.ld): the heap starts there.
     static __bss_end: u8;

@@ -14,8 +14,8 @@ use alloc::vec::Vec;
 use ferros_sys::svc;
 
 /// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes; and the networks remembered, read and parsed (`kept_all`: two lists of at most 16 networks, a few KiB with the parser's own; 128 KiB since 2026-11-18, twice what the detail alone had, so the lists never take what it needs).
-/// The heap's ceiling in the image header (docs/NO-CEILINGS.md steps 1 and 2): the interim ceiling every growing payload declares until step 3 (ferros_heap::INTERIM_CEILING), addresses only.
-const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
+/// The heap's ceiling in the image header: what the device holds (ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3; the kernel takes the least of it and its pool), refused only when the device is out. Addresses only: the kernel maps the start at spawn and the rest as the heap grows (SYS_ARC, ferros_heap::ArcHeap).
+const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The heap the kernel maps at spawn, as a log2 (the header's start-size word, process.rs `image_start`): 1 << 17, what the static array held until step 1, so the arc starts as it did and grows from there as the heap runs out. A kernel from before step 2 maps its 4 MiB instead.
 const HEAP_START_LOG2: usize = 17;
 unsafe extern "C" {

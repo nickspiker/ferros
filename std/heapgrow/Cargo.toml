@@ -1,0 +1,21 @@
+[package]
+name = "heapgrow"
+version = "0.1.0"
+edition = "2024"
+description = "The owner's test of docs/NO-CEILINGS.md step 3 (2026-11-23): 1 MiB held, then 4 GiB asked for and every byte of it written, then 256 MiB at a time until the device says no, each refusal said; built with no declared heap"
+
+[[bin]]
+name = "heapgrow"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

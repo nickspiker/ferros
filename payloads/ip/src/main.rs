@@ -637,8 +637,8 @@ const MSS_MAX: usize = 1460;
 const RECV_MAX: usize = 1 << 18;
 /// The largest request: 4096 bytes, all a call carries (process.rs SYS_CALL reads at most 4096).
 const MSG_MAX: usize = 1 << 12;
-/// The heap's ceiling in the image header (`ferros_sys::entry!(…, grows HEAP_CEILING)`): 32 MiB, room for every connection's block above what the kernel maps at spawn, in either mode (masked arcs grow by doubling).
-const HEAP_CEILING: usize = 1 << 25;
+/// The heap's ceiling in the image header (`ferros_sys::entry!(…, grows HEAP_CEILING)`): what the device holds (ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3; 32 MiB until then), in either mode (masked arcs grow by doubling). The connections' table (`TCPN`) is what bounds the blocks today.
+const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The heap the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`): 4 MiB, three blocks.
 const HEAP_START: usize = 4 << 20;
 /// Retransmission expiries a connection survives: the eighth fails it (from 250 ms, doubling to the 8 s ceiling: about 30 s in all).
@@ -3655,14 +3655,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
     // The resolver's cache, lookups and held calls (`Dns`).
     static mut DNS: Dns = Dns { cache: ferros_dns::Cache::new(), asks: [ASK_FREE; RECN], rq: [RQ_FREE; RQN], rq_seq: 0, port: 0 };
-    // The heap the kernel maps past .bss (`HEAP_START` of it, or the whole `HEAP_CEILING` on a kernel without SYS_ARC): the first blocks, on a cache line.
+    // The heap the kernel maps past .bss (`HEAP_START` of it): the first blocks, on a cache line. A kernel without SYS_ARC (before 2026-11-11) mapped the whole declared heap instead, which is the device's since docs/NO-CEILINGS.md step 3: no such kernel runs this, and one that did is said at once.
     unsafe extern "C" {
         static __image_end: u8;
     }
     let heap = ((&raw const __image_end) as usize + 16 + 63) & !63;
     let (top, _) = ferros_sys::arc::size();
     let blocks = if top as u64 == ERR {
-        Blocks { heap, start: (HEAP_CEILING - 64) / BLOCK, top0: 0, top: 0, grows: false, used: 0 }
+        panic!("ip: the kernel answered no arc size (SYS_ARC): ip needs a kernel from 2026-11-11 or later")
     } else {
         Blocks { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true, used: 0 }
     };

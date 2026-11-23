@@ -52,8 +52,8 @@ _entry:
 );
 
 /// The heap: the protocol's messages (a kilobyte or two each), the registry scripts while they are pushed.
-/// The heap's ceiling in the image header (docs/NO-CEILINGS.md steps 1 and 2): the interim ceiling every growing payload declares until step 3 (ferros_heap::INTERIM_CEILING), addresses only.
-const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
+/// The heap's ceiling in the image header: what the device holds (ferros_sys::HEAP_DEVICE, docs/NO-CEILINGS.md step 3; the kernel takes the least of it and its pool), refused only when the device is out. Addresses only: the kernel maps the start at spawn and the rest as the heap grows (SYS_ARC, ferros_heap::ArcHeap).
+const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The heap the kernel maps at spawn, as a log2 (the header's start-size word, process.rs `image_start`): 2 << 20, what the static array held until step 1, so the arc starts as it did and grows from there as the heap runs out. A kernel from before step 2 maps its 4 MiB instead.
 const HEAP_START_LOG2: usize = 21;
 

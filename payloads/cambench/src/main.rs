@@ -55,7 +55,8 @@ const OP_SET: u8 = 3;
 const K_SLIT_FULL: u8 = 4;
 
 /// The heap's ceiling (the image header's: the kernel sizes the arc's window for it, `ferros_sys::arc::grow` maps frames as asked): the main's 1:1 sums, 8192 x 6144 samples of u16 and u32, are 302 MB.
-const CEILING: usize = 1 << 30;
+/// Since docs/NO-CEILINGS.md step 3 what the device holds (ferros_sys::HEAP_DEVICE): it was 2^30.
+const CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The longest line a view gives (the 8a's 1:1 main RAW12 would be 13872 bytes): a thread's copy of one, and the slack its last block reads past.
 const LINE_MOST: usize = 1 << 14;
 /// The bench's own slit ring (Lumis's slitscan keeps a ring of slices): 2^10 slits unpacked to 16 bits.

@@ -3520,6 +3520,10 @@ impl<const SLOT: u64> Handle<SLOT> {
     }
 }
 
+/// The heap a growing image declares when nothing but the device bounds it (docs/NO-CEILINGS.md step 3; owner, 2026-11-23: "if I open notepad and it requests 1mb of memory and it's happy, then I go and open a video ... and it malloc's 4GB of RAM, it better work"): 2^47, the largest block of the arcs' 48-bit space, more than any device holds. The kernel takes the least of it and its pool (process.rs `image_tail_ceiling`), and every grow past the free frames is refused as it comes (ARC_WHY_MEMORY).
+/// Not the largest word: the bridge and the kernel add the image's other words to it, and 2^47 leaves those sums far from wrapping.
+pub const HEAP_DEVICE: usize = 1 << 47;
+
 /// A payload's entry with ferros_rt's image header (process.rs `image_tail`): `b main`, a pad word, "ferrosRT" at offset 8, the zeroed tail (.bss + 16, payload.ld's `__ferros_tail`), three unused words and a heap of 0. The kernel sizes the process's arc from the flat image plus that tail and refuses an image without the header (2026-11-09: the display's and bt's stacks sat on their own statics because the kernel never counted their .bss). `main` is `extern "C" fn(grants: u64, input: u64, input_len: u64) -> !`.
 #[macro_export]
 macro_rules! entry {
