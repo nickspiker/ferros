@@ -445,6 +445,8 @@ const SLIM_STRIDE: usize = 1 << 10;
 static BUF: AtomicU64 = AtomicU64::new(job::IMAGE_BYTES);
 /// The open mode's mosaic period in pixels (2 Bayer; a 1:1 mode's quad array, ferros_cam ccs `Array::period`), for the frame header's +14.
 static CFA_PERIOD: AtomicU64 = AtomicU64::new(2);
+/// The mosaic's period down (+15 in a frame's header): `CFA_PERIOD` but for a straddling 1:1 slit, whose 2 rows are one row of each quad half (2 against 4 across).
+static CFA_PERIOD_Y: AtomicU64 = AtomicU64::new(2);
 static ROWS: AtomicU64 = AtomicU64::new(cams::H_MOST as u64);
 static COLS: AtomicU64 = AtomicU64::new(cams::W_MOST as u64);
 static LINE: AtomicU64 = AtomicU64::new(cams::STRIDE_MOST as u64);
@@ -1420,7 +1422,7 @@ enum Fail {
 
 /// What an OPEN asks of the sensor (docs/CAMERA.md "Modes, the bench and the slit"): its mode block after `[1][id][view]`, every field optional, a shorter OPEN taking the defaults (the init's mode untouched, as every open before the bench).
 /// `kind`: 0 the init's mode (Android's binned), 1 the binned mode with its frame and integration cut, 2 the 1:1 readout (the 1:1 init `cam.<key>.init.full` replayed in place of the binned one: Android's own maximum-resolution mode, the main's 8160 x 6144 from the 16 s capture; docs/CAMERA.md "1:1 on the main"), 3 a binned slit, 4 a 1:1 slit (from the same 1:1 init).
-/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells), `fll` the frame in lines (0: the rows and `BLANK` more, or for kind 2 the 1:1 init's own; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`, or for kind 2 the 1:1 init's own: an all-zero block of kind 2 is Android's 1:1 mode as its init leaves it, as an all-zero block is the binned init's), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's), `cols` the window's output columns across the middle (0: the mode's whole width; on 2^4, ferros_cam ccs `Mode::cols`).
+/// `rows` a slit's output rows (binned: whole 2-row Bayer cells; 1:1, whole 4-row quad cells, or 2 rows straddling the quad's halves, ferros_cam ccs `Mode::slit`), `fll` the frame in lines (0: the rows and `BLANK` more, or for kind 2 the 1:1 init's own; G#FFFF the captured mode's own), `exposure` the integration in lines (0: `EXPOSURE`, or for kind 2 the 1:1 init's own: an all-zero block of kind 2 is Android's 1:1 mode as its init leaves it, as an all-zero block is the binned init's), `flags` the `F_*` bits, `ring` a slit ring's buffers as a power of two (0: 2^8), `llp` the line length (0: the mode's), `cols` the window's output columns across the middle (0: the mode's whole width; on 2^4, ferros_cam ccs `Mode::cols`).
 /// A windowed mode (a slit, or `cols` set) and a 1:1 mode turn the sensor's phase detect and embedded data off in its hold (ferros_cam ccs `Side`), unless `F_LOUD`: both are laid out for the whole binned frame (the 1:1 init writes the same 2040 x 768 PD block as the binned one, and the PD channel's size at 1:1 was never captured).
 #[derive(Clone, Copy)]
 struct Spec {
@@ -1912,6 +1914,8 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The shape the frame thread and the endpoint work to.
     BUF.store(buf, Ordering::Relaxed);
     CFA_PERIOD.store(match alt { Some(a) => a.period as u64, None if s.full() => c.array.period as u64, None => 2 }, Ordering::Relaxed);
+    // Down, the same but for a 1:1 slit that straddles the quad's halves (ferros_cam ccs `Mode::periods`: 4 across, 2 down).
+    CFA_PERIOD_Y.store(match (alt, &mode) { (Some(a), _) => a.period as u64, (None, Some(m)) => m.periods(c.array).1 as u64, (None, None) => 2 }, Ordering::Relaxed);
     ROWS.store(fe.h as u64, Ordering::Relaxed);
     COLS.store(fe.w as u64, Ordering::Relaxed);
     LINE.store(fe.stride as u64, Ordering::Relaxed);
@@ -2310,6 +2314,8 @@ fn header(h: &mut [u8], b: usize, bin: usize) {
     h[9] = c.cfa;
     // The mosaic's period (2 Bayer, 4 the quad array of a 1:1 frame: `cfa` then names its 2 x 2 blocks), at +14; a driver from before leaves it 0, which reads as 2.
     h[14] = CFA_PERIOD.load(Ordering::Relaxed) as u8;
+    // Its period down at +15 (2 Bayer, 4 the quad, 2 a straddling 1:1 slit's R R G G over G G B B); a driver from before leaves it 0, which reads as +14's.
+    h[15] = CFA_PERIOD_Y.load(Ordering::Relaxed) as u8;
     h[10..12].copy_from_slice(&c.black.to_le_bytes());
     h[12..14].copy_from_slice(&c.white.to_le_bytes());
     h[16..24].copy_from_slice(&B_NS[b].load(Ordering::Relaxed).to_le_bytes());

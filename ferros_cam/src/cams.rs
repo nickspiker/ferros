@@ -66,6 +66,11 @@ pub struct Cam {
     pub alts: &'static [Alt],
     /// The least blanking a whole frame of its captured readout takes, lines past its rows (the list's `fll_least`, a client's fastest whole rate): the driver's `BLANK_LEAST`, or more where the sensor pads its frame further (the tele).
     pub blank_least: u16,
+    /// A binned slit's least rows that reach memory, and its least frame (ns): measured on the Pro (2026-11-22, b1134, docs/CAMERA.md "Two-row slits, 2:1 and 1:1"), 0 where not measured.
+    /// Every sensor sends 2-row frames, but the receive side takes only these heights and up: the main 16 rows (12 and under, the link's ERR_CRC_PH and loch0's G#404), the ultrawide and the front 4, the tele 64 (16 and under refused).
+    /// The least frame at those rows: the main about 812 us whatever the frame or the line asked (1231 a second; a time, not a line count: a 5888-clock line ran 1244, not the 1321 a line count would give), the ultrawide 128 lines of 6.5616 us (1190 a second; at 96 nothing lands), the front about 121 lines of 10.4378 us (791 a second at 96 and under), the tele about 293 lines of 6.1068 us (559 a second at 64 rows).
+    pub slit_rows: u16,
+    pub slit_frame_ns: u64,
     /// Whether the sensor takes a mode's words only while streaming: written in the hold before stream on, its frame, window and output size are dropped at stream on (the sensor runs its init's mode), so the driver writes the mode after the first frame (payloads/camera `F_MID`).
     /// The tele (2026-11-18, docs/CAMERA.md "Slits on every camera"): frames of 4000 and 8000 lines written before stream on both ran 30 a second, and a 64-row slit sent whole 4032 x 3024 frames (a front end left at the whole frame took them clean); written after the first frame, 4000 lines ran 40 a second, 8000 lines 20, and the slit 559 a second.
     pub mode_live: bool,
@@ -200,6 +205,8 @@ pub const MAIN: Cam = Cam {
     alts: &[],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 16,
+    slit_frame_ns: 812_300,
     array: &crate::ccs::ARRAYS[0],
     optics: &crate::optics::OPTICS[0],
 };
@@ -252,6 +259,8 @@ pub const ULTRAWIDE: Cam = Cam {
     alts: &[UW48],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 4,
+    slit_frame_ns: 839_880,
     array: &crate::ccs::ARRAYS[1],
     optics: &crate::optics::OPTICS[1],
 };
@@ -303,6 +312,8 @@ pub const FRONT: Cam = Cam {
     alts: &[FRONT842],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 4,
+    slit_frame_ns: 1_264_200,
     array: &crate::ccs::ARRAYS[2],
     optics: &crate::optics::OPTICS[2],
 };
@@ -357,6 +368,8 @@ pub const TELE: Cam = Cam {
     mode_live: true,
     // Measured on the Pro (2026-11-21): asked 3211 lines (51 a second) its frames came 19.95 ms apart (about 3267 lines), so the sensor pads its frame past the driver's 128; asked 3275 (50 a second) they came 20.0 ms apart. 250 past its 3024 rows makes 50 its fastest whole rate.
     blank_least: 250,
+    slit_rows: 64,
+    slit_frame_ns: 1_789_000,
     array: &crate::ccs::ARRAYS[3],
     optics: &crate::optics::OPTICS[3],
 };
@@ -428,6 +441,8 @@ pub const AKITA_MAIN: Cam = Cam {
     alts: &[],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 0,
+    slit_frame_ns: 0,
     array: &crate::ccs::AKITA_ARRAYS[0],
     optics: &crate::optics::AKITA_OPTICS[0],
 };
@@ -476,6 +491,8 @@ pub const AKITA_ULTRAWIDE: Cam = Cam {
     alts: &[],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 0,
+    slit_frame_ns: 0,
     array: &crate::ccs::AKITA_ARRAYS[1],
     optics: &crate::optics::AKITA_OPTICS[1],
 };
@@ -523,6 +540,8 @@ pub const AKITA_FRONT: Cam = Cam {
     alts: &[],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
+    slit_rows: 0,
+    slit_frame_ns: 0,
     array: &crate::ccs::AKITA_ARRAYS[2],
     optics: &crate::optics::AKITA_OPTICS[2],
 };

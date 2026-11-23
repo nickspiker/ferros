@@ -92,6 +92,15 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     put("height", u(r.height as u64));
     put("cfa", u(c.cfa as u64));
     put("cfa_period", u(r.period as u64));
+    // The period down as well (2026-11-22, the Lumis session: a single 4 reads as the 4 x 4 quad): the same as across for every whole readout.
+    put("cfa_period_y", u(r.period as u64));
+    // Its slit where one is offered, the binned readout's (a 1:1 slit lands no frame yet, 2026-11-22: its fields wait for it): the OPEN kind that opens it, its least rows that reach memory, its mosaic's periods across and down.
+    if r.kind == 0 && c.slit_rows != 0 {
+        put("slit_kind", u(3));
+        put("slit_rows_least", u(c.slit_rows as u64));
+        put("slit_cfa_period", u(2));
+        put("slit_cfa_period_y", u(2));
+    }
     put("black", u(c.black as u64));
     put("white", u(c.white as u64));
     put("rotation", u(c.rotation as u64));
@@ -106,6 +115,14 @@ pub fn section_of(c: &Cam, idt: &[u8], r: &Readout) -> Result<vsf::file_format::
     // The readout's line (ps) at its own line length, and the shortest whole frame the driver streams it at (its rows and its least blanking: `Cam::blank_least` for the binned readout, the driver's `BLANK_LEAST` for the others): what a client paces any rate from (ferros_clip `Line::of_ps`, `Pacing::of_line`; 2026-11-21, RAW video on every camera, whose lines differ: the main 3.149 us, the ultrawide 6.562, the front 10.438, the tele 6.107).
     put("line_ps", u(t.line_ps_at(t.llp)));
     put("fll_least", u(r.height as u64 + if r.kind == 0 { c.blank_least } else { crate::BLANK_LEAST } as u64));
+    // A slit's least frame on the binned readout where measured (`Cam::slit_frame_ns`), and the same in lines at its line, rounded up: a slit's fastest period, and the longest integration that keeps it, the least frame's lines less the sensor's margin (2026-11-22: Lumis carried its stills' 15.6 ms into the tele's slit and the frame stretched to it, 63 slits a second against the 559 of the slit's own frame; the Lumis session's Slitscan shutter top).
+    if r.kind == 0 && c.slit_frame_ns != 0 {
+        let line = t.line_ps_at(t.llp);
+        let lines = (c.slit_frame_ns * 1000).div_ceil(line);
+        put("slit_frame_least_ns", u(c.slit_frame_ns));
+        put("slit_lines_least", u(lines));
+        put("slit_exposure_most_ns", u((lines - t.margin as u64) * line / 1000));
+    }
     // The readout at the longest exposure (ns), first row to last, the rolling shutter's skew (owner, 2026-11-17: a camera that ever stretches its line says what its readout costs; the default route never does, so this is the mode's own).
     put("readout", u(t.readout_ps(&t.own(1), r.height as u64) / 1000));
     // Gain (1024 one): the sensor's range as measured from its own capability words (ferros_cam ccs `ARRAYS`' gain, `Gain::range`); the captured code alone (1024 and 1024) for a camera not yet measured.
@@ -190,6 +207,10 @@ mod tests {
                 println!("{}: focus infinity G#{inf:04X}, near G#{near:04X}, travel G#{lo:04X} to G#{hi:04X}, past infinity G#{:04X}", c.name, inf - lo);
             }
             assert_eq!(s.uint("focus_near_mm"), None);
+            // The binned slit's measured shape on every Pro camera: its least rows, its least frame in ns and in lines, the longest integration that keeps it.
+            let (rows, frame, lines, most) = (s.uint("slit_rows_least").unwrap(), s.uint("slit_frame_least_ns").unwrap(), s.uint("slit_lines_least").unwrap(), s.uint("slit_exposure_most_ns").unwrap());
+            assert!(rows == c.slit_rows as u64 && frame == c.slit_frame_ns && most < frame && lines >= rows, "{}", c.name);
+            println!("{}: slits of {rows} rows and up, the least frame {frame} ns ({lines} lines, {} a second), exposure to {most} ns", c.name, 1_000_000_000 / frame);
             let o = c.optics;
             assert_eq!((floats("sensor_width_mm"), floats("sensor_height_mm"), floats("focal_mm"), floats("f_number")), (vec![o.sensor_mm.0], vec![o.sensor_mm.1], vec![o.focal_mm], vec![o.f_number]), "{}", c.name);
             let (m, sens) = (floats("idt"), floats("sensitivity"));
@@ -286,6 +307,13 @@ mod tests {
         assert_eq!((get(0, "id"), get(1, "id"), s[0].text("name"), s[1].text("name")), (0, 0, Some("main"), Some("main")));
         assert_eq!((get(0, "mode"), get(0, "width"), get(0, "height"), get(0, "cfa_period")), (0, 4080, 3072, 2));
         assert_eq!((get(1, "mode"), get(1, "width"), get(1, "height"), get(1, "cfa_period"), get(1, "cfa")), (2, 8160, 6144, 4, c.cfa as u64));
+        // The 1:1's slit: kind 4, 2 rows straddling the quad's halves, 4 across and 2 down; the binned one's a Bayer pair.
+        // The binned readout's slit: kind 3, 16 rows least on the main, a Bayer pair's periods; the 1:1 lists none yet.
+        assert_eq!((get(0, "cfa_period_y"), get(0, "slit_kind"), get(0, "slit_rows_least"), get(0, "slit_cfa_period"), get(0, "slit_cfa_period_y")), (2, 3, 16, 2, 2));
+        assert_eq!((get(1, "cfa_period_y"), s[1].uint("slit_kind")), (4, None));
+        // The main's slit at its floor: 812.3 us, 258 lines of 3.1489 us rounded up, less its margin of 2: 256 lines, 806.1 us.
+        assert_eq!((get(0, "slit_frame_least_ns"), get(0, "slit_lines_least")), (812_300, 258));
+        assert!((805_500..806_500).contains(&get(0, "slit_exposure_most_ns")), "{}", get(0, "slit_exposure_most_ns"));
         assert!((67_200_000..67_300_000).contains(&get(0, "frame_ns")), "{}", get(0, "frame_ns"));
         assert!((41_600_000..41_750_000).contains(&get(1, "frame_ns")), "{}", get(1, "frame_ns"));
         // A line of each: 3.149 us binned, 6.586 us 1:1; the 1:1's readout 6144 of them, 40.5 ms.

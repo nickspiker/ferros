@@ -621,9 +621,12 @@ impl Mode {
 
     /// A slit of `rows` output rows across the whole width, centred on the array's middle (the captured window's: the optical axis as Android crops it) and started on the colour filter's period, so its rows begin a whole cell (binned: a 2 x 2 Bayer cell is two rows; 1:1, a 4 x 4 quad cell is four), and the frame cut to `fll` lines with `coarse` lines of integration.
     /// The middle: the window's centre rounded to the nearest period, so the slit lies half a period off the true middle when its height is an odd number of periods.
+    /// At 1:1 on a quad array, a slit of 2 rows straddles the quad's halves (the owner, 2026-11-22: of R R G G / R R G G / G G B B / G G B B "we only pull" the second and the third): the period's rows 1 and 2, one row of the top half's colours over one of the bottom half's, all three colours in 2 rows (`Mode::periods`: 4 across, 2 down).
+    /// Rows 1 and 2 of a period read back as rows 2 and 1 under a vertical flip, and the captured window holds whole periods, so the same addresses give the period's rows 1 and 2 in the frame as read with the flip or without; the slit's colours are the captured frame's as ferros reads it (`Cam::cfa`'s blocks, each one row tall).
     pub fn slit(&self, a: &Array, rows: u16, fll: u16, coarse: u16) -> Result<Mode, Error> {
         let cell = if self.bin == 1 { a.period } else { a.period / 2 };
-        if rows == 0 || rows % cell != 0 || rows > self.y_out {
+        let straddle = self.straddles(a, rows);
+        if rows == 0 || (rows % cell != 0 && !straddle) || rows > self.y_out {
             return Err(Error::Rows(rows));
         }
         let mut m = *self;
@@ -636,7 +639,8 @@ impl Mode {
         let height = self.y_end + 1 - self.y_start;
         // The first period-aligned start whose slit is centred to the nearest period: (height - span) / 2 rounded to a period.
         let off = ((height - span) / 2 + period / 2) / period * period;
-        m.y_start = top + off;
+        // A straddling slit starts one row into its period.
+        m.y_start = top + off + if straddle { upr } else { 0 };
         m.y_end = m.y_start + span - 1;
         m.y_out = rows;
         if a.crop {
@@ -647,6 +651,22 @@ impl Mode {
         m.coarse = coarse;
         m.check()?;
         Ok(m)
+    }
+
+    /// Whether a slit of `rows` from this mode straddles the quad's halves (`slit`): 1:1 on a quad array, 2 rows.
+    pub fn straddles(&self, a: &Array, rows: u16) -> bool {
+        self.bin == 1 && a.period == 4 && rows == 2
+    }
+
+    /// The mosaic's periods as read, across and down: (2, 2) a Bayer mode (every binned mode; a plain Bayer array at 1:1), (4, 4) the quad array at 1:1, (4, 2) a straddling slit (`slit`); the colours `Cam::cfa`'s 2 x 2 cell, each place a block of half the periods.
+    pub fn periods(&self, a: &Array) -> (u16, u16) {
+        if self.bin != 1 {
+            (2, 2)
+        } else if self.straddles(a, self.y_out) {
+            (a.period, 2)
+        } else {
+            (a.period, a.period)
+        }
     }
 
     /// The frame cut to `fll` lines and `coarse` of integration: refused when the integration would pass the frame's margin or the frame its rows.
@@ -985,10 +1005,21 @@ mod tests {
         assert!((p16.coarse as i32 - 0x9446).abs() <= 1, "{:X}", p16.coarse);
         // The longest, the frame counter's (65533 lines of 2^16 at the 1:1 line): about 7.86 hours, twice the binned mode's 3.76 for its longer line.
         assert!((28_285_000_000_000..28_287_000_000_000).contains(&t.most_ns()), "{}", t.most_ns());
-        // A 1:1 slit: whole quad cells.
-        assert_eq!(m.slit(a, 2, 128, 16), Err(Error::Rows(2)));
+        // A 1:1 slit: whole quad cells, or the 2 rows that straddle the quad's halves (rows 1 and 2 of a period: one row, 2 addresses, past a period's start).
+        assert_eq!(m.slit(a, 6, 128, 16), Err(Error::Rows(6)));
+        assert_eq!(m.periods(a), (4, 4));
         let s = m.slit(a, 64, 64 + (1 << 7), 16).unwrap();
-        assert_eq!((s.y_end + 1 - s.y_start, (s.y_start - m.y_start) % 8, s.bin), (128, 0, 1));
+        assert_eq!((s.y_end + 1 - s.y_start, (s.y_start - m.y_start) % 8, s.bin, s.periods(a)), (128, 0, 1, (4, 4)));
+        let s2 = m.slit(a, 2, 2 + (1 << 7), 16).unwrap();
+        assert_eq!((s2.y_end + 1 - s2.y_start, (s2.y_start - m.y_start) % 8, s2.y_out, s2.periods(a)), (4, 2, 2, (4, 2)));
+        // Centred as the period-aligned slits are: its rows lie within a period of the frame's middle.
+        assert!((s2.y_start as i32 - (m.y_start + m.y_end) as i32 / 2).abs() < 8);
+        // The binned mode's 2-row slit is a whole Bayer pair, period-aligned.
+        if let Some(binned) = local("cam.frame") {
+            let b = Mode::captured(&binned, a).unwrap();
+            let s = b.slit(a, 2, 2 + (1 << 7), 16).unwrap();
+            assert_eq!(((s.y_start - b.y_start) % 8, s.periods(a), b.periods(a)), (0, (2, 2), (2, 2)));
+        }
         // The mode as the driver writes it in the hold: the init's own registers, phase detect and embedded data off.
         let ws = m.quiet().writes(a, c);
         let w: Vec<&[u8]> = ws.iter().collect();
@@ -1048,8 +1079,10 @@ mod tests {
             assert_eq!(s.y_end + 1 - s.y_start, rows * 2);
             assert_eq!((s.y_start - m.y_start) % 8, 0);
         }
-        // 1:1, a slit of two rows would cut the quad cell in half.
-        assert_eq!(u.slit(a, 2, 128, 16), Err(Error::Rows(2)));
+        // 1:1, a slit of two rows straddles the quad's halves (one row into its period); six would cut a quad cell.
+        let s = u.slit(a, 2, 128, 16).unwrap();
+        assert_eq!((s.y_end + 1 - s.y_start, (s.y_start - m.y_start) % 8, s.periods(a)), (4, 2, (4, 2)));
+        assert_eq!(u.slit(a, 6, 128, 16), Err(Error::Rows(6)));
     }
 
     /// The writes: the page, the hold as the camera's own bytes, the registers big-endian, the release; on the Sony part no page and its three binning bytes.
