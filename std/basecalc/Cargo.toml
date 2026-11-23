@@ -14,7 +14,7 @@ name = "basecalc"
 path = "src/main.rs"
 
 [dependencies]
-# The engine, without its terminal (basecalc branch ferros-engine until it is on basecalc's main).
+# The engine, without its terminal (on basecalc's main since 2026-11-23, 90cb1b6).
 basecalc = { path = "../../../basecalc", default-features = false }
 # The engine's numbers (rug's Complex over MPC, MPFR and GMP); the same rug the engine takes.
 rug = { version = "1.28", features = ["complex", "integer"] }

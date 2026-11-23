@@ -1,6 +1,6 @@
 #!/bin/bash
 # basecalc for a ferros device as a ferros process, a kist (docs/KISTS.md "basecalc"): the std/basecalc package (basecalc's own engine, its library without the terminal, behind the kist's keypad under fluor's ferros host) on the ferros target, std from the ferros-rust fork, then the flat image the kernel loads.
-# std/basecalc names basecalc, fluor, vsf and kete by path (siblings of this tree); the engine library is on basecalc's branch ferros-engine until it is on basecalc's main, so the sibling must be on that branch (or a worktree of it linked in the sibling's place).
+# std/basecalc names basecalc, fluor, vsf and kete by path (siblings of this tree); the engine library is on basecalc's main (since 2026-11-23, 90cb1b6).
 # libc with a ferros arm is std/basecalc's own patch (its Cargo.toml), so the host's tests and this build share one lockfile.
 # The engine's numbers are rug's, over GMP, MPFR and MPC in C: the gmp-mpfr-sys crate builds them with their own configure scripts, which know no ferros, so this script builds them first from the crate's own sources (freestanding, against std/basecalc/c/include, linking configure's checks against std/basecalc/c/configure-stub.c) and hands them to the crate as its cache (GMP_MPFR_SYS_CACHE); the crate then copies them in and builds nothing.
 # Pass extra cargo arguments after the script name.
