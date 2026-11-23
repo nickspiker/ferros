@@ -68,6 +68,7 @@ pub mod nr {
     pub const IRQ_ARM: u64 = 45;
     pub const PANIC: u64 = 46;
     pub const MAILBOX: u64 = 47;
+    pub const BASE: u64 = 48;
 }
 
 /// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
@@ -1127,6 +1128,49 @@ pub mod lang {
     /// The identity's language written to this device (the identity service only, payloads/fgtw): None, it has none.
     pub fn set_identity(code: Option<[u8; 3]>) -> bool {
         svc(nr::LANG, 2, code.map_or(0, pack) as u64, 0, 0, 0) == 0
+    }
+}
+
+/// The number base and whose choice it is (kernel base.rs, SETTINGS.md "The number base"; 2026-11-22, as `lang`): the identity's while the device follows it and it has one, else this device's own. The base in effect is `device_base` (preference 0); the rest is read with `state`, for the settings page.
+pub mod base {
+    use super::{nr, svc};
+
+    /// The choices as the kernel holds them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct State {
+        /// The base in effect, tatau's code.
+        pub effective: u8,
+        /// This device's own.
+        pub device: u8,
+        /// The identity's, as its service last wrote it; None for none.
+        pub identity: Option<u8>,
+        /// Whether this device follows the identity's (the default).
+        pub follows: bool,
+    }
+
+    /// The kernel's choices (SYS_BASE op 3); None from a kernel from before 2026-11-22, which knows only preference 0.
+    pub fn state() -> Option<State> {
+        let w = svc(nr::BASE, 3, 0, 0, 0, 0);
+        if w == super::ERR {
+            return None;
+        }
+        let identity = (w >> 16) as u8;
+        Some(State { effective: w as u8, device: (w >> 8) as u8, identity: (identity != 0).then_some(identity), follows: (w >> 24) & 1 == 0 })
+    }
+
+    /// This device's own base, given the Settings capability. True when taken and kept.
+    pub fn set_device(cap: u64, code: u8) -> bool {
+        svc(nr::BASE, 0, cap, code as u64, 0, 0) == 0
+    }
+
+    /// Whether this device follows the identity's base, given the Settings capability.
+    pub fn set_follow(cap: u64, on: bool) -> bool {
+        svc(nr::BASE, 1, cap, !on as u64, 0, 0) == 0
+    }
+
+    /// The identity's base written to this device (the identity service only, payloads/fgtw): None, it has none.
+    pub fn set_identity(code: Option<u8>) -> bool {
+        svc(nr::BASE, 2, code.unwrap_or(0) as u64, 0, 0, 0) == 0
     }
 }
 

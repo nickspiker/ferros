@@ -2069,6 +2069,8 @@ const SYS_PANIC: u64 = 46;
 /// mailbox(op, …) (2026-11-19, docs/KERNEL.md "Mailboxes"; owner: "a capability based public read only mailbox so you could have an unlimited number of items accessing it"). Op 0, open: x1 the mailbox (ferros_mailbox `GPS`, `MOTION`, ...), x2 the token offset of the proof (`mbox_open`), x3 an arc offset for the view's token (32 bytes) → the view's base, or ERR.
 /// Everything else is a syscall that was there: SYS_DMA on a mailbox's region maps it (the writer's making the caller its writer), SYS_WAIT on its sequence word waits for a publish, and SYS_WAKE on it by the writer wakes every reader waiting.
 const SYS_MAILBOX: u64 = 47;
+/// base(op, …): the number base the device draws in (base.rs, SETTINGS.md "The number base"; 2026-11-22, as SYS_LANG the language), tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS). Op 0, Settings at x1: this device's own base, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_LANG op 2): the identity's base, x1 the code (0: it has none). Op 3, no capability (the base is what every screen shows whoever holds the device): `base::word`, the base in effect, this device's, the identity's and whether it keeps its own, a byte each. Ops 0-2 keep the settings document, put back as it was when the vault refuses. The base in effect is also preference 0 (PREF_BASE), which every process reads. A Settings holder's SYS_SET_PREF of preference 0 is op 0. → 0 or ERR, op 3 the word.
+const SYS_BASE: u64 = 48;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_notice as note_post_notice, post_system as note_post_system, report as notes_report};
@@ -7382,6 +7384,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_BASE => {
+            let settings = |at: u64| {
+                let token = p.read(at, 32);
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
+            };
+            let keep = || keep_settings();
+            // WHY `valid`: the code is the caller's, and is kept in the vault and handed to every process as preference 0; one tatau does not know is refused.
+            f.x[0] = match f.x[0] {
+                0 if settings(f.x[1]) && crate::base::valid(f.x[2]) => {
+                    if crate::base::set_device(f.x[2] as u8, keep) { 0 } else { ERR }
+                }
+                1 if settings(f.x[1]) => {
+                    if crate::base::set_own(f.x[2] == 1, keep) { 0 } else { ERR }
+                }
+                2 if !p.kist && p.name.as_slice() == b"fgtw" && (f.x[1] == 0 || crate::base::valid(f.x[1])) => {
+                    if crate::base::set_identity(f.x[1] as u8, keep) { 0 } else { ERR }
+                }
+                3 => crate::base::word(),
+                _ => ERR,
+            };
+            0
+        }
         SYS_DETAIL => {
             let own = LINK_NAMES.iter().position(|n| !p.kist && *n == p.name.as_slice());
             f.x[0] = match f.x[0] {
@@ -7561,7 +7585,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = held && !(index == PREF_UNLOCK_AT_BOOT && value != 0);
             // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
             let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
-            f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {
+            f.x[0] = if index == PREF_BASE {
+                // The number base is this device's own choice now (base.rs, SYS_BASE op 0): the base in effect follows the identity's while the device does. Live is applied, not kept, as for any preference.
+                if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || unsafe { SETTINGS_WRITE }.is_some()) {
+                    if crate::base::set_device(value, || live || keep_settings()) { 0 } else { ERR }
+                } else {
+                    ERR
+                }
+            } else if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || kept(index)) {
                 set_pref_locked(index, value);
                 if !live {
                     keep_settings();

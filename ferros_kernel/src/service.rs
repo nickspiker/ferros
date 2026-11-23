@@ -5243,6 +5243,9 @@ pub fn run(mut b: Boot) -> ! {
                             code.is_some_and(|c| crate::process::with_lock(|| crate::lang::set_device(c, || true)))
                         }
                         ("language_follow", Some(v @ (0 | 1))) => crate::process::with_lock(|| crate::lang::set_own(v == 0, || true)),
+                        // The number base: this device's own (base.rs), and whether it follows the identity's.
+                        ("base", Some(v)) if (0..=255).contains(&v) && crate::base::valid(v as u64) => crate::process::with_lock(|| crate::base::set_device(v as u8, || true)),
+                        ("base_follow", Some(v @ (0 | 1))) => crate::process::with_lock(|| crate::base::set_own(v == 0, || true)),
                         ("tz", Some(z)) if z.abs() < 86_400 => {
                             crate::rtc::set_tz(z);
                             true

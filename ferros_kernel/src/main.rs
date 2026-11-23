@@ -70,6 +70,8 @@ mod idle;
 mod rtc;
 mod zone;
 mod lang;
+// The number base and whose choice it is (base.rs, SETTINGS.md).
+mod base;
 mod aoc;
 mod gps;
 mod nfc;
@@ -2476,7 +2478,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     checklist::step(checklist::Step::Slot);
 
     // The device's settings (SETTINGS.md, settings.rs): one VSF document under `device`, loaded here so everything drawn from now on reads in them. Defaults first (DMS, tatau's house base; brightness two stops down (64 32nds), white about 147 cd/m²; Dvorak; everything else 0), then whatever the document carries. An identity's preferences replace them when that identity attests; nothing here ever writes them back to an identity.
-    process::set_pref(process::PREF_BASE, tatau::base().code());
+    base::load(tatau::base().code(), 0, false, false);
     process::set_pref(process::PREF_BRIGHTNESS, 2 << 5);
     if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(settings::KEY).ok().flatten()) {
         let _ = settings::apply(&doc, false);

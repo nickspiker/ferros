@@ -5,15 +5,15 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
-use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_DND, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_RADIOS_BEFORE, PREF_RADIOS_OFF, PREF_SCALE, PREF_SCOPE, PREF_SOUND, PREF_THEME, PREF_TORCH_DUTY, PREF_TORCH_LEVEL, PREF_TORCH_STROBE, PREF_TORCH_TIMEOUT, PREF_UNLOCK_AT_BOOT, PREF_VOLUME, PREF_HELM};
+use crate::process::{PREF_BRIGHTNESS, PREF_DITHER, PREF_DND, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_RADIOS_BEFORE, PREF_RADIOS_OFF, PREF_SCALE, PREF_SCOPE, PREF_SOUND, PREF_THEME, PREF_TORCH_DUTY, PREF_TORCH_LEVEL, PREF_TORCH_STROBE, PREF_TORCH_TIMEOUT, PREF_UNLOCK_AT_BOOT, PREF_VOLUME, PREF_HELM};
 
 /// The vault key and the section name.
 pub const KEY: &str = "device";
 const SECTION: &str = "device";
 
 /// Each kept preference: its field name and its index in the preferences block. The screen's on/off (preference 2) is not kept: it is the power key's, every boot starts lit. Do not disturb is the identity's as its service last wrote it (`dnd_identity`, as `language_identity`), never read back into the identity.
-pub const FIELDS: [(&str, usize); 20] = [
-    ("base", PREF_BASE),
+/// The number base is not among them: preference 0 is the base in effect, and the document keeps this device's own and the identity's (`BASE`, base.rs).
+pub const FIELDS: [(&str, usize); 19] = [
     ("labels", PREF_LABELS),
     ("brightness", PREF_BRIGHTNESS),
     ("dither", PREF_DITHER),
@@ -34,6 +34,10 @@ pub const FIELDS: [(&str, usize); 20] = [
     ("volume", PREF_VOLUME),
     ("helm", PREF_HELM),
 ];
+/// The number base (base.rs; 2026-11-22, as the language): this device's own (`base`, tatau's code; absent, DMS), whether the device follows the identity's (`base_follow`, 1 the default), and the identity's as its service last wrote it (`base_identity`; absent, none). Until 2026-11-22 `base` was preference 0 itself, the only choice there was, so a document from before reads as this device's own, followed by default.
+const BASE: &str = "base";
+const BASE_FOLLOW: &str = "base_follow";
+const BASE_IDENTITY: &str = "base_identity";
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";
 /// What this device starts into (owner, 2026-11-21: "Start into: ferros / Android"; docs/BOOT.md "Android only by the identity's choice"): 0 ferros (the default), 1 Android, the attested identity's standing choice. Kept here and in the kernel alone, never in the preferences block: until the same day it was preference 8, which the kernel still writes as slot 0's surface generation for a display from before 2026-11-12 (process.rs `PREF_SURFACES`), so a window's generation became "Android" in the document and the 8a started into Android unasked (measured: b297-b299).
@@ -81,7 +85,7 @@ fn schema() -> SectionSchema {
     for name in [ZONE_AUTO, ZONE_FOLLOW, ZONE_IDENTITY_AUTO, ZONE_FOUND_BY] {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s.field(LANGUAGE, TypeConstraint::Language).field(LANGUAGE_IDENTITY, TypeConstraint::Language).field(LANGUAGE_FOLLOW, TypeConstraint::AnyUnsigned)
+    s.field(LANGUAGE, TypeConstraint::Language).field(LANGUAGE_IDENTITY, TypeConstraint::Language).field(LANGUAGE_FOLLOW, TypeConstraint::AnyUnsigned).field(BASE, TypeConstraint::AnyUnsigned).field(BASE_FOLLOW, TypeConstraint::AnyUnsigned).field(BASE_IDENTITY, TypeConstraint::AnyUnsigned)
 }
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
@@ -138,6 +142,10 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
         }
     }
     b = b.set(LANGUAGE_FOLLOW, unsigned(!crate::lang::own() as u8)).ok()?;
+    b = b.set(BASE, unsigned(crate::base::device())).ok()?.set(BASE_FOLLOW, unsigned(!crate::base::own() as u8)).ok()?;
+    if crate::base::identity() != 0 {
+        b = b.set(BASE_IDENTITY, unsigned(crate::base::identity())).ok()?;
+    }
     // A knob still unset (all ones) is left out: absent means the driver's own default.
     for (name, link, slot) in KNOBS {
         let v = crate::process::CONTROL[link][slot].load(core::sync::atomic::Ordering::Relaxed);
@@ -197,6 +205,11 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
         _ => 0,
     };
     crate::lang::load(language(LANGUAGE), language(LANGUAGE_IDENTITY), flag(LANGUAGE_FOLLOW) == Some(false), held);
+    n += 1;
+    // The base's choices, each absent one at its default (this device's as it stands, DMS at boot; following the identity; nothing from it yet).
+    // WHY `valid`: the document can be stored from the bridge, and a code tatau does not know would be handed to every process; read as absent.
+    let base = |name: &str| first(name).and_then(|v| v.as_u64()).filter(|&c| crate::base::valid(c)).map(|c| c as u8);
+    crate::base::load(base(BASE).unwrap_or(crate::base::device()), base(BASE_IDENTITY).unwrap_or(0), flag(BASE_FOLLOW) == Some(false), held);
     n += 1;
     if let Some(z) = first(TZ).and_then(|v| v.as_i64()) {
         // A zone is within a day of UTC; anything else is not a zone.
