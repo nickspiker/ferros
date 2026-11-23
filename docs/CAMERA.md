@@ -1877,6 +1877,24 @@ What the runs say together:
 
 At 2 rows its image channel reports VRESOL_MISMATCH (+1C G#40, channel 0 alone starting) and loch0 G#414: the Sony sends a line count other than its 2-row window's. Its slit sets the digital crop's height to the rows (ccs `Mode::slit`, `crop[3]`) over a 4-address window (2 rows binned 2 x 2); a crop or output height under its pipeline's least (4 rows streams) is the likely cause. Its floor is a whole frame of about 104 lines whatever the rows, so 2 rows would gain nothing over 4 with 2 kept: left until the main's line test is done. A device knob writing the link's channel 0 height (as the fifteenth byte writes channel 1's) would read the count it sends.
 
+### The main's short frames on the Pro (2026-11-22 night, the stored deca6b4f driver hand-spawned, kit/burst.sh; logs kit/runs/burst)
+
+| slit | line (clocks) | slits a second (sensor / drained) | link |
+|---|---|---|---|
+| 8 rows, 4080 | 6320 | nothing lands | ERR_CRC_PH, no frame end |
+| 8 rows, 4080 | 9480 | nothing lands | the same |
+| 8 rows, 4080 | 12640 | 1050 / 1005 | **clean** (+14 G#0) |
+| 8 rows, 4080 | 25280 | 581 / 576 | clean |
+| 12 rows, 4080 | 12640 | 1044 / 1035 | lands |
+| 4 and 2 rows, 4080 | 12640 | nothing lands | ERR_CRC_PH, no frame end |
+| 8 rows, 2048 wide | 6320 | nothing lands | |
+| 8 rows, 1280 wide | 6320 | 1237 / 1242 | lands, ERR_CRC_PH and ERR_LOST_FS beside |
+| 1:1 straddle, 8160 x 2 | 11600, 23200, 46400 | nothing lands (sensor 818, 512, 284) | ERR_CRC_PH, no frame end, at every line |
+
+- **The link's rate is the cause for 8 to 12 rows**: halving the bytes a second (the line doubled) or cutting them to a third (1280 columns) lands 8 rows, the doubled line with a clean link. 4 and 2 rows still fail at the doubled line, and the 1:1 straddle at every line to four times its own: under 8 rows something else holds, not settled.
+- **No faster for it**: at the doubled line the main's floor is about 952 us (1050 a second), against 812 us (1231) for 16 rows at its own line. Two rows kept a slit: 16 rows at the mode's line 2.46k lines a second, 8 rows at the doubled line 2.10k. So the list keeps 16 rows at the mode's line (`slit_rows_least` 16), the fastest full-width slit; 8 rows full width (a doubled line) or 8 rows 1280 wide (1237 a second, a third of the field) are there for a client that wants fewer bytes, not more speed.
+- **The 1:1 slit fields stay held back**: no 1:1 slit lands at any line tried.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
