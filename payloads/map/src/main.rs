@@ -1731,6 +1731,8 @@ struct Map {
     drop: targets::Drop,
     /// Pucks the person stopped (targets.rs `stop`): never launched again by the map until the person taps their circle; each shows its name alone meanwhile.
     pucks_held: alloc::vec::Vec<[u8; 32]>,
+    /// Kists whose last launch did not start because their capsule is not in this device's vault (the kernel's record, why `NOT_HERE`: a list restored from the fleet before its capsules came back). Never launched again by the map until the stower says a job for that capsule finished (a restore landed, a stow), never on a timer or a pass (owner's no-polling rule; the Pro, 2026-11-23: four pucks relaunched every 37 ms, each failure's bell the next launch's cause). Said once a kist as it comes. A tap is the person's own ask and still launches.
+    absent: alloc::vec::Vec<[u8; 32]>,
     /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
@@ -2385,6 +2387,14 @@ impl Map {
             }
             let capsule: [u8; 32] = r[1..33].try_into().unwrap();
             let why = r[0];
+            // No capsule here: the kist waits for the stower to bring it (`absent`), said once.
+            if why == ferros_kist::launch::why::NOT_HERE && !self.absent.contains(&capsule) {
+                self.absent.push(capsule);
+                let name = self.kists.kists.iter().find(|k| k.capsule == capsule).map(|k| k.name.clone()).unwrap_or_default();
+                let mut l = Line::new();
+                let _ = write!(l, "map: {name} waits: its capsule is not in the vault; launched again when the stower brings it\n");
+                ferros_sys::console_flash(self.grants, l.as_str().as_bytes());
+            }
             let mut l = Line::new();
             if self.asked.is_some_and(|(c, bell)| c == capsule && at > bell) {
                 self.asked = None;
@@ -2899,7 +2909,7 @@ impl Map {
         call(self.display, &m[..2 + 64 * n], &mut r);
         for i in 1..self.deck.n() {
             let Some(k) = self.kist(i) else { continue };
-            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) && !self.pucks_held.contains(&k.capsule) {
+            if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) && !self.pucks_held.contains(&k.capsule) && !self.absent.contains(&k.capsule) {
                 self.launch(i);
             }
         }
@@ -6583,6 +6593,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         asked: None,
         fault: None,
         stopped: alloc::vec::Vec::new(),
+        absent: alloc::vec::Vec::new(),
         drop: targets::Drop::default(),
         pucks_held: alloc::vec::Vec::new(),
         kists_read: 0,
@@ -7003,6 +7014,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             map.stower = s;
             if done != stower_done {
                 stower_done = done;
+                // A capsule the stower brought (a restore landed, a stow): its kist may launch again (`absent`), once, from the circles read again below.
+                let brought = |c: &[u8; 32]| map.stower.jobs.iter().any(|j| j.capsule == *c && j.stage == stower::DONE);
+                map.absent.retain(|c| !brought(c));
                 map.refresh_circles();
             }
             if matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck" && !map.settling {
