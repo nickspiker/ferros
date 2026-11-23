@@ -26,6 +26,8 @@ const LOCAL_US: u64 = 4_000_000;
 const SEED_US: u64 = 64_000_000;
 /// The most times the first pull's wait doubles while fgtw.org does not answer (`retry_us`): 16 s up to 2^6 times that, about 17 minutes.
 const MISS_SHIFT_MAX: u8 = 6;
+/// How long the fleet devices asked for a newer fan-out (`fanout_req`) have before fgtw.org is asked (µs, 2^23, about 8.4 s). A deadline, not a poll: a sibling with nothing newer stays silent by the protocol (fgtw 7785592 answers only a strictly newer fan-out), so its silence can be read only by a time. It covers a transfer's retries in Photon Transport (a SPEC tried again at half a second, doubling) and the sibling's own pass; fgtw.org comes sooner when every ask was given up (`space_ask_sent`).
+const ASK_US: u64 = 1 << 23;
 
 /// What was last said of the person key: nothing yet, opened (or minted) and held, sealed under a fleet key this device does not hold, a mint refused for want of an egg, the kernel refused it.
 const P_NONE: u8 = 0;
@@ -86,19 +88,30 @@ pub struct SpaceSync {
     /// The first pull's wait for the network said.
     said_no_net: bool,
     /// The key fingerprint of a copy (fgtw.org's or a sibling's) that did not open here: while Some, nothing of ours is pushed to fgtw.org (G2, docs/IDENTITY-SPACE.md).
-    held: Option<[u8; 32]>,
+    pub held: Option<[u8; 32]>,
     /// The key fingerprint of a copy the published fan-out was read for (`space_rekey`) and held nothing to adopt (none newer, or no wrap for this device), and the fingerprint of the key held here then. While both still stand the first pull is not asked again on a timer: an event asks again (`space_wake`; the key changing lifts it by itself).
     checked: Option<([u8; 32], [u8; 32])>,
     /// The device's copy changed (fgtw op 34: the map or the stower wrote it): joined at the next pass. Also set by a copy merged in and by the first settle: the join runs on these, never on a timer.
     pub copy_rang: bool,
+    /// The fleet devices asked for their fan-out (`fanout_ask`) for a copy sealed under `slot` while the key held here was `ours`: the frames' BLAKE3 (one per device asked), how many were given up, and when fgtw.org is asked instead (`ASK_US`).
+    asking: Option<Asking>,
     /// fgtw.org's failures in a row (a pull or a fan-out read), since it last answered: the first pull's wait doubles with each (`retry_us`).
     misses: u8,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, base_told: None, said_base: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, copy_rang: false, misses: 0 }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, said_out: Vec::new(), zone_told: None, said_zone: false, lang_told: None, said_lang: false, base_told: None, said_base: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE, said_ready: 8, pull_tries: 0, said_no_net: false, held: None, checked: None, copy_rang: false, asking: None, misses: 0 }
     }
+}
+
+/// A `fanout_req` out to the fleet devices heard (`SpaceSync::asking`).
+pub struct Asking {
+    slot: [u8; 32],
+    ours: [u8; 32],
+    sent: Vec<[u8; 32]>,
+    failed: usize,
+    until_us: u64,
 }
 
 /// The device's copy through this process's `map.` and `kists.` grants. A refused read is an error, never absent (ferros_space::Store).
@@ -419,6 +432,24 @@ impl Client {
         if *kfp == ours || self.space.checked.is_some_and(|(c, k)| c == *kfp && k == ours) {
             return false;
         }
+        // The fleet devices first (the owner's rule, devices before fgtw.org): asked once for this copy's key, and fgtw.org only once their time is out with no newer fan-out taken (`space_ask_step`). With none heard, fgtw.org at once.
+        if self.space.asking.as_ref().is_some_and(|a| a.slot == *kfp && a.ours == ours) {
+            return false;
+        }
+        let sent = self.fanout_ask();
+        if !sent.is_empty() {
+            self.log.put(b"fgtw: space: A#");
+            self.log.dec(sent.len() as u64);
+            self.log.put(b" fleet device(s) asked for a newer fan-out; fgtw.org only if none answers");
+            self.log.line();
+            self.space.asking = Some(Asking { slot: *kfp, ours, sent, failed: 0, until_us: now_us() + ASK_US });
+            return false;
+        }
+        self.space_fanout_org(kfp, ours)
+    }
+
+    /// fgtw.org's published fan-out read for a copy sealed under `kfp` (the key held here `ours`), the last rung (`fanout_check`). Whether a newer key was adopted.
+    fn space_fanout_org(&mut self, kfp: &[u8; 32], ours: [u8; 32]) -> bool {
         match self.fanout_check(kfp) {
             FanCheck::Adopted => true,
             FanCheck::Unreachable => {
@@ -437,6 +468,45 @@ impl Client {
                 self.log.line();
                 false
             }
+        }
+    }
+
+    /// The asked devices' time out, or every ask given up, with no newer fan-out taken from them: fgtw.org now. A key that moved meanwhile ended the ask (`space_key_moved`).
+    fn space_ask_step(&mut self, t: u64) {
+        let Some(a) = self.space.asking.as_ref() else { return };
+        if t < a.until_us && a.failed < a.sent.len() {
+            return;
+        }
+        let (slot, ours) = (a.slot, a.ours);
+        self.space.asking = None;
+        self.log.put(b"fgtw: space: no fleet device answered a newer fan-out: fgtw.org, the last rung");
+        self.log.line();
+        if self.space_fanout_org(&slot, ours) {
+            self.space_key_moved();
+        }
+    }
+
+    /// A frame's delivery (Photon Transport's `Sent`): a `fanout_req` given up on is counted, and once every one was, fgtw.org is asked at the next pass rather than at the deadline.
+    pub(crate) fn space_ask_sent(&mut self, hash: &[u8; 32], ok: bool) {
+        if ok {
+            return;
+        }
+        if let Some(a) = self.space.asking.as_mut() {
+            if a.sent.contains(hash) {
+                a.failed += 1;
+            }
+        }
+    }
+
+    /// The fleet key moved (a sibling's fan-out, fgtw.org's, a mint): an ask under way ends, and a copy that did not open is asked for again at once (fgtw.org's pull and the fleet's copies), the back-off reset.
+    pub(crate) fn space_key_moved(&mut self) {
+        self.space.asking = None;
+        self.space.checked = None;
+        self.space.misses = 0;
+        if self.space.held.is_some() {
+            self.space.last_seed_us = 0;
+            self.log.put(b"fgtw: space: asking again: the fleet key moved");
+            self.log.line();
         }
     }
 
@@ -719,18 +789,26 @@ impl Client {
         if !self.space.loaded {
             return Some(0);
         }
-        if !self.space.settled {
-            // Waiting on an event: no deadline of its own.
-            if self.space_parked() {
-                return None;
+        // The fleet devices' time to answer a `fanout_req` (at once when every ask was given up), beside the space's own.
+        let ask = self.space.asking.as_ref().map(|a| if a.failed >= a.sent.len() { 0 } else { a.until_us });
+        let own = if !self.space.settled {
+            // Waiting on an event (or on the asked devices): no deadline of its own.
+            if self.space_parked() || ask.is_some() {
+                None
+            } else {
+                Some(self.space.last_seed_us + self.retry_us())
             }
-            return Some(self.space.last_seed_us + self.retry_us());
+        } else if self.space.copy_rang {
+            // A join due (the copy rang, or a copy merged in): at once; else fgtw.org's pull (`SEED_US`).
+            Some(0)
+        } else {
+            Some(self.space.last_seed_us + SEED_US)
+        };
+        // WHY the min: the earlier of two deadlines, not a bound on a value.
+        match (ask, own) {
+            (Some(a), Some(o)) => Some(a.min(o)),
+            (a, o) => a.or(o),
         }
-        // A join due (the copy rang, or a copy merged in): at once; else fgtw.org's pull (`SEED_US`).
-        if self.space.copy_rang {
-            return Some(0);
-        }
-        Some(self.space.last_seed_us + SEED_US)
     }
 
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
@@ -755,6 +833,8 @@ impl Client {
         if self.space.held == Some(fgtw::fanout::fleet_key_fingerprint(&fk)) {
             self.space_release(b"this device holds the key the held copy is sealed under");
         }
+        // The fleet devices asked for a newer fan-out: fgtw.org once their time is out (`space_ask_step`).
+        self.space_ask_step(t);
         if !self.space.loaded {
             self.space_load();
             // The person key at once from this device's own copy of the space, before the first pull (owner, 2026-11-17: "all my person keys should be immediate as well"): opened only, never minted (a mint before the pull could go over the fleet's key); the pull's settle follows as before and hands another key only if the fleet's space says another won.
@@ -765,7 +845,7 @@ impl Client {
         }
         if !self.space.settled {
             // The first pull again until fgtw.org answers with a copy that opens or a sibling's copy arrives: on the back-off while fgtw.org does not answer, not at all while the pull waits on an event (`space_parked`).
-            if !self.space_parked() && t - self.space.last_seed_us >= self.retry_us() {
+            if !self.space_parked() && self.space.asking.is_none() && t - self.space.last_seed_us >= self.retry_us() {
                 self.space.last_seed_us = t;
                 self.space_ask_fleet();
                 self.space_seed(false);

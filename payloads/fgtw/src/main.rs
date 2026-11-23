@@ -1113,6 +1113,57 @@ impl Client {
         }
     }
 
+    /// The members of the chain held here that it has locked out (`chain_held`; none when it does not fold).
+    pub(crate) fn fleet_locked(&self) -> Vec<[u8; 32]> {
+        fgtw::fleet::MembershipBlob::from_vsf_bytes(&self.chain_held).ok().and_then(|b| b.locked_out().ok()).unwrap_or_default()
+    }
+
+    /// A sibling's `fanout_req` (fgtw 7785592; the owner's rule, devices before fgtw.org): our fan-out handed back as a plain `fanout_resp`, only to a live member of the chain held here and only when ours is strictly newer than the revision it holds, so an answer never hands a device an older key. Nothing is sent otherwise: silence is the answer "nothing newer here".
+    pub fn on_fanout_req(&mut self, from: Addr, bytes: &[u8]) {
+        let Ok((hp, theirs, sender)) = fgtw::protocol::parse_fanout_req(bytes) else { return };
+        if Some(hp) != self.hp || !self.bound || sender == self.me || !self.fleet_members().contains(&sender) || self.fleet_locked().contains(&sender) {
+            return;
+        }
+        let (rev, blob) = {
+            let h = self.held_fan.borrow();
+            (h.revision(&hp), h.blob(&hp).map(|b| b.to_vec()))
+        };
+        let Some(blob) = blob.filter(|_| rev > theirs) else { return };
+        let Ok(frame) = fgtw::protocol::fanout_resp(&hp, &blob, &self.keys, eagle()) else { return };
+        self.log.put(b"fgtw: fan-out revision A#");
+        self.log.dec(rev);
+        self.log.put(b" to ");
+        self.log.fp(&sender);
+        self.log.put(b", which holds A#");
+        self.log.dec(theirs);
+        self.log.line();
+        let out = self.pt.send(from, frame, now_us(), eagle());
+        self.send_all(out);
+    }
+
+    /// Ask the fleet devices heard on this network for their fan-out (`fanout_req`, with the revision held here), before fgtw.org: the frames' BLAKE3s, so their delivery can be followed (`space_ask_sent`). Empty when no live member is heard.
+    pub(crate) fn fanout_ask(&mut self) -> Vec<[u8; 32]> {
+        let Some(hp) = self.hp else { return Vec::new() };
+        let (members, locked) = (self.fleet_members(), self.fleet_locked());
+        let to: Vec<([u8; 32], Addr)> = self.sponsors.iter().filter(|s| members.contains(&s.key) && !locked.contains(&s.key)).map(|s| (s.key, s.addr)).collect();
+        if to.is_empty() {
+            return Vec::new();
+        }
+        let Ok(frame) = fgtw::protocol::fanout_req(&hp, self.key_floor(&hp), &self.keys, eagle()) else { return Vec::new() };
+        let hash = *blake3::hash(&frame).as_bytes();
+        let mut sent = Vec::new();
+        for (k, addr) in to {
+            self.log.put(b"fgtw: fan-out: asking ");
+            self.log.fp(&k);
+            self.log.put(b" for a newer one, before fgtw.org");
+            self.log.line();
+            let out = self.pt.send(addr, frame.clone(), now_us(), eagle());
+            self.send_all(out);
+            sent.push(hash);
+        }
+        sent
+    }
+
     /// The revision a new fleet key must pass: the higher of the revision the key in hand came with and the fan-out this device last grew or was handed (`held_fan`). 0 when neither is known (a kept key loaded at start, no fan-out seen since).
     fn key_floor(&self, hp: &[u8; 32]) -> u64 {
         // WHY the max: two records of revisions this device has seen for its key, kept by different paths (the add machine's grow keeps `held_fan`); the floor is the later of the two, not a bound on a value.
@@ -1255,6 +1306,7 @@ impl Client {
             if f.revision > self.fleet_rev {
                 self.fleet_rev = f.revision;
             }
+            self.held_fan.borrow_mut().hold(&hp, f.revision, &fgtw::fanout::fanout_to_bytes(f.revision, &f.kfp, &f.rotator_ed, &f.epoch_pub, &f.wraps));
             self.log.put(b"fgtw: fan-out: the published key is the one held here; the copy waits for the fleet");
             self.log.line();
             return FanCheck::Nothing;
@@ -1287,6 +1339,8 @@ impl Client {
         self.fleet_rev = f.revision;
         self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &key);
         wipe(&mut key);
+        // Kept to answer a sibling's `fanout_req` (`on_fanout_req`): the blob as published, rebuilt from the verified fan-out.
+        self.held_fan.borrow_mut().hold(&hp, f.revision, &fgtw::fanout::fanout_to_bytes(f.revision, &f.kfp, &f.rotator_ed, &f.epoch_pub, &f.wraps));
         self.log.put(b"fgtw: fan-out: THE FLEET KEY MOVES to fingerprint ");
         self.log.fp(&f.kfp);
         self.log.put(b" (revision A#");
@@ -1960,10 +2014,13 @@ impl Client {
                         // A new key is taken only from a member of the chain held here, and only newer than the key held: a device locked out still has the identity seed, so it could wrap a key of its own to this device and hand it over, or hand back the fan-out from before the lock (the shrink of 2026-11-22). A device joining holds no chain yet and takes its sponsor's.
                         let refused: Option<&[u8]> = if !new {
                             None
-                        } else if self.bound && !self.fleet_members().contains(&signer) {
-                            Some(b" - REFUSED: its sender is not a member of the chain held here")
+                        } else if self.bound && (!self.fleet_members().contains(&signer) || self.fleet_locked().contains(&signer)) {
+                            Some(b" - REFUSED: its sender is not a live member of the chain held here")
                         } else if self.fleet_key.is_some() && revision <= self.key_floor(&hp) {
                             Some(b" - REFUSED: not newer than the key held here (never back to an older fan-out)")
+                        } else if self.fleet_key.is_some() && self.key_floor(&hp) == 0 && self.space.held != Some(fgtw::fanout::fleet_key_fingerprint(&key)) {
+                            // No floor known (a key kept on disk, loaded at start, no fan-out seen since): a new key only when it is the one a copy of the space that did not open here is sealed under, as fgtw.org's path takes it (`fanout_check`), so a sibling's older fan-out is never taken back.
+                            Some(b" - REFUSED: the revision held here is unknown and no copy here is sealed under this key")
                         } else {
                             None
                         };
@@ -1982,12 +2039,18 @@ impl Client {
                         if !new && revision > self.fleet_rev {
                             self.fleet_rev = revision;
                         }
+                        // The fan-out of the key held, kept to answer a sibling's `fanout_req` (`on_fanout_req`); `hold` keeps only a revision at least the held one's.
+                        if !new || refused.is_none() {
+                            self.held_fan.borrow_mut().hold(&hp, revision, &blob);
+                        }
                         if new && refused.is_none() {
                             self.fleet_key = Some(key);
                             self.fleet_rev = revision;
                             self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &key);
                             // A key that arrives while the Fleet page shows opens the add flow there.
                             self.add_key();
+                            // A copy of the space that did not open is asked for again now (the fan-out a sibling answered our `fanout_req` with, or one it handed on its own).
+                            self.space_key_moved();
                         }
                         wipe(&mut key);
                     }
@@ -2022,6 +2085,8 @@ impl Client {
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
+            // A sibling asking for our fan-out (fgtw 7785592).
+            Ok((Inbound::Other(name), _)) if name == "fanout_req" => self.on_fanout_req(from, bytes),
             // A frame of the Photon app's own (history pages, avatars, the chain sync...): ip hands every datagram on 4383 to both readers, fgtw and Photon, so this service sees a copy of Photon's traffic and Photon answers it. Said once a name a run, not once a frame (2026-11-22: the Pro's console filled with "frame hist_page from 469e79b8 (not handled)", six a second while the desktop paged history to the Photon kist).
             Ok((Inbound::Other(name), signer)) => {
                 if !self.unhandled_said.iter().any(|n| *n == name) {
@@ -2169,6 +2234,8 @@ impl Client {
                             self.depart_sent(&to, &hash, ok);
                             // The add machine's sends the same way (a select, the grown fan-out).
                             self.add_sent(&to, &hash, ok);
+                            // A `fanout_req` given up on: fgtw.org at once when every one was.
+                            self.space_ask_sent(&hash, ok);
                         }
                     }
                 }
