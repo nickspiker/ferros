@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
 ferros_glyphs = { path = "../../ferros_glyphs" }
 # common.rs names the sky engine for its place helpers (unused by the clock).

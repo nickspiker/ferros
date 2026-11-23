@@ -19,12 +19,15 @@ const S_DISPLAY: u64 = 2;
 
 /// The heap the script is parsed in. The linker script lays the zeroed data into the file (payload.ld), so the heap and the allocator lie inside the arc the kernel sizes for the file, never under the spawn input, and syscalls may land in it.
 /// 2^19: at 2^17 a pinch of 32 frames (74 events, 6 KB of script) died in the parse (exit G#DEAD on the Pro and the 8a, 2026-11-12; 16 frames passed); 96 frames (196 events, 17.5 KB) pass at 2^19.
-const HEAP_SIZE: usize = 1 << 19;
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
+const HEAP_CEILING: usize = 1 << 19;
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 /// An injected finger's pressure on the controller's own 0-255 scale, and its axes in the controller's units (sixteenths of a pixel, `AREA_SCALE`): a light touch of a fingertip. Consumers filter on the kind (a finger), not on these.
 const PRESSURE: u8 = 1 << 6;
@@ -119,7 +122,7 @@ impl Hand {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, _input as usize, input_len as usize) };
     let mut doc = alloc::vec![0u8; input_len as usize];
     let mut got = 0;
     while got < doc.len() {
@@ -234,4 +237,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(payload_main);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

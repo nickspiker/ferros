@@ -44,30 +44,34 @@ global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym modem_main
+    main = sym modem_main,
+    heap = const HEAP_CEILING
 );
 
 /// The heap: the UE-capability files (half a megabyte, and their replies), the carrier configs, the DL queue and each pass's frames, freed as they go (ferros_heap, the kernel's own allocator).
-const HEAP_SIZE: usize = 16 << 20;
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 16 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
+
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
 
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     hw::init(grants);
     // After the jump from a running Android (fact 31 = 6) or ferros's own restart (7) the CP is still in the last session's: every path below takes it and the link down first (modem.rs `off`, at the head of each bring-up), never reading the controller before (the first jump that let this driver run hung the bus on the survey's ELBI read, 2026-11-01).
     let base = ferros_sys::arc_base();

@@ -10,5 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }

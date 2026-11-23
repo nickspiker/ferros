@@ -35,7 +35,7 @@ path = "src/thermo.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
 # The typeface each puck draws its words in (the display's own).
 ferros_glyphs = { path = "../../ferros_glyphs" }

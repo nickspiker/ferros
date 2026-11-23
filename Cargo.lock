@@ -1681,6 +1681,9 @@ dependencies = [
 [[package]]
 name = "ferros_heap"
 version = "0.0.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros_hv"

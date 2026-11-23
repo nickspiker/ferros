@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # Eagle time for a kist's stow stamp (the person's list).
 ferros_detail = { path = "../../ferros_detail" }
 # The person's list (`process`), the directory (`directory`) and the fetch's pure half (`fetch`: HTTP decoding, a capsule taken in as it streams).

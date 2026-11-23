@@ -13,7 +13,7 @@ ferros_sys = { path = "../../ferros_sys" }
 # A link's detail document (docs/RADIO-CONTROLS.md).
 ferros_detail = { path = "../../ferros_detail" }
 # The heap the links' detail documents are read in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync.
 ferros_kept = { path = "../../ferros_kept" }
 # Each circle as a thing (`ht`) and its icon by content (`hp`).

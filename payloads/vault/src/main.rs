@@ -23,13 +23,13 @@ use ferros_sys::{cap, console, freq, now, ERR, NOTHING};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
 /// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB from 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. 56 MiB since 2026-11-12 (the arc 64 MiB): on the 8a, after Mahere's cells, three Mahere capsules and an offer of Photon cut off at 64 MiB, the open itself ran 24 MiB out ("memory allocation of 69768 bytes failed" before "open in"), every boot, and the GPU, WiFi and sensors processes, which read their firmware from this vault, ended with it. The open's high water is on the console ("open in"). 2026-11-12, the 8a: it ran out again inside manifestus's reap while a 91 MB capsule was dropped (a reap window is a sixty-fourth of the tract, 2 GiB then 4 GiB there, and its survivors were held twice); manifestus `bounded-reap` writes them out 256 blocks at a time, and the same run of offers that ended it twice then left it alive (docs/VAULT-OUT.md "Its end").
-const HEAP_BYTES: usize = 56 << 20;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 56 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 const STACK_BYTES: usize = 1 << 18;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
 unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
 static STACK: Region<STACK_BYTES> = Region(UnsafeCell::new([0; STACK_BYTES]));
 
 core::arch::global_asm!(
@@ -39,20 +39,26 @@ core::arch::global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym vault_main
+    main = sym vault_main,
+    heap = const HEAP_CEILING
 );
 
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 const S_SERVE: u64 = 1;
 const S_BLOCKS: u64 = 2;
@@ -282,7 +288,7 @@ pub extern "C" fn vault_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     // Input bit 0, by hand over the bridge only (the kernel spawns with no input): start the region afresh (`FRESH`).
     unsafe { FRESH = input_len >= 1 && core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) & 1 == 1 };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     unsafe { GRANTS = g };
     let stack = unsafe { &mut *STACK.0.get() };
     ferros_sys::thread_spawn(work, stack, 0);
@@ -939,7 +945,7 @@ extern "C" fn work(_: u64) -> ! {
     say!("vault: tract {} blocks from {}, the window {} a mirror; generation {}, {} live blocks, plow {} reap {}{}", st.tract_blocks, vault.tract_base(), HALF, st.generation, st.live_blocks, st.plow, st.reap, if vault.settled() { "" } else { " (not settled: the walk that counts them follows, between requests)" });
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, eagle);
     store.set_clock(now);
-    say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
+    say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB held, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, ALLOC.held() >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
     // The pieces' helpers, idle until a read hands them a batch (`Helpers`).
     for s in HELPER_STACKS.iter() {
         if ferros_sys::thread_spawn(helper, unsafe { &mut *s.0.get() }, 0) == ERR {
@@ -1269,7 +1275,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                             // A large value's end says what the live set and the heap hold after it (2026-11-13: the live set's growth ended the process twice on the 8a).
                             if whole >= METER_MIN {
                                 let (hashed, tree) = store.engine().live_counts();
-                                say!("vault: wrote {} B; the live set {} hashed, {} by position, {} KiB; the heap {} KiB in use, high water {} of {} KiB", whole, hashed, tree, store.engine().live_bytes() >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10);
+                                say!("vault: wrote {} B; the live set {} hashed, {} by position, {} KiB; the heap {} KiB in use, high water {} of {} KiB held", whole, hashed, tree, store.engine().live_bytes() >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10, ALLOC.held() >> 10);
                             }
                             0
                         }
@@ -1993,7 +1999,7 @@ impl ferros_items::serve::Clips<St> for ItemClips<'_> {
     }
 }
 
-/// The largest value an export carries, and the largest export: the document is built whole in this process's heap (HEAP_BYTES). A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.
+/// The largest value an export carries, and the largest export: the document is built whole in this process's heap. A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.
 const EXPORT_VALUE_MAX: u64 = 1 << 20;
 const EXPORT_MAX: u64 = 1 << 22;
 
@@ -2132,13 +2138,13 @@ fn op_name(op: u8) -> &'static str {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let (op, offset, len, name) = unsafe { SERVING };
     // The heap's lock is not taken while a panic says so (try_lock): the panic may have come from inside the allocator, and a spin on its lock here would hang the report.
-    let (free, blocks, largest) = match ALLOC.try_lock() {
-        Some(h) => (h.free_bytes() >> 10, h.free_blocks(), h.largest_free() >> 10),
+    let (free, blocks, largest) = match ALLOC.try_stats() {
+        Some((f, b, l)) => (f >> 10, b, l >> 10),
         None => (0, 0, 0),
     };
     let (hashed, tree, live_bytes) = unsafe { LIVE };
     say!(
-        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the live set {} hashed, {} by position, {} KiB; the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
+        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the live set {} hashed, {} by position, {} KiB; the heap: {} KiB in use, high water {} of {} KiB held, {} KiB free in {} blocks, the largest {} KiB",
         info,
         op_name(op),
         offset,
@@ -2149,7 +2155,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         live_bytes >> 10,
         ferros_heap::IN_USE.load(Relaxed) >> 10,
         ferros_heap::PEAK.load(Relaxed) >> 10,
-        HEAP_BYTES >> 10,
+        ALLOC.held() >> 10,
         free,
         blocks,
         largest

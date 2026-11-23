@@ -18,8 +18,8 @@ use ferros_sys::{call_live, cap, claim};
 
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants, false);
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
+    let link = common::start(grants, input, input_len, false);
     let gps = cap(grants, common::S_GPS);
     let mut signals = [Signal::default(); SIGNALS];
     let mut n = 0usize;

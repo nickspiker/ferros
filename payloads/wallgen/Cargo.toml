@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # The picture as GPU kernels (its `gpu` feature: valhall's recorder), wallgen's only way to draw it.
 wallpaper = { path = "../../wallpaper", features = ["gpu"] }
 vsf = { path = "../../../vsf", default-features = false }

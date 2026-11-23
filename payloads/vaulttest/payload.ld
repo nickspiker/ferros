@@ -22,3 +22,5 @@ SECTIONS {
 }
 /* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */
 __ferros_tail = ADDR(.bss) + SIZEOF(.bss) - __file_end + 16;
+/* The end of .bss: a growing heap starts here (ferros_heap::ArcHeap::init, docs/NO-CEILINGS.md step 1). */
+__bss_end = ADDR(.bss) + SIZEOF(.bss);

@@ -243,8 +243,8 @@ fn face(px: &mut [u64], d: usize, (tc, ts): (f32, f32), tm: &Time, th: &ferros_s
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants, true);
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
+    let link = common::start(grants, input, input_len, true);
     let mut shown = 0u64;
     loop {
         let seen = common::rt::bell();

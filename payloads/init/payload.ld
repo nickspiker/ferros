@@ -16,6 +16,8 @@ SECTIONS {
     .dynamic : { *(.dynamic) }
     /* .bss carried in the image as zeros (the statics in .data, after .dynamic): the kernel sizes a native payload's arc from its flat image alone, so zeroed statics past the image ran into the entry stack and past the arc (2026-11-08: init's launcher heap and stack, the map's heap for the person's kists). */
     .data : { *(.data*) *(.got*) *(.got.plt*) *(.bss*) }
+    /* The end of .bss (carried in .data): a growing heap starts here (ferros_heap::ArcHeap::init, docs/NO-CEILINGS.md step 1). */
+    __bss_end = .;
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
 /* .bss is carried in .data (the image holds its zeros): the tail is only the 16 every image declares. */

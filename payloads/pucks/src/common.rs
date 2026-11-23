@@ -2,19 +2,17 @@
 //!
 //! Grant slots (ferros_kist `slots`: a capsule that declares no implicit right): 1 display, 2 touch, 3 its surface (empty: a puck holds none), 4 ira, 5 its own vault domain, 6 entropy; then its wants in order, 7 `puck` (its circle), 8 `gps` (asked: its place), 9 `udp` (the weather's alone); then the GPU's three (empty for a puck) and audio.
 
-use core::cell::UnsafeCell;
 pub use ferros_puck::rt::{self, Link};
 use ferros_puck::{call, Full, Writer, LIST_MAX};
 use ferros_glyphs::Glyphs;
 
-// WHY 2 MiB: the typeface's cache (64 KiB of table, 64 KiB of coverage) and swash's scaling beside the engines' own.
-const HEAP_SIZE: usize = 2 << 20;
-#[repr(C, align(64))]
-struct Region<const N: usize>(UnsafeCell<[u8; N]>);
-unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_SIZE> = Region(UnsafeCell::new([0; HEAP_SIZE]));
+// The heap (docs/NO-CEILINGS.md step 1): the zeroed tail the kernel maps past .bss for a growing image (each puck's `entry!(…, grows 1 << 26)`, 4 MiB of it at spawn) and what the arc grows by after it. Until then a static 2 MiB array (the typeface's cache, 64 KiB of table and 64 KiB of coverage, and swash's scaling beside the engines' own), and the 4 MiB the kernel mapped beside it went unused.
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there.
+    static __bss_end: u8;
+}
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 /// Its circle (`puck`), its place (`gps`, when the person grants it), the network (`udp`, the weather's).
 pub const S_PUCK: u64 = ferros_sys::kist::asked(0);
@@ -24,11 +22,11 @@ pub const S_UDP: u64 = ferros_sys::kist::asked(2);
 /// Its own vault domain: the place it keeps.
 pub const S_DOMAIN: u64 = ferros_sys::kist::DOMAIN;
 
-/// Relocate, the heap, the typeface, the view's watch: the puck's link to its circle. `frames`: the face moves continuously and is drawn at every frame the deck shows (the clock).
-pub fn start(grants: u64, frames: bool) -> Link {
+/// Relocate, the heap (around the spawn input at `input`, `input_len` bytes: the entry's x1 and x2), the typeface, the view's watch: the puck's link to its circle. `frames`: the face moves continuously and is drawn at every frame the deck shows (the clock).
+pub fn start(grants: u64, input: u64, input_len: u64, frames: bool) -> Link {
     unsafe { ferros_sys::relocate() };
     ferros_sys::panic_grants(grants);
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     unsafe { GLYPHS = Glyphs::with_arena(ferros_glyphs::FONT, 1 << 15) };
     let link = Link { grants, slot: S_PUCK, square: ferros_sys::kist::SURFACE };
     rt::watch(link, frames);

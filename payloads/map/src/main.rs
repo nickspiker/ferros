@@ -141,10 +141,9 @@ extern "C" fn tag_add_thread(grants: u64) -> ! {
 }
 
 /// And an icon handed to the display (`send_icons`): its decoded document (A#262_311 bytes), the section parsed from it and its texels, each about 256 KiB, one icon at a time (the Pro, b1063: with a 1 MiB heap the map panicked on a 256 KiB allocation at its first icon).
-/// Since 2026-11-20 not a static in the image (which a flat image carries whole: the map's grew past the 3 MiB a value holds) but the zeroed tail the kernel maps after .bss for an image whose heap grows (`entry!(…, grows HEAP_CEILING)`): its first 4 MiB (the kernel's HEAP_START), less a cache line.
-const HEAP_SIZE: usize = (1 << 22) - (1 << 7);
-/// The ceiling the image header declares: the kernel sizes the arc's window for it, and maps the first 4 MiB at spawn.
-const HEAP_CEILING: usize = 1 << 22;
+/// Since 2026-11-20 not a static in the image (which a flat image carries whole: the map's grew past the 3 MiB a value holds) but the zeroed tail the kernel maps after .bss for an image whose heap grows (`entry!(…, grows HEAP_CEILING)`): its first 4 MiB (the kernel's HEAP_START).
+/// Since docs/NO-CEILINGS.md step 1 it grows past them (ferros_heap::ArcHeap, SYS_ARC), up to the interim ceiling every growing payload declares until the address space widens: the 4 MiB the ceiling was until then held the deck to what it fit.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 /// The most of the deck document read (ferros_kept::deck): a place is under 200 bytes, so this holds hundreds.
 const DECK_MAX: usize = 1 << 16;
 /// The most of the stower's icon index read (ferros_kept::icon `INDEX`): an entry is under 100 bytes.
@@ -189,7 +188,7 @@ fn read_decoded(grants: u64, icon: &ferros_thing::Hp) -> Option<Vec<u8>> {
     ferros_kept::icon::read_decoded(&doc, icon)
 }
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the map's area in thousandths, and its icon in the display server's bundle (tools/app-icons order).
 struct Spec<'a> {
@@ -6454,14 +6453,14 @@ fn dist16(a: (i64, i64), b: (i64, i64)) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The circles' labels are `&'static str`, absolute addresses fixed at link time; linked position-independent, they are relocations this applies before anything reads them. Without it the first label read faulted at its link-time address, G#D9B (2026-10-21).
     unsafe { ferros_sys::relocate() };
-    // The heap: the zeroed tail the kernel maps past .bss (`entry!(…, grows HEAP_CEILING)`), from the first cache line past .bss and its 16 bytes, as ip takes it.
+    // The heap: the zeroed tail the kernel maps past .bss (`entry!(…, grows HEAP_CEILING)`) and the arc's slack, then what the arc grows by.
     unsafe extern "C" {
         static __image_end: u8;
     }
-    unsafe { ALLOC.init(((&raw const __image_end) as usize + 16 + 63) & !63, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __image_end) as usize, input as usize, input_len as usize) };
     // The deck's start by part, to the console with "deck drawn" (2026-11-12, measuring attest to the deck): [the display's size, the person's kists read, the places kept, the scene sent, the view kept, the first draw], counter ticks at each end.
     let mut t_start = [now(); 7];
     let display = cap(grants, S_DISPLAY);

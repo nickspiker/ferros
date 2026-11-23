@@ -3,3 +3,10 @@ name = "ferros_heap"
 edition.workspace = true
 license.workspace = true
 description = "no_std free-list heap allocator with coalescing for the ferros kernel"
+
+[dependencies]
+# A payload's heap reaches the kernel (SYS_ARC) thru ferros_sys (`arc::Kernel`); the kernel's own build and the host tests leave it out.
+ferros_sys = { path = "../ferros_sys", optional = true }
+
+[features]
+process = ["dep:ferros_sys"]

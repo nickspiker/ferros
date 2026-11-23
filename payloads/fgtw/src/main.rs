@@ -31,10 +31,12 @@ mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
 /// 8 MiB since 2026-11-17: at 2 MiB the Pro's service ended on "memory allocation of 67075 bytes failed" (b916) as the desktop's Photon, reloaded, began its sibling ceremony with this device's member key (baf3dec7 is a fleet member, so every Photon of the fleet takes it for a sibling until the alias cutover, PHOTON.md M4): its 573806-byte ClutchOffer arrives as a transfer this service takes in whole (photon_core pt, MAX_TRANSFER 4 MiB), beside the held chain (about 207 KB) and the bindings. A transfer as large as MAX_TRANSFER now fits beside the rest.
-const HEAP_BYTES: usize = 8 << 20;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 8 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 /// The most one peer's transfer may ask of this heap, and the most all of them in flight may hold together (`Pt::bound_inbound`).
 const IN_MOST: usize = 1 << 21;
-const IN_BUDGET: usize = HEAP_BYTES >> 1;
+/// WHY 4 MiB: half the 8 MiB static heap this was until docs/NO-CEILINGS.md step 1, kept as it was; the heap grows now, and this becomes a share of the device's free memory with the kernel's ARC_FREE (NO-CEILINGS.md, section 4, row N5).
+const IN_BUDGET: usize = 1 << 22;
 /// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
 const STACK_BYTES: usize = 1 << 20;
 /// What an untouched stack byte holds.
@@ -50,7 +52,6 @@ fn stack_used() -> usize {
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
 unsafe impl<const N: usize> Sync for Region<N> {}
 /// Both zero-initialised, so in `.bss`: the kernel zeroes the tail the header names.
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
 static STACK: Region<STACK_BYTES> = Region(UnsafeCell::new([0; STACK_BYTES]));
 /// The network watcher's stack (`net_watch`): it only calls and stores, nothing allocated.
 static WATCH_STACK: Region<{ 1 << 14 }> = Region(UnsafeCell::new([0; 1 << 14]));
@@ -168,23 +169,29 @@ core::arch::global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym fgtw_main
+    main = sym fgtw_main,
+    heap = const HEAP_CEILING
 );
 
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: Heap = Heap(ferros_heap::LockedHeap::empty());
+static ALLOC: Heap = Heap(ferros_heap::ArcHeap::new(ferros_heap::Kernel));
 
 /// The heap, saying what it held when an allocation fails: the panic's message (which the kernel keeps in the flash log's deaths) carries the bytes in use, the peak, the free bytes, how many free blocks they lie in and the largest of them, so a failure tells a heap too small from one too fragmented (2026-11-22, the Pro b1136: "memory allocation of 573806 bytes failed", and nothing else to go on).
-struct Heap(ferros_heap::LockedHeap);
+struct Heap(ferros_heap::ArcHeap<ferros_heap::Kernel>);
 
 unsafe impl core::alloc::GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
@@ -203,8 +210,9 @@ unsafe impl core::alloc::GlobalAlloc for Heap {
 #[inline(never)]
 fn heap_failed(size: usize) -> ! {
     use core::sync::atomic::Ordering::Relaxed;
-    let (free, blocks, largest) = ALLOC.0.try_lock().map_or((0, 0, 0), |h| (h.free_bytes(), h.free_blocks(), h.largest_free()));
-    panic!("memory allocation of A#{size} bytes failed; the heap of A#{HEAP_BYTES}: in use A#{}, peak A#{}, free A#{free} in A#{blocks} blocks, the largest A#{largest}", ferros_heap::IN_USE.load(Relaxed), ferros_heap::PEAK.load(Relaxed));
+    let (free, blocks, largest) = ALLOC.0.try_stats().unwrap_or((0, 0, 0));
+    let (held, (grows, refused)) = (ALLOC.0.held(), ALLOC.0.grow_counts());
+    panic!("memory allocation of A#{size} bytes failed; the heap holds A#{held} after A#{grows} grows, A#{refused} refused: in use A#{}, peak A#{}, free A#{free} in A#{blocks} blocks, the largest A#{largest}", ferros_heap::IN_USE.load(Relaxed), ferros_heap::PEAK.load(Relaxed));
 }
 
 const S_UDP: u64 = 1;
@@ -1173,10 +1181,7 @@ impl Client {
     /// The heap's state on the line being said: in use, the peak, and the largest free block with the number of free blocks (a heap that runs short, too small or fragmented).
     fn heap_said(&mut self) {
         use core::sync::atomic::Ordering::Relaxed;
-        let (blocks, largest) = {
-            let h = ALLOC.0.lock();
-            (h.free_blocks(), h.largest_free())
-        };
+        let (blocks, largest) = (ALLOC.0.free_blocks(), ALLOC.0.largest_free());
         self.log.put(b"; heap: in use A#");
         self.log.dec(ferros_heap::IN_USE.load(Relaxed) as u64);
         self.log.put(b", peak A#");
@@ -2919,7 +2924,7 @@ static mut GIVEN: Option<Addr> = None;
 #[unsafe(no_mangle)]
 pub extern "C" fn fgtw_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.0.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.0.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     unsafe { GRANTS = grants };
     fgtw::set_entropy(kernel_entropy);
     fgtw::set_log(crate_log);

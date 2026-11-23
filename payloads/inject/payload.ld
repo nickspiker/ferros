@@ -14,6 +14,8 @@ SECTIONS {
         __rela_end = .;
     }
     .data : { *(.data*) *(.got*) *(.got.plt*) *(.bss*) *(COMMON) }
+    /* The end of .bss (carried in .data): a growing heap starts here (ferros_heap::ArcHeap::init, docs/NO-CEILINGS.md step 1). */
+    __bss_end = .;
     .dynamic : { *(.dynamic) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }

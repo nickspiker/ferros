@@ -10,6 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # The engine and the station documents (docs/PUCKS.md).
 ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }

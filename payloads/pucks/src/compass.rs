@@ -51,8 +51,8 @@ fn load(domain: u64) -> Option<Calibration> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants, false);
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
+    let link = common::start(grants, input, input_len, false);
     common::start_place(grants);
     let domain = ferros_sys::cap(grants, common::S_DOMAIN);
     let kept = load(domain);

@@ -17,8 +17,8 @@ use ferros_faces::weather::face;
 use ferros_weather::{Ask, Forecast};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants, false);
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
+    let link = common::start(grants, input, input_len, false);
     common::start_place(grants);
     let udp = ferros_sys::cap(grants, common::S_UDP);
     let mut forecast: Option<Forecast> = None;

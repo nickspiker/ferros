@@ -14,7 +14,7 @@ ferros_sys = { path = "../../ferros_sys" }
 ferros_kepler = { path = "../../ferros_kepler" }
 # The last fix kept as a VSF document, as payloads/gps keeps it.
 ferros_kept = { path = "../../ferros_kept" }
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # The rough place and the predicted sky (payloads/gps predict.rs and net.rs, the same files).
 ferros_gnss = { path = "../../ferros_gnss" }
 ferros_sky = { path = "../../ferros_sky" }

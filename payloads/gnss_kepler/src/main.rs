@@ -24,7 +24,6 @@
 
 extern crate alloc;
 
-use core::cell::UnsafeCell;
 use core::fmt::Write;
 use ferros_kepler as kp;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_set, NOTHING};
@@ -775,13 +774,15 @@ fn advance(g: u64, s: &mut State, link_only: bool) -> bool {
 }
 
 /// The heap the documents are built and read in (as payloads/gps).
-const HEAP_BYTES: usize = 1 << 19;
-#[repr(C, align(16))]
-struct Region<const N: usize>(UnsafeCell<[u8; N]>);
-unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
+const HEAP_CEILING: usize = 1 << 19;
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 const _: () = assert!(ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND == ferros_kept::vsf::OSCILLATIONS_PER_SECOND);
 
 /// The last fix kept (`gps.last`): latitude and longitude in 2^-23 degrees, and when it came.
@@ -882,7 +883,7 @@ fn counts(s: &State) -> (u32, u32, u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     ferros_sys::panic_grants(grants);
     let g = grants;
     let input0 = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
@@ -1237,4 +1238,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_report(env!("CARGO_BIN_NAME"), info)
 }
 
-ferros_sys::entry!(payload_main);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

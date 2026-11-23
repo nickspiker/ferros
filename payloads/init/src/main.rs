@@ -29,12 +29,15 @@ const S_LAUNCH: u64 = 105;
 const S_KIST_LIST: u64 = 107;
 
 /// The heap the person's list of kists is read in (ferros_kist), a launch at a time.
-const HEAP_SIZE: usize = 1 << 18;
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
+const HEAP_CEILING: usize = 1 << 18;
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 /// The launcher's stack (`launcher`): a list parsed through vsf wants more than a keeper's.
 const LAUNCH_STACK: usize = 1 << 16;
 #[repr(C, align(16))]
@@ -76,7 +79,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The table's names and slot lists are `&'static` slices, absolute addresses fixed at link time: apply the payload's relocations before reading them (the first run faulted at address 0 without this, 2026-10-22, as the map once did).
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, _input as usize, _input_len as usize) };
     let mut failed = 0u64;
     // The keepers' stacks: in this frame, which never returns.
     let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
@@ -373,4 +376,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(payload_main);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

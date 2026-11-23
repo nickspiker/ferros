@@ -14,12 +14,15 @@ use alloc::vec::Vec;
 use ferros_sys::svc;
 
 /// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes; and the networks remembered, read and parsed (`kept_all`: two lists of at most 16 networks, a few KiB with the parser's own; 128 KiB since 2026-11-18, twice what the detail alone had, so the lists never take what it needs).
-const HEAP_SIZE: usize = 1 << 17;
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
+const HEAP_CEILING: usize = 1 << 17;
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 const ELBI: u64 = 1;
 const SOC: u64 = 2;
@@ -348,23 +351,24 @@ core::arch::global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym pcie1_main
+    main = sym pcie1_main,
+    heap = const HEAP_CEILING
 );
 
 extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     // First: the image's own relocations (payload.ld, build.rs: linked -pie).
     unsafe { ferros_sys::relocate() };
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     // Spawned by init at boot there is no input (a spawn from the vault carries none): with the vault scope granted, the whole bring-up from the vault's files; from the bridge, the stage byte it was given.
     // The grant count at 0x200 of the grants page (the handle table fills the first 512 bytes since 2026-11-03; read at 0 it was 0, and the driver thought it had no vault scope).
     let has_store = unsafe { core::ptr::read_volatile((base + grants + 0x200) as *const u32) } as u64 > STORE;

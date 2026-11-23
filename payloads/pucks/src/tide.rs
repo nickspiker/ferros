@@ -30,8 +30,8 @@ struct Using {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let link = common::start(grants, false);
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
+    let link = common::start(grants, input, input_len, false);
     common::start_place(grants);
     let Ok(catalog) = Catalog::parse(bundled::CATALOG) else {
         common::say(grants, b"tide: the bundled catalog does not read\n");

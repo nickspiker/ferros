@@ -12,6 +12,10 @@
 //
 // tlsf.rs ── ferros_rt/src/tlsf.rs by path (one source, not a copy): TLSF, two-level segregated fit
 //
+// arc.rs ── a payload's heap that grows (docs/NO-CEILINGS.md 0.3): trait Arc { base, size, grow, shrink } (SYS_ARC; `Kernel` with feature `process`)  struct ArcHeap<A> ::new(arc) (const) ::init(bss_end, input, input_len) ::add_region ::free_bytes ::free_blocks ::largest_free ::try_stats ::held ::grow_counts ::arc_size  impl GlobalAlloc (TLSF; grows the arc on a miss, gives its top back past a cushion)
+// layout.rs ── ferros_rt/src/layout.rs by path: heap_regions, grow_bytes, shrink_to (the one policy)
+// INTERIM_CEILING ── the ceiling a growing payload declares until step 2 widens the address space
+//
 // kernel.rs ── the kernel's heap: struct LockedTlsf(SpinLock<State>) ::empty() (const) ::add(start, size) per region ::report() → Option<Report> ::last_fail() → Fail ::try_lock()/lock() → guard  impl GlobalAlloc (realloc in place first; a refused allocation recorded as a Fail, then null)
 //   struct State ::levels(each(floor, blocks, bytes)) free space by size ::verify() the host tests' walk
 //   struct Report { region, regions, size, in_use, peak, free, free_blocks, largest, fails, last_fail }  struct Fail { size, align, caller, in_use, free, free_blocks, largest }
@@ -27,6 +31,17 @@
 #[path = "../../ferros_rt/src/tlsf.rs"]
 pub mod tlsf;
 pub mod kernel;
+#[path = "../../ferros_rt/src/layout.rs"]
+pub mod layout;
+pub mod arc;
+
+pub use arc::{Arc, ArcHeap};
+#[cfg(feature = "process")]
+pub use arc::Kernel;
+
+/// The heap ceiling a growing payload declares in its image header until the address space widens (docs/NO-CEILINGS.md step 2: today every window comes from 64 GiB, cachemap ARC_VA, and a window is sized from its ceiling, so a ceiling of the whole pool would give a payload 16 GiB of it and the fifth such spawn would find none).
+/// WHY 2^28: above every payload's heap today (wallgen's 248 MiB the largest) and the windows it sizes, a few hundred MiB each, fit the 64 GiB beside Lumis's 8 GiB and Photon's 1 GiB. Addresses only: the kernel maps 4 MiB at spawn and the rest only as the heap grows. Step 3 deletes it and the header names the pool.
+pub const INTERIM_CEILING: usize = 1 << 28;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};

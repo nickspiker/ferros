@@ -37,26 +37,30 @@ global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym sensors_main
+    main = sym sensors_main,
+    heap = const HEAP_CEILING
 );
 
 /// The heap: the protocol's messages (a kilobyte or two each), the registry scripts while they are pushed.
-const HEAP_SIZE: usize = 2 << 20;
-#[repr(C, align(64))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the heap the static array held until then, all of it mapped at spawn (the kernel maps up to 4 MiB of a growing image's heap, process.rs HEAP_START), so the arc is as it was. It grows past this once the kernel maps a start smaller than the ceiling (step 2), and the number goes with step 3.
+const HEAP_CEILING: usize = 2 << 20;
+
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
 
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 /// The published block (ferros_sys `sensor_block`): in this process's own memory, read in place by the kernel.
 #[repr(C, align(64))]
@@ -80,7 +84,7 @@ const THERMO_MS: u64 = 1 << 9;
 
 pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, _input as usize, _input_len as usize) };
     G.store(grants, core::sync::atomic::Ordering::Relaxed);
     usf::init(grants);
     // The `sensors` switch: the kernel starts the AoC unless it is up (its service loop, some 1.4 s of firmware from the vault, no sooner than 4 s into the boot).

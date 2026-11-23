@@ -14,7 +14,7 @@ ferros_spi = { path = "../../ferros_spi" }
 # The last fix kept as a VSF document (docs/VSF-AUDIT.md P15: the place as `w`, when it came as `e`).
 ferros_kept = { path = "../../ferros_kept" }
 # The heap that document is built and read in.
-ferros_heap = { path = "../../ferros_heap" }
+ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 # The rough place combined from its sources (the single egg rule), and the predicted sky: the orbits carried forward and seen from that place.
 ferros_gnss = { path = "../../ferros_gnss" }
 # A place on the earth for the predicted sky (the sun and moon engine's, which ferros_gnss shares).

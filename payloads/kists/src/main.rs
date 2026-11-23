@@ -54,7 +54,8 @@ const S_STOW: u64 = 6;
 const S_ICONS: u64 = 7;
 
 /// The heap: the directory, the person's list, a capsule's first bytes (64 KiB), the eggs' checks.
-const HEAP_SIZE: usize = 4 << 20;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 4 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 /// The worker's stack: SPHINCS+ and Falcon verification, the list parsed through vsf.
 const WORK_STACK: usize = 1 << 19;
 /// The space watcher's stack: two small calls.
@@ -65,7 +66,6 @@ const PIECE: usize = ferros_sys::STORE_MAX;
 #[repr(C, align(64))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
 unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_SIZE> = Region(UnsafeCell::new([0; HEAP_SIZE]));
 static WORKER_STACK: Region<WORK_STACK> = Region(UnsafeCell::new([0; WORK_STACK]));
 static WATCHER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
 /// The offers' watcher's stack: two small calls and a job pushed.
@@ -73,8 +73,13 @@ static OFFER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK
 /// The piece being filled: in the arc (.bss), where a syscall's bytes land (never the heap's start, a DMA region in some processes; here the heap is in the arc too).
 static PIECE_BUF: Region<PIECE> = Region(UnsafeCell::new([0; PIECE]));
 
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 /// The ferros project key's public bundle (`KeyBundle::to_bytes`), every scheme, that signs the directory (ferros_kist::directory::verify_directory). Not pinned yet (owner, 2026-11-10: "the project public bundle ... isn't pinned yet"): until it is, the directory is read unchecked and the page says so. A directory vouches for nothing either way: every capsule's own eggs are checked against the developer bundle it carries and the person's pin for that developer (below), so an unchecked directory can list nothing that stows unchecked. tools/kistcat publishes it UNSIGNED (`build --unsigned`) until the project key is chosen.
 const PROJECT_BUNDLE: &[u8] = &[];
@@ -347,7 +352,7 @@ fn make_room(s: &mut State) -> bool {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The tables of `&str` and the vtables are absolute words: relocated before anything reads them.
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_SIZE) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, _input as usize, _input_len as usize) };
     GRANTS.store(grants, Ordering::Relaxed);
     unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_gen: 0, dir_wanted: false, restore_wanted: true, jobs: Vec::new() }) };
     ferros_sys::thread_spawn(worker, unsafe { &mut *WORKER_STACK.0.get() }, grants);
@@ -1415,4 +1420,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(payload_main);
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

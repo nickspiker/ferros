@@ -19,15 +19,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use ferros_sys::{call, cap, console, freq, now, ERR};
 
-const HEAP_BYTES: usize = 248 << 20;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 248 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 
-#[repr(C, align(16))]
-struct Region<const N: usize>(UnsafeCell<[u8; N]>);
-unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
 
 core::arch::global_asm!(
     r#"
@@ -36,20 +32,26 @@ core::arch::global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym wall_main
+    main = sym wall_main,
+    heap = const HEAP_CEILING
 );
 
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 const S_STORE: u64 = 1;
 const S_DISPLAY: u64 = 2;
@@ -176,7 +178,7 @@ fn made_key(store: u64) -> Option<[u8; 32]> {
 #[unsafe(no_mangle)]
 pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     unsafe { GRANTS = g };
     if input_len != 32 {
         say!("wallgen: no wallpaper seed (32 bytes of input)");

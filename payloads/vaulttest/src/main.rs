@@ -7,15 +7,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use ferros_sys::{cap, console, freq, now};
 
-const HEAP_BYTES: usize = 16 << 20;
+/// The heap's ceiling in the image header (docs/NO-CEILINGS.md step 1): the interim ceiling every growing payload declares until the address space widens (ferros_heap::INTERIM_CEILING). The kernel maps 4 MiB of it at spawn (process.rs HEAP_START) and the rest only as the heap grows (SYS_ARC, ferros_heap::ArcHeap), refused only past it or when the device is out. Until then the heap was a static array of 16 MiB, held whole from spawn to end.
+const HEAP_CEILING: usize = ferros_heap::INTERIM_CEILING;
 
-#[repr(C, align(16))]
-struct Region<const N: usize>(UnsafeCell<[u8; N]>);
-unsafe impl<const N: usize> Sync for Region<N> {}
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
 
 core::arch::global_asm!(
     r#"
@@ -24,20 +20,26 @@ core::arch::global_asm!(
     .type _entry, %function
 _entry:
     b {main}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad 0
     .quad 0
     .quad 0
-    .quad 0
+    .quad {heap}
     .size _entry, . - _entry
 "#,
-    main = sym test_main
+    main = sym test_main,
+    heap = const HEAP_CEILING
 );
 
+unsafe extern "C" {
+    /// The end of .bss (payload.ld): the heap starts there, in the zeroed tail the kernel maps after it.
+    static __bss_end: u8;
+}
+
 #[global_allocator]
-static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
 const S_STORE: u64 = 1;
 /// The large value's size: 6 MiB.
@@ -122,7 +124,7 @@ pub extern "C" fn test_main(g: u64, input: u64, input_len: u64) -> ! {
     // The mode byte first: `arc_base` reads x28, which this function's own code may take for itself further down (the grow mode never ran after a rebuild, 2026-11-08).
     let mode = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
     unsafe { ferros_sys::relocate() };
-    unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
+    unsafe { ALLOC.init((&raw const __bss_end) as usize, input as usize, input_len as usize) };
     unsafe { GRANTS = g };
     // Input 02: the grow (manifestus grow_from, VAULT-OUT.md): one value larger than a blank vault's first 512 MiB a mirror, streamed in, read back and compared byte for byte (the pattern regenerated a transfer at a time; blake3's incremental Hasher faulted in this payload, 2026-11-08) and deleted, so the tract must grow into its half of the window.
     if mode == 2 {
