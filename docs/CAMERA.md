@@ -1862,6 +1862,21 @@ Hand-spawned from forge (7acde33f's driver, and tele-pd-off.diff for the tele), 
 
 Exactly 2 rows to memory today: the front (791 a second, 1.6k lines a second) and the tele (713, 1.4k); the ultrawide keeps 2 of 4 (1465, 2.9k lines a second of the 2 kept), the main 2 of 16 (1231, 2.5k).
 
+### The main's short frames: the link's rate, not the rows (2026-11-22, desk)
+
+What the runs say together:
+- The main's link fails on rate as well as on rows: at 64 rows a 6320-clock line is clean and a 5888-clock line sets ERR_CRC_PH; at the full 4080 width 5376 clocks takes no frame ("The line, toward a million"). At 6320 clocks it carries 5100 bytes a 3.149 us line, 1.62 GB/s, near what the link takes: the main runs its link closest to its limit of the four.
+- The tele (4032 a 6.107 us line, 0.83 GB/s), the front (3840 a 10.44 us line, 0.46 GB/s) and the ultrawide (4000 a 6.56 us line, 0.76 GB/s) carry half or less, and all three take short frames.
+- The main's errors grow as its frame shortens: 64 rows clean, 56 to 16 ERR_CRC_PH with frames landing, 12 and under no frame end at all. A binned sensor's line buffer starts a frame by sending its first lines as fast as they come, not a line time apart; in a long frame that is a few lines among thousands, in a short one it is the whole frame, and on a link already near its rate the frame end is lost in it.
+- The fix, if so, costs nothing in rate: the main's floor is a time (about 812 us), so a slit's line can be two or four times longer (16 rows of 12.6 us are 200 us of the 812) and its bytes a second on the link half or a quarter.
+- The 1:1 straddle (8160 a line, 6.586 us, 1.55 GB/s, ERR_CRC_PH at 2 and 4 rows) reads the same.
+
+**Device test (staged: target/farm/camera-work/kit/burst.sh, the stored deca6b4f driver hand-spawned, no code change):** the main's 8-row slit at lines of 6320, 9480, 12640 and 25280 clocks; 12, 8, 4 and 2 rows at 12640; 8 rows narrowed to 2048 and 1280 columns at the mode's line (fewer bytes a line, the same line); the 1:1 straddle at 11600, 23200 and 46400 clocks. If the longer line or the narrower window lands them, the main's slits take the line that keeps the link under its rate (a mode's `llp`, already in OPEN's mode block), and its least rows drop from 16.
+
+### The ultrawide's 2-row refusal (desk)
+
+At 2 rows its image channel reports VRESOL_MISMATCH (+1C G#40, channel 0 alone starting) and loch0 G#414: the Sony sends a line count other than its 2-row window's. Its slit sets the digital crop's height to the rows (ccs `Mode::slit`, `crop[3]`) over a 4-address window (2 rows binned 2 x 2); a crop or output height under its pipeline's least (4 rows streams) is the likely cause. Its floor is a whole frame of about 104 lines whatever the rows, so 2 rows would gain nothing over 4 with 2 kept: left until the main's line test is done. A device knob writing the link's channel 0 height (as the fifteenth byte writes channel 1's) would read the count it sends.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
