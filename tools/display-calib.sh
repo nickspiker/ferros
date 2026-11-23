@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Measure the husky panel with an i1 Pro through ArgyllCMS, patches driven through ferros: luminance per DBV on full white, a grey ramp at 140 nits for the EOTF, R/G/B/W for the primaries. Writes a CSV (patch, dbv, rgb, Y cd/m², x, y) the colour profile and the gamma2tanh mapping are built from (DISPLAY-DESIGN.md §6).
+# A record of how the October 2026 measurements were made: the kernel commands it drives are gone (the DSI ones 2026-11-01, the painter's fill, patch, patch10, dither and terate 2026-11-22; KERNEL-OUT.md move 6), so it no longer runs as written. tools/akita-profile.sh shows the way now: the display server's ops thru capture.bin (op 52 mode 8 patches, op 6 DBV, op 9 DCS) and tecount for the TE pin.
 # Needs: the instrument readable (sudo chmod a+rw /dev/bus/usb/<bus>/<dev>, or the colord group), its white-tile calibration done once (`spotread -e -O` by hand, or the first run here prompts), the i1 face-down on the panel over the fill, a dark room.
 # Usage: tools/display-calib.sh [out.csv] [--skip-cal]
 set -uo pipefail

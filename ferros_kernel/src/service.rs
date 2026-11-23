@@ -6143,7 +6143,10 @@ pub fn run(mut b: Boot) -> ! {
                 // A development door: compiled out of a production build (its `open` check refuses it there anyway).
                 #[cfg(not(ferros_production))]
                 {
-                // A leading G#01 byte = hold (bridge `display --hold`). The DSI tools — G#02 a packet script, G#03 the DSIM dump, G#04 a DCS read, G#06 the refresh rate, G#08 the raster, G#09 the idle floor, G#0A the modeset — left with dpu.rs and dsim.rs on 2026-11-01 (KERNEL-OUT.md decision 6): the display server drives the panel. Anything else is text for the painter.
+                // A leading G#01 byte = hold (bridge `display --hold`). The DSI tools — G#02 a packet script, G#03 the DSIM dump, G#04 a DCS read, G#06 the refresh rate, G#08 the raster, G#09 the idle floor, G#0A the modeset — left with dpu.rs and dsim.rs on 2026-11-01 (KERNEL-OUT.md decision 6): the display server drives the panel.
+                // The painter's dev tools went on 2026-11-22 (KERNEL-OUT.md move 6, decision 4's buckets): G#05 the TE rate (payloads/tecount reads the pin from EL0), G#07 DECON as Android (the display server's modeset sets that state), G#0C the fill, G#11 the patch, G#12 the 10-bit patch and G#14 its raw words (the display server's op 52 mode 8: any 10-bit disc on any surround, full field at radius 0), G#0F own framebuffer or ABL's, G#10 the DQE dither word and G#13 DECON's background (their questions answered: DISPLAY.md, DISPLAY-DESIGN.md).
+                // Each re-adopted the pipe, fighting a running display server.
+                // What stays: the painter itself (text, the boot status screen's path), G#15 the ruler (the board's key rows for the kernel's own gate), and G#0B, G#0D, G#0E, which are hsi2c_11's (KERNEL-OUT.md decision 5), not the display's. Anything else is text for the painter.
                 match cmd.params.split_first() {
                     // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
                     Some((11, args)) => {
@@ -6242,91 +6245,9 @@ pub fn run(mut b: Boot) -> ! {
                         }
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
-                    // G#0F [1 = ferros's own framebuffer (cachemap DISPLAY_FB), 0 = ABL's surface] = where the painter draws and the layer reads (bridge `display fb own|abl`), then a frame to prove it.
-                    Some((15, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::use_own_fb(args[0] == 1) {
-                            rep.extend_from_slice(b"no framebuffer region on this boot path\n");
-                        } else {
-                            let r = crate::display::show(if args[0] == 1 { b"ferros: own framebuffer" } else { b"ferros: ABL's surface" }, freq);
-                            rep.extend_from_slice(&r);
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#10 [dither word] = the DQE's display dither register (DQE_DISP_DITHER: EN b0, MODE b1 = shift, FRAME_CON b2 = temporal, FRAME_OFFSET [4:3], TABLE_SEL R/G/B b5..b7) with the DQE shadow update requested; the next present applies it (bridge `display dither <hex>`). For finding the setting that doesn't speckle black at 10 bpc.
-                    Some((16, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        let dqe = 0x194D_0000usize;
-                        unsafe {
-                            write_volatile((dqe + 0x2800) as *mut u32, args[0] as u32);
-                            let shd = 0x1947_0050usize;
-                            write_volatile(shd as *mut u32, read_volatile(shd as *const u32) | 1 << 24);
-                        }
-                        crate::display::append_hex(&mut rep, b"DQE_DISP_DITHER=", unsafe { read_volatile((dqe + 0x2800) as *const u32) });
-                        crate::display::append_hex(&mut rep, b"DQE_CGC_DITHER=", unsafe { read_volatile((dqe + 0x2400) as *const u32) });
-                        crate::display::append_hex(&mut rep, b"DECON_GLOBAL_CON=", unsafe { read_volatile(0x1947_0020usize as *const u32) });
-                        crate::display::append_hex(&mut rep, b"DATA_PATH_CON_0=", unsafe { read_volatile(0x1947_0200usize as *const u32) });
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#11 [diameter hi] [diameter lo] [r] [g] [b] [surround r] [g] [b] = a measurement disc centred on the panel over a surround; diameter 0 = full field (bridge `display patch <diameter px> <rrggbb> [surround rrggbb]`, tools/display-profile.sh).
-                    Some((17, args)) if args.len() >= 8 => {
-                        let diam = (args[0] as usize) << 8 | args[1] as usize;
-                        let c = |i: usize| (args[i] as u32) << 16 | (args[i + 1] as u32) << 8 | args[i + 2] as u32;
-                        let rep = crate::display::patch(diam, c(2), c(5), freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#12 [diameter hi lo] [r g b, 10-bit, hi lo each] [surround r g b, the same] = the measurement disc in 10 bits a channel, the layer in 2:10:10:10 (bridge `display patch10`).
-                    Some((18, args)) if args.len() >= 14 => {
-                        let diam = (args[0] as usize) << 8 | args[1] as usize;
-                        let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
-                        let rep = crate::display::patch10(diam, [v(2), v(4), v(6)], [v(8), v(10), v(12)], freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#13 [r g b, 10-bit, hi lo each] = DECON's background colour with the base window off; G#13 alone = the window back on (bridge `display bg <r> <g> <b>` / `display bg off`).
-                    Some((19, args)) => {
-                        let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
-                        let c = if args.len() >= 6 { Some([v(0), v(2), v(4)]) } else { None };
-                        let rep = crate::display::bg10(c, freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#14 [diameter hi lo] [word, 4 bytes BE] [surround word, 4 bytes BE] = the 10-bit layer's disc with raw words (bridge `display patchraw`).
-                    Some((20, args)) if args.len() >= 10 => {
-                        let diam = (args[0] as usize) << 8 | args[1] as usize;
-                        let w = |i: usize| u32::from_be_bytes([args[i], args[i + 1], args[i + 2], args[i + 3]]);
-                        let rep = crate::display::patch_raw(diam, w(2), w(6), freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
                     // G#15 = the binary ruler: every row its own number in binary across the width (bridge `display ruler`).
                     Some((21, _)) => {
                         let rep = crate::display::ruler(freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
-                    Some((12, args)) if args.len() >= 3 => {
-                        let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#07 = set DECON0 to Android's state (10 bpc, dither, SRAM, QoS, interrupts), then paint a frame to apply it (bridge `display tune`).
-                    Some((7, _)) => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() {
-                            rep.extend_from_slice(b"DPU powered down\n");
-                        } else {
-                            crate::display::configure_like_android(&mut rep);
-                            let r = crate::display::show(b"ferros: DECON as Android", freq);
-                            rep.extend_from_slice(&r);
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
-                    Some((5, _)) => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() {
-                            rep.extend_from_slice(b"DPU powered down\n");
-                        } else {
-                            let ((pin_hz, irq_hz), width_us) = crate::display::te_profile(freq);
-                            rep.extend_from_slice(alloc::format!("TE: {pin_hz} Hz on the pin ({width_us} us high), {irq_hz} Hz by DECON interrupt\n").as_bytes());
-                        }
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
                     _ => {

@@ -171,62 +171,7 @@ async fn main() {
                 }
             }
         }
-        "display" if args.get(2).map(String::as_str) == Some("dither") => {
-            // display dither <hex> — the DQE display dither word (1 = on, 0 = off, 5 = on + temporal frame control, 3 = shift mode); applied at the next present.
-            let v = args.get(3).and_then(|a| u8::from_str_radix(a.trim_start_matches("0x"), 16).ok()).unwrap_or(1);
-            cmd_display_raw(&[16, v]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("fb") => {
-            // display fb own|abl — paint on ferros's own framebuffer (the display-fb DMA region) or ABL's splash surface.
-            let own = args.get(3).map(|a| a == "own").unwrap_or(true) as u8;
-            cmd_display_raw(&[15, own]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("fill") => {
-            // display fill <rrggbb> — a solid colour over the whole panel.
-            let rgb = args.get(3).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);
-            cmd_display_raw(&[12, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("patch") => {
-            // display patch <diameter px> <rrggbb> [surround rrggbb] — a disc centred on the panel over a surround (default black); diameter 0 = full field. For instrument readings (tools/display-profile.sh).
-            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
-            let hex = |i: usize| args.get(i).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);
-            let (rgb, sur) = (hex(4), hex(5));
-            cmd_display_raw(&[17, (diam >> 8) as u8, diam as u8, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, (sur >> 16) as u8, (sur >> 8) as u8, sur as u8]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("patchraw") => {
-            // display patchraw <diameter px> <hex word> [hex surround word] — the 10-bit layer's disc with raw 32-bit words.
-            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
-            let hex = |i: usize| args.get(i).and_then(|a| u32::from_str_radix(a.trim_start_matches("G#"), 16).ok()).unwrap_or(0);
-            let mut m = vec![20u8, (diam >> 8) as u8, diam as u8];
-            m.extend_from_slice(&hex(4).to_be_bytes());
-            m.extend_from_slice(&hex(5).to_be_bytes());
-            cmd_display_raw(&m).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("bg") => {
-            // display bg <r> <g> <b> | off — DECON's background colour (decimal 0-1023 each) over the whole raster with the base window off; `off` turns the window back on.
-            let mut m = vec![19u8];
-            if args.get(3).map(String::as_str) != Some("off") {
-                for i in 3..6 {
-                    let v = args.get(i).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0).min(1023);
-                    m.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            cmd_display_raw(&m).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("patch10") => {
-            // display patch10 <diameter px> <r> <g> <b> [surround grey] — the disc in 10 bits a channel (decimal 0-1023), the layer switched to 2:10:10:10.
-            let n = |i: usize, d: u16| args.get(i).and_then(|a| a.parse::<u16>().ok()).unwrap_or(d).min(1023);
-            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
-            let (r, g, b, s) = (n(4, 0), n(5, 0), n(6, 0), n(7, 0));
-            let mut m = vec![18u8, (diam >> 8) as u8, diam as u8];
-            for v in [r, g, b, s, s, s] {
-                m.extend_from_slice(&v.to_be_bytes());
-            }
-            cmd_display_raw(&m).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("ruler") => cmd_display_raw(&[21]).await,
-        "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);

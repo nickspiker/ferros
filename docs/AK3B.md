@@ -118,7 +118,7 @@ Whole-device draw from the fuel gauge (`diag power`, 16 s windows, charger cut, 
    - Keep ABL's link (lanes, PLL, DSC) as on husky, where ABL's DSIM matched Android's.
 1. **120 Hz**:
    - the HS120 sequence above from the server's refresh op;
-   - measured on gpp0-3 with `display terate`, as HK3's W120 was;
+   - measured on gpp0-3 with `tecount` (`ferros-bridge spawn tecount.bin --hw gpio-gpp0`: rising edges in 250 ms and the high share), as HK3's W120 was with the kernel's `display terate` (gone 2026-11-22);
    - the server keeps triggering every TE on akita until the single-frame question above is answered.
 2. **Brightness policy**:
    - Measure first, as on HK3: emission duty and PWM against DBV (the `F2`/`BD` pulse settings), with the photodiode/i1 Pro.

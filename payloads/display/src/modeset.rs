@@ -349,7 +349,7 @@ impl M<'_> {
         self.wr(S_DQE_CGC, DQE_CGC_CON, 0);
         self.set(S_DPP0, DPP_COM_IO_CON, BPC_MODE_10);
         self.set(S_HDRCOMM0, LSI_COMM_IO_CON, BPC_MODE_10);
-        // Android's SRAM allocation, out-FIFO QoS and interrupt enables (the kernel's display::configure_like_android), so a modeset lands in its state.
+        // Android's SRAM allocation, out-FIFO QoS and interrupt enables (the kernel's `display tune` until 2026-11-22), so a modeset lands in its state.
         self.wr(S_DECON, 0x0300, 0x1111_1111);
         self.wr(S_DECON, 0x0304, 0x111);
         self.wr(S_DECON, 0x0320, 0);

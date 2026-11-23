@@ -7768,7 +7768,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
 
-/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0]; the panel's channels that are off (`CHANNELS`, op 63) at code 0.
+/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (measured with the kernel's `Panel::set_10bit`, gone since 2026-11-22; DISPLAY.md): B[31:22] G[21:12] R[11:2] A[1:0]; the panel's channels that are off (`CHANNELS`, op 63) at code 0.
 #[inline(always)]
 fn pack10(r: u32, g: u32, b: u32) -> u32 {
     (b << 22 | g << 12 | r << 2 | 3) & word_mask()

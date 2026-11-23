@@ -129,7 +129,7 @@ A plain power law to at least 10-bit code 8 (1/1250 of white), within the instru
 ## Method notes
 
 - The panel runs at 120 Hz; the i1 Pro's integration spans many cycles: white at 1353 read 132.82 (default) vs 132.77 (`-Y R:120`, refresh-locked) vs 132.84 (again); grey 128 30.16 vs 30.23. No beat problem.
-- Patches need a static surface: the display server with a one-shot client (`shelltest 01`), then the kernel's `display fill`.
+- Patches need a static surface: the display server with a one-shot client (`shelltest 01`), then the kernel's `display fill` (gone 2026-11-22: the display server's own patch, op 52 mode 8, raw 10-bit codes with the server running, as tools/akita-profile.sh drives it).
 - Repeat at a second brightness (2000 or 3307) before trusting the EOTF across the range: Samsung panels shift gamma with DBV (the AOR tables), and the AOD/LP mapping is a different curve altogether.
 
 

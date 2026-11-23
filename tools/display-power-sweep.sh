@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Display power profile under ferros: for each panel state and scene, the system's draw from the battery (charger buck off during the sample, `bridge display power … battery`) and the TE rate that proves the state. Prints a markdown table; DISPLAY-POWER.md keeps the results.
+# A record of how the October 2026 measurements were made: the kernel commands it drives are gone (the DSI ones 2026-11-01, the painter's fill, patch, patch10, dither and terate 2026-11-22; KERNEL-OUT.md move 6), so it no longer runs as written. tools/akita-profile.sh shows the way now: the display server's ops thru capture.bin (op 52 mode 8 patches, op 6 DBV, op 9 DCS) and tecount for the TE pin.
 # Usage: tools/display-power-sweep.sh [samples=8] [gap sixteenths=4]
 set -u
 cd "$(dirname "$0")/.."

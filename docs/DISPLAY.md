@@ -87,6 +87,8 @@ The panel is google-hk3 on DSIM0 (DISPLAY-HK3.md; the oracle of every transition
 
 The present stage as built — content, compositing, the ODT, the dither, frames and timing — is DISPLAY-DESIGN.md §6a (2026-10-24); the panel's measurements and the ODT's derivation are DISPLAY-CALIB.md. What follows is the bring-up log.
 
+The log names the kernel's display tools as they were used; the DSI ones left the kernel 2026-11-01 and the painter's (`display tune`, `fill`, `patch`, `patch10`, `patchraw`, `bg`, `dither`, `fb`, `terate`) 2026-11-22 (KERNEL-OUT.md move 6). Their work is the display server's now: op 52 mode 8 for patches, its modeset for DECON's state and the dither, `tecount` for the TE pin.
+
 
 Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, write ABL's surface, shadow update + trigger); it owns no power-up from off, no DSI command path (brightness G#51, display off/on G#28/G#29, sleep in/out G#10/G#11), no framebuffer of its own, no tear-effect sync, and it lives in the kernel rather than as a process. On cold boot the SYSMMU/S2MPU items below are moot (ABL leaves translation off). **Before the display driver work starts: a knobs inventory (everything DECON/DPP/DSIM/DSC/panel lets us set) and the ideal design, for the owner to review — no code first.**
 

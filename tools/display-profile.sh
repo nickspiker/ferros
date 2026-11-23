@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # A full profile of the husky panel with an i1 Pro through ArgyllCMS, patches driven by the kernel (`bridge display patch`), in phases so the person holding the instrument and the one driving can take turns (DISPLAY-CALIB.md has the first, partial profile of 2026-10-17).
+# A record of how the October 2026 measurements were made: the kernel commands it drives are gone (the DSI ones 2026-11-01, the painter's fill, patch, patch10, dither and terate 2026-11-22; KERNEL-OUT.md move 6), so it no longer runs as written. tools/akita-profile.sh shows the way now: the display server's ops thru capture.bin (op 52 mode 8 patches, op 6 DBV, op 9 DCS) and tecount for the TE pin.
 #
 # Every reading is spectral (`spotread -s`) and kept raw; the CSV holds the Yxy. The measurement window is a disc 1 cm across (PX_PER_CM, 489 ppi) at the centre of the panel: the instrument is lined up on it once, and every patch is drawn there, so window size (APL) and full field can be compared for the roll-off the panel and its driver apply (voltage sag, deliberate limiting).
 #
