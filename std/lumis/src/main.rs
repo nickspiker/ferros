@@ -965,8 +965,9 @@ fn open(cam: &camera::Camera, slit: bool, video: Option<(ferros_clip::Pacing, u6
         ask = pacing.open_msg(cam.id, shutter_ns).to_vec();
         println!("lumis: camera {}: RAW video: the open at {} a second (frame length {} lines, every {} kept)", cam.name, pacing.fps, pacing.fll, pacing.keep);
     } else if slit {
-        // The readout's least slit that streams (the list's `slit_rows_least`; the integrator keeps its centre pair), else the 64 rows of before.
-        ask.extend_from_slice(&camera::slit_block(cam.slit_rows.unwrap_or(camera::SLIT_ROWS)));
+        // The readout's least slit that streams, in its least frame (the list's `slit_rows_least` and `slit_lines_least`, measured together, so the frame is asked only with those rows; the integrator keeps the slit's centre pair), else the 64 rows of before in the driver's default frame.
+        let (rows, fll) = match cam.slit_rows { Some(r) => (r, cam.slit_lines.unwrap_or(0)), None => (camera::SLIT_ROWS, 0) };
+        ask.extend_from_slice(&camera::slit_block(rows, fll));
         // A slit ring is read by SLITS and never handed over by a MAP, the one that makes a buffer's lines right for the caches, so it is asked for non-cacheable (a slit's band is a few rows).
         ask.push(0);
     } else if knobs & DEV_COPY != 0 && cam.mode == 0 {
