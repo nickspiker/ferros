@@ -463,6 +463,20 @@ impl Client {
         r
     }
 
+    /// Ops 36 and 37 (docs/NO-CEILINGS.md step 7, U3): the People page's and a kist's card's people a page at a time, every one of them in as many calls as it takes: [the last add's state, or all u8][the people in all u32 LE][rows u16 LE][rows as op 25's, or op 27's with the chosen byte], from person `skip` on, as many rows as fit `PEOPLE_PAGE`. Ops 25 and 27 stay for a map from before, their count a byte.
+    pub fn people_page(&self, skip: usize) -> Vec<u8> {
+        let people = ferros_space::people(&self.space.space);
+        page(self.facets.state, &people, skip, None)
+    }
+
+    /// Op 37 [developer 32][option 32][skip u32 LE], as `people_page` with each person's chosen byte.
+    pub fn kist_people_page(&self, developer: &[u8; 32], option: &[u8; 32], skip: usize) -> Vec<u8> {
+        let s = &self.space.space;
+        let picked = ferros_space::chosen(s, developer, option);
+        let people = ferros_space::people(s);
+        page(ferros_space::people_all(s, developer, option) as u8, &people, skip, Some(&picked))
+    }
+
     /// Op 26 [handle proof 32]: a person removed from the person's people. → [0 done, 1 before the first pull].
     pub fn person_remove(&mut self, hp: &[u8; 32]) -> u8 {
         if self.space_ready().is_none() || !self.space.settled {
@@ -573,6 +587,34 @@ fn parse_be_you(body: &[u8]) -> Option<(fgtw::pq::KeyBundle, &[u8])> {
 }
 
 /// `s` cut to at most `n` bytes at a character's edge.
+/// The most bytes one paged People reply holds (ops 36 and 37): a page, not a bound on the people (the map asks again from where a page ended until it has them all), sized to the 4 KiB buffer a caller keeps for one.
+pub const PEOPLE_PAGE: usize = 1 << 12;
+
+/// One page of `people` from `skip` (`people_page`, `kist_people_page`): the head, then each person's row while it fits `PEOPLE_PAGE`.
+fn page(first: u8, people: &[fgtw::people::Person], skip: usize, picked: Option<&[[u8; 32]]>) -> Vec<u8> {
+    let mut r = alloc::vec![first];
+    r.extend_from_slice(&(people.len() as u32).to_le_bytes());
+    r.extend_from_slice(&[0, 0]);
+    let mut rows: u16 = 0;
+    for p in people.iter().skip(skip) {
+        let name = fit_utf8(&p.name, 63);
+        let row = 32 + picked.is_some() as usize + 1 + name.len();
+        // WHY the bounds: a page is the caller's buffer; the rest come in the next call, from where this one ended. The u16 count can never fill at 34 bytes a row in 4 KiB.
+        if r.len() + row > PEOPLE_PAGE {
+            break;
+        }
+        r.extend_from_slice(&p.handle_proof);
+        if let Some(c) = picked {
+            r.push(c.contains(&p.handle_proof) as u8);
+        }
+        r.push(name.len() as u8);
+        r.extend_from_slice(name.as_bytes());
+        rows += 1;
+    }
+    r[5..7].copy_from_slice(&rows.to_le_bytes());
+    r
+}
+
 fn fit_utf8(s: &str, n: usize) -> &str {
     let mut k = s.len().min(n);
     // WHY: a name is the person's own and any length; the page's field is a byte's length. PROOF: index 0 is always a boundary, so the loop ends.

@@ -390,74 +390,106 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
 /// The longest device name the Fleet page keeps: two voca words (fgtw::pair::device_name_default) are at most 36 bytes.
 const NAME_BYTES: usize = 1 << 6;
 
-/// The most people the People page and a kist's card list (the identity service holds them all; past this many the page shows the first, a page of its own to scroll them is later).
-const PEOPLE_MAX: usize = 1 << 5;
+/// One of the person's people as the map shows them: their handle proof, the name the person gave them, and on a kist's card whether the kist has them picked.
+#[derive(Clone)]
+struct Person {
+    hp: [u8; 32],
+    name: Vec<u8>,
+    picked: bool,
+}
 
-/// The person's people as the map knows them (docs/FACETS.md "People"): the People page (fgtw op 25: how the last add ended, then each person's handle proof and the name the person gave them), or one kist's card (op 27: all or chosen, and each person picked or not). Never a handle: the identity service has none.
-#[derive(Clone, Copy)]
+/// The person's people as the map knows them (docs/FACETS.md "People"): the People page (fgtw op 36, a page at a time: how the last add ended, then each person's handle proof and the name the person gave them), or one kist's card (op 37: all or chosen, and each person picked or not). Never a handle: the identity service has none.
+/// As many as the person has (docs/NO-CEILINGS.md step 7, U3): until then the first 32 (`PEOPLE_MAX`), the rest never shown.
+#[derive(Clone)]
 struct People {
     /// The People page: how the last add ended (payloads/fgtw facets.rs `add`). A card: whether the kist knows all of them.
     state: u8,
     all: bool,
-    hp: [[u8; 32]; PEOPLE_MAX],
-    name: [[u8; NAME_BYTES]; PEOPLE_MAX],
-    name_n: [u8; PEOPLE_MAX],
-    picked: [bool; PEOPLE_MAX],
-    n: usize,
+    rows: Vec<Person>,
     /// The kist a card's copy is of (developer, option); zeros for the People page's.
     kist: [u8; 64],
 }
 
 impl People {
     const fn new() -> Self {
-        People { state: 0, all: true, hp: [[0; 32]; PEOPLE_MAX], name: [[0; NAME_BYTES]; PEOPLE_MAX], name_n: [0; PEOPLE_MAX], picked: [false; PEOPLE_MAX], n: 0, kist: [0; 64] }
+        People { state: 0, all: true, rows: Vec::new(), kist: [0; 64] }
     }
 
-    /// Read op 25's reply (`card` false) or op 27's (`card` true). WHY the checks: the counts and lengths are another process's words; a row that would run past what the reply holds ends the reading.
-    fn read(&mut self, r: &[u8], card: bool) {
-        self.n = 0;
-        if r.len() < 2 {
-            return;
-        }
-        if card {
-            self.all = r[0] != 0;
+    /// Every person, a page at a time: op 36 (`card` None) or op 37 with the kist's developer and option, from where the last page ended until the service has said them all. None when the service did not answer (not running, or a service from before the paged ops; the caller keeps what it had).
+    /// WHY the checks: the counts and lengths are another process's words; a row that would run past what the reply holds ends that page, and a page of none ends the reading.
+    fn fetch(svc: u64, card: Option<&[u8; 64]>) -> Option<People> {
+        let mut p = People::new();
+        let mut q = [0u8; 69];
+        q[0] = if card.is_some() { 37 } else { 36 };
+        let at_skip = if let Some(k) = card {
+            q[1..65].copy_from_slice(k);
+            p.kist.copy_from_slice(k);
+            65
         } else {
-            self.state = r[0];
-        }
-        let mut at = 2;
-        for i in 0..(r[1] as usize).min(PEOPLE_MAX) {
-            let head = 32 + card as usize;
-            if at + head + 1 > r.len() {
-                break;
+            1
+        };
+        let mut r = [0u8; PEOPLE_PAGE];
+        loop {
+            q[at_skip..at_skip + 4].copy_from_slice(&(p.rows.len() as u32).to_le_bytes());
+            let k = ferros_sys::call_live(svc, &q[..at_skip + 4], &mut r);
+            if k == ferros_sys::ERR || (k as usize) < 7 {
+                return None;
             }
-            self.hp[i].copy_from_slice(&r[at..at + 32]);
-            self.picked[i] = card && r[at + 32] != 0;
-            let len = r[at + head] as usize;
-            if len > NAME_BYTES || at + head + 1 + len > r.len() {
-                break;
+            let got = (k as usize).min(r.len());
+            if card.is_some() {
+                p.all = r[0] != 0;
+            } else {
+                p.state = r[0];
             }
-            self.name[i][..len].copy_from_slice(&r[at + head + 1..at + head + 1 + len]);
-            self.name_n[i] = len as u8;
-            at += head + 1 + len;
-            self.n = i + 1;
+            let total = u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as usize;
+            let rows = u16::from_le_bytes([r[5], r[6]]) as usize;
+            let head = 32 + card.is_some() as usize;
+            let mut at = 7;
+            let before = p.rows.len();
+            for _ in 0..rows {
+                if at + head + 1 > got {
+                    break;
+                }
+                let len = r[at + head] as usize;
+                if at + head + 1 + len > got {
+                    break;
+                }
+                let mut hp = [0u8; 32];
+                hp.copy_from_slice(&r[at..at + 32]);
+                p.rows.push(Person { hp, name: r[at + head + 1..at + head + 1 + len].to_vec(), picked: card.is_some() && r[at + 32] != 0 });
+                at += head + 1 + len;
+            }
+            if p.rows.len() >= total || p.rows.len() == before {
+                return Some(p);
+            }
         }
+    }
+
+    /// How many.
+    fn n(&self) -> usize {
+        self.rows.len()
     }
 
     /// Person `i`'s name, or "no name".
     fn shown(&self, i: usize) -> &str {
-        match core::str::from_utf8(&self.name[i][..self.name_n[i] as usize]) {
+        match core::str::from_utf8(&self.rows[i].name) {
             Ok(s) if !s.is_empty() => s,
             _ => tr(Msg::NoName),
         }
     }
 }
 
-/// The reply buffer for ops 25 and 27: every row at its longest.
-const PEOPLE_REPLY: usize = 2 + PEOPLE_MAX * (32 + 1 + 1 + NAME_BYTES);
+/// A paged People reply's buffer (fgtw facets.rs `PEOPLE_PAGE`): a page, the rest asked for from where it ended.
+const PEOPLE_PAGE: usize = 1 << 12;
 
-/// A kist's card's people, as `people_thread` last read them (op 27), under a sequence count as the fleet's copy.
-static CARD_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static mut CARD_PEOPLE: People = People::new();
+/// The People page's people as `fgtw_poller` last read them, and a kist's card's as `people_thread` last read them: each behind a lock, taken whole by a clone (lists of any length, where the copies of fixed tables under a sequence count served until docs/NO-CEILINGS.md step 7).
+static PEOPLE_NOW: ferros_heap::SpinLock<People> = ferros_heap::SpinLock::new(People::new());
+static CARD_PEOPLE: ferros_heap::SpinLock<People> = ferros_heap::SpinLock::new(People::new());
+
+/// The People page's people now.
+fn people_now() -> People {
+    PEOPLE_NOW.lock().clone()
+}
 
 /// One request for the identity service from the People page or a card (ops 15 [2], 26, 28, 29, and 27 to read a card), made on `people_thread` so the main loop never waits on the service: the bytes, and a count the main loop moves on with each new one.
 static PEOPLE_ASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -480,7 +512,7 @@ extern "C" fn people_thread(grants: u64) -> ! {
     use core::sync::atomic::Ordering;
     let svc = cap(grants, S_FGTW);
     let mut done = 0u64;
-    let mut r = [0u8; PEOPLE_REPLY];
+    let mut r = [0u8; 4];
     loop {
         let v = PEOPLE_ASK.load(Ordering::Acquire);
         if v == done {
@@ -491,35 +523,25 @@ extern "C" fn people_thread(grants: u64) -> ! {
         let mut m = [0u8; 128];
         let n = unsafe { PEOPLE_REQ_N };
         m[..n].copy_from_slice(unsafe { &(&*(&raw const PEOPLE_REQ))[..n] });
-        if m[0] != 27 && ferros_sys::call_live(svc, &m[..n], &mut r[..4]) == ferros_sys::ERR {
+        if m[0] != 27 && ferros_sys::call_live(svc, &m[..n], &mut r) == ferros_sys::ERR {
             console(grants, b"map: the identity service did not take a people request\n");
         }
         if (27..=29).contains(&m[0]) && n >= 65 {
-            let mut q = [27u8; 65];
-            q[1..].copy_from_slice(&m[1..65]);
-            let k = ferros_sys::call_live(svc, &q, &mut r);
-            let mut p = People::new();
-            if k != ferros_sys::ERR {
-                p.read(&r[..(k as usize).min(r.len())], true);
-            }
-            p.kist.copy_from_slice(&m[1..65]);
-            CARD_SEQ.fetch_add(1, Ordering::AcqRel);
-            unsafe { *(&raw mut CARD_PEOPLE) = p };
-            CARD_SEQ.fetch_add(1, Ordering::AcqRel);
+            let mut k = [0u8; 64];
+            k.copy_from_slice(&m[1..65]);
+            let p = People::fetch(svc, Some(&k)).unwrap_or_else(|| {
+                let mut p = People::new();
+                p.kist = k;
+                p
+            });
+            *CARD_PEOPLE.lock() = p;
         }
     }
 }
 
-/// The card's people as `people_thread` last published them: a copy, read again when it was mid-write.
+/// The card's people as `people_thread` last published them.
 fn card_people() -> People {
-    use core::sync::atomic::Ordering;
-    loop {
-        let s0 = CARD_SEQ.load(Ordering::Acquire);
-        let v = unsafe { *(&raw const CARD_PEOPLE) };
-        if s0 & 1 == 0 && CARD_SEQ.load(Ordering::Acquire) == s0 {
-            return v;
-        }
-    }
+    CARD_PEOPLE.lock().clone()
 }
 
 /// The identity service as the map knows it (payloads/fgtw ops 1, 6, 9, 13 and 17), read by `fgtw_poller` each time the service's doorbell (op 21) rings, never on a timer; the main loop takes a copy (`fleet_take`). The page's own state (`confirm`, `leave_result`, `sent`, `left`) is the main loop's and survives each copy.
@@ -574,13 +596,11 @@ struct Fleet {
     /// This device's own departure denied (fgtw op 13 [2]): the name of the device that denied it.
     denied_by: [u8; NAME_BYTES],
     denied_by_n: usize,
-    /// The person's people, for the People page (fgtw op 25).
-    people: People,
 }
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0, people: People::new() }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -650,11 +670,9 @@ impl Fleet {
             self.n = cnt;
         }
         self.poll_add(svc);
-        // The person's people (op 25), for the People page.
-        let mut p = [0u8; PEOPLE_REPLY];
-        let k = ferros_sys::call_live(svc, &[25], &mut p);
-        if k != ferros_sys::ERR {
-            self.people.read(&p[..(k as usize).min(p.len())], false);
+        // The person's people (op 36, every page), for the People page.
+        if let Some(p) = People::fetch(svc, None) {
+            *PEOPLE_NOW.lock() = p;
         }
     }
 
@@ -1058,10 +1076,10 @@ enum Choice {
     Page(i8),
     /// The People page (docs/FACETS.md "People"): the add-a-person sheet (the keyboard asks for their handle, then a name; fgtw op 15 [2]), and a person's remove in two taps (its row; op 26).
     PersonAdd,
-    PersonRemove(u8),
+    PersonRemove(u32),
     /// A kist's card, once it holds people: all of them (true) or the chosen (op 28), and a person picked or not (op 29); the kist by its place in the person's list.
     PeopleAll(u8, bool),
-    PersonPick(u8, u8),
+    PersonPick(u8, u32),
     /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
     FleetRemove,
     /// The Fleet page's add flow (fgtw::sponsor through payloads/fgtw ops 8-15): open it, pick a device heard nearby (its row), type the newcomer's words (on the attest screen's keyboard, ahau), confirm a nearby pick turned green, close it.
@@ -1678,7 +1696,7 @@ struct Map {
     /// The Deck page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
     unstow_armed: Option<u8>,
     /// The People page's remove, armed by a first tap on that person's row.
-    person_armed: Option<u8>,
+    person_armed: Option<u32>,
     /// The Android page's "start Android now", its first tap taken (the second restarts into Android).
     android_armed: bool,
     /// The Android page's "allow once" for Android's recovery request, its first tap taken (the second answers yes).
@@ -3812,15 +3830,15 @@ impl Map {
             }
             "people" => {
                 // The person's people (docs/FACETS.md "People", D5): the people of their identity space, on every device of theirs; each with the name the person gave them and a remove in two taps; "add a person" opens the keyboard for their handle (shown as typed: a handle is not a password), then a name; how the last add ended under it. Nothing here shows a handle: none is kept.
-                let ps = self.fleet.people;
-                if ps.n == 0 {
+                let ps = people_now();
+                if ps.n() == 0 {
                     row(self, b, &mut y, small, grey(), tr(Msg::NoPeopleYet), None);
                 }
-                for i in 0..ps.n {
+                for i in 0..ps.n() {
                     row(self, b, &mut y, small, white(), ps.shown(i), None);
                     y -= uu(1, 2);
-                    let armed = self.person_armed == Some(i as u8);
-                    button(self, b, &mut y, tr(if armed { Msg::TapAgainRemove } else { Msg::TagRemove }), armed, Some(Choice::PersonRemove(i as u8)));
+                    let armed = self.person_armed == Some(i as u32);
+                    button(self, b, &mut y, tr(if armed { Msg::TapAgainRemove } else { Msg::TagRemove }), armed, Some(Choice::PersonRemove(i as u32)));
                 }
                 y += uu(1, 2);
                 button(self, b, &mut y, tr(Msg::AddPerson), false, Some(Choice::PersonAdd));
@@ -4819,11 +4837,11 @@ impl Map {
                             if cp.kist[..32] == k.developer && cp.kist[32..] == k.option {
                                 radios(self, b, &mut y, &[tr(Msg::PeopleAll), tr(Msg::PeopleChosen)], (!cp.all) as usize, &|v| Choice::PeopleAll(ki as u8, v == 0));
                                 if !cp.all {
-                                    if cp.n == 0 {
+                                    if cp.n() == 0 {
                                         row(self, b, &mut y, note, dim(), tr(Msg::NoPeopleYet), None);
                                     }
-                                    for i in 0..cp.n {
-                                        mark(self, b, &mut y, 50, cp.shown(i), cp.picked[i], Some(Choice::PersonPick(ki as u8, i as u8)));
+                                    for i in 0..cp.n() {
+                                        mark(self, b, &mut y, 50, cp.shown(i), cp.rows[i].picked, Some(Choice::PersonPick(ki as u8, i as u32)));
                                     }
                                 }
                             }
@@ -6314,11 +6332,11 @@ impl Map {
                     }
                     // A person removed in two taps: the first arms the row, the second asks the identity service (op 26), which removes them from every device of the person's.
                     Some(Choice::PersonRemove(i)) => {
-                        let ps = self.fleet.people;
-                        if self.person_armed == Some(i) && (i as usize) < ps.n {
+                        let ps = people_now();
+                        if self.person_armed == Some(i) && (i as usize) < ps.n() {
                             self.person_armed = None;
                             let mut m = [26u8; 33];
-                            m[1..].copy_from_slice(&ps.hp[i as usize]);
+                            m[1..].copy_from_slice(&ps.rows[i as usize].hp);
                             people_ask(&m);
                         } else {
                             self.person_armed = Some(i);
@@ -6336,12 +6354,12 @@ impl Map {
                     }
                     Some(Choice::PersonPick(ki, i)) => {
                         let cp = card_people();
-                        if let Some(kist) = self.kists.kists.get(ki as usize).filter(|_| (i as usize) < cp.n) {
+                        if let Some(kist) = self.kists.kists.get(ki as usize).filter(|_| (i as usize) < cp.n()) {
                             let mut m = [29u8; 98];
                             m[1..33].copy_from_slice(&kist.developer);
                             m[33..65].copy_from_slice(&kist.option);
-                            m[65..97].copy_from_slice(&cp.hp[i as usize]);
-                            m[97] = !cp.picked[i as usize] as u8;
+                            m[65..97].copy_from_slice(&cp.rows[i as usize].hp);
+                            m[97] = !cp.rows[i as usize].picked as u8;
                             people_ask(&m);
                         }
                     }

@@ -21,6 +21,8 @@ use photon_core::wire::{self, Frame};
 
 mod add;
 mod addview;
+/// The fleet's capsule source's bookkeeping (ops 36, 37, 38; `capsule_want`).
+mod capsule;
 mod depart;
 /// The facets (docs/FACETS.md): be you and the people on the `facets` endpoint, and the person's people added and listed.
 mod facets;
@@ -35,6 +37,8 @@ mod space;
 const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 /// The most one peer's transfer may ask of this heap, and the most all of them in flight may hold together (`Pt::bound_inbound`).
 const IN_MOST: usize = 1 << 21;
+/// The largest piece of a capsule the stower hands back in one op 38 (payloads/kists `FLEET_PIECE`, the same): the serve loop's request buffer holds it and its header. A longer one is taken short, and the asker asks the rest from where it ends.
+const CAPSULE_PIECE: usize = 1 << 16;
 /// WHY 4 MiB: half the 8 MiB static heap this was until docs/NO-CEILINGS.md step 1, kept as it was; the heap grows now, and this becomes a share of the device's free memory with the kernel's ARC_FREE (NO-CEILINGS.md, section 4, row N5).
 const IN_BUDGET: usize = 1 << 22;
 /// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
@@ -702,6 +706,8 @@ struct Client {
     fgtw_asked_us: u64,
     /// The facets served to kists and the person's people (facets.rs).
     facets: facets::Facets,
+    /// The fleet's capsule source (capsule.rs): the stower's asks out to the person's devices, and their asks waiting for the stower here.
+    capsules: capsule::Capsules,
 }
 
 impl Client {
@@ -911,6 +917,132 @@ impl Client {
         for (to, d) in out {
             self.udp.send(&to, join::PORT, &d);
         }
+    }
+
+    /// A reply to a call this loop answers or held, its token and bytes in the arc as every buffer here.
+    fn reply(&self, tok: &[u8; 32], r: &[u8]) {
+        svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+    }
+
+    /// Whether a capsule frame comes from a device of this person's fleet: the same handle proof, a member of the chain, not locked out, not this device.
+    fn capsule_member(&self, hp: &[u8; 32], sender: &[u8; 32]) -> bool {
+        Some(*hp) == self.hp && *sender != self.me && self.members.contains(sender) && !self.fleet_locked().contains(sender)
+    }
+
+    /// Op 36: a piece of `capsule` from `offset` asked of the person's devices heard (in the last two minutes, as the pings go: on this network, and any heard from beyond it), the call held (`capsule::Capsules::ask`); NOBODY at once with no handle proof or none heard.
+    fn capsule_ask(&mut self, tok: [u8; 32], capsule: [u8; 32], offset: u64) {
+        let nobody = [capsule::NOBODY];
+        let Some(hp) = self.hp else { return self.reply(&tok, &nobody) };
+        let t = now_us();
+        let (members, locked) = (self.fleet_members(), self.fleet_locked());
+        let heard: Vec<([u8; 32], Addr)> = self.sponsors.iter().filter(|s| t - s.heard_us < 120_000_000 && s.key != self.me && members.contains(&s.key) && !locked.contains(&s.key)).map(|s| (s.key, s.addr)).collect();
+        let to = self.capsules.targets(&capsule, offset, &heard);
+        if to.is_empty() {
+            if offset == 0 {
+                self.log.put(b"fgtw: capsules: a capsule asked for, and no fleet device heard to ask");
+                self.log.line();
+            }
+            return self.reply(&tok, &nobody);
+        }
+        let Ok(frame) = fgtw::protocol::capsule_want(&hp, &capsule, offset, self.keys.keypair(), eagle()) else { return self.reply(&tok, &nobody) };
+        let hash = *blake3::hash(&frame).as_bytes();
+        if offset == 0 {
+            self.log.put(b"fgtw: capsules: A#");
+            self.log.dec(to.len() as u64);
+            self.log.put(b" fleet device(s) asked for a capsule, before fgtw.org");
+            self.log.line();
+        }
+        for (_, a) in &to {
+            let out = self.pt.send(*a, frame.clone(), now_us(), eagle());
+            self.send_all(out);
+        }
+        self.capsules.ask(tok, capsule, offset, hash, &to, t);
+    }
+
+    /// The asks that ended with no piece: each held op 36 answered NOBODY.
+    fn capsule_nobody(&mut self, toks: Vec<[u8; 32]>) {
+        if toks.is_empty() {
+            return;
+        }
+        let r = [capsule::NOBODY];
+        for tok in &toks {
+            self.reply(tok, &r);
+        }
+        self.log.put(b"fgtw: capsules: no fleet device has the piece asked for (each said none, was given up on, or did not answer in time)");
+        self.log.line();
+    }
+
+    /// A sibling's `capsule_want`: handed to this device's stower (op 37), or a `capsule_none` at once when no stower answers here.
+    pub fn on_capsule_want(&mut self, from: Addr, bytes: &[u8]) {
+        let Ok((hp, capsule, offset, sender)) = fgtw::protocol::parse_capsule_want(bytes) else { return };
+        if !self.capsule_member(&hp, &sender) {
+            return;
+        }
+        match self.capsules.want(sender, from, capsule, offset) {
+            capsule::Wanted::None => {
+                self.capsule_send(from, &hp, &capsule, None);
+            }
+            capsule::Wanted::Queued => {}
+            capsule::Wanted::Ring(tok, r) => self.reply(&tok, &r),
+        }
+    }
+
+    /// A sibling's piece: the held op 36 it answers given it.
+    pub fn on_capsule_piece(&mut self, bytes: &[u8]) {
+        let Ok((hp, capsule, offset, total, piece, sender)) = fgtw::protocol::parse_capsule_piece(bytes) else { return };
+        if !self.capsule_member(&hp, &sender) {
+            return;
+        }
+        if let Some((tok, r)) = self.capsules.piece(&sender, &capsule, offset, total, &piece) {
+            if offset == 0 {
+                self.log.put(b"fgtw: capsules: ");
+                self.log.fp(&sender);
+                self.log.put(b" has the capsule asked for, A#");
+                self.log.dec(total);
+                self.log.put(b" bytes");
+                self.log.line();
+            }
+            self.reply(&tok, &r);
+        }
+    }
+
+    /// A sibling's none: that device out of the asks for the capsule, NOBODY once every one asked is.
+    pub fn on_capsule_none(&mut self, bytes: &[u8]) {
+        let Ok((hp, capsule, sender)) = fgtw::protocol::parse_capsule_none(bytes) else { return };
+        if !self.capsule_member(&hp, &sender) {
+            return;
+        }
+        let ended = self.capsules.none(&sender, &capsule);
+        self.capsule_nobody(ended);
+    }
+
+    /// Op 38: the stower's answer to want `id`, a piece (the whole length and the bytes) or none, signed and sent to the sibling that asked. 0 sent, 1 no such want, 2 not sent.
+    fn capsule_answer(&mut self, id: u32, piece: Option<(u64, &[u8])>) -> u8 {
+        let Some(w) = self.capsules.take(id) else { return 1 };
+        let Some(hp) = self.hp else { return 2 };
+        let piece = piece.filter(|(_, b)| !b.is_empty());
+        if w.offset == 0 && piece.is_some() {
+            self.log.put(b"fgtw: capsules: a capsule served to ");
+            self.log.fp(&w.sender);
+            self.log.line();
+        }
+        if self.capsule_send(w.from, &hp, &w.capsule, piece.map(|(total, b)| (w.offset, total, b))) {
+            0
+        } else {
+            2
+        }
+    }
+
+    /// A `capsule_piece` (offset, whole length, bytes) or, with none, a `capsule_none` to `to`. Whether the frame built.
+    fn capsule_send(&mut self, to: Addr, hp: &[u8; 32], capsule: &[u8; 32], piece: Option<(u64, u64, &[u8])>) -> bool {
+        let frame = match piece {
+            Some((at, total, b)) => fgtw::protocol::capsule_piece(hp, capsule, at, total, b, self.keys.keypair(), eagle()),
+            None => fgtw::protocol::capsule_none(hp, capsule, self.keys.keypair(), eagle()),
+        };
+        let Ok(frame) = frame else { return false };
+        let out = self.pt.send(to, frame, now_us(), eagle());
+        self.send_all(out);
+        true
     }
 
     /// A frame to every fleet device heard in the last two minutes (as the pings go), and to `extra` (a newcomer's address) once.
@@ -2090,6 +2222,10 @@ impl Client {
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
+            // The fleet's capsule source (capsule.rs): a sibling asking for a kist's capsule, and the answers to this device's asks.
+            Ok((Inbound::Other(name), _)) if name == "capsule_want" => self.on_capsule_want(from, bytes),
+            Ok((Inbound::Other(name), _)) if name == "capsule_piece" => self.on_capsule_piece(bytes),
+            Ok((Inbound::Other(name), _)) if name == "capsule_none" => self.on_capsule_none(bytes),
             // A sibling asking for our fan-out (fgtw 7785592).
             Ok((Inbound::Other(name), _)) if name == "fanout_req" => self.on_fanout_req(from, bytes),
             // A frame of the Photon app's own (history pages, avatars, the chain sync...): ip hands every datagram on 4383 to both readers, fgtw and Photon, so this service sees a copy of Photon's traffic and Photon answers it. Said once a name a run, not once a frame (2026-11-22: the Pro's console filled with "frame hist_page from 469e79b8 (not handled)", six a second while the desktop paged history to the Photon kist).
@@ -2145,6 +2281,7 @@ impl Client {
 
     fn run(&mut self) -> ! {
         let mut buf = alloc::vec![0u8; 2048];
+        let mut req_buf = alloc::vec![0u8; CAPSULE_PIECE + (1 << 6)];
         // Open both ports before anything can arrive, and join the app's beacon groups.
         for p in [join::PORT, join::BEACON_PORT] {
             let mut out = [0u8; 32];
@@ -2241,6 +2378,9 @@ impl Client {
                             self.add_sent(&to, &hash, ok);
                             // A `fanout_req` given up on: fgtw.org at once when every one was.
                             self.space_ask_sent(&hash, ok);
+                            // A `capsule_want` given up on: that device out of the ask, NOBODY at once when every one is.
+                            let ended = self.capsules.sent(&to, &hash, ok);
+                            self.capsule_nobody(ended);
                         }
                     }
                 }
@@ -2256,10 +2396,10 @@ impl Client {
             // The facets first (a kist's wait for be you, its be you, its people): answered before anything slow in this pass, and again between the slow steps below (`facets_now`), never held behind them.
             busy |= self.facets_now(&mut lap);
             // The attest screen: the state, or its roots (op 4, 65 bytes).
-            // On the stack: a syscall's buffers must be in the arc. 512 bytes hold the longest words entry (23 voca words, at most 18 letters each, with spaces).
-            let mut req = [0u8; 512];
+            // In the arc (the heap is), allocated once before the loop: op 38 carries a capsule's piece (`CAPSULE_PIECE` and its header); 512 bytes held every other call (the longest words entry, 23 voca words of at most 18 letters with spaces).
+            let req = &mut req_buf[..];
             let mut tok = [0u8; 32];
-            let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
+            let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), req, &mut tok, true);
             if n != ERR && n != ferros_sys::NOTHING {
                 busy = true;
                 // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
@@ -2271,6 +2411,37 @@ impl Client {
                     self.space.copy_rang = true;
                     let r = [0u8];
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                // The fleet's capsule source (capsule.rs; docs/IDENTITY-SPACE.md "Capsules", source 2), the stower's three calls:
+                // 36 [capsule 32][offset u64 LE]: a piece of a kist's capsule from the person's devices heard. Held until one answers → [0][the whole length u64 LE][the bytes], or → [1] when none is heard, every one said none or was given up on, or their time ran out (`capsule::ASK_US`).
+                // 37: held until a member asks this device for a capsule → [id u32 LE][capsule 32][offset u64 LE]; a held call answered empty when another takes its place.
+                // 38 [id u32 LE][0][the whole length u64 LE][the bytes] the piece for want `id`, or [id u32 LE][1] this device has no such capsule → [0] sent, [1] no such want, [2] not sent (no handle proof, or the frame did not build).
+                // WHY the lengths: another process's message, sliced below by fixed offsets.
+                if got >= 41 && req[0] == 36 {
+                    let mut capsule = [0u8; 32];
+                    capsule.copy_from_slice(&req[1..33]);
+                    let offset = u64::from_le_bytes(req[33..41].try_into().unwrap());
+                    self.capsule_ask(tok, capsule, offset);
+                    continue;
+                }
+                if got >= 1 && req[0] == 37 {
+                    let (now, old) = self.capsules.hold(tok);
+                    if let Some(r) = now {
+                        self.reply(&tok, &r);
+                    }
+                    if let Some(old) = old {
+                        // Empty, from a buffer in the arc (an empty literal's pointer is no address in it).
+                        let e = [0u8; 1];
+                        self.reply(&old, &e[..0]);
+                    }
+                    continue;
+                }
+                if got >= 6 && req[0] == 38 {
+                    let id = u32::from_le_bytes(req[1..5].try_into().unwrap());
+                    let piece = if req[5] == 0 && got >= 14 { Some((u64::from_le_bytes(req[6..14].try_into().unwrap()), &req[14..got])) } else { None };
+                    let r = [self.capsule_answer(id, piece)];
+                    self.reply(&tok, &r);
                     continue;
                 }
                 if n >= 1 && req[0] == 17 {
@@ -2355,6 +2526,22 @@ impl Client {
                 // 24 [on]: the person's do not disturb switched on this device's quick row (space.rs `space_dnd`) → [0 done, 1 before the first pull]. The kernel holds what the row shows (preference 40).
                 if n >= 2 && req[0] == 24 {
                     let r = [self.space_dnd(req[1] != 0)];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                // The person's people a page at a time (facets.rs `people_page`, docs/NO-CEILINGS.md step 7): 36 [skip u32 LE] → the People page's, 37 [developer][option][skip u32 LE] → a kist's card's; every person in as many calls as it takes.
+                if got >= 5 && req[0] == 36 {
+                    let skip = u32::from_le_bytes([req[1], req[2], req[3], req[4]]) as usize;
+                    let r = self.people_page(skip);
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                if got >= 69 && req[0] == 37 {
+                    let (mut d, mut o) = ([0u8; 32], [0u8; 32]);
+                    d.copy_from_slice(&req[1..33]);
+                    o.copy_from_slice(&req[33..65]);
+                    let skip = u32::from_le_bytes([req[65], req[66], req[67], req[68]]) as usize;
+                    let r = self.kist_people_page(&d, &o, skip);
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
@@ -2576,6 +2763,9 @@ impl Client {
             busy |= self.facets_now(&mut lap);
             // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
             self.space_step(t);
+            // The fleet's capsule asks whose devices' time is out.
+            let ended = self.capsules.step(t);
+            self.capsule_nobody(ended);
             lap.mark(b"space_step");
             // The facets (facets.rs): calls on `facets` taken in, one held binding signed, an add's chain looked up.
             busy |= self.facets_now(&mut lap);
@@ -2724,6 +2914,9 @@ impl Client {
         if let Some(d) = self.space_due() {
             at(d);
         }
+        if let Some(d) = self.capsules.due() {
+            at(d);
+        }
         // The Eagle-time deadlines (the add machine's, the request's 210 s), as microseconds from now.
         let osc = vsf::OSCILLATIONS_PER_SECOND as i128;
         let e = eagle() as i128;
@@ -2762,8 +2955,13 @@ impl Client {
         v.extend_from_slice(&self.add_reply());
         v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
-        // The People page: an add's outcome and the people (a change made here, or merged from another device).
-        v.extend_from_slice(&self.people_reply());
+        // The People page: an add's outcome and every person (a change made here, or merged from another device), all of them however many (op 25's reply stops at 255).
+        let people = ferros_space::people(&self.space.space);
+        v.push(self.facets.state);
+        for p in &people {
+            v.extend_from_slice(&p.handle_proof);
+            v.extend_from_slice(p.name.as_bytes());
+        }
         v
     }
 
@@ -2915,7 +3113,7 @@ extern "C" fn work(_: u64) -> ! {
     // What peers' transfers may hold here (photon_core `bound_inbound`): a SPEC asks up to 4 MiB and its buffer is made whole at once, a sender has 26 letters, and this heap is 8 MiB. The largest frame this service takes is a fleet chain (A#225840 bytes at 30 ops on the Pro, 2026-11-22, about 7.5 KB an op), so 2 MiB for one leaves room for about 270 ops, and half the heap for all in flight together.
     pt.bound_inbound(IN_MOST, IN_BUDGET);
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, unhandled_said: Vec::new(), lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, unhandled_said: Vec::new(), lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new(), capsules: capsule::Capsules::default() };
     c.run()
 }
 
