@@ -206,7 +206,8 @@ pub fn taken_bytes() -> usize {
 
 /// Frames given back (`give`) and not yet wiped. A 2 MiB frame's zeroing is about a tenth of a millisecond, and `give` made it under the kernel lock: a process's end held every core a frame of its arc at a time (the camera driver's region, 5.8 ms at its end, `diag lock` 2026-11-16; a 128 MiB arc about 5 ms).
 /// So `give` now only empties the frame's table and queues the frame here, still marked used: no take finds it and a reset's scrub zeroes it with every frame an arc holds (`scrub`, `taken_bytes`), as the owner's rule wants (2026-11-08: the kernel wipes what a process held as it reclaims it).
-/// Idle workers and the service loop wipe them with the lock let go and put them back clean (`reclaim_step`); a take that finds the pool short wipes the waiting ones at once under the lock, as before (`reclaim_all`), so no take is refused for frames that are on their way back.
+/// Idle workers and the service loop wipe them with the lock let go and put them back clean (`reclaim_step`); a take that finds the pool short is handed waiting ones (`take_returning`, `take_run_search`), so no take is refused for frames that are on their way back.
+/// Handed, not freed: a frame stays marked used from its give to its new owner, so a reset's scrub zeroes it whenever the reset comes, and only the frames a take hands out are zeroed then, each by its taker (until 2026-11-22 `reclaim_all` wiped every waiting frame under the kernel lock at once, about 90 us a frame: 138 ms after a dev run's 3 GiB arc came back).
 /// Under the kernel lock; `RETURNING_N` mirrors its length for a look without it.
 static mut RETURNING: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 static RETURNING_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -225,17 +226,14 @@ fn reclaimed(p: &mut Pool, f: usize, zero_now: bool) {
     p.free += 1;
 }
 
-/// Every frame waiting to come back, wiped and freed now, under the kernel lock (the cost `give` paid before): for a take that found the pool short. Whether there were any.
-fn reclaim_all(p: &mut Pool) -> bool {
-    let r = returning();
-    if r.is_empty() {
-        return false;
+/// A frame waiting to come back handed to a take that found the pool short, None when none waits: out of the queue and still marked used (as it was since its give), so it goes from its old owner to its new one without ever being free. Zeroed now when `zero_now` (one frame under the kernel lock, the cost of a take of a frame not known clean); a taker that fills it whole or zeroes it itself passes false. Under the kernel lock.
+fn take_returning(zero_now: bool) -> Option<usize> {
+    let f = returning().pop()?;
+    RETURNING_N.store(returning().len(), core::sync::atomic::Ordering::Relaxed);
+    if zero_now {
+        zero(pa(f));
     }
-    while let Some(f) = r.pop() {
-        reclaimed(p, f, true);
-    }
-    RETURNING_N.store(0, core::sync::atomic::Ordering::Relaxed);
-    true
+    Some(f)
 }
 
 /// One frame given back wiped with the kernel lock let go, then freed under it: idle workers in place of their sleep (smp.rs), and the service loop each pass. False when none waits.
@@ -336,7 +334,7 @@ pub fn prepare(n: usize) {
 
 /// A free frame, zeroed, now taken; None when every frame is taken. The first free in the map's order, so the ranges ferros has used longest fill first.
 pub fn take() -> Option<usize> {
-    take_first().or_else(|| if reclaim_all(pool()) { take_first() } else { None })
+    take_first().or_else(|| take_returning(true))
 }
 
 fn take_first() -> Option<usize> {
@@ -358,7 +356,7 @@ fn take_first() -> Option<usize> {
 
 /// A free frame from the far end of the map, zeroed, now taken: a surface's (process.rs `surface_take`), so surfaces fill the pool from its top while arcs fill it from its bottom (`take`), and a big arc's growth and a run of windows never meet until the pool is nearly full. None when every frame is taken.
 pub fn take_top() -> Option<usize> {
-    take_top_first().or_else(|| if reclaim_all(pool()) { take_top_first() } else { None })
+    take_top_first().or_else(|| take_returning(true))
 }
 
 fn take_top_first() -> Option<usize> {
@@ -382,7 +380,7 @@ fn take_top_first() -> Option<usize> {
 /// `n` free frames side by side in one range of the map, the run ending at or below the address `below`, now taken: one physically contiguous run, for a device that writes it by DMA with no IOMMU in front of it (the camera's front end, its SYSMMUs in bypass: process.rs `cam_ask`). Searched from the top of the map down, as surfaces and GPU blocks are taken (`take_top`), so the low ranges arcs grow into stay theirs.
 /// Not zeroed here (2026-11-18): the caller zeroes them itself with the kernel lock let go (`wipe`), so the run's first frame comes with, frame by frame, whether it still needs zeroing (not known clean). Taken, so nothing else is given them meanwhile. None when no range holds such a run now.
 pub fn take_run_unzeroed(n: usize, below: usize) -> Option<(usize, alloc::vec::Vec<bool>)> {
-    take_run_search(n, below).or_else(|| if reclaim_all(pool()) { take_run_search(n, below) } else { None })
+    take_run_search(n, below, false).or_else(|| if returning().is_empty() { None } else { take_run_search(n, below, true) })
 }
 
 /// Frame `f` zeroed by its own address (the kernel's), as a take zeroes it: for a caller holding it taken (`take_run_unzeroed`).
@@ -390,10 +388,17 @@ pub fn wipe(f: usize) {
     zero(pa(f));
 }
 
-/// The run's search (`take_run_unzeroed`).
-fn take_run_search(n: usize, below: usize) -> Option<(usize, alloc::vec::Vec<bool>)> {
+/// The run's search (`take_run_unzeroed`). With `waiting`, frames waiting to come back count as free too: one in the run is taken out of the queue (still marked used) and reported as needing zeroing, which its taker does with the lock let go.
+fn take_run_search(n: usize, below: usize, waiting: bool) -> Option<(usize, alloc::vec::Vec<bool>)> {
     let p = pool();
-    let used = |p: &Pool, f: usize| p.used[f / 64] >> (f % 64) & 1 == 1;
+    let mut back = [0u64; WORDS];
+    if waiting {
+        for &f in returning().iter() {
+            back[f / 64] |= 1 << (f % 64);
+        }
+    }
+    let is_back = |f: usize| back[f / 64] >> (f % 64) & 1 == 1;
+    let used = |p: &Pool, f: usize| p.used[f / 64] >> (f % 64) & 1 == 1 && !is_back(f);
     let mut starts = [0usize; 8];
     let ranges = map();
     let mut first = 0;
@@ -413,10 +418,16 @@ fn take_run_search(n: usize, below: usize) -> Option<(usize, alloc::vec::Vec<boo
             }
             run += 1;
             if run == n {
-                // Whether each still needs zeroing, read before `took` clears its clean mark.
+                // Whether each still needs zeroing, read before `took` clears its clean mark (a waiting frame's was cleared at its first take).
                 let dirty = (f..f + n).map(|g| p.clean[g / 64] >> (g % 64) & 1 == 0).collect();
                 for g in f..f + n {
-                    took(p, g, false);
+                    if !is_back(g) {
+                        took(p, g, false);
+                    }
+                }
+                if waiting {
+                    returning().retain(|&g| g < f || g >= f + n);
+                    RETURNING_N.store(returning().len(), core::sync::atomic::Ordering::Relaxed);
                 }
                 return Some((f, dirty));
             }
@@ -439,7 +450,7 @@ pub fn clean_invalidate(f: usize) {
 
 /// A free frame for a move's copy (process.rs `arc_move`), now taken and not zeroed first: the copy fills it whole.
 pub fn take_for_copy() -> Option<usize> {
-    take_for_copy_first().or_else(|| if reclaim_all(pool()) { take_for_copy_first() } else { None })
+    take_for_copy_first().or_else(|| take_returning(false))
 }
 
 fn take_for_copy_first() -> Option<usize> {
