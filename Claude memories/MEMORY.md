@@ -32,8 +32,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no web encodings](feedback_no_web_encodings.md) - no base64/JSON ferros-side; sole exception the eSIM SGP.22 client
 - [Feedback: VSF not for framing](feedback_vsf_not_for_framing.md) - encrypted transport frames lean; VSF for control + the assembled payload
 - [Feedback: no em dashes](feedback_no_em_dashes.md) + [short spellings](feedback_short_spellings.md) - never em dashes in wire text or VSF `a`; thru, altho, thruout
-- [Feedback: no manual line wraps](feedback_no_line_wraps.md) - one sentence per line in comments; comment-gate enforces
-- [Feedback: count from zero](feedback_count_from_zero.md) - every numbered thing starts at 0 (D0, O0, levels, Zil)
+- [Feedback: no manual line wraps](feedback_no_line_wraps.md) + [count from zero](feedback_count_from_zero.md) - one sentence per line in comments (gate enforces); every numbered thing starts at 0
 - [Feedback: number format](feedback_number_format.md) + [dozenal versioning](feedback_versioning.md) - G# hex, A# decimal, never 0x; versions Zil(0) Zila(1) Zilor(2) Ter(3)
 - [Feedback: device, not phone](feedback_device_not_phone.md) - say "device"; ferros places no calls
 - [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) - one Photon everywhere (std/photon); no stripped copy
@@ -101,6 +100,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [UFS firewall decided](ufs_firewall_decided.md) - hv refuses Android boot-chain writes + UFS reset; built 2026-11-01
 - [Firmware validate on demand](firmware_validate_on_demand.md) - no per-boot chain hashing; informational, never a green badge
 - [Pages allowed when equivalent](pages_allowed_when_equivalent.md) - masking by default, MMU pages where equal and faster
+- [Storage: the seed is the only fixed thing](storage_seed_only_fixed.md) - everything else on the partition is a field from one pool, VSF-described; never carve fixed windows
 - [Vault: flush per commit](vault_flush_per_commit.md) - every commit flushes the UFS cache before Ok; Ok carries copies (2, or 1 degraded)
 - [Syscall buffers: resolve or trap](syscall_buffers_resolve_or_trap.md) - arc, own DMA regions, else trap with report; built
 - [Biometrics move with identity](biometrics_move_with_identity.md) - fingerprint only if templates are ours; low priority
