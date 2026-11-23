@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "вид релиза",
         Msg::UntilReboot => "до перезагрузки",
         Msg::FrameCounter => "счётчик кадров",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "проверка динамика",
+        Msg::NoSpeakerProtection => "защиты динамика пока нет: уровень держится низким",
+        Msg::HoldToPlay => "удерживайте кнопку для воспроизведения, отпустите для остановки",
+        Msg::Left => "левый",
+        Msg::Right => "правый",
+        Msg::Both => "оба",
+        Msg::Playing => "играет",
+        Msg::ToneStopped => "остановлено",
+        Msg::AudioRefused => "аудиослужба отказала (причина в консоли)",
+        Msg::AudioNotAnswering => "аудиослужба не ответила",
+        Msg::AmpFault => "остановлено: усилитель сообщил об ошибке",
+        Msg::NoAudioRight => "нет права на звук: нужно обновить ядро",
+        Msg::MicTest => "проверка микрофонов",
+        Msg::Listen => "слушать",
+        Msg::RecordPlayBack => "записать и воспроизвести",
+        Msg::Recording => "запись",
+        Msg::MicGaveSilence => "микрофон дал тишину",
+        Msg::MicsWouldNotStart => "микрофоны не запустились (причина в консоли)",
+        Msg::SpeakerWouldNotStart => "записано, но динамик не запустился",
+        Msg::BuzzTest => "проверка вибрации",
+        Msg::Buzz => "вибрация",
+        Msg::MotorDidNotPlay => "мотор не сработал (NFC выключен или его драйвер не запущен)",
         // ---- the attest screen ----
         Msg::Attest => "аттестовать",
         Msg::Mint => "отчеканить",
@@ -558,6 +581,52 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" до ")?;
             num(o, f, max)?;
             o.write_str(if max % 10 == 1 && max % 100 != 11 { " обычного символа." } else { " обычных символов." })
+        }
+        Say::UnderFullScale(n) => {
+            o.write_str("на ")?;
+            num(o, f, n)?;
+            o.write_str(" dB ниже полной шкалы")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL захвачена ")?;
+            num(o, f, pll)?;
+            o.write_str(", ошибки ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("микрофон ")?;
+            num(o, f, mic)?;
+            o.write_str(": на ")?;
+            num(o, f, under)?;
+            o.write_str(" dB ниже полной шкалы")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("микрофон ")?;
+            num(o, f, mic)?;
+            o.write_str(": тишина")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("микрофон ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("записано, пик на ")?;
+            num(o, f, d)?;
+            o.write_str(" dB ниже полной шкалы: воспроизведение")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("форма волны ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "Release-Aussehen",
         Msg::UntilReboot => "bis zum Neustart",
         Msg::FrameCounter => "Bildzähler",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "Lautsprechertest",
+        Msg::NoSpeakerProtection => "noch kein Lautsprecherschutz: der Pegel bleibt niedrig",
+        Msg::HoldToPlay => "Taste halten zum Abspielen, loslassen zum Stoppen",
+        Msg::Left => "links",
+        Msg::Right => "rechts",
+        Msg::Both => "beide",
+        Msg::Playing => "spielt",
+        Msg::ToneStopped => "gestoppt",
+        Msg::AudioRefused => "der Audiodienst hat abgelehnt (die Konsole sagt, warum)",
+        Msg::AudioNotAnswering => "der Audiodienst hat nicht geantwortet",
+        Msg::AmpFault => "gestoppt: ein Verstärker meldete einen Fehler",
+        Msg::NoAudioRight => "kein Audiorecht: der Kernel muss aktualisiert werden",
+        Msg::MicTest => "Mikrofontest",
+        Msg::Listen => "zuhören",
+        Msg::RecordPlayBack => "aufnehmen, dann abspielen",
+        Msg::Recording => "nimmt auf",
+        Msg::MicGaveSilence => "das Mikrofon lieferte Stille",
+        Msg::MicsWouldNotStart => "die Mikrofone starteten nicht (die Konsole sagt, warum)",
+        Msg::SpeakerWouldNotStart => "aufgenommen, aber der Lautsprecher startete nicht",
+        Msg::BuzzTest => "Vibrationstest",
+        Msg::Buzz => "vibrieren",
+        Msg::MotorDidNotPlay => "der Motor vibrierte nicht (NFC ausgeschaltet oder sein Treiber nicht aktiv)",
         // ---- the attest screen ----
         Msg::Attest => "bezeugen",
         Msg::Mint => "prägen",
@@ -546,6 +569,51 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" bis ")?;
             num(o, f, max)?;
             o.write_str(" einfache Zeichen.")
+        }
+        Say::UnderFullScale(n) => {
+            num(o, f, n)?;
+            o.write_str(" dB unter Vollaussteuerung")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL eingerastet ")?;
+            num(o, f, pll)?;
+            o.write_str(", Fehler ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("Mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": ")?;
+            num(o, f, under)?;
+            o.write_str(" dB unter Vollaussteuerung")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("Mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": still")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("Mikrofon ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("aufgenommen, Spitze ")?;
+            num(o, f, d)?;
+            o.write_str(" dB unter Vollaussteuerung: wird abgespielt")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("ROM-Wellenform ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

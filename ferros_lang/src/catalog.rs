@@ -655,6 +655,29 @@ messages! {
     UntilReboot,
     /// The display's frame counter (frames a second and a frame's time, in the console's USB circle), a checkbox on the Developer page.
     FrameCounter,
+    // The Developer page's tests (payloads/map devtest.rs): the speaker test's heading, its warning, its buttons' note and labels, what the audio service answered; the microphone test's heading, its listen checkbox, its record button and outcomes; the buzz test's heading, its button, its failure.
+    SpeakerTest,
+    NoSpeakerProtection,
+    HoldToPlay,
+    Left,
+    Right,
+    Both,
+    Playing,
+    ToneStopped,
+    AudioRefused,
+    AudioNotAnswering,
+    AmpFault,
+    NoAudioRight,
+    MicTest,
+    Listen,
+    RecordPlayBack,
+    Recording,
+    MicGaveSilence,
+    MicsWouldNotStart,
+    SpeakerWouldNotStart,
+    BuzzTest,
+    Buzz,
+    MotorDidNotPlay,
 
     // ---- the attest screen (payloads/ahau): its button ----
     /// The button that attests the typed handle (owner, 2026-11-10: "needs to say attest, not unlock. always attest").
@@ -886,6 +909,21 @@ pub enum Say<'a> {
     // ---- Kūaha ----
     /// An item's open, naming the kist that opens its kind (a name, never translated): "open in Opsin".
     OpenIn(&'a str),
+    // ---- the Developer page's tests ----
+    /// A level as decibels under full scale (a count, in the person's base).
+    UnderFullScale(u64),
+    /// An amplifier's state (its side's word, `Msg::Left` or `Msg::Right`): PUP_DONE and PLL lock as 0 or 1, the error bits written already (developer G#): "left: PUP_DONE 1, PLL lock 1, errors G#0". PUP_DONE and PLL are register names and stay.
+    AmpState { side: &'a str, pup: u64, pll: u64, errors: &'a str },
+    /// A microphone's level now (its id, the decibels under full scale): "microphone 0: 42 dB under full scale".
+    MicLevel { mic: u64, under: u64 },
+    /// A microphone whose samples were all zero.
+    MicQuiet(u64),
+    /// A microphone by its id (husky's places for them are unknown): "microphone 0".
+    MicName(u64),
+    /// A recording made and being played back, its peak as decibels under full scale.
+    PlayingBack(u64),
+    /// The vibration motor's ROM waveform by number.
+    RomWaveform(u64),
 }
 
 /// A message in language `l`.

@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "mwonekano wa toleo",
         Msg::UntilReboot => "hadi kuwasha upya",
         Msg::FrameCounter => "kihesabu fremu",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "jaribio la spika",
+        Msg::NoSpeakerProtection => "bado hakuna kinga ya spika: kiwango kinawekwa chini",
+        Msg::HoldToPlay => "shikilia kitufe ili kucheza, achia ili kusimamisha",
+        Msg::Left => "kushoto",
+        Msg::Right => "kulia",
+        Msg::Both => "zote mbili",
+        Msg::Playing => "inacheza",
+        Msg::ToneStopped => "imesimama",
+        Msg::AudioRefused => "huduma ya sauti ilikataa (koni inaeleza sababu)",
+        Msg::AudioNotAnswering => "huduma ya sauti haikujibu",
+        Msg::AmpFault => "imesimama: kikuza sauti kimeripoti hitilafu",
+        Msg::NoAudioRight => "hakuna haki ya sauti: kiini kinahitaji kusasishwa",
+        Msg::MicTest => "jaribio la maikrofoni",
+        Msg::Listen => "sikiliza",
+        Msg::RecordPlayBack => "rekodi, kisha cheza tena",
+        Msg::Recording => "inarekodi",
+        Msg::MicGaveSilence => "maikrofoni ilitoa ukimya",
+        Msg::MicsWouldNotStart => "maikrofoni hazikuanza (koni inaeleza sababu)",
+        Msg::SpeakerWouldNotStart => "imerekodiwa, lakini spika haikuanza",
+        Msg::BuzzTest => "jaribio la mtetemo",
+        Msg::Buzz => "tetema",
+        Msg::MotorDidNotPlay => "mota haikutetema (NFC imezimwa, au kiendeshi chake hakijawaka)",
         // ---- the attest screen ----
         Msg::Attest => "thibitisha",
         Msg::Mint => "zalisha",
@@ -547,6 +570,52 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" hadi ")?;
             num(o, f, max)?;
             o.write_str(".")
+        }
+        Say::UnderFullScale(n) => {
+            o.write_str("dB ")?;
+            num(o, f, n)?;
+            o.write_str(" chini ya kiwango kamili")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL imefunga ")?;
+            num(o, f, pll)?;
+            o.write_str(", hitilafu ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("maikrofoni ")?;
+            num(o, f, mic)?;
+            o.write_str(": dB ")?;
+            num(o, f, under)?;
+            o.write_str(" chini ya kiwango kamili")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("maikrofoni ")?;
+            num(o, f, mic)?;
+            o.write_str(": kimya")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("maikrofoni ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("imerekodiwa, kilele chake dB ")?;
+            num(o, f, d)?;
+            o.write_str(" chini ya kiwango kamili: inachezwa tena")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("umbo la wimbi la ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

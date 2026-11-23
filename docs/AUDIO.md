@@ -116,7 +116,31 @@ In bypass the right amplifier takes the second slot (DAC_PCM1_SRC = ASPRX2) itse
 - The rails: a hard hold now; a smooth knee near full scale would distort less when streams sum loud.
 - The volume's page and the sound circle's ring.
 - Whether a kist with `audio` may also open an alert stream, or alerts are a separate right.
-- Microphones (they are the AoC's too: `audio_input_control`, the capture rings) and Bluetooth and USB sinks: the same service, later.
+- Bluetooth and USB sinks: the same service, later. (The microphones are built: "Microphones" below.)
+
+## Microphones (built 2026-11-22, research from source; not yet run on a device)
+
+husky has three built-in microphones, ids 0, 1 and 2 (mixer_paths.xml:750-753; the HAL's bottom, back and top for them are marked "fake data" by the HAL itself, so ferros names them by id). They are the AoC's, like the speaker: the AP asks for a capture on the input control queue `audio_input_control` and reads the ring `audio_capture0` (PCM device 8, `fe_ep1_tx`: gs101-audio.dtsi:63-205). The service's `mic.rs` and aoc.rs's capture section, every step with its source:
+
+- **The commands**, on the input queue only (its ids collide with the output queue's: 208 is AP_INPUT_START there and OUTPUT_AEC_NOTIFY here, zuma.h:119-123): MIC_POWER_ON (203) for each microphone (the factory test's; Linux's own capture leaves the power to the firmware, so a refusal is only said), SET_MIC_DC_BLOCKER (252) on, MIC_RECORD_AP_SET_PARAMS (224: three channels, 16 bits, 48 kHz, fixed point, PDM mask G#07, 10 ms periods, four of them, channel k from microphone k, raw), MIC_RECORD_AP_SET_PARAMS2 (359: device 8, the buffer and period in bytes), the microphone list as INPUT_SET_PARAMETER (233: block 139, value G#FF020100), AP_INPUT_START (208, input 1), the ring flushed, MIC_RECORD_AP_START_DATA (293). Stopped with AP_INPUT_STOP (209) and MIC_POWER_OFF (204). SET_PARAMS goes before AP_INPUT_START (the firmware refuses them while its input runs). A reply must carry the command's id: the input queue can carry the AoC's notifications (NOTIF_AUDIO_INPUT_AP_MIC_RECORD_DATA_AVAILABLE), which are passed over.
+- **The ring** is read from its UP region (ipc_core.c:613-652): tx less rx is what waits, at most a ring (anything older was written over and is skipped, the frame kept by the count), the samples read a word at a time where aligned, then rx and rp moved. The AP never signals the AoC after a read (aoc_service_core.c:500-510).
+- **The clock**: when `audio_capture0`'s mailbox channel is on block f1 (Linux treats channel 20 as interrupt-driven, aoc_alsa.h:241), the AoC's ring of the line this process holds clocks the capture; otherwise the ring is read every 128th of a second (Linux's own fallback is a 10 ms timer, pcm.c:258-278). The console says which at the first capture.
+- **Gains**: none set beyond the DC blocker. On a cold AoC the firmware's defaults apply (Android's HAL sets a record soft gain of -40 dB at boot and raises it per path); the meter shows what comes, and the playback is scaled from the recording's own peak, so the level heard does not depend on them.
+- **Unknown until the device says**: `audio_capture0`'s channel; whether MIC_POWER_ON is needed or refused; the firmware's default gains; whether 293 is needed after 208 (Linux always sends it).
+
+The protocol (ferros_sys `audio`): `MIC_LEVELS`, held until the next 80 ms of samples (eight periods) have come in, then each microphone's peak; `RECORD` + microphone + level, held while 2^17 frames (2.7 s) of that microphone are captured into the service's memory, then played back once on both speakers, scaled so the recording's loudest sample comes out at the level (never louder than the speaker test can be). The recording is never written anywhere and is gone with the process. A capture nobody asks for again within 64 periods (640 ms) is stopped, and the process ends once nothing else holds it.
+
+## The Developer page's tests (2026-11-22; owner: "Just throw a mic and speaker test in the ferros settings and I can test it", and earlier "sound and buzz, why not")
+
+Settings → Developer, after the light scope (payloads/map devtest.rs). Nothing on it is stored; every control starts at its default when the map starts.
+
+- **Speaker test.** A level slider (from 1 to `TONE_MAX`, 191: four octaves, 24 dB, under full scale; it starts at 111, nine octaves down, the first step of "A sound you can hear, quietly" below), and three buttons, left, right and both: a 1 kHz tone plays while a button is held and stops as the finger lifts or slides off it, faded in and out over a period (5.3 ms) so it does not click. The page says there is no speaker protection yet. Under the buttons, after every answer: what the service did (playing, stopped, refused, an amplifier's error) and each amplifier's PUP_DONE, PLL lock and error bits.
+  - **The ceiling is the service's** (ferros_sys audio `TONE_MAX`, WHY in its comment): a tone or a playback above 191, or at 0 (which means the default volume, 223), is refused, never cut down. The tone also carries its own bound, 1024 periods (5.5 s, `TONE_HOLD`), so a map that dies between its start and its stop leaves nothing playing.
+  - **An amplifier's error bit stops everything at once.** While sound plays the service reads both amplifiers' IRQ1_STATUS1 and IRQ1_STATUS3 every period (four SPI transactions, about 120 µs of each 5.3 ms period, clocked by the AoC's interrupt), and any of AMP_SHORT, BST_SHORT, TEMP, BST_OVP or BST_DCM_UVP stops the tone, every stream and the recording's playback, turns the source off and powers both amplifiers down. The process stays, silent, until the next call has been told (its report's last byte), then ends.
+- **Microphone test.** "listen": each microphone's peak as decibels under full scale and on a meter, about twelve times a second (the meter's call held by the service, answered as the samples come in). Then a microphone chosen by id and "record, then play back": 2.7 s recorded, then played back at the speaker test's level; the page says the recording's peak.
+- **Buzz test.** A waveform slider (the CS40L26's ROM waveforms 0 to G#26; it starts at 1, the notes' tap) and "buzz": one waveform thru the NFC driver (its op 8). The ROM's waveforms are unnamed and their strength unknown (the tuning, the RAM firmware's, is not applied); 1 is the one played in the motor's bring-up. NFC switched off by its status circle means no motor driver, and the page says so.
+
+The map reaches the service thru a send right on `audio` the kernel hands a Settings holder, the slot after the torch's (process.rs, 2026-11-22): a kernel from before leaves the slot empty and the page says the kernel needs updating.
 
 ## The path to a first sound (research from source, 2026-10-25 night; nothing here run on the device yet)
 
@@ -148,6 +172,16 @@ PCM instead goes thru the ring service `audio_playbackN` (S16_LE stereo 48 kHz; 
 ## Verification on the device (husky; the owner present for every step that makes sound)
 
 The kernel carries the new line, switch clock, right and preference, so it needs the owner's flash (slot b, as usual) before any of this; the capsules first, as always: `tools/husky-shell.sh audio` builds, signs and stores the service (it is not started: the first call starts it), and `amp` and `epcall` must be current.
+
+**Silent checks (2026-11-22): `PROBE` and the microphones.** Neither sounds: `PROBE` brings both amplifiers to ready without GLOBAL_EN and never starts the AoC's speaker port; a capture plays nothing.
+
+```
+ferros-bridge spawn epcall.bin 07 --name epcall --use audio     # PROBE: the services described, a control command answered, both amplifiers ready and back in reset
+ferros-bridge spawn epcall.bin 08 --name epcall --use audio     # MIC_LEVELS: the capture started, the first 80 ms's peaks per microphone
+ferros-bridge diag console
+```
+
+Expected from `PROBE`: `audio_output_control` and `audio_playback5` described, `control answered: entry point A#5 has taken A#… samples` (or the AoC's error code: still a round trip), both amplifiers' `ready` lines and `ready, off` with errors G#0, `probe done, nothing sounded`. From `MIC_LEVELS`: `audio_input_control` and `audio_capture0` described, the capture's channel and whether it is f1's, and a reply with three peaks (a room's noise gives small non-zero peaks; all zero means the AoC sends silence, its gains or its power). About 640 ms later `microphones stopped (nobody listening)`, `silent, ending`.
 
 **0. Nothing audible: the service comes up and its clock runs.**
 

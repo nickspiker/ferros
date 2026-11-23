@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "āhua tuku",
         Msg::UntilReboot => "tae noa ki te tīmata anō",
         Msg::FrameCounter => "kaute anga",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "whakamātautau tukuoro",
+        Msg::NoSpeakerProtection => "kāore anō kia whakamarumarutia te tukuoro: ka iti tonu te taumata",
+        Msg::HoldToPlay => "pupuritia tētahi pātene kia pāho, tukua kia mutu",
+        Msg::Left => "mauī",
+        Msg::Right => "matau",
+        Msg::Both => "e rua",
+        Msg::Playing => "e pāho ana",
+        Msg::ToneStopped => "kua mutu",
+        Msg::AudioRefused => "i whakahē te ratonga oro (kei te papatohu te take)",
+        Msg::AudioNotAnswering => "kāore te ratonga oro i whakautu",
+        Msg::AmpFault => "kua mutu: i pūrongo tētahi whakarahi oro i tētahi hapa",
+        Msg::NoAudioRight => "kāore he mana oro: me whakahou te kākano",
+        Msg::MicTest => "whakamātautau hopuoro",
+        Msg::Listen => "whakarongo",
+        Msg::RecordPlayBack => "hopu, kātahi ka whakatangi anō",
+        Msg::Recording => "e hopu ana",
+        Msg::MicGaveSilence => "i wahangū te hopuoro",
+        Msg::MicsWouldNotStart => "kāore ngā hopuoro i tīmata (kei te papatohu te take)",
+        Msg::SpeakerWouldNotStart => "kua hopukina, engari kāore te tukuoro i tīmata",
+        Msg::BuzzTest => "whakamātautau wiri",
+        Msg::Buzz => "wiri",
+        Msg::MotorDidNotPlay => "kāore te pūkaha i wiri (kua whakawetohia te NFC, kāore rānei tōna atekōkiri i te mahi)",
         // ---- the attest screen ----
         Msg::Attest => "whakaū",
         Msg::Mint => "whakawhānau",
@@ -552,6 +575,51 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" ki te ")?;
             num(o, f, max)?;
             o.write_str(" ngā pū māmā.")
+        }
+        Say::UnderFullScale(n) => {
+            num(o, f, n)?;
+            o.write_str(" dB i raro i te taumata katoa")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL rawa ")?;
+            num(o, f, pll)?;
+            o.write_str(", hapa ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("hopuoro ")?;
+            num(o, f, mic)?;
+            o.write_str(": ")?;
+            num(o, f, under)?;
+            o.write_str(" dB i raro i te taumata katoa")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("hopuoro ")?;
+            num(o, f, mic)?;
+            o.write_str(": wahangū")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("hopuoro ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("kua hopukina, ko tōna teitei ")?;
+            num(o, f, d)?;
+            o.write_str(" dB i raro i te taumata katoa: e whakatangi anō ana")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("āhua ngaru ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "रिलीज़ रूप",
         Msg::UntilReboot => "रीबूट तक",
         Msg::FrameCounter => "फ़्रेम गणक",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "स्पीकर परीक्षण",
+        Msg::NoSpeakerProtection => "अभी स्पीकर सुरक्षा नहीं: स्तर कम रखा जाता है",
+        Msg::HoldToPlay => "चलाने के लिए बटन दबाए रखें, रोकने के लिए छोड़ दें",
+        Msg::Left => "बायाँ",
+        Msg::Right => "दायाँ",
+        Msg::Both => "दोनों",
+        Msg::Playing => "चल रहा है",
+        Msg::ToneStopped => "रुका",
+        Msg::AudioRefused => "ऑडियो सेवा ने मना किया (कारण कंसोल में है)",
+        Msg::AudioNotAnswering => "ऑडियो सेवा ने उत्तर नहीं दिया",
+        Msg::AmpFault => "रुका: एक एम्पलीफ़ायर ने त्रुटि बताई",
+        Msg::NoAudioRight => "ऑडियो अधिकार नहीं: कर्नेल को अपडेट करना होगा",
+        Msg::MicTest => "माइक्रोफ़ोन परीक्षण",
+        Msg::Listen => "सुनें",
+        Msg::RecordPlayBack => "रिकॉर्ड करें, फिर चलाएँ",
+        Msg::Recording => "रिकॉर्ड हो रहा है",
+        Msg::MicGaveSilence => "माइक्रोफ़ोन से केवल ख़ामोशी मिली",
+        Msg::MicsWouldNotStart => "माइक्रोफ़ोन शुरू नहीं हुए (कारण कंसोल में है)",
+        Msg::SpeakerWouldNotStart => "रिकॉर्ड हुआ, पर स्पीकर शुरू नहीं हुआ",
+        Msg::BuzzTest => "कंपन परीक्षण",
+        Msg::Buzz => "कंपन",
+        Msg::MotorDidNotPlay => "मोटर नहीं चली (NFC बंद है, या उसका ड्राइवर चालू नहीं)",
         // ---- the attest screen ----
         Msg::Attest => "अटेस्ट",
         Msg::Mint => "बनाओ",
@@ -547,6 +570,52 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" से ")?;
             num(o, f, max)?;
             o.write_str(" सादे अक्षरों का होता है।")
+        }
+        Say::UnderFullScale(n) => {
+            o.write_str("पूर्ण स्तर से ")?;
+            num(o, f, n)?;
+            o.write_str(" dB नीचे")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL लॉक ")?;
+            num(o, f, pll)?;
+            o.write_str(", त्रुटियाँ ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("माइक्रोफ़ोन ")?;
+            num(o, f, mic)?;
+            o.write_str(": पूर्ण स्तर से ")?;
+            num(o, f, under)?;
+            o.write_str(" dB नीचे")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("माइक्रोफ़ोन ")?;
+            num(o, f, mic)?;
+            o.write_str(": ख़ामोश")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("माइक्रोफ़ोन ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("रिकॉर्ड हुआ, शिखर पूर्ण स्तर से ")?;
+            num(o, f, d)?;
+            o.write_str(" dB नीचे: वापस चल रहा है")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("ROM तरंग-रूप ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

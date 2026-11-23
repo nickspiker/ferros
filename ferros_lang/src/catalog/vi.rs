@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "giao diện bản phát hành",
         Msg::UntilReboot => "đến khi khởi động lại",
         Msg::FrameCounter => "bộ đếm khung hình",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "kiểm tra loa",
+        Msg::NoSpeakerProtection => "chưa có bảo vệ loa: mức âm được giữ thấp",
+        Msg::HoldToPlay => "giữ một nút để phát, thả ra để dừng",
+        Msg::Left => "trái",
+        Msg::Right => "phải",
+        Msg::Both => "cả hai",
+        Msg::Playing => "đang phát",
+        Msg::ToneStopped => "đã dừng",
+        Msg::AudioRefused => "dịch vụ âm thanh đã từ chối (bảng điều khiển cho biết lý do)",
+        Msg::AudioNotAnswering => "dịch vụ âm thanh không trả lời",
+        Msg::AmpFault => "đã dừng: một bộ khuếch đại báo lỗi",
+        Msg::NoAudioRight => "chưa có quyền âm thanh: cần cập nhật nhân",
+        Msg::MicTest => "kiểm tra micrô",
+        Msg::Listen => "nghe",
+        Msg::RecordPlayBack => "ghi âm rồi phát lại",
+        Msg::Recording => "đang ghi âm",
+        Msg::MicGaveSilence => "micrô chỉ cho ra im lặng",
+        Msg::MicsWouldNotStart => "micrô không khởi động được (bảng điều khiển cho biết lý do)",
+        Msg::SpeakerWouldNotStart => "đã ghi âm, nhưng loa không khởi động được",
+        Msg::BuzzTest => "kiểm tra rung",
+        Msg::Buzz => "rung",
+        Msg::MotorDidNotPlay => "động cơ không rung (NFC đã tắt, hoặc trình điều khiển chưa chạy)",
         // ---- the attest screen ----
         Msg::Attest => "chứng thực",
         Msg::Mint => "đúc",
@@ -547,6 +570,52 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" đến ")?;
             num(o, f, max)?;
             o.write_str(" ký tự cơ bản.")
+        }
+        Say::UnderFullScale(n) => {
+            o.write_str("thấp hơn mức tối đa ")?;
+            num(o, f, n)?;
+            o.write_str(" dB")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL khóa ")?;
+            num(o, f, pll)?;
+            o.write_str(", lỗi ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("micrô ")?;
+            num(o, f, mic)?;
+            o.write_str(": thấp hơn mức tối đa ")?;
+            num(o, f, under)?;
+            o.write_str(" dB")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("micrô ")?;
+            num(o, f, mic)?;
+            o.write_str(": im lặng")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("micrô ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("đã ghi âm, đỉnh thấp hơn mức tối đa ")?;
+            num(o, f, d)?;
+            o.write_str(" dB: đang phát lại")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("dạng sóng ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

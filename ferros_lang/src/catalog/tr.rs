@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "sürüm görünümü",
         Msg::UntilReboot => "yeniden başlatmaya kadar",
         Msg::FrameCounter => "kare sayacı",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "hoparlör testi",
+        Msg::NoSpeakerProtection => "henüz hoparlör koruması yok: seviye düşük tutulur",
+        Msg::HoldToPlay => "çalmak için bir düğmeyi basılı tut, durdurmak için bırak",
+        Msg::Left => "sol",
+        Msg::Right => "sağ",
+        Msg::Both => "ikisi",
+        Msg::Playing => "çalıyor",
+        Msg::ToneStopped => "durdu",
+        Msg::AudioRefused => "ses hizmeti reddetti (nedenini konsol söylüyor)",
+        Msg::AudioNotAnswering => "ses hizmeti yanıt vermedi",
+        Msg::AmpFault => "durdu: bir yükseltici hata bildirdi",
+        Msg::NoAudioRight => "ses hakkı yok: çekirdeğin güncellenmesi gerekiyor",
+        Msg::MicTest => "mikrofon testi",
+        Msg::Listen => "dinle",
+        Msg::RecordPlayBack => "kaydet, sonra çal",
+        Msg::Recording => "kaydediyor",
+        Msg::MicGaveSilence => "mikrofon sessizlik verdi",
+        Msg::MicsWouldNotStart => "mikrofonlar başlamadı (nedenini konsol söylüyor)",
+        Msg::SpeakerWouldNotStart => "kaydedildi, ama hoparlör başlamadı",
+        Msg::BuzzTest => "titreşim testi",
+        Msg::Buzz => "titret",
+        Msg::MotorDidNotPlay => "motor titreşmedi (NFC kapalı ya da sürücüsü çalışmıyor)",
         // ---- the attest screen ----
         Msg::Attest => "tasdikle",
         Msg::Mint => "bas",
@@ -548,6 +571,52 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" ile ")?;
             num(o, f, max)?;
             o.write_str(" arası basit karakterden oluşur.")
+        }
+        Say::UnderFullScale(n) => {
+            o.write_str("tam ölçeğin ")?;
+            num(o, f, n)?;
+            o.write_str(" dB altında")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL kilitli ")?;
+            num(o, f, pll)?;
+            o.write_str(", hatalar ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": tam ölçeğin ")?;
+            num(o, f, under)?;
+            o.write_str(" dB altında")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": sessiz")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("mikrofon ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("kaydedildi, tepe değeri tam ölçeğin ")?;
+            num(o, f, d)?;
+            o.write_str(" dB altında: çalınıyor")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("ROM dalga biçimi ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

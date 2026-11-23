@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "itsura ng release",
         Msg::UntilReboot => "hanggang mag-reboot",
         Msg::FrameCounter => "bilang ng frame",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "pagsubok ng speaker",
+        Msg::NoSpeakerProtection => "wala pang proteksyon ang speaker: pinananatiling mababa ang lakas",
+        Msg::HoldToPlay => "pindutin nang matagal ang button para tumugtog, bitawan para huminto",
+        Msg::Left => "kaliwa",
+        Msg::Right => "kanan",
+        Msg::Both => "pareho",
+        Msg::Playing => "tumutugtog",
+        Msg::ToneStopped => "huminto",
+        Msg::AudioRefused => "tumanggi ang serbisyo ng audio (sinasabi ng console kung bakit)",
+        Msg::AudioNotAnswering => "hindi sumagot ang serbisyo ng audio",
+        Msg::AmpFault => "huminto: nag-ulat ng error ang isang amplifier",
+        Msg::NoAudioRight => "walang karapatan sa audio: kailangang i-update ang kernel",
+        Msg::MicTest => "pagsubok ng mikropono",
+        Msg::Listen => "makinig",
+        Msg::RecordPlayBack => "mag-record, saka patugtugin",
+        Msg::Recording => "nagre-record",
+        Msg::MicGaveSilence => "katahimikan lang ang ibinigay ng mikropono",
+        Msg::MicsWouldNotStart => "hindi nagsimula ang mga mikropono (sinasabi ng console kung bakit)",
+        Msg::SpeakerWouldNotStart => "na-record, pero hindi nagsimula ang speaker",
+        Msg::BuzzTest => "pagsubok ng pag-vibrate",
+        Msg::Buzz => "pa-vibrate",
+        Msg::MotorDidNotPlay => "hindi nag-vibrate ang motor (naka-off ang NFC, o hindi pa tumatakbo ang driver nito)",
         // ---- the attest screen ----
         Msg::Attest => "patotohanan",
         Msg::Mint => "buuin",
@@ -546,6 +569,51 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" hanggang ")?;
             num(o, f, max)?;
             o.write_str(" na payak na character.")
+        }
+        Say::UnderFullScale(n) => {
+            num(o, f, n)?;
+            o.write_str(" dB sa ilalim ng buong lakas")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL naka-lock ")?;
+            num(o, f, pll)?;
+            o.write_str(", mga error ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("mikropono ")?;
+            num(o, f, mic)?;
+            o.write_str(": ")?;
+            num(o, f, under)?;
+            o.write_str(" dB sa ilalim ng buong lakas")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("mikropono ")?;
+            num(o, f, mic)?;
+            o.write_str(": tahimik")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("mikropono ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("na-record, ang rurok ay ")?;
+            num(o, f, d)?;
+            o.write_str(" dB sa ilalim ng buong lakas: pinapatugtog")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("waveform ng ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

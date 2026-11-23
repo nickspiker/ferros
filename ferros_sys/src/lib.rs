@@ -963,8 +963,14 @@ pub mod helm {
 /// - `CLOSE` + handle → [0]; what the ring holds still plays.
 /// - `GAIN` + handle + gain (u16, 32768 unity) → [0]: the stream's own level, under the device's volume.
 /// - `STATE` → [AoC online u8][playing u8][streams u8][0][periods played u64][underruns u32][interrupts u32][starved u32, the AoC's ring found empty]: for the console and the verification (docs/AUDIO.md).
-/// - `TONE` + level (u8, the volume's scale) + periods (u16): a 1 kHz sine of the service's own for that many periods, mixed like any stream: the first sound's safe test.
+/// - `TONE` + level (u8, the volume's scale, at most `TONE_MAX`) + periods (u16) [+ channels u8, `LEFT` | `RIGHT`, both when absent]: a 1 kHz sine of the service's own for that many periods, mixed like any stream, faded in and out over a period: the first sound's safe test, and the Developer page's speaker test (held while the finger is down). Periods 0 stops it (faded over the next period) and starts nothing. → [0][the amplifiers' `REPORT`], or [1] refused (a level over `TONE_MAX`, no channel, the sound would not start).
 /// - `SIGGEN` + wave type (u8) + period (u16) + amplitude (u32): the AoC's own signal generator on the speaker's entry point, no PCM at all (AUDIO.md "The AoC side, shortest"), for the bring-up; [0] sent, [1] refused.
+/// - `PROBE`: the bring-up's silent check (docs/AUDIO.md "Verification" step 0): the AoC's two services found and described, one control command answered (the entry point's sample count), both amplifiers brought from reset to ready (their trims, the port, the PLL set; never GLOBAL_EN, so nothing can sound), every line on the console. → [0][left DEVID u32][right DEVID u32][the control command answered u8], or [1] with the console saying where it stopped. The amplifiers go back to reset as the process ends.
+///
+/// - `MIC_LEVELS`: held until the next eighth of the capture's 10 ms periods has come in (80 ms, counted in what the microphones sent, no timer), then → [0][each microphone's peak, u16 × `MICS`, the largest magnitude of its samples since the last answer][bytes the service fell behind and lost, u32 so far][periods captured u32]; the first call starts the capture (the AoC's microphones, no sound out). Call it again at once for a live meter; a capture nobody asks for again within 64 periods (640 ms) is stopped. A second caller replaces the first, which is answered [1]. [2] the capture would not start (the console says why).
+/// - `RECORD` + microphone (0 to `MICS` - 1) + level (as `TONE`'s, at most `TONE_MAX`): held while `RECORD_FRAMES` of that microphone are captured, then the recording played back once on both speakers, scaled so its loudest sample comes out at the level (whatever the microphone picked up, never louder than the speaker test can be) → [0][its peak u16][played u8, 0 when the sound would not start][the amplifiers' `REPORT`]. [1] refused (a recording under way, a level or microphone out of range), [2] the capture would not start, [3] the microphone gave silence (peak 0: nothing to play).
+///
+/// `REPORT`, the amplifiers as the service last read them (it reads both each period while it plays, and stops everything at the first error bit): [left IRQ1_STATUS1 u32][left IRQ1_STATUS3 u32][right IRQ1_STATUS1 u32][right IRQ1_STATUS3 u32][stopped by an error u8]; `PUP_DONE`, `ERRORS` and `PLL_LOCK` pick the bits out. All zero before the amplifiers were first on.
 pub mod audio {
     use super::{call, pref, ERR, PREF_VOLUME};
 
@@ -975,6 +981,26 @@ pub mod audio {
     pub const STATE: u8 = 4;
     pub const TONE: u8 = 5;
     pub const SIGGEN: u8 = 6;
+    pub const PROBE: u8 = 7;
+    pub const MIC_LEVELS: u8 = 8;
+    pub const RECORD: u8 = 9;
+
+    /// The built-in microphones the service captures (husky's three, ids 0-2), and the recording's length: 2^17 frames, 2.7 s, one microphone, kept in the service's memory only and gone once played.
+    pub const MICS: usize = 3;
+    pub const RECORD_FRAMES: usize = 1 << 17;
+
+    /// `TONE`'s channels: the left amplifier (cs35l41@0, the frame's first sample), the right (cs35l41@1, the second).
+    pub const LEFT: u8 = 1 << 0;
+    pub const RIGHT: u8 = 1 << 1;
+    /// WHY a ceiling on the test tone (AGENT.md rule 0): the amplifiers run in bypass, without their speaker protection firmware (docs/AUDIO.md "Speaker protection"), so nothing between a sample and the cone limits its excursion or its coil's heat but the level. The first session's limit is four octaves (24 dB) under full scale, 191 (AUDIO.md "Verification" step 2: "Never above 191 in the first session"); a full scale sine held on an unprotected micro speaker is the one way this test could damage the device. The service refuses a level past it (never cuts it down), so a caller's mistake is said, not played.
+    pub const TONE_MAX: u8 = 191;
+    /// The tone's own bound in periods when a caller holds it (the Developer page: while the finger is down): 1024 periods, 5.5 s, counted by the hardware. WHY a bound: a caller that dies between its start and its stop never sends the stop, and an unprotected speaker must not play on for it.
+    pub const TONE_HOLD: u16 = 1 << 10;
+    /// `REPORT`'s length, and its bits (cs35l41.h:667-698): IRQ1_STATUS1's power-up done and its errors (the amplifier or the boost shorted, over temperature, the boost's over and under voltage), IRQ1_STATUS3's PLL lock.
+    pub const REPORT: usize = 17;
+    pub const PUP_DONE: u32 = 1 << 24;
+    pub const ERRORS: u32 = 1 << 31 | 1 << 8 | 1 << 17 | 1 << 6 | 1 << 7;
+    pub const PLL_LOCK: u32 = 1 << 1;
 
     /// Music, games, a call's voice: plays in every sound mode, at the device's volume.
     pub const MEDIA: u8 = 0;

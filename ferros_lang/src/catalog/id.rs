@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "tampilan rilis",
         Msg::UntilReboot => "sampai dimulai ulang",
         Msg::FrameCounter => "penghitung bingkai",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "uji pengeras suara",
+        Msg::NoSpeakerProtection => "belum ada perlindungan pengeras suara: levelnya dijaga rendah",
+        Msg::HoldToPlay => "tahan tombol untuk memutar, lepaskan untuk berhenti",
+        Msg::Left => "kiri",
+        Msg::Right => "kanan",
+        Msg::Both => "keduanya",
+        Msg::Playing => "memutar",
+        Msg::ToneStopped => "berhenti",
+        Msg::AudioRefused => "layanan audio menolak (konsol menyebutkan alasannya)",
+        Msg::AudioNotAnswering => "layanan audio tidak menjawab",
+        Msg::AmpFault => "berhenti: sebuah penguat melaporkan galat",
+        Msg::NoAudioRight => "tidak ada hak audio: kernel perlu diperbarui",
+        Msg::MicTest => "uji mikrofon",
+        Msg::Listen => "dengarkan",
+        Msg::RecordPlayBack => "rekam, lalu putar ulang",
+        Msg::Recording => "merekam",
+        Msg::MicGaveSilence => "mikrofon hanya memberi senyap",
+        Msg::MicsWouldNotStart => "mikrofon tidak mau mulai (konsol menyebutkan alasannya)",
+        Msg::SpeakerWouldNotStart => "terekam, tetapi pengeras suara tidak mau mulai",
+        Msg::BuzzTest => "uji getar",
+        Msg::Buzz => "getar",
+        Msg::MotorDidNotPlay => "motor tidak bergetar (NFC dimatikan, atau drivernya belum aktif)",
         // ---- the attest screen ----
         Msg::Attest => "sahkan",
         Msg::Mint => "cetak",
@@ -546,6 +569,51 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" sampai ")?;
             num(o, f, max)?;
             o.write_str(" karakter biasa.")
+        }
+        Say::UnderFullScale(n) => {
+            num(o, f, n)?;
+            o.write_str(" dB di bawah skala penuh")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL terkunci ")?;
+            num(o, f, pll)?;
+            o.write_str(", galat ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": ")?;
+            num(o, f, under)?;
+            o.write_str(" dB di bawah skala penuh")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("mikrofon ")?;
+            num(o, f, mic)?;
+            o.write_str(": senyap")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("mikrofon ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("terekam, puncaknya ")?;
+            num(o, f, d)?;
+            o.write_str(" dB di bawah skala penuh: memutar ulang")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("bentuk gelombang ROM ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

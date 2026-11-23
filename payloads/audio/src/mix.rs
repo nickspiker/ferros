@@ -2,7 +2,7 @@
 //!
 //! A frame is one word, the left sample in its low half and the right in its high half (S16_LE interleaved, as kists write and the AoC reads), so a frame moves as one load and one store.
 
-use ferros_sys::audio::{gain_q15, ALERT, PERIOD, RING, WRITE_MAX};
+use ferros_sys::audio::{gain_q15, ALERT, LEFT, PERIOD, RECORD_FRAMES, RIGHT, RING, WRITE_MAX};
 use ferros_sys::{dnd, pref, PREF_SOUND, SOUND};
 
 /// Streams at once: a power of two, more than a device plays together (a game, a call, a notification).
@@ -94,18 +94,58 @@ const SINE: [i16; 48] = [
     0, 4277, 8481, 12539, 16383, 19947, 23170, 25996, 28377, 30273, 31650, 32487, 32767, 32487, 31650, 30273, 28377, 25996, 23170, 19947, 16383, 12539, 8481, 4277, 0, -4277, -8481, -12539, -16383, -19947, -23170, -25996, -28377, -30273, -31650, -32487, -32767, -32487, -31650, -30273, -28377, -25996, -23170, -19947, -16383, -12539, -8481, -4277,
 ];
 
-/// The service's own tone: periods left to play, its gain, and where in the cycle it is.
+/// The service's own tone: periods left to play, its gain, where in the cycle it is, its channels, and whether its next period is its first (faded in).
 pub struct Tone {
     pub left: u32,
     pub gain: u32,
     phase: usize,
+    /// `audio::LEFT` | `audio::RIGHT`.
+    pub mask: u8,
+    first: bool,
 }
 
 impl Tone {
-    pub const NONE: Tone = Tone { left: 0, gain: 0, phase: 0 };
-    pub fn start(&mut self, level: u8, periods: u32) {
+    pub const NONE: Tone = Tone { left: 0, gain: 0, phase: 0, mask: 0, first: false };
+    /// Started, or changed while it plays (its level or channels; a playing tone is not faded in again).
+    pub fn start(&mut self, level: u8, periods: u32, mask: u8) {
+        self.first = self.left == 0;
         self.left = periods;
         self.gain = gain_q15(level);
+        self.mask = mask;
+    }
+    /// Stopped: its next period is its last, faded out.
+    pub fn stop(&mut self) {
+        if self.left > 1 {
+            self.left = 1;
+        }
+    }
+}
+/// The microphone test's recording (mic.rs): one microphone's samples, kept in this process's memory only (never written anywhere: AGENT.md rule -1), played back once and gone with the process. `audio::RECORD_FRAMES` of them, 2.7 s.
+pub static mut REC: [i16; RECORD_FRAMES] = [0; RECORD_FRAMES];
+
+/// The recording played back: frames left, where it is, its gain, and whether its next period is its first (faded in).
+pub struct Clip {
+    pub left: usize,
+    at: usize,
+    /// The gain in Q15 that takes the recording's own peak to the level asked for: `start`.
+    k: i64,
+    first: bool,
+}
+
+impl Clip {
+    pub const NONE: Clip = Clip { left: 0, at: 0, k: 0, first: false };
+    /// `n` frames of `REC` played from the start, scaled so their peak (`peak`, at least 1) comes out at the level's amplitude (`gain_q15(level)`, in sample units): the loudest sample played is the level asked for and no louder, whatever the microphone picked up. With the level at most `TONE_MAX` that is 2048, 24 dB under full scale, the speaker test's own ceiling (ferros_sys audio `TONE_MAX`).
+    pub fn start(&mut self, n: usize, peak: u16, level: u8) {
+        self.left = n;
+        self.at = 0;
+        self.k = ((gain_q15(level) as i64) << 15) / peak as i64;
+        self.first = true;
+    }
+    /// Stopped: faded out over at most one more period (the smaller of two counts: what is left, or a period).
+    pub fn stop(&mut self) {
+        if self.left > PERIOD {
+            self.left = PERIOD;
+        }
     }
 }
 
@@ -130,7 +170,7 @@ fn rail(v: i32) -> u32 {
 }
 
 /// One period mixed into `out`: every live stream at its gain times the device's volume (alerts silent unless the sound mode is `SOUND` and do not disturb is off: preferences 39 and 40), and the tone; the streams' rings advanced, the stale and the played-out freed.
-pub fn period(streams: &mut [Stream; STREAMS], tone: &mut Tone, out: &mut [u32; PERIOD]) -> Mixed {
+pub fn period(streams: &mut [Stream; STREAMS], tone: &mut Tone, clip: &mut Clip, out: &mut [u32; PERIOD]) -> Mixed {
     let mut acc = [[0i32; 2]; PERIOD];
     let volume = gain_q15(ferros_sys::audio::level());
     let alerts = pref(PREF_SOUND) == SOUND && !dnd::on();
@@ -164,16 +204,37 @@ pub fn period(streams: &mut [Stream; STREAMS], tone: &mut Tone, out: &mut [u32; 
     }
     if tone.left != 0 {
         let g = tone.gain as i32;
-        for a in acc.iter_mut() {
-            let v = (SINE[tone.phase] as i32 * g) >> 15;
-            a[0] += v;
-            a[1] += v;
+        let (l, r) = ((tone.mask & LEFT != 0) as i32, (tone.mask & RIGHT != 0) as i32);
+        for (k, a) in acc.iter_mut().enumerate() {
+            // The envelope in 256ths (a period is 256 frames): rising over the first period, falling over the last, so the tone starts and stops without the step a cut sine makes (a click). A one-period tone only rises.
+            let env = if tone.first { k } else if tone.left == 1 { PERIOD - 1 - k } else { PERIOD } as i32;
+            let v = ((SINE[tone.phase] as i32 * g) >> 15) * env >> 8;
+            a[0] += v * l;
+            a[1] += v * r;
             tone.phase += 1;
             if tone.phase == SINE.len() {
                 tone.phase = 0;
             }
         }
+        tone.first = false;
         tone.left -= 1;
+        m.sound = true;
+    }
+    if clip.left != 0 {
+        // SAFETY: REC is written only by the clock thread while recording (mic.rs) and read only here, on the same thread, after the recording has ended.
+        let rec = unsafe { &*(&raw const REC) };
+        // A clip shorter than a period plays what it has: the count of frames to take, the smaller of two counts.
+        let take = if clip.left < PERIOD { clip.left } else { PERIOD };
+        for (j, a) in acc[..take].iter_mut().enumerate() {
+            // The same envelope as the tone's: rising over the first period, falling over the frames of the last.
+            let env = if clip.first { j as i64 } else if clip.left <= PERIOD { (((take - j) as i64) << 8) / take as i64 } else { PERIOD as i64 };
+            let v = ((rec[clip.at + j] as i64 * clip.k) >> 15) * env >> 8;
+            a[0] += v as i32;
+            a[1] += v as i32;
+        }
+        clip.at += take;
+        clip.left -= take;
+        clip.first = false;
         m.sound = true;
     }
     for (o, a) in out.iter_mut().zip(acc.iter()) {

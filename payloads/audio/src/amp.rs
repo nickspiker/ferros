@@ -35,11 +35,9 @@ const DSP1_CCM_CORE_CTRL: u32 = 0x02BC_1000;
 const GLOBAL_EN: u32 = 1;
 const AMP_EN: u32 = 1;
 const PDN_DONE: u32 = 1 << 23;
-const PUP_DONE: u32 = 1 << 24;
-const PLL_LOCK: u32 = 1 << 1;
 const OTP_BOOT_DONE: u32 = 1 << 1;
-/// IRQ1_STATUS1's error bits (h:684-689): the amplifier or the boost shorted, over temperature, the boost's over and under voltage.
-const ERRORS: u32 = 1 << 31 | 1 << 8 | 1 << 17 | 1 << 6 | 1 << 7;
+// PUP_DONE, PLL_LOCK and IRQ1_STATUS1's error bits (h:684-689: the amplifier or the boost shorted, over temperature, the boost's over and under voltage) are the protocol's (ferros_sys audio), as the report carries them.
+use ferros_sys::audio::{ERRORS, PLL_LOCK, PUP_DONE};
 /// ASP RX1 and RX2 enables (c:2451-2456: SP_ENABLES bits 16 and 17).
 const ASP_RX1_EN: u32 = 1 << 16;
 const ASP_RX2_EN: u32 = 1 << 17;
@@ -311,21 +309,33 @@ impl Amps {
         Ok(())
     }
 
-    /// Both playing: the power-up patch, GLOBAL_EN, a millisecond (c:2279-2299); then each one's PLL lock, power-up done and errors read and said. Sound out needs the AoC's SCLK running already (AUDIO.md: the PLL has no source of its own).
-    pub fn on(&self) -> Result<(), &'static str> {
+    /// Both playing: the power-up patch, GLOBAL_EN, a millisecond (c:2279-2299); then each one's PLL lock, power-up done and errors read and said. Sound out needs the AoC's SCLK running already (AUDIO.md: the PLL has no source of its own). The two amplifiers' (IRQ1_STATUS1, IRQ1_STATUS3) as read, for the report; an error bit in them is the caller's to act on (main.rs `start` refuses to go on).
+    pub fn on(&self) -> Result<[(u32, u32); 2], &'static str> {
         for amp in 0..2 {
             self.seq(amp, &PUP_PATCH)?;
             self.update(amp, PWR_CTRL1, GLOBAL_EN, GLOBAL_EN)?;
         }
         sleep_ms(1);
-        let mut ok = true;
+        let w = self.status()?;
         for amp in 0..2 {
-            let s1 = self.read(amp, IRQ1_STATUS1)?;
-            let s3 = self.read(amp, IRQ1_STATUS3)?;
+            let (s1, s3) = w[amp];
             say!("audio: {} amplifier: on, IRQ1_STATUS1 G#{s1:X} (PUP_DONE {}, errors G#{:X}), IRQ1_STATUS3 G#{s3:X} (PLL lock {})", NAMES[amp], (s1 & PUP_DONE != 0) as u8, s1 & ERRORS, (s3 & PLL_LOCK != 0) as u8);
-            ok &= s1 & ERRORS == 0;
         }
-        if ok { Ok(()) } else { Err("an amplifier reports an error") }
+        Ok(w)
+    }
+
+    /// Both amplifiers' IRQ1_STATUS1 (power-up done, the errors) and IRQ1_STATUS3 (the PLL's lock), as they stand: the bits are sticky until written back (h:684-698), so an error between two reads is still there at the second. Four transactions, about 120 µs at the halved clock (80 bits each at 3.07 MHz, and the controller between): read every period (5.3 ms) while sound plays (main.rs `clock`).
+    pub fn status(&self) -> Result<[(u32, u32); 2], &'static str> {
+        let mut w = [(0, 0); 2];
+        for (amp, s) in w.iter_mut().enumerate() {
+            *s = (self.read(amp, IRQ1_STATUS1)?, self.read(amp, IRQ1_STATUS3)?);
+        }
+        Ok(w)
+    }
+
+    /// Each amplifier's DEVID as it reads now (0 for a read that failed): the probe's line.
+    pub fn devids(&self) -> [u32; 2] {
+        [self.read(0, DEVID).unwrap_or(0), self.read(1, DEVID).unwrap_or(0)]
     }
 
     /// Both quiet: GLOBAL_EN off, PDN_DONE awaited and cleared, the power-down patch (c:2305-2346). The switch goes off when this process ends (the kernel's, for a driver that ends), holding both in reset.

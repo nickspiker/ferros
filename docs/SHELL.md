@@ -119,7 +119,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 | Power | proximity wake | |
 | Connections | the links' states, each a door to its link's page; the NFC page holds the tags kept to attest with (add a tag, each kept one listed with when and a remove, the warning under them; AUTH.md "Attest with a tag") | choosing a WiFi network, Bluetooth accessories |
 | About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
-| Developer | hit map, panel channels (red, green, blue), release look, light scope (the dither went to Appearance, 2026-11-12); the hit map, the channels and the release look on development builds only, none of them kept past a reboot | |
+| Developer | hit map, panel channels (red, green, blue), release look, light scope (the dither went to Appearance, 2026-11-12); the hit map, the channels and the release look on development builds only, none of them kept past a reboot; the speaker, microphone and buzz tests (2026-11-22, AUDIO.md "The Developer page's tests"), nothing of them kept | |
 
 The page's title is large at the top, its neighbours' small and dim either side; a swipe across goes round the ring, a tap on a neighbour's title goes there. Under a lifted finger the strip snaps to a page, its offset halving each frame (floored, so it lands), and a fling scrolls a page longer than its band by the largest of the last three frames' movements, losing a pixel a frame; both counted in the panel's frames, not in frames drawn (owner, 2026-11-05).
 

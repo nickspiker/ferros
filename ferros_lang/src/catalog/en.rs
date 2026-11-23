@@ -384,6 +384,29 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ReleaseLook => "release look",
         Msg::UntilReboot => "until a reboot",
         Msg::FrameCounter => "frame counter",
+        // ---- the Developer page's speaker, microphone and buzz tests ----
+        Msg::SpeakerTest => "speaker test",
+        Msg::NoSpeakerProtection => "no speaker protection yet: the level is kept low",
+        Msg::HoldToPlay => "hold a button to play, let go to stop",
+        Msg::Left => "left",
+        Msg::Right => "right",
+        Msg::Both => "both",
+        Msg::Playing => "playing",
+        Msg::ToneStopped => "stopped",
+        Msg::AudioRefused => "the audio service refused (the console says why)",
+        Msg::AudioNotAnswering => "the audio service did not answer",
+        Msg::AmpFault => "stopped: an amplifier reported an error",
+        Msg::NoAudioRight => "no audio right: the kernel needs updating",
+        Msg::MicTest => "microphone test",
+        Msg::Listen => "listen",
+        Msg::RecordPlayBack => "record, then play back",
+        Msg::Recording => "recording",
+        Msg::MicGaveSilence => "the microphone gave silence",
+        Msg::MicsWouldNotStart => "the microphones would not start (the console says why)",
+        Msg::SpeakerWouldNotStart => "recorded, but the speaker would not start",
+        Msg::BuzzTest => "buzz test",
+        Msg::Buzz => "buzz",
+        Msg::MotorDidNotPlay => "the motor did not play (NFC switched off, or its driver not up)",
         // ---- the attest screen ----
         Msg::Attest => "attest",
         Msg::Mint => "mint",
@@ -545,6 +568,51 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
             o.write_str(" to ")?;
             num(o, f, max)?;
             o.write_str(" plain characters.")
+        }
+        Say::UnderFullScale(n) => {
+            num(o, f, n)?;
+            o.write_str(" dB under full scale")?;
+            Ok(())
+        }
+        Say::AmpState { side, pup, pll, errors } => {
+            o.write_str(side)?;
+            o.write_str(": PUP_DONE ")?;
+            num(o, f, pup)?;
+            o.write_str(", PLL lock ")?;
+            num(o, f, pll)?;
+            o.write_str(", errors ")?;
+            o.write_str(errors)?;
+            Ok(())
+        }
+        Say::MicLevel { mic, under } => {
+            o.write_str("microphone ")?;
+            num(o, f, mic)?;
+            o.write_str(": ")?;
+            num(o, f, under)?;
+            o.write_str(" dB under full scale")?;
+            Ok(())
+        }
+        Say::MicQuiet(mic) => {
+            o.write_str("microphone ")?;
+            num(o, f, mic)?;
+            o.write_str(": silent")?;
+            Ok(())
+        }
+        Say::MicName(n) => {
+            o.write_str("microphone ")?;
+            num(o, f, n)?;
+            Ok(())
+        }
+        Say::PlayingBack(d) => {
+            o.write_str("recorded, its peak ")?;
+            num(o, f, d)?;
+            o.write_str(" dB under full scale: playing it back")?;
+            Ok(())
+        }
+        Say::RomWaveform(n) => {
+            o.write_str("ROM waveform ")?;
+            num(o, f, n)?;
+            Ok(())
         }
     }
 }

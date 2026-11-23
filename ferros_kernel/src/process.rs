@@ -7659,6 +7659,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             // A child handed the Settings capability (the map: the quick row's torch, QUICK.md) gets the torch's send right too, as the slot after its last: init's grants page is full (108 slots), so init cannot hold one to pass on, and the torch's server is the kernel's to start anyway (`ON_DEMAND`, docs/TORCH.md). Who may set the device's settings may light its torch.
             if !bad && objects.iter().any(|o| matches!(o.0, Object::Settings)) {
                 objects.push((Object::Endpoint(endpoint(b"torch")), RIGHT_SEND));
+                // And the audio service's, the slot after the torch's (2026-11-22, the Developer page's speaker and microphone tests; owner: "Just throw a mic and speaker test in the ferros settings"): the same reasons, init's page full and the server the kernel's to start (`ON_DEMAND`). Who may set the device's settings may test its speaker.
+                objects.push((Object::Endpoint(endpoint(b"audio")), RIGHT_SEND));
             }
             // The server of `fgtw`, the identity service, gets the receive right on `facets` the same way, as the slot after its last (docs/FACETS.md, 2026-11-13): init's page is full, and the facets are its to serve, to every kist the person granted be you or people.
             if !bad && objects.iter().any(|o| matches!(o, (Object::Endpoint(e), r) if *e == endpoint(b"fgtw") && r & RIGHT_RECV != 0)) {
