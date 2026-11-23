@@ -1775,6 +1775,42 @@ Lines a second is 2 times slits a second. Measured where marked; the rest from e
 - **The 1:1 straddle**: kind 4, 2 rows, on the main, the ultrawide and the tele; CAPS reads the window back (y start one row into a period), and Lumis's DEV_CELLS on the red card names the two rows' colours (expected above).
 - **The front end at the floor**: every run above says its DMA_DONEs released by the kernel and its error words; any LATE_CONFIG at 2 rows would name the per-frame cost.
 
+### On the Pro, 2026-11-22 evening (b1134, the flashed e5f4da21, nothing stored, no reload; every driver hand-spawned from target/farm/camera-work/kit, forge 325e9e14 plus slit-2row.diff, one open each, every stream ended by its own close; logs in kit/runs/all)
+
+**Least rows** (binned slits, the frame rows plus 2^7 asked; sensor's counter / front end, a second):
+| rows | main | ultrawide | front | tele |
+|---|---|---|---|---|
+| 16 | 1241 / 1229 | 1017 / 1058 | 668 / 665 | 669 / 0 |
+| 12 | 1231 / 0 | 1013 / 1087 | 689 / 683 | 678 / 0 |
+| 8 | 1231 / 0 | 1007 / 1120 | 708 / 704 | 690 / 0 |
+| 4 | 1231 / 0 | 1001 / 1154 | 730 / 725 | 690 / 0 |
+| 2 | 1231 / 0 | 1000 / 0 | 742 / 0 | 708 / 0 |
+- **Every sensor sends 2-row frames**: its own counter runs at every height. What stops them is the receive side.
+- The Samsung parts (main, tele): the link reports ERR_CRC_PH (+14 G#20) and loch0 SENSOR_RESOL_MISMATCH (G#404) at the first frame; the main's least is 16 rows (12 and under no frame), the tele's over 16 (64 runs, 559 a second).
+- The ultrawide streams 4 rows (2 rows: link +1C G#40, loch0 G#414); the front streams 4 rows (2 rows: loch0 G#4040000).
+- The ultrawide's frame counter reads about 1000 a second wherever its front end runs faster; its front end's rate is the one that matches the frame asked (128 lines of 6.5616 us: 1190).
+
+**Least frame** (the least rows that streamed; the frame asked 192 down to 32):
+- **Main, 16 rows**: 1231 to 1242 a second at every frame asked (812 us): its floor.
+- **Ultrawide, 4 rows**: 794 at 192 lines, 952 at 160, **1190 at 128** (840 us); at 96 the link takes clean frame starts and ends (+24 = +2C = G#3, no error) but loch0 starts none, and at 80 and under nothing streams. So its least is between 96 and 128 lines: the front end's or the stream's start, not isolated.
+- **Front, 4 rows**: 504 at 192, 598 at 160, 747 at 128, **791 at 96 and every frame under it**: its sensor's floor, about 120 lines of 10.4378 us (1.25 ms).
+- **Tele, 64 rows**: 555 to 559 a second at every frame asked: its floor, about 293 lines (1.79 ms). With fewer rows its sensor runs faster (669 at 16 rows, 708 at 2: about rows plus 229 lines) but no frame lands.
+
+**Lines or clocks** (the main, 64 rows, frame 192 asked): line 6320 clocks 1222 a second (818 us), line 5888 clocks (read back as 5888) 1244 (804 us), where a floor of lines would give 1321. **The main's floor is a time, about 1.6 million clocks (800 to 820 us), not a line count**: a shorter line does not raise the slit rate. At 5888 the link also reports ERR_CRC_PH (+14 G#20) while frames land.
+
+**The 1:1 straddle** (the main, kind 4): the sensor took the window as built, y G#1812 to G#1815 (2 addresses, one row, into the period that G#1810 starts), 8160 x 2, its frame 130 lines of 11600 clocks (CAPS and the sensor's words read back), and ran 832 a second on its own counter. No frame reached memory: the link ERR_CRC_PH (+14 G#20), as at 4 rows (y G#1810 to G#1817, the same). The straddle's addresses are right; the 1:1 slit's receive side is the main's binned one's.
+
+**What reaches memory today, exactly the 2 wanted rows kept of the least window that streams:**
+| camera | window | slits a second | lines a second |
+|---|---|---|---|
+| main 2:1 | 16 rows | 1229 to 1241 | 2.5k |
+| ultrawide 2:1 | 4 rows, 128-line frame | 1190 | 2.4k |
+| front | 4 rows, its floor | 791 | 1.6k |
+| tele 2:1 | 64 rows (16 and under refused) | 559 | 1.1k |
+| main 1:1 | none (4 and 2 rows refused) | | |
+
+**The blocker for 2 rows on the Samsung parts is the receive side** (ERR_CRC_PH from 56 rows down on the main, every short slit on the tele, both 1:1 slits), not the sensors, the per-frame cost or the PDMA. Next, at the desk: the link's channel sizes (+44/+54/+64) and the embedded-data channel 2, which stays on in every slit ("The slit for real"), against what a 2-row frame carries; then the uw's 96-line start.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
