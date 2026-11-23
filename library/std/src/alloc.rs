@@ -357,6 +357,17 @@ fn default_alloc_error_hook(layout: Layout) {
         return;
     }
 
+    // ferros (its docs/NO-CEILINGS.md 0.5, owner 2026-11-23: running out is a clear refusal): one line naming what was asked and what the device has free (the kernel's ARC_FREE), built with no allocation, to the console (which names the process on every line) and into the death record the abort leaves (SYS_PANIC: the flash log keeps it with the process's name).
+    #[cfg(target_os = "ferros")]
+    {
+        let mut line = [0u8; 1 << 8];
+        let n = ferros_rt::alloc::out_of_memory(layout.size(), &mut line);
+        let msg = crate::str::from_utf8(&line[..n]).unwrap_or("out of memory");
+        rtprintpanic!("{msg}\n");
+        ferros_rt::panic_report(msg, "alloc", 0, 0);
+        return;
+    }
+
     // This is the default path taken on OOM, and the only path taken on stable with std.
     // Crucially, it does *not* call any user-defined code, and therefore users do not have to
     // worry about allocation failure causing reentrancy issues. That makes it different from
