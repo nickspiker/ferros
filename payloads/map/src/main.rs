@@ -7208,7 +7208,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
             }
             if pair == 1 && !pair_done && held >= 2 {
-                // Up past a twelfth of the screen's harmonic span (the corner's own threshold until 2026-11-12), both of them (`pair::slid`).
+                // Up past a 24th of the screen's harmonic span (a twelfth until 2026-11-22), both of them (`pair::slid`).
                 if pair::slid(ids[..held].iter().map(|&id| start[id].2 - cur[id].2), w, h) {
                     pair_done = true;
                     map.shot();

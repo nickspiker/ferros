@@ -90,8 +90,8 @@ mod tests {
     fn slide_needs_both_fingers_up() {
         for (w, h) in SCREENS {
             let span = (2 * w * h) as f64 / (w + h) as f64;
-            let past = (span / 12.) as i64 + 1;
-            let short = (span / 12.) as i64 - 1;
+            let past = (span / 24.) as i64 + 1;
+            let short = (span / 24.) as i64 - 1;
             assert!(pair::slid([past, past].into_iter(), w, h));
             assert!(!pair::slid([past, short].into_iter(), w, h));
             assert!(!pair::slid([past].into_iter(), w, h));
@@ -104,10 +104,10 @@ mod tests {
 
     #[test]
     fn slide_thresholds() {
-        // A twelfth of the harmonic span: 124 px on the 8a, 155 on the Pro.
-        assert!(pair::slid([125, 125].into_iter(), 1080, 2400));
-        assert!(!pair::slid([124, 124].into_iter(), 1080, 2400));
-        assert!(pair::slid([155, 155].into_iter(), 1344, 2992));
-        assert!(!pair::slid([154, 154].into_iter(), 1344, 2992));
+        // A 24th of the harmonic span: 62 px on the 8a, 77 on the Pro.
+        assert!(pair::slid([63, 63].into_iter(), 1080, 2400));
+        assert!(!pair::slid([62, 62].into_iter(), 1080, 2400));
+        assert!(pair::slid([78, 78].into_iter(), 1344, 2992));
+        assert!(!pair::slid([77, 77].into_iter(), 1344, 2992));
     }
 }
