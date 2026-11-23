@@ -18,6 +18,9 @@ Decisions the owner made on 2026-11-22 (each recorded where the work landed too)
 - **Kernel-out tonight:** the touch handshake and the remaining screen pieces leave the kernel.
 - **Dev box:** the USB card (ASMedia ASM1042, new) dies about hourly under use; tools/usb-card (keep-awake udev rule + an event-driven reviver) was written for him to install with sudo.
 
+- **Base and language are identity preferences** ("That's an identity preference, not Photon. Same with language."): kept in the identity's space (ferros_space LANG, BASE via fgtw::prefs), devices follow (identity to device only), Photon on ferros follows the device (set_host_numerals). Built 2026-11-22 night (75ad12af, 31253370, 40829830, 69bb2528, fgtw eaf451d).
+- **Mic, speaker and buzz tests in Settings** ("Just throw a mic and speaker test in the ferros settings and I can test it"): Settings > Developer (516d7559, f82206f1). The coordinator approved two AoC heap windows for the audio service (aoc-play-lo 4 MiB at G#95C0_0000, aoc-play-hi 2 MiB at G#9600_0000, aoc-capture 1 MiB at G#96A0_0000) for him to review: about 7 MiB of overreach beyond the rings, the least power-of-two handles allow.
+
 Still unanswered: the tele LATE_CONFIG recovery vs 48.7 fps; fixing the M1 build (broken since 4adb1e6d, ~270 errors); first sound and first buzz on the Pro (wait for him present).
 
 Related: [[owner-decisions-2026-11-21-night]], [[kernel-out-moves]], [[husky-camera-bringup]].
