@@ -136,8 +136,10 @@ fn two(c: (u16, u16), aspect: f64, r: impl Fn(f64) -> f64, th: impl Fn(f64) -> f
 /// A payload built and turned into its flat binary, as tools/screencap builds capture.
 fn payload(_bridge: &Path, name: &str) -> PathBuf {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let rel = repo.join("target/el0/aarch64-unknown-none/release");
-    let ok = Command::new("cargo").current_dir(&repo).args(["el0", "-q", "-p", &format!("ferros-payload-{name}")]).output().map(|o| o.status.success()).unwrap_or(false);
+    // FERROS_EL0 names a release directory where the payload is already built; then nothing is built here (a farm under the ferros tree can't run `cargo el0`: its alias joins the main checkout's, memory feedback_nested_cargo_alias).
+    let given = std::env::var_os("FERROS_EL0").map(PathBuf::from);
+    let rel = given.clone().unwrap_or_else(|| repo.join("target/el0/aarch64-unknown-none/release"));
+    let ok = given.is_some() || Command::new("cargo").current_dir(&repo).args(["el0", "-q", "-p", &format!("ferros-payload-{name}")]).output().map(|o| o.status.success()).unwrap_or(false);
     if !ok {
         fail(&format!("the {name} payload did not build (cargo el0 -p ferros-payload-{name})"));
     }
