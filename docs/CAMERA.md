@@ -1930,6 +1930,7 @@ The tele's capture puts the factory's near code at the HAL's minimum focus dista
 - Sharpness over the owner's near and far targets (the frame's middle half): 7 at the infinity end, rising to 10 at G#2280 to G#2400 (8832 to 9216, about 0.45 dioptres, 2.2 m), 7 again past G#2580: the lens racks and the scene comes into and out of focus.
 - The main's cornerfolk path unchanged (its open's G#1FD0 read back G#1FE4, G#5555 G#555C, G#8AAA G#8A98).
 - Stored: `camera` from b39efa9d (567473 bytes, blake3 b3468dc5...), read back equal; the one before (deca6b4f) kept in target/farm/camera-work/out/camera-before-b39efa9d.capsule.vsf.
+- **Its travel** (a test build with the range open, every target read back): G#0100 to G#1900 within 7 (G#100 apart), G#3300 to G#3B00 within 2, G#3F00 to G#3EEC; past G#3F00 the position reads G#3FF2 to G#3FFF whatever the target, its 14-bit end. Offered since d49a0433: 256 to 16128, about 1.24 dioptres past infinity and to about 55 cm. Stored from d49a0433 (blake3 2963178d...), read back equal; it took G#0100 (read G#0103) and refused G#4000 (answer 1); the one before (b39efa9d) kept in target/farm/camera-work/out/camera-before-d49a0433.capsule.vsf.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
