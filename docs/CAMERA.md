@@ -1676,6 +1676,7 @@ Two observations say so, and none says otherwise:
 - Android's two captured main targets (G#5D10 at the open, G#5120 at the boot probe) both end in a zero nibble.
 
 **The list now offers each lens's whole code range** (`focus_min` G#0000 to `focus_max` G#FFF0, ferros_cam cams `CORNERFOLK_TRAVEL`): the old G#0800 to G#7800 (the main's sweep span, copied to the others) held no camera's near point, and SET refuses a target outside the list's range.
+- **Since 2026-11-22 night the travel offered is the span tracked on the Pro, G#0100 to G#FF00** (`CORNERFOLK_TRAVEL`): every target from G#0100 to G#FF00 read back within G#24 on all three ("Focus calibration and the rear mosaics" travel check, b1134); G#0000 and past G#FF00 were never sent, and a lens driven past its stop can hold its coil at full current, so they are not offered.
 Past G#7800 is unmeasured: the front's position (G#84) read back every target of G#0800 to G#7800 within G#64 (2026-11-21) and the main's within 30 ms (2026-10-21).
 **Each open now starts at the infinity target** where the calibration is known (payloads/camera; it was G#3800 on every camera, about 750 codes past the front's infinity, so the front's first frames were blurred until a client set its focus).
 

@@ -112,9 +112,10 @@ pub const NEAR_MM: [u64; 4] = [105, 20, 100, 800];
 /// At 2^3 the front's infinity would sit at G#3350 and its near point at G#6000, both inside that span, which the owner's slider refutes; Android's two captured targets (G#5D10 and G#5120, docs/oracle/CAMERA.md) end in a zero nibble, as the code times 2^4 does.
 pub const CORNERFOLK_SHIFT: u32 = 4;
 
-/// The whole 12-bit code's travel as targets (G#0000 to G#FFF0): offered so a client reaches the near point (every one of the three past G#C000) and the lens's span past infinity.
-/// Unmeasured past G#7800: the position (G#84) read back every target of G#0800 to G#7800 within G#64 on the front (2026-11-21) and within 30 ms on the main (2026-10-21); its two ends are for a device check (the position read back at G#0000 and G#FFF0).
-pub const CORNERFOLK_TRAVEL: (u64, u64) = (0, 0xFFF << CORNERFOLK_SHIFT);
+/// The travel offered, the span every one of the three tracked on the Pro (2026-11-22, b1134, the position at G#84 read back after each target): G#0100 to G#FF00.
+/// The main read G#00EC for G#0100 and G#FEFC, then G#FF00, for G#FF00; the ultrawide G#00F0 and G#00E4, and G#FEE0; the front G#00F0 and G#FEF0; every target G#0FE0 apart between within G#24.
+/// Not offered: G#0000 and past G#FF00, never sent (a lens driven past its stop can hold its coil at full current).
+pub const CORNERFOLK_TRAVEL: (u64, u64) = (0x0100, 0xFF00);
 
 /// The module's factory AF calibration as this Pro's persist partition holds it (`/camera/AF_calibration.cal`, written at manufacture, read from the 2026-11-18 partition dump in keys/husky; one unit, as the IDTs are): its infinity and near ("macro") codes, the HAL's 12-bit codes for the cornerfolk actuators.
 /// The near point's distance is not in that file: it is the lens's HAL minimum focus distance (`NEAR_MM`).
@@ -197,7 +198,7 @@ pub const MAIN: Cam = Cam {
     actuator: 0x0C,
     lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
-    // Factory: infinity 509, near 3274 ("rear wide"): G#1FD0 and G#CCA0, 509 codes (G#1FD0 of target) past infinity to the travel's end.
+    // Factory: infinity 509, near 3274 ("rear wide"): G#1FD0 and G#CCA0, G#1ED0 of target past infinity to the travel's G#0100.
     focus_cal: cornerfolk_cal(509, 3274, NEAR_MM[0]),
     streams: true,
     rx_start: &crate::rx::RX_START,
@@ -252,7 +253,7 @@ pub const ULTRAWIDE: Cam = Cam {
     actuator: 0x0F,
     lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
-    // Factory: infinity 883, near 3224 ("rear uw"): G#3730 and G#C980, 883 codes past infinity.
+    // Factory: infinity 883, near 3224 ("rear uw"): G#3730 and G#C980, G#3630 of target past infinity to the travel's G#0100.
     focus_cal: cornerfolk_cal(883, 3224, NEAR_MM[1]),
     streams: true,
     rx_start: &crate::rx::RX_START_UW,
@@ -306,7 +307,7 @@ pub const FRONT: Cam = Cam {
     actuator: 0x0C,
     lens: Lens::Cornerfolk,
     focus: CORNERFOLK_TRAVEL,
-    // Factory: infinity 1642, near 3072 ("front normal"): G#66A0 and G#C000, 1642 codes past infinity.
+    // Factory: infinity 1642, near 3072 ("front normal"): G#66A0 and G#C000, G#65A0 of target past infinity to the travel's G#0100.
     focus_cal: cornerfolk_cal(1642, 3072, NEAR_MM[2]),
     streams: true,
     rx_start: &crate::rx::RX_START_FRONT,
