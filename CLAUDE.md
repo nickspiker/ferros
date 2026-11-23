@@ -44,6 +44,12 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 ## Current Priority
 Validate M1 DWC3 USB end-to-end: boot kernel via m1n1 proxy, verify USB enumeration, test PT transport with ferros-bridge. Then hot-reload.
 
+## Founding rules (owner, 2026-11-23: every session and agent reads these first)
+The design premise is unlimited and compact. Check every change against these before starting, and bring anything that touches them to the owner as a design first.
+1. **One branch, one line, one checkout, every repo.** ferros is `forge` only, on origin and at /mnt/Harbor/Code/ferros, kept current. No branches, no worktrees, no stashes, no per-agent farms. Commit straight to forge (fetch, rebase, push) under the git lock (`target/farm/GIT-LOCK`).
+2. **The seed is the only fixed-size thing on storage, and it runs on every boot.** Everything else lives in the vault and rotates with it: the kernel ring, the logs, the kernel's own store, settings, stills, clips. Build to the existing specs (RING.md, SEED.md, VAULT_ROOT.md, VAULT.md), never a parallel design. The one exception: RAW video's fast write, one copy split across both rings with a marker, no read-back.
+3. **No fixed ceilings anywhere.** No preset sizes, windows, regions or tables on storage, and no declared caps on memory: a process gets RAM and space as it uses them, up to what the device has. As wide as it needs and no wider, like VSF. Running out is a clear refusal, never a guessed constant.
+
 ## Do NOT
 - Commit **unfiled** patent material from `Intellectual Property/`. As of 2026-08-20 **all patents are FILED** (ISOMEM provisional on file with USPTO, etc.), so that directory is public and committable (`.tex`/`.pdf`/`.ots`/figures; Latex build artifacts stay gitignored). This guard only re-arms if genuinely new, unfiled patent work ever appears — then ask before committing, since a public push is irreversible.
 - Use 0x prefix for numbers
