@@ -264,6 +264,14 @@ macro_rules! say {
     }};
 }
 
+/// manifestus's storage events (verify retries, relocations, reap windows, averted laps, a degraded mirror) on the console, as the kernel's own vault logs its (2026-11-23: the Pro's full vault refused removals with no word of why).
+struct EngineEvents;
+impl manifestus::EventSink for EngineEvents {
+    fn emit(&mut self, e: manifestus::StorageEvent) {
+        say!("vault: engine: {:?}", e);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vault_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -913,7 +921,7 @@ extern "C" fn work(_: u64) -> ! {
     let blank = ferros_sys::block_read(cap(grants(), S_BLOCKS), 0, &mut probe) == 0 && probe.iter().all(|&b| b == 0);
     let bound = if blank { MIRROR } else { HALF };
     say!("vault: block 0 blank {}, opening bounded at {} blocks a mirror", blank, bound);
-    let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound });
+    let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound }).with_events(alloc::boxed::Box::new(EngineEvents));
     // Lazily (manifestus `open_lazy`): reads are served from the head's index at once, and the walk that finds what is live is stepped between requests (`settle_step`, below); every write finishes it first, so writes are as after an eager open. The eager open walked the whole index before serving anything: 10.7 s on the 8a with 462,713 live blocks (2026-11-12), and every reader waited behind it, the person's space at attest among them (the deck's kists list 4.9 s, the GPU's firmware, the wallpaper), which an attest in a boot's first seconds met as "four seconds to the deck".
     let vault = match Vault::open_lazy(mirror, RING_LOG2, eagle(), DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
@@ -1821,7 +1829,14 @@ fn items(store: &mut St, doms: &[Domain], rest: &[u8], out: &mut [u8], data: &mu
         if wrote >= 1 << 16 {
             write_pin(true);
         }
+        // A refused removal says where the engine stood before and after it (2026-11-23, the Pro's full vault: removals refused as TractFull with the put reserve waived).
+        let st0 = (op == ferros_items::wire::OP_REMOVE).then(|| store.engine().engine_stats());
         let a = server.serve(store, d, rest, &mut out[8..], eagle(), &mut random, &mut clips);
+        if let (Some(s0), Some(why)) = (st0, a.why.as_ref()) {
+            let s1 = store.engine().engine_stats();
+            let clean = |s: &manifestus::VaultStats| s.tract_blocks - (s.plow - s.reap);
+            say!("vault: items: remove refused ({:?}): generation {} to {}, plow {} to {}, reap {} to {}, clean {} to {}, live {} to {}", why, s0.generation, s1.generation, s0.plow, s1.plow, s0.reap, s1.reap, clean(&s0), clean(&s1), s0.live_blocks, s1.live_blocks);
+        }
         match op {
             ferros_items::wire::OP_MAKE | ferros_items::wire::OP_KEEP_AGAIN => meter.note(t, 0),
             ferros_items::wire::OP_WRITE => {
