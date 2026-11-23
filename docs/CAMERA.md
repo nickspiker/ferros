@@ -1835,6 +1835,22 @@ The CSI link's interrupt words, named from the LWIS tables (zuma-isp-event-info.
 - **The main at 8 and 2 rows with its PD and embedded data left on** (`F_LOUD`) refuses as quiet does: the side channels are not what stops its short frames.
 - **Stored**: `camera` from 7acde33f (566689 bytes, blake3 663d5577...), read back equal, restarted idle; the one before (564929 bytes, blake3 9ddd2682..., 7617f691) kept in target/farm/camera-work/out/camera-before-7acde33f.capsule.vsf. The camera's interface with the kernel is e5f4da21's (ferros_sys since adds only calls it does not make).
 
+### Lumis's slits ran the driver's default frame, not the floor (2026-11-22, desk)
+
+The Lumis session's runs on the 7acde33f driver (Lumis 0.2.60, DEV_SLIT_LATER, 16 s): the ultrawide's 4000 x 4 slits every 866.128 us (1155 a second), the front's 3840 x 2 at 737 a second.
+- **Both are the driver's default frame, rows plus 2^7** (payloads/camera `mode_of`: an OPEN's `fll` 0 gives `rows + BLANK`): the ultrawide's 132 lines of 6.5616 us are 866.13 us, the sensor's 866.128; the front's 130 lines of 10.4378 us are 1.357 ms, 737 a second. Neither the exposure (the driver's 16 lines fit both frames with their margins) nor a rounding.
+- The list's `slit_lines_least` (the ultrawide 104, the front 122) is the frame to ask: an OPEN with `fll` = `slit_lines_least` and `rows` = `slit_rows_least` runs at the floor (the ultrawide 104 lines measured at 4 rows, 1465 a second; the front's 122 from 791 a second at 4 rows and 96-line frames). No driver change is needed for that.
+- The driver's default stays rows plus 2^7: the floors were measured at one height each, and the ultrawide's 104 may be a blanking (rows plus 100) or a whole frame; the main's and the tele's floors are times the sensor pads to whatever is asked. A default from the floor waits for that answer.
+- **Device check**: the ultrawide at 64 rows with frames of 164, 150, 132 and 120 lines, and the front at 2 rows with 122, 110 and 96: whether a floor is a blanking past the rows or a whole frame, so the list can say the least frame for any rows.
+
+### The tele's phase detect off (staged)
+
+The tele's init writes G#0D00 = G#0101 and G#0D02 = G#0101 and nothing else PD-shaped (its 22-degree and 48.8 MP inits differ only in the vendor's G#0B30, the frame, the integration and two vendor tables). Staged as target/farm/camera-work/tele-pd-off.diff: its `Side::pd` G#0D00, written 0 in a windowed mode's hold as the main's G#0720 is. Device check: the tele at 64, 16, 8, 4 and 2 rows with it; its link should then start no channel 1 (+24 without bit 1).
+
+### The main's short frames (desk, not settled)
+
+At 12 rows and under the link takes frame starts on channels 0 and 2 and never a frame end, with ERR_CRC_PH; its PD is off and channel 1 silent; its side channels on or off change nothing (F_LOUD, 2026-11-22). Channel 2 (data type G#12, embedded) stays on whatever G#0118 is: its 4 lines and the image's few may be what the link reads wrong. Device check: F_KEEP_FE (the front end left at the whole frame) at 8 rows, to see in memory how many lines and of what a short frame carries, and the link's PHY header words at the stop.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
