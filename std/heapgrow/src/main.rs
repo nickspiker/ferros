@@ -60,6 +60,9 @@ fn main() {
     println!("heapgrow: done in {} ms, the notepad's megabyte as written", t0.elapsed().as_millis());
     // 4. A plain allocation past the device, as most code allocates (no try): the process ends, and the line before its end says what was asked and what the device had free (the fork's out-of-memory hook, ferros_rt `out_of_memory`, the kernel's ARC_FREE).
     println!("heapgrow: 4. 64 TiB asked plainly; the next line is the out-of-memory report and the process ends");
-    let past: Vec<u8> = Vec::with_capacity(1 << 46);
+    // Behind black_box and touched: an allocation nothing reads is one LLVM removes (the Pro, 2026-11-23: "given?! 70368744177664" with no allocation made).
+    let mut past: Vec<u8> = Vec::with_capacity(std::hint::black_box(1 << 46));
+    past.push(1);
+    std::hint::black_box(&past);
     println!("heapgrow: 4. given?! {}", past.capacity());
 }

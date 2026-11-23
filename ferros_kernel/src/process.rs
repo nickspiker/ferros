@@ -1743,11 +1743,10 @@ impl Process {
             return Some(self.read(off, len));
         }
         let mut v = crate::kheap::vec_for("a message", len)?;
-        v.resize(len, 0);
-        match self.span(off, len) {
-            // SAFETY: `span` resolved all `len` bytes inside this process's arc or one of its DMA regions; `v` holds `len`.
-            Some(a) => unsafe { core::ptr::copy_nonoverlapping(a as *const u8, v.as_mut_ptr(), len) },
-            None => self.bad_buf(off, len, false),
+        // One pass over the bytes, never zeroed first (the Pro, 2026-11-23: a 128 MiB call held the kernel lock 88 ms with the zeroing).
+        match self.view(off, len) {
+            Some(m) => v.extend_from_slice(m),
+            None => v.resize(len, 0),
         }
         Some(v)
     }
@@ -10419,13 +10418,15 @@ fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) ->
     kk.exited.clear();
     let at = kk.console.pos();
     let trips0 = kk.ipc_round_trips;
+    // The entry and the grants offset as `build_from` set them in the first thread's frame: the code lies past the tokens' pages when the grants page could not hold them (docs/NO-CEILINGS.md step 5; the Pro, 2026-11-23: entered at CODE, a 120-grant spawn faulted on its token page).
+    let (entry, grants) = th(me).map_or((arc.base + CODE, GRANTS as u64), |t| (t.frame.elr as usize, t.frame.x[0]));
     if let Some(p) = th(me) {
         p.state = State::Running;
     }
     cur_set(Some(me));
     unlock();
     arm_slice();
-    unsafe { ferros_el0_enter(arc.base + CODE, arc.top() - 16, arc.base, arc.x27(), GRANTS as u64, in_off as u64, input_len as u64) };
+    unsafe { ferros_el0_enter(entry, arc.top() - 16, arc.base, arc.x27(), grants, in_off as u64, input_len as u64) };
     disarm_slice();
     lock();
     let kk = k();

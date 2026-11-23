@@ -120,7 +120,15 @@ fn the_window_grows_and_gives_back() {
     assert_eq!(LockedTlsf::last_fail().size, 1 << 29);
     assert_eq!(unsafe { *p.add(100 * MIB - 1) }, 0x5A);
     assert!(HEAP.fits(lay(MIB)));
+    // Small allocations made while a large block holds the window come from the fixed regions, not the window's top (the Pro, 2026-11-23: one TLSF over both let one pin the top, and 8.6 GiB stayed mapped): freed, the window's top goes back.
+    let held: Vec<*mut u8> = (0..1024).map(|k| unsafe { HEAP.alloc(lay(64 + (k % 7) * 512)) }).collect();
+    assert!(held.iter().all(|q| !q.is_null() && ((*q as usize) < w || (*q as usize) >= w + (1 << 30))), "a small block landed in the window");
     unsafe { HEAP.dealloc(p, lay(100 * MIB)) };
+    assert!(trim(4 * MIB) >= 90 * MIB);
+    assert!(TOP.load(SeqCst) - w <= 8 * MIB);
+    for (k, q) in held.into_iter().enumerate() {
+        unsafe { HEAP.dealloc(q, lay(64 + (k % 7) * 512)) };
+    }
     for s in small {
         unsafe { HEAP.dealloc(s, lay(4096)) };
     }

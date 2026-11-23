@@ -1,5 +1,6 @@
 //! The kernel's heap: TLSF (ferros_rt's own tlsf.rs, by path, so the kernel and every std process run one allocator) behind the spinlock, over the fixed regions the kernel adds once (the 12 MiB after its stack, then the window's second region) and a window that grows (docs/NO-CEILINGS.md 1, step 4).
 //! The window: a reach of addresses the kernel maps frames of its pool into at the top as the heap runs low (`set_grow`'s hook, which calls `extend`), and gives back from the top past a cushion (`trim_begin`, `trim_end`), so one allocation can be as large as the pool and the heap holds about what it uses.
+//! The window is a TLSF of its own beside the fixed regions', asked only when they cannot serve (measured on the Pro, 2026-11-23: with one TLSF over both, a small allocation took the window's top cushion and pinned it, and 8.6 GiB stayed mapped after its 9 GiB of messages were freed). So the window holds the large blocks that come and go, and its free top goes back.
 //!
 //! Until 2026-11-12 the kernel ran the first-fit free list in lib.rs (`LockedHeap`), whose alloc walked every free block under the lock, and whose realloc was always a new block, a copy and a free, so a Vec doubling past half the largest free block failed with the rest of the heap free.
 //! Here realloc works in place first (TLSF `resize`: a grow takes the free block behind), an alloc or a free costs the same whatever the number of free blocks, and the report (`report`) gives what a failed allocation needs explained: the size of the regions, what is in use and its peak, the free bytes and blocks, the largest free block, and the free space by size (`State::levels`).
@@ -54,7 +55,10 @@ pub struct Report {
 
 /// The allocator and its regions, under one lock.
 pub struct State {
+    /// The fixed regions'.
     tlsf: Tlsf,
+    /// The window's (above).
+    win: Tlsf,
     region: [(usize, usize); REGIONS],
     regions: usize,
     /// The window's mapped part: its first address and its end, both 0 until the first `extend`.
@@ -63,19 +67,66 @@ pub struct State {
 
 impl State {
     /// The free space by size: `each(floor, blocks, bytes)` for every first level of the lists that holds a block (`Tlsf::levels`).
-    pub fn levels(&self, each: impl FnMut(usize, usize, usize)) {
-        self.tlsf.levels(each);
+    pub fn levels(&self, mut each: impl FnMut(usize, usize, usize)) {
+        self.tlsf.levels(&mut each);
+        self.win.levels(&mut each);
+    }
+
+    /// The fixed regions first, then the window.
+    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let p = unsafe { self.tlsf.alloc(layout) };
+        if !p.is_null() || self.window.1 == 0 {
+            return p;
+        }
+        unsafe { self.win.alloc(layout) }
+    }
+
+    /// Whether `p` lies in the window (every window block lies below its end, which trims only lower past free space).
+    fn in_window(&self, p: *mut u8) -> bool {
+        (p as usize) >= self.window.0 && (p as usize) < self.window.1
+    }
+
+    unsafe fn free(&mut self, p: *mut u8) {
+        if self.in_window(p) {
+            unsafe { self.win.free(p) };
+        } else {
+            unsafe { self.tlsf.free(p) };
+        }
+    }
+
+    unsafe fn resize(&mut self, p: *mut u8, new_size: usize) -> bool {
+        if self.in_window(p) { unsafe { self.win.resize(p, new_size) }.0 } else { unsafe { self.tlsf.resize(p, new_size) }.0 }
+    }
+
+    fn free_bytes(&self) -> usize {
+        self.tlsf.free_bytes() + self.win.free_bytes()
+    }
+
+    fn free_blocks(&self) -> usize {
+        self.tlsf.free_blocks() + self.win.free_blocks()
+    }
+
+    fn largest(&self) -> usize {
+        let (a, b) = (self.tlsf.largest_free(), self.win.largest_free());
+        if a > b { a } else { b }
     }
 
     /// The host tests' walk of the lists and of every region (tlsf.rs `verify_lists`, `verify_region`): returns the free (blocks, bytes), which both walks must agree on.
     pub fn verify(&self) -> (usize, usize) {
-        let lists = self.tlsf.verify_lists();
+        let (lb, ln) = self.tlsf.verify_lists();
+        let (wb, wn) = self.win.verify_lists();
+        let lists = (lb + wb, ln + wn);
         let (mut blocks, mut bytes) = (0, 0);
-        let window = if self.window.1 != 0 { Some(self.window) } else { None };
-        for &(start, _) in self.region[..self.regions].iter().chain(window.iter()) {
+        for &(start, _) in &self.region[..self.regions] {
             // `add` trims the start to the grain; the walk starts where it did.
             let s = (start + crate::tlsf::GRAIN - 1) & !(crate::tlsf::GRAIN - 1);
             let (_, b, n) = unsafe { self.tlsf.verify_region(s) };
+            blocks += b;
+            bytes += n;
+        }
+        if self.window.1 != 0 {
+            let s = (self.window.0 + crate::tlsf::GRAIN - 1) & !(crate::tlsf::GRAIN - 1);
+            let (_, b, n) = unsafe { self.win.verify_region(s) };
             blocks += b;
             bytes += n;
         }
@@ -101,7 +152,7 @@ pub struct LockedTlsf {
 
 impl LockedTlsf {
     pub const fn empty() -> Self {
-        LockedTlsf { lock: SpinLock::new(State { tlsf: Tlsf::empty(), region: [(0, 0); REGIONS], regions: 0, window: (0, 0) }), grow: AtomicUsize::new(0) }
+        LockedTlsf { lock: SpinLock::new(State { tlsf: Tlsf::empty(), win: Tlsf::empty(), region: [(0, 0); REGIONS], regions: 0, window: (0, 0) }), grow: AtomicUsize::new(0) }
     }
 
     /// The window's grower: called with the heap's lock let go when an allocation finds no free block, `grow(bytes)` maps at least `bytes` more at the window's top and adds them (`extend`), true when it did. It may refuse (false): the allocation then fails as it always did.
@@ -125,11 +176,11 @@ impl LockedTlsf {
     /// Whether an allocation of `layout` would succeed now without growing (taken and given back at once, under the lock): the grower's test after a growth, as another core may have used what it added.
     pub fn fits(&self, layout: Layout) -> bool {
         let mut s = self.lock.lock();
-        let p = unsafe { s.tlsf.alloc(layout) };
+        let p = unsafe { s.alloc(layout) };
         if p.is_null() {
             return false;
         }
-        unsafe { s.tlsf.free(p) };
+        unsafe { s.free(p) };
         true
     }
 
@@ -141,8 +192,7 @@ impl LockedTlsf {
         let mut s = self.lock.lock();
         // A growth that does not start at the window's end is a bug in the kernel's mapping: fail loud.
         assert!(s.window.1 == 0 || start == s.window.1, "the kernel heap's window grew somewhere other than its top");
-        assert!(s.window.1 == 0 || s.tlsf.top() == s.window.1, "the kernel heap's window is not its last region");
-        if unsafe { s.tlsf.add(start, end) } {
+        if unsafe { s.win.add(start, end) } {
             if s.window.1 == 0 {
                 s.window.0 = start;
             }
@@ -155,27 +205,27 @@ impl LockedTlsf {
     pub fn trim_begin(&self, cushion: usize, grain: usize) -> Option<(usize, usize)> {
         let mut s = self.lock.lock();
         let end = s.window.1;
-        if end == 0 || s.tlsf.top() != end {
+        if end == 0 {
             return None;
         }
-        let b = s.tlsf.top_free()?;
+        let b = s.win.top_free()?;
         // The cut keeps the free block a least block, its header and its sentinel, and the cushion past them.
         let keep = b + crate::tlsf::MIN_BLOCK + 2 * crate::tlsf::HEADER + cushion;
         let cut = (keep + grain - 1) & !(grain - 1);
         if cut >= end {
             return None;
         }
-        s.tlsf.take_top();
+        s.win.take_top();
         Some((b, cut))
     }
 
     /// The bytes of the free block at the window's top (0 when the window is not open, not the heap's last region, or its last block is in use): the kernel's cheap look before it takes its lock to trim.
     pub fn top_free_bytes(&self) -> usize {
         let s = self.lock.lock();
-        if s.window.1 == 0 || s.tlsf.top() != s.window.1 {
+        if s.window.1 == 0 {
             return 0;
         }
-        s.tlsf.top_free().map_or(0, |b| s.window.1 - b)
+        s.win.top_free().map_or(0, |b| s.window.1 - b)
     }
 
     /// The window now ends at `cut` (`trim_begin`'s): block `b` free again up to it, the bytes past it the kernel's to unmap.
@@ -185,7 +235,7 @@ impl LockedTlsf {
     pub unsafe fn trim_end(&self, b: usize, cut: usize) {
         let mut s = self.lock.lock();
         let end = s.window.1;
-        unsafe { s.tlsf.cut(b, cut) };
+        unsafe { s.win.cut(b, cut) };
         s.window.1 = cut;
         TRIMMED.fetch_add(end - cut, Ordering::Relaxed);
     }
@@ -225,9 +275,9 @@ impl LockedTlsf {
             trimmed: TRIMMED.load(Ordering::Relaxed),
             in_use: IN_USE.load(Ordering::Relaxed),
             peak: PEAK.load(Ordering::Relaxed),
-            free: s.tlsf.free_bytes(),
-            free_blocks: s.tlsf.free_blocks(),
-            largest: s.tlsf.largest_free(),
+            free: s.free_bytes(),
+            free_blocks: s.free_blocks(),
+            largest: s.largest(),
             fails: FAILS.load(Ordering::Relaxed),
             last_fail: Self::last_fail(),
         })
@@ -243,7 +293,7 @@ impl LockedTlsf {
     #[cold]
     fn refused(s: &State, layout: Layout, caller: usize) {
         FAILS.fetch_add(1, Ordering::Relaxed);
-        let words = [layout.size(), layout.align(), caller, IN_USE.load(Ordering::Relaxed), s.tlsf.free_bytes(), s.tlsf.free_blocks(), s.tlsf.largest_free()];
+        let words = [layout.size(), layout.align(), caller, IN_USE.load(Ordering::Relaxed), s.free_bytes(), s.free_blocks(), s.largest()];
         for (a, v) in LAST_FAIL.iter().zip(words) {
             a.store(v, Ordering::Relaxed);
         }
@@ -280,7 +330,7 @@ unsafe impl GlobalAlloc for LockedTlsf {
         let lr = caller();
         loop {
             let mut s = self.lock.lock();
-            let p = unsafe { s.tlsf.alloc(layout) };
+            let p = unsafe { s.alloc(layout) };
             if !p.is_null() {
                 drop(s);
                 Self::moved(0, layout.size());
@@ -296,7 +346,7 @@ unsafe impl GlobalAlloc for LockedTlsf {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.lock.lock().tlsf.free(ptr) };
+        unsafe { self.lock.lock().free(ptr) };
         Self::moved(layout.size(), 0);
     }
 
@@ -307,12 +357,12 @@ unsafe impl GlobalAlloc for LockedTlsf {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let p = loop {
             let mut s = self.lock.lock();
-            if unsafe { s.tlsf.resize(ptr, new_size) }.0 {
+            if unsafe { s.resize(ptr, new_size) } {
                 drop(s);
                 Self::moved(layout.size(), new_size);
                 return ptr;
             }
-            let p = unsafe { s.tlsf.alloc(new_layout) };
+            let p = unsafe { s.alloc(new_layout) };
             if !p.is_null() {
                 break p;
             }
@@ -325,7 +375,7 @@ unsafe impl GlobalAlloc for LockedTlsf {
         };
         unsafe {
             core::ptr::copy_nonoverlapping(ptr, p, if layout.size() < new_size { layout.size() } else { new_size });
-            self.lock.lock().tlsf.free(ptr);
+            self.lock.lock().free(ptr);
         }
         Self::moved(layout.size(), new_size);
         p

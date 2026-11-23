@@ -1,4 +1,4 @@
-//! ferros_rt's TCP client on the device (docs/STD-TARGET.md "TCP"): fgtw.org thru ip's resolver, a GET of /status on port 80 read to the peer's close, the same over a second connection read on its own thread (held at ip) while the main thread writes, and a read held to a deadline on a connection that brings nothing.
+//! ferros_rt's TCP client on the device (docs/STD-TARGET.md "TCP"): fgtw.org thru ip's resolver, a GET of /status on port 80 read to the peer's close, the same over a second connection read on its own thread (held at ip) while the main thread writes, a read held to a deadline on a connection that brings nothing, and one write of 64 KiB taken by ip in one call (docs/NO-CEILINGS.md step 5).
 //! Spawn: `ferros-bridge spawn tcptest.bin --name tcptest --use udp --entropy`: slot 0 the console, 1 the `udp` endpoint (`UDP_SLOT`).
 //! Each step is a console line; the exit code is the number of steps that failed (0 all passed).
 //! Addresses are not printed (ip's own rule for its lookups: the person's), only their family.
@@ -116,6 +116,30 @@ fn main() {
         }
     }
 
-    println!("tcptest: A#{failed} of 4 steps failed");
+    // Step 4 (docs/NO-CEILINGS.md step 5): one write of 64 KiB less ip's op and handle is one call, taken whole by ip (the request at its full length; 4094 bytes a call until then). A request ahead of it so the peer reads, then the body.
+    match Conn::connect(ip, addr, Until::after(EXCHANGE)) {
+        Ok(c) => {
+            let body = vec![b'x'; ferros_rt::tcp::SEND_MAX];
+            let head = format!("POST /status HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: ferros tcptest\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let t = Instant::now();
+            match c.write_all(head.as_bytes(), Until::after(EXCHANGE)).and_then(|()| c.write(&body, Until::after(EXCHANGE))) {
+                Ok(n) if n == body.len() => println!("tcptest: 4 one write of A#{n} bytes taken by ip in one call, A#{} ms", t.elapsed().as_millis()),
+                Ok(n) => {
+                    println!("tcptest: 4 one write took A#{n} of A#{} bytes", body.len());
+                    failed += 1;
+                }
+                Err(e) => {
+                    println!("tcptest: 4 write: {e:?}");
+                    failed += 1;
+                }
+            }
+        }
+        Err(e) => {
+            println!("tcptest: 4 connect: {e:?}");
+            failed += 1;
+        }
+    }
+
+    println!("tcptest: A#{failed} of 5 steps failed");
     std::process::exit(failed);
 }
