@@ -77,7 +77,7 @@ enum Got<'a> {
     Slit { count: u64, time: i64, rows: SlitRows<'a> },
 }
 
-/// The rows of a slit lumis_core reads (`process_slit`: its centre period, the 2 x 2 cell's two rows binned), held as the four rows from `first`: whatever the period (2 or 4), its rows start on a multiple of it at the slit's middle, inside those four. A row outside them is a bug in that arithmetic, and the index fails.
+/// The rows of a slit lumis_core reads (`process_slit`: its centre period, the 2 x 2 cell's two rows binned), held as the four rows from `first` (the whole slit when it has fewer, a two-row slit's pair): whatever the period (2 or 4), its rows start on a multiple of it at the slit's middle, inside those rows. A row outside them is a bug in that arithmetic, and the index fails.
 struct SlitRows<'a> {
     band: &'a [u16],
     first: usize,
@@ -739,8 +739,11 @@ impl Source {
                     continue;
                 };
                 let at = *base + ((k - 1) % slits.ring) as usize * slits.buffer;
-                let first = slits.rows / 2 / BAND_ROWS * BAND_ROWS;
-                band.resize(BAND_ROWS * slits.width, 0);
+                // The band: four rows at the slit's middle, or the whole slit when it has fewer (the owner, 2026-11-22: two-row slits, the one Bayer pair, top and bottom, that Slitscan keeps).
+                // WHY the min: the slit's rows are the driver's (its mode's), and a band past them would read the buffer after it, or past the view at the ring's last.
+                let band_rows = BAND_ROWS.min(slits.rows);
+                let first = slits.rows / 2 / band_rows * band_rows;
+                band.resize(band_rows * slits.width, 0);
                 // A RAW10 line of the widest readout fits: 8160 samples are 10200 bytes.
                 let mut tmp = [0u8; 1 << 14];
                 for (r, out) in band.chunks_exact_mut(slits.width).enumerate() {
@@ -1931,10 +1934,15 @@ fn close_camera(name: &str) {
     preview_settle();
     gpu::CAMERA_MAPPED.store(false, Ordering::Relaxed);
     let mut r = [0u8; 4];
-    if sys::call_live(CAMERA, &[camera::OP_CLOSE], &mut r) == sys::ERR {
-        println!("lumis: camera {name}: the CLOSE was not answered; the driver closes when Lumis ends");
-    } else {
+    // The GPU held across the CLOSE: every job of Lumis's is waited for inside this lock, so none is in flight when the view goes, and the service does not end the queue (`E_CAMERA`) under the camera screen's job (the Pro, 2026-11-22: lost at the tele's CLOSE for Slitscan, which turned Lumis's screen over to the CPU). The UI's next pass waits for the CLOSE.
+    let answered = {
+        let _held = gpu::SHARED.lock().unwrap();
+        sys::call_live(CAMERA, &[camera::OP_CLOSE], &mut r) != sys::ERR
+    };
+    if answered {
         println!("lumis: camera {name}: closed");
+    } else {
+        println!("lumis: camera {name}: the CLOSE was not answered; the driver closes when Lumis ends");
     }
     gpu::camera_changed(false);
 }

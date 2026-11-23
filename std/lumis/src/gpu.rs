@@ -2,7 +2,7 @@
 //!
 //! Lumis's part of the GPU block is its first 2^`UI_LOG` bytes: the queue, the kernels' words, the code table, the slots, the rows, the coverage, the splash, the ink and the camera screen's frame, each on its own place below; the recorder's kernel and frames after it (ferros_clip `gpu::set_base`). The block is grown to that before the queue opens, the two surfaces asked for before it too: a client's memory is its key to the GPU service (ferros_sys `gpu::Stamp::key`), so a block grown later (the recorder's) or a surface asked later is another client, and the queue is opened again for it (`Gpu::run`).
 
-use ferros_sys::gpu::queue::{Job, Queue, S_DONE};
+use ferros_sys::gpu::queue::{Job, Queue, E_CAMERA, S_DONE, S_LOST};
 use ferros_sys::gpu::{ARENA_VA, PRELOAD_REGS64, PRELOAD_X, SURFACES_PA, SURFACES_VA};
 use lumis_gpu::{frame, menu, stack, Compiled};
 
@@ -240,7 +240,13 @@ impl Gpu {
         uniforms.extend_from_slice(&self.compiled[i].consts);
         let groups = (invocations.div_ceil(1 << 4), 1);
         let n = self.q.submit(&Job { kernel: self.kernels[i], groups, uniforms: &uniforms }).ok_or("the GPU queue took no job")?;
-        let e = self.q.wait(n);
+        let mut e = self.q.wait(n);
+        // A menu or camera screen job (neither reads the camera) lost because the camera's view went while a job was in flight (E_CAMERA: the service ends the queue at a CLOSE or a view given anew) did nothing wrong: the queue opened again and the job run once more, the GPU kept (the Pro, 2026-11-22: the camera screen's job lost at the tele's CLOSE for Slitscan turned Lumis's screen over to the CPU for the rest of the session). `close_camera` holds the GPU across its CLOSE so none is in flight; this is for any other way the view goes.
+        if e.status == S_LOST && self.q.ended() == E_CAMERA && matches!(kind, Kind::Menu | Kind::Camera) {
+            self.q.reopen();
+            let n = self.q.submit(&Job { kernel: self.kernels[i], groups, uniforms: &uniforms }).ok_or("the GPU queue took no job")?;
+            e = self.q.wait(n);
+        }
         let name = ["the menu", "the camera screen", "the stack (a frame written)", "the stack (a frame added)"][i];
         if e.status != S_DONE {
             // The queue ended with it (a fault ends a queue): opened again for the next frame.
