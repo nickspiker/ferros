@@ -67,8 +67,8 @@ pub struct Cam {
     /// The least blanking a whole frame of its captured readout takes, lines past its rows (the list's `fll_least`, a client's fastest whole rate): the driver's `BLANK_LEAST`, or more where the sensor pads its frame further (the tele).
     pub blank_least: u16,
     /// A binned slit's least rows that reach memory, and its least frame (ns): measured on the Pro (2026-11-22, b1134, docs/CAMERA.md "Two-row slits, 2:1 and 1:1"), 0 where not measured.
-    /// Every sensor sends 2-row frames, but the receive side takes only these heights and up: the main 16 rows (12 and under, the link's ERR_CRC_PH and loch0's G#404), the ultrawide and the front 4, the tele 64 (16 and under refused).
-    /// The least frame at those rows: the main about 812 us whatever the frame or the line asked (1231 a second; a time, not a line count: a 5888-clock line ran 1244, not the 1321 a line count would give), the ultrawide 128 lines of 6.5616 us (1190 a second; at 96 nothing lands), the front about 121 lines of 10.4378 us (791 a second at 96 and under), the tele about 293 lines of 6.1068 us (559 a second at 64 rows).
+    /// Every sensor sends 2-row frames, but the receive side takes only these heights and up: the main 16 rows (12 and under, the link's ERR_CRC_PH and loch0's G#404), the ultrawide 4 (2: the link's VRESOL_MISMATCH on the image channel, its PD channel silent), the front 2 (since its PD channel is a quarter of the rows rounded up, geom `Geom::of`), the tele 64 (16 and under refused at every PD channel height tried, 1 to 16).
+    /// The least frame at those rows: the main about 812 us whatever the frame or the line asked (1231 a second; a time, not a line count: a 5888-clock line ran 1244, not the 1321 a line count would give), the ultrawide 104 lines of 6.5616 us (1465 a second; at 96 nothing lands), the front about 121 lines of 10.4378 us (791 a second at 96 and under), the tele about 293 lines of 6.1068 us (559 a second at 64 rows).
     pub slit_rows: u16,
     pub slit_frame_ns: u64,
     /// Whether the sensor takes a mode's words only while streaming: written in the hold before stream on, its frame, window and output size are dropped at stream on (the sensor runs its init's mode), so the driver writes the mode after the first frame (payloads/camera `F_MID`).
@@ -260,7 +260,7 @@ pub const ULTRAWIDE: Cam = Cam {
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
     slit_rows: 4,
-    slit_frame_ns: 839_880,
+    slit_frame_ns: 682_400,
     array: &crate::ccs::ARRAYS[1],
     optics: &crate::optics::OPTICS[1],
 };
@@ -312,7 +312,7 @@ pub const FRONT: Cam = Cam {
     alts: &[FRONT842],
     mode_live: false,
     blank_least: crate::BLANK_LEAST,
-    slit_rows: 4,
+    slit_rows: 2,
     slit_frame_ns: 1_264_200,
     array: &crate::ccs::ARRAYS[2],
     optics: &crate::optics::OPTICS[2],

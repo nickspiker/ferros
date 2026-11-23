@@ -18,10 +18,11 @@ pub const DT_RAW10: u8 = 0x2B;
 pub const DT_RAW12: u8 = 0x2C;
 
 impl Geom {
-    /// A mode's geometry: a line of `w` samples at `bits` each on a 256-byte boundary (the captured strides: the main's 4080 RAW10 G#1400; the ultrawide's 4000 at G#13C0 is on 64, so a camera's own captured stride wins where the width is its captured one, `with_stride`), the PD channel a quarter of the rows (the main's 768 of 3072).
+    /// A mode's geometry: a line of `w` samples at `bits` each on a 256-byte boundary (the captured strides: the main's 4080 RAW10 G#1400; the ultrawide's 4000 at G#13C0 is on 64, so a camera's own captured stride wins where the width is its captured one, `with_stride`), the PD channel a quarter of the rows rounded up (the main's 768 of 3072).
+    /// Rounded up: a 2-row slit's quarter was 0, a link channel programmed for 0 lines (G#0F00 on the front), and the front's 2-row slit landed nothing; with 1 line it lands, 747 a second, none lost (the Pro, 2026-11-22). Every captured height is a multiple of 4, so its quarter is as before.
     pub const fn of(w: u16, h: u16, bits: u16) -> Geom {
         let line = w as u32 * bits as u32 / 8;
-        Geom { w, h, stride: (line + 255) & !255, pd_h: h / 4, dt: if bits == 12 { DT_RAW12 } else { DT_RAW10 } }
+        Geom { w, h, stride: (line + 255) & !255, pd_h: h.div_ceil(4), dt: if bits == 12 { DT_RAW12 } else { DT_RAW10 } }
     }
     pub const fn with_stride(mut self, stride: u32) -> Geom {
         self.stride = stride;
@@ -249,6 +250,12 @@ mod tests {
     fn values() {
         let slit = Geom::of(4080, 4, 10).with_stride(0x1400);
         assert_eq!(slit.pd_h, 1);
+        // A 2-row slit's PD channel is one line, not none; every captured height keeps its quarter.
+        assert_eq!(Geom::of(3840, 2, 10).pd_h, 1);
+        assert_eq!(value(0x1C04_0054, 0x02AC_0F00, &Geom::of(3840, 2736, 10), &Geom::of(3840, 2, 10), Scope::Core), 0x0001_0F00);
+        for h in [3072u16, 3000, 2736, 3024, 6144, 6000] {
+            assert_eq!(Geom::of(4000, h, 10).pd_h, h / 4);
+        }
         assert_eq!(value(0x1C32_0474, 0x0C00_0FF0, &MAIN, &slit, Scope::Core), 0x0004_0FF0);
         assert_eq!(value(0x1C32_2074, 0x0300_0FF0, &MAIN, &slit, Scope::Core), 0x0001_0FF0);
         assert_eq!(value(0x1C05_0044, 0x0C00_0FF0, &MAIN, &slit, Scope::Core), 0x0004_0FF0);
