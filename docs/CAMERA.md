@@ -1895,6 +1895,13 @@ At 2 rows its image channel reports VRESOL_MISMATCH (+1C G#40, channel 0 alone s
 - **No faster for it**: at the doubled line the main's floor is about 952 us (1050 a second), against 812 us (1231) for 16 rows at its own line. Two rows kept a slit: 16 rows at the mode's line 2.46k lines a second, 8 rows at the doubled line 2.10k. So the list keeps 16 rows at the mode's line (`slit_rows_least` 16), the fastest full-width slit; 8 rows full width (a doubled line) or 8 rows 1280 wide (1237 a second, a third of the field) are there for a client that wants fewer bytes, not more speed.
 - **The 1:1 slit fields stay held back**: no 1:1 slit lands at any line tried.
 
+### Next: the main's frames of 4 rows and under (lead, not yet tested)
+
+What separates them from 8 rows and up: at a doubled line 8 and 12 rows land with a clean link and 4 and 2 rows do not, the same "frame starts on channels 0 and 2, no frame end, ERR_CRC_PH" whatever the rate; the 1:1 straddle (2 rows) and the 1:1 4-row control fail the same way at every line to four times their own. So under about 8 rows the cause is the frame's shape, not the link's rate.
+- **The lead: the embedded-data channel.** Channel 2 (data type G#12) carries 4 lines a frame and stays on whatever G#0118 is written ("The slit for real"); the link is told 4 lines of 4080 (+G#64 G#40FF0). A frame of 4 image lines or fewer is the one where the embedded lines are as many as the image's, and the tele and front, which take 2 rows, write their embedded control the same way but run their links at half the main's rate or less. Either the sensor's embedded lines interleave with so few image lines that the link misreads the packets, or the link's channel 2 expectation breaks the frame's end.
+- **Device test** (a driver knob, as the fifteenth byte writes channel 1's height): the main's 4 and 2-row slits at the doubled line with the link's channel 2 switched off (+G#60 = 0) and, separately, with its height set to 0; then the same on the 1:1 straddle. If either lands them, the slit's receiver drops channel 2 and the main's least rows go to 2 at a doubled line (1050 a second, the same as 8 rows there; worth it for the 1:1 straddle, the owner's quad rows).
+- If neither does: the sensor's own least output height (the main's binning G#3244 may need 8 output rows), read by its frame counter against a window of 8 rows with its output size 2, if its digital crop takes it.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
