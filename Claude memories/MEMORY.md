@@ -100,7 +100,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [UFS firewall decided](ufs_firewall_decided.md) - hv refuses Android boot-chain writes + UFS reset; built 2026-11-01
 - [Firmware validate on demand](firmware_validate_on_demand.md) - no per-boot chain hashing; informational, never a green badge
 - [Pages allowed when equivalent](pages_allowed_when_equivalent.md) - masking by default, MMU pages where equal and faster
-- [Storage: the seed is the only fixed thing](storage_seed_only_fixed.md) - everything else on the partition is a field from one pool, VSF-described; never carve fixed windows
+- [Storage: seed runs, all else in the vault](storage_seed_only_fixed.md) - the seed is the only fixed thing and must run; everything in the vault (rotates, levels); RAW video one-copy unverified write only
 - [Vault: flush per commit](vault_flush_per_commit.md) - every commit flushes the UFS cache before Ok; Ok carries copies (2, or 1 degraded)
 - [Syscall buffers: resolve or trap](syscall_buffers_resolve_or_trap.md) - arc, own DMA regions, else trap with report; built
 - [Biometrics move with identity](biometrics_move_with_identity.md) - fingerprint only if templates are ours; low priority
