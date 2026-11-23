@@ -1141,7 +1141,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // A rate's pacing on this readout: every rate `video_fps` gives is one it holds.
     let pace = |fps: u32| ferros_clip::Pacing::of_line(fps, line.expect("RAW video only where the driver gives a line (video_ok)")).expect("a rate up to the readout's fastest is paced");
     if video_ok && dev_knobs4() & DEV_VIDEO != 0 {
-        integrator.header[CURRENT_MODE_IDX] = RawMode::Video as u64;
+        // A clip in Average (the CLIP toggle, lumis_core 0.2.64: no RAW video mode).
+        integrator.header[lumis_core::shared_memory::SAVE_FORMAT_IDX] = lumis_core::shared_memory::SAVE_FORMAT_CLIP;
         integrator.header[lumis_core::shared_memory::VIDEO_FPS_IDX] = dev_video_fps() as u64;
         println!("lumis: development: RAW video at {} a second, recording from the 16th frame", video_fps(&integrator.header));
     }
@@ -1293,7 +1294,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             read_space(&mut *integrator.header);
         }
         // A rate whose open the driver refused is not asked again until another is chosen (the camera then stays at whole frames as ever, and the note under RECORD says why).
-        let want = if video_ok && integrator.header[CURRENT_MODE_IDX] == RawMode::Video as u64 { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
+        // Paced for a clip (CLIP, lumis_core `is_clip`: what was the RAW video mode), but not in Slitscan, whose slits are its own open.
+        let want = if video_ok && lumis_core::shared_memory::is_clip(&integrator.header) && !wants_slits(&integrator.header) { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
         if refused_fps.is_some_and(|f| Some(f) != Some(video_fps(&integrator.header))) {
             refused_fps = None;
         }
