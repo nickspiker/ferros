@@ -631,6 +631,14 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         self.finish(d, w)
     }
 
+    /// `f` with the engine's put reserve waived (manifestus `Vault::set_put_reserve`), held again after: a removal's own writes (the head's removal, its pieces' drop, the domain's lists, a caller's index pages) may use the room a full vault keeps for removals (2026-11-23, the Pro: the hold's remove could not rewrite a card's page in the full vault).
+    pub fn removing<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.vault.set_put_reserve(false);
+        let r = f(self);
+        self.vault.set_put_reserve(true);
+        r
+    }
+
     /// The value's pieces removed, DROP_BATCH to an engine commit: one commit a piece was 1,400 commits for a 91 MB kist capsule (2026-11-12, the 8a: its old Photon dropped at a re-stow), each a spine entry and a rewritten index path, the garbage of each feeding the reaps that ran inside the next.
     fn drop_pieces(&mut self, d: &Domain, h: &Head) -> Result<()> {
         let now = (self.now)();
@@ -644,6 +652,10 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
 
     /// Remove the value: its head (so it is gone at once), then its pieces, then its name from the domain's list. Returns whether it was there.
     pub fn delete(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
+        self.removing(|s| s.delete_inner(d, name))
+    }
+
+    fn delete_inner(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
         let Some((at, h)) = self.head(d, name)? else { return Ok(false) };
         self.vault.delete(&at, (self.now)())?;
         self.drop_pieces(d, &h)?;
@@ -656,6 +668,10 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
 
     /// Remove a value written with `begin_unlisted`: its head (gone at once), then its pieces; no list to edit. Returns whether it was there.
     pub fn delete_unlisted(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
+        self.removing(|s| s.delete_unlisted_inner(d, name))
+    }
+
+    fn delete_unlisted_inner(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
         let Some((at, h)) = self.head(d, name)? else { return Ok(false) };
         self.vault.delete(&at, (self.now)())?;
         self.drop_pieces(d, &h)?;
@@ -712,6 +728,10 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     ///
     /// In batches: DROP_BATCH names at a time, their heads and pieces DROP_BATCH to an engine commit, and the list of names removed once at the end. One `delete` a name (until 2026-11-12) wrote the list of names again for every value, so a kist's domain of a few thousand values (Mahere's cells) cost a few thousand rewrites of a list as long as the domain. Interrupted, what is left is heads that are gone under names still listed: `len`, `size` and a drop again pass over them.
     pub fn drop_domain(&mut self, d: &Domain) -> Result<u64> {
+        self.removing(|s| s.drop_domain_inner(d))
+    }
+
+    fn drop_domain_inner(&mut self, d: &Domain) -> Result<u64> {
         let names = self.names(d)?;
         let now = (self.now)();
         let mut n = 0;

@@ -804,6 +804,11 @@ impl Items {
 
     /// Every item of the domain gone (release: the person's items leave the device with their domains, AUTH.md): each page's stored bodies, the pages, the root and the hold's lists. The hold's values are off ferros_store's list, so `drop_domain` alone would leave them; the vault calls this first. Single-copy bodies' extents are the vault's to drop (by their owner tag). How many items went.
     pub fn drop_all<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<u64> {
+        // A removal's own writes (its index page, its lists) may use the room a full vault keeps for removals (ferros_store `removing`).
+        store.removing(|st| self.drop_all_inner(st, d))
+    }
+
+    fn drop_all_inner<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain) -> Result<u64> {
         self.forget();
         self.load_root(store, d)?;
         let root = self.root.take().ok_or(Error::Format)?;
@@ -1042,6 +1047,11 @@ impl Items {
 
     /// The vault's own removal of an item by its id (no caller: a single-copy body whose extent is gone from the table, so the card would name blocks nobody holds). The card comes back.
     pub fn remove_id<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: i64, now: i64) -> Result<Card> {
+        // A removal's own writes (its index page, its lists) may use the room a full vault keeps for removals (ferros_store `removing`).
+        store.removing(|st| self.remove_id_inner(st, d, id, made, now))
+    }
+
+    fn remove_id_inner<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, id: &Ht, made: i64, now: i64) -> Result<Card> {
         let Some((ri, pi, ci)) = self.locate(store, d, id, Some(made))? else {
             self.clips_edit(store, d, id, made, false, now)?;
             return Err(Error::NotFound);
@@ -1104,6 +1114,11 @@ impl Items {
 
     /// Removed, gone at once (STORE.md §7.7): its body's value, its card from its page. The card comes back, so the vault frees a single-copy body's extent.
     pub fn remove<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, handle: &[u8; 32], now: i64) -> Result<Card> {
+        // A removal's own writes (its index page, its lists) may use the room a full vault keeps for removals (ferros_store `removing`).
+        store.removing(|st| self.remove_inner(st, d, caller, handle, now))
+    }
+
+    fn remove_inner<A: BlockDev, B: BlockDev, N: Nonces>(&mut self, store: &mut Store<A, B, N>, d: &Domain, caller: &Caller, handle: &[u8; 32], now: i64) -> Result<Card> {
         let (id, made) = self.resolve(caller, handle)?;
         let (ri, pi, ci) = self.locate(store, d, &id, Some(made))?.ok_or(Error::NotFound)?;
         if !caller.may_open(&self.pages[pi].cards[ci]) {
