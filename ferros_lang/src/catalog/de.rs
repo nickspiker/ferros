@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "aus: dieses Gerät behält eine eigene Sprache",
         Msg::LangIdentityNone => "deine Identität hat noch keine Sprache: die hier gesetzte wird ihre",
+        Msg::BaseOwn => "aus: dieses Gerät behält eine eigene Zahlenbasis",
+        Msg::BaseIdentityNone => "deine Identität hat noch keine Zahlenbasis: die hier gesetzte wird ihre",
         Msg::MoreLanguagesNeedFace => "weitere Sprachen kommen mit einer Schrift, die sie darstellen kann",
         Msg::NotALanguage => "keine Sprache, die dieses Gerät hat",
         // ---- About ----

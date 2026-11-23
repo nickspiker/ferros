@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "weto: he reo ake tō tēnei pūrere",
         Msg::LangIdentityNone => "kāore anō he reo mō tō tuakiri: ko te mea ka tautuhia i konei, ka riro hei reo mōna",
+        Msg::BaseOwn => "weto: he pūnaha tau ake tō tēnei pūrere",
+        Msg::BaseIdentityNone => "kāore anō he pūnaha tau mō tō tuakiri: ko te mea ka tautuhia i konei, ka riro hei pūnaha mōna",
         Msg::MoreLanguagesNeedFace => "ka tae mai ētahi atu reo me tētahi momotuhi e tā ana i a rātou",
         Msg::NotALanguage => "ehara i te reo kei tēnei pūrere",
         // ---- About ----

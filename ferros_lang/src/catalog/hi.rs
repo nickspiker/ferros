@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "बंद: इस डिवाइस की अपनी भाषा है",
         Msg::LangIdentityNone => "तुम्हारी पहचान की अभी कोई भाषा नहीं: यहाँ सेट करो, वही उसकी हो जाएगी",
+        Msg::BaseOwn => "बंद: इस डिवाइस का अपना संख्या आधार है",
+        Msg::BaseIdentityNone => "तुम्हारी पहचान का अभी कोई संख्या आधार नहीं: यहाँ सेट करो, वही उसका हो जाएगा",
         Msg::MoreLanguagesNeedFace => "और भाषाएँ उन्हें दिखा सकने वाले फ़ॉन्ट के साथ आएँगी",
         Msg::NotALanguage => "यह भाषा इस डिवाइस पर नहीं है",
         // ---- About ----

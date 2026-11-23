@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "désactivé : cet appareil garde sa propre langue",
         Msg::LangIdentityNone => "ton identité n’a pas encore de langue : celle réglée ici devient la sienne",
+        Msg::BaseOwn => "désactivé : cet appareil garde sa propre base de numération",
+        Msg::BaseIdentityNone => "ton identité n’a pas encore de base de numération : celle réglée ici devient la sienne",
         Msg::MoreLanguagesNeedFace => "d’autres langues viendront avec une police qui sait les dessiner",
         Msg::NotALanguage => "cet appareil n’a pas cette langue",
         // ---- About ----

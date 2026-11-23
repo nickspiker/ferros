@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "mati: perangkat ini memakai bahasanya sendiri",
         Msg::LangIdentityNone => "identitasmu belum punya bahasa: atur di sini, maka itulah bahasanya",
+        Msg::BaseOwn => "mati: perangkat ini memakai basis bilangannya sendiri",
+        Msg::BaseIdentityNone => "identitasmu belum punya basis bilangan: atur di sini, maka itulah basisnya",
         Msg::MoreLanguagesNeedFace => "bahasa lain menyusul bersama jenis huruf yang bisa menggambarnya",
         Msg::NotALanguage => "bukan bahasa yang ada di perangkat ini",
         // ---- About ----

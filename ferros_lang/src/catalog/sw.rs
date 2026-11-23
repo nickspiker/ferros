@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "imezimwa: kifaa hiki kina lugha yake",
         Msg::LangIdentityNone => "utambulisho wako bado hauna lugha: ukiiweka hapa, inakuwa yake",
+        Msg::BaseOwn => "imezimwa: kifaa hiki kina msingi wake wa namba",
+        Msg::BaseIdentityNone => "utambulisho wako bado hauna msingi wa namba: ukiuweka hapa, unakuwa wake",
         Msg::MoreLanguagesNeedFace => "lugha zaidi zitakuja pamoja na fonti inayoweza kuziandika",
         Msg::NotALanguage => "si lugha iliyo kwenye kifaa hiki",
         // ---- About ----

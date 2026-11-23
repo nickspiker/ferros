@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "kapalı: bu cihaz kendi dilini kullanır",
         Msg::LangIdentityNone => "kimliğinin henüz dili yok: burada ayarlanan onun olur",
+        Msg::BaseOwn => "kapalı: bu cihaz kendi sayı tabanını kullanır",
+        Msg::BaseIdentityNone => "kimliğinin henüz sayı tabanı yok: burada ayarlanan onun olur",
         Msg::MoreLanguagesNeedFace => "daha fazla dil, onları çizebilen bir yazı tipiyle gelecek",
         Msg::NotALanguage => "bu cihazda olan bir dil değil",
         // ---- About ----

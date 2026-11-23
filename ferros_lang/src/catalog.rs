@@ -423,6 +423,10 @@ messages! {
     LangOwn,
     /// Under it, checked, before the identity has a language.
     LangIdentityNone,
+    /// The units page's "follow my identity" (the number base, as the language), unchecked.
+    BaseOwn,
+    /// Under it, checked, before the identity has a number base.
+    BaseIdentityNone,
     /// Under the list: the languages the face cannot draw yet (`Lang::renders`).
     MoreLanguagesNeedFace,
     NotALanguage,

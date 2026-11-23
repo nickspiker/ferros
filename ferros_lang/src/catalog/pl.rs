@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "wyłączone: to urządzenie zachowuje własny język",
         Msg::LangIdentityNone => "twoja tożsamość nie ma jeszcze języka: ustawiony tutaj stanie się jej językiem",
+        Msg::BaseOwn => "wyłączone: to urządzenie zachowuje własny system liczbowy",
+        Msg::BaseIdentityNone => "twoja tożsamość nie ma jeszcze systemu liczbowego: ustawiony tutaj stanie się jej systemem",
         Msg::MoreLanguagesNeedFace => "więcej języków przyjdzie z krojem pisma, który je narysuje",
         Msg::NotALanguage => "tego języka nie ma na tym urządzeniu",
         // ---- About ----

@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "patay: may sariling wika ang device na ito",
         Msg::LangIdentityNone => "wala pang wika ang pagkakakilanlan mo: itakda rito, iyon ang magiging wika nito",
+        Msg::BaseOwn => "patay: may sariling batayan ng numero ang device na ito",
+        Msg::BaseIdentityNone => "wala pang batayan ng numero ang pagkakakilanlan mo: itakda rito, iyon ang magiging batayan nito",
         Msg::MoreLanguagesNeedFace => "may darating pang mga wika kasama ng typeface na kayang gumuhit sa kanila",
         Msg::NotALanguage => "hindi wikang mayroon ang device na ito",
         // ---- About ----

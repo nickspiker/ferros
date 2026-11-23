@@ -1004,6 +1004,8 @@ fn hold_items(_developer: &[u8; 32], _option: &[u8; 32]) -> u64 {
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
     Base(u8),
+    /// The units page: "follow my identity" for the number base turned over (kernel base.rs, as the language's).
+    BaseFollow,
     Labels,
     Dither,
     /// The display's hit map in every fourth frame (Developer; display op 58).
@@ -3684,7 +3686,18 @@ impl Map {
                 mark(self, b, &mut y, 50, tr(Msg::TemporalDither), !spatial, Some(Choice::Dither));
             }
             "units" => {
-                // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath.
+                // Whose choice rules (2026-11-22, as the language: settings flow identity to device only): the identity's, the same on all the person's devices that follow it, or this device's own. A kernel from before SYS_BASE has no such choice and shows none.
+                if let Some(st) = ferros_sys::base::state() {
+                    mark(self, b, &mut y, 50, tr(Msg::FollowMyIdentity), st.follows, Some(Choice::BaseFollow));
+                    let says = match (st.follows, st.identity) {
+                        (false, _) => Msg::BaseOwn,
+                        (true, None) => Msg::BaseIdentityNone,
+                        (true, Some(_)) => Msg::SetHereAllFollow,
+                    };
+                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, tr(says));
+                    y += uu(2, 1);
+                }
+                // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath. The one shown chosen is the base in effect.
                 let now_base = ferros_sys::device_base();
                 for code in BASES {
                     let f = tatau::Fmt::new(tatau::Base::from_code(code).unwrap_or(tatau::Base::Dms), Style::Glyphs);
@@ -3702,6 +3715,9 @@ impl Map {
                         self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(15, 8), Choice::Base(code));
                     }
                     y += uu(4, 1);
+                }
+                if let Some(t) = self.zone_note {
+                    row(self, b, &mut y, note, white(), tr(t), None);
                 }
             }
             // What Deck and Back do (owner, 2026-11-18: "a settings addition to choose what back and home do"; WINDOWS.md "The helm"): a choice per gesture, each a pair, the default first (PREF_HELM, 0 every default).
@@ -5115,6 +5131,31 @@ impl Map {
         }
     }
 
+    /// A number base chosen on the units page: the identity's while this device follows it, thru its identity service (payloads/fgtw op 35: into the person's space, then to every device that follows it, this one first); else this device's own, straight to the kernel (SYS_BASE op 0). A kernel from before SYS_BASE takes it as preference 0, as it always did. What did not take is said on the page, as the language's is.
+    fn base_choose(&mut self, code: u8) {
+        match ferros_sys::base::state() {
+            Some(st) if st.follows => {
+                let m = [35, code];
+                let mut r = [0u8; 8];
+                let n = ferros_sys::call_live(cap(self.grants, S_FGTW), &m, &mut r);
+                self.zone_note = match (n, r[0]) {
+                    (ferros_sys::ERR | ferros_sys::NOTHING | 0, _) => Some(Msg::ServiceDidNotAnswer),
+                    (_, 0) => None,
+                    (_, 1) => Some(Msg::FleetNotAnsweredYet),
+                    _ => Some(Msg::KernelDidNotTake),
+                };
+            }
+            Some(_) => {
+                if !ferros_sys::base::set_device(cap(self.grants, S_SETTINGS), code) {
+                    self.zone_note = Some(Msg::KernelDidNotTake);
+                }
+            }
+            None => {
+                ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BASE, code);
+            }
+        }
+    }
+
     /// A typed setting as its slider left it, kept in the vault (the drag applied it live); anything else, nothing.
     fn typed_kept(&self, what: Choice) {
         if let Choice::Typed(i) = what {
@@ -5796,7 +5837,14 @@ impl Map {
                     ferros_sys::set_pref(cap(m.grants, S_SETTINGS), pref, v);
                 };
                 match row {
-                    Some(Choice::Base(code)) => set(self, ferros_sys::PREF_BASE, code),
+                    Some(Choice::Base(code)) => self.base_choose(code),
+                    Some(Choice::BaseFollow) => {
+                        if let Some(st) = ferros_sys::base::state() {
+                            if !ferros_sys::base::set_follow(cap(self.grants, S_SETTINGS), !st.follows) {
+                                self.zone_note = Some(Msg::KernelDidNotTake);
+                            }
+                        }
+                    }
                     // A slider tapped: its knob and its value there at once, as a drag would leave them; the scale is kept now (the lift that wrote a drag's has passed).
                     Some(c @ (Choice::Scale | Choice::Typed(_))) => {
                         self.slide_to(c, sx);

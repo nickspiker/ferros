@@ -255,6 +255,8 @@ pub fn text(m: Msg) -> &'static str {
         // ---- the language page ----
         Msg::LangOwn => "tắt: thiết bị này giữ ngôn ngữ riêng",
         Msg::LangIdentityNone => "danh tính của bạn chưa có ngôn ngữ: đặt ở đây, nó sẽ thành ngôn ngữ của danh tính",
+        Msg::BaseOwn => "tắt: thiết bị này giữ hệ cơ số riêng",
+        Msg::BaseIdentityNone => "danh tính của bạn chưa có hệ cơ số: đặt ở đây, nó sẽ thành hệ cơ số của danh tính",
         Msg::MoreLanguagesNeedFace => "thêm ngôn ngữ sẽ đến cùng một kiểu chữ vẽ được chúng",
         Msg::NotALanguage => "không phải ngôn ngữ thiết bị này có",
         // ---- About ----
