@@ -569,6 +569,22 @@ impl Client {
                         self.add_event(Flow::Grown { device, result: Err("this device does not hold the fleet key") });
                         continue;
                     };
+                    // Never a wrap for a locked device, whatever the machine was told: the job's members checked against the locked set of the chain this device holds now (`held`, which every adoption updates), and the grow refused when one of them is locked or no held chain folds (2026-11-22: a fan-out grown at fleet op 29 wrapped the locked 1be949c1, and the 3a's Photon minted 706917fe to heal it; ferros's machine fed only folded sets, so this holds whatever fed the machine).
+                    let locked = self.held.borrow().get(&hp).and_then(|b| b.locked_out().ok());
+                    let Some(locked) = locked else {
+                        self.log.put(b"fgtw: the fan-out grow REFUSED: no chain held here folds, so its members cannot be checked against the locked");
+                        self.log.line();
+                        self.add_event(Flow::Grown { device, result: Err("no held chain to check the grow's members against") });
+                        continue;
+                    };
+                    if let Some(k) = members.iter().find(|k| locked.contains(k)) {
+                        self.log.put(b"fgtw: the fan-out grow REFUSED: it would wrap ");
+                        self.log.fp(k);
+                        self.log.put(b", which the chain held here has locked out");
+                        self.log.line();
+                        self.add_event(Flow::Grown { device, result: Err("the grow would wrap a locked device") });
+                        continue;
+                    }
                     ferros_sys::pin(ferros_sys::CORES_BIG);
                     ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
                     fgtw::set_clock(eagle());
