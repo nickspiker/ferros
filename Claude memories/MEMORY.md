@@ -34,8 +34,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no em dashes](feedback_no_em_dashes.md) + [short spellings](feedback_short_spellings.md) - never em dashes in wire text or VSF `a`; thru, altho, thruout
 - [Feedback: no manual line wraps](feedback_no_line_wraps.md) - one sentence per line in comments; comment-gate enforces
 - [Feedback: count from zero](feedback_count_from_zero.md) - every numbered thing starts at 0 (D0, O0, levels, Zil)
-- [Feedback: number format](feedback_number_format.md) - G# hex, A# decimal, base in base36; never 0x in output
-- [Feedback: dozenal versioning](feedback_versioning.md) - spec versions Zil(0) Zila(1) Zilor(2) Ter(3)...
+- [Feedback: number format](feedback_number_format.md) + [dozenal versioning](feedback_versioning.md) - G# hex, A# decimal, never 0x; versions Zil(0) Zila(1) Zilor(2) Ter(3)
 - [Feedback: device, not phone](feedback_device_not_phone.md) - say "device"; ferros places no calls
 - [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) - one Photon everywhere (std/photon); no stripped copy
 - [Feedback: Photon cfg keeps Android](feedback_photon_cfg_keep_android.md) - twin cfgs go ABOVE the original's attributes
