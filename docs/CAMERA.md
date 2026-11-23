@@ -1925,6 +1925,11 @@ One Android boot (`diag android`, no flash), the kernel's i2c tracepoints under 
 The tele's capture puts the factory's near code at the HAL's minimum focus distance; the three cornerfolk lenses' near codes are taken the same way, unmeasured.
 
 **Next** (built on the owner's go): the tele's focus in the driver, humbaba's protocol beside the cornerfolk's (servo on, the target at G#0204/G#0205, the position at G#0208/G#0209), the list's `focus_infinity` 6668 and `focus_near` 13155; `focus_near_mm` on all four (105, 20, 100, 800). A device check: the tele's target written and its position read back across 6668 to 13155, and a sharpness rack on the owner's near and far targets.
+**Built and run (b39efa9d, the Pro b1137, the flashed 07f922ca kernel; the driver hand-spawned, then stored):**
+- The tele opens at infinity (6668), humbaba ready at its first read; camtest's sweep `1100000D031B33` (17 targets G#1B00 to G#3300): every target taken, the position read back within 4 of it (G#1AFF for G#1B00, G#2704 for G#2700, G#317F for G#3180), the open's 6668 read back exact.
+- Sharpness over the owner's near and far targets (the frame's middle half): 7 at the infinity end, rising to 10 at G#2280 to G#2400 (8832 to 9216, about 0.45 dioptres, 2.2 m), 7 again past G#2580: the lens racks and the scene comes into and out of focus.
+- The main's cornerfolk path unchanged (its open's G#1FD0 read back G#1FE4, G#5555 G#555C, G#8AAA G#8A98).
+- Stored: `camera` from b39efa9d (567473 bytes, blake3 b3468dc5...), read back equal; the one before (deca6b4f) kept in target/farm/camera-work/out/camera-before-b39efa9d.capsule.vsf.
 
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
