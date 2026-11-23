@@ -117,8 +117,9 @@ In bypass the right amplifier takes the second slot (DAC_PCM1_SRC = ASPRX2) itse
 - The volume's page and the sound circle's ring.
 - Whether a kist with `audio` may also open an alert stream, or alerts are a separate right.
 - Bluetooth and USB sinks: the same service, later. (The microphones are built: "Microphones" below.)
+- The microphones' gain: ferros sets none but the DC blocker, so the AoC's own defaults apply, and the first capture on the Pro (2026-11-22, a quiet room at night) peaked about 78 dB under full scale. Android sets a record soft gain of -40 dB at boot and raises it per use (5 dB unprocessed, 22 dB handset: mixer_paths.xml:240, :757-758, :847-848), by INPUT_SET_PARAMETER block 136, component 30, key 16 (hw.c:2236-2255; whole dB or float bits unknown, hw.c:2245), and the hardware gain by SET_MIC_HIGH_POWER_HW_GAIN (254, centibels, -720 to 240). Which gain a use wants (a call, a recording, a level meter) and who sets it is a decision still to make; the recording's playback is scaled from its own peak meanwhile, so the level heard does not depend on it.
 
-## Microphones (built 2026-11-22, research from source; not yet run on a device)
+## Microphones (built 2026-11-22, research from source; captured on the Pro that night, see "The rings' windows")
 
 husky has three built-in microphones, ids 0, 1 and 2 (mixer_paths.xml:750-753; the HAL's bottom, back and top for them are marked "fake data" by the HAL itself, so ferros names them by id). They are the AoC's, like the speaker: the AP asks for a capture on the input control queue `audio_input_control` and reads the ring `audio_capture0` (PCM device 8, `fe_ep1_tx`: gs101-audio.dtsi:63-205). The service's `mic.rs` and aoc.rs's capture section, every step with its source:
 
