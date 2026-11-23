@@ -1826,6 +1826,15 @@ The CSI link's interrupt words, named from the LWIS tables (zuma-isp-event-info.
 - The main at 8 and 2 rows with embedded data's other candidates off (its init's G#0118 alone does not stop channel 2), and with the frame left at the captured size (`F_KEEP_FE`, the front end whole) to see in memory how many lines a short frame carries.
 - The ultrawide at fll 96, 104, 112, 120: where the link stops counting.
 
+### The receive-side checks on the Pro (2026-11-22 evening, b1134, the flashed e5f4da21; camera-receive.bin hand-spawned, then the camera stored)
+
+- **The front's 2-row slit lands** with its PD channel at 1 line (geom's quarter rounded up, 7acde33f): 128 slits at 747 a second, none lost, 12 KiB buffers (3840 x 2 at G#12C0). Before, 0 lines and nothing.
+- **The ultrawide at 2 rows still refuses**: its PD channel now 1 line, but no PD rows start (+24 G#1, channel 0 alone) and the image channel reports VRESOL_MISMATCH (+1C G#40), loch0 G#414: the Sony sends another line count than its 2-row window, not found.
+- **The ultrawide's least frame at 4 rows is 104 lines**: 1269 a second at 120, 1360 at 112, **1465 at 104 (1483 drained, none lost, no error word)**, nothing at 96. In the list since 7acde33f.
+- **The tele at 16, 8, 4 and 2 rows refuses at every PD channel height tried** (1, 2, 4, 8, 16 lines, the driver's fifteenth spawn byte, read back as written): ERR_CRC_PH and VRESOL_MISMATCH each time, so its PD channel is not the only fault; its PD switch (G#0D00) is the next try.
+- **The main at 8 and 2 rows with its PD and embedded data left on** (`F_LOUD`) refuses as quiet does: the side channels are not what stops its short frames.
+- **Stored**: `camera` from 7acde33f (566689 bytes, blake3 663d5577...), read back equal, restarted idle; the one before (564929 bytes, blake3 9ddd2682..., 7617f691) kept in target/farm/camera-work/out/camera-before-7acde33f.capsule.vsf. The camera's interface with the kernel is e5f4da21's (ferros_sys since adds only calls it does not make).
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
