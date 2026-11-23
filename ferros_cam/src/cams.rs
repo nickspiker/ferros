@@ -361,8 +361,9 @@ pub const TELE: Cam = Cam {
     release: &[0x01, 0x04, 0x00, 0x01],
     actuator: 0x61,
     lens: Lens::Humbaba,
-    // The span Android drove (2026-11-22): its slider's far end 6668 to its near end 13155 (80 cm), eight steps between linear in dioptres; the lens's travel past them unmeasured, so the span offered is that one.
-    focus: (6668, 13155),
+    // Its travel, measured on the Pro (2026-11-22, b1137, every target read back): from G#0100 (256, read G#00FF) to G#3F00 (16128, read G#3EEC), every target G#100 apart below infinity within 7 of it and G#400 apart above the near point up to G#3B00 within 2; past G#3F00 the position reads G#3FF2 to G#3FFF whatever the target (its 14-bit end).
+    // So 6412 below Android's infinity (6668: about 1.24 dioptres past it at Android's 5190 a dioptre) and 2973 past its near point (13155, 80 cm: to about 1.82 dioptres, 55 cm); 0 itself unmeasured.
+    focus: (256, 16128),
     // The factory's AF calibration ("rear tele", persist /camera/AF_calibration.cal) is infinity 7050 and near 13538 in humbaba's own units; Android drives both 382 lower, so these are Android's.
     focus_cal: FocusCal { infinity: 6668, near: 13155, near_mm: NEAR_MM[3] },
     streams: true,
