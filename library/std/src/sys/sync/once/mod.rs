@@ -15,6 +15,7 @@ cfg_select! {
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "freebsd",
         target_os = "motor",
+        target_os = "ferros",
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "fuchsia",

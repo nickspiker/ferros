@@ -82,6 +82,9 @@ pub fn exit(code: i32) -> ! {
         target_os = "motor" => {
             moto_rt::process::exit(code)
         }
+        target_os = "ferros" => {
+            ferros_rt::exit(code)
+        }
         all(target_vendor = "fortanix", target_env = "sgx") => {
             crate::sys::pal::abi::exit_with_code(code as _)
         }

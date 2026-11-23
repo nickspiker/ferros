@@ -24,6 +24,10 @@ cfg_select! {
         mod motor;
         pub use self::motor::*;
     }
+    target_os = "ferros" => {
+        mod ferros;
+        pub use self::ferros::*;
+    }
     target_os = "trusty" => {
         mod trusty;
         pub use self::trusty::*;

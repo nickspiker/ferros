@@ -2535,6 +2535,8 @@ impl Child {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "process_exit")]
 pub fn exit(code: i32) -> ! {
+    // ferros: the exit syscall alone, one shot, nothing flushed or cleaned up on the way out (owner, 2026-11-08).
+    #[cfg(not(target_os = "ferros"))]
     crate::rt::cleanup();
     crate::sys::exit::exit(code)
 }

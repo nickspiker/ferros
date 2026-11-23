@@ -7,6 +7,7 @@ cfg_select! {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "motor",
+        target_os = "ferros",
         target_os = "fuchsia",
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",

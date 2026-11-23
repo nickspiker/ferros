@@ -710,13 +710,23 @@ static STDOUT: OnceLock<ReentrantLock<RefCell<LineWriter<StdoutRaw>>>> = OnceLoc
 /// ```
 ///
 /// [`flush`]: Write::flush
+// ferros: stdout holds nothing back (a LineWriter of no capacity writes straight through), so an exit, which flushes nothing (owner, 2026-11-08: every end is one shot dead), loses no output.
+#[cfg(target_os = "ferros")]
+fn stdout_writer() -> LineWriter<StdoutRaw> {
+    LineWriter::with_capacity(0, stdout_raw())
+}
+#[cfg(not(target_os = "ferros"))]
+fn stdout_writer() -> LineWriter<StdoutRaw> {
+    LineWriter::new(stdout_raw())
+}
+
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "io_stdout")]
 pub fn stdout() -> Stdout {
     Stdout {
         inner: STDOUT
-            .get_or_init(|| ReentrantLock::new(RefCell::new(LineWriter::new(stdout_raw())))),
+            .get_or_init(|| ReentrantLock::new(RefCell::new(stdout_writer()))),
     }
 }
 

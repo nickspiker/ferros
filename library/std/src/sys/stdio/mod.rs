@@ -17,6 +17,10 @@ cfg_select! {
         mod motor;
         pub use motor::*;
     }
+    target_os = "ferros" => {
+        mod ferros;
+        pub use ferros::*;
+    }
     target_os = "solid_asp3" => {
         mod solid;
         pub use solid::*;

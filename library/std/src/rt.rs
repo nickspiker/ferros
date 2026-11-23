@@ -184,6 +184,8 @@ fn lang_start_internal(
         });
         let ret_code = ret_code as isize;
 
+        // ferros: main's return is a plain exit (ferros_rt `rt_main`), one shot, with nothing flushed or cleaned up on the way out (owner, 2026-11-08: every end is one shot dead; ferros docs/KISTS.md).
+        #[cfg(not(target_os = "ferros"))]
         cleanup();
         // Guard against multiple threads calling `libc::exit` concurrently.
         // See the documentation for `unique_thread_exit` for more information.
