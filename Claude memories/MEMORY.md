@@ -10,8 +10,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Pro and 8a unlock at boot](pro_unlocks_at_boot.md) - since 2026-11-17 no handle after reloads/flashes on either; Pro overnight flashes OK
 - [Feedback: Harbor tmp is scratch](feedback_harbor_tmp_is_scratch.md) - owner clears it at will; agents build in scratchpads; device data in keys/<device>/
 - [Feedback: deploy sites freely](feedback_deploy_sites_ok.md) - fgtw.org, passless.org, ferros.org deploys need no go; keys/handles rules hold
-- [Feedback: don't SSH](feedback_no_ssh.md) - never SSH into another machine unless told to
-- [Feedback: no Google connectors](feedback_no_google_connectors.md) - owner doesn't use Google; ignore those auth notices
+- [Feedback: don't SSH](feedback_no_ssh.md) + [no Google connectors](feedback_no_google_connectors.md) - never SSH into another machine unless told; ignore Google auth notices
 - [Feedback: lock prep, never the lock](feedback_lock_prep_not_lock.md) - never run `fastboot flashing lock`; no risk unattended
 - [Cellular bring-up authorized](cellular_start_authorized.md) - bring up any radio stack; never place a call/SMS/911 myself
 - [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) - ask whose device + identity first
@@ -59,6 +58,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Owner decisions 2026-11-19](owner_decisions_2026_11_19.md) - approved: RAW video first, heat any method, GPU fence + host Mesa; NOT approved: gnss/fgtw fetch, camera cap, A510s, gain floor, motion right
 - [Owner decisions 2026-11-21 night](owner_decisions_2026_11_21_night.md) - GPU + hardware after a jump; build GPU compose now; promo Photon (Opsin in) + Lumis (RAW, 4 cams)
 - [Owner decisions 2026-11-22](owner_decisions_2026_11_22.md) - flush per commit; 3a key adopted; cam power stays in kernel; slide 1/24; full-range focus; Mahere GUI free rein
+- [Owner decisions 2026-11-23](owner_decisions_2026_11_23.md) - founding rules; storage to his specs; NO-CEILINGS all yes; the Pro's data disposable
 - [Owner directions 2026-10-27](owner_directions_2026_10_27.md) - windows, arcs, drivers out, attest at boot, HashMap rule
 - [No baked apps](no_baked_apps.md) - one built-in circle (settings); no identity = no way past attest
 - [ferros attest is OS-level](ferros_attest_os_level.md) - payloads/ahau at boot; ira unlocks drivers, identity the rest
