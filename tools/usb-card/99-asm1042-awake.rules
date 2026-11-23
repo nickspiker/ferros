@@ -1,0 +1,9 @@
+# Keep the dev box's ASMedia ASM1042 USB card (PCI 1b21:1042) and everything behind it out of power saving.
+# The card's controller died ("xHCI host controller not responding, assume dead") about hourly while the Pro and the 8a were busy on it (2026-11-22), each time near a device reboot or mode switch; its root hubs and ASM107x hubs were runtime-suspending (power/control "auto").
+# Install: tools/usb-card/install.sh (root).
+
+# The card: runtime PM off, and PCIe ASPM (L0s and L1) cleared in the Link Control register of the card and of the bridge port above it.
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x1b21", ATTR{device}=="0x1042", ATTR{power/control}="on", RUN+="/usr/bin/setpci -s %k CAP_EXP+0x10.w=0x0000:0x0003", RUN+="/bin/sh -c 'p=$$(basename $$(dirname /sys%p)); /usr/bin/setpci -s $$p CAP_EXP+0x10.w=0x0000:0x0003'"
+
+# Every USB hub and device behind the card stays awake.
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTRS{vendor}=="0x1b21", ATTRS{device}=="0x1042", TEST=="power/control", ATTR{power/control}="on"

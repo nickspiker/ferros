@@ -1,0 +1,10 @@
+[Unit]
+Description=Rebind a USB host controller the kernel declared dead (tools/usb-card/xhci-revive.sh)
+After=systemd-journald.service
+
+[Service]
+ExecStart=/usr/local/sbin/xhci-revive.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
