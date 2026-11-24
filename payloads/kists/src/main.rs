@@ -72,6 +72,8 @@ static WATCHER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STA
 static OFFER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
 /// The fleet answerer's stack (`fleet_answer`): its buffer is on the heap.
 static ANSWER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
+/// The fleet probe's stack (`fleet_probe`): its piece is on the heap.
+static PROBE_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
 /// A capsule's piece over the fleet (fgtw ops 38 and 40, payloads/fgtw `CAPSULE_PIECE`, the same): one `capsule_piece` frame over Photon Transport, which carries it in its own BLAKE3-checked pieces.
 const FLEET_PIECE: usize = 1 << 16;
 /// The piece being filled: in the arc (.bss), where a syscall's bytes land (never the heap's start, a DMA region in some processes; here the heap is in the arc too).
@@ -209,6 +211,10 @@ struct State {
     dir_wanted: bool,
     restore_wanted: bool,
     jobs: Vec<Job>,
+    /// The fleet's ask for a capsule's first piece, made on its own thread while the worker asks the web (`fleet_probe`).
+    probe: Probe,
+    /// The fleet answered nobody in time during this restore pass: not asked again until the next pass (the space moved, the page opened), so devices only heard never hold a capsule up.
+    fleet_quiet: bool,
 }
 
 /// The state the server, the worker and the space watcher share, behind a spin lock (held for a few copies at a time; nothing that waits is done under it).
@@ -435,11 +441,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init((&raw const __bss_end) as usize, _input as usize, _input_len as usize) };
     GRANTS.store(grants, Ordering::Relaxed);
-    unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_gen: 0, dir_wanted: false, restore_wanted: true, jobs: Vec::new() }) };
+    unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_gen: 0, dir_wanted: false, restore_wanted: true, jobs: Vec::new(), probe: Probe::Idle, fleet_quiet: false }) };
     ferros_sys::thread_spawn(worker, unsafe { &mut *WORKER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(space_watch, unsafe { &mut *WATCHER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(offer_watch, unsafe { &mut *OFFER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(fleet_answer, unsafe { &mut *ANSWER_STACK.0.get() }, grants);
+    ferros_sys::thread_spawn(fleet_probe, unsafe { &mut *PROBE_STACK.0.get() }, grants);
     say(b"kists: serving the stower (kists); a restore follows the identity service\n");
     serve(grants)
 }
@@ -914,6 +921,8 @@ fn unhide(grants: u64, developer: &[u8; 32], option: &[u8; 32]) {
 
 /// A restore pass: a job for each capsule the person's list names that this device lacks (the list came back from their fleet after a reset, or a kist was stowed on another of their devices).
 fn restore_pass(grants: u64) {
+    // A new pass asks the fleet again.
+    with(|s| s.fleet_quiet = false);
     // What this device leaves off its deck (an unstow "this device only") is not brought back.
     let Some(list) = ferros_kist::store::read_here(cap(grants, S_KISTS)) else { return };
     icon_pass(grants, &list);
@@ -973,21 +982,29 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
     let k = list.by_capsule(&job.capsule).cloned().ok_or(WHY_NOT_LISTED)?;
     let began = now();
-    let mut why = match bring(grants, i, Origin::Fleet, &job.capsule, None, &k.developer, &k.option, None, true) {
-        Ok((_, admitted)) => return restored(grants, i, job, &k, &admitted, "a fleet device", began),
-        // The next source only for a capsule this one did not have; a capsule that failed its checks fails the same anywhere.
-        Err(w @ (WHY_NETWORK | WHY_MISSING | WHY_BROKEN)) => w,
-        Err(w) => return Err(w),
-    };
+    // The fleet and the web together (2026-11-24: a fleet of devices only heard cost each capsule the whole ask time): the fleet's ask for the first piece goes out on its own thread, and the developer's entry is fetched from fgtw.org meanwhile. A fleet device that answered by then is taken (the fleet preferred); one still asking is left, and the web goes on.
+    let asked = probe_start(&job.capsule);
+    let entry = entry_by_hash(grants, &job.capsule, &k.developer, &k.option, &list);
+    let mut why = WHY_MISSING;
+    if asked {
+        if let Some(first) = probe_take(&job.capsule) {
+            match bring(grants, i, Origin::Fleet(Some(&first)), &job.capsule, None, &k.developer, &k.option, None, true) {
+                Ok((_, admitted)) => return restored(grants, i, job, &k, &admitted, "a fleet device", began),
+                // The next source only for a capsule this one did not have; a capsule that failed its checks fails the same anywhere.
+                Err(w @ (WHY_NETWORK | WHY_MISSING | WHY_BROKEN)) => why = w,
+                Err(w) => return Err(w),
+            }
+        }
+    }
     let mut sources: Vec<(String, Option<Entry>)> = Vec::new();
     let mut add = |u: &str, e: Option<&Entry>| {
         if !sources.iter().any(|(s, _)| s == u) {
             sources.push((String::from(u), e.cloned()));
         }
     };
-    if let Some(e) = entry_by_hash(grants, &job.capsule, &k.developer, &k.option, &list) {
+    if let Some(e) = &entry {
         for u in &e.web {
-            add(u, Some(&e));
+            add(u, Some(e));
         }
     }
     if let Some(u) = &k.source {
@@ -1037,15 +1054,15 @@ fn restored(grants: u64, i: usize, job: &Job, k: &ferros_kist::Kist, admitted: &
 /// Where `bring` takes a capsule's bytes from.
 #[derive(Clone, Copy)]
 enum Origin<'a> {
-    /// The person's other devices (docs/IDENTITY-SPACE.md "Capsules", source 2): `fleet_get`.
-    Fleet,
+    /// The person's other devices (docs/IDENTITY-SPACE.md "Capsules", source 2): `fleet_get`, from the first piece the probe already brought ([`Probed`]).
+    Fleet(Option<&'a Probed>),
     /// Plain HTTP (net.rs).
     Url(&'a str),
 }
 
 /// A capsule from the person's own devices (docs/IDENTITY-SPACE.md "Capsules", source 2): fgtw op 38 a piece at a time, each a `capsule_want` over Photon Transport to the fleet's devices heard (the one that served the piece before it alone, after the first), answered from that device's `capsules.` by its stower (`fleet_answer`). Each piece goes to `body` as an HTTP body's bytes do, so the same Intake, vault pieces and checks follow; the bytes are trusted no more than a server's.
 /// Missing when no device has it (none heard, each said none or was given up on, or none answered in time: fgtw's `capsule::ASK_US`), Network when the identity service is not serving.
-fn fleet_get(grants: u64, capsule: &[u8; 32], size: Option<u64>, length: &core::cell::Cell<u64>, mut body: impl FnMut(&[u8]) -> Result<(), &'static str>) -> Result<(), net::Fail> {
+fn fleet_get(grants: u64, capsule: &[u8; 32], size: Option<u64>, first: Option<&Probed>, length: &core::cell::Cell<u64>, mut body: impl FnMut(&[u8]) -> Result<(), &'static str>) -> Result<(), net::Fail> {
     let svc = cap(grants, S_FGTW);
     let mut ask = [0u8; 41];
     ask[0] = 38;
@@ -1053,9 +1070,17 @@ fn fleet_get(grants: u64, capsule: &[u8; 32], size: Option<u64>, length: &core::
     // On the heap, in the arc: [0][the whole length u64 LE][the bytes].
     let mut reply = alloc::vec![0u8; 9 + FLEET_PIECE];
     let mut at = 0u64;
+    let mut probed = first;
     loop {
         ask[33..41].copy_from_slice(&at.to_le_bytes());
-        let n = ferros_sys::call_live(svc, &ask, &mut reply);
+        // The first piece as the probe already took it, the rest asked here.
+        let n = match probed.take() {
+            Some(p) => {
+                reply[..p.reply.len()].copy_from_slice(&p.reply);
+                p.reply.len() as u64
+            }
+            None => ferros_sys::call_live(svc, &ask, &mut reply),
+        };
         if n == ERR {
             return Err(net::Fail::Network);
         }
@@ -1078,6 +1103,86 @@ fn fleet_get(grants: u64, capsule: &[u8; 32], size: Option<u64>, length: &core::
         at += got as u64;
         if at >= total {
             return Ok(());
+        }
+    }
+}
+
+/// The fleet's answer to the probe: the first piece's reply as fgtw op 38 gave it ([0][the whole length u64 LE][the bytes]).
+#[derive(Clone)]
+struct Probed {
+    reply: Vec<u8>,
+}
+
+/// The fleet probe's state, one capsule at a time.
+#[derive(Clone)]
+enum Probe {
+    Idle,
+    /// Asked for this capsule's first piece; the probe thread holds the call.
+    Asking([u8; 32]),
+    /// A fleet device answered with its first piece.
+    Answered([u8; 32], Probed),
+    /// Nobody answered (each said none, was given up on, or did not answer in time).
+    Nobody,
+}
+
+/// The probe's doorbell: moved on when there is a capsule to ask the fleet for.
+static PROBE_WORD: AtomicU64 = AtomicU64::new(0);
+
+/// The fleet asked for this capsule's first piece on the probe's thread. False when not asked: the probe still holds an earlier ask (a sibling that has not answered that one is not asked another), or the fleet answered nobody earlier in this pass.
+fn probe_start(capsule: &[u8; 32]) -> bool {
+    let started = with(|s| {
+        if s.fleet_quiet || matches!(s.probe, Probe::Asking(_)) {
+            return false;
+        }
+        s.probe = Probe::Asking(*capsule);
+        true
+    });
+    if started {
+        PROBE_WORD.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&PROBE_WORD, 1);
+    }
+    started
+}
+
+/// The fleet's first piece of this capsule, if a device answered by now; None when it answered nobody or is still asking (the web goes on, and a late answer is left unused).
+fn probe_take(capsule: &[u8; 32]) -> Option<Probed> {
+    with(|s| match &s.probe {
+        Probe::Answered(c, p) if c == capsule => {
+            let p = p.clone();
+            s.probe = Probe::Idle;
+            Some(p)
+        }
+        _ => None,
+    })
+}
+
+/// The fleet probe (2026-11-24): each capsule's first piece asked of the person's devices (fgtw op 38) on this thread, held as long as fgtw holds it (its own ask time, `capsule::ASK_US`), while the worker asks the web. Nobody answering marks the fleet quiet for the rest of the restore pass.
+extern "C" fn fleet_probe(grants: u64) -> ! {
+    let svc = cap(grants, S_FGTW);
+    let mut reply = alloc::vec![0u8; 9 + FLEET_PIECE];
+    loop {
+        let seen = PROBE_WORD.load(Ordering::Acquire);
+        let asking = with(|s| if let Probe::Asking(c) = s.probe { Some(c) } else { None });
+        let Some(capsule) = asking else {
+            ferros_sys::wait_world(&PROBE_WORD, seen, 0);
+            continue;
+        };
+        let mut ask = [0u8; 41];
+        ask[0] = 38;
+        ask[1..33].copy_from_slice(&capsule);
+        let n = ferros_sys::call_live(svc, &ask, &mut reply);
+        let answered = n != ERR && n >= 10 && reply[0] == 0;
+        with(|s| {
+            if answered {
+                // WHY the min: `n` is what fgtw sent, which may be more than the buffer took.
+                s.probe = Probe::Answered(capsule, Probed { reply: reply[..(n as usize).min(reply.len())].to_vec() });
+            } else {
+                s.probe = Probe::Nobody;
+                s.fleet_quiet = true;
+            }
+        });
+        if !answered {
+            say(b"kists: the fleet answered nobody for a capsule: not asked again in this restore pass\n");
         }
     }
 }
@@ -1540,7 +1645,7 @@ fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<
         Ok(())
     };
     let r = match origin {
-        Origin::Fleet => fleet_get(grants, expect, size, &length, body),
+        Origin::Fleet(first) => fleet_get(grants, expect, size, first, &length, body),
         Origin::Url(url) => net::get(
             cap(grants, S_UDP),
             url,
