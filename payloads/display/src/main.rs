@@ -897,8 +897,10 @@ struct Circle {
     /// Its state (op 57, `ferros_glow::Glow` as its byte; 0 none, the theme's glow by `ring` as ever) and the count of things waiting on the person that widens a for-you glow.
     glow: u8,
     count: u16,
+    /// Its loading pie (op 87, ferros_glow::pie): the three stages' shares, `Shares::DONE` while it is not loading (all three whole is the icon itself).
+    pie: ferros_glow::pie::Shares,
 }
-const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0 };
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0, pie: ferros_glow::pie::Shares::DONE };
 
 /// A circle's state glow (owner, 2026-11-11, on the device: "we just need to change the colour and add the multiply for the negative channel"; then "black-none, running, 500nm, stopped, 600 and for you 400"): the theme's glow (`draw::glow_log`, its falloff, its reach of 1/`GLOW_FRACTION` of the radius, its peaks) with its colour, peak and multiply from ferros_glow, as (colour, peak, reach divisor, multiply Q16). None for a circle with no state; not running is no light, a ring of darkness (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell").
 /// - Colour: the state's wavelength, its positive channels (linear VSF RGB) at the photopic luminance of the theme's ring colour (the glow every circle had), as 8-bit gamma 2 codes as the theme's colours are.
@@ -2306,7 +2308,10 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
             let th = ferros_sys::theme::current();
             if let Some(px) = px {
                 let full = draw::Rect::full(width, height);
-                if puck::is_puck(cir.icon) {
+                // Loading: its pie, as the deck shows it (op 87).
+                if cir.pie != ferros_glow::pie::Shares::DONE {
+                    draw::pie(px, width, height, cx, cy, rr, 1 << 14, 0, icon_mips(cir.icon), cir.pie);
+                } else if puck::is_puck(cir.icon) {
                     if !puck::draw_into(px, width, full, (cir.icon - puck::PUCK0) as usize, cx, cy, rr, 1 << 14, 0) {
                         draw::disc(px, width, height, cx, cy, rr, th.plane & 0x00FF_FFFF);
                     }
@@ -2641,6 +2646,8 @@ enum Item {
     Glow(i64, i64, i64, u32, u32, i64, u32),
     /// A puck's square sampled into its circle (`puck::draw_into`): the puck, centre, radius (Q8), the face's turn (Q14). On the list so its rows are drawn by bands across the threads (2026-11-20, the Pro: 14 ms a box on the render thread alone).
     Puck(usize, i64, i64, i64, i64, i64),
+    /// A loading circle (`draw::pie`): centre, radius (Q8), turn (Q14), its icon's chain (0 for none: the grey), its shares (`Shares::key`).
+    Pie(i64, i64, i64, i64, i64, usize, u64),
 }
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
@@ -2653,7 +2660,7 @@ impl Item {
     fn rows(&self) -> (i64, i64) {
         match *self {
             Item::Blit(_, _, d, _, oy) => (oy, oy + d as i64),
-            Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
+            Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) | Item::Pie(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
             // Its edge a row further up than a disc's (`puck::draw_into` starts a row above the circle).
             Item::Puck(_, _, y, r, _, _) => (((y - r) >> 8) - 1, ((y + r) >> 8) + 3),
             Item::Glow(_, y, r, _, _, frac, _) => {
@@ -2676,6 +2683,10 @@ impl Item {
             }
             Item::Icon(x, y, r, c, s, mp, _) => {
                 draw::icon(px, width, height, x, y, r, c, s, unsafe { &*(mp as *const draw::Mips) });
+            }
+            Item::Pie(x, y, r, c, s, mp, key) => {
+                let shares = ferros_glow::pie::Shares { blue: key as u16, green: (key >> 16) as u16, red: (key >> 32) as u16 };
+                draw::pie(px, width, height, x, y, r, c, s, (mp != 0).then(|| unsafe { &*(mp as *const draw::Mips) }), shares);
             }
             Item::Glow(x, y, r, colour, peak, frac, dark) => {
                 if GLOW_LOG {
@@ -3294,10 +3305,10 @@ static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood; 87, the loading pies) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85 | 87)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -8895,7 +8906,7 @@ fn server(grants: u64) -> ! {
                         let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
                         let mut label = [0u8; 16];
                         label.copy_from_slice(&m[at + 14..at + 30]);
-                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0, glow: 0, count: 0 };
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0, glow: 0, count: 0, pie: ferros_glow::pie::Shares::DONE };
                         unsafe {
                             SCENE[SCENE_N] = c;
                             SCENE_N += 1;
@@ -8971,6 +8982,31 @@ fn server(grants: u64) -> ! {
                         // An unknown state byte (a newer map) draws as none (`ferros_glow::Glow::from_u8`).
                         c.glow = m[at + 1];
                         c.count = u16::from_le_bytes([m[at + 2], m[at + 3]]);
+                    }
+                }
+                // 87 `loading [count u8] then per circle [scene index u8][blue u16][green u16][red u16]`: each circle's loading pie (ferros_glow::pie, docs/KISTS.md "The loading pie"), its stages' shares in Q15 (whole 1 << 15); all three whole ends it (the circle's own icon again).
+                // A fresh scene (op 13) starts every circle not loading.
+                // The system's alone (the map), so in `names_surface`: a kist's would paint over another kist's circle.
+                // → [0], or [1] refused: not the system's, a record short, past the scene or a share past whole (queued, so its caller is answered 0 before it runs).
+                Some(87) if m.len() >= 2 => {
+                    if !system(unsafe { HOLDS }) {
+                        out[0] = 1;
+                    } else {
+                        unsafe { LAST_FRAME.1 = 0 };
+                        LAST_FRAME_CLEARED.store(87, Ordering::Relaxed);
+                        client_owned = true;
+                        unsafe { CLIENT_DREW = true };
+                        unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
+                        for k in 0..m[1] as usize {
+                            let at = 2 + k * 7;
+                            // WHY the tests: the message is the map's; a short one or an index past the scene would read or write past what is there, and a share past whole is outside the sweep's proven range (`Shares::read`).
+                            let shares = if at + 7 <= m.len() && (m[at] as usize) < unsafe { SCENE_N } { ferros_glow::pie::Shares::read(m[at + 1..at + 7].try_into().expect("seven bytes, by the test")) } else { None };
+                            let Some(shares) = shares else {
+                                out[0] = 1;
+                                break;
+                            };
+                            unsafe { (*(&raw mut SCENE[m[at] as usize])).pie = shares };
+                        }
                     }
                 }
                 Some(14) if m.len() >= 13 => {
@@ -9220,8 +9256,10 @@ fn server(grants: u64) -> ! {
                             let stroke = ferros_sys::theme::index() as i64;
                             let lit = cir.lit != 0;
                             let ri = sr;
+                            // Loading (op 87): the pie, below, in place of a puck's square or the plain icon.
+                            let loading = cir.pie != ferros_glow::pie::Shares::DONE;
                             // A puck (puck.rs, docs/PUCKS.md): the square its kist drew, trimmed to its circle and placed, turned and scaled from the turn and size it was drawn at to the face's now, the theme's plane under it; cached as an icon is while its key (the square, the size, the turn) stays, drawn straight onto the canvas while the circle moves.
-                            if puck::is_puck(cir.icon) {
+                            if puck::is_puck(cir.icon) && !loading {
                                 let j = (cir.icon - puck::PUCK0) as usize;
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
                                 // The face's turn, as `puck::seen` gave it to the puck: the camera's and the circle's own.
@@ -9287,15 +9325,20 @@ fn server(grants: u64) -> ! {
                             let mp = icon_mips(cir.icon);
                             let d = (2 * ((sr >> 8) + 3)) as usize;
                             let mut r = draw::Rect::EMPTY;
-                            let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
-                            unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
+                            // The loading pie's shares ride in the key beside `lit` (48 bits above it), so a sprite is drawn again whenever a stage moves.
+                            let key = [sr, stroke, tc, ts, lit as i64 | (cir.pie.key() as i64) << 1, cir.icon as i64];
+                            let still = unsafe { LAST_KEY[i] == key };
+                            unsafe { LAST_KEY[i] = key };
                             if d <= SPRITE_MAX && still && !unsafe { REGION_ON } && sprite_room(i, d) {
                                 // Cached: drawn at the sprite's centre pixel, then blitted.
-                                let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
                                 let (spr, ext) = sprite(i, key, d, |px, d| {
                                     let c = ((d as i64 / 2) << 8) | 128;
                                     // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
                                     match mp {
+                                        // Loading: its icon (or the grey, for a puck or an icon not held) under its three sweeps.
+                                        _ if loading => {
+                                            draw::pie(px, d, d, c, c, ri, tc, ts, mp, cir.pie);
+                                        }
                                         // The ferros mark in its own colours, on black (owner, 2026-11-07): the mark first, the black disc under it.
                                         _ if cir.icon == ICON_FERROS => {
                                             draw::logo(px, d, d, c, c, ri, tc, ts, true);
@@ -9315,7 +9358,9 @@ fn server(grants: u64) -> ! {
                                 scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
                                 unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
                             } else {
-                                if cir.icon == ICON_FERROS {
+                                if loading {
+                                    scene_push(Item::Pie(sx, sy, ri, tc, ts, mp.map_or(0, |m| m as *const draw::Mips as usize), cir.pie.key()), pixels, width, height);
+                                } else if cir.icon == ICON_FERROS {
                                     // While something moves, by rings and segments without antialiasing (`draw::logo_hard`); at rest antialiased.
                                     scene_push(Item::Logo(sx, sy, ri, tc, ts, moving), pixels, width, height);
                                     scene_push(Item::Disc(sx, sy, ri, 0, moving), pixels, width, height);
@@ -9324,7 +9369,7 @@ fn server(grants: u64) -> ! {
                                 }
                                 let t_d = now();
                                 unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                                if mp.is_none() && cir.icon != ICON_FERROS {
+                                if mp.is_none() && cir.icon != ICON_FERROS && !loading {
                                     scene_push(Item::Disc(sx, sy, ri, fill, moving), pixels, width, height);
                                 }
                                 r = draw::Rect::EMPTY;

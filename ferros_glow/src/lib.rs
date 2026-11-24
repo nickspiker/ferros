@@ -17,6 +17,9 @@
 
 #![no_std]
 
+/// A loading circle's pie: three sweeps, one per channel, multiplying the circle's icon (docs/KISTS.md "The loading pie").
+pub mod pie;
+
 use vsf::colour::convert::{apply_matrix_3x3_f32, vsf_rgb_to_photopic_f32};
 use vsf::colour::spectral::constants::{LMS2VSF_RGB, LMS_2000_10DEG_1NM};
 

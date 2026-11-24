@@ -568,21 +568,44 @@ fn mix(a: Px, b: Px, w: u64) -> Px {
 /// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there, always in its own colours: a circle's graphic stays the same for recognisability, and its glow says its state (owner, 2026-11-08; until then a quiet circle drew its grey). Returns the rectangle it touched.
 /// Scaled as it is drawn from the icon at its own size, never kept at the circle's (2026-11-20), and smooth in the circle's size: the two mip levels about the disc's width, each bilinear, mixed by a C∞ step of where the width sits between them (`bump_step` of the fraction of λ = log2(level 0's side / the disc's width)), so a circle growing or shrinking never steps from one level to the next. Level 0 alone at or above its own width; the last level alone below its width.
 pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips) -> Rect {
+    layer(px, width, height, cx, cy, r, c, s, Some(m), 0, None)
+}
+
+/// The grey a loading circle shows under its sweeps where it has no icon (a puck, or a kist whose icon the display does not hold yet): the owner's "black/grey" (2026-11-24), black where no sweep has passed and this grey where all three have.
+/// A neutral grey, not the theme's: each sweep shows only its own channel of it, and a tinted theme colour would hide a channel (night's ring has almost no green or blue).
+pub const PIE_GREY: u32 = 0x808080;
+
+/// A loading circle (ferros_glow::pie, docs/KISTS.md "The loading pie"): its icon, or `PIE_GREY` where it has none, inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 as `icon` is, with each colour channel multiplied by its stage's sweep from the circle's own top, clockwise (red the final steps, green the checks, blue the download), under what is there.
+/// The sweeps turn with the icon, so a circle turned on the deck starts its pie at the icon's top.
+/// Returns the rectangle it touched.
+pub fn pie(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: Option<&Mips>, shares: ferros_glow::pie::Shares) -> Rect {
+    layer(px, width, height, cx, cy, r, c, s, m, opaque(PIE_GREY), Some(shares.turns()))
+}
+
+/// `icon`'s and `pie`'s one loop: the icon `m` sampled (or `solid` where there is none), scaled by the disc's coverage, multiplied channel by channel by the sweeps `turns` when it is loading, and put under the pixel.
+fn layer(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: Option<&Mips>, solid: Px, turns: Option<[f32; 3]>) -> Rect {
     if r < 256 {
         return Rect::EMPTY;
     }
-    // Octaves from level 0 down to the disc's width (2r/256 pixels).
-    let lambda = libm::log2f(m.size as f32 * 128. / r as f32);
-    let (l, w) = if lambda <= 0. {
-        (0, 0)
-    } else {
-        // WHY the min: past the last level's octave there is no level below to take; the last level is drawn alone, as the chain's end.
-        let l = (lambda as usize).min(m.levels - 1);
-        // `lambda - l` is in [0, 1) while a next level exists, the step's own domain.
-        (l, if l + 1 < m.levels { (bump_step(lambda - l as f32) * 256. + 0.5) as u64 } else { 0 })
+    let (l, w) = match m {
+        None => (0, 0),
+        Some(m) => {
+            // Octaves from level 0 down to the disc's width (2r/256 pixels).
+            let lambda = libm::log2f(m.size as f32 * 128. / r as f32);
+            if lambda <= 0. {
+                (0, 0)
+            } else {
+                // WHY the min: past the last level's octave there is no level below to take; the last level is drawn alone, as the chain's end.
+                let l = (lambda as usize).min(m.levels - 1);
+                // `lambda - l` is in [0, 1) while a next level exists, the step's own domain.
+                (l, if l + 1 < m.levels { (bump_step(lambda - l as f32) * 256. + 0.5) as u64 } else { 0 })
+            }
+        }
     };
-    let fine = Level::new(m, l, r, c, s);
-    let coarse = (w > 0).then(|| Level::new(m, l + 1, r, c, s));
+    let fine = m.map(|m| Level::new(m, l, r, c, s));
+    let coarse = m.filter(|_| w > 0).map(|m| Level::new(m, l + 1, r, c, s));
+    // The turn as floats, for the sweeps' frame: the circle's own (u right, v down), the inverse turn of the screen's offset as the icon's texels take it.
+    let (cf, sf) = (c as f32 * (1. / (1 << 14) as f32), s as f32 * (1. / (1 << 14) as f32));
     let (bx0, by0, bx1, by1) = bounds(width, height);
     // The edge's coverage, as `disc` computes it: 128 − (d² − r²)·k >> 24, with k = 255 / 2r in Q24.
     let r2 = r * r;
@@ -599,14 +622,22 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
         }
         let (ox, oy) = ((x0 << 8) + 128 - cx, (y << 8) + 128 - cy);
         let dy2 = oy * oy;
-        let (mut u, mut v) = fine.start(ox, oy);
+        let (mut u, mut v) = fine.as_ref().map_or((0, 0), |f| f.start(ox, oy));
         let (mut u1, mut v1) = coarse.as_ref().map_or((0, 0), |k| k.start(ox, oy));
         let row = &mut px[rowb + x0 as usize..=rowb + x1 as usize];
         for (n, p) in row.iter_mut().enumerate() {
             if *p >> 48 != 0xFFFF {
-                let mut t = fine.at(u, v);
+                let mut t = match &fine {
+                    Some(f) => f.at(u, v),
+                    None => solid,
+                };
                 if let Some(k) = &coarse {
                     t = mix(t, k.at(u1, v1), w);
+                }
+                // Loading: each channel by its sweep's coverage at this pixel's place in the circle's own frame.
+                if let Some(turns) = turns {
+                    let (dx, dy) = ((ox + ((n as i64) << 8)) as f32 * (1. / 256.), oy as f32 * (1. / 256.));
+                    t = ferros_glow::pie::multiply(t, ferros_glow::pie::cover(cf * dx + sf * dy, cf * dy - sf * dx, turns));
                 }
                 // Outside the inner span: the pixel straddles the edge, so the texel is scaled by the disc's coverage (premultiplied: every channel).
                 let x = x0 + n as i64;
@@ -627,8 +658,10 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
                     }
                 }
             }
-            u += fine.du_dx;
-            v += fine.dv_dx;
+            if let Some(f) = &fine {
+                u += f.du_dx;
+                v += f.dv_dx;
+            }
             if let Some(k) = &coarse {
                 u1 += k.du_dx;
                 v1 += k.dv_dx;

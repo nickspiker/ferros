@@ -54,6 +54,10 @@ pub struct Job {
     pub name: String,
     /// For a kist refused as signed by another key than its developer's other kists (why 17): that developer, as the person's pin names them.
     pub who: String,
+    /// The thing it brings, as the stower says (its op 0's last trailer, docs/KISTS.md "The loading pie"): its kind and its `ht`; None from a stower that sends none, or while it does not know yet (all-zero).
+    pub thing: Option<(ferros_thing::Hi, ferros_thing::Ht)>,
+    /// Its three stages' shares as the stower reports them, with `thing`; None from a stower that sends none (the map works them out from the stage, `pie`).
+    pub shares: Option<ferros_glow::pie::Shares>,
 }
 
 /// One kist the directory lists.
@@ -173,7 +177,7 @@ fn read_status(b: &[u8], into: &mut Stower) -> bool {
         if p + 52 + nl > b.len() {
             return false;
         }
-        into.jobs.push(Job { kind: r[0], stage: r[1], why: r[2], capsule: r[3..35].try_into().unwrap(), got: u64_at(r, 35), total: u64_at(r, 43), name: String::from(core::str::from_utf8(&r[52..52 + nl]).unwrap_or("")), who: String::new() });
+        into.jobs.push(Job { kind: r[0], stage: r[1], why: r[2], capsule: r[3..35].try_into().unwrap(), got: u64_at(r, 35), total: u64_at(r, 43), name: String::from(core::str::from_utf8(&r[52..52 + nl]).unwrap_or("")), who: String::new(), thing: None, shares: None });
         p += 52 + nl;
     }
     // Then per job its `who` (a stower from before sends none: the names stay empty).
@@ -190,6 +194,18 @@ fn read_status(b: &[u8], into: &mut Stower) -> bool {
     // WHY: the bytes are the stower's; four must be there to read.
     if p + 4 <= b.len() {
         into.dir_gen = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+    }
+    p += 4;
+    // Then per job its thing and its stages (docs/KISTS.md "The loading pie": [kind hi 32][thing ht 32][blue u16][green u16][red u16], Q15); a stower from before sends none, and the map works the stages out itself (`pie`).
+    for j in into.jobs.iter_mut() {
+        // WHY: the bytes are the stower's; a record cut short ends the trailer, and a share past whole is refused (`Shares::read`).
+        if p + 70 > b.len() {
+            break;
+        }
+        let (hi, ht) = (ferros_thing::Hi::from_bytes(b[p..p + 32].try_into().unwrap()), ferros_thing::Ht::from_bytes(b[p + 32..p + 64].try_into().unwrap()));
+        j.thing = (b[p + 32..p + 64].iter().any(|&x| x != 0)).then_some((hi, ht));
+        j.shares = ferros_glow::pie::Shares::read(b[p + 64..p + 70].try_into().unwrap());
+        p += 70;
     }
     true
 }
@@ -415,6 +431,34 @@ pub fn words(j: &Job, f: tatau::Fmt) -> Line {
         }
     }
     l
+}
+
+/// A job's loading pie (docs/KISTS.md "The loading pie"): its three stages' shares while it brings a kist (a stow, an update, a restore, an offer being checked); None when it brings nothing to a circle (an unstow, an offer waiting on the person) or has ended (done: the circle's own icon; failed: as it was).
+/// The stower's own shares when it sends them; until it does, worked out from today's stages: blue the fetch's bytes (whole from the start for an offer, carried in over USB); green the checks, its signature the first half (an offer's read back by its bytes, else a step) and its code the second (the kernel's read back by its bytes); red the final steps, sealing then storing, each a step.
+/// A stage that reports no bytes shows as a step: nothing moves until it ends.
+pub fn pie(j: &Job) -> Option<ferros_glow::pie::Shares> {
+    use ferros_glow::pie::{Shares, WHOLE};
+    if j.kind == KIND_UNSTOW || matches!(j.stage, DONE | FAILED | ASKING) {
+        return None;
+    }
+    if let Some(s) = j.shares {
+        return Some(s);
+    }
+    // Bytes so far of all, in Q15; 0 while the whole is not known.
+    // WHY the test: both counts are the stower's, and more than the whole would be a share past whole, outside the sweep's proven range; such a count reads as not known.
+    let part = |got: u64, total: u64| if total != 0 && got <= total { ((got << 15) / total) as u16 } else { 0 };
+    let blue = if j.kind == KIND_OFFER { WHOLE } else { 0 };
+    Some(match j.stage {
+        QUEUED => Shares { blue, green: 0, red: 0 },
+        FETCHING => Shares { blue: part(j.got, j.total), green: 0, red: 0 },
+        SIGNATURE if j.kind == KIND_OFFER => Shares { blue: WHOLE, green: part(j.got, j.total) >> 1, red: 0 },
+        SIGNATURE => Shares { blue: WHOLE, green: 0, red: 0 },
+        CODE => Shares { blue: WHOLE, green: (WHOLE >> 1) + (part(j.got, j.total) >> 1), red: 0 },
+        SEALING => Shares { blue: WHOLE, green: WHOLE, red: 0 },
+        STORING => Shares { blue: WHOLE, green: WHOLE, red: WHOLE >> 1 },
+        // A stage this build does not know (a later stower's): nothing it can say.
+        _ => return None,
+    })
 }
 
 /// How far a job under way is, 0 to 1, for its bar: its bytes while it fetches and while the kernel reads it back to check it, whole after.

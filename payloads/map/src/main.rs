@@ -1762,6 +1762,8 @@ struct Map {
     waiting: alloc::vec::Vec<([u8; 32], u16)>,
     /// Each circle's state as last sent to the display (op 57: the glow's byte and the count), so a ring of the kists' bell sends only what changed.
     sent: [(u8, u16); MAX],
+    /// Each circle's loading pie as last sent to the display (op 87, `send_pies`), so a ring of the stower's bell sends only what moved.
+    sent_pie: [ferros_glow::pie::Shares; MAX],
     /// The notes waiting on the person as the kernel last listed them (notes.rs, docs/NOTIFY.md), the newest one taken (its bell count: `notes_rang` acts on each once), and when the earliest deadline among them passes (counter ticks; the main loop's rest ends there and the list is read again).
     notes: Vec<notes::Rec>,
     notes_read: u64,
@@ -2925,6 +2927,7 @@ impl Map {
             }
         }
         let _ = self.send_states(true);
+        let _ = self.send_pies(true);
         self.send_pucks();
     }
 
@@ -2992,6 +2995,50 @@ impl Map {
     }
 
     /// The circles' states to the display (op 57): every circle's after a fresh scene (`all`), else only those changed since last sent. Whether any was sent.
+    /// Circle `i`'s loading pie (docs/KISTS.md "The loading pie"): the stower's job under way that brings its kist, found by the thing the stower names, else by the capsule (the person's list names it for a restore; the directory's row names its developer and option for a stow or an update), its shares (`stower::pie`); `Shares::DONE` (its own icon) when none is.
+    /// A stow of a kist not yet in the person's list has no circle to show it on: its pie waits for one (KISTS.md, open).
+    fn pie_of(&self, i: usize) -> ferros_glow::pie::Shares {
+        let Some(k) = self.kist(i) else { return ferros_glow::pie::Shares::DONE };
+        // A development build can show every kist circle loading with no stower job (FERROS_MAP_START=pie): each at one of a spread of stages, in turn, for seeing the pie on the glass.
+        if option_env!("FERROS_MAP_START") == Some("pie") {
+            use ferros_glow::pie::{Shares, WHOLE};
+            const SPREAD: [(u16, u16, u16); 8] = [(WHOLE >> 4, 0, 0), (WHOLE >> 1, 0, 0), (WHOLE - (WHOLE >> 3), 0, 0), (WHOLE, WHOLE >> 2, 0), (WHOLE, WHOLE - (WHOLE >> 2), 0), (WHOLE, WHOLE, WHOLE >> 1), (WHOLE, WHOLE, WHOLE - (WHOLE >> 5)), (0, 0, 0)];
+            let (blue, green, red) = SPREAD[(i - 1) % SPREAD.len()];
+            return Shares { blue, green, red };
+        }
+        let t = k.thing();
+        let brings = |j: &stower::Job| match j.thing {
+            Some((_, h)) => h == t,
+            None => j.capsule == k.capsule || self.stower.dir.iter().any(|e| e.capsule == j.capsule && ferros_thing::kist(&e.developer, &e.option) == t),
+        };
+        self.stower.jobs.iter().rev().filter(|j| brings(j)).find_map(stower::pie).unwrap_or(ferros_glow::pie::Shares::DONE)
+    }
+
+    /// Each circle's loading pie to the display (op 87: `[87][count] [index][blue u16][green u16][red u16]…`), only those that moved unless `all`; true when any was sent (a frame then shows it).
+    fn send_pies(&mut self, all: bool) -> bool {
+        let mut m = [0u8; 2 + 7 * MAX];
+        m[0] = 87;
+        let mut count = 0;
+        for i in 0..self.deck.n() {
+            let p = self.pie_of(i);
+            if !all && self.sent_pie[i] == p {
+                continue;
+            }
+            self.sent_pie[i] = p;
+            let at = 2 + count * 7;
+            m[at] = i as u8;
+            m[at + 1..at + 7].copy_from_slice(&p.bytes());
+            count += 1;
+        }
+        if count == 0 {
+            return false;
+        }
+        m[1] = count as u8;
+        let mut r = [0u8; 4];
+        call(self.display, &m[..2 + 7 * count], &mut r);
+        true
+    }
+
     fn send_states(&mut self, all: bool) -> bool {
         let mut m = [0u8; 2 + 4 * MAX];
         m[0] = 57;
@@ -6733,6 +6780,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         ended: alloc::vec::Vec::new(),
         waiting: alloc::vec::Vec::new(),
         sent: [(0, 0); MAX],
+        sent_pie: [ferros_glow::pie::Shares::DONE; MAX],
         notes: Vec::new(),
         notes_read: 0,
         notes_due: None,
@@ -7186,6 +7234,10 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             stower_seen = seq;
             let done = s.finished();
             map.stower = s;
+            // Each loading circle's pie as its stages move (docs/KISTS.md "The loading pie"), drawn with a frame of its own unless an app is in front.
+            if map.send_pies(false) && !map.app_front {
+                map.draw();
+            }
             if done != stower_done {
                 stower_done = done;
                 // A capsule the stower brought (a restore landed, a stow): its kist may launch again (`absent`), once, from the circles read again below.
