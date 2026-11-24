@@ -13,10 +13,11 @@ version=${MAHERE_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$mahere/
 [ -n "$version" ] || { echo "no version: set MAHERE_VERSION or check $mahere/Cargo.toml" >&2; exit 1; }
 out=target/mahere.capsule.vsf
 B=target/debug/ferros-bridge
-# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), in the signed declaration when it has been made (app-icons bundle writes target/icons/mahere.vsf); $MAHERE_ICON wins.
+# Its icon in the one icon format (tools/app-icons, ferros_kist::Icon), signed with the capsule: target/icons/mahere.vsf (`app-icons icon /mnt/Harbor/Code/mahere/installers/icon-1024.png target/icons/mahere.vsf`, or `app-icons bundle target/icons`); $MAHERE_ICON wins.
+# Refused when it is not there (2026-11-24: Mahere 0.7.4 was signed with no icon and its circle went plain, because a missing icon was skipped without a word).
 icon=${MAHERE_ICON:-target/icons/mahere.vsf}
-icon_arg=()
-[ -f "$icon" ] && icon_arg=(--icon "$icon")
+[ -f "$icon" ] || { echo "no icon at $icon: make it with tools/app-icons (icon /mnt/Harbor/Code/mahere/installers/icon-1024.png $icon) or set MAHERE_ICON" >&2; exit 1; }
+icon_arg=(--icon "$icon")
 FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/developer-nick.key.vsf}" "$B" capsule "$bin" "$out" --kist Mahere --option 4d725960dc438254d7f9cdc981d34b521840db34957187cdb1d4ce06e60621de --version "$version" "${icon_arg[@]}" \
     --want gps "to show where you are on the map" \
     --want udp "to fetch the map from Mahere's servers as you look around, keeping it on this device"
