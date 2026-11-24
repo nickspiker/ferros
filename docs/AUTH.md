@@ -175,7 +175,6 @@ From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw`
 | 15 | unbind (remove) this device (the identity service alone; "Unbind this device" above), with the person's approve held (taken) | 1 removed, 0 the seed is not the person present's, ERR |
 | 16 | ask for an approve (the Settings right, never a kist; "Approve on the attest screen" below): x2 a request's word; only while a person is present on a bound device and none waits; the identity locked at once and the attest screen started again | 0, ERR refused |
 | 17 | the request waiting (the Unlock or the Settings right) | its word, 0 none |
-| 18 | Decline (ahau alone): the request dropped, nothing applied, still locked | 0 |
 | 19 | the "require attest" guards: x2 0 read (Settings or Unlock), x2 1 guard x3 on (Settings; kept in the device's settings document) | the guards' bits, ERR |
 | 20 | take an approval a process carries out itself (developer mode, the add flow's opening; Settings or Unlock): x2 its kind, x3 1 to look without taking | the approved word (taken unless looking), NOTHING while it waits on the attest screen, 0 neither |
 
@@ -190,15 +189,16 @@ The owner, after the attest-at-boot confirm screen took Enter differently from t
 **How it goes.**
 1. A settings page asks the kernel for a change (`SYS_UNLOCK` op 16): a request is a kind and one number (ahau_core::approve), never text. The kernel takes it only while a person is present on a bound device and none waits, and checks what only it knows (a cap the battery takes; Android allowed here before starting into it).
 2. The kernel keeps the request and locks at once, as any lock: the identity's keys wiped, the identity service's bell rung (fgtw wipes its roots, the fleet key and the person key), an approved request not yet taken dropped. It starts the attest screen again over everything (the service loop's restart of `ahau`, as `diag restart ahau`).
-3. The fresh attest screen reads the request (op 17) and, under its state line, says what it approves in the person's own words for its kind (ferros_lang `Approve*`, all sixteen languages). Its button says approve; decline stands under it. No tag is read while it waits: a tag never approves.
+3. The fresh attest screen reads the request (op 17) and, under its state line, says what it approves in the person's own words for its kind (ferros_lang `Approve*`, all sixteen languages). Its button says approve, and it is the only one: no Decline (owner, 2026-11-24, after testing the approve on the Pro: "Don't think there needs to be a decline. You can toggle off again if you screw up."; Decline and its `SYS_UNLOCK` op 18 were removed the same day). No tag is read while it waits: a tag never approves.
 4. **Approve:** the handle typed unlocks (op 1). Opened, the kernel applies exactly the request, once, at that unlock, and the screen goes as at any attest (the roots to the identity service). The removal and developer mode are carried out by a process instead: the kernel holds the approval for it until it is taken or the next lock.
-5. **A failed attest** (another identity's handle, a typo: the kernel refuses it) **or Decline** (op 18): the request is dropped, nothing applied, and the screen is the plain attest screen, the device locked until the person attests.
+5. **A failed attest** (another identity's handle, a typo: the kernel refuses it): the request is dropped, nothing applied, and the screen is the plain attest screen, the device locked until the person attests.
 
 **Who holds the request across the lock: the kernel**, in RAM (process.rs `APPROVAL`).
 - Not the requester: the map asked and is still running under the attest screen, but nothing it can call changes a request that waits. Op 16 takes one only while a person is present, and asking locks, so while one waits nobody is present and every other ask is refused.
-- Not ahau: it is started again for the approve and only reads the request (op 17); its one write is Decline, which drops it. The words it shows come from the kind, so a requester cannot put its own text on the attest screen.
+- Not ahau: it is started again for the approve and only reads the request (op 17); it writes nothing of it. The words it shows come from the kind, so a requester cannot put its own text on the attest screen.
 - Not the vault: nothing of it touches the flash. A power cut drops it, and the next boot is a plain attest screen with nothing applied.
-- The writers: op 16 sets it; op 18, a failed unlock and a tag's unlock drop it; the approve's unlock applies and clears it.
+- The writers: op 16 sets it; a failed unlock and a tag's unlock drop it; the approve's unlock applies and clears it.
+- Changing one's mind: a toggle is toggled back (the owner's words above). The ones that are not a toggle, unbind this device and developer mode (no off in the interface), are left by not attesting until a power cycle, which drops the request (it is in RAM alone); the attest screen offers no other way out.
 
 **Routed through it (built 2026-11-24):**
 
@@ -297,7 +297,7 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | Mint failed | Minting failed. Enter to retry. | | proposed |
 | No answer | No answer yet. Still looking. |  | proposed |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
-| An approve waits | (the state line) Approve: (what, from the request's kind; "Approve on the attest screen") | approve, decline under it | the button the owner's ("should say 'approve' or similar", 2026-11-24); the text proposed |
+| An approve waits | (the state line) Approve: (what, from the request's kind; "Approve on the attest screen") | approve (no decline) | the button the owner's ("should say 'approve' or similar", 2026-11-24); the text proposed |
 | An approved removal refused | (why: the identity's only device, no fleet) | done | proposed |
 
 No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the join's screens and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry (from a confirmed join it withdraws the request).

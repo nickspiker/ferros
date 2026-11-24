@@ -3384,7 +3384,7 @@ pub mod approve {
     use super::{nr, svc, ERR, NOTHING};
 
     /// Ask for a change to be approved (SYS_UNLOCK op 16, the Settings right, never a kist): the kernel keeps the request, locks the identity at once (its keys dropped, as any lock), and starts the attest screen again over everything, which shows what is asked.
-    /// The person's handle typed there unlocks and the kernel applies exactly that change; a failed attest or a Decline leaves the device locked with nothing applied.
+    /// The person's handle typed there unlocks and the kernel applies exactly that change; a failed attest leaves the device locked with nothing applied. There is no Decline (owner, 2026-11-24: "You can toggle off again if you screw up.").
     /// True when asked; false when refused (nobody present, the device not bound, a request the kernel does not take, no right).
     pub fn ask(settings: u64, word: u64) -> bool {
         svc(nr::UNLOCK, settings, 16, word, 0, 0) == 0
@@ -3396,11 +3396,6 @@ pub mod approve {
             ERR | 0 => None,
             w => Some(w),
         }
-    }
-
-    /// Decline (SYS_UNLOCK op 18, the attest screen alone): the request dropped, nothing applied, the device still locked. True when done.
-    pub fn decline(unlock: u64) -> bool {
-        svc(nr::UNLOCK, unlock, 18, 0, 0, 0) == 0
     }
 
     /// The "require attest" guards on (SYS_UNLOCK op 19 [0], the Settings or the Unlock right): their bits (ahau_core::approve::guard), None without the right.
@@ -3426,7 +3421,7 @@ pub mod approve {
         Approved(u64),
         /// Asked and waiting on the attest screen.
         Waiting,
-        /// Neither: declined, failed, never asked, or gone with a lock.
+        /// Neither: failed, never asked, or gone with a lock.
         No,
     }
 

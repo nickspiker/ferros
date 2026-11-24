@@ -4856,7 +4856,7 @@ pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>
 /// The vault's identity half behind `SYS_UNLOCK`, registered with the store (service.rs): (op 0 query, 1 unlock with the seed, 2 lock) -> Ok(unlocked after the op) or Err.
 pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
 /// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): the request waiting on the attest screen, as its word (0 none).
-/// Set by SYS_UNLOCK op 16 while a person is present, which locks at once; from then until the attest settles it the device is locked, and nothing a process holds can change it: op 16 takes a request only while a person is present and none waits, and the only other writers are the attest screen's Decline (op 18), a failed attest, a tag's unlock (both drop it) and the approve's unlock (which applies it).
+/// Set by SYS_UNLOCK op 16 while a person is present, which locks at once; from then until the attest settles it the device is locked, and nothing a process holds can change it: op 16 takes a request only while a person is present and none waits, and the only other writers are a failed attest and a tag's unlock (both drop it) and the approve's unlock (which applies it). There is no Decline (owner, 2026-11-24: "Don't think there needs to be a decline. You can toggle off again if you screw up."; op 18 removed the same day): a request is approved by a good attest, or dropped by a failed one or a power cut.
 /// In RAM alone: a power loss drops it, and the next boot is a plain attest screen with nothing applied.
 static APPROVAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// An approved request a process carries out itself (ahau_core::approve `kernel` false: the removal, developer mode), as its word (0 none): held from the approve's unlock until it is taken (op 20, or op 15 for the removal) or the next lock.
@@ -5546,7 +5546,7 @@ fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
 /// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"), SYS_UNLOCK ops 16 to 20. Under the kernel lock.
 /// 16 ask (the Settings right, never a kist): x2 a request's word; taken only while a person is present on a bound device and none waits, with what only the kernel knows checked (a cap the battery takes, Android allowed here for starting into it); the identity locked at once (`unlock` op 2: its keys dropped, the identity service's bell rung) and the attest screen started again over everything (`APPROVE_RESTART`), which shows what is asked. → 0, ERR refused.
 /// 17 the request waiting (Unlock or Settings): its word, 0 none.
-/// 18 Decline (the attest screen alone: the Unlock right, ahau by name, never a kist): the request dropped, nothing applied, the device still locked. → 0.
+/// 18 is no op (Decline until it was removed, 2026-11-24): ERR.
 /// 19 the "require attest" guards (Settings; reading also Unlock): x2 0 their bits; x2 1 guard x3 on, kept in the device's settings document (no attest: tightening is always safe) → the bits after. Off is an approve (op 16, GUARD_OFF).
 /// 20 take an approval of kind x2 that a process carries out itself (Settings or Unlock): the approved word (the kernel holds it no longer; x3 1 only looks, leaving it held for the process that takes it), NOTHING while it waits on the attest screen, 0 neither.
 fn approve_syscall(p: &Process, f: &Frame) -> u64 {
@@ -5581,12 +5581,6 @@ fn approve_syscall(p: &Process, f: &Frame) -> u64 {
             0
         }
         17 if settings || unlock_right => APPROVAL.load(Acquire),
-        18 if unlock_right && !p.kist && p.name.as_slice() == b"ahau" => {
-            if APPROVAL.swap(0, AcqRel) != 0 {
-                crate::flashlog::line("approve: declined on the attest screen; nothing applied, the device stays locked");
-            }
-            0
-        }
         19 if f.x[2] == 0 && (settings || unlock_right) => crate::settings::GUARDS.load(Acquire),
         19 if f.x[2] == 1 && settings && !p.kist && approve::guard::known(f.x[3]) => {
             let was = crate::settings::GUARDS.fetch_or(1 << f.x[3], AcqRel);

@@ -885,7 +885,7 @@ struct Ahau {
     dev_name: ([u8; 48], usize),
     /// While joining: the person asked to see the pairing words ("Not in range?"). Hidden by default (owner, 2026-11-22); forgotten when the screen leaves the join.
     words_open: bool,
-    /// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): the request the kernel holds while the device is locked, read once as the screen starts. While it is set the entry's button says Approve and Decline stands under it; the handle typed unlocks and the kernel applies exactly that change. A failed attest or a Decline drops it, and the screen is the plain attest screen.
+    /// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): the request the kernel holds while the device is locked, read once as the screen starts. While it is set the entry's button says Approve, the only one; the handle typed unlocks and the kernel applies exactly that change. A failed attest drops it, and the screen is the plain attest screen.
     approve: Option<ahau_core::approve::Request>,
     /// The removal's seed and proof, from the handle typed at its approve, held only until the identity service is asked (`remove_go`), then wiped.
     remove_keys: Option<([u8; 32], [u8; 32])>,
@@ -1088,25 +1088,6 @@ impl Ahau {
         (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
     }
 
-    /// Decline, under Approve while an approve waits: in the space between the button's foot and the keyboard (a fixed 0.15 of the width), a sixty-fourth of the width below the button, its height seven sixty-fourths of the width (not the scale's, so a larger scale never runs it into the keys), as wide as the button. None while no approve waits.
-    fn decline_at(&self) -> Option<(usize, usize, usize, usize)> {
-        if self.approve.is_none() || self.mode != Mode::Fresh {
-            return None;
-        }
-        let (x0, _, x1, y1) = self.button_at();
-        let y0 = y1 + self.w / 64;
-        Some((x0, y0, x1, y0 + self.w * 7 / 64))
-    }
-
-    /// Decline (owner's design, 2026-11-24: "Decline below it, which goes to the plain attest screen"): the kernel drops the request (SYS_UNLOCK op 18), nothing applied, the device still locked, and the screen is the plain attest screen.
-    fn decline(&mut self) {
-        let done = ferros_sys::approve::decline(cap(self.grants, S_UNLOCK));
-        console(self.grants, if done { b"ahau: the approve declined; nothing applied, the device stays locked\n".as_slice() } else { b"ahau: the kernel did not take the decline (an older kernel?); the screen is the plain attest screen\n" });
-        self.approve = None;
-        self.all();
-        self.show();
-    }
-
     /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them. Back from a confirmed join withdraws it (fgtw op 32 [0]): the binding request is dropped and the radios stop.
     fn go_back(&mut self) {
         // On the network page: from the passphrase back to the list, from the list back to the screen under it.
@@ -1149,7 +1130,7 @@ impl Ahau {
         use ferros_lang::{t, Msg};
         match self.mode {
             // Always "attest", bound or not (owner, 2026-11-10: "needs to say attest, not unlock. always attest"): the prompt above says whether the handle also binds this device.
-            // An approve (owner, 2026-11-24: "the button instead of attest ... should say 'approve'"): Decline stands under it (`decline_at`).
+            // An approve (owner, 2026-11-24: "the button instead of attest ... should say 'approve'"), the only button: no Decline (owner, same day: "Don't think there needs to be a decline. You can toggle off again if you screw up.").
             Mode::Fresh if self.approve.is_some() => Some(t(Msg::Approve)),
             Mode::Fresh => Some(t(Msg::Attest)),
             Mode::Told => Some(t(Msg::Done)),
@@ -1183,19 +1164,6 @@ impl Ahau {
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(0) { PRESSED } else if self.joining { 1800 } else { 2600 }, self.k(self.w / 24));
-        }
-        // Decline under Approve, quieter than it (`decline_at`): its rows cleared and drawn here with the button's, its label composed with its own rows.
-        if let Some((dx0, dy0, dx1, dy1)) = self.decline_at() {
-            for y in dy0..dy1 {
-                s[y * self.w..(y + 1) * self.w].fill(self.bg());
-            }
-            pill(s, self.w, dx0, dy0, dx1, dy1, if self.pressed.get() == Some(2) { PRESSED } else { 1800 }, self.k(self.w / 24));
-            self.compose(dy0, dy1, || {
-                let px = self.k(self.w / 24);
-                let t = ferros_lang::t(ferros_lang::Msg::Decline).as_bytes();
-                let x = self.centre_x((dx0 + dx1) as i64 / 2, px, t);
-                window::text(self.display, self.text_to.get(), x as i16, ((dy0 + dy1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t);
-            });
         }
         // The labels in front of the pills, the row composed whole before it shows (`compose`): each of its lines centred, the block of them about the pill's middle.
         self.compose(ry0, ry1, || {
@@ -2014,9 +1982,6 @@ impl Ahau {
         if self.button_label().is_some() && inside(self.button_at()) {
             return Some(0);
         }
-        if self.decline_at().is_some_and(inside) {
-            return Some(2);
-        }
         if self.mode == Mode::Networks && !self.joining {
             return self.net_row_at(y).map(|k| 16 + k as u8);
         }
@@ -2066,7 +2031,6 @@ impl Ahau {
                 self.words();
             }
             k if k >= 16 => self.net_pick((k - 16) as usize),
-            2 if self.decline_at().is_some() => self.decline(),
             _ => {}
         }
     }
@@ -3782,7 +3746,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let approve = if !unlocked && bound_now { ferros_sys::approve::pending(cap(grants, S_UNLOCK)).and_then(ahau_core::approve::Request::from_word) } else { None };
     if let Some(r) = approve {
         let mut l = Line::new();
-        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: an approve waits (kind A#{}, A#{}): the button says approve, decline under it\n", r.kind, r.arg));
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: an approve waits (kind A#{}, A#{}): the button says approve\n", r.kind, r.arg));
         console(grants, l.as_bytes());
     }
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
