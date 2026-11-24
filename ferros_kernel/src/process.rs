@@ -1334,6 +1334,8 @@ struct Process {
     code_at: usize,
     /// The panic it told the kernel of (SYS_PANIC), for its end (`death_line`); None until then.
     panicked: Option<alloc::boxed::Box<Panicked>>,
+    /// Copies of its memory under way with the kernel lock let go (a call's message or a delivery a piece at a time, `message_unlocked`, `recv_big`): while any is, no thread of it gives frames back (SYS_ARC shrink and release answer `ARC_WHY_BUSY`), so no piece is read from or written to memory unmapped meanwhile.
+    copying: u32,
 }
 
 /// A panic a process told the kernel of (SYS_PANIC, ferros_sys `panic_tell`), kept for its end: the message, where (the file as the compiler named it, the line and column), the thread, and the call chain from the call (`frames`).
@@ -1671,6 +1673,93 @@ fn thread_name(t: usize) -> Vec<u8> {
 
 /// A message this short is read as before, from the fixed part of the kernel heap with no room asked (`Process::message`): what every message was cut to until docs/NO-CEILINGS.md step 5.
 const MESSAGE_SMALL: usize = 1 << 12;
+/// A message past this many bytes is copied a piece of this size at a time with the kernel lock let go between pieces, both from its caller (`message_unlocked`) and into its server (`recv_big`): a piece is about 0.15 ms, where a 128 MiB call held the lock 18 ms whole (the Pro, 2026-11-23; a camera stream dies behind a hold past its frame).
+const MESSAGE_PIECE: usize = 1 << 20;
+
+/// `Process::message` for the process thread `cur` runs, a message past `MESSAGE_PIECE` read a piece at a time with the kernel lock let go (`unlocked`): each piece resolved under the lock, copied without it. The process's frames stay where they are meanwhile: its thread is on this core (no move, no free: `unlocked`), and `copying` keeps its other threads from giving any back. None, the caller answering ERR, when the heap cannot hold it, a piece does not resolve (the trap at the syscall's end says where), or the process ended meanwhile.
+/// The process's references taken before are not used after: the caller looks it up again.
+fn message_unlocked(cur: usize, off: u64, len: usize) -> Option<Vec<u8>> {
+    let p = proc_of(cur)?;
+    if len <= MESSAGE_PIECE {
+        return p.message(off, len);
+    }
+    let mut v = crate::kheap::vec_for("a message", len)?;
+    let epoch = p.epoch;
+    p.copying += 1;
+    let mut at = 0;
+    let mut whole = true;
+    while at < len {
+        // WHY the min: the last piece is what is left.
+        let n = MESSAGE_PIECE.min(len - at);
+        let Some(p) = proc_of(cur).filter(|q| q.epoch == epoch && !q.dying) else {
+            whole = false;
+            break;
+        };
+        let Some(a) = p.span(off + at as u64, n) else {
+            p.bad_buf(off + at as u64, n, false);
+            whole = false;
+            break;
+        };
+        // SAFETY: `v` holds `len` bytes of capacity and `at + n <= len`; the source resolved inside the process's arc or one of its DMA regions and stays mapped (above).
+        let dst = unsafe { v.as_mut_ptr().add(at) } as usize;
+        unlocked(|| unsafe { core::ptr::copy_nonoverlapping(a as *const u8, dst as *mut u8, n) });
+        at += n;
+    }
+    if let Some(p) = proc_of(cur).filter(|q| q.epoch == epoch) {
+        p.copying -= 1;
+    }
+    if !whole {
+        return None;
+    }
+    // SAFETY: every byte of [0, len) was written by the pieces above.
+    unsafe { v.set_len(len) };
+    Some(v)
+}
+
+/// A receive whose queue holds, first, a message past `MESSAGE_PIECE` that fits the buffer: taken here, in the server's own syscall, and written into its buffer a piece at a time with the kernel lock let go (as `message_unlocked` reads), then its reply token minted as `deliver` mints it. A server that was waiting when it came is woken to receive again (`deliver` runs its `svc` once more), so a large message is always copied by its own server's thread. x0 the length, or ERR when its buffer stopped resolving (the trap says where; the caller is answered ERR).
+fn recv_big(f: &mut Frame, cur: usize, ep: usize) -> u64 {
+    let kk = k();
+    let Some((caller, mut msg)) = kk.endpoints[ep].queue.pop_front() else { return 0 };
+    let Some(p) = proc_of(cur) else { return 0 };
+    let (buf, tok_off, epoch, len) = (f.x[1], f.x[3], p.epoch, msg.len());
+    p.copying += 1;
+    let mut at = 0;
+    let mut whole = true;
+    while at < len {
+        // WHY the min: the last piece is what is left.
+        let n = MESSAGE_PIECE.min(len - at);
+        let Some(p) = proc_of(cur).filter(|q| q.epoch == epoch && !q.dying) else {
+            whole = false;
+            break;
+        };
+        let dst = match p.span(buf + at as u64, n) {
+            Some(a) if !in_grants(buf + at as u64, n, p.code_at) => a,
+            _ => {
+                p.bad_buf(buf + at as u64, n, true);
+                whole = false;
+                break;
+            }
+        };
+        let src = msg[at..at + n].as_ptr() as usize;
+        // SAFETY: the destination resolved inside the server's arc or one of its DMA regions and stays mapped (`copying`, and its thread on this core); the source is the message, the kernel's own.
+        unlocked(|| unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n) });
+        at += n;
+    }
+    crate::keys::wipe_to_dram(&mut msg);
+    let Some(p) = proc_of(cur).filter(|q| q.epoch == epoch) else { return 0 };
+    p.copying -= 1;
+    if !whole {
+        answer_err(caller);
+        f.x[0] = ERR;
+        return 0;
+    }
+    let token = mint(Object::Reply(caller), RIGHT_SEND, p.epoch);
+    p.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
+    p.write(tok_off, &token);
+    f.x[0] = len as u64;
+    tr(TR_DELIVER, cur, ep as u64);
+    0
+}
 /// A message (or a reply, for a caller that asked with `CALL_LONG`) longer than the buffer it would land in: x0 is this bit and the length (docs/NO-CEILINGS.md 1.0, owner decision 5: "too long", never a silent cut). The top two bits 01, so it is never ERR, NOTHING, PARKED or FAULT; lengths are under 2^47.
 pub const TOO_LONG: u64 = 1 << 62;
 /// Bit 1 of a receive's x4: tell this server a message too long for its buffer (x0 `TOO_LONG` | its length; it stays at the queue's head for a receive with a buffer that holds it). Without it (every server before docs/NO-CEILINGS.md step 5, and ferros_sys `recv`) such a message is refused: its caller answered ERR, the console told who and how long.
@@ -2143,8 +2232,7 @@ pub const ARC_FREE: u64 = 6;
 /// Why SYS_ARC refused: past the arc's ceiling, too few free frames in the pool, (no longer: a masked arc with another of its threads running on another core, which is held now), under what the process was spawned with, over a word the kernel holds in it (a bell, the sensors' block, the stower's word), an unknown op.
 pub const ARC_WHY_CEILING: u64 = 1;
 pub const ARC_WHY_MEMORY: u64 = 2;
-/// Answered only before step 3 held the process instead (2026-11-11): kept so the number is never reused.
-#[allow(dead_code)]
+/// A copy of the process's memory is under way with the kernel lock let go (a call's message, `Process::copying`): a shrink or a release is refused until it is done. Until 2026-11-11 it meant another thread ran on another core (step 3 holds the process for that now).
 pub const ARC_WHY_BUSY: u64 = 3;
 pub const ARC_WHY_FLOOR: u64 = 4;
 pub const ARC_WHY_HELD: u64 = 5;
@@ -5852,6 +5940,9 @@ fn deliver(server: usize, ep: usize, handoff: bool) {
     let Some(len) = kk.endpoints[ep].queue.front().map(|q| q.1.len()) else { return };
     if len > cap {
         st.frame.x[0] = TOO_LONG | len as u64;
+    } else if len > MESSAGE_PIECE {
+        // A large message is copied by its server's own thread (`recv_big`): the server is woken at its `svc` again (an exception's return address is the next instruction, so one instruction back), and receives it in its own syscall.
+        st.frame.elr -= 4;
     } else {
         let (caller, mut msg) = kk.endpoints[ep].queue.pop_front().unwrap();
         sp.write(buf, &msg);
@@ -5878,24 +5969,25 @@ fn deliver(server: usize, ep: usize, handoff: bool) {
 
 /// A message too long for a server's buffer, refused (`deliver`): its caller answered ERR (the kernel's own call, its answer an error), and the console says who sent how much to whom.
 fn refuse_long(caller: usize, server: &[u8], len: usize, cap: usize) {
-    let who = if caller == KERNEL_CALLER {
-        kernel_answered(Err(()));
-        alloc::string::String::from("the kernel")
-    } else {
-        let name = proc_of(caller).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned()).unwrap_or_default();
-        if let Some(ct) = th(caller) {
-            if matches!(ct.state, State::Calling(..)) {
-                ct.frame.x[0] = ERR;
-                ct.state = State::Runnable;
-                enqueue_back(caller);
-            }
-        }
-        name
-    };
+    let who = if caller == KERNEL_CALLER { alloc::string::String::from("the kernel") } else { proc_of(caller).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned()).unwrap_or_default() };
+    answer_err(caller);
     let line = alloc::format!("kernel: {who} called {} with A#{len} bytes, past its A#{cap}-byte receive buffer: refused, never cut\n", alloc::string::String::from_utf8_lossy(server));
     k().console.extend_from_slice(line.as_bytes());
     crate::platform::pstore(line.as_bytes());
     crate::flashlog::line(line.trim_end());
+}
+
+/// A caller whose message was not delivered answered ERR (the kernel's own call, its answer an error).
+fn answer_err(caller: usize) {
+    if caller == KERNEL_CALLER {
+        kernel_answered(Err(()));
+    } else if let Some(ct) = th(caller) {
+        if matches!(ct.state, State::Calling(..)) {
+            ct.frame.x[0] = ERR;
+            ct.state = State::Runnable;
+            enqueue_back(caller);
+        }
+    }
 }
 
 /// Take the next runnable process (if any) and make it the one the trap returns into.
@@ -7972,8 +8064,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
-                    // At its full length (docs/NO-CEILINGS.md step 5), or ERR when the kernel heap cannot hold it.
-                    let Some(msg) = p.message(f.x[1], f.x[2] as usize) else {
+                    // At its full length (docs/NO-CEILINGS.md step 5), past a piece read with the kernel lock let go between pieces, or ERR when the kernel heap cannot hold it.
+                    let Some(msg) = message_unlocked(cur, f.x[1], f.x[2] as usize) else {
                         f.x[0] = ERR;
                         return 0;
                     };
@@ -8000,6 +8092,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
             }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                // A message past a piece first in the queue, and one the buffer holds: copied a piece at a time with the lock let go (`recv_big`).
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && kk.endpoints[ep].queue.front().is_some_and(|q| q.1.len() > MESSAGE_PIECE && q.1.len() <= f.x[2] as usize) => recv_big(f, cur, ep),
                 // x4 bit 0 = poll: with nothing queued, return NOTHING at once instead of blocking — for a server that must also keep polling its hardware (the WiFi driver's rings).
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && f.x[4] & 1 != 0 && kk.endpoints[ep].queue.is_empty() => {
                     kk.endpoints[ep].poller = Some(cur);
@@ -8436,6 +8530,11 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
     let kk = k();
     let Some(p) = kk.procs.get(pi).and_then(|x| x.as_ref()) else { return 0 };
     let (op, n) = (f.x[0], f.x[1]);
+    // A copy of this process's memory under way with the lock let go (`copying`): nothing given back until it is done; the allocator asks again later, as for any refusal.
+    if p.copying != 0 && (op == ARC_SHRINK || op == ARC_RELEASE) {
+        arc_answer(pi, op, n, Err(ARC_WHY_BUSY), f);
+        return 0;
+    }
     // A masked arc's mask (ring) or limit (exact) changes in every thread at once: one of its threads at EL0 on another core now would go on with the old one. It is held until they have all left; a native thread never reads x27 after its start, so a native arc changes under its running threads.
     let elsewhere = kk.threads.iter().enumerate().any(|(i, x)| i != cur && matches!(x, Some(x) if x.proc == pi) && on_a_core(i));
     if p.arc.guard != 0 && elsewhere && (op == ARC_GROW || op == ARC_SHRINK) {
@@ -8521,7 +8620,7 @@ fn arc_answer(pi: usize, op: u64, n: u64, r: Result<(u64, u64), u64>, f: &mut Fr
             f.x[1] = was;
         }
         Err(why) => {
-            let reason = ["", "past its ceiling", "the pool has too few free frames", "another of its threads runs on another core", "under what it was spawned with", "a word the kernel holds lies past the new end", "no such op", "not a page it may guard or unguard"][why as usize];
+            let reason = ["", "past its ceiling", "the pool has too few free frames", "a copy of its memory is under way", "under what it was spawned with", "a word the kernel holds lies past the new end", "no such op", "not a page it may guard or unguard"][why as usize];
             let line = alloc::format!("{name}: arc op {op} of G#{n:X} refused: {reason}\n");
             kk.console.extend_from_slice(line.as_bytes());
             f.x[0] = ERR;
@@ -10750,7 +10849,7 @@ fn build_from(name: &[u8], mut arc: Arc, code_len: usize, input: &[u8], objects:
     let fast = alloc::boxed::Box::new(Grants { hw, tokens, ended: core::sync::atomic::AtomicBool::new(false) });
     // The hold's right as a development spawn has it (`--items`: any kind); a kist's is set from its capsule's declaration once it is built (`spawn_kist`).
     let items = cspace.iter().any(|c| c.object == Object::Items).then(|| alloc::boxed::Box::new(ItemRight { any: true, makes: Vec::new(), opens: Vec::new() }));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: kept_input, born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, items, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: code_at + exec_len, code_at, panicked: None };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: kept_input, born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, items, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast, text_end: code_at + exec_len, code_at, panicked: None, copying: 0 };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order (or the count and the tokens on the pages after it, `tokens`). Then the code, then the input.
