@@ -629,7 +629,7 @@ impl Probe {
             );
             // Why its passes drew the screen whole (lumis_core `draw_why`), and those drawn in part.
             use lumis_core::ui::screen::*;
-            println!("lumis: preview, those passes drawn whole for: a new image A#{}, the exposure's start A#{}, the level A#{}, a touch A#{}, a turn A#{}, a calibration or the scale A#{}, the corner pixel A#{}, the histogram A#{}; drawn in part A#{}", why[DRAW_WHY_IMAGE], why[DRAW_WHY_START], why[DRAW_WHY_LEVEL], why[DRAW_WHY_TOUCH], why[DRAW_WHY_ROTATION], why[DRAW_WHY_HOLD], why[DRAW_WHY_MAGIC], why[DRAW_WHY_HISTOGRAM], why[DRAW_WHY_PARTIAL]);
+            println!("lumis: preview, those passes drawn whole for: a new image A#{}, the exposure's start A#{}, a touch A#{}, a turn A#{}, a calibration or the scale A#{}, the corner pixel A#{}, the histogram A#{}; drawn in part A#{}, the level alone among them A#{}", why[DRAW_WHY_IMAGE], why[DRAW_WHY_START], why[DRAW_WHY_TOUCH], why[DRAW_WHY_ROTATION], why[DRAW_WHY_HOLD], why[DRAW_WHY_MAGIC], why[DRAW_WHY_HISTOGRAM], why[DRAW_WHY_PARTIAL], why[DRAW_WHY_LEVEL]);
             *why = [0; DRAW_WHY_COUNT];
             *self = Probe { counter: self.counter, ..Probe::new() };
         }
@@ -2299,6 +2299,9 @@ fn partial_parts(ui: &lumis_core::UserInterface, camera: &[fluor::canvas::PixelR
         }
         parts.push(c);
     }
+    // The level indicator's area (lumis_core `level_area`, saved at every whole draw): repainted alone when only the level moved.
+    let (x, y, ex, ey) = ui.level_area;
+    parts.push(PixelRect::new(x, y, ex, ey));
     // The progress band: an exposure's, or in RAW video the recording space's (lumis_core draw_progress, from the platform's space words).
     let space = ui.in_video() && ui.header[lumis_core::shared_memory::VIDEO_SPACE_TOTAL_IDX] > 0;
     if ui.slider_thickness > 0. && (ui.exposure_time_ms > 0 || space) {
@@ -2662,7 +2665,7 @@ impl FluorApp<G2t16> for Lumis {
                 self.frame_seen = frame;
                 self.ui_pass = std::time::Instant::now();
                 // What lumis_core's draw_screen last drew with, before this pass and after it: a field that moved is a full draw (the camera image and the controls whole).
-                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, (ui.device_rotation, ui.painted_roll, ui.painted_pitch));
+                let before = (ui.previous_image_counter, ui.previous_exposure_start, ui.previous_histogram_counter, ui.previous_hold_present, ui.last_touch_valid, ui.device_rotation);
                 let t = std::time::Instant::now();
                 // The AoC's gravity, as Android's Lumis gets TYPE_GRAVITY (owner, 2026-11-18: "looks like we aren't relaying gravity data to lumis?"): the controls turn with the device, the level indicator follows, and a save's orientation tag is the way it is held.
                 let gravity = sys::gravity();
@@ -2673,7 +2676,7 @@ impl FluorApp<G2t16> for Lumis {
                 app::ui_frame(ui, surface, Buttons::default(), gravity.unwrap_or(UPRIGHT), self.finger);
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64, &mut ui.draw_why);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
-                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device and the level indicator are read below, from the fields lumis_core keeps for them.
+                // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device is read below, from the field lumis_core keeps for it; a moved level is a part of its own (`partial_parts`).
                 // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
                 let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
                 let other = ui.previous_histogram_counter != before.2
@@ -2684,8 +2687,8 @@ impl FluorApp<G2t16> for Lumis {
                     || ui.last_touch_valid
                     || self.finger.is_some()
                     || video_label_moved(&mut self.video_label, &mut self.video_drawn, ui)
-                    // A turn of the device, or the level indicator repainted (lumis_core handle_input_and_draw: past its deadband, or any change after a second): the controls are drawn whole.
-                    || (ui.device_rotation, ui.painted_roll, ui.painted_pitch) != before.5;
+                    // A turn of the device: the controls are drawn whole. A level that moved repaints its own area alone (lumis_core `repaint_level`), among the parts (`partial_parts`, `level_area`).
+                    || ui.device_rotation != before.5;
                 self.parts.clear();
                 if surface.take_posted() {
                     let camera: Option<Vec<fluor::canvas::PixelRect>> = lumis_core::ui::screen::camera_damage(ui).map(|v| v.into_iter().map(|(x0, y0, x1, y1)| fluor::canvas::PixelRect::new(x0, y0, x1, y1)).collect());
