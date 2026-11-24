@@ -1,0 +1,7 @@
+[package]
+name = "sweep-ir"
+version = "0.1.0"
+edition = "2024"
+description = "The audio bench's sweep (Farina's exponential sine sweep): makes the sweep for the device, and from the device's dump the speaker-to-microphone impulse responses, the loopback latency, the frequency response and the harmonics (docs/AUDIO.md \"The sweep\")"
+
+[workspace]

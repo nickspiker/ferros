@@ -276,28 +276,52 @@ pub fn find(name: &[u8]) -> Option<Svc> {
 }
 
 /// The control queue and the playback ring, found and checked, and the window the ring's bytes are reached thru.
+#[derive(Clone, Copy)]
 pub struct Services {
     pub control: Svc,
     pub playback: Svc,
     play: RingMap,
+    /// The entry point the ring feeds.
+    pub ep: u8,
 }
 
-/// The two services this process speaks, by the names Linux allocates them by (alsa.h:42 `CMD_OUTPUT_CHANNEL`; aoc_alsa_drv.c:34-74, the playback ring of entry point 5 is `audio_playback5`, Android's low-latency path on husky: dmesg:7426-7430).
-pub fn services() -> Result<Services, &'static str> {
+/// The playback ring of an entry point, by the name Linux allocates it by (aoc_alsa_drv.c:34-74; the device tree's front ends, gs101-audio.dtsi:63-190 and :426-440, name each ring and its entry point, google-aoc.h:27-36), and what Android routes thru it on husky (aoc_alsa_path.c:43-58, mixer_paths.xml:363-418):
+/// - 0, `audio_playback0`: mmap-playback (EP1), AAudio's MMAP NOIRQ;
+/// - 1, `audio_playback1`: low-latency-playback (EP2);
+/// - 5, `audio_playback5`: deep-buffer-playback (EP6), 70 ms to the speaker in Android's own table (audio_platform_configuration.xml:80). The one this service used from 2026-11-11 to 2026-11-24, taken for the low-latency path from the boot log's bind of entry point 5;
+/// - 9, `audio_raw`: raw-playback (`RAW`).
+pub fn ring_name(ep: u8) -> Option<&'static [u8]> {
+    match ep {
+        0 => Some(b"audio_playback0"),
+        1 => Some(b"audio_playback1"),
+        5 => Some(b"audio_playback5"),
+        9 => Some(b"audio_raw"),
+        _ => None,
+    }
+}
+
+/// The two services this process speaks for entry point `ep` (`ring_name`), with the control queue Linux sends every output command on (alsa.h:42 `CMD_OUTPUT_CHANNEL`).
+pub fn services_for(ep: u8) -> Result<Services, &'static str> {
     let control = find(b"audio_output_control").ok_or("no audio_output_control service")?;
-    let playback = find(b"audio_playback5").ok_or("no audio_playback5 service")?;
+    let name = ring_name(ep).ok_or("no playback ring is known for that entry point")?;
+    let playback = find(name).ok_or("the entry point's playback ring is not in the AoC's service table")?;
     if control.ring() || !control.fits(DOWN) || !control.fits(UP) {
         return Err("audio_output_control is not a queue inside the aoc-ipc window");
     }
     let Some(play) = playback.ring_win(DOWN).filter(|_| playback.ring()) else {
-        return Err("audio_playback5 is not a ring inside the granted windows (aoc-ipc, aoc-play-lo, aoc-play-hi: a kernel from before has no ring window)");
+        return Err("the playback ring is not a ring inside the granted windows (aoc-ipc, aoc-play-lo, aoc-play-hi: a kernel from before has no ring window)");
     };
     // WHY: this process writes the ring a 32-bit word at a time (Device memory takes no unaligned access), so its start and its length must both be whole words; the AoC sets them, so it is checked, not assumed.
     let (off, len) = playback.span(DOWN);
     if off & 3 != 0 || len & 3 != 0 {
-        return Err("audio_playback5's ring is not word-aligned");
+        return Err("the playback ring is not word-aligned");
     }
-    Ok(Services { control, playback, play })
+    Ok(Services { control, playback, play, ep })
+}
+
+/// The default entry point's services.
+pub fn services() -> Result<Services, &'static str> {
+    services_for(EP)
 }
 
 // ── The control queue (ipc_core.c:654-689 write, :613-652 read; aoc_service_core.c:104-202) ──
@@ -444,23 +468,28 @@ pub fn source(s: &Services, src: u8, on: bool) -> Result<(), &'static str> {
 
 /// EP_SETUP then EP_SETUP2 for the entry point (hw.c:1729-1815, zuma.h:998-1017 and :2727-2733), as Linux fills them for 48 kHz, two channels, 16-bit fixed point: the descriptor's address and length 0, the watermark Linux's default (alsa.h:100, 48000), wraparound on; the metadata's channel count 2 (hw.c:1764 writes the count; zuma.h:810-817 CH_STEREO is 2), width WIDTH_16_BIT 1 (zuma.h:803-808), rate SR_48KHZ 5 (zuma.h:784-793), FRMT_FIXED_POINT 1 (zuma.h:797-801). EP_SETUP2 carries the buffer and period in bytes (hw.c:1690-1706); Linux gives ALSA's, this process the ring it keeps ahead and its period.
 pub fn setup(s: &Services, mode: u8, buffer_bytes: u32, period_bytes: u32) -> Result<(), &'static str> {
+    setup_as(s, mode, buffer_bytes, period_bytes, 1, 1)
+}
+
+/// `setup` with the sample's width and format codes (zuma.h:797-808: WIDTH_16_BIT 1, WIDTH_32_BIT 3; FRMT_FLOATING_POINT 0, FRMT_FIXED_POINT 1).
+pub fn setup_as(s: &Services, mode: u8, buffer_bytes: u32, period_bytes: u32, width: u8, format: u8) -> Result<(), &'static str> {
     let mut c = [0u8; 28];
     header(&mut c, CMD_EP_SETUP);
     c[8..12].copy_from_slice(&0u32.to_le_bytes());
     c[12..16].copy_from_slice(&48_000u32.to_le_bytes());
     c[16..20].copy_from_slice(&0u32.to_le_bytes());
     c[20] = 2;
-    c[21] = 1;
+    c[21] = width;
     c[22] = 5;
-    c[23] = 1;
+    c[23] = format;
     c[24] = 0;
-    c[25] = EP;
+    c[25] = s.ep;
     c[26] = 1;
     c[27] = mode;
     command(s, &mut c, &mut [0u8; 64])?;
     let mut c = [0u8; 18];
     header(&mut c, CMD_EP_SETUP2);
-    c[8] = EP;
+    c[8] = s.ep;
     c[9..13].copy_from_slice(&buffer_bytes.to_le_bytes());
     c[13..17].copy_from_slice(&period_bytes.to_le_bytes());
     c[17] = mode;
@@ -481,7 +510,7 @@ pub fn siggen(s: &Services, wave: u8, period: u16, amplitude: u32) -> Result<(),
 pub fn samples(s: &Services) -> Result<u64, &'static str> {
     let mut c = [0u8; 17];
     header(&mut c, CMD_GET_EP_TOT_SAMPLES);
-    c[8] = EP;
+    c[8] = s.ep;
     let mut r = [0u8; 64];
     let n = command(s, &mut c, &mut r)?;
     if n < 17 {
@@ -525,6 +554,11 @@ impl Services {
         p.set(DOWN, R_WP, 0);
     }
 
+    /// The running count of bytes the AoC took (rx) (ipc_core.c:87-100): what it has read, not what has played (aoc_alsa_pcm.c:194-199).
+    pub fn taken(&self) -> u32 {
+        self.playback.get(DOWN, R_RX)
+    }
+
     /// The ring's size in bytes.
     pub fn ring_bytes(&self) -> u32 {
         self.playback.get(DOWN, R_SIZE)
@@ -548,6 +582,84 @@ impl Services {
         p.set(DOWN, R_WP, wp as u32);
         if p.flags() & RING_PUSH != 0 {
             p.signal();
+        }
+    }
+}
+
+// ── The MMAP entry point (entry point 0, `audio_playback0`: AAudio's MMAP path, aoc_alsa_pcm.c:604-614 and :215-221) ──
+//
+// Linux marks the whole ring written at the stream's prepare and again at every interrupt (`aoc_service_advance_write_index` by all that is free: tx = rx + size), so the AoC reads the ring round and round from its own read place, and the writer puts samples just ahead of it. Written as a plain ring instead (tx moved by what was written), entry point 0 takes the samples at its 1 ms rate and plays none of them (2026-11-24, the Pro: a 1 kHz tone at -24 dBFS left the microphones at their noise floor).
+
+impl Services {
+    /// The byte the AoC reads at running count `count` (counts as tx and rx are kept: running byte counts, ipc_core.c:87-100), from its read place: its rp is rx's place in the ring.
+    fn place(&self, count: u32) -> u64 {
+        let p = self.playback;
+        let size = p.get(DOWN, R_SIZE) as i64;
+        let (rx, rp) = (p.get(DOWN, R_RX), p.get(DOWN, R_RP) as i64);
+        // A count behind rx is a place already read (the zeroing of what was played), ahead a place to come: both as a signed distance from rx, inside one turn of the ring.
+        (rp + count.wrapping_sub(rx) as i32 as i64).rem_euclid(size) as u64
+    }
+
+    /// Every free byte marked written (`aoc_service_advance_write_index(avail)`: tx and wp moved by size less what waits), so the AoC never finds the ring short.
+    pub fn mark_full(&self) {
+        let p = self.playback;
+        let size = p.get(DOWN, R_SIZE);
+        let free = size - p.get(DOWN, R_TX).wrapping_sub(p.get(DOWN, R_RX));
+        unsafe { core::arch::asm!("dsb sy") };
+        p.set(DOWN, R_TX, p.get(DOWN, R_TX).wrapping_add(free));
+        p.set(DOWN, R_WP, (p.get(DOWN, R_WP) + free) % size);
+    }
+
+    /// Frames written at running count `count` (at or after the AoC's rx), wrapping at the ring's end.
+    pub fn put_at(&self, count: u32, frames: &[u32]) {
+        let (off, _) = self.playback.span(DOWN);
+        let size = self.playback.get(DOWN, R_SIZE) as u64;
+        let mut at = self.place(count);
+        for &f in frames {
+            self.play.wr32(off + at, f);
+            at += 4;
+            if at == size {
+                at = 0;
+            }
+        }
+    }
+
+    /// Frames written at running count `count` as 32-bit floats, two words a frame (left, right): AAudio's MMAP port is PCM_FLOAT (audio_policy_configuration.xml:66-68), the format entry point 0 is set up for here (main.rs `start`).
+    pub fn put_at_f32(&self, count: u32, frames: &[u32]) {
+        let (off, _) = self.playback.span(DOWN);
+        let size = self.playback.get(DOWN, R_SIZE) as u64;
+        let mut at = self.place(count);
+        for &f in frames {
+            for x in [f as u16 as i16, (f >> 16) as u16 as i16] {
+                // A sample over 2^15: full scale at 1.
+                self.play.wr32(off + at, (x as f32 * (1. / ((1u32 << 15) as f32))).to_bits());
+                at += 4;
+                if at == size {
+                    at = 0;
+                }
+            }
+        }
+    }
+
+    /// `bytes` of silence at running count `count`: what the AoC has played, so a writer late by a turn plays nothing rather than the turn before.
+    pub fn zero_at(&self, count: u32, bytes: u32) {
+        let (off, _) = self.playback.span(DOWN);
+        let size = self.playback.get(DOWN, R_SIZE) as u64;
+        let mut at = self.place(count);
+        for _ in 0..bytes >> 2 {
+            self.play.wr32(off + at, 0);
+            at += 4;
+            if at == size {
+                at = 0;
+            }
+        }
+    }
+
+    /// The whole ring silent (its start).
+    pub fn zero_all(&self) {
+        let (off, len) = self.playback.span(DOWN);
+        for k in 0..len >> 2 {
+            self.play.wr32(off + 4 * k, 0);
         }
     }
 }
@@ -597,12 +709,113 @@ const CMD_INPUT_SET_PARAMETER: u16 = 233;
 const CMD_SET_MIC_DC_BLOCKER: u16 = 252;
 const CMD_MIC_RECORD_AP_START_DATA: u16 = 293;
 const CMD_MIC_RECORD_AP_SET_PARAMS2: u16 = 359;
+const CMD_INPUT_GET_PARAMETER: u16 = 235;
+const CMD_MMAP_ENABLE_2: u16 = 313;
+const CMD_RAW_ENABLE_2: u16 = 314;
+const CMD_MIC_MMAP_DISABLE: u16 = 295;
+const CMD_MIC_RAW_DISABLE: u16 = 306;
+const CMD_GET_MIC_CURRENT_HW_GAIN: u16 = 250;
+const CMD_SET_MIC_HIGH_POWER_HW_GAIN: u16 = 254;
+
+/// The record soft gain's place among the input's parameters (hw.c:2236-2255 `aoc_mic_record_gain_set`: block 136, component 30, key 16, whole dB as an integer, which Android's mixer_paths.xml:240, :758, :848 set to -40, 22 and 5).
+const SOFT_GAIN: (u8, u8, u32) = (136, 30, 16);
+
+/// The microphones' gains as the AoC holds them (measure before fixing): the hardware gain in centibels (GET_MIC_CURRENT_HW_GAIN, hw.c:560-588) and the record soft gain (INPUT_GET_PARAMETER, zuma.h:1460-1466). None for one not answered.
+fn gains(c: &Capture) -> (Option<i32>, Option<i32>) {
+    let mut m = [0u8; 12];
+    header(&mut m, CMD_GET_MIC_CURRENT_HW_GAIN);
+    let mut r = [0u8; 64];
+    let hw = command_on(c.control, &mut m, &mut r).ok().filter(|&n| n >= 12).map(|_| i32::from_le_bytes([r[8], r[9], r[10], r[11]]));
+    let mut m = [0u8; 18];
+    header(&mut m, CMD_INPUT_GET_PARAMETER);
+    m[8] = SOFT_GAIN.0;
+    m[9] = SOFT_GAIN.1;
+    m[10..14].copy_from_slice(&SOFT_GAIN.2.to_le_bytes());
+    let soft = command_on(c.control, &mut m, &mut r).ok().filter(|&n| n >= 18).map(|_| i32::from_le_bytes([r[14], r[15], r[16], r[17]]));
+    (hw, soft)
+}
+
+/// The gains set: the record soft gain (whole dB) and the hardware gain at high power (dB, sent in centibels: hw.c:590-620, zuma.h:1625-1628; Android's range -720 to 240 cB, alsa.h:102-103).
+fn set_gains(c: &Capture, soft: i8, hw: i8) {
+    let mut m = [0u8; 18];
+    header(&mut m, CMD_INPUT_SET_PARAMETER);
+    m[8] = SOFT_GAIN.0;
+    m[9] = SOFT_GAIN.1;
+    m[10..14].copy_from_slice(&SOFT_GAIN.2.to_le_bytes());
+    m[14..18].copy_from_slice(&(soft as i32).to_le_bytes());
+    let _ = mic_command(c, "INPUT_SET_PARAMETER (the record soft gain)", &mut m);
+    let mut m = [0u8; 12];
+    header(&mut m, CMD_SET_MIC_HIGH_POWER_HW_GAIN);
+    m[8..12].copy_from_slice(&(hw as i32 * 10).to_le_bytes());
+    let _ = mic_command(c, "SET_MIC_HIGH_POWER_HW_GAIN", &mut m);
+}
+
+/// The gains as last read at a capture's start (hardware cB, soft dB; `i32::MIN` for one not answered or not read), for the bench's report.
+pub static GAINS: [core::sync::atomic::AtomicI32; 2] = [const { core::sync::atomic::AtomicI32::new(i32::MIN) }; 2];
+
+fn say_gains(when: &str, g: (Option<i32>, Option<i32>)) {
+    GAINS[0].store(g.0.unwrap_or(i32::MIN), core::sync::atomic::Ordering::Relaxed);
+    GAINS[1].store(g.1.unwrap_or(i32::MIN), core::sync::atomic::Ordering::Relaxed);
+    match g {
+        (Some(h), Some(sg)) => say!("audio: microphone gains {when}: hardware A#{h} cB, record soft gain A#{sg} dB"),
+        (Some(h), None) => say!("audio: microphone gains {when}: hardware A#{h} cB, the soft gain not answered"),
+        (None, Some(sg)) => say!("audio: microphone gains {when}: the hardware gain not answered, record soft gain A#{sg} dB"),
+        (None, None) => say!("audio: microphone gains {when}: neither answered"),
+    }
+}
 
 /// husky's built-in microphones: ids 0, 1 and 2, slot 3 unused in every path (mixer_paths.xml:750-753, :840-843; mixer_paths_factory.xml:126-134). Their places (the HAL's bottom, back, top, audio_platform_configuration.xml:58-69) are marked "fake data" by the HAL itself, so the page names them by id.
 pub const MICS: usize = 3;
-/// The capture's period as the AoC is asked for it (hw.c:1901-1902: 10 ms, four of them): 480 frames at 48 kHz, three channels of 16 bits.
-pub const CAPTURE_PERIOD: usize = 480;
-pub const CAPTURE_FRAME_BYTES: usize = MICS * 2;
+/// The capture's period as Linux asks for it (hw.c:1901-1902: 10 ms, four of them), and its sample width: 16 bits.
+/// Both are a capture's own since 2026-11-24 (`Shape`): the field is whole milliseconds (zuma.h:832 `period_ms`, a u8), so 1, 2 and 5 ms are what can be asked, never 2.5.
+pub const CAPTURE_MS: u8 = 10;
+/// The widths a capture may ask for (zuma.h:803-808 `BitsPerSample`): WIDTH_16_BIT 1, WIDTH_24_BIT 2, WIDTH_32_BIT 3.
+pub const WIDTH_16: u8 = 1;
+pub const WIDTH_32: u8 = 3;
+
+/// A capture's shape: its period in milliseconds, its sample width's code, and the gains to set at its start (the record soft gain in whole dB and the hardware gain in dB; None leaves the AoC's own).
+#[derive(Clone, Copy, PartialEq)]
+pub struct Shape {
+    pub ms: u8,
+    pub width: u8,
+    pub gain: Option<(i8, i8)>,
+    /// Which of the AoC's record paths (aoc_alsa.h:52-57, the stream types aoc_alsa_hw.c:171-178): `REC_NORMAL` (device 8, `audio_capture0`, Android's audio record, three microphones), `REC_MMAP` (device 9, `audio_capture1`, AAudio's MMAP record) or `REC_RAW` (device 10, `audio_capture2`, the low-latency record, started as a raw stream); the last two carry at most two channels (aoc_alsa_hw.c:1352-1356, :1384-1388).
+    pub kind: u8,
+}
+
+pub const REC_NORMAL: u8 = 0;
+pub const REC_MMAP: u8 = 1;
+pub const REC_RAW: u8 = 2;
+
+impl Shape {
+    pub const LINUX: Shape = Shape { ms: CAPTURE_MS, width: WIDTH_16, gain: None, kind: REC_NORMAL };
+    /// Channels in the ring: the three microphones on the normal path, two on the others.
+    pub fn chans(self) -> usize {
+        if self.kind == REC_NORMAL { MICS } else { 2 }
+    }
+    /// The PCM device the record path is (SET_PARAMS2's channel, hw.c:1822 and aoc_alsa.h:52-57).
+    fn device(self) -> u8 {
+        8 + self.kind
+    }
+    fn ring_name(self) -> &'static [u8] {
+        match self.kind {
+            REC_MMAP => b"audio_capture1",
+            REC_RAW => b"audio_capture2",
+            _ => b"audio_capture0",
+        }
+    }
+    /// Bytes a sample: two for 16 bits, four for 24 and 32 (ALSA's S24_LE, which the AoC's playback side lists, is a 24-bit value in a 32-bit word: aoc_alsa_pcm.c:177-179).
+    pub fn sample_bytes(self) -> usize {
+        if self.width == WIDTH_16 { 2 } else { 4 }
+    }
+    /// Frames a period at 48 kHz.
+    pub fn period_frames(self) -> usize {
+        48 * self.ms as usize
+    }
+    pub fn period_bytes(self) -> u32 {
+        (self.period_frames() * self.chans() * self.sample_bytes()) as u32
+    }
+}
 
 /// The input control queue and the capture ring, found and checked.
 #[derive(Clone, Copy)]
@@ -610,24 +823,31 @@ pub struct Capture {
     pub control: Svc,
     pub ring: Svc,
     win: RingMap,
+    /// The record path (`Shape::kind`), for its stop.
+    pub kind: u8,
 }
 
-/// The capture's two services by the names Linux allocates them by.
+/// The capture's two services by the names Linux allocates them by: the normal record's ring.
 pub fn capture_services() -> Result<Capture, &'static str> {
+    capture_services_for(Shape::LINUX)
+}
+
+/// The input control queue and the ring of `shape`'s record path.
+pub fn capture_services_for(shape: Shape) -> Result<Capture, &'static str> {
     let control = find(b"audio_input_control").ok_or("no audio_input_control service")?;
-    let ring = find(b"audio_capture0").ok_or("no audio_capture0 service")?;
+    let ring = find(shape.ring_name()).ok_or("the record path's ring is not in the AoC's service table")?;
     if control.ring() || !control.fits(DOWN) || !control.fits(UP) {
         return Err("audio_input_control is not a queue inside the aoc-ipc window");
     }
     let Some(win) = ring.ring_win(UP).filter(|_| ring.ring()) else {
-        return Err("audio_capture0 is not a ring inside the granted windows (aoc-ipc, aoc-capture: a kernel from before has no ring window)");
+        return Err("the record ring is not inside the granted windows (aoc-ipc, aoc-capture: a kernel from before has no ring window)");
     };
     // WHY: samples are read two bytes at a time at the ring's byte positions; an odd start or length would split one across the wrap. The AoC sets both, so they are checked.
     let (off, len) = ring.span(UP);
     if off & 1 != 0 || len & 1 != 0 {
-        return Err("audio_capture0's ring is not sample-aligned");
+        return Err("the record ring is not sample-aligned");
     }
-    Ok(Capture { control, ring, win })
+    Ok(Capture { control, ring, win, kind: shape.kind })
 }
 
 /// A capture command's reply checked only for arriving: the AoC's answer, or its error said with the command's name.
@@ -639,9 +859,9 @@ fn mic_command(c: &Capture, name: &str, cmd: &mut [u8]) -> Result<(), &'static s
     })
 }
 
-/// The capture started: the microphones powered (as the factory test does, mixer_paths_factory.xml:56-66; Linux's own capture leaves it to the firmware, uncertain on a cold AoC, so sent and its refusal only said), the DC blocker on (the HAL's boot setting, mixer_paths.xml:238), then SET_PARAMS (before AP_INPUT_START: the firmware refuses them while the input runs, its string "SET_MIC_RECORD_AP_PARAMS called while APInputProcessor is started"), SET_PARAMS2, the microphone list, AP_INPUT_START, the ring flushed (hw.c:1979-1983), START_DATA (hw.c:1497-1520).
-pub fn capture_start(c: &Capture) -> Result<(), &'static str> {
-    let r = capture_steps(c);
+/// The capture started in `shape`: the microphones powered (as the factory test does, mixer_paths_factory.xml:56-66; Linux's own capture leaves it to the firmware, uncertain on a cold AoC, so sent and its refusal only said), the DC blocker on (the HAL's boot setting, mixer_paths.xml:238), then SET_PARAMS (before AP_INPUT_START: the firmware refuses them while the input runs, its string "SET_MIC_RECORD_AP_PARAMS called while APInputProcessor is started"), SET_PARAMS2, the microphone list, AP_INPUT_START, the ring flushed (hw.c:1979-1983), START_DATA (hw.c:1497-1520).
+pub fn capture_start(c: &Capture, shape: Shape) -> Result<(), &'static str> {
+    let r = capture_steps(c, shape);
     // A start that failed part way leaves nothing on: the input stopped (refused harmlessly if it never started) and the microphones' power taken back.
     if r.is_err() {
         capture_stop(c);
@@ -649,7 +869,7 @@ pub fn capture_start(c: &Capture) -> Result<(), &'static str> {
     r
 }
 
-fn capture_steps(c: &Capture) -> Result<(), &'static str> {
+fn capture_steps(c: &Capture, shape: Shape) -> Result<(), &'static str> {
     for mic in 0..MICS as u8 {
         let mut m = [0u8; 9];
         header(&mut m, CMD_MIC_POWER_ON);
@@ -660,26 +880,31 @@ fn capture_steps(c: &Capture) -> Result<(), &'static str> {
     header(&mut m, CMD_SET_MIC_DC_BLOCKER);
     m[8] = 1;
     let _ = mic_command(c, "SET_MIC_DC_BLOCKER", &mut m);
-    // MIC_RECORD_AP_SET_PARAMS (zuma.h:819-842; hw.c:1839-1949): three channels, WIDTH_16_BIT 1, SR_48KHZ 5 (twice: byte 10 and byte 20, hw.c:1941), FRMT_FIXED_POINT 1, offset 0, the PDM mask of microphones 0-2, 10 ms periods, four of them, channel k from microphone k (G#FF unused), AP_MIC_PROCESS_RAW 0.
+    say_gains("as found", gains(c));
+    if let Some((soft, hw)) = shape.gain {
+        set_gains(c, soft, hw);
+        say_gains("as set", gains(c));
+    }
+    // MIC_RECORD_AP_SET_PARAMS (zuma.h:819-842; hw.c:1839-1949): three channels, the width (Linux: WIDTH_16_BIT 1), SR_48KHZ 5 (twice: byte 10 and byte 20, hw.c:1941), FRMT_FIXED_POINT 1, offset 0, the PDM mask of microphones 0-2, the period in milliseconds (Linux: 10), four of them, channel k from microphone k (G#FF unused), AP_MIC_PROCESS_RAW 0.
     let mut m = [0u8; 22];
     header(&mut m, CMD_MIC_RECORD_AP_SET_PARAMS);
-    m[8] = MICS as u8;
-    m[9] = 1;
+    m[8] = shape.chans() as u8;
+    m[9] = shape.width;
     m[10] = 5;
     m[11] = 1;
     m[12] = 0;
-    m[13] = (1 << MICS) - 1;
-    m[14] = 10;
+    m[13] = (1 << shape.chans()) - 1;
+    m[14] = shape.ms;
     m[15] = 4;
-    m[16..20].copy_from_slice(&[0, 1, 2, 0xFF]);
+    m[16..20].copy_from_slice(if shape.chans() == MICS { &[0, 1, 2, 0xFF] } else { &[0, 1, 0xFF, 0xFF] });
     m[20] = 5;
     m[21] = 0;
     mic_command(c, "MIC_RECORD_AP_SET_PARAMS", &mut m)?;
     // MIC_RECORD_AP_SET_PARAMS2 (zuma.h:2738-2743; hw.c:1818-1837): the PCM device's index 8 (not an entry point, hw.c:1822), the buffer and period in bytes (Linux gives ALSA's: four periods of 10 ms).
-    let period = (CAPTURE_PERIOD * CAPTURE_FRAME_BYTES) as u32;
+    let period = shape.period_bytes();
     let mut m = [0u8; 17];
     header(&mut m, CMD_MIC_RECORD_AP_SET_PARAMS2);
-    m[8] = 8;
+    m[8] = shape.device();
     m[9..13].copy_from_slice(&(4 * period).to_le_bytes());
     m[13..17].copy_from_slice(&period.to_le_bytes());
     mic_command(c, "MIC_RECORD_AP_SET_PARAMS2", &mut m)?;
@@ -691,6 +916,18 @@ fn capture_steps(c: &Capture) -> Result<(), &'static str> {
     m[10..14].copy_from_slice(&0u32.to_le_bytes());
     m[14..18].copy_from_slice(&0xFF02_0100u32.to_le_bytes());
     mic_command(c, "INPUT_SET_PARAMETER (the microphone list)", &mut m)?;
+    // The MMAP and raw record paths start with their own enable and its channel count (hw.c:1345-1407: MMAP_ENABLE_2, RAW_ENABLE_2), once the microphones' input runs (the backend Linux's mixer starts before the trigger, hw.c:1584-1633; on the device the enable alone delivered nothing, 2026-11-24).
+    if shape.kind != REC_NORMAL {
+        let mut m = [0u8; 9];
+        header(&mut m, CMD_AP_INPUT_START);
+        m[8] = 1;
+        let _ = mic_command(c, "AP_INPUT_START", &mut m);
+        c.flush();
+        let mut m = [0u8; 9];
+        header(&mut m, if shape.kind == REC_MMAP { CMD_MMAP_ENABLE_2 } else { CMD_RAW_ENABLE_2 });
+        m[8] = shape.chans() as u8;
+        return mic_command(c, "MMAP_ENABLE_2 or RAW_ENABLE_2", &mut m);
+    }
     // AP_INPUT_START (zuma.h:1843-1862; hw.c:359-374, :411-413): input 1, AP_INPUT_PROCESSOR_MIC_INPUT_INDEX.
     let mut m = [0u8; 9];
     header(&mut m, CMD_AP_INPUT_START);
@@ -705,8 +942,8 @@ fn capture_steps(c: &Capture) -> Result<(), &'static str> {
 /// The capture stopped (hw.c:446-457, :1522-1538: AP_INPUT_STOP) and the microphones' power taken back.
 pub fn capture_stop(c: &Capture) {
     let mut m = [0u8; 8];
-    header(&mut m, CMD_AP_INPUT_STOP);
-    let _ = mic_command(c, "AP_INPUT_STOP", &mut m);
+    header(&mut m, match c.kind { REC_MMAP => CMD_MIC_MMAP_DISABLE, REC_RAW => CMD_MIC_RAW_DISABLE, _ => CMD_AP_INPUT_STOP });
+    let _ = mic_command(c, "the record path's stop", &mut m);
     for mic in 0..MICS as u8 {
         let mut m = [0u8; 9];
         header(&mut m, CMD_MIC_POWER_OFF);
@@ -739,25 +976,38 @@ impl Capture {
         skipped
     }
 
-    /// The samples the AoC has written since the last read (at most a ring: `skip_overrun` first), each handed to `f` in order (interleaved, microphone 0 first), then rx and rp moved past them (ipc_core.c:67-79, :634: rx first, then rp). A word read where the position is aligned, two bytes where it is not (Device memory takes no unaligned access). Whole samples only: an odd byte waits for its pair.
-    pub fn read(&self, mut f: impl FnMut(i16)) {
+    /// The samples the AoC has written since the last read (at most a ring: `skip_overrun` first), each handed to `f` in order (interleaved, microphone 0 first), then rx and rp moved past them (ipc_core.c:67-79, :634: rx first, then rp). `bytes` a sample, 2 or 4: a 4-byte sample is handed on as its top 16 bits, so meters and recordings keep one scale whatever the width (the whole word is in `raw` for the first few, to see how the AoC packs 24 bits). A word read where the position is aligned, two bytes where it is not (Device memory takes no unaligned access). Whole samples only: a part waits for the rest. The bytes read.
+    pub fn read(&self, bytes: u64, mut f: impl FnMut(i16, u32)) -> u32 {
         let r = self.ring;
         let (off, size) = r.span(UP);
         let rx = r.get(UP, R_RX);
         let delta = r.get(UP, R_TX).wrapping_sub(rx);
         // A delta past the ring is `skip_overrun`'s; here it is the smaller of the two counts, never more than one turn read.
-        let n = (if delta as u64 > size { size as u32 } else { delta } & !1) as u64;
+        let n = (if delta as u64 > size { size as u32 } else { delta } as u64) & !(bytes - 1);
         let mut rp = r.get(UP, R_RP) as u64;
         let mut done = 0u64;
         while done < n {
             if rp & 3 == 0 && n - done >= 4 && rp + 4 <= size {
                 let w = self.win.rd32(off + rp);
-                f(w as u16 as i16);
-                f((w >> 16) as u16 as i16);
+                if bytes == 4 {
+                    f((w >> 16) as u16 as i16, w);
+                } else {
+                    f(w as u16 as i16, w & 0xFFFF);
+                    f((w >> 16) as u16 as i16, w >> 16);
+                }
                 rp += 4;
                 done += 4;
             } else {
-                f((self.win.rd8(off + rp) as u16 | (self.win.rd8(off + rp + 1) as u16) << 8) as i16);
+                let x = self.win.rd8(off + rp) as u16 | (self.win.rd8(off + rp + 1) as u16) << 8;
+                if bytes == 4 {
+                    // The low half now, the high half after it: a 4-byte sample split by an unaligned place is read in two.
+                    let hi = self.win.rd8(off + (rp + 2) % size) as u32 | (self.win.rd8(off + (rp + 3) % size) as u32) << 8;
+                    f(hi as u16 as i16, x as u32 | hi << 16);
+                    rp = (rp + 4) % size;
+                    done += 4;
+                    continue;
+                }
+                f(x as i16, x as u32);
                 rp += 2;
                 done += 2;
             }
@@ -767,6 +1017,7 @@ impl Capture {
         }
         r.set(UP, R_RX, rx.wrapping_add(n as u32));
         r.set(UP, R_RP, rp as u32);
+        n as u32
     }
 
     /// The capture ring's mailbox channel.

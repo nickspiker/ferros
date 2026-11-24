@@ -9,10 +9,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ferros_sys::reply;
 use ferros_sys::audio::{MICS, RECORD_FRAMES, REPORT};
 
-/// Capture periods (10 ms each) a meter's answer covers: 8, 80 ms, so a live meter is answered about twelve times a second.
-const METER_BLOCKS: u32 = 1 << 3;
-/// Capture periods with no meter held and no recording before the capture is stopped: 64, 640 ms, long past the gap between a meter's answer and its next call.
-const IDLE_BLOCKS: u32 = 1 << 6;
+/// Frames a meter's answer covers: 2^12, 85 ms, so a live meter is answered about twelve times a second whatever the capture's period. Counted in frames since 2026-11-24 (the period is a capture's own: aoc.rs `Shape`).
+const METER_FRAMES: usize = 1 << 12;
+/// Frames with no meter held, no recording and no bench before the capture is stopped: 2^15, 683 ms, long past the gap between a meter's answer and its next call.
+const IDLE_FRAMES: usize = 1 << 15;
 
 // The capture's shape is aoc.rs's (three microphones interleaved, 16-bit, 480 frames a period); the protocol's count of microphones must be the same.
 const _: () = assert!(MICS == aoc::MICS);
@@ -32,13 +32,23 @@ pub struct Mic {
     /// Being started or stopped (its commands under way on the input queue, which one thread at a time speaks).
     pub starting: bool,
     pub stopping: bool,
+    /// The capture's period and width, asked at its start.
+    pub shape: aoc::Shape,
     /// The f1 channel bit the capture ring rings, or 0 when its channel is on a block whose line this process does not hold (then polled: `clock`).
     pub bit: u16,
-    /// The next sample's microphone (the samples come interleaved), and frames into the current period.
+    /// The next sample's microphone (the samples come interleaved), and frames into the current meter's window.
     phase: usize,
     frames: usize,
+    /// Frames since the capture started, read or skipped: the capture's own clock, stamped on every measurement.
+    pub total: u64,
     pub blocks: u32,
-    idle: u32,
+    idle: usize,
+    /// The capture's turns that found bytes, and the bytes each found (least and most): how the AoC hands the samples over.
+    pub reads: u32,
+    pub read_min: u32,
+    pub read_max: u32,
+    /// The first words of a wide capture, as the AoC packs them (said once).
+    raw_said: bool,
     /// Bytes the AoC wrote over before they were read (this process late), so far.
     pub skipped: u32,
     peaks: [u16; MICS],
@@ -49,20 +59,22 @@ pub struct Mic {
 }
 
 impl Mic {
-    pub const NONE: Mic = Mic { cap: None, starting: false, stopping: false, bit: 0, phase: 0, frames: 0, blocks: 0, idle: 0, skipped: 0, peaks: [0; MICS], window: 0, meter: None, rec: None };
+    pub const NONE: Mic = Mic { cap: None, starting: false, stopping: false, shape: aoc::Shape::LINUX, bit: 0, phase: 0, frames: 0, total: 0, blocks: 0, idle: 0, reads: 0, read_min: u32::MAX, read_max: 0, raw_said: false, skipped: 0, peaks: [0; MICS], window: 0, meter: None, rec: None };
     /// Anything that keeps the process: a capture, its start or stop under way, a meter waiting, a recording.
     pub fn busy(&self) -> bool {
+        // A bench holds the capture by its own flag (main.rs `Bench`), read with the rest of the state where this is called.
         self.cap.is_some() || self.starting || self.stopping || self.meter.is_some() || self.rec.is_some()
     }
 }
 
-/// The capture running, started if it is not (the receiving thread, as `ensure_up`): true when capturing. Refused while it is being stopped or the process is ending.
-pub fn ensure() -> bool {
+/// The capture running, started in `shape` if it is not (the receiving thread, as `ensure_up`): true when capturing. Refused while it is being stopped or the process is ending, and when it runs in another shape.
+pub fn ensure(shape: aoc::Shape) -> bool {
     {
         let st = lock();
         if st.mic.cap.is_some() {
+            let same = st.mic.shape == shape;
             unlock();
-            return true;
+            return same;
         }
         if st.mic.starting || st.mic.stopping || st.closing {
             unlock();
@@ -71,17 +83,23 @@ pub fn ensure() -> bool {
         st.mic.starting = true;
         unlock();
     }
-    let r = start();
+    let r = start(shape);
     let st = lock();
     st.mic.starting = false;
     let why = match r {
         Ok((c, bit)) => {
             st.mic.cap = Some(c);
+            st.mic.shape = shape;
             st.mic.bit = bit;
             st.mic.phase = 0;
             st.mic.frames = 0;
+            st.mic.total = 0;
             st.mic.idle = 0;
             st.mic.window = 0;
+            st.mic.reads = 0;
+            st.mic.read_min = u32::MAX;
+            st.mic.read_max = 0;
+            st.mic.raw_said = false;
             st.mic.peaks = [0; MICS];
             None
         }
@@ -99,14 +117,15 @@ pub fn ensure() -> bool {
     why.is_none()
 }
 
-fn start() -> Result<(aoc::Capture, u16), &'static str> {
+fn start(shape: aoc::Shape) -> Result<(aoc::Capture, u16), &'static str> {
     if !aoc::online() {
         return Err("the AoC is not up (the sensors process asks for its start at every boot)");
     }
-    let c = aoc::capture_services()?;
+    let c = aoc::capture_services_for(shape)?;
     aoc::describe("audio_input_control", c.control);
     aoc::describe_up("audio_capture0", c.ring);
-    aoc::capture_start(&c)?;
+    aoc::capture_start(&c, shape)?;
+    say!("audio: capture asked for A#{} ms periods, width code A#{} (A#{} bytes a sample), A#{} bytes a period", shape.ms, shape.width, shape.sample_bytes(), shape.period_bytes());
     let ch = c.irq();
     let bit = if (16..32).contains(&ch) { 1u16 << (ch - 16) } else { 0 };
     if bit != 0 {
@@ -152,18 +171,33 @@ pub fn turn(rang: u16) {
         unlock();
         return;
     }
+    let t = ferros_sys::now();
+    let bench = &mut st.bench;
     let m = &mut st.mic;
+    let sb = m.shape.sample_bytes();
+    let chans = m.shape.chans();
     let skipped = c.skip_overrun();
     if skipped != 0 {
         m.skipped = m.skipped.wrapping_add(skipped);
-        // The skipped bytes are whole samples of the interleaved stream: the next one read belongs that many microphones on.
-        m.phase = (m.phase + (skipped as usize >> 1)) % MICS;
+        // The skipped bytes are whole samples of the interleaved stream: the next one read belongs that many microphones on, and the clock moves by the frames they held.
+        let samples = skipped as usize / sb;
+        m.total += ((m.phase + samples) / chans) as u64;
+        m.phase = (m.phase + samples) % chans;
     }
     // SAFETY: REC is this thread's alone while a recording is under way (mix.rs reads it only once the recording has ended).
     let rec = unsafe { &mut *(&raw mut mix::REC) };
     let (mut phase, mut frames, mut peaks) = (m.phase, 0usize, m.peaks);
     let mut r = m.rec.as_ref().map(|r| (r.mic as usize, r.n, r.peak));
-    c.read(|x| {
+    let total0 = m.total;
+    let mut raw = [0u32; 6];
+    let mut raws = 0usize;
+    let said = m.raw_said;
+    let n = c.read(sb as u64, |x, w| {
+        if !said && raws < raw.len() {
+            raw[raws] = w;
+            raws += 1;
+        }
+        bench.sample(phase, x, total0 + frames as u64);
         let a = x.unsigned_abs();
         // A running maximum, the meter's peak: the larger of two magnitudes, nothing held to a range.
         if a > peaks[phase] {
@@ -180,23 +214,38 @@ pub fn turn(rang: u16) {
             }
         }
         phase += 1;
-        if phase == MICS {
+        if phase == chans {
             phase = 0;
             frames += 1;
         }
     });
     m.phase = phase;
     m.peaks = peaks;
+    m.total += frames as u64;
+    if n != 0 {
+        m.reads = m.reads.wrapping_add(1);
+        m.read_min = m.read_min.min(n);
+        m.read_max = m.read_max.max(n);
+        // The capture's frames now in: what a bench's detection is measured against (main.rs `Bench::read`).
+        bench.read(t, m.total);
+    }
+    let wide = if !m.raw_said && raws != 0 && sb == 4 {
+        m.raw_said = true;
+        Some(raw)
+    } else {
+        None
+    };
     if let (Some(rr), Some((_, n, peak))) = (m.rec.as_mut(), r) {
         rr.n = n;
         rr.peak = peak;
     }
     m.frames += frames;
-    let blocks = (m.frames / aoc::CAPTURE_PERIOD) as u32;
-    m.frames %= aoc::CAPTURE_PERIOD;
+    let pf = m.shape.period_frames();
+    let blocks = (m.frames / pf) as u32;
+    m.frames %= pf;
     m.blocks = m.blocks.wrapping_add(blocks);
-    m.window += blocks;
-    if m.window >= METER_BLOCKS {
+    m.window += frames as u32;
+    if m.window as usize >= METER_FRAMES {
         m.window = 0;
         if let Some(t) = m.meter.take() {
             let mut out = [0u8; 1 + 2 * MICS + 8];
@@ -209,19 +258,22 @@ pub fn turn(rang: u16) {
         }
         m.peaks = [0; MICS];
     }
-    if m.meter.is_none() && m.rec.is_none() {
-        m.idle += blocks;
+    if m.meter.is_none() && m.rec.is_none() && !bench.capturing() {
+        m.idle += frames;
     } else {
         m.idle = 0;
     }
     let done = if m.rec.as_ref().is_some_and(|r| r.n == RECORD_FRAMES) { m.rec.take() } else { None };
-    let stop = m.idle >= IDLE_BLOCKS;
+    let stop = m.idle >= IDLE_FRAMES;
     let bit = m.bit;
     if stop {
         m.cap = None;
         m.stopping = true;
     }
     unlock();
+    if let Some(w) = wide {
+        say!("audio: the capture's first words: G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X}", w[0], w[1], w[2], w[3], w[4], w[5]);
+    }
     if let Some(r) = done {
         recorded(r);
     }
@@ -247,7 +299,7 @@ fn recorded(r: Rec) {
         reply(&r.token, &[3]);
         return;
     }
-    let played = crate::ensure_up();
+    let played = crate::ensure_up(crate::Play::DEFAULT);
     let st: &mut State = lock();
     if played {
         st.clip.start(RECORD_FRAMES, r.peak, r.level);
@@ -281,7 +333,7 @@ pub fn record(token: [u8; 32], mic: u8, level: u8) {
             return;
         }
     }
-    if !ensure() {
+    if !ensure(aoc::Shape::LINUX) {
         reply(&token, &[2]);
         return;
     }
@@ -291,9 +343,9 @@ pub fn record(token: [u8; 32], mic: u8, level: u8) {
     say!("audio: recording microphone A#{mic}: A#{RECORD_FRAMES} frames");
 }
 
-/// `MIC_LEVELS` (the receiving thread): the capture running, the call held until the meter's window ends (`turn`); a meter already held is answered [1], replaced.
-pub fn levels(token: [u8; 32]) {
-    if !ensure() {
+/// `MIC_LEVELS` (the receiving thread): the capture running in `shape`, the call held until the meter's window ends (`turn`); a meter already held is answered [1], replaced.
+pub fn levels(token: [u8; 32], shape: aoc::Shape) {
+    if !ensure(shape) {
         reply(&token, &[2]);
         return;
     }

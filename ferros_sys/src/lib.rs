@@ -1005,6 +1005,8 @@ pub mod audio {
     pub const PROBE: u8 = 7;
     pub const MIC_LEVELS: u8 = 8;
     pub const RECORD: u8 = 9;
+    /// The bench (2026-11-24, docs/AUDIO.md "The bench"): the sound in a shape of the caller's, a quiet click train or tone, every interrupt measured and, with the capture on, each click found in the microphones. [BENCH, lead, buffer, period's log2, level, count (u16), spacing's log2, flags (bit 0 clicks, bit 1 capture), capture ms, capture width]; held until it ends, the measures on the console.
+    pub const BENCH: u8 = 10;
 
     /// The built-in microphones the service captures (husky's three, ids 0-2), and the recording's length: 2^17 frames, 2.7 s, one microphone, kept in the service's memory only and gone once played.
     pub const MICS: usize = 3;

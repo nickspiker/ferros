@@ -282,3 +282,73 @@ Then the volume: `ferros-bridge diag "pref volume 207"` (an octave down from the
 **5. The end of it.** After the last stream closes or its kist ends, about 1.4 s plus 85 ms later the console says `audio: silent, ending`, `diag arcs` no longer lists `audio`, and the amplifiers' DEVID reads 0 from the `amp` tool (held in reset: the switch went off with the process).
 
 **Not measured yet, and how:** the latency from a write to the air (a microphone capture of a click against the write's time; the AoC's microphones are the next service), the CPU the service takes (`diag sched`), and the AoC's own pipeline delay.
+
+## The bench and the sweep (2026-11-24, measured on the Pro)
+
+The owner, 2026-11-24, for waves and beams: "q removal. Less q's the better and smaller the buckets without getting stupid", "design up front, try options, experiment, benchmark, continue, repeat", "Like I want this creepy fast" (Photon docs/ferros-media.md).
+Every number here is from the Pro under ferros, stamped with the AoC's own counts: GET_EP_TOT_SAMPLES at a run's start and end, the playback ring's byte counts, the capture's frames.
+
+### The bench (`BENCH`, ferros_sys audio op 10)
+
+A development op on `audio`, sent by `epcall` to a hand-spawned service (target/farm-style hand spawn, the service's doc line, plus `--dma test-mailbox` and `--input-file <sweep>` for the sweep).
+The message: [10, lead, buffer, the period's log2, level, count (u16), spacing's log2, flags, capture ms, capture width, entry point, record soft gain dB, hardware gain dB, and optionally the clock thread's core mask].
+Flags: bit 0 clicks, bit 1 the capture on, bit 2 the gains set, bit 3 the spawn input played once (a sweep) with the capture dumped into the test mailbox, bits 4 and 5 one speaker alone, bits 6 and 7 the record path (0 normal, 1 MMAP, 2 raw).
+It brings the sound up in that shape, plays at a level never above `TONE_MAX`, and says on the console: the interrupts and the gaps between them, what the AoC took between two rings and what it left queued, its samples against 48 kHz times the time, the capture's reads, and for a sweep the dump.
+A sweep's dump is held (the process stays) until the next call, because the kernel zeroes a mailbox's payload when its writer ends.
+
+### What the AoC does with each entry point
+
+The service played thru `audio_playback5` from 2026-11-11 to now, taken for Android's low-latency path from the boot log's bind of entry point 5.
+It is not: the device tree's front ends (gs101-audio.dtsi:63-190, :426-440) and Android's paths (aoc_alsa_path.c:43-58, mixer_paths.xml:363-418) make entry point 5 `fe_ep6_rx`, deep-buffer-playback, 70 ms to the speaker in Android's own table (audio_platform_configuration.xml:80).
+
+| Entry point (ring) | Android's path | The AoC's take | Sound |
+|---|---|---|---|
+| 5 (`audio_playback5`, 4 MiB) | deep buffer | 480 frames every 10.000 ms, whatever period it is told | yes |
+| 1 (`audio_playback1`, 16 KiB) | low latency | 10 ms, whatever period it is told; with 128 frames queued it starved (148,224 samples in 11.6 s) | yes |
+| 0 (`audio_playback0`, 15 KiB) | AAudio MMAP | the period it is told, rounded up to whole ms: 256 frames 6 ms, 128 frames 3 ms, 64 frames 2 ms, 32 or 16 frames 1 ms (48 frames a ring) | no: taken at its rate, as a plain ring and as Linux's MMAP way (the ring marked full, written ahead of the AoC's read place, 16-bit or float), silent at the microphones |
+| 9 (`audio_raw`) | raw | its ring lies past the granted windows (G#D80000 in the IPC block) | not tried |
+
+With whole-period top-ups the 10 ms take starved the deep-buffer path: 5.84 s of samples in 7.29 s (the first bench).
+The service now tops the ring up to its lead in frames, a period at most at a time: 148,320 samples taken against 148,031 expected.
+At a 1 ms block (entry point 0, 32-frame period) with 64 frames queued, 0 underruns in 3 s: 148,224 against 148,144.
+
+### The sweep (the owner, 2026-11-24: "Doesn't a sweep give you a better idea of device audio latency?")
+
+Farina's exponential sine sweep (tools/sweep-ir: 2^17 frames, 100 Hz to 20 kHz, faded 2^8 frames at each end) played once at `TONE_MAX`; all three microphones captured; each deconvolved by the sweep on the host (Y·X*/(|X|² + ε), ε 60 dB under the sweep's strongest bin, by FFT, f64).
+The impulse's peak, placed to a fraction of a frame by a parabola, is the arrival; the capture's read anchors (frames in, counter) turn it into the counter's time, and the latency is from the sweep's first frame written into the AoC's ring.
+The harmonics fall ahead of the main impulse and are read off too; so is the response in octave bands.
+
+```
+tools/sweep-ir/target/release/sweep-ir gen sweep17.raw 17
+target/farm/audio/sweep.sh <BENCH hex with flags bit 3> dump.bin     # spawn, bench, read the frame `diag arcs` names, release, analyse
+```
+
+| Path (playback, record) | Write to arrival | Of it, queued ahead | Notes |
+|---|---|---|---|
+| EP5 deep buffer, normal record (1 ms) | 34.24 to 34.32 ms | 0.67 ms | h2 -29 to -48 dB |
+| EP1 low latency, normal record | 34.98 to 35.07 ms | 0.67 ms | |
+| EP5, normal record at 10 ms periods | 34.75 to 34.83 ms | 0.67 ms | the capture's period does not move it |
+| EP5, normal record 32-bit (width code 3) | 34.79 to 34.87 ms | 0.67 ms | the AoC carries 32-bit capture |
+| EP5, raw (low-latency) record, 2 channels | 34.85 ms | 0.67 ms | the record path does not move it |
+| EP5, MMAP record (`audio_capture1`) | none | | the ring fills at 1 ms with zeros |
+| EP0 MMAP playback | none | | silent |
+
+So about 34 ms of the loop is inside the AoC, the same for every working playback and record path: its speaker chain or the microphones' common front end, not the rings.
+Splitting play from capture needs one side of known delay; both MMAP sides, which Android's AAudio uses for its lowest latency, are silent here, so the next step is what Android's HAL sends for an MMAP stream (its userspace sends commands the kernel tree does not show: an oracle capture of the AoC's control queues while an AAudio MMAP stream plays, on slot b's Magisk root).
+
+### The microphones' places, measured
+
+One speaker at a time (flags bits 4 and 5): the left channel (cs35l41@0) reaches microphone 2 first at -45 dB and microphone 1 1.4 cm later at -48 dB, microphone 0 only at -68 dB; the right channel (cs35l41@1) reaches microphone 0 first at -48 dB and 1 and 2 at -69 and -72 dB, 18 frames (12.6 cm, about the device's length) later.
+Two microphones sit at the top and one at the bottom, so microphone 0 is the bottom (voice) microphone, the left channel the top (earpiece-side) speaker, the right the bottom speaker; 1 and 2 by the HAL's own order (bottom, back, top) and 2 being nearer the earpiece: 1 back, 2 top.
+A tap test by the owner settles 1 against 2. The AoC's default gains on a cold AoC: hardware 0 cB, record soft gain 0 dB.
+
+### The AoC's line, interrupt to run (`diag dev`, aoc-mbox-f1, INTID 110)
+
+Idle: mean 24 to 36 us, longest 66 to 383 us; the line lands on the X3 (G#100) and its waiter runs on the A715s (G#F0).
+Under load and pinned to an A510: to be measured (Lumis pins its intake to cores 0-2 and its camera thread to core 3).
+
+### Proposals for the owner (nothing of these is built)
+
+- **A mic right.** Today any kist holding `audio` (implicit for every kist) can call `MIC_LEVELS` and `RECORD`, and would read the planned `mic` mailbox. Proposed: `mic`, a right of its own in the kists' vocabulary, asked once per person per kist (permissions_asked_once), the proof for SYS_MAILBOX op 0 on `mic` and for `MIC_LEVELS` and `RECORD`; the Sound page's tests keep it as a Settings holder. Until the owner decides, the proof is the `audio` right, swapped in one place.
+- **The capture runs only while someone holds a view.** A kernel-kept count of views (a header word, +1 at an open, -1 at its process's end) the service reads every period: at 0 the microphones stop, so a kist that dies cannot leave them on, and the same count is the mic-in-use indicator.
+- **Gain policy.** The record soft gain (block 136, component 30, key 16, whole dB) and the hardware gain (cB) are the service's, never a kist's: one setting per use, a call's voice and a recording at Android's measured values (soft 0 dB, hardware 130 cB for voice; 5 dB unprocessed), the level meter at what a recording uses, the defaults stored as device settings; a kist gets the samples at that gain and scales its own copy. The calibration session (the owner's measurement microphone) turns them into dB SPL.
