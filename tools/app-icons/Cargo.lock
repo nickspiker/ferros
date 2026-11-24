@@ -255,6 +255,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app-icons"
 version = "0.1.0"
 dependencies = [
+ "ferros_kept",
  "image",
  "photon-messenger",
  "vsf",
@@ -2172,6 +2173,40 @@ name = "fearless_simd"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
+
+[[package]]
+name = "ferros_gnss"
+version = "0.1.0"
+dependencies = [
+ "ferros_sky",
+ "libm",
+]
+
+[[package]]
+name = "ferros_kept"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_gnss",
+ "ferros_thing",
+ "libm",
+ "vsf",
+]
+
+[[package]]
+name = "ferros_sky"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "ferros_thing"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "vsf",
+]
 
 [[package]]
 name = "ff"
@@ -5124,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "photon-messenger"
-version = "0.155.1"
+version = "0.156.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",

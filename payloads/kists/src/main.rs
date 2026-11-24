@@ -1517,11 +1517,13 @@ fn index_icon(grants: u64, capsule: Option<&[u8; 32]>, developer: &[u8; 32], opt
             return None;
         };
         let Ok(Some((at, len))) = ferros_kist::icon_span(&head[..n.min(head.len())]) else { return None };
-        // WHY: the span is the capsule's word (signed, but read before anything trusts the section); an icon is 5 to 31 KB, so a section past 1 MiB is none and is not read.
-        if len > 1 << 20 {
+        // As large as the capsule carries (2026-11-24: the 1 MiB and 64 KiB icon ceilings are gone, founding rule 3): only memory that is not there refuses it, said so, rather than a guessed size.
+        let mut section = Vec::new();
+        if section.try_reserve_exact(len).is_err() {
+            keep(&alloc::format!("kists: icon of capsule G#{:02X}{:02X}{:02X}{:02X}: its section of A#{len} bytes does not fit in memory; not read", c[0], c[1], c[2], c[3]));
             return None;
         }
-        let mut section = alloc::vec![0u8; len];
+        section.resize(len, 0);
         let got = ferros_sys::store_get_addr_at(caps, c, at, &mut section)?;
         if got < at + len {
             return None;
@@ -1556,10 +1558,6 @@ fn decode_icon(grants: u64, hp: &ferros_thing::Hp, icon: &ferros_kist::Icon) -> 
     if let Some(n) = ferros_sys::store_get_addr(list_cap, hp.as_bytes(), &mut probe) {
         keep(&alloc::format!("kists: icon {name}: decoded already (A#{n} bytes)"));
         return true;
-    }
-    if icon.av1.len() > dec::AV1_MAX {
-        keep(&alloc::format!("kists: icon {name}: its AV1 past an icon's size; not decoded"));
-        return false;
     }
     keep(&alloc::format!("kists: icon {name}: not decoded yet; to the decoder (icons)"));
     let ep = cap(grants, S_ICONS);
@@ -1597,7 +1595,9 @@ fn decode_icon(grants: u64, hp: &ferros_thing::Hp, icon: &ferros_kist::Icon) -> 
         }
         at += n as usize;
     }
-    let ok = ferros_kept::icon::decoded(hp, &texels, ferros_detail::eagle_now()).is_some_and(|d| ferros_sys::store_set_addr(list_cap, hp.as_bytes(), &d));
+    // What its codes are, as its section names them: VSF RGB kept, the source's sRGB numbers converted when the map reads it (ferros_kept::icon `Source`).
+    let source = if icon.primaries == Some(ferros_kist::vsf::visual::Primaries::Vsf) { ferros_kept::icon::Source::Vsf } else { ferros_kept::icon::Source::Srgb };
+    let ok = ferros_kept::icon::decoded(hp, &texels, source, ferros_detail::eagle_now()).is_some_and(|d| ferros_sys::store_set_addr(list_cap, hp.as_bytes(), &d));
     keep(&alloc::format!("kists: icon {name}: decoded icon {}", if ok { "kept in kists." } else { "NOT taken by the vault" }));
     ok
 }

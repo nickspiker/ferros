@@ -691,10 +691,14 @@ pub const ICON: &str = "icon";
 /// A kist's icon, in the one icon format (owner, 2026-11-20: "the exact same format and process as the Photon avatars so we have a consistent 256x256 g2t ... icon everywhere. friends, kists, except for pucks of course"): a Photon avatar's picture, an AV1 key frame of 256 x 256, 8 bits, VSF YCbCr 4:2:0, and what its codes mean, `g2t` (VSF RGB gamma2tanh, light above diffuse white kept) or gamma 2 (untagged).
 ///
 /// In the capsule it is the section `icon`, after the code (so the first 64 KiB the stower keeps and the kernel reads the code's header from are untouched), signed with the rest, so a kist's look is its developer's and nothing on the way can swap it. Its fields are vsf's flat image section's, `pixels` (`v'a'`) and `encoding` (`a`, absent for gamma 2), so the icon document tools/app-icons makes ([`icon_document`]) and the capsule carry the same fields. Read from the capsule by its table of contents, as the declaration is ([`icon_of`]); the person's list does not carry it.
+///
+/// Since 2026-11-24 the section may say what its codes are, `primaries` (`a`, vsf::visual `Primaries`' word): `vsf` for codes that are VSF RGB, kept as they are (Kūaha's, Aemulus's), `srgb` or none for the source's sRGB numbers, which the device converts (owner: "Convert FROM sRGB primaries TO VSF RGB, then assign g2t"; ferros_kept::icon `Source`). Other primaries are refused.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Icon {
     pub av1: Vec<u8>,
     pub encoding: vsf::visual::Encoding,
+    /// What its codes are, as the section names them (`vsf` or `srgb`); None when it names none.
+    pub primaries: Option<vsf::visual::Primaries>,
 }
 
 /// An icon from a section holding `pixels` (`v'a'`) and, unless gamma 2, `encoding` (`a`): AV1 alone, and only VSF's own encodings (an icon is VSF RGB).
@@ -711,7 +715,15 @@ fn icon_from(s: &VsfSection) -> Result<Icon, &'static str> {
         },
         Some(_) => return Err("an icon's encoding that is not text"),
     };
-    Ok(Icon { av1, encoding })
+    let primaries = match s.get_field("primaries").and_then(|f| f.values.first()) {
+        None => None,
+        Some(VsfType::a(t)) => match vsf::visual::Primaries::parse(t.as_str()) {
+            Ok(p @ (vsf::visual::Primaries::Vsf | vsf::visual::Primaries::Srgb)) => Some(p),
+            _ => return Err("an icon whose primaries are neither VSF RGB's nor its source's sRGB"),
+        },
+        Some(_) => return Err("an icon's primaries that are not text"),
+    };
+    Ok(Icon { av1, encoding, primaries })
 }
 
 /// The icon a capsule carries (its `icon` section), or None for a capsule without one.
@@ -757,6 +769,9 @@ pub fn icon_section(icon: &Icon) -> VsfSection {
     // Untagged is gamma 2 (vsf's rule), so only another encoding is written.
     if icon.encoding != vsf::visual::Encoding::Gamma2 {
         s.add_field("encoding", VsfType::a(vsf::Ascii::checked("encoding", String::from(icon.encoding.as_str()))));
+    }
+    if let Some(p) = icon.primaries {
+        s.add_field("primaries", VsfType::a(vsf::Ascii::checked("primaries", String::from(p.as_str()))));
     }
     s
 }
@@ -1981,7 +1996,7 @@ pub mod capsule {
             let av1 = alloc::vec![0x12u8, 0, 0x0A, 0x0B, 7, 7, 7];
             let doc = vsf::builders::compressed_image_encoded(av1.clone(), vsf::visual::Encoding::Gamma2Tanh).unwrap();
             let icon = crate::icon_document(&doc).unwrap();
-            assert_eq!(icon, crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2Tanh });
+            assert_eq!(icon, crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2Tanh, primaries: None });
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
             let c = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&icon), &key.public(), &code, 9).unwrap(), &key).unwrap();
             fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
@@ -1991,7 +2006,7 @@ pub mod capsule {
             assert_eq!(hp, ferros_thing::icon(&crate::icon_section(&icon).encode()));
             let again = fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 2])), None, Some(&icon), &key.public(), &code, 10).unwrap(), &key).unwrap();
             assert_eq!(crate::icon_hp(&again).unwrap(), Some(hp));
-            let other = crate::Icon { av1: alloc::vec![0x12u8, 0, 0x0A, 0x0B, 8], encoding: vsf::visual::Encoding::Gamma2Tanh };
+            let other = crate::Icon { av1: alloc::vec![0x12u8, 0, 0x0A, 0x0B, 8], encoding: vsf::visual::Encoding::Gamma2Tanh, primaries: None };
             let changed = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&other), &key.public(), &code, 9).unwrap(), &key).unwrap();
             assert_ne!(crate::icon_hp(&changed).unwrap(), Some(hp));
             // The kist is the same thing in all three.
@@ -2001,7 +2016,7 @@ pub mod capsule {
             let at = |s: &[u8]| (0..c.len() - s.len()).find(|&i| c[i..i + s.len()] == *s).unwrap();
             assert!(at(&av1) > at(&[7u8; 256]));
             // A gamma 2 icon is untagged, as vsf's flat image section has it, and reads back as gamma 2.
-            let plain = crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2 };
+            let plain = crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2, primaries: None };
             let s = crate::icon_section(&plain);
             assert!(s.get_field("encoding").is_none());
             assert_eq!(crate::icon_from(&s).unwrap(), plain);
@@ -2010,6 +2025,15 @@ pub mod capsule {
             srgb.add_field("pixels", VsfType::v(b'a', av1.clone()));
             srgb.add_field("encoding", VsfType::a(vsf::Ascii::checked("encoding", String::from("srgb"))));
             assert!(crate::icon_from(&srgb).is_err());
+            // What its codes are (2026-11-24): `vsf` kept and read back, a changed hp from the untagged icon's; other primaries refused.
+            let kept = crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2Tanh, primaries: Some(vsf::visual::Primaries::Vsf) };
+            let s = crate::icon_section(&kept);
+            assert_eq!(crate::icon_from(&s).unwrap(), kept);
+            assert_ne!(ferros_thing::icon(&s.encode()), hp);
+            let mut wide = VsfSection::new(crate::ICON);
+            wide.add_field("pixels", VsfType::v(b'a', av1.clone()));
+            wide.add_field("primaries", VsfType::a(vsf::Ascii::checked("primaries", String::from("rec2020"))));
+            assert!(crate::icon_from(&wide).is_err());
             let mut raw = VsfSection::new(crate::ICON);
             raw.add_field("pixels", VsfType::v(b'e', av1));
             assert!(crate::icon_from(&raw).is_err());

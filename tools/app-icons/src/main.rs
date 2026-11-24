@@ -57,6 +57,8 @@ enum Mapping {
     Place,
     /// Assigned inside a polygon of the source's pixels, placed outside it, with a feathered edge between ([`assign_mask`]).
     AssignInside(Vec<(f32, f32)>),
+    /// The source's codes are VSF RGB gamma 2 (√L, a picture already brought into VSF RGB, Aemulus's); the icon's codes are its linear numbers L themselves, labelled `g2t` with no curve applied (owner, 2026-11-24: "assign g2t, do not apply anything other than the decurve to linear and convert to VSF rgb"), the form an sRGB icon takes on the device (ferros_kept::icon `from_srgb`).
+    AssignLinear,
 }
 
 /// The feather's width, source pixels: the Gaussian's σ the polygon's inside is blurred by, so its edge is erf(d / (σ√2)) of the distance d across it, about 2.6 σ from 10 to 90 % (5 pixels at σ = 2).
@@ -213,7 +215,7 @@ fn prepare(path: &Path, codes: AvatarCodes) -> Vec<f32> {
 }
 
 /// One icon from its source: Photon's prepared picture with the codes read as the mapping says (module docs), the g2t of its light, Photon's AV1 encoder, vsf's flat image section tagged `g2t`.
-fn make_icon(path: &Path, mapping: &Mapping) -> Vec<u8> {
+fn make_icon(path: &Path, mapping: &Mapping, primaries: Option<Primaries>) -> Vec<u8> {
     // Photon's values are √L (the gamma 2 of the light), so the g2t of the light, tanh(√L), is tanh of the value.
     let g2t = |codes: AvatarCodes| -> Vec<f32> { prepare(path, codes).into_iter().map(f32::tanh).collect() };
     let mut px = match mapping {
@@ -224,13 +226,24 @@ fn make_icon(path: &Path, mapping: &Mapping) -> Vec<u8> {
             let (a, p, mask) = (g2t(AvatarCodes::G2t), g2t(AvatarCodes::Gamma2), assign_mask(path, poly));
             (0..a.len()).map(|i| mask[i / 3] * a[i] + (1. - mask[i / 3]) * p[i]).collect()
         }
+        // Photon's values are √L of the gamma 2 codes, so the linear numbers are their squares.
+        Mapping::AssignLinear => prepare(path, AvatarCodes::Gamma2).into_iter().map(|v| v * v).collect(),
     };
     // Into Photon's encoder, which truncates v x 255, as VSF's codes (v x 256, rounded): module docs.
     for v in px.iter_mut() {
         *v = (*v + 1. / ((1 << 9) as f32)) * (256. / 255.);
     }
     let av1 = encode_avatar_rgb_f32(&px).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
-    vsf::builders::compressed_image_encoded(av1, Encoding::Gamma2Tanh).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())))
+    icon_doc(av1, primaries).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())))
+}
+
+/// An icon document: vsf's flat image section (`pixels` the AV1, `encoding` `g2t`) and, when the icon says what its codes are, `primaries` (vsf::visual `Primaries`' word; owner, 2026-11-24: Kūaha's and Aemulus's say `vsf`, kept as they are; an icon naming none is taken as the source's sRGB numbers and converted on the device, ferros_kept::icon `Source`).
+fn icon_doc(av1: Vec<u8>, primaries: Option<Primaries>) -> Result<Vec<u8>, String> {
+    let mut fields = vec![("pixels".to_string(), VsfType::v(b'a', av1)), ("encoding".to_string(), VsfType::a(vsf::Ascii::new(Encoding::Gamma2Tanh.as_str()).map_err(|e| format!("encoding: {e}"))?))];
+    if let Some(p) = primaries {
+        fields.push(("primaries".to_string(), VsfType::a(vsf::Ascii::new(p.as_str()).map_err(|e| format!("primaries: {e}"))?)));
+    }
+    vsf::vsf_builder::VsfBuilder::new().provenance_only().add_section("image", fields).build()
 }
 
 /// An icon document decoded by Photon's decoder to `g2t` codes, RGB, 256 square: an untagged (gamma 2) icon's codes are taken to `g2t` (bucket bottom to light, then the 8-bit `g2t` code).
@@ -297,22 +310,26 @@ fn write_visual(out: &Path, w: usize, h: usize, rgb: &[u8]) {
 
 fn icon_cmd(args: &[String]) {
     let mut mapping = Mapping::Assign;
+    let mut primaries = None;
     let mut rest: Vec<&String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--place" => mapping = Mapping::Place,
+            "--assign-linear" => mapping = Mapping::AssignLinear,
+            "--primaries" => primaries = Some(Primaries::parse(it.next().unwrap_or_else(|| usage())).unwrap_or_else(|e| fail(format!("--primaries: {e}")))),
             "--assign-inside" => mapping = Mapping::AssignInside(parse_polygon(it.next().unwrap_or_else(|| usage()))),
             _ => rest.push(a),
         }
     }
     let [src, out] = rest[..] else { usage() };
-    let doc = make_icon(Path::new(src), &mapping);
+    let doc = make_icon(Path::new(src), &mapping, primaries);
     fs::write(out, &doc).unwrap_or_else(|e| fail(format!("{out}: {e}")));
     let how = match mapping {
         Mapping::Assign => "codes as g2t",
         Mapping::Place => "codes as gamma 2, white at diffuse white",
         Mapping::AssignInside(_) => "codes as g2t inside the polygon, as gamma 2 outside",
+        Mapping::AssignLinear => "codes as gamma 2, their linear numbers assigned as g2t",
     };
     println!("app-icons: {src} -> {out} ({} bytes, {SIZE} x {SIZE} AV1, g2t; {how})", doc.len());
 }
@@ -342,6 +359,94 @@ fn compare_cmd(args: &[String]) {
     println!("app-icons: {} icons side by side -> {out}", icons.len());
 }
 
+/// `tag <in.vsf> <out.vsf> --primaries <p>`: an icon document again with `primaries` set, its AV1 and encoding as they were (Kūaha's, owner 2026-11-24: "I like that one the way it is").
+fn tag_cmd(args: &[String]) {
+    let [src, out, flag, p] = args else { usage() };
+    if flag != "--primaries" {
+        usage();
+    }
+    let p = Primaries::parse(p).unwrap_or_else(|e| fail(format!("--primaries: {e}")));
+    let doc = fs::read(src).unwrap_or_else(|e| fail(format!("{src}: {e}")));
+    let av1 = match read_vsf_source(&doc).unwrap_or_else(|e| fail(format!("{src}: {e}"))) {
+        VsfSource::Icon(a, Encoding::Gamma2Tanh) => a,
+        _ => fail(format!("{src}: not a g2t icon")),
+    };
+    let tagged = icon_doc(av1, Some(p)).unwrap_or_else(|e| fail(format!("{out}: {e}")));
+    fs::write(out, &tagged).unwrap_or_else(|e| fail(format!("{out}: {e}")));
+    println!("app-icons: {src} -> {out} (primaries {})", p.as_str());
+}
+
+/// `looks <out.vsf> <name>=<path>[:keep|:linear]...`: the icons as the display drew them before 2026-11-24 (their codes as `g2t`) over the codes the device draws now (ferros_kept::icon: the source's sRGB numbers converted and assigned), two rows, each cut to its circle on black, as one VSF visual (8-bit `g2t`).
+/// `:keep` an icon kept as it is (Kūaha's, `primaries: vsf`); `:linear` a VSF gamma 2 source picture (Aemulus's): before, the `--place` icon made of it, after, the `--assign-linear` one.
+fn looks_cmd(args: &[String]) {
+    let [out, icons @ ..] = args else { usage() };
+    if icons.is_empty() {
+        usage();
+    }
+    let gap = SIZE >> 5;
+    let (w, h) = (icons.len() * (SIZE + gap) + gap, 2 * SIZE + 3 * gap);
+    let mut rgb = vec![0u8; w * h * 3];
+    let k = coverage();
+    for (n, arg) in icons.iter().enumerate() {
+        let (name, rest) = arg.split_once('=').unwrap_or_else(|| usage());
+        let (path, how) = rest.split_once(':').unwrap_or((rest, ""));
+        let doc = fs::read(path).unwrap_or_else(|e| fail(format!("{path}: {e}")));
+        let (before, after): (Vec<u8>, Vec<u8>) = match how {
+            "linear" => {
+                let px = match read_vsf_source(&doc).unwrap_or_else(|e| fail(format!("{path}: {e}"))) {
+                    VsfSource::Codes(..) => prepare(Path::new(path), AvatarCodes::Gamma2),
+                    VsfSource::Icon(..) => fail(format!("{path}: :linear takes a gamma 2 source picture")),
+                };
+                (px.iter().map(|&v| delinearize_gamma2tanh_u8_f32(v * v)).collect(), px.iter().map(|&v| (v * v * 256.) as u8).collect())
+            }
+            "keep" => {
+                let c = decode_icon(&doc, path);
+                (c.clone(), c)
+            }
+            "" => {
+                let c = decode_icon(&doc, path);
+                let mut a = Vec::with_capacity(c.len());
+                for p in c.chunks_exact(3) {
+                    a.extend_from_slice(&ferros_kept::icon::from_srgb([p[0], p[1], p[2]]));
+                }
+                (c, a)
+            }
+            _ => usage(),
+        };
+        for (row, codes) in [&before, &after].into_iter().enumerate() {
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let (i, at) = (y * SIZE + x, ((gap + row * (SIZE + gap) + y) * w + gap + n * (SIZE + gap) + x) * 3);
+                    for c in 0..3 {
+                        rgb[at + c] = over_black(codes[i * 3 + c], k[i]);
+                    }
+                }
+            }
+        }
+        // How far the two rows are apart inside the circle, per channel: the mean and the most of |after − before| in codes, and the mean code of each.
+        let mut stat = [(0f64, 0u8, 0f64, 0f64); 3];
+        let mut n_in = 0f64;
+        for i in 0..SIZE * SIZE {
+            if k[i] < 1. {
+                continue;
+            }
+            n_in += 1.;
+            for c in 0..3 {
+                let (b, a) = (before[i * 3 + c], after[i * 3 + c]);
+                let d = b.abs_diff(a);
+                stat[c].0 += d as f64;
+                stat[c].1 = stat[c].1.max(d);
+                stat[c].2 += b as f64;
+                stat[c].3 += a as f64;
+            }
+        }
+        let line: Vec<String> = ["R", "G", "B"].iter().zip(stat).map(|(ch, (sum, most, b, a))| format!("{ch} mean |diff| {:.1} most {most}, mean code {:.1} -> {:.1}", sum / n_in, b / n_in, a / n_in)).collect();
+        println!("  {name}: {path}{}; {}", if how.is_empty() { String::new() } else { format!(" ({how})") }, line.join("; "));
+    }
+    write_visual(Path::new(out), w, h, &rgb);
+    println!("app-icons: {} icons, before over after -> {out}", icons.len());
+}
+
 fn bundle_cmd(args: &[String]) {
     let [out] = args else { usage() };
     let out = Path::new(out);
@@ -360,7 +465,7 @@ fn bundle_cmd(args: &[String]) {
         let doc = match bytes.starts_with("RÅ<".as_bytes()).then(|| read_vsf_source(&bytes)) {
             Some(Ok(VsfSource::Icon(_, Encoding::Gamma2Tanh))) => bytes,
             Some(Ok(VsfSource::Icon(..))) => fail(format!("{}: an icon not tagged g2t (the form before 2026-11-20): make it again with app-icons icon", path.display())),
-            _ => make_icon(&path, &Mapping::Assign),
+            _ => make_icon(&path, &Mapping::Assign, None),
         };
         fs::write(out.join(format!("{}.vsf", name.to_ascii_lowercase())), &doc).unwrap_or_else(|e| fail(format!("{name}: {e}")));
         let codes = decode_icon(&doc, name);
@@ -387,7 +492,7 @@ fn bundle_cmd(args: &[String]) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--place | --assign-inside x,y,x,y,...]\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons bundle <out dir>");
+    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--place | --assign-linear | --assign-inside x,y,x,y,...] [--primaries vsf]\n  app-icons tag <icon.vsf> <out.vsf> --primaries vsf\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons looks <out.vsf> <name>=<path>[:keep|:linear]...\n  app-icons bundle <out dir>");
     process::exit(2);
 }
 
@@ -397,6 +502,8 @@ fn main() {
         Some("icon") => icon_cmd(&args[1..]),
         Some("compare") => compare_cmd(&args[1..]),
         Some("bundle") => bundle_cmd(&args[1..]),
+        Some("tag") => tag_cmd(&args[1..]),
+        Some("looks") => looks_cmd(&args[1..]),
         _ => usage(),
     }
 }

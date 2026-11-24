@@ -64,8 +64,8 @@ fn main() {
             Some(dec::OP_AV1) if m.len() >= 7 => {
                 let at = u32::from_le_bytes([m[2], m[3], m[4], m[5]]) as usize;
                 let piece = &m[7..];
-                // In order from 0, and no more than an icon is: anything else starts nothing.
-                if at != av1.len() || at + piece.len() > dec::AV1_MAX {
+                // In order from 0, as large as the icon is (2026-11-24: no ceiling, founding rule 3); a piece out of order, or one memory cannot hold, starts nothing and is refused.
+                if at != av1.len() || av1.try_reserve(piece.len()).is_err() {
                     av1.clear();
                     vec![1]
                 } else {
@@ -123,7 +123,8 @@ fn main() {
         }
     };
     let texels = decode(&icon.av1, icon.encoding == vsf::visual::Encoding::Gamma2).unwrap_or_else(|| fail("not a 256 x 256 AV1 icon"));
-    let doc = ferros_kept::icon::decoded(&hp, &texels, vsf::eagle_time_oscillations()).unwrap_or_else(|| fail("the decoded document did not build"));
+    let source = if icon.primaries == Some(vsf::visual::Primaries::Vsf) { ferros_kept::icon::Source::Vsf } else { ferros_kept::icon::Source::Srgb };
+    let doc = ferros_kept::icon::decoded(&hp, &texels, source, vsf::eagle_time_oscillations()).unwrap_or_else(|| fail("the decoded document did not build"));
     std::fs::write(out, &doc).unwrap_or_else(|e| fail(&e.to_string()));
     println!("icondec: {src}: icon {} decoded, {} bytes -> {out}", hp.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(), doc.len());
 }
@@ -146,7 +147,6 @@ mod tests {
             }
         }
         let av1 = vsf::visual::av1::encode(&planes, 3, SIDE, SIDE, 8, &vsf::visual::av1::Av1Settings::default()).expect("vsf's encoder");
-        assert!(av1.len() <= dec::AV1_MAX, "an icon's AV1 fits the endpoint: {} bytes", av1.len());
         let t = decode(&av1, false).expect("an icon");
         assert_eq!(t.len(), TEXELS);
         let at = |x: usize, y: usize| &t[(y * SIDE + x) * 4..(y * SIDE + x) * 4 + 4];

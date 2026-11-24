@@ -2,7 +2,7 @@
 //!
 //! - **An icon's `hp`** is the BLAKE3 of the `icon` section its capsule carries (ferros_kist `icon_hp`): the same icon in two builds of a kist is one icon.
 //! - **The index** (`kists.icons`, [`INDEX`], device data the stower writes at stow): a section `icon` per kist with an icon, `thing` (`ht`, the kist) and `icon` (`hp`, its icon now). The map reads it to know each circle's icon; the person's list does not carry it (KISTS.md "Icons").
-//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is) and `rgba` (`t_u3`, side × side × 4: straight VSF RGB `g2t` codes with the circle's coverage in alpha, [`texels`]). Side is [`SIDE`], the icon's own size, never the size it is drawn at.
+//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is), `rgba` (`t_u3`, side × side × 4: the icon's codes as decoded, with the circle's coverage in alpha, [`texels`]) and `primaries` (what the codes are, [`Source`]; none in a document from before 2026-11-24, which is sRGB). Side is [`SIDE`], the icon's own size, never the size it is drawn at. Read back ([`read_decoded`]) as straight VSF RGB `g2t` codes: the source's sRGB numbers linearised and reassigned ([`from_srgb`]), VSF RGB as it is.
 //! - **The display's cache** ([`Cache`]): a few icons built for drawing, each in a slot found by its `hp`; one missing is asked of the map, which sends its texels in pieces ([`Pieces`]).
 
 use crate::document;
@@ -14,7 +14,7 @@ use vsf::VsfType;
 
 /// The icon decoder's endpoint (`icons`, std/icondec), the stower's alone: an icon's AV1 in, its texels out.
 pub mod dec {
-    /// `[OP_AV1][encoding][offset u32 LE][last u8][bytes…]`: a piece of the icon's AV1, in order from 0; the last decodes it. → [0] taken (on the last: decoded), [1] not an icon this decodes (refused, or out of order).
+    /// `[OP_AV1][encoding][offset u32 LE][last u8][bytes…]`: a piece of the icon's AV1, in order from 0; the last decodes it. → [0] taken (on the last: decoded), [1] not an icon this decodes (refused, out of order, or more than memory holds: an icon is as large as its capsule carries, 2026-11-24).
     pub const OP_AV1: u8 = 0;
     /// `[OP_TEXELS][offset u32 LE]`: the decoded texels from `offset`, at most [`PIECE`] bytes. The decoder ends itself once it has handed over the last.
     pub const OP_TEXELS: u8 = 1;
@@ -23,8 +23,6 @@ pub mod dec {
     pub const GAMMA2: u8 = 1;
     /// The bytes one call carries either way: a call's message is at most 4 KiB, less the op and the header.
     pub const PIECE: usize = 4032;
-    /// The most AV1 an icon is: they are 5 to 31 KB, so past 64 KiB is no icon.
-    pub const AV1_MAX: usize = 1 << 16;
 }
 
 /// The index's name in the `kists.` scope.
@@ -95,33 +93,100 @@ pub fn set(icons: &mut Vec<(Ht, Hp)>, thing: Ht, icon: Option<Hp>) -> bool {
     }
 }
 
+/// What an icon's codes are, as its capsule's icon section names them (owner, 2026-11-24: "Let's assume they are all source sRGB instead of VSF rgb but keep the g2t curve", then the method: "Convert FROM sRGB primaries TO VSF RGB, then assign g2t, do not apply anything other than the decurve to linear and convert to VSF rgb! Should be interpreted as g2t."; Kūaha's kept: "I like that one the way it is").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// The section names no primaries, or `primaries: srgb`: the codes are the source picture's own sRGB numbers (tools/app-icons' assigned icons of 2026-11-20 are, tagged `g2t` though nothing was converted), converted as the owner said ([`from_srgb`]).
+    Srgb,
+    /// `primaries: vsf`: VSF RGB codes, kept as they are (Kūaha's, authored in VSF RGB; Aemulus's, made in VSF RGB from its picture by its own tool, and its icon made of the converted numbers themselves).
+    Vsf,
+}
+
+impl Source {
+    /// The `primaries` field's value as vsf's image sections name it (vsf::visual `Primaries`).
+    pub fn primaries(self) -> &'static str {
+        match self {
+            Source::Srgb => "srgb",
+            Source::Vsf => "vsf",
+        }
+    }
+
+    /// From the `primaries` field: none or `srgb` is the source's sRGB numbers, `vsf` VSF RGB; any other primaries are none an icon carries, refused.
+    pub fn from_primaries(p: Option<&str>) -> Option<Source> {
+        match p {
+            None | Some("srgb") => Some(Source::Srgb),
+            Some("vsf") => Some(Source::Vsf),
+            Some(_) => None,
+        }
+    }
+}
+
+/// An sRGB code triple in linear VSF RGB: each code decurved by sRGB's transfer (IEC 61966-2-1, the code over 255) to linear, then sRGB's primaries to VSF RGB's by vsf's `SRGB2VSF_RGB`.
+/// vsf builds that matrix thru 1931 XYZ, the only observer an xy-defined space supports, colorimetric with no chromatic adaptation.
+/// Every entry is positive, so no sRGB colour comes out negative: VSF RGB's spectral primaries hold sRGB's gamut.
+/// A channel may come out past 1 (sRGB's white is past it in VSF blue).
+#[allow(deprecated)]
+pub fn srgb_linear_vsf(c: [u8; 3]) -> [f32; 3] {
+    // sRGB is only the space an icon's codes arrive in (the owner's exception for decoding foreign pictures at ingest): decoded once, here, never encoded to.
+    let s = c.map(vsf::colour::legacy::convert::linearize_srgb_u8);
+    vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::legacy::constants::SRGB2VSF_RGB, &s)
+}
+
+/// An icon's sRGB code triple as the codes the display draws: its linear VSF RGB numbers ([`srgb_linear_vsf`]) assigned as `g2t` codes as they are, the value times 256 as VSF's codes are (bucket bottom), with no curve applied (the owner, 2026-11-24: "assign g2t, do not apply anything other than the decurve to linear and convert to VSF rgb").
+/// A value at or past 255/256 is the top code: the float-to-integer cast stops at 255, nothing else is done to it (sRGB's white is 1.09 in VSF blue, so the brightest sRGB whites and blues stop there).
+pub fn from_srgb(c: [u8; 3]) -> [u8; 3] {
+    srgb_linear_vsf(c).map(|v| (v * 256.) as u8)
+}
+
+/// Straight RGBA texels from codes of `source` to the codes the display draws, in place: sRGB numbers converted ([`from_srgb`]), VSF RGB left as it is; alpha untouched.
+pub fn to_g2t(rgba: &mut [u8], source: Source) {
+    if source == Source::Vsf {
+        return;
+    }
+    for p in rgba.chunks_exact_mut(4) {
+        let c = from_srgb([p[0], p[1], p[2]]);
+        p[..3].copy_from_slice(&c);
+    }
+}
+
 fn decoded_schema() -> SectionSchema {
     let rgba = TypeConstraint::Custom {
         name: "rgba",
         description: "side x side x 4 bytes",
         validator: alloc::sync::Arc::new(|v: &VsfType| matches!(v, VsfType::t_u3(t) if t.data.len() == TEXELS && t.shape.iter().product::<usize>() == TEXELS)),
     };
-    SectionSchema::new("decoded").field("icon", TypeConstraint::Blake3Provenance).field("rgba", rgba)
+    SectionSchema::new("decoded").field("icon", TypeConstraint::Blake3Provenance).field("rgba", rgba).field("primaries", TypeConstraint::AsciiText)
 }
 
-/// A decoded icon's document: the icon it is and its RGBA ([`TEXELS`]), stamped at `eagle`. None for texels of another size.
-pub fn decoded(icon: &Hp, rgba: &[u8], eagle: i64) -> Option<Vec<u8>> {
+/// A decoded icon's document: the icon it is, its RGBA ([`TEXELS`]) as decoded, and what its codes are (`primaries`, [`Source`]), stamped at `eagle`. None for texels of another size.
+pub fn decoded(icon: &Hp, rgba: &[u8], source: Source, eagle: i64) -> Option<Vec<u8>> {
     if rgba.len() != TEXELS {
         return None;
     }
-    let b = decoded_schema().build().set("icon", VsfType::from(*icon)).ok()?.set("rgba", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE, 4], rgba.to_vec()))).ok()?;
+    let primaries = VsfType::a(vsf::Ascii::checked("primaries", alloc::string::String::from(source.primaries())));
+    let b = decoded_schema().build().set("icon", VsfType::from(*icon)).ok()?.set("rgba", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE, 4], rgba.to_vec()))).ok()?.set("primaries", primaries).ok()?;
     document("decoded", b.encode().ok()?, eagle)
 }
 
-/// A decoded icon read back as the display takes it (its RGBA, [`TEXELS`]), only when it is the icon asked for: a value under one `hp` that says it is another is none.
+/// A decoded icon read back as the display takes it (its RGBA, [`TEXELS`], as `g2t` codes: [`to_g2t`] by what its codes are), only when it is the icon asked for: a value under one `hp` that says it is another is none.
+/// A document that names no primaries (every icon decoded before 2026-11-24) is the source's sRGB numbers, so every icon already in a vault follows the conversion with nothing decoded again.
 pub fn read_decoded(doc: &[u8], want: &Hp) -> Option<Vec<u8>> {
     let s = SectionBuilder::parse_document(decoded_schema(), doc, None).ok()?;
     let first = |name: &str| s.get_fields(name).first().and_then(|f| f.values.first()).cloned();
     if Hp::from_vsf(&first("icon")?).ok()? != *want {
         return None;
     }
+    let source = match first("primaries") {
+        None => Source::Srgb,
+        Some(VsfType::a(t)) => Source::from_primaries(Some(t.as_str()))?,
+        Some(_) => return None,
+    };
     match first("rgba") {
-        Some(VsfType::t_u3(rgba)) => Some(rgba.data),
+        Some(VsfType::t_u3(rgba)) => {
+            let mut rgba = rgba.data;
+            to_g2t(&mut rgba, source);
+            Some(rgba)
+        }
         _ => None,
     }
 }
@@ -272,10 +337,10 @@ mod tests {
     #[test]
     fn a_decoded_icon_round_trips_and_is_only_itself() {
         let rgba: Vec<u8> = (0..TEXELS).map(|i| (i * 7) as u8).collect();
-        let doc = decoded(&hp(9), &rgba, 1 << 45).unwrap();
+        let doc = decoded(&hp(9), &rgba, Source::Vsf, 1 << 45).unwrap();
         assert_eq!(read_decoded(&doc, &hp(9)), Some(rgba.clone()));
         assert_eq!(read_decoded(&doc, &hp(8)), None, "a value that says it is another icon");
-        assert_eq!(decoded(&hp(9), &rgba[1..], 1), None);
+        assert_eq!(decoded(&hp(9), &rgba[1..], Source::Vsf, 1), None);
         assert!(doc.len() < TEXELS + (1 << 10), "the icon at its own size: {} bytes", doc.len());
         std::println!("a decoded icon: {} bytes", doc.len());
     }
@@ -307,6 +372,44 @@ mod tests {
         assert_eq!(c, vsf::colour::convert::delinearize_gamma2tanh_u8_f32((255. / 256.) * (255. / 256.)));
         assert!(c < 255 && c > 180, "gamma 2's white lands on g2t's diffuse white, below the headroom: {c}");
         assert_eq!(texels(&planes[1..], false), None);
+    }
+
+    /// The owner's method (2026-11-24): sRGB decurved to linear, sRGB's primaries to VSF RGB's, the numbers assigned as codes (× 256) with no curve; black stays black, each channel's share as vsf's matrix gives it.
+    #[test]
+    fn srgb_numbers_are_converted_and_assigned() {
+        assert_eq!(from_srgb([0, 0, 0]), [0, 0, 0]);
+        let m = vsf::colour::legacy::constants::SRGB2VSF_RGB;
+        let white = vsf::colour::convert::apply_matrix_3x3_f32(&m, &[1.; 3]);
+        assert!(white.iter().all(|&v| v > 0.5), "{white:?}");
+        assert_eq!(from_srgb([255; 3]), white.map(|v| (v * 256.) as u8));
+        // sRGB 128 is 0.2158 linear: grey's numbers are the matrix's rows summed times it.
+        let g = from_srgb([128; 3]);
+        assert_eq!(g, white.map(|v| (v * 0.215_861 * 256.) as u8));
+        let mut v = alloc::vec![200u8, 100, 50, 255];
+        to_g2t(&mut v, Source::Vsf);
+        assert_eq!(v, [200, 100, 50, 255], "VSF RGB is kept");
+        to_g2t(&mut v, Source::Srgb);
+        let c = from_srgb([200, 100, 50]);
+        assert_eq!(v, [c[0], c[1], c[2], 255], "alpha untouched");
+        assert_eq!(Source::from_primaries(None), Some(Source::Srgb));
+        assert_eq!(Source::from_primaries(Some("srgb")), Some(Source::Srgb));
+        assert_eq!(Source::from_primaries(Some("vsf")), Some(Source::Vsf));
+        assert_eq!(Source::from_primaries(Some("rec2020")), None);
+        std::println!("sRGB white in VSF RGB: {white:?}; codes {:?}; red {:?}, green {:?}, blue {:?}", from_srgb([255; 3]), from_srgb([255, 0, 0]), from_srgb([0, 255, 0]), from_srgb([0, 0, 255]));
+        std::println!("linear: red {:?}, green {:?}, blue {:?}", srgb_linear_vsf([255, 0, 0]), srgb_linear_vsf([0, 255, 0]), srgb_linear_vsf([0, 0, 255]));
+    }
+
+    /// A decoded document from before (no `primaries`) reads as sRGB numbers, converted; one that names `vsf` reads as it is.
+    #[test]
+    fn decoded_icons_read_by_what_their_codes_are() {
+        let rgba: Vec<u8> = (0..TEXELS).map(|i| (i * 7) as u8).collect();
+        let old = document("decoded", decoded_schema().build().set("icon", VsfType::from(hp(3))).unwrap().set("rgba", VsfType::t_u3(Tensor::new(alloc::vec![SIDE, SIDE, 4], rgba.clone()))).unwrap().encode().unwrap(), 1).unwrap();
+        let mut want = rgba.clone();
+        to_g2t(&mut want, Source::Srgb);
+        assert_ne!(want, rgba);
+        assert_eq!(read_decoded(&old, &hp(3)), Some(want.clone()));
+        assert_eq!(read_decoded(&decoded(&hp(3), &rgba, Source::Srgb, 1).unwrap(), &hp(3)), Some(want));
+        assert_eq!(read_decoded(&decoded(&hp(3), &rgba, Source::Vsf, 1).unwrap(), &hp(3)), Some(rgba));
     }
 
     #[test]
