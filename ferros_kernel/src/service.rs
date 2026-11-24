@@ -3512,10 +3512,14 @@ pub fn run(mut b: Boot) -> ! {
         // The kept processes that died by a panic or a fault (process.rs `KEPT`, `crash_answer`; owner, 2026-11-21, after the deck panicked on the Pro and nothing answered a touch until the bridge restarted it): each started again at once from its capsule, as `diag restart` does, in `KEPT`'s order (the display before the deck). The death woke this loop (`sev`), never a timer; one that died again too soon was not asked for (a crash loop, said and noted where it was counted).
         // One alive already (started meanwhile by hand, or by init's keeper) is left alone. What reads the person's space is refused as `restart` refuses it (the deck until the device is bound, the identity service and the stower until a person attests), which one that was running had passed already. One refused for room is tried again once an arc has come back.
         // An approval asked (attest to approve, process.rs SYS_UNLOCK op 16; owner, 2026-11-24): the identity is locked already, and the attest screen is started again over everything, as `diag restart ahau` does, so a fresh one comes up showing what is asked with Approve on its button. The ask woke this loop (`sev`), never a timer.
+        // Refused for room alone (its arc not back yet from the kill), it is tried again at the loop's next wake, as a kept process put off for room is: a locked device must never sit with no attest screen.
         if crate::process::approve_restart_take() {
             let mut rep = alloc::vec::Vec::new();
             restart(&mut store, b"ahau", &mut rep);
             crate::flashlog::line(&alloc::format!("approve: the attest screen started again: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+            if rep.windows(18).any(|w| w == b"arc pool exhausted") {
+                crate::process::approve_restart_again();
+            }
         }
         let mut want = crate::process::kept_take();
         if kept_room != 0 && frees != kept_room_at {

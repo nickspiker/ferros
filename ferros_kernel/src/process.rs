@@ -4867,6 +4867,10 @@ static APPROVE_RESTART: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 pub fn approve_restart_take() -> bool {
     APPROVE_RESTART.swap(false, core::sync::atomic::Ordering::AcqRel)
 }
+/// The attest screen's restart for an approval was refused for room: asked for again, for the service loop's next pass.
+pub fn approve_restart_again() {
+    APPROVE_RESTART.store(true, core::sync::atomic::Ordering::Release);
+}
 /// Whether guard `g` (ahau_core::approve::guard) is on.
 fn guarded(g: u8) -> bool {
     ahau_core::approve::guard::on(crate::settings::GUARDS.load(core::sync::atomic::Ordering::Relaxed), g)
