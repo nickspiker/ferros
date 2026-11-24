@@ -751,9 +751,14 @@ impl lumis_core::RowSource for ViewRows {
             return false;
         }
         let Some(at) = gpu::plane_in_block(plane.as_ptr(), plane.len()) else { return false };
+        let t0 = ferros_clip::micros();
         let mut shared = gpu::SHARED.lock().unwrap();
+        let t1 = ferros_clip::micros();
         let Some(g) = shared.as_mut() else { return false };
-        match g.stack(self.gpu, self.line, self.width, self.height, at, add) {
+        let r = g.stack(self.gpu, self.line, self.width, self.height, at, add);
+        gpu::STACK_LOCK_US.store(t1 - t0, Ordering::Relaxed);
+        gpu::STACK_JOB_US.store(ferros_clip::micros() - t1, Ordering::Relaxed);
+        match r {
             Ok(()) => true,
             Err(e) => {
                 gpu::STACK_OFF.store(true, Ordering::Relaxed);
@@ -1253,6 +1258,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut stack_starting: Option<std::sync::mpsc::Receiver<Result<stack::Stack, String>>> = None;
     // The last whole turn: when it began (ferros_clip `micros`), how long it took, and its driver's answer, integration, and settings and saves within it, us.
     let mut last_turn = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // The last whole turn's GPU stack (`gpu::STACK_LOCK_US`, `STACK_JOB_US`, `STACK_GPU_US`, us, 0 when it stacked none) and how long after its frame ended (the driver's Eagle time) the driver's answer reached Lumis, us.
+    let mut last_gpu = (0u64, 0u64, 0u64, 0i64);
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
     // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
@@ -1504,6 +1511,9 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         };
         // This turn on the process's clock (ferros_clip `micros`) and the driver's wait before it: a stacked clip's frame not taken is said beside the turn before it (`last_turn`).
         let (turn_at, wait_was) = (ferros_clip::micros(), turns.wait);
+        for a in [&gpu::STACK_LOCK_US, &gpu::STACK_JOB_US, &gpu::STACK_GPU_US] {
+            a.store(0, Ordering::Relaxed);
+        }
         let got = src.next(&mut turns);
         reading = VIEW.lock().unwrap();
         // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
@@ -1628,6 +1638,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             continue;
         }
         let t_integrate = std::time::Instant::now();
+        // How long after its frame ended (its Eagle time, the kernel's wall clock as the driver stamps it) this answer reached Lumis, us: a frame on time answered late, or a frame late.
+        let age_us = match &got {
+            Got::Frame(h, _) => ((ferros_sys::eagle_now() as i128 * 1_000_000_000 / ferros_sys::EAGLE_OSCILLATIONS_PER_SECOND as i128 - h.time as i128) / 1000) as i64,
+            Got::Slit { .. } => 0,
+        };
         let (count, time) = match &got {
             Got::Frame(head, _) => (head.count, head.time),
             // The count crosses the console's arithmetic as a u32, as a frame's does (40 days of slits).
@@ -1957,6 +1972,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     if gap != 0 {
                         let (at, whole, wait, integrate, after) = last_turn;
                         println!("lumis: camera {}: A#{gap} of the camera's frames not taken before its frame A#{}, answered at {} us after a wait of {} us; the turn before began at {at} us and took {whole} us: the driver's answer {wait}, the integrator {integrate}, the settings and saves {after}", cam.name, head.count, turn_at + turns.wait - wait_was, turns.wait - wait_was);
+                        let ((lock, job, on_gpu, age), (ui_at, ui_us)) = (last_gpu, (gpu::UI_HELD_AT.load(Ordering::Relaxed), gpu::UI_HELD_US.load(Ordering::Relaxed)));
+                        println!("lumis: camera {}: that turn's frame reached Lumis {age} us after it ended, this one's {age_us} us; its stack waited {lock} us for the GPU, its job {job} us ({on_gpu} us of it on the GPU); the UI last held the GPU from {ui_at} us for {ui_us} us", cam.name);
                     }
                 }
                 s.last_count = Some(head.count);
@@ -1991,6 +2008,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         keep_saves(vault.as_deref(), &mut *integrator.header);
         turns.after += t_after.elapsed().as_micros() as u64;
         last_turn = (turn_at, ferros_clip::micros() - turn_at, turns.wait - wait_was, (t_after - t_integrate).as_micros() as u64, t_after.elapsed().as_micros() as u64);
+        last_gpu = (gpu::STACK_LOCK_US.load(Ordering::Relaxed), gpu::STACK_JOB_US.load(Ordering::Relaxed), gpu::STACK_GPU_US.load(Ordering::Relaxed), age_us);
         frames += 1;
         turns.n += 1;
         if let Some(r) = run {
@@ -2020,6 +2038,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             let period = (turns.last.1 - t0) as u64 / span / 1000;
             let images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] - turns.images;
             println!("lumis: camera: the sensor's period A#{period} us by the driver's clock; the driver wrote A#{} frames from the first of these 64 to the last, A#{} of them never taken; the settings and saves A#{} us a frame; A#{images} images completed; A#{} worker threads", span + 1, span + 1 - (1 << 6), turns.after / 64, rayon::current_num_threads());
+            println!("lumis: camera: the last of these 64 reached Lumis A#{} us after its frame ended; its stack waited A#{} us for the GPU, its job A#{} us (A#{} us on the GPU)", last_gpu.3, last_gpu.0, last_gpu.1, last_gpu.2);
             turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
         } else if turns.since.is_none() {
             turns.since = Some(std::time::Instant::now());
@@ -2711,10 +2730,13 @@ impl FluorApp<G2t16> for Lumis {
         let damage: Option<Vec<_>> = (!self.changed).then(|| ctx.damage_rects().iter().map(|r| (r.x0, r.y0, r.x1, r.y1)).collect());
         let mut shared = gpu::SHARED.lock().unwrap();
         let (Some(gpu), Some(menu), Some(surface)) = (shared.as_mut(), self.menu.as_mut(), self.surface.as_ref()) else { return false };
+        let held_at = ferros_clip::micros();
         let camera = matches!(self.screen, Screen::Camera(_));
         let t = std::time::Instant::now();
         // The camera screen: Lumis's frame as lumis_core drew it (in the block), whole, in place of the CPU's present of its changed rects (the owner, 2026-11-21: the GPU composes full frames).
         let drawn = if camera { gpu.camera(damage.as_deref()) } else { gpu.menu(menu, std::mem::take(&mut self.menu_fresh)) };
+        gpu::UI_HELD_AT.store(held_at, Ordering::Relaxed);
+        gpu::UI_HELD_US.store(ferros_clip::micros() - held_at, Ordering::Relaxed);
         match drawn {
             Ok(base) => {
                 self.own = Some(base);

@@ -254,6 +254,9 @@ impl Gpu {
             self.q.reopen();
             return Err(why);
         }
+        if matches!(kind, Kind::Stack | Kind::StackAdd) {
+            STACK_GPU_US.store(e.gpu_ticks().unwrap_or(0) * 1_000_000 / ferros_sys::freq(), core::sync::atomic::Ordering::Relaxed);
+        }
         self.ticks[i] += e.gpu_ticks().unwrap_or(0);
         self.frames[i] += ends_frame as u64;
         if self.frames[i] == 1 << 6 {
@@ -297,6 +300,13 @@ pub fn plane_in_block(plane: *const u16, len: usize) -> Option<usize> {
 pub static CAMERA_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A stack job failed: the stack is the CPU's for the rest of the process.
 pub static STACK_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The camera thread's last stack, us: its wait for `SHARED`, its job from submit to done, and the GPU's own time in it; and when the UI last took `SHARED` to draw (ferros_clip `micros`) and how long it held it: a camera frame not taken is said beside these (the coordinator, 2026-11-23: an integration of one frame's time looked like a wait behind the camera screen's job).
+pub static STACK_LOCK_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STACK_JOB_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STACK_GPU_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UI_HELD_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UI_HELD_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The camera opened (`open`) or closed: the GPU service told (op 5), which maps the camera's view in Lumis's GPU space after an OPEN and takes it away after a CLOSE, and whether frames can be stacked from it now.
 pub fn camera_changed(open: bool) {
