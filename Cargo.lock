@@ -1461,6 +1461,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-udplat"
+version = "0.1.0"
+dependencies = [
+ "ferros_netring",
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-ufsdme"
 version = "0.1.0"
 dependencies = [
@@ -1833,6 +1841,10 @@ dependencies = [
 
 [[package]]
 name = "ferros_mailbox"
+version = "0.1.0"
+
+[[package]]
+name = "ferros_netring"
 version = "0.1.0"
 
 [[package]]

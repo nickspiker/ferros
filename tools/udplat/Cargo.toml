@@ -1,0 +1,9 @@
+[package]
+name = "udplat"
+version = "0.1.0"
+edition = "2024"
+description = "The host half of the UDP latency bench (payloads/udplat): per-direction added latency on the device's datagram path, docs/WIFI.md \"Datagrams at speed\""
+
+[workspace]
+
+[dependencies]
