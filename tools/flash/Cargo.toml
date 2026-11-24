@@ -3,11 +3,25 @@ name = "ferros-flash"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Carve a ferros partition into a phone's GPT, surgically (library + CLI)"
+description = "Put ferros on a phone: the GPT carve, board manifests, the signed release, a fastboot client and the run log (library + CLI)"
 
 [[bin]]
 name = "ferros-flash"
 path = "src/main.rs"
 
+[features]
+default = ["usb"]
+# The fastboot transport on a real phone (usb.rs); off, the library is the host-tested protocol alone.
+usb = ["dep:nusb", "dep:tokio"]
+# Signing a release (the publisher's side, keys from keys/, never in the tool people download).
+publish = ["vsf/crypto", "dep:ed25519-dalek", "dep:ferros_kist"]
+
 [dependencies]
 blake3 = "1"
+# Every document the tool reads or writes: board manifests, the signed release, the run log (`text-encode` for words in `x`).
+vsf = { path = "../../../vsf", features = ["crypto-verify", "text-encode"] }
+nusb = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+ed25519-dalek = { version = "2", optional = true }
+# The signing key's one reader (keys/ferros.key.vsf), for `release make` only.
+ferros_kist = { path = "../../ferros_kist", optional = true }

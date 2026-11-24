@@ -1,6 +1,14 @@
 //! ferros-flash: the partition steps of putting ferros on a phone, as a library (the CLI now, the fluor installer later, both on this).
 //! A Pixel's GPT is edited surgically, never cleared and recreated: a fresh table loses the A/B slot attributes the bootloader keeps in the entries, and the phone no longer boots. The carve keeps every entry as it is except two: userdata ends earlier, and `ferros` takes the space after it. When every entry slot is in use (Pixels ship 34, all used), the entry count grows into the blocks the table already reserves before the first partition, so nothing moves.
 //! Everything works on images of the disk's two ends (the head from LBA 0, the tail ending at the last LBA), never on a device: reading them off the phone and writing the changed blocks back is the caller's (tools/pixel-carve.sh).
+//! The rest of putting ferros on a phone, each a module: board manifests (board.rs), the signed release (release.rs), the fastboot client (fastboot.rs, usb.rs) and the run log (runlog.rs).
+
+pub mod board;
+pub mod fastboot;
+pub mod release;
+pub mod runlog;
+#[cfg(feature = "usb")]
+pub mod usb;
 
 /// GPT type of a ferros partition: BLAKE3("ferros") truncated to 128 bits (RING.md), A0B51225-61C5-0F5A-FFE7-1B644F9CA954, in GPT's on-disk order (the first three fields little-endian).
 pub const FERROS_TYPE: [u8; 16] = [0x25, 0x12, 0xB5, 0xA0, 0xC5, 0x61, 0x5A, 0x0F, 0xFF, 0xE7, 0x1B, 0x64, 0x4F, 0x9C, 0xA9, 0x54];

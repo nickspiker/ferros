@@ -2,63 +2,188 @@
 
 Owner, 2026-11-10: "we do need to make a flash tool so users can download one signed executable, click thru some GUI options, then click download and flash, then it'll walk user thru unlocking bootloader if needed, etc." And: "it does need done for both targets."
 
-This is the plan, shelved on 2026-11-10 to be picked up whole. The targets are the Pixel 8 Pro (husky) and the Pixel 8a (akita); nothing here is written for one of them only.
+Owner, 2026-11-24: "the 8a and windows will be our first real world test and we'll need to make sure we store pre-built signed OS images on fgtw.org and/or ferros.org".
+Then: "I'd say we mirror the windows install for Photon and also focus on making sure the install process, OS and all of that is logged in proper VSF so that at any point the user can submit a log. I suspect this to be a bumpy road."
+
+Owner, 2026-11-24, on what is installed: "Default pure ferros, we do not support Android dual boot. Period. This will be the first legit production build and deploy."
+And: "if they want to enable the development gate that lets them run Android and build it themselves, they can but we do not host built OS images that run Android in any way."
+So the flasher offers no keep-Android option, and every hosted image is a production build with every Android path compiled out (below, "Production images").
+
+Owner, 2026-11-24, on the boot: "no 1s boot gate or green arrow, just straight to ferros since the google nag is already obnoxious."
+
+The targets are the Pixel 8a (akita, the first real-world test, from a Windows PC) and the Pixel 8 Pro (husky).
 
 ## What a person does
 
-0. Download one signed executable for their computer (Linux, macOS, Windows) and run it.
-1. Plug the phone in. The tool finds it by its product (husky, akita), says which phone it is, and never writes an image to a product it is not for.
-2. Choose: keep Android beside ferros (userdata shrunk, Android the escape) or pure ferros; the size of the ferros partition.
-3. If the bootloader is locked, the tool walks them through it: Developer options, OEM unlocking, `flashing unlock` on the phone's own screen. It says plainly that unlocking wipes the phone.
-4. The tool backs up the phone's own calibration before it writes anything, and keeps the backup on the computer. This step is not optional.
-5. Download and flash: the tool fetches the signed ferros images, checks each against its BLAKE3, carves the partition table, flashes, provisions, and turns pKVM off (again after any wipe).
-6. First boot: the tool waits for ferros on USB and checks it answers, then hands the phone over to the attest screen.
-7. **Re-lock, the default** (owner, 2026-11-13: "3 is required"): the tool sets up the ferros key as the bootloader's custom key and walks the person through `flashing lock` on the phone's own screen, their own act (the tool never runs it: "Claude memories/feedback_lock_prep_not_lock.md"). Leaving it unlocked is an explicit choice, and the tool says what it exposes: the device's ID (the ira) has no papers, so while unlocked anyone holding the phone can boot their own image, derive it, and read the device's settings, stowed kists and cached wallpaper; the person's identity, their people and anything of the fleet stay closed without the identity. ferros shows the lock state afterwards, never a nag (built 2026-11-13): a line on the settings' About page, a console line at boot, and SYS_FACTS fact 87 (ferros_sys `Facts::boot_lock`), all from the two words ABL puts in the bootconfig it hands the kernel, `androidboot.vbmeta.device_state` and `androidboot.verifiedbootstate` (kernel bootlock.rs).
+0. Paste one line into PowerShell (or a terminal on Linux and macOS). It downloads the tool, checks it, installs it for that user and starts the guide.
+1. Put the phone in its bootloader and plug it in. The tool finds it by its product, names it, and never writes to a product it has no board for.
+2. If the bootloader is locked, the tool walks them through unlocking: Developer options, OEM unlocking, then `flashing unlock`, answered on the phone's own screen. It says plainly that unlocking wipes the phone.
+3. The tool says what it will do: ferros replaces Android entirely; the phone's own calibration is copied to the computer first; userdata shrinks to its floor and `ferros` takes the rest; the signed production image goes on both boot slots.
+4. The calibration backup, never optional, kept on the computer with its BLAKE3.
+5. Download and flash: the signed release fetched, every file checked against its BLAKE3 before anything is written, the carve, both slots flashed and read back.
+6. First boot: the tool waits for ferros on USB and checks it answers, then hands the phone to the attest screen.
+7. **Re-lock, the default** (owner, 2026-11-13: "3 is required"): the ferros key set as the bootloader's custom key, and `flashing lock` on the phone's own screen, the person's own act (the tool never sends it: "Claude memories/feedback_lock_prep_not_lock.md"). Leaving it unlocked is an explicit choice, and the tool says what it exposes: the device's ID (the ira) has no papers, so while unlocked anyone holding the phone can boot their own image, derive it, and read the device's settings, stowed kists and cached wallpaper; the person's identity, their people and anything of the fleet stay closed without the identity. ferros shows the lock state afterwards, never a nag: a line on the settings' About page, a console line at boot, and SYS_FACTS fact 87 (`Facts::boot_lock`), from ABL's bootconfig (kernel bootlock.rs).
 
-## What exists today (2026-11-10)
+Every step says what it will do before it does it, every write is read back, and every step is in the run's log.
 
-| Piece | Where | Both targets? |
+## Status (2026-11-24)
+
+| Step | State | Where |
 |---|---|---|
-| GPT carve: read both ends of the disk, plan the shrink of userdata and the new `ferros` entry (BLAKE3("ferros") type GUID), write and verify primary and backup, the original kept | `tools/flash` (ferros-flash lib + CLI), driven by `tools/pixel-carve.sh` | built for akita first |
-| Signed boot images, the hv and ferros in one, both slots, A/B fallback | `tools/akita-hv.sh`, `tools/husky-hv.sh`, `sign_only.sh`, the owner's AVB key | yes, as two scripts |
-| Calibration backup | by hand (dd through Android with root), hash-checked, kept on Harbor | yes, by hand |
-| Shell processes and firmware into the vault | `ferros-bridge store put` over PT; `tools/husky-aoc-fw.sh`, `tools/husky-aoc-reg.sh`, `tools/akita-aoc.sh`, `tools/f2fs-cat` | yes, per-board scripts |
-| Device guard | `tools/lib/devices.sh`, the product checks in each script | yes |
+| 0 Firmware from the phone's own partitions | surveyed, per-firmware proposal below; kernel and driver work, staged, needs device slots | this file |
+| 1 Board manifests in VSF | built and host-tested (akita, husky) | tools/flash/src/board.rs |
+| `ferros-flash provision` | not built: needs the production install door (below) | |
+| 2 Native fastboot | built, host-tested against a scripted bootloader; not yet run on a phone | tools/flash/src/fastboot.rs, usb.rs |
+| 3 The guide | built to the lock step (find, name, lock state, unlock walkthrough, the plan); stops before the backup | tools/flash/src/main.rs `guide` |
+| 4 Distribution | built: the signed release (VSF, BLAKE3 names), staging, the PowerShell and sh installers; nothing uploaded | tools/flash/src/release.rs, publish.sh, install/ |
+| 5 Logging | built and host-tested: the run log, the submit report | tools/flash/src/runlog.rs |
+| Production images | Android paths compiled out of the kernel and the hv; image composition proposed (bare ferros) | below |
+| Updating while locked | designed, for the owner | below |
+| The fluor GUI, code signing | later; signing is the owner's cost decision | |
 
-What a full reset loses today: the vault holds the shell's processes, the GPU's and the AoC's firmware, the sensor registry and the WiFi credential, so a wiped ferros partition boots to the bare usb process until all of it is stored again by hand. The identity side survives: the device key is derived from the ira, so the fleet chain on fgtw.org still lists the phone, the owner's handle binds it without words, and fgtw.org's device owner index still refuses any other handle.
+## 0. Firmware from the phone's own partitions
 
-## What it needs
+Google's files cannot be shipped by us, and every phone carries them in its own partitions, so the kernel and drivers read them there.
+A reset then loses no firmware, and provisioning shrinks to ferros's own files.
 
-### 0. Firmware from the phone's own vendor partition
+The survey of 2026-11-24 (every firmware and calibration file the kernel and drivers load):
 
-Google's files cannot be shipped by us: `aoc.bin`, the Mali firmware, WiFi and Bluetooth firmware and their CLM and calibration, the GNSS firmware (akita's `kepler.bin`), the sensor registry scripts. Every phone carries them in its own vendor partition, and ferros already reads that partition on the device (partfs: the modem loads its carrier config from `vendor_b` this way). So the kernel and drivers read their firmware from the phone's own vendor partition rather than from copies in the vault, and the phone's own calibration from its persist and efs (persist is f2fs, read by ferros_f2fs). Provisioning shrinks to flashing ferros, nothing Google's passes through the tool, and a reset loses no firmware. Each driver keeps a fallback to the vault copy for development.
+| Read from the phone today (partfs, nothing to provision) | Stored in the vault by a host script today | Not on the phone at all |
+|---|---|---|
+| modem.bin and uecap (modem_X, ext4); NV images (efs, f2fs); replay_region.bin (modem_userdata); cpsha (persist); carrier configs (vendor); BT patch BCM.hcd (vendor) | WiFi firmware, NVRAM, CLM, txcap (`wifi.*`); GPU CSF firmware (`gpu.fw`); AoC firmware (`aoc.fw.*`, the kernel's vault); the sensor registry (`aoc.reg.*`, vendor) and its factory calibration (persist); the 8a's GNSS `gps.kepler` (vendor) | camera inits, CPU programs and PDMA jobs (oracle captures of Android's register writes); camera IDTs (the owner's own measurements); husky's GPS replay; the 8a's `gps.kepler.cfg` and session; the display's cold-power and cold-pipe snapshots (compiled in) |
 
-### 1. Board manifests and `ferros-flash provision`
+The proposal, one firmware at a time, each its own stage with its own device slot:
 
-One manifest a board (husky, akita), in VSF: the product name, the slot ferros boots from, the partition layout and sizes, the boot image layout (the hv's link base, the board's DRAM window), where each firmware lives on the phone, which calibration partitions to back up, and the per-board traps (husky: the 64 MiB fastboot send fails, so prefix flashes with the footer unchanged; akita: the hv on slot b through the avb footer). `ferros-flash provision <board>` replaces the per-board scripts: the shell's processes stored and read back, then a reboot and a check that each came up. The same library answers a full reset on either phone.
+0. **gpu.fw**: the gpu process gains a `vendor` partition grant and reads `/firmware/mali_csffw-<its interface>.bin`. Blocker on the 8a: its vendor carries r54p1 to r54p3 and r56p0, and the process speaks r52p0, so the 8a runs husky's file today; the process must learn r54 first, or the 8a keeps a vault copy.
+1. **wifi.\***: pcie1 reads the board's files from vendor by the names the board manifest lists (the 8a's `bcmdhd.cal_*` name is still to be read from a phone).
+2. **aoc.fw**: the kernel's AoC loader reads `/firmware/aoc.bin` thru partfs in place of the kernel vault (it already reads in runs).
+3. **aoc.reg.\***: the sensors process reads `/etc/sensors/registry` from vendor and the factory calibration from persist (f2fs), in the order tools/akita-aoc.sh stores them today.
+4. **gps.kepler**: the gnss_kepler process reads `/firmware/kepler.bin` from vendor.
+5. Each driver keeps the vault copy as its development fallback, and IDENTITY-SPACE.md's "Device firmware" plan (refill from vendor on a miss) becomes the first path rather than the fallback.
 
-### 2. Native fastboot
+Two things this rests on:
+- **Which slot's vendor.** The kernel grants `vendor_b`/`modem_b` on akita and `_a` on husky, fixed (service.rs). With virtual A/B, only the slot Android last ran from has its logical partitions in super; on the 8a since 2026-11-18 that is slot a, and `vendor_b` may be gone. The kernel must find the slot whose `vendor` exists in super's metadata and grant that one. Pure ferros freezes it there: Android never updates again, so the firmware is the build the phone carried when ferros went on.
+- **What is not on the phone ships with ferros.** The camera's captured programs and the GNSS session are ferros's own data, in the release beside the capsules. Whether captured register sequences may be hosted publicly is the owner's call.
 
-The single executable cannot depend on Android's platform-tools. A fastboot client in Rust over USB bulk (the transport ferros-bridge already speaks for PT): `getvar`, `download` in pieces small enough for the Pro, `flash`, `set_active`, `oem pkvm disable` and status, `flashing unlock` and its state, `reboot bootloader`. The bridge's USB port kick (tools/usb-kick.sh) becomes a retry in the tool.
+## 1. Board manifests
 
-### 3. The flow, as a CLI wizard
+One VSF document a board (tools/flash/src/board.rs), built into the tool and published in the signed release, so a board fix ships without a new executable.
+Section `board`: the product, its name, the fastboot and ferros USB ids, the block size and LU, whether `set_active` may be sent (husky: never), the boot partition's size, the download piece, userdata's floor, the smallest ferros partition today's kernel opens, and, on husky, the exact LBAs today's kernel demands.
+Repeated sections: `backup` (every per-unit partition copied before any write: persist, efs, efs_backup, modem_userdata, devinfo, pinfo, blenv, mfg_data, fips, trusty_persist, misc, frp), `firmware` (where each file lives on the phone and where the driver takes it from today), `trap` (what is known to go wrong, shown before the step).
 
-Detect, name the phone, the bootloader's lock state and the unlock walkthrough, the choices, the backup, the carve, the flash, provisioning, pKVM, first boot. Every step says what it will do before it does it, and every write is verified by reading it back.
+**The layout, and its gap to the storage founding rule.** ONE-VAULT.md is a plan; nothing of it is built. So the manifest describes what today's kernel expects:
+- one `ferros` partition, found by name on akita, at least 20 GiB for the vault process's window, 72 GiB for RAW clips (process.rs `WINDOWS`);
+- husky's kernel opens its vault only at FERROS_BASE_LBA..=FERROS_LAST_LBA (ufs_device.rs `locate`), so a person's husky must be carved to exactly those LBAs until the kernel finds the partition by name as on akita.
 
-### 4. The GUI and the executable
+The fixed windows inside the partition (flash log, kvault, the vault window, clips, rawbench) are the gap to the founding rule, flagged to the coordinator; the carve itself already follows it (one partition, everything past userdata's floor).
 
-A fluor front end over the same library: the same steps as screens, nothing the CLI cannot do. One executable a platform. Windows (Authenticode) and macOS (Developer ID, notarization) signing need certificates: outside decisions and costs for the owner. Linux: a signed static binary.
+## 2. Native fastboot
 
-### 5. Hosting
+tools/flash/src/fastboot.rs speaks the protocol over any bulk pipe; usb.rs is that pipe over nusb.
+- Commands: `getvar` (one or `all`), `download` (refused before sending when larger than the bootloader's `max-download-size`; sent in 1 MiB writes so a failing cable fails on a piece the log names), `flash`, `set_active`, `oem pkvm status|disable`, `flashing get_unlock_ability`, `flashing unlock`, `reboot`, `reboot-bootloader`.
+- Never sent, whoever asks: `flashing lock`, `flashing lock_critical`, `oem lock`; `set_active` on husky; a flash of anything but `boot_a`, `boot_b` and `avb_custom_key`.
+- pKVM: with no Android and no hv in a production image, pKVM no longer matters to ferros; the guide reads its status into the log only.
 
-The signed ferros images (boot, the hv, the shell's capsules) published where the tool fetches them (ferros.org or fgtw.org: the owner's call), each named by its BLAKE3 in a signed manifest the tool checks before writing anything.
+**nusb, and why.** Plain Rust on Linux (usbfs), macOS (IOKit) and Windows (WinUSB), no libusb to ship or build, and the crate ferros-bridge and ferros-link already use. rusb would bring libusb's C and the same WinUSB need on Windows.
 
-## Order
+**Windows and the driver (to measure).** nusb on Windows opens only a device bound to WinUSB. A Pixel's bootloader interface (class G#FF, subclass G#42, protocol G#03) gets WinUSB without a driver install only if it answers Microsoft OS descriptors (an MS OS 2.0 platform capability in its BOS, or the string at index G#EE); otherwise Windows shows it as an unknown device and needs Google's USB driver (an INF binding WinUSB, from developer.android.com) or Windows Update's optional "Android Bootloader Interface".
+- The measurement, read only: the Pro or the 8a in fastboot, its BOS descriptor and string G#EE read from Linux. Asked of the coordinator; not yet done.
+- If it does not, the first test installs Google's driver by hand, and the tool's open failure says so. Writing our own INF needs a signed catalog (admin and a certificate), which is the code-signing decision again.
+- ferros's own USB device (G#1209:G#4665) has no MS OS descriptors either (ferros_hal usb.rs has a BOS without them), so on Windows the tool could not reach ferros after the first boot. Adding them (an MS OS 2.0 platform capability and its descriptor set with compatible ID WINUSB) is a small ferros_hal change that rides a device slot.
 
-0 (firmware from the phone) and 1 (manifests and provision) first: they are also what a full reset needs on both phones today. Then 2 (fastboot), 3 (the wizard), 4 (the GUI and signing), with 5 decided before the first release.
+## 3. The guide
+
+`ferros-flash guide` (the default with no arguments): find the phone (one in fastboot, else the serial named), name it from the board manifests, the bootloader's lock state and unlock ability, the unlock walkthrough (the request sent only after a typed yes; the phone asks again on its own screen), then the plan in words.
+It stops there and says so: the backup, the carve and the flash run thru ferros on the phone (below), which is not built yet.
+
+**The carve without Android.** A person's phone has no root, so the GPT edit cannot go thru Android as tools/pixel-carve.sh does. The proposed order:
+0. Unlock (the phone wipes itself).
+1. Flash the signed production image to both boot slots (no `set_active`, so husky's trap never arises).
+2. Reboot: ferros starts with no `ferros` partition and opens an **install door** on USB, in production builds too, only while no `ferros` partition exists (an installed phone never has it open).
+3. Thru that door the tool reads the calibration partitions (the backup), reads both boot slots back (the flash's verification), reads the GPT, plans the carve on the computer (lib.rs `carve`, the board's floor), and sends the changed blocks; the kernel checks the new table itself (every entry kept but userdata's end and the new `ferros`) before writing, and reads it back.
+4. Reboot: the vault is created on the new partition, the release's capsules are stored thru the same door and read back, and the tool checks each process came up.
+
+The install door is kernel work (a production door, so the owner's to approve): ask the coordinator for a slot.
+
+## 4. Distribution
+
+The same shape as Photon's install (photon README "Installation", installers/install-release.ps1 and .sh).
+- **The one line.** Windows: `powershell -ExecutionPolicy Bypass -c "irm <base>/install.ps1 | iex"`. Linux and macOS: `curl -sSfL <base>/install.sh | sh`. The installer downloads `ferros-flash-<platform>`, checks its SHA-256 against the one tools/flash/publish.sh wrote into it, installs it for the user only (no administrator), and starts the guide.
+- **SHA-256 at the bootstrap only.** PowerShell has SHA-256 built in and no BLAKE3, and few systems have b3sum, so the installer's one check of the tool itself is SHA-256, as Photon's. Everything the tool fetches after that is BLAKE3 in VSF.
+- **The release** (release.rs): one VSF document Ed25519-signed with the ferros key (keys/ferros.key.vsf; the tool pins keys/ferros.pub), section `release` (channel, the commit) and one `artefact` section a file (role, name, board, platform, size, BLAKE3 `hb`). Every file is served under its BLAKE3 in hex, so a host can swap nothing.
+- **publish.sh** builds the Windows (x86_64-pc-windows-gnu, from this host) and Linux executables, the board manifests, any boot images given, signs the release, writes the installers and stages it all; it uploads only when told (`FERROS_FLASH_UPLOAD=r2:<bucket>/<path>`, Photon's route). macOS waits for a mac build host.
+- **The host is the owner's to pick** (ferros.org, fgtw.org, or holdmyoscilloscope where Photon lives). Recommended: **ferros.org**, on R2 behind it as Photon's is: it is the OS's own name, people will look for it there; fgtw.org is the network's bootstrap and FGTW is a DUNA nobody owns, so ferros's images there blur that; holdmyoscilloscope is the owner's personal site. The base is one variable, so a move is a republish.
+- **Code signing** (Authenticode, and Developer ID for macOS) is the owner's cost decision. Until then the executable is unsigned, the installer says Windows may warn of an unknown publisher, and the signed release is what vouches for the images.
+
+## 5. Logging
+
+**On the computer** (runlog.rs): one file a run, `<data>/ferros-flash/runs/<start in Eagle time, hex>.log.vsf` (Windows: `%LOCALAPPDATA%`; macOS: Application Support; Linux: XDG data), opened at the run's first step.
+- Each record is a complete VSF document in the stack's log shape (vsf::logging: section `log` with `lvl`, a `msg` template, typed `val`s), so `vsflog` reads it as it reads Photon's; each also carries its `step` and typed fields of its own (a partition, a size, a BLAKE3, a bootloader variable, a time taken).
+- Every record is on the disk (`sync_data`) before the step it describes goes on; a crash, a pulled cable or a power cut leaves every record before it, and a torn last record is skipped by the reader. A panic is logged as a record before the tool ends.
+- It holds the tool's version and platform, the phone's product, serial, bootloader and baseband versions, slot and lock state, every step with what it read and wrote (names, sizes, BLAKE3), every bootloader INFO line, every error with its context, all in Eagle time. Never a handle, a key, a location, or the contents of a calibration partition.
+- `ferros-flash log show <file>` renders it; `ferros-flash log report <file> <out>` makes the one document a person submits: section `report` (the tool, the record count, whether the tail was torn, whether the serial was kept) and each record whole as a `record` field, the serial replaced by its keyed BLAKE3 unless the person keeps it in.
+
+**On the phone.** The flash log is the ledger's ring (ferros_ledger): every entry a complete VSF document with its provenance hash, chained by BLAKE3, its words sealed under the ira-derived system key (personal entries under the person's key). The host pulls it today with `ferros-bridge diag log [--raw]` (the kernel opens the entries for the answer), but that is a development door, closed in production. Proposed: the install door and a production `log` door hand the tool the system entries sealed as stored plus the kernel's opened copy only while the device is unlocked or the person approves on the phone, so a submitted report can carry the phone's side of the run.
+
+**Submitting, proposed (nothing built on the server).**
+- Where: `https://fgtw.org/report` (POST of the report document; fgtw.org already takes VSF from devices). What it takes: the document checked (VSF, provenance hash, size cap), stored under its BLAKE3, the answer that hash so the person can quote it.
+- Privacy: the report carries no handle, key or location by construction; the serial is blinded by default; the computer's address is not stored with it. The person sees what will be sent (`log show`) and types yes; nothing is sent on its own.
+- Consent: per report, never a standing setting.
+- To build: an fgtw route and its store, a `ferros-flash log send` command. Proposed before building, as asked.
+
+## Production images
+
+Hosted images are production builds (owner, 2026-11-24), and production has no way into Android:
+- **Built (2026-11-24):** the hv's gate honours no ANDROID_ONCE or RECOVERY_ONCE in a production build (ferros, or fastboot when no ferros is packed); the kernel's ANDROID_ONCE writer, the boot-time Android branch, the Start into launch, the Android launch and the recovery "yes" are compiled out (`cfg(ferros_production)`), so a production build that still referred to them would not compile. The gate screen, the 1 s wait and the arrow were already compiled out of production in both the kernel (ready.rs) and the hv (gate.rs).
+- **Left for the map's owner:** the Settings page "Android" still shows in a production build (payloads/map PAGES); its controls set requests the production kernel no longer acts on. It should be absent there.
+- **Proposed: the hosted image is bare ferros**, `ferros-mkimg boot` with its AVB footer, no hv and no Linux Image. The gate format needs a Linux Image packed in front of ferros, and that Image is Google's Android kernel for one Android build: hosting it is hosting an image that runs Android, and it would be one image per Android build. Without Android the hv gives ferros nothing it needs: the UFS firewall, the chords into Android and the key routing exist for Android; the killswitch is the kernel's. A bare boot loses the jump-style restart (ferros reboots thru the bootloader instead) and the hv's early fastboot escape (ABL's own power + volume down remains). akita marked its slot only thru the hv; a production build now marks it bare too (main.rs), which the A/B updater needs.
+
+## Updating while locked (owner, 2026-11-24: to build before the first locked deploy)
+
+### (a) The A/B updater in ferros
+
+- **What it writes:** the release's boot image, whole partition, already signed with the ferros AVB key (the updater never signs), to the slot not running, by GPT name; read back and checked against the release's BLAKE3.
+- **The opening:** nothing in the kernel writes a boot partition today (processes reach only the ferros partition's windows; partfs only reads). The hv's UFS firewall guards against Android at EL1 only, and a bare production image has no hv. So the opening is a new kernel call, signed-only: it takes the release document and the image bytes, checks the release's signature against the ferros key compiled into the kernel and the image's BLAKE3 against it, and writes only `boot_a` or `boot_b`, the one not running. Nothing else can be written thru it.
+- **Then:** `slot::set_active` on the new slot (devinfo flags and `bBootLunEn`, as the Android path does today), reboot; the locked bootloader verifies the image against the custom key. A good boot marks itself successful (`slot::mark_booted_slot`); a bad one burns its retries and the bootloader falls back to the old slot (proven 2026-10-28), where ferros logs the failed update to the ledger. The old slot stays as the fallback until the next update.
+- **Who may ask:** the person, behind an approve on the phone; the release fetched over the network or handed over USB by the tool (a production `update` door taking only signed bytes), so a locked phone is updated without unlocking.
+- **Rollback index:** the image's AVB rollback index must not be below what the bootloader stored; raised only for security fixes, never past what the owner sets.
+
+### (b) "Allow unlocking" in Security
+
+- **What it is:** Android's "OEM unlocking" switch, which ferros must set itself as there is no Android. ON by default for the first deploys, behind an approve, the page saying plainly: with it on, anyone holding the phone can unlock it; unlocking wipes userdata, and ferros's device-class data (settings, stowed kists, cached wallpaper) becomes readable to whoever unlocks it, while the person's identity and fleet stay closed.
+- **Where the flag lives, found so far:** Android writes the last byte of `frp` (LU0 LBA 37126..=37253 on both phones, 512 KiB; husky's read 1 on 2026-11-01), with a SHA-256 over the partition after its first 32 bytes in those 32 bytes (AOSP's PersistentDataBlockService, from memory, unverified); a later Android boot wipes frp if the digest is wrong. But on Pixels with a Titan M2 the bootloader most likely asks Titan's own device lock (the AVB app's SetDeviceLock, which Android's Titan-backed OemLock service also sets), reached on zuma thru GSA (`GSA_MB_CMD_GSC_NOS_CALL`). Not proven from the trees: no oemlock HAL, no `get_unlock_ability` handler, no ABL log of it.
+- **The measurement first, on the 8a** (unlocked today; one boot of ferros): `fastboot flashing get_unlock_ability`, then ferros sets frp's last byte to 0 with the digest recomputed, then `get_unlock_ability` again. If it follows frp, (b) is an frp write behind the approve. If not, (b) is a Titan call thru GSA, and Titan may refuse it from anything but Android; that would make (b) much harder and is the owner's to weigh.
+- **A proposal that falls out of it:** keep ferros's device-only secret (the salt of the device-class keys) in the small userdata partition the carve leaves. The bootloader's unlock erases userdata, so an unlock becomes the key shred by the bootloader's own hand ("Claude memories/feedback_no_needless_writes.md": destroying data is destroying its keys), and the device-class data a thief would read after unlocking is noise.
+
+### (c) Kernel updates thru the vault's kernel ring
+
+With ONE-VAULT.md the boot slots hold the seed, not the kernel, and a kernel update is a vault write; the bootloader and AVB are no longer involved. It needs:
+- ONE-VAULT decision 0 (the kernel's runs in the spine entry beside `kernel_hash` and `kernel_sig`) and the migrating spine with its root ring;
+- the seed booting from the boot partition (bare, as above), reading the root ring and the spine, checking the kernel against the ferros key, jumping;
+- kernel A/B by `active_slot` in the spine entry, with a fallback when the new kernel does not mark itself good;
+- a kernel rollback floor kept in the spine (the seed refuses a kernel below it), since AVB's index no longer covers the kernel;
+- (a) still for the seed itself, which changes rarely.
+
+## Re-lock: what it needs
+
+`fastboot flash avb_custom_key <ferros AVB key blob>` (hosted as a release file), then the person's `flashing lock`.
+A locked bootloader verifies the top-level `vbmeta` against that key, and Google's top `vbmeta` chains `boot` to Google's key, so the phone also needs a top `vbmeta` signed by the ferros key. That `vbmeta` carries Google's hash descriptors for `dtbo`, `vendor_boot`, `vendor_kernel_boot`, `init_boot` and `pvmfw` (the bootloader still loads them), which differ per Android build: one signed `vbmeta` a (board, Android build) pair, hosted, the tool matching the phone's build (read by ferros from `vbmeta_a`/`_b`, `diag part avb` today) and refusing the lock on a build it has none for. The boot image's rollback index must not be below the one the phone stored under Google's build.
+This is not built and needs measuring on the 8a before any lock (none is ever sent by the tool).
+
+## The first Windows test (what it looks like today)
+
+On the owner's Windows PC, with the 8a in its bootloader on the cable:
+0. `powershell -ExecutionPolicy Bypass -c "irm <base>/install.ps1 | iex"` (once the release is staged and uploaded to the chosen host).
+1. The guide finds the phone and names it, or says the phone cannot be opened (the WinUSB question); the log says which.
+2. It reads the lock state (the 8a is unlocked), shows the plan, and stops before the backup.
+3. `ferros-flash log report <the run's file> report.vsf`, sent back to us.
+That run tests the install, the executable, USB on Windows and the log, and writes nothing to the phone. The flash itself follows once the install door, the production image and the measurements above are in.
 
 ## Open for the owner
 
-- Where the images are hosted, and the signing certificates for Windows and macOS.
-- Whether the default is keep-Android or pure ferros, and the default ferros size.
-- How the tool treats a phone whose Android build differs from the one its firmware paths were read from (the vendor files are read from the phone itself, so this matters only where a path or format moved).
+- The host (recommended ferros.org on R2), and code signing for Windows and macOS.
+- The carve's userdata floor (proposed 1 GiB, holding the device-only secret as above) and the production image as bare ferros.
+- The install door, the update door and the signed-only boot write (production doors, so the owner's).
+- (b)'s path once measured, and whether Titan may be asked.
+- The log endpoint at fgtw.org and its privacy rules.
+- Whether captured register sequences (camera, GNSS) may be hosted.
