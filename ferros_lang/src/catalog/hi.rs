@@ -34,6 +34,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageClock => "घड़ी",
         Msg::PageLanguage => "भाषा",
         Msg::PageAbout => "बारे में",
+        Msg::PageSound => "ध्वनि",
         Msg::PageDeveloper => "डेवलपर",
         // ---- a link's state ----
         Msg::SwitchedOff => "बंद किया गया",

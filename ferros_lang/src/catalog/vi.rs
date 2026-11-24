@@ -34,6 +34,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageClock => "đồng hồ",
         Msg::PageLanguage => "ngôn ngữ",
         Msg::PageAbout => "giới thiệu",
+        Msg::PageSound => "âm thanh",
         Msg::PageDeveloper => "nhà phát triển",
         // ---- a link's state ----
         Msg::SwitchedOff => "đã tắt",

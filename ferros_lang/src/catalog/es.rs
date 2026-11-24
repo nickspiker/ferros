@@ -34,6 +34,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageClock => "reloj",
         Msg::PageLanguage => "idioma",
         Msg::PageAbout => "acerca de",
+        Msg::PageSound => "sonido",
         Msg::PageDeveloper => "desarrollador",
         // ---- a link's state ----
         Msg::SwitchedOff => "apagado",

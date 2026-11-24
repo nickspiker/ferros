@@ -34,6 +34,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageClock => "jam",
         Msg::PageLanguage => "bahasa",
         Msg::PageAbout => "tentang",
+        Msg::PageSound => "suara",
         Msg::PageDeveloper => "pengembang",
         // ---- a link's state ----
         Msg::SwitchedOff => "dimatikan",

@@ -36,7 +36,7 @@ mod camera;
 mod jam;
 /// The screenshot's two-finger slide on the helm, pure so tools/chords tests it on the host.
 mod pair;
-// The Developer page's speaker, microphone and buzz tests (owner, 2026-11-22).
+// The Sound page's speaker, microphone and buzz tests (owner, 2026-11-22; on Developer until 2026-11-24).
 mod devtest;
 
 use alloc::vec::Vec;
@@ -1035,7 +1035,7 @@ enum Choice {
     Channel(u8),
     /// The release look until a reboot (Developer; display op 64).
     ReleaseLook,
-    /// The Developer page's tests (devtest.rs): the speaker's buttons, held to play on their channels (ferros_sys audio LEFT | RIGHT); the level slider the speaker and the recording's playback share; the buzz's waveform slider and its button; the microphones' listen checkbox, the microphone a recording takes, and the record-then-play-back button.
+    /// The Sound page's tests (devtest.rs): the speaker's buttons, held to play on their channels (ferros_sys audio LEFT | RIGHT); the level slider the speaker and the recording's playback share; the buzz's waveform slider and its button; the microphones' listen checkbox, the microphone a recording takes, and the record-then-play-back button.
     SpeakerHold(u8),
     TestLevel,
     BuzzWave,
@@ -1152,7 +1152,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 24] = ["appearance", "units", "keyboard", "security", "Android", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+const PAGES: [&str; 25] = ["appearance", "units", "keyboard", "security", "Android", "deck", "helm", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "sound", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -1194,6 +1194,7 @@ fn page_title(key: &'static str) -> &'static str {
         "language" => Msg::PageLanguage,
         "about" => Msg::PageAbout,
         "battery" => Msg::Battery,
+        "sound" => Msg::PageSound,
         "torch" => Msg::Torch,
         "developer" => Msg::PageDeveloper,
         _ => return key,
@@ -1717,7 +1718,7 @@ struct Map {
     tag_said: u64,
     /// The WiFi page's picker (wifi.rs).
     wifi: wifi::Picker,
-    /// The Developer page's tests (devtest.rs), never stored.
+    /// The Sound page's tests (devtest.rs), never stored.
     tests: devtest::Tests,
     /// How many adds this map has started (`TAG_ADD`'s values).
     tag_adds: u64,
@@ -4561,6 +4562,110 @@ impl Map {
                 fact(b, &mut y, tr(Msg::PowerDraw), power.as_str());
                 fact(b, &mut y, tr(Msg::Temperature), facts.battery_temp_cc().map_or_else(not_read, |c| num(c / 100, " °C")).as_str());
             }
+            "sound" => {
+                // Sound (owner, 2026-11-24: "Not sure why that's under developer options and not sound", then "yes, add a sound page"): the speaker, microphone and buzz tests, moved here from Developer, between the battery and the torch.
+                // The speaker test (owner, 2026-11-22: "Just throw a mic and speaker test in the ferros settings and I can test it"; devtest.rs): a 1 kHz tone while a button is held, at the slider's level, which the service never lets past its ceiling (no speaker protection yet, said here); the amplifiers' state after each answer, as numbers (their registers' bits, so in the developer's G#).
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::SpeakerTest));
+                y += uu(2, 1);
+                rows(self, b, &mut y, note, grey(), tr(Msg::NoSpeakerProtection));
+                let lv = match self.slide {
+                    Some((Choice::TestLevel, t)) => devtest::level_of(t),
+                    _ => self.tests.level,
+                };
+                row(self, b, &mut y, small, grey(), say(Say::UnderFullScale(devtest::level_under(lv))).as_str(), None);
+                slider(self, b, &mut y, Choice::TestLevel);
+                row(self, b, &mut y, note, grey(), tr(Msg::HoldToPlay), None);
+                for (m, name) in [(ferros_sys::audio::LEFT, Msg::Left), (ferros_sys::audio::RIGHT, Msg::Right), (ferros_sys::audio::LEFT | ferros_sys::audio::RIGHT, Msg::Both)] {
+                    button(self, b, &mut y, tr(name), false, Some(Choice::SpeakerHold(m)));
+                }
+                let (spk, amps) = devtest::speaker();
+                let said = match spk {
+                    devtest::Spk::None => None,
+                    devtest::Spk::Playing => Some(Msg::Playing),
+                    devtest::Spk::Stopped => Some(Msg::ToneStopped),
+                    devtest::Spk::Refused => Some(Msg::AudioRefused),
+                    devtest::Spk::NoAnswer => Some(Msg::AudioNotAnswering),
+                    devtest::Spk::Fault => Some(Msg::AmpFault),
+                    devtest::Spk::NoRight => Some(Msg::NoAudioRight),
+                };
+                if let Some(m) = said {
+                    row(self, b, &mut y, small, white(), tr(m), None);
+                }
+                if amps.iter().any(|&(s1, s3)| s1 | s3 != 0) {
+                    for (k, side) in [Msg::Left, Msg::Right].into_iter().enumerate() {
+                        let (s1, s3) = amps[k];
+                        let mut e = Line::new();
+                        let _ = write!(e, "G#{:X}", s1 & ferros_sys::audio::ERRORS);
+                        let l = say(Say::AmpState { side: tr(side), pup: (s1 & ferros_sys::audio::PUP_DONE != 0) as u64, pll: (s3 & ferros_sys::audio::PLL_LOCK != 0) as u64, errors: e.as_str() });
+                        row(self, b, &mut y, note, grey(), l.as_str(), None);
+                    }
+                }
+                y += uu(1, 1);
+                // The microphone test (devtest.rs): a live level per microphone while "listen" is checked (the audio service answers as the microphones send), each as decibels under full scale and on a meter (the slider's track, not touchable); then a recording of the chosen microphone, played back on the speaker at the level above.
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::MicTest));
+                y += uu(2, 1);
+                mark(self, b, &mut y, 50, tr(Msg::Listen), self.tests.listening, Some(Choice::MicListen));
+                match self.tests.listen_why {
+                    1 => row(self, b, &mut y, note, grey(), tr(Msg::AudioNotAnswering), None),
+                    2 => row(self, b, &mut y, note, grey(), tr(Msg::MicsWouldNotStart), None),
+                    3 => row(self, b, &mut y, note, grey(), tr(Msg::NoAudioRight), None),
+                    _ => {}
+                }
+                if self.tests.listening {
+                    let peaks = devtest::levels();
+                    let (a, z) = self.track(cx);
+                    let kr = uq >> 1;
+                    for k in 0..ferros_sys::audio::MICS {
+                        let p = peaks.map_or(0, |p| p[k]);
+                        let under = devtest::under(p);
+                        let l = match under {
+                            Some(d) => say(Say::MicLevel { mic: k as u64, under: d }),
+                            None => say(Say::MicQuiet(k as u64)),
+                        };
+                        row(self, b, &mut y, note, grey(), l.as_str(), None);
+                        // The meter: 0 at silence, then the 16-bit range's 96 dB across the track. A peak of 1 is 90 dB under (t about 0.06) and full scale 0 (t 1), so t stays inside the track for every peak a sample can have, with nothing held to it.
+                        let t = under.map_or(0., |d| 1. - d as f64 / 96.);
+                        b.slider(a, z, y, kr >> 2, kr, t, white(), 0, white());
+                        y += uu(3, 1);
+                    }
+                }
+                let mic_names: [Line; ferros_sys::audio::MICS] = core::array::from_fn(|k| say(Say::MicName(k as u64)));
+                let names: [&str; ferros_sys::audio::MICS] = core::array::from_fn(|k| mic_names[k].as_str());
+                radios(self, b, &mut y, &names, self.tests.mic as usize, &|v| Choice::MicPick(v as u8));
+                let (rec, peak) = devtest::recorded();
+                button(self, b, &mut y, tr(Msg::RecordPlayBack), rec == devtest::Rec::Recording, Some(Choice::RecordPlay));
+                let rec_said = match rec {
+                    devtest::Rec::None => None,
+                    devtest::Rec::Recording => Some(devtest::line(tr(Msg::Recording))),
+                    devtest::Rec::Played => Some(match devtest::under(peak) {
+                        Some(d) => say(Say::PlayingBack(d)),
+                        None => devtest::line(tr(Msg::MicGaveSilence)),
+                    }),
+                    devtest::Rec::Silent => Some(devtest::line(tr(Msg::MicGaveSilence))),
+                    devtest::Rec::MicsWouldNotStart => Some(devtest::line(tr(Msg::MicsWouldNotStart))),
+                    devtest::Rec::NoAnswer => Some(devtest::line(tr(Msg::AudioNotAnswering))),
+                    devtest::Rec::SpeakerWouldNotStart => Some(devtest::line(tr(Msg::SpeakerWouldNotStart))),
+                    devtest::Rec::Refused => Some(devtest::line(tr(Msg::AudioRefused))),
+                    devtest::Rec::NoRight => Some(devtest::line(tr(Msg::NoAudioRight))),
+                };
+                if let Some(l) = rec_said {
+                    rows(self, b, &mut y, note, grey(), l.as_str());
+                }
+                y += uu(1, 1);
+                // The buzz test (owner: "sound and buzz, why not"; devtest.rs): one ROM waveform of the vibration motor, by number (the ROM's are unnamed; 1 is the notes' tap).
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::BuzzTest));
+                y += uu(2, 1);
+                let wv = match self.slide {
+                    Some((Choice::BuzzWave, t)) => devtest::wave_of(t),
+                    _ => self.tests.wave,
+                };
+                row(self, b, &mut y, small, grey(), say(Say::RomWaveform(wv as u64)).as_str(), None);
+                slider(self, b, &mut y, Choice::BuzzWave);
+                button(self, b, &mut y, tr(Msg::Buzz), false, Some(Choice::Buzz));
+                if devtest::buzzed() == Some(false) {
+                    rows(self, b, &mut y, note, grey(), tr(Msg::MotorDidNotPlay));
+                }
+            }
             "torch" => {
                 // The torch (docs/TORCH.md "Settings"; owner, 2026-11-11: "like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout"), its quick circle's page (QUICK.md "Quick pages"): on and off as the circle's tap, then each of its typed settings (typed.rs), its name with its value in words, its slider under it, the value under a finger as it moves. Set with the torch dark, they wait for its next light.
                 let lit = quick::torch_now().is_some_and(|l| l > 0);
@@ -5078,107 +5183,6 @@ impl Map {
                 y += uu(2, 1);
                 radios(self, b, &mut y, &[tr(Msg::Off), tr(Msg::ScopeRed), tr(Msg::ScopeVisible), tr(Msg::ScopeBlue), tr(Msg::ScopeGreen), "IR", tr(Msg::ScopeClear)], sc as usize, &|v| Choice::ScopeSet(v as u8));
                 y += uu(1, 1);
-                // The speaker test (owner, 2026-11-22: "Just throw a mic and speaker test in the ferros settings and I can test it"; devtest.rs): a 1 kHz tone while a button is held, at the slider's level, which the service never lets past its ceiling (no speaker protection yet, said here); the amplifiers' state after each answer, as numbers (their registers' bits, so in the developer's G#).
-                b.text(cx, y, note as u16, dim(), 1, tr(Msg::SpeakerTest));
-                y += uu(2, 1);
-                rows(self, b, &mut y, note, grey(), tr(Msg::NoSpeakerProtection));
-                let lv = match self.slide {
-                    Some((Choice::TestLevel, t)) => devtest::level_of(t),
-                    _ => self.tests.level,
-                };
-                row(self, b, &mut y, small, grey(), say(Say::UnderFullScale(devtest::level_under(lv))).as_str(), None);
-                slider(self, b, &mut y, Choice::TestLevel);
-                row(self, b, &mut y, note, grey(), tr(Msg::HoldToPlay), None);
-                for (m, name) in [(ferros_sys::audio::LEFT, Msg::Left), (ferros_sys::audio::RIGHT, Msg::Right), (ferros_sys::audio::LEFT | ferros_sys::audio::RIGHT, Msg::Both)] {
-                    button(self, b, &mut y, tr(name), false, Some(Choice::SpeakerHold(m)));
-                }
-                let (spk, amps) = devtest::speaker();
-                let said = match spk {
-                    devtest::Spk::None => None,
-                    devtest::Spk::Playing => Some(Msg::Playing),
-                    devtest::Spk::Stopped => Some(Msg::ToneStopped),
-                    devtest::Spk::Refused => Some(Msg::AudioRefused),
-                    devtest::Spk::NoAnswer => Some(Msg::AudioNotAnswering),
-                    devtest::Spk::Fault => Some(Msg::AmpFault),
-                    devtest::Spk::NoRight => Some(Msg::NoAudioRight),
-                };
-                if let Some(m) = said {
-                    row(self, b, &mut y, small, white(), tr(m), None);
-                }
-                if amps.iter().any(|&(s1, s3)| s1 | s3 != 0) {
-                    for (k, side) in [Msg::Left, Msg::Right].into_iter().enumerate() {
-                        let (s1, s3) = amps[k];
-                        let mut e = Line::new();
-                        let _ = write!(e, "G#{:X}", s1 & ferros_sys::audio::ERRORS);
-                        let l = say(Say::AmpState { side: tr(side), pup: (s1 & ferros_sys::audio::PUP_DONE != 0) as u64, pll: (s3 & ferros_sys::audio::PLL_LOCK != 0) as u64, errors: e.as_str() });
-                        row(self, b, &mut y, note, grey(), l.as_str(), None);
-                    }
-                }
-                y += uu(1, 1);
-                // The microphone test (devtest.rs): a live level per microphone while "listen" is checked (the audio service answers as the microphones send), each as decibels under full scale and on a meter (the slider's track, not touchable); then a recording of the chosen microphone, played back on the speaker at the level above.
-                b.text(cx, y, note as u16, dim(), 1, tr(Msg::MicTest));
-                y += uu(2, 1);
-                mark(self, b, &mut y, 50, tr(Msg::Listen), self.tests.listening, Some(Choice::MicListen));
-                match self.tests.listen_why {
-                    1 => row(self, b, &mut y, note, grey(), tr(Msg::AudioNotAnswering), None),
-                    2 => row(self, b, &mut y, note, grey(), tr(Msg::MicsWouldNotStart), None),
-                    3 => row(self, b, &mut y, note, grey(), tr(Msg::NoAudioRight), None),
-                    _ => {}
-                }
-                if self.tests.listening {
-                    let peaks = devtest::levels();
-                    let (a, z) = self.track(cx);
-                    let kr = uq >> 1;
-                    for k in 0..ferros_sys::audio::MICS {
-                        let p = peaks.map_or(0, |p| p[k]);
-                        let under = devtest::under(p);
-                        let l = match under {
-                            Some(d) => say(Say::MicLevel { mic: k as u64, under: d }),
-                            None => say(Say::MicQuiet(k as u64)),
-                        };
-                        row(self, b, &mut y, note, grey(), l.as_str(), None);
-                        // The meter: 0 at silence, then the 16-bit range's 96 dB across the track. A peak of 1 is 90 dB under (t about 0.06) and full scale 0 (t 1), so t stays inside the track for every peak a sample can have, with nothing held to it.
-                        let t = under.map_or(0., |d| 1. - d as f64 / 96.);
-                        b.slider(a, z, y, kr >> 2, kr, t, white(), 0, white());
-                        y += uu(3, 1);
-                    }
-                }
-                let mic_names: [Line; ferros_sys::audio::MICS] = core::array::from_fn(|k| say(Say::MicName(k as u64)));
-                let names: [&str; ferros_sys::audio::MICS] = core::array::from_fn(|k| mic_names[k].as_str());
-                radios(self, b, &mut y, &names, self.tests.mic as usize, &|v| Choice::MicPick(v as u8));
-                let (rec, peak) = devtest::recorded();
-                button(self, b, &mut y, tr(Msg::RecordPlayBack), rec == devtest::Rec::Recording, Some(Choice::RecordPlay));
-                let rec_said = match rec {
-                    devtest::Rec::None => None,
-                    devtest::Rec::Recording => Some(devtest::line(tr(Msg::Recording))),
-                    devtest::Rec::Played => Some(match devtest::under(peak) {
-                        Some(d) => say(Say::PlayingBack(d)),
-                        None => devtest::line(tr(Msg::MicGaveSilence)),
-                    }),
-                    devtest::Rec::Silent => Some(devtest::line(tr(Msg::MicGaveSilence))),
-                    devtest::Rec::MicsWouldNotStart => Some(devtest::line(tr(Msg::MicsWouldNotStart))),
-                    devtest::Rec::NoAnswer => Some(devtest::line(tr(Msg::AudioNotAnswering))),
-                    devtest::Rec::SpeakerWouldNotStart => Some(devtest::line(tr(Msg::SpeakerWouldNotStart))),
-                    devtest::Rec::Refused => Some(devtest::line(tr(Msg::AudioRefused))),
-                    devtest::Rec::NoRight => Some(devtest::line(tr(Msg::NoAudioRight))),
-                };
-                if let Some(l) = rec_said {
-                    rows(self, b, &mut y, note, grey(), l.as_str());
-                }
-                y += uu(1, 1);
-                // The buzz test (owner: "sound and buzz, why not"; devtest.rs): one ROM waveform of the vibration motor, by number (the ROM's are unnamed; 1 is the notes' tap).
-                b.text(cx, y, note as u16, dim(), 1, tr(Msg::BuzzTest));
-                y += uu(2, 1);
-                let wv = match self.slide {
-                    Some((Choice::BuzzWave, t)) => devtest::wave_of(t),
-                    _ => self.tests.wave,
-                };
-                row(self, b, &mut y, small, grey(), say(Say::RomWaveform(wv as u64)).as_str(), None);
-                slider(self, b, &mut y, Choice::BuzzWave);
-                button(self, b, &mut y, tr(Msg::Buzz), false, Some(Choice::Buzz));
-                if devtest::buzzed() == Some(false) {
-                    rows(self, b, &mut y, note, grey(), tr(Msg::MotorDidNotPlay));
-                }
             }
         }
         self.page_h[p] = y - y0;
@@ -6920,7 +6924,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The quick row's slow calls (the torch, the identity service's do not disturb), on a thread of their own (quick.rs `worker`).
     static mut QUICK_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(quick::worker, unsafe { &mut *(&raw mut QUICK_STACK) }, grants);
-    // The Developer page's tests (devtest.rs): their calls, and the microphones' meter, each on a thread of its own.
+    // The Sound page's tests (devtest.rs): their calls, and the microphones' meter, each on a thread of its own.
     static mut TEST_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(devtest::worker, unsafe { &mut *(&raw mut TEST_STACK) }, grants);
     static mut METER_STACK: [u8; 1 << 13] = [0; 1 << 13];
@@ -7127,8 +7131,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         let mut page_dirty = false;
         // The WiFi page's picker (wifi.rs): its watch follows the page; a new list, or a request's reply, draws it again.
         page_dirty |= wifi::pass(&mut map, open && page == "WiFi") && open && page == "WiFi";
-        // The Developer page's tests (devtest.rs): the speaker's button followed as it is held and let go, the meter while it listens; an answer draws the page again.
-        page_dirty |= devtest::pass(&mut map, open && page == "developer");
+        // The Sound page's tests (devtest.rs): the speaker's button followed as it is held and let go, the meter while it listens; an answer draws the page again.
+        page_dirty |= devtest::pass(&mut map, open && page == "sound");
         // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim.
         if let Some((seq, v)) = gps_take(gps_seen) {
             gps_seen = seq;

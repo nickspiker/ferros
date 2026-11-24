@@ -78,6 +78,8 @@ messages! {
     PageClock,
     PageLanguage,
     PageAbout,
+    /// The sound page: the speaker, microphone and buzz tests (owner, 2026-11-24).
+    PageSound,
     PageDeveloper,
 
     // ---- a link's state (Connections, a link's page) ----
