@@ -93,12 +93,12 @@ pub fn set(icons: &mut Vec<(Ht, Hp)>, thing: Ht, icon: Option<Hp>) -> bool {
     }
 }
 
-/// What an icon's codes are, as its capsule's icon section names them (owner, 2026-11-24: "Let's assume they are all source sRGB instead of VSF rgb but keep the g2t curve", then the method: "Convert FROM sRGB primaries TO VSF RGB, then assign g2t, do not apply anything other than the decurve to linear and convert to VSF rgb! Should be interpreted as g2t."; Kūaha's kept: "I like that one the way it is").
+/// What an icon's codes are, as its capsule's icon section names them (owner, 2026-11-24: "Let's assume they are all source sRGB instead of VSF rgb but keep the g2t curve", then the method: "Convert FROM sRGB primaries TO VSF RGB, then assign g2t", VSF RGB being gamma 2 ([`from_srgb`]'s steps); Kūaha's kept: "I like that one the way it is").
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
     /// The section names no primaries, or `primaries: srgb`: the codes are the source picture's own sRGB numbers (tools/app-icons' assigned icons of 2026-11-20 are, tagged `g2t` though nothing was converted), converted as the owner said ([`from_srgb`]).
     Srgb,
-    /// `primaries: vsf`: VSF RGB codes, kept as they are (Kūaha's, authored in VSF RGB; Aemulus's, made in VSF RGB from its picture by its own tool, and its icon made of the converted numbers themselves).
+    /// `primaries: vsf`: VSF RGB codes, kept as they are (Kūaha's, authored in VSF RGB; Aemulus's, made in VSF RGB gamma 2 from its picture by its own tool, those codes its icon's as they stand: the same steps an sRGB icon takes here).
     Vsf,
 }
 
@@ -132,10 +132,11 @@ pub fn srgb_linear_vsf(c: [u8; 3]) -> [f32; 3] {
     vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::legacy::constants::SRGB2VSF_RGB, &s)
 }
 
-/// An icon's sRGB code triple as the codes the display draws: its linear VSF RGB numbers ([`srgb_linear_vsf`]) assigned as `g2t` codes as they are, the value times 256 as VSF's codes are (bucket bottom), with no curve applied (the owner, 2026-11-24: "assign g2t, do not apply anything other than the decurve to linear and convert to VSF rgb").
-/// A value at or past 255/256 is the top code: the float-to-integer cast stops at 255, nothing else is done to it (sRGB's white is 1.09 in VSF blue, so the brightest sRGB whites and blues stop there).
+/// An icon's sRGB code triple as the codes the display draws, the owner's steps (2026-11-24): "1. Undo the sRGB curve, to linear light. 2. Convert sRGB primaries to VSF RGB primaries, still linear. 3. Encode to VSF RGB by applying its gamma of two: code = sqrt(linear). 4. Assign g2t to those gamma-2 codes. Label only, no further curve."
+/// Steps 1 and 2 are [`srgb_linear_vsf`]; step 3 is VSF RGB's own gamma 2, √L × 256 truncated (vsf `delinearize_gamma2_u8_f32`, bucket bottom), never g2t's tanh; step 4 is only that the display reads these codes as `g2t`.
+/// A value whose root is at or past 255/256 is the top code: the float-to-integer cast stops at 255, nothing else is done to it (sRGB's white is VSF (0.91, 1.03, 1.09), codes (244, 255, 255)).
 pub fn from_srgb(c: [u8; 3]) -> [u8; 3] {
-    srgb_linear_vsf(c).map(|v| (v * 256.) as u8)
+    srgb_linear_vsf(c).map(vsf::colour::convert::delinearize_gamma2_u8_f32)
 }
 
 /// Straight RGBA texels from codes of `source` to the codes the display draws, in place: sRGB numbers converted ([`from_srgb`]), VSF RGB left as it is; alpha untouched.
@@ -374,17 +375,20 @@ mod tests {
         assert_eq!(texels(&planes[1..], false), None);
     }
 
-    /// The owner's method (2026-11-24): sRGB decurved to linear, sRGB's primaries to VSF RGB's, the numbers assigned as codes (× 256) with no curve; black stays black, each channel's share as vsf's matrix gives it.
+    /// The owner's steps (2026-11-24): sRGB decurved to linear, sRGB's primaries to VSF RGB's, VSF RGB's gamma 2 (√L × 256), the codes labelled g2t; black stays black, a grey's codes the roots of the matrix's rows times its light.
     #[test]
-    fn srgb_numbers_are_converted_and_assigned() {
+    fn srgb_numbers_are_converted_to_vsf_gamma2() {
         assert_eq!(from_srgb([0, 0, 0]), [0, 0, 0]);
         let m = vsf::colour::legacy::constants::SRGB2VSF_RGB;
         let white = vsf::colour::convert::apply_matrix_3x3_f32(&m, &[1.; 3]);
         assert!(white.iter().all(|&v| v > 0.5), "{white:?}");
-        assert_eq!(from_srgb([255; 3]), white.map(|v| (v * 256.) as u8));
-        // sRGB 128 is 0.2158 linear: grey's numbers are the matrix's rows summed times it.
-        let g = from_srgb([128; 3]);
-        assert_eq!(g, white.map(|v| (v * 0.215_861 * 256.) as u8));
+        assert_eq!(from_srgb([255; 3]), white.map(|v| (libm::sqrtf(v) * 256.) as u8));
+        assert_eq!(from_srgb([255; 3])[0], 244, "sRGB's white in VSF red, gamma 2");
+        // sRGB 128 is 0.2158 linear.
+        assert_eq!(from_srgb([128; 3]), white.map(|v| (libm::sqrtf(v * 0.215_861) * 256.) as u8));
+        // Gamma 2, never g2t's tanh: a mid grey sits where gamma 2 puts it, above g2t's code for the same light.
+        let mid = from_srgb([128; 3])[1];
+        assert!(mid > vsf::colour::convert::delinearize_gamma2tanh_u8_f32(white[1] * 0.215_861), "{mid}");
         let mut v = alloc::vec![200u8, 100, 50, 255];
         to_g2t(&mut v, Source::Vsf);
         assert_eq!(v, [200, 100, 50, 255], "VSF RGB is kept");
