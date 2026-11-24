@@ -629,7 +629,7 @@ impl Probe {
             );
             // Why its passes drew the screen whole (lumis_core `draw_why`), and those drawn in part.
             use lumis_core::ui::screen::*;
-            println!("lumis: preview, those passes drawn whole for: a new image A#{}, the exposure's start A#{}, a touch A#{}, a turn A#{}, a calibration or the scale A#{}, the corner pixel A#{}, the histogram A#{}; drawn in part A#{}, the level alone among them A#{}", why[DRAW_WHY_IMAGE], why[DRAW_WHY_START], why[DRAW_WHY_TOUCH], why[DRAW_WHY_ROTATION], why[DRAW_WHY_HOLD], why[DRAW_WHY_MAGIC], why[DRAW_WHY_HISTOGRAM], why[DRAW_WHY_PARTIAL], why[DRAW_WHY_LEVEL]);
+            println!("lumis: preview, those passes drawn whole for: a new image A#{}, a touch A#{}, a turn A#{}, a calibration or the scale A#{}, the corner pixel A#{}, the histogram A#{}; drawn in part A#{}, among them the level alone A#{}; a new exposure begun A#{}", why[DRAW_WHY_IMAGE], why[DRAW_WHY_TOUCH], why[DRAW_WHY_ROTATION], why[DRAW_WHY_HOLD], why[DRAW_WHY_MAGIC], why[DRAW_WHY_HISTOGRAM], why[DRAW_WHY_PARTIAL], why[DRAW_WHY_LEVEL], why[DRAW_WHY_START]);
             *why = [0; DRAW_WHY_COUNT];
             *self = Probe { counter: self.counter, ..Probe::new() };
         }
@@ -2677,8 +2677,8 @@ impl FluorApp<G2t16> for Lumis {
                 self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64, &mut ui.draw_why);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
                 // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device is read below, from the field lumis_core keeps for it; a moved level is a part of its own (`partial_parts`).
-                // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
-                let new_image = ui.previous_image_counter != before.0 || ui.previous_exposure_start != before.1;
+                // A new image (its counter; a new exposure alone restarts the progress, a part like the counters) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
+                let new_image = ui.previous_image_counter != before.0;
                 let other = ui.previous_histogram_counter != before.2
                     || ui.previous_hold_present
                     || before.3
