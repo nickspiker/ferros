@@ -10139,6 +10139,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "puck" => (Object::Endpoint(endpoint(b"puck")), RIGHT_SEND),
         // The person's things (docs/STORE.md, 2026-11-19): the hold, its kinds the capsule's `items` section (set on the process once it is built, `spawn_kist`).
         "items" => (Object::Items, RIGHT_SEND),
+        // Bluetooth (docs/BT.md "The client ops", 2026-11-24): a send right on the Bluetooth driver's `bt` endpoint. The driver tells a kist apart by the call (SYS_CALLER's CALLER_KIST) and refuses it the identity service's ops (the pairing beacon and the pairing scan); everything it does goes thru a session of its own, whose id only it holds.
+        "bluetooth" => (Object::Endpoint(endpoint(b"bt")), RIGHT_SEND),
         _ => return None,
     })
 }

@@ -30,10 +30,10 @@ use vsf::file_format::{VsfHeader, VsfSection};
 use vsf::types::EtType;
 use vsf::VsfType;
 
-/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way).
-pub const RIGHTS: [&str; 14] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items"];
+/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way), Bluetooth (`use bt`, docs/BT.md "The client ops": scans, connections and credit-based channels as an LE central; 2026-11-24 for Lumis's accessories, appended the same way).
+pub const RIGHTS: [&str; 15] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items", "bluetooth"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 14] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things"];
+pub const MEANS: [&str; 15] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things", "Bluetooth"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
@@ -48,6 +48,8 @@ pub const PUCK: u8 = 12;
 pub const SURFACE: u8 = 2;
 /// The person's things (docs/STORE.md part 1, "keep for you", 2026-11-19): keeping items in the hold for the person, of the kinds the capsule's `items` section declares it makes, and opening the kinds it declares it opens and what it made itself. Asked once, as every right outside the implicit set; appended, so every code before it keeps its meaning.
 pub const ITEMS: u8 = 13;
+/// Bluetooth (KISTS.md, the asked rights; docs/BT.md "The client ops", 2026-11-24): a send right on the Bluetooth driver's `bt` endpoint, so the kist scans, connects to devices near the person and opens credit-based channels to them as an LE central, from the device's static random address. The driver refuses a kist its own ops (the pairing beacon and the pairing scan). Asked once, as every right outside the implicit set; appended, so every code before it keeps its meaning.
+pub const BLUETOOTH: u8 = 14;
 
 /// A capsule's `items` section (STORE.md "Kinds, and the question asked"): each kind it makes and each it opens, with the developer's reason, signed with the rest of the capsule. A field `make` or `open` per kind: the kind (an idea, `hi`) and its reason (`a`), told apart by their types.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -1503,6 +1505,16 @@ mod tests {
         c.add_field("code", VsfType::v(b'b', alloc::vec![1u8; 16]));
         let bare = vsf::VsfBuilder::new().add_section_direct(c).build().unwrap();
         assert_eq!(declaration(&bare).unwrap().wants.len(), 0);
+    }
+
+    /// Bluetooth is a right a capsule declares by name (code 14, after the hold's items), asked and never implicit.
+    #[test]
+    fn bluetooth_is_an_asked_right_by_name() {
+        assert_eq!(RIGHTS[BLUETOOTH as usize], "bluetooth");
+        assert!(asked_right(BLUETOOTH));
+        let (kist, wants) = declaration_sections(&Decl { name: String::from("Lumis"), wants: alloc::vec![(BLUETOOTH, String::from("to drive your camera mount"))] }, Some([5; 32]));
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(kist).add_section_direct(wants.unwrap()).build().unwrap();
+        assert_eq!(want_codes(&file).unwrap(), alloc::vec![BLUETOOTH]);
     }
 
     /// The `items` section reads back as written, with the capsule's other sections; a capsule without one declares no kinds; a field neither make nor open refuses it.

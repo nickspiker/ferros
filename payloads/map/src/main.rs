@@ -1221,6 +1221,10 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
 fn right_name(r: usize) -> &'static str {
     // The puck right (12) is never shown to a person (it is never asked): it reads as its English meaning if anything ever names it.
     const NAMES: [Msg; 12] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera, Msg::RightBeYou, Msg::RightPeople];
+    // Bluetooth (14) has its own words; the hold's items (13) reads as its English meaning, as the puck does.
+    if r == ferros_kist::BLUETOOTH as usize {
+        return tr(Msg::RightBluetooth);
+    }
     NAMES.get(r).map_or(ferros_kist::MEANS[r], |m| tr(*m))
 }
 

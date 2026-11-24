@@ -488,6 +488,8 @@ messages! {
     RightBeYou,
     /// The person's people (FACETS.md "People"), all or the ones they choose.
     RightPeople,
+    /// Bluetooth (KISTS.md, the asked rights; BT.md "The client ops", 2026-11-24): scans, connections and channels to devices near the person.
+    RightBluetooth,
     // ---- People (docs/FACETS.md "People"): the system's page, its add-a-person sheet, a kist's card's chooser ----
     /// The People page's title, a settings page.
     PagePeople,

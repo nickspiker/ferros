@@ -297,6 +297,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightCamera => "le fotocamere",
         Msg::RightBeYou => "essere te",
         Msg::RightPeople => "le tue persone",
+        Msg::RightBluetooth => "Bluetooth",
         Msg::PagePeople => "persone",
         Msg::AddPerson => "aggiungi una persona",
         Msg::NoPeopleYet => "ancora nessuno",
