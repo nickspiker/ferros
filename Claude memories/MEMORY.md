@@ -23,6 +23,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: stage agents, keep the bench used](feedback_keep_devices_busy.md) - one staged job per device, few agents, no overlapping edits, no helpers; but never idle a set-up device for hours
 - [Feedback: one straight line](feedback_one_line.md) - every repo: one branch, one line, one checkout (/mnt/Harbor/Code/ferros on forge, kept current); no worktrees; git lock
 - [Feedback: Python, run not commit](feedback_python_run_not_commit.md) - run Python locally as a tool freely; never commit it (python-guard)
+- [Feedback: no needless writes](feedback_no_needless_writes.md) - destroy = destroy keys (renew device secret), never delete/overwrite sealed data; "sand on a beach"
 - [Feedback: stop is immediate](feedback_stop_is_immediate.md) - stopping an app or puck is OP_STOP at once; no close message, no grace, no shutdown
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) - one branchless path; owner picks
 - [Feedback: darkness space](feedback_darkness_space.md) - alpha + premultiplied darkness, front to back `under` only
@@ -52,6 +53,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 ## Vocabulary
 - [ferros vocabulary](ferros_vocabulary.md) - photon, beam, kist, stow, puck, the deck (Deck/Back), the hold, pandok, GPS
 - [Pucks draw squares](pucks_draw_squares.md) - on the 8a; deck = settings, kists, pucks only (display widgets deleted); basecalc dial
+- [Deck loading pie](deck_loading_pie.md) - loading kists/pucks: blue download, green verify, red final, pie sweeps multiplied by the icon
 - [Deck packs into the screen](deck_pack_into_screen.md) - jammed pack touching all sides by compression + pressure; halve the distance each frame; after the GPU queue fix
 
 ## Owner decisions and design
@@ -62,6 +64,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Owner directions 2026-10-27](owner_directions_2026_10_27.md) - windows, arcs, drivers out, attest at boot, HashMap rule
 - [No baked apps](no_baked_apps.md) - one built-in circle (settings); no identity = no way past attest
 - [ferros attest is OS-level](ferros_attest_os_level.md) - payloads/ahau at boot; ira unlocks drivers, identity the rest
+- [Attest to approve settings](attest_to_approve_settings.md) - protective settings lock + approve on ahau itself; debatable ones get a "require attest" guard
 - [Identity not on disk by default](identity_not_on_disk_default.md) - handle typed each boot, roots in RAM; opt-in unlock at boot
 - [Identity roots survive a crash](identity_roots_survive_crash.md) - a restarted fgtw gets the roots back from the kernel; only a reboot loses them (not built yet)
 - [Person keys at attest](person_keys_at_attest.md) - random key from the space, opened from the local copy at the bind; kernel-only
@@ -78,12 +81,13 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Notifications: in view](notifications_in_view.md) - in the deck's resting view can notify, out of view silent; three kinds
 - [Clipboard = capability handoff](clipboard_capability_handoff.md) - no buffer; one-shot caps on gesture; fleet doorbell
 - [Screencap goes to the clipboard](screencap_goes_to_clipboard.md) - no save-to-file; paste where wanted
+- [Kist distribution p2p](kist_distribution_p2p.md) - fgtw.org = bootstrap/phonebook; devices serve signed capsules; "support the network" on per device (WiFi + plugged in); devs append at will
 - [Kist catalog](kist_catalog.md) - pandok: no account, gatekeeper, fees or ads; metrics many-dimensional, never stars
 - [Kist keys follow ownership](kist_keys_follow_ownership.md) - Photon + ferros commons keys; Lumis + Mahere the owner's key
 - [Kist version stages](kist_version_stages.md) - any number of parts, more parts = later stage, each part in chosen base
 - [Ideas: language-independent meanings](ideas_language_independent.md) - 32-byte id per meaning; UI Msgs + kist reasons are ideas
 - [People vs devices split](people_not_devices_split.md) - a contact is a person with a fleet of device keys
-- [Device add rules](fleet_add_needs_open.md) - confirm first, then notify; NFC with Fleet page open, else BLE Add; words only behind "not in range"
+- [Device add rules](fleet_add_needs_open.md) - Fleet page passive until "bind new device" + an approve on attest; then NFC, else BLE Add; words only behind "not in range"
 - [Time zones decided](time_zones_decided.md) - arabic = legal DST wall time; dozenal/hex = standard offset, never DST
 - [Windows](windows_design_pending.md) - full-screen surface per app, frontmost first, inside a circle; WINDOWS.md
 - [Display: global mask, then layers](display_global_mask_then_layers.md) - one per-row shape plan per size, then span layers

@@ -15,3 +15,7 @@ Never sRGB (owner: "200 flavors", not spectrally defined), never OKLab, never Re
 **Why:** the display's ODT reads every surface as VSF RGB (payloads/display ODT, panel primaries measured). Colour authored in sRGB numbers came out oversaturated and hue-shifted — the attest mark and the keyboard rainbow were "completely fucked" (owner, 2026-11-01). VSF RGB was chosen so its R, G, B are perceptually right already.
 
 **How to apply:** any new colour code: VSF RGB + VSF's photopic function, from the vsf crate (no hand-copied matrices). Grep for OKLab/sRGB/709 when touching colour and replace. Related: [[colourspace-pinned-vsf-gamma2tanh]], [[feedback-no-web-encodings]].
+
+**VSF RGB is gamma-2 encoded, never linear (owner, 2026-11-24):** "VSF RGB is NOT linear, you know bloody well how to do colourspace conversions." A conversion "to VSF RGB" means linear light, VSF primaries, then encode with VSF RGB's gamma of two (code = sqrt(linear)); g2t is then assigned to those codes. Skipping the gamma-2 encode squared the icons' light twice (133dcd13, fixed after).
+
+**Kist icons (owner, 2026-11-24, approved on glass: "that's what it's supposed to look like"):** an icon without `primaries: vsf` is sRGB: decurve to linear x, extend highlights L = tan(x·π/2) (f64, so white → finite huge, never negative), SRGB2VSF_RGB, then g2t encode (tanh(√L)); white lands neutral at the top code, nothing clipped, no white balance (forge 52af0b98, KISTS.md "Icons"). Kūaha and Aemulus are tagged `primaries: vsf` and kept as authored.
