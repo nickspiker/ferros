@@ -639,6 +639,10 @@ _m1_entry:
     ubfx    x2, x2, #8, #4
     mov     x3, #2
     str     x3, [x1, x2, lsl #3]
+    // The INTID this core took last (process.rs `__irq_last`): what parked a thread, read by `ferros_el0_preempt` with the interrupts still masked.
+    adrp    x1, __irq_last
+    add     x1, x1, :lo12:__irq_last
+    str     x0, [x1, x2, lsl #3]
     adrp    x1, __irq_count
     add     x1, x1, :lo12:__irq_count
     ldr     x2, [x1]

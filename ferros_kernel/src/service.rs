@@ -5191,6 +5191,14 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"sched asks old on" || cmd.params == b"sched asks old off" {
+                    // `diag "sched asks old on|off"`: yields asked as before 2026-11-23 (process.rs `ASKS_OLD`: stale asks stand, `make_room` asks for a device thread its own core takes back, `unlocked` parks for a line on any core), to measure both on one boot.
+                    let on = cmd.params == b"sched asks old on";
+                    crate::process::ASKS_OLD.store(on, core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(if on { b"sched: yields asked as before 2026-11-23\n" } else { b"sched: stale asks dropped, lines on this core only\n" });
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"sched x3 on" || cmd.params == b"sched x3 off" {
                     // `diag "sched x3 on|off"`: unpinned threads may also run on the kernel's core while it is free (process.rs `X3_SHARE`).
                     let on = cmd.params == b"sched x3 on";

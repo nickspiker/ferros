@@ -335,28 +335,90 @@ pub static VAULT_SHARED: core::sync::atomic::AtomicBool = core::sync::atomic::At
 /// What the caller must keep to: no reference into the kernel's tables taken before this (`p`, `t`, an entry of `k()`) is used after it, since another core may change or move them meanwhile (a spawn grows the process table); `work` reads and writes no process's memory (an arc can shrink or give back frames under it from another thread), only kernel buffers.
 /// What holds meanwhile: the calling thread stays current on this core, so its process's arc is neither freed (only its last thread's drain frees it) nor moved (`hold_try` waits for its threads to leave the cores); its process may be killed meanwhile, and the trap drains it at its next entry as for any thread that ran on while its process ended elsewhere.
 /// An interrupt taken here at EL2 marks its line pending and returns; a slice tick taken here is re-armed at the trap's end; a yield asked of this core meanwhile, or a hold of the thread's process (SGI 3 both, which parks nothing at EL2), is asked again once the interrupts are masked, so it is pending at the eret and the thread parks there as if it had come with them masked.
+/// A yield is asked again only while it stands (`ask_stands`: the thread it was asked for still waits for a core), and a line only when it landed on this core.
 #[track_caller]
 fn unlocked<R>(work: impl FnOnce() -> R) -> R {
     use core::sync::atomic::Ordering::Relaxed;
     let what = crate::devsched::WHAT.load(Relaxed);
     let any_before = unsafe { core::ptr::read_volatile(&raw const __irq_any) };
+    let c = core();
+    let let_go = crate::platform::cntpct();
     unlock();
     unsafe { core::arch::asm!("msr daifclr, #2") };
     let r = work();
     unsafe { core::arch::asm!("msr daifset, #2") };
     lock();
     crate::devsched::WHAT.store(what, Relaxed);
-    let c = core();
+    let old = ASKS_OLD.load(Relaxed);
+    // A yield asked of this core meanwhile: asked again only while the thread it was asked for still waits for a core.
+    // Measured 2026-11-23 (the Pro, Lumis's stacked CLIP, `diag "sched all"`): the camera's frame thread, parked on its own core, had `make_room` ask the core the camera's server had just taken; it got its own core back at once, the ask stayed, and the server, 0.5 to 0.6 ms into its cache maintenance here, parked at this call's end and waited 4 to 15 ms (35 stale asks of 35 parked it).
+    let a = YIELD[c].load(Relaxed);
+    let ask = a != 0 && (old || ask_stands(a));
+    if a != 0 && !ask {
+        YIELD[c].store(0, Relaxed);
+        STALE[1].fetch_add(1, Relaxed);
+    }
     // The same for a hold of this thread's process asked meanwhile (`hold`, an arc to move or change: SGI 3 too), which waits for the thread to leave the core and would otherwise wait for its next trap or its slice's end.
     let held = cur_get().and_then(proc_of).is_some_and(|p| p.hold.is_some());
-    // And for a device line gone pending meanwhile (`__irq_any`, perhaps on this core, where it was taken at EL2 and parked nothing): with the interrupts masked it would have parked the thread at the eret, so the line's waiter was looked for at once; the thread parks there now as it would have.
-    let line = any_before == 0 && unsafe { core::ptr::read_volatile(&raw const __irq_any) } != 0;
-    if YIELD[c].load(Relaxed) != 0 || held || line {
+    // And for a device line taken on this core meanwhile, at EL2, where it parked nothing: with the interrupts masked it would have parked the thread at the eret, so the line's waiter was looked for at once; the thread parks there now as it would have.
+    // A line taken on another core parked that core's thread, or is seen by its service loop or idle look (`__irq_any`), as it would have been with this core's interrupts masked: until 2026-11-23 any line on any core parked the caller here, and a server without a device's credit went to the back of the queue for it.
+    let anywhere = any_before == 0 && unsafe { core::ptr::read_volatile(&raw const __irq_any) } != 0;
+    let line = if old { anywhere } else { line_here(c, let_go) };
+    if anywhere && !line {
+        STALE[2].fetch_add(1, Relaxed);
+    }
+    if ask || held || line {
+        // Why, for `ferros_el0_preempt` (the trace's preempt detail): 1 the ask, 2 the hold, 3 the line.
+        let why = if line { 3 } else if held { 2 } else { 1 };
+        SELF_PARK[c].store(why, Relaxed);
         // SGI 3 to this core, as `make_room` sends it.
         unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
     }
     r
 }
+/// Whether a granted line was taken on core `c` at or after `since` (counter ticks) and still waits for its waiter to be looked for (its pending byte set): `.Lirq` writes the line's time and core before its pending byte, with a barrier between, so the reads go the other way round.
+fn line_here(c: usize, since: u64) -> bool {
+    IRQS.iter().any(|l| {
+        let i = l.intid as usize;
+        if unsafe { core::ptr::read_volatile(&raw const __irq_pending[i]) } == 0 {
+            return false;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        unsafe { core::ptr::read_volatile(&raw const __irq_core[i]) as usize == c && core::ptr::read_volatile(&raw const __irq_at[i]) >= since }
+    })
+}
+/// Whether the yield asked of a core for thread `a - 1` (`YIELD`'s value, not 0) still stands: that thread waits in the run queue for a core.
+/// Once it runs (its own core took it back, another core picked it, a hand-off) or waits on something else, the ask is stale: the thread it would park waits behind the queue's head for nothing (2026-11-23, the camera's server, see `unlocked`).
+fn ask_stands(a: usize) -> bool {
+    th(a - 1).is_some_and(|x| x.state == State::Runnable)
+}
+/// Whether core `c` has a yield asked of it that stands (`make_room` and `make_way` ask a core once): a stale ask leaves the core free to be asked again.
+fn asked(c: usize) -> bool {
+    let a = YIELD[c].load(core::sync::atomic::Ordering::Relaxed);
+    a != 0 && (ASKS_OLD.load(core::sync::atomic::Ordering::Relaxed) || ask_stands(a))
+}
+/// Whether a granted line taken on core `c` and still pending has a thread waiting on it, which this core's next look (`wake_sleepers`) wakes and runs first.
+fn waiter_here(c: usize) -> bool {
+    k().threads.iter().flatten().any(|x| match x.state {
+        // WHY the test: a word's address shares the state with an INTID, which is under 1024 (`Waiting`).
+        State::Waiting(a, _) if a < 1024 => unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) != 0 && core::ptr::read_volatile(&raw const __irq_core[a]) as usize == c },
+        _ => false,
+    })
+}
+/// Whether this core's next pick takes queued thread `t` (`pick_runnable`: the first urgent thread it may run under devsched `first`, else the first it may run), looking at the queue as it is now.
+fn taken_back_here(t: usize) -> bool {
+    let kk = k();
+    let urgent = |u: usize| kk.threads.get(u).and_then(|x| x.as_ref()).is_some_and(|x| x.urgent);
+    let first = crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed);
+    let i = first.then(|| kk.runnable.iter().position(|&u| urgent(u) && may_pick(u))).flatten().or_else(|| kk.runnable.iter().position(|&u| may_pick(u)));
+    i.is_some_and(|i| kk.runnable[i] == t)
+}
+/// `diag "sched asks old on|off"`: yields asked as before 2026-11-23, to measure both on one boot: an ask stands until its core switches whatever became of the thread it was asked for, `make_room` asks for a device thread parked mid-run even when its own core takes it back next, and `unlocked` parks its caller for a line taken on any core. Off by default.
+pub static ASKS_OLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Yields not made since `diag "sched reset"`: [0] stale asks a thread was parked by and taken straight back (`ferros_el0_preempt`), [1] stale asks dropped at the end of an `unlocked` call, [2] `unlocked` calls not parked for a line taken on another core, [3] `make_room` asks not made for a device thread its own core takes back next.
+pub static STALE: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+/// Per core: why `unlocked` asked this core to park its own thread (1 a yield asked, 2 a hold, 3 a line taken here), for `ferros_el0_preempt`; 0 none.
+static SELF_PARK: [core::sync::atomic::AtomicU8; 16] = [const { core::sync::atomic::AtomicU8::new(0) }; 16];
 /// This core's index: MPIDR Aff1 (husky: 0-3 the A510s, 4-7 the A715s, 8 the X3).
 pub fn core() -> usize {
     let mpidr: u64;
@@ -368,7 +430,7 @@ static mut CURRENT: [Option<usize>; 16] = [None; 16];
 fn cur_get() -> Option<usize> {
     unsafe { (*(&raw const CURRENT))[core()] }
 }
-/// Per core: a yield asked of it for a device thread (devsched `first`, `make_room`), so it is asked once; cleared when the core next switches.
+/// Per core: a yield asked of it (`make_room`, `make_way`), as the thread it was asked for plus one, 0 none: asked once, standing while that thread waits for a core (`ask_stands`), cleared when the core next switches.
 static YIELD: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
 /// Per core: the thread it runs began its run for its device's interrupt (`Thread::on_irq`), readable without the lock by `lock` on the same core.
 static ON_IRQ: [core::sync::atomic::AtomicBool; 16] = [const { core::sync::atomic::AtomicBool::new(false) }; 16];
@@ -622,10 +684,10 @@ fn make_room(t: usize, line: usize, landed: usize) {
         // The cores from the last one it ran on, round the sixteen a mask names.
         let c = (start + j) & 15;
         let Some(r) = cur[c] else { continue };
-        if m >> c & 1 == 0 || th(r).is_none_or(|y| y.on_irq && !over_budget(r, y)) || YIELD[c].load(Relaxed) != 0 {
+        if m >> c & 1 == 0 || th(r).is_none_or(|y| y.on_irq && !over_budget(r, y)) || asked(c) {
             continue;
         }
-        YIELD[c].store(1, Relaxed);
+        YIELD[c].store(t + 1, Relaxed);
         crate::devsched::LAT[line][9].fetch_add(1, Relaxed);
         tr(TR_YIELD_ASK, t, c as u64);
         // SGI 3 to core c, as `hold` sends it.
@@ -672,7 +734,7 @@ fn make_way(t: usize) {
     let mut longest = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
     for c in 0..16 {
         // Not this core: its thread is the waker, in the kernel now, and if it blocks next this core takes the woken thread itself; an SGI to itself would land on whatever it switched to.
-        if (m & (MASK_WORKERS | MASK_LITTLE | kernel_mask())) >> c & 1 == 0 || YIELD[c].load(Relaxed) != 0 || c == core() {
+        if (m & (MASK_WORKERS | MASK_LITTLE | kernel_mask())) >> c & 1 == 0 || asked(c) || c == core() {
             continue;
         }
         let Some(r) = cur[c] else { continue };
@@ -700,7 +762,7 @@ fn make_way(t: usize) {
         WAY_LOOKS[2].fetch_add(1, Relaxed);
         return;
     };
-    YIELD[c].store(1, Relaxed);
+    YIELD[c].store(t + 1, Relaxed);
     WAY_ASKS[c].fetch_add(1, Relaxed);
     tr(TR_YIELD_ASK, t, c as u64);
     // SGI 3 to core c, as `make_room` and `hold` send it.
@@ -1447,6 +1509,7 @@ const TR_SLEEP: u8 = 5;
 const TR_WAKE: u8 = 6;
 const TR_SWITCH: u8 = 7;
 const TR_RUN: u8 = 8;
+/// A thread parked at EL0 (`ferros_el0_preempt`): the detail says what parked it and where it went (see there).
 const TR_PREEMPT: u8 = 9;
 const TR_PARK: u8 = 10;
 const TR_POLL_MISS: u8 = 11;
@@ -1539,6 +1602,8 @@ fn sched_counters(out: &mut Vec<u8>) {
     out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}, device threads parked mid-run by another line kept at the front A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed), PREEMPT_KEPT.load(Relaxed)).as_bytes());
     let y: [u64; 4] = core::array::from_fn(|i| YIELDS[i].load(Relaxed));
     out.extend_from_slice(alloc::format!("yields: A#{} without the lock, A#{} with nothing queued here, A#{} to another thread, A#{} back to itself\n", y[0], y[1], y[2], y[3]).as_bytes());
+    let st: [u64; 4] = core::array::from_fn(|i| STALE[i].load(Relaxed));
+    out.extend_from_slice(alloc::format!("yields not made{}: A#{} stale asks parked a thread taken straight back, A#{} dropped at an unlocked call's end, A#{} unlocked calls not parked for another core's line, A#{} asks not made for a device thread its own core takes back\n", if ASKS_OLD.load(Relaxed) { " (asks as before 2026-11-23: none of these)" } else { "" }, st[0], st[1], st[2], st[3]).as_bytes());
     let w: [u64; 3] = core::array::from_fn(|i| WAY_LOOKS[i].load(Relaxed));
     out.extend_from_slice(alloc::format!("light wakes (call, word, deadline): A#{}, A#{} with no worker idle, A#{} of them with none to ask; ", w[0], w[1], w[2]).as_bytes());
     out.extend_from_slice(b"cores asked to make way for one:");
@@ -1562,7 +1627,7 @@ fn sched_counters(out: &mut Vec<u8>) {
 /// `diag "sched reset"`: the counters `sched_counters` shows, zeroed.
 pub fn sched_reset() {
     use core::sync::atomic::Ordering::Relaxed;
-    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain(YIELDS.iter()).chain(WAY_ASKS.iter()).chain(WAY_LOOKS.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
+    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain(YIELDS.iter()).chain(WAY_ASKS.iter()).chain(WAY_LOOKS.iter()).chain(STALE.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
     // The lock's holds and the device lines' runs with them (devsched.rs), and the trace thawed.
     crate::devsched::lock_reset();
     crate::devsched::lat_reset();
@@ -2480,6 +2545,9 @@ pub static mut __irq_pending: [u8; 1024] = [0; 1024];
 pub static mut __irq_at: [u64; 1024] = [0; 1024];
 #[unsafe(no_mangle)]
 pub static mut __irq_core: [u8; 1024] = [0; 1024];
+/// Per core (MPIDR Aff1), the INTID `.Lirq` took last (ICC_IAR1_EL1 as read): the interrupt that parked a thread at EL0, read by `ferros_el0_preempt` before the interrupts open again (`diag sched`'s preempt detail).
+#[unsafe(no_mangle)]
+pub static mut __irq_last: [u64; 16] = [0; 16];
 /// Threads block on an interrupt as `Waiting(intid, deadline)`: an INTID is far below any arc address, so the two never meet.
 fn irq_pending_take(intid: u32) -> bool {
     unsafe {
@@ -9329,13 +9397,23 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     // A yield asked of this core for a device thread (devsched `first`, `make_room`), not the slice's end (the tick handler stops the slice timer): the thread keeps its place at the front, behind the urgent thread `pick_runnable` takes first, rather than waiting a queue's turn for a device's microseconds. Any other preemption (the slice's end, an interrupt taken at EL0, a hold) goes to the back as before: a thread put at the front for every interrupt would take a fresh slice ahead of the queue each time.
     let ctl: u64;
     unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
-    let asked = YIELD[core()].swap(0, core::sync::atomic::Ordering::Relaxed) != 0;
-    // Asked by `make_room` (devsched `first` on) or by `make_way` (a light thread woken with every worker busy, 2026-11-17).
+    let c = core();
+    // What parked the thread: the interrupt `.Lirq` took here (written there with the interrupts masked, as they still are), and why `unlocked` asked this core (SGI 3 to itself), if it did.
+    // WHY the mask: the trace's detail keeps the INTID in ten bits; ICC_IAR1_EL1's INTID field is wider, but this GIC answers only INTIDs under 1024 here (no LPIs), and 1020 to 1023 return from `.Lirq` without parking anything.
+    let intid = unsafe { core::ptr::read_volatile(&raw const __irq_last[c]) } & 0x3FF;
+    let why = SELF_PARK[c].swap(0, core::sync::atomic::Ordering::Relaxed);
+    let asks_old = ASKS_OLD.load(core::sync::atomic::Ordering::Relaxed);
+    // Asked by `make_room` (devsched `first` on) or by `make_way` (a light thread woken with every worker busy, 2026-11-17), while the thread asked for still waits for a core (`ask_stands`).
+    let a = YIELD[c].swap(0, core::sync::atomic::Ordering::Relaxed);
+    let asked = a != 0 && (asks_old || ask_stands(a));
     let old = OLD.load(core::sync::atomic::Ordering::Relaxed);
     let keep = asked && ctl & 1 != 0 && (!old || crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed));
     // A device thread in its run for its own interrupt (`on_irq`, inside its 2^10 us budget), parked unasked, by an interrupt taken at EL0 for another line or by the slice's end: it keeps its place just behind the thread that interrupt woke, and is urgent again, so the core takes it back next.
     // Measured 2026-11-18 (slit-robust, the Pro, Lumis in Slitscan): the camera's frame thread, preempted mid-answer on c6 by the sensors' line, went behind Lumis's threads for 4.4 ms with its line masked; once its line followed it, the same thread parked 2 ms between its last two syscalls of an answer (the slice it was handed on a busy core ending: a slice is armed once a `run_slice`, so a thread woken onto a core can inherit one nearly spent). Either way the next frame's descriptor went unreleased and the slit stream died on LATE_CONFIG.
     let irq_run = !asked && !old && cur_get().and_then(|c| th(c).map(|y| (c, y.on_irq))).is_some_and(|(c, on)| on && th(c).is_some_and(|y| !over_budget(c, y)));
+    // SGI 3 with no ask standing, no hold of the thread's process and no line taken here (`unlocked`'s third reason): an ask gone stale before it landed (its thread ran meanwhile, or this core switched since), which parks nothing; the thread is taken straight back.
+    let stale = !asks_old && intid == 3 && !asked && why != 3 && ctl & 1 != 0 && !cur_get().and_then(proc_of).is_some_and(|p| p.hold.is_some());
+    let mut detail = intid | (why as u64) << 10 | (asked as u64) << 12 | ((ctl & 1 == 0) as u64) << 13;
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
@@ -9347,19 +9425,36 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
                 } else if keep {
                     enqueue_second(cur);
                 } else if irq_run {
+                    detail |= 1 << 14;
                     p.urgent = true;
                     let line = p.run_line;
                     PREEMPT_KEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     enqueue_second(cur);
                     // And a core for it now if none is idle (`make_room`): behind the thread its core was taken for (another device's, which may run a while), it would otherwise wait for that thread (2026-11-18: the camera's frame thread parked 1.36 ms between two syscalls of one answer with every A715 busy, its line masked meanwhile).
+                    // Only when this core is taken for another: a line taken here wakes a thread waiting on it, which runs first, or an urgent thread ahead of it is picked first.
+                    // Otherwise this core takes it back next, and an ask made for it would park another core's thread for nothing.
+                    // Measured 2026-11-23 (the Pro, Lumis's stacked CLIP, the trace's preempt detail): the camera's frame thread was parked so 1760 times in 40 s by its own line (SPI 479, firing again while it still ran after its wake), and the asks made for it parked the camera's server 107 times, 7 of them for 2 to 12.6 ms.
+                    let elsewhere = asks_old || waiter_here(c) || !taken_back_here(cur);
                     if line != 0 && crate::devsched::FIRST.load(core::sync::atomic::Ordering::Relaxed) {
-                        make_room(cur, line as usize - 1, core());
+                        if elsewhere {
+                            make_room(cur, line as usize - 1, c);
+                        } else {
+                            STALE[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
                     }
+                } else if stale {
+                    detail |= 1 << 15;
+                    STALE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // At the very front, no core told: this core picks it next, unless a waiter a line woke here, or an urgent thread, comes first.
+                    unpause(cur);
+                    k().runnable.push_front(cur);
+                    runnable_sync();
                 } else {
                     enqueue_back(cur);
                 }
             }
-            tr(TR_PREEMPT, cur, 0);
+            // The detail: the INTID that parked it (bits 0-9, 3 = SGI 3, 26 = the slice's tick), why `unlocked` asked this core (bits 10-11: 1 an ask, 2 a hold, 3 a line), asked by a standing yield (bit 12), the slice ended (bit 13), kept as a device thread's run (bit 14), a stale ask taken straight back (bit 15).
+            tr(TR_PREEMPT, cur, detail);
         }
     }
     cur_set(None);
