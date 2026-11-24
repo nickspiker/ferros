@@ -435,6 +435,8 @@ fn eagle_ns() -> u64 {
 static RING_BUFS: AtomicU64 = AtomicU64::new(0);
 /// Where things are, set by the open before the frame thread starts (`RUN`): the first buffer as this process reads it; the full program's copies as the engine reads them (physical) and their length, the slim ones' likewise (`SLIM`); the descriptor ring as read; a descriptor's flags word (the job's own).
 static RING_VA: AtomicU64 = AtomicU64::new(0);
+/// The image ring's offset in the region (`lines`, SYS_DMA x1 = 6 takes offsets in it).
+static RING_OFF: AtomicU64 = AtomicU64::new(0);
 static PROG_PA: AtomicU64 = AtomicU64::new(0);
 static PROG_LEN: AtomicU64 = AtomicU64::new(0);
 static SLIM_PA: AtomicU64 = AtomicU64::new(0);
@@ -876,7 +878,8 @@ fn enable_paths(g: u64, enabled: &mut bool) {
     say!(g, "camera: SHADOW_UPDATE; loch0's image path enabled{}{}\n", if pd { " with its PD path" } else { ", its PD path left off" }, if OPEN.load(Ordering::Relaxed) != 0 { "; its image interrupt DMA_DONE alone" } else { "" });
 }
 
-fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
+/// A frame's interrupt answered: its descriptor released, its buffer made the ring's newest, its acknowledgements written. True when a frame landed, for the caller to hand it on (`landed`) as its last act before it waits again.
+fn answer(g: u64, idx: &mut u32, enabled: &mut bool) -> bool {
     let t0 = ferros_sys::now();
     let img = rd(g, ferros_cam::IMG_STATUS);
     // The first answers' image status and their counter, for the console at the close (what each of a frame's interrupts carries, the readout's ends among them).
@@ -995,8 +998,6 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
             let us = ferros_sys::us_since(OPEN_AT.load(Ordering::Relaxed));
             step!(g, "camera: first frame A#{} ms after the open (open step: first frame)\n", us / 1000);
         }
-        // The server's doorbell: counted always, rung only while it holds a call that waits for a frame (`WANT`), so a server holding none is not woken a thousand times a second by slits (`door_ring`).
-        door_ring();
     }
     let t = ferros_sys::now() - t0;
     if k < IMG_DUR.len() {
@@ -1005,6 +1006,7 @@ fn answer(g: u64, idx: &mut u32, enabled: &mut bool) {
     BUSY.fetch_add(t, Ordering::Relaxed);
     TL_IDX[k & 0xFF].store(wrote | t << 16, Ordering::Relaxed);
     BUSY_MOST.fetch_max(t, Ordering::Relaxed);
+    nf != 0
 }
 
 extern "C" fn frame_thread(g: u64) -> ! {
@@ -1035,24 +1037,34 @@ extern "C" fn frame_thread(g: u64) -> ! {
             ferros_sys::thread_exit(0);
         }
         if r == 0 {
-            let before = FRAMES.load(Ordering::Relaxed);
-            answer(g, &mut idx, &mut enabled);
+            let done = answer(g, &mut idx, &mut enabled);
             last = ferros_sys::now();
             ON_LINE.fetch_add(1, Ordering::Relaxed);
             ferros_sys::irq_ack(line);
-            let done = FRAMES.load(Ordering::Relaxed) != before;
             if MEASURE.load(Ordering::Relaxed) == 1 && done_last && !done && SLITS.load(Ordering::Relaxed) == 0 {
                 row_timing();
             }
             done_last = done;
+            // The server's doorbell, after the ack, as this thread's last act before its wait (`landed`).
+            // Why last (2026-11-23, the Pro, Lumis's stacked CLIP): a wake that finds every worker busy has one yield to the server (`make_way`), and the thread it parks, kept at the queue's front, kicks every core, which parks this thread if it still runs at EL0.
+            // Parked inside its interrupt's run, this thread has the kernel ask a core for it (`make_room`), the first from its own that runs no device thread: in 8 late answers of 8 (`diag sched`) the server's, which had just taken it.
+            // This thread got its own core back at once and never used the one asked; the ask stayed set there and parked the server, which waited 4 to 15 ms behind Lumis's threads for one to yield.
+            // Rung here, the kick finds this thread in its wait, in the kernel, where it parks nothing.
+            if done {
+                landed(g);
+            }
         } else if ticking {
-            answer(g, &mut idx, &mut enabled);
+            if answer(g, &mut idx, &mut enabled) {
+                landed(g);
+            }
         } else if ON_LINE.load(Ordering::Relaxed) == 0 {
             // No interrupt on the line in the front end's own deadline: answered on the tick from now on, and the console says so with the words that would say why.
             ticking = true;
             TICKING.store(1, Ordering::Relaxed);
             say!(g, "camera: no interrupt on SPI 479 in A#{} us of the stream; answering on a A#{} us tick (front end aggregate G#{:X}, image G#{:X}, engine G#{:X} index G#{:X})\n", ferros_sys::us_since(started), tick_us(), rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS), rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
-            answer(g, &mut idx, &mut enabled);
+            if answer(g, &mut idx, &mut enabled) {
+                landed(g);
+            }
         } else {
             // The line works and was quiet for `QUIET_US`: either the stream stopped, or the front end waits on an answer whose interrupt never came (2026-11-16, kernlock: streams at 96 a second stopped with every answer prompt). Its status words say which; one that holds bits is answered, counted, and said once.
             let (cmn, img) = (rd(g, ferros_cam::CMN_STATUS), rd(g, ferros_cam::IMG_STATUS));
@@ -1061,7 +1073,9 @@ extern "C" fn frame_thread(g: u64) -> ! {
                     say!(g, "camera: the line quiet A#{} us with the front end waiting (aggregate G#{cmn:X}, image G#{img:X}, engine G#{:X} index G#{:X}, our index G#{idx:X}); answered\n", QUIET_US, rd(g, ferros_cam::PDMA), rd(g, ferros_cam::PDMA + ferros_cam::PDMA_INDEX));
                     fe_say(g, "the line quiet");
                 }
-                answer(g, &mut idx, &mut enabled);
+                if answer(g, &mut idx, &mut enabled) {
+                    landed(g);
+                }
             } else if !enabled && idx != 0 && rd(g, ferros_cam::PDMA + 0x14) == idx && rd(g, ferros_cam::PDMA + 0x5C) != 0 {
                 // The first program ran (the engine's place at our index, its progress past the start) and no answer saw its SHADOW_UPDATE: the paths enabled on the engine's word (2026-11-19, the 8a: four opens in about twenty answered first with loch0's status 0, and two of them never again, the paths never enabled, the line quiet for good).
                 say!(g, "camera: the line quiet A#{} us before loch0's paths were on; the first program ran (engine place G#{idx:X}, progress G#{:X}), its SHADOW_UPDATE never seen\n", ferros_sys::us_since(last), rd(g, ferros_cam::PDMA + 0x5C));
@@ -1210,7 +1224,8 @@ struct Open {
     view: bool,
     /// The view is mapped write-back (docs/CAMERA.md "A cacheable view"; the OPEN's `VIEW_FLAGS` byte with `VIEW_CACHED`): every buffer handed over by MAP has its lines cleaned and invalidated first (`lines`), and a held buffer's probe line before its release reads it.
     cached: bool,
-    /// The maintenance's ticks at MAP (summed and the most, for the console every 64).
+    /// The maintenance at MAP, of buffers the frame thread had not cleaned (`landed`): how many, their ticks summed and the most, for the console every 64.
+    inv_n: u64,
     inv_sum: u64,
     inv_max: u64,
     /// The count of the last frame handed to the kist (MAP), the buffer it holds and that buffer's probe as handed out, to tell at its release whether anything wrote it meanwhile.
@@ -1220,6 +1235,9 @@ struct Open {
     maps: u64,
     lat_sum: u64,
     lat_max: u64,
+    /// The same from the later of DMA_DONE and the MAP's coming: the driver's own part of it.
+    own_sum: u64,
+    own_max: u64,
     overwritten: u64,
 }
 
@@ -1995,6 +2013,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     SLIM_PA.store(pa + (long + slim_at) as u64, Ordering::Relaxed);
     SLIM_LEN.store(slim_len as u64, Ordering::Relaxed);
     RING_VA.store((va + ring_off) as u64, Ordering::Relaxed);
+    RING_OFF.store(ring_off as u64, Ordering::Relaxed);
     // The engine, exactly as a camera open starts it, its long ring at the engine's area: the count asked for read back, the next smaller tried, the job's own ring at the region's start last (`RING_JOB`).
     let pd = ferros_cam::PDMA;
     let want = match RING_TEST.load(Ordering::Relaxed) {
@@ -2027,6 +2046,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     // The image ring's state, its first buffer given to descriptor 0 (released with the stream below): every buffer patterned above, so its probe shows the frame that lands.
     for b in 0..job::RING_MOST {
         B_COUNT[b].store(0, Ordering::Relaxed);
+        CLEAN[b].store(0, Ordering::Relaxed);
     }
     for a in AGE.iter() {
         a.store(0, Ordering::Relaxed);
@@ -2123,7 +2143,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let now = timing.own(exposure_lines as u16);
     // The gain model from the sensor's own words (owner, 2026-11-17: "the ISO doesn't do anything in lumis"), and the gain the init left (its G#0204 code and G#020E digital gain) in the endpoint's units; with no model, the captured gain is called one (1024), as before.
     let (gain_model, gain, gain_code) = gain_of(g, &bus, c, init);
-    let o = Open { va, pa, l, ring, timing, now, open_fll: fll, held_ns: 0, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, gain_code, probed: false, view: false, cached: false, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, overwritten: 0 };
+    let o = Open { va, pa, l, ring, timing, now, open_fll: fll, held_ns: 0, force: 0, gain, focus, asked_at: 0, asked_tick: ferros_sys::now(), captured: alt.is_none() && fe == from, gain_model, gain_code, probed: false, view: false, cached: false, inv_n: 0, inv_sum: 0, inv_max: 0, given: 0, held: None, maps: 0, lat_sum: 0, lat_max: 0, own_sum: 0, own_max: 0, overwritten: 0 };
     NOW_LINES.store(now.coarse as u64, Ordering::Relaxed);
     NOW_NS.store(timing.ns(&now), Ordering::Relaxed);
     FLL.store(now.fll as u64, Ordering::Relaxed);
@@ -2197,6 +2217,7 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
 
 /// The stream stopped and the switch off: the sensor's stream off, a frame's time for its last frame to land (67.8 ms measured; 2^16 µs, as `cam pdma` waited 50 ms before stopping the engine), the frame thread idle, then the switch, whose off stops the engine, replays Linux's close, shuts the S2MPUs and powers the module down (kernel camera_power.rs).
 fn close(g: u64) {
+    LINES_ON.store(0, Ordering::Relaxed);
     // The view taken back first (SYS_DMA x1 = 5): its blocks the blank frame, the holder's token dead, before the stream stops. Nothing when none was given.
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 5, 0, 0, 0);
     let c = cam();
@@ -2473,9 +2494,47 @@ const VIEW_CACHED: u8 = 1 << 0;
 static NO_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes `at` to `at + len` of ring buffer `b` cleaned and invalidated in every core's caches by the kernel (SYS_DMA x1 = 6, process.rs `cam_lines`), for a write-back view (docs/CAMERA.md "A cacheable view"): the counter's ticks it took.
-fn lines(g: u64, o: &Open, b: usize, at: usize, len: usize) -> u64 {
-    let off = RING_VA.load(Ordering::Relaxed) as usize - o.va + b * BUF.load(Ordering::Relaxed) as usize + at;
+fn lines(g: u64, b: usize, at: usize, len: usize) -> u64 {
+    let off = RING_OFF.load(Ordering::Relaxed) as usize + b * BUF.load(Ordering::Relaxed) as usize + at;
     ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 6, off as u64, len as u64, 0)
+}
+
+/// Whether a write-back view is out whose buffers MAP hands over made right (`Open::cached`, not `NO_LINES`): the frame thread then cleans each newest buffer as its frame lands (`landed`). Set at the view's grant, cleared at the close.
+static LINES_ON: AtomicU64 = AtomicU64::new(0);
+/// Per buffer, the count of the frame whose lines the frame thread cleaned and invalidated (`landed`), 0 none: MAP skips the maintenance of a buffer that matches its count. Zeroed with `B_COUNT` at the open; a frame's count is never 0.
+static CLEAN: [AtomicU64; job::RING_MOST] = [const { AtomicU64::new(0) }; job::RING_MOST];
+/// The frames counted when the frame thread last finished a landing (`landed`): a newest buffer whose count is past it is still being cleaned, and MAP waits for its doorbell rather than clean it again (`lines_due`).
+static LANDED_N: AtomicU64 = AtomicU64::new(0);
+/// The frame thread's maintenance (`landed`), for the console every 64 MAPs: buffers cleaned, their counter ticks summed and the most.
+static CLEAN_N: AtomicU64 = AtomicU64::new(0);
+static CLEAN_SUM: AtomicU64 = AtomicU64::new(0);
+static CLEAN_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// A frame landed (`answer` true): with a write-back view out, the newest buffer's lines dropped from every core's caches here (`CLEAN`), then the server's doorbell rung (`door_ring`); the frame thread's last act before it waits again.
+/// Why here and not in the server's MAP (2026-11-23, the Pro, Lumis's stacked CLIP, about one MAP in fifty answered one to three periods late): the maintenance takes 0.5 to 1 ms, and a thread past 2^-11 s of its turn is one the kernel asks to make way for a woken one (`make_way`, `make_room`).
+/// The server, asked so in its maintenance, was parked at its end (process.rs `unlocked`) and, its asker gone to another core, waited 4 to 15 ms behind Lumis's threads for one to yield (`diag sched`, every late answer).
+/// This thread is not asked for its interrupt's first 2^10 us (devsched's budget), and parked by an interrupt it is taken back first; the server's answer is then a hold and a reply, too short to be asked.
+/// Every frame, not only one a MAP waits for: a MAP that came just after its frame landed with none waiting (160 to 210 us after DMA_DONE) found its buffer uncleaned and cleaned it itself, late as before (5 of the 5 late answers left when only a waited-for frame was cleaned).
+/// A MAP that finds its buffer still being cleaned waits for the doorbell (`lines_due`).
+fn landed(g: u64) {
+    if LINES_ON.load(Ordering::Relaxed) != 0 {
+        if let Some(b) = newest_of(STATE.load(Ordering::Acquire)) {
+            let n = B_COUNT[b].load(Ordering::Relaxed);
+            let t = lines(g, b, 0, BUF.load(Ordering::Relaxed) as usize);
+            CLEAN[b].store(n, Ordering::Release);
+            CLEAN_N.fetch_add(1, Ordering::Relaxed);
+            CLEAN_SUM.fetch_add(t, Ordering::Relaxed);
+            CLEAN_MOST.fetch_max(t, Ordering::Relaxed);
+        }
+    }
+    LANDED_N.store(FRAMES.load(Ordering::Acquire), Ordering::Release);
+    door_ring();
+}
+
+/// Whether held buffer `b` waits for the frame thread's maintenance (`landed`): a write-back view out, the buffer not cleaned for its frame, and that frame's landing not finished (after it, a buffer left uncleaned, one that landed before the view, is cleaned by MAP itself).
+fn lines_due(o: &Open, b: usize) -> bool {
+    let n = B_COUNT[b].load(Ordering::Relaxed);
+    o.cached && NO_LINES.load(Ordering::Relaxed) == 0 && LINES_ON.load(Ordering::Relaxed) != 0 && CLEAN[b].load(Ordering::Acquire) != n && LANDED_N.load(Ordering::Acquire) < n
 }
 
 /// The kist's held buffer given back: its hold cleared, and its probe compared with what it read when handed out, which tells whether anything wrote the buffer while it was held (the ring's promise: never; counted, and said the first time).
@@ -2486,7 +2545,7 @@ fn release(g: u64, o: &mut Open, b: usize) {
         return;
     }
     if o.cached {
-        lines(g, o, b, probe_off(), 64);
+        lines(g, b, probe_off(), 64);
     }
     if probe_read(b) != then {
         o.overwritten += 1;
@@ -2756,12 +2815,13 @@ enum Want {
     Slits,
 }
 
-/// A call held while its frame is on its way: its reply token (SYS_REPLY's, kept until answered), what it waits for, the count its frame must be past, and the counter at which the stream is taken for stopped (`late_tick` at the call, moved later by an exposure that lengthens the frame).
+/// A call held while its frame is on its way: its reply token (SYS_REPLY's, kept until answered), what it waits for, the count its frame must be past, the counter at which the stream is taken for stopped (`late_tick` at the call, moved later by an exposure that lengthens the frame), and the counter when it came.
 struct Pending {
     token: [u8; 32],
     want: Want,
     after: u64,
     until: u64,
+    at: u64,
 }
 
 /// What became of a held call when looked at.
@@ -2780,33 +2840,44 @@ struct Served {
 }
 
 /// A MAP's frame, buffer `b` held for the kist already (`hold_newest`): its record made, a write-back view's lines dropped, its header the reply. False when the reply failed (the holder has ended).
-fn map_answer(g: u64, o: &mut Open, b: usize, token: &[u8; 32]) -> bool {
+fn map_answer(g: u64, o: &mut Open, b: usize, token: &[u8; 32], asked: u64) -> bool {
     let n = FRAMES.load(Ordering::Acquire);
     o.asked_at = n;
     o.given = B_COUNT[b].load(Ordering::Relaxed);
     // A write-back view: the buffer's lines dropped from every core's caches before the holder hears of it (docs/CAMERA.md "A cacheable view").
     // Its frame's DMA_DONE came before the hold (`ring_turn` makes a buffer the newest only then), and the front end writes it again only after the holder gives it back (`ring_turn` never names a held buffer), so what a core kept from the last time round the ring, or fetched by speculation while the front end wrote it, is gone and the holder reads this frame.
-    if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 {
-        let t = lines(g, o, b, 0, BUF.load(Ordering::Relaxed) as usize);
+    // Done by the frame thread as the frame landed (`landed`, `CLEAN` holding its count); here only for a frame that landed before the view was given.
+    if o.cached && NO_LINES.load(Ordering::Relaxed) == 0 && CLEAN[b].load(Ordering::Acquire) != o.given {
+        let t = lines(g, b, 0, BUF.load(Ordering::Relaxed) as usize);
+        o.inv_n += 1;
         o.inv_sum += t;
         o.inv_max = o.inv_max.max(t);
     }
     o.held = Some((b, probe_read(b)));
     let mut h = [0u8; HEADER];
     header(&mut h, b, 1);
-    let lat = ferros_sys::now() - B_TICK[b].load(Ordering::Relaxed);
+    let (now, tick) = (ferros_sys::now(), B_TICK[b].load(Ordering::Relaxed));
+    let lat = now - tick;
     o.lat_sum += lat;
     o.lat_max = o.lat_max.max(lat);
+    // The driver's own part: from the later of the frame's DMA_DONE and the MAP's coming (a MAP that came after its frame was not waited for) to the answer.
+    let own = now - tick.max(asked);
+    o.own_sum += own;
+    o.own_max = o.own_max.max(own);
     o.maps += 1;
+    // The reply first, the console's lines after it: a console write is a syscall the answer need not wait for.
+    let ok = reply(token, &h) != ERR;
     if o.maps % 64 == 0 {
         let us = |t: u64| t * 1_000_000 / ferros_sys::freq();
-        say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
+        say!(g, "camera: A#{} frames mapped; DMA_DONE to the MAP's answer A#{} us on average, A#{} us at most; from the later of DMA_DONE and the MAP A#{} us on average, A#{} us at most; held buffers written over A#{}; frames by buffer age (releases back) A#{} A#{} A#{}, unseen A#{}, crowded A#{}, none free A#{}; A#{} taken by the front end\n", o.maps, us(o.lat_sum / 64), us(o.lat_max), us(o.own_sum / 64), us(o.own_max), o.overwritten, AGE[0].load(Ordering::Relaxed), AGE[1].load(Ordering::Relaxed), AGE[2].load(Ordering::Relaxed), UNSEEN.load(Ordering::Relaxed), CROWDED.load(Ordering::Relaxed), NONE_FREE.load(Ordering::Relaxed), n);
         if o.cached {
-            say!(g, "camera: the write-back view's maintenance at MAP (A#{} bytes a buffer): A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), us(o.inv_sum / 64), us(o.inv_max));
+            // WHY the max on the counts: a window with no buffer cleaned on that side leaves its count 0, and the mean's division would panic.
+            let (n, sum, most) = (CLEAN_N.swap(0, Ordering::Relaxed), CLEAN_SUM.swap(0, Ordering::Relaxed), CLEAN_MOST.swap(0, Ordering::Relaxed));
+            say!(g, "camera: the write-back view's maintenance (A#{} bytes a buffer): A#{} buffers by the frame thread as their frames landed, A#{} us on average, A#{} us at most; A#{} at MAP, A#{} us on average, A#{} us at most\n", BUF.load(Ordering::Relaxed), n, us(sum / n.max(1)), us(most), o.inv_n, us(o.inv_sum / o.inv_n.max(1)), us(o.inv_max));
         }
-        (o.lat_sum, o.lat_max, o.inv_sum, o.inv_max) = (0, 0, 0, 0);
+        (o.lat_sum, o.lat_max, o.own_sum, o.own_max, o.inv_n, o.inv_sum, o.inv_max) = (0, 0, 0, 0, 0, 0, 0);
     }
-    reply(token, &h) != ERR
+    ok
 }
 
 /// A FRAME's frame, buffer `b` held for the binning already (`hold_newest`): binned into `OUT` and given back to the ring, the reply the binned frame. False when the reply failed (the holder has ended).
@@ -2843,7 +2914,12 @@ fn try_pending(g: u64, o: &mut Open, p: &Pending, s: &mut Served) -> Tried {
         }
         Want::Map => {
             let Some(b) = hold_newest(HOLD_KIST, p.after) else { return Tried::Waiting };
-            map_answer(g, o, b, &p.token)
+            // Its lines still being made right by the frame thread: given back, and the MAP answered at the doorbell that follows.
+            if lines_due(o, b) {
+                unhold(HOLD_KIST, b);
+                return Tried::Waiting;
+            }
+            map_answer(g, o, b, &p.token, p.at)
         }
         Want::Frame(bin) => {
             let Some(b) = hold_newest(HOLD_BIN, p.after) else { return Tried::Waiting };
@@ -3192,6 +3268,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                         let mut give = |cached: bool| ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 4, ferros_sys::off(token.as_ptr()), first | n << 32 | (cached as u64) << 63, ferros_sys::off(t.as_mut_ptr()));
                         let mut base = give(want);
                         o.cached = want && base != ERR;
+                        LINES_ON.store((o.cached && NO_LINES.load(Ordering::Relaxed) == 0) as u64, Ordering::Relaxed);
                         // A kernel from before the write-back view refuses the bit (it reads as frames past the run): the view as before.
                         if want && base == ERR {
                             say!(g, "camera: the kernel gave no write-back view; asking for the non-cacheable one\n");
@@ -3252,7 +3329,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     continue;
                 }
                 // The next frame: one counted after this request came, its buffer held while it is binned (the newest, `hold_newest`), so the engine is never given it meanwhile.
-                pending = Some(Pending { token, want: Want::Frame(bin), after: FRAMES.load(Ordering::Acquire), until: late_tick() });
+                pending = Some(Pending { token, want: Want::Frame(bin), after: FRAMES.load(Ordering::Acquire), until: late_tick(), at: ferros_sys::now() });
             }
             3 => {
                 let Some(o) = open_cam.as_mut() else {
@@ -3433,7 +3510,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                 if let Some((b, _)) = o.held {
                     release(g, o, b);
                 }
-                pending = Some(Pending { token, want: Want::Map, after: o.given, until: late_tick() });
+                pending = Some(Pending { token, want: Want::Map, after: o.given, until: late_tick(), at: ferros_sys::now() });
             }
             // RELEASE `[6][buffer]`: the held buffer given back → `[0]`, `[1]` when it was not held.
             6 => {
@@ -3472,7 +3549,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     continue;
                 }
                 let after = if got >= 5 { u32::from_le_bytes(msg[1..5].try_into().unwrap()) as u64 } else { 0 };
-                pending = Some(Pending { token, want: Want::Slits, after, until: late_tick() });
+                pending = Some(Pending { token, want: Want::Slits, after, until: late_tick(), at: ferros_sys::now() });
             }
             // RATE `[10][windows]`: the sensor's own frame count against the front end's (`rate`).
             10 => {
@@ -3502,7 +3579,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
                     reply(&token, &[]);
                     continue;
                 }
-                pending = Some(Pending { token, want: Want::Snap, after: FRAMES.load(Ordering::Acquire), until: late_tick() });
+                pending = Some(Pending { token, want: Want::Snap, after: FRAMES.load(Ordering::Acquire), until: late_tick(), at: ferros_sys::now() });
             }
             _ => {
                 reply(&token, &[]);
