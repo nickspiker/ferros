@@ -6927,6 +6927,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The Android page's state as last drawn (allowed, accepted, what the device starts into, and Android's recovery request waiting): it changes under the keyboard (the disclaimer's agreement) and from the bridge.
     let mut android_seen = u64::MAX;
     // The guards and the charge cap as their pages were last drawn with them.
+    // Whether a person was present at the last pass (the Deck button follows a change).
+    let mut present_seen = true;
     let mut guards_seen = (u64::MAX, 0u64);
 
     // The previous frame's held contacts, by contact id: present, x, y.
@@ -7440,6 +7442,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         let t_loop = now();
         let swipe = option_env!("FERROS_MAP_START") == Some("swipe");
         let pick = option_env!("FERROS_MAP_START") == Some("picker");
+        // A person present (fact 83): read once a pass, for the touches and the Deck button below.
+        let present = ferros_sys::facts().0[83] == 2;
         let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd") | Some("swipe") | Some("picker")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
             synth += 1;
             if synth == 2 {
@@ -7488,8 +7492,18 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 r[7..9].copy_from_slice(&(y.clamp(0, h - 1) as u16).to_le_bytes());
                 13
             }
-        } else if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 0 } else { call(touch, &[1], &mut r) as usize };
+        } else if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 || !present {
+            // Nobody present (the audit of 2026-11-24): an approve locks the device with the deck still running under the attest screen, which reads the same glass; a touch there is the attest screen's alone, so the deck takes none (until then a tap on the attest screen also reached the deck, its settings and the quick row under it, and a radio circle tapped switched twice).
+            0
+        } else {
+            call(touch, &[1], &mut r) as usize
+        };
         let touch_us = ferros_sys::us_since(t_loop);
+        // The person came or went (an approve's lock, its unlock): the Deck button's note follows (notes.rs `notes_view`, nothing while nobody is present).
+        if present != present_seen {
+            present_seen = present;
+            map.notes_view();
+        }
         let mut cur = [(false, 0i64, 0i64); 16];
         let mut ids = [0usize; 16];
         let mut held = 0usize;

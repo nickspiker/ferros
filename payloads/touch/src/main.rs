@@ -401,7 +401,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // Then any client waiting. `recv` polls, so the loop never blocks and the table keeps moving.
         let n = recv(cap(grants, S_TOUCH), &mut msg, &mut token, true);
-        if n != NOTHING && n != 0 {
+        // A kist reads no contacts while nobody is present (the audit of 2026-11-24): an approve locks the device with the kists still running under the attest screen, and every kist holds this endpoint (the implicit set), so one could otherwise read where the handle is typed on the attest screen's keyboard. Answered as an empty glass, the changes left for the system's readers; asked of the kernel only for a kist's call (SYS_CALLER, then fact 83). A call the kernel cannot name (no SYS_CALLER) is served as before: the attest screen itself must never go blind.
+        let blind = n != NOTHING && n != 0 && matches!(msg[0], 0 | 1) && ferros_sys::caller(&token).is_some_and(|h| h & ferros_sys::CALLER_KIST != 0) && ferros_sys::facts().0[83] != 2;
+        if blind {
+            out[0] = 0;
+            reply(&token, &out[..1]);
+        } else if n != NOTHING && n != 0 {
             let len = match msg[0] {
                 0 => {
                     // More waiting than a reply carries: the superseded moves go first, so the reply holds every enter and leave and each contact's latest place, not the oldest moves.

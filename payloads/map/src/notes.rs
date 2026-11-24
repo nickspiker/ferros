@@ -126,6 +126,11 @@ impl Map {
     /// The Deck button as the deck's summary (display op 66): the latest note in view's source's icon (a bundled icon only; the ring alone otherwise) and how many wait in view, in for you's violet. Sent when it changed; called as the list or the resting view changes.
     /// A system question waiting wins it (docs/NOTIFY.md "System questions"), whatever the view: the settings circle's icon (the ferros mark, which the bundle has not: the ring alone) in the system's red, its count the questions waiting. WHY it wins over the kists' notes: a question blocks something until it is answered (a host waiting on Stow, a device on its departure); a kist's note waits as well later as now. Mine, 2026-11-12: the owner can turn it round.
     pub fn notes_view(&mut self) {
+        // Nobody present (the audit of 2026-11-24: an approve locks the device with the deck running, and the helm is drawn over the attest screen): the Deck button shows nothing waiting, so the lock screen never says which kist has a note; the main loop calls this again as the person comes and goes.
+        if ferros_sys::facts().0[83] != 2 {
+            self.helm_send((0, 0, ferros_glow::Glow::ForYou as u8));
+            return;
+        }
         let questions = self.notes.iter().filter(|n| n.source == ferros_kist::note::SYSTEM).count();
         if questions > 0 {
             // WHY the cap: the op's field is 16 bits; sixteen at most wait (a source's notes are numbered by a nibble).
