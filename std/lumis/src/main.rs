@@ -479,8 +479,11 @@ const DEV_SCRATCH: u8 = 1 << 2;
 const DEV_OPEN: u8 = 1 << 3;
 /// Development: the intake stays on the A715 workers with the UI (as before 0.2.17) instead of its own threads on the A510s, to compare the two on a device.
 const DEV_BIG_INTAKE: u8 = 1 << 6;
-/// The A510 cluster (husky cores 0 to 3), where the intake runs (lumis_core `set_intake_cores`) so the UI's draw keeps the A715s.
-const CORES_LITTLE: u64 = 0x000F;
+/// The A510 cluster (husky cores 0 to 3), the intake's (lumis_core `set_intake_cores`) so the UI's draw keeps the A715s: its three A510s (cores 0 to 2), a thread each, and the camera thread's own (core 3): its turn is light with the GPU stacking (about 3 ms and a settle's share), and the threads that wake it (an intake worker, the GPU's interrupt) are on this cluster, where it never waits behind the UI's workers for an A715 (the coordinator, 2026-11-23: lumis-camera waited 2 to 13 ms for an A715 45 times in 40 s, all four running Lumis's own threads, and a frame was not taken).
+const CORES_INTAKE: u64 = 0x0007;
+const CORE_CAMERA: u64 = 0x0008;
+/// Every husky core (the A510s, the A715s, the X3): a thread the camera thread starts goes back to these, as it ran before the camera thread had a core of its own (a thread inherits its starter's pin).
+const CORES_ALL: u64 = 0x01FF;
 /// The A715 workers (husky cores 4 to 7), where a save encodes (lumis_core `set_save_cores`): a save is started from the intake on the A510s, and their shared NEON would hold up an AV1 encode.
 const CORES_WORKERS: u64 = 0x00F0;
 /// Development, with `DEV_OPEN`: sweep the shutter by itself, every two stops from 2^-13 s to 2^3 s, then 2^4 s (no further than the camera's longest: a long-exposure mode's frame takes its whole exposure in wall time), two frames each, each frame's exposure said beside the one asked.
@@ -708,6 +711,13 @@ impl lumis_core::RowSource for FreshRows {
     }
 }
 
+/// A thread the camera thread starts (its clips' starts, and the recorders and packers they start in turn, its preview), off the camera thread's core (`CORE_CAMERA`, which it would inherit) and back on every core, as before; nothing when the camera thread has no core of its own (`DEV_BIG_INTAKE`).
+fn off_camera_core() {
+    if dev_input().0 & DEV_BIG_INTAKE == 0 {
+        sys::pin(CORES_ALL);
+    }
+}
+
 /// The preview thread for the integrator at `integrator`: jobs in, their ends out.
 fn preview_thread(integrator: usize) -> Option<(std::sync::mpsc::Sender<PreviewJob>, std::sync::mpsc::Receiver<PreviewDone>)> {
     let (tx, jobs) = std::sync::mpsc::channel::<PreviewJob>();
@@ -715,6 +725,7 @@ fn preview_thread(integrator: usize) -> Option<(std::sync::mpsc::Sender<PreviewJ
     std::thread::Builder::new()
         .name("lumis-preview".into())
         .spawn(move || {
+            off_camera_core();
             for j in jobs {
                 let f = FreshRows { rows: j.rows, last: j.last, whole: AtomicBool::new(true) };
                 let t = std::time::Instant::now();
@@ -1142,6 +1153,10 @@ fn open(cam: &camera::Camera, slit: bool, video: Option<(ferros_clip::Pacing, u6
 }
 
 fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<Arc<kete::FlatStorage>>, opened: Arc<Mutex<Option<Opened>>>) {
+    // The camera thread on its own A510 (`CORE_CAMERA`) where the intake is on the others.
+    if dev_input().0 & DEV_BIG_INTAKE == 0 {
+        sys::pin(CORE_CAMERA);
+    }
     let fail = |why: String| {
         println!("lumis: camera {}: {why}", cam.name);
         *opened.lock().unwrap() = Some(Opened::Failed(why));
@@ -1723,6 +1738,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     let (c, head, line, digests) = (cam.clone(), *head, rows.line, dev_knobs4() & (DEV_VIDEO | DEV_HASHES) == DEV_VIDEO | DEV_HASHES);
                     let (tx, rx) = std::sync::mpsc::channel();
                     match std::thread::Builder::new().name("lumis-clip-start".into()).spawn(move || {
+                        off_camera_core();
                         let _ = tx.send(start_clip(&c, facts, pacing, head, line, digests));
                     }) {
                         Ok(_) => {
@@ -1944,6 +1960,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     let c = cam.clone();
                     let (tx, rx) = std::sync::mpsc::channel();
                     match std::thread::Builder::new().name("lumis-stack-start".into()).spawn(move || {
+                        off_camera_core();
                         let _ = tx.send(start_stack(&c, facts, head, frame_ns));
                     }) {
                         Ok(_) => {
@@ -2863,17 +2880,17 @@ fn main() {
     }));
     let _ = log::set_logger(&Console).map(|()| log::set_max_level(log::LevelFilter::Info));
     println!("lumis: Lumis {} on ferros, {} grants", env!("CARGO_PKG_VERSION"), sys::grant_count());
-    // The intake on the A510s (four threads, one a core) unless the knobs keep it with the UI.
+    // The intake on three A510s (a thread a core), the camera thread on the fourth (`camera_service`), unless the knobs keep the intake with the UI.
     if dev_input().0 & DEV_BIG_INTAKE == 0 {
         lumis_core::set_intake_cores(|| {
-            sys::pin(CORES_LITTLE);
-        }, 4);
+            sys::pin(CORES_INTAKE);
+        }, 3);
         lumis_core::set_save_cores(|| {
             sys::pin(CORES_WORKERS);
         });
         // A save on three of the four A715s (2026-11-22: on all four, at 60 a second, the owner's first shot ended Lumis, the UI drawing on the same cores; the fourth is the UI's now), a thread each (the coordinator, 2026-11-19: on two of them a 12 MP VSF 8B took 15.9 s, 9.6 s of it AV1): the preview loses frames for the seconds a save takes, the camera none (the X3, which answers the camera's frames, stays out of it).
         lumis_core::platform::set_save_threads(3);
-        println!("lumis: the intake on the A510s (cores G#{CORES_LITTLE:04X}), the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
+        println!("lumis: the intake on the A510s (cores G#{CORES_INTAKE:04X}), the camera thread on G#{CORE_CAMERA:04X}, the UI and saves on the A715s (G#{CORES_WORKERS:04X})");
     }
     // Whatever the intake's placement: a clip recording is sealed before Lumis ends, and the clips page lists and removes Lumis's clips in the person's hold.
     lumis_core::platform::set_before_exit(seal_at_exit);
