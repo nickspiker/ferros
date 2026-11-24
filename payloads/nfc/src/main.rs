@@ -19,7 +19,9 @@
 //! - `8` BUZZ + n (one byte, at most G#26): the motor plays ROM waveform n. → [0], or [1] refused (n too large) or a write failed.
 //! - `9` TAG: held until discovery reads an unlock tag (NFC-A, Type 2, a 7- or 10-byte UID), then → its UID; → nothing when let go (op 10, or a fifth caller held). Attest with a tag (AUTH.md): the attest screen holds it while it shows, the settings page while it adds a tag. The screen off stops discovery, so nothing is read in the dark.
 //! - `10` TAG STOP: every held TAG answered with nothing. → [0].
-//! - `11` PROBE: answered [0] at once, then the chip made sure of: running discovery is asked to start again (G#A0, already started, is the chip alive and discovering; a start means it had stopped without a word, and is said), stopped discovery is retried at once, and a chip that does not answer has its reset pulsed and is brought up again. The attest screen rings it at a touch on its empty entry (a doorbell, never a timer: 2026-11-17, a tag that read nothing at the attest screen after hours, `Nfc::probe`).
+//! - `11` PROBE: answered [0] at once, then running discovery stopped and started again, its tag detector afresh (`Nfc::rediscover`); a deactivation refused is discovery found stopped without a word, and is said; stopped discovery is retried at once; a chip that does not answer has its reset pulsed and is brought up again. The attest screen rings it at a touch on its empty entry (a doorbell, never a timer: 2026-11-17, a tag that read nothing at the attest screen after hours, `Nfc::probe`); until 2026-11-24 it sent RF_DISCOVER alone, which running discovery answers G#A0 and which changes nothing.
+//! - `12` OPEN: held while the client wants NFC on with the screen off (owner, 2026-11-24: "Screen off should turn off the NFC driver unless an app has it open specifically."); → nothing when let go (op 13, or a fifth holder), and dropped when the client's process ends. Without one held, the screen off stops discovery and the field, and the chip sleeps.
+//! - `13` CLOSE: every held OPEN answered with nothing; a client that still wants NFC open holds again. → [0].
 //!
 //! A chip that stops answering is brought up again from a reset pulse (`Nfc::restart`), not with NCI commands alone: a command left unanswered, a bring-up that failed, and a reset the chip did by itself (a CORE_RESET notification outside the bring-up) all lead there, at the next retry, which a screen coming on, a TAG held or a PROBE makes at once (2026-11-17: after a RAM reload the Pro's chip never came up, its CORE_RESET answered after A#590 ms, past the old wait, and every retry was CORE_RESET again; on 2026-11-14 it answered nothing at a screen on after A#42 minutes dark, and discovery was retried for good without a pulse).
 //!
@@ -227,9 +229,21 @@ struct Nfc {
     st_said: u32,
     /// When the chip last sent anything (the counter), for STATE.
     heard_at: u64,
+    /// The chip's full polls (ST's G#6F05, "active reader starts", the notification ST's HAL watches for a stuck poll): since the bring-up, and since discovery last started (`polls_at_start` the count then, `started_at` the counter).
+    /// Between full polls the chip only senses its antenna for a tag's load (its tag detector, measured on the Pro 2026-11-24: two full polls about 480 ms apart as discovery starts, then none until a tag comes near; docs/NFC.md "A tag that did nothing at the attest screen").
+    polls: u32,
+    polls_at_start: u32,
+    started_at: u64,
+    /// A tag or a reader activated us since discovery last started, for STATE.
+    read_since_start: bool,
+    /// Discovery started again on a doorbell (`rediscover`), for STATE.
+    rediscovers: u32,
     /// Op 9's held calls (attest with a tag, AUTH.md): each a reply token, answered with the UID of the next unlock tag discovery reads (`tag_read`), or with nothing by op 10. At most `HELD`, the oldest giving way.
     held: [[u8; 32]; HELD],
     nheld: usize,
+    /// Op 12's held calls: each a client holding NFC open with the screen off (owner, 2026-11-24: "Screen off should turn off the NFC driver unless an app has it open specifically."). Let go by op 13, or dropped when the process behind it ends (`sweep`). At most `HELD`, the oldest giving way.
+    opens: [[u8; 32]; HELD],
+    nopen: usize,
 }
 
 /// How many op 9 calls are held at once: the attest screen's and the settings page's, with room.
@@ -557,6 +571,7 @@ impl Nfc {
             }
             // RF_INTF_ACTIVATED_NTF: a reader selected us; byte 5 is the connection's initial credits.
             (3, 1, 5) => {
+                self.read_since_start = true;
                 // Byte 3 is the technology and mode: below G#80 we polled and found a tag (or a device answering as one). Its technology parameters follow byte 6 (their length): for NFC-A the SENS_RES, then the UID's length and the UID. Logged, then the tag let go back to discovery (RF_DEACTIVATE, type 3).
                 let mode = pl.get(3).copied().unwrap_or(0);
                 // Reader mode and an ISO-DEP device (interface G#02): Photon's tag asked for, its SELECT the first APDU.
@@ -613,6 +628,9 @@ impl Nfc {
             // ST's proprietary notifications (G#6F): not ours to act on, but counted and said (`st_notes`), since a chip that stops reading may say so only here.
             (3, 0xF, _) => {
                 self.st_notes += 1;
+                if p[1] & 0x3F == 5 {
+                    self.polls += 1;
+                }
                 // WHY the min: a notification may be shorter than the 8 bytes kept (a 3-byte header and nothing), and copying 8 from it would panic; a longer one keeps its start. The 64 said below is the console line's room (128 hex digits in its 512 bytes), not a bound (n is at most the packet's 258).
                 // Said whole up to 64 bytes since 2026-11-18: the reload's second notification (`6F 02 16 31 20 00 82 06 01 ...`, 25 bytes) was cut at 16, and it is the one a cold boot does not send.
                 let k = n.min(self.st_last.len());
@@ -681,6 +699,9 @@ impl Nfc {
         };
         self.quiet = false;
         if self.discovering {
+            self.polls_at_start = self.polls;
+            self.started_at = now();
+            self.read_since_start = false;
             if self.discover_failures > 0 {
                 say!(self.grants, "nfc: discovery started again after {} failed tries\n", self.discover_failures);
             }
@@ -843,6 +864,40 @@ impl Nfc {
         self.nheld = 0;
     }
 
+    /// Op 12 held: NFC kept on with the screen off for as long as it is (`sweep`, op 13). Full, the oldest gives way (answered with nothing, so its caller holds again if it still wants NFC open). The newest holder's end is watched: the kernel sets `CALLER_ENDED` in `RUNG` when it ends, any way, which wakes the loop (`sweep`).
+    fn open_hold(&mut self, token: [u8; 32]) {
+        if self.nopen == HELD {
+            reply(&self.opens[0], &[]);
+            self.opens.copy_within(1.., 0);
+            self.nopen -= 1;
+        }
+        let _ = ferros_sys::caller_watch(&token, &RUNG);
+        self.opens[self.nopen] = token;
+        self.nopen += 1;
+    }
+
+    /// Op 13: every held op 12 let go, answered with nothing.
+    fn open_let_go(&mut self) {
+        for t in &self.opens[..self.nopen] {
+            reply(t, &[]);
+        }
+        self.nopen = 0;
+    }
+
+    /// The held calls whose process has ended, dropped: at the kernel's ring of a watched end, and when the screen goes off (the moment an older holder's life decides). The kernel watches one caller a watcher, so an older holder's end is found here, never on a clock.
+    fn sweep(&mut self) {
+        let mut k = 0;
+        while k < self.nopen {
+            if ferros_sys::caller_alive(&self.opens[k]) == Some(false) {
+                self.opens.copy_within(k + 1.., k);
+                self.nopen -= 1;
+                say!(self.grants, "nfc: a client that held NFC open ended; A#{} hold it now\n", self.nopen);
+            } else {
+                k += 1;
+            }
+        }
+    }
+
     /// Reader mode on or off. Discovery stays as it is (listening and polling, interleaved): a tapped device found while this one polls is asked for Photon's tag. A poll-only discovery (NFC-A alone, `21 03 03 01 00 01`) went unanswered by this controller every time (2026-11-08), so the tap rides the polling discovery already does.
     fn set_reading(&mut self, on: bool) -> bool {
         if self.reading != on {
@@ -870,31 +925,47 @@ impl Nfc {
         freq() << self.discover_failures.min(6)
     }
 
-    /// Op 11 (a doorbell, `PROBE` in the module comment): running discovery asked to start again, G#A0 (already started) the chip alive and discovering. A start means discovery had stopped with no word from the chip, which is said and counted (`found_stopped`): what to look for when a tag reads nothing. No answer: the chip is brought up again from a reset pulse at the next retry. Any other status (an activation in progress refuses it) leaves things as they are. Discovery stopped (the dark, a retry pending): nothing here, the caller retries at once.
-    fn probe(&mut self, p: &mut Packet) {
-        self.probes += 1;
-        if !self.discovering {
-            return;
-        }
+    /// Discovery stopped (RF_DEACTIVATE to idle) and started again, which sets the chip's tag detector afresh: a PROBE's (op 11) way of making sure of the chip.
+    /// Between its full polls the chip only senses its antenna, and polls when a tag's load moves it (docs/NFC.md "A tag that did nothing at the attest screen"); RF_DISCOVER alone, the probe until 2026-11-24, is answered G#A0 by running discovery and changes nothing in the chip.
+    /// Measured on the Pro (2026-11-24): the detector still woke on the owner's tag after 52 minutes of discovery with the screen on, so nothing restarts discovery on a clock or on a TAG held.
+    /// A deactivation refused (G#06, not discovering) is discovery found stopped with no word from the chip, said and counted; no answer is a silent chip, brought up again from a reset pulse.
+    fn rediscover(&mut self, why: &str, p: &mut Packet) {
+        self.rediscovers += 1;
+        let polls = self.polls - self.polls_at_start;
+        let ms = (now() - self.started_at) * 1000 / freq();
         self.unanswered = false;
-        match self.cmd(&DISCOVER, p) {
-            Some(n) if n >= 4 && p[3] == ALREADY_STARTED => {}
-            Some(n) if n >= 4 && p[3] == 0 => {
+        match self.cmd(&[0x21, 0x06, 0x01, 0x00], p) {
+            Some(n) if n >= 4 && p[3] == 0 => {}
+            Some(n) => {
                 self.found_stopped += 1;
-                say!(self.grants, "nfc: a probe found discovery stopped without a word from the chip (last heard A#{} ms ago): started again\n", (now() - self.heard_at) * 1000 / freq());
+                say!(self.grants, "nfc: {why}: the chip was not discovering ({}), with no word from it (last heard A#{} ms ago)\n", Hex(&p[..n.min(8)]), (now() - self.heard_at) * 1000 / freq());
             }
-            Some(n) => say!(self.grants, "nfc: a probe was answered {}: left as it is\n", Hex(&p[..n.min(8)])),
             None => {}
         }
+        self.discovering = false;
         if self.unanswered {
-            say!(self.grants, "nfc: a probe found the chip silent: its reset pulsed and brought up again\n");
+            say!(self.grants, "nfc: {why}: the chip is silent: its reset pulsed and brought up again\n");
             self.needs_init = true;
-            self.discovering = false;
+            return;
+        }
+        say!(self.grants, "nfc: {why}: discovery started again, the tag detector afresh (A#{polls} full polls in the A#{ms} ms since it last started)\n");
+        self.discover(p);
+        if self.unanswered {
+            self.needs_init = true;
+        }
+    }
+
+    /// Op 11 (a doorbell, `PROBE` in the module comment): running discovery started again (`rediscover`). Discovery stopped (the dark, a retry pending): nothing here, the caller retries at once.
+    /// Until 2026-11-24 it sent RF_DISCOVER alone, which running discovery answers G#A0 (already started) and changes nothing in the chip.
+    fn probe(&mut self, p: &mut Packet) {
+        self.probes += 1;
+        if self.discovering {
+            self.rediscover("a probe", p);
         }
     }
 
     fn state(&self, out: &mut Line) {
-        let _ = write!(out, "firmware {}, RF config {}; {}{}; S {}; activations {}, S served {}, fields {}, tags {}; TAG held A#{}; discovery failures A#{}, reset pulses A#{}, probes A#{} (A#{} found discovery stopped); ST notifications A#{} (last {}); chip last heard A#{} ms ago; bus resets after a failed transfer A#{}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.needs_init { ", to be brought up again" } else { "" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags, self.nheld, self.discover_failures, self.pulses, self.probes, self.found_stopped, self.st_notes, Hex(&self.st_last), (now() - self.heard_at) * 1000 / freq(), RESETS.load(core::sync::atomic::Ordering::Relaxed));
+        let _ = write!(out, "firmware {}, RF config {}; {}{}; S {}; activations {}, S served {}, fields {}, tags {}; TAG held A#{}, held open A#{}; discovery failures A#{}, reset pulses A#{}, probes A#{} (A#{} found discovery stopped), discovery started again on a doorbell A#{}; full polls A#{} (A#{} in the A#{} ms since discovery started, a tag read since {}); ST notifications A#{} (last {}); chip last heard A#{} ms ago; bus resets after a failed transfer A#{}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.needs_init { ", to be brought up again" } else { "" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags, self.nheld, self.nopen, self.discover_failures, self.pulses, self.probes, self.found_stopped, self.rediscovers, self.polls, self.polls - self.polls_at_start, (now() - self.started_at) * 1000 / freq(), if self.read_since_start { "yes" } else { "no" }, self.st_notes, Hex(&self.st_last), (now() - self.heard_at) * 1000 / freq(), RESETS.load(core::sync::atomic::Ordering::Relaxed));
     }
 
     /// One of the motor's registers: its address written without STOP, then the value read.
@@ -971,7 +1042,7 @@ impl Nfc {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, in_init: false, needs_init: false, unanswered: false, pulses: 0, probes: 0, found_stopped: 0, st_notes: 0, st_last: [0; 8], st_said: 0, heard_at: now(), held: [[0; 32]; HELD], nheld: 0 };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, in_init: false, needs_init: false, unanswered: false, pulses: 0, probes: 0, found_stopped: 0, st_notes: 0, st_last: [0; 8], st_said: 0, heard_at: now(), polls: 0, polls_at_start: 0, started_at: now(), read_since_start: false, rediscovers: 0, held: [[0; 32]; HELD], nheld: 0, opens: [[0; 32]; HELD], nopen: 0 };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
@@ -1000,12 +1071,24 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let seen = RUNG.load(core::sync::atomic::Ordering::Acquire);
         passes += 1;
         if now().wrapping_sub(said_at) >= freq() << 6 {
-            say!(grants, "nfc: A#{passes} passes, A#{waits} waits in the last A#{} ms; ST notifications A#{} so far\n", (now() - said_at) * 1000 / freq(), nfc.st_notes);
+            say!(grants, "nfc: A#{passes} passes, A#{waits} waits in the last A#{} ms; ST notifications A#{} so far, full polls A#{} (A#{} since discovery started)\n", (now() - said_at) * 1000 / freq(), nfc.st_notes, nfc.polls, nfc.polls - nfc.polls_at_start);
             (passes, waits, said_at) = (0, 0, now());
             nfc.st_said = 0;
         }
+        // A watched holder of op 12 ended (`open_hold`): the bit cleared, the holders swept.
+        if seen & ferros_sys::CALLER_ENDED != 0 {
+            RUNG.fetch_and(!ferros_sys::CALLER_ENDED, core::sync::atomic::Ordering::AcqRel);
+            nfc.sweep();
+            continue;
+        }
         {
-            let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+            let screen_off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+            // An older holder's end is found as the screen goes off, before it keeps the radio on.
+            if screen_off && !dark && nfc.nopen > 0 {
+                nfc.sweep();
+            }
+            // The screen off turns NFC off unless a client holds it open (op 12; owner, 2026-11-24).
+            let off = screen_off && nfc.nopen == 0;
             if off != dark {
                 dark = off;
                 retry_at = 0;
@@ -1018,7 +1101,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         nfc.discovering = false;
                     }
                 }
-                say!(grants, "nfc: screen {}: {}\n", if dark { "off" } else { "on" }, if dark { "discovery stopped" } else if nfc.needs_init { "the chip is brought up again from a reset pulse" } else { "discovery again" });
+                say!(grants, "nfc: {}: {}\n", if dark { "screen off" } else if screen_off { "screen off, held open by a client" } else { "screen on" }, if dark { "discovery stopped, the field off, the chip in standby" } else if nfc.needs_init { "the chip is brought up again from a reset pulse" } else { "discovery again" });
             }
         }
         if shown != Some((nfc.discovering, nfc.field)) {
@@ -1136,6 +1219,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 10 => {
                     nfc.tag_let_go();
+                    reply(&token, &[0]);
+                }
+                // NFC held open with the screen off (owner, 2026-11-24): the call held until op 13 or the caller's end; the next pass decides the radio.
+                12 => {
+                    nfc.open_hold(token);
+                }
+                13 => {
+                    nfc.open_let_go();
                     reply(&token, &[0]);
                 }
                 // The attest screen's doorbell at a touch (`Nfc::probe`): answered first, so the caller never waits on the chip.

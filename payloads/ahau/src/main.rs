@@ -373,7 +373,7 @@ fn nets_take(seen: u32) -> Option<(u32, ([u8; 1 << 11], usize))> {
 }
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
-/// Slot 14: use nfc (payloads/nfc), for attest with a tag (AUTH.md; owner, 2026-11-11: "have NFC be on if the screen is on at the attest and have that NFC locked capsule for easy handle entry"). An older init leaves it empty: the tag thread's call then fails and the screen is as before.
+/// Slot 14: use nfc (payloads/nfc), for attest with a tag (AUTH.md; owner, 2026-11-11: "have NFC be on if the screen is on at the attest and have that NFC locked capsule for easy handle entry"). An older init, or a kernel restart before 2026-11-24 (every approve's attest screen), leaves it empty: the tag thread says so once and ends, and the screen is as before.
 const S_NFC: u64 = 14;
 
 /// Attest with a tag: `tag_thread` holds the NFC driver's TAG (op 9) while TAG_WANT is set (the attest screen's entry is up) and publishes each unlock tag's UID it is answered with (bytes, length) under TAG_SEQ (odd while written); the screen's loop takes it as it takes `client_thread`'s copy, nothing asked on a timer. The screen off stops the driver's discovery, so nothing is read in the dark.
@@ -384,6 +384,14 @@ static mut TAG_STACK: [u8; 1 << 14] = [0; 1 << 14];
 
 extern "C" fn tag_thread(grants: u64) -> ! {
     use core::sync::atomic::Ordering;
+    // No slot 14 (an init or a kernel restart that hands no `use nfc`): said once, and the thread ends; asking again could never succeed.
+    // Until 2026-11-24 the call failed at once and was asked again every second for as long as the screen stood: the kernel restarted the attest screen without the slot (every approve), so a tag read nothing there.
+    // SAFETY: the grant count is the u32 the kernel writes at the grants offset + G#200 (ferros_sys::cap), in this process's own arc.
+    let granted = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64;
+    if granted <= S_NFC {
+        console(grants, b"ahau: no NFC slot granted (slot 14, use nfc): a tag cannot attest here; the handle typed still does\n");
+        ferros_sys::thread_exit(0);
+    }
     let nfc = cap(grants, S_NFC);
     let mut absent = freq() >> 6;
     loop {
@@ -401,7 +409,7 @@ extern "C" fn tag_thread(grants: u64) -> ! {
                 unsafe { *(&raw mut TAG_UID) = (uid, n as usize) };
                 TAG_SEQ.fetch_add(1, Ordering::AcqRel);
             }
-            // The call failed (no driver behind the slot: it ended while holding the call, or an init without the slot): asked again after the doubling wait `absent_wait` gives, since no doorbell exists for a driver coming up.
+            // The call failed (no driver behind the slot: it ended while holding the call): asked again after the doubling wait `absent_wait` gives, since no doorbell exists for a driver coming up.
             ferros_sys::ERR => absent_wait(&mut absent),
             // Let go (op 10: the settings page's, or this screen's own as it closes): asked again at once while still wanted.
             _ => absent = freq() >> 6,

@@ -65,18 +65,51 @@ The `nfc` endpoint:
 | 8 BUZZ | n (one byte, at most G#26) | [0] played, [1] refused or a write failed |
 | 9 TAG | — | held until discovery reads an unlock tag, then its UID (7 or 10 bytes); nothing when let go |
 | 10 TAG STOP | — | [0]; every held TAG answered with nothing |
-| 11 PROBE | — | [0] at once; then the chip made sure of ("A chip that stops answering" below) |
+| 11 PROBE | — | [0] at once; then discovery stopped and started again, its tag detector afresh ("A tag that did nothing" below), or the chip brought up again ("A chip that stops answering") |
+| 12 OPEN | — | held while the caller wants NFC on with the screen off; nothing when let go ("The screen off" below) |
+| 13 CLOSE | — | [0]; every held OPEN answered with nothing |
 
 ## Unlock tags (attest with a tag, 2026-11-11)
 
 AUTH.md "Attest with a tag" has the whole of it; this is the driver's part.
 
-- **Nothing new is switched on.** Discovery (`21 03`) already polls for tags on A, B and V between its listens whenever the screen is on, attest screen or not, and stops when the screen goes off (`Nfc::screen`). So NFC is on at the attest screen exactly while the screen is, and a tag held to a dark device is never read. Photon's tag (card emulation) and the sponsor's reader (op 4) run in the same discovery, unchanged.
+- **Nothing new is switched on.** Discovery (`21 03`) already polls for tags on A, B and V between its listens whenever the screen is on, attest screen or not, and stops when the screen goes off unless a client holds NFC open (`Nfc::screen`, "The screen off" below; nothing holds it at the attest screen). So NFC is on at the attest screen exactly while the screen is, and a tag held to a dark device is never read. Photon's tag (card emulation) and the sponsor's reader (op 4) run in the same discovery, unchanged.
 - **Which tags:** an RF_INTF_ACTIVATED_NTF from a poll on NFC-A (mode 0) with protocol T2T (G#02) and a 7- or 10-byte UID. A 4-byte UID may be random at every read (ISO/IEC 14443-3), so none is offered.
 - **The doorbell:** op 9 is held (at most four callers, the oldest giving way) and answered with the UID when such a tag is read, so nobody asks the driver on a timer. The attest screen holds it while its entry is up; the settings NFC page holds it while it adds a tag. Op 10 lets every held call go: the page going, an add cancelled, the attest screen closing. A tag held to the device is read again each discovery cycle (TOTAL_DURATION, 500 ms), so a caller still waiting hears it again then.
 - **Not gated on a person present,** unlike ops 1 and 4: the attest screen needs it while locked, the owner's exception to "no NFC action while locked" (AUTH.md "Radios while locked"). While locked the attest screen is the endpoint's only holder; it hands the UID to the kernel and nowhere else.
 - **The UID is never logged:** a tag's line says its mode, protocol, interface, the UID's length and SENS_RES.
 - **For as long as the screen is up** (owner, 2026-11-17: "why's it time out? Like if I don't tap within the first min, I have to type my handle"): nothing in the driver or the attest screen gives up on a timer, so a tag that reads nothing is a chip that stopped, handled below.
+
+## The screen off (2026-11-24)
+
+The owner, 2026-11-24: "Screen off should turn off the NFC driver unless an app has it open specifically.", then "or sleep it or whatever's the proper way".
+
+- **Off is the chip's own sleep, Android's way.** At the screen off the driver sends RF_DEACTIVATE to idle (`21 06 01 00`): discovery stops, so no polling field, no listen as a card, and no tag detector (it runs only inside discovery). Then CORE_SET_POWER_SUB_STATE screen off (`20 09 01 01`). A chip in NCI idle with nothing to do drops into its own standby and wakes on the next command. That is libnfc-nci's screen off when no card-emulation route must listen (discovery stopped, then the power sub-state), and the chip keeps its configuration, so nothing is brought up again.
+- **On is milliseconds.** At the screen on: the sub-state screen on (`20 09 01 00`), then RF_DISCOVER. A chip that answers neither (2026-11-14, after A#42 minutes dark) is brought up again from a reset pulse ("A chip that stops answering"), measured 2026-11-24 on a cold boot with the modem's CP running: the reset answered (reason 02) 3 ms after its first notification, discovery running A#26 ms after that notification.
+- **Held open (op 12).** A client that needs NFC with the screen off holds op 12, a call the driver keeps and never answers while NFC is wanted. Then the screen off leaves discovery running ("screen off, held open by a client").
+  - Op 13 lets every held OPEN go (answered with nothing); a client that still wants NFC open holds again, as op 9 and op 10 work.
+  - A holder that ends, any way, is dropped: the kernel watches the newest holder's end (`caller_watch`, it sets `CALLER_ENDED` in the loop's word), and `sweep` drops every holder whose process has gone (`caller_alive`) at that ring and as the screen goes off. No timer looks.
+  - At most four held, the oldest answered with nothing to make room.
+  - Nothing holds it today: Photon's tag (op 1), the sponsor's reader (op 4) and the attest screen's TAG (op 9) all follow the screen, since a tap is consent only on a lit device (AUTH.md).
+
+## A tag that did nothing at the attest screen (2026-11-24)
+
+The owner, 2026-11-24: "presenting my identity does not work on the attest screen unless I type it in ... when you wait like 30 min I think the NFC driver sleeps or something." The screen was on the whole wait.
+
+**The cause was a missing grant, not the chip.** init starts the attest screen (ahau) with 14 grants, the 14th `use nfc` (grant 80, attest with a tag). The kernel's own list for starting it again (service.rs `shell_grants`) had 13 and left 80 out. Every attest screen the kernel starts again had no NFC slot: every approve's (AUTH.md "Approve on the attest screen"), the "never stuck" one, one after a crash. With unlock at boot on, those are the only attest screens the owner meets. Its tag thread's TAG (op 9) failed at once and was asked again every second for as long as the screen stood, so the driver read the tag with no TAG held to hand it to.
+- Measured on the Pro (b1172, 09:54): an approve's attest screen (ahau started again by the kernel at 09:54:06); the driver read the owner's tag 31 times from 09:54:08 and never said "an unlock tag's UID to A#n waiting" (no TAG held); the handle typed unlocked at 09:54:13.
+- That approve was attest at boot on, which a tag never approves anyway (AUTH.md "No tags"; ahau skips a tag for that kind); every other kind was hidden the same way.
+- Fixed: grant 80 in the kernel's list (it takes effect with the kernel it is built into). ahau's tag thread now says once that it has no NFC slot and ends, never asking on a clock.
+- The 30 minutes were the time until the next approve, not a timer anywhere.
+
+**Refuted on the way: the chip's tag detector drifting.** The chip does not poll all the time. Measured on the Pro (b1172, the driver's full-poll count, ST's G#6F05 "active reader starts", which ST's HAL watches for a stuck poll, G#6F06 its end):
+- discovery started (a bring-up, a probe): a full poll at once and one about 480 ms later, then none (3 in 9 minutes, 3 in 52);
+- in between the chip only senses its antenna (its tag detector: ST's FW trace TLV G#A2, a measurement and its signed deltas, `A2 0A 08 07 FF F7 FF BA` before the owner's tag at 9 minutes, `... 00 1E 00 3D` at 52);
+- a tag's load wakes it and full polls follow (TLV G#0A, the poll frames: `52` WUPA, `05 00 08` WUPB, `26 01 00` an ISO 15693 inventory; G#1A the tag's answers); the tag read every 62 ms while held.
+- The owner's tag, screen on, the deck in front, nothing touched: read at 9 minutes and at 52 minutes of untouched discovery. So nothing restarts discovery on a clock or when a TAG is held.
+- The driver hears nothing at all while nothing is near: no interrupt, no pass (75 passes in 9 minutes, 71 in 50). A quiet console is a chip asleep in its detector, not a dead one.
+
+**PROBE (op 11) restarts discovery** (`Nfc::rediscover`: RF_DEACTIVATE to idle, then RF_DISCOVER, so the detector is set afresh). Until 2026-11-24 a probe sent RF_DISCOVER alone, which running discovery answers G#A0 (already started) and which changes nothing in the chip. A deactivation the chip refuses (not discovering) is discovery found stopped with no word, said and counted; no answer is a silent chip, brought up again from a reset pulse. Measured on the Pro (2026-11-24): the probe woke the sleeping chip (one NACK, retried), deactivated it, and discovery started with full polls again.
 
 ## A chip that stops answering (2026-11-17)
 
@@ -106,9 +139,9 @@ What the driver does since:
 - A command waits two seconds for its response, the NCI stack's command-complete timeout (libnfc-nci NFC_CMD_CMPL_TIMEOUT).
 - A command left unanswered, a bring-up that failed, and a CORE_RESET notification outside the bring-up (the chip resetting by itself, which loses its discovery) all bring the chip up again from a reset pulse (the `nfc` power switch on again: the kernel's pulse, as at the start; `Nfc::restart`), never with NCI commands alone.
 - The retry waits a second, doubling to 64 (`retry_wait`), and three doorbells retry at once: the screen coming on, a TAG held, a PROBE.
-- **PROBE (op 11)** is the doorbell for the silent case: the attest screen rings it when a finger lands while its entry is empty (`TAG_PROBE`, its own thread, so the screen never waits). The driver answers first, then sends RF_DISCOVER: G#A0 (already started) is a chip alive and discovering; a start means discovery had stopped with no word from the chip, said and counted; no answer brings the chip up again from a reset pulse.
+- **PROBE (op 11)** is the doorbell for the silent case: the attest screen rings it when a finger lands while its entry is empty (`TAG_PROBE`, its own thread, so the screen never waits). The driver answers first, then stops and starts discovery ("A tag that did nothing at the attest screen" above; until 2026-11-24 RF_DISCOVER alone, answered G#A0 and changing nothing).
 - ST's own notifications (G#6F) are counted, the last kept for STATE, and said (at most 16 in a 64 s report window).
-- STATE says whether the chip is to be brought up again, the TAGs held, discovery failures, reset pulses, probes and how many found discovery stopped, the ST notifications, and how long ago the chip last sent anything.
+- STATE says whether the chip is to be brought up again, the TAGs and OPENs held, the full polls since the bring-up and since discovery last started, whether a tag was read since, discovery failures, reset pulses, probes and how many found discovery stopped, the ST notifications, and how long ago the chip last sent anything.
 
 ## The vibration motor
 

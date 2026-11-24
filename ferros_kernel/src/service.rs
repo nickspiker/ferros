@@ -1611,8 +1611,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer, 11 use gpu, 12 a 32 MiB block of the layer arena, its own, 13 use wlan (the network page) (payloads/ahau; as init gives them: without 13 a restarted attest screen's network page said "The WiFi is starting." forever, 2026-11-10).
-        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68, 44],
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer, 11 use gpu, 12 a 32 MiB block of the layer arena, its own, 13 use wlan (the network page), 14 use nfc (attest with a tag) (payloads/ahau; as init gives them: without 13 a restarted attest screen's network page said "The WiFi is starting." forever, 2026-11-10).
+        // Without 14 a restarted attest screen never held the NFC driver's TAG, so a tag read nothing there: every approve's attest screen is one the kernel restarts (2026-11-24, the Pro: the driver read the owner's tag 31 times and no TAG was held; owner: "presenting my identity does not work on the attest screen unless I type it in").
+        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68, 44, 80],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
         // 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch (payloads/sensors).
