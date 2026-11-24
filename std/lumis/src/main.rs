@@ -24,7 +24,7 @@ use lumis_core::platform::{ConfigStore, PixelSurface};
 use lumis_core::shared_memory::SharedMemory;
 use lumis_core::ui_main_menu::MainMenu;
 use lumis_core::{CameraIdentity, CameraInfo, UserInterface};
-use lumis_core::shared_memory::{RawMode, CURRENT_MODE_IDX, CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_NANOS_IDX, HEARTBEAT_SECS_IDX, MANUAL_SAVE_BIT, SHUTTER_NS_IDX};
+use lumis_core::shared_memory::{RawMode, CURRENT_MODE_IDX, CALIBRATING_BIT, CONTINUOUS_SAVE_BIT, CURRENTLY_SAVING, FLAGS_IDX, HEARTBEAT_IDX, MANUAL_SAVE_BIT, SHUTTER_NS_IDX};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1305,7 +1305,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     // What this thread last said of the window, so each change is said once.
     let mut stay = Stay::Front;
     // The UI's heartbeat as it stood while the window was behind: until the UI draws again and moves it, the integrator would read it as a UI gone quiet past its 1.6 s and end Lumis (lumis_core integrator `process_frame`), so the frames it would integrate are passed over instead.
-    let mut quiet: Option<[u64; 2]> = None;
+    let mut quiet: Option<u64> = None;
     // Whether this camera gives slits: until an open says it does not (a driver from before the slit, a camera with no slit mode, a slit narrower or wider than the frame), Slitscan opens it for slits; after, Slitscan takes its band from whole frames, as on Android.
     let mut slit_ok = knobs & DEV_COPY == 0 && cam.mode == 0;
     // Said once at the open, as every other reason Slitscan takes whole frames is (the slit is the driver's binned mode's, so another readout of the camera, its 1:1 or a crop, has none of its own).
@@ -1598,7 +1598,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             }
             stay = now;
         }
-        let heartbeat = [integrator.header[HEARTBEAT_SECS_IDX], integrator.header[HEARTBEAT_NANOS_IDX]];
+        let heartbeat = integrator.header[HEARTBEAT_IDX];
         if behind {
             quiet = Some(heartbeat);
         } else if quiet != Some(heartbeat) {
