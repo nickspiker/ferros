@@ -12,6 +12,7 @@
 //! A fourth byte of 5 walks the exposure up past the init's frame (2026-11-17, long exposures, docs/CAMERA.md "Long exposures"): 2^m ms (the seventh byte; 6 if 0), doubling to 2^n ms (the sixth byte; 11, about 2 s, if 0), then back to 2^6 ms, the first byte frames at each step (4 if 0), each step's SET answer, the frames' spacing and mean sample, the header's exposure and the sensor's own frame length, line length and integration read back (CAPS) (`0408000500` the main; `04080005010B` the ultrawide).
 //! A fourth byte of 9 drives the driver while a long frame's MAP waits (2026-11-18, docs/CAMERA.md "Serving while a frame waits"): OPEN with the view, the exposure to 2^n s (the sixth byte; 10 if 0), a second thread MAPping, then LIST, STATS and a SET back to 67 ms timed (the frame in flight cut), the exposure long again, and the end by the seventh byte: 0 CLOSE, 1 this process ends with the MAP held, 2 it holds until killed from the host (`00000009` the main, 2^10 s, CLOSE; `00000009001C01` the main, 2^28 s, about 8.5 years, its end; `00000009001C02` the same, killed from the host).
 //! A fourth byte of 10 (G#0A) finds where the main's long exposure really ends (2026-11-18, docs/CAMERA.md "The shift's ceiling"): OPEN with the view, then each shift from the seventh byte (14 if 0) to the sixth (31 if 0) forced with an exposure of the ninth and tenth bytes' lines (u16 LE; 2^15 if 0) of 2^shift, a window of the first byte's seconds (8 if 0) for frames, the sensor's frame counter and words read back, then 67 ms again (the long frame cut), the third byte 1 the driver's plain plan instead of a forced shift (`0000000A` binned 14 to 31; `0000000A00000002` the 1:1).
+//! A fourth byte of 14 (G#0E) holds the frame (the driver's SET 5, 2026-11-23, the owner's CLIP design): OPEN with the view, then 1/30 s held (the open's exposure inside it, cut when longer), a 4 ms exposure, 1/24 s held, a 60 ms exposure (cut), 1 s held with a 600 ms exposure, the frame let go (SET 5 of 0) and a 4 ms exposure; each step's answer (status, frame and exposure now) and the frames' spacing measured from the headers' end times over their counts (`0000000E03`: the tele).
 //! A fourth byte of 13 (G#0D) sweeps the lens: the sixth and seventh bytes the first and last target's high byte (G#08 and G#78 if 0), the first byte the steps (8 if 0), each a SET, three frames let pass and one at bin 2 whose middle half's sharpness is said (`0800000D0208` the front from G#0800 to G#7800 in 8 steps).
 //! A fourth byte of 8 keeps images with their phase-detect rows as pairs (2026-11-17, docs/CAMERA.md "Phase detect as data"): the init's mode, the first byte frames to settle (16 if 0), the sixth the lens's target's high byte (G#38 if 0; FF a focus rack, G#1000 to G#7000, seven pairs), the seventh the hold of each as about 2^n s (7 if 0) while the host reads it by address (`1000000800` the main: one pair at about a metre; `1000000800FF06` the rack, each held about 64 s); the ninth byte the exposure as 2^n ms and the tenth the gain as 2^n times unity, set first (`02000008000006000E06`: 16 s at 64x, two frames to settle).
 #![no_std]
@@ -116,6 +117,10 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     if arg(3) == 13 {
         focus_sweep(g, ep, id, arg(0), arg(5), arg(6), t1);
     }
+    // A fourth byte of 14: the frame held (SET 5), its spacing measured.
+    if arg(3) == 14 {
+        frame_hold(g, ep, id, t1);
+    }
     // A fourth byte of 11: the camera ring read in place by this process's GPU queue (docs/GPU-KISTS.md "The camera ring on the GPU").
     if arg(3) == 11 {
         camera_gpu(g, ep, id, frames, t1);
@@ -192,6 +197,78 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     }
     let n = call(ep, &[4], &mut r);
     say!(g, "camtest: A#{got} frames at bin A#{bin}; the first A#{} ms after the open began; then A#{} us apart; CLOSE G#{:X}\n", first_us / 1000, if got > 1 { gaps / (got - 1) as u64 } else { 0 }, if n == ERR { 0xEEE } else { r[0] as u64 });
+    ferros_sys::exit(0)
+}
+
+/// The frame held (the fourth byte 14): OPEN camera `id` with the view, then each step a SET and its answer, frames let pass, then the frames' spacing from the MAP headers' end times (+32, Eagle ns) over their counts (+0), the header's exposure (+16) beside it.
+fn frame_hold(g: u64, ep: u64, id: u8, t1: u64) -> ! {
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    // The OPEN's answer with the view is 64 bytes (its token and shape, unused here: only the MAP headers are read).
+    let mut o = [0u8; 64];
+    let n = { let (m, l) = open_msg(id, true); call(ep, &m[..l], &mut o) };
+    say!(g, "camtest: hold: OPEN of camera A#{id} answered G#{:X} in A#{} ms\n", if n == ERR { 0xEEE } else { o[0] as u64 }, ferros_sys::us_since(t1) / 1000);
+    let mut r = [0u8; 17];
+    if n == ERR || o[0] != 0 {
+        ferros_sys::exit(1);
+    }
+    let mut held = 0xFFu8;
+    // One MAP: the newest frame's (count, end time, exposure), the buffer before it given back; None when no frame came.
+    let mut map = |held: &mut u8| -> Option<(u32, u64, u64)> {
+        let n = call(ep, &[5, *held], &mut buf[..64]);
+        if n == ERR || n < 64 {
+            return None;
+        }
+        *held = buf[40];
+        Some((u32::from_le_bytes(buf[0..4].try_into().unwrap()), u64::from_le_bytes(buf[32..40].try_into().unwrap()), u64::from_le_bytes(buf[16..24].try_into().unwrap())))
+    };
+    // (what, value, frames to let pass, frames to measure over): 5 the frame held (ns), 0 the exposure (ns).
+    let steps: [(u8, u64, u32, u32); 8] = [
+        (5, 33_333_333, 4, 32),
+        (0, 4_000_000, 4, 32),
+        (5, 41_666_667, 4, 32),
+        (0, 60_000_000, 4, 32),
+        (5, 1_000_000_000, 2, 4),
+        (0, 600_000_000, 2, 4),
+        (5, 0, 2, 4),
+        (0, 4_000_000, 4, 16),
+    ];
+    for (what, value, pass, over) in steps {
+        let mut m = [3u8, what, 0, 0, 0, 0, 0, 0, 0, 0];
+        m[2..10].copy_from_slice(&value.to_le_bytes());
+        r = [0xEE; 17];
+        let n = call(ep, &m, &mut r);
+        let (frame, exp) = (u64::from_le_bytes(r[1..9].try_into().unwrap()), u64::from_le_bytes(r[9..17].try_into().unwrap()));
+        if what == 5 {
+            say!(g, "camtest: hold: SET 5 A#{value} ns answered A#{} (A#{n} bytes): the frame now A#{frame} ns, the exposure A#{exp} ns\n", r[0]);
+        } else {
+            say!(g, "camtest: hold: SET 0 A#{value} ns answered A#{}\n", r[0]);
+        }
+        for _ in 0..pass {
+            if map(&mut held).is_none() {
+                say!(g, "camtest: hold: no frame\n");
+                let _ = call(ep, &[4], &mut r[..1]);
+                ferros_sys::exit(1);
+            }
+        }
+        let Some((c0, t0, _)) = map(&mut held) else { ferros_sys::exit(1) };
+        let mut last = (c0, t0, 0u64);
+        for _ in 0..over {
+            match map(&mut held) {
+                Some(x) => last = x,
+                None => {
+                    say!(g, "camtest: hold: no frame\n");
+                    let _ = call(ep, &[4], &mut r[..1]);
+                    ferros_sys::exit(1);
+                }
+            }
+        }
+        let frames = last.0.wrapping_sub(c0) as u64;
+        // WHY the max: two MAPs of the same count (none newer came) would divide by zero and panic the process.
+        let spacing = last.1.wrapping_sub(t0) / frames.max(1);
+        say!(g, "camtest: hold: A#{frames} frames A#{spacing} ns apart (counts A#{c0} to A#{}), the header's exposure A#{} ns\n", last.0, last.2);
+    }
+    let n = call(ep, &[4], &mut r[..1]);
+    say!(g, "camtest: hold: CLOSE G#{:X}\n", if n == ERR { 0xEEE } else { r[0] as u64 });
     ferros_sys::exit(0)
 }
 
