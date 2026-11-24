@@ -1260,6 +1260,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut last_turn = (0u64, 0u64, 0u64, 0u64, 0u64);
     // The last whole turn's GPU stack (`gpu::STACK_LOCK_US`, `STACK_JOB_US`, `STACK_GPU_US`, us, 0 when it stacked none) and how long after its frame ended (the driver's Eagle time) the driver's answer reached Lumis, us.
     let mut last_gpu = (0u64, 0u64, 0u64, 0i64);
+    // The last whole turn's split inside the integrator (lumis_core `TurnTimes`).
+    let mut last_split = lumis_core::TurnTimes::default();
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
     // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
@@ -1974,6 +1976,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                         println!("lumis: camera {}: A#{gap} of the camera's frames not taken before its frame A#{}, answered at {} us after a wait of {} us; the turn before began at {at} us and took {whole} us: the driver's answer {wait}, the integrator {integrate}, the settings and saves {after}", cam.name, head.count, turn_at + turns.wait - wait_was, turns.wait - wait_was);
                         let ((lock, job, on_gpu, age), (ui_at, ui_us)) = (last_gpu, (gpu::UI_HELD_AT.load(Ordering::Relaxed), gpu::UI_HELD_US.load(Ordering::Relaxed)));
                         println!("lumis: camera {}: that turn's frame reached Lumis {age} us after it ended, this one's {age_us} us; its stack waited {lock} us for the GPU, its job {job} us ({on_gpu} us of it on the GPU); the UI last held the GPU from {ui_at} us for {ui_us} us", cam.name);
+                        let p = last_split;
+                        println!("lumis: camera {}: that turn in the integrator: {} us in all, the frame {} us, settles done whole {} us, this turn's settle {} us for {} rows, the save check {} us", cam.name, p.whole_us, p.frame_us, p.forced_us, p.settle_us, p.settle_rows, p.save_us);
                     }
                 }
                 s.last_count = Some(head.count);
@@ -2009,6 +2013,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         turns.after += t_after.elapsed().as_micros() as u64;
         last_turn = (turn_at, ferros_clip::micros() - turn_at, turns.wait - wait_was, (t_after - t_integrate).as_micros() as u64, t_after.elapsed().as_micros() as u64);
         last_gpu = (gpu::STACK_LOCK_US.load(Ordering::Relaxed), gpu::STACK_JOB_US.load(Ordering::Relaxed), gpu::STACK_GPU_US.load(Ordering::Relaxed), age_us);
+        last_split = integrator.turn;
         frames += 1;
         turns.n += 1;
         if let Some(r) = run {
@@ -2039,6 +2044,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             let images = integrator.header[lumis_core::shared_memory::IMAGE_COUNTER_IDX] - turns.images;
             println!("lumis: camera: the sensor's period A#{period} us by the driver's clock; the driver wrote A#{} frames from the first of these 64 to the last, A#{} of them never taken; the settings and saves A#{} us a frame; A#{images} images completed; A#{} worker threads", span + 1, span + 1 - (1 << 6), turns.after / 64, rayon::current_num_threads());
             println!("lumis: camera: the last of these 64 reached Lumis A#{} us after its frame ended; its stack waited A#{} us for the GPU, its job A#{} us (A#{} us on the GPU)", last_gpu.3, last_gpu.0, last_gpu.1, last_gpu.2);
+            println!("lumis: camera: the last of these 64 in the integrator: A#{} us in all, the frame A#{} us, settles done whole A#{} us, its settle A#{} us for A#{} rows, the save check A#{} us", last_split.whole_us, last_split.frame_us, last_split.forced_us, last_split.settle_us, last_split.settle_rows, last_split.save_us);
             turns = Turns { since: Some(std::time::Instant::now()), ..Turns::default() };
         } else if turns.since.is_none() {
             turns.since = Some(std::time::Instant::now());
