@@ -1733,6 +1733,8 @@ struct Map {
     pucks_held: alloc::vec::Vec<[u8; 32]>,
     /// Kists whose last launch did not start because their capsule is not in this device's vault (the kernel's record, why `NOT_HERE`: a list restored from the fleet before its capsules came back). Never launched again by the map until the stower says a job for that capsule finished (a restore landed, a stow), never on a timer or a pass (owner's no-polling rule; the Pro, 2026-11-23: four pucks relaunched every 37 ms, each failure's bell the next launch's cause). Said once a kist as it comes. A tap is the person's own ask and still launches.
     absent: alloc::vec::Vec<[u8; 32]>,
+    /// The puck launched last and answered "started", with the kists' bell as it stood before the ask, until its outcome comes (it is alive, or the kernel's record of it is newer than the ask): no other puck is launched meanwhile (`send_pucks`), and it is not taken for ended while it starts. So attest launches each puck once, one after another (the Pro, 2026-11-23: four pucks launched 10 times in 180 ms, each bell for one of them taking the others, still starting and not yet alive, for ended).
+    puck_pending: Option<([u8; 32], u64)>,
     /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
@@ -2287,6 +2289,9 @@ impl Map {
                     self.pucks_up.push(capsule);
                 }
             }
+            if r[0] == ferros_kist::launch::STARTED {
+                self.puck_pending = Some((capsule, bell));
+            }
             return r[0];
         }
         if r[0] == ferros_kist::launch::STARTED {
@@ -2416,12 +2421,23 @@ impl Map {
             self.live = Some(live.chunks_exact(32).take(k).map(|c| c.try_into().unwrap()).collect());
         }
         // A puck that ended is up no more (2026-11-18 on the 8a: a puck stowed over its running self kept the old process, and one that ended was never started again): launched again by `send_pucks` unless it stopped on a fault, which waits for a tap on its circle, so a broken puck never runs in a loop.
+        // The puck starting settles when it is alive or the kernel kept a record of it newer than its ask (it did not start, or stopped); then the next puck may go.
+        let settled = match (self.puck_pending, self.live.as_ref()) {
+            (Some((c, bell)), live) => live.is_some_and(|l| l.contains(&c)) || records().any(|r| r[1..33] == c && u64::from_le_bytes(r[33..41].try_into().unwrap()) > bell),
+            (None, _) => false,
+        };
+        if settled {
+            self.puck_pending = None;
+        }
         if let Some(live) = self.live.as_ref() {
             let before = self.pucks_up.len();
-            self.pucks_up.retain(|c| live.contains(c));
-            if self.pucks_up.len() != before {
+            let pending = self.puck_pending.map(|p| p.0);
+            self.pucks_up.retain(|c| live.contains(c) || pending == Some(*c));
+            if self.pucks_up.len() != before || settled {
                 self.send_pucks();
             }
+        } else if settled {
+            self.send_pucks();
         }
         if self.send_states(false) && !self.app_front {
             self.draw();
@@ -2907,10 +2923,18 @@ impl Map {
         m[1] = n as u8;
         let mut r = [0u8; 1];
         call(self.display, &m[..2 + 64 * n], &mut r);
+        // One puck at a time: the next once the last one's outcome has come (`puck_pending`, settled in `kists_rang`).
+        if self.puck_pending.is_some() {
+            return;
+        }
         for i in 1..self.deck.n() {
             let Some(k) = self.kist(i) else { continue };
             if k.is_puck() && !k.unanswered() && !self.pucks_up.contains(&k.capsule) && !self.stopped.iter().any(|s| s.0 == k.capsule) && !self.pucks_held.contains(&k.capsule) && !self.absent.contains(&k.capsule) {
                 self.launch(i);
+                // Started: its outcome first. Refused (another kist starting) or running: the next bell brings this pass again.
+                if self.puck_pending.is_some() {
+                    return;
+                }
             }
         }
     }
@@ -6594,6 +6618,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         fault: None,
         stopped: alloc::vec::Vec::new(),
         absent: alloc::vec::Vec::new(),
+        puck_pending: None,
         drop: targets::Drop::default(),
         pucks_held: alloc::vec::Vec::new(),
         kists_read: 0,
