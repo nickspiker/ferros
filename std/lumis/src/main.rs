@@ -956,6 +956,17 @@ fn set(what: u8, value: u64) -> bool {
     sys::call_live(CAMERA, &m, &mut r) != sys::ERR && r[0] == 0
 }
 
+/// The camera's frame held at `period_ns` from its next frame (the camera agent's SET frame period, op 3 sub 5, forge c1ca254c; 0 lets it go): the period in force (floored to whole lines), or None when refused (below the readout's least frame, past its frame counter, or a driver from before it).
+fn set_frame(period_ns: u64) -> Option<u64> {
+    let mut m = [0u8; 10];
+    m[0] = camera::OP_SET;
+    m[1] = camera::SET_FRAME;
+    m[2..10].copy_from_slice(&period_ns.to_le_bytes());
+    let mut r = [0u8; 17];
+    let n = sys::call_live(CAMERA, &m, &mut r);
+    (n != sys::ERR && n as usize >= 9 && (r[0] == 0 || r[0] == 2)).then(|| u64::from_le_bytes(r[1..9].try_into().unwrap()))
+}
+
 /// Lumis's camera service on ferros (Android: CameraInterface.kt and CameraProcessor): open the camera, build the integrator from its list entry and first frame, then a frame at a time into the integrator, applying the settings it answers, saving what it asks to save.
 /// A camera that fails ends Lumis, as Camera2's errors end Android's camera process.
 /// Why an open gave no stream Lumis reads.
@@ -1153,6 +1164,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let focus_of = |diopters: f32| span.map_or(0, |(inf, near, nearest)| (inf as f64 + (near as f64 - inf as f64) * (diopters as f64 / nearest)).round() as u64);
     // What the sensor was last told, so a setting goes to the driver only when it changes (as CameraProcessor.updateCameraSettings).
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
+    // The frame period the camera is held at for a stacked CLIP (`set_frame`), or None (no hold); a reopen forgets it (the driver starts at its own frame).
+    let mut held: Option<u64> = None;
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
     // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
@@ -1281,6 +1294,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
             };
             sent = (-1, -1, -1.);
+            held = None;
             paced = None;
             turns = Turns::default();
             // A reopen starts the driver's count over: its frames are at their length from the first.
@@ -1389,6 +1403,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 }
             };
             sent = (-1, -1, -1.);
+            held = None;
             turns = Turns::default();
             paced_from = 0;
             reopened = Some((t_close, std::time::Instant::now()));
@@ -1418,6 +1433,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 slit_ok = false;
                 src = reopen_whole(&cam, vault.as_deref(), &mut *integrator.header);
                 sent = (-1, -1, -1.);
+                held = None;
                 turns = Turns::default();
                 paced_from = 0;
                 continue;
@@ -1749,6 +1765,33 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         if shutter_ns != sent.1 && !set(camera::SET_EXPOSURE, shutter_ns as u64) {
             println!("lumis: the camera did not take exposure {shutter_ns} ns");
+        }
+        // A stacked CLIP's cadence exact (the owner, 2026-11-23: "always floor and use that"): the camera's frame held at the exposure / n, n the whole frames of the longer of the shutter and the camera's fastest frame that fit in the exposure, so n frames fill it exactly (`set_frame`), and the integrator told n (`set_frames_held`). An exposure under two of the camera's fastest frames is one frame each, paced at the open as ever; every other mode runs at the fastest: no hold.
+        let fastest_ns = cam.line.map_or(0, |l| l.ns_of(l.fll_least));
+        let exposure_ns = (f64::from_bits(integrator.header[lumis_core::shared_memory::EXPOSURE_TIME_MS_IDX]) * 1e6) as u64;
+        let want_hold = (lumis_core::shared_memory::is_clip(&integrator.header) && !src.is_slit() && fastest_ns > 0 && exposure_ns >= 2 * fastest_ns).then(|| {
+            // WHY the maxes: a frame is never shorter than the camera's fastest; a shutter longer than the exposure (capped only while recording) is the exposure's one frame.
+            let n = (exposure_ns / (shutter_ns as u64).max(fastest_ns)).max(1);
+            (exposure_ns / n, n)
+        });
+        if want_hold.map(|h| h.0) != held {
+            held = want_hold.map(|h| h.0);
+            match want_hold {
+                Some((period, n)) => match set_frame(period) {
+                    Some(in_force) => {
+                        integrator.set_frames_held(Some(n));
+                        println!("lumis: camera {}: the frame held at {in_force} ns, {n} to the exposure of {exposure_ns} ns", cam.name);
+                    }
+                    None => {
+                        integrator.set_frames_held(None);
+                        println!("lumis: camera {}: the camera held no frame of {period} ns (a driver from before the hold, or outside its range): the cadence follows the frames", cam.name);
+                    }
+                },
+                None => {
+                    set_frame(0);
+                    integrator.set_frames_held(None);
+                }
+            }
         }
         if focus != sent.2 && span.is_some() && !set(camera::SET_FOCUS, focus_of(focus)) {
             println!("lumis: the camera did not take focus G#{:X}", focus_of(focus));

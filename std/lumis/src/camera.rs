@@ -79,6 +79,8 @@ pub const SET_EXPOSURE: u8 = 0;
 pub const SET_GAIN: u8 = 1;
 /// The lens actuator's position, in the camera's own range (`focus_min`..=`focus_max`).
 pub const SET_FOCUS: u8 = 2;
+/// The frame period, ns, held from the next frame (the camera agent, forge c1ca254c: a stacked clip's cadence exact); 0 lets it go. Its reply: [status][period in force ns u64][exposure in force ns u64], status 0 held, 2 held with the exposure cut to fit, 1 refused.
+pub const SET_FRAME: u8 = 5;
 
 /// Unity gain in [`SET_GAIN`] and a frame's `gain`.
 pub const GAIN_UNITY: u32 = 1 << 10;
