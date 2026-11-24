@@ -28,3 +28,5 @@ ferros_lang = { path = "../../ferros_lang", features = ["process"] }
 ferros_glow = { path = "../../ferros_glow" }
 # Attest to approve (docs/AUTH.md "Approve on the attest screen"): the requests the settings pages ask the kernel for, and the "require attest" guards.
 ahau_core = { path = "../../ahau_core" }
+# The Security page as one model with Photon (fgtw::security; owner, 2026-11-24: "so ferros and Photon render the same"): its rows, their order, confirmations and words.
+fgtw = { path = "../../../fgtw", default-features = false, features = ["security"] }

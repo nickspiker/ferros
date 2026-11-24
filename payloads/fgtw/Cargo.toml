@@ -14,7 +14,7 @@ ferros_sys = { path = "../../ferros_sys" }
 ahau_core = { path = "../../ahau_core" }
 ferros_heap = { path = "../../ferros_heap", features = ["process"] }
 photon_core = { path = "../../photon_core" }
-fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow", "profile"] }
+fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow", "profile", "security"] }
 # Photon Transport names a frame by its BLAKE3 when it answers a send (depart.rs, route.rs): the same pure build photon_core takes.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }

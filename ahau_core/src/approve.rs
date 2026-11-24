@@ -26,6 +26,22 @@ pub const START_INTO: u8 = 7;
 pub const DEVELOPER: u8 = 8;
 /// Bind a new device to the identity (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"): approved here, the add flow opened by the identity service once it holds the roots again, which takes the approval from the kernel as it opens it (one approve, one opening).
 pub const FLEET_ADD: u8 = 9;
+/// Shred this device's copy of the identity (fgtw::security, the Security page; owner, 2026-11-24): its keys destroyed and its data deleted, the device staying in the fleet so the next attest brings everything back from it. Approved here, carried out by the identity service, which the kernel lets erase only with this approval held (SYS_UNLOCK op 15, the shred bit); the device restarts at the attest screen.
+pub const SHRED: u8 = 10;
+/// Revoke another device of the fleet (fgtw::security): the number is the first seven bytes of its key, big-endian (`device_arg`). Approved here, carried out by the identity service, which takes the approval and signs the chain's Lock op, the worker's refusal and a fresh fleet key without it.
+pub const REVOKE: u8 = 11;
+/// Reinstate a revoked device of the fleet: the number as for `REVOKE`. Carried out by the identity service as a revoke is.
+pub const REINSTATE: u8 = 12;
+
+/// A device's request number: the first seven bytes of its key, big-endian, which fit a request's number (`ARG_MAX`). Seven bytes name one device among a fleet's members (a collision among them is a 2^-56 chance a pair); the identity service matches it against the fold and acts only on a single match.
+pub const fn device_arg(key: &[u8; 32]) -> u64 {
+    u64::from_be_bytes([0, key[0], key[1], key[2], key[3], key[4], key[5], key[6]])
+}
+
+/// Whether `key` is the device a request number names.
+pub const fn device_is(arg: u64, key: &[u8; 32]) -> bool {
+    device_arg(key) == arg
+}
 
 /// The "require attest" guards (each a bit of the device setting `guards`, kept in the device's settings document): which setting each protects.
 /// Turning a guard on needs nothing (tightening is always safe); turning it off is an approve (`GUARD_OFF`); while it is on, changing its setting is an approve too.
@@ -65,7 +81,8 @@ impl Request {
     /// The kernel checks again what only it can know (a cap the battery takes, Android allowed here).
     pub const fn new(kind: u8, arg: u64) -> Option<Request> {
         let ok = match kind {
-            ATTEST_AT_BOOT_ON | ATTEST_AT_BOOT_OFF | ANDROID_ON | REMOVE_DEVICE | DEVELOPER | FLEET_ADD => arg == 0,
+            ATTEST_AT_BOOT_ON | ATTEST_AT_BOOT_OFF | ANDROID_ON | REMOVE_DEVICE | DEVELOPER | FLEET_ADD | SHRED => arg == 0,
+            REVOKE | REINSTATE => arg <= ARG_MAX,
             GUARD_OFF => guard::known(arg),
             // A cap in mV: the battery's own range is the kernel's check (process.rs `charge_cv_ok`); here only that it is a number a word carries.
             CHARGE_CAP => arg != 0 && arg <= ARG_MAX,
@@ -86,9 +103,9 @@ impl Request {
     }
 
     /// Whether the kernel carries the change out itself at the approve's unlock.
-    /// The others (the removal, developer mode, the add flow's opening) are carried out by a process, which the kernel lets act only while the approval is held for it (`kernel` false: held until taken or until the next lock).
+    /// The others (the removal, developer mode, the add flow's opening, a shred, a revoke, a reinstatement) are carried out by a process, which the kernel lets act only while the approval is held for it (`kernel` false: held until taken or until the next lock).
     pub const fn kernel(self) -> bool {
-        !matches!(self.kind, REMOVE_DEVICE | DEVELOPER | FLEET_ADD)
+        !matches!(self.kind, REMOVE_DEVICE | DEVELOPER | FLEET_ADD | SHRED | REVOKE | REINSTATE)
     }
 
     /// The guard this request is the change of, when it is a guarded setting's: changing it needs the approve only while that guard is on.
@@ -107,6 +124,22 @@ mod tests {
     use super::*;
 
     /// Every request a settings page makes reads back from its word as it was made.
+    const G: u8 = 167;
+
+    /// A device key's number names it and no other key with other first seven bytes.
+    #[test]
+    fn device_numbers() {
+        let mut k = [G; 32];
+        assert!(device_is(device_arg(&k), &k));
+        assert!(device_arg(&k) <= ARG_MAX);
+        let a = device_arg(&k);
+        k[6] ^= 1;
+        assert!(!device_is(a, &k));
+        k[6] ^= 1;
+        k[7] ^= 1;
+        assert!(device_is(a, &k), "the eighth byte on is not in the number");
+    }
+
     #[test]
     fn word_round_trip() {
         let all = [
@@ -122,6 +155,9 @@ mod tests {
             Request { kind: START_INTO, arg: 1 },
             Request { kind: DEVELOPER, arg: 0 },
             Request { kind: FLEET_ADD, arg: 0 },
+            Request { kind: SHRED, arg: 0 },
+            Request { kind: REVOKE, arg: device_arg(&[G; 32]) },
+            Request { kind: REINSTATE, arg: ARG_MAX },
         ];
         for r in all {
             assert_eq!(Request::new(r.kind, r.arg), Some(r));
@@ -133,11 +169,13 @@ mod tests {
     #[test]
     fn refused() {
         assert_eq!(Request::from_word(0), None);
-        for kind in [NONE, 10, 255] {
+        for kind in [NONE, 13, 255] {
             assert_eq!(Request::new(kind, 0), None, "{kind}");
         }
         assert_eq!(Request::new(ATTEST_AT_BOOT_ON, 1), None);
         assert_eq!(Request::new(REMOVE_DEVICE, 7), None);
+        assert_eq!(Request::new(SHRED, 1), None);
+        assert_eq!(Request::new(REVOKE, ARG_MAX + 1), None);
         assert_eq!(Request::new(GUARD_OFF, 3), None);
         assert_eq!(Request::new(GUARD_OFF, 64), None);
         assert_eq!(Request::new(GUARD_OFF, u64::MAX), None);
@@ -167,6 +205,9 @@ mod tests {
         assert!(!Request::new(REMOVE_DEVICE, 0).unwrap().kernel());
         assert!(!Request::new(FLEET_ADD, 0).unwrap().kernel());
         assert!(!Request::new(DEVELOPER, 0).unwrap().kernel());
+        assert!(!Request::new(SHRED, 0).unwrap().kernel());
+        assert!(!Request::new(REVOKE, 5).unwrap().kernel());
+        assert!(!Request::new(REINSTATE, 5).unwrap().kernel());
         for kind in [ATTEST_AT_BOOT_ON, ATTEST_AT_BOOT_OFF, ANDROID_ON] {
             assert!(Request::new(kind, 0).unwrap().kernel());
         }

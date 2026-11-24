@@ -719,6 +719,12 @@ messages! {
     BindDevice,
     /// What that approve approves: two lines.
     ApproveFleetAdd,
+    /// What the Security page's approves approve (fgtw::security; owner, 2026-11-24): shred this device's copy of the identity, revoke and reinstate another device of the fleet. Two lines each, as the others.
+    ApproveShred,
+    ApproveRevoke,
+    ApproveReinstate,
+    /// The attest screen while an approved shred runs: the person's data erased here, then the restart.
+    ShreddingDevice,
     /// The button while a network is being joined.
     JoiningButton,
     Join,

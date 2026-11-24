@@ -542,6 +542,47 @@ impl Client {
     }
 
     /// Ours to every fleet device heard, when it moved since they last had it.
+    /// After this device rotated the fleet key itself (a revoke, security.rs): the person key sealed again under the new key (`space_person`, fgtw::person::settle re-seals a shrink), then the space sealed under it and pushed to the fleet and to fgtw.org at once, over fgtw.org's stored copy (`prev`). No device keeps a key once it is replaced (fgtw::fanout: no chain of keys), so nothing may stay sealed under the one before. True when fgtw.org took it; false when the space is not in hand yet (its first pull is not done) or fgtw.org refused, and the next push seals it under the new key.
+    pub(crate) fn space_reseal(&mut self) -> bool {
+        if !self.space.settled {
+            return false;
+        }
+        // Our own rotation: whatever copy was held back as sealed under another key is not ours to wait for.
+        self.space.held = None;
+        self.space_person();
+        // The fleet's devices get it whatever they hold: the digest they were last sent is forgotten.
+        self.space.fleet_digest = [0; 32];
+        self.space_to_fleet();
+        let Some((hp, _)) = self.space_ready() else { return false };
+        let Some(sealed) = self.space_sealed() else { return false };
+        fgtw::set_clock(eagle());
+        let seen = {
+            let s = self.seed();
+            fgtw::client::pull_space_seen(&s, &hp).ok().flatten().map(|(_, d)| d)
+        };
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
+        let r = {
+            let s = self.seed();
+            fgtw::client::push_space_prev(&s, &hp, &self.keys, &sealed, seen.as_ref())
+        };
+        ferros_sys::pin(0);
+        match r {
+            Ok(()) => {
+                self.space.seed_digest = self.space.space.digest();
+                self.log.put(b"fgtw: space: sealed again under the new fleet key; fgtw.org holds it");
+                self.log.line();
+                true
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: space: fgtw.org did not take the copy sealed under the new key: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+                false
+            }
+        }
+    }
+
     pub(crate) fn space_to_fleet(&mut self) {
         let digest = self.space.space.digest();
         if digest == self.space.fleet_digest {

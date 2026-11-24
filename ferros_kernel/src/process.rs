@@ -5543,12 +5543,13 @@ fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
 /// - 8 forget (x2 the first `TAG_SHOWN` bytes of a tag's id as op 9 gives them, x3 that length; x3 0: every tag) → how many went;
 /// - 9 list (x2 a buffer, x3 its length) → how many tags are kept, as many `TAG_ENTRY` entries written as the buffer holds whole.
 /// Ops 7-9 are also a Settings holder's (the settings page keeps tags and holds no right to unlock); none acts while nobody is present.
-/// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"), SYS_UNLOCK ops 16 to 20. Under the kernel lock.
+/// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"), SYS_UNLOCK ops 16 to 21. Under the kernel lock.
 /// 16 ask (the Settings right, never a kist): x2 a request's word; taken only while a person is present on a bound device and none waits, with what only the kernel knows checked (a cap the battery takes, Android allowed here for starting into it); the identity locked at once (`unlock` op 2: its keys dropped, the identity service's bell rung) and the attest screen started again over everything (`APPROVE_RESTART`), which shows what is asked. → 0, ERR refused.
 /// 17 the request waiting (Unlock or Settings): its word, 0 none.
 /// 18 is no op (Decline until it was removed, 2026-11-24): ERR.
 /// 19 the "require attest" guards (Settings; reading also Unlock): x2 0 their bits; x2 1 guard x3 on, kept in the device's settings document (no attest: tightening is always safe) → the bits after. Off is an approve (op 16, GUARD_OFF).
 /// 20 take an approval of kind x2 that a process carries out itself (Settings or Unlock): the approved word (the kernel holds it no longer; x3 1 only looks, leaving it held for the process that takes it), NOTHING while it waits on the attest screen, 0 neither.
+/// 21 lock (Settings, never a kist; fgtw::security, the Security page): the identity locked and the attest screen started again, as an ask does, with no request. Only while a person is present. → 0, ERR nobody present.
 fn approve_syscall(p: &Process, f: &Frame) -> u64 {
     use ahau_core::approve::{self, Request};
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
@@ -5577,6 +5578,18 @@ fn approve_syscall(p: &Process, f: &Frame) -> u64 {
             APPROVE_RESTART.store(true, Release);
             crate::flashlog::line(&alloc::format!("approve: asked (kind A#{}, A#{}); the identity locked, the attest screen comes up to approve it", req.kind, req.arg));
             // The service loop starts the attest screen again (`approve_restart_take`).
+            unsafe { core::arch::asm!("sev") };
+            0
+        }
+        // 21, lock (fgtw::security, the Security page's lock; owner, 2026-11-24): the identity locked at once and the attest screen started again over everything, as an approve's ask does, with nothing asked. It only tightens, so it needs no approve. Only while a person is present (and so no request waits).
+        21 if settings && !p.kist => {
+            if unlock(0, None).unwrap_or(0) & 1 != 1 {
+                return ERR;
+            }
+            APPROVED.store(0, Release);
+            let _ = unlock(2, None);
+            APPROVE_RESTART.store(true, Release);
+            crate::flashlog::line("lock: asked on the Security page; the identity locked, the attest screen comes up");
             unsafe { core::arch::asm!("sev") };
             0
         }
@@ -7217,15 +7230,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
-        // Attest to approve, ops 16 to 20 (`approve_syscall`).
-        SYS_UNLOCK if (16..=20).contains(&f.x[1]) => {
+        // Attest to approve, ops 16 to 20, and the plain lock, op 21 (`approve_syscall`).
+        SYS_UNLOCK if (16..=21).contains(&f.x[1]) => {
             f.x[0] = approve_syscall(p, f);
             // An ask locked the identity.
             identity_bell();
             0
         }
         // Op 15, remove this device from its identity (AUTH.md "Remove this device"; owner, 2026-11-22: press remove, type the handle, unbind; the fleet told at once, then the identity's data erased and the killswitch's power off). Only the identity service (`fgtw` by name, never a kist), which tells the fleet before it asks.
-        // x2 a buffer in the caller's arc: in, [flags u8: bit 0 a dry run][the typed handle's seed 32][each kist the person has, (developer 32, option 32)]; x3 its length; x4 its room. Out, written over it: a dry run's account (lines of text, `remove_dry_text`), else nothing.
+        // x2 a buffer in the caller's arc: in, [flags u8: bit 0 a dry run, bit 1 a shred (no departure; the SHRED approval; a restart, not the power off)][the typed handle's seed 32][each kist the person has, (developer 32, option 32)]; x3 its length; x4 its room. Out, written over it: a dry run's account (lines of text, `remove_dry_text`), else nothing.
         // A removal: the seed must be the person present's (service.rs op 18, compared in registers); then each kist's own domain is stamped for a drop in the vault process while the person's keys still exist, and op 19 releases (op 4's release: every scope's domain of the person's dropped, the kernel's identity class, tags, bound mark and kept seed deleted, the device-only secret renewed, the lock) and powers the device off once the drops are sent. → 1 removed, 0 the seed is not the person present's (nothing changed), ERR nobody present, no right, or a buffer of another shape. A dry run → the account's whole length (what fits is written); nothing changed, no seed needed.
         SYS_UNLOCK if f.x[1] == 15 => {
             let token = p.read(f.x[0], 32);
@@ -7247,17 +7260,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         seed.copy_from_slice(&msg[1..33]);
                         let m = unlock(18, Some(&seed));
                         crate::keys::wipe_to_dram(&mut seed);
-                        // The person approved this removal on the attest screen (ahau_core::approve::REMOVE_DEVICE, owner 2026-11-24): taken now, so one approve removes once; without it nothing changes.
-                        let approved = matches!(m, Ok(1)) && APPROVED.compare_exchange(ahau_core::approve::Request { kind: ahau_core::approve::REMOVE_DEVICE, arg: 0 }.word(), 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_ok();
+                        // Flag bit 1: a shred (fgtw::security; owner, 2026-11-24), the same erase without a departure, held by its own approval (ahau_core::approve::SHRED), ending in a restart at the attest screen instead of the power off: the device stays in its fleet and the next attest brings everything back.
+                        let shred = msg[0] & 2 == 2;
+                        let kind = if shred { ahau_core::approve::SHRED } else { ahau_core::approve::REMOVE_DEVICE };
+                        // The person approved this removal or shred on the attest screen (ahau_core::approve::REMOVE_DEVICE or SHRED, owner 2026-11-24): taken now, so one approve erases once; without it nothing changes.
+                        let approved = matches!(m, Ok(1)) && APPROVED.compare_exchange(ahau_core::approve::Request { kind, arg: 0 }.word(), 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_ok();
                         if matches!(m, Ok(1)) && !approved {
-                            crate::flashlog::line("identity remove refused: no approve on the attest screen held for it; nothing changed");
+                            crate::flashlog::line(if shred { "identity shred refused: no approve on the attest screen held for it; nothing changed" } else { "identity remove refused: no approve on the attest screen held for it; nothing changed" });
                         }
                         match m {
                             Ok(1) if !approved => ERR,
                             Ok(1) => {
                                 // Each kist's own domain of the person's, stamped while their keys still exist (the release locks them).
                                 let mut drops: Vec<Vec<u8>> = kist_domains(&msg[33..]).iter().filter_map(|d| stamp(VOP_DROP, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], &[], &[])).collect();
-                                match unlock(19, None) {
+                                // 19 the removal's release and power off; 4 a shred's, the release and a restart (service.rs `RELEASE_RESET`).
+                                match unlock(if shred { 4 } else { 19 }, None) {
                                     Ok(_) => {
                                         crate::service::release_drops_add(drops);
                                         1
@@ -7271,7 +7288,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 }
                             }
                             Ok(_) => {
-                                crate::flashlog::line("identity remove refused: the handle typed is not the person present's; nothing changed");
+                                crate::flashlog::line(if shred { "identity shred refused: the handle typed is not the person present's; nothing changed" } else { "identity remove refused: the handle typed is not the person present's; nothing changed" });
                                 0
                             }
                             Err(()) => ERR,

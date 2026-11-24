@@ -29,6 +29,8 @@ mod facets;
 mod kept;
 mod remove;
 mod route;
+/// The Security page's acts carried out here (fgtw::security): shred (op 33 [2]), revoke and reinstate (approved on the attest screen, taken from the kernel), and the page's line (op 41).
+mod security;
 mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
@@ -629,6 +631,10 @@ struct Client {
     members: Vec<[u8; 32]>,
     /// Remove this device under way (op 33, remove.rs): told the fleet, then the erase and the power off.
     removing: Option<remove::Removing>,
+    /// The Security page's last act carried out here, for its line (op 41, security.rs).
+    sec: Option<security::Sec>,
+    /// Roots were handed in since an approved revoke or reinstatement was last looked for: looked for once, as soon as this device is a bound member holding the fleet key (`security_step`).
+    sec_check: bool,
     /// The chain's ops said on the console so far (`note_members`): its whole history the first time this run adopts one, then each op added after.
     chain_seen: usize,
     pt: Pt,
@@ -1620,13 +1626,15 @@ impl Client {
         }
         // WHY the cap: the reply's count is one byte and the Fleet page lays out at most 16 rows.
         let n = self.members.len().min(16);
+        let locked = self.fleet_locked();
         let mut r = Vec::with_capacity(1 + n * (9 + 1 + 36));
         r.push(n as u8);
         for k in &self.members[..n] {
             r.extend_from_slice(&k[..8]);
-            // Bit 0 this device; bit 1 heard on this network (a fleet device beaconing, `sponsors`, online).
+            // Bit 0 this device; bit 1 heard on this network (a fleet device beaconing, `sponsors`, online); bit 2 revoked (the chain locked it out; the Security page offers reinstate); bit 3, on this device's row, this device holds the fleet key (a revoke mints the next one).
             let heard = self.sponsors.iter().any(|s| s.online && s.key == *k);
-            r.push((*k == self.me) as u8 | (heard as u8) << 1);
+            let revoked = locked.contains(k);
+            r.push((*k == self.me) as u8 | (heard as u8) << 1 | (revoked as u8) << 2 | ((*k == self.me && self.fleet_key.is_some()) as u8) << 3);
         }
         // The names after the rows, one `[length][UTF-8]` per row in the same order: the two-word name every device of this fleet computes for a member (`fgtw::pair::device_name_default`, the one Photon's Fleet page and pairing screen show), length 0 when there is no identity seed to compute it with. A reader that knows only the rows stops before them.
         for k in &self.members[..n] {
@@ -2479,6 +2487,21 @@ impl Client {
                     continue;
                 }
                 // 33: remove this device (remove.rs; owner, 2026-11-22: press remove, type the handle, unbind), [33][0][the typed handle's seed 32][its memory-hard proof 32] from the attest screen, once the person approved the removal there (owner, 2026-11-24; the kernel erases only with that approve held) → [0 started, 1 not a member of a fleet, 4 the identity's last device, 6 not this identity's handle, 7 the kernel cannot remove (nothing told), else the departure's refusal]; the seed wiped from the message here. [33][1] the dry run (no handle): every check and what each step would take, on the console, nothing changed → [0 said, 1 no identity in hand].
+                // [33][2][the typed handle's seed 32]: shred, approved on the attest screen (security.rs; ahau_core::approve::SHRED) → [0 erasing then the restart, 6 not this identity's handle, 7 the kernel refused, 8 a removal under way]; the seed wiped from the message here.
+                if got >= 34 && req[0] == 33 && req[1] == 2 {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&req[2..34]);
+                    wipe(&mut req[2..34]);
+                    let r = [self.shred_start(&mut seed)];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                // 41: the Security page's line (security.rs) → [phase: 0 none, 2 running, 3 done, 4 failed][ahau_core::approve kind][the device's first 8 bytes].
+                if n >= 1 && req[0] == 41 {
+                    let r = self.security_reply();
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 2 && req[0] == 33 {
                     let r = if req[1] & 1 == 1 {
                         self.remove_dry()
@@ -2698,6 +2721,8 @@ impl Client {
                     // The departure and add machines, made with these roots: a departure or an add kept from before a restart is taken up now (with unlock-at-boot off, nothing of the identity is on disk at `load`).
                     self.depart_start();
                     self.add_start();
+                    // An approve's lock hands the roots in again: an approved revoke or reinstatement the kernel holds is looked for once, when this device holds the fleet key (security.rs).
+                    self.sec_check = true;
                 }
                 // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, 4 the identity's last device, else why not (depart.rs `leave`)], then the state (8 leaving).
                 if n >= 2 && req[0] == 5 {
@@ -2742,6 +2767,8 @@ impl Client {
             self.depart_work();
             // A removal under way (remove.rs): told, then the erase.
             self.remove_step(t);
+            // An approved revoke or reinstatement (security.rs), looked for once after the roots came back.
+            self.security_step();
             lap.mark(b"depart_work");
             busy |= self.facets_now(&mut lap);
             // Sponsoring (add.rs): the radios listening for newcomers and for a departure's tap, the add machine's deadline, and its slow work (signing, the registry's read, the bind, the grow), here in the loop and never inside a call another process waits on.
@@ -2942,6 +2969,7 @@ impl Client {
         v.extend_from_slice(&self.add_reply());
         v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
+        v.extend_from_slice(&self.security_reply());
         // The People page: an add's outcome and every person (a change made here, or merged from another device), all of them however many (op 25's reply stops at 255).
         let people = ferros_space::people(&self.space.space);
         v.push(self.facets.state);
@@ -3100,7 +3128,7 @@ extern "C" fn work(_: u64) -> ! {
     // What peers' transfers may hold here (photon_core `bound_inbound`): a SPEC asks up to 4 MiB and its buffer is made whole at once, a sender has 26 letters, and this heap is 8 MiB. The largest frame this service takes is a fleet chain (A#225840 bytes at 30 ops on the Pro, 2026-11-22, about 7.5 KB an op), so 2 MiB for one leaves room for about 270 ops, and half the heap for all in flight together.
     pt.bound_inbound(IN_MOST, IN_BUDGET);
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, unhandled_said: Vec::new(), lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new(), capsules: capsule::Capsules::default() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, fleet_rev: 0, unhandled_said: Vec::new(), lock_epoch: 0, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), join_confirmed: false, request: None, request_posted: 0, registry_asked: false, registry_due_us: 0, radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), removing: None, sec: None, sec_check: false, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, chain_held: Vec::new(), verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), depart_shown: false, listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, entry_net: Vec::new(), space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new(), capsules: capsule::Capsules::default() };
     c.run()
 }
 

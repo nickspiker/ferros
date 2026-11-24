@@ -566,6 +566,11 @@ struct Fleet {
     me: [bool; 16],
     /// Each member heard on this network (fgtw op 6, flag bit 1).
     heard: [bool; 16],
+    /// Each member revoked (fgtw op 6, flag bit 2: the chain has it locked out), and whether this device holds the fleet key (bit 3 on its own row): the Security page's rows (fgtw::security).
+    revoked: [bool; 16],
+    holds_key: bool,
+    /// The Security page's line from the identity service (fgtw op 41, payloads/fgtw security.rs): the phase (0 none, 2 running, 3 done, 4 failed), ahau_core::approve's kind, the device's first 8 bytes.
+    sec: (u8, u8, [u8; 8]),
     /// Each member's two-word device name (fgtw op 6's names), `names_n` bytes of it; 0 when the service gave none, and the row shows the key prefix instead.
     names: [[u8; NAME_BYTES]; 16],
     names_n: [u8; 16],
@@ -602,7 +607,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], revoked: [false; 16], holds_key: false, sec: (0, 0, [0; 8]), names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -653,6 +658,7 @@ impl Fleet {
                 self.keys[i].copy_from_slice(&m[1 + i * 9..9 + i * 9]);
                 self.me[i] = m[9 + i * 9] & 1 == 1;
                 self.heard[i] = m[9 + i * 9] & 2 == 2;
+                self.revoked[i] = m[9 + i * 9] & 4 == 4;
                 self.names_n[i] = 0;
             }
             // The names after the rows (`[length][UTF-8]` each, in row order). WHY the checks: the lengths are another process's words; a name that would run past what the reply holds or what a slot keeps ends the reading, and the rows from there show their key prefix.
@@ -670,7 +676,11 @@ impl Fleet {
                 at += 1 + len;
             }
             self.n = cnt;
+            self.holds_key = (0..cnt).any(|i| self.me[i] && m[9 + i * 9] & 8 == 8);
         }
+        // The Security page's line (op 41).
+        let mut q = [0u8; 10];
+        self.sec = if ferros_sys::call_live(svc, &[41], &mut q) == 10 { (q[0], q[1], [q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9]]) } else { (0, 0, [0; 8]) };
         self.poll_add(svc);
         // The person's people (op 36, every page), for the People page.
         if let Some(p) = People::fetch(svc, None) {
@@ -1088,6 +1098,12 @@ enum Choice {
     PersonPick(u8, u32),
     /// The Fleet page's "unbind this device" (until 2026-11-24 "remove this device"): an approve on the attest screen, then the departure and the erase.
     FleetRemove,
+    /// The Security page's rows (fgtw::security, shared with Photon): lock (no approve), revoke and reinstate a member by its row in the fleet list, shred and unbind (each an approve on the attest screen).
+    SecLock,
+    SecRevoke(u8),
+    SecReinstate(u8),
+    SecShred,
+    SecUnbind,
     /// The Fleet page's add flow (fgtw::sponsor through payloads/fgtw ops 8-15): open it, pick a device heard nearby (its row), type the newcomer's words (on the attest screen's keyboard, ahau), confirm a nearby pick turned green, close it.
     FleetAdd,
     FleetPick(u8),
@@ -3874,6 +3890,50 @@ impl Map {
                 radios(self, b, &mut y, &["Dvorak", "QWERTY"], now_l as usize, &|i| Choice::Layout(i as u8));
             }
             "security" => {
+                // The shared rows first, as Photon draws them (fgtw::security; owner, 2026-11-24: "so ferros and Photon render the same"): lock, each other device (revoke or reinstate), shred, unbind this device; then ferros's own, attest at boot.
+                let (facts_others, n) = self.sec_others();
+                let facts = self.sec_facts(&facts_others[..n]);
+                rows(self, b, &mut y, note, dim(), fleet(fgtw::security::intro(&facts)).as_str());
+                y += uu(1, 2);
+                for r in fgtw::security::rows(&facts) {
+                    if let Some(l) = r.lead {
+                        rows(self, b, &mut y, note, dim(), fleet(l).as_str());
+                    }
+                    let i = match r.act {
+                        fgtw::security::Act::Revoke(k) | fgtw::security::Act::Reinstate(k) => (0..self.fleet.n).find(|&i| self.fleet.keys[i] == k[..8]),
+                        _ => None,
+                    };
+                    if let Some(i) = i {
+                        let name = core::str::from_utf8(&self.fleet.names[i][..self.fleet.names_n[i] as usize]).unwrap_or("");
+                        if let Some(l) = r.line(name) {
+                            row(self, b, &mut y, small, white(), fleet(l).as_str(), None);
+                        }
+                    }
+                    let choice = match r.act {
+                        fgtw::security::Act::Lock => Some(Choice::SecLock),
+                        fgtw::security::Act::Revoke(_) => i.map(|i| Choice::SecRevoke(i as u8)),
+                        fgtw::security::Act::Reinstate(_) => i.map(|i| Choice::SecReinstate(i as u8)),
+                        fgtw::security::Act::Shred => Some(Choice::SecShred),
+                        fgtw::security::Act::Unbind => Some(Choice::SecUnbind),
+                        fgtw::security::Act::Wipe => None,
+                    };
+                    // A disabled row is drawn and takes no press (fgtw::security::Row::enabled), its note saying why.
+                    button(self, b, &mut y, fleet(r.button(false)).as_str(), false, if r.enabled { choice } else { None });
+                    if let Some(t) = r.note {
+                        rows(self, b, &mut y, note, dim(), fleet(t).as_str());
+                    }
+                    if let Some(t) = r.warn {
+                        rows(self, b, &mut y, note, white(), fleet(t).as_str());
+                    }
+                    y += uu(1, 2);
+                }
+                // The identity service's line for a revoke, a reinstatement or a shred it carried out (op 41).
+                if let Some((st, name)) = self.sec_status() {
+                    if let Some(m) = st.msg(name.as_str()) {
+                        rows(self, b, &mut y, small, white(), fleet(m).as_str());
+                    }
+                }
+                y += uu(1, 1);
                 // Unlock at boot: off by default. Turning it on asks for the person's handle again (the retype gate, AUTH.md "Unlock at boot": a stolen device then holds the identity, and a tap alone is a toddler's); off is one tap.
                 let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
                 // A checkbox; its words say attest, as the attest screen does (owner, 2026-11-10: "always attest").
@@ -5447,6 +5507,88 @@ impl Map {
     }
 
     /// Ask the kernel for an approve on the attest screen (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): it keeps the request, locks the device at once and puts the attest screen up over everything, showing what is asked; the handle typed there applies exactly it. A request the kernel does not take is said on the console.
+    /// The fleet's other members as the Security page shows them (fgtw::security::Other), from the Fleet page's copy (fgtw op 6): the map holds the first 8 bytes of each key, which is all a revoke's approve names (seven of them, ahau_core::approve::device_arg); the rest are zero.
+    fn sec_others(&self) -> ([fgtw::security::Other; 16], usize) {
+        let mut o = [fgtw::security::Other { key: [0; 32], revoked: false }; 16];
+        let mut n = 0;
+        for i in 0..self.fleet.n {
+            if self.fleet.me[i] {
+                continue;
+            }
+            o[n].key[..8].copy_from_slice(&self.fleet.keys[i]);
+            o[n].revoked = self.fleet.revoked[i];
+            n += 1;
+        }
+        (o, n)
+    }
+
+    /// What the page knows: a person is present (the map runs only then), a member (fgtw state 2 or 3), holding the fleet key, leaving (state 8, or a departure just sent).
+    fn sec_facts<'a>(&self, others: &'a [fgtw::security::Other]) -> fgtw::security::Facts<'a> {
+        let f = &self.fleet;
+        fgtw::security::Facts { present: true, member: matches!(f.state, Some(2 | 3)), fleet_key: f.holds_key, leaving: f.state == Some(8) || f.sent, others }
+    }
+
+    /// The identity service's line (op 41) as fgtw::security's status, with the name of the device it names.
+    fn sec_status(&self) -> Option<(fgtw::security::Status, Line)> {
+        let (phase, kind, dev) = self.fleet.sec;
+        let phase = match phase {
+            2 => fgtw::security::Phase::Running,
+            3 => fgtw::security::Phase::Done,
+            4 => fgtw::security::Phase::Failed,
+            _ => return None,
+        };
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&dev);
+        let act = match kind {
+            ahau_core::approve::REVOKE => fgtw::security::Act::Revoke(key),
+            ahau_core::approve::REINSTATE => fgtw::security::Act::Reinstate(key),
+            ahau_core::approve::SHRED => fgtw::security::Act::Shred,
+            _ => return None,
+        };
+        let mut name = Line::new();
+        if let Some(i) = (0..self.fleet.n).find(|&i| self.fleet.keys[i] == dev) {
+            name.s(core::str::from_utf8(&self.fleet.names[i][..self.fleet.names_n[i] as usize]).unwrap_or(""));
+        }
+        if name.as_str().is_empty() {
+            let _ = write!(name, "{}", fleet(FleetMsg::ADevice).as_str());
+        }
+        Some((fgtw::security::Status { act, phase }, name))
+    }
+
+    /// A press on the Security page, through fgtw::security's page (the same one Photon's draws): a lock at once, an identity act as the approve on the attest screen (the device locks at once; the handle typed there applies exactly this act). The kernel carries the approve across the lock and the identity service the act, so the page's own state keeps no act asked (the line comes back from op 41).
+    fn sec_press(&mut self, c: Choice) {
+        let (others, n) = self.sec_others();
+        let rows = fgtw::security::rows(&self.sec_facts(&others[..n]));
+        let key = |i: u8| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&self.fleet.keys[i as usize]);
+            k
+        };
+        let act = match c {
+            Choice::SecLock => fgtw::security::Act::Lock,
+            Choice::SecRevoke(i) => fgtw::security::Act::Revoke(key(i)),
+            Choice::SecReinstate(i) => fgtw::security::Act::Reinstate(key(i)),
+            Choice::SecShred => fgtw::security::Act::Shred,
+            _ => fgtw::security::Act::Unbind,
+        };
+        let mut page = fgtw::security::Page::new();
+        match page.press(&rows, act) {
+            fgtw::security::Do::Carry(fgtw::security::Act::Lock) => {
+                if !ferros_sys::approve::lock(cap(self.grants, S_SETTINGS)) {
+                    console(self.grants, b"map: the kernel did not lock (nobody present, or a kernel before 2026-11-24)\n");
+                }
+            }
+            fgtw::security::Do::Confirm(a) => match a {
+                fgtw::security::Act::Revoke(k) => self.approve_ask(ahau_core::approve::REVOKE, ahau_core::approve::device_arg(&k)),
+                fgtw::security::Act::Reinstate(k) => self.approve_ask(ahau_core::approve::REINSTATE, ahau_core::approve::device_arg(&k)),
+                fgtw::security::Act::Shred => self.approve_ask(ahau_core::approve::SHRED, 0),
+                fgtw::security::Act::Unbind => self.approve_ask(ahau_core::approve::REMOVE_DEVICE, 0),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     fn approve_ask(&self, kind: u8, arg: u64) {
         let Some(r) = ahau_core::approve::Request::new(kind, arg) else { return };
         if !ferros_sys::approve::ask(cap(self.grants, S_SETTINGS), r.word()) {
@@ -6299,6 +6441,8 @@ impl Map {
                     }
                     // Remove this device (owner, 2026-11-22: "press remove, type the handle, press unbind"; 2026-11-24: approved on the attest screen itself; docs/AUTH.md "Remove this device"): the device locks at once, the handle typed on the attest screen approves it, and the attest screen has the identity service tell the fleet, then the kernel erase this identity's data here and power off (payloads/fgtw remove.rs). No second tap: the approve is the confirmation.
                     Some(Choice::FleetRemove) => self.approve_ask(ahau_core::approve::REMOVE_DEVICE, 0),
+                    // The Security page (fgtw::security): its press against the rows as drawn; a lock is carried out at once (SYS_UNLOCK op 21), every other act asks for the approve on the attest screen, whose outcome the identity service reports (op 41).
+                    Some(c @ (Choice::SecLock | Choice::SecRevoke(_) | Choice::SecReinstate(_) | Choice::SecShred | Choice::SecUnbind)) => self.sec_press(c),
                     Some(Choice::Version) => {
                         // WHY the stop at twelve: the count means nothing past it, and held there an endless run of taps cannot wrap the u8 back under the hint.
                         if self.taps < DEV_TAPS {

@@ -98,7 +98,7 @@ impl Client {
     }
 
     /// The person's kists, each (developer, option, name): the stowed ones and those kept with answers after an unstow (their domains may hold data still), from the person's list (ferros_kist `domain_owners`). Empty when the list does not read (the kernel's release still renews the device-only secret, so a domain missed here can never be opened again).
-    fn remove_kists(&mut self) -> Vec<([u8; 32], [u8; 32], alloc::string::String)> {
+    pub(crate) fn remove_kists(&mut self) -> Vec<([u8; 32], [u8; 32], alloc::string::String)> {
         let mut c = self.copy();
         let Ok(list) = ferros_space::read_list(&mut c) else {
             self.log.put(b"fgtw: remove: the person's list of kists does not read; their own domains are left unopenable rather than dropped");
@@ -109,7 +109,7 @@ impl Client {
     }
 
     /// The kernel's message for SYS_UNLOCK op 15: [flags][seed][each kist (developer, option)].
-    fn remove_message(flags: u8, seed: &[u8; 32], kists: &[([u8; 32], [u8; 32], alloc::string::String)], room: usize) -> Vec<u8> {
+    pub(crate) fn remove_message(flags: u8, seed: &[u8; 32], kists: &[([u8; 32], [u8; 32], alloc::string::String)], room: usize) -> Vec<u8> {
         let mut m = Vec::with_capacity(room.max(33 + (kists.len() << 6)));
         m.push(flags);
         m.extend_from_slice(seed);

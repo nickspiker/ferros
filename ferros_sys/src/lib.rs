@@ -3366,9 +3366,9 @@ pub fn android(cap: u64, what: Android) -> Option<u64> {
     }
 }
 
-/// Remove this device from its identity (SYS_UNLOCK op 15, the identity service alone; docs/AUTH.md "Remove this device"): the first `len` bytes of `buf` hold [flags: bit 0 a dry run][the typed handle's seed 32][each kist of the person's, (developer 32, option 32)].
+/// Remove this device from its identity (SYS_UNLOCK op 15, the identity service alone; docs/AUTH.md "Remove this device"): the first `len` bytes of `buf` hold [flags: bit 0 a dry run, bit 1 a shred (fgtw::security: the same erase with no departure, under the SHRED approval, ending in a restart rather than the power off)][the typed handle's seed 32][each kist of the person's, (developer 32, option 32)].
 /// A removal → Some(1) removed (the device powers off once the kernel's drops are sent), Some(0) the seed is not the person present's (nothing changed).
-/// A removal needs the person's approve on the attest screen held in the kernel (ahau_core::approve::REMOVE_DEVICE, since 2026-11-24), which it takes: without it, None and nothing changed.
+/// A removal needs the person's approve on the attest screen held in the kernel (ahau_core::approve::REMOVE_DEVICE, since 2026-11-24; a shred, SHRED), which it takes: without it, None and nothing changed.
 /// A dry run → Some(the account's whole length), its text written over `buf`; nothing changed.
 /// None: refused (nobody present, no right, a buffer of another shape, a kernel before 2026-11-22).
 pub fn remove_device(cap: u64, buf: &mut [u8], len: usize) -> Option<u64> {
@@ -3388,6 +3388,12 @@ pub mod approve {
     /// True when asked; false when refused (nobody present, the device not bound, a request the kernel does not take, no right).
     pub fn ask(settings: u64, word: u64) -> bool {
         svc(nr::UNLOCK, settings, 16, word, 0, 0) == 0
+    }
+
+    /// Lock now (SYS_UNLOCK op 21, the Settings right, never a kist; fgtw::security, the Security page): the identity locked at once and the attest screen started again, as an ask does, with nothing asked. It only tightens, so it needs no approve.
+    /// True when locked; false when nobody is present or the right is missing (a kernel before 2026-11-24 refuses it too).
+    pub fn lock(settings: u64) -> bool {
+        svc(nr::UNLOCK, settings, 21, 0, 0, 0) == 0
     }
 
     /// The request waiting on the attest screen (SYS_UNLOCK op 17, the Unlock or the Settings right): its word, None when there is none.
