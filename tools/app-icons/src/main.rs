@@ -16,7 +16,7 @@
 //! - Beside it `<name>.vsf` per app (its icon) and `sheet.vsf`, the colours over the greys on black as one VSF visual (8-bit `g2t` plane) Opsin opens.
 //!
 //! Usage:
-//! - `app-icons icon <source> <out.vsf> [--place | --assign-inside x,y,x,y,...]`: one icon (JPEG, PNG, WebP, TIFF; or a 256 x 256 VSF picture of codes such as Opsin's orb, which enters at the stage Photon's resize leaves, its codes read as the icon's are).
+//! - `app-icons icon <source> <out.vsf> [--place | --assign-inside x,y,x,y,...] [--inset N]`: one icon (JPEG, PNG, WebP, TIFF; or a 256 x 256 VSF picture of codes such as Opsin's orb, which enters at the stage Photon's resize leaves, its codes read as the icon's are).
 //! - `app-icons compare <out.vsf> <icon.vsf>...`: the icons side by side, each cut to its circle on black, as one VSF visual (8-bit `g2t`) for Opsin.
 //! - `app-icons bundle <out dir>`: every app's icon and the bundle.
 use photon_messenger::ui::avatar::{decode_avatar, encode_avatar_rgb_f32, image_to_avatar_rgb_f32_framed, AvatarCodes, AvatarFrame, AVATAR_SIZE};
@@ -179,11 +179,13 @@ fn read_vsf_source(doc: &[u8]) -> Result<VsfSource, String> {
     }
 }
 
-/// Photon's prepared picture (256 x 256, the gamma 2 of the light in VSF RGB, f32, black past the circle grown by 3 pixels) from a source whose codes mean `codes` (G2t or Gamma2).
-fn prepare(path: &Path, codes: AvatarCodes) -> Vec<f32> {
+/// Photon's prepared picture (256 x 256, the gamma 2 of the light in VSF RGB, f32, black past the circle grown by 3 pixels) from a source whose codes mean `codes` (G2t or Gamma2), its art's square cut by `inset` 1024ths of its side at each edge (0: none).
+fn prepare(path: &Path, codes: AvatarCodes, inset: u16) -> Vec<f32> {
     let bytes = fs::read(path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
     if !bytes.starts_with("RÅ<".as_bytes()) {
-        return image_to_avatar_rgb_f32_framed(&bytes, AvatarFrame::Art, codes).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+        // The art's square, cut by `inset` 1024ths of its side at each edge when asked (`--inset`, Photon's `AvatarFrame::ArtInset`: before its one resize).
+        let frame = if inset == 0 { AvatarFrame::Art } else { AvatarFrame::ArtInset(inset) };
+        return image_to_avatar_rgb_f32_framed(&bytes, frame, codes).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
     }
     // A VSF picture of codes already 256 square is what Photon's resize leaves; it enters there, its codes read as `codes` says, with the same black past the grown circle.
     let (w, h, px) = match read_vsf_source(&bytes).unwrap_or_else(|e| fail(format!("{}: {e}", path.display()))) {
@@ -213,9 +215,9 @@ fn prepare(path: &Path, codes: AvatarCodes) -> Vec<f32> {
 }
 
 /// One icon from its source: Photon's prepared picture with the codes read as the mapping says (module docs), the g2t of its light, Photon's AV1 encoder, vsf's flat image section tagged `g2t`.
-fn make_icon(path: &Path, mapping: &Mapping, primaries: Option<Primaries>) -> Vec<u8> {
+fn make_icon(path: &Path, mapping: &Mapping, primaries: Option<Primaries>, inset: u16) -> Vec<u8> {
     // Photon's values are √L (the gamma 2 of the light), so the g2t of the light, tanh(√L), is tanh of the value.
-    let g2t = |codes: AvatarCodes| -> Vec<f32> { prepare(path, codes).into_iter().map(f32::tanh).collect() };
+    let g2t = |codes: AvatarCodes| -> Vec<f32> { prepare(path, codes, inset).into_iter().map(f32::tanh).collect() };
     let mut px = match mapping {
         Mapping::Assign => g2t(AvatarCodes::G2t),
         Mapping::Place => g2t(AvatarCodes::Gamma2),
@@ -307,18 +309,21 @@ fn write_visual(out: &Path, w: usize, h: usize, rgb: &[u8]) {
 fn icon_cmd(args: &[String]) {
     let mut mapping = Mapping::Assign;
     let mut primaries = None;
+    let mut inset: u16 = 0;
     let mut rest: Vec<&String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--place" => mapping = Mapping::Place,
+            // `--inset N`: the art's square cut by N 1024ths of its side at each edge (Lumis's, 2026-11-24, the owner: "crop 3% off the edges, the border is showing": 31).
+            "--inset" => inset = it.next().and_then(|n| n.parse().ok()).unwrap_or_else(|| usage()),
             "--primaries" => primaries = Some(Primaries::parse(it.next().unwrap_or_else(|| usage())).unwrap_or_else(|e| fail(format!("--primaries: {e}")))),
             "--assign-inside" => mapping = Mapping::AssignInside(parse_polygon(it.next().unwrap_or_else(|| usage()))),
             _ => rest.push(a),
         }
     }
     let [src, out] = rest[..] else { usage() };
-    let doc = make_icon(Path::new(src), &mapping, primaries);
+    let doc = make_icon(Path::new(src), &mapping, primaries, inset);
     fs::write(out, &doc).unwrap_or_else(|e| fail(format!("{out}: {e}")));
     let how = match mapping {
         Mapping::Assign => "codes as g2t",
@@ -388,7 +393,7 @@ fn looks_cmd(args: &[String]) {
         let (before, after, inverse): (Vec<u8>, Vec<u8>, Vec<u8>) = match how {
             "gamma2" => {
                 let px = match read_vsf_source(&doc).unwrap_or_else(|e| fail(format!("{path}: {e}"))) {
-                    VsfSource::Codes(..) => prepare(Path::new(path), AvatarCodes::Gamma2),
+                    VsfSource::Codes(..) => prepare(Path::new(path), AvatarCodes::Gamma2, 0),
                     VsfSource::Icon(..) => fail(format!("{path}: :gamma2 takes a gamma 2 source picture")),
                 };
                 let kept: Vec<u8> = px.iter().map(|&v| (v * 256.) as u8).collect();
@@ -469,7 +474,7 @@ fn bundle_cmd(args: &[String]) {
         let doc = match bytes.starts_with("RÅ<".as_bytes()).then(|| read_vsf_source(&bytes)) {
             Some(Ok(VsfSource::Icon(_, Encoding::Gamma2Tanh))) => bytes,
             Some(Ok(VsfSource::Icon(..))) => fail(format!("{}: an icon not tagged g2t (the form before 2026-11-20): make it again with app-icons icon", path.display())),
-            _ => make_icon(&path, &Mapping::Assign, None),
+            _ => make_icon(&path, &Mapping::Assign, None, 0),
         };
         fs::write(out.join(format!("{}.vsf", name.to_ascii_lowercase())), &doc).unwrap_or_else(|e| fail(format!("{name}: {e}")));
         let codes = decode_icon(&doc, name);
@@ -496,7 +501,7 @@ fn bundle_cmd(args: &[String]) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--place | --assign-inside x,y,x,y,...] [--primaries vsf]\n  app-icons tag <icon.vsf> <out.vsf> --primaries vsf\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons looks <out.vsf> <name>=<path>[:keep|:gamma2]...\n  app-icons bundle <out dir>");
+    eprintln!("usage:\n  app-icons icon <source> <out.vsf> [--place | --assign-inside x,y,x,y,...] [--primaries vsf] [--inset N]\n  app-icons tag <icon.vsf> <out.vsf> --primaries vsf\n  app-icons compare <out.vsf> <icon.vsf>...\n  app-icons looks <out.vsf> <name>=<path>[:keep|:gamma2]...\n  app-icons bundle <out dir>");
     process::exit(2);
 }
 
