@@ -40,7 +40,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use ferros_kist::directory::{Directory, Entry, Source};
+use ferros_kist::directory::{Directory, Entry};
 use ferros_kist::fetch::{Body, Intake, Taken};
 use ferros_sys::{cap, console, freq, now, sleep_until, ERR, NOTHING};
 
@@ -114,7 +114,7 @@ fn finished(stage: u8) -> bool {
 }
 
 /// Why a job failed (the page words each): ferros_kist::offer::why, shared with the map and `ferros send`.
-use ferros_kist::offer::why::{BROKEN as WHY_BROKEN, CHECKER as WHY_CHECKER, EGGS as WHY_EGGS, MANIFEST as WHY_MANIFEST, MISSING as WHY_MISSING, NATIVE as WHY_NATIVE, NATIVE_HERE as WHY_NATIVE_HERE, NETWORK as WHY_NETWORK, NOT_CLEARED as WHY_NOT_CLEARED, NOBODY as WHY_NOBODY, NOT_ITS_KEYS as WHY_NOT_ITS_KEYS, NOT_KIST as WHY_NOT_KIST, NOT_LISTED as WHY_NOT_LISTED, NOT_NAMED as WHY_NOT_NAMED, NO_BUNDLE as WHY_NO_BUNDLE, OTHER_KEY as WHY_OTHER_KEY, ROOM as WHY_ROOM, SEAL as WHY_SEAL, SIZE as WHY_SIZE, VAULT as WHY_VAULT};
+use ferros_kist::offer::why::{BROKEN as WHY_BROKEN, CHECKER as WHY_CHECKER, EGGS as WHY_EGGS, ENTRY as WHY_ENTRY, MISSING as WHY_MISSING, NATIVE as WHY_NATIVE, NATIVE_HERE as WHY_NATIVE_HERE, NETWORK as WHY_NETWORK, NOT_CLEARED as WHY_NOT_CLEARED, NOBODY as WHY_NOBODY, NOT_ITS_KEYS as WHY_NOT_ITS_KEYS, NOT_KIST as WHY_NOT_KIST, NOT_LISTED as WHY_NOT_LISTED, NOT_NAMED as WHY_NOT_NAMED, NO_BUNDLE as WHY_NO_BUNDLE, OTHER_KEY as WHY_OTHER_KEY, ROOM as WHY_ROOM, SEAL as WHY_SEAL, SIZE as WHY_SIZE, VAULT as WHY_VAULT};
 
 /// The most jobs the page lists (finished ones give way first): one reply holds them, and the map holds sixteen circles.
 const JOBS_MAX: usize = 1 << 4;
@@ -141,6 +141,44 @@ struct Job {
     unstow: u8,
     /// An offer's Stow said by the stower itself, the device in developer mode (`developer_mode`; docs/KISTS.md "Stowing", auto-stow), not by the person's tap.
     auto: bool,
+    /// Whether it is a puck (its declaration wants the puck right): None until its declaration has been read (a stow from the directory, an offer before its check). With `developer` and `option`, the deck's (kind, thing) for its loading pie.
+    puck: Option<bool>,
+    /// The loading pie's three shares (the deck's; owner, 2026-11-24, memory deck_loading_pie): blue the download, green the optimisation and verification, red the final steps, each Q15 (0 not started, [`WHOLE`] done). Moved only by `stage` and `red`, as the work moves.
+    pie: [u16; 3],
+}
+
+/// A share of the loading pie done whole (Q15).
+const WHOLE: u16 = 1 << 15;
+
+/// `got` of `total` as a Q15 share. A total not known yet (a restore before the host gave the length) is no share at all.
+fn q15(got: u64, total: u64) -> u16 {
+    // WHY the guard: division by a length not known yet (0), which says nothing of how far the work is.
+    if total == 0 {
+        return 0;
+    }
+    ((got << 15) / total) as u16
+}
+
+/// The loading pie's shares after a job moved to `st` with `got` of `total` bytes (the stage's byte count, where it has one; a stage with none is 0 until it ends, then whole).
+/// - blue, the download: the fetch's bytes; whole from its end on (an offer's bytes came over USB before its job began: whole from the start).
+/// - green, the optimisation and verification: a quarter for the signature (an offer's read-back hashed as it passes), half more as the kernel reads the capsule back, the last quarter when its checker has passed (the seal begins).
+/// - red, the final steps (seal, store, register): a third once sealed, two thirds once the person's list is written ([`red`]), whole when done.
+fn shares(kind: u8, st: u8, got: u64, total: u64, was: [u16; 3]) -> [u16; 3] {
+    let quarter = WHOLE >> 2;
+    let third = WHOLE / 3;
+    let blue_start = if kind == KIND_OFFER { WHOLE } else { 0 };
+    match st {
+        STAGE_QUEUED => [blue_start, 0, 0],
+        STAGE_FETCHING => [q15(got, total), 0, 0],
+        STAGE_SIGNATURE if kind == KIND_OFFER => [WHOLE, q15(got, total) >> 2, 0],
+        STAGE_SIGNATURE => [WHOLE, 0, 0],
+        STAGE_CODE => [WHOLE, quarter + (q15(got, total) >> 1), 0],
+        STAGE_SEALING => [WHOLE, WHOLE, 0],
+        STAGE_STORING => [WHOLE, WHOLE, third],
+        STAGE_DONE => [WHOLE; 3],
+        // Failed, or an offer waiting on the person: where it stood.
+        _ => was,
+    }
 }
 
 /// An unstow's choices (op 4's flags byte; docs/KISTS.md "The unstow sheet"; owner, 2026-11-12: "ask if the user wants to clear data? and if so, what categories?"): what it kept for itself cleared (its own vault domain, dropped whole at once: gone means gone); the person's answers forgotten (everywhere only: they are the person's on every device); this device only (the kist left in the person's list and off this device's deck, `ferros_kist::Hidden`). No flags byte (a map from before) is none of them: today's unstow, everything kept, everywhere.
@@ -198,6 +236,10 @@ static GRANTS: AtomicU64 = AtomicU64::new(0);
 
 /// A development build (`FERROS_PRODUCTION` unset at build, as the map's and the display's `DEV`): developer mode always, as the map's Developer page is always there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// A restore takes native code unchecked, on a development build only (owner, 2026-11-24: "Native, yes."; docs/KISTS.md "Restoring native kists"): Photon, Mahere, Aemulus and Kuaha are native until std apps build masked, and without it a reset device brings none of them back from the network.
+/// Only a restore, never a stow from the directory: the capsule is one the person's list already names by its blake3, and every egg checked against the bundle the person pins for its developer before the kernel sees it. A production build refuses native code whatever this says (the kernel's `native_ok` is a development build's alone).
+const RESTORE_NATIVE: bool = DEV;
+
 /// Developer mode as the map last said it (op 8): on a release build, the twelve taps on About's version line made Developer a page (the map's `map.dev`, the person's, which only the map reads).
 /// Held in RAM only: the map says it again whenever it reaches a stower that started (again).
 static DEVELOPER: AtomicBool = AtomicBool::new(false);
@@ -255,8 +297,21 @@ fn status(s: &State) -> Vec<u8> {
         r.push(w.len() as u8);
         r.extend_from_slice(w);
     }
-    // Last, the directory's generation (u32 LE): the page reads the rows again whenever it moves.
+    // The directory's generation (u32 LE): the page reads the rows again whenever it moves.
     r.extend_from_slice(&s.dir_gen.to_le_bytes());
+    // Then the loading pie's trailer (the deck's, agreed 2026-11-24; docs/KISTS.md), per job in job order: [kind hi 32: kinds::KIST or kinds::PUCK][thing ht 32: ferros_thing::kist(developer, option)][blue u16 LE][green u16 LE][red u16 LE], each share Q15 (1 << 15 whole). A job whose thing is not known yet (its declaration not read) sends an all-zero kind and thing.
+    for j in &s.jobs {
+        match j.puck {
+            Some(puck) if j.developer != [0; 32] => {
+                r.extend_from_slice(if puck { ferros_thing::kinds::PUCK } else { ferros_thing::kinds::KIST }.as_bytes());
+                r.extend_from_slice(ferros_thing::kist(&j.developer, &j.option).as_bytes());
+            }
+            _ => r.extend_from_slice(&[0; 64]),
+        }
+        for p in j.pie {
+            r.extend_from_slice(&p.to_le_bytes());
+        }
+    }
     r
 }
 
@@ -282,9 +337,31 @@ fn stage(job: usize, st: u8, got: u64, total: u64) {
             j.stage = st;
             j.got = got;
             j.total = total;
+            j.pie = shares(j.kind, st, got, total, j.pie);
         }
     });
     ring();
+}
+
+/// The final steps' share past the seal: `thirds` of red (2 once the person's list is written; whole is `stage`'s at done).
+fn red(job: usize, thirds: u16) {
+    with(|s| {
+        if let Some(j) = s.jobs.get_mut(job) {
+            j.pie[2] = (WHOLE / 3) * thirds;
+        }
+    });
+    ring();
+}
+
+/// A job's kind on the deck, once its declaration is read: a puck or a kist.
+fn set_puck(job: usize, developer: &[u8; 32], option: &[u8; 32], puck: bool) {
+    with(|s| {
+        if let Some(j) = s.jobs.get_mut(job) {
+            j.developer = *developer;
+            j.option = *option;
+            j.puck = Some(puck);
+        }
+    });
 }
 
 fn fail(job: usize, why: u8) {
@@ -417,7 +494,7 @@ fn serve(grants: u64) -> ! {
                     if !make_room(s) {
                         return 3;
                     }
-                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
+                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None, unstow: 0, auto: false, puck: None, pie: [0; 3] });
                     0
                 });
                 reply(&tok, &[r]);
@@ -440,7 +517,7 @@ fn serve(grants: u64) -> ! {
                         if !make_room(s) {
                             return 3;
                         }
-                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: flags, auto: false });
+                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: flags, auto: false, puck: Some(k.is_puck()), pie: [0; 3] });
                         0
                     }),
                 };
@@ -695,19 +772,48 @@ fn pin(i: usize, list: &mut ferros_kist::Kists, developer: &[u8; 32], a: &ferros
     }
 }
 
-/// Where an entry's capsule is fetched from: a path on the directory's host. A manifest entry (the developer's own signed manifest, Photon's) is not read on the device yet.
-fn entry_url(e: &Entry) -> Result<String, u8> {
-    match &e.source {
-        Source::Path(p) => Ok(alloc::format!("http://{}{}", ferros_kist::directory::HOST, p)),
-        Source::Manifest { .. } => Err(WHY_MANIFEST),
+/// A capsule's developer entry by its blake3 from fgtw.org's phonebook (`http://kists.fgtw.org/capsules/<blake3>.entry.vsf`; docs/KIST-DISTRIBUTION.md 1.0, 1.1), verified alone (every egg against the bundle it carries), naming that capsule, and of the kist the person's list says (its developer and option) under the bundle the person pins for that developer, if they pin one. None when there is none, it does not verify, or it names anything else: the restore then goes on to its other sources.
+fn entry_by_hash(grants: u64, capsule: &[u8; 32], developer: &[u8; 32], option: &[u8; 32], list: &ferros_kist::Kists) -> Option<Entry> {
+    let url = alloc::format!("http://{}{}", ferros_kist::directory::HOST, ferros_kist::entry::path(capsule));
+    let mut doc: Vec<u8> = Vec::new();
+    // WHY the cap: an entry is about 10 KB (its SPHINCS+ egg most of it); a body past 64 KiB is no entry, and is not read into the heap.
+    if net::get(cap(grants, S_UDP), &url, |_| Ok(()), |b| if doc.len() + b.len() > 1 << 16 { Err("longer than an entry") } else { Ok(doc.extend_from_slice(b)) }).is_err() {
+        say(b"kists: no developer entry for this capsule on fgtw.org\n");
+        return None;
     }
+    let e = match ferros_kist::entry::verify(&doc) {
+        Ok(e) => e,
+        Err(_) => {
+            say(b"kists: fgtw.org's entry for this capsule does not verify: dropped\n");
+            return None;
+        }
+    };
+    if e.capsule != *capsule || e.developer != *developer || e.option != *option {
+        say(b"kists: fgtw.org's entry names another capsule or kist: dropped\n");
+        return None;
+    }
+    if let ferros_kist::Trust::Other(_) = list.judge(&e.developer, &e.bundle.commit()) {
+        say(b"kists: fgtw.org's entry is under another bundle than the person pins for its developer: dropped\n");
+        return None;
+    }
+    say(alloc::format!("kists: {}'s entry from fgtw.org, its developer's every egg checked; its capsule at {}\n", e.name, e.web.join(" ")).as_bytes());
+    Some(e)
 }
 
 /// A stow (or an update) of the directory's entry: brought in through every stage, then into the person's list.
 fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let e = with(|s| s.dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == job.capsule)).cloned()).ok_or(WHY_NOT_LISTED)?;
-    let url = entry_url(&e)?;
-    let (taken, admitted) = bring(grants, i, Origin::Url(&url), &e.capsule, Some(e.size), &e.developer, &e.option)?;
+    // Each of the developer's web hosts in turn (the entry's `web`): the next only for a capsule the last did not have.
+    let mut brought = Err(WHY_MISSING);
+    let mut url = String::new();
+    for u in &e.web {
+        url = u.clone();
+        brought = bring(grants, i, Origin::Url(u), &e.capsule, Some(e.size), &e.developer, &e.option, Some(&e), false);
+        if !matches!(brought, Err(WHY_NETWORK | WHY_MISSING | WHY_BROKEN)) {
+            break;
+        }
+    }
+    let (taken, admitted) = brought?;
     stage(i, STAGE_STORING, e.size, e.size);
     let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
     // Its version as its signed declaration gives it (what the page compares a listed one against); a capsule without one (a manifest's artefact) takes the entry's, which its developer's signed manifest gave. A version field that does not read is no kist's.
@@ -732,6 +838,7 @@ fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         drop_capsule(grants, &e.capsule);
         return Err(WHY_VAULT);
     }
+    red(i, 2);
     copy_changed(grants);
     unhide(grants, &e.developer, &e.option);
     index_icon(grants, Some(&e.capsule), &e.developer, &e.option);
@@ -825,7 +932,7 @@ fn restore_pass(grants: u64) {
             if !make_room(s) {
                 break;
             }
-            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
+            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: 0, auto: false, puck: Some(k.is_puck()), pie: [0; 3] });
             added = true;
         }
     });
@@ -861,60 +968,70 @@ fn capsules_here(grants: u64) -> Option<Vec<[u8; 32]>> {
     }
 }
 
-/// A restore of one capsule: the fleet's devices first (`fleet_get`), then where it was stowed from, then the directory's entry, then the directory's host by its blake3.
+/// A restore of one capsule (docs/KIST-DISTRIBUTION.md section 2.0, the web rung of phase 1): the fleet's devices first (`fleet_get`); then its developer's entry by its blake3 from fgtw.org's phonebook (`entry_by_hash`) and each of the developer's web hosts it names (the owner's kists on holdmyoscilloscope, commons kists on kists.fgtw.org), the capsule checked against the entry's signed word as well; then where it was stowed from; then the directory's entry; then kists.fgtw.org by its blake3. The person's own devices before any server (owner, 2026-11-10: "BLE, then LAN, then WAN, then hopefully we shouldn't need to but fgtw.org"), so nothing is asked of fgtw.org until the fleet has said none.
 fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
     let k = list.by_capsule(&job.capsule).cloned().ok_or(WHY_NOT_LISTED)?;
-    let dir = directory(grants);
-    let entry = dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == job.capsule));
-    let mut sources: Vec<String> = Vec::new();
-    if let Some(u) = &k.source {
-        sources.push(u.clone());
-    }
-    if let Some(u) = entry.map(entry_url).and_then(|r| r.ok()) {
-        if !sources.contains(&u) {
-            sources.push(u);
+    let began = now();
+    let mut why = match bring(grants, i, Origin::Fleet, &job.capsule, None, &k.developer, &k.option, None, true) {
+        Ok((_, admitted)) => return restored(grants, i, job, &k, &admitted, "a fleet device", began),
+        // The next source only for a capsule this one did not have; a capsule that failed its checks fails the same anywhere.
+        Err(w @ (WHY_NETWORK | WHY_MISSING | WHY_BROKEN)) => w,
+        Err(w) => return Err(w),
+    };
+    let mut sources: Vec<(String, Option<Entry>)> = Vec::new();
+    let mut add = |u: &str, e: Option<&Entry>| {
+        if !sources.iter().any(|(s, _)| s == u) {
+            sources.push((String::from(u), e.cloned()));
+        }
+    };
+    if let Some(e) = entry_by_hash(grants, &job.capsule, &k.developer, &k.option, &list) {
+        for u in &e.web {
+            add(u, Some(&e));
         }
     }
-    // The capsule by its own blake3 on the directory's host, listed or not (2026-11-23, the Pro after its vault's reset: nine kists in the person's list came back and not one capsule, those stowed over USB having no source and the directory listing none of them). The checks below are the trust, whoever served the bytes.
-    let by_hash = alloc::format!("http://{}{}", ferros_kist::directory::HOST, ferros_kist::directory::capsule_path(&job.capsule));
-    if !sources.contains(&by_hash) {
-        sources.push(by_hash);
+    if let Some(u) = &k.source {
+        add(u, None);
     }
-    let size = entry.map(|e| e.size);
-    let mut why = WHY_NOT_LISTED;
-    // The person's own devices before any server (owner, 2026-11-10: "BLE, then LAN, then WAN, then hopefully we shouldn't need to but fgtw.org").
-    let origins = core::iter::once(Origin::Fleet).chain(sources.iter().map(|u| Origin::Url(u)));
-    for o in origins {
-        match bring(grants, i, o, &job.capsule, size, &k.developer, &k.option) {
-            Ok((_, admitted)) => {
-                // A list from before pins (or one whose pin has not arrived from the space yet): the restored kist's bundle pinned now, as at a first stow.
-                let list_cap = cap(grants, S_KISTS);
-                if let Some(mut list) = ferros_kist::store::read(list_cap) {
-                    let at = ferros_detail::eagle_now();
-                    match pin(i, &mut list, &k.developer, &admitted, at) {
-                        Ok(true) if !ferros_kist::store::write(list_cap, &list, at) => return Err(WHY_VAULT),
-                        Ok(_) => {}
-                        Err(w) => {
-                            drop_capsule(grants, &job.capsule);
-                            return Err(w);
-                        }
-                    }
-                }
-                let mut l = Vec::new();
-                index_icon(grants, Some(&job.capsule), &k.developer, &k.option);
-                l.extend_from_slice(b"kists: restored ");
-                l.extend_from_slice(k.name.as_bytes());
-                l.extend_from_slice(b", checked and sealed\n");
-                say(&l);
-                return Ok(());
-            }
-            // The next source only for a capsule this one did not have; a capsule that failed its checks fails the same anywhere.
-            Err(w @ (WHY_NETWORK | WHY_MISSING | WHY_BROKEN)) => why = w,
+    let dir = directory(grants);
+    if let Some(e) = dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == job.capsule)) {
+        for u in &e.web {
+            add(u, Some(e));
+        }
+    }
+    // The capsule by its own blake3 on kists.fgtw.org, listed or not (2026-11-23, the Pro after its vault's reset: nine kists in the person's list came back and not one capsule). The checks are the trust, whoever served the bytes.
+    add(&alloc::format!("http://{}{}", ferros_kist::directory::HOST, ferros_kist::directory::capsule_path(&job.capsule)), None);
+    for (u, e) in &sources {
+        match bring(grants, i, Origin::Url(u), &job.capsule, e.as_ref().map(|e| e.size), &k.developer, &k.option, e.as_ref(), true) {
+            Ok((_, admitted)) => return restored(grants, i, job, &k, &admitted, u, began),
+            // A capsule that disagrees with its entry: that entry is dropped and the sources without one are tried.
+            Err(w @ (WHY_NETWORK | WHY_MISSING | WHY_BROKEN | WHY_ENTRY)) => why = w,
             Err(w) => return Err(w),
         }
     }
     Err(why)
+}
+
+/// A restored capsule kept: its developer's bundle pinned when the person's list had no pin for them yet (a list from before pins, or one whose pin has not arrived from the space), its icon indexed, and the line that says where it came from and how long it took.
+fn restored(grants: u64, i: usize, job: &Job, k: &ferros_kist::Kist, admitted: &ferros_kist::capsule::Admitted, from: &str, began: u64) -> Result<(), u8> {
+    stage(i, STAGE_STORING, job.total, job.total);
+    let list_cap = cap(grants, S_KISTS);
+    if let Some(mut list) = ferros_kist::store::read(list_cap) {
+        let at = ferros_detail::eagle_now();
+        match pin(i, &mut list, &k.developer, admitted, at) {
+            Ok(true) if !ferros_kist::store::write(list_cap, &list, at) => return Err(WHY_VAULT),
+            Ok(_) => {}
+            Err(w) => {
+                drop_capsule(grants, &job.capsule);
+                return Err(w);
+            }
+        }
+    }
+    red(i, 2);
+    index_icon(grants, Some(&job.capsule), &k.developer, &k.option);
+    let ms = (now() - began) * 1000 / freq();
+    keep(&alloc::format!("kists: restored {} from {from}, checked and kept, in A#{ms} ms", k.name));
+    Ok(())
 }
 
 /// Where `bring` takes a capsule's bytes from.
@@ -1030,7 +1147,7 @@ extern "C" fn offer_watch(grants: u64) -> ! {
                 if !make_room(s) {
                     return Some(false);
                 }
-                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None, unstow: 0, auto: false });
+                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None, unstow: 0, auto: false, puck: None, pie: [WHOLE, 0, 0] });
                 Some(true)
             });
             match added {
@@ -1127,6 +1244,7 @@ fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
             j.developer = developer;
             j.option = option;
             j.name = decl.name.clone();
+            j.puck = Some(decl.wants.iter().any(|w| w.0 == ferros_kist::PUCK));
         }
     });
     let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
@@ -1192,6 +1310,7 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
     if !ferros_kist::store::write(list_cap, &list, at) {
         return Err(WHY_VAULT);
     }
+    red(i, 2);
     copy_changed(grants);
     unhide(grants, &job.developer, &job.option);
     index_icon(grants, Some(&job.capsule), &job.developer, &job.option);
@@ -1379,8 +1498,11 @@ fn decode_icon(grants: u64, hp: &ferros_thing::Hp, icon: &ferros_kist::Icon) -> 
 }
 
 /// Stages 0 to 3 for one capsule from one URL: fetched into the vault as it streams, its signature checked (its blake3, its size, its identity, every egg against the developer bundle it carries, and that bundle the one the person pinned for its developer), committed, then checked and sealed by the kernel. On any failure its bytes are dropped. Returns what was taken in (its first bytes carry its declaration) and what to pin.
-fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32]) -> Result<(Taken, ferros_kist::capsule::Admitted), u8> {
+/// `entry`, when the capsule came by its developer's entry: its own signed declaration must agree with it (`entry::agrees`), or it is refused with `WHY_ENTRY`. `restore`: a capsule the person's list already names, which on a development build may be native (`RESTORE_NATIVE`).
+#[allow(clippy::too_many_arguments)]
+fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32], entry: Option<&Entry>, restore: bool) -> Result<(Taken, ferros_kist::capsule::Admitted), u8> {
     let total = size.unwrap_or(0);
+    let began = now();
     stage(i, STAGE_FETCHING, 0, total);
     let capsules = cap(grants, S_CAPSULES);
     let piece = unsafe { &mut *PIECE_BUF.0.get() };
@@ -1460,6 +1582,16 @@ fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<
         Ok((d, o)) if d == *developer && o == *option => {}
         _ => return failed(WHY_NOT_KIST),
     }
+    // The capsule's own signed word against its developer's entry (docs/KIST-DISTRIBUTION.md 1.0): developer, option, name, version and the bundle it carries.
+    if let Some(e) = entry {
+        if let Err(w) = ferros_kist::entry::agrees(e, &taken.first) {
+            say(alloc::format!("kists: refused against its entry: {w}\n").as_bytes());
+            return failed(WHY_ENTRY);
+        }
+    }
+    let fetched = now();
+    // The kind on the deck, now its declaration is read.
+    set_puck(i, developer, option, ferros_kist::want_codes(&taken.first).is_ok_and(|w| w.contains(&ferros_kist::PUCK)));
     // Every egg against the bundle the capsule carries, its Ed25519 key the kist's developer, and that bundle the one the person pinned for this developer if they pinned one (trust on first stow; Photon's release key against fgtw's pinned bundle).
     let Some(list) = ferros_kist::store::read(cap(grants, S_KISTS)) else { return failed(WHY_NOBODY) };
     let admitted = match ferros_kist::capsule::admit(&taken.first, &taken.head.signer, &taken.head.eggs, &taken.file_hash, &list) {
@@ -1471,17 +1603,20 @@ fn bring(grants: u64, i: usize, origin: Origin, expect: &[u8; 32], size: Option<
     }
     // 2 and 3: the kernel reads it back, checks its code and seals it (SANDBOX.md: once, at stow).
     stage(i, STAGE_CODE, 0, len);
-    if let Err(why) = kernel_check(grants, i, expect, len, false) {
-        return failed(why);
-    }
+    let native = match kernel_check(grants, i, expect, len, restore && RESTORE_NATIVE) {
+        Ok(n) => n,
+        Err(why) => return failed(why),
+    };
+    let f = freq();
+    keep(&alloc::format!("kists: {} A#{len} bytes: fetched in A#{} ms, checked{} in A#{} ms", ferros_kist::declaration(&taken.first).map(|d| d.name).unwrap_or_default(), (fetched - began) * 1000 / f, if native { " (native code, taken unchecked: a restore on a development build)" } else { " and sealed" }, (now() - fetched) * 1000 / f));
     Ok((taken, admitted))
 }
 
-/// The kernel's check and seal of a stored capsule, each stage it tells shown: its reading of the capsule is the code stage's bar, then the checker, then the seal. For an offer (`offered`, ferros_sys `stow_check`), native code on a development build is taken unchecked: Ok(true); a production build refuses it (`WHY_NATIVE_HERE`). Ok(false): checked and sealed.
-fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64, offered: bool) -> Result<bool, u8> {
+/// The kernel's check and seal of a stored capsule, each stage it tells shown: its reading of the capsule is the code stage's bar, then the checker, then the seal. With `native_ok` (an offer, or a restore under `RESTORE_NATIVE`: ferros_sys `stow_check`), native code on a development build is taken unchecked: Ok(true); a production build refuses it (`WHY_NATIVE_HERE`). Ok(false): checked and sealed.
+fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64, native_ok: bool) -> Result<bool, u8> {
     use ferros_sys::stow as k;
     KERNEL_WORD.store(u64::MAX, Ordering::Release);
-    let asked = if offered { ferros_sys::stow_check(grants, S_STOW, capsule, &KERNEL_WORD) } else { ferros_sys::stow_kist(grants, S_STOW, capsule, &KERNEL_WORD) };
+    let asked = if native_ok { ferros_sys::stow_check(grants, S_STOW, capsule, &KERNEL_WORD) } else { ferros_sys::stow_kist(grants, S_STOW, capsule, &KERNEL_WORD) };
     if asked != 0 {
         return Err(WHY_ROOM);
     }
@@ -1498,7 +1633,7 @@ fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64, offered: bo
                 k::DONE => return Ok(v == k::NATIVE),
                 k::REFUSED => {
                     return Err(match v {
-                        k::WHY_NATIVE if offered => WHY_NATIVE_HERE,
+                        k::WHY_NATIVE if native_ok => WHY_NATIVE_HERE,
                         k::WHY_NATIVE => WHY_NATIVE,
                         k::WHY_CHECKER | k::WHY_MODES => WHY_CHECKER,
                         k::WHY_SIGNATURE | k::WHY_SECTIONS => WHY_EGGS,

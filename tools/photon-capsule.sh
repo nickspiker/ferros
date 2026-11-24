@@ -4,11 +4,15 @@
 # The option is Photon's identity across versions (ORACLE.md §5: minted once, kept), so an update keeps the person's answers and its vault domain. Minted 2026-11-08; never change it.
 # The key is Photon's release key, keys/photon-signing-key.vsf: the raw photon-signing-key converted once (2026-11-12, kistcat devkey convert --raw keys/photon-signing-key --label PHOTON_RELEASE --secret keys/photon-signing-key.vsf; PHOTON_RELEASE is the label whose post-quantum domains are fgtw SigningBundle::release's, and the bridge knows the key by its public key and signs with the release bundle fgtw pins). It is handed to the bridge as $FERROS_DEV_KEY (a key kept as VSF, ferros_kist::secret: section developer_key { label, seed kge }); a FERROS_DEV_KEY already set wins (Photon's deploy sets it to the same file). A raw key file is refused. Photon's kist is signed with Photon's release key (owner, 2026-11-10: Photon is a commons project, KISTS.md "Whose key signs a kist"); the path is passed, the key never leaves the bridge's process.
 # The version is Photon's own (its Cargo.toml `version`, e.g. 0.151.1, three parts as Photon numbers its releases), in the signed declaration, so the Items card shows it and the pandok can list it and offer an update (KISTS.md "The version"); $PHOTON_VERSION wins (Photon's deploy passes the version it injects into its frozen snapshot), else the tree std/photon builds against (PHOTON_FERROS_PKG's, as photon-build.sh), read here.
-# Usage: tools/photon-capsule.sh <image.bin> <out.vsf>  (the bridge at target/debug/ferros-bridge, built)
+# The entry (docs/KIST-DISTRIBUTION.md 1.0; owner, 2026-11-24: "One entry format, yes.", Photon included): with `--entry <out.entry.vsf>`, Photon's signed entry for the capsule is written beside it with the same key (tools/kistcat `entry`), naming kists.fgtw.org as where Photon's capsule lives (Photon is a commons kist: "Photon and possibly some other system apps will be hosted at kists.fgtw.org since Photon is not mine"). The capsule then goes to the `kists` bucket at capsules/<blake3>.vsf and the entry beside it at capsules/<blake3>.entry.vsf; kistcat prints the commands.
+# Usage: tools/photon-capsule.sh <image.bin> <out.vsf> [--entry <out.entry.vsf>]  (the bridge at target/debug/ferros-bridge, built)
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 <image.bin> <out.vsf>" >&2
+entry=""
+if [ $# -eq 4 ] && [ "$3" = --entry ]; then
+    entry=$4
+elif [ $# -ne 2 ]; then
+    echo "Usage: $0 <image.bin> <out.vsf> [--entry <out.entry.vsf>]" >&2
     exit 1
 fi
 pkg=${PHOTON_FERROS_PKG:-$here/std/photon}
@@ -33,3 +37,6 @@ FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}"
     --want entropy "to make the keys your photons are sealed with" \
     --want be_you "so your contacts find and recognise you in Photon" \
     --want people "to show your people as your contacts"
+[ -n "$entry" ] || exit 0
+cargo run -q --release --manifest-path "$here/tools/kistcat/Cargo.toml" -- entry --key "${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}" --capsule "$2" \
+    --about "Messages, voice and video between people, not numbers" --host http://kists.fgtw.org --out "$entry"

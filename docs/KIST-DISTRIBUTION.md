@@ -24,6 +24,18 @@ The shape in one paragraph: a capsule is named by its BLAKE3 and signed by its d
   - fgtw.org's role: the bootstrap and phonebook, and host for a few things (the commons kists' capsules). It checks signatures and keys; it never judges content.
 - Every other open question in section 7 is still open.
 
+## Built (2026-11-24): phase 1's web rung
+
+The owner's goal that day: "Would be nice to factory reset this thing, have it pull my list o shit and settings from my fleet, then fetch from fgtw.org for hashes that match the kists and pucks I have, and then get pointed to the servers/nodes accordingly for everything on my deck to show back up." Built for it, ahead of the rest of phase 1 (docs/KISTS.md "Restoring from the web"):
+- the entry of 1.0 (ferros_kist `entry`: `unsigned`, `read`, `verify`, `agrees`, `path`), written by `kistcat entry`, `kistcat kist --entry` and `tools/photon-capsule.sh --entry`;
+- every capsule on the Pro's deck on its developer's web host with its entry beside it, and every entry on fgtw.org's phonebook (`kists.fgtw.org/capsules/<blake3>.entry.vsf`): the owner's own-key kists on holdmyoscilloscope under `kists/`, commons kists on the `kists` bucket;
+- the directory of 1.1 built from entries carried byte for byte (`kistcat build --entry`), each entry verified alone on the device; the manifest pointer and the directory's own fields gone;
+- the stower's restore: the fleet, then the entry by blake3 from fgtw.org and its `web` hosts with the capsule checked against the entry, then the older sources;
+- on a development build a restore takes native code (owner, 2026-11-24: "Native, yes."; docs/KISTS.md "Restoring native kists");
+- the stower's progress for the deck's loading pie (docs/KISTS.md "The loading pie's progress").
+
+Not built yet: the append endpoint of 1.6 and `kistcat publish` (the entries were put on R2 with wrangler by hand), `kists.entries` (1.4), people as a source, the claims exchange, and everything of phases 2 and 3.
+
 ## 0. What exists today
 
 **Built and running:**
