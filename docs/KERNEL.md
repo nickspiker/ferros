@@ -504,6 +504,38 @@ Why: a call per reader (a held WATCH, a FIX asked at each ring) caps the readers
 **The cost**: a frame (2 MiB) per mailbox in use; a publish is the stores and one syscall, whose wake scans the threads once (as every SYS_WAKE); a reader's wait is SYS_WAIT. Measured on the Pro (b1005, this kernel RAM-reloaded, payloads/mbtest): a writer at 2^7 a second, 1024 publishes of 64 words. With one reader each publish cost the writer 12.6 us on average (93 us at most) and the reader woke 19 us after the publish on average (105 us at most). With 64 readers (four processes of 16 threads) every wake made all 64 runnable, the publish cost 122 us on average (208 us at most: the wake's enqueue, about 1.7 us a reader, the writer's only per-reader cost), the readers woke 184 to 461 us late on average per process (1.5 ms at most; most between 128 us and 1 ms, the A715s queueing 64 threads), none skipped a publish, none read a torn one; each saw the writer's end as dead. The motion mailbox (gravity, the field, the accelerometer, some 300 publishes a second) under 64 readers: 1024 reads each, 0 torn, 10 to 14 looks a process caught a publish under way and read again, woke 176 to 345 us late on average; readers that slept thru a publish read the next (latest-value semantics).
 **Not built**: a "someone waits" word the writer reads to skip the wake when nobody waits (a Dekker pair of fences on both sides); a ring layout for streams (the microphones': SENSORS.md "The microphones").
 
+### Shared regions (2026-11-24, built, not yet run on a device)
+
+The owner, on waves and beams: "q removal. Less q's the better and smaller the buckets without getting stupid", "Like I want this creepy fast".
+A sound stream or a socket's datagrams pass between a kist and its server thru memory both map, with no call per item: the server owns a pool, gives a run of it to the caller it is answering, and each side rings the other thru a word of the run.
+Built for both the sound service (AUDIO.md, its playback and capture rings) and `ip` (WIFI.md "Datagrams at speed"), one mechanism (the coordinator's call, the same day).
+
+**SYS_SHARE (49)**, ferros_sys `share` (share.rs):
+- **Op 0 POOL** (the server): x1 log2 of the bytes wanted, x2 the handle slot, x3 an arc offset of the server's bell word (0: none, or as named before) → the pool's address.
+  - One pool a process, made at the first POOL, grown in place by whole frames (2 MiB) of the pool, never moving: a GiB of addresses in the shared window (cachemap `SHARE_VA`, G#60_0000_0000 to G#80_0000_0000, 128 pools), Normal write-back, EL0 read-write, never executable.
+  - Its handle (SANDBOX.md "Handles") is written at the slot the server names, a free pair past the ones its build wrote, so masked code (`ip`) reaches it thru `Handle<SLOT>`; native code by its address.
+  - ERR, said on the console: past a GiB, the slot taken, the bell not a word of the arc, the frame pool short.
+- **Op 1 GIVE** (the server): x1 the arc offset of a reply token it holds (the caller of the OPEN it is answering, as the camera's view is given), x2 the run's offset in the pool, x3 log2 of its bytes → the view's id (never 0), which the server puts in its reply.
+  - A run is a power of two from one page (4 KiB) at an offset aligned to its size, inside what the pool holds: a stream's ring of 4 to 16 KiB costs 4 to 16 KiB, many runs to a frame.
+  - The holder's handle is written at its first free pair past its build's (as a mailbox's view is); the run's address is the same in both processes.
+  - ERR: no pool, the run outside it or misaligned, the token answering no other process.
+- **Op 2 TAKE** (the server): x1 the id → 0: the view ended (below).
+- **Op 3 VIEW** (the holder): x1 the id, x2 an arc offset for 16 bytes, [the run's bytes u64 LE][its handle slot u64 LE, u64::MAX when no pair was free] → the run's address. ERR: not a view the caller holds.
+- **Op 4 ALIVE** (the server): x1 the id → 1 while held, 0 once ended (its holder gone, or taken back).
+
+**The doorbell** is SYS_WAIT and SYS_WAKE on a word of a run either side holds, as on a word of the arc.
+- Waiters of every process are kept under the word's address, the same in both (one map for all, as the mailboxes' and the GPU blocks' windows), so one wake reaches whoever waits there, in the one scan of the threads a wake costs; the server never counts its holders.
+- **The server's bell**: a holder's wake also counts the server's bell word up by one and wakes its waiters. A server with many holders waits on that one word (in its own arc, so its other doorbells can ring it too) and looks at its rings when it moves; the count moving is what keeps a wake between its look and its wait from being lost.
+- A holder's end rings its server's bell too, so the server finds the run gone (ALIVE 0) at once.
+- A wait on a word of the window the caller does not hold (its view taken back, its server ended) answers ERR, never the trap a buffer outside the arc earns: that is how a holder learns its run ended.
+- To skip a wake nobody waits for, a ring keeps a "waiting" word per side, the waiter setting it before its last look and the producer reading it after its store, a SeqCst fence on each side (a Dekker pair). That is the ring's own protocol (ferros_netring for sockets), not the kernel's.
+
+**Ends.** A view ends at TAKE, at its holder's end or at its server's: the holder's pair cleared (a masked holder reaching thru it lands on 0 and faults), every thread waiting on a word of the run woken. A pool ends with its server (`share::gone`, beside `mailboxes_gone`, where the arc is freed): every view of it ended, its blocks mapped to the blank frame and every TLB told, its frames back to the pool.
+
+**The isolation, said plainly**, as for the mailboxes: a masked holder reaches its run and nothing else of the pool; a native process could name the window by its address, as it could any region of the one shared table, and native code is trusted by its signature.
+
+**The cost**: a frame per pool at least, a run's bytes per view; a produce is stores and, when the other side waits, one SYS_WAKE.
+
 ### Cores
 
 husky has 1× Cortex-X3, 4× A715, 4× A510 (ASID.md). The kernel today is one core's worth of code: `k()` is a bare global, the run queue is one, there are no locks, and the one core is the X3 (previous section). Going to eight:

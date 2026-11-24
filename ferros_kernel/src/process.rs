@@ -2350,6 +2350,10 @@ const SYS_PANIC: u64 = 46;
 const SYS_MAILBOX: u64 = 47;
 /// base(op, …): the number base the device draws in (base.rs, SETTINGS.md "The number base"; 2026-11-22, as SYS_LANG the language), tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS). Op 0, Settings at x1: this device's own base, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_LANG op 2): the identity's base, x1 the code (0: it has none). Op 3, no capability (the base is what every screen shows whoever holds the device): `base::word`, the base in effect, this device's, the identity's and whether it keeps its own, a byte each. Ops 0-2 keep the settings document, put back as it was when the vault refuses. The base in effect is also preference 0 (PREF_BASE), which every process reads. A Settings holder's SYS_SET_PREF of preference 0 is op 0. → 0 or ERR, op 3 the word.
 const SYS_BASE: u64 = 48;
+/// share(op, …) (2026-11-24, docs/KERNEL.md "Shared regions", share.rs): a server's pool of memory and the runs of it it gives to the processes it answers, a stream's ring between them with no call per item. Op 0 POOL: x1 log2 of the bytes, x2 the handle slot, x3 an arc offset of the server's bell word (0 none) → the pool's address; a holder's wake on its run counts the bell up and rings it. Op 1 GIVE: x1 a reply token's arc offset, x2 the run's offset in the pool, x3 log2 of its bytes → the view's id. Op 2 TAKE: x1 the id → 0. Op 3 VIEW (the holder): x1 the id, x2 an arc offset for [bytes u64][handle slot u64] → the run's address. Op 4 ALIVE (the server): x1 the id → 1 held, 0 ended. ERR for anything refused. SYS_WAIT and SYS_WAKE on a word of a run either side holds are the doorbell.
+const SYS_SHARE: u64 = 49;
+#[path = "share.rs"]
+mod share;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_notice as note_post_notice, post_system as note_post_system, report as notes_report};
@@ -6470,6 +6474,7 @@ fn drain_dying(cur: usize) -> bool {
         if let Some(p) = kk.procs[pi].take() {
             // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
             mailboxes_gone(p.epoch);
+            share::gone(p.epoch);
             arc_free(p.arc);
             // The slot empty only now: the table changed again (the process count the facts' bell watches, service.rs `bell_facts`).
             PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
@@ -6675,7 +6680,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
         }
         // A word in the arc, or a mailbox's sequence word thru a region the caller holds (2026-11-19, `mbox_wait_word`): waiters of every process on one mailbox are kept under its view's address, so its writer's wake finds them all.
-        SYS_WAIT => match p.word(f.x[0]).or_else(|| mbox_wait_word(p, f.x[0])).or_else(|| gpub_word(p, f.x[0])) {
+        // A word of a shared run the caller holds (2026-11-24, share.rs): waiters of every process kept under its address, as a mailbox's. A word of the shared window the caller no longer holds (its view taken back, its server gone) answers ERR without the trap: the holder learns the run ended.
+        SYS_WAIT if p.word(f.x[0]).is_none() && share::word(p, f.x[0]).is_none() && share::in_window(p, f.x[0]) => {
+            f.x[0] = ERR;
+            0
+        }
+        SYS_WAIT => match p.word(f.x[0]).or_else(|| mbox_wait_word(p, f.x[0])).or_else(|| gpub_word(p, f.x[0])).or_else(|| share::word(p, f.x[0])) {
             // A word outside the arc: the syscall resolves or traps (`bad_buf`).
             None => {
                 p.bad_buf(f.x[0], 8, false);
@@ -6723,6 +6733,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
         // A word of a GPU block, by its owner or the GPU service (2026-11-20, `gpub_word`): every process's waiters on it, as a mailbox's writer wakes its readers.
         SYS_WAKE if p.word(f.x[0]).is_none() && gpub_word(p, f.x[0]).is_some() => {
             f.x[0] = mbox_wake(gpub_word(p, f.x[0]).unwrap(), f.x[1]);
+            0
+        }
+        // A word of a shared run, by the server or the holder (2026-11-24, share.rs): every process's waiters on it.
+        SYS_WAKE if p.word(f.x[0]).is_none() && share::word(p, f.x[0]).is_some() => {
+            f.x[0] = share::wake(p, share::word(p, f.x[0]).unwrap(), f.x[1]);
             0
         }
         SYS_WAKE => {
@@ -7834,6 +7849,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
                 _ => ERR,
             };
+            0
+        }
+        SYS_SHARE => {
+            share::syscall(f, p);
             0
         }
         SYS_MAILBOX => {
@@ -9550,6 +9569,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         } else if let Some(p) = kk.procs[pi].take() {
             // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
             mailboxes_gone(p.epoch);
+            share::gone(p.epoch);
             arc_free(p.arc);
         }
     }
@@ -9937,6 +9957,7 @@ fn kill_at(i: usize) {
     } else if let Some(p) = kk.procs[i].take() {
         // Its mailboxes marked dead only now, with no thread of it left to publish over the mark.
         mailboxes_gone(p.epoch);
+        share::gone(p.epoch);
         arc_free(p.arc);
     }
     for t in mine {
@@ -11377,6 +11398,7 @@ pub fn arcs_report() -> alloc::string::String {
     blocks_report(&mut s);
     pucks_report(&mut s);
     mailboxes_report(&mut s);
+    share::report(&mut s);
     s.push_str(&crate::frames::pool_report());
     unlock();
     s

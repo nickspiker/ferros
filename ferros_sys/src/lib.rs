@@ -81,6 +81,7 @@ pub mod nr {
     pub const PANIC: u64 = 46;
     pub const MAILBOX: u64 = 47;
     pub const BASE: u64 = 48;
+    pub const SHARE: u64 = 49;
 }
 
 /// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
@@ -1453,6 +1454,58 @@ pub mod claim {
     /// The claims' doorbell (kernel op 4), given Settings: the kernel writes GPS's claims (`FACT`'s word: the count, and a change count above bit 16) into `word` now and whenever they change, waking whatever waits on it (`wait_world`). False without the capability.
     pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
         svc(nr::CLAIM, 4, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
+}
+
+/// Shared regions (docs/KERNEL.md "Shared regions", 2026-11-24): a server's pool of memory and the runs of it it gives to the processes it answers, so a stream (a sound ring, a socket's datagrams) passes between them thru memory both map, with no call per item.
+/// - The server: `pool` makes or grows its pool (one a process, in place, its address never moving), names the handle slot a masked server reaches it thru and its bell (a word of its own every holder's wake counts up and rings); `give` hands a run of it to the caller of the request it is answering (its reply token), answering the view's id, which the server puts in its reply; `take` takes a run back; `alive` says whether its holder still holds it.
+/// - The holder: `view` with the id from the server's reply gives the run's address, its bytes and the handle slot the kernel wrote for it.
+/// - The doorbell: `wait` / `wait_world` on a word of the run, and `wake` on it, by either side, as on a word of the arc: waiters of every process are kept under the word's address, the same in both, so one wake reaches whoever waits there. A wait on a run the caller no longer holds (taken back, its server ended) answers ERR: the run is gone.
+/// - A run ends at `take`, at its holder's end or at its server's; every thread waiting on one of its words is woken then.
+pub mod share {
+    use super::{nr, off, svc, ERR};
+
+    /// The pool's handle slot names "the first free pair past the build's" for a holder; a server names its own.
+    pub const NO_SLOT: u64 = u64::MAX;
+    /// The least a run is: a page.
+    pub const RUN_LEAST_LOG: u32 = 12;
+
+    /// The caller's pool, made when it has none, grown in place to 2^`log` bytes (whole 2 MiB frames; asking for less than it holds leaves it), its handle at `slot` of the caller's handle table (a free pair past the ones the build wrote), its bell `bell` (a word of the caller's own, which every holder's wake counts up and rings: the one word a server waits on for all its holders; None leaves it as it was). Its address, the same in every process; None, said on the console: past a GiB, the slot taken, the bell not in the arc, the frame pool short, or a kernel from before.
+    pub fn pool(log: u32, slot: u64, bell: Option<&core::sync::atomic::AtomicU64>) -> Option<u64> {
+        let b = bell.map_or(0, |w| off(w as *const _ as *const u8));
+        let r = svc(nr::SHARE, 0, log as u64, slot, b, 0);
+        (r != ERR).then_some(r)
+    }
+
+    /// The run of 2^`log` bytes at `at` in the caller's pool (a power of two from a page, `at` aligned to it, inside what the pool holds) given read-write to the process waiting on the reply token `reply` (the caller of the request being answered). The view's id, never 0, for the reply to carry; None, said on the console: no pool, a run outside it or misaligned, a token answering no other process.
+    pub fn give(reply: &[u8; 32], at: u64, log: u32) -> Option<u64> {
+        let r = svc(nr::SHARE, 1, off(reply.as_ptr()), at, log as u64, 0);
+        (r != ERR).then_some(r)
+    }
+
+    /// The caller's view `id` taken back: its holder's handle cleared, its waiters woken. False when it is not one of the caller's (ended already).
+    pub fn take(id: u64) -> bool {
+        svc(nr::SHARE, 2, id, 0, 0, 0) == 0
+    }
+
+    /// A view the caller holds: (its address, its bytes, the handle slot the kernel wrote for it, or None when no pair was free). None: not a view the caller holds (taken back, its server ended), or a kernel from before.
+    pub fn view(id: u64) -> Option<(u64, u64, Option<u64>)> {
+        let mut b = [0u8; 16];
+        let a = svc(nr::SHARE, 3, id, off(b.as_mut_ptr()), 0, 0);
+        if a == ERR {
+            return None;
+        }
+        let bytes = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let slot = u64::from_le_bytes(b[8..].try_into().unwrap());
+        Some((a, bytes, (slot != NO_SLOT).then_some(slot)))
+    }
+
+    /// Whether the caller's view `id` is still held: Some(false) once its holder ended or it was taken back; None without a pool.
+    pub fn alive(id: u64) -> Option<bool> {
+        match svc(nr::SHARE, 4, id, 0, 0, 0) {
+            ERR => None,
+            r => Some(r == 1),
+        }
     }
 }
 
