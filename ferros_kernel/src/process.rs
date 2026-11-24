@@ -1665,6 +1665,24 @@ fn sched_report_locked(out: &mut Vec<u8>, all: bool) {
         }
     }
     out.extend_from_slice(alloc::format!("sched trace: A#{} events over A#{} ms; A#{} round trips\n", entries.len(), us(entries.last().unwrap().0) / 1000, trips.len()).as_bytes());
+    // The threads in the ring that named themselves (SYS_THREAD_NAME, `thread_called`), so a name like lumis.9 reads as what it does; named as the events are, at the dump.
+    let mut seen = [false; 256];
+    for e in &entries {
+        seen[e.2 as usize] = true;
+    }
+    let mut named = Vec::new();
+    for (i, _) in seen.iter().enumerate().filter(|s| *s.1) {
+        let called = thread_called(i);
+        if called.len() != thread_name(i).len() {
+            named.extend_from_slice(b" ");
+            named.extend_from_slice(&called);
+        }
+    }
+    if !named.is_empty() {
+        out.extend_from_slice(b"threads named:");
+        out.extend_from_slice(&named);
+        out.push(b'\n');
+    }
     // The slow trips in full, the rest summed per (caller, server).
     let mut slow = 0;
     for &(c, sv, w, h, b) in &trips {
