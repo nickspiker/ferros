@@ -224,6 +224,25 @@ pub mod charger {
     pub fn restore_input(raw: u8) -> Result<(), u32> {
         super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_12, raw)
     }
+
+    /// CHG_CNFG_01: FCHGTIME [2:0] is the fast-charge safety timer, 0 = off; the bootloader leaves the reset value G#99 (timer on).
+    pub const CHG_CNFG_01: u8 = 0xBA;
+    pub const FCHGTIME_MASK: u8 = 0x07;
+    /// CHG_CNFG_06: CHGPROT [3:2], 3 = the protected registers open; the bootloader leaves G#0C (open).
+    pub const CHG_CNFG_06: u8 = 0xBF;
+
+    /// The fast-charge safety timer off (owner, 2026-11-24: "Turn the safety timer off, yes."), the same plain read-modify-write Android's driver makes at probe (bms max77759_charger.c, "disable fast charge safety timer"), CHGPROT left as found as Android leaves it there.
+    /// Left on, it ends a slow charge in a timer fault: the Pro on the dev box's 500 mA sat at 88 % with CHG_DTLS 6 (docs/CHARGING.md).
+    /// One try: returns CHG_CNFG_01 before and after the write, and CHG_CNFG_06, for the boot's log line.
+    pub fn safety_timer_off() -> Result<(u8, u8, u8), u32> {
+        let before = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_01)?;
+        if before & FCHGTIME_MASK != 0 {
+            super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_01, before & !FCHGTIME_MASK)?;
+        }
+        let after = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_01)?;
+        let prot = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_06)?;
+        Ok((before, after, prot))
+    }
 }
 
 /// The MAX77759 fuel gauge (PMIC.md): one sample of what matters for power profiling.

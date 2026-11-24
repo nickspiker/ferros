@@ -61,6 +61,20 @@ The timer fault latched (CHG_DTLS 6, CHG_OK and BAT_OK low): the buck still carr
 The same ceiling will come back on any slow source after the timer's length (3 h if the family encoding holds).
 Note that `display power ... battery` and `diag power start` write MODE (0, then 5 again); whether that restarts the timer is UNCONFIRMED.
 
+## Decided 2026-11-24: the safety timer off
+
+Owner, 2026-11-24: "Turn the safety timer off, yes."
+Only that: no other charging policy (ceiling, current, scheduling) until he decides those.
+
+- **How:** CHG_CNFG_01 G#BA, FCHGTIME [2:0] to 0, a plain read-modify-write, as Android's driver does at probe (max77759_charger.c:3254-3257).
+  Google's probe does not touch CHGPROT for it; the bootloader leaves CHG_CNFG_06 at G#0C (CHGPROT 3, the protected registers open), so the write takes as is, and ferros leaves CHGPROT as found too.
+  Android's other protected writes (`max77759_external_reg_write`, the input select, the headroom) open CHGPROT and close it after; none of those is this one.
+- **At every boot:** `hsi2c::charger::safety_timer_off` from `kernel_main`, after the flash log comes up; one try, read back, and a flash log line: "charger safety timer off: CHG_CNFG_01 G#99 -> G#98 (CHG_CNFG_06 G#0C)", or "NOT off" with the error or the read-back, and the boot goes on.
+  It runs on the 8a too (the same MAX77759 charger).
+- **On the live Pro (2026-11-24, RAM kernel, attested):** `display i2c 69 BA 98` read back G#98, CHG_CNFG_06 stayed G#0C.
+  The fault stayed latched: CHG_DTLS 6 (B6 = G#A6), CHG_INT_OK G#C7, the cell at −5 to −6 mA, SOC 86 %, 4.109 V, several minutes after the write.
+  Turning the timer off does not clear a fault already latched; a replug (or a MODE cycle) should, not yet tried.
+
 ## The charger registers a driver needs
 
 Encodings from max77759_charger.c (Google's own conversions; the register map is `max77759_A1_regs.h`).

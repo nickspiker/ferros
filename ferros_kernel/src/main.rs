@@ -2414,6 +2414,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             flashlog::line(&alloc::format!("bootloader saw: {}", platform::abl_reset_lines()));
         }
     }
+    // The charger's fast-charge safety timer off at every boot, as Android's driver does at probe (hsi2c.rs `charger::safety_timer_off`, docs/CHARGING.md; owner, 2026-11-24: "Turn the safety timer off, yes."). One try: a failure is said and the boot goes on.
+    flashlog::line(&match hsi2c::charger::safety_timer_off() {
+        Ok((b, a, p)) if a & hsi2c::charger::FCHGTIME_MASK == 0 => alloc::format!("charger safety timer off: CHG_CNFG_01 G#{b:02X} -> G#{a:02X} (CHG_CNFG_06 G#{p:02X})"),
+        Ok((b, a, p)) => alloc::format!("charger safety timer NOT off: CHG_CNFG_01 G#{b:02X}, reads G#{a:02X} after the write (CHG_CNFG_06 G#{p:02X}, CHGPROT [3:2] 3 = open); booting on"),
+        Err(e) => alloc::format!("charger safety timer NOT off: hsi2c_11 G#{e:X}; booting on"),
+    });
     checklist::step(checklist::Step::Log);
     // The wall clock before the vault opens (docs/VSF-AUDIT.md P10, 2026-11-17): every commit and document the vault writes is stamped with Eagle time from it (kvault `now`). A failed read leaves it unknown (0, the Eagle epoch: settings.rs), never made up; the service reads it again at its start and every hour.
     let clock = rtc::sync_early();
