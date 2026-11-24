@@ -25,7 +25,11 @@ const ADDRESS: &str = "address";
 /// The device-only secret mixed into every identity key (`\0id.secret`): section `identity_secret`, field `secret`, 32 bytes of random material `hR`.
 const SECRET_SECTION: &str = "identity_secret";
 const SECRET: &str = "secret";
-/// The seed kept for unlock at boot (`\0id.unlock`): section `identity_unlock`, field `seed`, the identity seed `hI`.
+/// The device-only secret and the bound mark together (`\0id.secret` since 2026-11-24): section `device_secret`, field `secret` (32 bytes of random material, `hR`) and field `bound` (whether an identity's fleet bound this device under this secret). One document, so renewing the secret (one write) also unbinds: the owner's rule of 2026-11-24 that destroying is a key operation, never deletes ("Sand on a beach my friend"). A device whose secret is still the `identity_secret` document reads its bound mark from `\0id.bound` as before.
+const DEVICE_SECRET_SECTION: &str = "device_secret";
+/// The seed kept for unlock at boot, sealed under a key made from the device-only secret (`\0id.unlock` since 2026-11-24): section `kept_seed`, field `seal`, the XChaCha20-Poly1305 envelope wrapped `v'e'`. Renewing the secret leaves it unopenable, so nothing need be deleted.
+const KEPT_SECTION: &str = "kept_seed";
+/// The seed kept for unlock at boot (`\0id.unlock`, until 2026-11-24, read only while the secret is still its `identity_secret` document): section `identity_unlock`, field `seed`, the identity seed `hI`.
 const UNLOCK_SECTION: &str = "identity_unlock";
 const SEED: &str = "seed";
 /// The mark that an identity's fleet bound this device (`\0id.bound`): section `identity_bound`, field `bound`, a boolean.
@@ -50,6 +54,12 @@ fn entries_schema() -> SectionSchema {
 }
 fn secret_schema() -> SectionSchema {
     SectionSchema::new(SECRET_SECTION).field(SECRET, TypeConstraint::AnyHash)
+}
+fn device_secret_schema() -> SectionSchema {
+    SectionSchema::new(DEVICE_SECRET_SECTION).field(SECRET, TypeConstraint::AnyHash).field(BOUND, TypeConstraint::AnyUnsigned)
+}
+fn kept_schema() -> SectionSchema {
+    SectionSchema::new(KEPT_SECTION).field(SEAL, TypeConstraint::Wrapped(b'e'))
 }
 fn unlock_schema() -> SectionSchema {
     SectionSchema::new(UNLOCK_SECTION).field(SEED, TypeConstraint::AnyHash)
@@ -192,6 +202,42 @@ pub fn secret_of(doc: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
+/// The device-only secret with the bound mark (`device_secret`).
+pub fn device_secret_document(secret: &[u8; 32], bound: bool, now: i64) -> Option<Vec<u8>> {
+    let name = String::from(DEVICE_SECRET_SECTION);
+    let section = device_secret_schema().build().set(SECRET, VsfType::hR(secret.to_vec())).ok()?.set(BOUND, VsfType::u0(bound)).ok()?.encode().ok()?;
+    document(&name, section, now)
+}
+
+/// The device-only secret and the bound mark out of a `device_secret` document; None for anything else (an `identity_secret` document is read by `secret_of`).
+/// The caller wipes the secret once used, and the document it came in.
+pub fn device_secret_of(doc: &[u8]) -> Option<([u8; 32], bool)> {
+    let s = SectionBuilder::parse_document(device_secret_schema(), doc, None).ok()?;
+    let first = |f: &str| s.get_fields(f).first().and_then(|x| x.values.first()).cloned();
+    let secret = match first(SECRET)? {
+        VsfType::hR(b) => k32(&b)?,
+        _ => return None,
+    };
+    let bound = match first(BOUND)? {
+        VsfType::u0(b) => b,
+        _ => return None,
+    };
+    Some((secret, bound))
+}
+
+/// The kept seed's sealed document (`kept_seed`): the envelope as the caller sealed it.
+pub fn kept_document(envelope: Vec<u8>, now: i64) -> Option<Vec<u8>> {
+    single(kept_schema(), SEAL, VsfType::v(b'e', envelope), now)
+}
+
+/// The envelope out of a `kept_seed` document.
+pub fn kept_of(doc: &[u8]) -> Option<Vec<u8>> {
+    match first(kept_schema(), SEAL, doc)?? {
+        VsfType::v(b'e', b) if b.len() >= ENVELOPE_MIN => Some(b),
+        _ => None,
+    }
+}
+
 /// The kept seed's document.
 pub fn unlock_document(seed: &[u8; 32], now: i64) -> Option<Vec<u8>> {
     single(unlock_schema(), SEED, VsfType::hI(seed.to_vec()), now)
@@ -258,6 +304,21 @@ mod tests {
         assert_eq!(bound_of(&bound_document(true, NOW).unwrap()), Some(true));
         assert_eq!(genesis_of(&genesis_document(NOW).unwrap()), Some(Some(NOW)));
         assert_eq!(genesis_of(&genesis_document(0).unwrap()), Some(None));
+        assert_eq!(device_secret_of(&device_secret_document(&[5; 32], true, NOW).unwrap()), Some(([5; 32], true)));
+        assert_eq!(device_secret_of(&device_secret_document(&[6; 32], false, NOW).unwrap()), Some(([6; 32], false)));
+        assert_eq!(kept_of(&kept_document(env.clone(), NOW).unwrap()), Some(env));
+    }
+
+    /// The two secret documents are never read for each other, and a kept seed is never read as the old plain one.
+    #[test]
+    fn the_secret_formats_stay_apart() {
+        let new = device_secret_document(&[1; 32], true, NOW).unwrap();
+        let old = secret_document(&[1; 32], NOW).unwrap();
+        assert_eq!(secret_of(&new), None);
+        assert_eq!(device_secret_of(&old), None);
+        let kept = kept_document(alloc::vec![2; 72], NOW).unwrap();
+        assert_eq!(unlock_of(&kept), None);
+        assert_eq!(kept_of(&unlock_document(&[2; 32], NOW).unwrap()), None);
     }
 
     #[test]

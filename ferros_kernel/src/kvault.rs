@@ -87,6 +87,9 @@ const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
 /// The base the kernel derives the person's vault domains from (process.rs `domain_keys`, VAULT-OUT.md): one per unlock, wiped at lock.
 const ID_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 identity vault domain";
 const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
+/// The kept seed's seal key (`kept_key`): BLAKE3 derive_key over (the ira-derived device key ‖ the device-only secret), so a renewed secret leaves a kept seed unopenable with nothing deleted (owner, 2026-11-24).
+const KEPT_CONTEXT: &str = "ferros 2026-11-24 kept seed v0";
+const KEPT_DEVICE_CONTEXT: &str = "ferros 2026-11-24 kept seed device";
 /// The person's ledger key, from the identity root as the vault keys are (`IdKeys.ledger`).
 const ID_LEDGER_CONTEXT: &str = "ferros 2026-11-17 identity ledger v0";
 /// Attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-05: a plain NTAG-type tag in his glasses opens the device without the handle typed, and nothing is remembered without the tag). One record per kept tag, in the device class, kept by its id (a hash of its UID, never the UID) as an address under this reserved prefix (`set_addr`), so the address list is the list of kept tags and nothing names them.
@@ -733,13 +736,9 @@ impl KVault {
     pub fn unlock(&mut self, seed: &[u8; 32], keep: bool) -> Result<(), KvError> {
         self.lock();
         let mut secret = [0u8; 32];
-        match self.raw_get(ID_SECRET)? {
-            // The vault's copy of the device-only secret wiped once taken: it is half of what the identity key is made from.
-            Some(mut s) => {
-                let got = ferros_pieces::kv::secret_of(&s);
-                crate::keys::wipe_to_dram(&mut s);
-                // A secret that does not read is never replaced by a new one: every identity entry here is sealed under a key made from it.
-                let Some(mut got) = got else { return Err(KvError::Document("the device-only secret")) };
+        // A secret that does not read is never replaced by a new one: every identity entry here is sealed under a key made from it (`secret_read` refuses it).
+        match self.secret_read()? {
+            Some((mut got, _)) => {
                 secret.copy_from_slice(&got);
                 crate::keys::wipe_to_dram(&mut got);
             }
@@ -747,7 +746,8 @@ impl KVault {
                 if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
                     return Err(KvError::NoIra);
                 }
-                let doc = ferros_pieces::kv::secret_document(&secret, now());
+                // The secret and the bound mark in one document (not bound yet).
+                let doc = ferros_pieces::kv::device_secret_document(&secret, false, now());
                 let Some(mut doc) = doc else {
                     crate::keys::wipe_to_dram(&mut secret);
                     return Err(KvError::Document("the device-only secret"));
@@ -793,16 +793,13 @@ impl KVault {
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
+        // A handle this device holds no space for: its name list made. Whatever an earlier handle left here, on a device not bound yet, stays where it is, unopened (owner, 2026-11-24: no needless writes; leftovers are noise and the vault's rotation takes their room).
         if names.is_none() {
-            self.wipe_identity()?;
             // The (empty) name list written at once: it is what recognises this identity here after a bind, and one that stores nothing in the kernel's vault (everything in the vault process since 2026-11) would otherwise have none and be refused as another's at its next unlock (the 8a, 2026-11-09: bound in boot 117, its own handle refused in 118).
             self.put_names(Class::Identity, &[])?;
         }
         if keep {
-            let mut doc = ferros_pieces::kv::unlock_document(seed, now()).ok_or(KvError::Document("the kept seed"))?;
-            let r = self.raw_put(ID_UNLOCK, &doc);
-            crate::keys::wipe_to_dram(&mut doc);
-            r?;
+            self.keep_seed(seed)?;
         }
         // The person's wallpaper seed for wallgen (payloads/wallgen), which makes their wallpaper once on this device and keeps it: derived one way, as the attest screen derives it (ahau_core::wallpaper_seed, the same context), so nothing of the identity seed leaves here.
         if let Some(ws) = crate::keys::held_derive(&self.id_keys()?.seed, "ferros 2026-11-07 wallpaper seed", &[]) {
@@ -894,9 +891,17 @@ impl KVault {
         if let Some(b) = self.bound {
             return Ok(b);
         }
-        let b = match self.raw_get(ID_BOUND)? {
-            None => false,
-            Some(doc) => ferros_pieces::kv::bound_of(&doc).ok_or(KvError::Document("the bound mark"))?,
+        // The mark rides in the secret's document (`device_secret`), so a renewed secret is an unbound device; a device whose secret is still the older document reads its mark from `ID_BOUND`.
+        let b = match self.secret_read()? {
+            Some((mut s, Some(b))) => {
+                crate::keys::wipe_to_dram(&mut s);
+                b
+            }
+            Some((mut s, None)) => {
+                crate::keys::wipe_to_dram(&mut s);
+                self.bound_legacy()?
+            }
+            None => self.bound_legacy()?,
         };
         self.bound = Some(b);
         Ok(b)
@@ -911,23 +916,140 @@ impl KVault {
         if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
             self.put_names(Class::Identity, &[])?;
         }
-        let doc = ferros_pieces::kv::bound_document(true, now()).ok_or(KvError::Document("the bound mark"))?;
-        self.raw_put(ID_BOUND, &doc)?;
+        // The mark written into the secret's document, the same secret (one write, as the separate mark was).
+        let Some((mut secret, _)) = self.secret_read()? else { return Err(KvError::Document("the device-only secret")) };
+        let doc = ferros_pieces::kv::device_secret_document(&secret, true, now());
+        crate::keys::wipe_to_dram(&mut secret);
+        let Some(mut doc) = doc else { return Err(KvError::Document("the device-only secret")) };
+        let r = self.raw_put(ID_SECRET, &doc);
+        crate::keys::wipe_to_dram(&mut doc);
+        r?;
         self.bound = Some(true);
         Ok(())
     }
 
-    /// Release the device (a completed departure, or the developer's `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the device-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
-    pub fn release(&mut self) -> Result<usize, KvError> {
-        let n = self.wipe_identity()?;
-        // The cached mark forgotten first: a delete that fails part way leaves it read again from the flash.
+    /// The bound mark of a device whose secret is still the older `identity_secret` document (before 2026-11-24).
+    fn bound_legacy(&mut self) -> Result<bool, KvError> {
+        Ok(match self.raw_get(ID_BOUND)? {
+            None => false,
+            Some(doc) => ferros_pieces::kv::bound_of(&doc).ok_or(KvError::Document("the bound mark"))?,
+        })
+    }
+
+    /// The device-only secret, and the bound mark when its document carries it (`device_secret`; None in the older `identity_secret`). None when no identity has unlocked here yet. A document that is neither is refused, never replaced: everything of the identity is sealed under a key made from it.
+    /// The caller wipes the secret once used.
+    fn secret_read(&mut self) -> Result<Option<([u8; 32], Option<bool>)>, KvError> {
+        let Some(mut doc) = self.raw_get(ID_SECRET)? else { return Ok(None) };
+        let got = match ferros_pieces::kv::device_secret_of(&doc) {
+            Some((s, b)) => Some((s, Some(b))),
+            None => ferros_pieces::kv::secret_of(&doc).map(|s| (s, None)),
+        };
+        crate::keys::wipe_to_dram(&mut doc);
+        got.map(Some).ok_or(KvError::Document("the device-only secret"))
+    }
+
+    /// The kept seed's seal key from the ira-derived device key and the device-only secret (`KEPT_CONTEXT`).
+    fn kept_key(secret: &[u8; 32]) -> Result<[u8; 32], KvError> {
+        let mut dev = crate::ira::derive(KEPT_DEVICE_CONTEXT).ok_or(KvError::NoIra)?;
+        let key = *blake3::Hasher::new_derive_key(KEPT_CONTEXT).update(&dev).update(secret).finalize().as_bytes();
+        crate::keys::wipe_to_dram(&mut dev);
+        Ok(key)
+    }
+
+    /// The seed kept for unlock at boot, sealed under the kept key (`kept_seed`), so a renewed secret leaves it unopenable.
+    fn keep_seed(&mut self, seed: &[u8; 32]) -> Result<(), KvError> {
+        let Some((mut secret, _)) = self.secret_read()? else { return Err(KvError::Document("the device-only secret")) };
+        let key = Self::kept_key(&secret);
+        crate::keys::wipe_to_dram(&mut secret);
+        let mut key = key?;
+        let n = self.nonce.next_nonce();
+        let mut cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        crate::keys::wipe_to_dram(&mut key);
+        let mut sealed = Vec::with_capacity(24 + 32 + 16);
+        sealed.extend_from_slice(&n[..]);
+        sealed.extend_from_slice(seed);
+        let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), KEPT_CONTEXT.as_bytes(), &mut sealed[24..]);
+        crate::keys::wipe_value_to_dram(&mut cipher);
+        let Ok(tag) = tag else {
+            crate::keys::wipe_to_dram(&mut sealed);
+            return Err(KvError::Seal);
+        };
+        sealed.extend_from_slice(&tag);
+        let mut doc = ferros_pieces::kv::kept_document(sealed, now()).ok_or(KvError::Document("the kept seed"))?;
+        let r = self.raw_put(ID_UNLOCK, &doc);
+        crate::keys::wipe_to_dram(&mut doc);
+        r.map(|_| ())
+    }
+
+    /// The kept seed, opened: a `kept_seed` document under the current secret's kept key; the older plain `identity_unlock` document only while the secret is still its older document (a renewed secret writes the new one, so a plain seed from before is never used after it). None when there is none, or none that opens (a seed kept under a secret since renewed: noise).
+    fn kept_seed(&mut self) -> Result<Option<[u8; 32]>, KvError> {
+        let Some(mut doc) = self.raw_get(ID_UNLOCK)? else { return Ok(None) };
+        let kept = ferros_pieces::kv::kept_of(&doc);
+        let plain = ferros_pieces::kv::unlock_of(&doc);
+        crate::keys::wipe_to_dram(&mut doc);
+        let Some((mut secret, format)) = self.secret_read()? else { return Ok(None) };
+        let r = match (kept, plain, format) {
+            (Some(mut sealed), _, _) => {
+                let key = Self::kept_key(&secret);
+                let mut key = match key {
+                    Ok(k) => k,
+                    Err(e) => {
+                        crate::keys::wipe_to_dram(&mut secret);
+                        return Err(e);
+                    }
+                };
+                let mut cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+                crate::keys::wipe_to_dram(&mut key);
+                let mut n = [0u8; 24];
+                n.copy_from_slice(&sealed[..24]);
+                sealed.drain(..24);
+                let opened = cipher.decrypt_in_place(XNonce::from_slice(&n), KEPT_CONTEXT.as_bytes(), &mut sealed);
+                crate::keys::wipe_value_to_dram(&mut cipher);
+                let seed = if opened.is_ok() && sealed.len() == 32 { sealed[..].try_into().ok() } else { None };
+                crate::keys::wipe_to_dram(&mut sealed);
+                seed
+            }
+            (None, Some(p), None) => Some(p),
+            (None, Some(mut p), Some(_)) => {
+                crate::keys::wipe_to_dram(&mut p);
+                None
+            }
+            (None, None, _) => None,
+        };
+        crate::keys::wipe_to_dram(&mut secret);
+        Ok(r)
+    }
+
+    /// Renew the device-only secret (an unbind the fleet consented to, a shred; process.rs op 15 and op 4, each gated there): the identity locked (its keys wiped from memory) and one write, a new secret with the bound mark off in its one document. Nothing is deleted (owner, 2026-11-24: "whoever's dumbfuck idea to add more writes to an SSD that has a fixed number of writes is beyond me but it's dead wrong. Sand on a beach my friend."): every identity key here is made from the secret (`unlock`: the identity root over the secret and the seed; the person's vault-process domains, a kist's own domain, the flash log's personal key and the ledger all derive from that root), and so are the kept tags' seal keys and the kept seed's, so with the old secret gone nothing sealed under it opens again, for anyone, the handle and the device together included. The vault's rotation reclaims their room.
+    /// The one exception, kept to the older format: a plain kept seed (`identity_unlock`, before 2026-11-24) is a root on the disk sealed by the device alone, so it is deleted if one is there; a device that kept none (the Pro, unlock at boot off) writes nothing more.
+    pub fn renew(&mut self) -> Result<(), KvError> {
+        self.lock();
+        let legacy_seed = match self.raw_get(ID_UNLOCK)? {
+            Some(mut d) => {
+                let plain = ferros_pieces::kv::unlock_of(&d).map(|mut p| crate::keys::wipe_to_dram(&mut p)).is_some();
+                crate::keys::wipe_to_dram(&mut d);
+                plain
+            }
+            None => false,
+        };
+        let mut secret = [0u8; 32];
+        if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
+            return Err(KvError::NoIra);
+        }
+        let doc = ferros_pieces::kv::device_secret_document(&secret, false, now());
+        crate::keys::wipe_to_dram(&mut secret);
+        let Some(mut doc) = doc else { return Err(KvError::Document("the device-only secret")) };
+        // The cached mark forgotten first: a write that fails leaves it read again from the flash.
         self.bound = None;
-        for name in [ID_BOUND, ID_UNLOCK, ID_SECRET] {
-            let a = self.addr(Class::Device, name)?;
+        let r = self.raw_put(ID_SECRET, &doc);
+        crate::keys::wipe_to_dram(&mut doc);
+        r?;
+        self.bound = Some(false);
+        if legacy_seed {
+            let a = self.addr(Class::Device, ID_UNLOCK)?;
             self.vault.delete(&a, now())?;
         }
-        self.lock();
-        Ok(n)
+        Ok(())
     }
 
     /// What removing this device from its identity would take from the kernel's vault and its registers (SYS_UNLOCK op 15's dry run, AUTH.md "Remove this device"), read only: nothing is written or deleted.
@@ -953,23 +1075,6 @@ impl KVault {
             secret,
             person_key: self.person_held(),
         })
-    }
-
-    /// Every identity-class entry deleted by its address (`ID_ADDRS`), without needing its key, and every kept tag with them (a tag opens only the identity it was kept for, which goes here: on release, and when another handle unlocks a device not bound yet). Returns how many identity entries.
-    fn wipe_identity(&mut self) -> Result<usize, KvError> {
-        self.wipe_tags()?;
-        let list = self.id_addrs()?;
-        for a in list.chunks_exact(32) {
-            let mut b = [0u8; 32];
-            b.copy_from_slice(a);
-            crate::platform::pet_watchdogs();
-            self.vault.delete(&b, now())?;
-        }
-        if !list.is_empty() {
-            let a = self.addr(Class::Device, ID_ADDRS)?;
-            self.vault.delete(&a, now())?;
-        }
-        Ok(list.len() / 32)
     }
 
     /// The identity class's vault addresses (`ID_ADDRS`), concatenated; none when it keeps none. A list that is not its document is refused, never read as empty: the wipe it serves would miss every entry on it.
@@ -1028,10 +1133,9 @@ impl KVault {
     pub fn boot_unlock(&mut self, on: bool) -> Result<bool, KvError> {
         match (on, self.raw_get(ID_UNLOCK)?) {
             (true, Some(mut s)) => {
-                let got = ferros_pieces::kv::unlock_of(&s);
-                // The vault's copy of the kept seed, as the one it is copied into.
                 crate::keys::wipe_to_dram(&mut s);
-                let Some(mut seed) = got else { return Err(KvError::Document("the kept seed")) };
+                // A kept seed that does not open under this secret (kept before a renewal) is noise: no unlock, nothing written.
+                let Some(mut seed) = self.kept_seed()? else { return Ok(false) };
                 let r = self.unlock(&seed, false);
                 crate::keys::wipe_to_dram(&mut seed);
                 r.map(|_| true)
@@ -1047,13 +1151,9 @@ impl KVault {
 
     /// A tag's id and seal key from its UID (`TAG_ID_CONTEXT`, `TAG_SEAL_CONTEXT`), both from the ira-derived device key; the seal key with the device-only secret too. None without the ira this boot, or before any identity has unlocked here (no secret yet, so nothing can have been kept).
     fn tag_keys(&mut self, uid: &[u8]) -> Result<([u8; 32], [u8; 32]), KvError> {
-        let mut secret = match self.raw_get(ID_SECRET)? {
-            Some(mut doc) => {
-                let s = ferros_pieces::kv::secret_of(&doc);
-                crate::keys::wipe_to_dram(&mut doc);
-                s.ok_or(KvError::Open)?
-            }
-            None => return Err(KvError::Open),
+        let mut secret = match self.secret_read() {
+            Ok(Some((s, _))) => s,
+            _ => return Err(KvError::Open),
         };
         let mut dev = crate::ira::derive(TAG_DEVICE_CONTEXT).ok_or(KvError::NoIra)?;
         let id = *blake3::Hasher::new_derive_key(TAG_ID_CONTEXT).update(&dev).update(uid).finalize().as_bytes();
@@ -1188,7 +1288,7 @@ impl KVault {
         }
     }
 
-    /// Every kept tag deleted, and their list, needing no key: on release, and with the identity they open (`wipe_identity`).
+    /// Every kept tag deleted, and their list, needing no key: the NFC page's "forget every tag" (op 8), the person's own choice.
     fn wipe_tags(&mut self) -> Result<usize, KvError> {
         let ids = self.addrs(TAGS)?;
         for c in ids.chunks_exact(32) {

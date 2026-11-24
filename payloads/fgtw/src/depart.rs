@@ -392,17 +392,53 @@ impl Client {
         self.log.line();
     }
 
-    /// This device has left the fleet: the identity's roots, chain and key forgotten here, on disk and in RAM, and the kernel's binding released.
+    /// This device has left the fleet (the fold no longer lists it: a member consented and the Remove landed; fgtw::security::UnbindStep::Forget): its keys forgotten and the device-only secret renewed, nothing deleted (owner, 2026-11-24: "Sand on a beach my friend."). With the unbind's typed handle in hand (remove.rs) the kernel checks it again and powers off; otherwise it renews only while the person's approve of the unbind is held, and with neither it locks and destroys nothing ("if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped").
     fn depart_wipe(&mut self) {
-        self.log.put(b"fgtw: departed; the identity is forgotten here");
+        if self.removing.is_some() {
+            self.log.put(b"fgtw: departed (a member consented): the unbind completes");
+            self.log.line();
+            self.remove_erase();
+            return;
+        }
+        self.log.put(b"fgtw: departed (a member consented): the device-only secret renewed if the person's approve of the unbind is held, else locked with nothing destroyed");
         self.log.line();
-        let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
-        let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), add::ADD_KEY);
-        self.forget_disk();
         self.forget_identity();
         if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-            self.log.put(b"fgtw: the kernel did not release the device's identity space");
+            self.log.put(b"fgtw: the kernel did not renew (no approve of an unbind held): locked, nothing destroyed; the person unbinds again to finish");
             self.log.line();
+        }
+    }
+
+    /// The approver's rotation once a departure it approved has landed (fgtw::security::rotate_after_departure): the new key adopted here and everything sealed under the old one sealed again (`space_reseal`).
+    fn rotate_after(&mut self, leaver: &[u8; 32]) {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        fgtw::set_clock(eagle());
+        let r = {
+            let s = self.seed();
+            fgtw::security::rotate_after_departure(&s, &self.keys, &hp, leaver, &seed)
+        };
+        match r {
+            Ok((rev, k)) => {
+                if let Some(mut old) = self.fleet_key.replace(k) {
+                    wipe(&mut old);
+                }
+                self.fleet_rev = rev;
+                self.persist_secret(ferros_kept::secret::Kind::FleetKey, b"fleet_key", &k);
+                self.log.put(b"fgtw: departure: the fleet key rotated to revision A#");
+                self.log.dec(rev);
+                self.log.put(b" without the device that left; the space sealed again under it");
+                self.log.line();
+                if !self.space_reseal() {
+                    self.log.put(b"fgtw: departure: the space was not sealed again yet; its next push seals it under the new key");
+                    self.log.line();
+                }
+                self.refresh_chain();
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: departure: the fleet key was NOT rotated (the device that left still opens what is sealed until a member rotates): ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+            }
         }
     }
 
@@ -450,11 +486,13 @@ impl Client {
                         self.seed_ip = s.ip.get();
                         r
                     };
-                    ferros_sys::pin(0);
                     if r.is_ok() {
                         self.seed_heard_us = now_us();
                         self.space_drop_depart(&leaver);
+                        // Rotate on remove (owner, 2026-11-24; fgtw::security::UnbindStep::Rotate): the approving device mints a fresh fleet key wrapped to the live members alone, so the device that left opens nothing sealed after; then the space and the person key sealed again under it at once.
+                        self.rotate_after(&leaver);
                     }
+                    ferros_sys::pin(0);
                     self.depart_event(Flow::Approved { leaver, result: r.as_ref().map_err(|e| e.as_str()) });
                 }
                 // The chain the approval just published is what the leaving device must see: handed after the next read (`RefreshChain`, which the machine asks for right behind it).

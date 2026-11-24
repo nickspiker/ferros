@@ -1,6 +1,6 @@
 //! The Security page's acts this service carries out (fgtw::security, shared with Photon; owner, 2026-11-24: "build the lock, revoke, shred, all that stuff needs to work on both"), each approved on the attest screen first (docs/AUTH.md "Approve on the attest screen").
 //!
-//! - **Shred** (op 33 [2]): the attest screen hands the seed of the handle typed at the approve; the kernel erases this identity's data here exactly as a removal does (each kist's own domain, every scope of the person's, the kernel's identity class, tags, kept seed, bound mark, the device-only secret, the person key), with no departure and under its own approval (ahau_core::approve::SHRED), then restarts at the attest screen. The device stays in its fleet: the chain still lists it and the fan-out still wraps to its key, so the next attest with the same handle binds it again and brings the space, the fleet key and the kists back.
+//! - **Shred** (op 33 [2]; owner, 2026-11-24: "if you cannot attest, there's ZERO reason my shit should get wiped ... that's mostly key management formalities"): the attest screen hands the seed of the handle typed at the approve; the kernel checks it, takes its own approval (ahau_core::approve::SHRED) and renews the device-only secret (the keys wiped from memory, one write, nothing deleted), then restarts at the attest screen. The device stays in its fleet: the chain still lists it and the fan-out still wraps to its key, so the next attest with the same handle binds it again and brings the space, the fleet key and the kists back.
 //! - **Revoke** and **reinstate** (ahau_core::approve::REVOKE, REINSTATE): the kernel holds the approval with the device's number (the first seven bytes of its key); this service takes it once it holds the roots and the fleet key again (the approve's lock wiped them), on that edge alone, never on a timer (`sec_check`).
 //!   A revoke signs the chain's Lock op and the worker's refusal (`fgtw::security::revoke`), mints a fresh fleet key wrapped to the live members alone (`fgtw::security::rotate`), adopts it, and seals the person's space and person key again under it at once, to the fleet and to fgtw.org (`space_reseal`): no device keeps the key before (there is no chain of keys), so nothing may stay sealed only under it.
 //!   A reinstatement signs Unlock and lifts the refusal (`fgtw::security::reinstate`), then grows the fan-out to the live members with the key held (never a mint).
@@ -35,18 +35,15 @@ impl Client {
             return 8;
         }
         self.sec = Some(Sec { kind: ap::SHRED, phase: 2, device: self.me });
-        let kists = self.remove_kists();
-        // Flag bit 1: the shred (no departure, the SHRED approval, a restart).
-        let mut m = Self::remove_message(2, typed, &kists, 0);
+        // Flag bit 1: the shred (no departure, the SHRED approval, a restart). No kists named: nothing of theirs is dropped, their domains derive from the identity root the renewal ends.
+        let mut m = Self::remove_message(2, typed, &[], 0);
         wipe(typed);
         let len = m.len();
         let got = ferros_sys::remove_device(cap(unsafe { GRANTS }, S_UNLOCK), &mut m, len);
         wipe(&mut m);
         match got {
             Some(1) => {
-                self.log.put(b"fgtw: shred: the kernel erases this identity's data here (A#");
-                self.log.dec(kists.len() as u64);
-                self.log.put(b" kists' own domains and every scope of the person's) and restarts at the attest screen; the device stays in its fleet");
+                self.log.put(b"fgtw: shred: the kernel renewed the device-only secret (this identity's data here unreadable, nothing deleted) and restarts at the attest screen; the device stays in its fleet");
                 self.log.line();
                 self.forget_identity();
                 0

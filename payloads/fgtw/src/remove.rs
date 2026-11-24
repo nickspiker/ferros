@@ -1,26 +1,24 @@
-//! Remove this device from its identity (owner, 2026-11-22; docs/AUTH.md "Remove this device"), on the device being removed: Remove on the Fleet page, then the approve on the attest screen itself (owner, 2026-11-24: the device locks at once and the person's handle typed there approves it; ahau_core::approve::REMOVE_DEVICE), which hands the roots here again and then asks for the removal.
-//! No Fleet page needs to be open anywhere and nothing waits on another device before the erase.
+//! Unbind this device (owner, 2026-11-22 and 2026-11-24; docs/AUTH.md "Unbind this device"; fgtw::security::UNBIND), on the device being unbound, in the owner's order:
 //!
-//! 0. **The check.** The typed handle's seed against the roots in hand here (op 33), its memory-hard proof against this identity's by fgtw's removal gate (`UserOp::Remove`, then `Event::Unbind`), and the seed again in the kernel at the erase (SYS_UNLOCK op 15, compared in registers).
-//! 1. **The fleet told at once**, with what fgtw has today: the departure machine's signed request (depart.rs), intent 1 (to a new owner), handed by Photon Transport to every fleet device heard here and put in the identity space, whose push goes to the fleet and to fgtw.org in the same pass (space.rs `space_put_depart`).
-//!    On today's fgtw the chain still drops this device only when a surviving member approves (its Approve publishes the consented Remove and frees this device's brand on fgtw.org, which another identity's add needs: fgtw-bootstrap refuses a bare self-departure and a device branded to another identity).
-//!    fgtw's shared departure machine (the Photon session's) takes this step over when it lands: `remove_tell` is the one place that starts it, and `remove_step` the one place that decides it has gone out.
-//! 2. **The erase**, once the request is out and the fleet's devices heard here have had `TELL_US` to take it: every kist's own domain of the person's (from their list, `kists.list`: the kists stowed and those kept after an unstow), the person's domain in every scope (map., gps., wifi., fgtw., ahau., kists. and the hold), the kernel's identity class, tags, kept seed and bound mark, the device-only secret, the person key and the roots. Never the device class, another identity's data, or devinfo.
-//! 3. **The power off**: the kernel sends its drops to the vault process, then PSCI SYSTEM_OFF (the killswitch's), so the next power-on is a fresh attest screen.
+//! 0. **The handle.** The approve on the attest screen (ahau_core::approve::REMOVE_DEVICE): the device locks and the handle typed there unlocks it; the attest screen hands the roots here again and then the typed seed and its memory-hard proof (op 33). The seed is checked against the roots in hand, the proof by fgtw's removal gate (`UserOp::Remove`, then `Event::Unbind`), and the seed again in the kernel at the end (SYS_UNLOCK op 15, compared in registers).
+//! 1. **The request to the fleet**: the departure machine's signed request (depart.rs), intent 1 (to a new owner), handed to every fleet device heard and put in the identity space. The identity's last device refuses here.
+//! 2. **Consent**: a member's person approves it. Waited for however long it takes; nothing acts in its place on a timer (until 2026-11-24 the erase ran about 4 s after the request went out, consent or not).
+//! 3. **The sign-out**: the approver publishes the consented Remove, which carries this device's own signature over its departure.
+//! 4. **The rotation**: the approver mints a fresh fleet key without this device (depart.rs `rotate_after`, on the approving device).
+//! 5. **Forgetting**: once the fold no longer lists this device (`Action::Wipe`, depart.rs `depart_wipe`), the kernel checks the handle again, renews the device-only secret (its keys wiped from memory, one write, nothing deleted: owner, 2026-11-24, "Sand on a beach my friend.") and powers off.
+//!
+//! A deny, no device reachable, a power cut or a lock before step 5 changes nothing: the device stays bound with its keys and its secret (owner, 2026-11-24: "if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped. Lock is fine, but no wipe and certainly no unbind."). The typed seed is held in RAM only, so a lock or a power cut drops the unbind here; if the fleet's consent lands after that, the device stays bound and locked out of nothing until its person unbinds again (the kernel then renews with that approve held, op 4).
 //!
 //! A dry run (op 33 [1]) runs every check and says on the console what each step would take, changing nothing and needing no handle; `ferros-bridge spawn` of payloads/removedry asks for it.
 
 use super::*;
 
-/// How long the fleet's devices heard here have to take the request once it is out, before the erase starts: 2^22 us (about 4.2 s), past Photon Transport's retries on a LAN.
-const TELL_US: u64 = 1 << 22;
-
 /// A removal under way.
 pub struct Removing {
     /// The typed handle's seed, held for the kernel's own check at the erase, then wiped.
     seed: [u8; 32],
-    /// When the request was out (built, handed to the fleet's devices heard here, pushed into the space); 0 not yet.
-    told_us: u64,
+    /// Whether the request is out (built, handed to the fleet's devices heard here, pushed into the space).
+    told: bool,
 }
 
 impl Client {
@@ -57,9 +55,9 @@ impl Client {
             self.log.line();
             return r;
         }
-        self.removing = Some(Removing { seed: *typed, told_us: 0 });
+        self.removing = Some(Removing { seed: *typed, told: false });
         wipe(typed);
-        self.log.put(b"fgtw: remove: the handle matches; telling the fleet, then this identity's data erased here and the power off");
+        self.log.put(b"fgtw: unbind: the handle matches; asking the fleet: once a member consents and the Remove lands, the device-only secret is renewed here and the power off");
         self.log.line();
         0
     }
@@ -69,43 +67,28 @@ impl Client {
         self.remove_unbind(*proof)
     }
 
-    /// Once a pass of the loop: the request out (the machine holds our signed frame, which `depart_work` handed to the fleet's devices heard here and pushed into the space as it built it), then `TELL_US` for them to take it, then the erase.
-    /// A request that did not build (the machine dropped it) ends the removal with nothing erased.
-    pub fn remove_step(&mut self, t: u64) {
-        let Some(told) = self.removing.as_ref().map(|r| r.told_us) else { return };
-        if told == 0 {
-            if self.dep.m.as_ref().and_then(|m| m.own_frame()).is_some() {
-                if let Some(r) = self.removing.as_mut() {
-                    r.told_us = t;
-                }
-                let heard = self.sponsors.iter().filter(|s| s.online).count();
-                self.log.put(b"fgtw: remove: the fleet is told (the request to A#");
-                self.log.dec(heard as u64);
-                self.log.put(b" devices heard here and into the identity space); the erase in about 4 s");
-                self.log.line();
-            } else if !self.depart_asking() {
-                if let Some(mut r) = self.removing.take() {
-                    wipe(&mut r.seed);
-                }
-                self.log.put(b"fgtw: remove: the departure request did not build; nothing erased");
-                self.log.line();
-            }
+    /// Once a pass of the loop: says when the request is out, and ends the unbind with nothing done if the request did not build. The erase waits for the fleet's consent (depart.rs `depart_wipe`, on the fold that no longer lists this device), never for a time.
+    pub fn remove_step(&mut self, _t: u64) {
+        let Some(told) = self.removing.as_ref().map(|r| r.told) else { return };
+        if told {
             return;
         }
-        if t - told >= TELL_US {
-            self.remove_erase();
-        }
-    }
-
-    /// The person's kists, each (developer, option, name): the stowed ones and those kept with answers after an unstow (their domains may hold data still), from the person's list (ferros_kist `domain_owners`). Empty when the list does not read (the kernel's release still renews the device-only secret, so a domain missed here can never be opened again).
-    pub(crate) fn remove_kists(&mut self) -> Vec<([u8; 32], [u8; 32], alloc::string::String)> {
-        let mut c = self.copy();
-        let Ok(list) = ferros_space::read_list(&mut c) else {
-            self.log.put(b"fgtw: remove: the person's list of kists does not read; their own domains are left unopenable rather than dropped");
+        if self.dep.m.as_ref().and_then(|m| m.own_frame()).is_some() {
+            if let Some(r) = self.removing.as_mut() {
+                r.told = true;
+            }
+            let heard = self.sponsors.iter().filter(|s| s.online).count();
+            self.log.put(b"fgtw: unbind: the fleet is asked (the request to A#");
+            self.log.dec(heard as u64);
+            self.log.put(b" devices heard here and into the identity space); waiting for a member to consent");
             self.log.line();
-            return Vec::new();
-        };
-        list.domain_owners()
+        } else if !self.depart_asking() {
+            if let Some(mut r) = self.removing.take() {
+                wipe(&mut r.seed);
+            }
+            self.log.put(b"fgtw: unbind: the departure request did not build; nothing changed");
+            self.log.line();
+        }
     }
 
     /// The kernel's message for SYS_UNLOCK op 15: [flags][seed][each kist (developer, option)].
@@ -120,20 +103,17 @@ impl Client {
         m
     }
 
-    /// Steps 2 and 3: the kernel checks the handle again, drops every domain of the person's and releases the identity, then powers off.
-    fn remove_erase(&mut self) {
+    /// Step 5, once the fleet consented: the kernel checks the handle again, renews the device-only secret (nothing deleted) and powers off.
+    pub(crate) fn remove_erase(&mut self) {
         let Some(mut r) = self.removing.take() else { return };
-        let kists = self.remove_kists();
-        let mut m = Self::remove_message(0, &r.seed, &kists, 0);
+        let mut m = Self::remove_message(0, &r.seed, &[], 0);
         wipe(&mut r.seed);
         let len = m.len();
         let got = ferros_sys::remove_device(cap(unsafe { GRANTS }, S_UNLOCK), &mut m, len);
         wipe(&mut m);
         match got {
             Some(1) => {
-                self.log.put(b"fgtw: remove: the kernel erases this identity's data here (A#");
-                self.log.dec(kists.len() as u64);
-                self.log.put(b" kists' own domains and every scope of the person's) and powers off");
+                self.log.put(b"fgtw: unbind: the kernel renewed the device-only secret (everything of the person's here unreadable, nothing deleted) and powers off");
                 self.log.line();
                 self.forget_identity();
             }
@@ -179,30 +159,14 @@ impl Client {
         if self.depart_asking() {
             self.log.put(b"fgtw: remove (dry run): a departure request of ours already stands: it would be the one told");
         } else {
-            self.log.put(b"fgtw: remove (dry run): fgtw's removal gate checks the typed handle's memory-hard proof, then the request, to a new owner, signed with every egg (seconds on the X3), then A#4 s for the fleet to take it");
+            self.log.put(b"fgtw: remove (dry run): fgtw's removal gate checks the typed handle's memory-hard proof, then the request, to a new owner, signed with every egg (seconds on the X3), then handed to the fleet");
         }
         self.log.line();
         self.log.put(b"fgtw: remove (dry run): on today's fgtw a surviving member's Approve then publishes the Remove and frees this device's brand on fgtw.org (another identity's add needs it)");
         self.log.line();
-        let kists = self.remove_kists();
-        self.log.put(b"fgtw: remove (dry run): the kists' own domains of the person's to drop: A#");
-        self.log.dec(kists.len() as u64);
+        self.log.put(b"fgtw: remove (dry run): then the wait for a member's consent, however long (no timer); on its Remove the approver rotates the fleet key, and this device renews its device-only secret and powers off: nothing deleted, everything of the person's here unreadable");
         self.log.line();
-        for (d, o, name) in &kists {
-            self.log.put(b"fgtw: remove (dry run): kist ");
-            if name.is_empty() {
-                self.log.put(b"(unstowed, its answers kept)");
-            } else {
-                self.log.put(name.as_bytes());
-            }
-            self.log.put(b", developer ");
-            self.log.fp(d);
-            self.log.put(b", option ");
-            self.log.fp(o);
-            self.log.line();
-        }
-        self.log.put(b"fgtw: remove (dry run): this service forgets the roots, the chain, the fleet key, the person key and its departure and add state (its fgtw. scope goes with the person's domains)");
-        self.log.line();
+        let kists: Vec<([u8; 32], [u8; 32], alloc::string::String)> = Vec::new();
         // The kernel's half, thru the same call the removal makes, with the dry bit: it reads, says, and changes nothing.
         let mut m = Self::remove_message(1, &[0; 32], &kists, 1 << 12);
         let len = m.len();

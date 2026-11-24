@@ -7239,7 +7239,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         // Op 15, remove this device from its identity (AUTH.md "Remove this device"; owner, 2026-11-22: press remove, type the handle, unbind; the fleet told at once, then the identity's data erased and the killswitch's power off). Only the identity service (`fgtw` by name, never a kist), which tells the fleet before it asks.
         // x2 a buffer in the caller's arc: in, [flags u8: bit 0 a dry run, bit 1 a shred (no departure; the SHRED approval; a restart, not the power off)][the typed handle's seed 32][each kist the person has, (developer 32, option 32)]; x3 its length; x4 its room. Out, written over it: a dry run's account (lines of text, `remove_dry_text`), else nothing.
-        // A removal: the seed must be the person present's (service.rs op 18, compared in registers); then each kist's own domain is stamped for a drop in the vault process while the person's keys still exist, and op 19 releases (op 4's release: every scope's domain of the person's dropped, the kernel's identity class, tags, bound mark and kept seed deleted, the device-only secret renewed, the lock) and powers the device off once the drops are sent. → 1 removed, 0 the seed is not the person present's (nothing changed), ERR nobody present, no right, or a buffer of another shape. A dry run → the account's whole length (what fits is written); nothing changed, no seed needed.
+        // An unbind or a shred: the seed must be the person present's (service.rs op 18, compared in registers) and the person's approve of exactly this act held (taken); then the device-only secret is renewed (service.rs `renew`: the lock, one write, nothing deleted; owner, 2026-11-24) and the device powers off (an unbind, op 19) or restarts (a shred, op 4). The kists named after the seed are no longer read (nothing of theirs is dropped: their domains derive from the identity root, which the renewal ends). An unbind's other condition, the fleet's consent, is the identity service's to hold to: it calls this only once the consented Remove has folded this device out (payloads/fgtw remove.rs), and the kernel, which folds no chain, takes its word as the only process that may call. → 1 done, 0 the seed is not the person present's (nothing changed), ERR nobody present, no right, or a buffer of another shape. A dry run → the account's whole length (what fits is written); nothing changed, no seed needed.
         SYS_UNLOCK if f.x[1] == 15 => {
             let token = p.read(f.x[0], 32);
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0);
@@ -7270,23 +7270,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         }
                         match m {
                             Ok(1) if !approved => ERR,
-                            Ok(1) => {
-                                // Each kist's own domain of the person's, stamped while their keys still exist (the release locks them).
-                                let mut drops: Vec<Vec<u8>> = kist_domains(&msg[33..]).iter().filter_map(|d| stamp(VOP_DROP, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], &[], &[])).collect();
-                                // 19 the removal's release and power off; 4 a shred's, the release and a restart (service.rs `RELEASE_RESET`).
-                                match unlock(if shred { 4 } else { 19 }, None) {
-                                    Ok(_) => {
-                                        crate::service::release_drops_add(drops);
-                                        1
-                                    }
-                                    Err(()) => {
-                                        for d in drops.iter_mut() {
-                                            crate::keys::wipe_to_dram(d);
-                                        }
-                                        ERR
-                                    }
-                                }
-                            }
+                            // 19 an unbind's renewal and the power off; 4 a shred's, the renewal and a restart (service.rs `RELEASE_RESET`).
+                            Ok(1) => match unlock(if shred { 4 } else { 19 }, None) {
+                                Ok(_) => 1,
+                                Err(()) => ERR,
+                            },
                             Ok(_) => {
                                 crate::flashlog::line(if shred { "identity shred refused: the handle typed is not the person present's; nothing changed" } else { "identity remove refused: the handle typed is not the person present's; nothing changed" });
                                 0
@@ -7347,12 +7335,25 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         }
                         r.unwrap_or(ERR)
                     }
-                    // A lock and a release end the session: an approval a process had not yet taken goes with it.
-                    2..=4 => {
-                        if op != 3 {
+                    // A lock ends the session: an approval a process had not yet taken goes with it.
+                    2 | 3 => {
+                        if op == 2 {
                             APPROVED.store(0, core::sync::atomic::Ordering::Release);
                         }
                         unlock(op as u8, None).unwrap_or(ERR)
+                    }
+                    // Op 4, the device-only secret renewed after an unbind the fleet consented to (the identity service's departure, payloads/fgtw depart.rs `depart_wipe`): only the identity service (`fgtw` by name, never a kist), only with a person present and their approve of the unbind held, which it takes (owner, 2026-11-24: "if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped. Lock is fine, but no wipe and certainly no unbind."). Anything else: the lock alone, nothing destroyed. Until 2026-11-24 any holder of the Unlock right could release with no person present (the attest screen's wipe before attest did).
+                    4 => {
+                        let present = unlock(0, None).is_ok_and(|s| s & 1 == 1);
+                        let approved = present && !p.kist && p.name.as_slice() == b"fgtw" && APPROVED.compare_exchange(ahau_core::approve::Request { kind: ahau_core::approve::REMOVE_DEVICE, arg: 0 }.word(), 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_ok();
+                        if approved {
+                            unlock(4, None).unwrap_or(ERR)
+                        } else {
+                            crate::flashlog::line("identity: a renewal refused (no person present, no approve of an unbind held, or not the identity service): locked, nothing destroyed");
+                            APPROVED.store(0, core::sync::atomic::Ordering::Release);
+                            let _ = unlock(2, None);
+                            ERR
+                        }
                     }
                     // Op 11: the identity's doorbell, x2 a word in the caller's arc (8-aligned, as SYS_WAIT takes one).
                     // The state as op 0 answers it, with a change count above bit 8 (`ID_WORD`), is written there now and at every change, waking whatever of the process waits on it (`identity_ring`, one of the bells).

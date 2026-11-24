@@ -867,8 +867,6 @@ struct Ahau {
     status_text: core::cell::Cell<([u8; 256], usize)>,
     /// A denial is on the status line (this device belongs to another identity): the next press puts the screen's own words back (owner, 2026-11-10: "The moment you press anything after the denied message on the attest screen it should go back to the regular message").
     denied: core::cell::Cell<bool>,
-    /// The wipe before attest armed by its first press (`wipe_press`): the second press wipes, any other press or key disarms it.
-    wipe_armed: core::cell::Cell<bool>,
     /// An approved shred is under way (`Mode::Removing` carries it out as the removal is carried out, op 33 [2] instead of [0]).
     shredding: bool,
     /// The surface text goes into: the shown one, or the back one while a band is composed there (`compose`).
@@ -1824,7 +1822,6 @@ impl Ahau {
         }
         self.entry();
         self.button();
-        self.wipe_pill();
         self.show_board();
         // The join's band (this device's name, and the words once asked for): `show_board` draws it only when it was up already.
         if matches!(self.mode, Mode::Join) && !self.words_shown.get() {
@@ -1995,9 +1992,6 @@ impl Ahau {
         if self.button_label().is_some() && inside(self.button_at()) {
             return Some(0);
         }
-        if self.wipe_offered() && self.wipe_rect().is_some_and(inside) {
-            return Some(1);
-        }
         if self.mode == Mode::Networks && !self.joining {
             return self.net_row_at(y).map(|k| 16 + k as u8);
         }
@@ -2008,8 +2002,6 @@ impl Ahau {
     fn net_redraw(&self, what: u8) {
         if what >= 16 {
             self.net_draw();
-        } else if what == 1 {
-            self.wipe_pill();
         } else {
             self.button();
         }
@@ -2037,11 +2029,7 @@ impl Ahau {
     fn net_release(&mut self) {
         let Some(e) = self.pressed.take() else { return };
         self.net_redraw(e);
-        if e != 1 {
-            self.wipe_disarm();
-        }
         match e {
-            1 => self.wipe_press(),
             0 if self.mode == Mode::Pass => self.net_join(),
             // The list fills by itself (`wlan_thread`); while a join runs the button says so and does nothing.
             0 if self.mode == Mode::Networks => {}
@@ -2733,76 +2721,6 @@ impl Ahau {
         }
     }
 
-    /// The wipe before attest (fgtw::security, the Security page narrowed to one verb; photon docs/settings-panel.md "Before attest"): offered on the plain attest screen of a bound device with nobody attested, the case of a handle lost or another identity's, which had no way out but the bridge. It grants nothing: the identity class is sealed under the handle's seed and the device-only secret, which the wipe renews, and the old fleet keeps this hardware (its chain, its brand at fgtw.org) until it lets it go, so nobody else can bind it meanwhile. Not under an approve (the person who asked it is the one at the screen), not on a device not bound (a new handle there wipes the earlier attempt's leftovers by itself).
-    fn wipe_offered(&self) -> bool {
-        self.bound && self.mode == Mode::Fresh && self.approve.is_none() && !self.net_open() && self.wipe_rect().is_some()
-    }
-
-    /// The wipe's pill: centred between the status line's last row and the entry line, a quiet pill at the scale's size; None when the scale leaves it no room.
-    fn wipe_rect(&self) -> Option<(usize, usize, usize, usize)> {
-        let (top, _) = self.words_band();
-        let (b, px) = self.entry_at();
-        let bottom = b.checked_sub(px * 3 / 2 + self.w / 64)?;
-        let h = self.k(self.w / 14);
-        // WHY: at a large scale the status and the entry leave less than the pill; then there is none.
-        if bottom <= top || bottom - top < h {
-            return None;
-        }
-        let half = self.k(self.w * 5 / 32);
-        let y0 = (top + bottom - h) / 2;
-        Some((self.w / 2 - half, y0, self.w / 2 + half, y0 + h))
-    }
-
-    /// The wipe's pill drawn (armed, its label asks for the second press), when it is offered.
-    fn wipe_pill(&self) {
-        if !self.wipe_offered() {
-            return;
-        }
-        let Some((x0, y0, x1, y1)) = self.wipe_rect() else { return };
-        let s = self.surf();
-        for y in y0..y1 {
-            s[y * self.w..(y + 1) * self.w].fill(self.bg());
-        }
-        let px = self.k(self.w / 32);
-        pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(1) { PRESSED } else { 1800 }, px);
-        let label = fl(ferros_lang::Fleet::SecWipe { armed: self.wipe_armed.get() });
-        self.compose(y0, y1, || {
-            let t = label.as_str().as_bytes();
-            let x = self.centre_x(self.w as i64 / 2, px, t);
-            window::text(self.display, self.text_to.get(), x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, QUIET, t);
-        });
-    }
-
-    /// The wipe's press: the first arms it (the status says what it does and does not do), the second asks the kernel to release this device's identity class (SYS_UNLOCK op 4: every identity entry deleted by its address, the kept tags, the kept seed and the bound mark deleted, the device-only secret renewed, so nothing left can ever be opened), and the kernel restarts the device at a fresh attest screen. The device class (drivers, firmware and calibration, the device's settings) stays.
-    fn wipe_press(&mut self) {
-        if !self.wipe_armed.get() {
-            self.wipe_armed.set(true);
-            self.status(fl(ferros_lang::Fleet::SecWipeNote).as_str());
-            self.wipe_pill();
-            self.show();
-            return;
-        }
-        self.wipe_armed.set(false);
-        console(self.grants, b"ahau: wipe before attest, pressed twice: the kernel releases this device's identity class (nothing is opened) and restarts\n");
-        self.status(fl(ferros_lang::Fleet::SecShredding).as_str());
-        self.show();
-        if !ferros_sys::release_identity(cap(self.grants, S_UNLOCK)) {
-            console(self.grants, b"ahau: wipe before attest: the kernel refused the release; nothing changed\n");
-            self.status(fl(ferros_lang::Fleet::SecShredFailed).as_str());
-            self.wipe_pill();
-            self.show();
-        }
-    }
-
-    /// Any other press or key: an armed wipe disarms, and the screen's own words come back.
-    fn wipe_disarm(&self) {
-        if self.wipe_armed.take() {
-            self.status(self.prompt().as_str());
-            self.wipe_pill();
-            self.show();
-        }
-    }
-
     /// The removal approved (owner, 2026-11-22 and 2026-11-24; docs/AUTH.md "Remove this device"): the handle typed at the approve unlocked the device, so its seed is the person's.
     /// Its memory-hard proof (from the identity's space, or made now) and the seed go to the identity service as roots, as at any attest; once it holds the identity as a member again (the lock wiped what it held), it is asked to remove this device with them (fgtw op 33, `remove_go`), which tells the fleet and has the kernel erase this identity's data, with this approve held for it, and power off.
     /// The screen stays up meanwhile; back gives the removal up while it waits (nothing removed).
@@ -2862,7 +2780,7 @@ impl Ahau {
             6 if self.shredding => (b"ahau: shred: the handle is not the identity's in hand; nothing changed\n", ferros_lang::Msg::TheyDontMatch),
             255 if self.shredding => (b"ahau: shred: the identity service did not answer; nothing changed\n", ferros_lang::Msg::IdentityServiceNotAnswering),
             _ if self.shredding => (b"ahau: shred: not started; nothing changed\n", ferros_lang::Msg::RemoveNotStarted),
-            0 => (b"ahau: remove: the fleet is told, then this identity's data is erased and the device powers off\n", ferros_lang::Msg::RemovingDevice),
+            0 => (b"ahau: unbind: the fleet is asked; once a member consents this device's secret is renewed and it powers off\n", ferros_lang::Msg::RemovingDevice),
             6 => (b"ahau: remove: the handle is not the identity's in hand; nothing changed\n", ferros_lang::Msg::TheyDontMatch),
             4 => (b"ahau: remove: the identity's last device; nothing changed\n", ferros_lang::Msg::RemoveLastDevice),
             1 => (b"ahau: remove: this device is not a member of a fleet; nothing changed\n", ferros_lang::Msg::RemoveNotMember),
@@ -2870,7 +2788,8 @@ impl Ahau {
             _ => (b"ahau: remove: not started; nothing changed\n", ferros_lang::Msg::RemoveNotStarted),
         };
         console(self.grants, line);
-        if r != 0 {
+        // Refused, or an unbind now waiting on the fleet's consent (owner, 2026-11-24: nothing happens without it, however long it takes): why, or what follows, and Done closes the screen. A shred stays up until its restart.
+        if r != 0 || !self.shredding {
             self.told = msg;
             self.mode = Mode::Told;
         }
@@ -3406,7 +3325,6 @@ impl Ahau {
     }
 
     fn tap(&mut self, key: Key) {
-        self.wipe_disarm();
         if self.mode == Mode::Keys {
             self.keys_tap(key);
             return;
@@ -3902,7 +3820,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), wipe_armed: core::cell::Cell::new(false), shredding: false, word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0), words_open: false, confirm_echo: false, approve, remove_keys: None, told: ferros_lang::Msg::RemoveNotStarted };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), shredding: false, word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0), words_open: false, confirm_echo: false, approve, remove_keys: None, told: ferros_lang::Msg::RemoveNotStarted };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // Unlocked at boot (above): straight to the keyboard, the attest screen never shown.
     if at_boot {
