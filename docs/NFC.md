@@ -111,6 +111,17 @@ The owner, 2026-11-24: "presenting my identity does not work on the attest scree
 
 **PROBE (op 11) restarts discovery** (`Nfc::rediscover`: RF_DEACTIVATE to idle, then RF_DISCOVER, so the detector is set afresh). Until 2026-11-24 a probe sent RF_DISCOVER alone, which running discovery answers G#A0 (already started) and which changes nothing in the chip. A deactivation the chip refuses (not discovering) is discovery found stopped with no word, said and counted; no answer is a silent chip, brought up again from a reset pulse. Measured on the Pro (2026-11-24): the probe woke the sleeping chip (one NACK, retried), deactivated it, and discovery started with full polls again.
 
+## The console's NFC circle (2026-11-24)
+
+The owner, 2026-11-24: "can we get a visual indication for the NFC circle in the console?" He accepted the states below ("You'd see off if you manually turned it off, but sure"), with the full polls folded into listening, no blink.
+
+The driver writes its link's measures (SYS_STATUS, facts 33-80) only when one changes; the kernel rings the link's bell then, and the display draws the circle again:
+- **STATE 0, not listening** (the chip being brought up again; the screen off, which nobody sees): grey, as a circle that does not run.
+- **STATE 1, listening** (the chip's tag detector between its polls): NFC's flavour one stop darker, as every radio up and searching.
+- **STATE 2, a tag in the field or a reader's field on us**: the full flavour. A tag is in from its read until a full poll ends with no tag read (measured on the Pro: a tag held is read once a poll, every 62 ms, each read between its poll's G#6F05 and G#6F06), so the circle changes twice a tap, at the tag's coming and its going.
+- **HOLDS (measure kind 39)**: the clients holding NFC open with the screen off (op 12): a dot inside the rim at the top, in the "for you" wavelength (400 nm), so the person sees it before the screen goes dark.
+- **Switched off** by its status circle: the plain "NFC" text, as every radio off.
+
 ## A chip that stops answering (2026-11-17)
 
 Measured on the Pro:

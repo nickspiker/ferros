@@ -6926,8 +6926,12 @@ fn g2t_colour(c: (f32, f32, f32)) -> u64 {
 /// The console (`BAR`): when the minute, a radio's state, a measure or a switch changed (or `force`), every top circle drawn again, front to back from empty in fluor's α + darkness, each by fluor's `under` and nothing else: its text first, in front, then its disc under the text. A disc is solid, no stroke, no glow (owner, 2026-11-07): the radio's flavour while it is on and linked, one stop darker while up and searching, grey when it does not run, and grey and darker with no text once switched off by a tap (preference 15). The text is dark on a lit disc, light on a grey one. Then the layer is decoded once into `BAR_W` and each row's columns into `BAR_SPAN`. Returns whether it drew.
 /// The battery's colour (owner, 2026-11-07): the spectrum between VSF red (703 nm, empty) and VSF blue (462 nm, full), its wavelength log-spaced by the charge (703 · (462/703)^(charge/100) nm). A wavelength is its cone response (vsf's 1 nm table, linear between its samples) in VSF RGB, moved toward white (E) by its most negative channel (a spectral colour lies outside the primaries' gamut but at the primaries themselves, where that channel is 0): the hue exact, the most saturation the primaries reach. Then, as the radios' flavours, at the grey's photopic light (RING_ON's) where the colour reaches it, else its brightest channel full. As working values, gamma 2, white at Q14.
 fn battery_flavour(charge: u64) -> (f32, f32, f32) {
+    spectral_flavour(703.0 * libm::powf(462.0 / 703.0, charge as f32 * (1.0 / 100.0)))
+}
+
+/// A wavelength as a console colour, the battery's way (`battery_flavour`): its cone response in VSF RGB moved toward white by its most negative channel, at the grey's photopic light where it reaches it, else its brightest channel full; working values, gamma 2, white at Q14.
+fn spectral_flavour(nm: f32) -> (f32, f32, f32) {
     use vsf::colour::spectral::constants::{LMS2VSF_RGB, LMS_2000_10DEG_1NM};
-    let nm = 703.0 * libm::powf(462.0 / 703.0, charge as f32 * (1.0 / 100.0));
     let s = &LMS_2000_10DEG_1NM;
     let f = nm - s.start_nm;
     let (i, w) = (f as usize, f - (f as usize) as f32);
@@ -7256,7 +7260,10 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             alloc::vec::Vec::new()
         };
         // The radio's state as its driver says it (measure STATE): connected the flavour's full colour, up and searching one stop darker.
+        // NFC (2026-11-24): 1 listening (the chip's tag detector), 2 a tag or a reader's field, 0 not listening (the chip being brought up again), drawn as a circle that does not run.
         let state = radio.and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
+        // How many clients hold NFC open with the screen off (measure HOLDS), for its mark (`hold_mark`).
+        let holds = radio.and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::HOLDS).map(|m| m.1)).unwrap_or(0);
         // Switched off by a tap (preference 15, the radios' bits in facts 32's order; USB is no switch).
         let switched_off = match radio {
             Some(ri) if ri < 5 => off >> ri & 1 != 0,
@@ -7266,7 +7273,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         let stop = core::f32::consts::FRAC_1_SQRT_2;
         let fill = if switched_off {
             (OFF_GREY * stop, OFF_GREY * stop, OFF_GREY * stop)
-        } else if !live {
+        } else if !live || (what == Corner::Nfc && state == Some(0)) {
             (OFF_GREY, OFF_GREY, OFF_GREY)
         } else if what == Corner::Battery {
             battery_flavour(facts[1])
@@ -7431,6 +7438,10 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Frames => fps.str(),
                 Corner::Deck | Corner::Back | Corner::Spare => "",
             };
+            // A client holds NFC open with the screen off (nfc op 12, measure HOLDS; owner, 2026-11-24): the mark inside the rim, so the person sees it before the screen goes dark.
+            if what == Corner::Nfc && live && !switched_off && holds > 0 {
+                hold_mark(x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), &mut |px, py| at(px, py), console, cut);
+            }
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
                 gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
             } else if OFF_ART && what == Corner::Gps && !(live && !switched_off) {
@@ -11535,6 +11546,23 @@ fn frame_lines(fw: u64, name: &mut Txt, lines: &mut [Txt; 9], mut nl: usize) -> 
 
 /// GPS's satellites as rings that all meet over the person (owner, 2026-11-09: "arcs like the edge of a bubble ... imagine refractive index of a smooth sphere, fresnel ... those should intersect over me and if I get more ... the point gets brighter"). Each satellite (azimuth, elevation in degrees, weight) is a circle through the disc's centre: its centre toward the satellite's azimuth (north up), its radius from a quarter of the disc's radius `ri` at the zenith to half at the horizon. Its light is a bubble's limb, dense at its edge and faint inside: w / √(s² + w²) with s = 1 − (d/ρ)² across the circle, w its width (an eighth of a 16th of the disc, in s), C∞ everywhere and 1 on the edge. The satellites' light adds as depth, its opacity 1 − e^(−depth), so where every ring meets (the centre) the light grows with each one; the disc's own edge fades it by exp(1 − 1/(1 − t²)), as the radios' fields fade.
 /// Predicted birds (2026-11-18, the fourth of each tuple; GPS.md "Predicted birds") are a second layer behind the heard ones, in the flavour moved halfway toward white, their depth faded near the disc's centre by 1 − e^(−(r/r₀)²) with r₀ a quarter of the disc (C∞, 0 at the centre): faint arcs pointing where each bird is, while the point over the person brightens only with real signal.
+/// The NFC circle's mark while a client holds NFC open with the screen off (nfc op 12, measure HOLDS; owner, 2026-11-24): a dot inside the rim at the top, an eighth of the inner radius, in the "for you" wavelength (ferros_glow `FOR_YOU_NM`, 400 nm, `spectral_flavour`), its edge the C∞ step across two pixels, under what is drawn in front of it.
+fn hold_mark(x: f32, y: f32, ri: f32, at: &mut dyn FnMut(i64, i64) -> Option<usize>, console: &mut [u64], cut: impl Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
+    use fluor::pixel::{Blend, BlendMode};
+    let colour = g2t_colour(spectral_flavour(ferros_glow::FOR_YOU_NM));
+    let rm = ri * (1.0 / (1 << 3) as f32);
+    let (cx, cy) = (x, y - ri + 2.0 * rm);
+    let (x0, x1, y0, y1) = cut(((cx - rm - 2.0) as i64, (cx + rm + 2.0) as i64 + 1, (cy - rm - 2.0) as i64, (cy + rm + 2.0) as i64 + 1));
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let Some(i) = at(px, py) else { continue };
+            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+            let cov = draw::bump_step((rm - libm::sqrtf(dx * dx + dy * dy)) * 0.5 + 0.5);
+            console[i] = console[i].under(colour | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+        }
+    }
+}
+
 fn gps_rings(sats: &[(f32, f32, f32, bool)], x: f32, y: f32, ri: f32, flav: (f32, f32, f32), at: &mut dyn FnMut(i64, i64) -> Option<usize>, console: &mut [u64], cut: impl Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
     use fluor::pixel::{Blend, BlendMode};
     let colour = g2t_colour(flav);

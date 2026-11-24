@@ -236,6 +236,10 @@ struct Nfc {
     started_at: u64,
     /// A tag or a reader activated us since discovery last started, for STATE.
     read_since_start: bool,
+    /// A tag in the field, for the console's circle (measure STATE 2): set when one is read, cleared when a full poll ends with none read (the chip's G#6F06), when discovery stops, or at a reset pulse.
+    tag_here: bool,
+    /// A tag read since the chip's last full poll began (its G#6F05).
+    poll_saw_tag: bool,
     /// Discovery started again on a doorbell (`rediscover`), for STATE.
     rediscovers: u32,
     /// Op 9's held calls (attest with a tag, AUTH.md): each a reply token, answered with the UID of the next unlock tag discovery reads (`tag_read`), or with nothing by op 10. At most `HELD`, the oldest giving way.
@@ -588,6 +592,8 @@ impl Nfc {
                 }
                 if mode < 0x80 {
                     self.tags += 1;
+                    self.tag_here = true;
+                    self.poll_saw_tag = true;
                     let tl = pl.get(6).copied().unwrap_or(0) as usize;
                     let tp = pl.get(7..7 + tl).unwrap_or(&[]);
                     let uid = if mode == 0 { tp.get(2).and_then(|&l| tp.get(3..3 + l as usize)).unwrap_or(&[]) } else { &[] };
@@ -628,8 +634,13 @@ impl Nfc {
             // ST's proprietary notifications (G#6F): not ours to act on, but counted and said (`st_notes`), since a chip that stops reading may say so only here.
             (3, 0xF, _) => {
                 self.st_notes += 1;
+                // A full poll begins (G#6F05) and ends (G#6F06), each tag read inside one: measured on the Pro (2026-11-24), a tag held to the device is read once a poll, every 62 ms, each read between its poll's 6F05 and 6F06. A poll that ends with no tag read is the tag gone.
                 if p[1] & 0x3F == 5 {
                     self.polls += 1;
+                    self.poll_saw_tag = false;
+                }
+                if p[1] & 0x3F == 6 && !self.poll_saw_tag {
+                    self.tag_here = false;
                 }
                 // WHY the min: a notification may be shorter than the 8 bytes kept (a 3-byte header and nothing), and copying 8 from it would panic; a longer one keeps its start. The 64 said below is the console line's room (128 hex digits in its 512 bytes), not a bound (n is at most the packet's 258).
                 // Said whole up to 64 bytes since 2026-11-18: the reload's second notification (`6F 02 16 31 20 00 82 06 01 ...`, 25 bytes) was cut at 16, and it is the one a cold boot does not send.
@@ -728,6 +739,7 @@ impl Nfc {
     fn restart(&mut self, p: &mut Packet) -> bool {
         self.pulses += 1;
         self.discovering = false;
+        self.tag_here = false;
         self.credits = 0;
         self.apdu_len = 0;
         self.rstage = 0;
@@ -910,6 +922,7 @@ impl Nfc {
     /// The screen off: discovery stopped (RF_DEACTIVATE to idle) and the controller told (CORE_SET_POWER_SUB_STATE 1, screen off), so neither the field nor the listen runs in the dark; a tap is consent only on a device whose screen is on (AUTH.md), so nothing is lost. On: sub-state 0 (on, unlocked, as the bring-up sets it), and the loop starts discovery again at once. 2026-11-10: NFC drew ~20 mW with the screen off and woke its driver ~115 times a second.
     fn screen(&mut self, dark: bool, p: &mut Packet) {
         if dark {
+            self.tag_here = false;
             if self.discovering {
                 self.ok(&[0x21, 0x06, 0x01, 0x00], p);
                 self.discovering = false;
@@ -1042,7 +1055,7 @@ impl Nfc {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, in_init: false, needs_init: false, unanswered: false, pulses: 0, probes: 0, found_stopped: 0, st_notes: 0, st_last: [0; 8], st_said: 0, heard_at: now(), polls: 0, polls_at_start: 0, started_at: now(), read_since_start: false, rediscovers: 0, held: [[0; 32]; HELD], nheld: 0, opens: [[0; 32]; HELD], nopen: 0 };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, in_init: false, needs_init: false, unanswered: false, pulses: 0, probes: 0, found_stopped: 0, st_notes: 0, st_last: [0; 8], st_said: 0, heard_at: now(), polls: 0, polls_at_start: 0, started_at: now(), read_since_start: false, tag_here: false, poll_saw_tag: false, rediscovers: 0, held: [[0; 32]; HELD], nheld: 0, opens: [[0; 32]; HELD], nopen: 0 };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
@@ -1104,11 +1117,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 say!(grants, "nfc: {}: {}\n", if dark { "screen off" } else if screen_off { "screen off, held open by a client" } else { "screen on" }, if dark { "discovery stopped, the field off, the chip in standby" } else if nfc.needs_init { "the chip is brought up again from a reset pulse" } else { "discovery again" });
             }
         }
-        if shown != Some((nfc.discovering, nfc.field)) {
-            shown = Some((nfc.discovering, nfc.field));
+        // The console's NFC circle (owner, 2026-11-24): STATE 0 not listening, 1 listening (the chip's tag detector; its full polls are not shown apart), 2 a tag in the field or a reader's field on us; HOLDS, the clients holding NFC open with the screen off. Written only when one changes: the kernel rings the link's bell then, and the display draws the circle again.
+        let showing = (nfc.discovering, nfc.field || nfc.tag_here, nfc.nopen);
+        if shown != Some(showing) {
+            shown = Some(showing);
             use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
-            status(0, w(k::STATE, if nfc.field { 2 } else { 1 }));
+            status(0, w(k::STATE, if !nfc.discovering { 0 } else if showing.1 { 2 } else { 1 }));
             status(1, if nfc.discovering { w(k::FREQ, 13_560) } else { MEASURE_NONE });
+            status(2, if nfc.nopen > 0 { w(k::HOLDS, nfc.nopen as i64) } else { MEASURE_NONE });
         }
         if nfc.irq() {
             match nfc.read(&mut p) {
