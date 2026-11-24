@@ -7,8 +7,6 @@ description = "ahau's identity derivation without std: a handle typed on the hon
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
-# The retype gate's reply (retype.rs): a VSF document the kernel makes and the attest screen's keyboard reads; without the text tables.
-vsf = { version = "0.11", path = "../../vsf", default-features = false }
 
 [dev-dependencies]
 vsf = { version = "0.11", path = "../../vsf", default-features = false, features = ["text-encode"] }

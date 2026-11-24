@@ -85,10 +85,10 @@ Built 2026-11-22 on ferros (ahau, payloads/fgtw, ferros_lang); Photon's own join
 
 ## Remove this device (owner, 2026-11-22)
 
-On the device being removed: press Remove on the Fleet page, type the handle, press enter (unbind).
+On the device being removed: press Remove on the Fleet page, and approve it on the attest screen (since 2026-11-24, "Approve on the attest screen" below: the device locks at once and the handle typed there approves the removal; until then a second handle-entry screen took it).
 No Fleet page needs to be open anywhere and no other device is waited on before the erase.
 
-1. **The check.** The attest screen's keyboard (ahau, words kind 7, asked by the map's Remove thru fgtw op 15 `[15][7]`) makes the typed handle's seed and its memory-hard proof (seconds on the X3, as at attest) and hands both to the identity service (fgtw op 33 `[33][0][seed][proof]`). It compares the seed with the identity in hand, and fgtw's removal gate (fgtw e5766f4: `UserOp::Remove`, then `Event::Unbind` with the proof) sends nothing unless the proof is this identity's. The kernel compares the seed again in registers before it erases anything (`SYS_UNLOCK` op 15, service.rs op 18). A mismatch changes nothing and keeps the text on screen to correct.
+1. **The check.** The approve: the map's Remove asks the kernel (`SYS_UNLOCK` op 16, `REMOVE_DEVICE`), the device locks, and the handle typed on the attest screen unlocks it, so it is the device's own identity's. The kernel then holds the approved removal for the identity service. The attest screen hands the roots over as at any attest, waits until the identity service holds the identity as a member again (the lock wiped what it held), and hands it the handle's seed and its memory-hard proof (fgtw op 33 `[33][0][seed][proof]`; the proof from the identity's space, or made, seconds on the X3). The identity service compares the seed with the identity in hand, and fgtw's removal gate (fgtw e5766f4: `UserOp::Remove`, then `Event::Unbind` with the proof) sends nothing unless the proof is this identity's. The kernel compares the seed again in registers before it erases anything (`SYS_UNLOCK` op 15, service.rs op 18) and erases only with the approved removal held, which it takes (one approve, one removal). Refused (the identity's last device, no fleet), the attest screen says why and Done closes it, nothing changed.
 2. **The fleet is told at once.** Today that is the departure machine's signed request (intent 1, to a new owner), handed by Photon Transport to every fleet device heard here and put in the identity space, whose push reaches the fleet and fgtw.org in the same pass.
    - On today's fgtw the chain drops this device only when a surviving member approves. Its Approve publishes the consented Remove and frees this device's brand on fgtw.org.
    - Another identity's add needs that brand freed: fgtw-bootstrap refuses a bare self-departure (`consent_required`) and refuses to add a device branded to another identity (`device_owned`, `plate_owned`).
@@ -127,22 +127,20 @@ From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw`
   - **Never stuck** (2026-11-18): a boot that unlocks shows no attest screen only while fgtw holds the roots (ahau asks its state, op 1, before it decides; `ahau_core::attest_screen`).
     Unlocked and bound with fgtw holding none, the attest screen comes up over whatever started, and the handle typed (or a kept tag) unlocks again, hands the roots over and fgtw keeps them.
     Any way the keeps can still part (a reset between the kernel's keep and fgtw's, a write the vault refused, fgtw started while the setting was off) ends there, never in a device that cannot attest.
-  - **Turning it on takes the handle typed again** (the retype gate; owner, 2026-11-17: "require a handle to be typed in to enable attest at boot (since my toddler could do it without me)").
-    The Security page's checkbox asks the identity service for the keyboard (fgtw op 15 [5]); the attest screen's keyboard (ahau, kind 5) takes the person's own handle, shown as typed, with the warning in its prompt.
-    Enter derives the seed (ahau_core::identity_seed) and hands it to the kernel (`SYS_UNLOCK` op 12), which compares it with the seed of the person present: a one-way tag of each (`derive_key("ferros 2026-11-17 retype gate v0", seed)`), the held one made in registers so the held seed is never opened, compared in time that does not depend on where they differ (ahau_core::retype).
-    Only a match turns the setting on, and the kernel turns it on itself; a mismatch says "They don't match.", keeps the text to correct, and changes nothing.
-    The reply is a VSF document (section `attest_at_boot`: `error`, `reason`, `present`, `matched`, `on`; VSF-AUDIT.md "The reply form").
-    `SYS_SET_PREF` refuses to turn it on (it takes 0 only), so the plain settings write is no way around the gate; turning it off needs no handle (off is always safe).
-    Op 12 answers ahau alone (by name, never a kist, as do not disturb is fgtw's): fgtw holds the Unlock right and the seed all session, and must not switch it on with no handle typed.
+  - **On and off are an approve on the attest screen** (owner, 2026-11-24; "Approve on the attest screen" below).
+    The Security page's checkbox asks the kernel for it (`SYS_UNLOCK` op 16, `ATTEST_AT_BOOT_ON` or `ATTEST_AT_BOOT_OFF`); the device locks at once, and the handle typed on the attest screen unlocks it.
+    That unlock is the approve: for on, the kernel keeps the seed typed then for unlock at boot (`\0id.unlock`, its `unlock` document sealed in the device class, as a typed attest with the setting on keeps it) and turns the setting on; for off, it keeps nothing and turns it off.
+    `SYS_SET_PREF` refuses the setting both ways, so the plain settings write is no way around the approve.
     The bridge (`diag pref`, a `device` document stored over USB) still sets anything, in a development build only: a production build closes those USB doors outright (service.rs, "Production builds ... close the development doors over USB").
-  - **It takes effect at once** (2026-11-18): on a match the kernel keeps the seed for unlock at boot then (`retype_keep`: `\0id.unlock`, its `unlock` document sealed in the device class, as a typed attest with the setting on keeps it), and the identity service (fgtw) sees the setting turn on at its next pass and keeps the roots, the fleet key and the chain it holds, each as its document (`follow_persist`).
+    From 2026-11-17 to 2026-11-24 turning it on took the retype gate instead: the handle typed again on a second entry screen (ahau's keyboard, words kind 5), compared by the kernel (`SYS_UNLOCK` op 12). Its Enter submitted, where the attest screen's types a newline (a handle may hold one: owner, 2026-10-28, "enter is a valid char"), so a handle with a newline could never be typed there, and the owner met the difference (2026-11-24). The gate, its op and its screen are gone: one screen, one input path.
+  - **It takes effect at once**: the kernel keeps the seed at the approve's unlock, and the identity service (fgtw) sees the setting turn on at its next pass and keeps the roots, the fleet key and the chain it holds, each as its document (`follow_persist`).
     So the next boot unlocks with no attest typed in between.
     Turned off, fgtw deletes them at once, and the kernel deletes its kept seed at the next boot.
     A window remains: a power cut between the kernel's keep and fgtw's (one pass of its loop) boots unlocked with no roots for fgtw (the Fleet page says no identity in hand); turning attest at boot off and rebooting brings the attest screen back.
   - **No tags** (owner, 2026-11-18): a kept tag never turns it on and never keeps the seed.
-    A tag's unlock (op 6) unlocks without keeping, whatever the setting (`tag_unlock`); ops 6 to 9 are served apart from op 12 and never set the setting; and the attest screen reads tags only on its entry, never while it hosts the keyboard, so a tag cannot stand in for the retype.
-    The seed a tag unlock hands the attest screen is wiped once handed to fgtw; until kernel-tagged touch (below) the kernel cannot tell a typed seed from one a process knows, which is why op 12 answers ahau alone.
-  - **The next layer is kernel-tagged touch** (PRESENCE.md (a), a design not built): the kernel tags every touch event, and op 12 takes the tagged keystrokes instead of a seed, so the handle must have been typed on this glass, this session.
+    A tag's unlock (op 6) unlocks without keeping, whatever the setting (`tag_unlock`), and drops any approve waiting with nothing applied; the attest screen never offers a tag while an approve waits.
+    The seed a tag unlock hands the attest screen is wiped once handed to fgtw; until kernel-tagged touch (below) the kernel cannot tell a typed seed from one a process knows.
+  - **The next layer is kernel-tagged touch** (PRESENCE.md (a), a design not built): the kernel tags every touch event, and the approve's unlock takes the tagged keystrokes instead of a seed, so the handle must have been typed on this glass, this session.
     The crypto-proper answer for the stored seed (sealed under a release share the person's fleet holds, so an offline stolen device never unlocks by itself) is PRESENCE.md (b).
 - **Locking.** Only when power goes, or when the device switches OS. Every reset the kernel orders drops the key first, its bytes overwritten (`platform::before_reset`), because a warm reset keeps DRAM. There are no timers.
   - **How the kernel holds them** (2026-11-17): the seed, the identity's three vault keys and the person key only sealed under the wairua, opened in registers by lifted code (KEY_REGISTERS.md "Sealed under the wairua at rest"); the exceptions, with how long each touches memory, are listed there.
@@ -150,7 +148,7 @@ From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw`
     The identity service (fgtw) hears it and overwrites the roots, the fleet key and the person key it holds, and goes back to no identity in hand without touching the vault.
     The attest screen (ahau) keeps no copy of the roots once fgtw has them.
     Moving these keys into the kernel alone: KEY_REGISTERS.md "The identity's keys in the kernel alone".
-- **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and fgtw (the identity service) hold; ops 7 to 9 also with Settings (the map's settings pages, which keep tags and hold no right to unlock):
+- **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and fgtw (the identity service) hold; ops 7 to 9 also with Settings (the map's settings pages, which keep tags and hold no right to unlock), and ops 13, 16, 17, 19 and 20 with Settings (the Android page, and asking for an approve):
 
 | Op | Does | Returns |
 |---|---|---|
@@ -166,7 +164,71 @@ From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw`
 | 9 | list the kept tags | how many; each the start of its id and when it was kept |
 | 10 | the person key from the identity service (Unlock right only; FACETS.md D1): 32 bytes, held beside the identity key and wiped with it at lock; the kernel derives each kist's alias from it | 0, or ERR while nobody is present |
 | 11 | the identity's doorbell: x2 a word in the caller's arc, 8-aligned; the state written there now (read live, so an unlock at boot is in it) and at every change, bits 0-2 as op 0 with a change count above bit 8, waking whatever of the process waits on it. One word a process (a second moves it); any number of processes | 0, or ERR with no vault |
-| 12 | the retype gate (the Unlock right, and only the attest screen's keyboard: ahau by name, never a kist; "Unlock at boot" above): the seed of the handle typed again, compared with the person present's; a match turns attest at boot on | the reply document's length (the document into the caller's buffer), or ERR when none could be made |
+| 13 | Android on this device (the Settings right; docs/BOOT.md): start now, off, the state, what it starts into (refused while its guard is on), Android's recovery request; Android on is an approve (op 16) | 1 done, 0 refused |
+| 15 | remove this device (the identity service alone; "Remove this device" above), with the person's approve held (taken) | 1 removed, 0 the seed is not the person present's, ERR |
+| 16 | ask for an approve (the Settings right, never a kist; "Approve on the attest screen" below): x2 a request's word; only while a person is present on a bound device and none waits; the identity locked at once and the attest screen started again | 0, ERR refused |
+| 17 | the request waiting (the Unlock or the Settings right) | its word, 0 none |
+| 18 | Decline (ahau alone): the request dropped, nothing applied, still locked | 0 |
+| 19 | the "require attest" guards: x2 0 read (Settings or Unlock), x2 1 guard x3 on (Settings; kept in the device's settings document) | the guards' bits, ERR |
+| 20 | take an approval a process carries out itself (developer mode; Settings or Unlock): x2 its kind | the approved word (taken), NOTHING while it waits on the attest screen, 0 neither |
+
+Op 12 (the retype gate, 2026-11-17) and op 14 (the Android disclaimer's typed confirmation, 2026-11-21) were removed on 2026-11-24 with the second handle-entry screen they answered.
+
+## Approve on the attest screen (owner, 2026-11-24)
+
+The owner, after the attest-at-boot confirm screen took Enter differently from the attest screen: asking for such a setting "should immediately lock the device anyways and drop to the attest screen, pending success to apply the setting and the button instead of attest or in the weird case you designed 'cancel' should say 'approve' or similar and keep the user locked out if fail."
+
+**Why the Enter differed.** The confirm screen was not a copy of the attest screen's code but the same process in another mode: after attest ahau stays as the keyboard for words the identity service asks for (`host_words`, `Mode::Words`), and the retype gate (2026-11-17) was added there as words kind 5, followed by the Android disclaimer (kind 6) and the removal (kind 7). In that mode Enter submits the words, as it does for a newcomer's pairing words or a WiFi passphrase. On the attest entry Enter is a character of the handle (owner, 2026-10-28: "enter is a valid char"), typed as a newline, and the button attests. So the three confirm screens took a handle by other rules than attest: a handle with a newline in it could never be typed there. One screen and one input path now: every approval is the attest screen itself.
+
+**How it goes.**
+1. A settings page asks the kernel for a change (`SYS_UNLOCK` op 16): a request is a kind and one number (ahau_core::approve), never text. The kernel takes it only while a person is present on a bound device and none waits, and checks what only it knows (a cap the battery takes; Android allowed here before starting into it).
+2. The kernel keeps the request and locks at once, as any lock: the identity's keys wiped, the identity service's bell rung (fgtw wipes its roots, the fleet key and the person key), an approved request not yet taken dropped. It starts the attest screen again over everything (the service loop's restart of `ahau`, as `diag restart ahau`).
+3. The fresh attest screen reads the request (op 17) and says what it approves in the person's own words for its kind (ferros_lang `Approve*`, all sixteen languages), then "Type your handle to approve." Its button says approve; decline stands under it. No tag is read while it waits: a tag never approves.
+4. **Approve:** the handle typed unlocks (op 1). Opened, the kernel applies exactly the request, once, at that unlock, and the screen goes as at any attest (the roots to the identity service). The removal and developer mode are carried out by a process instead: the kernel holds the approval for it until it is taken or the next lock.
+5. **A failed attest** (another identity's handle, a typo: the kernel refuses it) **or Decline** (op 18): the request is dropped, nothing applied, and the screen is the plain attest screen, the device locked until the person attests.
+
+**Who holds the request across the lock: the kernel**, in RAM (process.rs `APPROVAL`).
+- Not the requester: the map asked and is still running under the attest screen, but nothing it can call changes a request that waits. Op 16 takes one only while a person is present, and asking locks, so while one waits nobody is present and every other ask is refused.
+- Not ahau: it is started again for the approve and only reads the request (op 17); its one write is Decline, which drops it. The words it shows come from the kind, so a requester cannot put its own text on the attest screen.
+- Not the vault: nothing of it touches the flash. A power cut drops it, and the next boot is a plain attest screen with nothing applied.
+- The writers: op 16 sets it; op 18, a failed unlock and a tag's unlock drop it; the approve's unlock applies and clears it.
+
+**Routed through it (built 2026-11-24):**
+
+| Kind | Asked by | Applied at the approve |
+|---|---|---|
+| Attest at boot on | the Security page's checkbox | the unlock keeps the seed (`\0id.unlock`), the setting on |
+| Attest at boot off | the same | the unlock keeps nothing, the setting off (the kept seed goes at the next boot, fgtw's keeps at once) |
+| Android on | the Android page: the disclaimer's agreement, and on again for a person who accepted before | the acceptance kept in the person's identity class if it is not yet (service.rs op 22), Android allowed here |
+| Remove this device | the Fleet page's Remove | held for the identity service: the attest screen asks it (fgtw op 33) once it holds the identity again, and the kernel erases only with the approval held ("Remove this device" above) |
+| A guard off, a guarded change | "Require attest" below | the guard off, the cap, what the device starts into; developer mode held for the map, which turns it on |
+
+The kernel refuses the plain way to each: `SYS_SET_PREF` refuses attest at boot both ways, op 13 refuses Android on (its request 2), the removal's erase needs the approval held.
+
+**Not routed, for the owner to decide:**
+- **Adding a fleet device.** The add flow (the Fleet page's list, its NFC reader and BLE scan) is open whenever the Fleet page is on the glass (2026-11-22), and the lock wipes the identity service's add machine with its pick. Routing it means the Fleet page opens with the flow closed, its Add asks for the approve, and the flow opens once the identity service holds the identity again: a change to the 2026-11-22 flow the owner designed, so it waits for him. An add already needs the identity's handle typed and confirmed on the new device.
+- **Approving another device's departure** (the Fleet page's Approve and Deny), **start Android now** (two taps; Android already allowed by an approve), **Android's recovery request** (allow once: a wipe of Android's data), **keeping and forgetting tags**.
+- **Identity export or reveal:** none exists in the interface. The kernel's export (op 5, the departure's "save first") has no caller yet; when the Fleet page's save first is built it should be an approve.
+
+## Require attest (owner, 2026-11-24)
+
+The owner: "for any debatable settings you could add a toggle that requires attest, and to untoggle, of course requires an attest but then after that your kid can change it all day long until you toggle 'require attest' on again."
+
+- **A guard a setting.** Each guardable setting has a "require attest" checkbox beside it. The guards are a device setting, `guards` in the device's settings document (SETTINGS.md), one bit each (ahau_core::approve::guard), kept at every change.
+- **On** is one tap (op 19 [1]): tightening is always safe, so it needs no attest.
+- **While on**, the setting changes only by an approve: the kernel refuses its plain write, the page asks for the approve with the value chosen, and the kernel applies that value at the approve's unlock.
+- **Off** is an approve (`GUARD_OFF`). From then on anyone holding the unlocked device may change that setting, until the guard is turned on again.
+- All guards are off out of the box.
+
+**Built (2026-11-24):**
+
+| Guard | Bit | Beside | Enforced by |
+|---|---|---|---|
+| The charge cap | 0 | the battery page's slider | the kernel (`SYS_CONTROL` refuses the cap) |
+| What the device starts into | 1 | the Android page's choice | the kernel (op 13 refuses requests 4 and 5) |
+| Developer mode | 2 | About's version line, on a release build while it is off | the map (Developer is the map's own entry); the approve is the kernel's, the map takes it (op 20) |
+
+**Proposed guardable, for the owner to choose:** the permissions answers (a kist's rights), the deck layout and its arrangement, the radios' switches (note: the attest screen switches them too, while locked), proximity wake, the time zone and the language, the WiFi networks kept, kists stowed and unstowed, do not disturb, the helm.
 
 ## Attest with a tag (owner, 2026-11-05 and 2026-11-11)
 
@@ -222,6 +284,8 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | Mint failed | Minting failed. Enter to retry. | | proposed |
 | No answer | No answer yet. Still looking. |  | proposed |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
+| An approve waits | Approve: (what, from the request's kind; "Approve on the attest screen") Type your handle to approve. | approve, decline under it | the button the owner's ("should say 'approve' or similar", 2026-11-24); the text proposed |
+| An approved removal refused | (why: the identity's only device, no fleet) | done | proposed |
 
 No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the join's screens and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry (from a confirmed join it withdraws the request).
 
@@ -289,4 +353,4 @@ To check before building:
 - **The hypervisor net is not built yet.** Until it is, Android with root can read the ferros partition, and so the device-only secret.
 - **A hang the watchdog resets** cannot run `before_reset`, so the key can survive in DRAM into the next boot. Planned: the gate's hypervisor scrubs the kernel's heap before it boots Android.
 - **Stowed apps and device pairings** are not in the identity class yet (their capsules are device class today); the plan is above.
-- **No way back to the attest screen** without a power cycle once a person is unlocked.
+- **Back to the attest screen** once a person is unlocked: only for an approve (the kernel's lock and the attest screen started again, "Approve on the attest screen"), or a power cycle. No plain lock in the interface yet.

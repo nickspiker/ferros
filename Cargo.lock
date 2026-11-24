@@ -1223,6 +1223,7 @@ dependencies = [
 name = "ferros-payload-map"
 version = "0.1.0"
 dependencies = [
+ "ahau_core",
  "ferros_detail",
  "ferros_glow",
  "ferros_heap",

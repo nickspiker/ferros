@@ -44,6 +44,11 @@ const TZ: &str = "tz";
 const START_INTO: &str = "start_into";
 /// The setting in effect (`START_INTO`): set from the document at boot, by SYS_UNLOCK op 13 (the Settings page; Android only while a person is present on a device that allows it) and by `diag "start into ..."`; read by the service loop after the attest of a boot nobody answered (service.rs `START_INTO`).
 pub static START_ANDROID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The "require attest" guards (owner, 2026-11-24: "for any debatable settings you could add a toggle that requires attest"; ahau_core::approve::guard; docs/AUTH.md "Require attest"): a bit each, kept as `guards`, absent none.
+/// While a guard is on its setting changes only by an approve on the attest screen (process.rs SYS_UNLOCK op 16); on is a plain write (op 19), off an approve.
+const GUARDS_FIELD: &str = "guards";
+/// The guards in effect: set from the document at boot, by SYS_UNLOCK op 19 (on) and by an approved GUARD_OFF (off).
+pub static GUARDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The zone (owner, 2026-11-10: "Proper zone too"; zone.rs): this device's own choice, its IANA id by hand (`zone`; none: `tz` is the offset) and whether it is automatic (`zone_auto`, 1 the default); whether the device follows the identity's (`zone_follow`, 1 the default); the identity's as its service last wrote it (`zone_identity_auto` present once it has, `zone_identity` its id); the zone last found here and what found it (`zone_found`, `zone_found_by`: 1 the network, 2 a position).
 const ZONE: &str = "zone";
 const ZONE_AUTO: &str = "zone_auto";
@@ -79,7 +84,7 @@ fn schema() -> SectionSchema {
     for (name, _, _) in KNOBS {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s = s.field(TZ, TypeConstraint::AnySigned).field(START_INTO, TypeConstraint::AnyUnsigned);
+    s = s.field(TZ, TypeConstraint::AnySigned).field(START_INTO, TypeConstraint::AnyUnsigned).field(GUARDS_FIELD, TypeConstraint::AnyUnsigned);
     for name in [ZONE, ZONE_IDENTITY, ZONE_FOUND] {
         s = s.field(name, TypeConstraint::AsciiText);
     }
@@ -121,6 +126,7 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
         b = b.set(name, VsfType::u(v as usize, false)).ok()?;
     }
     b = b.set(START_INTO, VsfType::u(START_ANDROID.load(core::sync::atomic::Ordering::Relaxed) as usize, false)).ok()?;
+    b = b.set(GUARDS_FIELD, VsfType::u(GUARDS.load(core::sync::atomic::Ordering::Relaxed) as usize, false)).ok()?;
     let tz = crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed);
     b = b.set(TZ, VsfType::i(tz as isize)).ok()?;
     let z = crate::zone::state();
@@ -177,6 +183,11 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
     // What the device starts into: Android only for exactly 1.
     if let Some(v) = first(START_INTO).and_then(|v| v.as_u64()) {
         START_ANDROID.store(v == 1, core::sync::atomic::Ordering::Relaxed);
+        n += 1;
+    }
+    // The guards: only bits that name one (the document can be stored from the bridge, and a bit no build knows guards nothing).
+    if let Some(v) = first(GUARDS_FIELD).and_then(|v| v.as_u64()) {
+        GUARDS.store(v & ahau_core::approve::guard::ALL, core::sync::atomic::Ordering::Relaxed);
         n += 1;
     }
     // The knobs as kept; a driver ignores a value it cannot use, so none is range-checked here.

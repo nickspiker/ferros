@@ -3330,9 +3330,8 @@ pub enum Android {
     /// Start Android now: ferros leaves the gate its word and resets (the device must allow Android).
     StartNow = 0,
     /// Android off on this device; what it starts into goes back to ferros.
+    /// (2 was Android on again until 2026-11-24: Android on is an approve on the attest screen now, `approve::ask` with ahau_core::approve::ANDROID_ON, and the kernel refuses 2.)
     Off = 1,
-    /// Android on again, for a person who accepted the disclaimer before.
-    OnAgain = 2,
     /// The state: bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android.
     State = 3,
     /// What this device starts into (the person's standing choice, applied after the attest of a boot nobody answered): ferros, always taken.
@@ -3367,16 +3366,9 @@ pub fn android(cap: u64, what: Android) -> Option<u64> {
     }
 }
 
-/// The disclaimer's typed confirmation (SYS_UNLOCK op 14, the Unlock right, the attest screen's keyboard only): the seed of the person's own handle typed again after the disclaimer was read in full. The kernel compares it with the seed of the person present; one, their acceptance is kept in their identity class and this device allows Android. The reply, a VSF document (ahau_core::retype, `on` = allowed now), lands in `out`. Its whole length, or None without the right.
-pub fn android_accept(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize> {
-    match svc(nr::UNLOCK, cap, 14, off(seed.as_ptr()), off(out.as_mut_ptr()), out.len() as u64) {
-        ERR => None,
-        n => Some(n as usize),
-    }
-}
-
 /// Remove this device from its identity (SYS_UNLOCK op 15, the identity service alone; docs/AUTH.md "Remove this device"): the first `len` bytes of `buf` hold [flags: bit 0 a dry run][the typed handle's seed 32][each kist of the person's, (developer 32, option 32)].
 /// A removal → Some(1) removed (the device powers off once the kernel's drops are sent), Some(0) the seed is not the person present's (nothing changed).
+/// A removal needs the person's approve on the attest screen held in the kernel (ahau_core::approve::REMOVE_DEVICE, since 2026-11-24), which it takes: without it, None and nothing changed.
 /// A dry run → Some(the account's whole length), its text written over `buf`; nothing changed.
 /// None: refused (nobody present, no right, a buffer of another shape, a kernel before 2026-11-22).
 pub fn remove_device(cap: u64, buf: &mut [u8], len: usize) -> Option<u64> {
@@ -3386,11 +3378,65 @@ pub fn remove_device(cap: u64, buf: &mut [u8], len: usize) -> Option<u64> {
     }
 }
 
-/// The retype gate (SYS_UNLOCK op 12, the Unlock right; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again. The kernel compares it with the seed of the person present and turns the setting on only when they are one; the reply, a VSF document (ahau_core::retype), lands in `out`. Its whole length, or None without the right or from a kernel before 2026-11-17 (whose SET_PREF still takes the setting, unchecked).
-pub fn attest_at_boot_on(cap: u64, seed: &[u8; 32], out: &mut [u8]) -> Option<usize> {
-    match svc(nr::UNLOCK, cap, 12, off(seed.as_ptr()), off(out.as_mut_ptr()), out.len() as u64) {
-        ERR => None,
-        n => Some(n as usize),
+/// Attest to approve (owner, 2026-11-24; docs/AUTH.md "Approve on the attest screen"): a protective change, or a change to a setting under a "require attest" guard, approved on the attest screen itself.
+/// A request is ahau_core::approve's word (its kind in bits 0-7, its number above): never text, so the screen says what it approves in the person's own words.
+pub mod approve {
+    use super::{nr, svc, ERR, NOTHING};
+
+    /// Ask for a change to be approved (SYS_UNLOCK op 16, the Settings right, never a kist): the kernel keeps the request, locks the identity at once (its keys dropped, as any lock), and starts the attest screen again over everything, which shows what is asked.
+    /// The person's handle typed there unlocks and the kernel applies exactly that change; a failed attest or a Decline leaves the device locked with nothing applied.
+    /// True when asked; false when refused (nobody present, the device not bound, a request the kernel does not take, no right).
+    pub fn ask(settings: u64, word: u64) -> bool {
+        svc(nr::UNLOCK, settings, 16, word, 0, 0) == 0
+    }
+
+    /// The request waiting on the attest screen (SYS_UNLOCK op 17, the Unlock or the Settings right): its word, None when there is none.
+    pub fn pending(cap: u64) -> Option<u64> {
+        match svc(nr::UNLOCK, cap, 17, 0, 0, 0) {
+            ERR | 0 => None,
+            w => Some(w),
+        }
+    }
+
+    /// Decline (SYS_UNLOCK op 18, the attest screen alone): the request dropped, nothing applied, the device still locked. True when done.
+    pub fn decline(unlock: u64) -> bool {
+        svc(nr::UNLOCK, unlock, 18, 0, 0, 0) == 0
+    }
+
+    /// The "require attest" guards on (SYS_UNLOCK op 19 [0], the Settings or the Unlock right): their bits (ahau_core::approve::guard), None without the right.
+    pub fn guards(cap: u64) -> Option<u64> {
+        match svc(nr::UNLOCK, cap, 19, 0, 0, 0) {
+            ERR => None,
+            g => Some(g),
+        }
+    }
+
+    /// Guard `g` on (SYS_UNLOCK op 19 [1], the Settings right): no attest, since tightening is always safe; kept in the device's settings document at once. The guards' bits after, None when refused.
+    /// Off is an approve (`ask` with ahau_core::approve::GUARD_OFF).
+    pub fn guard_on(settings: u64, g: u8) -> Option<u64> {
+        match svc(nr::UNLOCK, settings, 19, 1, g as u64, 0) {
+            ERR => None,
+            b => Some(b),
+        }
+    }
+
+    /// What became of an approval asked for (`take`).
+    pub enum Taken {
+        /// Approved: the word, now this caller's to carry out.
+        Approved(u64),
+        /// Asked and waiting on the attest screen.
+        Waiting,
+        /// Neither: declined, failed, never asked, or gone with a lock.
+        No,
+    }
+
+    /// What became of an approval of `kind` that a process carries out itself (SYS_UNLOCK op 20, the Settings or the Unlock right; ahau_core::approve `kernel` false): approved, its word taken (the kernel holds it no longer); still waiting; or neither.
+    pub fn take(cap: u64, kind: u8) -> Taken {
+        match svc(nr::UNLOCK, cap, 20, kind as u64, 0, 0) {
+            NOTHING => Taken::Waiting,
+            ERR | 0 => Taken::No,
+            w => Taken::Approved(w),
+        }
     }
 }
 

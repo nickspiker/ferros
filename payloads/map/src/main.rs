@@ -1065,7 +1065,9 @@ enum Choice {
     Helm(u8, bool),
     UnlockAtBoot,
     ProxWake,
-    /// The Android page (docs/BOOT.md "Android only by the identity's choice"): what this device starts into (0 ferros, 1 Android: SYS_UNLOCK op 13, requests 4 and 5), start Android now (two taps), Android off, on again (a person who accepted before), and the disclaimer's agreement (the keyboard asks for the handle).
+    /// A setting's "require attest" guard (ahau_core::approve::guard; owner, 2026-11-24): on in one tap, off by an approve on the attest screen.
+    Guard(u8),
+    /// The Android page (docs/BOOT.md "Android only by the identity's choice"): what this device starts into (0 ferros, 1 Android: SYS_UNLOCK op 13, requests 4 and 5; an approve while its guard is on), start Android now (two taps), Android off, and Android on (on again for a person who accepted before, or the disclaimer's agreement), an approve on the attest screen.
     StartInto(u8),
     AndroidNow,
     AndroidOff,
@@ -1708,6 +1710,8 @@ struct Map {
     person_armed: Option<u32>,
     /// The Android page's "start Android now", its first tap taken (the second restarts into Android).
     android_armed: bool,
+    /// Developer mode asked for under its guard (an approve on the attest screen): taken from the kernel once approved, at the main loop's passes, and dropped when declined or failed.
+    dev_asked: bool,
     /// The Android page's "allow once" for Android's recovery request, its first tap taken (the second answers yes).
     recovery_armed: bool,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
@@ -3855,6 +3859,9 @@ impl Map {
                     y += uu(2, 1);
                     let now_s = (st >> 2 & 1) as usize;
                     radios(self, b, &mut y, &["ferros", "Android"], now_s, &|i| Choice::StartInto(i as u8));
+                    // Its "require attest" guard beside it (owner, 2026-11-24): on, what it starts into changes only by an approve on the attest screen.
+                    let guarded = self.guard_on(ahau_core::approve::guard::START_INTO);
+                    mark(self, b, &mut y, 50, tr(Msg::RequireAttest), guarded, Some(Choice::Guard(ahau_core::approve::guard::START_INTO)));
                     y += uu(1, 1);
                     notes(b, &mut y, tr(Msg::StartIntoNote));
                     y += uu(1, 1);
@@ -4581,6 +4588,11 @@ impl Map {
                 fact_wrap(b, &mut y, tr(Msg::ChargeCap), say(Say::ChargeCapAt { mv: volts.as_str(), share: pct.as_str() }).as_str());
                 slider(self, b, &mut y, Choice::ChargeCap);
                 notes(b, &mut y, tr(Msg::ChargeCapNote));
+                // Its "require attest" guard beside it (owner, 2026-11-24): on, the cap changes only by an approve on the attest screen.
+                y += uu(1, 2);
+                let guarded = self.guard_on(ahau_core::approve::guard::CHARGE_CAP);
+                mark(self, b, &mut y, 50, tr(Msg::RequireAttest), guarded, Some(Choice::Guard(ahau_core::approve::guard::CHARGE_CAP)));
+                notes(b, &mut y, tr(Msg::RequireAttestNote));
                 y += uu(1, 2);
                 let default = num(ferros_sys::control::CHARGE_CV_DEFAULT as i64, " mV");
                 row(self, b, &mut y, note, dim(), say(Say::ChargeCapDefault(default.as_str())).as_str(), None);
@@ -4715,6 +4727,11 @@ impl Map {
                     y += uu(2, 1);
                 }
                 row(self, b, &mut y, small, grey(), tr(if DEV { Msg::VersionDev } else { Msg::Version }), Some(Choice::Version));
+                // Developer mode's "require attest" guard (owner, 2026-11-24), on a release build while it is not on yet: on, the version line's twelfth tap asks for an approve on the attest screen. A development build is in developer mode from the start, so it has none.
+                if !DEV && !self.dev {
+                    let guarded = self.guard_on(ahau_core::approve::guard::DEVELOPER);
+                    mark(self, b, &mut y, 50, tr(Msg::RequireAttest), guarded, Some(Choice::Guard(ahau_core::approve::guard::DEVELOPER)));
+                }
                 // The hint from the fourth tap on, counting down to Developer; it stays until the next tap changes it (no timers).
                 if self.taps >= DEV_HINT {
                     let l = if DEV || self.dev {
@@ -5369,11 +5386,40 @@ impl Map {
     }
 
     /// The charge cap as its slider left it (`t`, the knob's place): asked of the kernel, which checks it, keeps it in the vault and writes the charger's CV at once; nothing asked when it is the cap already.
+    /// Under its "require attest" guard the cap is asked for by an approve on the attest screen instead (the kernel sets it at that unlock), and the knob goes back to the cap in effect.
     fn charge_keep(&self, t: f64) {
         let mv = charge::mv_at(t);
-        if mv != charge::now_mv() && !charge::set(cap(self.grants, S_SETTINGS), mv) {
+        if mv == charge::now_mv() {
+            return;
+        }
+        if self.guard_on(ahau_core::approve::guard::CHARGE_CAP) {
+            self.approve_ask(ahau_core::approve::CHARGE_CAP, mv);
+        } else if !charge::set(cap(self.grants, S_SETTINGS), mv) {
             console(self.grants, b"map: the kernel did not take the charge cap\n");
         }
+    }
+
+    /// Ask the kernel for an approve on the attest screen (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): it keeps the request, locks the device at once and puts the attest screen up over everything, showing what is asked; the handle typed there applies exactly it. A request the kernel does not take is said on the console.
+    fn approve_ask(&self, kind: u8, arg: u64) {
+        let Some(r) = ahau_core::approve::Request::new(kind, arg) else { return };
+        if !ferros_sys::approve::ask(cap(self.grants, S_SETTINGS), r.word()) {
+            console(self.grants, b"map: the kernel did not take the approve (nobody present, the device not bound, or one asked already)\n");
+        }
+    }
+
+    /// Whether guard `g` is on (the kernel's word, read as it is needed).
+    fn guard_on(&self, g: u8) -> bool {
+        ferros_sys::approve::guards(cap(self.grants, S_SETTINGS)).is_some_and(|b| ahau_core::approve::guard::on(b, g))
+    }
+
+    /// Developer mode on: Developer is a page from now on, kept in the vault, and said to the stower at once (auto-stow, docs/KISTS.md "Stowing"); one not serving yet hears it from the watcher.
+    fn developer_on(&mut self) {
+        self.dev = true;
+        if !ferros_kept::map::developer(true, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &doc)) {
+            console(self.grants, b"map: the vault did not take Developer\n");
+        }
+        stower::DEVELOPER.store(true, core::sync::atomic::Ordering::Release);
+        let _ = stower::tell_developer(self.grants);
     }
     /// A typed setting as its slider left it, kept in the vault (the drag applied it live); anything else, nothing.
     fn typed_kept(&self, what: Choice) {
@@ -6123,17 +6169,26 @@ impl Map {
                         set(self, ferros_sys::PREF_HELM, if on { was | bit } else { was & !bit });
                     }
                     Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
-                    // Off in one tap. On only thru the retype gate (owner, 2026-11-17: "require a handle to be typed in to enable attest at boot (since my toddler could do it without me)"): the keyboard asks for the person's own handle again (fgtw op 15 [5], kind 5 on the attest screen's keyboard), which the kernel compares with the person present's and turns the setting on itself (SYS_UNLOCK op 12); the kernel refuses this page's plain set of it. The checkbox follows the setting as it changes.
+                    // On and off by an approve on the attest screen (owner, 2026-11-24: "it should immediately lock the device anyways and drop to the attest screen, pending success to apply the setting"): the device locks at once and the attest screen asks for the handle; the kernel turns it over itself at that unlock, and refuses this page's plain set of it. The checkbox follows the setting as it changes.
                     Some(Choice::UnlockAtBoot) => {
-                        if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 {
-                            set(self, ferros_sys::PREF_UNLOCK_AT_BOOT, 0);
-                        } else {
-                            people_ask(&[15, 5]);
+                        let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
+                        self.approve_ask(if on { ahau_core::approve::ATTEST_AT_BOOT_OFF } else { ahau_core::approve::ATTEST_AT_BOOT_ON }, 0);
+                    }
+                    // A "require attest" guard: on in one tap (tightening is always safe), off by an approve.
+                    Some(Choice::Guard(g)) => {
+                        if self.guard_on(g) {
+                            self.approve_ask(ahau_core::approve::GUARD_OFF, g as u64);
+                        } else if ferros_sys::approve::guard_on(cap(self.grants, S_SETTINGS), g).is_none() {
+                            console(self.grants, b"map: the kernel did not take the guard\n");
                         }
                     }
                     // The Android page (docs/BOOT.md "Android only by the identity's choice"). What it starts into: the kernel takes Android only while a person is present on a device that allows it.
                     Some(Choice::StartInto(v)) => {
-                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), if v == 1 { ferros_sys::Android::StartIntoAndroid } else { ferros_sys::Android::StartIntoFerros });
+                        if self.guard_on(ahau_core::approve::guard::START_INTO) {
+                            self.approve_ask(ahau_core::approve::START_INTO, v as u64);
+                        } else {
+                            let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), if v == 1 { ferros_sys::Android::StartIntoAndroid } else { ferros_sys::Android::StartIntoFerros });
+                        }
                     }
                     // Start Android now, on the second tap: the kernel leaves the hv's gate its word and resets (the person present checked there again).
                     Some(Choice::AndroidNow) => {
@@ -6147,9 +6202,8 @@ impl Map {
                     Some(Choice::AndroidOff) => {
                         let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::Off);
                     }
-                    Some(Choice::AndroidOn) => {
-                        let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::OnAgain);
-                    }
+                    // Android on, for a person who accepted the disclaimer before, and the disclaimer's agreement: an approve on the attest screen (owner, 2026-11-24), the kernel keeping the acceptance (once per person) and allowing Android at its unlock.
+                    Some(Choice::AndroidOn | Choice::AndroidAgree) => self.approve_ask(ahau_core::approve::ANDROID_ON, 0),
                     // Android's recovery request: allow once on the second tap (the kernel checks the person and misc again, then resets into recovery with Android's own arguments), no in one (the kernel clears the command and arguments in misc; ferros stays).
                     Some(Choice::RecoveryAllow) => {
                         if self.recovery_armed {
@@ -6162,8 +6216,6 @@ impl Map {
                     Some(Choice::RecoveryRefuse) => {
                         let _ = ferros_sys::android(cap(self.grants, S_SETTINGS), ferros_sys::Android::RecoveryNo);
                     }
-                    // The disclaimer's agreement: the keyboard asks for the person's own handle again (kind 6 on the attest screen's keyboard), which the kernel compares with the person present's and keeps their acceptance itself (SYS_UNLOCK op 14).
-                    Some(Choice::AndroidAgree) => people_ask(&[15, 6]),
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
                     // Adding a device (payloads/fgtw ops 8, 10, 12, 15): the flow opened and closed, a nearby device picked, a pick confirmed, the keyboard asked for the newcomer's words (1) or a leaver's (2), which the attest screen (ahau) hosts.
                     // The flow opened and closed thru the one state the main loop tells fgtw (`FLEET_PAGE`, op 8 from `fleet_page_thread` alone), so it is open only while the page is on the glass: Add lifts the visit's hold and tells the state again, Close (Done) holds it closed. No on a selected device is op 8 [1] itself (fgtw drops the pick; the flow, open, stays open).
@@ -6198,22 +6250,21 @@ impl Map {
                         let on = self.fleet.deck.is_some_and(|h| h.0);
                         self.fleet.add_op(cap(self.grants, S_FGTW), &[18, !on as u8]);
                     }
-                    // Remove this device (owner, 2026-11-22: "press remove, type the handle, press unbind"; docs/AUTH.md "Remove this device"): the attest screen's keyboard asks for the person's own handle (words kind 7), and its enter has the identity service tell the fleet at once, then the kernel erase this identity's data here and power off (payloads/fgtw remove.rs). No second tap: the typed handle is the confirmation.
-                    Some(Choice::FleetRemove) => people_ask(&[15, 7]),
+                    // Remove this device (owner, 2026-11-22: "press remove, type the handle, press unbind"; 2026-11-24: approved on the attest screen itself; docs/AUTH.md "Remove this device"): the device locks at once, the handle typed on the attest screen approves it, and the attest screen has the identity service tell the fleet, then the kernel erase this identity's data here and power off (payloads/fgtw remove.rs). No second tap: the approve is the confirmation.
+                    Some(Choice::FleetRemove) => self.approve_ask(ahau_core::approve::REMOVE_DEVICE, 0),
                     Some(Choice::Version) => {
                         // WHY the stop at twelve: the count means nothing past it, and held there an endless run of taps cannot wrap the u8 back under the hint.
                         if self.taps < DEV_TAPS {
                             self.taps += 1;
                         }
-                        // The twelfth tap on a release build: Developer is a page from now on, kept in the vault.
+                        // The twelfth tap on a release build: Developer is a page from now on, kept in the vault. Under its "require attest" guard, an approve on the attest screen first (`developer_on` once the kernel says it was approved).
                         if self.taps == DEV_TAPS && !DEV && !self.dev {
-                            self.dev = true;
-                            if !ferros_kept::map::developer(true, ferros_sys::eagle_now()).is_some_and(|doc| ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &doc)) {
-                                console(self.grants, b"map: the vault did not take Developer\n");
+                            if self.guard_on(ahau_core::approve::guard::DEVELOPER) {
+                                self.dev_asked = true;
+                                self.approve_ask(ahau_core::approve::DEVELOPER, 0);
+                            } else {
+                                self.developer_on();
                             }
-                            // Developer mode said to the stower at once (auto-stow, docs/KISTS.md "Stowing"); one not serving yet hears it from the watcher.
-                            stower::DEVELOPER.store(true, core::sync::atomic::Ordering::Release);
-                            let _ = stower::tell_developer(self.grants);
                         }
                     }
                     // Attest with a tag: an add started (the next tag held to the device is kept, `tag_add_thread`), or the one waiting cancelled.
@@ -6663,6 +6714,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         unstow_armed: None,
         person_armed: None,
         android_armed: false,
+        dev_asked: false,
         recovery_armed: false,
         card: None,
         sheet: None,
@@ -6873,6 +6925,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut unlock_boot_seen = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT);
     // The Android page's state as last drawn (allowed, accepted, what the device starts into, and Android's recovery request waiting): it changes under the keyboard (the disclaimer's agreement) and from the bridge.
     let mut android_seen = u64::MAX;
+    // The guards and the charge cap as their pages were last drawn with them.
+    let mut guards_seen = (u64::MAX, 0u64);
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0i64, 0i64); 16];
@@ -7050,6 +7104,27 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if ub != unlock_boot_seen {
             unlock_boot_seen = ub;
             map.draw();
+        }
+        // Developer mode asked for under its guard: taken once the attest screen approved it (the kernel holds it for this map until then), dropped when it was declined or failed.
+        if map.dev_asked {
+            match ferros_sys::approve::take(cap(map.grants, S_SETTINGS), ahau_core::approve::DEVELOPER) {
+                ferros_sys::approve::Taken::Approved(_) => {
+                    map.dev_asked = false;
+                    map.developer_on();
+                    console(map.grants, b"map: developer mode on, approved on the attest screen\n");
+                    map.draw();
+                }
+                ferros_sys::approve::Taken::Waiting => {}
+                ferros_sys::approve::Taken::No => map.dev_asked = false,
+            }
+        }
+        // The pages with a "require attest" guard follow the guards and the charge cap while they show (an approve applies them while the attest screen has the glass): read at a wake, never on a timer.
+        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "battery" | "Android" | "about") && !map.settling {
+            let g = (ferros_sys::approve::guards(cap(map.grants, S_SETTINGS)).unwrap_or(0), charge::now_mv());
+            if g != guards_seen {
+                guards_seen = g;
+                map.draw();
+            }
         }
         // The Android page follows the kernel's state while it shows: read at a wake, never on a timer.
         if matches!(map.view, View::Open(_)) && PAGES[map.page] == "Android" && !map.settling {

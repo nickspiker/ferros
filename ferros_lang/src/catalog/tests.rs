@@ -26,6 +26,7 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
         (Say::OnBattery(H), 1),
         (Say::ChargeCapAt { mv: H, share: H }, 2),
         (Say::ChargeCapDefault(H), 1),
+        (Say::ApproveChargeCap(H), 1),
         (Say::ChargeCapCycles { share: H, mv: H }, 2),
         (Say::Throttled(H), 1),
         (Say::NotAskedYet(H), 1),

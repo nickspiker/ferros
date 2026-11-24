@@ -1,4 +1,4 @@
-//! Remove this device from its identity (owner, 2026-11-22; docs/AUTH.md "Remove this device"), on the device being removed: Remove on the Fleet page, the person's handle typed on the attest screen's keyboard (ahau, words kind 7), enter.
+//! Remove this device from its identity (owner, 2026-11-22; docs/AUTH.md "Remove this device"), on the device being removed: Remove on the Fleet page, then the approve on the attest screen itself (owner, 2026-11-24: the device locks at once and the person's handle typed there approves it; ahau_core::approve::REMOVE_DEVICE), which hands the roots here again and then asks for the removal.
 //! No Fleet page needs to be open anywhere and nothing waits on another device before the erase.
 //!
 //! 0. **The check.** The typed handle's seed against the roots in hand here (op 33), its memory-hard proof against this identity's by fgtw's removal gate (`UserOp::Remove`, then `Event::Unbind`), and the seed again in the kernel at the erase (SYS_UNLOCK op 15, compared in registers).
@@ -24,7 +24,7 @@ pub struct Removing {
 }
 
 impl Client {
-    /// Op 33 [0][seed 32][proof 32]: the person typed their handle to remove this device (its seed, and its memory-hard proof for fgtw's removal gate, both made by the attest screen's keyboard). → 0 started (or already under way), 1 not a member of a fleet, 4 the identity's last device (an identity must live somewhere: nothing to tell, nothing done), 6 the handle is not this identity's (nothing done), 7 the kernel cannot remove (nothing told), else the departure's own refusal (depart.rs `leave`).
+    /// Op 33 [0][seed 32][proof 32]: the person approved removing this device on the attest screen (the seed of the handle typed there, and its memory-hard proof for fgtw's removal gate, both made by the attest screen). → 0 started (or already under way), 1 not a member of a fleet, 4 the identity's last device (an identity must live somewhere: nothing to tell, nothing done), 6 the handle is not this identity's (nothing done), 7 the kernel cannot remove (nothing told), else the departure's own refusal (depart.rs `leave`).
     /// `typed` is wiped here whatever the answer.
     pub fn remove_start(&mut self, typed: &mut [u8; 32], proof: &[u8; 32]) -> u8 {
         let same = self.identity_seed.as_ref().is_some_and(|s| s.iter().zip(typed.iter()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0);

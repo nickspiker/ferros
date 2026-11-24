@@ -1110,7 +1110,12 @@ fn identity_ring() {
 fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match (op, seed) {
-        (1, Some(s)) => match st.unlock(s, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1) {
+        // 1 an attest (the seed kept for unlock at boot when it is on); 20 the approve of attest at boot on (kept, the setting written once it opened, process.rs `approve_settle`); 21 the approve of attest at boot off (never kept).
+        (1 | 20 | 21, Some(s)) => match st.unlock(s, match op {
+            20 => true,
+            21 => false,
+            _ => crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1,
+        }) {
             Ok(()) => {
                 crate::flashlog::line("identity unlocked");
                 Ok(st.identity_entries() as u64)
@@ -1137,18 +1142,6 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             }
             Ok(false) => Ok(0),
             Err(_) => Err(()),
-        },
-        // The retype gate (ahau_core::retype, process.rs op 12): 1 the seed typed again is the person present's and is now kept for unlock at boot (`retype_keep`), 0 it is not and nothing was written, 2 it is but could not be kept; Err while nobody is present. The log says which, never a byte of either seed.
-        (12, Some(s)) => match st.retype_keep(s) {
-            Ok(m) => {
-                crate::flashlog::line(if m { "attest at boot: the handle typed again matches the person present; the seed kept for the next boot" } else { "attest at boot: the handle typed again does not match; nothing changed" });
-                Ok(m as u64)
-            }
-            Err(crate::kvault::KvError::Locked) => Err(()),
-            Err(e) => {
-                crate::flashlog::line(&alloc::format!("attest at boot: the handle typed again matches, but the seed could not be kept: {e:?}"));
-                Ok(2)
-            }
         },
         (3, _) => {
             st.bind().map_err(|_| ())?;
@@ -1194,23 +1187,20 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             }
             Ok(ok as u64)
         }
-        // 14: the disclaimer's typed confirmation (ahau's keyboard): the handle typed again is the person present's, so their acceptance is kept in their identity class (once per person) and this device allows Android. 1 done, 0 they do not match, 2 they match but it could not be kept.
-        (14, Some(s)) => match st.retype_matches(s) {
-            Ok(true) => {
-                let accepted = disclaimer_document().map(|d| st.set(crate::kvault::ANDROID_DISCLAIMER, &d).is_ok()).unwrap_or(false);
-                let allowed = st.set("android.allowed", &[1]).is_ok();
-                crate::flashlog::line(&alloc::format!("android: the disclaimer accepted by the person present (handle typed again): acceptance kept {accepted}, allowed on this device {allowed}"));
-                if allowed {
-                    ANDROID_ALLOWED.store(2, core::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(if accepted && allowed { 1 } else { 2 })
+        // 22: Android on, approved on the attest screen (process.rs `approve_settle`, ahau_core::approve::ANDROID_ON; owner, 2026-11-24): the person present's acceptance of the disclaimer kept in their identity class if it is not yet (once per person; they read it in full on the Android page before asking), and this device allows Android. 1 done, 2 not kept; Err while nobody is present.
+        (22, _) => {
+            if !st.unlocked() {
+                return Err(());
             }
-            Ok(false) => {
-                crate::flashlog::line("android: the disclaimer's handle typed again does not match; nothing changed");
-                Ok(0)
+            let before = matches!(st.get_by_key(crate::kvault::ANDROID_DISCLAIMER), Ok(Some(_)));
+            let accepted = before || disclaimer_document().map(|d| st.set(crate::kvault::ANDROID_DISCLAIMER, &d).is_ok()).unwrap_or(false);
+            let allowed = accepted && st.set("android.allowed", &[1]).is_ok();
+            crate::flashlog::line(&alloc::format!("android: on, approved on the attest screen: acceptance {}, allowed on this device {allowed}", if before { "kept before" } else if accepted { "kept now" } else { "not kept" }));
+            if allowed {
+                ANDROID_ALLOWED.store(2, core::sync::atomic::Ordering::Relaxed);
             }
-            Err(_) => Err(()),
-        },
+            Ok(if allowed { 1 } else { 2 })
+        }
         // 15: Android off on this device (the setting goes back to ferros in process.rs). The person's acceptance stays theirs. 1 done.
         (15, _) => {
             if !st.unlocked() {
@@ -1220,19 +1210,6 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             crate::flashlog::line(&alloc::format!("android: off on this device (the person's choice), kept {ok}"));
             if ok {
                 ANDROID_ALLOWED.store(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(ok as u64)
-        }
-        // 16: Android on again for a person who accepted the disclaimer before (on this device: their identity class). 1 done, 0 no acceptance kept.
-        (16, _) => {
-            if !st.unlocked() {
-                return Err(());
-            }
-            let before = matches!(st.get_by_key(crate::kvault::ANDROID_DISCLAIMER), Ok(Some(_)));
-            let ok = before && st.set("android.allowed", &[1]).is_ok();
-            crate::flashlog::line(if ok { "android: on again on this device (the person accepted the disclaimer before)" } else { "android: on again refused: no acceptance of the disclaimer kept for the person present" });
-            if ok {
-                ANDROID_ALLOWED.store(2, core::sync::atomic::Ordering::Relaxed);
             }
             Ok(ok as u64)
         }
@@ -3534,6 +3511,12 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The kept processes that died by a panic or a fault (process.rs `KEPT`, `crash_answer`; owner, 2026-11-21, after the deck panicked on the Pro and nothing answered a touch until the bridge restarted it): each started again at once from its capsule, as `diag restart` does, in `KEPT`'s order (the display before the deck). The death woke this loop (`sev`), never a timer; one that died again too soon was not asked for (a crash loop, said and noted where it was counted).
         // One alive already (started meanwhile by hand, or by init's keeper) is left alone. What reads the person's space is refused as `restart` refuses it (the deck until the device is bound, the identity service and the stower until a person attests), which one that was running had passed already. One refused for room is tried again once an arc has come back.
+        // An approval asked (attest to approve, process.rs SYS_UNLOCK op 16; owner, 2026-11-24): the identity is locked already, and the attest screen is started again over everything, as `diag restart ahau` does, so a fresh one comes up showing what is asked with Approve on its button. The ask woke this loop (`sev`), never a timer.
+        if crate::process::approve_restart_take() {
+            let mut rep = alloc::vec::Vec::new();
+            restart(&mut store, b"ahau", &mut rep);
+            crate::flashlog::line(&alloc::format!("approve: the attest screen started again: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+        }
         let mut want = crate::process::kept_take();
         if kept_room != 0 && frees != kept_room_at {
             want |= kept_room;

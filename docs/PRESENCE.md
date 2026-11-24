@@ -9,7 +9,7 @@ and later:
 > I keep thinking there's a need for spaghettify("handle plaintext", proof that they actually typed the handle in) = user typed it in?
 
 Three answers, in the order they can be built:
-- **The retype gate** (built 2026-11-17, AUTH.md "Unlock at boot"): turning attest at boot on takes the handle typed again, compared with the person present's in the kernel.
+- **The retype gate** (built 2026-11-17, AUTH.md "Unlock at boot"): turning attest at boot on takes the handle typed again, compared with the person present's in the kernel. Replaced 2026-11-24 by the approve on the attest screen itself (AUTH.md "Approve on the attest screen"): the device locks and the handle typed at attest is the approve. What this page says of the gate's open questions holds for the approve's unlock the same way: it takes a seed, so (a) would have it take the tagged keystrokes instead.
   It answers the toddler.
 - **(a) Kernel-tagged touch**: the handle provably typed on this glass, now, by a finger, not handed in by a process that knows it.
   It answers "proof that they actually typed the handle in".

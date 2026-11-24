@@ -40,7 +40,7 @@ pub const SEALED: &str = "sealed";
 
 /// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's: the map's arrangement, the identity service's chain and key (payloads/fgtw), the attest screen's own, the WiFi credential (networks travel with the identity; the per-network MAC stays the device's), and the GPS driver's last fix (owner, 2026-11-04: where the device has been is the person's, and no GPS runs while nobody has attested; the replays it aids from keep no place, gps scrub). They are sealed under a key bound to this device and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not. Since 2026-11-12 also the notes kists have waiting on the person (process notify.rs, docs/NOTIFY.md), under a reserved name no process scope reaches: who wrote to the person and what about is theirs. Since 2026-11-21 also the person's acceptance of the Android disclaimer (`ANDROID_DISCLAIMER`, docs/BOOT.md "Android only by the identity's choice"): once per person, so it is theirs, not the device's.
 const IDENTITY: [&str; 8] = ["map.", "fgtw.", "ahau.", "wifi.cred", "gps.last", "kists.", "\0notes.", "\0android."];
-/// The person accepted the Android disclaimer (SYS_UNLOCK op 14): a VSF document (section `android_disclaimer`: `version`, the disclaimer text's number; `accepted`, Eagle time), in the identity class under a reserved name no process scope reaches.
+/// The person accepted the Android disclaimer (approved on the attest screen, service.rs op 22): a VSF document (section `android_disclaimer`: `version`, the disclaimer text's number; `accepted`, Eagle time), in the identity class under a reserved name no process scope reaches.
 pub const ANDROID_DISCLAIMER: &str = "\0android.disclaimer";
 /// What a removal would take from the kernel's vault and registers (`Store::remove_preview`): the dry run's account, counts and marks only.
 pub struct RemovePreview {
@@ -844,7 +844,7 @@ impl KVault {
         Ok(true)
     }
 
-    /// The retype gate (SYS_UNLOCK op 12; ahau_core::retype): whether `typed`, the seed of a handle typed again just now, is the seed of the person present.
+    /// Whether `typed`, the seed of a handle typed just now, is the seed of the person present (ahau_core::retype; the removal's erase, SYS_UNLOCK op 15).
     /// The held seed is never opened: its tag is derived from it in registers (`held_derive`, the same `derive_key` as `retype::tag`), and the two tags are compared in time that does not depend on where they differ.
     /// `Locked` while nobody is present.
     pub fn retype_matches(&self, typed: &[u8; 32]) -> Result<bool, KvError> {
@@ -852,19 +852,6 @@ impl KVault {
         let same = ahau_core::retype::matches(&held, typed);
         crate::keys::wipe_to_dram(&mut held);
         Ok(same)
-    }
-
-    /// The retype gate's keep (SYS_UNLOCK op 12): when `typed` is the seed of the person present (`retype_matches`), the seed is kept for unlock at boot now (`ID_UNLOCK`, its `unlock` document sealed in the device class, as `unlock` keeps it), so turning the setting on takes effect at the next boot with no attest typed in between.
-    /// Ok(false) and nothing written for any other seed; `Locked` while nobody is present.
-    /// The only writer of the kept seed besides a typed attest's `unlock` with the setting on: a tag's unlock never keeps it (`tag_unlock`; owner, 2026-11-18: "no tags").
-    pub fn retype_keep(&mut self, typed: &[u8; 32]) -> Result<bool, KvError> {
-        if !self.retype_matches(typed)? {
-            return Ok(false);
-        }
-        let mut doc = ferros_pieces::kv::unlock_document(typed, now()).ok_or(KvError::Document("the kept seed"))?;
-        let r = self.raw_put(ID_UNLOCK, &doc);
-        crate::keys::wipe_to_dram(&mut doc);
-        r.map(|_| true)
     }
 
     /// Whether the person key is held (a person present and their identity service has handed it in).
@@ -1122,7 +1109,7 @@ impl KVault {
     }
 
     /// Unlock by tag (the attest screen, AUTH.md): the record kept under the tag's id opened with its seal key, and its seed unlocked exactly as a typed handle's is (`unlock`, the same binding rule: a bound device opens only its own identity). The seed is returned for the attest screen to hand to the identity service, as it would the one it derived. `Open` for a tag kept for nothing here or a record that does not open (one refusal, no detail).
-    /// A tag never keeps the seed for unlock at boot, whatever the setting (owner, 2026-11-18: "no tags"): the kept seed is written only by a typed attest with the setting on (`unlock`) and by the retype gate (`retype_keep`), both from a handle typed on the glass.
+    /// A tag never keeps the seed for unlock at boot, whatever the setting (owner, 2026-11-18: "no tags"): the kept seed is written only by a typed attest with the setting on or approving it on (`unlock` with `keep`), from a handle typed on the glass.
     pub fn tag_unlock(&mut self, uid: &[u8]) -> Result<[u8; 32], KvError> {
         let (id, mut key) = self.tag_keys(uid)?;
         let record = self.get_addr(TAGS, &id)?.and_then(|d| Self::tag_record(&d));

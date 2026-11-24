@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod approve;
 pub mod retype;
 
 mod codes {

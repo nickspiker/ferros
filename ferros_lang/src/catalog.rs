@@ -290,8 +290,6 @@ messages! {
     // ---- Security ----
     /// The checkbox: the device attests at boot without the handle typed ("attest", as the attest screen says it; owner, 2026-11-10: "always attest").
     AttestAtBoot,
-    /// The keyboard's prompt when the checkbox is tapped on (the retype gate, docs/AUTH.md "Unlock at boot"): the person's own handle again, with what turning it on means. Two lines.
-    RetypeForAttestAtBoot,
     /// Two lines.
     AttestAtBootNote,
 
@@ -307,10 +305,8 @@ messages! {
     /// For a person who accepted the disclaimer before: no disclaimer again (once per person).
     TurnAndroidOn,
     AndroidOffHere,
-    /// The button under the disclaimer: the attest screen's keyboard asks for the person's own handle again (the typed confirmation, no tap and no hold).
+    /// The button under the disclaimer: the device locks and the attest screen asks to approve Android on, the person's handle typed there (owner, 2026-11-24; no tap and no hold).
     AndroidAgree,
-    /// The keyboard's prompt for that confirmation. Two lines.
-    RetypeForAndroid,
     /// The disclaimer in full (owner, 2026-11-01, android_behind_attestation; the one place "phone" is right, it names what is lost). Three paragraphs. Its number is kernel service.rs `DISCLAIMER_VERSION`: a changed text gets the next one.
     AndroidDisclaimer,
     /// Android's recovery request, asked after the attest (owner, 2026-11-22; docs/BOOT.md "Recovery requests from Android"): one question for each class, each a paragraph the page wraps. A factory reset Android asked for.
@@ -355,8 +351,6 @@ messages! {
     DeckOwn,
     /// Two lines under the Fleet page's Remove: what removing this device does (owner, 2026-11-22; docs/AUTH.md "Remove this device").
     RemoveNote,
-    /// The attest screen keyboard's prompt for Remove (words kind 7): the person's own handle, and what enter does. Two lines.
-    RetypeToRemove,
     /// The keyboard's status once the removal started: the fleet told, the erase, the power off.
     RemovingDevice,
     /// Remove refused: the identity's only device (an identity must live somewhere).
@@ -695,6 +689,27 @@ messages! {
     Mint,
     StartOver,
     Cancel,
+    // Attest to approve (owner, 2026-11-24; docs/AUTH.md "Approve on the attest screen"): the button that attests and applies (Decline below it is the calls' word), and the button that closes the screen after a removal it could not start.
+    Approve,
+    Done,
+    /// Under what is approved.
+    ApproveTypeHandle,
+    /// What is approved, one message a request (ahau_core::approve), never words of the requester's. Each starts "Approve:"; two lines where the second says what it means.
+    ApproveAttestAtBootOn,
+    ApproveAttestAtBootOff,
+    ApproveAndroidOn,
+    ApproveRemoveDevice,
+    ApproveGuardOffChargeCap,
+    ApproveGuardOffStartInto,
+    ApproveGuardOffDeveloper,
+    /// One line.
+    ApproveStartIntoFerros,
+    ApproveStartIntoAndroid,
+    ApproveDeveloper,
+    /// A guardable setting's checkbox beside it (owner, 2026-11-24: "a toggle that requires attest"): on, changing the setting is an approve.
+    RequireAttest,
+    /// Two lines under the guards: what the checkbox does, and that turning it off is an approve too.
+    RequireAttestNote,
     /// The button while a network is being joined.
     JoiningButton,
     Join,
@@ -722,7 +737,7 @@ messages! {
     JoinShowWords,
     /// A tag held to the attest screen that does not open the device: one refusal, no detail (AUTH.md "Attest with a tag").
     TagDenied,
-    /// A handle typed again that is not the one it must be (attest at boot's retype): nothing changed, the text kept to correct.
+    /// A handle that is not the one it must be (the removal's, after its approve): nothing changed.
     TheyDontMatch,
     ComputingKeys,
     IdentityServiceNotAnswering,
@@ -885,6 +900,8 @@ pub enum Say<'a> {
     ChargeCapAt { mv: &'a str, share: &'a str },
     /// Why the default is the default: the default voltage (written already, with its unit).
     ChargeCapDefault(&'a str),
+    /// The attest screen's approve of a guarded charge cap: the cap, written already in the person's base (mV).
+    ApproveChargeCap(&'a str),
     /// Above the default: the share of the default's charge cycles (written already) and the default voltage (written already, with its unit).
     ChargeCapCycles { share: &'a str, mv: &'a str },
     /// The chip's temperature (written already, with its unit) while its clock is held down for heat.

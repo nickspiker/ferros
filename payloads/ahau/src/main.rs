@@ -796,8 +796,12 @@ enum Mode {
     Wrong,
     /// fgtw.org refused the binding request: this device is in another identity's fleet (fgtw verdict 9). Enter starts over.
     Owned,
-    /// After attest, the keyboard for words the identity service wants typed (the Fleet page, fgtw ops 15 and 16): 1 a newcomer's pairing words, 2 a leaver's approval words. Nothing of the handle is in it.
+    /// After attest, the keyboard for words the identity service wants typed (the Fleet page, fgtw ops 15 and 16): 1 a newcomer's pairing words, 2 a person's handle, 3 the name the person gives them, 4 a WiFi passphrase. Nothing of the person's own handle is ever typed here: what needs it is approved on the attest screen itself (`approve`).
     Words(u8),
+    /// The removal approved (ahau_core::approve::REMOVE_DEVICE): the roots handed to the identity service, which is waited for until it holds the identity as a member, then asked to remove this device (fgtw op 33) with the seed and proof of the handle typed at the approve.
+    Removing,
+    /// After an approve's removal that could not start: why, on the status line, and the button that closes the screen (`told`).
+    Told,
     /// After attest, waiting for words to be wanted, the window gone.
     Hosting,
     /// After attest, the system keyboard for the app in front (WINDOWS.md "The keyboard"): the keys alone, docked at the screen's bottom at the input level, each stroke typed into that app thru the display (op 70), never kept here.
@@ -881,6 +885,12 @@ struct Ahau {
     dev_name: ([u8; 48], usize),
     /// While joining: the person asked to see the pairing words ("Not in range?"). Hidden by default (owner, 2026-11-22); forgotten when the screen leaves the join.
     words_open: bool,
+    /// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): the request the kernel holds while the device is locked, read once as the screen starts. While it is set the entry's button says Approve and Decline stands under it; the handle typed unlocks and the kernel applies exactly that change. A failed attest or a Decline drops it, and the screen is the plain attest screen.
+    approve: Option<ahau_core::approve::Request>,
+    /// The removal's seed and proof, from the handle typed at its approve, held only until the identity service is asked (`remove_go`), then wiped.
+    remove_keys: Option<([u8; 32], [u8; 32])>,
+    /// Why the approve's removal did not start (`Mode::Told`).
+    told: ferros_lang::Msg,
     /// The join confirmed here and the identity service not yet seen saying so (state 1): a copy still saying 11 was read before the press, and does not take the screen back to the question. The service signs the request in the pass that takes the press, so its echo comes a few seconds late.
     confirm_echo: bool,
 }
@@ -1044,7 +1054,7 @@ impl Ahau {
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
     fn can_go_back(&self) -> bool {
-        matches!(self.mode, Mode::Looking | Mode::Confirm | Mode::Join | Mode::Mint | Mode::Grey | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
+        matches!(self.mode, Mode::Looking | Mode::Confirm | Mode::Join | Mode::Mint | Mode::Grey | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass) || (self.mode == Mode::Removing && self.remove_keys.is_some())
     }
 
     /// Whether the button is the join's wide one: a sentence wrapped over as many lines as it takes (the confirmation, "Not in range?"), not a word.
@@ -1078,12 +1088,40 @@ impl Ahau {
         (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
     }
 
+    /// Decline, under Approve while an approve waits: in the space between the button's foot and the keyboard (a fixed 0.15 of the width), a sixty-fourth of the width below the button, its height seven sixty-fourths of the width (not the scale's, so a larger scale never runs it into the keys), as wide as the button. None while no approve waits.
+    fn decline_at(&self) -> Option<(usize, usize, usize, usize)> {
+        if self.approve.is_none() || self.mode != Mode::Fresh {
+            return None;
+        }
+        let (x0, _, x1, y1) = self.button_at();
+        let y0 = y1 + self.w / 64;
+        Some((x0, y0, x1, y0 + self.w * 7 / 64))
+    }
+
+    /// Decline (owner's design, 2026-11-24: "Decline below it, which goes to the plain attest screen"): the kernel drops the request (SYS_UNLOCK op 18), nothing applied, the device still locked, and the screen is the plain attest screen.
+    fn decline(&mut self) {
+        let done = ferros_sys::approve::decline(cap(self.grants, S_UNLOCK));
+        console(self.grants, if done { b"ahau: the approve declined; nothing applied, the device stays locked\n".as_slice() } else { b"ahau: the kernel did not take the decline (an older kernel?); the screen is the plain attest screen\n" });
+        self.approve = None;
+        self.all();
+        self.show();
+    }
+
     /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them. Back from a confirmed join withdraws it (fgtw op 32 [0]): the binding request is dropped and the radios stop.
     fn go_back(&mut self) {
         // On the network page: from the passphrase back to the list, from the list back to the screen under it.
         match self.mode {
             Mode::Pass => return self.net_list(),
             Mode::Networks => return self.net_close(),
+            // The removal given up before the identity service was asked: its seed and proof wiped, nothing removed, and the screen goes (the device was unlocked by the approve's attest).
+            Mode::Removing => {
+                if let Some((mut seed, mut proof)) = self.remove_keys.take() {
+                    scrub(&mut seed);
+                    scrub(&mut proof);
+                }
+                console(self.grants, b"ahau: the approved removal given up before it started (back); nothing removed\n");
+                self.host_words()
+            }
             _ => {}
         }
         let whole = matches!(self.mode, Mode::Confirm | Mode::Join);
@@ -1111,7 +1149,11 @@ impl Ahau {
         use ferros_lang::{t, Msg};
         match self.mode {
             // Always "attest", bound or not (owner, 2026-11-10: "needs to say attest, not unlock. always attest"): the prompt above says whether the handle also binds this device.
+            // An approve (owner, 2026-11-24: "the button instead of attest ... should say 'approve'"): Decline stands under it (`decline_at`).
+            Mode::Fresh if self.approve.is_some() => Some(t(Msg::Approve)),
             Mode::Fresh => Some(t(Msg::Attest)),
+            Mode::Told => Some(t(Msg::Done)),
+            Mode::Removing => None,
             Mode::Mint => Some(t(Msg::Mint)),
             Mode::Wrong | Mode::Owned => Some(t(Msg::StartOver)),
             Mode::Words(_) => Some(t(Msg::Cancel)),
@@ -1141,6 +1183,19 @@ impl Ahau {
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(0) { PRESSED } else if self.joining { 1800 } else { 2600 }, self.k(self.w / 24));
+        }
+        // Decline under Approve, quieter than it (`decline_at`): its rows cleared and drawn here with the button's, its label composed with its own rows.
+        if let Some((dx0, dy0, dx1, dy1)) = self.decline_at() {
+            for y in dy0..dy1 {
+                s[y * self.w..(y + 1) * self.w].fill(self.bg());
+            }
+            pill(s, self.w, dx0, dy0, dx1, dy1, if self.pressed.get() == Some(2) { PRESSED } else { 1800 }, self.k(self.w / 24));
+            self.compose(dy0, dy1, || {
+                let px = self.k(self.w / 24);
+                let t = ferros_lang::t(ferros_lang::Msg::Decline).as_bytes();
+                let x = self.centre_x((dx0 + dx1) as i64 / 2, px, t);
+                window::text(self.display, self.text_to.get(), x as i16, ((dy0 + dy1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t);
+            });
         }
         // The labels in front of the pills, the row composed whole before it shows (`compose`): each of its lines centred, the block of them about the pill's middle.
         self.compose(ry0, ry1, || {
@@ -1959,6 +2014,9 @@ impl Ahau {
         if self.button_label().is_some() && inside(self.button_at()) {
             return Some(0);
         }
+        if self.decline_at().is_some_and(inside) {
+            return Some(2);
+        }
         if self.mode == Mode::Networks && !self.joining {
             return self.net_row_at(y).map(|k| 16 + k as u8);
         }
@@ -2008,6 +2066,7 @@ impl Ahau {
                 self.words();
             }
             k if k >= 16 => self.net_pick((k - 16) as usize),
+            2 if self.decline_at().is_some() => self.decline(),
             _ => {}
         }
     }
@@ -2375,10 +2434,39 @@ impl Ahau {
         }
     }
 
+    /// What an approve approves (ahau_core::approve), then "Type your handle to approve.": the words the person's language has for the request's kind, never anything the requester wrote. The charge cap's in the person's base, in mV.
+    fn approve_words(&self) -> Line {
+        use ahau_core::approve as ap;
+        use ferros_lang::Msg;
+        let Some(r) = self.approve else { return Line::new() };
+        let mut l = match (r.kind, r.arg as u8) {
+            (ap::ATTEST_AT_BOOT_ON, _) => tx(Msg::ApproveAttestAtBootOn),
+            (ap::ATTEST_AT_BOOT_OFF, _) => tx(Msg::ApproveAttestAtBootOff),
+            (ap::ANDROID_ON, _) => tx(Msg::ApproveAndroidOn),
+            (ap::REMOVE_DEVICE, _) => tx(Msg::ApproveRemoveDevice),
+            (ap::GUARD_OFF, ap::guard::CHARGE_CAP) => tx(Msg::ApproveGuardOffChargeCap),
+            (ap::GUARD_OFF, ap::guard::START_INTO) => tx(Msg::ApproveGuardOffStartInto),
+            (ap::GUARD_OFF, _) => tx(Msg::ApproveGuardOffDeveloper),
+            (ap::CHARGE_CAP, _) => {
+                let mut mv = signed(r.arg as i64);
+                let _ = core::fmt::Write::write_str(&mut mv, " mV");
+                sx(ferros_lang::Say::ApproveChargeCap(mv.as_str()))
+            }
+            (ap::START_INTO, 1) => tx(Msg::ApproveStartIntoAndroid),
+            (ap::START_INTO, _) => tx(Msg::ApproveStartIntoFerros),
+            _ => tx(Msg::ApproveDeveloper),
+        };
+        let _ = core::fmt::Write::write_str(&mut l, "\n");
+        let _ = core::fmt::Write::write_str(&mut l, ferros_lang::t(Msg::ApproveTypeHandle));
+        l
+    }
+
     fn prompt(&self) -> Line {
         use ferros_lang::{Fleet, Msg};
         match self.mode {
             // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says"), in the person's language; the fleet's and identity's are fgtw's, the same Photon shows.
+            // An approve: what is approved, in the person's words from the request's kind alone, then what to do.
+            Mode::Fresh if self.approve.is_some() => self.approve_words(),
             Mode::Fresh if self.bound => tx(Msg::TypeYourHandle),
             Mode::Fresh => tx(Msg::UnboundTypeToBind),
             // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
@@ -2401,14 +2489,12 @@ impl Ahau {
                 let shown = printable(&self.pick.0[..self.pick.1]);
                 sx(ferros_lang::Say::PassphraseFor(core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("")))
             }
-            // The Security page's attest at boot: the person's own handle again (docs/AUTH.md "Unlock at boot").
-            Mode::Words(5) => tx(Msg::RetypeForAttestAtBoot),
-            // The Android page's agreement: the person's own handle again, after the disclaimer.
-            Mode::Words(6) => tx(Msg::RetypeForAndroid),
-            // The Fleet page's Remove (docs/AUTH.md "Remove this device"): the person's own handle, then enter unbinds.
-            Mode::Words(7) => tx(Msg::RetypeToRemove),
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
+            // The approve's removal: waiting for the identity service to hold the identity, then under way (the power goes when it is done).
+            Mode::Removing if self.remove_keys.is_some() => tx(Msg::FindingIdentity),
+            Mode::Removing => tx(Msg::RemovingDevice),
+            Mode::Told => tx(self.told),
             // The network page writes its own lines (`net_status`).
             Mode::Networks | Mode::Pass => Line::new(),
         }
@@ -2450,7 +2536,9 @@ impl Ahau {
                 self.end_words(true);
                 return;
             }
-            Mode::Hosting | Mode::Keys => return,
+            Mode::Hosting | Mode::Keys | Mode::Removing => return,
+            // Done, after an approve's removal that did not start: the device is unlocked (the approve's attest), so the screen goes.
+            Mode::Told => self.host_words(),
             // The join confirmed (owner, 2026-11-22): only now does the identity service send the binding request (fgtw op 32 [1]); the screen goes on to how to finish it at once, the service's doorbell following.
             Mode::Confirm => {
                 let mut o = [0u8; 4];
@@ -2499,13 +2587,31 @@ impl Ahau {
         };
         // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the identity service's business (the public registry), not the unlock's. One identity per device: on a device its fleet has bound, the kernel opens only that identity's space, so an open space there is the device's own person and the screen goes now, the proof made behind it; another handle is refused. On a device not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
         if self.mode == Mode::Fresh {
+            // An approve waiting: the kernel applies its change at this unlock (or holds it for the process that carries it out) when it opens, and drops it when it does not; either way it is no longer waiting.
+            let approving = self.approve.take();
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
-                // Opened on a bound device: this is the identity the device belongs to.
-                ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => self.unlocked_known(&mut seed),
+                // The removal approved: carried out from here, the screen staying up until the power goes (`remove_approved`).
+                ferros_sys::Unlock::Opened(_) if approving.is_some_and(|r| r.kind == ahau_core::approve::REMOVE_DEVICE) => {
+                    console(self.grants, b"ahau: approved: remove this device\n");
+                    self.remove_approved(&mut seed);
+                    return;
+                }
+                // Opened on a bound device: this is the identity the device belongs to (and an approve's change is applied).
+                ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => {
+                    if approving.is_some() {
+                        console(self.grants, b"ahau: approved; the kernel applied it\n");
+                    }
+                    self.unlocked_known(&mut seed)
+                }
                 ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this device is not bound to a fleet yet: looking the identity up\n"),
                 ferros_sys::Unlock::Belongs => {
                     scrub(&mut seed);
                     console(self.grants, b"ahau: refused: this device belongs to another identity\n");
+                    // A failed approve (owner, 2026-11-24: "keep the user locked out if fail"): nothing applied, the plain attest screen.
+                    if approving.is_some() {
+                        console(self.grants, b"ahau: the approve failed; nothing applied, the device stays locked\n");
+                        self.all();
+                    }
                     // The handle stays as typed, the caret at its end (owner, 2026-11-11: "not have it clear the handle if you attest with a wrong letter, usually it's just one that needs fixed"): a handle is not a secret (owner, 2026-10-28), and the seed derived from it was never kept.
                     self.caret = self.len;
                     self.status(fl(ferros_lang::Fleet::DeniedBoundOther).as_str());
@@ -2513,7 +2619,12 @@ impl Ahau {
                     self.entry();
                     return;
                 }
-                ferros_sys::Unlock::Failed => console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n"),
+                ferros_sys::Unlock::Failed => {
+                    console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n");
+                    if approving.is_some() {
+                        self.all();
+                    }
+                }
             }
         }
         match self.mode {
@@ -2597,6 +2708,72 @@ impl Ahau {
                 false
             }
         }
+    }
+
+    /// The removal approved (owner, 2026-11-22 and 2026-11-24; docs/AUTH.md "Remove this device"): the handle typed at the approve unlocked the device, so its seed is the person's.
+    /// Its memory-hard proof (from the identity's space, or made now) and the seed go to the identity service as roots, as at any attest; once it holds the identity as a member again (the lock wiped what it held), it is asked to remove this device with them (fgtw op 33, `remove_go`), which tells the fleet and has the kernel erase this identity's data, with this approve held for it, and power off.
+    /// The screen stays up meanwhile; back gives the removal up while it waits (nothing removed).
+    fn remove_approved(&mut self, seed: &mut [u8; 32]) {
+        self.wipe();
+        self.mode = Mode::Removing;
+        let mut proof = self.proof_for(seed, true);
+        self.send_roots(seed, &proof);
+        self.remove_keys = Some((*seed, proof));
+        scrub(seed);
+        scrub(&mut proof);
+        self.all();
+        self.show();
+    }
+
+    /// While the approve's removal waits: once the roots are taken and the identity service holds the identity as a member (its state 3, `client_thread`'s copy), the removal is asked for. Whether the screen changed.
+    fn follow_removal(&mut self) -> bool {
+        if self.mode != Mode::Removing || self.remove_keys.is_none() {
+            return false;
+        }
+        if self.roots_pending {
+            if ROOTS_TAKEN.load(core::sync::atomic::Ordering::Acquire) != self.roots_gen {
+                return false;
+            }
+            self.roots_pending = false;
+            console(self.grants, b"ahau: roots handed to fgtw; the removal waits for it to hold the identity as a member\n");
+        }
+        let Some((seq, c)) = client_take(self.client_seen) else { return false };
+        self.client_seen = seq;
+        if c.roots != self.roots_gen || c.state != 3 {
+            return false;
+        }
+        self.remove_go();
+        true
+    }
+
+    /// The identity service asked to remove this device (fgtw op 33 [0][seed][proof]), the seed and proof wiped once sent. Started: the screen says so and stays until the power goes. Refused: why, and Done closes the screen.
+    fn remove_go(&mut self) {
+        let Some((mut seed, mut proof)) = self.remove_keys.take() else { return };
+        let mut m = [0u8; 66];
+        m[0] = 33;
+        m[2..34].copy_from_slice(&seed);
+        m[34..].copy_from_slice(&proof);
+        scrub(&mut seed);
+        scrub(&mut proof);
+        let mut o = [0u8; 8];
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut o);
+        scrub(&mut m);
+        let r = if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 { 255 } else { o[0] };
+        let (line, msg): (&[u8], ferros_lang::Msg) = match r {
+            0 => (b"ahau: remove: the fleet is told, then this identity's data is erased and the device powers off\n", ferros_lang::Msg::RemovingDevice),
+            6 => (b"ahau: remove: the handle is not the identity's in hand; nothing changed\n", ferros_lang::Msg::TheyDontMatch),
+            4 => (b"ahau: remove: the identity's last device; nothing changed\n", ferros_lang::Msg::RemoveLastDevice),
+            1 => (b"ahau: remove: this device is not a member of a fleet; nothing changed\n", ferros_lang::Msg::RemoveNotMember),
+            255 => (b"ahau: remove: the identity service did not answer; nothing changed\n", ferros_lang::Msg::IdentityServiceNotAnswering),
+            _ => (b"ahau: remove: not started; nothing changed\n", ferros_lang::Msg::RemoveNotStarted),
+        };
+        console(self.grants, line);
+        if r != 0 {
+            self.told = msg;
+            self.mode = Mode::Told;
+        }
+        self.all();
+        self.show();
     }
 
     /// Clear during the mint's second entry only clears it: the verdict stands.
@@ -2732,9 +2909,6 @@ impl Ahau {
                     match kind {
                         1 => b"ahau: words wanted: a new device's\n".as_slice(),
                         4 => b"ahau: words wanted: a WiFi passphrase (the WiFi page)\n",
-                        5 => b"ahau: words wanted: the person's own handle again (attest at boot)\n",
-                        6 => b"ahau: words wanted: the person's own handle again (the Android disclaimer)\n",
-                        7 => b"ahau: words wanted: the person's own handle (remove this device)\n",
                         _ => b"ahau: words wanted: a person's handle (the People page)\n",
                     },
                 );
@@ -2859,7 +3033,7 @@ impl Ahau {
         }
     }
 
-    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a person's handle, 3 the name the person gives them, 4 a WiFi network's passphrase, 5 the person's own handle again (attest at boot).
+    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a person's handle, 3 the name the person gives them, 4 a WiFi network's passphrase.
     fn words_wanted(&self) -> u8 {
         self.words_asked().0
     }
@@ -2869,8 +3043,8 @@ impl Ahau {
         let mut o = [0u8; 2 + 32];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
         let mut name = [0u8; 32];
-        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4), the person's own handle again for attest at boot (5), for the Android disclaimer (6) and to remove this device (7): a departure asked of another device takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 7 {
+        // A newcomer's words (1), a person's handle (2), the name the person gives them (3), a WiFi passphrase (4): a departure asked of another device takes no words since 2026-11-10 (owner: Approve or Deny), and the person's own handle is never asked here since 2026-11-24 (what needs it is approved on the attest screen itself, `approve`).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 4 {
             return (0, (name, 0));
         }
         if o[0] == 4 {
@@ -2916,134 +3090,6 @@ impl Ahau {
             (_, 3) => self.status(tx(ferros_lang::Msg::AlreadyOnNetwork).as_str()),
             _ => self.status(tx(ferros_lang::Msg::CouldNotKeepNetwork).as_str()),
         }
-    }
-
-    /// Enter on the Security page's attest at boot (docs/AUTH.md "Unlock at boot"; the retype gate, ahau_core::retype): the person's own handle typed again, shown as typed (a handle is not a password).
-    /// Its seed goes to the kernel (SYS_UNLOCK op 12), which compares it with the seed of the person present and turns the setting on only when they are one; the seed is wiped once sent.
-    /// A match: the keyboard goes, the setting on. A mismatch: "They don't match.", the text kept to be corrected, nothing changed. Anything else (nobody present, a kernel before 2026-11-17, the setting not kept): the keyboard goes and the page shows the setting as it is.
-    fn retype_enter(&mut self) {
-        use ahau_core::retype::{read, REPLY_MAX};
-        if self.len == 0 {
-            return;
-        }
-        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
-        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
-            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
-            return;
-        };
-        let mut doc = [0u8; REPLY_MAX];
-        let n = ferros_sys::attest_at_boot_on(cap(self.grants, S_UNLOCK), &seed, &mut doc);
-        scrub(&mut seed);
-        let mut why = [0u8; 64];
-        // WHY the filter: the length is the kernel's whole document; one longer than the buffer was cut and is not read.
-        match n.filter(|&n| n <= doc.len()).and_then(|n| read(&doc[..n], &mut why)) {
-            Some((r, _)) if !r.error => {
-                console(self.grants, b"ahau: attest at boot on (the handle typed again is the person present's)\n");
-                self.end_words(true);
-            }
-            Some((r, _)) if r.present && !r.matched => {
-                console(self.grants, b"ahau: attest at boot: the handle typed again does not match; nothing changed\n");
-                self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
-            }
-            Some((_, w)) => {
-                console(self.grants, b"ahau: attest at boot not turned on: ");
-                console(self.grants, &why[..w]);
-                console(self.grants, b"\n");
-                self.end_words(true);
-            }
-            None => {
-                console(self.grants, b"ahau: attest at boot: the kernel gave no reply (one before 2026-11-17?)\n");
-                self.end_words(true);
-            }
-        }
-    }
-
-    /// Enter on the Android page's agreement (owner, 2026-11-01 and 2026-11-21; docs/BOOT.md "Android only by the identity's choice"): the disclaimer was read in full on that page, and the person's own handle typed again (shown as typed: a handle is not a password) is the typed confirmation. The kernel compares its seed with the person present's (SYS_UNLOCK op 14); one, it keeps their acceptance and this device allows Android.
-    fn android_enter(&mut self) {
-        use ahau_core::retype::{read, REPLY_MAX};
-        if self.len == 0 {
-            return;
-        }
-        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
-        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
-            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
-            return;
-        };
-        let mut doc = [0u8; REPLY_MAX];
-        let n = ferros_sys::android_accept(cap(self.grants, S_UNLOCK), &seed, &mut doc);
-        scrub(&mut seed);
-        let mut why = [0u8; 64];
-        // WHY the filter: the length is the kernel's whole document; one longer than the buffer was cut and is not read.
-        match n.filter(|&n| n <= doc.len()).and_then(|n| read(&doc[..n], &mut why)) {
-            Some((r, _)) if !r.error => {
-                console(self.grants, b"ahau: the Android disclaimer accepted (the handle typed again is the person present's); Android allowed on this device\n");
-                self.end_words(true);
-            }
-            Some((r, _)) if r.present && !r.matched => {
-                console(self.grants, b"ahau: the Android disclaimer: the handle typed again does not match; nothing changed\n");
-                self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
-            }
-            Some((_, w)) => {
-                console(self.grants, b"ahau: Android not allowed: ");
-                console(self.grants, &why[..w]);
-                console(self.grants, b"\n");
-                self.end_words(true);
-            }
-            None => {
-                console(self.grants, b"ahau: the Android disclaimer: the kernel gave no reply (one before 2026-11-21?)\n");
-                self.end_words(true);
-            }
-        }
-    }
-
-    /// Enter on the Fleet page's Remove (words kind 7; owner, 2026-11-22: "press remove, type the handle, press unbind"; docs/AUTH.md "Remove this device"): the person's own handle, shown as typed (a handle is not a password).
-    /// Its seed and memory-hard proof go to the identity service (fgtw op 33), which checks them against the identity in hand, tells the fleet at once, and has the kernel check it again before it erases this identity's data and powers the device off; the seed is wiped once sent.
-    /// Started: the keyboard stays with what happens on its status line, until the power goes. A mismatch: "They don't match.", the text kept to be corrected, nothing changed.
-    fn remove_enter(&mut self) {
-        if self.len == 0 {
-            return;
-        }
-        // A character the keyboard cannot encode makes no seed; it cannot be the person's handle, which was typed on these keys.
-        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
-            self.status(tx(ferros_lang::Msg::TheyDontMatch).as_str());
-            return;
-        };
-        // Its memory-hard proof too, for fgtw's removal gate (the departure goes out only when it is this identity's handle proof, as attest checks it): seconds on the X3, the status saying so, the text kept on screen for a mismatch.
-        self.status(tx(ferros_lang::Msg::ComputingKeys).as_str());
-        self.show();
-        // Let the display put the status up before the proof holds the core.
-        sleep_until(now() + freq() / 30);
-        ferros_sys::pin(ferros_sys::CORES_BIG);
-        sleep_until(now() + freq() / 1000);
-        // The heap is the proof's while it runs, as at attest (HEAP_USE).
-        while HEAP_USE.compare_exchange(0, 2, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
-        let mut proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
-        HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
-        ferros_sys::pin(0);
-        let mut m = [0u8; 66];
-        m[0] = 33;
-        m[2..34].copy_from_slice(&seed);
-        m[34..].copy_from_slice(&proof);
-        scrub(&mut seed);
-        scrub(&mut proof);
-        let mut o = [0u8; 8];
-        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut o);
-        scrub(&mut m);
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 {
-            self.status(tx(ferros_lang::Msg::IdentityServiceNotAnswering).as_str());
-            return;
-        }
-        let (line, msg): (&[u8], ferros_lang::Msg) = match o[0] {
-            0 => (b"ahau: remove: the handle matches; the fleet is told, then this identity's data is erased and the device powers off\n", ferros_lang::Msg::RemovingDevice),
-            6 => (b"ahau: remove: the handle typed does not match; nothing changed\n", ferros_lang::Msg::TheyDontMatch),
-            4 => (b"ahau: remove: the identity's last device; nothing changed\n", ferros_lang::Msg::RemoveLastDevice),
-            1 => (b"ahau: remove: this device is not a member of a fleet; nothing changed\n", ferros_lang::Msg::RemoveNotMember),
-            _ => (b"ahau: remove: not started; nothing changed\n", ferros_lang::Msg::RemoveNotStarted),
-        };
-        console(self.grants, line);
-        self.status(tx(msg).as_str());
     }
 
     /// The words as typed to the identity service: a newcomer's, matched at every stroke (fgtw op 11, the live matcher). The answer on the status line; a match ends the words.
@@ -3242,7 +3288,7 @@ impl Ahau {
     fn type_char(&mut self, c: char) {
         let limit = match self.mode {
             // A person's handle as a handle is typed; the name the person gives them, a line.
-            Mode::Words(2 | 5 | 6) => MAX_CHARS,
+            Mode::Words(2) => MAX_CHARS,
             Mode::Words(3) => 63,
             // A WiFi passphrase: WPA2's longest.
             Mode::Words(4) => 63,
@@ -3298,21 +3344,6 @@ impl Ahau {
             // A WiFi passphrase: enter hands it to the WiFi driver.
             Some(Event::Enter) if self.mode == Mode::Words(4) => {
                 self.wifi_enter();
-                return;
-            }
-            // The person's own handle again (attest at boot): enter hands it to the kernel to compare, as a person's handle is handed on.
-            Some(Event::Enter) if self.mode == Mode::Words(5) => {
-                self.retype_enter();
-                return;
-            }
-            // The person's own handle again (the Android disclaimer's agreement): handed to the kernel to compare.
-            Some(Event::Enter) if self.mode == Mode::Words(6) => {
-                self.android_enter();
-                return;
-            }
-            // The person's own handle (remove this device): handed to the identity service, which tells the fleet and has the kernel erase.
-            Some(Event::Enter) if self.mode == Mode::Words(7) => {
-                self.remove_enter();
                 return;
             }
             // Words: enter sends them as typed (they hold no newline).
@@ -3742,6 +3773,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     let mode = Mode::Fresh;
+    // An approve waiting (attest to approve; ahau_core::approve): the kernel holds the request while the device is locked, and started this screen again for it (SYS_UNLOCK op 16). Only while locked on a bound device: anything else is no approve.
+    let approve = if !unlocked && bound_now { ferros_sys::approve::pending(cap(grants, S_UNLOCK)).and_then(ahau_core::approve::Request::from_word) } else { None };
+    if let Some(r) = approve {
+        let mut l = Line::new();
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: an approve waits (kind A#{}, A#{}): the button says approve, decline under it\n", r.kind, r.arg));
+        console(grants, l.as_bytes());
+    }
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
     fit_bar(cap(grants, S_DISPLAY), &mut kb);
     // The bar's words in the person's language (the left key clears what is typed); the board cache follows them (`board_key`).
@@ -3761,7 +3799,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0), words_open: false, confirm_echo: false };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, wall: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0), words_open: false, confirm_echo: false, approve, remove_keys: None, told: ferros_lang::Msg::RemoveNotStarted };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // Unlocked at boot (above): straight to the keyboard, the attest screen never shown.
     if at_boot {
@@ -4078,14 +4116,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if let Some((seq, (uid, n))) = tag_take(tag_seen) {
             tag_seen = seq;
             let again = a.denied.get() && tag_refused == Some((uid, n));
-            if a.mode == Mode::Fresh && !again {
+            // Never for an approve: a tag never approves (the kernel would drop the request and apply nothing); the handle is typed.
+            if a.mode == Mode::Fresh && a.approve.is_none() && !again {
                 tag_refused = if a.tag_attest(&uid[..n]) { None } else { Some((uid, n)) };
                 a.show();
             }
         }
         // Following the identity service's verdict while the identity is looked up or joined: `client_thread`'s copy, read when it moved (no call here).
         polls += 1;
-        let followed = !a.net_open() && a.follow_client();
+        let followed = !a.net_open() && (a.follow_client() || a.follow_removal());
         // The network page: the list each pass (a copy, no call); a join's outcome from the facts about four times a second.
         if a.net_open() && (!a.joining || polls % 64 == 0) && a.net_poll() {
             a.show();

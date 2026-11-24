@@ -26,3 +26,5 @@ ferros_kist = { path = "../../ferros_kist", features = ["process"] }
 ferros_lang = { path = "../../ferros_lang", features = ["process"] }
 # The kist circles' states as their glows (display op 57): the state's byte.
 ferros_glow = { path = "../../ferros_glow" }
+# Attest to approve (docs/AUTH.md "Approve on the attest screen"): the requests the settings pages ask the kernel for, and the "require attest" guards.
+ahau_core = { path = "../../ahau_core" }

@@ -2298,7 +2298,7 @@ const SYS_LIGHT: u64 = 21;
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
-/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op: 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one, bit 2 the person key held), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR), 5 the person's export, 6-9 attest with a tag (`tag_syscall`: unlock by a tag, keep, forget, list), 10 the person key, 11 the identity's doorbell (x2 a word: the state and a change count, rung at every change, `identity_ring`). AUTH.md.
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op: 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one, bit 2 the person key held), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR), 5 the person's export, 6-9 attest with a tag (`tag_syscall`: unlock by a tag, keep, forget, list), 10 the person key, 11 the identity's doorbell (x2 a word: the state and a change count, rung at every change, `identity_ring`), 13 Android (Settings), 15 remove this device (the identity service, with an approve held), 16-20 attest to approve (`approve_syscall`). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
 /// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 2 says a transfer is moving (the clock policy counts it as activity) → 0. Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
@@ -4855,6 +4855,22 @@ pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
 pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
 /// The vault's identity half behind `SYS_UNLOCK`, registered with the store (service.rs): (op 0 query, 1 unlock with the seed, 2 lock) -> Ok(unlocked after the op) or Err.
 pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
+/// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"): the request waiting on the attest screen, as its word (0 none).
+/// Set by SYS_UNLOCK op 16 while a person is present, which locks at once; from then until the attest settles it the device is locked, and nothing a process holds can change it: op 16 takes a request only while a person is present and none waits, and the only other writers are the attest screen's Decline (op 18), a failed attest, a tag's unlock (both drop it) and the approve's unlock (which applies it).
+/// In RAM alone: a power loss drops it, and the next boot is a plain attest screen with nothing applied.
+static APPROVAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// An approved request a process carries out itself (ahau_core::approve `kernel` false: the removal, developer mode), as its word (0 none): held from the approve's unlock until it is taken (op 20, or op 15 for the removal) or the next lock.
+static APPROVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// An approval was asked: the service loop starts the attest screen again (`approve_restart_take`), so a fresh one comes up over everything showing what is asked.
+static APPROVE_RESTART: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether the attest screen is to be started again for an approval asked (`APPROVE_RESTART`), cleared as read: the service loop's, once a pass.
+pub fn approve_restart_take() -> bool {
+    APPROVE_RESTART.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+/// Whether guard `g` (ahau_core::approve::guard) is on.
+fn guarded(g: u8) -> bool {
+    ahau_core::approve::guard::on(crate::settings::GUARDS.load(core::sync::atomic::Ordering::Relaxed), g)
+}
 /// The identity's entries as one VSF document (service.rs `store_export`), for SYS_UNLOCK op 5.
 pub static mut EXPORT: Option<fn() -> Option<alloc::vec::Vec<u8>>> = None;
 /// Attest with a tag (AUTH.md), SYS_UNLOCK ops 6-9 (`tag_syscall`), as the vault's owner serves them (service.rs `store_tag`).
@@ -5523,6 +5539,114 @@ fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
 /// - 8 forget (x2 the first `TAG_SHOWN` bytes of a tag's id as op 9 gives them, x3 that length; x3 0: every tag) → how many went;
 /// - 9 list (x2 a buffer, x3 its length) → how many tags are kept, as many `TAG_ENTRY` entries written as the buffer holds whole.
 /// Ops 7-9 are also a Settings holder's (the settings page keeps tags and holds no right to unlock); none acts while nobody is present.
+/// Attest to approve (owner, 2026-11-24; ahau_core::approve; docs/AUTH.md "Approve on the attest screen"), SYS_UNLOCK ops 16 to 20. Under the kernel lock.
+/// 16 ask (the Settings right, never a kist): x2 a request's word; taken only while a person is present on a bound device and none waits, with what only the kernel knows checked (a cap the battery takes, Android allowed here for starting into it); the identity locked at once (`unlock` op 2: its keys dropped, the identity service's bell rung) and the attest screen started again over everything (`APPROVE_RESTART`), which shows what is asked. → 0, ERR refused.
+/// 17 the request waiting (Unlock or Settings): its word, 0 none.
+/// 18 Decline (the attest screen alone: the Unlock right, ahau by name, never a kist): the request dropped, nothing applied, the device still locked. → 0.
+/// 19 the "require attest" guards (Settings; reading also Unlock): x2 0 their bits; x2 1 guard x3 on, kept in the device's settings document (no attest: tightening is always safe) → the bits after. Off is an approve (op 16, GUARD_OFF).
+/// 20 take an approval of kind x2 that a process carries out itself (Settings or Unlock): the approved word (the kernel holds it no longer), NOTHING while it waits on the attest screen, 0 neither.
+fn approve_syscall(p: &Process, f: &Frame) -> u64 {
+    use ahau_core::approve::{self, Request};
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    let token = p.read(f.x[0], 32);
+    let (settings, unlock_right) = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+        Some((Object::Settings, r)) => (r & RIGHT_SEND != 0, false),
+        Some((Object::Unlock, r)) => (false, r & RIGHT_SEND != 0),
+        _ => (false, false),
+    };
+    let Some(unlock) = (unsafe { UNLOCK }) else { return ERR };
+    match f.x[1] {
+        16 if settings && !p.kist => {
+            let Some(req) = Request::from_word(f.x[2]) else { return ERR };
+            let fits = match req.kind {
+                approve::CHARGE_CAP => charge_cv_ok(req.arg),
+                approve::START_INTO => req.arg == 0 || crate::service::ANDROID_ALLOWED.load(Acquire) == 2,
+                _ => true,
+            };
+            // A person present on a bound device: the approve is that person's handle typed, and only the device's own identity opens it.
+            let state = unlock(0, None).unwrap_or(0);
+            if !fits || state & 3 != 3 || APPROVAL.compare_exchange(0, req.word(), AcqRel, Acquire).is_err() {
+                return ERR;
+            }
+            APPROVED.store(0, Release);
+            let _ = unlock(2, None);
+            APPROVE_RESTART.store(true, Release);
+            crate::flashlog::line(&alloc::format!("approve: asked (kind A#{}, A#{}); the identity locked, the attest screen comes up to approve it", req.kind, req.arg));
+            // The service loop starts the attest screen again (`approve_restart_take`).
+            unsafe { core::arch::asm!("sev") };
+            0
+        }
+        17 if settings || unlock_right => APPROVAL.load(Acquire),
+        18 if unlock_right && !p.kist && p.name.as_slice() == b"ahau" => {
+            if APPROVAL.swap(0, AcqRel) != 0 {
+                crate::flashlog::line("approve: declined on the attest screen; nothing applied, the device stays locked");
+            }
+            0
+        }
+        19 if f.x[2] == 0 && (settings || unlock_right) => crate::settings::GUARDS.load(Acquire),
+        19 if f.x[2] == 1 && settings && !p.kist && approve::guard::known(f.x[3]) => {
+            let was = crate::settings::GUARDS.fetch_or(1 << f.x[3], AcqRel);
+            if was >> f.x[3] & 1 == 0 && !keep_settings() {
+                crate::settings::GUARDS.store(was, Release);
+                return ERR;
+            }
+            crate::settings::GUARDS.load(Acquire)
+        }
+        20 if (settings || unlock_right) && !p.kist => {
+            let kind = f.x[2] as u8;
+            let held = APPROVED.load(Acquire);
+            if held != 0 && held as u8 == kind && APPROVED.compare_exchange(held, 0, AcqRel, Acquire).is_ok() {
+                crate::flashlog::line(&alloc::format!("approve: kind A#{kind} taken by {}", core::str::from_utf8(&p.name).unwrap_or("?")));
+                held
+            } else if APPROVAL.load(Acquire) as u8 == kind && kind != 0 {
+                NOTHING
+            } else {
+                0
+            }
+        }
+        _ => ERR,
+    }
+}
+
+/// The approve's unlock settled (SYS_UNLOCK op 1 with a request waiting): opened, the request is applied, exactly it and once; refused (a handle not this device's identity's, no vault), it is dropped and nothing is applied, the device staying locked on the attest screen. Under the kernel lock.
+/// Applied by the kernel itself (ahau_core::approve `kernel`): attest at boot (the unlock kept or did not keep the seed, service.rs ops 20 and 21; the setting written here), Android on (service.rs op 22), a guard off, the charge cap, what the device starts into. The rest is held for the process that carries it out (`APPROVED`).
+fn approve_settle(r: Result<u64, ()>, unlock: fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>) {
+    use ahau_core::approve::{self, Request};
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let Some(req) = Request::from_word(APPROVAL.swap(0, AcqRel)) else { return };
+    if !matches!(r, Ok(n) if n != NOTHING) {
+        crate::flashlog::line("approve: the attest failed; nothing applied, the device stays locked");
+        return;
+    }
+    let done = match req.kind {
+        approve::ATTEST_AT_BOOT_ON | approve::ATTEST_AT_BOOT_OFF => {
+            set_pref_locked(PREF_UNLOCK_AT_BOOT, (req.kind == approve::ATTEST_AT_BOOT_ON) as u8);
+            keep_settings()
+        }
+        approve::ANDROID_ON => unlock(22, None) == Ok(1),
+        approve::GUARD_OFF => {
+            crate::settings::GUARDS.fetch_and(!(1 << req.arg), AcqRel);
+            keep_settings()
+        }
+        approve::CHARGE_CAP if charge_cv_ok(req.arg) => {
+            CONTROL[CONTROL_BATTERY][CONTROL_CHARGE_CV].store(req.arg, Relaxed);
+            CONTROL_GEN[CONTROL_BATTERY].fetch_add(1, Relaxed);
+            wake_word_waiters();
+            keep_settings()
+        }
+        approve::START_INTO if req.arg == 0 || crate::service::ANDROID_ALLOWED.load(Relaxed) == 2 => {
+            crate::settings::START_ANDROID.store(req.arg == 1, Relaxed);
+            keep_settings()
+        }
+        _ if !req.kernel() => {
+            APPROVED.store(req.word(), Release);
+            true
+        }
+        _ => false,
+    };
+    crate::flashlog::line(&alloc::format!("approve: kind A#{} (A#{}) approved by the person's attest: {}", req.kind, req.arg, if !req.kernel() { "held for the process that carries it out" } else if done { "applied" } else { "not applied (refused or not kept)" }));
+}
+
 fn tag_syscall(p: &Process, f: &Frame) -> u64 {
     let token = p.read(f.x[0], 32);
     let op = f.x[1];
@@ -7035,7 +7159,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 0
             }
         },
-        // Android on this device (owner, 2026-11-21; docs/BOOT.md "Android only by the identity's choice"), op 13 for a Settings holder (the Settings page), x2 the request: 0 start Android now, 1 Android off on this device (and the setting back to ferros), 2 Android on again for a person who accepted the disclaimer before, 3 the state (bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android), 4 start into ferros, 5 start into Android (only while a person is present on a device that allows Android), 6 Android's recovery request waiting on the person, 7 yes to it, 8 no to it (docs/BOOT.md "Recovery requests from Android"). 0 to 2 only while a person is present; the vault's half of 0 to 3 is service.rs `store_unlock` (its ops 13, 15, 16, 17); 4 and 5 are the kernel's own setting (settings.rs `START_ANDROID`), kept in the device document. → 1 done, 0 refused, ERR without the right or a vault.
+        // Android on this device (owner, 2026-11-21; docs/BOOT.md "Android only by the identity's choice"), op 13 for a Settings holder (the Settings page), x2 the request: 0 start Android now, 1 Android off on this device (and the setting back to ferros), 2 refused since 2026-11-24 (Android on is an approve on the attest screen, op 16 ANDROID_ON), 3 the state (bit 0 this device allows Android, bit 1 the person present accepted the disclaimer, bit 2 it starts into Android), 4 start into ferros, 5 start into Android (only while a person is present on a device that allows Android; 4 and 5 answered 0 while the start-into guard is on, an approve then), 6 Android's recovery request waiting on the person, 7 yes to it, 8 no to it (docs/BOOT.md "Recovery requests from Android"). 0 to 2 only while a person is present; the vault's half of 0 to 3 is service.rs `store_unlock` (its ops 13, 15, 16, 17); 4 and 5 are the kernel's own setting (settings.rs `START_ANDROID`), kept in the device document. → 1 done, 0 refused, ERR without the right or a vault.
         SYS_UNLOCK if f.x[1] == 13 => {
             let token = p.read(f.x[0], 32);
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
@@ -7046,7 +7170,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     keep_settings();
                 }
             };
+            // What it starts into, under its "require attest" guard: changed only by an approve on the attest screen (SYS_UNLOCK op 16, START_INTO).
+            let held_into = held && !guarded(ahau_core::approve::guard::START_INTO);
             f.x[0] = match (held, unsafe { UNLOCK }) {
+                (true, Some(_)) if (f.x[2] == 4 || f.x[2] == 5) && !held_into => 0,
                 (true, Some(_)) if f.x[2] == 4 => {
                     start_into(false);
                     1
@@ -7074,6 +7201,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     crate::flashlog::line(&alloc::format!("recovery: the Android page answered {} ({})", if yes { "yes" } else { "no" }, if ok { "taken" } else { "refused" }));
                     ok as u64
                 }
+                // Android on is an approve on the attest screen (owner, 2026-11-24; SYS_UNLOCK op 16, ANDROID_ON), never this page's plain request: 2 is refused.
+                (true, Some(_)) if f.x[2] == 2 => 0,
                 // WHY the bound: x2 is the caller's; only the four requests below exist.
                 (true, Some(unlock)) if f.x[2] < 4 => match unlock([13, 15, 16, 17][f.x[2] as usize], None) {
                     // Android off: what this device starts into goes back to ferros with it.
@@ -7086,6 +7215,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 },
                 _ => ERR,
             };
+            0
+        }
+        // Attest to approve, ops 16 to 20 (`approve_syscall`).
+        SYS_UNLOCK if (16..=20).contains(&f.x[1]) => {
+            f.x[0] = approve_syscall(p, f);
+            // An ask locked the identity.
+            identity_bell();
             0
         }
         // Op 15, remove this device from its identity (AUTH.md "Remove this device"; owner, 2026-11-22: press remove, type the handle, unbind; the fleet told at once, then the identity's data erased and the killswitch's power off). Only the identity service (`fgtw` by name, never a kist), which tells the fleet before it asks.
@@ -7111,7 +7247,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         seed.copy_from_slice(&msg[1..33]);
                         let m = unlock(18, Some(&seed));
                         crate::keys::wipe_to_dram(&mut seed);
+                        // The person approved this removal on the attest screen (ahau_core::approve::REMOVE_DEVICE, owner 2026-11-24): taken now, so one approve removes once; without it nothing changes.
+                        let approved = matches!(m, Ok(1)) && APPROVED.compare_exchange(ahau_core::approve::Request { kind: ahau_core::approve::REMOVE_DEVICE, arg: 0 }.word(), 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_ok();
+                        if matches!(m, Ok(1)) && !approved {
+                            crate::flashlog::line("identity remove refused: no approve on the attest screen held for it; nothing changed");
+                        }
                         match m {
+                            Ok(1) if !approved => ERR,
                             Ok(1) => {
                                 // Each kist's own domain of the person's, stamped while their keys still exist (the release locks them).
                                 let mut drops: Vec<Vec<u8>> = kist_domains(&msg[33..]).iter().filter_map(|d| stamp(VOP_DROP, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], &[], &[])).collect();
@@ -7146,6 +7288,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
         SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
+            // A tag never approves (owner, 2026-11-18: "no tags" for attest at boot; the approve is the handle typed): an unlock by a tag drops an approval waiting, nothing applied, and ends one not yet taken.
+            if f.x[1] == 6 {
+                if APPROVAL.swap(0, core::sync::atomic::Ordering::AcqRel) != 0 {
+                    crate::flashlog::line("approve: dropped, an unlock by a tag (a tag never approves); nothing applied");
+                }
+                APPROVED.store(0, core::sync::atomic::Ordering::Release);
+            }
             f.x[0] = tag_syscall(p, f);
             // An unlock by tag locks whatever was open first.
             identity_bell();
@@ -7161,11 +7310,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         let mut seed = [0u8; 32];
                         // Read straight into the array: `read` would leave a heap copy of the seed behind.
                         p.read_into(f.x[2], &mut seed);
-                        let r = unlock(1, Some(&seed));
+                        // An approval waiting (`APPROVAL`): this unlock is its approve, the handle typed on the attest screen. Attest at boot's two decide whether the unlock keeps the seed (service.rs ops 20 and 21); the rest is applied once it has opened (`approve_settle`).
+                        let pending = ahau_core::approve::Request::from_word(APPROVAL.load(core::sync::atomic::Ordering::Acquire));
+                        let how = match pending.map(|r| r.kind) {
+                            Some(ahau_core::approve::ATTEST_AT_BOOT_ON) => 20,
+                            Some(ahau_core::approve::ATTEST_AT_BOOT_OFF) => 21,
+                            _ => 1,
+                        };
+                        let r = unlock(how, Some(&seed));
                         crate::keys::wipe_to_dram(&mut seed);
+                        if pending.is_some() {
+                            approve_settle(r, unlock);
+                        }
                         r.unwrap_or(ERR)
                     }
-                    2..=4 => unlock(op as u8, None).unwrap_or(ERR),
+                    // A lock and a release end the session: an approval a process had not yet taken goes with it.
+                    2..=4 => {
+                        if op != 3 {
+                            APPROVED.store(0, core::sync::atomic::Ordering::Release);
+                        }
+                        unlock(op as u8, None).unwrap_or(ERR)
+                    }
                     // Op 11: the identity's doorbell, x2 a word in the caller's arc (8-aligned, as SYS_WAIT takes one).
                     // The state as op 0 answers it, with a change count above bit 8 (`ID_WORD`), is written there now and at every change, waking whatever of the process waits on it (`identity_ring`, one of the bells).
                     // The state is read live first, so an unlock at boot (before any bell existed) is in the first word.
@@ -7184,60 +7349,6 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         let r = unlock(10, Some(&key));
                         crate::keys::wipe_to_dram(&mut key);
                         r.unwrap_or(ERR)
-                    }
-                    // Op 12, the retype gate (ahau_core::retype; docs/AUTH.md "Unlock at boot"): turn attest at boot on with the seed of the handle typed again, 32 bytes at x2; the reply document into x3, x4 its length.
-                    // Only a seed that is the person present's turns it on (`retype_keep`, compared in the kernel), and the kernel keeps that seed for unlock at boot at once, so the next boot unlocks with no attest typed in between; anything else changes nothing. No tag reaches this: a tag unlock (ops 6 to 9) never keeps the seed nor sets the setting (owner, 2026-11-18: "no tags"). SYS_SET_PREF refuses to turn it on, so this is the one way a process does.
-                    // Returns the document's whole length (what fits of it is written), or ERR when no document could be made.
-                    // Only the attest screen's keyboard (ahau, by name and never a kist, as PREF_DND is fgtw's): the identity service holds the Unlock right and the seed all session, and must not be able to switch it on without the handle typed.
-                    12 if p.kist || p.name.as_slice() != b"ahau" => ERR,
-                    12 => {
-                        let mut seed = [0u8; 32];
-                        p.read_into(f.x[2], &mut seed);
-                        let r = unlock(12, Some(&seed));
-                        crate::keys::wipe_to_dram(&mut seed);
-                        use ahau_core::retype::{reply, Reply};
-                        let (answer, why) = match r {
-                            Ok(1) if pref(PREF_UNLOCK_AT_BOOT) == 1 => (Reply { error: false, present: true, matched: true, on: true }, "on already"),
-                            Ok(1) if keep_settings() => {
-                                set_pref_locked(PREF_UNLOCK_AT_BOOT, 1);
-                                (Reply { error: false, present: true, matched: true, on: true }, "on")
-                            }
-                            Ok(1) => (Reply { error: true, present: true, matched: true, on: false }, "the setting was not kept"),
-                            Ok(2) => (Reply { error: true, present: true, matched: true, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "the seed could not be kept"),
-                            Ok(_) => (Reply { error: true, present: true, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "they do not match"),
-                            Err(()) => (Reply { error: true, present: false, matched: false, on: pref(PREF_UNLOCK_AT_BOOT) == 1 }, "no seed held: nobody present"),
-                        };
-                        match reply(answer, why, crate::settings::eagle_now()) {
-                            Some(doc) => {
-                                // WHY the min: x4 is the caller's buffer length; only what it holds is written.
-                                p.write(f.x[3], &doc[..doc.len().min(f.x[4] as usize)]);
-                                doc.len() as u64
-                            }
-                            None => ERR,
-                        }
-                    }
-                    // Op 14, the disclaimer's typed confirmation (owner, 2026-11-01 and 2026-11-21; docs/BOOT.md "Android only by the identity's choice"): Android allowed on this device once the person present has read the disclaimer in full and typed their own handle again, 32 bytes of its seed at x2; the reply document (ahau_core::retype, `on` = Android allowed now) into x3, x4 its length. Only the attest screen's keyboard (ahau, by name and never a kist), as op 12.
-                    14 if p.kist || p.name.as_slice() != b"ahau" => ERR,
-                    14 => {
-                        let mut seed = [0u8; 32];
-                        p.read_into(f.x[2], &mut seed);
-                        let r = unlock(14, Some(&seed));
-                        crate::keys::wipe_to_dram(&mut seed);
-                        use ahau_core::retype::{reply, Reply};
-                        let (answer, why) = match r {
-                            Ok(1) => (Reply { error: false, present: true, matched: true, on: true }, "Android allowed on this device"),
-                            Ok(2) => (Reply { error: true, present: true, matched: true, on: false }, "the acceptance could not be kept"),
-                            Ok(_) => (Reply { error: true, present: true, matched: false, on: false }, "they do not match"),
-                            Err(()) => (Reply { error: true, present: false, matched: false, on: false }, "nobody present"),
-                        };
-                        match reply(answer, why, crate::settings::eagle_now()) {
-                            Some(doc) => {
-                                // WHY the min: x4 is the caller's buffer length; only what it holds is written.
-                                p.write(f.x[3], &doc[..doc.len().min(f.x[4] as usize)]);
-                                doc.len() as u64
-                            }
-                            None => ERR,
-                        }
                     }
                     // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length) from offset x4, for saving them to the fleet before a departure; the document's whole length, or ERR while locked. With a vault process serving, it answers instead (`export_forward`).
                     5 => {
@@ -7392,8 +7503,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         ERR
                     }
                 }
-            } else if link == CONTROL_BATTERY && slot == CONTROL_CHARGE_CV && !charge_cv_ok(word) {
+            } else if link == CONTROL_BATTERY && slot == CONTROL_CHARGE_CV && (!charge_cv_ok(word) || guarded(ahau_core::approve::guard::CHARGE_CAP)) {
                 // The kernel drives the charger, so it checks the cap before keeping it: a voltage off the charger's steps or past the battery's ceiling is refused, never rounded.
+                // Under its "require attest" guard the cap changes only by an approve on the attest screen (SYS_UNLOCK op 16, CHARGE_CAP), which the kernel applies itself.
                 ERR
             } else {
                 let was = CONTROL[link][slot].swap(word, Relaxed);
@@ -7946,8 +8058,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = if index == PREF_DND { !p.kist && p.name.as_slice() == b"fgtw" } else { held };
             // WHY: the person's app scale is any app's to change (owner, 2026-11-20: "settings pages should modify that, same with apps"; every kist follows it, ferros_fluor), so a pinch inside a kist sets it for every kist: for this preference alone the display grant, which every kist holds (the implicit set), is the right.
             let held = held || (index == PREF_SCALE && matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Endpoint(e), r)) if e == endpoint(b"display") && r & RIGHT_SEND != 0));
-            // Attest at boot turns on only thru the retype gate (SYS_UNLOCK op 12: the handle typed again, compared with the person present's in the kernel); off is always safe and stays a plain set (owner, 2026-11-17: "my toddler could do it without me").
-            let held = held && !(index == PREF_UNLOCK_AT_BOOT && value != 0);
+            // Attest at boot changes only by an approve on the attest screen, on and off (owner, 2026-11-24; SYS_UNLOCK op 16, ATTEST_AT_BOOT_ON and _OFF), which the kernel applies itself at the approve's unlock: never a plain set (until 2026-11-24, off was one and on took the retype gate, op 12).
+            let held = held && index != PREF_UNLOCK_AT_BOOT;
             // A kept preference is one the settings document carries (settings.rs `FIELDS`), with a vault to keep it in; it is applied now and the document written at the trap's end, the kernel lock let go (`keep_settings`).
             let kept = |index: usize| crate::settings::FIELDS.iter().any(|&(_, i)| i == index) && unsafe { SETTINGS_WRITE }.is_some();
             f.x[0] = if index == PREF_BASE {
