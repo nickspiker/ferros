@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "температура",
         Msg::Charging => "заряжается",
         Msg::Discharging => "разряжается",
+        Msg::ChargeCap => "заряжать до",
+        Msg::ChargeCapNote => "контроллер заряда перестаёт заряжать батарею здесь.\nдоля рядом приблизительная.",
+        Msg::ChargeCapWear => "износ нелинеен: каждый шаг вверх стоит больше ресурса батареи, чем предыдущий.\nBattery University измерил, что каждая десятая доля вольта меньше удваивает число циклов заряда элемента, на элементах для более низкого напряжения; форма кривой сохраняется и здесь.",
         // ---- Keyboard ----
         Msg::Layout => "раскладка",
         // ---- Security ----
@@ -556,6 +559,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  заряжается"),
         Say::OnBattery(pct) => write!(o, "{pct}  от батареи"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, около {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} по умолчанию: почти весь заряд при гораздо меньшем износе."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "около {share} циклов заряда при {mv}"),
         Say::Throttled(t) => write!(o, "{t}  замедлен"),
         Say::NotAskedYet(what) => write!(o, "{what} (ещё не спрошено)"),
         Say::UsingNow(what) => write!(o, "{what} (использует сейчас)"),

@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "sıcaklık",
         Msg::Charging => "şarj oluyor",
         Msg::Discharging => "boşalıyor",
+        Msg::ChargeCap => "şarj sınırı",
+        Msg::ChargeCapNote => "şarj devresi pili burada doldurmayı bırakır.\nyanındaki oran kabacadır.",
+        Msg::ChargeCapWear => "aşınma doğrusal değildir: her yukarı adım, bir öncekinden daha fazla pil ömrüne mal olur.\nBattery University, voltun her onda biri kadar düşüşün bir hücrenin şarj döngülerini iki katına çıkardığını ölçtü, daha düşük gerilim için yapılmış hücrelerde; eğrinin şekli burada da geçerli.",
         // ---- Keyboard ----
         Msg::Layout => "düzen",
         // ---- Security ----
@@ -547,6 +550,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  şarj oluyor"),
         Say::OnBattery(pct) => write!(o, "{pct}  pilde"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, yaklaşık {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} varsayılandır: şarjın çoğu, çok daha az aşınmayla."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "{mv} değerinde şarj döngülerinin yaklaşık {share} kadarı"),
         Say::Throttled(t) => write!(o, "{t}  kısıldı"),
         Say::NotAskedYet(what) => write!(o, "{what} (henüz sorulmadı)"),
         Say::UsingNow(what) => write!(o, "{what} (şu an kullanıyor)"),

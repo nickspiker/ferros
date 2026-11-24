@@ -1374,6 +1374,19 @@ pub mod control {
     pub const WIFI_BAND: u64 = 2;
     /// The clock: the zone, seconds east of UTC (signed, within a day). Kept as the settings document's `tz`.
     pub const CLOCK_ZONE: u64 = 1;
+    /// The battery: the kernel is its driver (the MAX77759 charger on hsi2c_11, docs/CHARGING.md).
+    pub const BATTERY: u64 = 7;
+    /// The battery, kept: the charge voltage cap in mV, the charger's CV (CHG_CNFG_04, 10 mV steps), from `CHARGE_CV_FLOOR` to the battery's own ceiling; unset, `CHARGE_CV_DEFAULT` (owner, 2026-11-24: "I'd set it to 4.2 v by default and allow the user to set it above").
+    /// Applied at once.
+    pub const CHARGE_CV: u64 = 1;
+    /// The charger's lowest CV in its 10 mV range, mV.
+    pub const CHARGE_CV_FLOOR: u64 = 4000;
+    /// The battery's own ceiling, mV: the last step of Google's table for the cell (google,chg-cv-limits ends at 4480000 on husky and on akita alike), never the chip's 4.50 V.
+    pub const CHARGE_CV_CEILING: u64 = 4480;
+    /// The cap with nothing kept, mV.
+    pub const CHARGE_CV_DEFAULT: u64 = 4200;
+    /// The CV's step, mV.
+    pub const CHARGE_CV_STEP: u64 = 10;
 }
 
 /// Set knob `slot` of link `link` (`control`) to `word`, given the Settings capability. Returns true when the kernel took it (and kept it, for a kept knob).

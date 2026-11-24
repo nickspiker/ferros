@@ -46,6 +46,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `zone_found`, `zone_found_by` | ASCII, unsigned | the zone last found here, and by what: 1 the network, 2 a position | none |
 | `wifi_power_save` | unsigned | WiFi power save: 0 off, 1 on (PM1), 2 fast (PM2); a radio knob (RADIO-CONTROLS.md), set on the WiFi page | unset: off |
 | `wifi_band` | unsigned | the band WiFi joins on: 0 any (5 GHz first), 1 5 GHz only, 2 2.4 GHz only; takes at the next join | unset: any |
+| `charge_cv` | unsigned | the battery's charge voltage cap, mV: 4000 to 4480 in 10 mV steps (the battery's own ceiling), the charger's CV; a knob on the battery's link 7 (docs/CHARGING.md "Decided: the charge voltage cap"), set on the battery page, applied at once and at every boot | unset: 4200 |
 | `language` | language (`wl`) | this device's own language, its ISO 639-3 code (no script or region) | none: English |
 | `language_follow` | unsigned | 1 the device follows the identity's language, 0 it keeps its own | 1 |
 | `language_identity` | language (`wl`) | the identity's language as its identity service last wrote it; never read back into the identity | none |

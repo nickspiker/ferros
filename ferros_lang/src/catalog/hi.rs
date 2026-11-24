@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "तापमान",
         Msg::Charging => "चार्ज हो रहा है",
         Msg::Discharging => "डिस्चार्ज हो रहा है",
+        Msg::ChargeCap => "यहाँ तक चार्ज करें",
+        Msg::ChargeCapNote => "चार्जर यहाँ बैटरी भरना बंद कर देता है।\nबगल का हिस्सा मोटा अनुमान है।",
+        Msg::ChargeCapWear => "घिसाव सीधी रेखा में नहीं बढ़ता: हर अगला कदम पिछले से ज़्यादा बैटरी जीवन लेता है।\nBattery University ने मापा कि वोल्ट का हर दसवाँ हिस्सा कम करने से सेल के चार्ज चक्र दोगुने हो जाते हैं, कम वोल्टेज के लिए बने सेलों पर; यहाँ भी आकार वैसा ही रहता है।",
         // ---- Keyboard ----
         Msg::Layout => "लेआउट",
         // ---- Security ----
@@ -546,6 +549,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  चार्ज हो रहा है"),
         Say::OnBattery(pct) => write!(o, "{pct}  बैटरी पर"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, लगभग {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} डिफ़ॉल्ट है: लगभग पूरा चार्ज, बहुत कम घिसाव के साथ।"),
+        Say::ChargeCapCycles { share, mv } => write!(o, "{mv} पर लगभग {share} चार्ज चक्र"),
         Say::Throttled(t) => write!(o, "{t}  धीमा किया गया"),
         Say::NotAskedYet(what) => write!(o, "{what} (अभी पूछा नहीं)"),
         Say::UsingNow(what) => write!(o, "{what} (अभी इस्तेमाल में)"),

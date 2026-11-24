@@ -3110,6 +3110,35 @@ pub fn gauge_last() -> [u64; 4] {
     unsafe { (*(&raw const GAUGE)).0 }
 }
 
+/// The battery block's generation the charge cap was last applied at; all ones until the first pass applies it.
+static CHARGE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// From the service loop on the kernel's core, where the charger's bus is driven: the charge voltage cap written to the charger when the battery's control block moves (a set from the battery page, or the settings read at boot), and once on the first pass.
+/// The cap only ever sets the charger's CV (CHG_CNFG_04); the charger's own JEITA stays on, and the temperature tiers are a later step (docs/CHARGING.md).
+/// Kept but not a cap the battery takes (a document stored from the bridge), or nothing kept: 4.20 V, said in the flash log; never the bootloader's 4.35 V.
+fn charge_poll() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::process::{charge_cv_ok, CHARGE_CV_DEFAULT, CONTROL, CONTROL_BATTERY, CONTROL_CHARGE_CV, CONTROL_GEN};
+    let block_gen = CONTROL_GEN[CONTROL_BATTERY].load(Relaxed);
+    if CHARGE_GEN.swap(block_gen, Relaxed) == block_gen {
+        return;
+    }
+    let kept = CONTROL[CONTROL_BATTERY][CONTROL_CHARGE_CV].load(Relaxed);
+    let (mv, why) = if charge_cv_ok(kept) {
+        (kept, "kept")
+    } else if kept == u64::MAX {
+        (CHARGE_CV_DEFAULT, "nothing kept: the default")
+    } else {
+        (CHARGE_CV_DEFAULT, "the kept value is not a cap the battery takes: the default")
+    };
+    // One try: a failure is said, and the next set tries again.
+    crate::flashlog::line(&match crate::hsi2c::charger::set_cv(mv as u32) {
+        Ok(back) if back as u64 == mv => alloc::format!("charge cap A#{mv} mV ({why}), read back A#{back} mV"),
+        Ok(back) => alloc::format!("charge cap A#{mv} mV ({why}) NOT taken: the charger reads back A#{back} mV"),
+        Err(e) => alloc::format!("charge cap A#{mv} mV ({why}) NOT written: hsi2c_11 G#{e:X}"),
+    });
+}
+
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
@@ -3990,6 +4019,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::zone::step(&mut store);
         crate::rtc::resolve_zone();
         gauge_poll();
+        charge_poll();
         power_poll();
         // The heap's second region, 2 s in (main.rs heap2_join: its line invalidation kept off the boot path).
         #[cfg(not(shim_handoff))]

@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "nhiệt độ",
         Msg::Charging => "đang sạc",
         Msg::Discharging => "đang xả",
+        Msg::ChargeCap => "sạc đến",
+        Msg::ChargeCapNote => "bộ sạc ngừng nạp pin tại đây.\nphần bên cạnh chỉ là ước lượng.",
+        Msg::ChargeCapWear => "độ hao mòn không tuyến tính: mỗi bước tăng lên tốn tuổi thọ pin nhiều hơn bước trước.\nBattery University đo được rằng cứ giảm một phần mười vôn thì số chu kỳ sạc của một cell tăng gấp đôi, trên các cell làm cho điện áp thấp hơn; hình dạng ấy vẫn đúng ở đây.",
         // ---- Keyboard ----
         Msg::Layout => "bố cục",
         // ---- Security ----
@@ -546,6 +549,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  đang sạc"),
         Say::OnBattery(pct) => write!(o, "{pct}  dùng pin"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, khoảng {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} là mặc định: gần như toàn bộ dung lượng mà hao mòn ít hơn nhiều."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "khoảng {share} số chu kỳ sạc ở {mv}"),
         Say::Throttled(t) => write!(o, "{t}  bị hạ xung"),
         Say::NotAskedYet(what) => write!(o, "{what} (chưa hỏi)"),
         Say::UsingNow(what) => write!(o, "{what} (đang dùng)"),

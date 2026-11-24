@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "temperatura",
         Msg::Charging => "ładowanie",
         Msg::Discharging => "rozładowywanie",
+        Msg::ChargeCap => "ładuj do",
+        Msg::ChargeCapNote => "ładowarka przestaje tu napełniać baterię.\nudział obok jest przybliżony.",
+        Msg::ChargeCapWear => "zużycie nie jest liniowe: każdy krok w górę kosztuje więcej żywotności baterii niż poprzedni.\nBattery University zmierzył, że każda dziesiąta część wolta mniej podwaja liczbę cykli ładowania ogniwa, w ogniwach przeznaczonych na niższe napięcie; kształt krzywej obowiązuje i tu.",
         // ---- Keyboard ----
         Msg::Layout => "układ",
         // ---- Security ----
@@ -556,6 +559,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  ładowanie"),
         Say::OnBattery(pct) => write!(o, "{pct}  na baterii"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, około {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} to ustawienie domyślne: prawie cały ładunek przy znacznie mniejszym zużyciu."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "około {share} cykli ładowania przy {mv}"),
         Say::Throttled(t) => write!(o, "{t}  spowolniony"),
         Say::NotAskedYet(what) => write!(o, "{what} (jeszcze nie pytano)"),
         Say::UsingNow(what) => write!(o, "{what} (używa teraz)"),

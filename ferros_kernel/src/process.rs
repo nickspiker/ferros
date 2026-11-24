@@ -2378,11 +2378,22 @@ pub const ARC_WHY_PAGE: u64 = 7;
 pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
-/// The links with a control block: the six of the facts, and the clock.
-pub const CONTROL_LINKS: usize = 7;
+/// The links with a control block: the six of the facts, the clock and the battery.
+pub const CONTROL_LINKS: usize = 8;
 /// The clock's link, and its zone's slot.
 pub const CONTROL_CLOCK: usize = 6;
 pub const CONTROL_ZONE: usize = 1;
+/// The battery's link (the kernel is its driver: the MAX77759 charger, docs/CHARGING.md), and its charge voltage cap's slot: mV, kept in the settings document as `charge_cv`, applied by the service loop when the block's generation moves (service.rs `charge_poll`).
+pub const CONTROL_BATTERY: usize = 7;
+pub const CONTROL_CHARGE_CV: usize = 1;
+/// The cap's range and default, mV (ferros_sys::control `CHARGE_CV_*`; owner, 2026-11-24): the charger's 10 mV CV steps from its 4.00 V floor up to the battery's own ceiling, the last step of Google's table for the cell (google,chg-cv-limits ends at 4480000 on husky and on akita alike), never the chip's 4.50 V; 4.20 V while nothing is kept.
+pub const CHARGE_CV_FLOOR: u64 = 4000;
+pub const CHARGE_CV_CEILING: u64 = 4480;
+pub const CHARGE_CV_DEFAULT: u64 = 4200;
+/// Whether `mv` is a cap the battery takes: within the range, on a 10 mV step.
+pub fn charge_cv_ok(mv: u64) -> bool {
+    (CHARGE_CV_FLOOR..=CHARGE_CV_CEILING).contains(&mv) && (mv - CHARGE_CV_FLOOR) % 10 == 0
+}
 pub static CONTROL: [[core::sync::atomic::AtomicU64; CONTROLS]; CONTROL_LINKS] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; CONTROLS] }; CONTROL_LINKS];
 pub static CONTROL_GEN: [core::sync::atomic::AtomicU64; CONTROL_LINKS] = [const { core::sync::atomic::AtomicU64::new(0) }; CONTROL_LINKS];
 /// Writes the settings document (the preferences, the knobs, the zone and the language) into the vault: (the document, its generation) -> kept, a write older than one already kept answered kept without writing. Registered by whoever owns the vault (service.rs `settings_write`), which takes the vault's lock for it.
@@ -7381,6 +7392,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         ERR
                     }
                 }
+            } else if link == CONTROL_BATTERY && slot == CONTROL_CHARGE_CV && !charge_cv_ok(word) {
+                // The kernel drives the charger, so it checks the cap before keeping it: a voltage off the charger's steps or past the battery's ceiling is refused, never rounded.
+                ERR
             } else {
                 let was = CONTROL[link][slot].swap(word, Relaxed);
                 let kept = crate::settings::KNOBS.iter().any(|k| k.1 == link && k.2 == slot);

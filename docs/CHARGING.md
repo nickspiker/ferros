@@ -75,6 +75,44 @@ Only that: no other charging policy (ceiling, current, scheduling) until he deci
   The fault stayed latched: CHG_DTLS 6 (B6 = G#A6), CHG_INT_OK G#C7, the cell at −5 to −6 mA, SOC 86 %, 4.109 V, several minutes after the write.
   Turning the timer off does not clear a fault already latched; a replug (or a MODE cycle) should, not yet tried.
 
+## Decided 2026-11-24: the charge voltage cap
+
+Owner, 2026-11-24, on the battery setting: a charge voltage cap only, set on Settings → battery; "for daily use, I'd set it to 4.2 v by default and allow the user to set it above".
+Only the charger's CV: no SOC watching, no mode toggling, no "full charge" override.
+The charger's own JEITA stays on, and the cap only ever lowers the limit; the full temperature tiers (Android's C-rate and CV table above) are a later step.
+
+- **The range:** the charger's 10 mV steps from its 4.00 V floor up to the battery's own ceiling, the last step of Google's table for the cell: 4.48 V on husky (`google,chg-cv-limits` = 4.20, 4.30, 4.35, 4.48 V) and 4.48 V on the 8a too (akita: 4.20, 4.25, 4.30, 4.35, 4.48 V); never the chip's 4.50 V.
+- **Where it lives:** a device setting (this battery's), never the identity's: the battery's control block, link 7 (ferros_sys::control `BATTERY`, slot `CHARGE_CV`, mV), kept in the device's settings document as `charge_cv` (SETTINGS.md) and written to the vault on every change, as every knob is (RADIO-CONTROLS.md).
+  The preference block was full (48 of 48), so the cap is a control knob, not a preference.
+- **Applied:** the kernel checks the cap (range and step, else refused) and the service loop writes CHG_CNFG_04 when the block's generation moves (service.rs `charge_poll`), reads it back and says so in the flash log ("charge cap A#4200 mV (kept), read back A#4200 mV").
+  At every boot: 4.20 V right after the safety-timer write (main.rs), so the bootloader's 4.35 V never stands; then the kept cap on the service loop's first pass, once the settings are read.
+  Nothing kept, or a kept value the battery does not take (a document stored from the bridge): 4.20 V, and the flash log says which.
+- **The slider:** the battery page, under the gauge's facts: "charge to", the voltage with a rough share beside it, the slider, what it does, why 4.20 V is the default, and above 4.20 V the share of 4.20 V's charge cycles and why wear is not linear.
+  The finger's place maps to the knob with no clamp and no kink (map charge.rs `of_finger`: softplus(k u) − softplus(k (u − 1)), over k = 2^7, C∞, within 2^-7 of linear along the track, and its ends still reach 4.00 and 4.48 V).
+  The cap is set at the lift or the tap (one write to the vault), the value under the finger shown while it moves.
+  Words in all sixteen languages (ferros_lang `ChargeCap`, `ChargeCapNote`, `ChargeCapWear`, `ChargeCapAt`, `ChargeCapDefault`, `ChargeCapCycles`).
+
+**The numbers on the page, and where they come from:**
+- **Wear:** Battery University, BU-808 "How to Prolong Lithium-based Batteries", Table 4 ("Discharge cycles and capacity as a function of charge voltage limit"): 4.30 V 150 to 250 cycles, 4.25 V 200 to 350, 4.20 V 300 to 500, 4.13 V 400 to 700, 4.06 V 600 to 1,000, 4.00 V 850 to 1,500, 3.92 V 1,200 to 2,000; "Every 0.10V drop below 4.20V/cell doubles the cycle but holds less capacity."
+  Those cells were built for 4.20 V; this one is built for 4.48 V, so its own figures differ, and the page says so.
+  The page's "about N of the charge cycles at 4.20 V" is that rule, 2^-(V − 4.20)/0.1: 4.30 V a half, 4.40 V a quarter, 4.48 V about a seventh.
+- **The share beside the voltage:** an estimate for a 4.48 V lithium-cobalt cell, not a measurement of this one: 64 % at 4.00 V, 74 % at 4.10, 82 % at 4.20, 89 % at 4.30, 96 % at 4.40, 100 % at 4.48 (a smooth rising curve through those, map charge.rs `share_pct`).
+  No cell-specific public curve was found.
+  The Pro's own gauge cannot stand in yet: on 2026-11-24 it read 88 % at 4.126 V at rest and 100 % at 4.29 V while still taking 563 mA, so its "full" was learned under the bootloader's 4.35 V cap, not the cell's 4.48 V.
+  To replace the curve: charge to each cap to the end, rest, read the gauge's VFOCV and RepCap against a full 4.48 V charge's.
+
+**Measured on the Pro, 2026-11-24 (by register writes on the RAM kernel; the kernel part not yet loaded):**
+
+| CV written | read back | the cell | CHG_DTLS / BAT_DTLS | current |
+|---|---|---|---|---|
+| 4.35 V (as found) | G#23 | 4.284 V | 1 (CC) / 3 OK | +425 to +486 mA, input at its 500 mA (AICL_OK 0) |
+| 4.00 V | G#00 | 4.291 → 4.185 V | 2 (CV), then 8 (off) / 5 (over the CV) | +475 mA falling to −249 and −448 mA: the device runs from the cell |
+| 4.20 V | G#14 | 4.209 → 4.219 V | 8 (off), then 4 (done) / 3 OK | +2, then −3 mA: held on the input |
+
+- A cap below the cell's voltage stops charging and the device runs from the cell until the cell comes down to the cap; the input does not carry it meanwhile (CHG_OK and BAT_OK low).
+  So setting 4.00 V on a full cell drains it to about 4.00 V first, at the device's own draw.
+- At the cap, the charger rests off and the device runs on the input, the cell at about 0 mA.
+
 ## The charger registers a driver needs
 
 Encodings from max77759_charger.c (Google's own conversions; the register map is `max77759_A1_regs.h`).

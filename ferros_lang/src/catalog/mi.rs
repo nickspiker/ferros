@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "pāmahana",
         Msg::Charging => "e utu ana",
         Msg::Discharging => "e heke ana",
+        Msg::ChargeCap => "whakakī ki",
+        Msg::ChargeCapNote => "ka mutu te whakakī i te pūhiko i konei.\nhe āwhiwhi noa te wāhanga i tōna taha.",
+        Msg::ChargeCapWear => "ehara te ngaronga i te rārangi tika: ko ia piki ake he nui ake tōna utu ki te ora o te pūhiko i tō mua.\ni ine a Battery University, ko ia hautekau o te volt ka heke ka rearua ngā huringa whakakī o tētahi pūtau, i ngā pūtau i hangaia mō te ngaohiko iti iho; e mau tonu ana te āhua i konei.",
         // ---- Keyboard ----
         Msg::Layout => "tahora",
         // ---- Security ----
@@ -551,6 +554,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  e whakakī ana"),
         Say::OnBattery(pct) => write!(o, "{pct}  i te pūhiko"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, tata ki te {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "ko {mv} te taunoa: te nuinga o te whakakī, he iti iho te ngaronga."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "tata ki te {share} o ngā huringa whakakī i {mv}"),
         Say::Throttled(t) => write!(o, "{t}  kua whakapōturihia"),
         Say::NotAskedYet(what) => write!(o, "{what} (kāore anō kia pātaitia)"),
         Say::UsingNow(what) => write!(o, "{what} (e whakamahi ana ināianei)"),

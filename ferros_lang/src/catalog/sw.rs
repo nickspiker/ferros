@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "joto",
         Msg::Charging => "inachaji",
         Msg::Discharging => "inapunguza chaji",
+        Msg::ChargeCap => "chaji hadi",
+        Msg::ChargeCapNote => "chaja inaacha kujaza betri hapa.\nsehemu iliyo kando yake ni ya kukadiria.",
+        Msg::ChargeCapWear => "uchakavu si wa mstari ulionyooka: kila hatua juu inagharimu maisha ya betri zaidi kuliko ile iliyotangulia.\nBattery University ilipima kwamba kila sehemu ya kumi ya volti pungufu huongeza maradufu mizunguko ya chaji ya seli, kwenye seli zilizoundwa kwa volteji ya chini; umbo hilo linabaki hapa.",
         // ---- Keyboard ----
         Msg::Layout => "mpangilio",
         // ---- Security ----
@@ -546,6 +549,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  inachaji"),
         Say::OnBattery(pct) => write!(o, "{pct}  kwa betri"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, takriban {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} ndiyo chaguo-msingi: chaji karibu yote kwa uchakavu mdogo sana."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "takriban {share} ya mizunguko ya chaji kwa {mv}"),
         Say::Throttled(t) => write!(o, "{t}  imepunguzwa kasi"),
         Say::NotAskedYet(what) => write!(o, "{what} (bado haijaulizwa)"),
         Say::UsingNow(what) => write!(o, "{what} (inatumia sasa)"),

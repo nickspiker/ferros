@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "temperatura",
         Msg::Charging => "nagcha-charge",
         Msg::Discharging => "nagdi-discharge",
+        Msg::ChargeCap => "mag-charge hanggang",
+        Msg::ChargeCapNote => "humihinto rito ang charger sa pagpuno ng baterya.\ntantiya lang ang bahagi sa tabi nito.",
+        Msg::ChargeCapWear => "hindi tuwid ang pagkasira: bawat hakbang pataas ay mas malaki ang kabawas sa buhay ng baterya kaysa sa nauna.\nsinukat ng Battery University na bawat ikasampu ng volt na mas mababa ay dinodoble ang charge cycle ng isang cell, sa mga cell na gawa para sa mas mababang boltahe; ganoon din ang hugis dito.",
         // ---- Keyboard ----
         Msg::Layout => "ayos",
         // ---- Security ----
@@ -545,6 +548,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  nagcha-charge"),
         Say::OnBattery(pct) => write!(o, "{pct}  sa baterya"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, mga {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} ang default: halos buong karga, mas kaunting pagkasira."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "mga {share} ng charge cycle sa {mv}"),
         Say::Throttled(t) => write!(o, "{t}  pinabagal"),
         Say::NotAskedYet(what) => write!(o, "{what} (hindi pa naitatanong)"),
         Say::UsingNow(what) => write!(o, "{what} (ginagamit ngayon)"),

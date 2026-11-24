@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "température",
         Msg::Charging => "en charge",
         Msg::Discharging => "en décharge",
+        Msg::ChargeCap => "charger jusqu'à",
+        Msg::ChargeCapNote => "le chargeur cesse de remplir la batterie ici.\nla part à côté est approximative.",
+        Msg::ChargeCapWear => "l'usure n'est pas linéaire : chaque cran de plus coûte plus de durée de vie que le précédent.\nBattery University a mesuré que chaque dixième de volt en moins double les cycles de charge d'un élément, sur des éléments prévus pour une tension plus basse ; la forme reste la même ici.",
         // ---- Keyboard ----
         Msg::Layout => "disposition",
         // ---- Security ----
@@ -545,6 +548,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  en charge"),
         Say::OnBattery(pct) => write!(o, "{pct}  sur batterie"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, environ {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} est la valeur par défaut : presque toute la charge pour bien moins d'usure."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "environ {share} des cycles de charge à {mv}"),
         Say::Throttled(t) => write!(o, "{t}  bridée"),
         Say::NotAskedYet(what) => write!(o, "{what} (pas encore demandé)"),
         Say::UsingNow(what) => write!(o, "{what} (l’utilise maintenant)"),

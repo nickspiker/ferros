@@ -20,6 +20,7 @@ And one way in:
   - **A value** (a mode, a preference): kept in the device's settings document in the vault (SETTINGS.md), as every device setting is (AGENT.md: every change hits disk), loaded at boot before any driver starts. The kernel's `settings::KNOBS` names each kept one.
   - **An action** (do this now): a counter the page counts up; the driver acts once when it sees it change. Never kept: a count means nothing across a boot.
 - **Link 6 is the clock**, whose driver is the kernel: its zone is the settings document's `tz`, applied the moment it is set.
+- **Link 7 is the battery**, whose driver is the kernel too: slot 1 the charge voltage cap in mV (`charge_cv`, docs/CHARGING.md), checked by the kernel and written to the charger by the service loop the moment it is set.
 
 The kernel checks only the capability and the slot; whether a value means anything is the driver's (it owns the hardware), and a value it cannot use it ignores and shows as it is.
 

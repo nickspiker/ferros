@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "suhu",
         Msg::Charging => "mengisi daya",
         Msg::Discharging => "mengosongkan",
+        Msg::ChargeCap => "isi sampai",
+        Msg::ChargeCapNote => "pengisi daya berhenti mengisi baterai di sini.\nbagian di sampingnya hanya perkiraan.",
+        Msg::ChargeCapWear => "keausan tidak linear: setiap langkah naik memakan lebih banyak umur baterai daripada langkah sebelumnya.\nBattery University mengukur bahwa setiap sepersepuluh volt lebih rendah menggandakan siklus pengisian sel, pada sel yang dibuat untuk tegangan lebih rendah; bentuknya tetap berlaku di sini.",
         // ---- Keyboard ----
         Msg::Layout => "tata letak",
         // ---- Security ----
@@ -545,6 +548,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  mengisi daya"),
         Say::OnBattery(pct) => write!(o, "{pct}  pakai baterai"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, sekitar {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} adalah bawaan: hampir seluruh isi daya dengan keausan jauh lebih sedikit."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "sekitar {share} dari siklus pengisian pada {mv}"),
         Say::Throttled(t) => write!(o, "{t}  diperlambat"),
         Say::NotAskedYet(what) => write!(o, "{what} (belum ditanyakan)"),
         Say::UsingNow(what) => write!(o, "{what} (sedang dipakai)"),

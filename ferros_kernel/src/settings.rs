@@ -67,8 +67,9 @@ fn language_of(code: u16) -> Option<vsf::Language> {
     Some(vsf::Language::new(l))
 }
 
-/// The radio knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …), slot. Value knobs only: actions are counters and are never kept.
-pub const KNOBS: [(&str, usize, usize); 2] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2)];
+/// The knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …, 7 the battery), slot. Value knobs only: actions are counters and are never kept.
+/// `charge_cv` is the battery's charge voltage cap in mV (docs/CHARGING.md, owner 2026-11-24): this device's battery, so a device setting, never the identity's.
+pub const KNOBS: [(&str, usize, usize); 3] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2), ("charge_cv", crate::process::CONTROL_BATTERY, crate::process::CONTROL_CHARGE_CV)];
 
 fn schema() -> SectionSchema {
     let mut s = SectionSchema::new(SECTION);

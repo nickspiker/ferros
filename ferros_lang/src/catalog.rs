@@ -276,6 +276,12 @@ messages! {
     /// The current's direction: into the cell, or out of it.
     Charging,
     Discharging,
+    /// The charge voltage cap's slider (owner, 2026-11-24; docs/CHARGING.md): its name.
+    ChargeCap,
+    /// Under the slider: what the cap does, and that the share beside the voltage is rough (two lines).
+    ChargeCapNote,
+    /// Above the default: wear is not linear, and the one sourced measure of it (Battery University BU-808, Table 4; two lines).
+    ChargeCapWear,
 
     // ---- Keyboard ----
     /// The keyboard layout's heading (Dvorak, QWERTY stay).
@@ -875,6 +881,12 @@ pub enum Say<'a> {
     Charging(&'a str),
     /// The battery's level (written already) while the device runs on it.
     OnBattery(&'a str),
+    /// The charge cap's value: the voltage (written already, with its unit) and the rough share of a full charge it holds (written already).
+    ChargeCapAt { mv: &'a str, share: &'a str },
+    /// Why the default is the default: the default voltage (written already, with its unit).
+    ChargeCapDefault(&'a str),
+    /// Above the default: the share of the default's charge cycles (written already) and the default voltage (written already, with its unit).
+    ChargeCapCycles { share: &'a str, mv: &'a str },
     /// The chip's temperature (written already, with its unit) while its clock is held down for heat.
     Throttled(&'a str),
     // ---- Kists, Permissions ----

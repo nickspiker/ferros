@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "temperature",
         Msg::Charging => "charging",
         Msg::Discharging => "discharging",
+        Msg::ChargeCap => "charge to",
+        Msg::ChargeCapNote => "the charger stops filling the battery here.\nthe share beside it is rough.",
+        Msg::ChargeCapWear => "wear is not linear: each step up costs more battery life than the one before.\nBattery University measured each tenth of a volt less doubling a cell's charge cycles, on cells built for a lower voltage; the shape holds here.",
         // ---- Keyboard ----
         Msg::Layout => "layout",
         // ---- Security ----
@@ -544,6 +547,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  charging"),
         Say::OnBattery(pct) => write!(o, "{pct}  on battery"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, about {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} is the default: most of the charge for far less wear."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "about {share} of the charge cycles at {mv}"),
         Say::Throttled(t) => write!(o, "{t}  throttled"),
         Say::NotAskedYet(what) => write!(o, "{what} (not asked yet)"),
         Say::UsingNow(what) => write!(o, "{what} (using now)"),

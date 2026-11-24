@@ -2420,6 +2420,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         Ok((b, a, p)) => alloc::format!("charger safety timer NOT off: CHG_CNFG_01 G#{b:02X}, reads G#{a:02X} after the write (CHG_CNFG_06 G#{p:02X}, CHGPROT [3:2] 3 = open); booting on"),
         Err(e) => alloc::format!("charger safety timer NOT off: hsi2c_11 G#{e:X}; booting on"),
     });
+    // The charge voltage cap's default at once, so the bootloader's 4.35 V never stands (owner, 2026-11-24: 4.20 V by default); the kept cap follows on the service loop's first pass, once the settings are read (service.rs `charge_poll`).
+    flashlog::line(&match hsi2c::charger::set_cv(process::CHARGE_CV_DEFAULT as u32) {
+        Ok(mv) => alloc::format!("charge cap at boot: A#{mv} mV (the default) until the kept setting is read"),
+        Err(e) => alloc::format!("charge cap NOT set at boot: hsi2c_11 G#{e:X}; booting on"),
+    });
     checklist::step(checklist::Step::Log);
     // The wall clock before the vault opens (docs/VSF-AUDIT.md P10, 2026-11-17): every commit and document the vault writes is stamped with Eagle time from it (kvault `now`). A failed read leaves it unknown (0, the Eagle epoch: settings.rs), never made up; the service reads it again at its start and every hour.
     let clock = rtc::sync_early();

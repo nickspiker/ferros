@@ -163,6 +163,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Temperature => "Temperatur",
         Msg::Charging => "lädt",
         Msg::Discharging => "entlädt",
+        Msg::ChargeCap => "laden bis",
+        Msg::ChargeCapNote => "die Ladeschaltung hört hier auf, den Akku zu füllen.\nder Anteil daneben ist grob.",
+        Msg::ChargeCapWear => "der Verschleiß ist nicht linear: jeder Schritt nach oben kostet mehr Akkulebensdauer als der davor.\nBattery University hat gemessen, dass jedes Zehntel Volt weniger die Ladezyklen einer Zelle verdoppelt, bei Zellen für eine niedrigere Spannung; die Form gilt auch hier.",
         // ---- Keyboard ----
         Msg::Layout => "Belegung",
         // ---- Security ----
@@ -545,6 +548,9 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         }
         Say::Charging(pct) => write!(o, "{pct}  lädt"),
         Say::OnBattery(pct) => write!(o, "{pct}  im Akkubetrieb"),
+        Say::ChargeCapAt { mv, share } => write!(o, "{mv}, etwa {share}"),
+        Say::ChargeCapDefault(mv) => write!(o, "{mv} ist die Voreinstellung: fast die ganze Ladung bei viel weniger Verschleiß."),
+        Say::ChargeCapCycles { share, mv } => write!(o, "etwa {share} der Ladezyklen bei {mv}"),
         Say::Throttled(t) => write!(o, "{t}  gedrosselt"),
         Say::NotAskedYet(what) => write!(o, "{what} (noch nicht gefragt)"),
         Say::UsingNow(what) => write!(o, "{what} (nutzt es gerade)"),

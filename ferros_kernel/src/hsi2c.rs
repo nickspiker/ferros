@@ -243,6 +243,31 @@ pub mod charger {
         let prot = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_06)?;
         Ok((before, after, prot))
     }
+
+    /// CHG_CNFG_04: CHG_CV_PRM [5:0], the charge voltage, 4.000 V + 10 mV a code up to G#32 (4.50 V); bits 7:6 spare, kept as found (bms max77759_charger.c `max77759_set_regulation_voltage`).
+    pub const CHG_CNFG_04: u8 = 0xBD;
+    pub const CV_MASK: u8 = 0x3F;
+
+    /// The charge voltage, mV (4000 to 4500 in 10 mV steps; the caller checks the range), written as Android's driver writes it: a read-modify-write of CHG_CV_PRM, CHGPROT left as found.
+    /// One try: returns the voltage read back, mV.
+    pub fn set_cv(mv: u32) -> Result<u32, u32> {
+        let was = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_04)?;
+        let code = ((mv - 4000) / 10) as u8 & CV_MASK;
+        if was & CV_MASK != code {
+            super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_04, (was & !CV_MASK) | code)?;
+        }
+        cv()
+    }
+
+    /// The charge voltage the charger holds now, mV: codes past G#32 are not a voltage in the 10 mV range (G#38 and G#39 are 3.8 and 3.9 V), read as such.
+    pub fn cv() -> Result<u32, u32> {
+        let code = (super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_04)? & CV_MASK) as u32;
+        Ok(match code {
+            0x38 => 3800,
+            0x39 => 3900,
+            _ => 4000 + code * 10,
+        })
+    }
 }
 
 /// The MAX77759 fuel gauge (PMIC.md): one sample of what matters for power profiling.

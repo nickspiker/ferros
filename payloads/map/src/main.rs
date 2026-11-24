@@ -26,6 +26,8 @@ mod quick;
 /// Notes on the deck (docs/NOTIFY.md): the kernel's list, the glows, the resting view, the Deck button, the live takeover.
 mod notes;
 mod typed;
+// The battery's charge voltage cap (docs/CHARGING.md): its slider's mapping and its words' numbers.
+mod charge;
 /// The WiFi page's picker (docs/WIFI.md "The picker"): the networks in range and remembered, a pick, the passphrase on the keyboard, the join, a network forgotten.
 mod wifi;
 /// The deck's drop targets while an item is dragged: About, Unstow, Stop; and the one Stop path.
@@ -1049,6 +1051,8 @@ enum Choice {
     Scale,
     /// A typed setting's slider (typed.rs, its index in `typed::ALL`; brightness one since 2026-11-12): its kept byte decided by x, live while the finger is on it and kept at the lift.
     Typed(u8),
+    /// The battery's charge voltage cap (charge.rs): its mV decided by x, shown while the finger is on it and set (applied and kept by the kernel) at the lift or the tap.
+    ChargeCap,
     /// The torch page's on and off: the torch lit at its level (and strobe, and timeout) or dark (the quick circle's tap until 2026-11-12; its tap opens this page now).
     TorchOn,
     /// A link's value knob set to one of its choices (its radio group): link, slot, value.
@@ -4565,6 +4569,27 @@ impl Map {
                 };
                 fact(b, &mut y, tr(Msg::PowerDraw), power.as_str());
                 fact(b, &mut y, tr(Msg::Temperature), facts.battery_temp_cc().map_or_else(not_read, |c| num(c / 100, " °C")).as_str());
+                // The charge voltage cap (charge.rs; owner, 2026-11-24: "for daily use, I'd set it to 4.2 v by default and allow the user to set it above"): the voltage with its rough share of a full charge, the slider (the value under a finger as it moves), what it does, why the default, and above the default what wear costs.
+                y += uu(1, 1);
+                let mv = match self.slide {
+                    Some((Choice::ChargeCap, t)) => charge::mv_at(t),
+                    _ => charge::now_mv(),
+                };
+                let volts = num(mv as i64, " mV");
+                let mut pct = Line::new();
+                let _ = tatau::share(&mut pct, f, charge::share_pct(mv), 100, 2);
+                fact_wrap(b, &mut y, tr(Msg::ChargeCap), say(Say::ChargeCapAt { mv: volts.as_str(), share: pct.as_str() }).as_str());
+                slider(self, b, &mut y, Choice::ChargeCap);
+                notes(b, &mut y, tr(Msg::ChargeCapNote));
+                y += uu(1, 2);
+                let default = num(ferros_sys::control::CHARGE_CV_DEFAULT as i64, " mV");
+                row(self, b, &mut y, note, dim(), say(Say::ChargeCapDefault(default.as_str())).as_str(), None);
+                if mv > ferros_sys::control::CHARGE_CV_DEFAULT {
+                    let mut cycles = Line::new();
+                    let _ = tatau::share(&mut cycles, f, charge::cycles_share(mv), charge::CYCLES_WHOLE, 2);
+                    row(self, b, &mut y, small, white(), say(Say::ChargeCapCycles { share: cycles.as_str(), mv: default.as_str() }).as_str(), None);
+                    rows(self, b, &mut y, note, dim(), tr(Msg::ChargeCapWear));
+                }
             }
             "sound" => {
                 // Sound (owner, 2026-11-24: "Not sure why that's under developer options and not sound", then "yes, add a sound page"): the speaker, microphone and buzz tests, moved here from Developer, between the battery and the torch.
@@ -5209,6 +5234,7 @@ impl Map {
                 let s = typed::ALL[i as usize];
                 s.place(s.now())
             }
+            Choice::ChargeCap => charge::place(charge::now_mv()),
             _ => 0.,
         }
     }
@@ -5231,8 +5257,10 @@ impl Map {
     /// A slider set from the finger at x (a drag across it, or a tap): the knob there, and the value written as it changes. A typed setting (brightness's 32nds of a stop among them) is written live thru the Settings capability each time its value changes; the scale follows the finger live (`scale_live`) and is kept when the finger lifts, as the pinch's is (every process lays itself out again on a scale change, so once, not every frame).
     fn slide_to(&mut self, what: Choice, x: i64) {
         let (a, b) = self.track(self.w / 2);
+        let u = (x - a) as f64 / (b - a) as f64;
         // WHY the bounds: the finger runs past either end of the track, and the knob stays at the end it passed.
-        let t = ((x - a) as f64 / (b - a) as f64).clamp(0., 1.);
+        // The charge cap's slider leans onto its ends with no clamp (the owner's C¹ rule for it, charge.rs `of_finger`); the others still clamp.
+        let t = if what == Choice::ChargeCap { charge::of_finger(u) } else { u.clamp(0., 1.) };
         self.slide = Some((what, t));
         self.knob = None;
         match what {
@@ -5264,6 +5292,9 @@ impl Map {
     fn slide_done(&mut self) {
         let Some((what, t)) = self.slide.take() else { return };
         self.typed_kept(what);
+        if what == Choice::ChargeCap {
+            self.charge_keep(t);
+        }
         let rest = match what {
             // The scale is kept rounded to its 64ths (the lift writes it).
             Choice::Scale => (libm::round(t * 128. - 64.) + 64.) / 128.,
@@ -5337,6 +5368,13 @@ impl Map {
         }
     }
 
+    /// The charge cap as its slider left it (`t`, the knob's place): asked of the kernel, which checks it, keeps it in the vault and writes the charger's CV at once; nothing asked when it is the cap already.
+    fn charge_keep(&self, t: f64) {
+        let mv = charge::mv_at(t);
+        if mv != charge::now_mv() && !charge::set(cap(self.grants, S_SETTINGS), mv) {
+            console(self.grants, b"map: the kernel did not take the charge cap\n");
+        }
+    }
     /// A typed setting as its slider left it, kept in the vault (the drag applied it live); anything else, nothing.
     fn typed_kept(&self, what: Choice) {
         if let Choice::Typed(i) = what {
@@ -5362,7 +5400,7 @@ impl Map {
         if self.swipe == 0 {
             self.swipe = if dx.abs() >= dy.abs() { 1 } else { 2 };
             // Across, from a slider: the drag is the slider's (3), not the strip's; up and down still scrolls the page.
-            if self.swipe == 1 && matches!(self.row_at(start.1, start.2), Some(Choice::Scale | Choice::Typed(_) | Choice::TestLevel | Choice::BuzzWave)) {
+            if self.swipe == 1 && matches!(self.row_at(start.1, start.2), Some(Choice::Scale | Choice::Typed(_) | Choice::TestLevel | Choice::BuzzWave | Choice::ChargeCap)) {
                 self.swipe = 3;
             }
         }
@@ -6027,10 +6065,14 @@ impl Map {
                         }
                     }
                     // A slider tapped: its knob and its value there at once, as a drag would leave them; the scale is kept now (the lift that wrote a drag's has passed).
-                    Some(c @ (Choice::Scale | Choice::Typed(_) | Choice::TestLevel | Choice::BuzzWave)) => {
+                    Some(c @ (Choice::Scale | Choice::Typed(_) | Choice::TestLevel | Choice::BuzzWave | Choice::ChargeCap)) => {
                         self.slide_to(c, sx);
+                        let t = self.slide.map(|s| s.1);
                         self.slide = None;
                         self.typed_kept(c);
+                        if let (Choice::ChargeCap, Some(t)) = (c, t) {
+                            self.charge_keep(t);
+                        }
                         if let Some(s) = self.scale_live.take() {
                             set(self, ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
                         }
