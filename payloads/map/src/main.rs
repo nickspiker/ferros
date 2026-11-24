@@ -1735,6 +1735,8 @@ struct Map {
     absent: alloc::vec::Vec<[u8; 32]>,
     /// The puck launched last and answered "started", with the kists' bell as it stood before the ask, until its outcome comes (it is alive, or the kernel's record of it is newer than the ask): no other puck is launched meanwhile (`send_pucks`), and it is not taken for ended while it starts. So attest launches each puck once, one after another (the Pro, 2026-11-23: four pucks launched 10 times in 180 ms, each bell for one of them taking the others, still starting and not yet alive, for ended).
     puck_pending: Option<([u8; 32], u64)>,
+    /// The kists' bell registered and the records the kernel kept before this map started counted (`kists_read`): no puck is launched before, since a launch's outcome is told apart from those older records by the bell's count (the Pro, 2026-11-23, measured: the map's first pass launched Tide with the bell still 0, an older record of Tide settled it at once, and Tide was launched again).
+    kists_ready: bool,
     /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
@@ -2290,7 +2292,8 @@ impl Map {
                 }
             }
             if r[0] == ferros_kist::launch::STARTED {
-                self.puck_pending = Some((capsule, bell));
+                // WHY the max: a record the map has read already is no outcome of this ask, whatever the bell said before it.
+                self.puck_pending = Some((capsule, bell.max(self.kists_read)));
             }
             return r[0];
         }
@@ -2923,8 +2926,8 @@ impl Map {
         m[1] = n as u8;
         let mut r = [0u8; 1];
         call(self.display, &m[..2 + 64 * n], &mut r);
-        // One puck at a time: the next once the last one's outcome has come (`puck_pending`, settled in `kists_rang`).
-        if self.puck_pending.is_some() {
+        // One puck at a time: the next once the last one's outcome has come (`puck_pending`, settled in `kists_rang`); none before the kists' bell is counted (`kists_ready`).
+        if self.puck_pending.is_some() || !self.kists_ready {
             return;
         }
         for i in 1..self.deck.n() {
@@ -6619,6 +6622,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         stopped: alloc::vec::Vec::new(),
         absent: alloc::vec::Vec::new(),
         puck_pending: None,
+        kists_ready: false,
         drop: targets::Drop::default(),
         pucks_held: alloc::vec::Vec::new(),
         kists_read: 0,
@@ -6944,6 +6948,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     map.kists_read = kists_seen;
     // The kist circles' states as they stand (`kists_rang` says nothing kept before this map started): a map started again finds a running kist running and a stopped one stopped.
     map.kists_rang();
+    // From here a puck's launch is told from what came before it: the pucks launched now, one at a time.
+    map.kists_ready = true;
+    map.send_pucks();
     // The links' and the facts' bells (SYS_BELL): the kernel writes each source's change count into BELLS at every change. A kernel from before refuses them, and those pages then draw only as they open or are touched.
     for (s, w) in BELLS.iter().enumerate() {
         if !ferros_sys::bell(s as u64, w) {
