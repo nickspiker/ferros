@@ -2254,6 +2254,16 @@ pub mod directory {
         b.build()
     }
 
+    /// The directory from entries each already verified when they were taken (fgtw.org's append, KIST-DISTRIBUTION.md 1.6: every egg checked as it came in), read for shape only, so assembling it costs no signature checks however many it lists. The device still verifies each one alone ([`parse_directory`]).
+    pub fn build_held(entries: &[Vec<u8>], made: i64) -> Result<Vec<u8>, String> {
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).provenance_only();
+        for doc in entries {
+            let e = crate::entry::read(doc).map_err(String::from)?;
+            b = b.add_section_direct(kist_section(doc)).add_section_direct(metrics_section(&e));
+        }
+        b.build()
+    }
+
     /// The directory's entries, each verified alone (`entry::verify`: every egg against the bundle it carries); one that does not verify is left out and counted. Two entries of one kist (developer and option): the newer version is kept (KIST-DISTRIBUTION.md 1.3). A section of another name is skipped. Whether the directory as a whole was signed is [`verify_directory`]'s.
     pub fn parse_directory(doc: &[u8]) -> Result<Directory, &'static str> {
         let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;

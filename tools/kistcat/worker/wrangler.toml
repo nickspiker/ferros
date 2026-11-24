@@ -13,7 +13,12 @@ command = "cargo install -q worker-build@0.1.0 && worker-build --release"
 binding = "KISTS"
 bucket_name = "kists"
 
-# The bare address only (a pattern without `*` matches that path alone). /kists.vsf, /capsules/… and every other path stay R2's, never routed here.
+# The bare address and /append only (a pattern without `*` matches that path alone). /kists.vsf, /capsules/… and every other path stay R2's, never routed here.
 [[routes]]
 pattern = "kists.fgtw.org/"
+zone_name = "fgtw.org"
+
+# Developers append their own signed entries (docs/KIST-DISTRIBUTION.md 1.6; `kistcat publish`).
+[[routes]]
+pattern = "kists.fgtw.org/append"
 zone_name = "fgtw.org"

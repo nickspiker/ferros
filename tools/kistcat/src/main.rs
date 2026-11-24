@@ -3,6 +3,7 @@
 //! - `kistcat entry --key <developer key .vsf> --capsule <capsule.vsf> --about TEXT --host <base URL>... --out <entry.vsf>`: the developer's signed entry for a capsule (KIST-DISTRIBUTION.md 1.0; owner, 2026-11-24: "One entry format, yes."), its `web` the capsule's path under each host (`<base>/capsules/<blake3>.vsf`). The capsule is checked first as the device's stower checks it (every egg against the bundle it carries, or Photon's release bundle), the key must be the capsule's own developer's, and the entry is verified and checked against the capsule's declaration before it is written. Prints the wrangler commands that publish both. Uploads nothing.
 //! - `kistcat kist ... --entry <out> --about TEXT --host <base URL>...`: the entry written beside the capsule, in the same run, with the same key.
 //! - `kistcat build --unsigned --out <dir> [--web <web/index.html>] --entry <entry.vsf>...`: `<dir>/kists.vsf` (each kist's entry carried byte for byte, KIST-DISTRIBUTION.md 1.1), `<dir>/index.html` (the page for kists.fgtw.org) and, with `--web`, the list on ferros.org between its markers, then the wrangler commands that publish them. `--key <secret>` in place of `--unsigned` signs the whole with the project key (open question 14 recommends dropping that signature). An entry that does not verify stops the build.
+//! - `kistcat publish <entry.vsf>... [--to <http URL>]`: each entry appended to fgtw.org's list as its developer signed it (KIST-DISTRIBUTION.md 1.6: `POST http://kists.fgtw.org/append`), checked here first as the device checks it; the answer (taken, or refused and why) printed per entry. No account, no approval: the record's own signatures are the whole of it.
 //! - `kistcat verify <kists.vsf> [--key <secret>]`: every entry verified alone, and with `--key` the directory's own signature.
 //! - `kistcat devkey ...`: developer keys and their public records (devkey.rs).
 //! - A key file (`--key`) is VSF, section `developer_key` { label a, seed kge }, read thru ferros_kist::secret (the one reader, shared with the bridge and ferros-mkimg). Nothing of a key is printed, copied or written.
@@ -24,7 +25,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  kistcat entry --key <developer key .vsf> --capsule <capsule.vsf> --about TEXT --host <http base URL>... --out <entry.vsf>\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] --entry <entry.vsf>...\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf> [--entry <entry.vsf> --about TEXT --host <http base URL>...]\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
+    eprintln!("usage:\n  kistcat entry --key <developer key .vsf> --capsule <capsule.vsf> --about TEXT --host <http base URL>... --out <entry.vsf>\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] --entry <entry.vsf>...\n  kistcat publish <entry.vsf>... [--to <http URL>]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf> [--entry <entry.vsf> --about TEXT --host <http base URL>...]\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
     exit(2)
 }
 
@@ -32,6 +33,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("entry") => entry_cmd(&args[1..]),
+        Some("publish") => publish(&args[1..]),
         Some("build") => build(&args[1..]),
         Some("verify") => verify(&args[1..]),
         Some("devkey") => devkey(&args[1..]),
@@ -194,6 +196,46 @@ fn entry_cmd(args: &[String]) {
     let (e, doc) = make_entry(&signer, &c, &about, &hosts).unwrap_or_else(|e| fail(format!("{}: {e}", capsule.display())));
     drop(signer);
     write_entry(&e, &doc, &out, &capsule);
+}
+
+/// `kistcat publish`: each entry POSTed to fgtw.org's append endpoint (KIST-DISTRIBUTION.md 1.6), its answer read from the reply's `append` section (`taken`, `why`). Exits non-zero when any was refused.
+fn publish(args: &[String]) {
+    let mut to = format!("http://{}/append", directory::HOST);
+    let mut files = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--to" => to = it.next().cloned().unwrap_or_else(|| fail("--to needs a URL")),
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    if files.is_empty() {
+        fail("publish needs at least one entry file");
+    }
+    let mut refused = 0usize;
+    for f in &files {
+        let doc = std::fs::read(f).unwrap_or_else(|e| fail(format!("{}: {e}", f.display())));
+        let e = ferros_kist::entry::verify(&doc).unwrap_or_else(|e| fail(format!("{}: it does not verify here, so it is not sent: {e}", f.display())));
+        let answer = ureq::post(&to).header("Content-Type", "application/vnd.vsf").config().http_status_as_error(false).build().send(&doc[..]).map_err(|err| format!("{to}: {err}")).and_then(|mut r| r.body_mut().read_to_vec().map_err(|err| format!("{to}: {err}")));
+        let (taken, why) = match answer.and_then(|b| append_reply(&b)) {
+            Ok(a) => a,
+            Err(err) => (false, err),
+        };
+        refused += !taken as usize;
+        println!("{} {} {}: {why}", if taken { "taken" } else { "REFUSED" }, e.name, version_text(&e.version));
+    }
+    if refused != 0 {
+        exit(1);
+    }
+}
+
+/// The append endpoint's reply: a complete VSF document, section `append` with `taken` (u) and `why` (a).
+fn append_reply(b: &[u8]) -> Result<(bool, String), String> {
+    let (h, end) = vsf::file_format::VsfHeader::decode(b).map_err(|e| format!("the reply is not VSF ({e})"))?;
+    let s = h.sections(b, end)?.into_iter().find(|s| s.name == "append").ok_or("the reply has no append section")?;
+    let taken = s.get_field("taken").and_then(|f| f.values.iter().find_map(|v| v.as_u64())).ok_or("the reply says nothing taken or refused")? == 1;
+    let why = s.get_field("why").and_then(|f| f.values.iter().find_map(|v| if let vsf::VsfType::a(t) = v { Some(t.as_str().to_string()) } else { None })).unwrap_or_default();
+    Ok((taken, why))
 }
 
 fn build(args: &[String]) {

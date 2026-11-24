@@ -34,7 +34,9 @@ The owner's goal that day: "Would be nice to factory reset this thing, have it p
 - on a development build a restore takes native code (owner, 2026-11-24: "Native, yes."; docs/KISTS.md "Restoring native kists");
 - the stower's progress for the deck's loading pie (docs/KISTS.md "The loading pie's progress").
 
-Not built yet: the append endpoint of 1.6 and `kistcat publish` (the entries were put on R2 with wrangler by hand), `kists.entries` (1.4), people as a source, the claims exchange, and everything of phases 2 and 3.
+- the append endpoint of 1.6, deployed (the Worker `kists`, route kists.fgtw.org/append; tools/kistcat/worker) with `kistcat publish <entry.vsf>...`: the shape, every egg, the same bundle as the developer key's first entry there (kept at `developers/<key>.entry.vsf`), newest only per (developer, option) at `entries/<key>/<option>.entry.vsf`, the entry also at `capsules/<blake3>.entry.vsf`, and kists.vsf assembled again from every entry held (`directory::build_held`: each verified when it came in, so the assembly checks no signature). The reply is VSF, section `append` (`taken`, `why`). Tried 2026-11-24: the nine entries of the Pro's deck taken, the same one again "taken already", a changed one and a body that is no VSF refused.
+
+Not built yet: hand-off and revocation records (1.5; the endpoint takes entries only), R2's conditional put for two appends racing (today the last write wins), index.html assembled by the Worker (kistcat build writes it), `kists.entries` (1.4), people as a source, the claims exchange, and everything of phases 2 and 3.
 
 ## 0. What exists today
 

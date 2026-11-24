@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 worker = "0.4"
+# The entry's reader and verifier and the directory's builder: the same code kistcat writes with and the device's stower reads with (no_std + alloc; fgtw's verify-only base, as fgtw-bootstrap runs it in wasm).
+ferros_kist = { path = "../../../ferros_kist", features = ["directory"] }
+vsf = { path = "../../../../vsf", default-features = false }
 
 [package.metadata.wasm-pack.profile.release]
 # As fgtw-bootstrap: the wasm-opt worker-build runs rejects bulk memory operations (rustc emits them), so the binary ships without it.
