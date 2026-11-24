@@ -26,10 +26,12 @@ pub const W_TX_LEN: usize = 16;
 pub const W_RX_OFF: usize = 24;
 pub const W_RX_LEN: usize = 32;
 pub const W_PORT: usize = 40;
-/// The application's line: bytes it wrote into the send ring, bytes it took from the receive ring, and what it waits for (`WAIT_RX`, `WAIT_ROOM`).
+/// The application's line: bytes it wrote into the send ring, bytes it took from the receive ring, whether its reader waits for a datagram (`W_APP_WAITS`, on `W_RX_HEAD`) and whether its writer waits for room (`W_APP_ROOM`, on `W_TX_TAIL`).
+/// A word each, so a reader and a writer on two threads never clear each other's arm (the Photon session's question, 2026-11-24).
 pub const W_TX_HEAD: usize = 64;
 pub const W_RX_TAIL: usize = 72;
 pub const W_APP_WAITS: usize = 80;
+pub const W_APP_ROOM: usize = 88;
 /// ip's line: bytes it took from the send ring, bytes it wrote into the receive ring, whether it sleeps (1), and its counts: datagrams that found the receive ring full, send records that were not whole, the ring's state (`OPEN`, `CLOSED`), sends it could not send (no address of that family yet, too long for the link), sends sent.
 pub const W_TX_TAIL: usize = 128;
 pub const W_RX_HEAD: usize = 136;
@@ -42,9 +44,8 @@ pub const W_TX_SENT: usize = 184;
 /// ip's line, the receive side: datagrams written into the ring.
 pub const W_RX_COUNT: usize = 192;
 
-/// What the application waits for (`W_APP_WAITS` bits): a datagram (it waits on `W_RX_HEAD`), room in the send ring (on `W_TX_TAIL`).
-pub const WAIT_RX: u64 = 1;
-pub const WAIT_ROOM: u64 = 2;
+/// The value of a waiting word while its side waits.
+pub const WAITING: u64 = 1;
 
 /// The ring's state (`W_STATE`): ip serves it; ip let it go (the port or the link went, or ip is ending): no more datagrams either way.
 pub const OPEN: u64 = 0;
@@ -287,34 +288,39 @@ impl<M: Mem> App<M> {
         Ok(r)
     }
 
-    /// Before a wait for a datagram: the waiting word set, then one more look. Some((the word to wait on, its value)): nothing waits, so wait there (SYS_WAIT at the run's address + the offset) while it holds that value, then `disarm`. None: a datagram came meanwhile, read it (the word is cleared again).
+    /// Before a wait for a datagram: the reader's waiting word set, then one more look. Some((the word to wait on, its value)): nothing waits, so wait there (SYS_WAIT at the run's address + the offset) while it holds that value, then `disarm_rx`. None: a datagram came meanwhile, read it (the word is cleared again).
     pub fn arm_rx(&self) -> Option<(usize, u64)> {
-        self.m.st(W_APP_WAITS, WAIT_RX);
+        self.m.st(W_APP_WAITS, WAITING);
         fence(Ordering::SeqCst);
         let head = self.m.ld(W_RX_HEAD);
         if head != self.rx_tail || self.closed() {
-            self.disarm();
+            self.disarm_rx();
             return None;
         }
         Some((W_RX_HEAD, head))
     }
 
-    /// Before a wait for room in the send ring (a send that found it `Full`): as `arm_rx`, on ip's tail.
+    /// After a wait for a datagram.
+    pub fn disarm_rx(&self) {
+        self.m.st(W_APP_WAITS, 0);
+    }
+
+    /// Before a wait for room in the send ring (a send that found it `Full`): as `arm_rx`, on ip's tail, with the writer's own word; then `disarm_room`. A writer that drops a datagram finding the ring full (as a full socket buffer drops) never arms.
     pub fn arm_room(&self, need: usize) -> Option<(usize, u64)> {
-        self.m.st(W_APP_WAITS, WAIT_ROOM);
+        self.m.st(W_APP_ROOM, WAITING);
         fence(Ordering::SeqCst);
         let tail = self.m.ld(W_TX_TAIL);
         let used = self.tx_head.wrapping_sub(tail);
         if used > self.l.tx_len as u64 || self.l.tx_len as u64 - used >= rec_bytes(need) as u64 || self.closed() {
-            self.disarm();
+            self.disarm_room();
             return None;
         }
         Some((W_TX_TAIL, tail))
     }
 
-    /// After a wait: nothing waited for any more.
-    pub fn disarm(&self) {
-        self.m.st(W_APP_WAITS, 0);
+    /// After a wait for room.
+    pub fn disarm_room(&self) {
+        self.m.st(W_APP_ROOM, 0);
     }
 
     /// The word whose wake rings ip (any word of the run does; this one is the application's own line).
@@ -393,7 +399,7 @@ impl<M: Mem> Server<M> {
         fence(Ordering::Release);
         self.m.st(W_TX_TAIL, self.tx_tail);
         fence(Ordering::SeqCst);
-        self.m.ld(W_APP_WAITS) & WAIT_ROOM != 0
+        self.m.ld(W_APP_ROOM) != 0
     }
 
     /// Counts a send ip could not send (no address yet, too long for the link) or sent.
@@ -420,7 +426,7 @@ impl<M: Mem> Server<M> {
         self.m.st(W_RX_HEAD, self.rx_head);
         self.m.st(W_RX_COUNT, self.m.ld(W_RX_COUNT) + 1);
         fence(Ordering::SeqCst);
-        Some(self.m.ld(W_APP_WAITS) & WAIT_RX != 0)
+        Some(self.m.ld(W_APP_WAITS) != 0)
     }
 
     /// Before ip sleeps: its waiting word set, then one more look. False: sends came meanwhile, so ip must not sleep (the word cleared again).
@@ -525,7 +531,7 @@ mod tests {
         let mut out = vec![0u8; PAYLOAD_MOST];
         assert!(matches!(s.take(&mut out), Some(Took::Sent(_))));
         assert!(s.commit());
-        a.disarm();
+        a.disarm_room();
         assert_eq!(a.send(4, [0; 16], 1, 0, 0, &p), Ok(false));
     }
 
@@ -553,6 +559,27 @@ mod tests {
         let big = [0u8; 1000];
         while s.deliver(&r, &big).is_some() {}
         assert_eq!(m.ld(W_RX_DROPPED), 1);
+    }
+
+    /// A reader waiting while a writer waits for room: each side's arm stands, and neither one's disarm clears the other's (the Photon session's question, 2026-11-24).
+    #[test]
+    fn reader_and_writer_arms_apart() {
+        let (_v, m) = run(14);
+        let (l, _) = Layout::plan(12, 12);
+        let mut s = Server::lay_out(m, l, 7);
+        let mut a = App::open(m, 1 << 14).unwrap();
+        let p = [1u8; 1000];
+        while a.send(4, [0; 16], 1, 0, 0, &p).is_ok() {}
+        assert!(a.arm_rx().is_some());
+        assert!(a.arm_room(1000).is_some());
+        a.disarm_room();
+        let r = Rec { len: 0, fam: 4, class: 0, port: 1, flags: 0, stamp: 0, addr: [0; 16] };
+        assert_eq!(s.deliver(&r, b"y"), Some(true));
+        assert!(a.arm_room(1000).is_some());
+        a.disarm_rx();
+        let mut out = vec![0u8; PAYLOAD_MOST];
+        s.take(&mut out);
+        assert!(s.commit());
     }
 
     #[test]
@@ -593,7 +620,7 @@ mod tests {
         assert_eq!(a.arm_rx(), Some((W_RX_HEAD, 0)));
         let r = Rec { len: 0, fam: 4, class: 0, port: 1, flags: 0, stamp: 0, addr: [0; 16] };
         assert_eq!(s.deliver(&r, b"y"), Some(true));
-        a.disarm();
+        a.disarm_rx();
         assert_eq!(a.arm_rx(), None);
     }
 
@@ -647,7 +674,7 @@ mod tests {
                             std::hint::spin_loop();
                         }
                     }
-                    a.disarm();
+                    a.disarm_room();
                 }
                 Err(e) => panic!("{e:?}"),
             }

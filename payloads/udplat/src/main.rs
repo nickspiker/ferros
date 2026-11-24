@@ -229,7 +229,7 @@ fn ring_main(grants: u64) -> ! {
             Err(ferros_netring::RecvErr::Empty) => {
                 if let Some((w, v)) = app.arm_rx() {
                     ferros_sys::wait_world(word(addr + w as u64), v, 0);
-                    app.disarm();
+                    app.disarm_rx();
                 }
             }
             Err(_) => {
