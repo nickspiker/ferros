@@ -19,7 +19,9 @@ What must be true before a release build ships. An item comes off this list only
 - **A production build** (`FERROS_PRODUCTION=1`):
   - It compiles every development door out ([KERNEL-OUT.md](KERNEL-OUT.md), [BOOT.md](BOOT.md) "The USB development doors close in a production build").
   - It refuses native capsules ([SANDBOX.md](SANDBOX.md)).
-  - Its "Ready?" gate waits for the press with no timer. Whether it boots at once instead is undecided (owner, 2026-11-05).
+  - It boots straight to ferros: no "Ready?" gate, no wait, no press, no arrow (owner, 2026-11-24: "no 1s boot gate or green arrow, just straight to ferros since the google nag is already obnoxious"). Built in the kernel (ready.rs) and the hv (gate.rs).
+  - It has no way into Android (owner, 2026-11-24: "Default pure ferros, we do not support Android dual boot. Period."; "we do not host built OS images that run Android in any way"). Built: the kernel's and the hv's Android and recovery launches compiled out ([BOOT.md](BOOT.md) "Production: pure ferros, no Android"). Open: the map's Settings page "Android" still shows.
+  - Updating it while locked: the A/B updater and "Allow unlocking" are built before the first locked deploy (owner, 2026-11-24; [FLASHER.md](FLASHER.md) "Updating while locked").
 - **The device lock** (owner): prepared freely, run only for the release, never before.
 
 ## Done

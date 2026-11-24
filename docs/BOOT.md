@@ -54,12 +54,17 @@ The disk and the identity are never touched without a human present.
 
 ### The gate's contract (owner, 2026-10-17)
 
-Dev builds never default to Android: the one-second auto-press goes to ferros, and Android takes an explicit volume-down during the second (or volume-up to hold, then down). Release builds do not auto-press; they stop on Ready? and wait for the power key (ferros) or volume down (Android). ferros_kernel/src/ready.rs is this today. Slot-a hypervisor tests bypass the gate by making slot a active, which is the owner-approved override for those tests only.
+Dev builds never default to Android: the one-second auto-press goes to ferros, and Android takes an explicit volume-down during the second (or volume-up to hold, then down). Release builds do not auto-press; they stop on Ready? and wait for the power key (ferros) or volume down (Android). Superseded for production on 2026-11-24 (below, "Production: straight to ferros"). ferros_kernel/src/ready.rs is this today. Slot-a hypervisor tests bypass the gate by making slot a active, which is the owner-approved override for those tests only.
 
 **Planned: a USB handshake at the gate.** The host should be able to choose ferros or Android from the Ready? screen (a PT command while the gate waits), for the dev loop and for recovery without touching the phone. The gate currently stops the USB controller before the press on purpose ("nothing answers on USB before the press"); the handshake means bringing DWC3 and a minimal PT endpoint up while the screen waits, so it costs the gate its "only what it takes to ask" economy on release builds only when the cable is present.
 
+### Production: straight to ferros (decided 2026-11-24)
+The owner, 2026-11-24: "no 1s boot gate or green arrow, just straight to ferros since the google nag is already obnoxious."
+A production build has no "Ready?" screen, no one-second wait, no press and no green arrow, in the kernel (ready.rs returns at once, `GATE_HOW` 4) and in the hv (gate.rs `ask`, telemetry 7). Development builds keep the gate as below.
+Nothing else depended on the press: the boot checklist's start time becomes "now", the Start into setting read the unattended answer (and is compiled out of production with the rest of Android, below), and no USB door opens during the wait. The hv's 100 ms early-fastboot check (both volumes held at its start) still runs in production; it leads only to the bootloader, which a person needs for a reflash.
+
 ### Dev builds: auto-press
-Dev builds show "Ready?" and proceed as if the key were pressed after one second; production builds compile that out and wait for the key.
+Dev builds show "Ready?" and proceed as if the key were pressed after one second; production builds have no gate at all (above).
 In a dev build, a volume key (up or down) during that second cancels the timer: the gate then waits for the power key indefinitely, as production does (owner hardware test 2026-10-15: PASS).
 Every line after the gate is identical in both, and nothing new listens on any interface: flashing a dev build is itself the developer's consent.
 There is deliberately no remote "press" (no USB bypass): USB data does not exist before the press.
@@ -289,7 +294,15 @@ How a boot goes:
 - Android boots only on explicit physical input: a volume key held through early boot (GPIO read at EL2, small driver). Superseded 2026-11-21: Android starts only by the attested identity's choice ("Android only by the identity's choice", below).
 - Future: NFID/sticker-gated — Android as a summoned domain, invisible unless its token is present.
 
-### Android only by the identity's choice (decided 2026-11-21)
+### Production: pure ferros, no Android (decided 2026-11-24)
+
+The owner, 2026-11-24: "Default pure ferros, we do not support Android dual boot. Period. This will be the first legit production build and deploy." And: "if they want to enable the development gate that lets them run Android and build it themselves, they can but we do not host built OS images that run Android in any way."
+- A production build has no way into Android or its recovery: the hv's gate honours neither ANDROID_ONCE nor RECOVERY_ONCE (ferros, or fastboot with no ferros packed); the kernel's ANDROID_ONCE writer (platform::android_once), the boot-time Android branch, the Start into launch, the Android launch and the recovery "yes" are compiled out (`cfg(ferros_production)`), so a production path that still reached them would not compile.
+- The Android code below stays in the source, behind the development build, for people who build it themselves.
+- The hosted image is proposed bare (ferros alone with its AVB footer, no hv, no Linux Image): docs/FLASHER.md "Production images".
+- Updating a locked phone (the in-ferros A/B updater, "Allow unlocking" in Security, kernel updates thru the vault's kernel ring) is designed in docs/FLASHER.md "Updating while locked", for the owner.
+
+### Android only by the identity's choice (decided 2026-11-21; development builds only since 2026-11-24)
 
 The owner, 2026-11-21: Android keeps Google's own identity (no keys of ours under it, the "plate and papers" it would have without ferros), and it starts only when the attested identity chose it, by a reboot ferros triggers. A "Start into: ferros / Android" setting on the Settings page is that person's standing choice for the device, beside a "start Android now" action. Production builds have no gate screen at all: ferros boots, attests, then reboots into Android when the person chose it. Development builds keep the 1 s gate with its override (volume down Android, volume up hold), its untouched second following the person's setting.
 
@@ -341,7 +354,7 @@ The owner, 2026-11-22: "this one time flashey thing is annoying. We should have 
 
 **The USB development doors close in a production build (2026-10-28).** With `FERROS_PRODUCTION=1`, the PT dispatch answers only a reboot and a plain DIAG (status, no secrets), and refuses everything else: reload, run, memory read and poke, the vault store, the display read, spawn, seal, and every DIAG subcommand. ABL checks only what it boots, so without this a cable could replace the running kernel of a locked phone. One gate at the top of the dispatch (service.rs); dev builds compile it out. The portal (STATUS.md 7) will grant those verbs back to the owner's identity.
 - **Tested** by hot-loading a production kernel into RAM: the plain DIAG answered, `diag keys` and a memory read got the refusal, a reload was refused (the phone stayed on it), and a reboot brought back the flashed dev build. The bridge does not expect a refusal mid-transfer and lost step after the refused reload; the next command was fine.
-- **Do not flash a production build unattended:** its "Ready?" gate waits for the power key (dev builds auto-choose after a second).
+- A production build has no "Ready?" gate since 2026-11-24 ("Production: straight to ferros"); before that it waited for the power key.
 
 **Signed and unlocked: done (2026-10-28).** ABL verified slot b's whole chain under the owner's key, still unlocked: the next boot's record reads `Last AVB: avb_ret=OK`, `avb_veritymode=enforcing`, `avb_error_parts=` (none), and `boot_state: 160000:20260505:20260505` (OS 16, both security patch levels, which ABL could not find while verification was off).
 - **How it is built:** in Rust, `ferros-mkimg` (tools/mkimg/src/avb.rs), not avbtool.

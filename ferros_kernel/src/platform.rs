@@ -956,6 +956,8 @@ pub fn before_reset() {
 }
 
 /// ANDROID_ONCE (ferros_hv gate.rs, "ANDROID1" at G#FD60_0FF8 in the ramoops page): the hv's gate at the next boot goes on into Android, once. The only way into Android (owner, 2026-11-21): left by the service loop on the attested identity's choice (service.rs `ANDROID_REQ`), and by a development gate's volume down (main.rs). Cleaned to DRAM, since the gate reads it with the caches off; Android cannot write that page (the hv maps it read-only), so it cannot leave the word for itself.
+/// Not in a production build, so nothing there can leave the word (owner, 2026-11-24: pure ferros, no Android beside it); a production hv honours no word either (ferros_hv gate.rs `ask`).
+#[cfg(not(ferros_production))]
 pub fn android_once() {
     unsafe {
         let p = 0xFD60_0FF8usize as *mut u64;

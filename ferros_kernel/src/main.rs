@@ -2379,7 +2379,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     // The gate chose Android (development builds only: volume down at this gate or at the hv's; a production build has no gate): the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault), ANDROID_ONCE left for the hv's gate, slot a active, then a plain reset. Android lives on slot a on both boards (akita's since 2026-11-18, BOARDS.md), whose hv gate takes the word and goes to Android, once. The way back is a reboot: no word, so the gate gives ferros (owner, 2026-11-21: Android starts only by ferros's hand).
     // Cleaned to DRAM, since the gate reads it with the caches off.
-    if cfg!(not(ferros_production)) && gate_choice == ready::Choice::Android && link_up {
+    #[cfg(not(ferros_production))]
+    if gate_choice == ready::Choice::Android && link_up {
         if slot::set_active(0) == slot::MARKED {
             platform::android_once();
             platform::crumb(0xC7);
@@ -2492,7 +2493,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     // On akita only through the hv's gate, which shares Android's slot (b) as husky's does: there an unmarked slot loses a retry at every ferros boot, and ABL retires Android's slot with it. A bare ferros (tools/akita-boot.sh, slot a) stays unmarked, so ABL falls back to slot b's Android (the way out) when it does not boot.
     let through_hv = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) != 0;
-    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && (!board::akita() || through_hv) {
+    // A production build marks on akita too, bare (no hv) as it is hosted: there is no Android slot to fall back to (owner, 2026-11-24: pure ferros), and the A/B updater needs the booted slot marked so a bad update falls back to the last good one (docs/FLASHER.md "Updating while locked").
+    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && (!board::akita() || through_hv || cfg!(ferros_production)) {
         let m = slot::mark_booted_slot(dtb_addr);
         if m.result == slot::MARKED || m.result == slot::ALREADY {
             checklist::mark(checklist::Item::Slot);

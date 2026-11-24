@@ -912,6 +912,8 @@ pub fn recovery_ask_read() {
 }
 
 /// RECOVERY_ONCE for the hv's gate (ferros_hv gate.rs: the gate refuses a recovery boot without it; no reflash without the handle, owner 2026-11-01), cleaned to DRAM, then the reset into the bootloader's recovery mode. Returns only when the EL3 monitor refused the reboot mode (its answer).
+/// Not in a production build: it has no way into Android or its recovery (owner, 2026-11-24: "we do not support Android dual boot. Period.").
+#[cfg(not(ferros_production))]
 fn recovery_once_reset() -> u64 {
     unsafe {
         let p = 0xFD60_0FF0usize as *mut u64;
@@ -923,6 +925,7 @@ fn recovery_once_reset() -> u64 {
 }
 
 /// The person said yes to Android's request (the service loop, a person present): misc read again, and only while it still asks what the person was shown and that is theirs to allow, RECOVERY_ONCE and the reset into recovery. misc is not touched: recovery reads the arguments Android left and does what it asked.
+#[cfg(not(ferros_production))]
 fn recovery_yes() {
     let ask = RECOVERY_ASK.load(core::sync::atomic::Ordering::Acquire);
     if !recovery_allowable(ask) {
@@ -3662,11 +3665,15 @@ pub fn run(mut b: Boot) -> ! {
         match RECOVERY_ANSWER.swap(0, core::sync::atomic::Ordering::AcqRel) {
             0 => {}
             _ if !crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) => crate::flashlog::line("recovery: an answer with no one present: not taken"),
+            #[cfg(not(ferros_production))]
             1 => recovery_yes(),
+            #[cfg(ferros_production)]
+            1 => crate::flashlog::line("recovery: yes refused: a production build has no way into Android's recovery"),
             _ => recovery_no(),
         }
         // The person's standing choice, once, at the first attest of a boot nobody answered (`START_INTO`): Android when they chose it and this device allows it.
-        #[cfg(not(shim_handoff))]
+        // Neither this nor the launch below is in a production build (owner, 2026-11-24: pure ferros, no Android beside it).
+        #[cfg(not(any(shim_handoff, ferros_production)))]
         if START_INTO.load(core::sync::atomic::Ordering::Relaxed) && crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) {
             START_INTO.store(false, core::sync::atomic::Ordering::Relaxed);
             let android = crate::settings::START_ANDROID.load(core::sync::atomic::Ordering::Relaxed);
@@ -3680,7 +3687,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // A launch of Android the attested identity chose (the "Start into" setting, "start Android now" on the Settings page, the `android` switch): the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         // Android's own recovery request first (a factory reset, RescueParty, an update left in misc; owner, 2026-11-22): the launch waits until the person has answered it on the Android page, and is never the answer itself, so a wipe they asked for in Android is never cleared on the way past. Their no clears it and the launch goes on; their yes resets into recovery instead.
-        #[cfg(not(shim_handoff))]
+        #[cfg(not(any(shim_handoff, ferros_production)))]
         if ANDROID_REQ.load(core::sync::atomic::Ordering::Acquire) {
             let held = || {
                 if !ANDROID_HELD_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {

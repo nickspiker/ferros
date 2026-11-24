@@ -48,7 +48,7 @@ fn main() {
     if usb_capsule.exists() {
         println!("cargo:rustc-cfg=ferros_usb_capsule");
     }
-    // FERROS_PRODUCTION: the "Ready?" gate waits for the power key (dev builds auto-press after two seconds).
+    // FERROS_PRODUCTION: no "Ready?" gate (straight to ferros), no development doors, no way into Android (docs/BOOT.md "Production: straight to ferros", "Production: pure ferros, no Android").
     if std::env::var("FERROS_PRODUCTION").is_ok() {
         println!("cargo:rustc-cfg=ferros_production");
     }

@@ -364,11 +364,19 @@ fn no_ferros() -> Choice {
 
 /// Ask. The hv goes on into Android only on ferros's word: ANDROID_ONCE for a normal boot, RECOVERY_ONCE for a recovery boot (owner, 2026-11-21: Android starts only when the attested identity chose it, by a reboot ferros triggers; the words live in a page Android cannot write, main.rs `stage2_protect`). Everything else is ferros, or fastboot when no ferros is packed (`no_ferros`).
 /// A recovery boot without its word goes to ferros (telemetry how = 4); the power + volume up chord's FERROS_ONCE goes to ferros without asking (how = 5).
-/// A production build shows nothing and asks nothing: ferros (how = 7). A development build shows the gate: power = ferros, the second untouched = ferros, volume down = Android by way of ferros (how = 3: ferros reads the answer and leaves ANDROID_ONCE before the vault opens, then resets, so this hv still starts Android only on the word), volume up holds.
+/// A production build shows nothing, asks nothing and honours no word for Android or recovery: ferros (how = 7), or fastboot with no ferros packed. A development build shows the gate: power = ferros, the second untouched = ferros, volume down = Android by way of ferros (how = 3: ferros reads the answer and leaves ANDROID_ONCE before the vault opens, then resets, so this hv still starts Android only on the word), volume up holds.
 /// What the untouched second gives follows the person's "Start into" setting, which lives in the vault this gate cannot read: ferros takes the timer's answer (how = 2) as "no one chose", and after the attest reboots into Android when the person's setting says Android (ferros_kernel service.rs `START_INTO`).
 pub fn ask(dtb: usize) -> Choice {
     let packed = ferros_image().is_some();
     let (android, recovery_once, ferros_once) = take_once();
+    // A production build never starts Android or its recovery, whatever word was left (owner, 2026-11-24: "Default pure ferros, we do not support Android dual boot. Period."): ferros, or fastboot when no ferros is packed.
+    if PRODUCTION {
+        if !packed {
+            return super::chord::to_fastboot(b"\nferros hv: gate -- production, no ferros packed: fastboot\n");
+        }
+        gate_telemetry(7, 0, 0);
+        return Choice::Ferros;
+    }
     if recovery(dtb) {
         if recovery_once {
             return Choice::Android;
@@ -396,10 +404,6 @@ pub fn ask(dtb: usize) -> Choice {
     }
     if ferros_once {
         gate_telemetry(5, 0, 0);
-        return Choice::Ferros;
-    }
-    if PRODUCTION {
-        gate_telemetry(7, 0, 0);
         return Choice::Ferros;
     }
     // The power pin as a plain input (ABL may leave it as a wakeup interrupt; Linux sets it up again).
