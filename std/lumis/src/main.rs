@@ -421,6 +421,13 @@ fn src_is_slit(got: &Got) -> bool {
     matches!(got, Got::Slit { .. })
 }
 
+/// Whether the camera records a stacked CLIP (the owner, 2026-11-23: two controls; an exposure of two of the camera's fastest frames or more stacks them, a clip frame each exposure): CLIP, not Slitscan (its slits are their own open), and an exposure at least twice the readout's fastest frame (its line times fll_least). Such a clip is never paced at the open (the camera runs at its fastest, its frame held to the exposure by SET 5) and is recorded by `stack`, not the paced recorder.
+fn stacked_clip(header: &[u64], cam: &camera::Camera) -> bool {
+    let fastest_ns = cam.line.map_or(0, |l| l.ns_of(l.fll_least));
+    let exposure_ns = (f64::from_bits(header[lumis_core::shared_memory::EXPOSURE_TIME_MS_IDX]) * 1e6) as u64;
+    lumis_core::shared_memory::is_clip(header) && !wants_slits(header) && fastest_ns > 0 && exposure_ns >= 2 * fastest_ns
+}
+
 /// Whether the integrator wants slits: Slitscan, and no calibration (its darks are whole frames).
 fn wants_slits(header: &[u64]) -> bool {
     header[CURRENT_MODE_IDX] == RawMode::Slitscan as u64 && header[FLAGS_IDX] & CALIBRATING_BIT == 0
@@ -1387,7 +1394,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         // A rate whose open the driver refused is not asked again until another is chosen (the camera then stays at whole frames as ever, and the note under RECORD says why).
         // Paced for a clip (CLIP, lumis_core `is_clip`: what was the RAW video mode), but not in Slitscan, whose slits are its own open.
-        let want = if video_ok && lumis_core::shared_memory::is_clip(&integrator.header) && !wants_slits(&integrator.header) { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
+        let want = if video_ok && lumis_core::shared_memory::is_clip(&integrator.header) && !wants_slits(&integrator.header) && !stacked_clip(&integrator.header, &cam) { Some(video_fps(&integrator.header)).filter(|&f| refused_fps != Some(f)) } else { None };
         if refused_fps.is_some_and(|f| Some(f) != Some(video_fps(&integrator.header))) {
             refused_fps = None;
         }
@@ -1647,7 +1654,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         {
             use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX, VIDEO_LEFT_S_IDX};
-            if video_ok && dev_knobs4() & (DEV_VIDEO | DEV_VIDEO_IDLE) == DEV_VIDEO && frames == 16 && paced.is_some() {
+            // A stacked clip too (an exposure asked, `dev_exposure_ms`), which is never paced.
+            if video_ok && dev_knobs4() & (DEV_VIDEO | DEV_VIDEO_IDLE) == DEV_VIDEO && frames == 16 && (paced.is_some() || stacked_clip(&integrator.header, &cam)) {
                 integrator.header[FLAGS_IDX] |= RECORDING_BIT;
             }
             let asked = integrator.header[FLAGS_IDX] & RECORDING_BIT != 0;
@@ -1687,7 +1695,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                     lumis_core::platform::set_video_note(Some("RAW video needs the GPU, which is not running".into()));
                     integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
                 }
-                (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) if head.count as u64 >= paced_from => {
+                (true, false, false, Some(fps), Got::Frame(head, Taken::View(rows))) if head.count as u64 >= paced_from && !stacked_clip(&integrator.header, &cam) => {
                     let h = &integrator.header;
                     let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX], h[lumis_core::shared_memory::VIDEO_SPACE_USED_IDX]);
                     let pacing = pace(fps);
@@ -1852,7 +1860,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         // A stacked CLIP's cadence exact (the owner, 2026-11-23: "always floor and use that"): the camera's frame held at the exposure / n, n the whole frames of the longer of the shutter and the camera's fastest frame that fit in the exposure, so n frames fill it exactly (`set_frame`), and the integrator told n (`set_frames_held`). An exposure under two of the camera's fastest frames is one frame each, paced at the open as ever; every other mode runs at the fastest: no hold.
         let fastest_ns = cam.line.map_or(0, |l| l.ns_of(l.fll_least));
         let exposure_ns = (f64::from_bits(integrator.header[lumis_core::shared_memory::EXPOSURE_TIME_MS_IDX]) * 1e6) as u64;
-        let want_hold = (lumis_core::shared_memory::is_clip(&integrator.header) && !src.is_slit() && fastest_ns > 0 && exposure_ns >= 2 * fastest_ns).then(|| {
+        let want_hold = (stacked_clip(&integrator.header, &cam) && !src.is_slit()).then(|| {
             // WHY the maxes: a frame is never shorter than the camera's fastest; a shutter longer than the exposure (capped only while recording) is the exposure's one frame.
             let n = (exposure_ns / (shutter_ns as u64).max(fastest_ns)).max(1);
             (exposure_ns / n, n)
