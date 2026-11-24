@@ -1,10 +1,10 @@
 # Kists device to device
 
-Status: design for the owner, 2026-11-24; three of its questions answered the same day ("Decided" below). Nothing here is built; founding rules say a design goes to the owner first. The decisions it builds on are the owner's of 2026-11-24 (memory kist_distribution_p2p): "where do we host the list? fgtw.org bootstrap I suppose? and then with clients? This is part of the bittorrent like network for distributing. I'd presume if my desktop has a copy and a friend wants it, I can serve it directly rather than going to brobdingnagian."
+Status: design for the owner, 2026-11-24; five of its questions answered the same day ("Decided" below). Nothing here is built; founding rules say a design goes to the owner first. The decisions it builds on are the owner's of 2026-11-24 (memory kist_distribution_p2p): "where do we host the list? fgtw.org bootstrap I suppose? and then with clients? This is part of the bittorrent like network for distributing. I'd presume if my desktop has a copy and a friend wants it, I can serve it directly rather than going to brobdingnagian."
 
 What it covers: how kists and pucks spread from device to device the way BitTorrent spreads files, built on what exists: the directory on R2, the fleet's capsule source, Photon Transport, the stower's checks and the BLAKE3 tree ferros_kist already walks. Words: a kist's capsule is the developer's signed VSF file (KISTS.md "Trust on first stow"); a puck is a kist too, so everything here applies to pucks unchanged.
 
-The shape in one paragraph: a capsule is named by its BLAKE3 and signed by its developer, so the bytes are as good from a friend's device as from fgtw.org. The list of what exists is a bag of small developer-signed entries; fgtw.org holds the first copy and devices hand newer entries to each other when they meet. A fetch asks the person's own devices first, then their people's, then the local network, then the web, takes pieces from several of them at once, and checks every piece against the capsule's BLAKE3 tree as it lands. A device serves only what it has stowed, keeps nothing extra, and serves strangers only when the person opted in.
+The shape in one paragraph: a capsule is named by its BLAKE3 and signed by its developer, so the bytes are as good from a friend's device as from fgtw.org. The list of what exists is a bag of small developer-signed entries; fgtw.org holds the first copy and devices hand newer entries to each other when they meet. A fetch asks the person's own devices first, then their people's, then the local network, then the web, takes pieces from several of them at once, and checks every piece against the capsule's BLAKE3 tree as it lands. A device serves only what it has stowed and keeps nothing extra; it serves its fleet and the person's people as they ask, and strangers too, by default on WiFi while plugged in ("think bittorrent"). Developers append their own signed entries to fgtw.org's list, with no gatekeeper.
 
 ## Decided (owner, 2026-11-24)
 
@@ -15,6 +15,13 @@ The shape in one paragraph: a capsule is named by its BLAKE3 and signed by its d
   - Commons-key kists (Photon, and possibly other system apps, signed with a project key: kist_keys_follow_ownership) are hosted in the `kists` bucket at kists.fgtw.org.
   - So the web rung is per developer, not one bucket: each entry carries where its capsule lives on the web (`web`, 1.0), and fgtw.org lists entries without holding every capsule.
   - **Photon's deploy changes** (the Photon session's to make, recorded here): it uploads the ferros capsule to the holdmyoscilloscope bucket today (`photon/v<n>/photon-messenger-ferros-arm64-release.vsf`); it should go to the `kists` bucket at kists.fgtw.org, with Photon's entry naming it there.
+- **"Support the network"** (open question 6): "and support network is per device, yes, and it's actually enabled. Limit to WiFi and when plugged in by default but without clients supporting... think bittorrent."
+  - A switch per device, ON by default.
+  - By default a device serves strangers only on WiFi and while plugged in; both conditions become the person's to change later.
+  - The fleet and the person's people are served as before (3.0). Strangers are served by default under those two conditions (3.0 to 3.2, 5).
+- **Developers append to fgtw.org's list** (open question 12): "fgtw.org is just the bootstrap/phonebook and host for a few things. devs should be able to append to that list at will."
+  - Any developer appends their own signed entries themselves, with no gatekeeper (the pandok rule: no account, no approval, no fee). Designed now, in 1.6, and built with the entry format in phase 1, not after phase 3.
+  - fgtw.org's role: the bootstrap and phonebook, and host for a few things (the commons kists' capsules). It checks signatures and keys; it never judges content.
 - Every other open question in section 7 is still open.
 
 ## 0. What exists today
@@ -37,7 +44,7 @@ The shape in one paragraph: a capsule is named by its BLAKE3 and signed by its d
 **Missing:**
 - every stowable capsule on its developer's web host (the restore has nowhere else to go when the fleet is silent): the owner's own kists on holdmyoscilloscope, commons kists on kists.fgtw.org ("Decided" above); Photon's ferros capsule is on holdmyoscilloscope today and moves to kists.fgtw.org (Photon's deploy);
 - the stower reading a manifest entry (Photon's manifest writes `platform` and `arch` as `x`, which a no_std stower cannot decode: KISTS.md "Open"), so Photon is not in the directory;
-- a developer-signed entry of its own (today the directory's entries are written and vouched for by whoever runs kistcat);
+- a developer-signed entry of its own (today the directory's entries are written and vouched for by whoever runs kistcat), and a way for a developer to append one to fgtw.org's list without the owner;
 - a developer's key hand-off or revocation (KISTS.md "Whose key signs a kist", the custody gap);
 - contacts as a source, the local network beyond the fleet, several sources at once, verification per piece, resuming;
 - any serving policy beyond "a member of the same fleet";
@@ -56,15 +63,15 @@ One kist version, as its developer states it: a complete VSF file signed by the 
 - `about` (`a`), `icon` (`hb`, the icon's own BLAKE3, fetched like a capsule; today a path);
 - `web` (`nu`, one or more): plain-http URLs where the developer hosts the capsule, the web rung of the fetch (decided 2026-11-24: per developer). The owner's own kists name brobdingnagian.holdmyoscilloscope.com, commons kists name kists.fgtw.org. Where the bytes come from is never trusted: they are checked against the entry's BLAKE3 and the capsule's own signature, as from any peer.
 
-About 10 KB, most of it the SPHINCS+ egg (7856 bytes). `kistcat kist` writes it beside the capsule in the same run with the same key (`--entry <out>`); Photon's deploy writes one thru tools/photon-capsule.sh as it signs the capsule. At stow the capsule's own signed declaration must agree with the entry (developer, option, name, version); one that does not is refused and the entry dropped.
+About 10 KB, most of it the SPHINCS+ egg (7856 bytes). `kistcat kist` writes it beside the capsule in the same run with the same key (`--entry <out>`); Photon's deploy writes one thru tools/photon-capsule.sh as it signs the capsule. Either then appends it to fgtw.org's list (1.6). At stow the capsule's own signed declaration must agree with the entry (developer, option, name, version); one that does not is refused and the entry dropped.
 
 Metrics are not in an entry: they are about the kist, not the developer's word, and stay in the directory's `metrics` sections by developer and option.
 
 ### 1.1 The bootstrap copy: fgtw.org
 
-kists.fgtw.org keeps the directory as today, its content changed: per kist the newest entry, carried byte for byte (one `v` blob per entry, as Photon's `release_tell` carries its manifest), plus the `metrics` sections. The directory's own signature (the ferros project key, once chosen) then says only "fgtw.org held these at this time"; every entry verifies on its own whoever passed it. kistcat builds it from entry files as it builds it from capsules today. fgtw.org lists entries whose capsules live elsewhere (the owner's on holdmyoscilloscope) and hosts only commons capsules itself. The manifest pointer form goes: one entry form for every developer (decided 2026-11-24, "One entry format, yes.").
+fgtw.org is the bootstrap and phonebook, and host for a few things (decided 2026-11-24). kists.fgtw.org keeps the directory as today, its content changed: per kist the newest entry, carried byte for byte (one `v` blob per entry, as Photon's `release_tell` carries its manifest), plus the `metrics` sections. Every entry verifies on its own whoever passed it, so a signature over the whole directory would say only "fgtw.org held these at this time" (open question 14). Entries arrive by developers appending them (1.6), not by kistcat run by the owner. fgtw.org lists entries whose capsules live elsewhere (the owner's on holdmyoscilloscope) and hosts only commons capsules itself. The manifest pointer form goes: one entry form for every developer (decided 2026-11-24, "One entry format, yes.").
 
-A device reads the bootstrap copy when the person browses the Kists page's "available" (as now), at a stow, and on the freshness events of section 4. It keeps from it only the entries of kists the person has stowed (1.4).
+A device reads the bootstrap copy when the person browses the Kists page's "available" (as now), at a stow, and on the freshness events of section 4. Once anyone can append, the list is read in pages and by search, and an entry by its developer and option, never the whole bag at once, so what a device fetches follows what the person looks at, however long the list grows. It keeps from it only the entries of kists the person has stowed (1.4).
 
 ### 1.2 Passing entries between devices
 
@@ -98,6 +105,33 @@ Two more signed records, passed with entries and ahead of them (a device always 
 **Theft.** A stolen key can sign updates and could hand off to the thief's key. The defence is pre-rotation: a developer's bundle commits to its successor (`next`, the commitment `KeyBundle::commit` of the next bundle, kept offline), and a hand-off is taken only when the new bundle matches the old bundle's `next`. The thief, lacking the next key, cannot hand off; the developer, holding it, hands off and so cuts the stolen key off on every device the record reaches. Bundles today carry no `next` (open question 1). Without it, two hand-offs from one key are refused both and the person is told.
 
 **What a revocation does to a stowed kist:** it keeps running as checked and sealed; no update is offered; its card says its developer withdrew the key (decided 2026-11-24, "revoked key, also yes."). Stopping or unstowing it stays the person's choice.
+
+### 1.6 Developers append to fgtw.org's list
+
+Owner, 2026-11-24: "fgtw.org is just the bootstrap/phonebook and host for a few things. devs should be able to append to that list at will." No gatekeeper, no account, no approval, no fee (the pandok rule, kist_catalog). Built with the entry format, in phase 1.
+
+**The endpoint.** `POST http://kists.fgtw.org/append`, the body one complete VSF record exactly as the developer signed it: an entry (1.0), a hand-off or a revocation (1.5). Plain HTTP serves a ferros device and costs nothing, since the record carries its own signatures; the same path answers over HTTPS for desktops. `kistcat publish <record>` sends it; `kistcat kist --entry` and Photon's deploy end with it. The answer is a small VSF reply (`taken`, or `refused` with `why` in words), so a developer sees exactly why.
+
+**What fgtw.org checks**, in order, cheapest first, so junk costs it least:
+0. The shape: a complete VSF file that parses as one of the three records, every field of its type, nothing missing. A body that is not one is refused unread past that.
+1. The signature: the Ed25519 egg against the header's `ke` first, then Falcon-512, then SPHINCS+, every egg against the `kb` the record carries, and that `kb`'s Ed25519 key the header's. The same verification fgtw-bootstrap's Worker already runs on fleet frames (the fgtw crate in wasm, `fgtw::pq`).
+2. The same developer key across versions: fgtw.org pins, per developer Ed25519 key, the bundle commitment (`KeyBundle::commit`) of the first record it took from that key, as a person's devices pin it (trust on first stow). A later record under that key with another bundle is refused, unless a hand-off fgtw.org took moved the pin. With pre-rotation (open question 1) a hand-off is taken only to the bundle the old one named as `next`.
+3. Revocations and hand-offs: under a revoked key, nothing more is taken, ever (the revocation itself is kept and served). After a hand-off, nothing more under the old key.
+4. Newest only: per (developer, option), an entry is taken only when its version is newer by the stage rule than the one held, and it replaces that one. The same version naming another capsule is refused as the developer's own equivocation. Two appends racing for one kist are settled by R2's conditional put on the held object, so the newest stays whatever the order.
+
+**What fgtw.org never does:** judge content. No review, no category, no name policy, no ranking, no removal for what a kist is or says. Two developers may list kists of the same name: a kist's identity is its key and option, and the page shows the key's first bytes beside the developer's self-given name. It does not fetch or check the capsule either: whether the bytes at `web` exist and match is the device's check at stow (2.4), and a dead link only means the peers carry it or nobody does. A developer's own revocation is the only way an entry stops being served as current.
+
+**What it stores:** one R2 object per (developer, option), the newest entry; per developer key, its pin and its key records. Updates replace, so storage grows with the number of kists, never with their versions. The directory (1.1) is assembled from these objects.
+
+**Bounding the cost without bans or invented quotas.** What a listing costs fgtw.org is real: one Worker run with signature checks, about 10 KB of R2 per kist, and the reads of whoever looks. Bounded by what it is, not by a number picked in advance:
+- updates replace, so an active developer costs one object per kist however often they publish;
+- the checks run cheapest first, so a forgery or junk dies at the shape or the Ed25519 egg, before Falcon and SPHINCS+;
+- fgtw.org fetches nothing on a developer's behalf and hosts no capsule it was not given by a commons project's own deploy (1.1, "Decided": hosting per developer), so an entry costs its 10 KB and no more;
+- devices read the list in pages and by search (1.1), and are never handed an entry by gossip for a kist they did not choose (1.2), so a flood of listings costs devices nothing until a person looks;
+- the requests themselves meet Cloudflare's own limits, which fgtw.org pays for at cost (fgtw_duna_runanga).
+What is not designed: a flood of new keys, each listing kists, grows R2 without end. If that ever costs more than the DUNA's at-cost budget covers, the choices are the owner's (open question 15), and none of them is a ban list.
+
+**What the page and the device show** of an appended entry: its name, developer's name and key's first bytes, version and about, as they show today; the device's checks at stow are the trust, as before ("It vouches for nothing", KISTS.md).
 
 ## 2. Fetching
 
@@ -164,8 +198,8 @@ The framing rule (feedback_vsf_not_for_framing): control is complete signed VSF,
 
 - **The fleet**: the members heard (built).
 - **People**: their devices heard on this network (their beacons carry their handle proof, which the person's `PERSON` facts know), and once there is a WAN peer path, their devices' last-known addresses. The peer path itself is Photon's open gap (photon_on_ferros_no_bootstrap: FindNode and Query exist, no peer answers them).
-- **The local network** (phase 3): a signed `capsule_who` (the capsule's BLAKE3) to the beacon groups and the subnet broadcast on 4384, answered with a unicast `capsule_have` only by a device that holds it whole and may serve the asker (3.0). Nobody announces what they hold unasked.
-- **Strangers beyond the local network**: not in this design. Later, the FGTW peer network's own lookup among devices that opted in; never a tracker at fgtw.org listing who runs what (open question 9).
+- **The local network** (phase 3): a `capsule_who` (the capsule's BLAKE3, signed with a key made for that one fetch, 3.1) to the beacon groups and the subnet broadcast on 4384, answered with a unicast `capsule_have` by a device that holds it whole and serves strangers now (support the network on, on WiFi, plugged in: 3.0). Since support the network is on by default, most ferros devices on a network are sources. Nobody announces what they hold unasked.
+- **Strangers beyond the local network**: not in this design. Later, the FGTW peer network's own lookup among devices that serve; never a tracker at fgtw.org listing who runs what (open question 9).
 
 ## 3. Serving
 
@@ -175,24 +209,35 @@ The framing rule (feedback_vsf_not_for_framing): control is complete signed VSF,
 |---|---|---|
 | the person's own devices | always | a member of the chain under the same handle proof, not locked out (`capsule_member`, built) |
 | the person's people | on by default, one switch off | the asking device's key in the fleet of a `PERSON` fact (fgtw::people) |
-| anyone | only with "support the network" on | the device's own switch, off by default |
+| anyone | by default, while on WiFi and plugged in | "support the network", a switch per device, ON by default (decided 2026-11-24) |
 
-"Support the network" is its own switch, apart from custodians: custodians are a trust choice about named people for recovery; serving is a contribution to strangers (owner, 2026-11-24). It may later also cover relaying and bootstrap. Recommended per device, not per person (open question 6), since it is about this device's link and power.
+"Support the network" is its own switch, apart from custodians: custodians are a trust choice about named people for recovery; serving is a contribution to strangers (owner, 2026-11-24). It may later also cover relaying and bootstrap. It is per device and on: "and support network is per device, yes, and it's actually enabled. Limit to WiFi and when plugged in by default but without clients supporting... think bittorrent." A swarm works only when the clients serve, so the default is to serve.
+- **The two conditions**, both by default, both the person's to change later: the reply leaves on WiFi (3.2), and the device is on external power (the charger's input present, CHARGING.md). Off the charger or off WiFi, a stranger's want is answered with none, and a run already going stops at its next piece; the asker's scheduler moves it to another source (2.2).
+- **Where the switch sits:** the device's Network page; its two conditions beside it once they are adjustable.
+- **The fleet and the person's people** are not under this switch: they are served as the table says, the fleet on any link, people on WiFi (3.2), plugged in or not.
 
 ### 3.1 What a request reveals, and to whom
 
-- **A want** shows the asked device which capsule (so which kist and version) and which device asks. Fleet and people: their device key, so the person, as every frame between them already does. To a stranger under support the network: a key made for that one fetch, never the device's key, since the server needs no identity to serve public bytes.
-- **A who-has** shows everyone on the local network that someone here wants that capsule, and from which address.
-- **A claim** shows the peer which kists and versions this device holds: only fleet and people get claims.
-- **A have** shows the asker that this device runs that kist. To a stranger, a device answers only for the capsule of the newest entry it holds: one running an old version it has not yet replaced does not tell strangers so.
+Strangers are served by default, so most asks go to strangers and most devices answer them. Keys follow from that:
+- **Asking the fleet and people** (unicast, to devices heard or known): signed with the device's key, so the person, as every frame between them already does; the server needs it to serve them under their rules.
+- **Asking anyone else** (a who-has, a want to a stranger): signed with a key made for that one fetch, never the device's key. The server needs no identity to serve public bytes, and the tree checks what comes back. A fleet device or one of the person's people that answers a who-has is then served by the stranger rules for that fetch; the device already asks those unicast first (2.0), so this costs little.
+- **Answering a stranger** (a `capsule_have`, the pieces): signed with the server's own one-fetch key, so a stranger learns that some device at that address holds the capsule, not whose device it is.
 
-The threat model is harm, not being seen (threat_model_harm_not_observation); the one harm here is pointing an attacker at a device behind on an update, and the last rule closes it for strangers.
+What each reveals, and to whom:
+- **A want** shows the asked device which capsule (so which kist and version) is wanted, and from which address; to the fleet and people, by whom.
+- **A who-has** shows everyone on the local network that someone at that address wants that capsule.
+- **A claim** shows the peer which kists and versions this device holds: only the fleet and people get claims, never a stranger.
+- **A have** shows the asker that a device at that address runs that kist. Since strangers are served by default, any device on the network can ask; so a device answers a stranger only for the capsule of the newest entry it holds: one running an old version it has not yet replaced is silent to strangers about it.
+
+The threat model is harm, not being seen (threat_model_harm_not_observation). With serving on by default, the harm to close is pointing an attacker at a device behind on an update, and the have rule closes it; what a device runs today, at its newest, is otherwise as public as the kist itself.
 
 ### 3.2 Which link
 
 WiFi preferred, cellular off for serving by default ("Whatever. WiFi preferred", owner, 2026-11-24), granular later:
 - the fleet is served on any link (the person's own restore; open question 7);
-- people and strangers only when the reply would leave on WiFi. ip needs a per-send flag, "WiFi only, else not at all", so the answer is refused rather than quietly carried on cellular when WiFi drops mid-transfer;
+- people only when the reply would leave on WiFi;
+- strangers only on WiFi and while plugged in (decided 2026-11-24: "Limit to WiFi and when plugged in by default");
+- ip needs a per-send flag, "WiFi only, else not at all", so an answer is refused rather than quietly carried on cellular when WiFi drops mid-transfer;
 - fetching is allowed on either link, WiFi preferred: the person asked for the kist.
 
 ### 3.3 Desktops
@@ -224,9 +269,10 @@ A device whose every source is controlled by one party (its network and its peer
 
 - **Bad pieces:** a piece that fails its leaf drops its source for this fetch, and the piece goes to another. A fleet device that does it is a bug or a compromise: the Fleet page tells the person. A person's device or a stranger: the device stops asking that key for the rest of this boot; nothing is written down beyond that and nothing is shared.
 - **Bad entries and records:** one that does not verify is dropped, and the peer that sent it gets no more of this device's attention on this link.
-- **Too many asks:** rate by what is real, not by made-up quotas. The stower answers one want at a time (fgtw queues them, built), in order fleet, then people, then strangers; a stranger's want is answered only while nothing of the person's own waits, on WiFi, and never faster than the PT window to that asker drains. A queue that outgrows what the uplink drains refuses strangers first. Nothing here is a constant to tune.
+- **Too many asks:** rate by what is real, not by made-up quotas. The stower answers one want at a time (fgtw queues them, built), in order fleet, then people, then strangers; a stranger's want is answered only while nothing of the person's own waits, on WiFi and on the charger (the defaults, 3.0), and never faster than the PT window to that asker drains. A queue that outgrows what the uplink drains refuses strangers first. Nothing here is a constant to tune.
 - **Spoofing:** a want with a forged address draws one SPEC (2.5); a want under someone else's key fails its signature.
-- **No central bans.** Each device decides from what it saw; no list of bad peers exists anywhere, fgtw.org included. A bad developer is the person's call (unstow, and the pin keeps their other kists recognisable).
+- **Floods of listings at fgtw.org:** bounded by what a listing really costs, not by quotas (1.6).
+- **No central bans.** Each device decides from what it saw; no list of bad peers or bad developers exists anywhere, fgtw.org included (it refuses records that do not verify, never developers). A bad developer is the person's call (unstow, and the pin keeps their other kists recognisable).
 
 ## 6. Phased build
 
@@ -244,13 +290,14 @@ Test (IDENTITY-SPACE.md "The two-device test", unchanged): the Pro and a sibling
 
 ### Phase 1: people
 
-Build: a person's devices as a source (their beacons matched to `PERSON` facts; the stower's asks to them after the fleet's); the serving switch for people; the claims and entries exchange between fleet and people, with the entry format (1.0), `kistcat kist --entry`, and Photon's deploy writing its entry; `kists.entries`.
+Build: a person's devices as a source (their beacons matched to `PERSON` facts; the stower's asks to them after the fleet's); the serving switch for people; the claims and entries exchange between fleet and people, with the entry format (1.0), `kistcat kist --entry`, and Photon's deploy writing its entry; `kists.entries`; fgtw.org's append endpoint (1.6) with `kistcat publish`, and the directory assembled from appended entries, read in pages.
 
 Test: two devices of two identities that are each other's people (with the owner's choice of identities), on one network.
 0. Device A stows the Clock from the directory; B lacks it; B stows it: A serves it, B's console names a person's device as the source, and it runs.
 1. A's people switch off: A answers none, B goes on to fgtw.org.
 2. A third device of neither person asks A: refused.
 3. A newer Clock entry given to A only: on the next link edge B is handed it and offers the update, without fgtw.org.
+4. The append, from the dev box with a test developer key: `kistcat publish` of an entry is taken and shows in the device's "available"; a newer version replaces it; an older one, one under the same key with another bundle, a forged one (a byte flipped) and one after that key's revocation are each refused with their why; the device stows the taken one from its `web`.
 
 ### Phase 2: pieces from several sources
 
@@ -266,17 +313,17 @@ Test: the Pro fetches Photon's capsule from a fleet sibling, a person's device a
 
 ### Phase 3: support the network, the local network, and the list between peers
 
-Build: the "support the network" switch and serving strangers under it (a one-fetch key on the asker's side); `capsule_who` and `capsule_have` on the local network; the list passed between all peers with key records first; `kist_handoff` and `kist_revoke`, and pre-rotation if approved.
+Build: the "support the network" switch, on by default, and serving strangers under it on WiFi and the charger (one-fetch keys on both sides, 3.1); `capsule_who` and `capsule_have` on the local network; the list passed between all peers with key records first; `kist_handoff` and `kist_revoke`, and pre-rotation if approved.
 
 Test:
-0. A device of neither person on the network with support the network on: a who-has is answered and it serves; switched off: silent.
+0. A device of neither person on the network, fresh (support the network at its default, on), on the charger and WiFi: a who-has is answered and it serves, and neither side's console shows the other's device key. Unplugged mid-transfer: it stops at the next piece and the asker finishes elsewhere. On cellular only: silent. Switched off: silent.
 1. A newer entry on fgtw.org that a peer withholds: opening the Kists page brings it from fgtw.org.
 2. A hand-off record for a test developer: the pin moves, the kist's answers and its place on the deck stay, its `ht` is unchanged, the next update under the new key stows; an entry under the old key is refused.
 3. A revocation: no update taken under the key, the kist runs on, its card says so.
 
 ## 7. Open questions for the owner
 
-Questions 0, 2 and 11 are answered ("Decided" at the top); the rest are open.
+Questions 0, 2, 6, 11 and 12 are answered ("Decided" at the top); the rest are open.
 
 0. **One entry form.** DECIDED 2026-11-24: "One entry format, yes." Photon included.
 1. **Pre-rotation.** Add `next` (the commitment of the successor bundle) to every developer bundle, so a stolen key cannot hand off? Recommended: yes, before more developers pin (the bundles out today, the owner's and Photon's release key's, rotate once by a hand-off to bundles that carry it).
@@ -284,11 +331,13 @@ Questions 0, 2 and 11 are answered ("Decided" at the top); the rest are open.
 3. **Same version, different capsule.** Keep the first, never switch, note it on the developer page? Recommended: yes.
 4. **Discovery thru people.** Should a device learn of kists its people run (not just updates to kists it holds)? Recommended: not now; it is a product question, and leaving it out keeps a stranger developer's flood to devices that chose them.
 5. **Serving partial capsules.** Recommended: no; only stowed and admitted, so nothing unchecked is ever relayed. It also keeps the scheduler free of who-has-which-piece.
-6. **"Support the network" per device or per person.** Recommended: per device, off by default, on the device's Network page: it is about this device's link, power and uplink, and a desktop and a device in a pocket differ.
-7. **Cellular.** The fleet served on any link, people and strangers on WiFi only, fetching on either? Recommended: yes, until the granular settings.
+6. **"Support the network."** DECIDED 2026-11-24: "and support network is per device, yes, and it's actually enabled. Limit to WiFi and when plugged in by default but without clients supporting... think bittorrent." Per device, on by default, strangers served on WiFi and while plugged in.
+7. **Cellular, for the fleet and people.** The fleet served on any link, people on WiFi only (plugged in or not), fetching on either? Recommended: yes, until the granular settings. (Strangers: decided, question 6.)
 8. **The desktop as a capsule source for its own fleet.** Should a desktop Photon keep the person's ferros capsules so the person's devices restore from it? Recommended: no (it runs none of them; "not bloat"); the folder rig is for the phase 0 test only.
-9. **Strangers beyond the local network.** Recommended: later, by the FGTW peer network's own lookup among devices that opted in, never a tracker at fgtw.org.
+9. **Strangers beyond the local network.** Recommended: later, by the FGTW peer network's own lookup among devices that serve, never a tracker at fgtw.org.
 10. **A doorbell at fgtw.org for updates** (a held call answered on change) for devices that meet no event. Recommended: not now; events cover a device in use, and a connection held open costs power on a device in a pocket. Revisit with measurements.
 11. **Where capsules are hosted.** DECIDED 2026-11-24, revised from "everything on kists.fgtw.org": "I'd put Lumis and Mahere on holdmyoscilloscope and make fgtw.org point there since those are mine. Photon and possibly some other system apps will be hosted at kists.fgtw.org since Photon is not mine." Per developer; the entry carries its `web` URL. Still open within it: whether the owner's other own-key kists (the pucks, Aemulus) go on holdmyoscilloscope as Lumis and Mahere do (recommended: yes, the same rule), and whether a stow over USB puts its capsule on the web at all (recommended: no; the fleet carries it, and publishing is the developer's act).
-12. **Listing without the owner** (passless listing): a fgtw.org endpoint that takes a developer's verified entry and capsule. R2 storage then costs money, which the DUNA prices at cost (fgtw_duna_runanga). Recommended: after phase 3; until then kistcat, run by the owner, is the door.
+12. **Listing without the owner.** DECIDED 2026-11-24: "fgtw.org is just the bootstrap/phonebook and host for a few things. devs should be able to append to that list at will." Designed in 1.6, built in phase 1: entries and key records only, no capsule upload.
 13. **The piece size.** 2^16, the size twin.rs and the fleet source already use. Recommended: fixed as a protocol constant (it is the tree's shape, not a ceiling).
+14. **The directory's own signature.** With developers appending at will, signing the assembled directory with the ferros project key would put that key's secret in the Worker, and would add nothing a reader can use: every entry verifies alone, and a signature cannot stop fgtw.org from leaving an entry out. Recommended: drop it (KISTS.md's plan to sign the directory, and its "not signed yet" line on the page, go); the project key then signs only the commons kists, as each project's own key.
+15. **If listings ever flood.** A flood of fresh keys, each listing kists, grows fgtw.org's R2 without end (1.6). Choices, none a ban list: (a) an at-cost price per stored listing, paid as any FGTW service is (fgtw_duna_runanga); (b) a developer key bound to an FGTW identity, so many listings cost many identities (Sybil cost thru TOKEN, as the DUNA's member unit question has it); (c) proof of work per new (developer, option), its cost set from fgtw.org's measured storage cost. Recommended: none until measured; build the append with storage per developer key counted, and bring the numbers to the owner if R2 grows past what the DUNA's budget covers. Of the three, (b) fits the pandok best (no money, no wasted work), but it is a person-shaped gate and is the owner's call.
