@@ -84,6 +84,7 @@ members = [
     "payloads/pcie1",
     "ferros_sys",
     "ferros_mailbox",
+    "ferros_shell",
     "ferros_gpuq",
     "ferros_spi",
     "ferros_cam",

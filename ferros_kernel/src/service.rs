@@ -1150,16 +1150,26 @@ fn store_unlock_held(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
         }
         // 18: whether `seed` (a handle typed again just now) is the person present's (`retype_matches`, compared in registers): 1 it is, 0 it is not; Err while nobody is present. Nothing written. The first step of a removal (process.rs op 15).
         (18, Some(s)) => st.retype_matches(s).map(|m| m as u64).map_err(|_| ()),
-        // 4 an unbind the fleet consented to (process.rs op 4, with the person's approve held) and a shred (op 15's shred bit), each then restarting at the attest screen; 19 an unbind carried out by op 15 (the handle typed again matched, the approve held), then the power off (`RELEASE_OFF`). Each is gated in process.rs; here the act itself: the secret renewed (`renew`: the identity locked, its keys wiped from memory, one write), nothing deleted and nothing dropped (owner, 2026-11-24: "Sand on a beach my friend."). Until 2026-11-24 this deleted every identity entry and sent the vault process a drop of every domain of the person's.
+        // 4 the release (a completed departure, `diag "identity release"`); 19 a removal (process.rs op 15, after op 18 matched): the same release, then the device powers off rather than restarting (`RELEASE_OFF`).
         (4 | 19, _) => {
-            if st.renew().is_err() {
-                crate::flashlog::line("identity: the device-only secret was not renewed; nothing changed but the lock");
-                return Err(());
-            }
-            crate::flashlog::line("identity: the device-only secret renewed (one write): everything of the person's here is sealed under keys that can no longer be made; nothing deleted");
+            // The person's domains in the vault process, stamped while their keys still exist (release locks them); the service loop sends the drops before its restart.
+            let mut drops = crate::process::vault_stamp_drops();
+            let n = match st.release() {
+                Ok(n) => n,
+                Err(_) => {
+                    for d in drops.iter_mut() {
+                        crate::keys::wipe_to_dram(d);
+                    }
+                    return Err(());
+                }
+            };
+            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted from the kernel's vault, the device-only secret renewed; {} of the person's domains to drop in the vault process", drops.len()));
+            // The person's zone goes with them (zone.rs): this device's own choice rules again.
+            let _ = crate::zone::set_identity(None, || crate::process::settings_snapshot().is_some_and(|(d, g)| settings_write(&d, g)));
+            unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             if op == 19 {
                 RELEASE_OFF.store(true, core::sync::atomic::Ordering::Release);
-                crate::flashlog::line("identity unbound (the person typed their handle on this device, the fleet consented): the device powers off");
+                crate::flashlog::line("identity removed (the person typed their handle on this device): the device powers off once the drops are sent");
             }
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
@@ -1585,35 +1595,12 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     if name == b"init" {
         return Some(home_grants());
     }
-    let slots: &[usize] = match name {
-        // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
-        b"touch" => &[14, 15, 16, 23, 91],
-        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page), 9 use nfc (the NFC page's add), 10 use wlan (the WiFi page's picker) (payloads/map; as init gives them: with eight a restarted map had no NFC add, its torch was slot 9 not 11, and the WiFi page said the driver gives no list, 2026-11-18 on the 8a).
-        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108, 80, 44],
-        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
-        b"ip" => &[44, 45, 41, 52],
-        // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
-        b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.`, 10 the vault scope `kists.` (payloads/fgtw; as init gives them: without 9 and 10 a restarted fgtw could not join the identity space, "the person's list is not readable", 2026-11-10).
-        b"fgtw" => &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107],
-        // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
-        b"nfc" => &[77, 78, 67, 79],
-        // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
-        b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer, 11 use gpu, 12 a 32 MiB block of the layer arena, its own, 13 use wlan (the network page), 14 use nfc (attest with a tag) (payloads/ahau; as init gives them: without 13 a restarted attest screen's network page said "The WiFi is starting." forever, 2026-11-10).
-        // Without 14 a restarted attest screen never held the NFC driver's TAG, so a tag read nothing there: every approve's attest screen is one the kernel restarts (2026-11-24, the Pro: the driver read the owner's tag 31 times and no TAG was held; owner: "presenting my identity does not work on the attest screen unless I type it in").
-        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68, 44, 80],
-        // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
-        b"usb" => &[86, 87, 88, 89, 90],
-        // 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch (payloads/sensors).
-        b"sensors" => &[92, 93, 94, 95, 96],
-        _ => return None,
-    };
+    // The same slots init hands out, from the one table both read (ferros_shell): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23; the attest screen had no NFC after every approve until 2026-11-24, the kernel's copy one grant short of init's).
+    let slots = ferros_shell::slots(name)?;
     let all = home_grants();
     // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free slot with frames of its own behind it. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
     let own = name == b"ahau";
-    let mut out: alloc::vec::Vec<crate::process::Grant<'static>> = slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
+    let mut out: alloc::vec::Vec<crate::process::Grant<'static>> = slots.iter().filter_map(|&s| all.get(s as usize - 1).copied()).map(|g| match g {
         crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),
         // The arena as init's spawn passes it (SYS_SPAWN): a 32 MiB block, the attest screen's own (GPU-KISTS.md plan step 1).
         crate::process::Grant::Dma(b"arena") => crate::process::Grant::Dma(b"layers-32"),
@@ -5893,10 +5880,10 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"identity" {
-                    // `diag identity`: the identity class's state (AUTH.md). `diag "identity release"` is gone (owner, 2026-11-24: "if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped"): the cable is neither.
-                    // Under the kernel lock, as every UFS command (the state reads the vault).
-                    let s: Result<&str, ()> = Ok("");
+                if cmd.params == b"identity" || cmd.params == b"identity release" {
+                    // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the device-only secret renewed — what a completed departure does, for a developer starting the device over.
+                    // Under the kernel lock, as every UFS command (release writes the vault; the state reads it).
+                    let s = if cmd.params == b"identity release" { crate::process::with_lock(|| store_unlock(4, None)).map(|_| "released") } else { Ok("") };
                     let st = crate::process::with_lock(|| store_unlock(0, None)).unwrap_or(0);
                     // The person key only as held or not, and the alias derivation against fgtw's known answer (FACETS.md): never a byte of either.
                     resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}, person key held {}, alias known answer {}, aliases given A#{}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2, st & 4 == 4, if crate::kvault::alias_known_answer() { "ok" } else { "WRONG" }, crate::process::ALIASES_GIVEN.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());

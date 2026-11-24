@@ -46,6 +46,7 @@ vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify
 ferros_kist = { path = "../ferros_kist" }
 # Mailboxes (process.rs `mbox_*`): the names, the header and the kernel's end of a writer.
 ferros_mailbox = { path = "../ferros_mailbox" }
+ferros_shell = { path = "../ferros_shell" }
 # The zone's rule: standard and legal offsets and the next change (owner, 2026-11-10)
 ferros_tz = { path = "../ferros_tz" }
 

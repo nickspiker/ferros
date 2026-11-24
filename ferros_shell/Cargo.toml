@@ -1,0 +1,9 @@
+[package]
+name = "ferros_shell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The shell's processes and the grants each is started with, one table for init's boot and the kernel's restarts (2026-11-24: the kernel restarted the attest screen without the NFC grant init gives it, and a tag never attested on an approve). no_std, no dependencies; host-tested."
+
+[lib]
+path = "src/lib.rs"
