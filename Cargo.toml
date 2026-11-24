@@ -44,6 +44,7 @@ members = [
     "payloads/torch",
     "payloads/audio",
     "payloads/bt",
+    "payloads/bttest",
     "payloads/usb",
     "payloads/gpstest",
     "payloads/clock",

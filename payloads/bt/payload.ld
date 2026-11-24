@@ -20,5 +20,7 @@ SECTIONS {
     .bss : { *(.bss*) *(COMMON) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
+/* The end of .bss: a growing heap starts here (ferros_heap::ArcHeap::init, docs/NO-CEILINGS.md step 1): connections, channels, queued SDUs and the clients' events live there, as many as are open. */
+__bss_end = ADDR(.bss) + SIZEOF(.bss);
 /* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */
 __ferros_tail = ADDR(.bss) + SIZEOF(.bss) - __file_end + 16;

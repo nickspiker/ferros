@@ -918,6 +918,14 @@ dependencies = [
 name = "ferros-payload-bt"
 version = "0.1.0"
 dependencies = [
+ "ferros_heap",
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-bttest"
+version = "0.1.0"
+dependencies = [
  "ferros_sys",
 ]
 
