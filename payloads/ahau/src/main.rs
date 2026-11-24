@@ -2650,11 +2650,19 @@ impl Ahau {
     }
 
     /// Attest with a tag (AUTH.md; owner, 2026-11-05: the tag in his glasses, no handle typed): the kernel opens what it keeps for this tag and unlocks its identity as a typed handle's seed would, handing the seed back. On a bound device the screen goes now (`unlocked_known`); on one not bound yet the look-up and join run as after a first entry. Refused: the denial on the status line, cleared by the next press. True when it opened.
+    /// An approve waiting is settled by the tag as by a typed handle (owner, 2026-11-24: "cannot use a tag, prolly should be able to"): the kernel applies it when the tag opens and drops it when it does not. Attest at boot on is the exception (a tag never keeps the seed): the tag is not offered for it (the main loop) and the kernel refuses one.
     fn tag_attest(&mut self, uid: &[u8]) -> bool {
         let mut seed = [0u8; 32];
+        let approving = self.approve.take();
         match ferros_sys::unlock_by_tag(cap(self.grants, S_UNLOCK), uid, &mut seed) {
+            // The removal approved by the tag: carried out as after a typed handle (`remove_approved`).
+            ferros_sys::Unlock::Opened(_) if approving.is_some_and(|r| r.kind == ahau_core::approve::REMOVE_DEVICE) => {
+                console(self.grants, b"ahau: approved by a kept tag: remove this device\n");
+                self.remove_approved(&mut seed);
+                true
+            }
             ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => {
-                console(self.grants, b"ahau: unlocked by a kept tag\n");
+                console(self.grants, if approving.is_some() { b"ahau: unlocked by a kept tag; approved, the kernel applied it\n".as_slice() } else { b"ahau: unlocked by a kept tag\n" });
                 self.unlocked_known(&mut seed)
             }
             ferros_sys::Unlock::Opened(_) => {
@@ -2672,6 +2680,10 @@ impl Ahau {
             // One refusal for every way a tag does not open (AUTH.md): kept for nothing here, a record that does not open, another identity's.
             _ => {
                 console(self.grants, b"ahau: a tag was refused\n");
+                // A failed approve: nothing applied, the plain attest screen (the kernel dropped the request).
+                if approving.is_some() {
+                    self.all();
+                }
                 self.status(tx(ferros_lang::Msg::TagDenied).as_str());
                 self.denied.set(true);
                 false
@@ -4085,8 +4097,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if let Some((seq, (uid, n))) = tag_take(tag_seen) {
             tag_seen = seq;
             let again = a.denied.get() && tag_refused == Some((uid, n));
-            // Never for an approve: a tag never approves (the kernel would drop the request and apply nothing); the handle is typed.
-            if a.mode == Mode::Fresh && a.approve.is_none() && !again {
+            // An approve too (owner, 2026-11-24), but for attest at boot on, which only the handle typed turns on (a tag never keeps the seed; the kernel refuses it).
+            if a.mode == Mode::Fresh && a.approve.is_none_or(|r| r.kind != ahau_core::approve::ATTEST_AT_BOOT_ON) && !again {
                 tag_refused = if a.tag_attest(&uid[..n]) { None } else { Some((uid, n)) };
                 a.show();
             }

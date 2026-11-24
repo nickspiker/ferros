@@ -7288,14 +7288,20 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
         SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
-            // A tag never approves (owner, 2026-11-18: "no tags" for attest at boot; the approve is the handle typed): an unlock by a tag drops an approval waiting, nothing applied, and ends one not yet taken.
+            // A kept tag approves as a typed handle does (owner, 2026-11-24: "seems you need to type your handle in, cannot use a tag, prolly should be able to"): its unlock settles an approval waiting (`approve_settle`), applied when it opens, dropped when it does not. The one exception is attest at boot on, which keeps the seed for the next boot: a tag never turns it on nor keeps the seed (owner, 2026-11-18: "no tags"), so while that waits a tag is refused before anything is opened and the request waits for the handle typed. An unlock by a tag ends an approval not yet taken, as any unlock does.
+            let pending = if f.x[1] == 6 { ahau_core::approve::Request::from_word(APPROVAL.load(core::sync::atomic::Ordering::Acquire)) } else { None };
+            if pending.is_some_and(|r| r.kind == ahau_core::approve::ATTEST_AT_BOOT_ON) {
+                crate::flashlog::line("approve: a tag does not turn attest at boot on; the handle is typed for it (the request waits)");
+                f.x[0] = ERR;
+                return 0;
+            }
             if f.x[1] == 6 {
-                if APPROVAL.swap(0, core::sync::atomic::Ordering::AcqRel) != 0 {
-                    crate::flashlog::line("approve: dropped, an unlock by a tag (a tag never approves); nothing applied");
-                }
                 APPROVED.store(0, core::sync::atomic::Ordering::Release);
             }
             f.x[0] = tag_syscall(p, f);
+            if let (Some(_), Some(unlock)) = (pending, unsafe { UNLOCK }) {
+                approve_settle(if f.x[0] == ERR { Err(()) } else { Ok(f.x[0]) }, unlock);
+            }
             // An unlock by tag locks whatever was open first.
             identity_bell();
             0
