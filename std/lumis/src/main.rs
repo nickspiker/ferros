@@ -10,6 +10,8 @@
 mod camera;
 mod gpu;
 mod hold;
+/// A stacked CLIP: every completed exposure a frame of its exact sums (ferros_clip packed).
+mod stack;
 mod sys;
 
 use fluor::coord::Coord;
@@ -142,10 +144,16 @@ struct Clip {
 /// The clip recording, if any: the camera thread starts it and hands it each frame (holding this only for the frame), and whatever ends Lumis seals it (`seal_at_exit`, from lumis_core's `exit_because` on any thread).
 static CLIP: Mutex<Option<Clip>> = Mutex::new(None);
 
+/// The stacked CLIP recording, if any (`stack::Stack`): the camera thread starts it and hands it each completed exposure, and whatever ends Lumis seals it (`seal_at_exit`).
+static STACK: Mutex<Option<stack::Stack>> = Mutex::new(None);
+
 /// lumis_core `set_before_exit`: a clip recording sealed before Lumis ends, so the Exit button (the UI thread) or an error never leaves one open. The camera thread never ends Lumis while it holds `CLIP` (it seals a clip itself before each of its own exits), so this waits at most for the frame in hand.
 fn seal_at_exit() {
     if let Some(c) = CLIP.lock().unwrap().take() {
         end_clip(c, None, "Lumis ending");
+    }
+    if let Some(s) = STACK.lock().unwrap().take() {
+        end_stack(s, None, "Lumis ending");
     }
     // A save on the keeper's thread is kept before Lumis ends (`keep_saves`).
     saves_settle();
@@ -279,6 +287,74 @@ fn start_clip(cam: &camera::Camera, facts: (u64, u64, u64), pacing: ferros_clip:
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// A stacked CLIP started (`stack`): its extent opened in the person's hold as an item of kind RAW video, generation 0 written (ferros_clip `PackedRecorder`), its thread started. Its frame is the exposure (`period_ns`), every frame of the camera's own size and mosaic (`head`).
+fn start_stack(cam: &camera::Camera, facts: (u64, u64), head: camera::FrameHeader, period_ns: u64) -> Result<stack::Stack, String> {
+    let (mount, held) = facts;
+    if !hold::held() {
+        return Err("your things were not given to Lumis: no clip can be kept".into());
+    }
+    let slot = ferros_clip::ferros::store_slot().ok_or("no vault domain among Lumis's grants")?;
+    let orientation = match (mount + held) % 360 {
+        90 => 6,
+        180 => 3,
+        270 => 8,
+        _ => 1,
+    };
+    let clip_cam = ferros_clip::Camera {
+        width: head.width,
+        height: head.height,
+        stride: head.width * 2,
+        cfa: ferros_clip::cfa_of_byte(head.cfa),
+        black: head.black,
+        white: head.white,
+        make: identity(cam).make_tag(),
+        model: identity(cam).model_tag(),
+        sensor_module: cam.name.clone(),
+        lens: String::new(),
+        f_number: (cam.f_number > 0.).then_some(cam.f_number),
+        focal_mm: (cam.focal_mm > 0.).then_some(cam.focal_mm),
+        characterization: None,
+        observer: String::new(),
+        orientation,
+    };
+    let name = lumis_core::capture_stamp(std::time::SystemTime::now());
+    let at = ferros_clip::eagle_osc(head.time as u64);
+    let mut blocks = ferros_clip::ferros::space(slot).map_or(CLIP_BLOCKS_MOST, |sp| sp.largest_free_bytes / ferros_clip::BLOCK as u64);
+    loop {
+        let mode = ferros_clip::packed::PackedMode { title: format!("Lumis stacked clip, a frame each {} ms", period_ns / 1_000_000), period_ns, motion: false, at, blocks };
+        // The card Lumis proposes: kind RAW video, its start, its frame's time (ms), its size and the camera's name.
+        let attrs = vec![
+            ("frame_ms".to_string(), vsf::VsfType::u((period_ns / 1_000_000) as usize, false)),
+            ("width".to_string(), vsf::VsfType::u(head.width, false)),
+            ("height".to_string(), vsf::VsfType::u(head.height, false)),
+            ("camera".to_string(), vsf::VsfType::x(cam.name.clone())),
+        ];
+        let (sink, receipt) = ferros_clip::items::raw_video(hold::ITEMS, None, at, attrs);
+        match ferros_clip::packed::PackedRecorder::start(&clip_cam, &mode, Box::new(sink)) {
+            Ok(rec) => {
+                println!("lumis: camera {}: a stacked clip: recording {name} into the hold, a frame each {} ns", cam.name, period_ns);
+                return stack::Stack::new(rec, name, cam.name.clone(), receipt);
+            }
+            Err(e) if blocks > CLIP_BLOCKS_LEAST => {
+                println!("lumis: camera {}: a stacked clip: {e}; asking half", cam.name);
+                blocks >>= 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A stacked clip ended: every exposure handed over written, the clip closed and sealed, its counts into the header (when the caller has it), said on the console with why it ended.
+fn end_stack(s: stack::Stack, header: Option<&mut [u64]>, why: &str) {
+    let (name, cam, passed, ms) = (s.name.clone(), s.cam.clone(), s.passed_over, s.began.elapsed().as_millis());
+    let e = s.end();
+    println!("lumis: camera {cam}: the stacked clip {name} ended ({why}): {} frames, {} bytes in {ms} ms, {passed} passed over{}", e.frames, e.bytes, e.error.map(|e| format!("; {e}")).unwrap_or_default());
+    if let Some(h) = header {
+        h[FLAGS_IDX] &= !lumis_core::shared_memory::RECORDING_BIT;
+        h[lumis_core::shared_memory::VIDEO_FRAMES_IDX] = e.frames;
     }
 }
 
@@ -1166,6 +1242,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut sent: (i32, i64, f32) = (-1, -1, -1.);
     // The frame period the camera is held at for a stacked CLIP (`set_frame`), or None (no hold); a reopen forgets it (the driver starts at its own frame).
     let mut held: Option<u64> = None;
+    // A stacked CLIP's start on its own thread (`start_stack`: its extent's open can wait), as a paced clip's (`starting`).
+    let mut stack_starting: Option<std::sync::mpsc::Receiver<Result<stack::Stack, String>>> = None;
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
     // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
@@ -1486,6 +1564,11 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         }
         // F, the sensor's own rate (the owner, 2026-11-20): the frames, or in Slitscan the slits, the driver counted since the last one taken over the time its clock says passed, at every one taken (one the preview passes over too), not Lumis's intake. A slit's count and time are its record's (the owner: "the :Fps number up top is wrong for slitscan. I doubt it's 14": it kept the whole frames' rate).
         // WHY the order and kind checks: the count and the time are the driver's, both start over when the camera reopens, and a slit's count is not a frame's; such a one only starts the next measure.
+        // The frame's header, kept past its integration (which takes `got`): a stacked clip's exposure is stamped with it.
+        let head_now = match &got {
+            Got::Frame(h, _) => Some(*h),
+            Got::Slit { .. } => None,
+        };
         let stamp = match &got {
             Got::Frame(head, _) => (false, head.count as u64, head.time),
             Got::Slit { count, time, .. } => (true, *count, *time),
@@ -1790,6 +1873,75 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 None => {
                     set_frame(0);
                     integrator.set_frames_held(None);
+                }
+            }
+        }
+        // A stacked CLIP records (RECORD in CLIP at a held frame, `want_hold`): started on its own thread, then each completed exposure the integrator builds (lumis_core `take_clip_frame`) stamped with this frame's facts and handed to the clip's thread, never waited for; the buffers it has packed back to the integrator; STOP, its space full or a write failing ends and seals it.
+        {
+            use lumis_core::shared_memory::{RECORDING_BIT, VIDEO_DROPPED_IDX, VIDEO_FRAMES_IDX};
+            let asked = integrator.header[FLAGS_IDX] & RECORDING_BIT != 0;
+            let mut st = STACK.lock().unwrap();
+            if let Some(rx) = stack_starting.take() {
+                match rx.try_recv() {
+                    Ok(Ok(s)) if asked => {
+                        integrator.set_clip_recording(true);
+                        *st = Some(s);
+                        lumis_core::platform::set_video_note(None);
+                    }
+                    Ok(Ok(s)) => end_stack(s, Some(&mut *integrator.header), "STOP before its first frame"),
+                    Ok(Err(e)) => {
+                        println!("lumis: camera {}: no stacked clip ({e})", cam.name);
+                        lumis_core::platform::set_video_note(Some(e));
+                        integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => stack_starting = Some(rx),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        lumis_core::platform::set_video_note(Some("the clip did not start".into()));
+                        integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                    }
+                }
+            }
+            match (asked, st.is_some(), stack_starting.is_some(), want_hold, head_now) {
+                (true, false, false, Some((period, _)), Some(head)) => {
+                    let h = &integrator.header;
+                    let facts = (h[lumis_core::shared_memory::SENSOR_ORIENTATION_IDX], h[lumis_core::shared_memory::DEVICE_ROTATION_IDX]);
+                    // The clip's frame is the exposure: n held frames of `period`.
+                    let frame_ns = period * (exposure_ns / period);
+                    let c = cam.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    match std::thread::Builder::new().name("lumis-stack-start".into()).spawn(move || {
+                        let _ = tx.send(start_stack(&c, facts, head, frame_ns));
+                    }) {
+                        Ok(_) => {
+                            lumis_core::platform::set_video_note(Some("opening the clip's space".into()));
+                            stack_starting = Some(rx);
+                        }
+                        Err(e) => {
+                            println!("lumis: camera {}: no thread to start the stacked clip ({e})", cam.name);
+                            integrator.header[FLAGS_IDX] &= !RECORDING_BIT;
+                        }
+                    }
+                }
+                (false, true, ..) => {
+                    integrator.set_clip_recording(false);
+                    end_stack(st.take().unwrap(), Some(&mut *integrator.header), "STOP");
+                }
+                _ => {}
+            }
+            if let (Some(s), Some(head)) = (&mut *st, head_now) {
+                while let Ok(v) = s.back.try_recv() {
+                    integrator.give_clip_buffer(v);
+                }
+                if let Some(frame) = integrator.take_clip_frame() {
+                    if let Some(v) = s.hand(stack::Exposure { frame, eagle_ns: head.time, shutter_ns: head.exposure_ns, gain: head.gain, focus: head.focus }) {
+                        integrator.give_clip_buffer(v);
+                    }
+                }
+                integrator.header[VIDEO_FRAMES_IDX] = s.written.load(Ordering::Relaxed);
+                integrator.header[VIDEO_DROPPED_IDX] = s.passed_over + integrator.clip_dropped;
+                if s.ended() {
+                    integrator.set_clip_recording(false);
+                    end_stack(st.take().unwrap(), Some(&mut *integrator.header), "its space is full, or a write failed");
                 }
             }
         }
