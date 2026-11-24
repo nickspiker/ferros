@@ -45,17 +45,19 @@ pub struct Stack {
     /// The item's handle and card as the sink fills them (kept with the clip, as a paced clip's are).
     pub _receipt: Arc<Mutex<ferros_clip::items::Receipt>>,
     pub began: std::time::Instant,
+    /// The sum buffers its frames are built in (two, a frame being packed while the next completes), made on the clip's start thread with it, for the integrator at RECORD (lumis_core `give_clip_buffer`): never made in the camera's turn (the Pro, 2026-11-23: two made there took 33 to 44 ms and frames were not taken).
+    pub spares: Vec<Vec<u64>>,
 }
 
 impl Stack {
     /// The stacked clip started on `rec` (its extent open, generation 0 written): its thread started.
-    pub fn new(rec: PackedRecorder, name: String, cam: String, receipt: Arc<Mutex<ferros_clip::items::Receipt>>) -> Result<Stack, String> {
+    pub fn new(rec: PackedRecorder, name: String, cam: String, receipt: Arc<Mutex<ferros_clip::items::Receipt>>, samples: usize) -> Result<Stack, String> {
         let (to_thread, from) = sync_channel::<Exposure>(QUEUE);
         let (give, back) = std::sync::mpsc::channel::<Vec<u64>>();
         let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let w = written.clone();
         let thread = std::thread::Builder::new().name("lumis-stack".into()).spawn(move || pack_and_write(rec, from, give, w)).map_err(|e| format!("no thread for the clip ({e})"))?;
-        Ok(Stack { to_thread: Some(to_thread), back, thread: Some(thread), written, passed_over: 0, last_count: None, skipped: 0, skipped_total: 0, name, cam, _receipt: receipt, began: std::time::Instant::now() })
+        Ok(Stack { to_thread: Some(to_thread), back, thread: Some(thread), written, passed_over: 0, last_count: None, skipped: 0, skipped_total: 0, name, cam, _receipt: receipt, began: std::time::Instant::now(), spares: (0..2).map(|_| vec![0; samples]).collect() })
     }
 
     /// A completed exposure to the thread, never waited for: when it is still packing the one before, this one is passed over and its buffer comes back for the integrator.

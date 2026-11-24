@@ -336,7 +336,7 @@ fn start_stack(cam: &camera::Camera, facts: (u64, u64), head: camera::FrameHeade
         match ferros_clip::packed::PackedRecorder::start(&clip_cam, &mode, Box::new(sink)) {
             Ok(rec) => {
                 println!("lumis: camera {}: a stacked clip: recording {name} into the hold, a frame each {} ns", cam.name, period_ns);
-                return stack::Stack::new(rec, name, cam.name.clone(), receipt);
+                return stack::Stack::new(rec, name, cam.name.clone(), receipt, head.width * head.height);
             }
             Err(e) if blocks > CLIP_BLOCKS_LEAST => {
                 println!("lumis: camera {}: a stacked clip: {e}; asking half", cam.name);
@@ -1938,6 +1938,12 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             if let Some(rx) = stack_starting.take() {
                 match rx.try_recv() {
                     Ok(Ok(s)) if asked => {
+                        // Its sum buffers, made with it on its start thread, to the integrator.
+                        let mut s = s;
+                        for v in s.spares.drain(..) {
+                            assert_eq!(v.len(), integrator.clip_buffer_len(), "a stacked clip's sum buffer is the frame's size");
+                            integrator.give_clip_buffer(v);
+                        }
                         integrator.set_clip_recording(true);
                         *st = Some(s);
                         lumis_core::platform::set_video_note(None);
