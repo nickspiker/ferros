@@ -711,7 +711,7 @@ messages! {
     /// Two lines under the guards: what the checkbox does, and that turning it off is an approve too.
     RequireAttestNote,
     /// The Fleet page's button that opens the add flow (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"): an approve on the attest screen first.
-    BindNewDevice,
+    BindDevice,
     /// What that approve approves: two lines.
     ApproveFleetAdd,
     /// The button while a network is being joined.
@@ -735,7 +735,7 @@ messages! {
     JoinConfirmPrompt,
     /// The confirmation's button, in the owner's words: a sentence the attest screen wraps.
     JoinConfirmYes,
-    /// Two lines: how to finish the join, the two devices held together (NFC) with "bind new device" pressed and approved on the other's Fleet page (owner, 2026-11-24: its page is passive until then), or this device touched on that page and its green button (BLE).
+    /// Two lines: how to finish the join, the two devices held together (NFC) with "bind device" pressed and approved on the other's Fleet page (owner, 2026-11-24: its page is passive until then), or this device touched on that page and its green button (BLE).
     JoinTogether,
     /// The button behind which the pairing words wait (never shown by default: shoulder surfing), a sentence the attest screen wraps.
     JoinShowWords,

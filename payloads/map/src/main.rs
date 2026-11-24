@@ -1667,9 +1667,9 @@ struct Map {
     /// The page picker is up (a tap on the title), and how far its list is scrolled, pixels.
     picker: bool,
     pick_scroll: i64,
-    /// The add flow held closed on this visit to the Fleet page: closed by default (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"), cleared only once "bind new device" has been approved on the attest screen and the identity service holds the identity again (`fleet_bind_asked`), set again by Close, Done or Back on the page and as the visit ends (the page or the circle left). Until 2026-11-24 the flow opened whenever the page showed.
+    /// The add flow held closed on this visit to the Fleet page: closed by default (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"), cleared only once "bind device" has been approved on the attest screen and the identity service holds the identity again (`fleet_bind_asked`), set again by Close, Done or Back on the page and as the visit ends (the page or the circle left). Until 2026-11-24 the flow opened whenever the page showed.
     fleet_hold: bool,
-    /// "bind new device" asked for (an approve on the attest screen, ahau_core::approve::FLEET_ADD): the flow opens once the kernel holds the approval and the identity service is a member again; dropped when it was declined or failed, or the page left.
+    /// "bind device" asked for (an approve on the attest screen, ahau_core::approve::FLEET_ADD): the flow opens once the kernel holds the approval and the identity service is a member again; dropped when it was declined or failed, or the page left.
     fleet_bind_asked: bool,
     /// The page's Add tapped: what of the page is on the glass told to fgtw again even when it is what was told last (fgtw may have closed the flow itself: started again, or refused it for want of the fleet key).
     fleet_retell: bool,
@@ -4023,7 +4023,7 @@ impl Map {
                     }
                     if f.add == 0 {
                         // The page is passive until this is pressed (owner, 2026-11-24): no NFC read for an add, no BLE scan, no list of devices asking, and no word that one asks (until then "a device asks to join" showed here from what the network heard).
-                        button(self, b, &mut y, tr(Msg::BindNewDevice), false, Some(Choice::FleetAdd));
+                        button(self, b, &mut y, tr(Msg::BindDevice), false, Some(Choice::FleetAdd));
                     } else {
                         let phase = match f.add {
                             1 => FleetMsg::AddAsking,
@@ -6217,7 +6217,7 @@ impl Map {
                     }
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
                     // Adding a device (payloads/fgtw ops 8, 10, 12, 15): the flow opened and closed, a nearby device picked, a pick confirmed, the keyboard asked for the newcomer's words (1) or a leaver's (2), which the attest screen (ahau) hosts.
-                    // The flow opened and closed thru the one state the main loop tells fgtw (`FLEET_PAGE`, op 8 from `fleet_page_thread` alone), so it is open only while the page is on the glass: "bind new device" asks for an approve on the attest screen (the device locks at once), and the main loop lifts the visit's hold once it is approved (`fleet_bind_asked`); Close (Done) holds it closed. No on a selected device is op 8 [1] itself (fgtw drops the pick; the flow, open, stays open).
+                    // The flow opened and closed thru the one state the main loop tells fgtw (`FLEET_PAGE`, op 8 from `fleet_page_thread` alone), so it is open only while the page is on the glass: "bind device" asks for an approve on the attest screen (the device locks at once), and the main loop lifts the visit's hold once it is approved (`fleet_bind_asked`); Close (Done) holds it closed. No on a selected device is op 8 [1] itself (fgtw drops the pick; the flow, open, stays open).
                     Some(Choice::FleetAdd) if self.fleet.add == 3 => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 1]),
                     Some(Choice::FleetAdd) => {
                         self.fleet_bind_asked = true;
@@ -7150,14 +7150,14 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             map.fleet_hold = true;
             map.fleet_bind_asked = false;
         }
-        // "bind new device" approved: the flow opens once the identity service holds the identity as a member again (the lock wiped its add machine), told to it as any opening is; it takes the approval from the kernel as it opens the flow (payloads/fgtw add.rs `add_page`). Looked at only while one is asked, never on a timer.
+        // "bind device" approved: the flow opens once the identity service holds the identity as a member again (the lock wiped its add machine), told to it as any opening is; it takes the approval from the kernel as it opens the flow (payloads/fgtw add.rs `add_page`). Looked at only while one is asked, never on a timer.
         if map.fleet_bind_asked {
             match ferros_sys::approve::held(cap(map.grants, S_SETTINGS), ahau_core::approve::FLEET_ADD) {
                 ferros_sys::approve::Taken::Approved(_) if map.fleet.state == Some(3) => {
                     map.fleet_bind_asked = false;
                     map.fleet_hold = false;
                     map.fleet_retell = true;
-                    console(map.grants, b"map: bind new device approved; the add flow opens\n");
+                    console(map.grants, b"map: bind device approved; the add flow opens\n");
                 }
                 ferros_sys::approve::Taken::Approved(_) | ferros_sys::approve::Taken::Waiting => {}
                 ferros_sys::approve::Taken::No => map.fleet_bind_asked = false,
@@ -7353,7 +7353,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             map.live_note = None;
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
-        // The add flow stays closed on that visit (`fleet_hold`): the person did not choose the page, and answering the departure leads to no add flow (the security review of 2026-11-22). Only "bind new device", approved on the attest screen, opens it (owner, 2026-11-24).
+        // The add flow stays closed on that visit (`fleet_hold`): the person did not choose the page, and answering the departure leads to no add flow (the security review of 2026-11-22). Only "bind device", approved on the attest screen, opens it (owner, 2026-11-24).
         if !map.app_front && !down && !map.settling {
             let ask = map.fleet.depart.filter(|d| d.1 == 0).map(|d| (d.0, map.fleet.depart_name, map.fleet.depart_name_n));
             if ask.is_some() && ask != ask_seen {

@@ -257,7 +257,7 @@ impl Client {
         if on && !self.add.shown {
             match ferros_sys::approve::take(cap(unsafe { GRANTS }, S_UNLOCK), ahau_core::approve::FLEET_ADD) {
                 ferros_sys::approve::Taken::Approved(_) => {
-                    self.log.put(b"fgtw: the add flow opens, approved on the attest screen (bind new device)");
+                    self.log.put(b"fgtw: the add flow opens, approved on the attest screen (bind device)");
                     self.log.line();
                 }
                 _ => {
