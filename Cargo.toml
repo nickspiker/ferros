@@ -127,6 +127,7 @@ members = [
     "payloads/vault",
     "payloads/vaulttest",
     "payloads/kheaptest",
+    "payloads/peopletest",
     "payloads/holdtest",
     "payloads/wallgen",
     "payloads/pqprobe",
