@@ -49,6 +49,12 @@ Not on ACPM. I²C address G#36 (charger G#69, PMIC G#66) on `hsi2c_11` = G#10CB_
 | AvgCurrent | G#0B | same |
 | AvgVCell | G#19 | as VCell |
 
+## The charger: MAX77759 at G#69, and the direct charger at G#57
+
+Also on hsi2c_11: the MAX77759's switching charger (G#69, Android's `main-charger`, IRQ IF_PMIC_IRQ_L gpa8-0 shared with the PMIC/TCPC side at G#66) and the PCA9468 direct charger (G#57, IRQ gpa7-4, enabled thru S2MPG14 GPIO 1).
+ferros has no charge control yet: the charger runs on the bootloader's settings, which leave the fast-charge safety timer on, and that timer stopped the Pro at 88% on 2026-11-24.
+The register map, Android's algorithm on husky (CC/CV tables, input limits, termination, the direct charger, the charge limits and adaptive charging) and the capture plan are in CHARGING.md.
+
 ## For ferros
 
 1. **Battery current from ferros** (power profiling) — DONE 2026-10-16: `ferros_kernel/src/hsi2c.rs`, a polled master on hsi2c_11 reusing the bootloader's bring-up (confirmed: sysreg mode 4, mux/gates on, DIV /1 so the controller runs at 400 MHz with FS3 divider G#3E for 400 kHz, AUTO_MODE set); `bridge display power [n] [sixteenths] [battery]` reads SOC, temperature, VCell and current, `display i2c <target> <reg> [val]` any 8-bit register. On USB the battery current reads 0 ± 5 mA — the charger carries the load — so `battery` switches the MAX77759 charger's MODE (CHG_CNFG_00 G#B9 [3:0], 5 = charger + buck on) to 0 for the run and restores it in the kernel; the system then draws from the cell (662 mA at 4.28 V idle) and the gauge is a power meter. Results: DISPLAY-POWER.md.
