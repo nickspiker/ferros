@@ -65,7 +65,7 @@ pub struct Array {
     /// The gain the list offers (1024 one): the sensor's own range (`Gain::range`, read at each open and said on the console), written here once measured on the device so the list, built with no camera powered, can carry it; 1024 and 1024 (the captured code alone) until then.
     pub gain: (u64, u64),
     /// The integration's margin under the frame (CCS coarse_integration_time_max_margin, G#1006) as the sensor answered it on the device, so the list, built with no camera powered, can offer the long exposures it makes (`Timing`); None where never read, and there the frame never moves for an exposure (the init's own integration is the longest offered).
-    /// The driver reads the sensor's own word at each open and drives with that (`Timing::margin`); the console says so when it differs from this.
+    /// The driver reads the sensor's own word at each open and drives with the larger of it and this (`Timing::margin`): a sensor that pads its frame past what its word says has its measured margin here (the tele); the console says so when the sensor's is the larger.
     pub margin: Option<u16>,
     /// The vendor's long-exposure shift (`Lte`), once a capture of Android's own long exposure shows how it is written; None until then.
     pub lte: Option<Lte>,
@@ -139,7 +139,8 @@ pub const ARRAYS: [Array; 4] = [
     // Measured on the Pro (2026-11-18 night, docs/CAMERA.md "Every readout, captured"): its own words say integration least 4 and margin 4 (CAPS), gain code / 32 over codes 32 to 2048 (1x to 64x analogue; no noise test yet); frames 1 s to 65.5 s the exposure apart (shifts 1 to 8, the mean doubling each step); the shift field holds 29 (frames of 8 << 29 and 32770 << 29 lines held, 2^32 lines and past: no 32-bit wrap as the main's), while 30 and 31 run every frame at the sensor's floor (19.9 ms) whatever the frame. So its most is 29; the frame is held to 2^32 lines (`frame_bits` 32, 7.3 hours at the 22-degree line) as the longest waited out by inference, none past 65.5 s watched land.
     // Its phase detect: G#0D00 (and G#0D02), G#0101 in its init beside no other PD-shaped word (the main's G#0720 block has no twin here), written 0 in a windowed mode's hold as the main's is.
     // Measured on the Pro (2026-11-22, the 07f922ca kernel): with it off every slit lands, 64, 16, 8, 4 and 2 rows (2 rows 713 a second drained, none lost, the link's ERR_CRC_PH gone); with it on every slit of 16 rows and under was refused at every PD channel height tried.
-    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(4), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 29, frame_bits: 32, byte: false }), side: Some(Side { pd: Some(0x0D00), emb: 0x0118 }) },
+    // Its margin 24, not its CAPS word's 4 (owner, 2026-11-24, "yes on the 24 lines"): measured on the Pro (2026-11-23, SET 5 at 1/24 s with a 60 ms exposure cut to the frame less 4 lines), its frames ran 41.784 ms against the 41.661 held, about 20 lines long: the sensor pads a frame whose integration ends within about 24 lines of its end, and Android's own frames there are the integration plus 24.
+    Array { unit: 1, period: 4, full: (8064, 6048), samsung: true, incs: true, crop: false, weighting: false, unbinned: [0x00, 0x11], gain: (UNITY, 64 * UNITY), margin: Some(24), lte: Some(Lte { fll_reg: 0x0702, coarse_reg: 0x0704, at: 8, most: 29, frame_bits: 32, byte: false }), side: Some(Side { pd: Some(0x0D00), emb: 0x0118 }) },
 ];
 
 /// The 8a's cameras by id (ferros_cam cams `AKITA`: 0 the main, 1 the ultrawide, 2 the front), each its `Cam::array`.
@@ -1512,10 +1513,10 @@ mod tests {
     /// A camera whose margin was never read keeps to its frame: the list offers what it did before (the init's integration), and SET refuses past the frame less `MARGIN`.
     #[test]
     fn short_cameras_keep_their_frame() {
-        // The tele, since its capture and run (2026-11-18 night): the main's words, its margin 4, its frame held to 2^32 lines: 65531 lines of 2^16 at its 6.11 us line, about 7.3 hours.
+        // The tele, since its capture and run (2026-11-18 night): the main's words, its frame held to 2^32 lines; its margin 24 since 2026-11-24 (4 its CAPS word): 65511 lines of 2^16 at its 6.11 us line, about 7.3 hours.
         let f = cams::TELE.listed_timing();
         assert!(f.long);
-        assert_eq!(f.most_ns(), (65535 - 4) * (1 << 16) * cams::TELE.line_ps / 1000);
+        assert_eq!(f.most_ns(), (65535 - 24) * (1 << 16) * cams::TELE.line_ps / 1000);
         // The front, since its counter was measured (2026-11-18 night): 65535 - 5 lines of 2^16 at its 10.44 us line, about 12.45 hours.
         let f = cams::FRONT.listed_timing();
         assert!(f.long);

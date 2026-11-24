@@ -2126,13 +2126,15 @@ fn open(g: u64, c: &'static Cam, s: &Spec) -> Result<Open, Fail> {
     let sane = read && margin < fll;
     // A captured readout with its own measured line takes it at its own line length; the rest the camera's line scaled by the init's PLL.
     let (line_ps, captured_llp) = match alt { Some(a) if a.line_ps != 0 => (a.line_ps, llp), _ => (ccs::line_ps_for(c, &page), c.llp) };
-    let timing = ccs::Timing { line_ps, captured_llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if !sane { ccs::MARGIN } else if margin == 0 { arr.margin.unwrap_or(0) } else { margin }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
+    // WHY the larger of the sensor's word and the list's: each is a floor the frame must keep past the integration, the word the sensor's stated one, the list's one measured where the sensor pads its frame past its word (the tele: 4 said, 24 measured, ferros_cam ccs); a word of 0 states none, and the list's holds alone.
+    let margin_used = match arr.margin { Some(m) if m > margin => m, _ => margin };
+    let timing = ccs::Timing { line_ps, captured_llp, llp, fll, coarse_min: if sane && cmin != 0 { cmin } else { 1 }, margin: if !sane { ccs::MARGIN } else { margin_used }, long: sane && arr.margin.is_some(), lte: arr.lte.map(|l| match LTE_MOST.load(Ordering::Relaxed) { 0 => l, m => ccs::Lte { most: m as u8, ..l } }), stretch: false };
     let listed = arr.margin.map_or(alloc::string::String::from("none"), |m| alloc::format!("A#{m}"));
-    say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
+    say!(g, "camera: {}: integration least A#{cmin} and margin A#{margin}{} (the list's margin {listed}, A#{} used); frame A#{fll} lines of A#{llp} clocks, a line A#{} ns (the PLL G#0306 = A#{}), a frame every A#{} us; exposures to A#{} ms{}\n", c.name, if read { "" } else { " (the read failed)" }, timing.margin, timing.line_ps_at(llp) / 1000, page.get(ccs::PLL_MULTIPLIER).unwrap_or(0), timing.frame_ns(&timing.own(1)) / 1000, timing.most_ns() / 1_000_000, if timing.long { "" } else { ", inside the mode's frame" });
     say!(g, "camera: {}: the vendor shift to A#{}{}, the frame counter A#{} bits (the longest exposure at shift A#{}); the readout A#{} us at the mode's line (A#{} rows), unchanged at every exposure (the line is never stretched by default)\n", c.name, timing.lte.map_or(0, |l| l.most), if LTE_MOST.load(Ordering::Relaxed) != 0 { " (the spawn's override, a device test)" } else { "" }, timing.lte.map_or(0, |l| l.frame_bits), timing.lte.map_or(0, |l| timing.shift_most(&l)), timing.readout_ps(&timing.own(1), fe.h as u64) / 1_000_000, fe.h);
     readout_reset();
-    if sane && margin != 0 && arr.margin.is_some_and(|m| m != margin) {
-        say!(g, "camera: {}: the sensor's margin is not the list's: the list's longest exposure is off by the difference\n", c.name);
+    if sane && margin != 0 && arr.margin.is_some_and(|m| m < margin) {
+        say!(g, "camera: {}: the sensor's margin is past the list's: the list's longest exposure is off by the difference\n", c.name);
     }
     // A captured readout starts at its own init's integration (G#0202 as the init wrote it last), the camera's table at its binned one.
     let exposure_lines = match (mode, alt) {
