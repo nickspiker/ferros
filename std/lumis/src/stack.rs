@@ -36,6 +36,10 @@ pub struct Stack {
     pub written: Arc<std::sync::atomic::AtomicU64>,
     /// Exposures the thread had no room for (it was still packing the one before).
     pub passed_over: u64,
+    /// The camera's count of the last frame taken while it records, and its frames the driver wrote but Lumis did not take: since the last exposure handed over, and in all (the coordinator, 2026-11-23: a frame not taken is light no exposure summed, its exposure spanning a frame more).
+    pub last_count: Option<u32>,
+    pub skipped: u64,
+    pub skipped_total: u64,
     pub name: String,
     pub cam: String,
     /// The item's handle and card as the sink fills them (kept with the clip, as a paced clip's are).
@@ -51,7 +55,7 @@ impl Stack {
         let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let w = written.clone();
         let thread = std::thread::Builder::new().name("lumis-stack".into()).spawn(move || pack_and_write(rec, from, give, w)).map_err(|e| format!("no thread for the clip ({e})"))?;
-        Ok(Stack { to_thread: Some(to_thread), back, thread: Some(thread), written, passed_over: 0, name, cam, _receipt: receipt, began: std::time::Instant::now() })
+        Ok(Stack { to_thread: Some(to_thread), back, thread: Some(thread), written, passed_over: 0, last_count: None, skipped: 0, skipped_total: 0, name, cam, _receipt: receipt, began: std::time::Instant::now() })
     }
 
     /// A completed exposure to the thread, never waited for: when it is still packing the one before, this one is passed over and its buffer comes back for the integrator.

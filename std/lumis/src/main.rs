@@ -349,9 +349,9 @@ fn start_stack(cam: &camera::Camera, facts: (u64, u64), head: camera::FrameHeade
 
 /// A stacked clip ended: every exposure handed over written, the clip closed and sealed, its counts into the header (when the caller has it), said on the console with why it ended.
 fn end_stack(s: stack::Stack, header: Option<&mut [u64]>, why: &str) {
-    let (name, cam, passed, ms) = (s.name.clone(), s.cam.clone(), s.passed_over, s.began.elapsed().as_millis());
+    let (name, cam, passed, skipped, ms) = (s.name.clone(), s.cam.clone(), s.passed_over, s.skipped_total, s.began.elapsed().as_millis());
     let e = s.end();
-    println!("lumis: camera {cam}: the stacked clip {name} ended ({why}): {} frames, {} bytes in {ms} ms, {passed} passed over{}", e.frames, e.bytes, e.error.map(|e| format!("; {e}")).unwrap_or_default());
+    println!("lumis: camera {cam}: the stacked clip {name} ended ({why}): {} frames, {} bytes in {ms} ms, {passed} passed over, {skipped} of the camera's frames not taken while it recorded{}", e.frames, e.bytes, e.error.map(|e| format!("; {e}")).unwrap_or_default());
     if let Some(h) = header {
         h[FLAGS_IDX] &= !lumis_core::shared_memory::RECORDING_BIT;
         h[lumis_core::shared_memory::VIDEO_FRAMES_IDX] = e.frames;
@@ -1818,10 +1818,15 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             Got::Frame(head, Taken::View(rows)) => {
                 let pd = rows.pd();
                 let pd = pd.as_ref().map(|(p, n)| lumis_core::PdRows { rows: p, count: *n, blacks: PD_BLACKS });
+                // The frame's time by the driver's clock: a finished exposure carries its completing frame's (lumis_core `set_frame_time`), a stacked clip's frame timed by the camera.
+                integrator.set_frame_time(head.time);
                 integrator.process_rows_pd(&rows, pd, iso(head.gain) as i32, head.exposure_ns as i64, 0., head.quad())
             }
             // A copy is 16-bit samples of a binned readout (the driver gives none at 1:1); process_frame's flag is RAW10 bytes, not the filter.
-            Got::Frame(head, Taken::Bytes(bytes)) => integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2),
+            Got::Frame(head, Taken::Bytes(bytes)) => {
+                integrator.set_frame_time(head.time);
+                integrator.process_frame(bytes, iso(head.gain) as i32, head.exposure_ns as i64, 0., false, head.width * 2)
+            }
             // A slit carries no settings of its own: the last sent are what it was taken at (the integrator reads none of them for a slit).
             Got::Slit { rows, .. } => integrator.process_slit(&rows, rows.rows, sent.0, sent.1, sent.2),
         } };
@@ -1940,8 +1945,22 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 while let Ok(v) = s.back.try_recv() {
                     integrator.give_clip_buffer(v);
                 }
+                // The camera's frames between the last taken and this one, written and not taken: light no exposure summed (said per clip frame, and in all at the end).
+                // WHY checked_sub: the driver's count starts over at a reopen; such a step is no skip.
+                if let Some(gap) = s.last_count.and_then(|l| head.count.checked_sub(l + 1)) {
+                    s.skipped += gap as u64;
+                    s.skipped_total += gap as u64;
+                }
+                s.last_count = Some(head.count);
                 if let Some(frame) = integrator.take_clip_frame() {
-                    if let Some(v) = s.hand(stack::Exposure { frame, eagle_ns: head.time, shutter_ns: head.exposure_ns, gain: head.gain, focus: head.focus }) {
+                    // Timed by the frame that completed the exposure (lumis_core `ClipFrame::at`), else this one.
+                    let eagle_ns = if frame.at != 0 { frame.at } else { head.time };
+                    let (index, exposures) = (s.written.load(Ordering::Relaxed) + s.passed_over, frame.exposures);
+                    if s.skipped != 0 {
+                        println!("lumis: camera {}: stacked clip frame {index}: {exposures} exposures, {} of the camera's frames not taken inside it", cam.name, s.skipped);
+                    }
+                    s.skipped = 0;
+                    if let Some(v) = s.hand(stack::Exposure { frame, eagle_ns, shutter_ns: head.exposure_ns, gain: head.gain, focus: head.focus }) {
                         integrator.give_clip_buffer(v);
                     }
                 }
