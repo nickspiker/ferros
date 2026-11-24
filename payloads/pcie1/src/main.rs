@@ -50,6 +50,11 @@ const BT_POWER: u64 = 18;
 /// PCIe channel 1's interrupt (kernel IRQS `pcie1`, SPI 439): the slot after the last, which the kernel adds for a process granted the controller (process.rs `build_from`), so a spawn with 19 or fewer slots has none.
 const IRQ: u64 = 19;
 /// Wait on the chip's interrupt, never on the clock (owner, 2026-11-10: "No polling! No timers unless PROVEN necessary!"; 2026-11-13, the 8a dark at 782-859 mW with this driver waking ~1,300 times a second). Channel 1's MSIs reach the GIC on SPI 439 thru ELBI PCIE_IRQ2 bit 17 (pcie-exynos-rc.c); the chip raises one for its completions once its mailbox mask is set at the PCIe core's G#C34 (brcmfmac pcie.c, the register set of PCIe core rev 64 and up: the BCM4398's is rev 130, the BCM4383's 77). `FERROS_WIFI_IRQ=0` builds keep the millisecond's sleep; otherwise a chip that raises no MSI is found at serve start (`irq_selftest`) and served with the sleep, said on the console.
+/// ASPM L1 with its substates (`enable_l1ss`), the default: `FERROS_WIFI_L1SS=0` builds leave the link awake between frames, for the latency measure (docs/WIFI.md "Datagrams at speed": the chip's doorbell cost ~100 us a write with the link asleep).
+const L1SS: bool = match option_env!("FERROS_WIFI_L1SS") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
 const WIFI_IRQ: bool = match option_env!("FERROS_WIFI_IRQ") {
     Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
     None => true,
@@ -1240,7 +1245,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, sfh: false, tx_ooo: 0, tx_bad: 0, tx_busy: 0, tx_seq: [0; TX_BUFS as usize], mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net::EMPTY; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6, kept: Vec::new(), gone: false, fresh_link: false, served: false, irq: false };
+    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, sfh: false, tx_ooo: 0, tx_bad: 0, tx_busy: 0, tx_seq: [0; TX_BUFS as usize], tx_at: [0; TX_BUFS as usize], vo: false, vo_w: 0, vo_dirty: false, be_dirty: false, vo_n: 0, chip_n: 0, chip_t: 0, chip_most: 0, out_most: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net::EMPTY; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6, kept: Vec::new(), gone: false, fresh_link: false, served: false, irq: false };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1371,6 +1376,19 @@ struct Msgbuf {
     /// The transmit buffers the chip still holds, a bit each (bit k: buffer k, its frame posted with request id `TX_ID + k` and not yet completed), and the posting number of each buffer's frame (for `tx_ooo`).
     tx_busy: u128,
     tx_seq: [u32; TX_BUFS as usize],
+    /// The chip's hold on a frame (2026-11-24, docs/WIFI.md "Datagrams at speed"): when each buffer's frame was posted (the counter), and since the last `say_tx` the completions seen, their ticks from post to the completion's being read in all and the longest, and the most frames out with the chip at once.
+    tx_at: [u64; TX_BUFS as usize],
+    /// The voice flowring (2026-11-24, docs/WIFI.md "Datagrams at speed"): flowring 3 (msgbuf ring 6, H2D index slot 3), TID 6, the chip's voice queue (WMM AC_VO: the shortest wait for the air, no waiting behind the best-effort ring's frames). Frames marked EF (DSCP 46, ip's voice class) go on it once it exists; its posting count (`vo_w`) and whether its write index waits to be published.
+    vo: bool,
+    vo_w: u32,
+    vo_dirty: bool,
+    be_dirty: bool,
+    /// Frames posted on the voice flowring since the last `say_tx`.
+    vo_n: u32,
+    chip_n: u32,
+    chip_t: u64,
+    chip_most: u64,
+    out_most: u32,
     mac: [u8; 6],
     /// DHCP: transaction id, the offer (address, server), the ack and what it carried (subnet, router, DNS, lease seconds).
     xid: u32,
@@ -1656,6 +1674,11 @@ impl Msgbuf {
             if k < TX_BUFS {
                 self.tx_busy &= !(1u128 << k);
                 self.tx_ooo += (self.tx_seq[k as usize] != self.tx_done) as u32;
+                let held = ferros_sys::now().wrapping_sub(self.tx_at[k as usize]);
+                self.chip_n += 1;
+                self.chip_t += held;
+                // WHY the max: the high water, for the measure.
+                self.chip_most = self.chip_most.max(held);
             }
             self.tx_bad += (words[2] & 0xFFFF != 0) as u32;
             self.tx_done += 1;
@@ -1667,7 +1690,7 @@ impl Msgbuf {
         }
     }
     /// One line of the transmit path's totals since serving began: `tx: A#<posted> posted, A#<done> completed, A#<n> out of order, A#<n> not sent (last status G#<s>), 802.3+LLC <0|1>`.
-    fn say_tx(&self, d: &mut Drv) {
+    fn say_tx(&mut self, d: &mut Drv) {
         d.put(b"tx: ");
         d.dec(self.tx_w);
         d.put(b" posted, ");
@@ -1680,6 +1703,22 @@ impl Msgbuf {
         d.hex(self.tx_status);
         d.put(b"), 802.3+LLC ");
         d.dec(self.sfh as u32);
+        // The chip's hold since the last line: post to completion read, and the most frames out at once.
+        if self.chip_n > 0 {
+            d.put(b"; since the last line the chip held a frame ");
+            d.dec((self.chip_t * 1_000_000 / d.freq / self.chip_n as u64) as u32);
+            d.put(b" us on average from post to its completion read, ");
+            d.dec((self.chip_most * 1_000_000 / d.freq) as u32);
+            d.put(b" us longest, ");
+            d.dec(self.out_most);
+            d.put(b" frames out at most");
+        }
+        if self.vo {
+            d.put(b"; voice flowring: ");
+            d.dec(self.vo_n);
+            d.put(b" frames");
+        }
+        (self.chip_n, self.chip_t, self.chip_most, self.out_most, self.vo_n) = (0, 0, 0, 0, 0);
         d.put(b"\n");
     }
     /// Send one Ethernet frame now: `tx_post`, then `tx_ring`. False: refused (`tx_post`).
@@ -1710,8 +1749,17 @@ impl Msgbuf {
     /// Publish the frames `tx_post` wrote: the flowring's TCM write index, then doorbell 0 for ring 5. Once for a batch: each is a register write thru a syscall.
     fn tx_ring(&mut self, d: &mut Drv) {
         ferros_sys::dma_barrier();
-        d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
-        d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
+        // The voice ring first: its frames are the ones waited for.
+        if self.vo_dirty {
+            d.tcm_wr(self.h2d_w + 12, self.vo_w % 512);
+            d.wr(MEM, 0x2140, 0xFF00_0000 | 6 << 16 | (self.vo_w % 512));
+            self.vo_dirty = false;
+        }
+        if self.be_dirty || !self.vo {
+            d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
+            d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
+            self.be_dirty = false;
+        }
     }
     /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from `TX_BASE`), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id `TX_ID` + the buffer), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14 (with `sfh`, flags G#11 and the data the whole frame as 802.3 + LLC/SNAP).
     /// A buffer is free once the chip has completed the frame it held (`tx_busy`, cleared by the completion naming it, `pump_tx`): with every buffer still in flight the completions are read once more, and if none came the frame is refused (false), as a full transmit ring drops (TCP sends again). Until 2026-11-11 one frame went per request and eight buffers were reused in turn unchecked; a batch from the IP stack (`serve` op 8) would overwrite buffers the chip had not fetched yet.
@@ -1731,6 +1779,9 @@ impl Msgbuf {
         let k = (!self.tx_busy).trailing_zeros();
         self.tx_busy |= 1u128 << k;
         self.tx_seq[k as usize] = self.tx_w;
+        self.tx_at[k as usize] = ferros_sys::now();
+        // WHY the max: the high water, for the measure.
+        self.out_most = self.out_most.max(self.tx_busy.count_ones());
         let buf = self.dma + TX_BASE + 0x800 * k;
         let (data, len, flags) = if self.sfh {
             // 802.3 with LLC/SNAP (dhd_common.c dhd_ether_to_8023_hdr, RFC 1042, bridge-tunnel OUI 00:00:F8 for the 802.1H types G#80F3 and G#8137): DA, SA, the length of what follows, AA AA 03, the OUI, the EtherType, the payload. The whole of it is the data (dhd posts it from the 802.3 header on, the Ethernet header still in the item), flag G#10 BCMPCIE_TXPOST_FLAGS_HOST_SFH_LLC.
@@ -1748,21 +1799,37 @@ impl Msgbuf {
             dma_put(buf, frame);
             (buf + 14, frame.len() - 14, 0x01)
         };
-        let phase = if (self.tx_w / 512) % 2 == 0 { 0x80 } else { 0 };
-        let a = self.dma + 0x6_0000 + 48 * (self.tx_w % 512);
+        // The class from the IP header's DSCP (as dhd's pktsetprio reads it): EF (46) is voice, on the voice flowring with priority 6 in the item's flags.
+        let ty = u16::from_be_bytes([frame[12], frame[13]]);
+        let dscp = match ty {
+            0x0800 if frame.len() > 15 => frame[15] >> 2,
+            0x86DD if frame.len() > 15 => (frame[14] << 4 | frame[15] >> 4) >> 2,
+            _ => 0,
+        };
+        let voice = self.vo && dscp == 46;
+        let (ring, w) = if voice { (0x7_0000, self.vo_w) } else { (0x6_0000, self.tx_w) };
+        let phase = if (w / 512) % 2 == 0 { 0x80 } else { 0 };
+        let a = self.dma + ring + 48 * (w % 512);
         let mut item = [0u8; 48];
         item[0] = 0x0F;
         item[2] = phase as u8;
         item[4..8].copy_from_slice(&(TX_ID + k).to_le_bytes());
         item[8..22].copy_from_slice(&frame[..14]);
-        item[22] = flags;
+        item[22] = flags | if voice { 6 << 5 } else { 0 };
         item[23] = 1;
         item[32..36].copy_from_slice(&data.to_le_bytes());
         item[42..44].copy_from_slice(&(len as u16).to_le_bytes());
         for j in 0..12 {
             dw(a + 4 * j, u32::from_le_bytes(item[4 * j as usize..4 * j as usize + 4].try_into().unwrap()));
         }
-        self.tx_w += 1;
+        if voice {
+            self.vo_w += 1;
+            self.vo_dirty = true;
+            self.vo_n += 1;
+        } else {
+            self.tx_w += 1;
+            self.be_dirty = true;
+        }
         true
     }
     /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length, transaction id), its buffer re-posted.
@@ -2481,6 +2548,14 @@ struct Path {
     by_other: u32,
     /// The line re-armed (`irq_arm`): once an idle spell at most.
     arms: u32,
+    /// The pass before a request is taken (2026-11-24, docs/WIFI.md "Datagrams at speed"): after a wait a call ended, the ticks from the wake to the request's receive, in all and the longest; and the exchanges that carried frames out, from their receive to the doorbell rung for the chip, in all.
+    pre_n: u32,
+    pre_t: u64,
+    pre_most: u64,
+    post_n: u32,
+    post_t: u64,
+    /// Of that, the doorbell itself (`tx_ring`: the write indices into the chip's memory and the doorbell register, each a register write over the link).
+    bell_t: u64,
 }
 
 impl Path {
@@ -2539,6 +2614,24 @@ impl Path {
             d.dec(self.by_other);
             d.put(b"; armed ");
             d.dec(self.arms);
+        }
+        if self.pre_n > 0 {
+            d.put(b"; a call's wake to its request taken ");
+            d.dec((self.pre_t * 1_000_000 / f / self.pre_n as u64) as u32);
+            d.put(b" us on average, ");
+            d.dec((self.pre_most * 1_000_000 / f) as u32);
+            d.put(b" us longest (");
+            d.dec(self.pre_n);
+            d.put(b")");
+        }
+        if self.post_n > 0 {
+            d.put(b"; exchanges with frames out: receive to the chip's doorbell ");
+            d.dec((self.post_t * 1_000_000 / f / self.post_n as u64) as u32);
+            d.put(b" us on average, the doorbell ");
+            d.dec((self.bell_t * 1_000_000 / f / self.post_n as u64) as u32);
+            d.put(b" us of it (");
+            d.dec(self.post_n);
+            d.put(b")");
         }
         d.put(b"\n");
     }
@@ -2620,7 +2713,11 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
         d.put(if m.sfh { b"tx frames as 802.3 + LLC/SNAP (the firmware's cap names host_sfhllc)\n" } else { b"tx frames as Ethernet (no host_sfhllc in the firmware's cap)\n" });
         d.put(b"serving wlan\n");
         d.flush();
-        enable_l1ss(d);
+        if L1SS {
+            enable_l1ss(d);
+        } else {
+            d.put(b"l1ss: left off (FERROS_WIFI_L1SS=0): the link stays awake between frames\n");
+        }
     }
     // The chip's interrupt (the line granted): the root complex's MSI receiver onto the controller's line, the chip's completions onto MSI, the interrupt's thread started, then proven by an ioctl's completion (`irq_selftest`).
     let irq = first && WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
@@ -2660,6 +2757,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
     let mut ring: Option<[u8; 32]> = None;
     // How the last wait ended: 0 not waited (a request was served), 1 the interrupt, 2 a call, 3 the deadline, 4 anything else (a preference changed, the kernel waking every word waiter).
     let mut woke = 0u8;
+    // When the last wait ended (the counter), for the pass's measure before a request (`Path::pre_t`).
+    let mut woke_at = 0u64;
     // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
     let mut lstates = [0u32; 8];
     let mut lstates_at = d.now();
@@ -2812,6 +2911,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
             path.irq_rx += (woke == 1) as u32;
             path.other_rx += (woke >= 2) as u32;
         }
+        let by_call = woke == 2;
         woke = 0;
         // WHY the max: the high water, for the measure.
         path.queued_most = path.queued_most.max(m.rxq_len as u32);
@@ -2853,6 +2953,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
                     2 => 3,
                     _ => 4,
                 };
+                woke_at = ferros_sys::now();
                 path.irq_wakes += (woke == 1) as u32;
                 path.by_call += (woke == 2) as u32;
                 path.by_deadline += (woke == 3) as u32;
@@ -2862,6 +2963,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
                 ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
             }
             continue;
+        }
+        let t_req = ferros_sys::now();
+        if by_call {
+            let pre = t_req.wrapping_sub(woke_at);
+            path.pre_n += 1;
+            path.pre_t += pre;
+            // WHY the max: the high water, for the measure.
+            path.pre_most = path.pre_most.max(pre);
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
         let n = n as usize;
@@ -2909,7 +3018,12 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) -> Left {
                     at += l;
                 }
                 if sent > 0 {
+                    let t_bell = ferros_sys::now();
                     m.tx_ring(d);
+                    let t_rung = ferros_sys::now();
+                    path.post_n += 1;
+                    path.post_t += t_rung.wrapping_sub(t_req);
+                    path.bell_t += t_rung.wrapping_sub(t_bell);
                 }
                 path.from_ip += sent;
                 path.refused += refused;
@@ -3051,6 +3165,21 @@ fn leave(d: &mut Drv, m: &mut Msgbuf) -> bool {
         d.us(1000);
     }
     d.kv(b"flowring delete status", m.flow_status.unwrap_or(u32::MAX));
+    let be_deleted = m.flow_status;
+    if m.vo {
+        m.flow_status = None;
+        m.post(d, 0x05, 0, [3, 0, 0, 0, 0, 0, 0, 0]);
+        m.ring(d);
+        let ts = d.now();
+        while m.flow_status.is_none() && d.now().wrapping_sub(ts) < 2 * d.freq {
+            let _ = m.pump(d);
+            m.pump_tx(d);
+            d.us(1000);
+        }
+        d.kv(b"voice flowring delete status", m.flow_status.unwrap_or(u32::MAX));
+        (m.vo, m.vo_w) = (false, 0);
+        m.flow_status = be_deleted;
+    }
     // The transmit buffers the deleted ring held are the host's again (dhd frees a deleted ring's packets; no completion comes for them), and the next flowring starts at slot 0 (`flowring`); the totals start again with it.
     (m.tx_busy, m.tx_w, m.tx_done, m.tx_ooo, m.tx_bad) = (0, 0, 0, 0, 0);
     (m.linked, m.keyed, m.join_failed, m.target) = (false, false, false, None);
@@ -3150,7 +3279,34 @@ fn flowring(d: &mut Drv, m: &mut Msgbuf) -> bool {
     }
     d.kv(b"flowring create status", m.flow_status.unwrap_or(u32::MAX));
     d.flush();
-    m.flow_status == Some(0)
+    if m.flow_status != Some(0) {
+        return false;
+    }
+    // The voice flowring: TID 6 (AC_VO), flowring 3 at G#7_0000 of the DMA region (512 items of 48 bytes, past the best-effort ring's at G#6_0000), its write index at H2D slot 3. Refused, the voice frames ride the best-effort ring and the console says so.
+    for off in (0x7_0000u32..0x7_0000 + 512 * 48).step_by(4) {
+        dw(m.dma + off, 0);
+    }
+    d.tcm_wr(m.h2d_w + 12, 0);
+    c[12] = 6;
+    c[14..16].copy_from_slice(&3u16.to_le_bytes());
+    c[24..28].copy_from_slice(&(m.dma + 0x7_0000).to_le_bytes());
+    let body: [u32; 8] = core::array::from_fn(|k| u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().unwrap()));
+    m.flow_status = None;
+    m.post(d, 0x03, 0, body);
+    m.ring(d);
+    let ts = d.now();
+    while m.flow_status.is_none() && d.now().wrapping_sub(ts) < 2 * d.freq {
+        let _ = m.pump(d);
+        d.us(1000);
+    }
+    m.vo = m.flow_status == Some(0);
+    m.vo_w = 0;
+    d.kv(b"voice flowring create status", m.flow_status.unwrap_or(u32::MAX));
+    if !m.vo {
+        d.put(b"no voice flowring: voice frames ride the best-effort ring\n");
+    }
+    d.flush();
+    true
 }
 
 fn dhcp_run(d: &mut Drv, m: &mut Msgbuf) {

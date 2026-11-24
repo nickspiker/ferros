@@ -38,6 +38,9 @@
 //! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first: it is latched for the id).
 //! - 13 UNWATCH: id (u32 BE) → [0]: the reader is gone (a socket dropped): its watch answered as things stand, its KICKs dropped, its reader entries retired, so no datagram waits for it. A reader no watch of its id has named for 64 s is retired the same way at the next datagram (a process that ended).
 //! - 14 TCP ROOM: handle, want (u32 BE), deadline (u64 BE, counter ticks; 0 at once) → [state, room (u32 BE)]: the state byte as op 6's deadline form says it, and the free bytes of the send buffer; [5] not a connection (or a request shorter than its 14 bytes). Held while the room is under `want` (at most the buffer's 256 KiB) and the connection is connecting, open or closed by the peer and not closed by its app: answered when that much is free, the state changes, the app closes, or the deadline passes (2026-11-18, ferros_rt::tcp: a writer whose op 5 found the buffer full waits here, where fgtw's post sleeps a millisecond and sends again).
+//! - 15 RING OPEN: port (u16 BE), log2 of the send ring, log2 of the receive ring (each at least 12) → status, view id (u64 BE), the run's bytes (u64 BE): a socket ring, a run of ip's pool given to the caller (docs/KERNEL.md "Shared regions"), laid out by ferros_netring, bound to the port; status 0 open, 3 a bad request, 4 no memory, 6 every ring in use. Sends land in the ring and go in the pass ip sees them (it looks at every ring each pass, and sleeps only after telling each ring so); arrivals for the port are written into it and wake its reader only when it waits (docs/WIFI.md "Datagrams at speed").
+//! - 16 RING CLOSE: view id (u64 BE) → [0]: the ring let go and its view taken back; a holder that ends lets it go the same way (the kernel rings ip's bell).
+//! - 17 SEND with a class: class (ferros_netring CLASS_*), then op 1's fields → op 1's answer: the class's DSCP on the datagram (voice EF, video AF41), which pcie1 maps to the chip's voice queue.
 //!
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
@@ -115,6 +118,49 @@ struct Reasm {
 }
 
 const REASM_FREE: Reasm = Reasm { used: false, src: [0; 4], dst: [0; 4], id: 0, at: 0, total: 0, units: 0, got: [0; REASM_MAX / 8 / 64], buf: [0; REASM_MAX] };
+
+/// The socket rings (docs/WIFI.md "Datagrams at speed"; owner, 2026-11-24: "q removal", "Like I want this creepy fast"): each a run of ip's pool given to the application that opened it (docs/KERNEL.md "Shared regions"), laid out by ferros_netring.
+/// The pool's handle slot: the first pair past ip's five grants.
+const POOL_SLOT: u64 = 5;
+/// The pool's first size (a frame), doubled in place as rings need more.
+const POOL_FIRST_LOG: u32 = 21;
+/// Rings at once: a table of this process's, as its other UDP tables (docs/NO-CEILINGS.md N1: all of them become `Vec`s with ip's heap).
+const RINGN: usize = 1 << 6;
+
+/// The pool's memory as ferros_netring reads it: thru the pool's handle (masked code reaches no other way), at a run's offset.
+#[derive(Clone, Copy)]
+struct PoolMem {
+    at: u64,
+}
+
+impl ferros_netring::Mem for PoolMem {
+    #[inline(always)]
+    fn ld(&self, at: usize) -> u64 {
+        ferros_sys::Handle::<POOL_SLOT>::read64(self.at + at as u64)
+    }
+    #[inline(always)]
+    fn st(&self, at: usize, v: u64) {
+        ferros_sys::Handle::<POOL_SLOT>::write64(self.at + at as u64, v)
+    }
+}
+
+/// One ring: the view's id (the kernel's, for ALIVE and TAKE; 0 while the ring is free and its run kept for the next of its size), its local port, its run (offset in the pool, log2 of its bytes), ip's side of it.
+struct Ring {
+    id: u64,
+    port: u16,
+    at: u64,
+    log: u32,
+    srv: ferros_netring::Server<PoolMem>,
+}
+
+/// A ring datagram's class as the TOS byte (DSCP << 2): voice EF (46), video AF41 (34), else best effort.
+fn class_tos(class: u8) -> u8 {
+    match class {
+        ferros_netring::CLASS_VOICE => 46 << 2,
+        ferros_netring::CLASS_VIDEO => 34 << 2,
+        _ => 0,
+    }
+}
 
 struct Ip {
     grants: u64,
@@ -197,6 +243,8 @@ struct Ip {
     batch: bool,
     txb: &'static mut [u8; TX_MAX],
     txn: usize,
+    /// When the batch's first frame went in (the counter), for the send path's measure (`Path::hold_t`).
+    txb_t: u64,
     /// The WiFi path's measures since the last connection report.
     path: Path,
     /// The WiFi doorbell (`WIFI_RING`): in use (armed, the idle wait on it), its helper thread started, and a driver found without it (never armed again).
@@ -207,6 +255,17 @@ struct Ip {
     cell_thread: bool,
     /// The resolver (op 10): a static, not the 64 KiB stack.
     res: &'static mut Dns,
+    /// The TOS byte (IPv4) and traffic class (IPv6) of what is being sent now: 0, but for a ring's voice or video datagram (`class_tos`).
+    tos: u8,
+    /// The socket rings (docs/WIFI.md "Datagrams at speed"): the pool's address (0 before the first RING OPEN), its bytes, the next unused offset in it, the rings.
+    pool: u64,
+    pool_bytes: u64,
+    pool_bump: u64,
+    rings: &'static mut [Option<Ring>; RINGN],
+    /// When a ring's datagram came from the driver: the stamp its record carries (the counter at the exchange's return).
+    rx_t: u64,
+    /// The bell's count when the rings were last asked whether their holders live.
+    rings_bell: u64,
     /// DHCPv4's measures since WiFi came up (`wifi_up`), said every 16th retransmit while unbound and once at the bind (2026-11-13: the 8a got no lease for minutes on end while IPv6 worked, and nothing said why).
     dhcp_n: DhcpCount,
 }
@@ -260,7 +319,7 @@ struct Path {
     requests: u32,
     watch_answers: u32,
     /// Datagrams an application took (op 2), by port and reader, the first four seen in the window: (port, the reader's watch id or 0 for a RECV naming none, how many, their ticks in the queue in all, the longest). The wait from a datagram landing to its reader taking it: a reader that polls shows its period here, one that waits on a doorbell its wake (2026-11-13).
-    took: [(u16, u32, u32, u64, u64); 4],
+    took: [(u16, u32, u32, u64, u64); 8],
     /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
     t0: u64,
     /// Echo requests answered, IPv4 (WiFi and the cellular call) and IPv6: counted here, said once a window, where each was a console line of its own until 2026-11-14 (`PING_LINES`).
@@ -271,6 +330,20 @@ struct Path {
     whole4: u32,
     whole_most: usize,
     frag_dropped: u32,
+    /// The send path (2026-11-24, docs/WIFI.md "Datagrams at speed"): the exchanges that carried frames out, their ticks in all, and how long their first frame waited in the batch before the exchange took it (in all and the longest): from an application's SEND (or ip's own frame) to the call that hands it to the driver.
+    xsend: u32,
+    xsend_t: u64,
+    hold_t: u64,
+    hold_most: u64,
+    /// Datagrams applications sent (op 1).
+    udp_out: u32,
+    /// The rings: opened, datagrams sent from them and their wait in the ring (the application's stamp to ip taking it, in all and the longest), datagrams written into them and those that found one full.
+    rings_opened: u32,
+    ring_out: u32,
+    ring_wait_t: u64,
+    ring_wait_most: u64,
+    ring_in: u32,
+    ring_dropped: u32,
 }
 
 impl Path {
@@ -350,6 +423,38 @@ impl Path {
             ip.put(b" bytes, unfinished after A#");
             ip.dec(1 << REASM_LOG2);
             ip.put(b" s, or given way)");
+        }
+        if self.xsend > 0 {
+            ip.put(b"; sends: A#");
+            ip.dec(self.udp_out as u64);
+            ip.put(b" datagrams from apps, A#");
+            ip.dec(self.xsend as u64);
+            ip.put(b" exchanges carried frames out (A#");
+            ip.dec(us(self.xsend_t) / self.xsend as u64);
+            ip.put(b" us each on average), the first frame held A#");
+            ip.dec(us(self.hold_t) / self.xsend as u64);
+            ip.put(b" us on average before its exchange, A#");
+            ip.dec(us(self.hold_most));
+            ip.put(b" us longest");
+        }
+        if self.ring_out + self.ring_in + self.rings_opened > 0 {
+            ip.put(b"; rings: A#");
+            ip.dec(self.rings_opened as u64);
+            ip.put(b" opened, A#");
+            ip.dec(self.ring_out as u64);
+            ip.put(b" datagrams out");
+            if self.ring_out > 0 {
+                ip.put(b" (A#");
+                ip.dec(us(self.ring_wait_t) / self.ring_out as u64);
+                ip.put(b" us on average in the ring, A#");
+                ip.dec(us(self.ring_wait_most));
+                ip.put(b" us longest)");
+            }
+            ip.put(b", A#");
+            ip.dec(self.ring_in as u64);
+            ip.put(b" in, A#");
+            ip.dec(self.ring_dropped as u64);
+            ip.put(b" dropped full");
         }
         for &(port, who, n, t, most) in self.took.iter().filter(|e| e.2 > 0) {
             ip.put(b"; port A#");
@@ -452,6 +557,9 @@ extern "C" fn ring_thread(grants: u64) -> ! {
         }
     }
 }
+
+/// A ring send's payload as ip takes it (`rings_tx`): the longest a datagram is.
+static mut RING_BUF: [u8; ferros_netring::PAYLOAD_MOST] = [0; ferros_netring::PAYLOAD_MOST];
 
 /// Held UDP receives at once: sixteen, twice the eight ports kept for them. A connection's held calls have places of their own (`TcpHeld`), so no UDP reader ever pushes one out.
 const HELDN: usize = 1 << 4;
@@ -964,6 +1072,9 @@ impl Ip {
                 self.exchange(&mut head);
             }
             let at = self.txn;
+            if at == EXCH_HEAD {
+                self.txb_t = now();
+            }
             self.txb[at..at + 2].copy_from_slice(&((n - 1) as u16).to_be_bytes());
             self.txb[at + 2..at + 1 + n].copy_from_slice(&f[1..n]);
             self.txn = at + 1 + n;
@@ -994,6 +1105,14 @@ impl Ip {
         let n = svc(CALL, self.cap(S_WLAN), self.off(self.txb.as_ptr()), self.txn as u64, self.off(into.as_mut_ptr()), into.len() as u64 | CALL_LIVE);
         if sent || (n != ERR && n > EXCH_REPLY as u64) {
             self.path_call(t0);
+        }
+        if sent {
+            let held = t0.wrapping_sub(self.txb_t);
+            self.path.xsend += 1;
+            self.path.xsend_t += now().wrapping_sub(t0);
+            self.path.hold_t += held;
+            // WHY the max: the high water, for the measure.
+            self.path.hold_most = self.path.hold_most.max(held);
         }
         if sent {
             // The frames each carried their length: counted back out of the batch for the measure.
@@ -1072,6 +1191,7 @@ impl Ip {
         let mut moved = self.txn > EXCH_HEAD;
         for _ in 0..EXCH_PASS {
             let n = self.exchange(r);
+            self.rx_t = now();
             if n == ERR {
                 break;
             }
@@ -1145,7 +1265,7 @@ impl Ip {
 
     fn ipv4_send_ttl(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) {
         let mut p = [0u8; 1500];
-        let total = ip4(&mut p, src, dst, proto, payload, ttl);
+        let total = ip4(&mut p, src, dst, proto, payload, ttl, self.tos);
         if total != 0 {
             self.eth_send(dst_mac, 0x0800, &p[..total]);
         }
@@ -1276,7 +1396,7 @@ impl Ip {
     fn out4(&mut self, cell: bool, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> bool {
         if cell {
             let mut p = [0u8; 1500];
-            let n = ip4(&mut p, src, dst, proto, payload, HOP);
+            let n = ip4(&mut p, src, dst, proto, payload, HOP, self.tos);
             if n != 0 && n <= self.cell.mtu as usize {
                 self.cell_send(&p[..n]);
             }
@@ -1291,7 +1411,7 @@ impl Ip {
     fn out6(&mut self, cell: bool, src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) -> bool {
         if cell {
             let mut p = [0u8; 1500];
-            let n = ip6(&mut p, src, dst, nh, payload, hop);
+            let n = ip6(&mut p, src, dst, nh, payload, hop, self.tos);
             if n != 0 && n <= self.cell.mtu as usize {
                 self.cell_send(&p[..n]);
             }
@@ -1674,7 +1794,7 @@ impl Ip {
 
     fn ipv6_send(&mut self, dst_mac: [u8; 6], src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) {
         let mut p = [0u8; 1500];
-        let total = ip6(&mut p, src, dst, nh, payload, hop);
+        let total = ip6(&mut p, src, dst, nh, payload, hop, self.tos);
         if total != 0 {
             self.eth_send(dst_mac, 0x86DD, &p[..total]);
         }
@@ -1966,6 +2086,10 @@ impl Ip {
             }
         }
         let readers = self.readers_of(dport);
+        // The port's rings first, written straight into each and its reader woken; the queue only when the port is read by RECV or a watch too.
+        if self.person && self.rings_rx(fam, addr, sport, dport, data) && !(self.ports.contains(&dport) || readers != 0) {
+            return;
+        }
         if dport == 0 || !(self.ports.contains(&dport) || readers != 0) {
             return;
         }
@@ -2072,6 +2196,173 @@ impl Ip {
     }
 
     /// Keep datagrams for `port` from now on (one of the last eight opened).
+    /// Op 15 RING OPEN: [15][port u16 BE][log2 of the send ring u8][log2 of the receive ring u8] → [status][view id u64 BE][the run's bytes u64 BE].
+    /// Status 0: the run given to the caller (`share::view` with the id gives its address), laid out, bound to the port; 3 a bad request (a ring under a page, a run past a GiB, port 0 or the resolver's); 4 no pool or no room in it (the console says why); 6 every ring in use.
+    fn ring_open(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> usize {
+        let port = u16::from_be_bytes([m[1], m[2]]);
+        let (tx_log, rx_log) = (m[3] as u32, m[4] as u32);
+        out[0] = 3;
+        // WHY: the logs and the port are the caller's words; a ring under a page or a run past the pool's GiB is no ring, and the resolver's port is ip's own.
+        if tx_log < ferros_netring::RING_LEAST_LOG || rx_log < ferros_netring::RING_LEAST_LOG || tx_log > 29 || rx_log > 29 || port == 0 || port == self.res.port {
+            return 1;
+        }
+        let (l, log) = ferros_netring::Layout::plan(tx_log, rx_log);
+        if log > 30 {
+            return 1;
+        }
+        // A free ring that kept a run of that size, else a fresh run from the pool's top (aligned to its size, the pool doubled in place until it holds it).
+        let i = match (0..RINGN).find(|&i| self.rings[i].as_ref().is_some_and(|r| r.id == 0 && r.log == log)).or_else(|| (0..RINGN).find(|&i| self.rings[i].is_none())) {
+            Some(i) => i,
+            None => {
+                out[0] = 6;
+                return 1;
+            }
+        };
+        let at = match &self.rings[i] {
+            Some(r) => r.at,
+            None => {
+                let size = 1u64 << log;
+                let at = (self.pool_bump + size - 1) & !(size - 1);
+                let mut want = self.pool_bytes.max(1 << POOL_FIRST_LOG);
+                while want < at + size {
+                    want <<= 1;
+                }
+                if want != self.pool_bytes {
+                    match ferros_sys::share::pool(want.trailing_zeros(), POOL_SLOT, Some(&BELL)) {
+                        Some(a) => {
+                            self.pool = a;
+                            self.pool_bytes = want;
+                        }
+                        None => {
+                            self.put(b"rings: the pool could not grow (the kernel's console says why)\n");
+                            out[0] = 4;
+                            return 1;
+                        }
+                    }
+                }
+                self.pool_bump = at + size;
+                at
+            }
+        };
+        let srv = ferros_netring::Server::lay_out(PoolMem { at }, l, port);
+        let Some(id) = ferros_sys::share::give(tok, at, log) else {
+            self.rings[i] = Some(Ring { id: 0, port, at, log, srv });
+            self.put(b"rings: the run could not be given (the kernel's console says why)\n");
+            out[0] = 4;
+            return 1;
+        };
+        self.rings[i] = Some(Ring { id, port, at, log, srv });
+        self.path.rings_opened += 1;
+        out[0] = 0;
+        out[1..9].copy_from_slice(&id.to_be_bytes());
+        out[9..17].copy_from_slice(&(1u64 << log).to_be_bytes());
+        17
+    }
+
+    /// A ring let go (its holder ended, or op 16): taken back when `take` (the kernel ends the view; a holder that ended took it with it), its run kept for the next ring of its size.
+    fn ring_close(&mut self, id: u64, take: bool) {
+        for r in self.rings.iter_mut().flatten().filter(|r| r.id == id && id != 0) {
+            r.srv.close();
+            if take {
+                ferros_sys::share::take(id);
+            }
+            r.id = 0;
+        }
+    }
+
+    /// A wake on a word of a ring's run (`W_RX_HEAD` for its reader, `W_TX_TAIL` for a writer waiting for room): SYS_WAKE at the word's address, the pool's own.
+    fn ring_wake(&self, at: u64, word: usize) {
+        let a = self.pool + at + word as u64;
+        svc(ferros_sys::nr::WAKE, a.wrapping_sub(self.base), u64::MAX, 0, 0, 0);
+    }
+
+    /// Every ring's sends out (`udp_send`, each with its class's TOS), the rooms given back; whether any datagram went. Not while nobody is present: they wait in their rings.
+    fn rings_tx(&mut self) -> bool {
+        if !self.person || self.pool == 0 {
+            return false;
+        }
+        // SAFETY: the one buffer for a ring's payload, used here alone from the one thread.
+        let buf = unsafe { &mut *(&raw mut RING_BUF) };
+        let mut moved = false;
+        for i in 0..RINGN {
+            let Some(mut r) = self.rings[i].take() else { continue };
+            if r.id != 0 && r.srv.tx_pending() {
+                let mut n = 0u32;
+                while let Some(t) = r.srv.take(buf) {
+                    if let ferros_netring::Took::Sent(x) = t {
+                        let t0 = now();
+                        self.tos = class_tos(x.class);
+                        let st = self.udp_send(x.fam, x.addr, x.port, r.port, &buf[..x.len]);
+                        self.tos = 0;
+                        r.srv.count(st == 0);
+                        self.path.ring_out += 1;
+                        // The application's stamp is the counter it wrote the record at: its wait in the ring until ip took it.
+                        let waited = t0.wrapping_sub(x.stamp);
+                        self.path.ring_wait_t += waited;
+                        // WHY the max: the high water, for the measure.
+                        self.path.ring_wait_most = self.path.ring_wait_most.max(waited);
+                    }
+                    n += 1;
+                }
+                moved |= n > 0;
+                if r.srv.commit() {
+                    self.ring_wake(r.at, ferros_netring::W_TX_TAIL);
+                }
+            }
+            self.rings[i] = Some(r);
+        }
+        moved
+    }
+
+    /// A datagram for `dport` into every ring bound to it: true when one took it (it is not queued for RECV then, unless the port is read that way too).
+    fn rings_rx(&mut self, fam: u8, addr: [u8; 16], sport: u16, dport: u16, data: &[u8]) -> bool {
+        if self.pool == 0 {
+            return false;
+        }
+        let mut took = false;
+        let rec = ferros_netring::Rec { len: 0, fam, class: 0, port: sport, flags: 0, stamp: self.rx_t, addr };
+        for i in 0..RINGN {
+            let Some(mut r) = self.rings[i].take() else { continue };
+            if r.id != 0 && r.port == dport {
+                took = true;
+                match r.srv.deliver(&rec, data) {
+                    Some(wake) => {
+                        self.path.ring_in += 1;
+                        if wake {
+                            self.ring_wake(r.at, ferros_netring::W_RX_HEAD);
+                        }
+                    }
+                    None => self.path.ring_dropped += 1,
+                }
+            }
+            self.rings[i] = Some(r);
+        }
+        took
+    }
+
+    /// The rings whose holders ended let go (the kernel rang the bell when each ended): asked only when the bell moved.
+    fn rings_alive(&mut self, bell: u64) {
+        if self.pool == 0 || bell == self.rings_bell {
+            return;
+        }
+        self.rings_bell = bell;
+        for i in 0..RINGN {
+            let id = self.rings[i].as_ref().map_or(0, |r| r.id);
+            if id != 0 && ferros_sys::share::alive(id) == Some(false) {
+                self.ring_close(id, false);
+            }
+        }
+    }
+
+    /// Before ip sleeps: each ring told so (its waiting word), false when a send came meanwhile (no sleep then).
+    fn rings_arm(&self) -> bool {
+        self.rings.iter().flatten().filter(|r| r.id != 0).all(|r| r.srv.arm())
+    }
+
+    fn rings_disarm(&self) {
+        self.rings.iter().flatten().filter(|r| r.id != 0).for_each(|r| r.srv.disarm());
+    }
+
     fn open_port(&mut self, port: u16) {
         if !self.ports.contains(&port) {
             self.ports[self.ports_at] = port;
@@ -3415,6 +3706,13 @@ impl Ip {
                 return Some(n);
             }
             Some(11) => return self.watch(m, tok, out),
+            Some(15) if m.len() >= 5 => return Some(self.ring_open(m, tok, out)),
+            Some(16) if m.len() >= 9 => {
+                let id = u64::from_be_bytes(m[1..9].try_into().unwrap());
+                self.ring_close(id, true);
+                out[0] = 0;
+                return Some(1);
+            }
             Some(12) if m.len() >= 5 => {
                 self.kick(u32::from_be_bytes([m[1], m[2], m[3], m[4]]), out);
                 out[0] = 0;
@@ -3497,7 +3795,24 @@ impl Ip {
                     return 1;
                 }
                 self.open_port(sport);
+                self.path.udp_out += 1;
                 out[0] = self.udp_send(m[1], addr, dport, sport, &m[22..]);
+                1
+            }
+            // 17 SEND with a class: [17][class][then op 1's fields]: the class's DSCP on the datagram (ferros_netring CLASS_*: voice rides the WiFi chip's voice queue), as a ring's sends carry it.
+            Some(17) if m.len() >= 23 => {
+                let addr: [u8; 16] = m[3..19].try_into().unwrap();
+                let dport = u16::from_be_bytes([m[19], m[20]]);
+                let sport = u16::from_be_bytes([m[21], m[22]]);
+                if sport == self.res.port {
+                    out[0] = 3;
+                    return 1;
+                }
+                self.open_port(sport);
+                self.path.udp_out += 1;
+                self.tos = class_tos(m[1]);
+                out[0] = self.udp_send(m[2], addr, dport, sport, &m[23..]);
+                self.tos = 0;
                 1
             }
             Some(3) => {
@@ -3578,12 +3893,14 @@ impl Ip {
 }
 
 /// An IPv4 packet (no options) into `p`; its length, or 0 when the payload does not fit a 1500-byte packet.
-fn ip4(p: &mut [u8; 1500], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) -> usize {
+fn ip4(p: &mut [u8; 1500], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8, tos: u8) -> usize {
     let total = 20 + payload.len();
     if total > p.len() {
         return 0;
     }
     p[0] = 0x45;
+    // The DSCP (`Ip::tos`): a ring's voice or video class, which the WiFi driver maps to the chip's queue (WMM).
+    p[1] = tos;
     p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
     p[8] = ttl;
     p[9] = proto;
@@ -3596,12 +3913,14 @@ fn ip4(p: &mut [u8; 1500], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]
 }
 
 /// An IPv6 packet into `p`; its length, or 0 when the payload does not fit a 1500-byte packet.
-fn ip6(p: &mut [u8; 1500], src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) -> usize {
+fn ip6(p: &mut [u8; 1500], src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8, tos: u8) -> usize {
     let total = 40 + payload.len();
     if total > p.len() {
         return 0;
     }
-    p[0] = 0x60;
+    // Version 6 and the traffic class (`Ip::tos`, as IPv4's TOS byte), the flow label 0.
+    p[0] = 0x60 | tos >> 4;
+    p[1] = tos << 4;
     p[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
     p[6] = nh;
     p[7] = hop;
@@ -3655,6 +3974,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The frames batched for the WiFi driver's next exchange (`Ip::txb`): the driver's request buffer, 4096 bytes.
     static mut TXB: [u8; TX_MAX] = [0; TX_MAX];
     static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
+    // The socket rings (`Ring`).
+    static mut RINGS: [Option<Ring>; RINGN] = [const { None }; RINGN];
     // The resolver's cache, lookups and held calls (`Dns`).
     static mut DNS: Dns = Dns { cache: ferros_dns::Cache::new(), asks: [ASK_FREE; RECN], rq: [RQ_FREE; RQN], rq_seq: 0, port: 0 };
     // The heap the kernel maps past .bss (`HEAP_START` of it): the first blocks, on a cache line. A kernel without SYS_ARC (before 2026-11-11) mapped the whole declared heap instead, which is the device's since docs/NO-CEILINGS.md step 3: no such kernel runs this, and one that did is said at once.
@@ -3733,6 +4054,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         batch: false,
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
+        txb_t: 0,
         path: Path::default(),
         dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0, bcast_in: 0, mcast_in: 0, ucast_in: 0, arp_in: 0, v4_in: 0 },
         ring: false,
@@ -3740,6 +4062,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         cell_thread: false,
         ring_none: false,
         res: unsafe { &mut *(&raw mut DNS) },
+        tos: 0,
+        pool: 0,
+        pool_bytes: 0,
+        pool_bump: 0,
+        rings: unsafe { &mut *(&raw mut RINGS) },
+        rx_t: 0,
+        rings_bell: 0,
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -3795,6 +4124,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The helpers' count before this pass looks: a ring while it runs ends its wait at once.
         let bell_seen = BELL.load(core::sync::atomic::Ordering::Acquire);
         ip.path.passes += 1;
+        // The rings: holders that ended let go (the bell moved), then every send waiting in them into the batch, which the exchange below carries out at once (docs/WIFI.md "Datagrams at speed").
+        ip.rings_alive(bell_seen);
+        busy |= ip.rings_tx();
         // Frames from the WiFi driver: in batches, our own going with each call (`wlan_batch`), or from a driver without batches [2] → the oldest frame, or nothing. With the doorbell (`WIFI_RING`) only when it rang or frames wait to go, re-armed after the exchange: the driver answers a new ask at once while frames still wait (op 9 looks at its queue when asked), so nothing that came during the exchange is missed, and no empty exchange follows each ring.
         if ip.wifi && ip.batch {
             use core::sync::atomic::Ordering::{Acquire, Release};
@@ -3896,6 +4228,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             busy = true;
         }
+        // Sends the requests and the rings made this pass go now, not after the rest of the pass (owner, 2026-11-24: "a send goes out the instant it lands"): the exchange also brings in what waits at the driver.
+        busy |= ip.rings_tx();
+        if ip.wifi && ip.batch && ip.txn > EXCH_HEAD {
+            busy |= ip.wlan_batch();
+        }
         ip.tcp_tick();
         // The resolver's tries run out, and its held calls' waits.
         ip.dns_tick();
@@ -3930,6 +4267,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // WHY the max: the high water, for the measure.
         ip.path.pass_most = ip.path.pass_most.max(dt);
         // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26). With the screen off, each idle pass in a row doubles it up to 8 ms, and anything that comes in brings it back to 1 (2026-11-10: the WiFi and cellular drivers were each asked a thousand times a second in the dark, every one a wakeup of the kernel's core).
+        // Every ring told ip sleeps, and one more look at each (ferros_netring's Dekker pair): a send that came meanwhile keeps it awake.
+        if !busy && !ip.rings_arm() {
+            ip.rings_disarm();
+            busy = true;
+        }
         if busy {
             ip.backoff = 0;
         } else {
@@ -3944,6 +4286,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             } else {
                 ferros_sys::sleep_until(t0 + (ip.freq / 1000 << ip.backoff));
             }
+            ip.rings_disarm();
             ip.path.sleeps += 1;
             ip.path.slept_t += now().wrapping_sub(t0);
             ip.backoff = match (ip.dark, ip.backoff) {

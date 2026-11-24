@@ -14,3 +14,4 @@ ferros_sys = { path = "../../ferros_sys" }
 ferros_tcp = { path = "../../ferros_tcp" }
 # The pure parts of the resolver (op 10: names, the question, the answer read, the cache), tested on the host.
 ferros_dns = { path = "../../ferros_dns" }
+ferros_netring = { path = "../../ferros_netring" }

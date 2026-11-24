@@ -116,6 +116,84 @@ Source tags (all under `/mnt/Harbor/husky-kernel/`):
 | **SFR** | `private/google-modules/soc/gs/drivers/soc/google/cal-if/zuma/cmucal-sfr.c` |
 | **DHD** | `private/google-modules/wlan/bcm4398/` |
 
+## Datagrams at speed: socket rings and the voice queue (2026-11-24)
+
+The owner, on waves and beams: "no fallbacks", "q removal. Less q's the better and smaller the buckets without getting stupid", "design up front, try options, experiment, benchmark, continue, repeat", "Like I want this creepy fast".
+Sound needs 200 to 400 datagrams a second each way with the least added latency; a beam's slices ride beside it. Photon's side: photon docs/ferros-media.md.
+
+### The bench
+
+`payloads/udplat` on the device and `tools/udplat` on the dev box (its WiFi, wlp5s0 192.168.1.213 now; the wired NIC is the DMX network).
+- The device echoes each datagram to its port 7778, writing four counter stamps into it: its receive returning, just before its send, the counter's rate, the previous send call's length. Spawned with any input it echoes thru a socket ring instead of ops 2 and 17.
+- The box sends at a fixed spacing and splits each round trip into its two one-way legs: host to the device process, and the device process to host. The two clocks are never joined; each leg is told as what it added over its own least (the clocks' drift taken out from the least delays of the first and last eighth), so the numbers are the queueing and waking each way, not the air's own time.
+- `--bulk burst,size,period` has the device send a beam's load beside the echoes (16 datagrams of 1190 bytes every 16.7 ms: 1050 a second, 10 Mbit/s), `--class 2` marks the echoes voice.
+- The device's stages come from its own counter: ip's `WiFi path` line (every 64 s) and pcie1's `rx path` and `tx:` lines (every 32 s) carry them.
+- `tools/udplat <device> 2500 28000 --bind 192.168.1.213` is 70 s at 400 a second each way, a window of both lines.
+- The dev box's own WiFi has power save on (it cannot be turned off without root), so the box adds its own milliseconds to the tails; the device's stages are measured on the device.
+
+### Measured before (the Pro, forge 4842f4b2's kernel, 2026-11-24)
+
+BEAM.md's ~2.3 frames/s is long gone (one call a datagram, before the exchange and the doorbells): today the device keeps up 400 echoes a second each way with a 10 Mbit/s bulk stream beside them, losing about one in 3000.
+End to end, by the box (p50 / p99, microseconds):
+
+| spacing | round trip | added, box to process | added, process to box | send call | with bulk: round trip | with bulk: added each way |
+|---|---|---|---|---|---|---|
+| 2.5 ms | 8364 / 33211 | 2661 / 22720 | 2196 / 16617 | 62 / 533 | 11141 / 101593 | 4252 / 79862, 3305 / 38617 |
+| 5 ms | 8067 / 131207 | 2506 / 123277 | 2046 / 46762 | 66 / 451 | 9604 / 63101 | 3552 / 39239, 2201 / 28821 |
+| 10 ms | 7481 / 48727 | 1911 / 12711 | 1766 / 40617 | 69 / 143 | 8616 / 70455 | 2652 / 18577, 1916 / 65473 |
+| 20 ms | 8773 / 50014 | 2503 / 43556 | 2374 / 14287 | 63 / 136 | 8912 / 43396 | 2959 / 29665, 1647 / 20439 |
+
+The air and the box move these from run to run: the same code an hour later gave a round trip of 3.9 ms p50 and 11.7 ms p99 at 2.5 ms. Only runs side by side in one session compare; the device's own stages below are the steady measure.
+
+Where a datagram waits, at 400 a second each way (the device's counter, averages; `diag "console kept"`):
+- **Send**, process to the chip: the SEND call A#43 us (the call to ip and its answer); the frame held in ip's batch until its exchange A#47 us; the exchange with pcie1 A#221 us, of which pcie1's wake to taking the request A#38 us and the request to the chip's doorbell A#142 us (the doorbell's two register writes over the link most of it, below).
+- **The chip** held a frame A#1.7 ms on average from its post to its completion being read (A#42 ms at worst), up to A#19 frames out with it at once.
+- **Receive**, the chip to the process: a frame waited A#281 us in pcie1 before ip's exchange took it (its doorbell, ip's helper thread, ip's pass, the exchange), A#7 us a frame to copy out of the DMA region, then A#29 us in ip's queue until the bench's held receive took it.
+- At rest, Photon's and fgtw's reader of 4383 left datagrams A#12 to A#19 ms in ip's queue on average: their watch-then-receive, the next thing to put on a ring.
+
+### What changed
+
+- **Sends go at once.** ip carried a pass's sends to the driver at its next pass; now the requests and the rings it served go in an exchange at once, in the same pass.
+- **The voice queue.** pcie1 had one transmit flowring, best effort, so a voice frame waited behind every bulk frame posted before it, and the chip's best-effort access category behind that. pcie1 now creates a second flowring, TID 6 (AC_VO: the shortest wait for the air), and puts every frame whose DSCP is EF (46) on it, priority 6 in its item; ip marks a datagram EF when its class is voice (ring records, op 17). Video (AF41, 34) is marked but rides the best-effort ring until it is measured.
+- **Socket rings** (below), on the kernel's shared regions (KERNEL.md "Shared regions").
+
+### The socket ring API (for Photon and every kist)
+
+A socket ring is a run of ip's pool given to the application: a header, a send ring and a receive ring of datagram records, the layout and both sides' code in `ferros_netring` (no_std, no dependencies, host-tested; Photon may take it by path or copy its 400 lines).
+1. **Open:** call ip (`udp`) with `[15][local port u16 BE][log2 of the send ring u8][log2 of the receive ring u8]` (each at least 12, a page). The answer: `[status][view id u64 BE][run bytes u64 BE]`; status 0 open, 3 a bad request, 4 no memory (the console says why), 6 every ring in use. Nothing while nobody is present.
+2. **Map:** `ferros_sys::share::view(id)` (SYS_SHARE op 3) gives the run's address (and a handle slot for masked code). `ferros_netring::App::open(Raw(addr as *mut u64), bytes)` reads the layout ip wrote.
+3. **Send:** `app.send(family, address, port, class, stamp, payload)`. The class is `CLASS_VOICE`, `CLASS_VIDEO` or `CLASS_BULK`; the stamp is the counter (`cntvct_el0`) now, which ip reads to measure the record's wait. `Ok(true)` means ip sleeps: wake it with `ferros_sys::wake` on the word at `addr + app.wake_word()` (one syscall, which rings ip's bell). `Ok(false)` needs nothing: ip looks at every ring each pass. `Err(Full)`: wait for room (`arm_room`, then wait on the word it names, then `disarm`). One writer per ring: a socket shared by threads takes a lock around `send`.
+4. **Receive:** `app.recv(&mut buf)` gives the record (family, address, the sender's port, ip's stamp: the counter when the frame left the driver) and its payload. `Err(Empty)`: call `app.arm_rx()`; `Some((word, value))` means wait (`ferros_sys::wait_world` on the word at `addr + word` while it holds `value`), then `disarm` and receive again; `None` means one came meanwhile. A datagram longer than the buffer stays (`TooLong(len)`). One reader per ring.
+5. **Close:** `[16][view id u64 BE]` to ip, or simply end: the kernel ends the view with the process and rings ip's bell, and ip lets the ring go. A ring ip let go reads `Closed`, and a wait on its words answers ERR.
+- The receive ring takes every datagram to its port, as a RECV reader does; when it is full the datagram is dropped and counted (`W_RX_DROPPED`), as a full socket buffer drops. Size the rings for what the stream holds in flight, not for latency: the writer stays one ahead of the reader, so the ring's depth is capacity, never delay.
+- A send past the link's MTU (1460 bytes of UDP payload on WiFi) is refused and counted (`W_TX_REFUSED`); ip does not fragment on send.
+- **op 17 SEND with a class**, for a socket not on a ring: `[17][class][family][address 16][destination port u16 BE][source port u16 BE][payload]`, answered as op 1.
+
+### Measured after
+
+Ring sends (udplat spawned with input, every echo thru its ring, voice class; the Pro on forge 73c1b042 RAM-reloaded, L1 substates on as by default), p50 / p99 in microseconds:
+
+| spacing | round trip | added, box to process | added, process to box | send | with bulk: round trip | with bulk: added each way |
+|---|---|---|---|---|---|---|
+| 2.5 ms | 3749 / 11280 | 868 / 5896 | 903 / 5942 | 0.5 / 7 | 4374 / 10792 | 1079 / 5850, 1027 / 5613 |
+| 5 ms | 3550 / 11067 | 504 / 6339 | 365 / 4604 | 3.8 / 7 | 4394 / 35474 | 771 / 7305, 682 / 22449 |
+| 10 ms | 3682 / 8093 | 523 / 4221 | 214 / 3692 | 0.4 / 7 | 4453 / 13532 | 796 / 8016, 629 / 5192 |
+| 20 ms | 3898 / 9070 | 440 / 5160 | 243 / 4263 | 0.4 / 8 | 4194 / 18432 | 696 / 4769, 333 / 12226 |
+
+- **The send** is the ring's stores: 0.4 us p50, 4 us when ip sleeps and the one wake goes, against A#44 us for op 17's call.
+- **ip took a ring's datagram A#15 us after it landed on average** (its stamp to ip's take, A#1.2 ms at worst), and held the batch A#28 us before the exchange (A#47 before sends went at once).
+- **The doorbell is now most of the exchange:** request to doorbell A#112 us, the doorbell's writes A#84 us of it, with the link in its L1 substates.
+- **L1 substates off** (`FERROS_WIFI_L1SS=0`, the link kept in L0, measured side by side in one session): the doorbell A#14 us (from A#92 to A#107), request to doorbell A#39 us, a received frame's wait in pcie1 A#121 us (from A#281), the chip's hold A#1.14 ms (from A#1.5 to A#1.7), the box's round trip 3.0 ms p50 against 3.9, the process-to-box leg 0.45 ms p50 against 1.0. With voice marking and 10 Mbit/s of bulk: 2.5 ms 3455 / 25228 round trip; 5 ms 3139 / 27344; 10 ms 3264 / 8946; 20 ms 3546 / 8347 (p50 / p99).
+- **The voice queue** carried every voice frame (`voice flowring: A#12800 frames` in a window) but bought nothing measurable against 10 Mbit/s of bulk on a 585 Mbit/s link: side by side, best effort and voice gave the same p50 and the voice runs the worse p99 once. The chip's own A#1.1 to A#1.7 ms is not the queue behind our bulk.
+- The tails (p99 past 20 ms, a few at 100 ms) come with the box's power save and the air; they show in both legs at once and no device stage reaches them.
+
+### For the owner
+
+- **L1 substates during a call.** Off, the link stays awake: each doorbell and each received frame loses about 0.1 to 0.2 ms, the round trip about 0.9 ms p50. On, the radio's link sleeps between frames. Proposed: pcie1 turns ASPM L1 off while a voice ring is open and back on when the last one closes (a config write each way, no restart). Yours to decide, power against latency.
+- **WiFi power save during a call.** pcie1 sets PM 2 with the screen off, PM 0 with it on; a call with the screen off would ride PM 2 (the access point holding frames for the radio's wakes). Proposed: PM 0 while a voice ring is open.
+- **The chip's own hold** (1.1 ms with L1 off) is the next thing to find: AMPDU aggregation for the voice TID (`ampdu_tid` 6 off), the firmware's completion coalescing, or the air. Not yet measured apart.
+- **ip's tables** (NO-CEILINGS N1: the datagram queue, ports, held receives, watches, readers, the resolver's, and now the rings' table of 64) are still fixed: they become `Vec`s when ip carries a heap, which needs the TCP blocks moved into it (NO-CEILINGS 7). The rings themselves have no fixed size: each is the size its socket asks, from a pool that grows.
+
 ## 0. Address map (ch1 = HSI2 "GEN3A_1", not HSI1)
 
 Source: ZDT/zuma-pcie.dtsi:75-122, ZDT/zuma-board-pcie.dtsi:31-43.
@@ -420,6 +498,7 @@ A random address joined at once: WPA2 keyed, DHCP, SLAAC, fgtw.org over IPv6 and
 **Regression, 2026-11-17 to 2026-11-24: no join wore the person's address.** Found 2026-11-24 on the Pro: a restarted pcie1 said "this network's for this boot: nobody present" with the owner attested and his person key held, and so did every join at boot.
 - **The cause:** the person-worn key (SYS_IRA x4 bit 0, be262869) was the ira key joined with `service::domain_base(true)`, the identity's domain base. b261a07b (2026-11-17: the identity's held keys rest sealed, plaintext only in registers) made `domain_base(true)` answer None always, so SYS_IRA answered ERR to every person-worn key and pcie1 took the boot's session key: an address that was the device's alone, unlinked across boots, against the rule that the person wears it (radio_addresses_belong_to_identity).
 - **The fix (kernel, rides the next reload):** the person's half derived from their held domain key in registers under a context of its own (`identity_domain_keys(b"ira person", ...)`, never the base), joined with the ira key by ferros_pieces `worn` (host test: per person, per device, none while locked). Each network sees one new address, the person's, which then holds across restarts and boots.
+
 
 **The router throttles rejoins.** A join a few seconds after the previous session was cut off (a driver killed, so no disassociation) is refused. The keeper's retry 64 s later joined. That's probably what happened to the placeholder on 2026-10-29, after dozens of reload rejoins under one address.
 
