@@ -1933,6 +1933,25 @@ The tele's capture puts the factory's near code at the HAL's minimum focus dista
 - Stored: `camera` from b39efa9d (567473 bytes, blake3 b3468dc5...), read back equal; the one before (deca6b4f) kept in target/farm/camera-work/out/camera-before-b39efa9d.capsule.vsf.
 - **Its travel** (a test build with the range open, every target read back): G#0100 to G#1900 within 7 (G#100 apart), G#3300 to G#3B00 within 2, G#3F00 to G#3EEC; past G#3F00 the position reads G#3FF2 to G#3FFF whatever the target, its 14-bit end. Offered since d49a0433: 256 to 16128, about 1.24 dioptres past infinity and to about 55 cm. Stored from d49a0433 (blake3 2963178d...), read back equal; it took G#0100 (read G#0103) and refused G#4000 (answer 1); the one before (b39efa9d) kept in target/farm/camera-work/out/camera-before-d49a0433.capsule.vsf.
 
+### The frame held (SET 5), on the Pro (2026-11-23, b1165, the flashed 389b6483; c1ca254c's driver hand-spawned, camtest `0000000E0k`, then stored)
+
+The owner's CLIP design (via the Lumis session): a clip's cadence fixed, its shutter live and capped at the exposure. SET `[3][5][ns u64 LE]` holds the frame from the next frame; the answer is 17 bytes, the status (0 held, 2 held with the exposure cut to the frame, 1 refused) then the frame and the exposure now in force (ns, u64 LE each); `[3][5][0]` or a SET 4 lets it go. Each step's frames measured from the MAP headers' end times over their counts:
+
+| step | main (asked, answered, measured) | tele |
+|---|---|---|
+| 1/30 s held | 33333333: [2] (the open's 67 ms cut to 33.325 ms), frame 33331275, 32 frames 33334388 apart | [0], frame 33330941, 33330683 apart |
+| a 4 ms exposure | [0], 33334983 apart | [0], 33331771 apart |
+| 1/24 s held | 41666667: [0], frame 41666456, 41666206 apart | [0], frame 41660623, 41662059 apart |
+| a 60 ms exposure | [2], cut to 41.64 ms | [2], cut to 41.636 ms, 41783897 apart |
+| 1 s held (shift 3 on the main) | [0], frame 999994956, 4 frames 999985107 apart | [0], 999978861 apart |
+| a 600 ms exposure inside it | [0], 999995035 apart, the header's 599.98 ms | [0], 999984639 apart |
+| let go (SET 5 of 0) | [0], the frame back to the shutter's, 600007070 apart | [0], 600124064 apart |
+| a 4 ms exposure | [0], 67271329 apart (the open's frame) | [0], 33335286 apart (the open's) |
+
+- Every held period lands within a line of the frame asked, rounded down as built (the main's 1/30 s 2 us short, its 1 s 5 us short), at 1/30 s, 1/24 s and 1 s on both; the exposure inside it as asked, cut to the frame less the margin when longer, answered [2]; the release brings back the exposure-driven frame.
+- **The tele's margin**: with its exposure cut to the frame less its CAPS margin (4 lines), its frames ran 41.784 ms against the 41.661 held, 20 lines long: its sensor pads a frame whose integration comes within about 24 lines of its end (Android's own margin there is 24). Every other tele step holds exact. The fix would be the tele's margin 24 in ferros_cam ccs (its CAPS says 4), for the owner's call; until then a client keeps the tele's shutter 24 lines (147 us) under its held frame for an exact cadence.
+- **Stored**: `camera` from c1ca254c (586113 bytes, blake3 22641548...), read back equal; started on demand it listed and streamed (camtest `1008`, 16 frames). The one before (716609 bytes, blake3 590b3d40..., not this agent's: stored with the 389b6483 flash) kept in target/farm/camera-work/out/camera-before-c1ca254c.capsule.vsf.
+
 ## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
