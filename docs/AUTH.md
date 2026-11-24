@@ -282,7 +282,7 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | The proof running | Computing identity keys. | | owner |
 | Looking up | Finding this identity. | | owner |
 | An identity exists | This identity already has devices. Add this one? Nothing reaches them until you say yes. | Yes, I really would like to add this device and this is my identity and not a typo | the button owner (2026-11-22); the text proposed |
-| Confirmed | Put the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros. Or touch this device's name on that page, then its green button. (this device's name below) | Not in range? Show words to copy/paste or dictate | the button owner (2026-11-22); the text proposed, after the owner's |
+| Confirmed | Put the two devices together, the other one's screen on, with "bind new device" pressed and approved on its Fleet page. Or touch this device's name on that page, then its green button. (this device's name below) | Not in range? Show words to copy/paste or dictate | the button owner (2026-11-22); the text proposed, after the owner's |
 | Words asked for | (as above, the pairing words below the name) |  | owner |
 | None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint | owner |
 | The two differ | They don't match. Try again. | | proposed |

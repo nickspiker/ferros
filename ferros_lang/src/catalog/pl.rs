@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Powołanie nie powiodło się. Enter, by spróbować ponownie.",
         Msg::JoinConfirmPrompt => "Ta tożsamość ma już urządzenia.\nDodać to? Nic do nich nie dotrze, dopóki nie powiesz tak.",
         Msg::JoinConfirmYes => "Tak, naprawdę chcę dodać to urządzenie, to moja tożsamość, a nie literówka",
-        Msg::JoinTogether => "Zbliż oba urządzenia, ekran drugiego włączony i otwarta jego strona floty, w Photon lub ferros.\nAlbo dotknij nazwy tego urządzenia na tamtej stronie, potem jego zielonego przycisku.",
+        Msg::JoinTogether => "Zbliż oba urządzenia, ekran drugiego włączony, a na jego stronie floty naciśnięte i zatwierdzone „powiąż nowe urządzenie”.\nAlbo dotknij nazwy tego urządzenia na tamtej stronie, potem jego zielonego przycisku.",
         Msg::JoinShowWords => "Poza zasięgiem? Pokaż słowa do skopiowania/wklejenia lub podyktowania",
         Msg::ComputingKeys => "Obliczanie kluczy tożsamości.",
         Msg::IdentityServiceNotAnswering => "Usługa tożsamości nie odpowiada.",

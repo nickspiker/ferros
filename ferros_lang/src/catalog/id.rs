@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Pencetakan gagal. Tekan enter untuk mencoba lagi.",
         Msg::JoinConfirmPrompt => "Identitas ini sudah punya perangkat.\nTambahkan yang ini? Tidak ada yang sampai ke mereka sebelum kamu bilang ya.",
         Msg::JoinConfirmYes => "Ya, saya sungguh ingin menambahkan perangkat ini, ini identitas saya dan bukan salah ketik",
-        Msg::JoinTogether => "Dekatkan kedua perangkat, layar perangkat yang lain menyala dan halaman armadanya terbuka, di Photon atau ferros.\nAtau sentuh nama perangkat ini di halaman itu, lalu tombol hijaunya.",
+        Msg::JoinTogether => "Dekatkan kedua perangkat, layar perangkat yang lain menyala dan \"ikat perangkat baru\" sudah ditekan dan disetujui di halaman armadanya.\nAtau sentuh nama perangkat ini di halaman itu, lalu tombol hijaunya.",
         Msg::JoinShowWords => "Tidak dalam jangkauan? Tampilkan kata untuk disalin/ditempel atau didiktekan",
         Msg::ComputingKeys => "Menghitung kunci identitas.",
         Msg::IdentityServiceNotAnswering => "Layanan identitas tidak menjawab.",

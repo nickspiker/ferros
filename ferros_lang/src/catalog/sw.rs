@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Kuzalisha kumeshindikana. Bonyeza ingiza ili kujaribu tena.",
         Msg::JoinConfirmPrompt => "Utambulisho huu tayari una vifaa.\nUongeze hiki? Hakuna kinachowafikia hadi useme ndiyo.",
         Msg::JoinConfirmYes => "Ndiyo, kweli nataka kuongeza kifaa hiki, huu ni utambulisho wangu na si kosa la kuandika",
-        Msg::JoinTogether => "Weka vifaa viwili pamoja, skrini ya kingine ikiwa imewashwa na ukurasa wake wa kundi ukiwa wazi, katika Photon au ferros.\nAu gusa jina la kifaa hiki kwenye ukurasa huo, kisha kitufe chake cha kijani.",
+        Msg::JoinTogether => "Weka vifaa viwili pamoja, skrini ya kingine ikiwa imewashwa na \"unganisha kifaa kipya\" kikiwa kimebonyezwa na kuidhinishwa kwenye ukurasa wake wa kundi.\nAu gusa jina la kifaa hiki kwenye ukurasa huo, kisha kitufe chake cha kijani.",
         Msg::JoinShowWords => "Haupo karibu? Onyesha maneno ya kunakili/kubandika au kuyasoma kwa sauti",
         Msg::ComputingKeys => "Inakokotoa funguo za utambulisho.",
         Msg::IdentityServiceNotAnswering => "Huduma ya utambulisho haijibu.",

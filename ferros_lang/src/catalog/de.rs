@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Prägen fehlgeschlagen. Enter für einen neuen Versuch.",
         Msg::JoinConfirmPrompt => "Diese Identität hat schon Geräte.\nDieses hinzufügen? Bis zu deinem Ja erfahren sie nichts.",
         Msg::JoinConfirmYes => "Ja, ich will dieses Gerät wirklich hinzufügen, das ist meine Identität und kein Tippfehler",
-        Msg::JoinTogether => "Halte die beiden Geräte zusammen, beim anderen den Bildschirm an und seine Flotten-Seite offen, in Photon oder ferros.\nOder berühre dort den Namen dieses Geräts, dann seinen grünen Knopf.",
+        Msg::JoinTogether => "Halte die beiden Geräte zusammen, beim anderen den Bildschirm an und auf seiner Flotten-Seite „neues Gerät binden“ gedrückt und bestätigt.\nOder berühre dort den Namen dieses Geräts, dann seinen grünen Knopf.",
         Msg::JoinShowWords => "Nicht in Reichweite? Wörter zum Kopieren/Einfügen oder Diktieren zeigen",
         Msg::ComputingKeys => "Berechne die Identitätsschlüssel.",
         Msg::IdentityServiceNotAnswering => "Der Identitätsdienst antwortet nicht.",

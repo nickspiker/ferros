@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "I rahua te whakawhānau. Pēhia te tāuru kia ngana anō.",
         Msg::JoinConfirmPrompt => "He pūrere kē tō tēnei tuakiri.\nMe tāpiri tēnei? Kāore he aha e tae atu ki a rātou kia whakaae rā anō koe.",
         Msg::JoinConfirmYes => "Āe, e tino hiahia ana ahau ki te tāpiri i tēnei pūrere, ko tōku tuakiri tēnei, ehara i te hapa patopato",
-        Msg::JoinTogether => "Whakatataria ngā pūrere e rua, kia ara te mata o tērā atu, kia tuwhera tōna whārangi kāhui, i Photon, i ferros rānei.\nKo te mea kē, pāwhiria te ingoa o tēnei pūrere i taua whārangi, kātahi ko tōna pātene kākāriki.",
+        Msg::JoinTogether => "Whakatataria ngā pūrere e rua, kia ara te mata o tērā atu, kia pēhia, kia whakaaetia hoki te \"herea he pūrere hou\" i tōna whārangi kāhui.\nKo te mea kē, pāwhiria te ingoa o tēnei pūrere i taua whārangi, kātahi ko tōna pātene kākāriki.",
         Msg::JoinShowWords => "Kāore i te tata? Whakaaturia ngā kupu hei tārua/whakapiri, hei whakahua rānei",
         Msg::ComputingKeys => "E tātai ana i ngā kī tuakiri.",
         Msg::IdentityServiceNotAnswering => "Kāore te ratonga tuakiri e whakautu ana.",

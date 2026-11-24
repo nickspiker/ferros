@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Conio non riuscito. Invio per riprovare.",
         Msg::JoinConfirmPrompt => "Questa identità ha già dei dispositivi.\nAggiungere questo? Non arriva loro nulla finché non dici sì.",
         Msg::JoinConfirmYes => "Sì, voglio davvero aggiungere questo dispositivo, questa è la mia identità e non un errore di battitura",
-        Msg::JoinTogether => "Avvicina i due dispositivi, con lo schermo dell'altro acceso e la sua pagina flotta aperta, in Photon o ferros.\nOppure tocca il nome di questo dispositivo in quella pagina, poi il suo pulsante verde.",
+        Msg::JoinTogether => "Avvicina i due dispositivi, con lo schermo dell'altro acceso e «associa nuovo dispositivo» premuto e approvato nella sua pagina flotta.\nOppure tocca il nome di questo dispositivo in quella pagina, poi il suo pulsante verde.",
         Msg::JoinShowWords => "Fuori portata? Mostra le parole da copiare/incollare o dettare",
         Msg::ComputingKeys => "Calcolo delle chiavi d’identità.",
         Msg::IdentityServiceNotAnswering => "Il servizio di identità non risponde.",

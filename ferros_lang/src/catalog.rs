@@ -735,7 +735,7 @@ messages! {
     JoinConfirmPrompt,
     /// The confirmation's button, in the owner's words: a sentence the attest screen wraps.
     JoinConfirmYes,
-    /// Two lines: how to finish the join, the two devices held together (NFC) with the other's Fleet page open, or this device touched on that page and its green button (BLE).
+    /// Two lines: how to finish the join, the two devices held together (NFC) with "bind new device" pressed and approved on the other's Fleet page (owner, 2026-11-24: its page is passive until then), or this device touched on that page and its green button (BLE).
     JoinTogether,
     /// The button behind which the pairing words wait (never shown by default: shoulder surfing), a sentence the attest screen wraps.
     JoinShowWords,

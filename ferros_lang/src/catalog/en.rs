@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Minting failed. Enter to retry.",
         Msg::JoinConfirmPrompt => "This identity already has devices.\nAdd this one? Nothing reaches them until you say yes.",
         Msg::JoinConfirmYes => "Yes, I really would like to add this device and this is my identity and not a typo",
-        Msg::JoinTogether => "Put the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros.\nOr touch this device's name on that page, then its green button.",
+        Msg::JoinTogether => "Put the two devices together, the other one's screen on, with \"bind new device\" pressed and approved on its Fleet page.\nOr touch this device's name on that page, then its green button.",
         Msg::JoinShowWords => "Not in range? Show words to copy/paste or dictate",
         Msg::ComputingKeys => "Computing identity keys.",
         Msg::IdentityServiceNotAnswering => "The identity service is not answering.",

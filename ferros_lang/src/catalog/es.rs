@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Falló el acuñado. Intro para reintentar.",
         Msg::JoinConfirmPrompt => "Esta identidad ya tiene dispositivos.\n¿Añadir este? No les llega nada hasta que digas que sí.",
         Msg::JoinConfirmYes => "Sí, de verdad quiero añadir este dispositivo, esta es mi identidad y no es un error de tecleo",
-        Msg::JoinTogether => "Junta los dos dispositivos, con la pantalla del otro encendida y su página de flota abierta, en Photon o ferros.\nO toca el nombre de este dispositivo en esa página y luego su botón verde.",
+        Msg::JoinTogether => "Junta los dos dispositivos, con la pantalla del otro encendida y «vincular dispositivo nuevo» pulsado y aprobado en su página de flota.\nO toca el nombre de este dispositivo en esa página y luego su botón verde.",
         Msg::JoinShowWords => "¿Fuera de alcance? Mostrar palabras para copiar y pegar o dictar",
         Msg::ComputingKeys => "Calculando las claves de identidad.",
         Msg::IdentityServiceNotAnswering => "El servicio de identidad no responde.",

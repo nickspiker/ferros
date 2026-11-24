@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Nabigo ang pagbuo. Pindutin ang enter para subukan ulit.",
         Msg::JoinConfirmPrompt => "May mga device na ang pagkakakilanlang ito.\nIdagdag ito? Walang aabot sa kanila hangga't hindi ka pumapayag.",
         Msg::JoinConfirmYes => "Oo, gusto ko talagang idagdag ang device na ito, ito ang aking pagkakakilanlan at hindi typo",
-        Msg::JoinTogether => "Pagdikitin ang dalawang device, nakabukas ang screen ng isa at ang pahina ng armada nito, sa Photon o ferros.\nO pindutin ang pangalan ng device na ito sa pahinang iyon, saka ang berdeng button nito.",
+        Msg::JoinTogether => "Pagdikitin ang dalawang device, nakabukas ang screen ng isa at pinindot at inaprubahan ang \"mag-bind ng bagong device\" sa pahina ng armada nito.\nO pindutin ang pangalan ng device na ito sa pahinang iyon, saka ang berdeng button nito.",
         Msg::JoinShowWords => "Wala sa abot? Ipakita ang mga salita para kopyahin/i-paste o idikta",
         Msg::ComputingKeys => "Kinukuwenta ang mga susi ng pagkakakilanlan.",
         Msg::IdentityServiceNotAnswering => "Hindi sumasagot ang serbisyo ng pagkakakilanlan.",

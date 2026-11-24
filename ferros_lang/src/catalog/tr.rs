@@ -444,7 +444,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::MintingFailed => "Basılamadı. Yeniden denemek için giriş tuşuna dokun.",
         Msg::JoinConfirmPrompt => "Bu kimliğin zaten cihazları var.\nBu da eklensin mi? Sen evet diyene kadar onlara hiçbir şey gitmez.",
         Msg::JoinConfirmYes => "Evet, bu cihazı gerçekten eklemek istiyorum, bu benim kimliğim ve yazım hatası değil",
-        Msg::JoinTogether => "İki cihazı birbirine yaklaştır, diğerinin ekranı açık ve filo sayfası açık olsun, Photon veya ferros'ta.\nYa da o sayfada bu cihazın adına dokun, sonra yeşil düğmesine.",
+        Msg::JoinTogether => "İki cihazı birbirine yaklaştır; diğerinin ekranı açık olsun ve filo sayfasında \"yeni cihaz bağla\" basılıp onaylanmış olsun.\nYa da o sayfada bu cihazın adına dokun, sonra yeşil düğmesine.",
         Msg::JoinShowWords => "Menzilde değil mi? Kopyalayıp yapıştırmak veya dikte etmek için kelimeleri göster",
         Msg::ComputingKeys => "Kimlik anahtarları hesaplanıyor.",
         Msg::IdentityServiceNotAnswering => "Kimlik hizmeti yanıt vermiyor.",
