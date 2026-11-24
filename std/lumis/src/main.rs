@@ -597,7 +597,7 @@ impl Probe {
     }
 
     /// One pass of the camera screen: the image counter as it read before the draw, and the draw's time.
-    fn pass(&mut self, counter: u64, us: u64) {
+    fn pass(&mut self, counter: u64, us: u64, why: &mut [u32; lumis_core::ui::screen::DRAW_WHY_COUNT]) {
         self.passes += 1;
         self.counter_at.get_or_insert(counter);
         match self.counter {
@@ -627,6 +627,10 @@ impl Probe {
                 mean(self.draw_other, self.passes - self.fresh),
                 mean(self.convert, self.converts)
             );
+            // Why its passes drew the screen whole (lumis_core `draw_why`), and those drawn in part.
+            use lumis_core::ui::screen::*;
+            println!("lumis: preview, those passes drawn whole for: a new image A#{}, the exposure's start A#{}, the level A#{}, a touch A#{}, a turn A#{}, a calibration or the scale A#{}, the corner pixel A#{}, the histogram A#{}; drawn in part A#{}", why[DRAW_WHY_IMAGE], why[DRAW_WHY_START], why[DRAW_WHY_LEVEL], why[DRAW_WHY_TOUCH], why[DRAW_WHY_ROTATION], why[DRAW_WHY_HOLD], why[DRAW_WHY_MAGIC], why[DRAW_WHY_HISTOGRAM], why[DRAW_WHY_PARTIAL]);
+            *why = [0; DRAW_WHY_COUNT];
             *self = Probe { counter: self.counter, ..Probe::new() };
         }
     }
@@ -2667,7 +2671,7 @@ impl FluorApp<G2t16> for Lumis {
                     println!("lumis: development: the gravity given, {gravity:?} (None: upright)");
                 }
                 app::ui_frame(ui, surface, Buttons::default(), gravity.unwrap_or(UPRIGHT), self.finger);
-                self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64);
+                self.probe.pass(ui.previous_image_counter, t.elapsed().as_micros() as u64, &mut ui.draw_why);
                 // Every reason draw_screen draws the whole screen that this side can read: a new image, a new exposure, a new histogram, a calibration hold or its end, the calibration screens, and any touch (a touch may change any control).
                 // Not readable from here: a buffer whose corner pixel another drew over (never on ferros: the buffer is Lumis's own). A turn of the device and the level indicator are read below, from the fields lumis_core keeps for them.
                 // A new image (its counter, or the exposure's start that moves with it at every completion) is what it changed of the camera's part and the controls that tick (`partial_parts` with lumis_core `camera_damage`: the fit view's rect, the bars around the image holding controls that did not move; in Slitscan the wiper's band of rows, owner 2026-11-18). Anything else that moved draws whole.
