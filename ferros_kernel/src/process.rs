@@ -4843,7 +4843,9 @@ const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
 /// The context binding a kist's ira-derived key to its gate identity (`SYS_IRA`).
 const KIST_IRA_CONTEXT: &str = "ferros 2026-11-08 kist ira";
 /// A process's ira key bound to the person present (SYS_IRA x4 bit 0): the WiFi address a person wears on a network, theirs and this device's together.
-const PERSON_IRA_CONTEXT: &str = "ferros 2026-11-09 person ira";
+/// The contexts of the person's part of a person-worn key (SYS_IRA x4 bit 0): the address one is the part, the seal one is derived with it and dropped.
+const PERSON_IRA_ADDR: &str = "ferros 2026-11-24 person-worn ira part";
+const PERSON_IRA_SEAL: &str = "ferros 2026-11-24 person-worn ira unused";
 /// A system process's key for this power session (SYS_IRA x4 bit 2), from the wairua: the WiFi address while nobody is present, the same on every join in one boot and unlinkable to any other boot.
 const SESSION_KEY_CONTEXT: &str = "ferros 2026-11-14 process session key";
 /// The root those keys come from (`wairua::derive`), one per power session.
@@ -8036,12 +8038,16 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     // Bit 0 of x4: the key worn by the person as well as the device (owner, 2026-11-09: "We mix the ira in with our identity. can't have same address devices on network"): bound to the unlocked identity's domain key, so it differs for every person on every device and exists only while someone is present (none while locked).
                     let person = f.x[4] & 1 != 0;
                     let key = core::str::from_utf8(&context).ok().and_then(crate::ira::derive).and_then(|k| match (p.kist, p.domain) {
-                        (false, _) if person => crate::service::domain_base(true).map(|id| {
-                            let mut h = blake3::Hasher::new_derive_key(PERSON_IRA_CONTEXT);
-                            h.update(&id);
-                            h.update(&k);
-                            *h.finalize().as_bytes()
-                        }),
+                        // The person's part derived from their held domain key in registers (`identity_domain_keys` under a prefix of its own), never the base itself: since b261a07b (2026-11-17) the base is never handed out (`domain_base(true)` answers None), and this branch, which read it, answered ERR to every person-worn key, so pcie1 wore the boot's address on every join while a person was present (found 2026-11-24).
+                        (false, _) if person => {
+                            let mut ks = crate::service::identity_domain_keys(b"ira person", PERSON_IRA_ADDR, PERSON_IRA_SEAL);
+                            let mut part = ks.map(|x| <[u8; 32]>::try_from(&x[..32]).unwrap());
+                            let w = ferros_pieces::worn::worn(part.as_ref(), &k);
+                            // The person's half leaves no copy behind.
+                            ks.iter_mut().for_each(|x| x.fill(0));
+                            part.iter_mut().for_each(|x| x.fill(0));
+                            w
+                        }
                         (false, _) => Some(k),
                         // A kist asks for its own keys only.
                         (true, _) if person => None,
