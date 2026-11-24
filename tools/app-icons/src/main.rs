@@ -370,7 +370,7 @@ fn tag_cmd(args: &[String]) {
     println!("app-icons: {src} -> {out} (primaries {})", p.as_str());
 }
 
-/// `looks <out.vsf> <name>=<path>[:keep|:gamma2]...`: the icons as the display drew them before 2026-11-24 (their codes as `g2t`) over the codes the device draws now (ferros_kept::icon: the source's sRGB numbers converted and assigned), two rows, each cut to its circle on black, as one VSF visual (8-bit `g2t`).
+/// `looks <out.vsf> <name>=<path>[:keep|:gamma2]...`: three rows, each icon cut to its circle on black, as one VSF visual (8-bit `g2t`): the gamma 2 build (7c76fd89: vsf's colorimetric `SRGB2VSF_RGB`, then gamma 2, each value cast as it came); the owner's highlight extension (ferros_kept::icon `from_srgb`: L = tan(x · π/2), the matrix, g2t); and the comparison extension (`extend_g2t_inverse`: L = atanh(√x)², a grey keeping its gamma 2 code).
 /// `:keep` an icon kept as it is (Kūaha's, `primaries: vsf`); `:gamma2` a VSF RGB gamma 2 source picture (Aemulus's, already through the owner's steps 1 to 3 by its own tool): before, the `--place` icon made of it, after, its codes assigned as they stand (`icon <source> <out> --primaries vsf`), what an sRGB icon becomes on the device.
 fn looks_cmd(args: &[String]) {
     let [out, icons @ ..] = args else { usage() };
@@ -378,36 +378,46 @@ fn looks_cmd(args: &[String]) {
         usage();
     }
     let gap = SIZE >> 5;
-    let (w, h) = (icons.len() * (SIZE + gap) + gap, 2 * SIZE + 3 * gap);
+    let (w, h) = (icons.len() * (SIZE + gap) + gap, 3 * SIZE + 4 * gap);
     let mut rgb = vec![0u8; w * h * 3];
     let k = coverage();
     for (n, arg) in icons.iter().enumerate() {
         let (name, rest) = arg.split_once('=').unwrap_or_else(|| usage());
         let (path, how) = rest.split_once(':').unwrap_or((rest, ""));
         let doc = fs::read(path).unwrap_or_else(|e| fail(format!("{path}: {e}")));
-        let (before, after): (Vec<u8>, Vec<u8>) = match how {
+        let (before, after, inverse): (Vec<u8>, Vec<u8>, Vec<u8>) = match how {
             "gamma2" => {
                 let px = match read_vsf_source(&doc).unwrap_or_else(|e| fail(format!("{path}: {e}"))) {
                     VsfSource::Codes(..) => prepare(Path::new(path), AvatarCodes::Gamma2),
                     VsfSource::Icon(..) => fail(format!("{path}: :gamma2 takes a gamma 2 source picture")),
                 };
-                (px.iter().map(|&v| delinearize_gamma2tanh_u8_f32(v * v)).collect(), px.iter().map(|&v| (v * 256.) as u8).collect())
+                let kept: Vec<u8> = px.iter().map(|&v| (v * 256.) as u8).collect();
+                (kept.clone(), kept.clone(), kept)
             }
             "keep" => {
                 let c = decode_icon(&doc, path);
-                (c.clone(), c)
+                (c.clone(), c.clone(), c)
             }
             "" => {
                 let c = decode_icon(&doc, path);
-                let mut a = Vec::with_capacity(c.len());
+                let (mut b, mut a, mut v) = (Vec::with_capacity(c.len()), Vec::with_capacity(c.len()), Vec::with_capacity(c.len()));
                 for p in c.chunks_exact(3) {
-                    a.extend_from_slice(&ferros_kept::icon::from_srgb([p[0], p[1], p[2]]));
+                    let t = [p[0], p[1], p[2]];
+                    // The gamma 2 build on the Pro now, for the comparison only.
+                    #[allow(deprecated)]
+                    let s = t.map(vsf::colour::legacy::convert::linearize_srgb_u8);
+                    let l = apply_matrix_3x3_f32(&vsf::colour::legacy::constants::SRGB2VSF_RGB, &s);
+                    b.extend(l.map(|x| (x.sqrt() * 256.) as u8));
+                    a.extend_from_slice(&ferros_kept::icon::from_srgb(t));
+                    v.extend_from_slice(&ferros_kept::icon::from_srgb_extended(t, ferros_kept::icon::extend_g2t_inverse));
                 }
-                (c, a)
+                let white = |x: &[u8]| x.chunks_exact(3).zip(&k).filter(|(p, kk)| **kk >= 1. && p.iter().all(|&q| q == 255)).count();
+                println!("  {name}: pixels at code 255 in all three: on the Pro now {}, tan {}, atanh {} (of {} inside)", white(&b), white(&a), white(&v), k.iter().filter(|&&kk| kk >= 1.).count());
+                (b, a, v)
             }
             _ => usage(),
         };
-        for (row, codes) in [&before, &after].into_iter().enumerate() {
+        for (row, codes) in [&before, &after, &inverse].into_iter().enumerate() {
             for y in 0..SIZE {
                 for x in 0..SIZE {
                     let (i, at) = (y * SIZE + x, ((gap + row * (SIZE + gap) + y) * w + gap + n * (SIZE + gap) + x) * 3);

@@ -2,7 +2,7 @@
 //!
 //! - **An icon's `hp`** is the BLAKE3 of the `icon` section its capsule carries (ferros_kist `icon_hp`): the same icon in two builds of a kist is one icon.
 //! - **The index** (`kists.icons`, [`INDEX`], device data the stower writes at stow): a section `icon` per kist with an icon, `thing` (`ht`, the kist) and `icon` (`hp`, its icon now). The map reads it to know each circle's icon; the person's list does not carry it (KISTS.md "Icons").
-//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is), `rgba` (`t_u3`, side × side × 4: the icon's codes as decoded, with the circle's coverage in alpha, [`texels`]) and `primaries` (what the codes are, [`Source`]; none in a document from before 2026-11-24, which is sRGB). Side is [`SIDE`], the icon's own size, never the size it is drawn at. Read back ([`read_decoded`]) as straight VSF RGB `g2t` codes: the source's sRGB numbers linearised and reassigned ([`from_srgb`]), VSF RGB as it is.
+//! - **A decoded icon** (in `kists.` under its `hp` as a 32-byte address): what the display draws, so the display decodes nothing (COMPOSITOR.md "Baked"): section `decoded`, `icon` (`hp`, the icon it is), `rgba` (`t_u3`, side × side × 4: the icon's codes as decoded, with the circle's coverage in alpha, [`texels`]) and `primaries` (what the codes are, [`Source`]; none in a document from before 2026-11-24, which is sRGB). Side is [`SIDE`], the icon's own size, never the size it is drawn at. Read back ([`read_decoded`]) as straight VSF RGB `g2t` codes: the source's sRGB numbers converted ([`from_srgb`]), VSF RGB as it is.
 //! - **The display's cache** ([`Cache`]): a few icons built for drawing, each in a slot found by its `hp`; one missing is asked of the map, which sends its texels in pieces ([`Pieces`]).
 
 use crate::document;
@@ -121,22 +121,33 @@ impl Source {
     }
 }
 
-/// An sRGB code triple in linear VSF RGB: each code decurved by sRGB's transfer (IEC 61966-2-1, the code over 255) to linear, then sRGB's primaries to VSF RGB's by vsf's `SRGB2VSF_RGB`.
-/// vsf builds that matrix thru 1931 XYZ, the only observer an xy-defined space supports, colorimetric with no chromatic adaptation.
-/// Every entry is positive, so no sRGB colour comes out negative: VSF RGB's spectral primaries hold sRGB's gamut.
-/// A channel may come out past 1 (sRGB's white is past it in VSF blue).
-#[allow(deprecated)]
-pub fn srgb_linear_vsf(c: [u8; 3]) -> [f32; 3] {
-    // sRGB is only the space an icon's codes arrive in (the owner's exception for decoding foreign pictures at ingest): decoded once, here, never encoded to.
-    let s = c.map(vsf::colour::legacy::convert::linearize_srgb_u8);
-    vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::legacy::constants::SRGB2VSF_RGB, &s)
+/// The owner's highlight extension (2026-11-24): sRGB's linear light x, 0 to 1, as unbounded light L = tan(x · π/2), so sRGB's white is light without end and g2t's tanh brings it back to the top code; nothing clips, and no white is balanced.
+/// In f64: f32's π/2 rounds up past the true π/2, where tan turns a huge negative, while f64's rounds down, where tan(π/2) is 1.6 × 10^16, positive and finite (tested).
+pub fn extend_tan(x: f64) -> f64 {
+    libm::tan(x * core::f64::consts::FRAC_PI_2)
 }
 
-/// An icon's sRGB code triple as the codes the display draws, the owner's steps (2026-11-24): "1. Undo the sRGB curve, to linear light. 2. Convert sRGB primaries to VSF RGB primaries, still linear. 3. Encode to VSF RGB by applying its gamma of two: code = sqrt(linear). 4. Assign g2t to those gamma-2 codes. Label only, no further curve."
-/// Steps 1 and 2 are [`srgb_linear_vsf`]; step 3 is VSF RGB's own gamma 2, √L × 256 truncated (vsf `delinearize_gamma2_u8_f32`, bucket bottom), never g2t's tanh; step 4 is only that the display reads these codes as `g2t`.
-/// A value whose root is at or past 255/256 is the top code: the float-to-integer cast stops at 255, nothing else is done to it (sRGB's white is VSF (0.91, 1.03, 1.09), codes (244, 255, 255)).
+/// The comparison extension: g2t's exact inverse of x's gamma 2, L = atanh(√x)², so a grey keeps the gamma 2 code it had (tanh(atanh(√x)) = √x) and only highlights and hue differ; sRGB's white is infinite light (atanh(1)).
+pub fn extend_g2t_inverse(x: f64) -> f64 {
+    let a = libm::atanh(libm::sqrt(x));
+    a * a
+}
+
+/// An sRGB code triple as the `g2t` codes the display draws, extended by `extend`, the owner's steps (2026-11-24): "1. Read the pixel, sRGB code. 2. Decurve to sRGB linear x, in 0..1, float. 3. Extend the highlights: L = tan(x · π/2), so x = 1 → ∞ (white), all in float. 4. Convert sRGB primaries to VSF RGB linear with the matrix, in float. 5. Encode g2t properly: code = tanh(sqrt(L))".
+/// Step 4 is vsf's `SRGB2VSF_RGB` (built thru 1931 XYZ, colorimetric): every entry positive and none zero, so a channel of any light, even infinite, times its entry is light of the same sign and no infinity ever meets a zero.
+/// Step 5 is vsf's g2t encode (`delinearize_gamma2tanh_u8_f32`, truncation settled against its decoder): g2t's top code is the bucket of every light from atanh(255/256)², about 9.6 times diffuse white, to infinity, so a white of any of its channels' lights, however large, is code 255 in all three, neutral, and nothing is clipped.
+#[allow(deprecated)]
+pub fn from_srgb_extended(c: [u8; 3], extend: impl Fn(f64) -> f64) -> [u8; 3] {
+    // sRGB is only the space an icon's codes arrive in (the owner's exception for decoding foreign pictures at ingest): decoded once, here, never encoded to.
+    let x = c.map(vsf::colour::legacy::convert::linearize_srgb_u8);
+    let l = x.map(|v| extend(v as f64) as f32);
+    let v = vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::legacy::constants::SRGB2VSF_RGB, &l);
+    v.map(vsf::colour::convert::delinearize_gamma2tanh_u8_f32)
+}
+
+/// An sRGB code triple as the codes the display draws, the owner's pipeline ([`from_srgb_extended`] with [`extend_tan`]).
 pub fn from_srgb(c: [u8; 3]) -> [u8; 3] {
-    srgb_linear_vsf(c).map(vsf::colour::convert::delinearize_gamma2_u8_f32)
+    from_srgb_extended(c, extend_tan)
 }
 
 /// Straight RGBA texels from codes of `source` to the codes the display draws, in place: sRGB numbers converted ([`from_srgb`]), VSF RGB left as it is; alpha untouched.
@@ -375,20 +386,33 @@ mod tests {
         assert_eq!(texels(&planes[1..], false), None);
     }
 
-    /// The owner's steps (2026-11-24): sRGB decurved to linear, sRGB's primaries to VSF RGB's, VSF RGB's gamma 2 (√L × 256), the codes labelled g2t; black stays black, a grey's codes the roots of the matrix's rows times its light.
+    /// The owner's pipeline (2026-11-24): white of any channel's light is code 255 in all three, black is 0, f64's tan(π/2) positive and finite, a grey D65's light rising in every channel; the codes asked for printed under both extensions.
     #[test]
-    fn srgb_numbers_are_converted_to_vsf_gamma2() {
-        assert_eq!(from_srgb([0, 0, 0]), [0, 0, 0]);
-        let m = vsf::colour::legacy::constants::SRGB2VSF_RGB;
-        let white = vsf::colour::convert::apply_matrix_3x3_f32(&m, &[1.; 3]);
-        assert!(white.iter().all(|&v| v > 0.5), "{white:?}");
-        assert_eq!(from_srgb([255; 3]), white.map(|v| (libm::sqrtf(v) * 256.) as u8));
-        assert_eq!(from_srgb([255; 3])[0], 244, "sRGB's white in VSF red, gamma 2");
-        // sRGB 128 is 0.2158 linear.
-        assert_eq!(from_srgb([128; 3]), white.map(|v| (libm::sqrtf(v * 0.215_861) * 256.) as u8));
-        // Gamma 2, never g2t's tanh: a mid grey sits where gamma 2 puts it, above g2t's code for the same light.
-        let mid = from_srgb([128; 3])[1];
-        assert!(mid > vsf::colour::convert::delinearize_gamma2tanh_u8_f32(white[1] * 0.215_861), "{mid}");
+    fn srgb_highlights_extend_to_the_top_code() {
+        let tan_white = extend_tan(1.);
+        assert!(tan_white.is_finite() && tan_white > 1e15, "f64's tan(π/2): {tan_white}");
+        assert_eq!(from_srgb([255; 3]), [255; 3], "white, neutral at the top code");
+        assert_eq!(from_srgb_extended([255; 3], extend_g2t_inverse), [255; 3]);
+        assert_eq!(from_srgb([0; 3]), [0; 3]);
+        assert_eq!(from_srgb_extended([0; 3], extend_g2t_inverse), [0; 3]);
+        // No white is balanced: an sRGB grey is D65 light, which in VSF RGB is (0.91, 1.03, 1.09) times it, so its codes lean that way below white; each channel rises with the grey and none goes back.
+        let mut last = [0u8; 3];
+        for c in 0..=255u8 {
+            let g = from_srgb([c; 3]);
+            assert!(g[0] <= g[1] && g[1] <= g[2], "a grey is D65's light, red the least, blue the most: {c} -> {g:?}");
+            assert!((0..3).all(|k| g[k] >= last[k]), "codes rise with the grey: {c} -> {g:?} after {last:?}");
+            last = g;
+        }
+        // The codes the coordinator asked for: x (sRGB linear) 0.214, 0.5, 0.9 and 1, by the sRGB code that decurves nearest each, and the three primaries.
+        #[allow(deprecated)]
+        let code_of = |x: f32| (0..=255u8).min_by(|&a, &b| (vsf::colour::legacy::convert::linearize_srgb_u8(a) - x).abs().total_cmp(&(vsf::colour::legacy::convert::linearize_srgb_u8(b) - x).abs())).unwrap();
+        for x in [0.214f32, 0.5, 0.9, 1.] {
+            let c = code_of(x);
+            std::println!("x {x} (sRGB code {c}): tan {:?}, atanh {:?}", from_srgb([c; 3]), from_srgb_extended([c; 3], extend_g2t_inverse));
+        }
+        for (n, c) in [("red", [255, 0, 0]), ("green", [0, 255, 0]), ("blue", [0, 0, 255])] {
+            std::println!("{n}: tan {:?}, atanh {:?}", from_srgb(c), from_srgb_extended(c, extend_g2t_inverse));
+        }
         let mut v = alloc::vec![200u8, 100, 50, 255];
         to_g2t(&mut v, Source::Vsf);
         assert_eq!(v, [200, 100, 50, 255], "VSF RGB is kept");
@@ -399,8 +423,6 @@ mod tests {
         assert_eq!(Source::from_primaries(Some("srgb")), Some(Source::Srgb));
         assert_eq!(Source::from_primaries(Some("vsf")), Some(Source::Vsf));
         assert_eq!(Source::from_primaries(Some("rec2020")), None);
-        std::println!("sRGB white in VSF RGB: {white:?}; codes {:?}; red {:?}, green {:?}, blue {:?}", from_srgb([255; 3]), from_srgb([255, 0, 0]), from_srgb([0, 255, 0]), from_srgb([0, 0, 255]));
-        std::println!("linear: red {:?}, green {:?}, blue {:?}", srgb_linear_vsf([255, 0, 0]), srgb_linear_vsf([0, 255, 0]), srgb_linear_vsf([0, 0, 255]));
     }
 
     /// A decoded document from before (no `primaries`) reads as sRGB numbers, converted; one that names `vsf` reads as it is.
