@@ -5548,7 +5548,7 @@ fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
 /// 17 the request waiting (Unlock or Settings): its word, 0 none.
 /// 18 Decline (the attest screen alone: the Unlock right, ahau by name, never a kist): the request dropped, nothing applied, the device still locked. → 0.
 /// 19 the "require attest" guards (Settings; reading also Unlock): x2 0 their bits; x2 1 guard x3 on, kept in the device's settings document (no attest: tightening is always safe) → the bits after. Off is an approve (op 16, GUARD_OFF).
-/// 20 take an approval of kind x2 that a process carries out itself (Settings or Unlock): the approved word (the kernel holds it no longer), NOTHING while it waits on the attest screen, 0 neither.
+/// 20 take an approval of kind x2 that a process carries out itself (Settings or Unlock): the approved word (the kernel holds it no longer; x3 1 only looks, leaving it held for the process that takes it), NOTHING while it waits on the attest screen, 0 neither.
 fn approve_syscall(p: &Process, f: &Frame) -> u64 {
     use ahau_core::approve::{self, Request};
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
@@ -5599,7 +5599,9 @@ fn approve_syscall(p: &Process, f: &Frame) -> u64 {
         20 if (settings || unlock_right) && !p.kist => {
             let kind = f.x[2] as u8;
             let held = APPROVED.load(Acquire);
-            if held != 0 && held as u8 == kind && APPROVED.compare_exchange(held, 0, AcqRel, Acquire).is_ok() {
+            if held != 0 && held as u8 == kind && f.x[3] == 1 {
+                held
+            } else if held != 0 && held as u8 == kind && APPROVED.compare_exchange(held, 0, AcqRel, Acquire).is_ok() {
                 crate::flashlog::line(&alloc::format!("approve: kind A#{kind} taken by {}", core::str::from_utf8(&p.name).unwrap_or("?")));
                 held
             } else if APPROVAL.load(Acquire) as u8 == kind && kind != 0 {

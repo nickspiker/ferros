@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Схвалити: режим розробника увімк.\nkist, запропонований через USB, ховається без питання.",
         Msg::RequireAttest => "вимагати засвідчення",
         Msg::RequireAttestNote => "увімк: зміна вимагає засвідчення;\nвимкнення цього теж",
+        Msg::BindNewDevice => "прив'язати новий пристрій",
+        Msg::ApproveFleetAdd => "Схвалити: прив'язати новий пристрій.\nЦя сторінка флоту слухатиме його: обидва поруч, дотик до його назви або його слова.",
         Msg::JoiningButton => "підключення",
         Msg::Join => "підключитися",
         Msg::TypeYourHandle => "Введи свій handle.",

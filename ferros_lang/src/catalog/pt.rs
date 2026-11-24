@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Aprovar: modo desenvolvedor ligado.\nUm kist oferecido por USB é guardado sem perguntar.",
         Msg::RequireAttest => "exigir atestar",
         Msg::RequireAttestNote => "ligado, mudar isto exige atestar;\ndesligar isto também",
+        Msg::BindNewDevice => "vincular novo dispositivo",
+        Msg::ApproveFleetAdd => "Aprovar: vincular um novo dispositivo.\nEsta página da frota passa a ouvi-lo: os dois juntos, o nome dele tocado ou as palavras dele.",
         Msg::JoiningButton => "conectando",
         Msg::Join => "conectar",
         Msg::TypeYourHandle => "Digite o seu handle.",

@@ -247,11 +247,25 @@ impl Client {
     }
 
     /// The add flow on the glass (op 8 [1]) or not (anything else). The map's No on a selected device is also [8][1] (No does what Back does): it drops the pick. Answers 0.
+    /// It opens only with the person's approve held in the kernel (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"; ahau_core::approve::FLEET_ADD), taken here as it opens, so one approve opens it once; without it the flow stays closed, its NFC reader and BLE scan off. A flow already open stays open when told again.
     pub fn add_page(&mut self, on: bool) -> u8 {
         if on && self.add_phase() == Phase::Selected {
             self.add_event(Flow::User(UserOp::No));
             self.add.note.clear();
             return 0;
+        }
+        if on && !self.add.shown {
+            match ferros_sys::approve::take(cap(unsafe { GRANTS }, S_UNLOCK), ahau_core::approve::FLEET_ADD) {
+                ferros_sys::approve::Taken::Approved(_) => {
+                    self.log.put(b"fgtw: the add flow opens, approved on the attest screen (bind new device)");
+                    self.log.line();
+                }
+                _ => {
+                    self.log.put(b"fgtw: the add flow stays closed: no approve on the attest screen held for it");
+                    self.log.line();
+                    return 0;
+                }
+            }
         }
         self.add.shown = on;
         self.add.refused = false;

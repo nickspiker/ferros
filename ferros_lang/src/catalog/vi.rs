@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Chấp thuận: bật chế độ nhà phát triển.\nMột kist được đưa qua USB sẽ được cất mà không hỏi.",
         Msg::RequireAttest => "yêu cầu chứng thực",
         Msg::RequireAttestNote => "khi bật, đổi nó cần chứng thực;\ntắt mục này cũng vậy",
+        Msg::BindNewDevice => "liên kết thiết bị mới",
+        Msg::ApproveFleetAdd => "Chấp thuận: liên kết thiết bị mới.\nTrang Đội này sẽ lắng nghe nó: hai máy đặt cạnh nhau, chạm vào tên nó, hoặc các từ của nó.",
         Msg::JoiningButton => "đang kết nối",
         Msg::Join => "kết nối",
         Msg::TypeYourHandle => "Gõ handle của bạn.",

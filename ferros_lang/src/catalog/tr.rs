@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Onayla: geliştirici modu açık.\nUSB ile sunulan bir kist sormadan yerleştirilir.",
         Msg::RequireAttest => "tasdik iste",
         Msg::RequireAttestNote => "açıkken değiştirmek tasdik ister;\nbunu kapatmak da",
+        Msg::BindNewDevice => "yeni cihaz bağla",
+        Msg::ApproveFleetAdd => "Onayla: yeni bir cihaz bağla.\nBu Filo sayfası onu dinler: ikisi yan yana, adına dokunularak ya da sözcükleriyle.",
         Msg::JoiningButton => "katılınıyor",
         Msg::Join => "katıl",
         Msg::TypeYourHandle => "Handle'ını yaz.",

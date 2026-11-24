@@ -792,7 +792,7 @@ impl Client {
 
     /// Unlock at boot as the kernel has it now, followed (`ferros_kept::secret::follow`): turned on (the Security page), the roots, the fleet key and the chain in hand are kept now, each as its document, so the next boot finds them; turned off, everything of the identity goes from the disk at once (off is always safe; AUTH.md).
     /// Nothing when it has not changed.
-    /// The kernel keeps its own seed at the retype gate's match (SYS_UNLOCK op 12, `retype_keep`) and at a typed attest with the setting on (a tag unlock never keeps it); that unlock hands the roots here (op 4), which keeps them as well.
+    /// The kernel keeps its own seed at a typed attest with the setting on, and at the approve that turns it on (a tag unlock never keeps it); that unlock hands the roots here (op 4), which keeps them as well.
     fn follow_persist(&mut self) {
         use ferros_kept::secret::{Follow, Kind};
         let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
@@ -1722,6 +1722,8 @@ impl Client {
             return;
         }
         self.forget_identity();
+        // The add flow closes with the lock: it opens again only with a new approve (add.rs `add_page`), never by itself once the roots are back.
+        self.add_page(false);
         self.log.put(b"fgtw: the kernel locked the identity: its roots, the fleet key and the person key wiped from RAM; no identity in hand");
         self.log.line();
     }

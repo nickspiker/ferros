@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Bestätigen: Entwicklermodus an.\nEine über USB angebotene Kist wird dann ohne Nachfrage verstaut.",
         Msg::RequireAttest => "Bezeugen verlangen",
         Msg::RequireAttestNote => "an, eine Änderung verlangt ein Bezeugen;\ndies auszuschalten auch",
+        Msg::BindNewDevice => "neues Gerät binden",
+        Msg::ApproveFleetAdd => "Bestätigen: ein neues Gerät binden.\nDiese Flottenseite hört dann darauf: beide zusammengehalten, sein Name berührt oder seine Wörter.",
         Msg::JoiningButton => "verbindet",
         Msg::Join => "verbinden",
         Msg::TypeYourHandle => "Tippe dein Handle ein.",

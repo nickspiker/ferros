@@ -24,6 +24,8 @@ pub const CHARGE_CAP: u8 = 6;
 pub const START_INTO: u8 = 7;
 /// Developer mode on, under its guard: approved here, carried out by the settings pages, which take the approval from the kernel.
 pub const DEVELOPER: u8 = 8;
+/// Bind a new device to the identity (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"): approved here, the add flow opened by the identity service once it holds the roots again, which takes the approval from the kernel as it opens it (one approve, one opening).
+pub const FLEET_ADD: u8 = 9;
 
 /// The "require attest" guards (each a bit of the device setting `guards`, kept in the device's settings document): which setting each protects.
 /// Turning a guard on needs nothing (tightening is always safe); turning it off is an approve (`GUARD_OFF`); while it is on, changing its setting is an approve too.
@@ -63,7 +65,7 @@ impl Request {
     /// The kernel checks again what only it can know (a cap the battery takes, Android allowed here).
     pub const fn new(kind: u8, arg: u64) -> Option<Request> {
         let ok = match kind {
-            ATTEST_AT_BOOT_ON | ATTEST_AT_BOOT_OFF | ANDROID_ON | REMOVE_DEVICE | DEVELOPER => arg == 0,
+            ATTEST_AT_BOOT_ON | ATTEST_AT_BOOT_OFF | ANDROID_ON | REMOVE_DEVICE | DEVELOPER | FLEET_ADD => arg == 0,
             GUARD_OFF => guard::known(arg),
             // A cap in mV: the battery's own range is the kernel's check (process.rs `charge_cv_ok`); here only that it is a number a word carries.
             CHARGE_CAP => arg != 0 && arg <= ARG_MAX,
@@ -84,9 +86,9 @@ impl Request {
     }
 
     /// Whether the kernel carries the change out itself at the approve's unlock.
-    /// The others (the removal, developer mode) are carried out by a process, which the kernel lets act only while the approval is held for it (`kernel` false: held until taken or until the next lock).
+    /// The others (the removal, developer mode, the add flow's opening) are carried out by a process, which the kernel lets act only while the approval is held for it (`kernel` false: held until taken or until the next lock).
     pub const fn kernel(self) -> bool {
-        !matches!(self.kind, REMOVE_DEVICE | DEVELOPER)
+        !matches!(self.kind, REMOVE_DEVICE | DEVELOPER | FLEET_ADD)
     }
 
     /// The guard this request is the change of, when it is a guarded setting's: changing it needs the approve only while that guard is on.
@@ -119,6 +121,7 @@ mod tests {
             Request { kind: START_INTO, arg: 0 },
             Request { kind: START_INTO, arg: 1 },
             Request { kind: DEVELOPER, arg: 0 },
+            Request { kind: FLEET_ADD, arg: 0 },
         ];
         for r in all {
             assert_eq!(Request::new(r.kind, r.arg), Some(r));
@@ -130,7 +133,7 @@ mod tests {
     #[test]
     fn refused() {
         assert_eq!(Request::from_word(0), None);
-        for kind in [NONE, 9, 255] {
+        for kind in [NONE, 10, 255] {
             assert_eq!(Request::new(kind, 0), None, "{kind}");
         }
         assert_eq!(Request::new(ATTEST_AT_BOOT_ON, 1), None);
@@ -158,10 +161,11 @@ mod tests {
         assert!(!guard::known(63));
     }
 
-    /// Only the removal and developer mode are a process's to carry out.
+    /// Only the removal, developer mode and the add flow's opening are a process's to carry out.
     #[test]
     fn who_applies() {
         assert!(!Request::new(REMOVE_DEVICE, 0).unwrap().kernel());
+        assert!(!Request::new(FLEET_ADD, 0).unwrap().kernel());
         assert!(!Request::new(DEVELOPER, 0).unwrap().kernel());
         for kind in [ATTEST_AT_BOOT_ON, ATTEST_AT_BOOT_OFF, ANDROID_ON] {
             assert!(Request::new(kind, 0).unwrap().kernel());

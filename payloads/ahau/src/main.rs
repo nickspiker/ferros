@@ -2454,6 +2454,7 @@ impl Ahau {
             }
             (ap::START_INTO, 1) => tx(Msg::ApproveStartIntoAndroid),
             (ap::START_INTO, _) => tx(Msg::ApproveStartIntoFerros),
+            (ap::FLEET_ADD, _) => tx(Msg::ApproveFleetAdd),
             _ => tx(Msg::ApproveDeveloper),
         };
         let _ = core::fmt::Write::write_str(&mut l, "\n");

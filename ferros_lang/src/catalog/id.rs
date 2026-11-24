@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Setujui: mode pengembang nyala.\nKist yang ditawarkan lewat USB lalu disimpan tanpa bertanya.",
         Msg::RequireAttest => "wajib sahkan",
         Msg::RequireAttestNote => "jika nyala, mengubahnya perlu pengesahan;\nmematikan ini juga",
+        Msg::BindNewDevice => "ikat perangkat baru",
+        Msg::ApproveFleetAdd => "Setujui: ikat perangkat baru.\nHalaman Armada ini lalu mendengarkannya: keduanya didekatkan, namanya disentuh, atau kata-katanya.",
         Msg::JoiningButton => "bergabung",
         Msg::Join => "gabung",
         Msg::TypeYourHandle => "Ketik handle-mu.",

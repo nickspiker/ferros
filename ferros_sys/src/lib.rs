@@ -3430,6 +3430,15 @@ pub mod approve {
         No,
     }
 
+    /// `take`, only looking: an approval of `kind` approved and held is left for the process that takes it (the map looks, the identity service takes as it opens the add flow).
+    pub fn held(cap: u64, kind: u8) -> Taken {
+        match svc(nr::UNLOCK, cap, 20, kind as u64, 1, 0) {
+            NOTHING => Taken::Waiting,
+            ERR | 0 => Taken::No,
+            w => Taken::Approved(w),
+        }
+    }
+
     /// What became of an approval of `kind` that a process carries out itself (SYS_UNLOCK op 20, the Settings or the Unlock right; ahau_core::approve `kernel` false): approved, its word taken (the kernel holds it no longer); still waiting; or neither.
     pub fn take(cap: u64, kind: u8) -> Taken {
         match svc(nr::UNLOCK, cap, 20, kind as u64, 0, 0) {

@@ -710,6 +710,10 @@ messages! {
     RequireAttest,
     /// Two lines under the guards: what the checkbox does, and that turning it off is an approve too.
     RequireAttestNote,
+    /// The Fleet page's button that opens the add flow (owner, 2026-11-24: "the fleet page does nothing unique until you press 'bind new device' or similar, then it does the scan/tap enable, all that"): an approve on the attest screen first.
+    BindNewDevice,
+    /// What that approve approves: two lines.
+    ApproveFleetAdd,
     /// The button while a network is being joined.
     JoiningButton,
     Join,

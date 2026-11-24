@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Zatwierdź: tryb programisty włączony.\nKist oferowany przez USB jest wtedy chowany bez pytania.",
         Msg::RequireAttest => "wymagaj poświadczenia",
         Msg::RequireAttestNote => "włączone, zmiana wymaga poświadczenia;\nwyłączenie tego też",
+        Msg::BindNewDevice => "powiąż nowe urządzenie",
+        Msg::ApproveFleetAdd => "Zatwierdź: powiąż nowe urządzenie.\nTa strona floty będzie go wtedy słuchać: oba urządzenia razem, dotknięta jego nazwa albo jego słowa.",
         Msg::JoiningButton => "łączenie",
         Msg::Join => "dołącz",
         Msg::TypeYourHandle => "Wpisz swój handle.",

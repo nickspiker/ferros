@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "मंज़ूर करो: डेवलपर मोड चालू।\nफिर USB से पेश किया गया kist बिना पूछे रख लिया जाता है।",
         Msg::RequireAttest => "अटेस्ट माँगो",
         Msg::RequireAttestNote => "चालू: इसे बदलने के लिए अटेस्ट चाहिए;\nइसे बंद करने के लिए भी",
+        Msg::BindNewDevice => "नया डिवाइस जोड़ो",
+        Msg::ApproveFleetAdd => "मंज़ूर करो: नया डिवाइस जोड़ो।\nफिर यह बेड़ा पेज उसे सुनता है: दोनों साथ रखे हों, उसका नाम छुआ जाए, या उसके शब्द।",
         Msg::JoiningButton => "जुड़ रहा है",
         Msg::Join => "जुड़ो",
         Msg::TypeYourHandle => "अपना हैंडल लिखो।",

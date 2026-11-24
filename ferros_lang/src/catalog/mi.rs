@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Whakaae: kā te aratau kaiwhakawhanake.\nKa penapenatia he kist i tukuna mā te USB me te kore e pātai.",
         Msg::RequireAttest => "me whakaū",
         Msg::RequireAttestNote => "ki te kā, me whakaū hei huri;\nme whakaū hoki hei whakaweto i tēnei",
+        Msg::BindNewDevice => "herea he pūrere hou",
+        Msg::ApproveFleetAdd => "Whakaae: herea he pūrere hou.\nKa whakarongo tēnei whārangi Kāhui: ka piri ngā mea e rua, ka pāngia tōna ingoa, ko ōna kupu rānei.",
         Msg::JoiningButton => "e hono ana",
         Msg::Join => "hono",
         Msg::TypeYourHandle => "Tāurua tō handle.",

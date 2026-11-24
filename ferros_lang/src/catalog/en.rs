@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Approve: developer mode on.\nA kist offered over USB is then stowed without asking.",
         Msg::RequireAttest => "require attest",
         Msg::RequireAttestNote => "on, changing it takes an attest;\nturning this off takes one too",
+        Msg::BindNewDevice => "bind new device",
+        Msg::ApproveFleetAdd => "Approve: bind a new device.\nThis Fleet page then listens for it: the two held together, its name touched, or its words.",
         Msg::JoiningButton => "joining",
         Msg::Join => "join",
         Msg::TypeYourHandle => "Type your handle.",

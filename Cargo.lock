@@ -1051,6 +1051,7 @@ dependencies = [
 name = "ferros-payload-fgtw"
 version = "0.1.0"
 dependencies = [
+ "ahau_core",
  "blake3",
  "ed25519-dalek",
  "ferros_heap",

@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Aprubahan: bukas ang developer mode.\nAng kist na inalok sa USB ay itatabi nang hindi nagtatanong.",
         Msg::RequireAttest => "humingi ng patotoo",
         Msg::RequireAttestNote => "kapag bukas, kailangan ng patotoo para palitan ito;\nganoon din para patayin ito",
+        Msg::BindNewDevice => "mag-bind ng bagong device",
+        Msg::ApproveFleetAdd => "Aprubahan: mag-bind ng bagong device.\nMakikinig na ang pahinang Fleet na ito: pinagdikit ang dalawa, hinawakan ang pangalan nito, o ang mga salita nito.",
         Msg::JoiningButton => "sumasali",
         Msg::Join => "sumali",
         Msg::TypeYourHandle => "I-type ang handle mo.",

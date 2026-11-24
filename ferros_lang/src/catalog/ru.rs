@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Одобрить: режим разработчика вкл.\nkist, предложенный через USB, укладывается без вопроса.",
         Msg::RequireAttest => "требовать аттестацию",
         Msg::RequireAttestNote => "вкл: изменение требует аттестации;\nвыключение этого тоже",
+        Msg::BindNewDevice => "привязать новое устройство",
+        Msg::ApproveFleetAdd => "Одобрить: привязать новое устройство.\nЭта страница флота будет его слушать: оба рядом, касание его имени или его слова.",
         Msg::JoiningButton => "подключение",
         Msg::Join => "подключиться",
         Msg::TypeYourHandle => "Введи свой handle.",

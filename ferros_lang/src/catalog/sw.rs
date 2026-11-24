@@ -429,6 +429,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ApproveDeveloper => "Idhinisha: hali ya msanidi imewashwa.\nkist iliyotolewa kupitia USB itahifadhiwa bila kuuliza.",
         Msg::RequireAttest => "hitaji kuthibitisha",
         Msg::RequireAttestNote => "ikiwashwa, kuibadilisha kunahitaji kuthibitisha;\nkuzima hiki pia",
+        Msg::BindNewDevice => "unganisha kifaa kipya",
+        Msg::ApproveFleetAdd => "Idhinisha: unganisha kifaa kipya.\nUkurasa huu wa Kundi utakisikiliza: vifaa viwili pamoja, jina lake likiguswa, au maneno yake.",
         Msg::JoiningButton => "inajiunga",
         Msg::Join => "jiunge",
         Msg::TypeYourHandle => "Andika handle yako.",
