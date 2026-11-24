@@ -806,23 +806,20 @@ impl Write for Line {
 }
 
 /// The ops of one frame, sent to the display server as one batch (op 15): one call per frame however much is on it.
+/// It grows as a frame needs (founding rule 3; until 2026-11-24 it was 4 KiB and an op past that was dropped without a word), and the display takes it at its length (its `Room`s).
 struct Batch {
-    b: [u8; 4096],
-    n: usize,
+    b: Vec<u8>,
 }
 impl Batch {
     fn new() -> Batch {
-        let mut b = Batch { b: [0; 4096], n: 1 };
-        b.b[0] = 15;
-        b
+        let mut b = Vec::with_capacity(1 << 12);
+        b.push(15);
+        Batch { b }
     }
     fn op(&mut self, bytes: &[u8]) {
-        if self.n + 2 + bytes.len() > self.b.len() {
-            return;
-        }
-        self.b[self.n..self.n + 2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-        self.b[self.n + 2..self.n + 2 + bytes.len()].copy_from_slice(bytes);
-        self.n += 2 + bytes.len();
+        // An op's length is the batch's u16 (an op is at most a line of text and its fields, hundreds of bytes).
+        self.b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.b.extend_from_slice(bytes);
     }
     /// Text with its baseline at y; align 0 left, 1 centred on x, 2 right edge at x.
     fn text(&mut self, x: i64, y: i64, px: u16, colour: u32, align: u8, t: &str) {
@@ -933,7 +930,7 @@ impl Batch {
     }
     fn send(&self, display: u64) {
         let mut r = [0u8; 4];
-        call(display, &self.b[..self.n], &mut r);
+        call(display, &self.b, &mut r);
     }
 }
 
@@ -1627,8 +1624,8 @@ struct Map {
     icon_slots: Vec<(ferros_thing::Hp, u8)>,
     cam: Cam,
     view: View,
-    /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what).
-    rows: [(i64, i64, i64, i64, Choice); 64],
+    /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what); as many as the frame lays out (64 until 2026-11-24, when a long Deck page lost its last buttons' taps), the first that holds a point winning.
+    rows: Vec<(i64, i64, i64, i64, Choice)>,
     /// The settings page on show; the strip's offset from it in pixels (positive: dragged right, the page before it coming in), kept within half a screen by moving `page` as it passes; how far the page is scrolled up; and the fling still carrying it (pixels a frame, under `coast`'s friction), with the fraction of a pixel it has gone past its last whole one.
     page: usize,
     page_dx: i64,
@@ -1696,7 +1693,6 @@ struct Map {
     pressed: Option<Choice>,
     slide: Option<(Choice, f64)>,
     knob: Option<(Choice, f64, f64, i32)>,
-    nrows: usize,
     /// An app is in front (a kist, or one the map did not start: a bridge spawn), and it has the touches.
     app_front: bool,
     /// The kists brought to the front, most recent first, by capsule (owner, 2026-11-11: back's swipe "flip to the previous kist"): a kist launched or raised goes to the head; each once.
@@ -3260,19 +3256,15 @@ impl Map {
         let opening = !self.leaving;
         // Opening: the plane is where the camera is now, the page where it lands. Closing: the plane where it lands, the page as it was landed.
         let (plane, page) = if opening { (self.cam, to) } else { (to, self.page_cam.unwrap_or_else(|| self.at(i))) };
-        let mut b = [0u8; 4096];
-        b[0] = 45;
-        b[1] = opening as u8;
-        b[2..20].copy_from_slice(&plane.op(true));
-        b[20..38].copy_from_slice(&page.op(true));
-        let mut n = 38;
-        let mut put = |b: &mut [u8; 4096], op: &[u8]| {
-            // WHY the test: a page of more than the message holds is cut, as `Batch::op` cuts one.
-            if n + 2 + op.len() <= b.len() {
-                b[n..n + 2].copy_from_slice(&(op.len() as u16).to_le_bytes());
-                b[n + 2..n + 2 + op.len()].copy_from_slice(op);
-                n += 2 + op.len();
-            }
+        // Grown as the page needs, as a `Batch` is.
+        let mut b: Vec<u8> = Vec::with_capacity(1 << 12);
+        b.push(45);
+        b.push(opening as u8);
+        b.extend_from_slice(&plane.op(true));
+        b.extend_from_slice(&page.op(true));
+        let put = |b: &mut Vec<u8>, op: &[u8]| {
+            b.extend_from_slice(&(op.len() as u16).to_le_bytes());
+            b.extend_from_slice(op);
         };
         if opening {
             // The page as landing shows it: laid out with no flight (`page_frame` landed), its region op, its ops, the landed camera.
@@ -3284,21 +3276,17 @@ impl Map {
                 View::Open(i) if i > 0 => self.ask_page(&mut pb, i, true),
                 _ => self.settings(&mut pb, true),
             }
-            self.nrows = 0;
+            self.rows.clear();
             self.target = target;
-            let mut at = 1usize;
-            while at + 2 <= pb.n {
-                let l = u16::from_le_bytes([pb.b[at], pb.b[at + 1]]) as usize;
-                put(&mut b, &pb.b[at + 2..at + 2 + l]);
-                at += 2 + l;
-            }
+            // The page's batch carries its ops whole, each with its length: copied as they are.
+            b.extend_from_slice(&pb.b[1..]);
             put(&mut b, &page.op(true));
             self.page_cam = Some(page);
         } else {
             put(&mut b, &plane.op(true));
         }
         let mut r = [0u8; 4];
-        let got = call(self.display, &b[..n], &mut r);
+        let got = call(self.display, &b, &mut r);
         self.fast = got >= 1 && got != ferros_sys::ERR && r[0] == 0;
         let mut l = Line::new();
         let _ = write!(l, "map: flight {}: {}\n", if opening { "in" } else { "out" }, if self.fast { "prerendered" } else { "drawn whole (the display has no room)" });
@@ -3365,7 +3353,7 @@ impl Map {
         let mut b = Batch::new();
         // Flying to or from the open circle on the display's prerendered images: the camera now and the fade, nothing drawn (op 46).
         if self.fast && self.target.is_some() && matches!(self.view, View::Open(_)) {
-            self.nrows = 0;
+            self.rows.clear();
             let mut m = [0u8; 21];
             m[0] = 46;
             m[1..19].copy_from_slice(&self.cam.op(true));
@@ -3383,7 +3371,7 @@ impl Map {
         } else {
             b.op(&[1]);
         }
-        self.nrows = 0;
+        self.rows.clear();
         match self.view {
             View::Map => self.drop_draw(&mut b),
             View::Open(0) => self.settings(&mut b, region),
@@ -4937,51 +4925,185 @@ impl Map {
                     let l = stower::words(j, f);
                     row(m, b, y, note, if j.stage == stower::FAILED { white() } else { grey() }, l.as_str(), None);
                 };
-                // A kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "the proper term for installing a kist is stow"), above everything: while the stower checks it, its bar; once checked, what it is, who made it, its version and size, plainly whether its code is unchecked (a development build's native code), what it asks for and why, then Stow and Cancel; then how it ended, until the job gives way. Nothing is in the person's list before Stow. No icon yet: a capsule carries none (the circles' icons are the display's own).
+                // The page as cards (owner, 2026-11-24, on the Pro: "the deck list ... is really hard to tell what's going on. Can we add icons, spacers, buttons, stuff to make it more intuitive?"): every thing a card led by its own picture with its state's glow, sections under headings, the actions as pills, a disabled one drawn dim.
+                // Sizes in the page's unit (`uq`, the global app scale's), so the page scales and themes with every other: a card 6.5 units tall (a 4-unit tier with the picture, the name and a line under it, then a 2.5-unit tier of pills), half a unit between cards, a unit of margin either side.
+                // Only the cards that meet the page's band are sent (their room still taken), so a list of any length costs a screen's ops.
+                let u = uu(1, 1);
+                let (cl, cr) = (cx - half + u, cx + half - u);
+                let card_h = uu(13, 2);
+                let gap = uu(1, 2);
+                let [bfill, bheld, btl, bbr] = ferros_sys::theme::current().button;
+                let shows = |y0: i64, h: i64| y0 + h + u > top && y0 - u < bottom;
+                // A card's ground: fluor's pill with no label in the theme's button fill and two-tone edge (on the Pro, the page's own ground inside the edge read as no card at all), held while a finger is down on it; sent after what is on it (what is sent first is in front), its tap after theirs (the first place holding a point wins).
+                let card = |m: &mut Map, b: &mut Batch, y0: i64, h: i64, what: Option<Choice>| {
+                    let down = what.is_some() && m.pressed == what;
+                    b.button((cl + cr) / 2, y0 + h / 2, cr - cl, h, note, [if down { bheld } else { bfill }, btl, bbr, white()], "");
+                    if let (true, Some(c)) = (hit, what) {
+                        m.push_row(cl, cr, y0, y0 + h, c);
+                    }
+                };
+                // A pill from x0 to x1 centred on y, on its card: 0 the action (the theme's held fill, the brightest it has; its plain fill while pressed), 1 a quiet one (the page's ground inside the edge, held while pressed), 2 disabled (the card's own fill, a dim edge and label, no tap).
+                let pill = |m: &mut Map, b: &mut Batch, x0: i64, x1: i64, y: i64, t: &str, style: u8, what: Option<Choice>| {
+                    let down = style != 2 && what.is_some() && m.pressed == what;
+                    let look = match style {
+                        0 => [if down { bfill } else { bheld }, btl, bbr, white()],
+                        1 => [if down { bheld } else { fill() }, btl, bbr, white()],
+                        _ => [bfill, dim(), dim(), dim()],
+                    };
+                    let h = uu(7, 4);
+                    b.button((x0 + x1) / 2, y, x1 - x0, h, note, look, t);
+                    if let (true, Some(c)) = (hit && style != 2, what) {
+                        m.push_row(x0, x1, y - h / 2, y + h / 2, c);
+                    }
+                };
+                // Pills sharing the text column of a card whose top is y0, half a unit apart on the action tier, each as wide as its share of the characters (four more each for its rounded ends), so a long label in one language takes room from a short one beside it rather than running into it.
+                let pills = |m: &mut Map, b: &mut Batch, y0: i64, ps: &[(&str, u8, Option<Choice>)]| {
+                    let n = ps.len() as i64;
+                    let (x0, x1) = (cl + uu(4, 1), cr - u);
+                    let weight = |t: &str| t.chars().count() as i64 + 4;
+                    let all: i64 = ps.iter().map(|p| weight(p.0)).sum();
+                    let room = x1 - x0 - gap * (n - 1);
+                    let mut a = x0;
+                    for &(t, style, what) in ps {
+                        let w = room * weight(t) / all;
+                        pill(m, b, a, a + w, y0 + uu(5, 1), t, style, what);
+                        a += w + gap;
+                    }
+                };
+                // A thing's picture (display op 77's longer form): scene circle `index` (G#FF none), radius r, with the state its glow says and its loading pie, so the page's bytes change when they do.
+                let picture = |b: &mut Batch, x: i64, y: i64, r: i64, index: u8, glow: (ferros_glow::Glow, u16), pie: ferros_glow::pie::Shares| {
+                    let mut m = [0u8; 17];
+                    m[0] = 77;
+                    // Only cards meeting the band are drawn (`shows`), so x and y are on the screen, inside the fields.
+                    m[1..3].copy_from_slice(&(x as i16).to_le_bytes());
+                    m[3..5].copy_from_slice(&(y as i16).to_le_bytes());
+                    m[5..7].copy_from_slice(&(r as u16).to_le_bytes());
+                    m[7] = index;
+                    m[8] = glow.0 as u8;
+                    m[9..11].copy_from_slice(&glow.1.to_le_bytes());
+                    m[11..17].copy_from_slice(&pie.bytes());
+                    b.op(&m);
+                };
+                // A line cut to what fits `width` at `px`, by the face's average advance as `row` judges it (five eighths of the size), an ellipsis where it was cut (the Pro, 2026-11-24: Photon's about ran past its card).
+                let cut = |t: &str, width: i64, px: i64| -> Line {
+                    let fits = (width * 8 / (px * 5)) as usize;
+                    let mut l = Line::new();
+                    if t.chars().count() <= fits {
+                        l.s(t);
+                    } else {
+                        // WHY the test: a column narrower than one character (fits 0) keeps no character, only the ellipsis; fits - 1 would wrap. Past it the line has more than `fits` characters, so the (fits - 1)th exists.
+                        let end = if fits == 0 { 0 } else { t.char_indices().nth(fits - 1).map_or(t.len(), |(k, _)| k) };
+                        l.s(t[..end].trim_end());
+                        l.s("\u{2026}");
+                    }
+                    l
+                };
+                // A card's top tier: its picture, its name, the line under it (dim or grey), and the chevron saying it opens (when it does); the text cut to the column left of the chevron.
+                let face = |b: &mut Batch, y0: i64, index: u8, glow: (ferros_glow::Glow, u16), pie: ferros_glow::pie::Shares, name: &str, under: &str, under_colour: u32, opens: bool| {
+                    picture(b, cl + uu(2, 1), y0 + uu(2, 1), uu(3, 2), index, glow, pie);
+                    let column = cr - uu(5, 2) - (cl + uu(4, 1));
+                    b.text(cl + uu(4, 1), y0 + uu(7, 4), small as u16, white(), 0, cut(name, column, small).as_str());
+                    b.text(cl + uu(4, 1), y0 + uu(25, 8), note as u16, under_colour, 0, cut(under, column, note).as_str());
+                    if opens {
+                        b.text(cr - u, y0 + uu(9, 4), uu(3, 2) as u16, dim(), 2, "\u{203A}");
+                    }
+                };
+                // A section's heading: its words and how many under it, grey, at the cards' left, two units above.
+                let heading = |b: &mut Batch, y: &mut i64, t: &str, count: Option<usize>| {
+                    *y += uu(2, 1);
+                    let mut l = Line::new();
+                    l.s(t);
+                    if let Some(c) = count {
+                        l.s(" \u{B7} ");
+                        let _ = tatau::count(&mut l, f, c as u64, 1);
+                    }
+                    b.text(cl + uu(1, 2), *y, u as u16, grey(), 0, l.as_str());
+                    *y += u;
+                };
+                // A kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "the proper term for installing a kist is stow"), a card of its own above everything.
+                // Being checked: its pie on a plain picture and the stage under its name. Checked: what it is, who made it, its version and size, plainly whether its code is unchecked (a development build's native code), what it asks for and why, then Stow and Cancel. Nothing is in the person's list before Stow.
+                // Once stowed it is a card in the kists below, so a finished offer is not shown here (until 2026-11-24 each one stayed at the top as its name and "stowed", sixteen of them on the Pro pushing the list off the screen); one that failed shows how, while it is the newest offer.
+                let last_offer = inst.jobs.iter().rev().find(|j| j.kind == stower::KIND_OFFER).map(|j| j.capsule);
                 for j in inst.jobs.iter().filter(|j| j.kind == stower::KIND_OFFER) {
                     match (j.stage, inst.offer.as_ref().filter(|o| o.capsule == j.capsule)) {
                         (stower::ASKING, Some(o)) => {
-                            row(self, b, &mut y, uu(3, 2), white(), tr(Msg::OfferedOverUsb), None);
-                            let mut l = Line::new();
-                            let _ = write!(l, "{} ", o.name);
-                            let _ = ferros_kist::write_version(&mut l, f, &o.version.0);
-                            row(self, b, &mut y, small, white(), l.as_str(), None);
-                            // Its developer by the name the capsule gives (the person's pin keeps the same), else its key's first bytes.
+                            let y0 = y;
+                            let x = cl + uu(4, 1);
+                            let width = cr - u - x;
+                            // Left-aligned lines in the text column, wrapped at spaces by the face's average advance as `row` wraps.
+                            let lines = |b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str| {
+                                let fits = (width * 8 / (px * 5)) as usize;
+                                let mut rest = t;
+                                loop {
+                                    let cut = if rest.len() <= fits {
+                                        rest.len()
+                                    } else {
+                                        let mut k = fits;
+                                        while !rest.is_char_boundary(k) {
+                                            k -= 1;
+                                        }
+                                        rest[..k].rfind(' ').map_or(k, |c| c + 1)
+                                    };
+                                    // WHY: a line that takes nothing (a column narrower than a glyph) would never end the loop; it takes its first character.
+                                    let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
+                                    b.text(x, *y, px as u16, colour, 0, rest[..cut].trim_end());
+                                    rest = rest[cut..].trim_start();
+                                    *y += uu(3, 2);
+                                    if rest.is_empty() {
+                                        break;
+                                    }
+                                }
+                            };
+                            let mut t = Line::new();
+                            let _ = write!(t, "{} ", o.name);
+                            let _ = ferros_kist::write_version(&mut t, f, &o.version.0);
+                            picture(b, cl + uu(2, 1), y0 + uu(2, 1), uu(3, 2), 0xFF, (ferros_glow::Glow::None, 0), ferros_glow::pie::Shares::DONE);
+                            let mut yy = y0 + uu(5, 4);
+                            lines(b, &mut yy, note, grey(), tr(Msg::OfferedOverUsb));
+                            lines(b, &mut yy, small, white(), t.as_str());
+                            // Its developer by the name the capsule gives (the person's pin keeps the same), else its key's first bytes; its size.
                             let mut d = Line::new();
                             if o.developer_name.is_empty() {
-                                let _ = write!(d, "G#{:02X}{:02X}{:02X}{:02X}", o.developer[0], o.developer[1], o.developer[2], o.developer[3]);
+                                short_key(&mut d, &o.developer);
                             } else {
                                 d.s(&o.developer_name);
                             }
-                            let by = say(Say::ByDeveloper(d.as_str()));
-                            row(self, b, &mut y, note, grey(), by.as_str(), None);
-                            let mut s = Line::new();
-                            let _ = tatau::size_bits(&mut s, f, o.size << 3, 1);
-                            row(self, b, &mut y, note, grey(), s.as_str(), None);
+                            let mut by = say(Say::ByDeveloper(d.as_str()));
+                            by.s(" \u{B7} ");
+                            let _ = tatau::size_bits(&mut by, f, o.size << 3, 1);
+                            lines(b, &mut yy, note, grey(), by.as_str());
                             if o.native {
-                                row(self, b, &mut y, small, white(), tr(Msg::UncheckedDevOnly), None);
+                                lines(b, &mut yy, note, white(), tr(Msg::UncheckedDevOnly));
                             }
                             // Only what its first start will ask: the implicit set (ferros_kist::IMPLICIT) is every kist's, never asked, so an older capsule's declaration of it is not shown.
                             if !o.wants.iter().any(|w| !ferros_kist::implicit(w.0)) {
-                                row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
+                                lines(b, &mut yy, note, dim(), tr(Msg::AsksForNothing));
                             } else {
-                                row(self, b, &mut y, note, grey(), tr(Msg::AsksAtFirstStart), None);
+                                lines(b, &mut yy, note, grey(), tr(Msg::AsksAtFirstStart));
                                 for (right, reason) in o.wants.iter().filter(|w| !ferros_kist::implicit(w.0)) {
-                                    row(self, b, &mut y, small, white(), right_name(*right as usize), None);
-                                    y -= uu(3, 4);
-                                    row(self, b, &mut y, note, dim(), reason, None);
+                                    lines(b, &mut yy, note, white(), right_name(*right as usize));
+                                    lines(b, &mut yy, note, dim(), reason);
                                 }
                             }
-                            button(self, b, &mut y, tr(Msg::Stow), false, Some(Choice::Stow(true)));
-                            button(self, b, &mut y, tr(Msg::Cancel), false, Some(Choice::Stow(false)));
+                            // Stow and Cancel on the card's last tier.
+                            let h = yy - y0 + uu(5, 2);
+                            pills(self, b, yy - uu(9, 2), &[(tr(Msg::Stow), 0, Some(Choice::Stow(true))), (tr(Msg::Cancel), 1, Some(Choice::Stow(false)))]);
+                            card(self, b, y0, h, None);
+                            y += h + gap;
                         }
-                        // Under way (its bar), or ended: its name when the check found it, the words under.
-                        _ => {
-                            row(self, b, &mut y, small, white(), if j.name.is_empty() { tr(Msg::OfferedOverUsb) } else { &j.name }, None);
-                            progress(self, b, &mut y, j);
+                        // Under way: its pie on a plain picture (G#FF, the stower's shares), its stage under its name.
+                        (s, _) if s < stower::DONE || (s == stower::FAILED && last_offer == Some(j.capsule)) => {
+                            if shows(y, uu(4, 1)) {
+                                let pie = if s < stower::DONE { stower::pie(j).unwrap_or(ferros_glow::pie::Shares::DONE) } else { ferros_glow::pie::Shares::DONE };
+                                let words = stower::words(j, f);
+                                face(b, y, 0xFF, (ferros_glow::Glow::None, 0), pie, if j.name.is_empty() { tr(Msg::OfferedOverUsb) } else { &j.name }, words.as_str(), if s == stower::FAILED { white() } else { grey() }, false);
+                                card(self, b, y, uu(4, 1), None);
+                            }
+                            y += uu(4, 1) + gap;
                         }
+                        // Stowed: a card in the kists below.
+                        _ => {}
                     }
-                    y += uu(1, 1);
                 }
                 // A thing's card (owner, 2026-11-12, of four ways to see a kist's info: "just 4", the Deck's row opening its card): the only place its info shows, in place of the list while it is open, Back above it. One gone meanwhile (unstowed, here or on another device of theirs) closes it.
                 let open = self.card.and_then(|c| ks.iter().position(|k| k.capsule == c));
@@ -5052,6 +5174,10 @@ impl Map {
                     let k = &ks[ki];
                     let puck = puck_icon(&ks, ki);
                     button(self, b, &mut y, tr(Msg::Back), false, Some(Choice::CardBack));
+                    // Its picture over its name, larger, with its state's glow and its loading pie, as on its card in the list.
+                    let i = ki + 1;
+                    picture(b, cx, y + u, uu(2, 1), i as u8, self.state(i), self.pie_of(i));
+                    y += uu(9, 2);
                     row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
                     y -= uu(3, 4);
                     row(self, b, &mut y, note, grey(), tr(if puck.is_some() { Msg::KindPuck } else { Msg::KindKist }), None);
@@ -5185,100 +5311,125 @@ impl Map {
                     self.page_h[p] = y - y0;
                     return;
                 }
-                // Everything on the deck as a circle, by kind (owner, 2026-11-12: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts"): the kists first, then the pucks (a puck: a live circle never opened, docs/PUCKS.md), each kind a group, room for more kinds (contacts) as more groups. A row is its name, and under it its kind and a kist's state (as its glow says it); the whole of it opens its card.
+                // Everything on the deck as a circle, by kind (owner, 2026-11-12: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts"): the kists first, then the pucks (a puck: a live circle never opened, docs/PUCKS.md), each kind a section under its heading, room for more kinds (contacts) as more sections.
+                // A card: its picture with its state's glow (the deck's: running, stopped, not running, for you) and its loading pie while a restore, an update or an unstow brings it; its name; its state in words and its version; and its actions, Stop (dim while it is not running), Update with its size when the pandok lists a newer one, and Unstow (a kist's asked on its card, a puck's two taps there). The card itself opens the thing's card (About).
+                // A job of its own under way: its stage in words in place of the pills, its pie on the picture; one that failed: its words in white over the pills' tier, the pills back.
+                let pucks_n = (0..ks.len()).filter(|&ki| puck_icon(&ks, ki).is_some()).count();
                 if ks.is_empty() {
+                    heading(b, &mut y, tr(Msg::DeckKists), None);
                     row(self, b, &mut y, small, grey(), tr(Msg::NothingStowed), None);
                 }
                 for puck in [false, true] {
+                    let n = if puck { pucks_n } else { ks.len() - pucks_n };
+                    if n == 0 {
+                        continue;
+                    }
+                    heading(b, &mut y, tr(if puck { Msg::DeckPucks } else { Msg::DeckKists }), Some(n));
                     for (ki, k) in ks.iter().enumerate().filter(|(ki, _)| puck_icon(&ks, *ki).is_some() == puck) {
-                        let what = Some(Choice::Card(ki as u8));
-                        let y_top = y;
-                        row(self, b, &mut y, uu(3, 2), white(), &k.name, what);
-                        y -= uu(3, 4);
-                        let mut l = Line::new();
-                        l.s(tr(if puck { Msg::KindPuck } else { Msg::KindKist }));
-                        if let Some((s, _)) = self.kist_state(&k.capsule).filter(|_| !puck) {
-                            l.s(", ");
-                            l.s(tr(s));
+                        let y0 = y;
+                        y += card_h + gap;
+                        if !shows(y0, card_h) {
+                            continue;
                         }
-                        row(self, b, &mut y, note, grey(), l.as_str(), what);
-                        // Its circle's own picture at the row's left (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): the display draws scene circle ki + 1 (op 77), its icon, or a puck's square as it is now.
-                        let ir = uu(3, 2);
-                        let (ix, iy) = (cx - half + ir + uu(1, 2), (y_top + y) / 2 - uu(1, 2));
-                        let mut m = [0u8; 8];
-                        m[0] = 77;
-                        m[1..3].copy_from_slice(&(ix as i16).to_le_bytes());
-                        m[3..5].copy_from_slice(&(iy as i16).to_le_bytes());
-                        m[5..7].copy_from_slice(&(ir as u16).to_le_bytes());
-                        m[7] = (ki + 1) as u8;
-                        b.op(&m);
-                        // The deck's drop targets as buttons too (owner, 2026-11-18, via ferros-52: "A non-gesture path"): About (its card), Stop while it runs, Unstow (asked on its card, never at once); right of its picture, side by side.
+                        let what = Some(Choice::Card(ki as u8));
                         let running = if puck { self.pucks_up.contains(&k.capsule) && !self.pucks_held.contains(&k.capsule) } else { self.kist_state(&k.capsule).is_some_and(|s| s.0 == Msg::Running) };
-                        let acts = [(Msg::PageAbout, Choice::Card(ki as u8), true), (Msg::Stop, Choice::Stop(ki as u8), running), (Msg::Unstow, Choice::UnstowAsk(ki as u8), true)];
-                        let shown = acts.iter().filter(|a| a.2).count() as i64;
-                        let [bfill, bheld, btl, bbr] = ferros_sys::theme::current().button;
-                        let (gap, left) = (uu(1, 2), cx - half + 2 * ir + uu(1, 1));
-                        let bw = (cx + half - uu(1, 1) - left - gap * (shown - 1)) / shown;
-                        for (j, &(word, what, _)) in acts.iter().filter(|a| a.2).enumerate() {
-                            let bx = left + j as i64 * (bw + gap) + bw / 2;
-                            let down = self.pressed == Some(what);
-                            b.button(bx, y - uu(1, 2), bw, uu(3, 2), uu(1, 1), [if down { bheld } else { bfill }, btl, bbr, white()], tr(word));
-                            if hit {
-                                self.push_row(bx - bw / 2, bx + bw / 2, y - uu(3, 2), y + uu(1, 2), what);
+                        // Its state in words as its glow says it ("-" before the kernel has said which kists are alive), then its version in the person's base.
+                        let mut l = Line::new();
+                        if puck {
+                            l.s(tr(if running { Msg::Running } else { Msg::NotRunning }));
+                        } else {
+                            l.s(self.kist_state(&k.capsule).map_or("-", |s| tr(s.0)));
+                        }
+                        if let Some(v) = k.version.as_ref() {
+                            l.s(" \u{B7} ");
+                            let _ = ferros_kist::write_version(&mut l, f, &v.0);
+                        }
+                        // A restore or an unstow of it under way, or an update of it (the newer capsule's job), or one that failed (its words in white in place of the line under its name).
+                        let newer = inst.dir.iter().position(|e| e.developer == k.developer && e.option == k.option && e.capsule != k.capsule && k.version.as_ref().is_none_or(|v| e.version > *v));
+                        let job = inst.job_for(&k.capsule).or_else(|| newer.and_then(|di| inst.job_for(&inst.dir[di].capsule))).filter(|j| j.stage != stower::DONE);
+                        let failed = job.filter(|j| j.stage == stower::FAILED).map(|j| stower::words(j, f));
+                        let i = ki + 1;
+                        face(b, y0, i as u8, self.state(i), self.pie_of(i), &k.name, failed.as_ref().map_or(l.as_str(), |w| w.as_str()), if failed.is_some() { white() } else { grey() }, true);
+                        match job {
+                            Some(j) if j.stage < stower::DONE => {
+                                b.text(cl + uu(4, 1), y0 + uu(41, 8), note as u16, grey(), 0, stower::words(j, f).as_str());
+                            }
+                            _ => {
+                                let mut up = Line::new();
+                                let mut ps: Vec<(&str, u8, Option<Choice>)> = Vec::with_capacity(3);
+                                ps.push((tr(Msg::Stop), if running { 1 } else { 2 }, Some(Choice::Stop(ki as u8))));
+                                if let Some(di) = newer {
+                                    let _ = write!(up, "{} \u{B7} ", tr(Msg::Update));
+                                    let _ = tatau::size_bits(&mut up, f, inst.dir[di].size << 3, 1);
+                                    ps.push((up.as_str(), 0, Some(Choice::StowListed(di as u8))));
+                                }
+                                ps.push((tr(if puck { Msg::RemoveFromDeck } else { Msg::Unstow }), if inst.here { 1 } else { 2 }, Some(Choice::UnstowAsk(ki as u8))));
+                                pills(self, b, y0, &ps);
                             }
                         }
-                        y += uu(5, 2);
-                        // A restore or an unstow of it under way, or one that failed.
-                        if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE) {
-                            progress(self, b, &mut y, j);
-                        }
-                        y += uu(1, 2);
+                        card(self, b, y0, card_h, what);
                     }
                 }
-                // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the list as it was on the Kists page before the Deck: every kist listed, to stow, or to update when a newer one is listed than the one stowed.
+                // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the deck: each kist it lists that is not on the deck, or is at an older version there, a card with Stow or Update and its size.
+                // A kist on the deck at the newest listed version is not listed again (owner, 2026-11-24: fold them); one line says so.
+                // Two listed under one name by different developers each show their developer's key's first bytes (`G#…`), so the two can be told apart.
                 if inst.here {
-                    y += uu(1, 2);
-                    row(self, b, &mut y, uu(3, 2), white(), tr(Msg::Pandok), None);
+                    heading(b, &mut y, tr(Msg::Pandok), None);
                     match inst.dir_state {
-                        0 | 1 => row(self, b, &mut y, small, grey(), "reading the list of kists", None),
-                        3 => row(self, b, &mut y, small, grey(), "the list of kists could not be reached", None),
-                        _ if inst.dir.is_empty() => row(self, b, &mut y, small, grey(), "no kists listed yet", None),
+                        0 | 1 => row(self, b, &mut y, note, grey(), tr(Msg::PandokReading), None),
+                        3 => row(self, b, &mut y, note, grey(), tr(Msg::PandokUnreachable), None),
+                        _ if inst.dir.is_empty() => row(self, b, &mut y, note, grey(), tr(Msg::PandokEmpty), None),
                         _ => {}
                     }
                     if inst.dir_state == 2 && !inst.dir_checked {
-                        row(self, b, &mut y, note, dim(), "the list's signature is not checked yet", None);
+                        row(self, b, &mut y, note, dim(), tr(Msg::PandokUnchecked), None);
                     }
+                    let mut folded = false;
                     for (di, e) in inst.dir.iter().enumerate() {
-                        let mut l = Line::new();
-                        // Its version in the person's base, leading zero parts left out: what is shown is what the update below compares.
-                        let _ = write!(l, "{} ", e.name);
-                        let _ = ferros_kist::write_version(&mut l, f, &e.version.0);
-                        row(self, b, &mut y, small, white(), l.as_str(), None);
-                        y -= uu(3, 4);
-                        row(self, b, &mut y, note, dim(), &e.about, None);
-                        let mine = ks.iter().find(|k| k.developer == e.developer && k.option == e.option);
+                        let mine = ks.iter().position(|k| k.developer == e.developer && k.option == e.option);
+                        // Current on the deck: its capsule the listed one, or its version not older (ferros_kist `Version`'s order; one stowed before versions takes any listed one).
+                        let current = mine.is_some_and(|ki| ks[ki].capsule == e.capsule || ks[ki].version.as_ref().is_some_and(|v| e.version <= *v));
                         let job = inst.job_for(&e.capsule).filter(|j| j.stage != stower::DONE);
-                        if let Some(j) = job {
-                            progress(self, b, &mut y, j);
+                        if current && job.is_none() {
+                            folded = true;
+                            continue;
                         }
-                        // Under way: no button until it is done or has failed.
-                        let busy = job.is_some_and(|j| j.stage < stower::DONE);
-                        if busy {
-                        } else if mine.is_some_and(|k| k.capsule == e.capsule) {
-                            row(self, b, &mut y, note, grey(), tr(Msg::Stowed), None);
-                        } else if let Some(v) = mine.and_then(|k| k.version.as_ref()).filter(|v| e.version <= **v) {
-                            // An update only when the listed version is newer than the one stowed (ferros_kist `Version`'s order: more parts is a later stage, leading zeros mean nothing); one stowed before versions (None) takes any listed one.
-                            let mut l = Line::new();
-                            let _ = write!(l, "{} ", tr(Msg::Stowed));
-                            let _ = ferros_kist::write_version(&mut l, f, &v.0);
-                            row(self, b, &mut y, note, grey(), l.as_str(), None);
-                        } else {
-                            let mut l = Line::new();
-                            let _ = write!(l, "{}, ", tr(if mine.is_some() { Msg::Update } else { Msg::Stow }));
-                            let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
-                            button(self, b, &mut y, l.as_str(), false, Some(Choice::StowListed(di as u8)));
+                        let y0 = y;
+                        y += card_h + gap;
+                        if !shows(y0, card_h) {
+                            continue;
                         }
-                        y += uu(1, 2);
+                        let mut t = Line::new();
+                        let _ = write!(t, "{} ", e.name);
+                        let _ = ferros_kist::write_version(&mut t, f, &e.version.0);
+                        let mut a = Line::new();
+                        if inst.dir.iter().any(|o| o.name == e.name && o.developer != e.developer) {
+                            short_key(&mut a, &e.developer);
+                            a.s(" \u{B7} ");
+                        }
+                        a.s(&e.about);
+                        // Its picture: the deck's circle when it is there (an update), its pie with it; else a plain one, with the stow's pie while it runs.
+                        let (index, glow, pie) = match mine {
+                            Some(ki) => ((ki + 1) as u8, self.state(ki + 1), self.pie_of(ki + 1)),
+                            None => (0xFF, (ferros_glow::Glow::None, 0), job.and_then(stower::pie).unwrap_or(ferros_glow::pie::Shares::DONE)),
+                        };
+                        let failed = job.filter(|j| j.stage == stower::FAILED).map(|j| stower::words(j, f));
+                        face(b, y0, index, glow, pie, t.as_str(), failed.as_ref().map_or(a.as_str(), |w| w.as_str()), if failed.is_some() { white() } else { dim() }, mine.is_some());
+                        match job {
+                            Some(j) if j.stage < stower::DONE => {
+                                b.text(cl + uu(4, 1), y0 + uu(41, 8), note as u16, grey(), 0, stower::words(j, f).as_str());
+                            }
+                            _ => {
+                                let mut l = Line::new();
+                                let _ = write!(l, "{} \u{B7} ", tr(if mine.is_some() { Msg::Update } else { Msg::Stow }));
+                                let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
+                                pills(self, b, y0, &[(l.as_str(), 0, Some(Choice::StowListed(di as u8)))]);
+                            }
+                        }
+                        card(self, b, y0, card_h, mine.map(|ki| Choice::Card(ki as u8)));
+                    }
+                    if folded {
+                        row(self, b, &mut y, note, dim(), tr(Msg::PandokRestOnDeck), None);
                     }
                 }
             }
@@ -5619,14 +5770,11 @@ impl Map {
     }
     /// The settings' row under a panel point, as the last frame laid them out.
     fn row_at(&self, sx: i64, sy: i64) -> Option<Choice> {
-        self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4)
+        self.rows.iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4)
     }
 
     fn push_row(&mut self, x0: i64, x1: i64, top: i64, bottom: i64, what: Choice) {
-        if self.nrows < self.rows.len() {
-            self.rows[self.nrows] = (x0, x1, top, bottom, what);
-            self.nrows += 1;
-        }
+        self.rows.push((x0, x1, top, bottom, what));
     }
 
     /// A finger dragging on the open settings, at `cur` having been at `prev` last frame and touched down at `start`: locked across or up and down by its first movement past the slop. Across, the strip follows it, the page changing as the strip passes half a screen; up and down, the page scrolls with it, its last three frames' movements kept for the fling.
@@ -6268,7 +6416,7 @@ impl Map {
                     self.draw();
                     return;
                 }
-                let row = self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4);
+                let row = self.rows.iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4);
                 // Any other tap starts the version count again.
                 if row != Some(Choice::Version) {
                     self.taps = 0;
@@ -6838,7 +6986,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         icon_slots: Vec::new(),
         cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
-        rows: [(0, 0, 0, 0, Choice::Labels); 64],
+        rows: Vec::new(),
         page: 0,
         page_dx: 0,
         scroll: 0,
@@ -6881,7 +7029,6 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         pressed: None,
         slide: None,
         knob: None,
-        nrows: 0,
         app_front: false,
         recent: alloc::vec::Vec::new(),
         front_kist: None,
@@ -7620,7 +7767,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             if map.view == View::Map {
                 let (sx, sy) = map.cam.screen(w, h, map.deck.circles[map.deck.n() - 1].at.x, map.deck.circles[map.deck.n() - 1].at.y);
                 map.tap(1, sx, sy);
-            } else if let Some(r) = map.rows[..map.nrows].iter().find(|r| r.4 == Choice::AskGo).copied() {
+            } else if let Some(r) = map.rows.iter().find(|r| r.4 == Choice::AskGo).copied() {
                 map.tap(1, (r.0 + r.1) / 2, (r.2 + r.3) / 2);
             }
         }

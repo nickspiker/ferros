@@ -575,6 +575,20 @@ messages! {
     Pandok,
     /// The Deck with nothing on deck but settings.
     NothingStowed,
+    /// The Deck page's heading over the kists on deck (a ferros word, kept unless a language has a reason; its plural as the language makes one).
+    DeckKists,
+    /// The Deck page's heading over the pucks on deck (a ferros word, never "widget").
+    DeckPucks,
+    /// The pandok while its list is being fetched.
+    PandokReading,
+    /// The pandok when its list could not be fetched.
+    PandokUnreachable,
+    /// The pandok when its list holds no kists.
+    PandokEmpty,
+    /// The pandok's list read without its signature checked (no project key pinned yet).
+    PandokUnchecked,
+    /// Under the pandok's kists: every other kist it lists is already on the person's deck at its newest version, so it is not listed again.
+    PandokRestOnDeck,
     /// A card's fact: who made it (the developer's name, else their key's first bytes).
     MadeBy,
     /// A card's fact: its version (`Version` is About's line).

@@ -987,9 +987,18 @@ fn icon(icon: u8) -> Option<(&'static [u8], usize)> {
 /// A box between frames (a puck's, puck.rs `phase_due`): Some(k) while the last camera op is replayed with `draw::CLIP` set to the box, to publish that region alone into phase k (the one the next flip shows): no clear beyond the clip, no frame armed, no interaction counted, the frame's damage left as the last full op made it.
 static mut CLIP_PHASE: Option<usize> = None;
 /// The last frame a client sent — a camera op alone, or a batch holding one (the map's: `begin`, its overlay, the camera with the keep flag) — as it came: the boxes between frames replay it.
-static mut LAST_FRAME: ([u8; SLOT], usize) = ([0; SLOT], 0);
+static mut LAST_FRAME: (Room, usize) = (NO_ROOM, 0);
 /// The last plain deck frame (a batch from `begin`, or a camera op alone) as the map sent it, never emptied by the glows or the scene changing (ops 57, 12, 13, 17 empty `LAST_FRAME` until the next frame): what the pucks' squares are drawn again with when `LAST_FRAME` is empty, the camera as the map last showed it, the scene and glows as they are now (the 8a, 2026-11-18: the map sent glows with no frame after them, and the pucks' squares stopped reaching the glass).
-static mut LAST_DECK: ([u8; SLOT], usize) = ([0; SLOT], 0);
+static mut LAST_DECK: (Room, usize) = (NO_ROOM, 0);
+/// A frame kept for replay (`LAST_FRAME`, `LAST_DECK`): its bytes in the room, grown as frames need; refused by the arc, none kept (nothing replays, the next frame from the map draws it).
+fn keep_frame(to: &mut (Room, usize), m: &[u8]) {
+    to.1 = if to.0.fit(m.len()) {
+        to.0.get_mut(m.len()).copy_from_slice(m);
+        m.len()
+    } else {
+        0
+    };
+}
 /// The op that last emptied `LAST_FRAME` (a measure, 2026-11-18: the pucks' squares stopped reaching the glass on the 8a while nothing drew the deck again).
 static LAST_FRAME_CLEARED: AtomicU32 = AtomicU32::new(0);
 /// Back's Escapes the apps did not use (op 76), counted; its low byte rides on op 5.
@@ -1145,6 +1154,8 @@ const GLOW_FLOOR: u32 = 2;
 /// The log glow (`draw::glow_log`) in place of the 1/distance one: on; how far it reaches, 1/GLOW_FRACTION of the circle's radius past its edge at every size (owner, 2026-10-24: 1/12, no minimum, no maximum); and its fade, 2^GLOW_OCT_LOG2 octaves of squared distance from full light to none (2 = four). Tunables, by eye.
 const GLOW_LOG: bool = true;
 const GLOW_FRACTION: i64 = 12;
+/// A row's icon on a page (op 77's longer form) carries its state glow reaching 1/`PAGE_GLOW` of its radius past its edge: the deck's twelfth is a hairline at a row's size. A tunable, by eye on the Pro.
+const PAGE_GLOW: i64 = 1 << 2;
 const GLOW_OCT_LOG2: u32 = 2;
 const BLACK: u32 = rgb(0, 0, 0);
 
@@ -2239,25 +2250,55 @@ static mut REGION_REQ: Option<[u8; 10]> = None;
 static mut CLEAN_KEY: Option<([u8; 10], [u8; 18], u8, u32)> = None;
 /// Counts every change to the retained scene (ops 12, 13, 17): a clean window made before one is stale.
 static mut SCENE_GEN: u32 = 0;
-/// A frame's front ops, kept so the next frame draws only what changed: the ops' bytes back to back, and each op's offset, length and the rectangle it may touch.
-const FRONT_OPS: usize = 128;
+/// A frame's front ops, kept so the next frame draws only what changed: the ops' bytes back to back (`buf`), and each op's place in them and the rectangle it may touch (`at`, a run of `OpAt`).
+/// Both grow by the arc as a page needs (founding rule 3: no fixed count of ops or bytes; until 2026-11-24 a page past 128 ops or 4 KiB had the rest refused, status 2).
 #[derive(Clone, Copy)]
 struct FrontOps {
-    buf: [u8; SLOT],
+    buf: Room,
     n: usize,
-    ops: [(u16, u16, draw::Rect); FRONT_OPS],
+    at: Room,
     k: usize,
 }
+/// One kept op: its offset and length in `buf`, and its rectangle.
+#[derive(Clone, Copy)]
+struct OpAt {
+    o: usize,
+    l: usize,
+    r: draw::Rect,
+}
 impl FrontOps {
-    const EMPTY: FrontOps = FrontOps { buf: [0; SLOT], n: 0, ops: [(0, 0, draw::Rect::EMPTY); FRONT_OPS], k: 0 };
+    const EMPTY: FrontOps = FrontOps { buf: NO_ROOM, n: 0, at: NO_ROOM, k: 0 };
+    /// The kept ops' places, in the frame's order.
+    fn ops(&self) -> &[OpAt] {
+        let b = self.at.get(self.k * core::mem::size_of::<OpAt>());
+        // SAFETY: the room's run starts on a page (the arc grows by pages), so it is aligned for `OpAt`, and its first `k` entries were written by `push`.
+        unsafe { core::slice::from_raw_parts(b.as_ptr() as *const OpAt, self.k) }
+    }
     fn op(&self, i: usize) -> &[u8] {
-        let (o, l, _) = self.ops[i];
-        &self.buf[o as usize..o as usize + l as usize]
+        let a = self.ops()[i];
+        &self.buf.get(a.o + a.l)[a.o..]
+    }
+    /// An op kept with its rectangle; false when the arc refused the room (the op then not kept, said by the caller's status).
+    fn push(&mut self, m: &[u8], r: draw::Rect) -> bool {
+        let e = core::mem::size_of::<OpAt>();
+        if !self.buf.fit_keep(self.n + m.len(), self.n) || !self.at.fit_keep((self.k + 1) * e, self.k * e) {
+            return false;
+        }
+        self.buf.get_mut(self.n + m.len())[self.n..].copy_from_slice(m);
+        let entry = OpAt { o: self.n, l: m.len(), r };
+        // SAFETY: as `ops`; entry k is inside the run just fitted.
+        unsafe { (self.at.get_mut((self.k + 1) * e).as_mut_ptr() as *mut OpAt).add(self.k).write(entry) };
+        self.n += m.len();
+        self.k += 1;
+        true
     }
 }
 /// Last frame's front ops (what the front layer holds) and this frame's (being received).
 static mut FRONT_OLD: FrontOps = FrontOps::EMPTY;
 static mut FRONT_NEW: FrontOps = FrontOps::EMPTY;
+/// `front_frame`'s working lists, grown as pages need: which of last frame's ops this frame matched (a byte each), and the rectangles to draw again.
+static mut FRONT_MATCHED: Room = NO_ROOM;
+static mut FRONT_DMG: Room = NO_ROOM;
 
 /// The front layer: the sprite arena as a full screen, or None when the arena is too small for one (no `display-sprites` region: the old path draws the page into the canvas).
 fn front_layer(width: usize, height: usize) -> Option<&'static mut [Px]> {
@@ -2296,16 +2337,30 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
             }
             Some(draw::Rect { x0: x as i32, y0: y as i32, x1: (x + w.max(1)) as i32, y1: (y + h.max(1)) as i32 })
         }
-        // 77 `icon [cx i16][cy i16][r u16][scene index u8]`: scene circle i's own picture, upright, in a circle of radius r at (cx, cy) on the page (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): its bundle icon, the ferros mark, a puck's square as it is now (its name's plane until it has one), else the theme's fill.
+        // 77 `icon [cx i16][cy i16][r u16][scene index u8]`, optionally `[glow u8][count u16][blue u16][green u16][red u16]`: scene circle i's own picture, upright, in a circle of radius r at (cx, cy) on the page (owner, 2026-11-18: "icons in the settings/deck page ... Just names is bland"): its bundle icon, the ferros mark, a puck's square as it is now (its name's plane until it has one), else the theme's fill.
+        // The longer form (2026-11-24, the Deck page made legible) carries the circle's state as op 57 says it and its loading pie as op 87 says it, so the page's bytes change when they do (the front layer draws again only ops whose bytes changed), and its state glow is drawn round it as on the deck, reaching a quarter of its radius (`PAGE_GLOW`) so it reads at a row's size. Index G#FF in that form is a thing with no circle yet (a kist being stowed from the pandok): its pie on grey, or a plain disc.
         Some(77) if m.len() >= 8 => {
             let (x, y, r, i) = (i16le(1), i16le(3), u16le(5), m[7] as usize);
-            // WHY the bound: the index is the client's, and the scene holds SCENE_N circles.
-            if i >= unsafe { SCENE_N } {
+            let long = m.len() >= 17;
+            // WHY the bound: the index is the client's, and the scene holds SCENE_N circles; G#FF stands for none only in the longer form.
+            let mut cir = if i < unsafe { SCENE_N } {
+                unsafe { SCENE[i] }
+            } else if long && i == 0xFF {
+                NO_CIRCLE
+            } else {
                 return None;
+            };
+            if long {
+                cir.glow = m[8];
+                cir.count = u16::from_le_bytes([m[9], m[10]]);
+                cir.pie = ferros_glow::pie::Shares::read(m[11..17].try_into().unwrap()).unwrap_or(ferros_glow::pie::Shares::DONE);
             }
-            let cir = unsafe { SCENE[i] };
             let (cx, cy, rr) = ((x << 8) + 128, (y << 8) + 128, r << 8);
             let th = ferros_sys::theme::current();
+            // WHY the max: `glow_log` divides the radius by the fraction, and a for-you glow with many things waiting reaches far enough (ferros_glow `reach`) that its scene fraction scaled to the page's rounds to 0; 1 is a glow reaching a whole radius out.
+            let glow = state_glow(&cir, &th).map(|(colour, peak, frac, dark)| (colour, peak, (frac * PAGE_GLOW / GLOW_FRACTION).max(1), dark));
+            // How far the glow reaches past the icon, as `draw::glow_log` draws it.
+            let reach = glow.map_or(0, |g| (r << 8) / g.2 + 256) >> 8;
             if let Some(px) = px {
                 let full = draw::Rect::full(width, height);
                 // Loading: its pie, as the deck shows it (op 87).
@@ -2324,8 +2379,12 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 } else {
                     draw::disc(px, width, height, cx, cy, rr, th.ring & 0x00FF_FFFF);
                 }
+                // Its state's glow, under the picture (front to back: the picture went in first), as the deck's circles carry it.
+                if let Some((colour, peak, frac, dark)) = glow {
+                    draw::glow_log(px, width, height, cx, cy, rr, colour, peak, frac, GLOW_OCT_LOG2, dark);
+                }
             }
-            Some(draw::Rect { x0: (x - r - 2) as i32, y0: (y - r - 2) as i32, x1: (x + r + 3) as i32, y1: (y + r + 3) as i32 })
+            Some(draw::Rect { x0: (x - r - reach - 2) as i32, y0: (y - r - reach - 2) as i32, x1: (x + r + reach + 3) as i32, y1: (y + r + reach + 3) as i32 })
         }
         Some(16) if m.len() >= 11 => {
             let (x, y, r) = (i16le(1), i16le(3), u16le(5));
@@ -2526,22 +2585,36 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
 
 /// The front layer brought to this frame's ops (`FRONT_NEW`) from last frame's (`FRONT_OLD`): an op sent again byte for byte stays as drawn; the rectangles of the ops that went and of the ops that came, merged until no two overlap, are cleared and every op touching one is drawn again inside it, in the frame's order (front first). Returns their union, the frame's damage; `FRONT_NEW` becomes `FRONT_OLD`.
 fn front_frame(front: &mut [Px], width: usize, height: usize) -> draw::Rect {
-    let (old, new) = unsafe { (&mut *(&raw mut FRONT_OLD), &*(&raw const FRONT_NEW)) };
-    let mut matched = [false; FRONT_OPS];
-    let mut dmg = [draw::Rect::EMPTY; 2 * FRONT_OPS];
+    let (old, new) = unsafe { (&mut *(&raw mut FRONT_OLD), &mut *(&raw mut FRONT_NEW)) };
+    let (mroom, droom) = unsafe { (&mut *(&raw mut FRONT_MATCHED), &mut *(&raw mut FRONT_DMG)) };
+    let rect = core::mem::size_of::<draw::Rect>();
+    // Refused by the arc (the device out of memory): the whole front drawn again, which needs no lists.
+    if !mroom.fit(old.k) || !droom.fit((old.k + new.k) * rect) {
+        let all = draw::Rect::full(width, height);
+        draw::clear(front, width, all);
+        for i in 0..new.k {
+            page_op(new.op(i), Some(&mut *front), width, height);
+        }
+        core::mem::swap(old, new);
+        return all;
+    }
+    let matched = mroom.get_mut(old.k);
+    matched.fill(0);
+    // SAFETY: the room's run starts on a page, aligned for `Rect`, and holds old.k + new.k of them (fitted above).
+    let dmg = unsafe { core::slice::from_raw_parts_mut(droom.get_mut((old.k + new.k) * rect).as_mut_ptr() as *mut draw::Rect, old.k + new.k) };
     let mut nd = 0usize;
     for i in 0..new.k {
-        match (0..old.k).find(|&j| !matched[j] && old.op(j) == new.op(i)) {
-            Some(j) => matched[j] = true,
+        match (0..old.k).find(|&j| matched[j] == 0 && old.op(j) == new.op(i)) {
+            Some(j) => matched[j] = 1,
             None => {
-                dmg[nd] = new.ops[i].2;
+                dmg[nd] = new.ops()[i].r;
                 nd += 1;
             }
         }
     }
     for j in 0..old.k {
-        if !matched[j] {
-            dmg[nd] = old.ops[j].2;
+        if matched[j] == 0 {
+            dmg[nd] = old.ops()[j].r;
             nd += 1;
         }
     }
@@ -2570,17 +2643,15 @@ fn front_frame(front: &mut [Px], width: usize, height: usize) -> draw::Rect {
         draw::clear(front, width, d);
         unsafe { draw::CLIP = d };
         for i in 0..new.k {
-            if !new.ops[i].2.intersect(d).is_empty() {
+            if !new.ops()[i].r.intersect(d).is_empty() {
                 page_op(new.op(i), Some(&mut *front), width, height);
             }
         }
         all = all.union(d);
     }
     unsafe { draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX } };
-    old.buf[..new.n].copy_from_slice(&new.buf[..new.n]);
-    old.n = new.n;
-    old.ops = new.ops;
-    old.k = new.k;
+    // This frame's ops are what the front holds now; the other lists' rooms are kept for the next frame's (`FRONT_NEW` emptied at its region op).
+    core::mem::swap(old, new);
     all
 }
 
@@ -3300,7 +3371,7 @@ fn surface_of(base: u64) -> Option<usize> {
 const NOT_YOURS: u8 = ferros_sys::window::NOT_YOURS;
 /// What the caller of the request being run holds (`caller_of`), for the render thread's ops: set from the ring's slot before its request runs, 0 for the display's own runs (a frame replayed, the quick row's capture), so an op that names a surface refuses there.
 static mut HOLDS: u64 = 0;
-/// Each ring slot's caller's holdings, written with the slot's message (`RING_MSG`).
+/// Each ring slot's caller's holdings, written with the slot's message (`RING_ROOM`).
 static mut RING_HOLDS: [u64; RING] = [0; RING];
 /// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
 static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7917,9 +7988,65 @@ fn isqrt(v: i64) -> i64 {
 //
 // Two threads (KERNEL.md "Threads, interrupts and cores": receive and work are different threads). The receive thread blocks in `recv` and never touches hardware or the canvas: it answers `5` (the query) from statics, and puts every other message into this ring for the render thread, replying at once — so a client's call costs microseconds whatever the panel is doing. A frame (op 14, or a batch, 15) that arrives while the previous frame still waits in the ring replaces it: the client outran the renderer, and only the newest scene matters. The dev and hardware ops that answer with data (a DSI read, "moved") wait for the render thread to run them and reply with its result.
 const RING: usize = 16;
+/// A message taken in place: one this long or shorter needs no room of its own (`Room`).
 const SLOT: usize = 4096;
-static mut RING_MSG: [[u8; SLOT]; RING] = [[0; SLOT]; RING];
-static mut RING_LEN: [u16; RING] = [0; RING];
+
+/// A run of bytes grown by the arc as its messages need (docs/NO-CEILINGS.md decision 5, founding rule 3: no fixed message size), never given back: it holds the most it was asked to.
+/// One thread writes each room at a time (the ring's slots are handed over by `RING_HEAD` and `RING_TAIL`).
+/// A grow maps a fresh run at the arc's top and the old one is left behind, so a room that keeps growing costs at most twice its largest message (each run a power of two).
+#[derive(Clone, Copy)]
+struct Room {
+    at: usize,
+    cap: usize,
+}
+const NO_ROOM: Room = Room { at: 0, cap: 0 };
+impl Room {
+    /// At least `n` bytes: false when the arc refuses (the device out of memory), the room as it was.
+    fn fit(&mut self, n: usize) -> bool {
+        if n <= self.cap {
+            return true;
+        }
+        match ferros_sys::arc::grow(n.next_power_of_two()) {
+            Ok((top, was)) => {
+                self.at = ferros_sys::arc_base() as usize + was;
+                self.cap = top - was;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    /// At least `n` bytes with its first `keep` as they were (copied into the new run when it grows).
+    fn fit_keep(&mut self, n: usize, keep: usize) -> bool {
+        if n <= self.cap {
+            return true;
+        }
+        let was = *self;
+        if !self.fit(n) {
+            return false;
+        }
+        self.get_mut(keep).copy_from_slice(was.get(keep));
+        true
+    }
+    /// Its first `n` bytes (`n` at most what `fit` was given).
+    fn get(&self, n: usize) -> &[u8] {
+        // WHY: a room never grown has no run (`at` 0), and a slice of none must not be made from a null pointer; only an empty one is asked of it.
+        if n == 0 {
+            return &[];
+        }
+        // SAFETY: `at` is the start of `cap` bytes this process grew its arc by, held by this room alone, and `n` <= `cap` (the caller fitted it).
+        unsafe { core::slice::from_raw_parts(self.at as *const u8, n) }
+    }
+    fn get_mut(&mut self, n: usize) -> &mut [u8] {
+        if n == 0 {
+            return &mut [];
+        }
+        // SAFETY: as `get`.
+        unsafe { core::slice::from_raw_parts_mut(self.at as *mut u8, n) }
+    }
+}
+/// Each slot's message, grown by the arc as its messages need (docs/NO-CEILINGS.md decision 5), and its length.
+static mut RING_ROOM: [Room; RING] = [NO_ROOM; RING];
+static mut RING_LEN: [usize; RING] = [0; RING];
 static mut RING_REPLY: [[u8; 16]; RING] = [[0; 16]; RING];
 static mut RING_RLEN: [u8; RING] = [0; RING];
 /// When the receive thread took each slot's message in (counter ticks, as `recv` returned it): the render thread's take less this is the time it waited in the ring.
@@ -7958,14 +8085,27 @@ extern "C" fn receive(grants: u64) -> ! {
     let ep = cap(grants, S_DISPLAY);
     let mut msg = [0u8; SLOT];
     let mut tok = [0u8; 32];
+    // A message longer than `msg` (a page of many rows, docs/NO-CEILINGS.md decision 5): told "too long" with its length, and taken whole into this run, grown by the arc as needed.
+    let mut rx = NO_ROOM;
     loop {
-        let n = ferros_sys::recv(ep, &mut msg, &mut tok, false);
-        if n == ferros_sys::ERR || n == 0 || n > SLOT as u64 {
+        let r = ferros_sys::recv_long(ep, &mut msg, &mut tok, false);
+        let (long, n) = match ferros_sys::too_long(r) {
+            Some(len) if rx.fit(len) => (true, ferros_sys::recv_long(ep, rx.get_mut(len), &mut tok, false)),
+            Some(len) => {
+                // No room for it: taken by a plain receive, which the kernel refuses for us (its caller answered ERR, the console and the flash log naming the length).
+                let _ = len;
+                let _ = ferros_sys::recv(ep, &mut msg, &mut tok, false);
+                continue;
+            }
+            None => (false, r),
+        };
+        if n == ferros_sys::ERR || n == 0 || ferros_sys::too_long(n).is_some() {
             continue;
         }
         let t_in = now();
         let n = n as usize;
-        let op = msg[0];
+        let m: &[u8] = if long { rx.get(n) } else { &msg[..n] };
+        let op = m[0];
         // Whose surfaces the caller holds, asked of the kernel while its token is live (before the reply), for the ops that need it.
         let h = if names_surface(op) { caller_of(&tok) } else { 0 };
         if op == 5 {
@@ -7985,7 +8125,7 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         // 76 `escape unused [base u64]`: the app on that surface was handed Back's Escape and did not use it, at its top already (fluor's ferros host, owner 2026-11-18): counted for the deck (op 5 byte 13). Only the surface's holder; anyone else's word is not counted. → [0], or [4] `NOT_YOURS`.
         if op == 76 && n >= 9 {
-            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
+            let mine = surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
             if mine.is_some() {
                 ESC_UNUSED.fetch_add(1, Ordering::Relaxed);
             }
@@ -7995,8 +8135,8 @@ extern "C" fn receive(grants: u64) -> ! {
         if op == 27 && n >= 13 {
             // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window owns it on the glass, else 0: one read of the hit map (hit.rs), where a window owns the pixels it is frontmost and not see-through at, inside the circle (in full screen to the glass's edge but the helm's two wedges, the console's rows the app's), and never one the system holds (the corners, the quick row and what is behind it while it shows). Answered here: a client asks it on every finger down.
             // Only the caller's own surface: another app's window is never "mine" to it.
-            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
-            let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
+            let mine = surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
+            let (x, y) = (u16::from_le_bytes([m[9], m[10]]) as i64, u16::from_le_bytes([m[11], m[12]]) as i64);
             let yes = mine.is_some_and(|k| hit::at(x, y) == hit::WINDOW + k as u16);
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
@@ -8008,8 +8148,8 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 54 && n >= 4 {
-            let level = u16::from_le_bytes([msg[2], msg[3]]) as u32;
-            match msg[1] {
+            let level = u16::from_le_bytes([m[2], m[3]]) as u32;
+            match m[1] {
                 8 => HELM_TARGET[0].store(level, Ordering::Release),
                 9 => HELM_TARGET[1].store(level, Ordering::Release),
                 10 => HELM_HIDE.store(level, Ordering::Release),
@@ -8024,8 +8164,8 @@ extern "C" fn receive(grants: u64) -> ! {
                 ferros_sys::reply(&tok, &[NOT_YOURS]);
                 continue;
             }
-            let glow = if n >= 5 { msg[4] as u32 } else { 0 };
-            HELM_NOTE.store(glow << 24 | (msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
+            let glow = if n >= 5 { m[4] as u32 } else { 0 };
+            HELM_NOTE.store(glow << 24 | (m[1] as u32) << 16 | u16::from_le_bytes([m[2], m[3]]) as u32, Ordering::Release);
             // A pass now, so the bars' worker (nudged on every pass) draws the helm with it: an idle screen (a kist in front drawing nothing new) had no pass to show it until the next minute (2026-11-12, on the 8a: a question waited with the Deck button still grey).
             ring_bell();
             ferros_sys::reply(&tok, &[0]);
@@ -8033,13 +8173,13 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         // 73 `puck bind [count u8][count × (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on `puck` (puck.rs; docs/PUCKS.md). The system's alone: [4] (`NOT_YOURS`) from anyone else.
         if op == 73 {
-            let r = if system(h) { puck::bind(&msg[1..n]) } else { NOT_YOURS };
+            let r = if system(h) { puck::bind(&m[1..n]) } else { NOT_YOURS };
             ferros_sys::reply(&tok, &[r]);
             continue;
         }
         // 74 `puck tap [scene index u8][x u16][y u16]`: a tap on a puck's circle at that screen pixel, passed thru to the puck (puck.rs `tap`; owner, 2026-11-18: "a simple tap passes thru so we can make our dozenal calculator work"). The system's alone: [4] (`NOT_YOURS`) from anyone else.
         if op == 74 {
-            let r = if system(h) { puck::tap(&msg[1..n]) } else { NOT_YOURS };
+            let r = if system(h) { puck::tap(&m[1..n]) } else { NOT_YOURS };
             ferros_sys::reply(&tok, &[r]);
             continue;
         }
@@ -8050,14 +8190,14 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 56 && n >= 15 {
-            let r = quick::set(&msg[..15]);
+            let r = quick::set(&m[..15]);
             ferros_sys::reply(&tok, &r);
             continue;
         }
         if op == 41 && n >= 5 {
             // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 deck on the right, whole (the arrow and the ring are only drawn there, nothing to aim at), in front of the deck's circles as they are on the glass (hit.rs `row`, owner 2026-11-17); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
             let (w, h) = unsafe { SCREEN_WH };
-            let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
+            let (x, y) = (u16::from_le_bytes([m[1], m[2]]) as i64, u16::from_le_bytes([m[3], m[4]]) as i64);
             let id = hit::at(x, y);
             let code = if (hit::SYS..hit::WINDOW).contains(&id) { (id - hit::SYS) as u8 } else { 0xFF };
             if (32..32 + quick::N as u8).contains(&code) {
@@ -8074,11 +8214,11 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         // 62 `events [base u64][seen u32]`: the caller's window's events after `seen`, held until there is one (events.rs; a doorbell, never a poll). Answered here or later by whoever posts the event; a base that names no surface, [3] at once; another's surface, [4] (`NOT_YOURS`).
         if op == 62 && n >= 13 {
-            match surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())) {
+            match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
                 Some(k) if !holds(h, k) => {
                     ferros_sys::reply(&tok, &[not_yours(op, k)]);
                 }
-                Some(k) => events::watch(k, live_gen(k), u32::from_le_bytes(msg[9..13].try_into().unwrap()), &tok),
+                Some(k) => events::watch(k, live_gen(k), u32::from_le_bytes(m[9..13].try_into().unwrap()), &tok),
                 None => {
                     ferros_sys::reply(&tok, &[3]);
                 }
@@ -8088,7 +8228,7 @@ extern "C" fn receive(grants: u64) -> ! {
         // 80 `windows as they stood [surface u8][generation u8]` (2026-11-20, WINDOWS.md "A display started again"): from the deck after this display started again, the window that was in front (generation 0: none). Every app of the display before, held at its first watch until now, hears it: the one in front that the display's bake changed (it makes its frame again and shows it), the others that they are behind (events.rs `restore`). The system's alone: [4] (`NOT_YOURS`) from another caller.
         if op == 80 && n >= 3 {
             if system(h) {
-                let front = (msg[2] != 0 && (msg[1] as usize) < SURFACES).then_some((msg[1] as usize, msg[2]));
+                let front = (m[2] != 0 && (m[1] as usize) < SURFACES).then_some((m[1] as usize, m[2]));
                 let (told, fronted) = events::restore(front);
                 ferros_sys::reply(&tok, &[0]);
                 ferros_sys::console_flash(unsafe { PANIC_GRANTS }, alloc::format!("display: the deck says how the windows stood (in front: {}); re-attached apps told G#{told:X}, of them in front G#{fronted:X}", front.map_or(alloc::string::String::from("none"), |(k, g)| alloc::format!("surface A#{k} generation A#{g}"))).as_bytes());
@@ -8100,7 +8240,7 @@ extern "C" fn receive(grants: u64) -> ! {
         // 69 `keyboard watch [seen u32]`: the system keyboard's doorbell (keyboard.rs; WINDOWS.md "The keyboard"), held until whether an app wants the keyboard changed past `seen` → [0][count u32][wanted u8]. The system's alone: [4] (`NOT_YOURS`) from another caller.
         if op == 69 && n >= 5 {
             if system(h) {
-                keyboard::watch(u32::from_le_bytes(msg[1..5].try_into().unwrap()), &tok);
+                keyboard::watch(u32::from_le_bytes(m[1..5].try_into().unwrap()), &tok);
             } else {
                 ferros_sys::reply(&tok, &[NOT_YOURS]);
             }
@@ -8109,7 +8249,7 @@ extern "C" fn receive(grants: u64) -> ! {
         // 75 `front watch [seen u32]`: op 5's byte 12 as a doorbell (front.rs), held until whether an app window is in front changed past `seen` → [0][count u32][front u8].
         // Anyone's, as op 5 is: init waits on it for the attest screen's window.
         if op == 75 && n >= 5 {
-            front::watch(u32::from_le_bytes(msg[1..5].try_into().unwrap()), &tok);
+            front::watch(u32::from_le_bytes(m[1..5].try_into().unwrap()), &tok);
             continue;
         }
         // 84 `shot` → [0]: a screenshot (WINDOWS.md "Screenshot"; owner, 2026-11-18: "screenshot is the two finger slide"), taken at the render thread's next pass as op 30 takes one and kept as the offer (`offer_keep`). The system's alone: [4] (`NOT_YOURS`) from another caller, so no kist can make one.
@@ -8144,7 +8284,7 @@ extern "C" fn receive(grants: u64) -> ! {
         // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs), the Developer page's switch. On every build since 2026-11-18, the page being the gate; on a release build the system's alone ([4], `NOT_YOURS`, from another caller), on a development build anyone's (the bridge's tools), as before. Answered here, at once.
         if op == 58 && n >= 2 {
             if DEV || system(h) {
-                ferros_sys::reply(&tok, &hit::view_op(msg[1]));
+                ferros_sys::reply(&tok, &hit::view_op(m[1]));
             } else {
                 ferros_sys::reply(&tok, &[NOT_YOURS, 0]);
             }
@@ -8153,16 +8293,16 @@ extern "C" fn receive(grants: u64) -> ! {
         // 72 `frames [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the frame counter in the console's USB circle (`frames_op`).
         // Answered here, at once, on every build: it shows only how fast frames come, nobody's pixels.
         if op == 72 && n >= 2 {
-            ferros_sys::reply(&tok, &frames_op(msg[1]));
+            ferros_sys::reply(&tok, &frames_op(m[1]));
             continue;
         }
         // 86 `gpu compose [what u8: 0 off, 1 on, 2 toggle, 3 ask, 4 check]` → [0][on u8][state u8: 0 not started, 2 ready, 3 failed] (docs/GPU-COMPOSE.md step 2, 2026-11-21): the windows' frames composed on the GPU (`gpu::compose`), off at every start; 4 asks the render thread to compose the next app frame on NEON and again on the GPU, and to say how many words differ (`gpu::check`). Development builds only (status 1 on a release build), as op 63. Answered here, at once.
         if op == 86 && n >= 2 {
             if DEV {
-                if msg[1] == 4 {
+                if m[1] == 4 {
                     gpu::check_next();
                 }
-                ferros_sys::reply(&tok, &gpu::op(if msg[1] == 4 { 3 } else { msg[1] }));
+                ferros_sys::reply(&tok, &gpu::op(if m[1] == 4 { 3 } else { m[1] }));
             } else {
                 ferros_sys::reply(&tok, &[1, 0, 0]);
             }
@@ -8170,12 +8310,12 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         // 63 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
         if op == 63 && n >= 2 {
-            ferros_sys::reply(&tok, &channels_op(msg[1]));
+            ferros_sys::reply(&tok, &channels_op(m[1]));
             continue;
         }
         // 64 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look until the display starts again (`look_op`; development builds only, status 1 on a release build). Answered here, at once.
         if op == 64 && n >= 2 {
-            ferros_sys::reply(&tok, &look_op(msg[1]));
+            ferros_sys::reply(&tok, &look_op(m[1]));
             continue;
         }
         // 65 `bake` → [0][generation u32][k f32][m 9 × f32, the panel's rows][g f32] (ferros_sys `window::bake`): what a `BAKED` surface is made with (bake.rs; COMPOSITOR.md "Baked"). Answered here, at once, by anyone: the panel's matrix and the brightness are no secret. Read between two looks at the generation, so the numbers are one bake's.
@@ -8208,12 +8348,12 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         // A surface that is not the caller's, named by the op itself: refused here, with its status, never queued (a show is otherwise answered 0 before it is drawn). One inside a batch or a flight is refused as it runs (`not_theirs` in the render thread).
-        if let Some(k) = not_theirs(&msg[..n], h) {
+        if let Some(k) = not_theirs(m, h) {
             ferros_sys::reply(&tok, &[not_yours(op, k)]);
             continue;
         }
         // A show above the app level from a caller that is not the system's: refused the same way (`level_not_theirs`; one inside a batch or a flight as it runs).
-        if let Some(level) = level_not_theirs(&msg[..n], h) {
+        if let Some(level) = level_not_theirs(m, h) {
             ferros_sys::reply(&tok, &[level_refused(level, h)]);
             continue;
         }
@@ -8226,10 +8366,16 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         let frame = matches!(op, 14 | 15);
         // A frame behind another unconsumed frame replaces it (the slot being overwritten is never the one the render thread is copying: at least two are queued, and it works on the oldest).
-        let (slot, append) = if frame && tail - head >= 2 && matches!(unsafe { RING_MSG[((tail - 1) % RING as u64) as usize][0] }, 14 | 15) { (((tail - 1) % RING as u64) as usize, false) } else { ((tail % RING as u64) as usize, true) };
+        let (slot, append) = if frame && tail - head >= 2 && matches!(unsafe { RING_ROOM[((tail - 1) % RING as u64) as usize].get(1)[0] }, 14 | 15) { (((tail - 1) % RING as u64) as usize, false) } else { ((tail % RING as u64) as usize, true) };
         unsafe {
-            RING_MSG[slot][..n].copy_from_slice(&msg[..n]);
-            RING_LEN[slot] = n as u16;
+            // WHY: the slot grows to hold the message; refused by the arc, the request is dropped with an empty reply below (said on the console).
+            if !RING_ROOM[slot].fit(n) {
+                ferros_sys::console(grants, b"display: a request dropped: the arc gave no room for its bytes\n");
+                ferros_sys::reply(&tok, &[]);
+                continue;
+            }
+            RING_ROOM[slot].get_mut(n).copy_from_slice(m);
+            RING_LEN[slot] = n;
             RING_HOLDS[slot] = h;
             RING_AT[slot] = t_in;
         }
@@ -8240,7 +8386,7 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         ring_bell();
         // A buffer of 0 in the 40-byte form (a host saying its frame's time of a frame in its own surface) is no mailbox: answered at once, as the shorter forms are.
-        if op == 22 && n >= 36 && msg[28..36] != [0; 8] {
+        if op == 22 && n >= 36 && m[28..36] != [0; 8] {
             // A mailbox show (op 22's 36-byte form): answered once the render thread has taken it, so every show before it, and the publish of the buffer shown before it, is done, and that buffer is its owner's to draw into again (GPU-KISTS.md 1.4). A wait on the ring's head, which the render thread rings as it takes each request: a doorbell, never a poll.
             let mut h = RING_HEAD.load(Ordering::Acquire);
             while h < tail {
@@ -8694,7 +8840,10 @@ fn server(grants: u64) -> ! {
     let mut next_tick = (now() / freq() + 1) * freq();
     // The last tick's time: the frame counter divides by the time since it, so a late tick does not read as more frames a second.
     let mut frames_tick_at = now();
-    let mut msg = [0u8; 4096];
+    // The request being run, copied out of its ring slot (`RING_ROOM`): grown by the arc as requests need.
+    let mut msg = NO_ROOM;
+    // The last frame copied out for a replay (`replay`), grown as frames need.
+    let mut replay_room = NO_ROOM;
     let mut last_slow_log = 0u64;
     let mut last_reply = 0u64;
     // A second console writer: `log` is lent to the op handler for the whole pass.
@@ -8823,18 +8972,13 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 // The page's drawing ops (2 text, 3 rect, 16 disc, 19 turned text, 47 button, 48 slider, 49 radio, 50 checkbox; `page_op`): after a region op, kept for the front layer and drawn at the camera op, only where they changed (`front_frame`); otherwise drawn into the canvas now.
-                Some(2 | 3 | 16 | 19 | 47 | 48 | 49 | 50) => {
+                Some(2 | 3 | 16 | 19 | 47 | 48 | 49 | 50 | 77) => {
                     let collect = unsafe { { REGION_REQ }.is_some() } && front_layer(width, height).is_some();
                     if collect {
                         let f = unsafe { &mut *(&raw mut FRONT_NEW) };
                         match page_op(m, None, width, height) {
-                            // WHY the bounds: the batch is the client's, and a page of more ops or bytes than the kept list holds would write past it; such an op is refused (status 2).
-                            Some(r) if f.k < FRONT_OPS && f.n + m.len() <= f.buf.len() => {
-                                f.buf[f.n..f.n + m.len()].copy_from_slice(m);
-                                f.ops[f.k] = (f.n as u16, m.len() as u16, r);
-                                f.n += m.len();
-                                f.k += 1;
-                            }
+                            Some(r) if f.push(m, r) => {}
+                            // The arc gave no room to keep it (the device out of memory): refused, status 2.
                             Some(_) => out[0] = 2,
                             None => out[0] = 1,
                         }
@@ -9628,7 +9772,7 @@ fn server(grants: u64) -> ! {
                                 text_rows.fill(0);
                                 let old = &*(&raw const FRONT_OLD);
                                 for i in 0..old.k {
-                                    let r = old.ops[i].2.clip(width, height);
+                                    let r = old.ops()[i].r.clip(width, height);
                                     if r.is_empty() {
                                         continue;
                                     }
@@ -10475,8 +10619,13 @@ fn server(grants: u64) -> ! {
         // A clock on the screen, spatial dither only (no flips): a new second, the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
         // The last frame again: a camera op, or each op of a batch in order.
         let mut replay = |handle: &mut dyn FnMut(&[u8], &mut [u8; 16]) -> usize| {
+            // Copied out first (`replay_room`): an op it runs may empty or rewrite the last frame.
             let (b, n) = unsafe { *(&raw const LAST_FRAME) };
-            let m = &b[..n];
+            if !replay_room.fit(n) {
+                return;
+            }
+            replay_room.get_mut(n).copy_from_slice(b.get(n));
+            let m = replay_room.get(n);
             let mut out = [0u8; 16];
             if m.first() == Some(&15) {
                 let mut at = 1usize;
@@ -10506,7 +10655,7 @@ fn server(grants: u64) -> ! {
         // The last frame, or when the glows or the scene have come since and emptied it, the last plain deck frame (`LAST_DECK`), drawn with the scene and glows as they are now.
         if puck_due && !screen_off && !app_up {
             if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
-                unsafe { LAST_FRAME = LAST_DECK };
+                unsafe { keep_frame(&mut *(&raw mut LAST_FRAME), { LAST_DECK.0 }.get(LAST_DECK.1)) };
             }
             if unsafe { LAST_FRAME.1 > 0 } {
                 puck::count(3);
@@ -10520,7 +10669,7 @@ fn server(grants: u64) -> ! {
         // The pucks between frames (puck.rs): when this pass will flip, each puck whose newest square the phase about to show does not hold yet is drawn again there, its box alone (`draw::CLIP`, `CLIP_PHASE`), so a square costs its own circle's pixels, not the deck's (the 8a, 2026-11-18: a whole redraw per square was 35 to 46 ms of scene and 34 to 41 ms of publish at about ten squares a second).
         if flip_due && !screen_off && unsafe { (*(&raw const APP)).is_none() } {
             if unsafe { LAST_FRAME.1 == 0 && LAST_DECK.1 > 0 } {
-                unsafe { LAST_FRAME = LAST_DECK };
+                unsafe { keep_frame(&mut *(&raw mut LAST_FRAME), { LAST_DECK.0 }.get(LAST_DECK.1)) };
             }
             if unsafe { LAST_FRAME.1 > 0 } {
                 let k = unsafe { (CUR_PHASE + 1) % PHASES };
@@ -10721,13 +10870,21 @@ fn server(grants: u64) -> ! {
                 break;
             }
             let slot = (head % RING as u64) as usize;
-            let n = unsafe { RING_LEN[slot] } as usize;
-            msg[..n].copy_from_slice(unsafe { &RING_MSG[slot][..n] });
+            let n = unsafe { RING_LEN[slot] };
+            // The request copied into this thread's own room, grown as it needs; refused by the arc, it runs as nothing (an empty request), said on the console.
+            let n = if msg.fit(n) {
+                n
+            } else {
+                tlog.s(b"display: a request not run: the arc gave no room to copy it\n");
+                tlog.flush();
+                0
+            };
+            msg.get_mut(n).copy_from_slice(unsafe { RING_ROOM[slot].get(n) });
             // Its caller's holdings, for the ops it runs (`not_theirs`); back to none once it has run.
             unsafe { HOLDS = RING_HOLDS[slot] };
             RING_HEAD.store(head + 1, Ordering::Release);
             ferros_sys::wake(&RING_HEAD, 1);
-            let m = &msg[..n];
+            let m = msg.get(n);
             let mut out = [0u8; 16];
             let t_call = now();
             ncalls += 1;
@@ -10806,14 +10963,10 @@ fn server(grants: u64) -> ! {
             }
             if m.first() == Some(&14) || (m.first() == Some(&15) && batch_has_camera(m)) {
                 unsafe {
-                    let lf = &mut *(&raw mut LAST_FRAME);
-                    lf.0[..m.len()].copy_from_slice(m);
-                    lf.1 = m.len();
+                    keep_frame(&mut *(&raw mut LAST_FRAME), m);
                     // A plain deck frame (no page, no region: its batch opens with `begin`) kept for the pucks as well.
                     if m.first() == Some(&14) || m.get(3) == Some(&1) {
-                        let ld = &mut *(&raw mut LAST_DECK);
-                        ld.0[..m.len()].copy_from_slice(m);
-                        ld.1 = m.len();
+                        keep_frame(&mut *(&raw mut LAST_DECK), m);
                     }
                 }
             }
