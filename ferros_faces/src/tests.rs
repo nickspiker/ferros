@@ -58,14 +58,44 @@ fn tide() {
     let mut t = ferros_tide::Tide::flat(2.);
     t.set(ferros_tide::index_of("M2").unwrap(), 1.07, 10.);
     t.set(ferros_tide::index_of("K1").unwrap(), 0.84, 260.);
-    let face = ferros_tide::Face::at(&t, NOW).unwrap();
-    let about = tide::About { scale: tide::scale(&t), place: Some(ferros_sky::Place::deg(47.6, -122.3)), station: "Seattle", distance_m: 3200. };
-    let words = both("tide", osc(NOW), |w, focus| tide::face(w, &face, &about, focus));
-    // Height now, the high and the low with their heights; in focus the station and its distance too.
-    assert_eq!(words[0].len(), 5);
-    assert_eq!(words[1].len(), 7);
-    assert!(words[1].iter().any(|s| s == "Seattle") && words[1].iter().any(|s| s == "3km"));
-    assert!(tide::deadline(&face) > NOW && tide::deadline(&face) <= face.until);
+    let mut glyphs = ferros_glyphs::Glyphs::with_arena(ferros_glyphs::FONT, 1 << 15).unwrap();
+    let mut cache = tide::Cache::new();
+    let zone = -8 * 3600;
+    for (base, focus, turn) in [(12u8, false, (1f32, 0f32)), (10, true, (0.6, 0.8)), (16, false, (1., 0.))] {
+        let chart = tide::Chart { tide: &t, scale: tide::scale(&t), place: ferros_sky::Place::deg(47.6, -122.3), now: NOW, zone, base, station: focus.then_some(("Seattle", 3200.)) };
+        let d = 256;
+        let mut px = vec![0u64; d * d];
+        tide::paint(&mut px, d, turn, &chart, &mut cache, &mut glyphs);
+        // Every pixel inside the circle is opaque: the sky is drawn under everything.
+        let r = d as f32 * 0.5;
+        let mut inside = 0;
+        for y in 0..d {
+            for x in 0..d {
+                let (dx, dy) = (x as f32 + 0.5 - r, y as f32 + 0.5 - r);
+                if dx * dx + dy * dy < (r - 1.) * (r - 1.) {
+                    inside += 1;
+                    assert_eq!(px[y * d + x] >> 48, 0xFFFF, "base {base}: pixel ({x}, {y}) not opaque");
+                }
+            }
+        }
+        assert!(inside > 0);
+        // The next square is due within a turn of now's words, and after now.
+        let next = tide::deadline(&chart, d);
+        assert!(next > NOW && next <= NOW + tide::word_step(base), "base {base}: deadline {}", next - NOW);
+        println!("tide base {base}: next square in {} s", next - NOW);
+    }
+}
+
+#[test]
+fn tide_words() {
+    // A minute past 2026-11-18 16:00 UTC is 08:01 at -8 h (a minute past, so float rounding at the turn of the minute cannot floor it back): the day's 48th of 144 in dozenal (Ter, Zil: the zil dropped), 08:01 in decimal, G#70BC s in hex (to G#100 s, G#70: 7, the bar, 0).
+    let words = |base| {
+        let w = tide::time_words(NOW + 60., -8 * 3600, base);
+        (String::from(w.a.as_str()), String::from(w.b.as_str()), w.split == tide::Split::Lone)
+    };
+    assert_eq!(words(12), (String::from("\u{14}"), String::new(), true));
+    assert_eq!(words(10), (String::from("08"), String::from("01"), false));
+    assert_eq!(words(16), (String::from("7"), String::from("0"), false));
 }
 
 #[test]

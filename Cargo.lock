@@ -1644,6 +1644,7 @@ name = "ferros_faces"
 version = "0.1.0"
 dependencies = [
  "ferros_compass",
+ "ferros_glyphs",
  "ferros_puck",
  "ferros_sky",
  "ferros_tide",

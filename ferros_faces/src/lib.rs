@@ -1,12 +1,14 @@
 //! The faces of ferros's own pucks (docs/PUCKS.md; owner, 2026-11-17: "plus a tide puck", "GPS, compass, shit that's useful!"): each engine's values written as a ferros_puck list, at rest and in focus (the fuller face).
 //!
-//! - **Words.** No face writes a human word: every time is a `MOMENT` and every measure a `NUMBER`, which the display formats in the person's base and zone; what a value means is said by where it sits and what it is drawn with (the tide's high below its curve and low above it, as the owner's e-ink tide clock draws them; sunrise on the left, sunset on the right). The one exception is a tide station's name in focus, which is a place's name as its source publishes it.
+//! - **Words.** No face writes a human word: every time is a `MOMENT` and every measure a `NUMBER`, which the display formats in the person's base and zone; what a value means is said by where it sits and what it is drawn with (the tide's high below its curve and low above it, as the owner's e-ink tide clock draws them; sunrise on the left, sunset on the right). The one exception is a tide station's name in focus, which is a place's name as its source publishes it. The tide's face (since 2026-11-24, the owner's tide widget) is painted per pixel instead of written as a list, and writes its times itself, in the person's base and zone.
 //! - **Colours.** VSF RGB gamma-2 codes (AGENT.md, memory feedback_vsf_rgb_only), or the person's theme; the water's, the sky's and the marker's are provisional picks for the owner (PUCKS.md question 9).
 //! - **Order.** Front first: the words, then the markers, then the curves, then the bands, then the sky, as ferros_puck draws them (`under`).
 //! - **Sizes.** Every coordinate a fraction of the circle's radius (`q14`), so a face is the same at every zoom.
 //! - **Time.** Engines count Eagle seconds; ops take Eagle oscillations (`osc`).
 
 #![no_std]
+
+extern crate alloc;
 
 pub mod compass;
 pub mod gps;
@@ -31,8 +33,6 @@ pub fn u(f: f32) -> u16 {
 
 /// The deep sky every face sits on: VSF RGB gamma 2, a blue so dark it reads as night on a lit panel and does not glow on a dark one (provisional, the owner's pick).
 pub const SKY: Colour = Colour::rgb(6, 10, 26);
-/// Night on a curve (the sun below the horizon): the sky's black at a third, laid behind the curve so the water and the line stay as they are (inksurf inverts its night columns; a dim band is the same reading on an emitting panel).
-pub const NIGHT: Colour = Colour::Rgb { r: 0, g: 0, b: 0, a: 1 << 7 };
 /// The water (provisional): a sea blue, and its surface line lighter.
 pub const WATER: Colour = Colour::rgb(24, 92, 168);
 pub const WATER_LINE: Colour = Colour::rgb(120, 196, 236);

@@ -11,6 +11,8 @@ path = "src/lib.rs"
 [dependencies]
 libm = "0.2"
 ferros_puck = { path = "../ferros_puck" }
+# The typeface the tide face draws its own words in (it paints its square per pixel, as the clock does).
+ferros_glyphs = { path = "../ferros_glyphs" }
 ferros_tide = { path = "../ferros_tide" }
 ferros_sky = { path = "../ferros_sky" }
 ferros_compass = { path = "../ferros_compass" }

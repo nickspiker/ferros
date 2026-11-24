@@ -1,0 +1,19 @@
+[package]
+name = "tide-face"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The tide puck's face rendered on the host (docs/PUCKS.md \"The tide puck\"): a station, a place, a moment and a circle's size in, a VSF visual out, to look at the face without a device and set it beside the owner's tide widget."
+
+# Its own workspace, as the other host tools under tools/ have.
+[workspace]
+
+[dependencies]
+# The face and its engines: the same code the tide puck runs.
+ferros_faces = { path = "../../ferros_faces" }
+ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
+ferros_sky = { path = "../../ferros_sky" }
+ferros_glyphs = { path = "../../ferros_glyphs" }
+ferros_puck = { path = "../../ferros_puck" }
+# The visual it writes, as tools/screencap writes the screen.
+vsf = { path = "../../../vsf" }

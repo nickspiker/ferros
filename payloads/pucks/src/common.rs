@@ -91,6 +91,16 @@ pub fn show(link: Link, mut face: impl FnMut(&mut Writer, bool) -> Result<(), Fu
     unsafe { NEXT = rt::eagle_now().and_then(|now| ferros_puck::draw::next_change(l, v.d as f32 * 0.5, now)) };
 }
 
+/// Draw the square itself (`paint(pixels, d, turn)`, as the clock and the tide do) for the circle as it is now and hand it to the display; nothing while the circle is not on the glass.
+#[allow(dead_code)]
+pub fn show_square(link: Link, paint: impl FnOnce(&mut [u64], usize, (f32, f32))) {
+    // A face drawn whole has no time-anchored ops for `wait` to follow: its own deadline is the caller's.
+    unsafe { NEXT = None };
+    if rt::show_with(link, &rt::view(), paint) == Some(call::REFUSED) {
+        ferros_sys::console(link.grants, b"puck: the display refused a square\n");
+    }
+}
+
 /// Sleep until the bell moves (the view, a tap, a frame, a worker), the content's own `deadline`, or the last face's next move, whichever is first.
 pub fn wait(seen: u64, deadline: Option<i64>) -> u64 {
     let next = unsafe { NEXT };
