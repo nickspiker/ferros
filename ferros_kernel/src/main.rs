@@ -158,6 +158,9 @@ mod process;
 // Device threads and the kernel lock: the measures and the switches (KERNEL.md "Device threads").
 #[cfg(feature = "pixel8")]
 mod devsched;
+// The scheduler's plain choices (where a kept thread queues, whom make_way asks, a slice's length), host-tested.
+#[cfg(feature = "pixel8")]
+mod schedrule;
 // The frame pool: the DRAM every arc is made of, in 2 MiB frames (frames.rs, ARCS.md).
 #[cfg(feature = "pixel8")]
 mod frames;

@@ -599,24 +599,53 @@ fn queue_back(t: usize) {
             unsafe { (*(&raw mut RUN_AT))[core()] = crate::platform::cntpct() };
         }
     }
+    if let Some(x) = th(t) {
+        x.front = false;
+    }
     k().runnable.push_back(t);
     runnable_sync();
 }
 fn enqueue_front(t: usize) {
     unpause(t);
+    if let Some(x) = th(t) {
+        x.front = true;
+    }
     k().runnable.push_front(t);
     runnable_sync();
     kick(mask_of(t));
 }
-/// A thread that yielded its core for the thread at the head of the queue (`ferros_el0_preempt`, asked by `make_room` or `make_way`): just behind that head, so it runs again next after it, and the woken thread its core was asked for is still the one its core picks (at the very front it was picked again itself whenever devsched `first`'s urgency did not apply).
+/// A thread that yielded its core for the thread at the head of the queue (`ferros_el0_preempt`, asked by `make_room` or `make_way`): behind that head, so the woken thread its core was asked for is still the one its core picks (at the very front it was picked again itself whenever devsched `first`'s urgency did not apply), and behind every thread already waiting at the front (`sched fifo`), ahead of those at the back.
+/// Until 2026-11-24 it went just behind the head, ahead of everyone already waiting: under Lumis's four compute threads on the A715s every device interrupt displaced one of them and put it back ahead of Lumis's camera thread, woken to the front 2 to 13 ms earlier (45 such waits in 40 s, 246 displaced threads put ahead of it), and ahead of a thread parked the same way before it.
 fn enqueue_second(t: usize) {
     unpause(t);
-    let q = &mut k().runnable;
-    // WHY the min: the head may be gone already (another core took the woken thread), and an insert past the end panics; with the queue empty it goes to the front.
-    q.insert(q.len().min(1), t);
+    let kk = k();
+    if let Some(x) = kk.threads.get_mut(t).and_then(|x| x.as_mut()) {
+        x.front = true;
+    }
+    let q = &kk.runnable;
+    // The head may be gone already (another core took the woken thread); `kept_slot` never names a place past the end.
+    let at = crate::schedrule::kept_slot(q.iter().map(|&u| kk.threads.get(u).and_then(|x| x.as_ref()).is_some_and(|x| x.front)), q.len(), FIFO.load(core::sync::atomic::Ordering::Relaxed));
+    if at > q.len().min(1) {
+        RULES_SEEN[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    kk.runnable.insert(at, t);
     runnable_sync();
     kick(mask_of(t));
 }
+/// `diag "sched fifo|kin|carry|midcall on|off"` (2026-11-24, the owner's go for the four; off by default since the A/B on the Pro showed no gain, KERNEL.md Order item 13; on, each for A/B on one boot):
+/// `fifo`: a thread kept after a yield queues behind the threads already waiting at the front (`enqueue_second`).
+pub static FIFO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `kin`: `make_way` may ask a thread of the woken one's own process when that process holds every core it could ask and the wake came from a core the woken thread may not run on.
+pub static KIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `carry`: a core whose thread was asked to yield (or taken straight back for a stale ask) goes on with the slice it was in, not a fresh one (`ferros_el0_preempt`, `arm_slice`).
+pub static CARRY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `midcall`: `make_way` never asks a thread whose process holds a caller's reply token (a call taken and not yet answered).
+/// The choices themselves are schedrule.rs's, host-tested.
+pub static MIDCALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Since `diag "sched reset"`: [0] kept threads queued behind others waiting at the front (`fifo`), [1] `make_way` asks of the woken one's own process (`kin`), [2] slices carried past a yield (`carry`), [3] `make_way` looks whose choice the mid-call rule changed (`midcall`).
+pub static RULES_SEEN: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+/// Per core: the compare value of the slice a yield interrupted (`carry`), for the next `arm_slice` there; 0 none.
+static SLICE_END: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 
 // ---------------------------------------------------------------- who runs next after a wake
 //
@@ -642,6 +671,9 @@ fn place_here(t: usize) -> bool {
     let here = th(t).is_some_and(|x| runs_here(x) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
     if here {
         unpause(t);
+        if let Some(x) = th(t) {
+            x.front = true;
+        }
         kk.runnable.push_front(t);
         runnable_sync();
     }
@@ -715,7 +747,7 @@ pub static WAY_ASKS: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::
 /// `make_way`'s looks: [0] light threads woken by a call, a word or a deadline, [1] of those that found no worker idle, [2] of those with no thread long enough in its turn to ask.
 pub static WAY_LOOKS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 /// Thread `t`, woken to the front by a word, a deadline or a call (`enqueue_woken`, its front credit unspent): when no worker it may run on is idle, the worker whose thread has run longest in its turn is asked to yield for it (SGI 3, as `make_room` asks for a device's thread), so a light thread never waits out a busy thread's slice (2026-11-17, Photon's scroll: with rayon's four workers computing a whole 10 ms slice on the four A715s, the display's receive thread, the touch server and the map waited 2.4 to 4.5 ms, and every futex wake that found the workers busy waited up to a slice).
-/// Never asked: the X3 (the render thread's core and the kernel's), the waker's own core, a thread of the woken one's own process (a parallel section's threads share the work, and the woken one taking its sibling's core gains nothing), a device thread inside its interrupt's run, a core already asked, a thread that has run less than `WAY_RUN_LOG2` or less than the woken thread's spent credit (so two light threads never take turns preempting each other). The thread asked keeps its place just behind the head of the queue (`ferros_el0_preempt`). Under the kernel lock.
+/// Never asked: the X3 (the render thread's core and the kernel's), the waker's own core, a thread of the woken one's own process (a parallel section's threads share the work, and the woken one taking its sibling's core gains nothing; unless that process holds every core it could ask and the wake came from outside them, `kin`), a thread answering a call (`midcall`), a device thread inside its interrupt's run, a core already asked, a thread that has run less than `WAY_RUN_LOG2` or less than the woken thread's spent credit (so two light threads never take turns preempting each other). The thread asked keeps its place just behind the head of the queue (`ferros_el0_preempt`). Under the kernel lock.
 fn make_way(t: usize) {
     use core::sync::atomic::Ordering::Relaxed;
     if OLD.load(Relaxed) {
@@ -730,8 +762,13 @@ fn make_way(t: usize) {
     }
     WAY_LOOKS[1].fetch_add(1, Relaxed);
     let now = crate::platform::cntpct();
+    // The woken one's own process's threads (`kin`): asked only when that process holds every core this could ask, and the wake came from a core the woken thread may not run on (not a parallel section's thread handing work along among its siblings' cores).
+    // Measured 2026-11-23 (the Pro, Lumis): Lumis's camera thread, woken from an A510 by an intake thread with Lumis's four compute threads on all four A715s, had no core asked for it and waited 2 to 13 ms, 45 times in 40 s.
+    // A thread whose process holds a caller's reply token is answering a call (`midcall`): parked, its caller waits with it (2026-11-23: the camera's server, asked 0.58 ms into a MAP's maintenance for one of Lumis's wakes, waited 14.2 ms behind the threads displaced after it).
+    let midcall = MIDCALL.load(Relaxed);
+    let mut cands = [crate::schedrule::Candidate { core: 0, kin: false, device_run: false, midcall: false, run: 0 }; 16];
+    let mut n = 0;
     let mut best = None;
-    let mut longest = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
     for c in 0..16 {
         // Not this core: its thread is the waker, in the kernel now, and if it blocks next this core takes the woken thread itself; an SGI to itself would land on whatever it switched to.
         if (m & (MASK_WORKERS | MASK_LITTLE | kernel_mask())) >> c & 1 == 0 || asked(c) || c == core() {
@@ -748,14 +785,24 @@ fn make_way(t: usize) {
             best = Some(c);
             break;
         }
-        if y.proc == x.proc || (y.on_irq && !over_budget(r, y)) {
-            continue;
-        }
+        let held = midcall && k().procs.get(y.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.cspace.iter().any(|e| matches!(e.object, Object::Reply(_))));
         // WHY saturating: `RUN_AT[c]` is core c's counter read, which this core's read is not ordered against (see `cur_set`).
         let run = now.saturating_sub(unsafe { (*(&raw const RUN_AT))[c] });
-        if run >= longest {
-            longest = run;
-            best = Some(c);
+        // `c` is under 16 and one candidate is kept per core, so `n` stays under 16.
+        cands[n] = crate::schedrule::Candidate { core: c, kin: y.proc == x.proc, device_run: y.on_irq && !over_budget(r, y), midcall: held, run };
+        n += 1;
+    }
+    if best.is_none() {
+        let least = credit(x, now) + (crate::platform::cntfrq() >> WAY_RUN_LOG2);
+        let from_outside = m >> core() & 1 == 0;
+        let kin = KIN.load(Relaxed);
+        best = crate::schedrule::way_choice(&cands[..n], least, midcall, kin, from_outside);
+        // Counted: asks of the woken one's own process, and mid-call threads that would have been asked without that rule.
+        if kin && best.is_some_and(|b| cands[..n].iter().any(|c| c.core == b && c.kin)) {
+            RULES_SEEN[1].fetch_add(1, Relaxed);
+        }
+        if midcall && best != crate::schedrule::way_choice(&cands[..n], least, false, kin, from_outside) {
+            RULES_SEEN[3].fetch_add(1, Relaxed);
         }
     }
     let Some(c) = best else {
@@ -1298,6 +1345,8 @@ struct Thread {
     wait_call: bool,
     /// The name it gave itself (SYS_THREAD_NAME: std's thread name), its first 16 bytes, zero past the end; all zero for none. A fault names the thread by it (`fault_report`).
     label: [u8; 16],
+    /// Queued at the front (woken with front credit, kept after a yield asked of it, taken straight back), not at the back: a thread kept after a yield goes behind every such thread already waiting (`enqueue_second`, `sched fifo`).
+    front: bool,
 }
 
 /// The longest forwarded store call (`STORE_GETS[3]`): its caller's name (`pin_key`), and what it was (`Thread::what`); and the calls answered while the clock policy held each of its states (0 not yet applied: the boot's own clocks, 1 rest, 2 active, 3 dark; service.rs `clock_state`), so a slow read says whether the cores were at their reading clocks (2026-11-11).
@@ -1602,6 +1651,9 @@ fn sched_counters(out: &mut Vec<u8>) {
     out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}, device threads parked mid-run by another line kept at the front A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed), PREEMPT_KEPT.load(Relaxed)).as_bytes());
     let y: [u64; 4] = core::array::from_fn(|i| YIELDS[i].load(Relaxed));
     out.extend_from_slice(alloc::format!("yields: A#{} without the lock, A#{} with nothing queued here, A#{} to another thread, A#{} back to itself\n", y[0], y[1], y[2], y[3]).as_bytes());
+    let on = |b: &core::sync::atomic::AtomicBool| if b.load(Relaxed) { "on" } else { "off" };
+    let rs: [u64; 4] = core::array::from_fn(|i| RULES_SEEN[i].load(Relaxed));
+    out.extend_from_slice(alloc::format!("rules: fifo {} (A#{} kept threads queued behind others at the front), kin {} (A#{} asks of the woken one's own process), carry {} (A#{} slices carried past a yield), midcall {} (A#{} looks whose choice it changed)\n", on(&FIFO), rs[0], on(&KIN), rs[1], on(&CARRY), rs[2], on(&MIDCALL), rs[3]).as_bytes());
     let st: [u64; 4] = core::array::from_fn(|i| STALE[i].load(Relaxed));
     out.extend_from_slice(alloc::format!("yields not made{}: A#{} stale asks parked a thread taken straight back, A#{} dropped at an unlocked call's end, A#{} unlocked calls not parked for another core's line, A#{} asks not made for a device thread its own core takes back\n", if ASKS_OLD.load(Relaxed) { " (asks as before 2026-11-23: none of these)" } else { "" }, st[0], st[1], st[2], st[3]).as_bytes());
     let w: [u64; 3] = core::array::from_fn(|i| WAY_LOOKS[i].load(Relaxed));
@@ -1627,7 +1679,7 @@ fn sched_counters(out: &mut Vec<u8>) {
 /// `diag "sched reset"`: the counters `sched_counters` shows, zeroed.
 pub fn sched_reset() {
     use core::sync::atomic::Ordering::Relaxed;
-    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain(YIELDS.iter()).chain(WAY_ASKS.iter()).chain(WAY_LOOKS.iter()).chain(STALE.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
+    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain(YIELDS.iter()).chain(WAY_ASKS.iter()).chain(WAY_LOOKS.iter()).chain(STALE.iter()).chain(RULES_SEEN.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
     // The lock's holds and the device lines' runs with them (devsched.rs), and the trace thawed.
     crate::devsched::lock_reset();
     crate::devsched::lat_reset();
@@ -6330,7 +6382,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16], front: false });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -9465,11 +9517,19 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
                     STALE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // At the very front, no core told: this core picks it next, unless a waiter a line woke here, or an urgent thread, comes first.
                     unpause(cur);
+                    p.front = true;
                     k().runnable.push_front(cur);
                     runnable_sync();
                 } else {
                     enqueue_back(cur);
                 }
+            }
+            // A yield asked of it, or a stale ask taken straight back, is not the slice's end: the core goes on with the slice it was in (`carry`), so a thread displaced and put back by device interrupts does not start a fresh slice at each one.
+            if CARRY.load(core::sync::atomic::Ordering::Relaxed) && ctl & 1 != 0 && (keep || stale) {
+                let end: u64;
+                unsafe { core::arch::asm!("mrs {}, cnthp_cval_el2", out(reg) end) };
+                SLICE_END[c].store(end, core::sync::atomic::Ordering::Relaxed);
+                RULES_SEEN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             // The detail: the INTID that parked it (bits 0-9, 3 = SGI 3, 26 = the slice's tick), why `unlocked` asked this core (bits 10-11: 1 an ask, 2 a hold, 3 a line), asked by a standing yield (bit 12), the slice ended (bit 13), kept as a device thread's run (bit 14), a stale ask taken straight back (bit 15).
             tr(TR_PREEMPT, cur, detail);
@@ -9498,7 +9558,9 @@ fn arm_slice() {
         crate::killswitch::enable_ppi(26);
         crate::killswitch::enable_sgi(3);
     }
-    let ticks = slice_ticks();
+    // The slice a yield interrupted here, if it has time left (`carry`): what runs next has its rest, not a fresh one. Past its end, a fresh one.
+    let end = SLICE_END[core()].swap(0, core::sync::atomic::Ordering::Relaxed);
+    let ticks = crate::schedrule::slice_left(end, crate::platform::cntpct(), slice_ticks());
     unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
 }
 
@@ -9579,6 +9641,8 @@ pub fn run_slice() -> bool {
     wake_sleepers();
     let kk = k();
     let Some(next) = pick_runnable() else {
+        // Nothing to run: a carried slice ends here, so a later run does not inherit what is left of it.
+        SLICE_END[core()].store(0, core::sync::atomic::Ordering::Relaxed);
         unlock();
         return false;
     };
@@ -11023,7 +11087,7 @@ fn build_from(name: &[u8], mut arc: Arc, code_len: usize, input: &[u8], objects:
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16] });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, irq_at: 0, irq_line: 0, irq_core: 0, irq_noticed: 0, device: false, urgent: false, on_irq: false, run_line: 0, irq_run_at: 0, last_core: 0, wait_call: false, label: [0; 16], front: false });
     Ok((me, arc, in_off))
 }
 

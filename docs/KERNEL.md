@@ -632,6 +632,23 @@ husky has 1× Cortex-X3, 4× A715, 4× A510 (ASID.md). The kernel today is one c
    | the camera as stored (df5cd8b3), Lumis's frames not taken | 0, 1, 0, 1, 0, 1 | 0, 0, 0, 0, 0 |
    | a run's stale SGIs taken straight back / `make_room` asks not made / `unlocked` not parked for another core's line | | about 2200 / 1650 / 6 to 13 |
    **Left, scheduling policy (to the coordinator):** a thread parked to make way goes second in the queue (`enqueue_second`), ahead of every thread already waiting behind the head, so a woken thread is passed by every thread a later interrupt displaces; `make_way` never asks a thread of the woken one's own process, so Lumis's camera thread, woken from an A510 with Lumis's own threads on all four A715s, has no core asked for it (45 waits of 2 to 13 ms in 40 s, none asked for); a displaced thread's core arms a fresh slice for whatever runs next, so under device interrupts Lumis's compute threads never reach a slice's end (1 in those 45 waits); and a server past 2^-11 s of its turn mid-call is a thread `make_way` asks (the 14.2 ms above).
+13. Four scheduling rules, built and run 2026-11-24 (the owner's go for the item 12 proposals), each behind its own switch, all off by default (the owner: "Commit the scheduler changes off by default and flash"). The choices are schedrule.rs's: plain arithmetic over what process.rs gathers under the lock, host-tested (`rustc --edition 2024 --test ferros_kernel/src/schedrule.rs`).
+   - `diag "sched fifo on"`: a thread kept after a yield queues behind every thread already waiting at the front, ahead of those at the back (`enqueue_second`, `kept_slot`; `Thread::front` marks how a thread was queued). Off, just behind the head, as before.
+   - `diag "sched kin on"`: `make_way` may ask a thread of the woken one's own process when that process holds every core it could ask (no other process's thread, device run or mid-call thread among them) and the wake came from a core the woken thread may not run on: Lumis's camera thread woken from an A510 with Lumis's own threads on all four A715s, and never a parallel section handing work along among its siblings' cores (`way_choice`).
+   - `diag "sched carry on"`: a core whose thread was asked to yield, or taken straight back for a stale ask, goes on with the slice it was in (`SLICE_END`, `slice_left`); a carried slice ends when the core finds nothing to run.
+   - `diag "sched midcall on"`: `make_way` never asks a thread whose process holds a caller's reply token.
+   - `diag sched` says each rule's state and counts (the `rules:` line), and its dump names the threads that named themselves (`threads named:`, 8fad8706).
+   **Measured** (the Pro, attested, this kernel RAM-reloaded, one boot, Lumis 0.2.76 bridge-spawned with the stored camera driver, its stacked clip recording to the hold every run; all four on against all four off, the stale-ask rules of item 12 on in both):
+   | | `48` on | `48` off | `08` on | `08` off |
+   |---|---|---|---|---|
+   | lumis-camera waits of 2 ms or more, 40 s of `sched all` | 2 (12.7 ms the longest) | 1 (2.2 ms) | 1 (9.9 ms) | 2 (7.5 ms) |
+   | the camera server's longest park | 1.04 ms | 0.08 ms | 1.67 ms | 0.05 ms |
+   | frames not taken, three runs each | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
+   | Lumis's draw a new image (console-only runs) | 36.9, 37.6 ms | 35.8, 36.8 ms | 34.1, 40.9 ms | 32.8, 33.9 ms |
+   | fluor's draw a frame (console-only runs) | 22.9, 22.3 ms | 21.9, 21.9 ms | 21.0, 23.3 ms | 20.7, 21.0 ms |
+   - The counts a 40 s run, on: fifo 225 to 275 kept threads queued behind others, kin 0 to 30 asks, carry 854 to 1591 slices carried, midcall 1440 to 2994 `make_way` choices changed.
+   - Item 12's waits (45 of 2 to 13 ms in 40 s, Lumis 0.2.70) did not come back with `48` (DEV_BIG_INTAKE, the old placement) under Lumis 0.2.76 with the rules off, so the rules had little to fix; the server's longest park rose with them (`fifo` queues it behind those already waiting), still under 2 ms. Off by default for that.
+   - Thread names in these runs: lumis.3 is lumis-camera; with `08`, lumis.5 to lumis.7 are lumis-intake-0 to 2; the long-running compute threads are unnamed (rayon's).
 
 What the GPU and TPU are not for: the compositor at 1344×2992 fits on NEON across the A715s, and effects (glow, shadow, shine) are separable integer blurs on sprite-cached pixels. The Mali needs its closed CSF firmware and a shader compiler we do not have; it belongs after toka, when an app needs it. The TPU is closed end to end and is not on the path.
 

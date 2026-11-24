@@ -5191,6 +5191,14 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if let Some(rule) = [(&b"fifo"[..], &crate::process::FIFO), (b"kin", &crate::process::KIN), (b"carry", &crate::process::CARRY), (b"midcall", &crate::process::MIDCALL)].iter().find(|(n, _)| cmd.params.strip_prefix(b"sched ").and_then(|r| r.strip_prefix(*n)).is_some_and(|r| r == b" on" || r == b" off")) {
+                    // `diag "sched fifo|kin|carry|midcall on|off"`: each of the 2026-11-24 rules (process.rs `FIFO`, `KIN`, `CARRY`, `MIDCALL`) on or off at run time, to measure each on one boot.
+                    let on = cmd.params.ends_with(b" on");
+                    rule.1.store(on, core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(alloc::format!("sched: {} {}\n", core::str::from_utf8(rule.0).unwrap_or("?"), if on { "on" } else { "off" }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"sched asks old on" || cmd.params == b"sched asks old off" {
                     // `diag "sched asks old on|off"`: yields asked as before 2026-11-23 (process.rs `ASKS_OLD`: stale asks stand, `make_room` asks for a device thread its own core takes back, `unlocked` parks for a line on any core), to measure both on one boot.
                     let on = cmd.params == b"sched asks old on";
