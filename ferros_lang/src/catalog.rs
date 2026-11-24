@@ -353,11 +353,11 @@ messages! {
     RemoveNote,
     /// The keyboard's status once the removal started: the fleet told, the erase, the power off.
     RemovingDevice,
-    /// Remove refused: the identity's only device (an identity must live somewhere).
+    /// Unbind refused: the identity's only device (an identity must live somewhere).
     RemoveLastDevice,
-    /// Remove refused: this device is in no fleet.
+    /// Unbind refused: this device is in no fleet.
     RemoveNotMember,
-    /// Remove refused for any other reason; nothing erased.
+    /// Unbind refused for any other reason; nothing erased.
     RemoveNotStarted,
 
     // ---- Power ----
@@ -692,8 +692,13 @@ messages! {
     // Attest to approve (owner, 2026-11-24; docs/AUTH.md "Approve on the attest screen"): the button that attests and applies (Decline below it is the calls' word), and the button that closes the screen after a removal it could not start.
     Approve,
     Done,
-    /// Under what is approved.
-    ApproveTypeHandle,
+    /// The attest screen's state line above the handle box (owner, 2026-11-24: "1 device, 1 identity"), never whose: the device not bound yet, and bound. An approve keeps it and puts what is approved under it.
+    AttestUnbound,
+    AttestBound,
+    /// Any handle that does not open a bound device, the device's own mistyped or another identity's alike (the kernel cannot tell them apart, and says nothing of whether one exists).
+    DeniedNotThisIdentity,
+    /// The Fleet page's button that unbinds this device (owner, 2026-11-24: "I need to unbind first, then she needs to bind it to her fleet"; docs/AUTH.md "Remove this device"), an approve on the attest screen.
+    UnbindPill,
     /// What is approved, one message a request (ahau_core::approve), never words of the requester's. Each starts "Approve:"; two lines where the second says what it means.
     ApproveAttestAtBootOn,
     ApproveAttestAtBootOff,
@@ -718,9 +723,6 @@ messages! {
     JoiningButton,
     Join,
     // Its prompts (owner, 2026-10-31: simple and direct; sentences, capitalised).
-    TypeYourHandle,
-    /// Two lines.
-    UnboundTypeToBind,
     WaitingConnectivity,
     FindingIdentity,
     /// Three lines.

@@ -2434,12 +2434,12 @@ impl Ahau {
         }
     }
 
-    /// What an approve approves (ahau_core::approve), then "Type your handle to approve.": the words the person's language has for the request's kind, never anything the requester wrote. The charge cap's in the person's base, in mV.
+    /// The state line, then what an approve approves (ahau_core::approve): the words the person's language has for the request's kind, never anything the requester wrote. The charge cap's in the person's base, in mV.
     fn approve_words(&self) -> Line {
         use ahau_core::approve as ap;
         use ferros_lang::Msg;
         let Some(r) = self.approve else { return Line::new() };
-        let mut l = match (r.kind, r.arg as u8) {
+        let l = match (r.kind, r.arg as u8) {
             (ap::ATTEST_AT_BOOT_ON, _) => tx(Msg::ApproveAttestAtBootOn),
             (ap::ATTEST_AT_BOOT_OFF, _) => tx(Msg::ApproveAttestAtBootOff),
             (ap::ANDROID_ON, _) => tx(Msg::ApproveAndroidOn),
@@ -2457,9 +2457,11 @@ impl Ahau {
             (ap::FLEET_ADD, _) => tx(Msg::ApproveFleetAdd),
             _ => tx(Msg::ApproveDeveloper),
         };
-        let _ = core::fmt::Write::write_str(&mut l, "\n");
-        let _ = core::fmt::Write::write_str(&mut l, ferros_lang::t(Msg::ApproveTypeHandle));
-        l
+        // The state line first, as on the plain screen (owner, 2026-11-24), then what is approved under it.
+        let mut out = tx(if self.bound { Msg::AttestBound } else { Msg::AttestUnbound });
+        let _ = core::fmt::Write::write_str(&mut out, "\n");
+        let _ = core::fmt::Write::write_str(&mut out, l.as_str());
+        out
     }
 
     fn prompt(&self) -> Line {
@@ -2468,8 +2470,9 @@ impl Ahau {
             // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says"), in the person's language; the fleet's and identity's are fgtw's, the same Photon shows.
             // An approve: what is approved, in the person's words from the request's kind alone, then what to do.
             Mode::Fresh if self.approve.is_some() => self.approve_words(),
-            Mode::Fresh if self.bound => tx(Msg::TypeYourHandle),
-            Mode::Fresh => tx(Msg::UnboundTypeToBind),
+            // The state line (owner, 2026-11-24: "1 device, 1 identity"), never whose.
+            Mode::Fresh if self.bound => tx(Msg::AttestBound),
+            Mode::Fresh => tx(Msg::AttestUnbound),
             // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
             Mode::Looking if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
             Mode::Looking => tx(Msg::FindingIdentity),
@@ -2607,7 +2610,7 @@ impl Ahau {
                 ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this device is not bound to a fleet yet: looking the identity up\n"),
                 ferros_sys::Unlock::Belongs => {
                     scrub(&mut seed);
-                    console(self.grants, b"ahau: refused: this device belongs to another identity\n");
+                    console(self.grants, b"ahau: refused: the handle does not open this bound device\n");
                     // A failed approve (owner, 2026-11-24: "keep the user locked out if fail"): nothing applied, the plain attest screen.
                     if approving.is_some() {
                         console(self.grants, b"ahau: the approve failed; nothing applied, the device stays locked\n");
@@ -2615,7 +2618,8 @@ impl Ahau {
                     }
                     // The handle stays as typed, the caret at its end (owner, 2026-11-11: "not have it clear the handle if you attest with a wrong letter, usually it's just one that needs fixed"): a handle is not a secret (owner, 2026-10-28), and the seed derived from it was never kept.
                     self.caret = self.len;
-                    self.status(fl(ferros_lang::Fleet::DeniedBoundOther).as_str());
+                    // One refusal for every handle that does not open this bound device, its own mistyped or another identity's alike: the kernel cannot tell them apart, nothing is looked up, and nothing says whether such an identity exists.
+                    self.status(tx(ferros_lang::Msg::DeniedNotThisIdentity).as_str());
                     self.denied.set(true);
                     self.entry();
                     return;

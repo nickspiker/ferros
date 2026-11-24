@@ -1086,7 +1086,7 @@ enum Choice {
     /// A kist's card, once it holds people: all of them (true) or the chosen (op 28), and a person picked or not (op 29); the kist by its place in the person's list.
     PeopleAll(u8, bool),
     PersonPick(u8, u32),
-    /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
+    /// The Fleet page's "unbind this device" (until 2026-11-24 "remove this device"): an approve on the attest screen, then the departure and the erase.
     FleetRemove,
     /// The Fleet page's add flow (fgtw::sponsor through payloads/fgtw ops 8-15): open it, pick a device heard nearby (its row), type the newcomer's words (on the attest screen's keyboard, ahau), confirm a nearby pick turned green, close it.
     FleetAdd,
@@ -4108,7 +4108,8 @@ impl Map {
                     }
                 }
                 if matches!(f.state, Some(2) | Some(3)) {
-                    button(self, b, &mut y, fleet(FleetMsg::RemovePill { armed: false }).as_str(), false, Some(Choice::FleetRemove));
+                    // "unbind" (owner, 2026-11-24: "1 device, 1 identity ... I need to unbind first, then she needs to bind it to her fleet"): ferros's own words, not the fleet's shared "remove this device".
+                    button(self, b, &mut y, tr(Msg::UnbindPill), false, Some(Choice::FleetRemove));
                     notes(b, &mut y, tr(Msg::RemoveNote));
                     // 4: the identity's last device cannot leave (fgtw's departure machine refuses it); any other refusal, the departure did not start.
                     match f.leave_result {

@@ -779,16 +779,21 @@ impl KVault {
         })();
         crate::keys::wipe_to_dram(&mut secret);
         self.id = Some(made.ok_or(KvError::NoIra)?);
+        // One identity per device (owner, 2026-11-24: "1 device, 1 identity"): a seed whose key opens no name list is not the bound identity's, refused before anything marks a person present, so a handle mistyped and another identity's are refused alike and leave nothing behind (until 2026-11-24 the person-present mark, the flash log's personal key and the migration flag were set first and undone by the lock); on a device not bound yet, a different handle from the last one, whose leftovers go.
+        // Read or refused, the keys are dropped (`lock`) on any way out before the person is present: a refusal or a read that failed leaves nothing open.
+        let checked = self.raw_get_in(Class::Identity, ID_NAMES).and_then(|names| if names.is_none() && self.bound()? { Err(KvError::Belongs) } else { Ok(names) });
+        let names = match checked {
+            Ok(n) => n,
+            Err(e) => {
+                self.lock();
+                return Err(e);
+            }
+        };
         crate::flashlog::set_personal(self.id.as_ref().map(|k| k.ledger));
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
-        // One identity per device: a seed whose key opens no name list is not the bound identity's (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
-        if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
-            if self.bound()? {
-                self.lock();
-                return Err(KvError::Belongs);
-            }
+        if names.is_none() {
             self.wipe_identity()?;
             // The (empty) name list written at once: it is what recognises this identity here after a bind, and one that stores nothing in the kernel's vault (everything in the vault process since 2026-11) would otherwise have none and be refused as another's at its next unlock (the 8a, 2026-11-09: bound in boot 117, its own handle refused in 118).
             self.put_names(Class::Identity, &[])?;

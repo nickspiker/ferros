@@ -45,11 +45,16 @@ A device not attached to an identity is not usable (owner, 2026-11-04: "if it's 
 
 ## One identity per device
 
-The network owns the assignment: a device belongs to the identity whose fleet bound it, and never reassigns itself.
+The owner, 2026-11-24, asked whether his wife could use his device: "Nope. 1 device, 1 identity. My wife wants to use it? I need to unbind first, then she needs to bind it to her fleet."
+
+The network owns the assignment: a device belongs to the identity whose fleet bound it, and never reassigns itself. Another person uses it only after its identity unbinds it ("Unbind this device" below) and theirs binds it.
+
+**The attest screen's state line** (owner, 2026-11-24), above the handle box, never saying whose: unbound, "This device is unbound. Present an identity to bind it to."; bound, "This device is bound. Present its identity to unlock it." An approve keeps the line and puts what it approves under it.
 
 - **Not bound.** The first handle typed unlocks, and its space is created. The device then joins that identity's fleet (the look-up, the pairing words, a sponsor adds it). A different handle typed later, still unbound, wipes the earlier one's leftovers first.
-- **Bound.** When the fleet's chain names this device, fgtw (the identity service) binds it (`SYS_UNLOCK` op 3; the attest screen does too when it sees membership). From then on, only that identity's handle opens the device; any other is refused ("This device belongs to another identity").
+- **Bound.** When the fleet's chain names this device, fgtw (the identity service) binds it (`SYS_UNLOCK` op 3; the attest screen does too when it sees membership). From then on, only that identity's handle opens the device; any other is refused: "Denied. This handle does not unlock this device."
   - The check needs no stored verifier: a seed whose key opens no name list is not the bound identity's.
+  - **A refusal says nothing** (checked 2026-11-24, from the code): the kernel cannot tell the device's own handle mistyped from another identity's, since both are seeds whose key opens no name list here, so both get the same refusal at the same point, before any proof is made, anything is looked up on the network or anything is written. Until 2026-11-24 the words were "Denied. This device is bound to another identity.", which named a typo another identity; and the kernel marked a person present (and set the flash log's personal key and the migration flag) before the check, undoing it with the lock. Now nothing is marked before the check, and any refusal or failed read drops the keys at once.
 - **Released.** A completed departure (the fleet's consented Remove, PHOTON.md "Leaving the fleet") releases the device (op 4):
   - every identity entry is deleted by its address;
   - the binding and any kept seed are gone;
@@ -83,9 +88,11 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 
 Built 2026-11-22 on ferros (ahau, payloads/fgtw, ferros_lang); Photon's own join screen is Photon's to follow.
 
-## Remove this device (owner, 2026-11-22)
+## Unbind this device (owner, 2026-11-22; "unbind" since 2026-11-24)
 
-On the device being removed: press Remove on the Fleet page, and approve it on the attest screen (since 2026-11-24, "Approve on the attest screen" below: the device locks at once and the handle typed there approves the removal; until then a second handle-entry screen took it).
+The owner's word for it (2026-11-24): "I need to unbind first, then she needs to bind it to her fleet." The Fleet page's button says "unbind this device" (until then "remove this device", the fleet's shared words), and the approve "Approve: unbind this device." What it does is unchanged: the identity's hold on the device is erased, and after it the device is unbound, ready for another person to bind. The code keeps the word remove (fgtw op 33, `SYS_UNLOCK` op 15, ahau_core::approve::REMOVE_DEVICE).
+
+On the device being unbound: press "unbind this device" on the Fleet page, and approve it on the attest screen (since 2026-11-24, "Approve on the attest screen" below: the device locks at once and the handle typed there approves the removal; until then a second handle-entry screen took it).
 No Fleet page needs to be open anywhere and no other device is waited on before the erase.
 
 1. **The check.** The approve: the map's Remove asks the kernel (`SYS_UNLOCK` op 16, `REMOVE_DEVICE`), the device locks, and the handle typed on the attest screen unlocks it, so it is the device's own identity's. The kernel then holds the approved removal for the identity service. The attest screen hands the roots over as at any attest, waits until the identity service holds the identity as a member again (the lock wiped what it held), and hands it the handle's seed and its memory-hard proof (fgtw op 33 `[33][0][seed][proof]`; the proof from the identity's space, or made, seconds on the X3). The identity service compares the seed with the identity in hand, and fgtw's removal gate (fgtw e5766f4: `UserOp::Remove`, then `Event::Unbind` with the proof) sends nothing unless the proof is this identity's. The kernel compares the seed again in registers before it erases anything (`SYS_UNLOCK` op 15, service.rs op 18) and erases only with the approved removal held, which it takes (one approve, one removal). Refused (the identity's last device, no fleet), the attest screen says why and Done closes it, nothing changed.
@@ -165,7 +172,7 @@ From the host: `ferros-bridge spawn <removedry.bin> --name removedry --use fgtw`
 | 10 | the person key from the identity service (Unlock right only; FACETS.md D1): 32 bytes, held beside the identity key and wiped with it at lock; the kernel derives each kist's alias from it | 0, or ERR while nobody is present |
 | 11 | the identity's doorbell: x2 a word in the caller's arc, 8-aligned; the state written there now (read live, so an unlock at boot is in it) and at every change, bits 0-2 as op 0 with a change count above bit 8, waking whatever of the process waits on it. One word a process (a second moves it); any number of processes | 0, or ERR with no vault |
 | 13 | Android on this device (the Settings right; docs/BOOT.md): start now, off, the state, what it starts into (refused while its guard is on), Android's recovery request; Android on is an approve (op 16) | 1 done, 0 refused |
-| 15 | remove this device (the identity service alone; "Remove this device" above), with the person's approve held (taken) | 1 removed, 0 the seed is not the person present's, ERR |
+| 15 | unbind (remove) this device (the identity service alone; "Unbind this device" above), with the person's approve held (taken) | 1 removed, 0 the seed is not the person present's, ERR |
 | 16 | ask for an approve (the Settings right, never a kist; "Approve on the attest screen" below): x2 a request's word; only while a person is present on a bound device and none waits; the identity locked at once and the attest screen started again | 0, ERR refused |
 | 17 | the request waiting (the Unlock or the Settings right) | its word, 0 none |
 | 18 | Decline (ahau alone): the request dropped, nothing applied, still locked | 0 |
@@ -183,7 +190,7 @@ The owner, after the attest-at-boot confirm screen took Enter differently from t
 **How it goes.**
 1. A settings page asks the kernel for a change (`SYS_UNLOCK` op 16): a request is a kind and one number (ahau_core::approve), never text. The kernel takes it only while a person is present on a bound device and none waits, and checks what only it knows (a cap the battery takes; Android allowed here before starting into it).
 2. The kernel keeps the request and locks at once, as any lock: the identity's keys wiped, the identity service's bell rung (fgtw wipes its roots, the fleet key and the person key), an approved request not yet taken dropped. It starts the attest screen again over everything (the service loop's restart of `ahau`, as `diag restart ahau`).
-3. The fresh attest screen reads the request (op 17) and says what it approves in the person's own words for its kind (ferros_lang `Approve*`, all sixteen languages), then "Type your handle to approve." Its button says approve; decline stands under it. No tag is read while it waits: a tag never approves.
+3. The fresh attest screen reads the request (op 17) and, under its state line, says what it approves in the person's own words for its kind (ferros_lang `Approve*`, all sixteen languages). Its button says approve; decline stands under it. No tag is read while it waits: a tag never approves.
 4. **Approve:** the handle typed unlocks (op 1). Opened, the kernel applies exactly the request, once, at that unlock, and the screen goes as at any attest (the roots to the identity service). The removal and developer mode are carried out by a process instead: the kernel holds the approval for it until it is taken or the next lock.
 5. **A failed attest** (another identity's handle, a typo: the kernel refuses it) **or Decline** (op 18): the request is dropped, nothing applied, and the screen is the plain attest screen, the device locked until the person attests.
 
@@ -200,7 +207,7 @@ The owner, after the attest-at-boot confirm screen took Enter differently from t
 | Attest at boot on | the Security page's checkbox | the unlock keeps the seed (`\0id.unlock`), the setting on |
 | Attest at boot off | the same | the unlock keeps nothing, the setting off (the kept seed goes at the next boot, fgtw's keeps at once) |
 | Android on | the Android page: the disclaimer's agreement, and on again for a person who accepted before | the acceptance kept in the person's identity class if it is not yet (service.rs op 22), Android allowed here |
-| Remove this device | the Fleet page's Remove | held for the identity service: the attest screen asks it (fgtw op 33) once it holds the identity again, and the kernel erases only with the approval held ("Remove this device" above) |
+| Unbind this device | the Fleet page's unbind | held for the identity service: the attest screen asks it (fgtw op 33) once it holds the identity again, and the kernel erases only with the approval held ("Unbind this device" above) |
 | Bind device | the Fleet page's button | held for the identity service, which takes it as it opens the add flow ("Bind device" below) |
 | A guard off, a guarded change | "Require attest" below | the guard off, the cap, what the device starts into; developer mode held for the map, which turns it on |
 
@@ -275,9 +282,9 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 
 | When | Text | Button | Words |
 |---|---|---|---|
-| Unbound, waiting | This device is unbound. Type your handle to bind. | bind | owner |
-| Bound, waiting | Type your handle. | unlock | proposed |
-| Denied | Denied. This device is bound to another identity. | | owner ("DENIED"); the second sentence proposed |
+| Unbound, waiting | This device is unbound. Present an identity to bind it to. | attest | owner (2026-11-24) |
+| Bound, waiting | This device is bound. Present its identity to unlock it. | attest | owner (2026-11-24) |
+| Denied | Denied. This handle does not unlock this device. | | owner ("DENIED"); the second sentence proposed, the same for a typo and another identity |
 | A tag refused | Denied. This tag does not open this device. | | proposed (the owner's "Denied." first, as above) |
 | The proof running | Computing identity keys. | | owner |
 | Looking up | Finding this identity. | | owner |
@@ -290,7 +297,7 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | Mint failed | Minting failed. Enter to retry. | | proposed |
 | No answer | No answer yet. Still looking. |  | proposed |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
-| An approve waits | Approve: (what, from the request's kind; "Approve on the attest screen") Type your handle to approve. | approve, decline under it | the button the owner's ("should say 'approve' or similar", 2026-11-24); the text proposed |
+| An approve waits | (the state line) Approve: (what, from the request's kind; "Approve on the attest screen") | approve, decline under it | the button the owner's ("should say 'approve' or similar", 2026-11-24); the text proposed |
 | An approved removal refused | (why: the identity's only device, no fleet) | done | proposed |
 
 No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the join's screens and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry (from a confirmed join it withdraws the request).
