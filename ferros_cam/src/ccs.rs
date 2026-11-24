@@ -297,6 +297,39 @@ impl Timing {
         Some(Plan { llp: llp as u16, fll, coarse: c as u16, shift })
     }
 
+    /// A frame held at `frame_ns` with an exposure of `exp_ns` inside it (the owner's CLIP design, 2026-11-23, via the Lumis session: a clip's cadence fixed, its shutter live and capped at the exposure; payloads/camera SET 5).
+    /// The frame: `frame_ns` in whole lines of the mode's line, rounded down, so n such frames never outlast the n frame times asked; counted in 2^shift lines at the least shift whose frame fits the 16-bit register and the sensor's frame counter (`Lte::holds`), rounded down again there; the line never stretched.
+    /// The integration: the exposure's lines in the same units, and when they pass the frame less the sensor's margin, that frame less the margin (`clamped`).
+    /// WHY the clamp: CCS takes an integration only up to the frame length less its margin (coarse_integration_time <= frame_length_lines - coarse_integration_time_max_margin), and here the frame is the caller's fixed cadence, not a floor the exposure may push (as `plan` does): the owner's design caps the shutter at the clip's frame, and the clamped exposure is what the frame's header then says (`ns`).
+    /// None: the frame in whole lines holds no least integration and margin, it passes what the shift and counter hold, the exposure is under the sensor's least, or the camera's frame may not move (`long` false); the caller holds the readout's least frame itself (its rows and blanking: the list's `fll_least`).
+    pub fn frame_plan(&self, frame_ns: u64, exp_ns: u64) -> Option<(Plan, bool)> {
+        if !self.long {
+            return None;
+        }
+        let lines = (frame_ns as u128 * 1000 / self.line_ps_at(self.llp) as u128) as u64;
+        let top = self.lte.map_or(0, |l| self.shift_most(&l));
+        let mut shift = 0u8;
+        // The least shift whose frame fits: 16 bits of register, and the counter where the sensor has one.
+        while lines >> shift > LINES_MOST || self.lte.is_some_and(|l| !l.holds((lines >> shift) as u16, shift)) {
+            if shift >= top {
+                return None;
+            }
+            shift += 1;
+        }
+        let fll = lines >> shift;
+        if fll < self.margin as u64 + self.coarse_min as u64 {
+            return None;
+        }
+        let want = self.lines(exp_ns) >> shift;
+        if want < self.coarse_min as u64 {
+            return None;
+        }
+        let room = fll - self.margin as u64;
+        let clamped = want > room;
+        let coarse = if clamped { room } else { want };
+        Some((Plan { llp: self.llp, fll: fll as u16, coarse: coarse as u16, shift }, clamped))
+    }
+
     /// The most integration (in units of 2^`shift` lines) whose frame, the integration plus the margin, fits both the 16 bits of CCS's frame length and the sensor's frame counter (`Lte::frame_bits`) at `shift`; None when no integration does.
     fn coarse_most(&self, l: &Lte, shift: u8) -> Option<u64> {
         let regs = LINES_MOST;
@@ -1316,6 +1349,33 @@ mod tests {
         assert_eq!(t.plan(1_000_000_000).unwrap().shift, 3);
         // The most: 65533 lines of 2^7 at the longest line (15.27 us), about 128 s.
         assert!((128_000_000_000..128_100_000_000).contains(&t.most_ns()), "{}", t.most_ns());
+    }
+
+    /// A frame held for a clip's cadence (`frame_plan`): the frame floored to whole lines (and to whole 2^shift lines past 16 bits), the exposure inside it as asked, clamped to the frame less the margin when it is longer, refused under the least integration or a frame too short to hold one; never stretched.
+    #[test]
+    fn a_frame_held() {
+        let t = cams::MAIN.listed_timing();
+        let t = Timing { fll: 0x5372, coarse_min: 2, ..t };
+        let line = t.line_ps_at(t.llp);
+        // 1/30 s at a 4 ms exposure: 10585 whole lines of 3.1489 us (33.3307 ms, under the 33.3333 asked), the integration 1270 lines, no clamp.
+        let (p, clamped) = t.frame_plan(33_333_333, 4_000_000).unwrap();
+        assert_eq!((p.llp, p.shift, p.fll, clamped), (6320, 0, (33_333_333u128 * 1000 / line as u128) as u16, false));
+        assert!(t.frame_ns(&p) <= 33_333_333 && 33_333_333 - t.frame_ns(&p) < line / 1000 + 1);
+        assert_eq!(p.coarse as u64, 4_000_000u64 * 1000 / line);
+        // The exposure longer than the frame: clamped to the frame less the margin (2), the frame unmoved.
+        let (q, clamped) = t.frame_plan(33_333_333, 40_000_000).unwrap();
+        assert_eq!((q.fll, q.coarse, clamped), (p.fll, p.fll - 2, true));
+        // A 1 s frame (the owner's 0.6 s shutter in a 1 s clip frame): past 16 bits, so in 2^3 lines (317571 lines, 39696 of 2^3), the 0.6 s inside it.
+        let (r, clamped) = t.frame_plan(1_000_000_000, 600_000_000).unwrap();
+        assert_eq!((r.shift, clamped), (3, false));
+        assert!(t.frame_ns(&r) <= 1_000_000_000 && 1_000_000_000 - t.frame_ns(&r) < 8 * line / 1000 + 1, "{}", t.frame_ns(&r));
+        assert!(t.ns(&r) <= 600_000_000 && 600_000_000 - t.ns(&r) < 8 * line / 1000 + 1);
+        // Refused: an exposure under the least integration, a frame of one line, a camera whose frame may not move.
+        assert_eq!(t.frame_plan(33_333_333, 1), None);
+        assert_eq!(t.frame_plan(line / 1000 + 1, 4_000_000), None);
+        assert_eq!(Timing { long: false, ..t }.frame_plan(33_333_333, 4_000_000), None);
+        // Past what the main's counter holds at any shift (2^32 lines, about 3.8 hours): refused, never wrapped.
+        assert_eq!(t.frame_plan(20_000 * 1_000_000_000, 1_000_000), None);
     }
 
     /// The main's own shift on the default route (the 16 s capture, 2026-11-17: high byte; 7 and 8 run on ferros, b933; owner: the line never stretched by default): every exposure past the 16-bit frame is the least shift at the mode's 6320-clock line, so the readout stays 3072 lines of 3.15 us (9.67 ms); 6 reaches 13.2 s, 8 52.8 s; the stretch, asked for explicitly, carries 16 s at shift 6 on a longer line and says its longer readout.
