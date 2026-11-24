@@ -1,6 +1,6 @@
 //! Stacked clips: every completed exposure one frame of its exact sums, bit-packed at the width it needs (vsf `ClipCodec::Packed`, vsf 3bf262a), with how many exposures it sums and its levels; in a Motion clip a motion plane beside them. Lumis's CLIP records these where an exposure stacks more than one frame: a time-lapse, and Difference and Motion (the owner, 2026-11-23: "our nice bitpacked RAW frames for video that probably is a time lapse, thus has a bunch of integrations per frame so the bit depth would be higher but you also wouldn't be shooting at 60fps"). The frames arrive packed, so nothing is coded here: a writer thread of its own puts each in the sink as it comes, as `write_clip` does a coded frame.
 
-use super::{seal_clip, Camera, ClipInfo, Sink, Stage, BLOCK, WRITE_MAX};
+use super::{micros, seal_clip, Camera, ClipInfo, Sink, Stage, BLOCK, WRITE_MAX};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -117,7 +117,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// The writer: generation 0, then each frame as it comes (its head, its samples, the piece after, and in a Motion clip its motion plane and the last piece), then the closing generation and the seal (`seal_clip`). A frame that would not leave room for the close ends the clip there (`ended`).
 fn write_packed(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, blocks: u64, from: Receiver<PackedFrame>, written: Arc<AtomicU64>, ended: Arc<AtomicBool>) -> ClipInfo {
-    let mut st = Stage { buf: Vec::with_capacity(WRITE_MAX << 1), block: 0, us: 0 };
+    let mut st = Stage { buf: Vec::with_capacity(WRITE_MAX << 1), block: 0, us: 0, longest: 0 };
     let mut failed: Option<String> = st.put(&mut *sink, &head).err();
     let mut full = false;
     for f in from {
@@ -130,6 +130,8 @@ fn write_packed(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, bl
         if cw.end() + need > blocks * BLOCK as u64 {
             full = true;
         } else {
+            let (t0, us0) = (micros(), st.us);
+            st.longest = 0;
             match cw.packed_frame(&f.meta, &f.sum, &f.samples, f.motion.as_ref()) {
                 Ok(pieces) => {
                     // The pieces around the planes: [0], the samples, [1], and in a Motion clip the motion plane and [2].
@@ -146,6 +148,8 @@ fn write_packed(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, bl
                 }
                 Err(e) => failed = Some(e.to_string()),
             }
+            // Each frame's write on the process's clock (`micros`), its time in the sink and its longest single write: a camera frame Lumis did not take lines up against these (the coordinator, 2026-11-23: a vault commit may hold the kernel lock).
+            println!("clip-packed: {} frames in, the last written from {} us to {} us: {} us in the sink, its longest write {} us", cw.frames().len(), t0, micros(), st.us - us0, st.longest);
         }
         written.store(st.block * BLOCK as u64, Ordering::Relaxed);
         if failed.is_some() || full {

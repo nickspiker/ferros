@@ -1251,6 +1251,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
     let mut held: Option<u64> = None;
     // A stacked CLIP's start on its own thread (`start_stack`: its extent's open can wait), as a paced clip's (`starting`).
     let mut stack_starting: Option<std::sync::mpsc::Receiver<Result<stack::Stack, String>>> = None;
+    // The last whole turn: when it began (ferros_clip `micros`), how long it took, and its driver's answer, integration, and settings and saves within it, us.
+    let mut last_turn = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut frames = 0u64;
     // Development runs (`DEV_OPEN`, `DEV_SWEEP`): the run's length, and the shutter sweep's steps (ns) with the step in hand and when its frames began.
     // The run's length: 2^(3 to 6) s by the knobs' bits 4 and 5, or 2^n s by the input's 25th byte (longer runs: a RAW video clip until its space is full).
@@ -1500,6 +1502,8 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
             Source::View { view, .. } => view.buffers as u64,
             _ => 0,
         };
+        // This turn on the process's clock (ferros_clip `micros`) and the driver's wait before it: a stacked clip's frame not taken is said beside the turn before it (`last_turn`).
+        let (turn_at, wait_was) = (ferros_clip::micros(), turns.wait);
         let got = src.next(&mut turns);
         reading = VIEW.lock().unwrap();
         // Closed for leaving while this waited: the frame it may have brought is not read (the view is the driver's again).
@@ -1950,6 +1954,10 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
                 if let Some(gap) = s.last_count.and_then(|l| head.count.checked_sub(l + 1)) {
                     s.skipped += gap as u64;
                     s.skipped_total += gap as u64;
+                    if gap != 0 {
+                        let (at, whole, wait, integrate, after) = last_turn;
+                        println!("lumis: camera {}: A#{gap} of the camera's frames not taken before its frame A#{}, answered at {} us after a wait of {} us; the turn before began at {at} us and took {whole} us: the driver's answer {wait}, the integrator {integrate}, the settings and saves {after}", cam.name, head.count, turn_at + turns.wait - wait_was, turns.wait - wait_was);
+                    }
                 }
                 s.last_count = Some(head.count);
                 if let Some(frame) = integrator.take_clip_frame() {
@@ -1982,6 +1990,7 @@ fn camera_service(cam: camera::Camera, calibration: Option<bool>, vault: Option<
         integrator.try_save();
         keep_saves(vault.as_deref(), &mut *integrator.header);
         turns.after += t_after.elapsed().as_micros() as u64;
+        last_turn = (turn_at, ferros_clip::micros() - turn_at, turns.wait - wait_was, (t_after - t_integrate).as_micros() as u64, t_after.elapsed().as_micros() as u64);
         frames += 1;
         turns.n += 1;
         if let Some(r) = run {

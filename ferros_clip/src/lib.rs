@@ -350,7 +350,8 @@ fn pin(mask: u64) {
     let _ = mask;
 }
 
-fn micros() -> u64 {
+/// Microseconds since the process first asked, one clock for every thread (Lumis lines its camera's turns up against a clip's writes by it).
+pub fn micros() -> u64 {
     use std::time::Instant;
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
@@ -1088,7 +1089,7 @@ pub fn eagle_osc(ns: u64) -> i64 {
 /// A full extent ends the clip cleanly (the frame that did not fit is left out and the clip closed after the last one); a failed write leaves the clip unclosed, readable to its last whole frame by its chain, and says why.
 #[allow(clippy::too_many_arguments)]
 fn write_clip(mut cw: clip::Writer, head: Vec<u8>, mut sink: Box<dyn Sink>, blocks: u64, from: Receiver<ToWriter>, give_back: SyncSender<Box<Slot>>, written: Arc<std::sync::atomic::AtomicU64>, ended: Arc<std::sync::atomic::AtomicBool>) -> ClipInfo {
-    let mut st = Stage { buf: Vec::with_capacity(WRITE_MAX << 1), block: 0, us: 0 };
+    let mut st = Stage { buf: Vec::with_capacity(WRITE_MAX << 1), block: 0, us: 0, longest: 0 };
     let mut failed: Option<String> = st.put(&mut *sink, &head).err();
     let mut full = false;
     while let Ok(msg) = from.recv() {
@@ -1143,6 +1144,8 @@ struct Stage {
     buf: Vec<u8>,
     block: u64,
     us: u64,
+    /// The longest single write since it was last read (`write_packed` says it a frame).
+    longest: u64,
 }
 
 impl Stage {
@@ -1161,7 +1164,9 @@ impl Stage {
     fn write(&mut self, sink: &mut dyn Sink, n: usize) -> Result<(), String> {
         let t = micros();
         sink.write(self.block, &self.buf[..n])?;
-        self.us += micros() - t;
+        let took = micros() - t;
+        self.us += took;
+        self.longest = self.longest.max(took);
         self.block += (n / BLOCK) as u64;
         self.buf.drain(..n);
         Ok(())

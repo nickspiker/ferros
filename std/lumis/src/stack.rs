@@ -93,14 +93,18 @@ fn pack_and_write(rec: PackedRecorder, from: Receiver<Exposure>, give: std::sync
     let mut frames = 0u64;
     for e in from {
         let f = &e.frame;
+        let t0 = ferros_clip::micros();
         let peak = f.sums.iter().copied().max().unwrap_or(0).max(f.white);
         let samples = BitPackedTensor::pack((64 - peak.leading_zeros()) as u8, vec![f.height, f.width], &f.sums);
+        let t1 = ferros_clip::micros();
         let meta = FrameMeta { index: frames, at: ferros_clip::eagle_osc(e.eagle_ns as u64), exposure_s: e.shutter_ns as f32 / 1e9, gain: e.gain as f32 / 1024., focus: e.focus };
         let sum = Sum { exposures: f.exposures as u32, levels: Levels { black: vec![f.black as f32; 3], white: vec![f.white as f32; 3] }, motion: None };
         let _ = give.send(e.frame.sums);
         if !rec.frame(PackedFrame { meta, sum, samples, motion: None }) {
             break;
         }
+        // Its packing and its hand-over to the writer on the process's clock (ferros_clip `micros`), beside the camera's turns and the writer's writes.
+        println!("lumis-stack: frame {frames} packed from {t0} us to {t1} us, handed to the writer at {} us", ferros_clip::micros());
         frames += 1;
         written.store(frames, std::sync::atomic::Ordering::Relaxed);
     }
