@@ -3297,7 +3297,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -7980,6 +7980,11 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         // 54 `corner light [corner u8: 8 deck, 9 back, 10 the marks put away][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
+        // The system's alone (the audit of 2026-11-24): the deck and the attest screen light the helm; a kist that could hide it or light it could dress its own window as the system's. [4] (`NOT_YOURS`) from another caller.
+        if op == 54 && n >= 4 && !system(h) {
+            ferros_sys::reply(&tok, &[NOT_YOURS]);
+            continue;
+        }
         if op == 54 && n >= 4 {
             let level = u16::from_le_bytes([msg[2], msg[3]]) as u32;
             match msg[1] {
@@ -8017,6 +8022,11 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         // 56 `quick`: the quick row's state from the map (quick.rs `set`, QUICK.md). → [0][the slide's length u16].
+        // The system's alone (the audit of 2026-11-24): until then any caller could open the row, over the attest screen as well (its circles then hid the attest screen's keys from its own touches, the row taking them), and set its screenshot bit, a screenshot op 84 keeps from every kist. [4] (`NOT_YOURS`) from another caller.
+        if op == 56 && n >= 15 && !system(h) {
+            ferros_sys::reply(&tok, &[NOT_YOURS]);
+            continue;
+        }
         if op == 56 && n >= 15 {
             let r = quick::set(&msg[..15]);
             ferros_sys::reply(&tok, &r);
