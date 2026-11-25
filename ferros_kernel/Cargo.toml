@@ -9,6 +9,8 @@ description = "Ferros bare-metal kernel — boots on aarch64, mounts the ledger"
 default = ["pixel8"]
 pixel8 = []
 m1 = ["dep:ferros_hal_m1"]
+# Microsoft OS 2.0 descriptors on ferros's USB device (ferros_hal msos.rs): Windows binds WinUSB with no driver; off until a device has enumerated with it (docs/FLASHER.md).
+msos = ["ferros_hal/msos"]
 
 [dependencies]
 # Every number a person reads, in the base they chose (Code/tatau): the device base is loaded from the vault at boot (SETTINGS.md).

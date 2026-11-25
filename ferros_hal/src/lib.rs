@@ -66,6 +66,10 @@ pub mod hsi2c;
 // Modules requiring alloc
 #[cfg(feature = "alloc")]
 pub mod console;
+// The Microsoft OS 2.0 descriptor set the USB device serves with `msos` (any target, so the host tests read it).
+#[cfg(any(feature = "msos", test))]
+pub mod msos;
+
 // The DWC3 driver needs no allocator: the kernel and the USB driver process (payloads/usb, no heap) both link it.
 #[cfg(target_arch = "aarch64")]
 pub mod usb;

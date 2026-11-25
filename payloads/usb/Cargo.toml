@@ -8,6 +8,10 @@ license.workspace = true
 name = "usb"
 path = "src/main.rs"
 
+[features]
+# As the kernel's: Microsoft OS 2.0 descriptors, so Windows reaches ferros with no driver (docs/FLASHER.md).
+msos = ["ferros_hal/msos"]
+
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
 ferros_pt = { path = "../../ferros_pt" }

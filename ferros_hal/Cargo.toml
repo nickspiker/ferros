@@ -16,3 +16,5 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 default = ["alloc"]
 alloc = []
 std = ["alloc"]
+# Microsoft OS 2.0 descriptors on the USB device (usb.rs): bcdUSB 2.01, a BOS naming the descriptor set, the set with compatible ID WINUSB, so Windows reaches ferros with no driver installed (docs/FLASHER.md). Off until a device has enumerated with it on Linux and Windows.
+msos = []

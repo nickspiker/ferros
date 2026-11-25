@@ -277,6 +277,9 @@ pub fn take_session_request() -> bool {
 /// Vendor debug readout request (bmRequestType G#C0, device-to-host vendor).
 /// Returns 16 LE u32 counters — a live window into the PT dispatch loop that works even when the bulk path is wedged, since EP0 keeps running.
 pub const VENDOR_REQ_DBG: u8 = 0x5A;
+/// The vendor request Windows sends for the Microsoft OS 2.0 descriptor set (wIndex 7), named in the BOS's platform capability (`msos`).
+#[cfg(feature = "msos")]
+pub const VENDOR_REQ_MSOS: u8 = crate::msos::VENDOR_REQ;
 
 /// Raw event-path readout (bmRequestType G#C0): last 12 EP event words + count + ep2 TRB snapshots + last DEPCMD failure.
 pub const VENDOR_REQ_DBG2: u8 = 0x5B;
@@ -1951,6 +1954,14 @@ impl Dwc3Dev {
                 self.ep0_state = Ep0State::StatusInWait;
                 true
             }
+            // Windows asks for the Microsoft OS 2.0 descriptor set the BOS names, and binds WinUSB from its compatible ID: no driver to install for the flasher or the bridge (docs/FLASHER.md "Windows and the driver").
+            #[cfg(feature = "msos")]
+            VENDOR_REQ_MSOS if bm_request_type == 0xC0 && _w_index == 7 => {
+                let len = crate::msos::SET.len().min(w_length as usize);
+                self.ep0_send(&crate::msos::SET[..len], TRBCTL_CONTROL_DATA);
+                self.ep0_state = Ep0State::DataIn;
+                true
+            }
             VENDOR_REQ_DBG2 if bm_request_type == 0xC0 => {
                 // Raw event-path readout: last 12 EP event words (oldest first), total event count, ep2 TRB size+ctrl snapshots, DEPCMD failure detail.
                 let mut buf = [0u8; 64];
@@ -2052,7 +2063,8 @@ impl Dwc3Dev {
 static DEVICE_DESC: [u8; 18] = [
     18,                 // bLength
     USB_DT_DEVICE,      // bDescriptorType
-    0x00, 0x02,         // bcdUSB = 2.00 (HS-only, no SS PHY)
+    // bcdUSB 2.00 (HS-only, no SS PHY); 2.01 with `msos`, the version from which a host reads the BOS and Windows its Microsoft OS 2.0 descriptors.
+    MSOS_BCD_USB, 0x02,
     0xFF,               // bDeviceClass = Vendor Specific
     0x00,               // bDeviceSubClass
     0x00,               // bDeviceProtocol
@@ -2117,7 +2129,13 @@ static DEVICE_QUALIFIER_DESC: [u8; 10] = [
     0,                  // bReserved
 ];
 
-/// BOS descriptor (minimal — required for USB 3.x enumeration).
+#[cfg(not(feature = "msos"))]
+const MSOS_BCD_USB: u8 = 0x00;
+#[cfg(feature = "msos")]
+const MSOS_BCD_USB: u8 = 0x01;
+
+/// BOS descriptor (minimal; no host reads it while bcdUSB is 2.00).
+#[cfg(not(feature = "msos"))]
 static BOS_DESC: [u8; 22] = [
     // BOS descriptor header
     5,                  // bLength
@@ -2142,6 +2160,21 @@ static BOS_DESC: [u8; 22] = [
     0x20, 0x00,         // wU2DevExitLat = 32us
 ];
 
+/// The BOS with `msos` (bcdUSB 2.01, so every host reads it): the USB 2.0 extension with no LPM claimed (the link behaves as it did when no host read the BOS) and the Microsoft OS 2.0 platform capability; the SuperSpeed capability goes, as the device has no SuperSpeed PHY.
+#[cfg(feature = "msos")]
+static BOS_DESC: [u8; 40] = [
+    5, USB_DT_BOS, 40, 0, 2,
+    // USB 2.0 Extension: bmAttributes 0, no LPM.
+    7, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00,
+    // Platform capability: Microsoft OS 2.0, UUID D8DD60DF-4589-4CC7-9CD2-659D9E648A9F in its little-endian form, Windows 8.1 and later (G#0603_0000), the set's length, the vendor request that returns it, no alternate enumeration.
+    28, 0x10, 0x05, 0x00,
+    0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C, 0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F,
+    0x00, 0x00, 0x03, 0x06,
+    crate::msos::SET_LEN as u8, (crate::msos::SET_LEN >> 8) as u8,
+    crate::msos::VENDOR_REQ, 0,
+];
+
+
 /// All string descriptors packed contiguously. Using a single static avoids the compiler generating a lookup table of absolute pointers (which break when ABL loads the kernel at a different address than the linker assumed).
 ///
 /// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 "Nick Spiker" (24B)] [STRING_DESC_2 "ferros" (14B)] [STRING_DESC_3 "0" (4B)] Offsets: 0, 4, 28, 42  Total: 46 bytes
@@ -2158,3 +2191,13 @@ static ALL_STRING_DESCS: [u8; 46] = [
     4, USB_DT_STRING,
     b'0', 0,
 ];
+
+// The BOS with `msos`: its own length, and the platform capability naming the set's length and its request (what Windows checks before it asks).
+#[cfg(feature = "msos")]
+const _: () = {
+    assert!(BOS_DESC[2] as usize == BOS_DESC.len());
+    assert!(BOS_DESC[12] as usize == BOS_DESC.len() - 12);
+    assert!(BOS_DESC[36] as usize | (BOS_DESC[37] as usize) << 8 == crate::msos::SET_LEN);
+    assert!(BOS_DESC[38] == crate::msos::VENDOR_REQ);
+    assert!(DEVICE_DESC[2] == 0x01 && DEVICE_DESC[3] == 0x02);
+};
