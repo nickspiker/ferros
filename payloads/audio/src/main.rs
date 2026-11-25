@@ -69,6 +69,8 @@ pub fn input_file(k: usize) -> Option<&'static [u8]> {
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 /// The cores the clock thread is pinned to, as `ferros_sys::pin` takes them (0: as spawned); set by a bench, taken by the clock thread at its next wake (a pin applies to the calling thread).
 static PIN: AtomicU64 = AtomicU64::new(0);
+/// The watch thread's cores, as `PIN` (a bench's byte 15): pinned to an idle core its multi-millisecond reads went (AUDIO.md "The amplifiers' watch, measured").
+static WATCH_PIN: AtomicU64 = AtomicU64::new(0);
 /// The clock thread's longest turn and its parts, in counter ticks (the microphones' turn, the playback's mix and writes, the amplifiers' watch): what keeps the thread from its next ring (measure before fixing: the clicks of 2026-11-24).
 static TURN_MAX: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 fn turn_part(k: usize, t: u64) {
@@ -167,7 +169,7 @@ pub struct State {
     starved: u32,
     irqs: u32,
     quiet: u32,
-    /// Both amplifiers' (IRQ1_STATUS1, IRQ1_STATUS3) as last read: at GLOBAL_EN, then every period while sound plays (`clock`).
+    /// Both amplifiers' (IRQ1_STATUS1, IRQ1_STATUS3) as last read: at GLOBAL_EN, then every `WATCH_FRAMES` written while sound plays (`watch`).
     amps: [(u32, u32); 2],
     /// An amplifier's error bit stopped everything (`fault`): the process stays, silent, until the next call has been told, then ends.
     fault: bool,
@@ -192,7 +194,7 @@ pub fn amp_unlock() {
     }
 }
 
-/// The watch's doorbell (the clock thread counts it up once a period while sound plays) and the counter's time of its last completed read.
+/// The watch's doorbell (the clock thread counts it up every `WATCH_FRAMES` written while sound plays) and the counter's time of its last completed read.
 static WATCH_BELL: AtomicU64 = AtomicU64::new(0);
 static WATCH_DONE_AT: AtomicU64 = AtomicU64::new(0);
 /// WHY a bound on the watch's age (the coordinator for the owner, 2026-11-24: "treat a stale watch as unknown, not as safe"): the watch is the only protection the unprotected speaker has (amp.rs: bypass, no protection firmware), so a watch that has not completed a read for 2^11 frames (42.7 ms at 48 kHz) means the amplifiers' state is unknown, and the sound stops as it does on an error bit. 2^11 frames is about nine times the slowest read measured on the Pro (4.5 ms, the SPI stall that made the clicks) and about four of the deep-buffer path's 10 ms takes, so a healthy watch never trips it.
@@ -316,6 +318,8 @@ fn idle(st: &State) -> bool {
 
 /// The clock: the AoC rang (a period taken, or the microphones' ring written), so the microphones' samples are taken (mic.rs `turn`), the playback ring topped up to the lead's periods (`Play`), each a period mixed, and held writes that now fit answered.
 extern "C" fn clock(_: u64) -> ! {
+    let name = b"clock";
+    ferros_sys::svc(ferros_sys::nr::THREAD_NAME, ferros_sys::off(name.as_ptr()), name.len() as u64, 0, 0, 0);
     let irq = cap(grants(), S_IRQ);
     let mut pinned = 0;
     loop {
@@ -386,6 +390,7 @@ fn play_turn(rang: u16) {
             let o = &mut out[..if room < p.per { room } else { p.per }];
             let m = mix::period(&mut st.streams, &mut st.tone, &mut st.clip, &mut st.clicks, &mut st.feed, o, p.per);
             s.write(o);
+            WATCH_DUE.fetch_add(o.len() as u64, Ordering::Relaxed);
             st.periods += 1;
             st.underruns = st.underruns.wrapping_add(m.underruns);
             st.quiet = if m.sound || st.streams.iter().any(|x| x.live) { 0 } else { st.quiet + 1 };
@@ -461,6 +466,7 @@ fn mmap_turn(st: &mut State, s: &aoc::Services, p: Play) {
         let m = mix::period(&mut st.streams, &mut st.tone, &mut st.clip, &mut st.clicks, &mut st.feed, o, p.per);
         s.put_at_f32(st.cursor, o);
         st.cursor = st.cursor.wrapping_add((o.len() * p.frame_bytes()) as u32);
+        WATCH_DUE.fetch_add(o.len() as u64, Ordering::Relaxed);
         st.periods += 1;
         st.underruns = st.underruns.wrapping_add(m.underruns);
         st.quiet = if m.sound || st.streams.iter().any(|x| x.live) { 0 } else { st.quiet + 1 };
@@ -489,7 +495,7 @@ fn mmap_turn(st: &mut State, s: &aoc::Services, p: Play) {
     }
 }
 
-/// The amplifiers read once a period while sound plays (the AoC's interrupt is the clock, no timer), outside the lock: only this thread drives their port while `up` (`start` runs before it is set, `down` and `fault` after this thread clears it). Any error bit (AMP_SHORT, BST_SHORT, TEMP, BST_OVP, BST_DCM_UVP) stops everything at once (`fault`): there is no speaker protection in bypass (amp.rs), so a fault is never played thru.
+/// The amplifiers read every `WATCH_FRAMES` written while sound plays (the AoC's interrupt is the clock, no timer), outside the state's lock, under the port's (`amp_lock`): the bring-up and the power-down hold it for their whole sequence. Any error bit (AMP_SHORT, BST_SHORT, TEMP, BST_OVP, BST_DCM_UVP) stops everything at once (`fault`): there is no speaker protection in bypass (amp.rs), so a fault is never played thru.
 fn watch() {
     let t = ferros_sys::now();
     amp_lock();
@@ -530,18 +536,37 @@ fn watch() {
     }
 }
 
-/// The amplifiers' watch on a thread of its own (2026-11-24): woken by the clock thread once a period (`ring_watch`), it reads both amplifiers' status, so a slow SPI read (measured to 4.5 ms) never holds the next period's mix past the AoC's read. Every period still rings it; a read still finding an error bit stops everything (`fault`); a watch that falls behind is caught by the clock thread (`WATCH_STALE_FRAMES`).
+/// The amplifiers' watch on a thread of its own (2026-11-24): woken by the clock thread every `WATCH_FRAMES` written (`ring_watch`), it reads both amplifiers' status, so a slow SPI read (measured to 4.5 ms) never holds the next period's mix past the AoC's read.
+/// A read finding an error bit stops everything (`fault`); a watch that falls behind is caught by the clock thread (`WATCH_STALE_FRAMES`).
 extern "C" fn watcher(_: u64) -> ! {
+    let name = b"watch";
+    ferros_sys::svc(ferros_sys::nr::THREAD_NAME, ferros_sys::off(name.as_ptr()), name.len() as u64, 0, 0, 0);
     let mut seen = WATCH_BELL.load(Ordering::Acquire);
+    let mut pinned = 0;
     loop {
         ferros_sys::wait(&WATCH_BELL, seen, 0);
+        let want = WATCH_PIN.load(Ordering::Relaxed);
+        if want != pinned {
+            ferros_sys::pin(want);
+            pinned = want;
+        }
         seen = WATCH_BELL.load(Ordering::Acquire);
         watch();
     }
 }
 
-/// The clock thread's ring of the watch, once a period while sound plays.
+/// Frames written to the AoC since the watch was last rung (the clock thread's alone).
+static WATCH_DUE: AtomicU64 = AtomicU64::new(0);
+/// The watch's cadence in frames written: 2^8 (5.3 ms), the period the watch was designed for (AUDIO.md "Speaker protection").
+/// Rung every interrupt instead, the watch read both amplifiers about once a millisecond on the MMAP path and on any path with the microphones on (their ring shares the line): about 500 us of an A715 each, half a core (2026-11-24, the Pro, `diag sched`).
+const WATCH_FRAMES: u64 = 1 << 8;
+
+/// The clock thread's ring of the watch, once `WATCH_FRAMES` have been written while sound plays.
 fn ring_watch() {
+    if WATCH_DUE.load(Ordering::Relaxed) < WATCH_FRAMES {
+        return;
+    }
+    WATCH_DUE.store(0, Ordering::Relaxed);
     WATCH_BELL.fetch_add(1, Ordering::AcqRel);
     ferros_sys::wake(&WATCH_BELL, 1);
 }
@@ -834,7 +859,7 @@ pub extern "C" fn audio_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             // The capture's shape asked with it (2026-11-24): its period in whole milliseconds and its width's code.
             // WHY the bounds: the caller's bytes; the AoC's field is a u8 of milliseconds (a period of 0 is none), its widths 1 to 3 (aoc.rs `WIDTH_16`..`WIDTH_32`); a period past 10 ms is longer than Linux's own and buys nothing here.
             audio::MIC_LEVELS if n == 3 && (1..=10).contains(&m[1]) && (aoc::WIDTH_16..=aoc::WIDTH_32).contains(&m[2]) => mic::levels(token, aoc::Shape { ms: m[1], width: m[2], gain: None, kind: aoc::REC_NORMAL }),
-            audio::BENCH if n == 14 || n == 15 => bench(token, m),
+            audio::BENCH if (14..=16).contains(&n) => bench(token, m),
             audio::RECORD if n == 3 => mic::record(token, m[1], m[2]),
             audio::SIGGEN if n == 8 => {
                 let amplitude = u32::from_le_bytes([m[4], m[5], m[6], m[7]]);
@@ -1147,6 +1172,18 @@ impl Bench {
         // The mean gap over the gaps there were: one fewer than the interrupts (none for one interrupt, said as 0).
         let mean = if self.irqs > 1 { us(self.gap_sum / (self.irqs as u64 - 1)) } else { 0 };
         say!("audio: bench: the clock thread's longest turn A#{} us: the microphones' A#{}, the playback's A#{} (of it the amplifiers' watch A#{})", us(TURN_MAX[0].load(Ordering::Relaxed)), us(TURN_MAX[1].load(Ordering::Relaxed)), us(TURN_MAX[2].load(Ordering::Relaxed)), us(TURN_MAX[3].load(Ordering::Relaxed)));
+        {
+            let sl: [u64; 6] = core::array::from_fn(|k| amp::SLOW[k].load(Ordering::Relaxed));
+            say!("audio: bench: the slowest status read A#{} us: its longest access A#{} us (at G#{:X}), its longest gap between accesses A#{} us, its longest STATUS wait A#{} us, A#{} accesses", us(sl[0]), us(sl[1]), sl[2], us(sl[3]), us(sl[4]), sl[5]);
+            let mut l = Line { b: [0; 256], n: 0 };
+            for (k, c) in amp::BY_US.iter().enumerate() {
+                let c = c.load(Ordering::Relaxed);
+                if c != 0 {
+                    let _ = write!(l, " >=A#{}:A#{}", 1u64 << k, c);
+                }
+            }
+            say!("audio: bench: status reads by us from{}", core::str::from_utf8(&l.b[..l.n]).unwrap_or(""));
+        }
         say!("audio: bench: A#{} interrupts, gaps A#{} to A#{} us, mean A#{}; queued at a ring A#{} to A#{} bytes; taken between rings A#{} to A#{} bytes", self.irqs, us(self.gap_min), us(self.gap_max), mean, self.q_min, self.q_max, self.take_min, self.take_max);
         let mut l = Line { b: [0; 256], n: 0 };
         for (k, &c) in self.gaps.iter().enumerate().filter(|(_, c)| **c != 0) {
@@ -1209,8 +1246,11 @@ fn bench(token: [u8; 32], m: &[u8]) {
     let shape = aoc::Shape { ms: m[9], width: m[10], gain: (m[8] & 4 != 0).then_some((m[12] as i8, m[13] as i8)), kind: (m[8] >> 6) & 3 };
     let ep = m[11];
     // Byte 14, when sent: the clock thread's cores (bit k core k: the A510s 0 to 3, the A715s 4 to 7), to measure a pinned thread's doorbell to run.
-    if m.len() == 15 && m[14] != 0 {
+    if m.len() >= 15 && m[14] != 0 {
         PIN.store(m[14] as u64, Ordering::Relaxed);
+    }
+    if m.len() >= 16 && m[15] != 0 {
+        WATCH_PIN.store(m[15] as u64, Ordering::Relaxed);
     }
     let feed = m[8] & 8 != 0;
     // WHY each bound (the caller's bytes): a lead of 0 plays nothing and a buffer under the lead is a lie to the AoC; a period from 2^4 frames (ALSA's least, 16 bytes, is four frames; 2^4 is the least the AoC is asked for here) to `PERIOD` (the mixer's arrays); the level at most `TONE_MAX`, the unprotected speaker's ceiling, never 0 (the default volume, far louder); a spacing of 2^10 to 2^16 frames (21 ms, longer than any loopback, to 1.4 s); the capture's shape as `MIC_LEVELS` takes it.

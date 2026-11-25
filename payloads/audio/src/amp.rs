@@ -125,14 +125,57 @@ const FS_MON_6M144: u32 = 16 | 24 << 12;
 /// Polls for a hardware handshake, a millisecond apart (out of reset, power down): Linux's own waits (c:4224-4240 OTP boot; c:2321-2331 PDN_DONE, 100 of them).
 const POLLS: u32 = 1 << 7;
 
-/// The port thru its hardware grant.
-pub struct Grant(u64);
+/// The port thru its hardware grant, every access timed for the bench (2026-11-24: a status read sometimes took milliseconds; AUDIO.md "The amplifiers' watch, measured").
+pub struct Grant(u64, core::cell::Cell<Acc>);
+/// One status read's accesses: the longest access (a syscall) and its offset, the longest time between two accesses (the thread off its core at EL0), the longest run of STATUS reads (the controller's FIFO wait), the accesses, and the end of the last.
+#[derive(Clone, Copy, Default)]
+pub struct Acc {
+    pub acc: u64,
+    pub acc_off: u64,
+    pub gap: u64,
+    pub wait: u64,
+    pub n: u64,
+    last: u64,
+    wait_from: u64,
+}
+/// The slowest status read so far: its time, then `Acc`'s five measures; and status reads by time, from 2^k microseconds (k the top bit of a u64).
+pub static SLOW: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+pub static BY_US: [core::sync::atomic::AtomicU32; 64] = [const { core::sync::atomic::AtomicU32::new(0) }; 64];
+impl Grant {
+    fn timed(&self, off: usize, f: impl FnOnce() -> u64) -> u64 {
+        let t0 = now();
+        let v = f();
+        let t1 = now();
+        let mut a = self.1.get();
+        if a.last != 0 && t0 - a.last > a.gap {
+            a.gap = t0 - a.last;
+        }
+        if t1 - t0 > a.acc {
+            a.acc = t1 - t0;
+            a.acc_off = off as u64;
+        }
+        if off == 0x14 {
+            if a.wait_from == 0 {
+                a.wait_from = t0;
+            }
+            if t1 - a.wait_from > a.wait {
+                a.wait = t1 - a.wait_from;
+            }
+        } else {
+            a.wait_from = 0;
+        }
+        a.n += 1;
+        a.last = t1;
+        self.1.set(a);
+        v
+    }
+}
 impl Regs for Grant {
     fn rd(&self, off: usize) -> u32 {
-        mmio_read(self.0, off as u64) as u32
+        self.timed(off, || mmio_read(self.0, off as u64)) as u32
     }
     fn wr(&self, off: usize, v: u32) {
-        mmio_write(self.0, off as u64, v);
+        self.timed(off, || mmio_write(self.0, off as u64, v));
     }
     fn now(&self) -> u64 {
         now()
@@ -161,7 +204,7 @@ pub const NAMES: [&str; 2] = ["left", "right"];
 
 impl Amps {
     pub fn new() -> Self {
-        Amps { spi: Spi { regs: Grant(cap(crate::grants(), S_SPI)), mode: 0, fb: 0 } }
+        Amps { spi: Spi { regs: Grant(cap(crate::grants(), S_SPI), core::cell::Cell::new(Acc::default())), mode: 0, fb: 0 } }
     }
 
     fn cs(amp: usize) -> Cs<'static> {
@@ -324,11 +367,25 @@ impl Amps {
         Ok(w)
     }
 
-    /// Both amplifiers' IRQ1_STATUS1 (power-up done, the errors) and IRQ1_STATUS3 (the PLL's lock), as they stand: the bits are sticky until written back (h:684-698), so an error between two reads is still there at the second. Four transactions, about 120 µs at the halved clock (80 bits each at 3.07 MHz, and the controller between): read every period (5.3 ms) while sound plays (main.rs `clock`).
+    /// Both amplifiers' IRQ1_STATUS1 (power-up done, the errors) and IRQ1_STATUS3 (the PLL's lock), as they stand: the bits are sticky until written back (h:684-698), so an error between two reads is still there at the second.
+    /// Four transactions of about 56 register syscalls each: 256 to 512 us on an A715 (2026-11-24, the Pro), of which the wire is about 104 us (80 bits each at 3.07 MHz).
+    /// Read every `WATCH_FRAMES` written while sound plays (main.rs `watch`).
     pub fn status(&self) -> Result<[(u32, u32); 2], &'static str> {
         let mut w = [(0, 0); 2];
+        self.spi.regs.1.set(Acc::default());
+        let t0 = now();
         for (amp, s) in w.iter_mut().enumerate() {
             *s = (self.read(amp, IRQ1_STATUS1)?, self.read(amp, IRQ1_STATUS3)?);
+        }
+        let t = now() - t0;
+        let a = self.spi.regs.1.get();
+        use core::sync::atomic::Ordering::Relaxed;
+        let us = t * 1_000_000 / freq();
+        BY_US[63 - (us | 1).leading_zeros() as usize].fetch_add(1, Relaxed);
+        if t > SLOW[0].load(Relaxed) {
+            for (k, v) in [t, a.acc, a.acc_off, a.gap, a.wait, a.n].into_iter().enumerate() {
+                SLOW[k].store(v, Relaxed);
+            }
         }
         Ok(w)
     }

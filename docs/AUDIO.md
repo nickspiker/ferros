@@ -160,7 +160,7 @@ Settings → Sound, between the battery and the torch (payloads/map devtest.rs).
 
 - **Speaker test.** A level slider (from 1 to `TONE_MAX`, 191: four octaves, 24 dB, under full scale; it starts at 111, nine octaves down, the first step of "A sound you can hear, quietly" below), and three buttons, left, right and both: a 1 kHz tone plays while a button is held and stops as the finger lifts or slides off it, faded in and out over a period (5.3 ms) so it does not click. The page says there is no speaker protection yet. Under the buttons, after every answer: what the service did (playing, stopped, refused, an amplifier's error) and each amplifier's PUP_DONE, PLL lock and error bits.
   - **The ceiling is the service's** (ferros_sys audio `TONE_MAX`, WHY in its comment): a tone or a playback above 191, or at 0 (which means the default volume, 223), is refused, never cut down. The tone also carries its own bound, 1024 periods (5.5 s, `TONE_HOLD`), so a map that dies between its start and its stop leaves nothing playing.
-  - **An amplifier's error bit stops everything at once.** While sound plays the service reads both amplifiers' IRQ1_STATUS1 and IRQ1_STATUS3 every period (four SPI transactions, about 120 µs of each 5.3 ms period, clocked by the AoC's interrupt), and any of AMP_SHORT, BST_SHORT, TEMP, BST_OVP or BST_DCM_UVP stops the tone, every stream and the recording's playback, turns the source off and powers both amplifiers down. The process stays, silent, until the next call has been told (its report's last byte), then ends.
+  - **An amplifier's error bit stops everything at once.** While sound plays the service reads both amplifiers' IRQ1_STATUS1 and IRQ1_STATUS3 every 2^8 frames played (5.3 ms; four SPI transactions, 256 to 512 µs on an A715, on a thread of its own since 2026-11-24: "The amplifiers' watch, measured"), and any of AMP_SHORT, BST_SHORT, TEMP, BST_OVP or BST_DCM_UVP stops the tone, every stream and the recording's playback, turns the source off and powers both amplifiers down. The process stays, silent, until the next call has been told (its report's last byte), then ends.
 - **Microphone test.** "listen": each microphone's peak as decibels under full scale and on a meter, about twelve times a second (the meter's call held by the service, answered as the samples come in). Then a microphone chosen by id and "record, then play back": 2.7 s recorded, then played back at the speaker test's level; the page says the recording's peak.
 - **Buzz test.** A waveform slider (the CS40L26's ROM waveforms 0 to G#26; it starts at 1, the notes' tap) and "buzz": one waveform thru the NFC driver (its op 8). The ROM's waveforms are unnamed and their strength unknown (the tuning, the RAM firmware's, is not applied); 1 is the one played in the motor's bring-up. NFC switched off by its status circle means no motor driver, and the page says so.
   - **No buzz until 2026-11-24 (the Pro, b1168).** The owner pressed it and felt nothing: the `nfc` capsule in the vault was from before 28b7f9e8 (the reset after a NACK), never stored after its hand test. The motor NACKs the transfer that wakes it, so every later transfer went out behind the unsent 4-byte address: op 7 read DEVID G#0, REVID G#0 and the ROM state G#40A260 (DEVID's value), and op 8's two mailbox writes landed elsewhere. With forge's nfc stored and restarted, op 7 read DEVID G#40A260, REVID G#A1, the ROM in standby, and op 8 (waveform 1) left the mailbox acknowledged (G#0), the ROM active (3) and EINT1 G#C00EC100 against G#80004100 before: bits 15, 17, 18, 19 and 30 newly set, none of the error bits 20 to 29 (Google's driver names none of the five; by the datasheet as remembered, not checked, the global enable, the power-up done, the boost's overvoltage flag up and down, and the mailbox written). Whether it was felt is the owner's to say.
@@ -367,10 +367,39 @@ Captured under Android with tracefs kprobes on `aoc_service_write` (tools/aaudio
 | Android, legacy (raw entry point 23) | 88.1 ms | 21.3 ms |
 | ferros, entry point 5, normal record | 34.2 to 34.8 ms | 0.67 ms |
 | ferros, entry point 0 MMAP (heap), normal record | 19.3 ms | 0.33 ms |
-| ferros, entry point 0 MMAP, MMAP record (heap) | 10.7 to 19.0 ms over four starts | 0.33 ms |
+| ferros, entry point 0 MMAP, MMAP record (heap), before the watch had its own thread | 10.7 to 19.0 ms over four starts | 0.33 ms |
+| ferros, entry point 0 MMAP, MMAP record, lead 96 frames (3 × 32) | 8.58 to 8.66 ms over four starts | 1.0 ms |
+| ferros, entry point 0 MMAP, MMAP record, lead 64 frames (2 × 32) | 7.89 to 8.03 ms over two starts | 0.33 ms |
+| ferros, entry point 0 MMAP, MMAP record, lead 48 frames (3 × 16) | 7.67 ms | 0 |
+| ferros, entry point 0 MMAP, normal record (1 ms, 16-bit), lead 64 frames | 7.87 to 8.03 ms over two starts, three microphones | 0.33 ms |
 
-The spread from one start to the next (about 8 ms) is under study: where the AoC reads the heap against where the service writes.
-**Clicks** (the owner heard them): with 64 frames (1.33 ms) of lead, the clock thread's wake-up tail (up to 4 ms, unpinned on the A715s) let the AoC read the zeroed heap: 2 to 3 holes of 3 to 5 ms in every 2.7 s of tone, each at a late turn. The lead must cover the wake-up's tail, or the tail must shrink (KERNEL.md's scheduling proposal).
+**Clicks** (the owner heard them): with 64 frames (1.33 ms) of lead, the clock thread's turn held up to 4.5 ms by the amplifiers' watch let the AoC read the zeroed heap: 2 to 3 holes of 3 to 5 ms in every 2.7 s of tone, each at a late turn. Gone since the watch has a thread of its own (051e07d0); the spread from start to start went with them (below).
+
+### The amplifiers' watch, measured (2026-11-24, later)
+
+Every register access of the port is timed (amp.rs `Grant`) and the bench says the slowest status read and its parts. A status read is four transactions, about 220 register syscalls.
+- **The slow reads were one access long.** A read of 5,227 µs (against 256 to 512 µs) spent 4,724 µs inside one register access; the time between two accesses stayed under 14 µs, and the controller's FIFO wait (the run of STATUS reads) under 18 µs. So neither ferros_spi's wait nor the SPI clock.
+- **Not the kernel lock.** The register syscalls took the lock-free path (`diag sched`: A#1,172,779 without the lock, A#42 with it, those the port's setup), and `diag lock` showed no hold past 353 µs over the run.
+- **The thread parked inside the access, waiting for a core.** `mmio_fast` erets with IRQs masked, so a pending SGI 3 (a device thread's ask to make way) or the slice's tick parks the watch as the eret lands, and a parked thread that is not a device thread queues behind whatever holds the A715s. In the trace those were the display's three publish workers (runs of 3 to 4.4 ms), the pucks Clock, Compass and Thermometer and fgtw.1 (whole 10 ms slices); the watch's own wake waited up to 2.9 ms behind them. Pinned to an idle core (the bench's byte 15, A510 core 0) no read passed 1.69 ms in two runs (512 to 1,024 µs each at the A510's clock), against reads of 2 to 3.9 ms unpinned in the runs beside them.
+- **It cost half a core.** Rung at every interrupt, the watch read both amplifiers once a millisecond on the MMAP path, and on any path with the microphones on (their ring rings the same line): about 500 µs of an A715 a millisecond (58 of 227 ms on one core in the trace). It is now rung every 2^8 frames written (5.3 ms, the cadence it was designed for, main.rs `WATCH_FRAMES`): 456 reads in 2.7 s instead of 5,467, and in 19 runs since the slowest read was 1.9 ms (one access parked for 1.3 ms), most under 700 µs.
+
+Not pinned: the A510s are Lumis's when it runs (cores 0 to 2 its intake, 3 its camera). Why a parked thread waits behind whole slices is the scheduler's, and the audio scheduling class is the owner's to decide.
+
+### The lead, measured again (2026-11-24, later)
+
+MMAP playback and MMAP record, a 1 kHz tone at `TONE_MAX`, judged on the recording high-passed at 400 Hz (below it the residual was room rumble, 7 to 80 Hz) in 1 ms blocks: a hole is a block under 70% of the tone's median, a skipped or repeated sample a jump in its phase.
+- **64 frames (2 × 32, 1.33 ms):** 11 runs of 2.7 s, no hole and no phase jump. The AoC line's interrupt to the clock thread's run: mean 25 to 30 µs, the longest 221 to 447 µs in those runs.
+- **48 frames (3 × 16, 1 ms), one take of the AoC's:** clean in two runs, but the writer reaches the AoC's rx at every other turn (2,732 of 8,196 turns): no margin.
+- **96 frames (3 × 32, 2 ms):** clean, as before.
+- **The tail:** 3 of 20 runs had one clock run 2.1 to 3.2 ms late, which at 64 frames would be a hole of up to 2 ms. A trace frozen at the first run later than 0.9 or 1 ms (`dev freeze 110`) caught none in 9 runs, so its cause is not yet seen.
+
+One run's burst (the tone's phase steady, broadband energy over 400 Hz rising for 25 ms and dying away) was a sound in the room, not the path.
+
+### The spread from start to start (2026-11-24, later)
+
+At every setup on the Pro the AoC's rp is 0 and its count a whole number of rings (playback rx A#38,860,800 = 2,530 × 15,360; capture tx A#20,736,000 = 450 × 46,080): the service's places (from rp) are Linux's ((count − hw_ptr_base) mod buffer, aoc_alsa_pcm.c:149, :596-599), and an A/B of the two placings over four starts measured alike (8.58 to 8.66 ms).
+The spread came from the holes: a writer found behind the AoC's rx starts again at rx (main.rs `mmap_turn`), so each hole delays the rest of the stream by its length, and a sweep measures the stream's delay at its end. With the holes gone, nine sweeps over three leads land within 0.4 ms of their lead.
+What is left past the queue, 7.56 to 7.70 ms in every sweep and the same for the MMAP and the normal record, is the AoC's speaker to microphone path; a steady stream at 64 frames of lead hears itself about 9 ms after its write.
 
 ## Where audio stands (2026-11-24, end of the audio session)
 
@@ -379,9 +408,7 @@ The spread from one start to the next (about 8 ms) is under study: where the AoC
 **What works, measured:** entry point 0 (MMAP) plays from the playback heap and `audio_capture1` records into the capture heap at 1 ms blocks; speaker to microphone 10.7 to 19.0 ms against Android's 21.5 ms; no holes with a 2 ms lead since the amplifiers' watch has its own thread (051e07d0). Entry point 5 stays the default shape.
 
 **Next, in order:**
-1. The watch's SPI read still takes up to 2 ms (4.5 ms seen): its cause, ferros_spi's wait against a kernel lock on the mmio path, by measurement.
-2. The lead toward 1 ms and the clock thread's pinning, measured again now the turn is 76 us (pinning was worse only while the watch stalled the turn); Lumis pins cores 0 to 3.
-3. The about 8 ms spread from one MMAP start to the next: where the AoC reads the heap (Linux counts from rx at prepare) against where the service writes (from rp).
+1. Done (later on 2026-11-24): the watch's slow reads, the lead and the spread ("The amplifiers' watch, measured", "The lead, measured again", "The spread from start to start").
 4. The split of the loop into its speaker and microphone halves: the amplifiers' V/I sense on TDM0's TX as an electrical reference; Android's stage list; the owner's calibrated microphone at the calibration session.
 5. The service's default to entry point 0 with the heaps, then the shared playback ring (SYS_SHARE, the network agent's) and the `mic` mailbox (its kernel part unwritten: the grant, the op-0 proof, the view count), the APIs drafted for Photon.
 
