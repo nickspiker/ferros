@@ -321,8 +321,17 @@ name = "ferros_kist"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_thing",
  "fgtw",
  "tatau",
+ "vsf",
+]
+
+[[package]]
+name = "ferros_thing"
+version = "0.1.0"
+dependencies = [
+ "blake3",
  "vsf",
 ]
 
