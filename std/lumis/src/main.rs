@@ -10,6 +10,7 @@
 mod camera;
 mod gpu;
 mod hold;
+mod mount;
 /// A stacked CLIP: every completed exposure a frame of its exact sums (ferros_clip packed).
 mod stack;
 mod sys;
@@ -2397,6 +2398,8 @@ struct Lumis {
     /// Relayouts since the last line, and their time.
     relaids: u64,
     relaid_us: u64,
+    /// The mount's state changes the menu last drew (lumis_core `spin::mount_changes`): its MOUNT row drawn again when they move.
+    mount_seen: u32,
 }
 
 impl Lumis {
@@ -2406,7 +2409,7 @@ impl Lumis {
             let light = (v as f32 / 255.) * (v as f32 / 255.);
             *d = G2t16::ONE - vsf::colour::convert::delinearize_gamma2tanh_bits_f32(light, 16);
         }
-        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), frame_seen: 0, knobs: dev_input().0, lut, probe: Probe::new(), gpu_asked: false, menu_fresh: true, own: None, own_changed: None, relayout: false, relaids: 0, relaid_us: 0 }
+        Lumis { width: 0, height: 0, cameras, vault, screen: Screen::Menu, menu: None, menu_dirty: true, camera_name: String::new(), dev_opened: false, surface: None, opened: Arc::new(Mutex::new(None)), finger: None, down_sampled: false, pending_up: false, changed: false, parts: Vec::new(), video_label: (String::new(), None, false, 0, false), video_drawn: std::time::Instant::now(), ui_pass: std::time::Instant::now(), frame_seen: 0, knobs: dev_input().0, lut, probe: Probe::new(), gpu_asked: false, menu_fresh: true, own: None, own_changed: None, relayout: false, relaids: 0, relaid_us: 0, mount_seen: 0 }
     }
 
     /// The menu asked to open camera `index` (its place in the list).
@@ -2641,6 +2644,15 @@ impl FluorApp<G2t16> for Lumis {
                             println!("lumis: the menu laid out again A#{} times, A#{} us each", self.relaids, self.relaid_us >> 5);
                             (self.relaids, self.relaid_us) = (0, 0);
                         }
+                    }
+                }
+                // The mount moved (paired, its code, connected): its row drawn again.
+                let changes = lumis_core::spin::mount_changes();
+                if changes != self.mount_seen {
+                    self.mount_seen = changes;
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.refresh();
+                        self.menu_dirty = true;
                     }
                 }
                 if self.menu_dirty {
@@ -2910,6 +2922,8 @@ fn main() {
     lumis_core::clips::set_hold(lumis_core::clips::Hold { list: hold::list_clips, remove: hold::remove_clip });
     println!("lumis: the hold (your things) {}", if hold::held() { format!("in slot {}", hold::ITEMS) } else { format!("not given (slot {} empty): stills kept in Lumis's own domain, no RAW clips", hold::ITEMS) });
     let vault = open_vault();
+    // The camera mount over Bluetooth (mount.rs), when Lumis holds the right: its menu row from then.
+    mount::start(vault.clone());
     if let Some(v) = &vault {
         lumis_core::platform::set_config_store(Box::new(Vault(v.clone())));
         // The keeper (`keep_saves`) keeps saves in it from its own thread.
